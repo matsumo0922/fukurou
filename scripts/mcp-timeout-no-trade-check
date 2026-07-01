@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+readonly TIMEOUT_SECONDS="${FUKUROU_TIMEOUT_CHECK_SECONDS:-12}"
+readonly SIMULATED_DELAY_MS="${FUKUROU_TIMEOUT_CHECK_DELAY_MS:-60000}"
+readonly JAR_PATH="${REPO_ROOT}/mcp/build/libs/fukurou-mcp-all.jar"
+readonly TEMP_DIR="$(mktemp -d)"
+
+cleanup() {
+  rm -rf "${TEMP_DIR}"
+}
+
+trap cleanup EXIT
+
+fail() {
+  echo "${SCRIPT_NAME}: $*" >&2
+  exit 1
+}
+
+build_fat_jar() {
+  (cd "${REPO_ROOT}" && ./gradlew :mcp:buildFatJar)
+}
+
+run_with_timeout() {
+  local label="$1"
+  local output_file="$2"
+  shift 2
+
+  python3 - "${label}" "${TIMEOUT_SECONDS}" "${output_file}" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+label = sys.argv[1]
+timeout_seconds = int(sys.argv[2])
+output_file = Path(sys.argv[3])
+command = sys.argv[4:]
+
+with output_file.open("wb") as output:
+    process = subprocess.Popen(
+        command,
+        stdout=output,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    try:
+        exit_status = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        time.sleep(1)
+
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+        print(f"{label} timeout_exit=124 no_trade=true")
+        sys.exit(0)
+
+print(f"{label} exited before timeout: {exit_status}", file=sys.stderr)
+
+if output_file.exists():
+    lines = output_file.read_text(errors="replace").splitlines()
+    for line in lines[-80:]:
+        print(line, file=sys.stderr)
+
+sys.exit(1)
+PY
+}
+
+run_claude_timeout_check() {
+  local output_file="${TEMP_DIR}/claude-timeout.log"
+
+  run_with_timeout \
+    "claude" \
+    "${output_file}" \
+    claude -p "simulate_tool_timeout MCP tool を delay_ms=${SIMULATED_DELAY_MS} で必ず呼び、tool result を待ってから答えて。" \
+      --mcp-config "${REPO_ROOT}/.mcp.json" \
+      --strict-mcp-config \
+      --permission-mode dontAsk \
+      --allowedTools mcp__fukurou-gmo-coin-mcp__simulate_tool_timeout \
+      --verbose \
+      --output-format stream-json \
+      --no-session-persistence
+}
+
+run_codex_timeout_check() {
+  local output_file="${TEMP_DIR}/codex-timeout.log"
+
+  run_with_timeout \
+    "codex" \
+    "${output_file}" \
+    codex exec \
+      --ignore-user-config \
+      --sandbox read-only \
+      -c "approval_policy=\"never\"" \
+      -c "mcp_servers.fukurou-gmo-coin-mcp.command=\"java\"" \
+      -c "mcp_servers.fukurou-gmo-coin-mcp.args=[\"-jar\",\"${JAR_PATH}\"]" \
+      "Use the fukurou-gmo-coin-mcp simulate_tool_timeout MCP tool with delay_ms=${SIMULATED_DELAY_MS}. Wait for the tool result before answering. Do not run shell commands and do not edit files."
+}
+
+main() {
+  command -v python3 >/dev/null || fail "python3 is required"
+  [[ "${TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] || fail "FUKUROU_TIMEOUT_CHECK_SECONDS must be an integer"
+  [[ "${SIMULATED_DELAY_MS}" =~ ^[0-9]+$ ]] || fail "FUKUROU_TIMEOUT_CHECK_DELAY_MS must be an integer"
+
+  build_fat_jar
+  [[ -f "${JAR_PATH}" ]] || fail "MCP fat jar was not built: ${JAR_PATH}"
+
+  run_claude_timeout_check
+  run_codex_timeout_check
+}
+
+main "$@"
