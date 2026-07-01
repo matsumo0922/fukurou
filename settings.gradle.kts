@@ -1,7 +1,6 @@
 @file:Suppress("UnstableApiUsage")
 
 rootProject.name = "fukurou"
-enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
 
 pluginManagement {
     includeBuild("build-logic")
@@ -21,3 +20,5 @@ dependencyResolutionManagement {
 }
 
 include(":fukurou")
+include(":mcp")
+include(":trading")

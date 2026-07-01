@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "fukurou-gmo-coin-mcp": {
+      "command": "java",
+      "args": [
+        "-jar",
+        "mcp/build/libs/fukurou-mcp-all.jar"
+      ]
+    }
+  }
+}
