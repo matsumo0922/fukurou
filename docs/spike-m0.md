@@ -48,7 +48,7 @@ reject_dummy_trade rejected as expected: Rejected: Step1 dummy trade never perfo
 
 ## Claude headless
 
-使用予定の設定:
+使用した設定:
 
 ```sh
 claude -p 'MCP tool get_ticker を必ず使って BTC の ticker を取得し、最後に取得した symbol/last/bid/ask/timestamp だけを短く出力して。' \
@@ -62,14 +62,14 @@ claude -p 'MCP tool get_ticker を必ず使って BTC の ticker を取得し、
 
 結果:
 
-- 未達。MCP 有無に関係なく `claude -p 'hello'` が `401 Invalid authentication credentials` で失敗した。
-- `claude auth status` は `loggedIn: true` / `authMethod: claude.ai` / `subscriptionType: max` を返した。
-- `--model sonnet` を指定しても同じ 401。
+- 成功。
+- `--permission-mode dontAsk` と `--allowedTools mcp__fukurou-gmo-coin-mcp__get_ticker` で approval prompt なしに `get_ticker` が呼ばれた。
+- 出力例: `symbol=BTC last=9747365 bid=9742999 ask=9746000 timestamp=2026-07-01T16:46:28.403Z`
 
 判断:
 
-- 今回の Claude 未達は MCP server 起動や tool approval の問題ではなく、Claude CLI の print-mode 認証経路の問題として扱う。
-- Claude の headless 承認設定は上記コマンド形で継続検証する。
+- Claude headless の読み取り tool は、上記オプションで非対話実行できる。
+- 以前は `claude -p` が 401 を返したが、その後 `claude -p "こんにちは"` と MCP tool call の両方が成功したため、少なくとも現在のローカル認証状態では解消済みとして扱う。
 
 ## Codex headless
 
@@ -110,11 +110,31 @@ codex exec \
 - approval prompt は出ず、取引系 tool は headless `approval_policy="never"` で no-trade 終了した。
 - SDK smoke では server handler まで届き、`Rejected: Step1 dummy trade never performs side effects.` が返ることを確認済み。
 
+## Claude dummy trade reject
+
+```sh
+claude -p 'reject_dummy_trade MCP tool を reason="headless reject check" で呼び、拒否されたことだけを短く答えて。' \
+  --mcp-config .mcp.json \
+  --strict-mcp-config \
+  --permission-mode dontAsk \
+  --allowedTools mcp__fukurou-gmo-coin-mcp__reject_dummy_trade \
+  --output-format json \
+  --no-session-persistence
+```
+
+結果:
+
+- 成功。
+- tool handler が `Rejected: Step1 dummy trade never performs side effects.` を返し、取引副作用なしで終了した。
+- approval prompt は出なかった。
+
 ## 失敗系
 
-### Claude 認証切れ相当
+### CLI 認証切れ相当
 
-`claude -p 'hello' --output-format json --no-session-persistence` が 401 を返した。MCP tool call 以前に終了し、取引は行われない。
+以前の検証では `claude -p 'hello' --output-format json --no-session-persistence` が 401 を返した。MCP tool call 以前に終了し、取引は行われない。
+
+現在のローカル環境では同じ print-mode 認証経路が復旧しており、Claude headless の `get_ticker` と `reject_dummy_trade` は成功した。
 
 ### MCP 起動失敗
 
@@ -135,6 +155,23 @@ codex exec \
 - Codex の callable tools に `get_ticker` が出ず、`Unavailable` で終了した。
 - no-trade で終了した。
 
+Claude headless でも missing jar を指定して実行した。
+
+```sh
+claude -p 'fukurou-gmo-coin-mcp の get_ticker を使ってみて。MCP server が利用できなければ unavailable とだけ答えて。' \
+  --mcp-config '{"mcpServers":{"fukurou-gmo-coin-mcp":{"command":"java","args":["-jar","/tmp/fukurou-missing-mcp.jar"]}}}' \
+  --strict-mcp-config \
+  --permission-mode dontAsk \
+  --allowedTools mcp__fukurou-gmo-coin-mcp__get_ticker \
+  --output-format json \
+  --no-session-persistence
+```
+
+結果:
+
+- Claude は `unavailable` を返した。
+- MCP server が起動できない場合も、取引系 tool は呼ばれない。
+
 ### timeout
 
 今回の Step1 実装には sleep tool や wrapper daemon がないため、tool timeout / LLM timeout は独立再現していない。Step1.5 の no-trade wrapper 契約で timeout を明示的に固定する。
@@ -142,9 +179,18 @@ codex exec \
 ## CLI 認証と container 化メモ
 
 - Codex はローカルの `CODEX_HOME` 認証を使い、複数回の `codex exec` で headless 実行できた。
-- Claude は `claude auth status` では logged in だが、`claude -p` は 401。container mount の前に print-mode 認証経路の修復が必要。
+- Claude はローカルの Claude Code 認証を使い、複数回の `claude -p` で headless 実行できた。
 - container 検証では `CODEX_HOME` / Claude の認証保存先を read-only volume として mount し、token を image や log に焼かない。
 - trade 専用 container では一般 Bash/File tool を閉じ、必要な MCP server だけを登録する。`--dangerously-skip-permissions` 系は secret 漏洩リスクがあるため既定にしない。
+
+## 未実測の項目
+
+Issue #4 の追記条件のうち、以下は本 PR では実測していない。
+
+- CLI 認証 token を read-only volume mount し、container 再起動後も非対話で動くこと。
+- tool timeout / LLM timeout を独立再現し、呼び出し元が no-trade で終了できること。
+
+どちらも実資金取引前の安全床として必要だが、今回の最小 MCP server には wrapper daemon や timeout 専用 tool がない。#10 の no-trade wrapper / timeout 契約で固定する。
 
 ## 次への申し送り
 
