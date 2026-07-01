@@ -3,6 +3,7 @@ package me.matsumo.fukurou.mcp
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.server.StdioServerTransport
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
 import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
@@ -142,17 +143,7 @@ private fun Server.registerTickerTool(marketDataSource: MarketDataSource) {
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
-        val symbolResult = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull)
-
-        symbolResult.fold(
-            onSuccess = { symbol ->
-                marketDataSource.getTicker(symbol).fold(
-                    onSuccess = { ticker -> tickerResult(ticker) },
-                    onFailure = { throwable -> errorResult("gmo_public_error", throwable.message.orEmpty()) },
-                )
-            },
-            onFailure = { throwable -> errorResult("invalid_symbol", throwable.message.orEmpty()) },
-        )
+        handleGetTicker(request, marketDataSource)
     }
 }
 
@@ -180,6 +171,15 @@ private fun Server.registerRejectDummyTradeTool() {
             isError = true,
         )
     }
+}
+
+private suspend fun handleGetTicker(request: CallToolRequest, marketDataSource: MarketDataSource): CallToolResult {
+    val symbol = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull)
+        .getOrElse { throwable -> return errorResult("invalid_symbol", throwable.message.orEmpty()) }
+    val ticker = marketDataSource.getTicker(symbol)
+        .getOrElse { throwable -> return errorResult("gmo_public_error", throwable.message.orEmpty()) }
+
+    return tickerResult(ticker)
 }
 
 private fun parseTradingSymbol(rawSymbol: String?): Result<TradingSymbol> {
