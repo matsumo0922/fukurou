@@ -20,11 +20,70 @@
 
 ## 技術スタック
 
-Kotlin/JVM ・ Ktor ・ Exposed(SQLite) ・ MCP 公式 Kotlin SDK ・ Docker Compose ・ GMO コイン API
+Kotlin/JVM ・ Ktor ・ Exposed ・ PostgreSQL ・ Docker Compose ・ MCP 公式 Kotlin SDK ・ GMO コイン API
 
 ## ステータス
 
-**設計フェーズ完了 → 実装着手前。** 詳細設計は [`docs/design.md`](docs/design.md) を参照。
+**backend scaffold 実装済み。** 詳細設計は [`docs/design.md`](docs/design.md) を参照。
+
+現時点の実装は、将来の bot 実装を載せるための最小 Ktor backend だけです。trading bot domain、MCP server、daemon scheduler、paper simulator、Obsidian knowledge layer はまだ実装していません。
+
+## Backend scaffold
+
+Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
+
+公開済みの placeholder endpoint:
+
+- `GET /revision`
+- `GET /health/live`
+- `GET /health/ready`
+- `GET /swagger`
+- `GET /openapi.json`
+
+`/health/ready` は `DB_URL` / `DB_USER` / `DB_PASSWORD` が揃っている場合に Hikari + Exposed で PostgreSQL に接続し、`SELECT 1` が成功したら ready を返します。
+
+## Local development
+
+PostgreSQL を Docker Compose で起動します。
+
+```sh
+cp .env.example .env
+editor .env # POSTGRES_PASSWORD を設定する
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
+```
+
+`.env` の `POSTGRES_PASSWORD` と同じ値を `DB_PASSWORD` に設定して Ktor を起動します。
+
+```sh
+export DB_URL="jdbc:postgresql://localhost:5432/fukurou"
+export DB_USER="fukurou"
+export DB_PASSWORD="<your local password>"
+make run
+```
+
+よく使うコマンド:
+
+```sh
+make test
+make detekt
+make build
+```
+
+## Deployment
+
+Docker Compose と GitHub Actions による GHCR image pull 型の NAS deploy scaffold を用意しています。
+
+- `Dockerfile`
+- `docker-compose.yml`
+- `docker-compose.dev.yml`
+- `docker-compose.prod.yml`
+- `.github/workflows/deploy.yml`
+- `scripts/deploy/deploy-fukurou`
+- `scripts/deploy/sudoers-fukurou`
+- `scripts/prod-curl`
+- [`docs/deploy.md`](docs/deploy.md)
+
+秘密情報は repository にコミットしません。Cloudflare Tunnel token と PostgreSQL password は `.env` で管理し、Cloudflare Access の Service Token は NAS `.env` ではなく手元の未追跡 env file か secret manager に置きます。
 
 ## ライセンス
 

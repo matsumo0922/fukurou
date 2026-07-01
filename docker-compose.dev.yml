@@ -1,0 +1,9 @@
+# Local development overlay for IntelliJ / Gradle runs.
+#
+# Start only the postgres service with this file:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
+services:
+  # Expose PostgreSQL to the host so Ktor launched from IntelliJ can connect via localhost.
+  postgres:
+    ports:
+      - "5432:5432"

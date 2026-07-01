@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly DEPLOY_ROOT="${FUKUROU_DEPLOY_ROOT:-/srv/fukurou}"
+readonly REPO_DIR="${DEPLOY_ROOT}/repo"
+readonly ENV_FILE="${DEPLOY_ROOT}/.env"
+readonly LOCK_FILE="${FUKUROU_DEPLOY_LOCK:-/var/lock/fukurou-deploy.lock}"
+readonly COMPOSE_FILE="${REPO_DIR}/docker-compose.prod.yml"
+readonly MAIN_REF="${FUKUROU_MAIN_REF:-origin/main}"
+
+usage() {
+  echo "Usage: deploy-fukurou <40-character commit sha>" >&2
+}
+
+fail() {
+  echo "deploy-fukurou: $*" >&2
+  exit 1
+}
+
+require_root() {
+  if [[ "$(id -u)" != "0" ]]; then
+    fail "this script must run as root via sudo"
+  fi
+}
+
+normalize_sha() {
+  local raw_sha="$1"
+
+  if [[ ! "${raw_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    usage
+    fail "commit sha must be a 40-character hexadecimal string"
+  fi
+
+  printf '%s' "${raw_sha}" | tr 'A-F' 'a-f'
+}
+
+require_initial_paths() {
+  [[ -d "${REPO_DIR}/.git" ]] || fail "${REPO_DIR} is not a Git checkout"
+  [[ -f "${ENV_FILE}" ]] || fail "${ENV_FILE} is missing"
+}
+
+require_compose_file() {
+  [[ -f "${COMPOSE_FILE}" ]] || fail "${COMPOSE_FILE} is missing"
+}
+
+checkout_deploy_sha() {
+  local deploy_sha="$1"
+
+  git -C "${REPO_DIR}" fetch --prune origin +refs/heads/main:refs/remotes/origin/main
+  git -C "${REPO_DIR}" cat-file -e "${deploy_sha}^{commit}"
+
+  if ! git -C "${REPO_DIR}" merge-base --is-ancestor "${deploy_sha}" "${MAIN_REF}"; then
+    fail "${deploy_sha} is not reachable from ${MAIN_REF}"
+  fi
+
+  git -C "${REPO_DIR}" cat-file -e "${deploy_sha}:docker-compose.prod.yml" ||
+    fail "${deploy_sha} does not contain docker-compose.prod.yml"
+
+  git -C "${REPO_DIR}" checkout --detach "${deploy_sha}"
+  require_compose_file
+}
+
+deploy_compose() {
+  local deploy_sha="$1"
+
+  export FUKUROU_IMAGE_TAG="${deploy_sha}"
+
+  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" pull
+  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
+}
+
+main() {
+  require_root
+
+  local deploy_sha
+  deploy_sha="$(normalize_sha "${1:-}")"
+
+  require_initial_paths
+
+  exec 9>"${LOCK_FILE}"
+  if ! flock -n 9; then
+    fail "another deployment is already running"
+  fi
+
+  checkout_deploy_sha "${deploy_sha}"
+  deploy_compose "${deploy_sha}"
+}
+
+main "$@"

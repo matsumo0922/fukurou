@@ -1,0 +1,3 @@
+# Install to /etc/sudoers.d/fukurou-deploy with mode 0440.
+# Validate with: visudo -cf /etc/sudoers.d/fukurou-deploy
+github-runner ALL=(root) NOPASSWD: /usr/local/sbin/deploy-fukurou
