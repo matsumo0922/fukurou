@@ -10,6 +10,9 @@ import org.gradle.kotlin.dsl.configure
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.dsl.KotlinJvmProjectExtension
 
+/**
+ * Kotlin/JVM と serialization plugin を適用する Gradle convention plugin。
+ */
 class KotlinJvmPlugin : Plugin<Project> {
     override fun apply(target: Project) {
         with(target) {

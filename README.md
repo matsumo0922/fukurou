@@ -51,10 +51,11 @@ PostgreSQL を Docker Compose で起動します。
 
 ```sh
 cp .env.example .env
+editor .env # POSTGRES_PASSWORD を設定する
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
 ```
 
-`.env` の値に合わせて Ktor を起動します。
+`.env` の `POSTGRES_PASSWORD` と同じ値を `DB_PASSWORD` に設定して Ktor を起動します。
 
 ```sh
 export DB_URL="jdbc:postgresql://localhost:5432/fukurou"
