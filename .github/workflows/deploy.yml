@@ -1,0 +1,112 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      image_sha:
+        description: "Commit SHA on main to build and deploy. Leave empty to use the workflow ref."
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: fukurou-production-deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE_REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/matsumo0922/fukurou
+
+jobs:
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      deploy_sha: ${{ steps.resolve.outputs.deploy_sha }}
+      image_name: ${{ env.IMAGE_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve deploy SHA
+        id: resolve
+        shell: bash
+        env:
+          INPUT_IMAGE_SHA: ${{ github.event.inputs.image_sha }}
+        run: |
+          set -euo pipefail
+
+          deploy_sha="${INPUT_IMAGE_SHA:-${GITHUB_SHA}}"
+          if [[ ! "${deploy_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::image_sha must be a 40-character commit SHA"
+            exit 1
+          fi
+
+          deploy_sha="$(printf '%s' "${deploy_sha}" | tr 'A-F' 'a-f')"
+
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git cat-file -e "${deploy_sha}^{commit}"
+          git merge-base --is-ancestor "${deploy_sha}" origin/main
+          git checkout --detach "${deploy_sha}"
+
+          {
+            echo "deploy_sha=${deploy_sha}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve image tags
+        id: image_tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tags="${IMAGE_NAME}:${{ steps.resolve.outputs.deploy_sha }}"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            tags="${tags}"$'\n'"${IMAGE_NAME}:main"
+          fi
+
+          {
+            echo "tags<<EOF"
+            echo "${tags}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image_tags.outputs.tags }}
+          build-args: |
+            FUKUROU_REVISION=${{ steps.resolve.outputs.deploy_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy on NAS
+    needs: build
+    runs-on:
+      - self-hosted
+      - fukurou-prod
+    permissions: {}
+    steps:
+      - name: Deploy pinned image
+        run: sudo /usr/local/sbin/deploy-fukurou ${{ needs.build.outputs.deploy_sha }}

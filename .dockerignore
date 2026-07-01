@@ -1,0 +1,24 @@
+# Build 成果物（コンテナ内でビルドするため不要・コンテキストを軽くする）
+.gradle/
+build/
+fukurou/build/
+build-logic/build/
+
+# VCS / IDE
+.git/
+.gitignore
+.idea/
+*.iml
+
+# シークレット・ローカル設定
+.env
+local.properties
+*.local
+
+# OS / ログ
+.DS_Store
+*.log
+
+# ドキュメント（イメージに不要）
+docs/
+README.md

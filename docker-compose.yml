@@ -1,0 +1,75 @@
+name: fukurou
+
+# 構成: ktor + postgres + cloudflared。
+# ネットワークを 2 面に分離し、cloudflared は postgres へ到達できないようにする。
+#   - edge: cloudflared <-> ktor
+#   - data: ktor <-> postgres
+
+services:
+  # アプリ本体。外部公開ポートは持たず、cloudflared 経由でのみ到達させる。
+  ktor:
+    build:
+      context: .
+      args:
+        FUKUROU_REVISION: ${FUKUROU_REVISION:-unknown}
+    image: fukurou:latest
+    container_name: fukurou-ktor
+    restart: unless-stopped
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+    networks:
+      - edge
+      - data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # ports:
+    #   - "8080:8080"   # Phase 3 の LAN 疎通確認時のみ一時的に有効化する。
+    #                   # Phase 6 で必ず削除すること（LAN 直アクセスは Cloudflare Access を迂回するため）。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # PostgreSQL。記憶役。データは volume に永続化し、アプリ再デプロイで巻き込まない。
+  postgres:
+    image: postgres:16
+    container_name: fukurou-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Cloudflare Tunnel コネクタ。外向き outbound のみで、ルータのポート開放は不要。
+  # ingress（Public Hostname -> http://ktor:8080）は Cloudflare ダッシュボードで設定する。
+  cloudflared:
+    image: cloudflare/cloudflared:2026.6.1
+    container_name: fukurou-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARED_TUNNEL_TOKEN}
+    networks:
+      - edge
+    depends_on:
+      - ktor
+
+networks:
+  edge:
+  data:
+
+volumes:
+  pgdata:
