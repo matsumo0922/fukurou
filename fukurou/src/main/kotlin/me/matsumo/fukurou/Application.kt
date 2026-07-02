@@ -12,6 +12,9 @@ import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
+import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
+import java.time.Clock
+import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
  * readiness 判定。外部依存が利用可能かを返す。
@@ -25,13 +28,27 @@ fun interface ReadinessProbe {
  *
  * @param readinessProbe `/health/ready` で参照する readiness 判定。null なら環境変数の DB 設定を用いる
  * @param revision `/revision` で返す稼働中 image の revision。既定は環境変数から読む
+ * @param reconcilerStatus ProtectionReconciler の状態 holder
+ * @param clock Reconciler readiness の鮮度判定に使う clock
  */
 fun Application.module(
     readinessProbe: ReadinessProbe? = null,
     revision: String = currentRevisionFromEnv(),
+    reconcilerStatus: MutableReconcilerStatus = MutableReconcilerStatus(),
+    clock: Clock = Clock.systemUTC(),
 ) {
     val databaseDataSource = createDataSourceIfConfigured(readinessProbe)
-    val resolvedReadinessProbe = readinessProbe ?: databaseReadinessProbe(databaseDataSource)
+    val database = databaseDataSource?.let { dataSource -> ExposedDatabase.connect(dataSource) }
+    val baseReadinessProbe = readinessProbe ?: databaseReadinessProbe(database)
+    val resolvedReadinessProbe = if (database == null || readinessProbe != null) {
+        baseReadinessProbe
+    } else {
+        ReconcilerFreshnessReadinessProbe(
+            delegate = baseReadinessProbe,
+            reconcilerStatusProvider = reconcilerStatus,
+            clock = clock,
+        )
+    }
 
     install(CallLogging)
     install(ContentNegotiation) {
@@ -45,14 +62,26 @@ fun Application.module(
     }
 
     routing {
-        healthRoutes(resolvedReadinessProbe)
+        healthRoutes(resolvedReadinessProbe, reconcilerStatus)
         revisionRoute(revision)
         apiDocumentationRoutes()
     }
 
-    if (databaseDataSource != null) {
+    val reconcilerWorker = if (databaseDataSource != null && database != null) {
+        startProtectionReconcilerWorker(
+            dataSource = databaseDataSource,
+            database = database,
+            status = reconcilerStatus,
+            clock = clock,
+        )
+    } else {
+        null
+    }
+
+    if (databaseDataSource != null || reconcilerWorker != null) {
         monitor.subscribe(ApplicationStopped) {
-            databaseDataSource.close()
+            reconcilerWorker?.close()
+            databaseDataSource?.close()
         }
     }
 }

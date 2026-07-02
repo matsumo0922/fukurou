@@ -91,6 +91,17 @@ fun databaseReadinessProbe(dataSource: HikariDataSource?): ReadinessProbe {
 
     val database = ExposedDatabase.connect(dataSource)
 
+    return databaseReadinessProbe(database)
+}
+
+/**
+ * 共有 Exposed database から readiness probe を構築する。
+ */
+fun databaseReadinessProbe(database: ExposedDatabase?): ReadinessProbe {
+    if (database == null) {
+        return ReadinessProbe { false }
+    }
+
     return ReadinessProbe { database.isReachableByExposed() }
 }
 

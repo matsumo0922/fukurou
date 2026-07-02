@@ -8,6 +8,8 @@ import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 import io.ktor.server.routing.openapi.describe
 import io.ktor.utils.io.ExperimentalKtorApi
+import me.matsumo.fukurou.trading.reconciler.NoReconcilerStatusProvider
+import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
 
 /**
  * ヘルスチェックエンドポイントを分類する OpenAPI タグ。
@@ -18,7 +20,10 @@ private const val HEALTH_TAG = "ヘルスチェック"
  * ヘルスチェック系エンドポイントを定義する。
  */
 @OptIn(ExperimentalKtorApi::class)
-internal fun Route.healthRoutes(readinessProbe: ReadinessProbe) {
+internal fun Route.healthRoutes(
+    readinessProbe: ReadinessProbe,
+    reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
+) {
     get("/health") {
         call.respond(HealthResponse(status = "ok"))
     }.describe {
@@ -54,7 +59,7 @@ internal fun Route.healthRoutes(readinessProbe: ReadinessProbe) {
     }
 
     get("/health/ready") {
-        respondReadiness(call, readinessProbe)
+        respondReadiness(call, readinessProbe, reconcilerStatusProvider)
     }.describe {
         summary = "受入可能状態を取得する"
         tag(HEALTH_TAG)
@@ -81,13 +86,20 @@ internal fun Route.healthRoutes(readinessProbe: ReadinessProbe) {
 internal suspend fun respondReadiness(
     call: ApplicationCall,
     readinessProbe: ReadinessProbe,
+    reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
 ) {
     val ready = readinessProbe.isReady()
+    val reconcilerStatus = reconcilerStatusProvider.snapshot()
+    val readinessResponse = ReadinessResponse(
+        status = if (ready) "ready" else "not_ready",
+        lastReconciledAt = reconcilerStatus.lastReconciledAt?.toString(),
+        lastMarketDataAt = reconcilerStatus.lastMarketDataAt?.toString(),
+    )
 
     if (ready) {
-        call.respond(ReadinessResponse(status = "ready"))
+        call.respond(readinessResponse)
         return
     }
 
-    call.respond(HttpStatusCode.ServiceUnavailable, ReadinessResponse(status = "not_ready"))
+    call.respond(HttpStatusCode.ServiceUnavailable, readinessResponse)
 }

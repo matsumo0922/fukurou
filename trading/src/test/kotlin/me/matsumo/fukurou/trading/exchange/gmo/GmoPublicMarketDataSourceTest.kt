@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.exchange.gmo
 
+import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -37,6 +38,26 @@ class GmoPublicMarketDataSourceTest {
             parseTickerResponse(ERROR_RESPONSE, TradingSymbol.BTC)
         }
     }
+
+    @Test
+    fun parseTradesResponse_returnsRecentTrades() {
+        val trades = parseTradesResponse(TRADES_SUCCESS_RESPONSE, TradingSymbol.BTC)
+        val firstTrade = trades.first()
+
+        assertEquals(2, trades.size)
+        assertEquals("BTC", firstTrade.symbol)
+        assertEquals("9748750", firstTrade.price)
+        assertEquals("0.01", firstTrade.size)
+        assertEquals(TradeSide.BUY, firstTrade.side)
+        assertEquals("2026-07-01T16:26:58.000Z", firstTrade.timestamp)
+    }
+
+    @Test
+    fun parseTradesResponse_rejectsNonZeroStatus() {
+        assertFailsWith<IllegalArgumentException> {
+            parseTradesResponse(TRADES_ERROR_RESPONSE, TradingSymbol.BTC)
+        }
+    }
 }
 
 private const val SUCCESS_RESPONSE = """
@@ -69,5 +90,37 @@ private const val ERROR_RESPONSE = """
 {
   "status": 1,
   "data": []
+}
+"""
+
+private const val TRADES_SUCCESS_RESPONSE = """
+{
+  "status": 0,
+  "data": {
+    "list": [
+      {
+        "price": "9748750",
+        "size": "0.01",
+        "side": "BUY",
+        "timestamp": "2026-07-01T16:26:58.000Z"
+      },
+      {
+        "price": "9748740",
+        "size": "0.02",
+        "side": "SELL",
+        "timestamp": "2026-07-01T16:26:59.000Z"
+      }
+    ]
+  },
+  "responsetime": "2026-07-01T16:27:00.000Z"
+}
+"""
+
+private const val TRADES_ERROR_RESPONSE = """
+{
+  "status": 1,
+  "data": {
+    "list": []
+  }
 }
 """
