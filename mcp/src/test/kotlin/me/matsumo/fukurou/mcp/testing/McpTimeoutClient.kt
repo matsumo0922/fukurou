@@ -18,7 +18,15 @@ fun main(args: Array<String>) = runBlocking {
         "Usage: McpTimeoutClientKt <mcp-fat-jar>"
     }
 
-    val process = ProcessBuilder("java", "-jar", jarPath)
+    val process = ProcessBuilder(
+        "java",
+        "-Dfukurou.mcp.testInMemoryRuntime=true",
+        "-jar",
+        jarPath,
+    )
+        .apply {
+            environment()["FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME"] = "true"
+        }
         .redirectError(ProcessBuilder.Redirect.INHERIT)
         .start()
 

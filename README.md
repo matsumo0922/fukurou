@@ -24,9 +24,9 @@ Kotlin/JVM ・ Ktor ・ Exposed ・ PostgreSQL ・ Docker Compose ・ MCP 公式
 
 ## ステータス
 
-**backend scaffold 実装済み。** 詳細設計は [`docs/design.md`](docs/design.md) を参照。
+**Step6（堅牢化 / config / Docker MCP 配線）まで実装済み。** 詳細設計は [`docs/design.md`](docs/design.md)、MCP runtime と Docker 手順は [`docs/mcp-runtime.md`](docs/mcp-runtime.md) を参照。
 
-現時点の実装は、将来の bot 実装を載せるための最小 Ktor backend だけです。trading bot domain、MCP server、daemon scheduler、paper simulator、Obsidian knowledge layer はまだ実装していません。
+現時点では、`:trading` の paper account / broker / safety / reconciler / GMO Public market data、`:mcp` の stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 `ProtectionReconciler` worker が実装済みです。daemon scheduler、LlmInvoker 本実装、Falsifier、`decision.submit_decision` 本実装、live 実発注はまだ実装していません。
 
 ## Backend scaffold
 
@@ -68,6 +68,8 @@ make test
 make detekt
 make build
 ```
+
+runtime config は `.env.example` の `FUKUROU_*` で上書きできます。既定は BTC 現物 / `PAPER` / 仮想 10 万円で、`LIVE` は予約値です。live broker 実装前は `LIVE` 起動を拒否し、実資金を動かす機能はまだ有効化されません。
 
 ## Deployment
 

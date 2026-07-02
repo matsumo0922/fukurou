@@ -2,7 +2,7 @@
 
 Fukurou の最小 Ktor backend を NAS 上で常時稼働させ、Cloudflare Tunnel + Access で公開・保護するための運用手順。
 
-この scaffold では `ktor` + `postgres` + `cloudflared` の 3 サービスだけを扱う。trading bot、MCP server、daemon scheduler、paper simulator、Obsidian knowledge layer はまだ実装しない。
+この scaffold では `ktor` + `postgres` + `cloudflared` の 3 サービスを扱う。Step6 時点では Ktor backend、paper trading runtime、常駐 `ProtectionReconciler`、MCP stdio fat jar の image 同梱まで実装済み。daemon scheduler、LlmInvoker 本実装、Obsidian knowledge layer、live 実発注はまだ実装しない。
 
 ## 全体像
 

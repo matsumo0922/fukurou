@@ -114,7 +114,44 @@ data class SafetyFloorConfig(
     val minExpectedMoveToCostRatio: BigDecimal = DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO,
     val maxTakerFeeRatio: BigDecimal = DEFAULT_MAX_TAKER_FEE_RATIO,
     val marketSlippageReserveBps: BigDecimal = DEFAULT_MARKET_SLIPPAGE_RESERVE_BPS,
-)
+) {
+    init {
+        val maxRiskPerTradeIsPositive = maxRiskPerTradeRatio > BigDecimal.ZERO
+        val maxRiskPerTradeIsAtOrBelowDefault = maxRiskPerTradeRatio <= DEFAULT_MAX_RISK_PER_TRADE_RATIO
+        val maxRiskPerTradeIsConservative = maxRiskPerTradeIsPositive && maxRiskPerTradeIsAtOrBelowDefault
+        val maxDrawdownIsAtOrAboveDefault = maxDrawdownRatio >= SafetyFloorDefaults.maxDrawdownRatio
+        val maxDrawdownIsNegative = maxDrawdownRatio < BigDecimal.ZERO
+        val maxDrawdownIsConservative = maxDrawdownIsAtOrAboveDefault && maxDrawdownIsNegative
+        val maxTotalExposureIsPositive = maxTotalExposureRatio > BigDecimal.ZERO
+        val maxTotalExposureIsAtOrBelowDefault = maxTotalExposureRatio <= DEFAULT_MAX_TOTAL_EXPOSURE_RATIO
+        val maxTotalExposureIsConservative = maxTotalExposureIsPositive && maxTotalExposureIsAtOrBelowDefault
+        val maxTakerFeeIsNonNegative = maxTakerFeeRatio >= BigDecimal.ZERO
+        val maxTakerFeeIsAtOrBelowDefault = maxTakerFeeRatio <= DEFAULT_MAX_TAKER_FEE_RATIO
+        val maxTakerFeeIsConservative = maxTakerFeeIsNonNegative && maxTakerFeeIsAtOrBelowDefault
+
+        require(maxRiskPerTradeIsConservative) {
+            "maxRiskPerTradeRatio must be greater than 0 and less than or equal to 0.02."
+        }
+        require(maxDrawdownIsConservative) {
+            "maxDrawdownRatio must be greater than or equal to -0.15 and less than 0."
+        }
+        require(maxTotalExposureIsConservative) {
+            "maxTotalExposureRatio must be greater than 0 and less than or equal to 0.80."
+        }
+        require(minExpectedValueR >= DEFAULT_MIN_EXPECTED_VALUE_R) {
+            "minExpectedValueR must be greater than or equal to 0.10."
+        }
+        require(minExpectedMoveToCostRatio >= DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO) {
+            "minExpectedMoveToCostRatio must be greater than or equal to 3.0."
+        }
+        require(maxTakerFeeIsConservative) {
+            "maxTakerFeeRatio must be greater than or equal to 0 and less than or equal to 0.0010."
+        }
+        require(marketSlippageReserveBps >= DEFAULT_MARKET_SLIPPAGE_RESERVE_BPS) {
+            "marketSlippageReserveBps must be greater than or equal to 5."
+        }
+    }
+}
 
 /**
  * SafetyFloor 検証に必要な最新状態。

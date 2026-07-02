@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
+import me.matsumo.fukurou.trading.config.PaperMarketConfig
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
@@ -21,7 +22,9 @@ import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
+import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
@@ -297,12 +300,14 @@ private val TradingDateZone = ZoneId.of("Asia/Tokyo")
  * Exposed/JDBC で paper ledger を読む repository。
  *
  * @param database Exposed database
+ * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  */
 class ExposedPaperLedgerRepository(
     private val database: ExposedDatabase,
+    fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
 ) : PaperLedgerRepository {
 
-    private val writer = ExposedPaperLedgerWriter(database)
+    private val writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules)
 
     override suspend fun getAccountSnapshot(): Result<AccountSnapshot> {
         return withContext(Dispatchers.IO) {

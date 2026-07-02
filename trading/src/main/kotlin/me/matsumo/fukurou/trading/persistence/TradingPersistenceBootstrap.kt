@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.persistence
 
 import me.matsumo.fukurou.trading.broker.PaperAccountConfig
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import java.math.BigDecimal
@@ -226,7 +227,7 @@ private const val VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL = """
 class TradingPersistenceBootstrap(
     private val database: ExposedDatabase,
     private val clock: Clock = Clock.systemUTC(),
-    private val paperAccountConfig: PaperAccountConfig = PaperAccountConfig.fromEnvironment(),
+    private val paperAccountConfig: PaperAccountConfig = TradingBotConfig.fromEnvironment().paperAccount,
 ) {
 
     /**

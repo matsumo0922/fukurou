@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.broker
 
+import me.matsumo.fukurou.trading.config.PaperMarketConfig
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
@@ -27,12 +28,14 @@ import java.util.UUID
  * @param positions position 一覧
  * @param openOrders open order 一覧
  * @param executions execution 一覧
+ * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  */
 class InMemoryPaperLedgerRepository(
-    accountSnapshot: AccountSnapshot = defaultAccountSnapshot(),
+    accountSnapshot: AccountSnapshot = PaperAccountConfig().toInitialAccountSnapshot(),
     positions: List<Position> = emptyList(),
     openOrders: List<Order> = emptyList(),
     executions: List<Execution> = emptyList(),
+    private val fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
 ) : PaperLedgerRepository {
 
     private val lock = Any()
@@ -231,7 +234,7 @@ class InMemoryPaperLedgerRepository(
         return runCatching {
             synchronized(lock) {
                 val ticker = tickSnapshot.requireTicker()
-                val rules = tickSnapshot.symbolRules ?: defaultSymbolRules()
+                val rules = tickSnapshot.symbolRules ?: fallbackSymbolRules
                 val lastPrice = tickSnapshot.lastPrice?.toBigDecimal() ?: ticker.last.toBigDecimal()
                 val triggeredOrderIds = mutableListOf<String>()
                 val closedPositionIds = mutableListOf<String>()
@@ -765,33 +768,6 @@ private fun Order.createEntryFill(ticker: Ticker, rules: SymbolRules, simulator:
         OrderType.STOP -> simulator.stopFill(side, sizeBtc.toBigDecimal(), requireNotNull(triggerPriceJpy).toBigDecimal(), ticker, rules)
         OrderType.MARKET -> error("MARKET entry is not a resting order.")
     }
-}
-
-private fun defaultSymbolRules(): SymbolRules {
-    return SymbolRules(
-        symbol = TradingSymbol.BTC.apiSymbol,
-        minOrderSize = "0.0001",
-        sizeStep = "0.0001",
-        tickSize = "1",
-        takerFee = "0.0005",
-        makerFee = "-0.0001",
-    )
-}
-
-/**
- * 初期 paper 口座 snapshot を返す。
- */
-private fun defaultAccountSnapshot(): AccountSnapshot {
-    return AccountSnapshot(
-        mode = TradingMode.PAPER,
-        cashJpy = "100000.00000000",
-        initialCashJpy = "100000.00000000",
-        btcQuantity = "0.000000000000",
-        btcMarkPriceJpy = "0.00000000",
-        totalEquityJpy = "100000.00000000",
-        equityPeakJpy = "100000.00000000",
-        drawdownRatio = "0E-10",
-    )
 }
 
 private fun fillInstantText(): String {

@@ -42,10 +42,12 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
  * paper ledger mutation 用 writer。
  *
  * @param database Exposed database
+ * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  * @param clock DB 更新時刻に使う clock
  */
 internal class ExposedPaperLedgerWriter(
     private val database: ExposedDatabase,
+    private val fallbackSymbolRules: SymbolRules,
     private val clock: Clock = Clock.systemUTC(),
 ) {
 
@@ -201,7 +203,7 @@ internal class ExposedPaperLedgerWriter(
             runCatching {
                 exposedTransaction(database) {
                     val ticker = tickSnapshot.requireTicker()
-                    val rules = tickSnapshot.symbolRules ?: defaultSymbolRules()
+                    val rules = tickSnapshot.symbolRules ?: fallbackSymbolRules
                     val lastPrice = (tickSnapshot.lastPrice ?: ticker.last).toBigDecimal()
                     val triggeredOrderIds = mutableListOf<String>()
                     val closedPositionIds = mutableListOf<String>()
@@ -893,17 +895,6 @@ private fun drawdownRatio(totalEquity: BigDecimal, equityPeak: BigDecimal): BigD
         .subtract(equityPeak)
         .divide(equityPeak, DRAW_DOWN_SCALE, RoundingMode.HALF_UP)
         .ratioScale()
-}
-
-private fun defaultSymbolRules(): SymbolRules {
-    return SymbolRules(
-        symbol = TradingSymbol.BTC.apiSymbol,
-        minOrderSize = "0.0001",
-        sizeStep = "0.0001",
-        tickSize = "1",
-        takerFee = "0.0005",
-        makerFee = "-0.0001",
-    )
 }
 
 /**
