@@ -114,7 +114,7 @@ private const val MAX_CANDLE_LIMIT = 500
 /**
  * 短期足 stitching で 1 回の呼び出し中に許可する最大 request 数。
  */
-private const val MAX_DAILY_KLINE_REQUESTS = 7
+const val GMO_MAX_DAILY_KLINE_REQUESTS = 7
 
 /**
  * GMO の営業日が切り替わる JST 時刻。
@@ -342,7 +342,7 @@ class GmoPublicMarketDataSource(
         requestCount: Int,
     ): Boolean {
         val needsMoreCandles = candles.size < limit
-        val canRequestMore = requestCount < MAX_DAILY_KLINE_REQUESTS
+        val canRequestMore = requestCount < GMO_MAX_DAILY_KLINE_REQUESTS
 
         return needsMoreCandles && canRequestMore
     }
