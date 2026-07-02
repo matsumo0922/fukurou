@@ -35,11 +35,19 @@ import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.CancelOrderCommand
+import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
+import me.matsumo.fukurou.trading.broker.PaperTradeResult
+import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.RecentTrade
@@ -66,6 +74,7 @@ import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.NoTradeExitException
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
+import java.math.BigDecimal
 import java.util.UUID
 
 /**
@@ -127,6 +136,26 @@ private const val GET_OPEN_ORDERS_TOOL = "get_open_orders"
  * account status 取得 tool 名。
  */
 private const val GET_ACCOUNT_STATUS_TOOL = "get_account_status"
+
+/**
+ * paper entry 発注 tool 名。
+ */
+private const val PLACE_ORDER_TOOL = "place_order"
+
+/**
+ * paper position close tool 名。
+ */
+private const val CLOSE_POSITION_TOOL = "close_position"
+
+/**
+ * paper protection 更新 tool 名。
+ */
+private const val UPDATE_PROTECTION_TOOL = "update_protection"
+
+/**
+ * paper order cancel tool 名。
+ */
+private const val CANCEL_ORDER_TOOL = "cancel_order"
 
 /**
  * trade 風 dummy 拒否 tool 名。
@@ -230,7 +259,9 @@ fun main() {
  */
 class FukurouMcpServer(
     private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource(),
-    private val tradingRuntime: TradingRuntime = TradingRuntimeFactory.fromEnvironment(),
+    private val tradingRuntime: TradingRuntime = TradingRuntimeFactory.fromEnvironment(
+        marketDataSource = marketDataSource,
+    ),
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
 ) {
 
@@ -287,10 +318,128 @@ class FukurouMcpServer(
         server.registerPositionsTool(tradingRuntime, decisionRunContext)
         server.registerOpenOrdersTool(tradingRuntime, decisionRunContext)
         server.registerAccountStatusTool(tradingRuntime, decisionRunContext)
+        server.registerPlaceOrderTool(tradingRuntime, decisionRunContext)
+        server.registerClosePositionTool(tradingRuntime, decisionRunContext)
+        server.registerUpdateProtectionTool(tradingRuntime, decisionRunContext)
+        server.registerCancelOrderTool(tradingRuntime, decisionRunContext)
         server.registerRejectDummyTradeTool(tradingRuntime.toolCallGuard, decisionRunContext)
         server.registerSimulateToolTimeoutTool(tradingRuntime.toolCallGuard, decisionRunContext)
 
         return server
+    }
+}
+
+private fun Server.registerPlaceOrderTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+) {
+    addTool(
+        name = PLACE_ORDER_TOOL,
+        description = "Place a paper BTC entry order. protective_stop_price_jpy and reason are required.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putSymbolSchema()
+                putJsonObject("side") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "BUY entry only for BTC spot.")
+                    put("enum", ToolJson.encodeToJsonElement(listOf(OrderSide.BUY.name)))
+                }
+                putJsonObject("type") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "MARKET, LIMIT, or STOP.")
+                    put("enum", ToolJson.encodeToJsonElement(OrderType.entries.map { type -> type.name }))
+                }
+                putDecimalStringSchema("size_btc", "BTC order size.")
+                putDecimalStringSchema("price_jpy", "LIMIT or STOP price. Omit for MARKET.")
+                putDecimalStringSchema("protective_stop_price_jpy", "Required protective STOP price after entry fill.")
+                putDecimalStringSchema("take_profit_price_jpy", "Optional virtual take-profit trigger price.")
+                putReasonSchema()
+                putClientRequestIdSchema()
+            },
+            required = listOf("side", "type", "size_btc", "protective_stop_price_jpy", "reason"),
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+    ) { request ->
+        handlePlaceOrder(request, tradingRuntime, decisionRunContext)
+    }
+}
+
+private fun Server.registerClosePositionTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+) {
+    addTool(
+        name = CLOSE_POSITION_TOOL,
+        description = "Close one open paper position, or all open paper positions when all=true. reason is required.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("position_id") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Position UUID. Required unless all=true.")
+                }
+                putJsonObject("all") {
+                    put("type", "boolean")
+                    put("description", "Close all open positions.")
+                    put("default", false)
+                }
+                putReasonSchema()
+                putClientRequestIdSchema()
+            },
+            required = listOf("reason"),
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+    ) { request ->
+        handleClosePosition(request, tradingRuntime, decisionRunContext)
+    }
+}
+
+private fun Server.registerUpdateProtectionTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+) {
+    addTool(
+        name = UPDATE_PROTECTION_TOOL,
+        description = "Update a paper position protective STOP and/or virtual TP. reason is required.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("position_id") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Position UUID.")
+                }
+                putDecimalStringSchema("new_stop_price_jpy", "New protective STOP price.")
+                putDecimalStringSchema("new_take_profit_price_jpy", "New virtual TP price. Use null to clear.")
+                putReasonSchema()
+                putClientRequestIdSchema()
+            },
+            required = listOf("position_id", "reason"),
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+    ) { request ->
+        handleUpdateProtection(request, tradingRuntime, decisionRunContext)
+    }
+}
+
+private fun Server.registerCancelOrderTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+) {
+    addTool(
+        name = CANCEL_ORDER_TOOL,
+        description = "Cancel an open paper order. Protective STOP cancellation is rejected; use update_protection or close_position.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("order_id") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Order UUID.")
+                }
+                putReasonSchema()
+                putClientRequestIdSchema()
+            },
+            required = listOf("order_id", "reason"),
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+    ) { request ->
+        handleCancelOrder(request, tradingRuntime, decisionRunContext)
     }
 }
 
@@ -741,6 +890,78 @@ private suspend fun handleGetAccountStatus(
     )
 }
 
+private suspend fun handlePlaceOrder(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(PLACE_ORDER_TOOL, decisionRunContext)
+    val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
+        val command = parsePlaceOrderCommand(request, call).getOrThrow()
+
+        tradingRuntime.broker.placeOrder(command).getOrThrow()
+    }
+
+    return result.fold(
+        onSuccess = { value -> tradeResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
+private suspend fun handleClosePosition(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(CLOSE_POSITION_TOOL, decisionRunContext)
+    val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
+        val command = parseClosePositionCommand(request, call).getOrThrow()
+
+        tradingRuntime.broker.closePosition(command).getOrThrow()
+    }
+
+    return result.fold(
+        onSuccess = { value -> tradeResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
+private suspend fun handleUpdateProtection(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(UPDATE_PROTECTION_TOOL, decisionRunContext)
+    val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
+        val command = parseUpdateProtectionCommand(request, call).getOrThrow()
+
+        tradingRuntime.broker.updateProtection(command).getOrThrow()
+    }
+
+    return result.fold(
+        onSuccess = { value -> tradeResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
+private suspend fun handleCancelOrder(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(CANCEL_ORDER_TOOL, decisionRunContext)
+    val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
+        val command = parseCancelOrderCommand(request, call).getOrThrow()
+
+        tradingRuntime.broker.cancelOrder(command).getOrThrow()
+    }
+
+    return result.fold(
+        onSuccess = { value -> tradeResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
 private suspend fun handleRejectDummyTrade(
     request: CallToolRequest,
     toolCallGuard: ToolCallGuard,
@@ -813,6 +1034,27 @@ private fun JsonObjectBuilder.putIntervalSchema() {
         put("type", JSON_TYPE_STRING)
         put("description", "Candle interval.")
         put("enum", ToolJson.encodeToJsonElement(CandleInterval.entries.map { interval -> interval.apiValue }))
+    }
+}
+
+private fun JsonObjectBuilder.putDecimalStringSchema(name: String, description: String) {
+    putJsonObject(name) {
+        put("type", JSON_TYPE_STRING)
+        put("description", description)
+    }
+}
+
+private fun JsonObjectBuilder.putReasonSchema() {
+    putJsonObject("reason") {
+        put("type", JSON_TYPE_STRING)
+        put("description", "Required audit reason.")
+    }
+}
+
+private fun JsonObjectBuilder.putClientRequestIdSchema() {
+    putJsonObject("client_request_id") {
+        put("type", JSON_TYPE_STRING)
+        put("description", "Optional caller-provided request ID.")
     }
 }
 
@@ -959,6 +1201,126 @@ private fun parseReason(request: CallToolRequest): Result<String> {
     }
 }
 
+private fun parsePlaceOrderCommand(request: CallToolRequest, call: GuardedToolCall): Result<PlaceOrderCommand> {
+    return runCatching {
+        PlaceOrderCommand(
+            commandId = UUID.randomUUID(),
+            symbol = parseTradingSymbol(request.stringArgument("symbol")).getOrThrow(),
+            side = parseOrderSide(request.stringArgument("side")).getOrThrow(),
+            orderType = parseOrderType(request.stringArgument("type")).getOrThrow(),
+            sizeBtc = parseBigDecimalArgument(request, "size_btc").getOrThrow(),
+            priceJpy = parseOptionalBigDecimalArgument(request, "price_jpy").getOrThrow(),
+            protectiveStopPriceJpy = parseBigDecimalArgument(request, "protective_stop_price_jpy").getOrThrow(),
+            takeProfitPriceJpy = parseOptionalBigDecimalArgument(request, "take_profit_price_jpy").getOrThrow(),
+            reasonJa = parseReason(request).getOrThrow(),
+            auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
+        )
+    }
+}
+
+private fun parseClosePositionCommand(request: CallToolRequest, call: GuardedToolCall): Result<ClosePositionCommand> {
+    return runCatching {
+        ClosePositionCommand(
+            commandId = UUID.randomUUID(),
+            positionId = request.stringArgument("position_id")?.let { value -> UUID.fromString(value) },
+            closeAll = parseBooleanArgument(request, "all", defaultValue = false),
+            reasonJa = parseReason(request).getOrThrow(),
+            auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
+        )
+    }
+}
+
+private fun parseUpdateProtectionCommand(request: CallToolRequest, call: GuardedToolCall): Result<UpdateProtectionCommand> {
+    return runCatching {
+        val takeProfitPriceSpecified = request.arguments?.containsKey("new_take_profit_price_jpy") == true
+
+        UpdateProtectionCommand(
+            commandId = UUID.randomUUID(),
+            positionId = UUID.fromString(requireNotNull(request.stringArgument("position_id")) { "position_id is required." }),
+            newStopPriceJpy = parseOptionalBigDecimalArgument(request, "new_stop_price_jpy").getOrThrow(),
+            takeProfitPriceSpecified = takeProfitPriceSpecified,
+            newTakeProfitPriceJpy = parseOptionalBigDecimalArgument(request, "new_take_profit_price_jpy").getOrThrow(),
+            reasonJa = parseReason(request).getOrThrow(),
+            auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
+        )
+    }
+}
+
+private fun parseCancelOrderCommand(request: CallToolRequest, call: GuardedToolCall): Result<CancelOrderCommand> {
+    return runCatching {
+        CancelOrderCommand(
+            commandId = UUID.randomUUID(),
+            orderId = UUID.fromString(requireNotNull(request.stringArgument("order_id")) { "order_id is required." }),
+            reasonJa = parseReason(request).getOrThrow(),
+            auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
+        )
+    }
+}
+
+private fun parseOrderSide(rawSide: String?): Result<OrderSide> {
+    return runCatching {
+        val sideText = rawSide?.trim().orEmpty()
+
+        require(sideText.isNotBlank()) {
+            "side is required."
+        }
+
+        OrderSide.valueOf(sideText.uppercase())
+    }
+}
+
+private fun parseOrderType(rawType: String?): Result<OrderType> {
+    return runCatching {
+        val typeText = rawType?.trim().orEmpty()
+
+        require(typeText.isNotBlank()) {
+            "type is required."
+        }
+
+        OrderType.valueOf(typeText.uppercase())
+    }
+}
+
+private fun parseBigDecimalArgument(request: CallToolRequest, name: String): Result<BigDecimal> {
+    return runCatching {
+        val value = request.stringArgument(name).orEmpty()
+
+        require(value.isNotBlank()) {
+            "$name is required."
+        }
+
+        value.toBigDecimal()
+    }
+}
+
+private fun parseOptionalBigDecimalArgument(request: CallToolRequest, name: String): Result<BigDecimal?> {
+    return runCatching {
+        val value = request.stringArgument(name) ?: return@runCatching null
+
+        if (value.isBlank()) {
+            return@runCatching null
+        }
+
+        value.toBigDecimal()
+    }
+}
+
+private fun parseBooleanArgument(request: CallToolRequest, name: String, defaultValue: Boolean): Boolean {
+    val rawValue = request.arguments
+        ?.get(name)
+        ?.jsonPrimitive
+        ?.contentOrNull
+
+    return rawValue?.toBooleanStrictOrNull() ?: defaultValue
+}
+
+private fun CallToolRequest.stringArgument(name: String): String? {
+    return arguments
+        ?.get(name)
+        ?.jsonPrimitive
+        ?.contentOrNull
+}
+
 private fun parseDelayMs(request: CallToolRequest): Result<Long> {
     val delayMs = request.arguments
         ?.get("delay_ms")
@@ -1059,6 +1421,19 @@ private fun accountStatusResult(accountStatus: AccountStatus): CallToolResult {
     return CallToolResult(
         content = listOf(TextContent(ToolJson.encodeToString(accountStatus))),
         structuredContent = structuredContent,
+    )
+}
+
+private fun tradeResult(result: PaperTradeResult): CallToolResult {
+    return jsonObjectResult(
+        buildJsonObject {
+            put("accepted", result.accepted)
+            put("status", result.status.name)
+            put("order_ids", ToolJson.encodeToJsonElement(result.orderIds))
+            put("position_ids", ToolJson.encodeToJsonElement(result.positionIds))
+            put("execution_ids", ToolJson.encodeToJsonElement(result.executionIds))
+            put("message", result.messageJa)
+        },
     )
 }
 

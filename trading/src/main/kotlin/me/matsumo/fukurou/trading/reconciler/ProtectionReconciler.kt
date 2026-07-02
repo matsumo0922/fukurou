@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -75,6 +76,7 @@ enum class ReconcilePassKind {
  * @param commandEventLog command_event_log repository
  * @param tradingLock trade 系 tool と共有する global lock
  * @param tickStream 市場データ tick stream 抽象
+ * @param broker tick ごとに paper ledger を前進させる broker
  * @param status Reconciler の状態 holder
  * @param clock pass timestamp に使う clock
  * @param warnLogger rate-limited warning logger
@@ -84,6 +86,7 @@ class ProtectionReconciler(
     private val commandEventLog: CommandEventLog,
     private val tradingLock: TradingLock,
     private val tickStream: TickStream = EmptyTickStream,
+    private val broker: Broker? = null,
     private val status: MutableReconcilerStatus = MutableReconcilerStatus(),
     private val clock: Clock = Clock.systemUTC(),
     private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
@@ -159,6 +162,10 @@ class ProtectionReconciler(
 
             val reconciledAt = Instant.now(clock)
             val tickSnapshot = readTickSnapshot()
+
+            if (tickSnapshot != null) {
+                broker?.reconcile(tickSnapshot)?.getOrThrow()
+            }
 
             markSuccessfulPass(passKind, tickSnapshot, reconciledAt).getOrThrow()
         }
