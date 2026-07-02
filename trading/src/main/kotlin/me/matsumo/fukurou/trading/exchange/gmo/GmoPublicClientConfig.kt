@@ -28,15 +28,24 @@ data class GmoPublicClientConfig(
  * @param burstSize 短時間に許す最大 burst 数
  */
 data class GmoRateLimitConfig(
-    val permitsPerSecond: Int = 10,
+    val permitsPerSecond: Int = DEFAULT_GMO_PUBLIC_REST_PER_SECOND,
     val burstSize: Int = permitsPerSecond,
 ) {
     init {
+        val permitsPerSecondIsConservative = permitsPerSecond <= DEFAULT_GMO_PUBLIC_REST_PER_SECOND
+        val burstSizeIsConservative = burstSize <= DEFAULT_GMO_PUBLIC_REST_BURST
+
         require(permitsPerSecond > 0) {
             "permitsPerSecond must be greater than 0."
         }
+        require(permitsPerSecondIsConservative) {
+            "permitsPerSecond must be less than or equal to 10."
+        }
         require(burstSize > 0) {
             "burstSize must be greater than 0."
+        }
+        require(burstSizeIsConservative) {
+            "burstSize must be less than or equal to 10."
         }
     }
 }
@@ -70,3 +79,13 @@ data class GmoRetryConfig(
         }
     }
 }
+
+/**
+ * GMO Public REST client-side rate limit の既定値。
+ */
+private const val DEFAULT_GMO_PUBLIC_REST_PER_SECOND = 10
+
+/**
+ * GMO Public REST client-side burst limit の既定値。
+ */
+private const val DEFAULT_GMO_PUBLIC_REST_BURST = 10

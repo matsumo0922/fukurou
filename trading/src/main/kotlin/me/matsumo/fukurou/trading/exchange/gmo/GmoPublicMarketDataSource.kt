@@ -281,16 +281,7 @@ class GmoPublicMarketDataSource(
                 nextBackoff = nextRetryBackoff(nextBackoff)
                 attemptNumber += 1
             } catch (exception: IllegalArgumentException) {
-                val marketFailure = MarketInvalidRequestException(exception.message.orEmpty(), exception)
-
-                if (!shouldRetry(marketFailure, attemptNumber)) {
-                    throw marketFailure
-                }
-
-                lastFailure = marketFailure
-                sleeper.sleep(nextBackoff)
-                nextBackoff = nextRetryBackoff(nextBackoff)
-                attemptNumber += 1
+                throw MarketInvalidRequestException(exception.message.orEmpty(), exception)
             }
         }
 

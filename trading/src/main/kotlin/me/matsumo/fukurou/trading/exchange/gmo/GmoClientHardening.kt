@@ -62,15 +62,28 @@ class GmoTokenBucketRateLimiter(
             "endpointName must not be blank."
         }
 
-        synchronized(lock) {
-            refillPermits()
+        while (true) {
+            val waitDuration = acquirePermitOrWaitDuration()
 
-            while (availablePermits < REQUIRED_PERMIT) {
-                sleeper.sleep(waitDurationUntilNextPermit())
-                refillPermits()
+            if (waitDuration == null) {
+                return
             }
 
-            availablePermits -= REQUIRED_PERMIT
+            sleeper.sleep(waitDuration)
+        }
+    }
+
+    private fun acquirePermitOrWaitDuration(): Duration? {
+        return synchronized(lock) {
+            refillPermits()
+
+            if (availablePermits >= REQUIRED_PERMIT) {
+                availablePermits -= REQUIRED_PERMIT
+
+                return@synchronized null
+            }
+
+            waitDurationUntilNextPermit()
         }
     }
 

@@ -52,10 +52,10 @@ CLI から stdio MCP を登録する場合の command / args:
 | `FUKUROU_MAX_RISK_PER_TRADE_RATIO` | `0.02` | 1 trade group 最大損失 |
 | `FUKUROU_MAX_DRAWDOWN_RATIO` | `-0.15` | HARD_HALT drawdown |
 | `FUKUROU_MAX_TOTAL_EXPOSURE_RATIO` | `0.80` | 合計 exposure 上限 |
-| `FUKUROU_GMO_PUBLIC_REST_PER_SECOND` | `10` | GMO Public REST client-side limit |
+| `FUKUROU_GMO_PUBLIC_REST_PER_SECOND` | `10` | GMO Public REST client-side limit。10 以下だけ許可 |
 | `FUKUROU_GMO_RETRY_MAX_ATTEMPTS` | `3` | 一時失敗 retry 回数 |
 
-SafetyFloor 系 env と fallback fee / spread は、既定値と同等またはより保守的な値だけ許可する。GMO Public REST の timeout / retry backoff も `.env.example` から上書きできる。GMO `/public/v1/symbols` が取得できる場合、paper 手数料は取引所 rule を優先する。
+SafetyFloor 系 env と fallback fee / spread は、既定値と同等またはより保守的な値だけ許可する。GMO Public REST の rate-limit も既定 10 req/s / burst 10 以下だけ許可する。GMO Public REST の timeout / retry backoff も `.env.example` から上書きできる。GMO `/public/v1/symbols` が取得できる場合、paper 手数料は取引所 rule を優先する。
 
 ## secrets / CLI auth
 

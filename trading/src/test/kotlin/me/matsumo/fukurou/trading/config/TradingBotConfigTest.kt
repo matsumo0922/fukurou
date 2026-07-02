@@ -131,6 +131,16 @@ class TradingBotConfigTest {
                 mapOf("FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS" to "0"),
             )
         }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_GMO_PUBLIC_REST_PER_SECOND" to "11"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_GMO_PUBLIC_REST_BURST" to "11"),
+            )
+        }
     }
 
     @Test
