@@ -2,22 +2,33 @@ package me.matsumo.fukurou.trading.broker
 
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
+import me.matsumo.fukurou.trading.domain.Candle
+import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
+import me.matsumo.fukurou.trading.domain.RecentTrade
+import me.matsumo.fukurou.trading.domain.SymbolRules
+import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import java.math.BigDecimal
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 /**
  * PaperBroker の読み取り集計 contract を検証するテスト。
@@ -109,6 +120,178 @@ class PaperBrokerTest {
 
         assertEquals(fixedInstant().toString(), protectionStatus.lastReconciledAt)
         assertEquals(fixedInstant().toString(), protectionStatus.lastMarketDataAt)
+    }
+
+    @Test
+    fun place_order_market_entry_creates_position_stop_execution_and_updates_account() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val result = broker.placeOrder(marketEntryCommand()).getOrThrow()
+        val balance = broker.getBalance().getOrThrow()
+        val positions = broker.getPositions().getOrThrow()
+        val orders = broker.getOpenOrders().getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertTrue(result.accepted)
+        assertEquals(OrderStatus.FILLED, result.status)
+        assertEquals("0.005000000000", balance.btcQuantity)
+        assertEquals(1, positions.size)
+        assertEquals("9700000.00000000", positions.single().currentStopLossJpy)
+        assertEquals("10500000.00000000", positions.single().currentTakeProfitJpy)
+        assertEquals(listOf(OrderType.STOP), orders.map { order -> order.orderType })
+        assertEquals(1, executions.size)
+    }
+
+    @Test
+    fun update_protection_updates_stop_and_virtual_take_profit() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(marketEntryCommand()).getOrThrow()
+        val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
+
+        val result = broker.updateProtection(
+            UpdateProtectionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = positionId,
+                newStopPriceJpy = BigDecimal("9800000"),
+                takeProfitPriceSpecified = true,
+                newTakeProfitPriceJpy = BigDecimal("10600000"),
+                reasonJa = "test update",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val position = broker.getPositions().getOrThrow().single()
+        val stopOrder = broker.getOpenOrders().getOrThrow().single { order -> order.orderType == OrderType.STOP }
+
+        assertEquals(OrderStatus.OPEN, result.status)
+        assertEquals("9800000", position.currentStopLossJpy)
+        assertEquals("10600000", position.currentTakeProfitJpy)
+        assertEquals("9800000.00000000", stopOrder.triggerPriceJpy)
+    }
+
+    @Test
+    fun cancel_order_rejects_protective_stop_and_allows_resting_entry_cancel() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(restingLimitCommand()).getOrThrow()
+        val restingOrderId = UUID.fromString(broker.getOpenOrders().getOrThrow().single().orderId)
+        broker.placeOrder(marketEntryCommand()).getOrThrow()
+        val stopOrderId = UUID.fromString(
+            broker.getOpenOrders()
+                .getOrThrow()
+                .single { order -> order.orderType == OrderType.STOP }
+                .orderId,
+        )
+
+        val cancelRestingResult = broker.cancelOrder(cancelCommand(restingOrderId)).getOrThrow()
+        val cancelStopResult = broker.cancelOrder(cancelCommand(stopOrderId))
+
+        assertEquals(OrderStatus.CANCELED, cancelRestingResult.status)
+        assertTrue(cancelStopResult.isFailure)
+    }
+}
+
+private fun marketEntryCommand(): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = UUID.randomUUID(),
+        symbol = TradingSymbol.BTC,
+        side = OrderSide.BUY,
+        orderType = OrderType.MARKET,
+        sizeBtc = BigDecimal("0.0050"),
+        priceJpy = null,
+        protectiveStopPriceJpy = BigDecimal("9700000"),
+        takeProfitPriceJpy = BigDecimal("10500000"),
+        reasonJa = "test entry",
+        auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+private fun restingLimitCommand(): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = UUID.randomUUID(),
+        symbol = TradingSymbol.BTC,
+        side = OrderSide.BUY,
+        orderType = OrderType.LIMIT,
+        sizeBtc = BigDecimal("0.0050"),
+        priceJpy = BigDecimal("9900000"),
+        protectiveStopPriceJpy = BigDecimal("9700000"),
+        takeProfitPriceJpy = null,
+        reasonJa = "test resting entry",
+        auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+private fun cancelCommand(orderId: UUID): CancelOrderCommand {
+    return CancelOrderCommand(
+        commandId = UUID.randomUUID(),
+        orderId = orderId,
+        reasonJa = "test cancel",
+        auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+/**
+ * PaperBroker execution test 用 fake market data。
+ */
+private object FakeMarketDataSource : MarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return Result.success(
+            Ticker(
+                symbol = symbol.apiSymbol,
+                last = "10000000",
+                bid = "9990000",
+                ask = "10000000",
+                high = "10100000",
+                low = "9900000",
+                volume = "1.0",
+                timestamp = fixedInstant().toString(),
+            ),
+        )
+    }
+
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
+        return Result.success(
+            SymbolRules(
+                symbol = symbol.apiSymbol,
+                minOrderSize = "0.0001",
+                sizeStep = "0.0001",
+                tickSize = "1",
+                takerFee = "0.0005",
+                makerFee = "-0.0001",
+            ),
+        )
     }
 }
 
@@ -220,6 +403,8 @@ private fun order(
         sizeBtc = "0.010000000000",
         limitPriceJpy = "10200000.00000000",
         triggerPriceJpy = null,
+        protectiveStopPriceJpy = null,
+        takeProfitPriceJpy = null,
         reasonJa = "test",
         createdAt = fixedInstant().toString(),
         updatedAt = fixedInstant().toString(),

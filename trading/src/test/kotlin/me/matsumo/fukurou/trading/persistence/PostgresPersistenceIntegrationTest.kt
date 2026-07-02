@@ -9,12 +9,27 @@ import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.PaperBroker
+import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
+import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.domain.Candle
+import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.RecentTrade
+import me.matsumo.fukurou.trading.domain.SymbolRules
+import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
+import java.math.BigDecimal
 import java.sql.SQLTimeoutException
 import java.time.Clock
 import java.time.Duration
@@ -121,6 +136,8 @@ private const val INSERT_TEST_ORDER_SQL = """
         size_btc,
         limit_price_jpy,
         trigger_price_jpy,
+        protective_stop_price_jpy,
+        take_profit_price_jpy,
         reason_ja,
         created_at,
         updated_at
@@ -137,6 +154,8 @@ private const val INSERT_TEST_ORDER_SQL = """
         0.010000000000,
         NULL,
         9800000.00000000,
+        NULL,
+        NULL,
         'test',
         ?,
         ?
@@ -304,6 +323,57 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun paper_execution_persists_market_entry_then_stop_trigger() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        broker.placeOrder(postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000"))).getOrThrow()
+        repository.reconcile(stopTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
+
+        val balance = broker.getBalance().getOrThrow()
+        val positions = broker.getPositions().getOrThrow()
+        val openOrders = broker.getOpenOrders().getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertEquals(0, balance.btcQuantity.toBigDecimal().compareTo(BigDecimal.ZERO))
+        assertEquals(0, positions.size)
+        assertEquals(0, openOrders.size)
+        assertEquals(2, executions.size)
+        assertEquals(listOf(OrderSide.BUY, OrderSide.SELL), executions.map { execution -> execution.side })
+    }
+
+    @Test
+    fun paper_execution_persists_virtual_take_profit_then_stop_cancel() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        broker.placeOrder(postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000"))).getOrThrow()
+        repository.reconcile(takeProfitTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
+
+        val positions = broker.getPositions().getOrThrow()
+        val openOrders = broker.getOpenOrders().getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertEquals(0, positions.size)
+        assertEquals(0, openOrders.size)
+        assertEquals(2, executions.size)
+    }
+
+    @Test
     fun risk_state_repository_current_does_not_create_missing_single_row() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         deleteRiskStateRow(database)
@@ -388,6 +458,94 @@ private class PostgresTestContext(
             user = container.username,
             password = container.password,
         )
+    }
+}
+
+private fun postgresEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = UUID.randomUUID(),
+        symbol = TradingSymbol.BTC,
+        side = OrderSide.BUY,
+        orderType = OrderType.MARKET,
+        sizeBtc = BigDecimal("0.0050"),
+        priceJpy = null,
+        protectiveStopPriceJpy = BigDecimal("9700000"),
+        takeProfitPriceJpy = takeProfitPriceJpy,
+        reasonJa = "integration entry",
+        auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+private fun stopTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "9700000",
+        bidPrice = "9690000",
+        askPrice = "9700000",
+        symbolRules = postgresSymbolRules(),
+    )
+}
+
+private fun takeProfitTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "10100000",
+        bidPrice = "10100000",
+        askPrice = "10110000",
+        symbolRules = postgresSymbolRules(),
+    )
+}
+
+private fun postgresSymbolRules(): SymbolRules {
+    return SymbolRules(
+        symbol = "BTC",
+        minOrderSize = "0.0001",
+        sizeStep = "0.0001",
+        tickSize = "1",
+        takerFee = "0.0005",
+        makerFee = "-0.0001",
+    )
+}
+
+/**
+ * Postgres paper execution test 用 fake market data。
+ */
+private object PostgresFakeMarketDataSource : MarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return Result.success(
+            Ticker(
+                symbol = symbol.apiSymbol,
+                last = "10000000",
+                bid = "9990000",
+                ask = "10000000",
+                high = "10100000",
+                low = "9900000",
+                volume = "1.0",
+                timestamp = fixedInstant().toString(),
+            ),
+        )
+    }
+
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
+        return Result.success(postgresSymbolRules())
     }
 }
 
