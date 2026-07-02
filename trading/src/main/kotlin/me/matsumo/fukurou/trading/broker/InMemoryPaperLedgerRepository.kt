@@ -227,7 +227,7 @@ class InMemoryPaperLedgerRepository(
                 val closedPositionIds = mutableListOf<String>()
                 val executionIds = mutableListOf<String>()
 
-                updateMarksLocked(lastPrice, tickSnapshot.atr14Jpy?.toBigDecimal())
+                updateMarksLocked(lastPrice, tickSnapshot.atr14Jpy?.toBigDecimal(), rules)
                 fillTriggeredEntryOrdersLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, executionIds)
                 triggerPositionProtectionsLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, closedPositionIds, executionIds)
 
@@ -417,7 +417,7 @@ class InMemoryPaperLedgerRepository(
         }
     }
 
-    private fun updateMarksLocked(lastPrice: BigDecimal, atr14Jpy: BigDecimal?) {
+    private fun updateMarksLocked(lastPrice: BigDecimal, atr14Jpy: BigDecimal?, rules: SymbolRules) {
         positions.replaceAll { position ->
             if (position.status != PositionStatus.OPEN) {
                 return@replaceAll position
@@ -426,7 +426,11 @@ class InMemoryPaperLedgerRepository(
             val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
             val sizeBtc = position.sizeBtc.toBigDecimal()
             val highestPrice = maxOf(position.highestPriceSinceEntryJpy.toBigDecimal(), lastPrice)
-            val trailingStop = atr14Jpy?.let { atrValue -> highestPrice.subtract(atrValue.multiply(TRAILING_ATR_MULTIPLIER)) }
+            val trailingStop = atr14Jpy?.let { atrValue ->
+                highestPrice
+                    .subtract(atrValue.multiply(TRAILING_ATR_MULTIPLIER))
+                    .floorToStep(rules.tickSize.toBigDecimal())
+            }
             val currentStop = position.currentStopLossJpy?.toBigDecimal()
             val tightenedStop = listOfNotNull(currentStop, trailingStop).maxOrNull()
             val unrealizedPnl = lastPrice.subtract(entryPrice).multiply(sizeBtc).moneyScale()

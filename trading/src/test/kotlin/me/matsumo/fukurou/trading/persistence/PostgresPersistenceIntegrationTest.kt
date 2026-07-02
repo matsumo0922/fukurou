@@ -374,6 +374,28 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun paper_reconcile_rounds_atr_trailing_stop_down_to_tick_size() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        broker.placeOrder(postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000"))).getOrThrow()
+        repository.reconcile(trailingTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
+
+        val position = broker.getPositions().getOrThrow().single()
+        val stopOrder = broker.getOpenOrders().getOrThrow().single()
+
+        assertEquals("10099750.00000000", position.currentStopLossJpy)
+        assertEquals("10099750.00000000", stopOrder.triggerPriceJpy)
+    }
+
+    @Test
     fun risk_state_repository_current_does_not_create_missing_single_row() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         deleteRiskStateRow(database)
@@ -498,12 +520,35 @@ private fun takeProfitTickSnapshot(): TickSnapshot {
     )
 }
 
+private fun trailingTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "10100000",
+        bidPrice = "10100000",
+        askPrice = "10110000",
+        symbolRules = trailingSymbolRules(),
+        atr14Jpy = "123.456789",
+    )
+}
+
 private fun postgresSymbolRules(): SymbolRules {
     return SymbolRules(
         symbol = "BTC",
         minOrderSize = "0.0001",
         sizeStep = "0.0001",
         tickSize = "1",
+        takerFee = "0.0005",
+        makerFee = "-0.0001",
+    )
+}
+
+private fun trailingSymbolRules(): SymbolRules {
+    return SymbolRules(
+        symbol = "BTC",
+        minOrderSize = "0.0001",
+        sizeStep = "0.0001",
+        tickSize = "10",
         takerFee = "0.0005",
         makerFee = "-0.0001",
     )

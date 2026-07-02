@@ -183,6 +183,11 @@ private const val JSON_TYPE_INTEGER = "integer"
 private const val JSON_TYPE_OBJECT = "object"
 
 /**
+ * JSON schema の null 型。
+ */
+private const val JSON_TYPE_NULL = "null"
+
+/**
  * candles 取得の既定本数。
  */
 private const val DEFAULT_CANDLE_LIMIT = 100
@@ -295,7 +300,7 @@ class FukurouMcpServer(
         }
     }
 
-    private fun createServer(): Server {
+    internal fun createServer(): Server {
         val server = Server(
             serverInfo = Implementation(
                 name = MCP_SERVER_NAME,
@@ -407,7 +412,7 @@ private fun Server.registerUpdateProtectionTool(
                     put("description", "Position UUID.")
                 }
                 putDecimalStringSchema("new_stop_price_jpy", "New protective STOP price.")
-                putDecimalStringSchema("new_take_profit_price_jpy", "New virtual TP price. Use null to clear.")
+                putNullableDecimalStringSchema("new_take_profit_price_jpy", "New virtual TP price. Use null to clear.")
                 putReasonSchema()
                 putClientRequestIdSchema()
             },
@@ -1040,6 +1045,13 @@ private fun JsonObjectBuilder.putIntervalSchema() {
 private fun JsonObjectBuilder.putDecimalStringSchema(name: String, description: String) {
     putJsonObject(name) {
         put("type", JSON_TYPE_STRING)
+        put("description", description)
+    }
+}
+
+private fun JsonObjectBuilder.putNullableDecimalStringSchema(name: String, description: String) {
+    putJsonObject(name) {
+        put("type", ToolJson.encodeToJsonElement(listOf(JSON_TYPE_STRING, JSON_TYPE_NULL)))
         put("description", description)
     }
 }

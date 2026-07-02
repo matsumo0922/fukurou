@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.broker.btcScale
+import me.matsumo.fukurou.trading.broker.floorToStep
 import me.matsumo.fukurou.trading.broker.moneyScale
 import me.matsumo.fukurou.trading.broker.ratioScale
 import me.matsumo.fukurou.trading.domain.Order
@@ -204,7 +205,7 @@ internal class ExposedPaperLedgerWriter(
                     val closedPositionIds = mutableListOf<String>()
                     val executionIds = mutableListOf<String>()
 
-                    updateMarks(lastPrice, tickSnapshot.atr14Jpy?.toBigDecimal())
+                    updateMarks(lastPrice, tickSnapshot.atr14Jpy?.toBigDecimal(), rules)
                     fillTriggeredEntryOrders(ticker, rules, simulator, lastPrice, triggeredOrderIds, executionIds)
                     triggerPositionProtections(ticker, rules, simulator, lastPrice, triggeredOrderIds, closedPositionIds, executionIds)
 
@@ -326,12 +327,16 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 
-    private fun JdbcTransaction.updateMarks(lastPrice: BigDecimal, atr14Jpy: BigDecimal?) {
+    private fun JdbcTransaction.updateMarks(lastPrice: BigDecimal, atr14Jpy: BigDecimal?, rules: SymbolRules) {
         selectOpenPositions().forEach { position ->
             val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
             val sizeBtc = position.sizeBtc.toBigDecimal()
             val highestPrice = maxOf(position.highestPriceSinceEntryJpy.toBigDecimal(), lastPrice)
-            val trailingStop = atr14Jpy?.let { atrValue -> highestPrice.subtract(atrValue.multiply(TRAILING_ATR_MULTIPLIER)) }
+            val trailingStop = atr14Jpy?.let { atrValue ->
+                highestPrice
+                    .subtract(atrValue.multiply(TRAILING_ATR_MULTIPLIER))
+                    .floorToStep(rules.tickSize.toBigDecimal())
+            }
             val currentStop = position.currentStopLossJpy?.toBigDecimal()
             val tightenedStop = listOfNotNull(currentStop, trailingStop).maxOrNull()
             val unrealizedPnl = lastPrice.subtract(entryPrice).multiply(sizeBtc).moneyScale()

@@ -148,6 +148,19 @@ internal fun BigDecimal.ratioScale(): BigDecimal {
 }
 
 /**
+ * 取引所 tick / step に対して下方向へ丸める。
+ */
+internal fun BigDecimal.floorToStep(step: BigDecimal): BigDecimal {
+    require(step > BigDecimal.ZERO) {
+        "step must be greater than zero."
+    }
+
+    val stepCount = divide(step, 0, RoundingMode.DOWN)
+
+    return stepCount.multiply(step)
+}
+
+/**
  * JPY 金額 scale。
  */
 internal const val MONEY_SCALE = 8

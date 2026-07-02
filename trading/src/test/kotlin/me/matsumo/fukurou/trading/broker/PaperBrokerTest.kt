@@ -19,6 +19,7 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
+import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import java.math.BigDecimal
 import java.time.Clock
@@ -205,6 +206,26 @@ class PaperBrokerTest {
         assertEquals(OrderStatus.CANCELED, cancelRestingResult.status)
         assertTrue(cancelStopResult.isFailure)
     }
+
+    @Test
+    fun reconcile_rounds_atr_trailing_stop_down_to_tick_size() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(marketEntryCommand()).getOrThrow()
+
+        broker.reconcile(trailingTickSnapshot()).getOrThrow()
+
+        val position = broker.getPositions().getOrThrow().single()
+        val stopOrder = broker.getOpenOrders().getOrThrow().single { order -> order.orderType == OrderType.STOP }
+
+        assertEquals("10099750.00000000", position.currentStopLossJpy)
+        assertEquals("10099750.00000000", stopOrder.triggerPriceJpy)
+    }
 }
 
 private fun marketEntryCommand(): PlaceOrderCommand {
@@ -243,6 +264,29 @@ private fun cancelCommand(orderId: UUID): CancelOrderCommand {
         orderId = orderId,
         reasonJa = "test cancel",
         auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+private fun trailingTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "10100000",
+        bidPrice = "10100000",
+        askPrice = "10110000",
+        symbolRules = trailingSymbolRules(),
+        atr14Jpy = "123.456789",
+    )
+}
+
+private fun trailingSymbolRules(): SymbolRules {
+    return SymbolRules(
+        symbol = "BTC",
+        minOrderSize = "0.0001",
+        sizeStep = "0.0001",
+        tickSize = "10",
+        takerFee = "0.0005",
+        makerFee = "-0.0001",
     )
 }
 
