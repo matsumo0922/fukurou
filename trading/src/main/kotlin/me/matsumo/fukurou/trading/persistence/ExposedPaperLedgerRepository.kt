@@ -2,7 +2,15 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import me.matsumo.fukurou.trading.broker.CancelOrderCommand
+import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.broker.PaperReconcileResult
+import me.matsumo.fukurou.trading.broker.PaperTradeResult
+import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.SimulatedFill
+import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
@@ -14,6 +22,7 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
@@ -89,6 +98,8 @@ private const val SELECT_OPEN_ORDERS_SQL = """
         size_btc,
         limit_price_jpy,
         trigger_price_jpy,
+        protective_stop_price_jpy,
+        take_profit_price_jpy,
         reason_ja,
         created_at,
         updated_at
@@ -157,6 +168,8 @@ class ExposedPaperLedgerRepository(
     private val database: ExposedDatabase,
 ) : PaperLedgerRepository {
 
+    private val writer = ExposedPaperLedgerWriter(database)
+
     override suspend fun getAccountSnapshot(): Result<AccountSnapshot> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -206,6 +219,45 @@ class ExposedPaperLedgerRepository(
             }
         }
     }
+
+    override suspend fun fillMarketEntry(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        stopOrderId: UUID,
+    ): Result<PaperTradeResult> {
+        return writer.fillMarketEntry(command, fill, positionId, tradeGroupId, stopOrderId)
+    }
+
+    override suspend fun createRestingEntryOrder(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+    ): Result<PaperTradeResult> {
+        return writer.createRestingEntryOrder(command, orderId, tradeGroupId)
+    }
+
+    override suspend fun closePosition(
+        command: ClosePositionCommand,
+        positionId: UUID,
+        orderId: UUID,
+        fill: SimulatedFill,
+    ): Result<PaperTradeResult> {
+        return writer.closePosition(command, positionId, orderId, fill)
+    }
+
+    override suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult> {
+        return writer.updateProtection(command)
+    }
+
+    override suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult> {
+        return writer.cancelOrder(command)
+    }
+
+    override suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult> {
+        return writer.reconcile(tickSnapshot, simulator)
+    }
 }
 
 /**
@@ -222,7 +274,7 @@ internal fun JdbcTransaction.selectPaperAccount(): AccountSnapshot {
     }
 }
 
-private fun JdbcTransaction.selectOpenPositions(): List<Position> {
+internal fun JdbcTransaction.selectOpenPositions(): List<Position> {
     return jdbcConnection().prepareStatement(SELECT_OPEN_POSITIONS_SQL).use { statement ->
         statement.setString(1, PositionStatus.OPEN.name)
         statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
@@ -236,7 +288,7 @@ private fun JdbcTransaction.selectOpenPositions(): List<Position> {
     }
 }
 
-private fun JdbcTransaction.selectOpenOrders(): List<Order> {
+internal fun JdbcTransaction.selectOpenOrders(): List<Order> {
     return jdbcConnection().prepareStatement(SELECT_OPEN_ORDERS_SQL).use { statement ->
         statement.setString(1, OrderStatus.OPEN.name)
         statement.setString(2, OrderStatus.PENDING_CANCEL.name)
@@ -328,6 +380,8 @@ private fun ResultSet.toOrder(): Order {
         sizeBtc = getBigDecimal("size_btc").toPlainString(),
         limitPriceJpy = getNullableBigDecimal("limit_price_jpy")?.toPlainString(),
         triggerPriceJpy = getNullableBigDecimal("trigger_price_jpy")?.toPlainString(),
+        protectiveStopPriceJpy = getNullableBigDecimal("protective_stop_price_jpy")?.toPlainString(),
+        takeProfitPriceJpy = getNullableBigDecimal("take_profit_price_jpy")?.toPlainString(),
         reasonJa = getString("reason_ja"),
         createdAt = getInstant("created_at").toString(),
         updatedAt = getInstant("updated_at").toString(),

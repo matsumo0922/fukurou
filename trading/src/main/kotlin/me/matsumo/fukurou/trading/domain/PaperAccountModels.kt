@@ -209,6 +209,8 @@ data class Position(
  * @param sizeBtc 注文数量
  * @param limitPriceJpy 指値価格
  * @param triggerPriceJpy STOP trigger 価格
+ * @param protectiveStopPriceJpy entry intent に紐づく保護 STOP 価格
+ * @param takeProfitPriceJpy entry intent に紐づく virtual TP 価格
  * @param reasonJa LLM / system の判断理由
  * @param createdAt 作成時刻
  * @param updatedAt 更新時刻
@@ -226,6 +228,8 @@ data class Order(
     val sizeBtc: String,
     val limitPriceJpy: String?,
     val triggerPriceJpy: String?,
+    val protectiveStopPriceJpy: String?,
+    val takeProfitPriceJpy: String?,
     val reasonJa: String?,
     val createdAt: String,
     val updatedAt: String,

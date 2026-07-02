@@ -314,6 +314,16 @@ object OrdersTable : Table("orders") {
     val triggerPriceJpy = decimal("trigger_price_jpy", precision = 24, scale = 8).nullable()
 
     /**
+     * entry intent に紐づく保護 STOP 価格。
+     */
+    val protectiveStopPriceJpy = decimal("protective_stop_price_jpy", precision = 24, scale = 8).nullable()
+
+    /**
+     * entry intent に紐づく virtual TP 価格。
+     */
+    val takeProfitPriceJpy = decimal("take_profit_price_jpy", precision = 24, scale = 8).nullable()
+
+    /**
      * 判断理由。
      */
     val reasonJa = text("reason_ja").nullable()
