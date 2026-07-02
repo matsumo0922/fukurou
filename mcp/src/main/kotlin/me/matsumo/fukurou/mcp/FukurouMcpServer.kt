@@ -362,7 +362,7 @@ private fun Server.registerPlaceOrderTool(
                     put("description", "Optional trade group UUID when adding to an existing group.")
                 }
                 putDecimalStringSchema("protective_stop_price_jpy", "Required protective STOP price after entry fill.")
-                putDecimalStringSchema("take_profit_price_jpy", "Optional virtual take-profit trigger price.")
+                putDecimalStringSchema("take_profit_price_jpy", "Required virtual take-profit trigger price for SafetyFloor EV calculation.")
                 putDecimalStringSchema("estimated_win_probability", "Estimated win probability from 0 to 1. SafetyFloor calculates EV from this value.")
                 putReasonSchema()
                 putClientRequestIdSchema()
@@ -372,6 +372,7 @@ private fun Server.registerPlaceOrderTool(
                 "type",
                 "size_btc",
                 "protective_stop_price_jpy",
+                "take_profit_price_jpy",
                 "estimated_win_probability",
                 "reason",
             ),
