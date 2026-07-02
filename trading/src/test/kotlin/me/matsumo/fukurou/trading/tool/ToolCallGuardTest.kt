@@ -1,13 +1,15 @@
 package me.matsumo.fukurou.trading.tool
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -122,17 +124,21 @@ class ToolCallGuardTest {
     fun cancellation_records_no_trade_exit_with_context_switching_audit_log() = runBlocking {
         val eventLog = ToolContextSwitchingCommandEventLog()
         val guard = createGuard(eventLog = eventLog)
+        val blockStarted = CompletableDeferred<Unit>()
 
-        val result = runCatching {
+        val job = launch {
             guard.runReadOnlyTool(createCall(toolName = "read.slow")) {
-                withTimeout(10) {
-                    delay(1_000)
-                }
+                blockStarted.complete(Unit)
+
+                awaitCancellation()
             }
         }
+
+        blockStarted.await()
+        job.cancelAndJoin()
+
         val event = eventLog.events().single()
 
-        assertTrue(result.exceptionOrNull() is TimeoutCancellationException)
         assertEquals(CommandEventType.NO_TRADE_EXIT, event.eventType)
         assertTrue(event.payload.contains("tool_call_cancelled"))
     }

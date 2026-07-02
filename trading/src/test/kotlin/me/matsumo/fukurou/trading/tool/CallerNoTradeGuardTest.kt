@@ -1,8 +1,12 @@
 package me.matsumo.fukurou.trading.tool
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -66,17 +70,21 @@ class CallerNoTradeGuardTest {
     fun caller_cancellation_records_no_trade_exit_with_context_switching_audit_log() = runBlocking {
         val eventLog = CallerContextSwitchingCommandEventLog()
         val guard = CallerNoTradeGuard(eventLog, fixedClock())
+        val blockStarted = CompletableDeferred<Unit>()
 
-        val result = runCatching {
+        val job = launch {
             guard.run(createInvocation()) {
-                withTimeout(10) {
-                    delay(1_000)
-                }
+                blockStarted.complete(Unit)
+
+                awaitCancellation()
             }
         }
+
+        blockStarted.await()
+        job.cancelAndJoin()
+
         val event = eventLog.events().single()
 
-        assertTrue(result.exceptionOrNull() is TimeoutCancellationException)
         assertEquals(CommandEventType.NO_TRADE_EXIT, event.eventType)
         assertTrue(event.payload.contains("caller_cancelled"))
     }
