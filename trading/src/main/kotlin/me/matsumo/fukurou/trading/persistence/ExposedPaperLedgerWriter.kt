@@ -206,8 +206,11 @@ internal class ExposedPaperLedgerWriter(
                     val executionIds = mutableListOf<String>()
 
                     updateMarks(lastPrice, tickSnapshot.atr14Jpy?.toBigDecimal(), rules)
-                    fillTriggeredEntryOrders(ticker, rules, simulator, lastPrice, triggeredOrderIds, executionIds)
-                    triggerPositionProtections(ticker, rules, simulator, lastPrice, triggeredOrderIds, closedPositionIds, executionIds)
+
+                    if (!paperAccountHardHaltReached()) {
+                        fillTriggeredEntryOrders(ticker, rules, simulator, lastPrice, triggeredOrderIds, executionIds)
+                        triggerPositionProtections(ticker, rules, simulator, lastPrice, triggeredOrderIds, closedPositionIds, executionIds)
+                    }
 
                     PaperReconcileResult(
                         advanced = triggeredOrderIds.isNotEmpty() || closedPositionIds.isNotEmpty(),
@@ -774,6 +777,10 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 
+    private fun JdbcTransaction.paperAccountHardHaltReached(): Boolean {
+        return selectPaperAccount().drawdownRatio.toBigDecimal() <= HARD_HALT_DRAWDOWN_RATIO
+    }
+
     private fun JdbcTransaction.requireOpenPosition(positionId: UUID): Position {
         return selectOpenPositions()
             .firstOrNull { position -> position.positionId == positionId.toString() }
@@ -921,6 +928,11 @@ private const val DRAW_DOWN_SCALE = 10
  * ATR trailing の既定係数。
  */
 private val TRAILING_ATR_MULTIPLIER = BigDecimal("2.0")
+
+/**
+ * HARD_HALT を立てる drawdown。
+ */
+private val HARD_HALT_DRAWDOWN_RATIO = BigDecimal("-0.15")
 
 /**
  * resting order 復元時の既定推定勝率。

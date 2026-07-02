@@ -236,8 +236,11 @@ class InMemoryPaperLedgerRepository(
                 val executionIds = mutableListOf<String>()
 
                 updateMarksLocked(lastPrice, tickSnapshot.atr14Jpy?.toBigDecimal(), rules)
-                fillTriggeredEntryOrdersLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, executionIds)
-                triggerPositionProtectionsLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, closedPositionIds, executionIds)
+
+                if (!accountSnapshot.isHardHaltDrawdownReached()) {
+                    fillTriggeredEntryOrdersLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, executionIds)
+                    triggerPositionProtectionsLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, closedPositionIds, executionIds)
+                }
 
                 PaperReconcileResult(
                     advanced = triggeredOrderIds.isNotEmpty() || closedPositionIds.isNotEmpty(),
@@ -739,6 +742,10 @@ private fun AccountSnapshot.withMarkPrice(markPrice: BigDecimal): AccountSnapsho
     )
 }
 
+private fun AccountSnapshot.isHardHaltDrawdownReached(): Boolean {
+    return drawdownRatio.toBigDecimal() <= HARD_HALT_DRAWDOWN_RATIO
+}
+
 private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
     return when (orderType) {
         OrderType.MARKET -> false
@@ -807,6 +814,11 @@ private fun fillInstantText(): String {
  * ATR trailing の既定係数。
  */
 private val TRAILING_ATR_MULTIPLIER = BigDecimal("2.0")
+
+/**
+ * HARD_HALT を立てる drawdown。
+ */
+private val HARD_HALT_DRAWDOWN_RATIO = BigDecimal("-0.15")
 
 /**
  * resting order 復元時の既定推定勝率。

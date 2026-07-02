@@ -345,6 +345,34 @@ class ProtectionReconcilerTest {
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertEquals(0, repository.getExecutions().getOrThrow().size)
     }
+
+    @Test
+    fun reconcile_pass_cancels_open_entry_before_fill_when_tick_reaches_drawdown_halt() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("12000000"))).getOrThrow()
+        broker.placeOrder(restingReconcilerEntryCommand(sizeBtc = BigDecimal("0.0010"))).getOrThrow()
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(drawdownHaltTickSnapshot())),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+        val riskState = riskStateRepository.current().getOrThrow()
+
+        assertTrue(result.isSuccess)
+        assertTrue(riskState.hardHalt)
+        assertEquals(0, broker.getPositions().getOrThrow().size)
+        assertEquals(0, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
 }
 
 /**
@@ -544,6 +572,17 @@ private fun neutralBtcTickSnapshot(): TickSnapshot {
     )
 }
 
+private fun drawdownHaltTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "6000000",
+        bidPrice = "5990000",
+        askPrice = "6000000",
+        symbolRules = reconcilerSymbolRules(),
+    )
+}
+
 private fun reconcilerEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = java.util.UUID.randomUUID(),
@@ -561,13 +600,13 @@ private fun reconcilerEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderCo
     )
 }
 
-private fun restingReconcilerEntryCommand(): PlaceOrderCommand {
+private fun restingReconcilerEntryCommand(sizeBtc: BigDecimal = BigDecimal("0.0050")): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = java.util.UUID.randomUUID(),
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
         orderType = OrderType.LIMIT,
-        sizeBtc = BigDecimal("0.0050"),
+        sizeBtc = sizeBtc,
         priceJpy = BigDecimal("10000000"),
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),

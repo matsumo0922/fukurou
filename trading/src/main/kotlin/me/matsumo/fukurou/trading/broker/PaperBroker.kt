@@ -217,7 +217,13 @@ class PaperBroker(
     }
 
     override suspend fun reconcile(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
-        return ledgerRepository.reconcile(tickSnapshot, fillSimulator)
+        return runCatching {
+            val result = ledgerRepository.reconcile(tickSnapshot, fillSimulator).getOrThrow()
+
+            activateHardHaltIfAccountDrawdownReached()
+
+            result
+        }
     }
 
     override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult> {
@@ -360,6 +366,29 @@ class PaperBroker(
             }
 
         return mergeTradeResults(cancelResults + closeResults, "HARD_HALT 掃引で open order を取消し、open position を close しました。")
+    }
+
+    private suspend fun activateHardHaltIfAccountDrawdownReached() {
+        val accountSnapshot = ledgerRepository.getAccountSnapshot().getOrThrow()
+        val drawdownRatio = accountSnapshot.drawdownRatio.toBigDecimal()
+
+        if (drawdownRatio > HARD_HALT_DRAWDOWN_RATIO) {
+            return
+        }
+
+        val riskState = riskStateRepository.current().getOrThrow()
+
+        if (riskState.hardHalt) {
+            return
+        }
+
+        val reason = "Paper account drawdown reached HARD_HALT threshold."
+
+        if (riskStateCommandService != null) {
+            riskStateCommandService.setHardHalt(reason, PaperTradeAuditContext.EMPTY.decisionRunContext).getOrThrow()
+        } else {
+            riskStateRepository.setHardHalt(reason, Instant.now(clock)).getOrThrow()
+        }
     }
 }
 
@@ -655,3 +684,8 @@ private fun TickSnapshot.toTicker(): Ticker {
  * 取引日判定に使う timezone。
  */
 private val TRADING_DATE_ZONE = ZoneId.of("Asia/Tokyo")
+
+/**
+ * HARD_HALT を立てる drawdown。
+ */
+private val HARD_HALT_DRAWDOWN_RATIO = BigDecimal("-0.15")
