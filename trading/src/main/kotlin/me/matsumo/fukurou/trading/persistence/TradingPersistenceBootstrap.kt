@@ -150,6 +150,7 @@ private const val VERIFY_ORDERS_SCHEMA_SQL = """
         trigger_price_jpy,
         protective_stop_price_jpy,
         take_profit_price_jpy,
+        estimated_win_probability,
         reason_ja,
         decision_run_id,
         tool_call_id,

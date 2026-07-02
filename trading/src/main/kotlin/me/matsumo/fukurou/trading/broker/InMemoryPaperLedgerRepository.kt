@@ -14,6 +14,8 @@ import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.reconciler.requireTicker
+import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.math.BigDecimal
 import java.time.LocalDate
 import java.util.UUID
@@ -228,7 +230,7 @@ class InMemoryPaperLedgerRepository(
     override suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult> {
         return runCatching {
             synchronized(lock) {
-                val ticker = tickSnapshot.toTicker()
+                val ticker = tickSnapshot.requireTicker()
                 val rules = tickSnapshot.symbolRules ?: defaultSymbolRules()
                 val lastPrice = tickSnapshot.lastPrice?.toBigDecimal() ?: ticker.last.toBigDecimal()
                 val triggeredOrderIds = mutableListOf<String>()
@@ -470,7 +472,7 @@ class InMemoryPaperLedgerRepository(
             val highestPrice = maxOf(position.highestPriceSinceEntryJpy.toBigDecimal(), lastPrice)
             val trailingStop = atr14Jpy?.let { atrValue ->
                 highestPrice
-                    .subtract(atrValue.multiply(TRAILING_ATR_MULTIPLIER))
+                    .subtract(atrValue.multiply(SafetyFloorDefaults.trailingAtrMultiplier))
                     .floorToStep(rules.tickSize.toBigDecimal())
             }
             val currentStop = position.currentStopLossJpy?.toBigDecimal()
@@ -563,6 +565,7 @@ private fun PlaceOrderCommand.toEntryOrder(
         triggerPriceJpy = if (orderType == OrderType.STOP) priceJpy?.moneyScale()?.toPlainString() else null,
         protectiveStopPriceJpy = protectiveStopPriceJpy.moneyScale().toPlainString(),
         takeProfitPriceJpy = takeProfitPriceJpy?.moneyScale()?.toPlainString(),
+        estimatedWinProbability = estimatedWinProbability.ratioScale().toPlainString(),
         reasonJa = reasonJa,
         clientRequestId = auditContext.clientRequestId,
         createdAt = fillInstantText(),
@@ -585,6 +588,7 @@ private fun PlaceOrderCommand.toProtectiveStopOrder(orderId: UUID, positionId: U
         triggerPriceJpy = protectiveStopPriceJpy.moneyScale().toPlainString(),
         protectiveStopPriceJpy = null,
         takeProfitPriceJpy = null,
+        estimatedWinProbability = null,
         reasonJa = "protective stop: $reasonJa",
         clientRequestId = auditContext.clientRequestId,
         createdAt = fillInstantText(),
@@ -627,7 +631,8 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
         tradeGroupId = tradeGroupId?.let { value -> UUID.fromString(value) },
         protectiveStopPriceJpy = requireNotNull(protectiveStopPriceJpy).toBigDecimal(),
         takeProfitPriceJpy = takeProfitPriceJpy?.toBigDecimal(),
-        estimatedWinProbability = DEFAULT_RESTORED_ESTIMATED_WIN_PROBABILITY,
+        estimatedWinProbability = estimatedWinProbability?.toBigDecimal()
+            ?: DEFAULT_RESTORED_ESTIMATED_WIN_PROBABILITY,
         reasonJa = reasonJa.orEmpty(),
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
@@ -743,7 +748,7 @@ private fun AccountSnapshot.withMarkPrice(markPrice: BigDecimal): AccountSnapsho
 }
 
 private fun AccountSnapshot.isHardHaltDrawdownReached(): Boolean {
-    return drawdownRatio.toBigDecimal() <= HARD_HALT_DRAWDOWN_RATIO
+    return drawdownRatio.toBigDecimal() <= SafetyFloorDefaults.maxDrawdownRatio
 }
 
 private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
@@ -760,23 +765,6 @@ private fun Order.createEntryFill(ticker: Ticker, rules: SymbolRules, simulator:
         OrderType.STOP -> simulator.stopFill(side, sizeBtc.toBigDecimal(), requireNotNull(triggerPriceJpy).toBigDecimal(), ticker, rules)
         OrderType.MARKET -> error("MARKET entry is not a resting order.")
     }
-}
-
-private fun TickSnapshot.toTicker(): Ticker {
-    val last = lastPrice ?: bidPrice ?: askPrice ?: "0"
-    val bid = bidPrice ?: last
-    val ask = askPrice ?: last
-
-    return Ticker(
-        symbol = symbol,
-        last = last,
-        bid = bid,
-        ask = ask,
-        high = last,
-        low = last,
-        volume = "0",
-        timestamp = observedAt.toString(),
-    )
 }
 
 private fun defaultSymbolRules(): SymbolRules {
@@ -809,16 +797,6 @@ private fun defaultAccountSnapshot(): AccountSnapshot {
 private fun fillInstantText(): String {
     return java.time.Instant.EPOCH.toString()
 }
-
-/**
- * ATR trailing の既定係数。
- */
-private val TRAILING_ATR_MULTIPLIER = BigDecimal("2.0")
-
-/**
- * HARD_HALT を立てる drawdown。
- */
-private val HARD_HALT_DRAWDOWN_RATIO = BigDecimal("-0.15")
 
 /**
  * resting order 復元時の既定推定勝率。

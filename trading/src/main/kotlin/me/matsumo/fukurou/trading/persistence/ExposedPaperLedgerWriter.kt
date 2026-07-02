@@ -27,6 +27,8 @@ import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.reconciler.requireTicker
+import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -198,7 +200,7 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    val ticker = tickSnapshot.toTicker()
+                    val ticker = tickSnapshot.requireTicker()
                     val rules = tickSnapshot.symbolRules ?: defaultSymbolRules()
                     val lastPrice = (tickSnapshot.lastPrice ?: ticker.last).toBigDecimal()
                     val triggeredOrderIds = mutableListOf<String>()
@@ -344,7 +346,7 @@ internal class ExposedPaperLedgerWriter(
             val highestPrice = maxOf(position.highestPriceSinceEntryJpy.toBigDecimal(), lastPrice)
             val trailingStop = atr14Jpy?.let { atrValue ->
                 highestPrice
-                    .subtract(atrValue.multiply(TRAILING_ATR_MULTIPLIER))
+                    .subtract(atrValue.multiply(SafetyFloorDefaults.trailingAtrMultiplier))
                     .floorToStep(rules.tickSize.toBigDecimal())
             }
             val currentStop = position.currentStopLossJpy?.toBigDecimal()
@@ -373,11 +375,11 @@ internal class ExposedPaperLedgerWriter(
                 INSERT INTO orders (
                     id, position_id, trade_group_id, mode, symbol, side, order_type, status,
                     size_btc, limit_price_jpy, trigger_price_jpy, protective_stop_price_jpy,
-                    take_profit_price_jpy, reason_ja, decision_run_id, tool_call_id,
-                    client_request_id, llm_provider, prompt_hash, system_prompt_version,
-                    market_snapshot_id, created_at, updated_at
+                    take_profit_price_jpy, estimated_win_probability, reason_ja,
+                    decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
+                    system_prompt_version, market_snapshot_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
         ).use { statement ->
             statement.bindOrderId(orderId, positionId, tradeGroupId)
@@ -391,10 +393,11 @@ internal class ExposedPaperLedgerWriter(
             statement.setNullableBigDecimal(11, command.priceJpy.takeIf { command.orderType == OrderType.STOP }?.moneyScale())
             statement.setBigDecimal(12, command.protectiveStopPriceJpy.moneyScale())
             statement.setNullableBigDecimal(13, command.takeProfitPriceJpy?.moneyScale())
-            statement.setString(14, command.reasonJa)
-            statement.bindAudit(15, command.auditContext)
-            statement.setLong(22, nowMillis())
+            statement.setBigDecimal(14, command.estimatedWinProbability.ratioScale())
+            statement.setString(15, command.reasonJa)
+            statement.bindAudit(16, command.auditContext)
             statement.setLong(23, nowMillis())
+            statement.setLong(24, nowMillis())
             statement.executeUpdate()
         }
     }
@@ -410,11 +413,11 @@ internal class ExposedPaperLedgerWriter(
                 INSERT INTO orders (
                     id, position_id, trade_group_id, mode, symbol, side, order_type, status,
                     size_btc, limit_price_jpy, trigger_price_jpy, protective_stop_price_jpy,
-                    take_profit_price_jpy, reason_ja, decision_run_id, tool_call_id,
-                    client_request_id, llm_provider, prompt_hash, system_prompt_version,
-                    market_snapshot_id, created_at, updated_at
+                    take_profit_price_jpy, estimated_win_probability, reason_ja,
+                    decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
+                    system_prompt_version, market_snapshot_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
         ).use { statement ->
             statement.bindOrderId(stopOrderId, positionId, tradeGroupId)
@@ -444,11 +447,11 @@ internal class ExposedPaperLedgerWriter(
                 INSERT INTO orders (
                     id, position_id, trade_group_id, mode, symbol, side, order_type, status,
                     size_btc, limit_price_jpy, trigger_price_jpy, protective_stop_price_jpy,
-                    take_profit_price_jpy, reason_ja, decision_run_id, tool_call_id,
-                    client_request_id, llm_provider, prompt_hash, system_prompt_version,
-                    market_snapshot_id, created_at, updated_at
+                    take_profit_price_jpy, estimated_win_probability, reason_ja,
+                    decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
+                    system_prompt_version, market_snapshot_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
         ).use { statement ->
             statement.bindOrderId(orderId, UUID.fromString(position.positionId), UUID.fromString(position.tradeGroupId))
@@ -778,7 +781,7 @@ internal class ExposedPaperLedgerWriter(
     }
 
     private fun JdbcTransaction.paperAccountHardHaltReached(): Boolean {
-        return selectPaperAccount().drawdownRatio.toBigDecimal() <= HARD_HALT_DRAWDOWN_RATIO
+        return selectPaperAccount().drawdownRatio.toBigDecimal() <= SafetyFloorDefaults.maxDrawdownRatio
     }
 
     private fun JdbcTransaction.requireOpenPosition(positionId: UUID): Position {
@@ -866,7 +869,8 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
         tradeGroupId = tradeGroupId?.let { value -> UUID.fromString(value) },
         protectiveStopPriceJpy = requireNotNull(protectiveStopPriceJpy).toBigDecimal(),
         takeProfitPriceJpy = takeProfitPriceJpy?.toBigDecimal(),
-        estimatedWinProbability = DEFAULT_RESTORED_ESTIMATED_WIN_PROBABILITY,
+        estimatedWinProbability = estimatedWinProbability?.toBigDecimal()
+            ?: DEFAULT_RESTORED_ESTIMATED_WIN_PROBABILITY,
         reasonJa = reasonJa.orEmpty(),
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
@@ -891,23 +895,6 @@ private fun drawdownRatio(totalEquity: BigDecimal, equityPeak: BigDecimal): BigD
         .ratioScale()
 }
 
-private fun TickSnapshot.toTicker(): Ticker {
-    val last = lastPrice ?: bidPrice ?: askPrice ?: "0"
-    val bid = bidPrice ?: last
-    val ask = askPrice ?: last
-
-    return Ticker(
-        symbol = symbol,
-        last = last,
-        bid = bid,
-        ask = ask,
-        high = last,
-        low = last,
-        volume = "0",
-        timestamp = observedAt.toString(),
-    )
-}
-
 private fun defaultSymbolRules(): SymbolRules {
     return SymbolRules(
         symbol = TradingSymbol.BTC.apiSymbol,
@@ -923,16 +910,6 @@ private fun defaultSymbolRules(): SymbolRules {
  * drawdown 計算 scale。
  */
 private const val DRAW_DOWN_SCALE = 10
-
-/**
- * ATR trailing の既定係数。
- */
-private val TRAILING_ATR_MULTIPLIER = BigDecimal("2.0")
-
-/**
- * HARD_HALT を立てる drawdown。
- */
-private val HARD_HALT_DRAWDOWN_RATIO = BigDecimal("-0.15")
 
 /**
  * resting order 復元時の既定推定勝率。

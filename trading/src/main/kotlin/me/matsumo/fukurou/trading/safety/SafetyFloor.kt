@@ -108,7 +108,7 @@ enum class SafetyFloorRule {
  */
 data class SafetyFloorConfig(
     val maxRiskPerTradeRatio: BigDecimal = DEFAULT_MAX_RISK_PER_TRADE_RATIO,
-    val maxDrawdownRatio: BigDecimal = DEFAULT_MAX_DRAWDOWN_RATIO,
+    val maxDrawdownRatio: BigDecimal = SafetyFloorDefaults.maxDrawdownRatio,
     val maxTotalExposureRatio: BigDecimal = DEFAULT_MAX_TOTAL_EXPOSURE_RATIO,
     val minExpectedValueR: BigDecimal = DEFAULT_MIN_EXPECTED_VALUE_R,
     val minExpectedMoveToCostRatio: BigDecimal = DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO,
@@ -125,6 +125,7 @@ data class SafetyFloorConfig(
  * @param openOrders open order 一覧
  * @param ticker 最新 ticker
  * @param symbolRules 取引所 symbol rule
+ * @param atr14Jpy 5分足 ATR(14)
  */
 data class SafetyFloorContext(
     val account: AccountSnapshot,
@@ -133,6 +134,7 @@ data class SafetyFloorContext(
     val openOrders: List<Order>,
     val ticker: Ticker,
     val symbolRules: SymbolRules,
+    val atr14Jpy: BigDecimal? = null,
 )
 
 /**
@@ -233,7 +235,7 @@ class SafetyFloor(
         validateStopTightening(command, position, newStopPrice)?.let { violation ->
             return SafetyFloorVerdict.Rejected(violation)
         }
-        validateTrailingFloor(command, position, newStopPrice)?.let { violation ->
+        validateTrailingFloor(command, position, newStopPrice, context)?.let { violation ->
             return SafetyFloorVerdict.Rejected(violation)
         }
         validateImmediateStop(command, context, newStopPrice)?.let { violation ->
@@ -520,8 +522,12 @@ class SafetyFloor(
         command: UpdateProtectionCommand,
         position: Position,
         newStopPrice: BigDecimal,
+        context: SafetyFloorContext,
     ): SafetyViolation? {
-        val atrFloor = position.currentStopLossJpy?.toBigDecimal() ?: return null
+        val atrValue = context.atr14Jpy ?: return null
+        val atrFloor = position.highestPriceSinceEntryJpy.toBigDecimal()
+            .subtract(atrValue.multiply(SafetyFloorDefaults.trailingAtrMultiplier))
+            .floorToStep(context.symbolRules.tickSize.toBigDecimal())
 
         if (newStopPrice >= atrFloor) {
             return null
@@ -783,6 +789,16 @@ private fun BigDecimal.safetyScale(): BigDecimal {
     return setScale(SAFETY_SCALE, RoundingMode.HALF_UP)
 }
 
+private fun BigDecimal.floorToStep(step: BigDecimal): BigDecimal {
+    if (step.compareTo(BigDecimal.ZERO) == 0) {
+        return this
+    }
+
+    return divide(step, 0, RoundingMode.DOWN)
+        .multiply(step)
+        .safetyScale()
+}
+
 private fun Any.auditContextOrNull() = when (this) {
     is PlaceOrderCommand -> auditContext
     is UpdateProtectionCommand -> auditContext
@@ -834,11 +850,6 @@ private val BPS_DIVISOR = BigDecimal("10000")
  * 1 trade group の既定最大損失割合。
  */
 private val DEFAULT_MAX_RISK_PER_TRADE_RATIO = BigDecimal("0.02")
-
-/**
- * HARD_HALT の既定 drawdown。
- */
-private val DEFAULT_MAX_DRAWDOWN_RATIO = BigDecimal("-0.15")
 
 /**
  * 既定 exposure 上限。

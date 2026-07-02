@@ -324,6 +324,11 @@ object OrdersTable : Table("orders") {
     val takeProfitPriceJpy = decimal("take_profit_price_jpy", precision = 24, scale = 8).nullable()
 
     /**
+     * entry intent で LLM が申告した推定勝率。
+     */
+    val estimatedWinProbability = decimal("estimated_win_probability", precision = 20, scale = 10).nullable()
+
+    /**
      * 判断理由。
      */
     val reasonJa = text("reason_ja").nullable()

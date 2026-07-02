@@ -15,7 +15,7 @@ import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
-import java.math.BigDecimal
+import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -55,11 +55,6 @@ private const val START_AUDIT_FAILURE_LOG_KEY = "protection-reconciler-start-aud
  * ProtectionReconciler 用 logger。
  */
 private val RECONCILER_LOGGER = Logger.getLogger(ProtectionReconciler::class.java.name)
-
-/**
- * HARD_HALT を立てる drawdown。
- */
-private val HARD_HALT_DRAWDOWN_RATIO = BigDecimal("-0.15")
 
 /**
  * Reconciler が HARD_HALT 掃引を実行する理由。
@@ -223,7 +218,7 @@ class ProtectionReconciler(
 
     private suspend fun enforceHardHaltSweepIfNeeded(tickSnapshot: TickSnapshot): Boolean {
         val currentRiskState = riskStateRepository.current().getOrThrow()
-        val hardHaltReached = currentRiskState.drawdownRatio <= HARD_HALT_DRAWDOWN_RATIO
+        val hardHaltReached = currentRiskState.drawdownRatio <= SafetyFloorDefaults.maxDrawdownRatio
         val shouldSweep = currentRiskState.hardHalt || hardHaltReached
 
         if (!shouldSweep) {

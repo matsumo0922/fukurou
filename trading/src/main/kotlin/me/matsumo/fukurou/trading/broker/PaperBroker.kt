@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.broker
 
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
+import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
@@ -12,20 +13,26 @@ import me.matsumo.fukurou.trading.domain.ProtectionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.market.IndicatorCalculator
+import me.matsumo.fukurou.trading.market.IndicatorParams
+import me.matsumo.fukurou.trading.market.IndicatorType
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.NoReconcilerStatusProvider
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyFloorContext
+import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import me.matsumo.fukurou.trading.safety.SafetyFloorVerdict
 import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.safety.SafetyViolationRepository
 import java.math.BigDecimal
+import java.math.RoundingMode
 import java.time.Clock
 import java.time.Instant
 import java.time.LocalDate
@@ -182,7 +189,11 @@ class PaperBroker(
 
             val ticker = tickerFor(TradingSymbol.BTC).getOrThrow()
             val symbolRules = symbolRulesFor(TradingSymbol.BTC).getOrThrow()
-            val context = safetyContext(ticker, symbolRules)
+            val context = safetyContext(
+                ticker = ticker,
+                symbolRules = symbolRules,
+                includeAtr = true,
+            )
 
             enforceSafetyFloor(
                 verdict = safetyFloor.evaluateUpdateProtection(command, context),
@@ -228,7 +239,7 @@ class PaperBroker(
 
     override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult> {
         return runCatching {
-            val ticker = tickSnapshot.toTicker()
+            val ticker = tickSnapshot.requireTicker()
             val symbolRules = tickSnapshot.symbolRules ?: symbolRulesFor(TradingSymbol.BTC).getOrThrow()
 
             sweepOpenRisk(
@@ -270,7 +281,11 @@ class PaperBroker(
         )
     }
 
-    private suspend fun safetyContext(ticker: Ticker, symbolRules: SymbolRules): SafetyFloorContext {
+    private suspend fun safetyContext(
+        ticker: Ticker,
+        symbolRules: SymbolRules,
+        includeAtr: Boolean = false,
+    ): SafetyFloorContext {
         return SafetyFloorContext(
             account = ledgerRepository.getAccountSnapshot().getOrThrow(),
             riskState = riskStateRepository.current().getOrThrow(),
@@ -278,7 +293,37 @@ class PaperBroker(
             openOrders = ledgerRepository.getOpenOrders().getOrThrow(),
             ticker = ticker,
             symbolRules = symbolRules,
+            atr14Jpy = if (includeAtr) {
+                atr14JpyFor(TradingSymbol.BTC)
+            } else {
+                null
+            },
         )
+    }
+
+    private suspend fun atr14JpyFor(symbol: TradingSymbol): BigDecimal? {
+        val marketData = marketDataSource ?: return null
+        val candles = marketData.getCandles(
+            symbol = symbol,
+            interval = CandleInterval.FIVE_MINUTES,
+            limit = ATR_CANDLE_LIMIT,
+        )
+            .getOrNull()
+            ?: return null
+        val atr = IndicatorCalculator.calculate(
+            candles = candles,
+            indicator = IndicatorType.ATR,
+            params = IndicatorParams(period = ATR_PERIOD),
+        )
+            .getOrNull()
+            ?: return null
+        val latestAtr = atr.values
+            .lastOrNull { value -> value.value != null }
+            ?.value
+            ?: return null
+
+        return BigDecimal.valueOf(latestAtr)
+            .setScale(ATR_SCALE, RoundingMode.HALF_UP)
     }
 
     private suspend fun enforceSafetyFloor(
@@ -372,7 +417,7 @@ class PaperBroker(
         val accountSnapshot = ledgerRepository.getAccountSnapshot().getOrThrow()
         val drawdownRatio = accountSnapshot.drawdownRatio.toBigDecimal()
 
-        if (drawdownRatio > HARD_HALT_DRAWDOWN_RATIO) {
+        if (drawdownRatio > SafetyFloorDefaults.maxDrawdownRatio) {
             return
         }
 
@@ -663,29 +708,22 @@ private fun Order.isLinkedProtectiveStop(): Boolean {
     return side == OrderSide.SELL && orderType == OrderType.STOP && positionId != null
 }
 
-private fun TickSnapshot.toTicker(): Ticker {
-    val last = lastPrice ?: bidPrice ?: askPrice ?: "0"
-    val bid = bidPrice ?: last
-    val ask = askPrice ?: last
-
-    return Ticker(
-        symbol = symbol,
-        last = last,
-        bid = bid,
-        ask = ask,
-        high = last,
-        low = last,
-        volume = "0",
-        timestamp = observedAt.toString(),
-    )
-}
-
 /**
  * 取引日判定に使う timezone。
  */
 private val TRADING_DATE_ZONE = ZoneId.of("Asia/Tokyo")
 
 /**
- * HARD_HALT を立てる drawdown。
+ * ATR 算出に取得する 5分足本数。
  */
-private val HARD_HALT_DRAWDOWN_RATIO = BigDecimal("-0.15")
+private const val ATR_CANDLE_LIMIT = 64
+
+/**
+ * ATR の期間。
+ */
+private const val ATR_PERIOD = 14
+
+/**
+ * ATR の返却 scale。
+ */
+private const val ATR_SCALE = 8

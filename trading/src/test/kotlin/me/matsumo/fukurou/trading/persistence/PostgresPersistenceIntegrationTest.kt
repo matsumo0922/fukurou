@@ -145,6 +145,7 @@ private const val INSERT_TEST_ORDER_SQL = """
         trigger_price_jpy,
         protective_stop_price_jpy,
         take_profit_price_jpy,
+        estimated_win_probability,
         reason_ja,
         created_at,
         updated_at
@@ -161,6 +162,7 @@ private const val INSERT_TEST_ORDER_SQL = """
         0.010000000000,
         NULL,
         9800000.00000000,
+        NULL,
         NULL,
         NULL,
         'test',
@@ -414,6 +416,32 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun paper_execution_persists_estimated_win_probability_for_resting_entry() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        broker.placeOrder(
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+                estimatedWinProbability = BigDecimal("0.73"),
+            ),
+        ).getOrThrow()
+
+        val openOrder = repository.getOpenOrders().getOrThrow().single()
+
+        assertEquals("0.7300000000", openOrder.estimatedWinProbability)
+    }
+
+    @Test
     fun paper_execution_persists_virtual_take_profit_then_stop_cancel() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -548,20 +576,23 @@ private class PostgresTestContext(
 }
 
 private fun postgresEntryCommand(
+    orderType: OrderType = OrderType.MARKET,
+    priceJpy: BigDecimal? = null,
     takeProfitPriceJpy: BigDecimal,
+    estimatedWinProbability: BigDecimal = BigDecimal("0.95"),
     clientRequestId: String? = null,
 ): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
-        orderType = OrderType.MARKET,
+        orderType = orderType,
         sizeBtc = BigDecimal("0.0050"),
-        priceJpy = null,
+        priceJpy = priceJpy,
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
         takeProfitPriceJpy = takeProfitPriceJpy,
-        estimatedWinProbability = BigDecimal("0.95"),
+        estimatedWinProbability = estimatedWinProbability,
         reasonJa = "integration entry",
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
