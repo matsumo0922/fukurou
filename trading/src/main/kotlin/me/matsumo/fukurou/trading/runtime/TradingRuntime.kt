@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
+import me.matsumo.fukurou.trading.persistence.ExposedReconcilerStatusProvider
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
@@ -126,7 +127,7 @@ object TradingRuntimeFactory {
     fun fromEnvironment(
         environment: Map<String, String> = System.getenv(),
         clock: Clock = Clock.systemUTC(),
-        reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
+        reconcilerStatusProvider: ReconcilerStatusProvider? = null,
     ): TradingRuntime {
         val databaseConfig = requireNotNull(TradingDatabaseConfig.fromEnvironment(environment)) {
             "DB_URL, DB_USER, and DB_PASSWORD are required for trading runtime."
@@ -186,7 +187,7 @@ object TradingRuntimeFactory {
     fun postgres(
         config: TradingDatabaseConfig,
         clock: Clock = Clock.systemUTC(),
-        reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
+        reconcilerStatusProvider: ReconcilerStatusProvider? = null,
     ): TradingRuntime {
         val dataSource = createDataSource(config)
 
@@ -195,10 +196,11 @@ object TradingRuntimeFactory {
             TradingPersistenceBootstrap(database, clock).verifySchema().getOrThrow()
 
             val riskStateRepository = ExposedRiskStateRepository(database)
+            val resolvedReconcilerStatusProvider = reconcilerStatusProvider ?: ExposedReconcilerStatusProvider(database)
             val broker = PaperBroker(
                 ledgerRepository = ExposedPaperLedgerRepository(database),
                 riskStateRepository = riskStateRepository,
-                reconcilerStatusProvider = reconcilerStatusProvider,
+                reconcilerStatusProvider = resolvedReconcilerStatusProvider,
                 clock = clock,
             )
             val commandEventLog = ExposedCommandEventLog(database)

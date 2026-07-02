@@ -6,6 +6,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
@@ -45,6 +47,19 @@ private const val DELETE_RISK_STATE_ROW_SQL = "DELETE FROM risk_state WHERE id =
  * command_event_log table を削除する SQL。
  */
 private const val DROP_COMMAND_EVENT_LOG_TABLE_SQL = "DROP TABLE command_event_log"
+
+/**
+ * test 用 reconciler 完了 event の payload。
+ */
+private const val TEST_RECONCILER_COMPLETED_PAYLOAD = """
+    {
+        "pass": "loop",
+        "state": "completed",
+        "lastReconciledAt": "2026-07-02T00:00:00Z",
+        "startupFullReconcileCompleted": true,
+        "lastMarketDataAt": "2026-07-02T00:00:00Z"
+    }
+"""
 
 /**
  * test 用 position 行を追加する SQL。
@@ -229,6 +244,36 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(runtime.broker.getBalance().isSuccess)
 
         runtime.close()
+    }
+
+    @Test
+    fun runtime_postgres_reads_reconciler_freshness_from_command_event_log() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        ExposedCommandEventLog(database).append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext.EMPTY,
+                toolName = "protection-reconciler",
+                toolCallId = null,
+                clientRequestId = null,
+                eventType = CommandEventType.RECONCILER_PASS_COMPLETED,
+                payload = TEST_RECONCILER_COMPLETED_PAYLOAD,
+                occurredAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+
+        val runtime = TradingRuntimeFactory.postgres(
+            config = tradingDatabaseConfig(),
+            clock = fixedClock(),
+        )
+
+        try {
+            val protectionStatus = runtime.broker.getAccountStatus().getOrThrow().protectionStatus
+
+            assertEquals(fixedInstant().toString(), protectionStatus.lastReconciledAt)
+            assertEquals(fixedInstant().toString(), protectionStatus.lastMarketDataAt)
+        } finally {
+            runtime.close()
+        }
     }
 
     @Test

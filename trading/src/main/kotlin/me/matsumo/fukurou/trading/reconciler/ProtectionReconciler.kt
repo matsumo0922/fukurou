@@ -29,11 +29,6 @@ private const val RECONCILER_LOCK_OWNER = "protection-reconciler"
 private const val RECONCILER_STARTED_PAYLOAD = """{"worker":"protection_reconciler","state":"started"}"""
 
 /**
- * startup full reconcile pass の payload。
- */
-private const val STARTUP_FULL_COMPLETED_PAYLOAD = """{"pass":"startup_full","state":"completed"}"""
-
-/**
  * loop reconcile pass が回復したことを示す payload。
  */
 private const val LOOP_RECOVERED_PAYLOAD = """{"pass":"loop","state":"recovered"}"""
@@ -216,7 +211,13 @@ class ProtectionReconciler(
         reconciledAt: Instant,
     ): Result<Unit> {
         val isStartupFullPass = passKind == ReconcilePassKind.STARTUP_FULL
-        val auditResult = recordSuccessTransition(passKind, reconciledAt)
+        val lastMarketDataAt = tickSnapshot?.observedAt ?: status.snapshot().lastMarketDataAt
+        val auditResult = recordSuccessTransition(
+            passKind = passKind,
+            reconciledAt = reconciledAt,
+            startupFullReconcileCompleted = isStartupFullPass,
+            lastMarketDataAt = lastMarketDataAt,
+        )
 
         if (auditResult.isFailure) {
             return auditResult
@@ -225,29 +226,42 @@ class ProtectionReconciler(
         status.markReconciled(
             reconciledAt = reconciledAt,
             startupFullReconcileCompleted = isStartupFullPass,
-            lastMarketDataAt = tickSnapshot?.observedAt,
+            lastMarketDataAt = lastMarketDataAt,
         )
 
         return Result.success(Unit)
     }
 
-    private suspend fun recordSuccessTransition(passKind: ReconcilePassKind, occurredAt: Instant): Result<Unit> {
-        if (passKind == ReconcilePassKind.STARTUP_FULL) {
-            return appendReconcilerEvent(
-                eventType = CommandEventType.RECONCILER_PASS_COMPLETED,
-                payload = STARTUP_FULL_COMPLETED_PAYLOAD,
-                occurredAt = occurredAt,
-            )
+    private suspend fun recordSuccessTransition(
+        passKind: ReconcilePassKind,
+        reconciledAt: Instant,
+        startupFullReconcileCompleted: Boolean,
+        lastMarketDataAt: Instant?,
+    ): Result<Unit> {
+        val completedResult = appendReconcilerEvent(
+            eventType = CommandEventType.RECONCILER_PASS_COMPLETED,
+            payload = buildPassCompletedPayload(
+                passKind = passKind,
+                reconciledAt = reconciledAt,
+                startupFullReconcileCompleted = startupFullReconcileCompleted,
+                lastMarketDataAt = lastMarketDataAt,
+            ),
+            occurredAt = reconciledAt,
+        )
+
+        if (completedResult.isFailure) {
+            return completedResult
         }
 
-        if (!previousPassFailed) {
+        val shouldRecordRecovery = previousPassFailed && passKind != ReconcilePassKind.STARTUP_FULL
+        if (!shouldRecordRecovery) {
             return Result.success(Unit)
         }
 
         return appendReconcilerEvent(
             eventType = CommandEventType.RECONCILER_PASS_RECOVERED,
             payload = LOOP_RECOVERED_PAYLOAD,
-            occurredAt = occurredAt,
+            occurredAt = reconciledAt,
         )
     }
 
@@ -288,6 +302,26 @@ class ProtectionReconciler(
             throwable = throwable,
         )
     }
+}
+
+/**
+ * 完了した reconcile pass の payload を組み立てる。
+ */
+private fun buildPassCompletedPayload(
+    passKind: ReconcilePassKind,
+    reconciledAt: Instant,
+    startupFullReconcileCompleted: Boolean,
+    lastMarketDataAt: Instant?,
+): String {
+    return buildJsonObject {
+        put("pass", passKind.payloadName())
+        put("state", "completed")
+        put("lastReconciledAt", reconciledAt.toString())
+        put("startupFullReconcileCompleted", startupFullReconcileCompleted)
+        lastMarketDataAt?.let { marketDataAt ->
+            put("lastMarketDataAt", marketDataAt.toString())
+        }
+    }.toString()
 }
 
 /**

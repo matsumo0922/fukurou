@@ -100,7 +100,7 @@ class ProtectionReconcilerTest {
     }
 
     @Test
-    fun steady_loop_success_does_not_append_heartbeat_events() = runBlocking {
+    fun steady_loop_success_appends_completed_events_for_persistent_freshness() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
         val reconciler = createReconciler(eventLog = eventLog)
 
@@ -110,7 +110,14 @@ class ProtectionReconcilerTest {
 
         val eventTypes = eventLog.events().map { event -> event.eventType }
 
-        assertEquals(listOf(CommandEventType.RECONCILER_PASS_COMPLETED), eventTypes)
+        assertEquals(
+            listOf(
+                CommandEventType.RECONCILER_PASS_COMPLETED,
+                CommandEventType.RECONCILER_PASS_COMPLETED,
+                CommandEventType.RECONCILER_PASS_COMPLETED,
+            ),
+            eventTypes,
+        )
     }
 
     @Test
@@ -160,6 +167,7 @@ class ProtectionReconcilerTest {
             listOf(
                 CommandEventType.RECONCILER_PASS_COMPLETED,
                 CommandEventType.RECONCILER_PASS_FAILED,
+                CommandEventType.RECONCILER_PASS_COMPLETED,
                 CommandEventType.RECONCILER_PASS_RECOVERED,
             ),
             eventTypes,
@@ -193,7 +201,13 @@ class ProtectionReconcilerTest {
         assertTrue(result.isSuccess)
         assertEquals(secondInstant, snapshot.lastReconciledAt)
         assertEquals(firstInstant, snapshot.lastMarketDataAt)
-        assertEquals(listOf(CommandEventType.RECONCILER_PASS_COMPLETED), eventTypes)
+        assertEquals(
+            listOf(
+                CommandEventType.RECONCILER_PASS_COMPLETED,
+                CommandEventType.RECONCILER_PASS_COMPLETED,
+            ),
+            eventTypes,
+        )
     }
 
     @Test
