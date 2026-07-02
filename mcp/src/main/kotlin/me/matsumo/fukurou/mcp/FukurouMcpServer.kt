@@ -15,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.io.asSink
 import kotlinx.io.asSource
@@ -26,6 +27,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import me.matsumo.fukurou.trading.domain.Ticker
@@ -54,9 +56,34 @@ private const val GET_TICKER_TOOL = "get_ticker"
 private const val REJECT_DUMMY_TRADE_TOOL = "reject_dummy_trade"
 
 /**
+ * timeout 再現用の副作用なし tool 名。
+ */
+private const val SIMULATE_TOOL_TIMEOUT_TOOL = "simulate_tool_timeout"
+
+/**
  * JSON schema の string 型。
  */
 private const val JSON_TYPE_STRING = "string"
+
+/**
+ * JSON schema の integer 型。
+ */
+private const val JSON_TYPE_INTEGER = "integer"
+
+/**
+ * timeout 再現 tool の既定 delay。
+ */
+private const val DEFAULT_SIMULATED_TIMEOUT_DELAY_MS = 30_000L
+
+/**
+ * timeout 再現 tool に指定できる最小 delay。
+ */
+private const val MIN_SIMULATED_TIMEOUT_DELAY_MS = 1L
+
+/**
+ * timeout 再現 tool に指定できる最大 delay。
+ */
+private const val MAX_SIMULATED_TIMEOUT_DELAY_MS = 120_000L
 
 /**
  * Tool response の JSON 設定。
@@ -123,6 +150,7 @@ class FukurouMcpServer(
 
         server.registerTickerTool(marketDataSource)
         server.registerRejectDummyTradeTool()
+        server.registerSimulateToolTimeoutTool()
 
         return server
     }
@@ -173,6 +201,27 @@ private fun Server.registerRejectDummyTradeTool() {
     }
 }
 
+private fun Server.registerSimulateToolTimeoutTool() {
+    addTool(
+        name = SIMULATE_TOOL_TIMEOUT_TOOL,
+        description = "Sleep without side effects so headless callers can verify timeout handling ends in no-trade.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("delay_ms") {
+                    put("type", JSON_TYPE_INTEGER)
+                    put("description", "Delay duration in milliseconds.")
+                    put("default", DEFAULT_SIMULATED_TIMEOUT_DELAY_MS)
+                    put("minimum", MIN_SIMULATED_TIMEOUT_DELAY_MS)
+                    put("maximum", MAX_SIMULATED_TIMEOUT_DELAY_MS)
+                }
+            },
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+    ) { request ->
+        handleSimulateToolTimeout(request)
+    }
+}
+
 private suspend fun handleGetTicker(request: CallToolRequest, marketDataSource: MarketDataSource): CallToolResult {
     val symbol = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull)
         .getOrElse { throwable -> return errorResult("invalid_symbol", throwable.message.orEmpty()) }
@@ -180,6 +229,22 @@ private suspend fun handleGetTicker(request: CallToolRequest, marketDataSource: 
         .getOrElse { throwable -> return errorResult("gmo_public_error", throwable.message.orEmpty()) }
 
     return tickerResult(ticker)
+}
+
+private suspend fun handleSimulateToolTimeout(request: CallToolRequest): CallToolResult {
+    val delayMs = parseDelayMs(request)
+        .getOrElse { throwable -> return errorResult("invalid_delay_ms", throwable.message.orEmpty()) }
+
+    delay(delayMs)
+
+    return CallToolResult(
+        content = listOf(TextContent("Completed simulated wait without side effects.")),
+        structuredContent = buildJsonObject {
+            put("completed", true)
+            put("delay_ms", delayMs)
+            put("side_effects", false)
+        },
+    )
 }
 
 private fun parseTradingSymbol(rawSymbol: String?): Result<TradingSymbol> {
@@ -194,6 +259,24 @@ private fun parseTradingSymbol(rawSymbol: String?): Result<TradingSymbol> {
         }
 
         TradingSymbol.BTC
+    }
+}
+
+private fun parseDelayMs(request: CallToolRequest): Result<Long> {
+    val delayMs = request.arguments
+        ?.get("delay_ms")
+        ?.jsonPrimitive
+        ?.longOrNull
+        ?: DEFAULT_SIMULATED_TIMEOUT_DELAY_MS
+
+    return runCatching {
+        val isInRange = delayMs in MIN_SIMULATED_TIMEOUT_DELAY_MS..MAX_SIMULATED_TIMEOUT_DELAY_MS
+
+        require(isInRange) {
+            "delay_ms must be between $MIN_SIMULATED_TIMEOUT_DELAY_MS and $MAX_SIMULATED_TIMEOUT_DELAY_MS: $delayMs"
+        }
+
+        delayMs
     }
 }
 

@@ -36,6 +36,7 @@ fun main(args: Array<String>) = runBlocking {
         client.connect(transport)
         verifyTicker(client)
         verifyDummyTradeReject(client)
+        verifySimulatedTimeoutTool(client)
     } finally {
         client.close()
         process.destroy()
@@ -75,4 +76,23 @@ private suspend fun verifyDummyTradeReject(client: Client) {
     }
 
     println("reject_dummy_trade rejected as expected: $text")
+}
+
+private suspend fun verifySimulatedTimeoutTool(client: Client) {
+    val result = client.callTool(
+        name = "simulate_tool_timeout",
+        arguments = mapOf("delay_ms" to 10),
+    )
+    val text = result.content.joinToString(separator = "\n") { content ->
+        if (content is TextContent) content.text else content.toString()
+    }
+
+    check(result.isError != true) {
+        "simulate_tool_timeout should complete without MCP error for short smoke delay: $text"
+    }
+    check(text.contains("without side effects")) {
+        "simulate_tool_timeout response did not prove no-side-effect completion: $text"
+    }
+
+    println("simulate_tool_timeout completed as expected: $text")
 }

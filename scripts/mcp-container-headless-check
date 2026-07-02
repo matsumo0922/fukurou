@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+readonly IMAGE_NAME="${FUKUROU_MCP_HEADLESS_IMAGE:-fukurou-mcp-headless-validation:local}"
+readonly CLAUDE_CREDENTIALS_FILE="${CLAUDE_CREDENTIALS_FILE:-${HOME}/.claude/.credentials.json}"
+readonly CODEX_AUTH_FILE="${CODEX_AUTH_FILE:-${HOME}/.codex/auth.json}"
+readonly TEMP_DIR="$(mktemp -d)"
+
+cleanup() {
+  rm -rf "${TEMP_DIR}"
+}
+
+trap cleanup EXIT
+
+fail() {
+  echo "${SCRIPT_NAME}: $*" >&2
+  exit 1
+}
+
+require_file() {
+  local path="$1"
+  local label="$2"
+
+  [[ -f "${path}" ]] || fail "${label} not found: ${path}"
+}
+
+build_fat_jar() {
+  (cd "${REPO_ROOT}" && ./gradlew :mcp:buildFatJar)
+}
+
+write_dockerfile() {
+  cat >"${TEMP_DIR}/Dockerfile" <<'DOCKERFILE'
+FROM eclipse-temurin:21-jre
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm ca-certificates git \
+    && npm install -g @anthropic-ai/claude-code @openai/codex \
+    && mkdir -p /auth /root/.claude /root/.codex \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+DOCKERFILE
+}
+
+build_validation_image() {
+  write_dockerfile
+  docker build -t "${IMAGE_NAME}" "${TEMP_DIR}"
+}
+
+run_container_once() {
+  local run_label="$1"
+
+  docker run --rm \
+    --mount "type=bind,src=${REPO_ROOT},dst=/work,readonly" \
+    --mount "type=bind,src=${CLAUDE_CREDENTIALS_FILE},dst=/auth/claude-credentials.json,readonly" \
+    --mount "type=bind,src=${CODEX_AUTH_FILE},dst=/auth/codex-auth.json,readonly" \
+    -e "RUN_LABEL=${run_label}" \
+    -w /work \
+    "${IMAGE_NAME}" \
+    bash -lc '
+set -Eeuo pipefail
+
+ln -sf /auth/claude-credentials.json /root/.claude/.credentials.json
+ln -sf /auth/codex-auth.json /root/.codex/auth.json
+
+assert_read_only_mount() {
+  local mount_path="$1"
+  local label="$2"
+
+  awk -v mount_path="${mount_path}" "
+    \$5 == mount_path {
+      split(\$6, options, \",\")
+      seen = 1
+
+      for (option_index in options) {
+        if (options[option_index] == \"ro\") {
+          read_only = 1
+        }
+      }
+    }
+
+    END {
+      if (!seen) {
+        exit 2
+      }
+
+      if (!read_only) {
+        exit 1
+      }
+    }
+  " /proc/self/mountinfo
+
+  local status="$?"
+
+  if [[ "${status}" == "0" ]]; then
+    return
+  fi
+
+  if [[ "${status}" == "2" ]]; then
+    echo "${label} auth mount entry was not found" >&2
+  else
+    echo "${label} auth mount is not read-only" >&2
+  fi
+
+  exit 1
+}
+
+assert_read_only_mount /auth/claude-credentials.json claude
+assert_read_only_mount /auth/codex-auth.json codex
+
+if ! claude -p "MCP tool get_ticker を必ず使って BTC の ticker を取得し、symbol だけを出力して。" \
+    --mcp-config /work/.mcp.json \
+    --strict-mcp-config \
+    --permission-mode dontAsk \
+    --allowedTools mcp__fukurou-gmo-coin-mcp__get_ticker \
+    --output-format json \
+    --no-session-persistence \
+    >/tmp/claude-result.json 2>/tmp/claude-stderr.log; then
+  cat /tmp/claude-result.json >&2
+  cat /tmp/claude-stderr.log >&2
+  exit 1
+fi
+
+if ! grep -q BTC /tmp/claude-result.json; then
+  cat /tmp/claude-result.json >&2
+  cat /tmp/claude-stderr.log >&2
+  exit 1
+fi
+
+if ! codex exec \
+    --ignore-user-config \
+    --sandbox read-only \
+    -c "approval_policy=\"never\"" \
+    -c "mcp_servers.fukurou-gmo-coin-mcp.command=\"java\"" \
+    -c "mcp_servers.fukurou-gmo-coin-mcp.args=[\"-jar\",\"/work/mcp/build/libs/fukurou-mcp-all.jar\"]" \
+    "Use the fukurou-gmo-coin-mcp get_ticker MCP tool to fetch BTC ticker. Then answer with only symbol. Do not run shell commands and do not edit files." \
+    >/tmp/codex-result.txt 2>/tmp/codex-stderr.log; then
+  cat /tmp/codex-result.txt >&2
+  cat /tmp/codex-stderr.log >&2
+  exit 1
+fi
+
+if ! grep -q BTC /tmp/codex-result.txt; then
+  cat /tmp/codex-result.txt >&2
+  cat /tmp/codex-stderr.log >&2
+  exit 1
+fi
+
+printf "%s claude_ok=true codex_ok=true auth_mount=read_only\n" "${RUN_LABEL}"
+'
+}
+
+main() {
+  require_file "${CLAUDE_CREDENTIALS_FILE}" "Claude credentials file"
+  require_file "${CODEX_AUTH_FILE}" "Codex auth file"
+
+  build_fat_jar
+  build_validation_image
+  run_container_once "first_container"
+  run_container_once "second_container"
+}
+
+main "$@"

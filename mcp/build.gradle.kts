@@ -54,3 +54,12 @@ tasks.register<JavaExec>("smokeStdio") {
     mainClass.set("me.matsumo.fukurou.mcp.testing.McpSmokeClientKt")
     args(layout.buildDirectory.file("libs/fukurou-mcp-all.jar").get().asFile.absolutePath)
 }
+
+tasks.register<JavaExec>("timeoutStdio") {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Starts the MCP fat jar and verifies a caller-side timeout exits before any trade side effect."
+    dependsOn(mcpFatJar, tasks.named("testClasses"))
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("me.matsumo.fukurou.mcp.testing.McpTimeoutClientKt")
+    args(layout.buildDirectory.file("libs/fukurou-mcp-all.jar").get().asFile.absolutePath)
+}
