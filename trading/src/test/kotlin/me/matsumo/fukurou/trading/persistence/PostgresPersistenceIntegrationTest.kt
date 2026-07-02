@@ -10,13 +10,16 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
 import java.sql.SQLTimeoutException
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneOffset
+import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -42,6 +45,122 @@ private const val DELETE_RISK_STATE_ROW_SQL = "DELETE FROM risk_state WHERE id =
  * command_event_log table を削除する SQL。
  */
 private const val DROP_COMMAND_EVENT_LOG_TABLE_SQL = "DROP TABLE command_event_log"
+
+/**
+ * test 用 position 行を追加する SQL。
+ */
+private const val INSERT_TEST_POSITION_SQL = """
+    INSERT INTO positions (
+        id,
+        trade_group_id,
+        mode,
+        symbol,
+        side,
+        status,
+        opened_at,
+        closed_at,
+        size_btc,
+        average_entry_price_jpy,
+        current_price_jpy,
+        current_stop_loss_jpy,
+        current_take_profit_jpy,
+        unrealized_pnl_jpy,
+        unrealized_r,
+        pyramid_add_count,
+        highest_price_since_entry_jpy
+    )
+    VALUES (
+        ?,
+        ?,
+        ?,
+        'BTC',
+        'LONG',
+        'OPEN',
+        ?,
+        NULL,
+        0.010000000000,
+        10000000.00000000,
+        10100000.00000000,
+        9800000.00000000,
+        NULL,
+        1000.00000000,
+        0.500000,
+        0,
+        10100000.00000000
+    )
+"""
+
+/**
+ * test 用 order 行を追加する SQL。
+ */
+private const val INSERT_TEST_ORDER_SQL = """
+    INSERT INTO orders (
+        id,
+        position_id,
+        trade_group_id,
+        mode,
+        symbol,
+        side,
+        order_type,
+        status,
+        size_btc,
+        limit_price_jpy,
+        trigger_price_jpy,
+        reason_ja,
+        created_at,
+        updated_at
+    )
+    VALUES (
+        ?,
+        ?,
+        ?,
+        ?,
+        'BTC',
+        'SELL',
+        'STOP',
+        'OPEN',
+        0.010000000000,
+        NULL,
+        9800000.00000000,
+        'test',
+        ?,
+        ?
+    )
+"""
+
+/**
+ * test 用 execution 行を追加する SQL。
+ */
+private const val INSERT_TEST_EXECUTION_SQL = """
+    INSERT INTO executions (
+        id,
+        order_id,
+        position_id,
+        mode,
+        symbol,
+        side,
+        price_jpy,
+        size_btc,
+        fee_jpy,
+        realized_pnl_jpy,
+        liquidity,
+        executed_at
+    )
+    VALUES (
+        ?,
+        NULL,
+        ?,
+        ?,
+        'BTC',
+        'SELL',
+        10100000.00000000,
+        0.010000000000,
+        0.00000000,
+        ?,
+        'TAKER',
+        ?
+    )
+"""
 
 /**
  * Exposed/Postgres 実装の DB 契約を実 Postgres で検証するテスト。
@@ -110,6 +229,33 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(runtime.broker.getBalance().isSuccess)
 
         runtime.close()
+    }
+
+    @Test
+    fun paper_ledger_repository_filters_rows_by_account_mode() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        insertLedgerRows(
+            database = database,
+            mode = "PAPER",
+            realizedPnlJpy = "10.00000000",
+        )
+        insertLedgerRows(
+            database = database,
+            mode = "LIVE",
+            realizedPnlJpy = "20.00000000",
+        )
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val positions = repository.getOpenPositions().getOrThrow()
+        val orders = repository.getOpenOrders().getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+        val realizedPnl = repository.getRealizedPnlForDate(LocalDate.of(2026, 7, 2)).getOrThrow()
+
+        assertEquals(listOf(TradingMode.PAPER), positions.map { position -> position.mode })
+        assertEquals(listOf(TradingMode.PAPER), orders.map { order -> order.mode })
+        assertEquals(listOf(TradingMode.PAPER), executions.map { execution -> execution.mode })
+        assertEquals("10.00000000", realizedPnl.toPlainString())
     }
 
     @Test
@@ -282,6 +428,78 @@ private fun dropCommandEventLogTable(database: ExposedDatabase) {
         jdbcConnection().prepareStatement(DROP_COMMAND_EVENT_LOG_TABLE_SQL).use { statement ->
             statement.executeUpdate()
         }
+    }
+}
+
+/**
+ * mode filter 検証用 ledger 行を追加する。
+ */
+private fun insertLedgerRows(
+    database: ExposedDatabase,
+    mode: String,
+    realizedPnlJpy: String,
+) {
+    val positionId = UUID.randomUUID()
+    val tradeGroupId = UUID.randomUUID()
+
+    exposedTransaction(database) {
+        insertTestPosition(positionId, tradeGroupId, mode)
+        insertTestOrder(positionId, tradeGroupId, mode)
+        insertTestExecution(positionId, mode, realizedPnlJpy)
+    }
+}
+
+/**
+ * mode filter 検証用 position 行を追加する。
+ */
+private fun JdbcTransaction.insertTestPosition(
+    positionId: UUID,
+    tradeGroupId: UUID,
+    mode: String,
+) {
+    jdbcConnection().prepareStatement(INSERT_TEST_POSITION_SQL).use { statement ->
+        statement.setObject(1, positionId)
+        statement.setObject(2, tradeGroupId)
+        statement.setString(3, mode)
+        statement.setLong(4, fixedInstant().toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+/**
+ * mode filter 検証用 order 行を追加する。
+ */
+private fun JdbcTransaction.insertTestOrder(
+    positionId: UUID,
+    tradeGroupId: UUID,
+    mode: String,
+) {
+    jdbcConnection().prepareStatement(INSERT_TEST_ORDER_SQL).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setObject(2, positionId)
+        statement.setObject(3, tradeGroupId)
+        statement.setString(4, mode)
+        statement.setLong(5, fixedInstant().toEpochMilli())
+        statement.setLong(6, fixedInstant().toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+/**
+ * mode filter 検証用 execution 行を追加する。
+ */
+private fun JdbcTransaction.insertTestExecution(
+    positionId: UUID,
+    mode: String,
+    realizedPnlJpy: String,
+) {
+    jdbcConnection().prepareStatement(INSERT_TEST_EXECUTION_SQL).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setObject(2, positionId)
+        statement.setString(3, mode)
+        statement.setBigDecimal(4, realizedPnlJpy.toBigDecimal())
+        statement.setLong(5, fixedInstant().toEpochMilli())
+        statement.executeUpdate()
     }
 }
 

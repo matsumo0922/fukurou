@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import java.time.Clock
 import java.time.Instant
@@ -48,7 +49,12 @@ class PaperBrokerTest {
         val ledgerRepository = InMemoryPaperLedgerRepository(
             accountSnapshot = accountSnapshot(),
             positions = listOf(protectedPosition(), unprotectedPosition()),
-            openOrders = listOf(orphanStopOrder(), orphanTakeProfitOrder(), pendingCancelOrder()),
+            openOrders = listOf(
+                linkedStopOrder(),
+                orphanStopOrder(),
+                orphanTakeProfitOrder(),
+                pendingCancelOrder(),
+            ),
         )
         val broker = PaperBroker(
             ledgerRepository = ledgerRepository,
@@ -63,6 +69,46 @@ class PaperBrokerTest {
         assertEquals(1, protectionStatus.orphanStopCount)
         assertEquals(1, protectionStatus.orphanTakeProfitCount)
         assertEquals(1, protectionStatus.pendingCancelCount)
+    }
+
+    @Test
+    fun get_account_status_requires_active_stop_order_to_count_position_as_protected() = runBlocking {
+        val ledgerRepository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshot(),
+            positions = listOf(protectedPosition()),
+            openOrders = emptyList(),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            clock = fixedClock(),
+        )
+
+        val protectionStatus = broker.getAccountStatus().getOrThrow().protectionStatus
+
+        assertEquals(0, protectionStatus.protectedPositionCount)
+        assertEquals(1, protectionStatus.unprotectedPositionCount)
+    }
+
+    @Test
+    fun get_account_status_includes_reconciler_freshness() = runBlocking {
+        val reconcilerStatus = MutableReconcilerStatus()
+        reconcilerStatus.markReconciled(
+            reconciledAt = fixedInstant(),
+            startupFullReconcileCompleted = true,
+            lastMarketDataAt = fixedInstant(),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = InMemoryPaperLedgerRepository(),
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            reconcilerStatusProvider = reconcilerStatus,
+            clock = fixedClock(),
+        )
+
+        val protectionStatus = broker.getAccountStatus().getOrThrow().protectionStatus
+
+        assertEquals(fixedInstant().toString(), protectionStatus.lastReconciledAt)
+        assertEquals(fixedInstant().toString(), protectionStatus.lastMarketDataAt)
     }
 }
 
@@ -118,6 +164,7 @@ private fun position(positionId: String, currentStopLossJpy: String?): Position 
 private fun orphanStopOrder(): Order {
     return order(
         orderId = "20000000-0000-0000-0000-000000000001",
+        positionId = null,
         orderType = OrderType.STOP,
         side = OrderSide.SELL,
         status = OrderStatus.OPEN,
@@ -127,6 +174,7 @@ private fun orphanStopOrder(): Order {
 private fun orphanTakeProfitOrder(): Order {
     return order(
         orderId = "20000000-0000-0000-0000-000000000002",
+        positionId = null,
         orderType = OrderType.LIMIT,
         side = OrderSide.SELL,
         status = OrderStatus.OPEN,
@@ -136,21 +184,33 @@ private fun orphanTakeProfitOrder(): Order {
 private fun pendingCancelOrder(): Order {
     return order(
         orderId = "20000000-0000-0000-0000-000000000003",
+        positionId = null,
         orderType = OrderType.LIMIT,
         side = OrderSide.BUY,
         status = OrderStatus.PENDING_CANCEL,
     )
 }
 
+private fun linkedStopOrder(): Order {
+    return order(
+        orderId = "20000000-0000-0000-0000-000000000004",
+        positionId = "00000000-0000-0000-0000-000000000001",
+        orderType = OrderType.STOP,
+        side = OrderSide.SELL,
+        status = OrderStatus.OPEN,
+    )
+}
+
 private fun order(
     orderId: String,
+    positionId: String?,
     orderType: OrderType,
     side: OrderSide,
     status: OrderStatus,
 ): Order {
     return Order(
         orderId = orderId,
-        positionId = null,
+        positionId = positionId,
         tradeGroupId = null,
         symbol = "BTC",
         mode = TradingMode.PAPER,

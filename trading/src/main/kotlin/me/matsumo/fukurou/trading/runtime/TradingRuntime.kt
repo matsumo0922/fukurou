@@ -15,6 +15,8 @@ import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import me.matsumo.fukurou.trading.reconciler.NoReconcilerStatusProvider
+import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
@@ -124,22 +126,31 @@ object TradingRuntimeFactory {
     fun fromEnvironment(
         environment: Map<String, String> = System.getenv(),
         clock: Clock = Clock.systemUTC(),
+        reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
     ): TradingRuntime {
         val databaseConfig = requireNotNull(TradingDatabaseConfig.fromEnvironment(environment)) {
             "DB_URL, DB_USER, and DB_PASSWORD are required for trading runtime."
         }
 
-        return postgres(databaseConfig, clock)
+        return postgres(
+            config = databaseConfig,
+            clock = clock,
+            reconcilerStatusProvider = reconcilerStatusProvider,
+        )
     }
 
     /**
      * in-memory runtime を構築する。
      */
-    fun inMemory(clock: Clock = Clock.systemUTC()): TradingRuntime {
+    fun inMemory(
+        clock: Clock = Clock.systemUTC(),
+        reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
+    ): TradingRuntime {
         val riskStateRepository = InMemoryRiskStateRepository(clock)
         val broker = PaperBroker(
             ledgerRepository = InMemoryPaperLedgerRepository(),
             riskStateRepository = riskStateRepository,
+            reconcilerStatusProvider = reconcilerStatusProvider,
             clock = clock,
         )
         val commandEventLog = InMemoryCommandEventLog()
@@ -172,7 +183,11 @@ object TradingRuntimeFactory {
     /**
      * Postgres/Exposed runtime を構築し、backend bootstrap 済み schema を検証する。
      */
-    fun postgres(config: TradingDatabaseConfig, clock: Clock = Clock.systemUTC()): TradingRuntime {
+    fun postgres(
+        config: TradingDatabaseConfig,
+        clock: Clock = Clock.systemUTC(),
+        reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
+    ): TradingRuntime {
         val dataSource = createDataSource(config)
 
         try {
@@ -183,6 +198,7 @@ object TradingRuntimeFactory {
             val broker = PaperBroker(
                 ledgerRepository = ExposedPaperLedgerRepository(database),
                 riskStateRepository = riskStateRepository,
+                reconcilerStatusProvider = reconcilerStatusProvider,
                 clock = clock,
             )
             val commandEventLog = ExposedCommandEventLog(database)

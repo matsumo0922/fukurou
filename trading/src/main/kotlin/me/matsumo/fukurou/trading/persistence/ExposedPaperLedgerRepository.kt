@@ -65,6 +65,11 @@ private const val SELECT_OPEN_POSITIONS_SQL = """
         highest_price_since_entry_jpy
     FROM positions
     WHERE status = ?
+        AND mode = (
+            SELECT mode
+            FROM paper_account
+            WHERE id = ?
+        )
     ORDER BY opened_at ASC
 """
 
@@ -89,6 +94,11 @@ private const val SELECT_OPEN_ORDERS_SQL = """
         updated_at
     FROM orders
     WHERE status IN (?, ?)
+        AND mode = (
+            SELECT mode
+            FROM paper_account
+            WHERE id = ?
+        )
     ORDER BY created_at ASC
 """
 
@@ -110,6 +120,11 @@ private const val SELECT_EXECUTIONS_SQL = """
         liquidity,
         executed_at
     FROM executions
+    WHERE mode = (
+        SELECT mode
+        FROM paper_account
+        WHERE id = ?
+    )
     ORDER BY executed_at ASC
 """
 
@@ -121,6 +136,11 @@ private const val SELECT_REALIZED_PNL_FOR_RANGE_SQL = """
     FROM executions
     WHERE executed_at >= ?
         AND executed_at < ?
+        AND mode = (
+            SELECT mode
+            FROM paper_account
+            WHERE id = ?
+        )
 """
 
 /**
@@ -205,6 +225,7 @@ internal fun JdbcTransaction.selectPaperAccount(): AccountSnapshot {
 private fun JdbcTransaction.selectOpenPositions(): List<Position> {
     return jdbcConnection().prepareStatement(SELECT_OPEN_POSITIONS_SQL).use { statement ->
         statement.setString(1, PositionStatus.OPEN.name)
+        statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {
@@ -219,6 +240,7 @@ private fun JdbcTransaction.selectOpenOrders(): List<Order> {
     return jdbcConnection().prepareStatement(SELECT_OPEN_ORDERS_SQL).use { statement ->
         statement.setString(1, OrderStatus.OPEN.name)
         statement.setString(2, OrderStatus.PENDING_CANCEL.name)
+        statement.setInt(3, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {
@@ -231,6 +253,7 @@ private fun JdbcTransaction.selectOpenOrders(): List<Order> {
 
 private fun JdbcTransaction.selectExecutions(): List<Execution> {
     return jdbcConnection().prepareStatement(SELECT_EXECUTIONS_SQL).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {
@@ -248,6 +271,7 @@ private fun JdbcTransaction.selectRealizedPnlForDate(date: LocalDate): BigDecima
     return jdbcConnection().prepareStatement(SELECT_REALIZED_PNL_FOR_RANGE_SQL).use { statement ->
         statement.setLong(1, startAt)
         statement.setLong(2, endAt)
+        statement.setInt(3, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
             require(resultSet.next()) { "realized pnl aggregate did not return a row." }
 
