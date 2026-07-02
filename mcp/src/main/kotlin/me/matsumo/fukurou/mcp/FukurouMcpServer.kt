@@ -27,6 +27,8 @@ import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
@@ -44,6 +46,14 @@ import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
+import me.matsumo.fukurou.trading.decision.EntryIntentDraft
+import me.matsumo.fukurou.trading.decision.FalsificationRecord
+import me.matsumo.fukurou.trading.decision.FalsificationSubmission
+import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Order
@@ -70,6 +80,7 @@ import me.matsumo.fukurou.trading.tool.NoTradeExitException
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import me.matsumo.fukurou.trading.tool.ToolCompletionAuditFailedException
 import java.math.BigDecimal
+import java.time.Instant
 import java.util.UUID
 
 /**
@@ -106,6 +117,16 @@ private const val GET_ACCOUNT_STATUS_TOOL = "get_account_status"
  * paper entry 発注 tool 名。
  */
 private const val PLACE_ORDER_TOOL = "place_order"
+
+/**
+ * LLM 判断提出 tool 名。
+ */
+private const val SUBMIT_DECISION_TOOL = "submit_decision"
+
+/**
+ * Falsifier verdict 提出 tool 名。
+ */
+private const val SUBMIT_FALSIFICATION_TOOL = "submit_falsification"
 
 /**
  * paper position close tool 名。
@@ -257,6 +278,8 @@ class FukurouMcpServer(
         server.registerPositionsTool(tradingRuntime, decisionRunContext)
         server.registerOpenOrdersTool(tradingRuntime, decisionRunContext)
         server.registerAccountStatusTool(tradingRuntime, decisionRunContext)
+        server.registerSubmitDecisionTool(tradingRuntime, decisionRunContext)
+        server.registerSubmitFalsificationTool(tradingRuntime, decisionRunContext)
         server.registerPlaceOrderTool(tradingRuntime, decisionRunContext)
         server.registerClosePositionTool(tradingRuntime, decisionRunContext)
         server.registerUpdateProtectionTool(tradingRuntime, decisionRunContext)
@@ -326,6 +349,93 @@ private fun useTestInMemoryRuntime(): Boolean {
         ?: false
 
     return environmentEnabled && propertyEnabled
+}
+
+private fun Server.registerSubmitDecisionTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+) {
+    addTool(
+        name = SUBMIT_DECISION_TOOL,
+        description = "Submit the structured LLM decision. ENTER creates a trade intent and TradePlan.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("action") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "ENTER, EXIT, ADJUST_PROTECTION, or NO_TRADE.")
+                    put("enum", ToolJson.encodeToJsonElement(DecisionAction.entries.map { action -> action.name }))
+                }
+                putStringArraySchema("setup_tags", "Setup taxonomy tags.")
+                putDecimalStringSchema("estimated_win_probability", "Estimated win probability from 0 to 1.")
+                putDecimalStringSchema("expected_r_multiple", "Expected reward multiple in R.")
+                putDecimalStringSchema("round_trip_cost_r", "Round-trip cost expressed in R.")
+                putStringArraySchema("tool_evidence_ids", "Tool call IDs used as decision evidence.")
+                putJsonObject("fact_check") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Fact-check JSON string.")
+                }
+                putJsonObject("self_review") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Self-review JSON string.")
+                }
+                putJsonObject("reason_ja") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Decision reason in Japanese.")
+                }
+                putStringArraySchema("missing_data_ja", "Missing data list for NO_TRADE and calibration.")
+                putStringArraySchema("no_trade_conditions_ja", "Conditions to wait for before trading.")
+                putEntryIntentDecisionSchemas()
+                putTradePlanDecisionSchemas()
+                putClientRequestIdSchema()
+            },
+            required = listOf(
+                "action",
+                "estimated_win_probability",
+                "fact_check",
+                "self_review",
+                "reason_ja",
+            ),
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+    ) { request ->
+        handleSubmitDecision(request, tradingRuntime, decisionRunContext)
+    }
+}
+
+private fun Server.registerSubmitFalsificationTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+) {
+    addTool(
+        name = SUBMIT_FALSIFICATION_TOOL,
+        description = "Submit an APPROVED or REJECTED Falsifier verdict for one trade intent.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("intent_id") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Trade intent UUID.")
+                }
+                putJsonObject("verdict") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "APPROVED or REJECTED.")
+                    put("enum", ToolJson.encodeToJsonElement(FalsificationVerdict.entries.map { verdict -> verdict.name }))
+                }
+                putJsonObject("llm_provider") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Falsifier provider name.")
+                }
+                putJsonObject("reason_ja") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Falsifier reason in Japanese.")
+                }
+                putClientRequestIdSchema()
+            },
+            required = listOf("intent_id", "verdict", "reason_ja"),
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+    ) { request ->
+        handleSubmitFalsification(request, tradingRuntime, decisionRunContext)
+    }
 }
 
 private fun Server.registerPlaceOrderTool(
@@ -621,6 +731,42 @@ private suspend fun handleGetAccountStatus(
     )
 }
 
+private suspend fun handleSubmitDecision(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(SUBMIT_DECISION_TOOL, decisionRunContext)
+    val result = tradingRuntime.toolCallGuard.runDecisionTool(call) {
+        val submission = parseDecisionSubmission(request, decisionRunContext).getOrThrow()
+
+        tradingRuntime.decisionRepository.submitDecision(submission).getOrThrow()
+    }
+
+    return result.fold(
+        onSuccess = { value -> decisionSubmissionResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
+private suspend fun handleSubmitFalsification(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(SUBMIT_FALSIFICATION_TOOL, decisionRunContext)
+    val result = tradingRuntime.toolCallGuard.runDecisionTool(call) {
+        val submission = parseFalsificationSubmission(request, decisionRunContext).getOrThrow()
+
+        tradingRuntime.decisionRepository.submitFalsification(submission).getOrThrow()
+    }
+
+    return result.fold(
+        onSuccess = { value -> falsificationResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
 private suspend fun handlePlaceOrder(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
@@ -774,6 +920,56 @@ private fun JsonObjectBuilder.putNullableDecimalStringSchema(name: String, descr
     }
 }
 
+private fun JsonObjectBuilder.putStringArraySchema(name: String, description: String) {
+    putJsonObject(name) {
+        put("type", "array")
+        put("description", description)
+        putJsonObject("items") {
+            put("type", JSON_TYPE_STRING)
+        }
+    }
+}
+
+private fun JsonObjectBuilder.putEntryIntentDecisionSchemas() {
+    putSymbolSchema()
+    putJsonObject("side") {
+        put("type", JSON_TYPE_STRING)
+        put("description", "BUY entry only for ENTER.")
+        put("enum", ToolJson.encodeToJsonElement(listOf(OrderSide.BUY.name)))
+    }
+    putJsonObject("type") {
+        put("type", JSON_TYPE_STRING)
+        put("description", "MARKET, LIMIT, or STOP for ENTER.")
+        put("enum", ToolJson.encodeToJsonElement(OrderType.entries.map { type -> type.name }))
+    }
+    putDecimalStringSchema("size_btc", "BTC intent size.")
+    putDecimalStringSchema("price_jpy", "LIMIT or STOP intent price. Omit for MARKET.")
+    putDecimalStringSchema("protective_stop_price_jpy", "Protective STOP price for ENTER.")
+    putDecimalStringSchema("take_profit_price_jpy", "Virtual take-profit price for ENTER.")
+}
+
+private fun JsonObjectBuilder.putTradePlanDecisionSchemas() {
+    putJsonObject("parent_trade_plan_id") {
+        put("type", JSON_TYPE_STRING)
+        put("description", "Parent TradePlan UUID when revising.")
+    }
+    putJsonObject("trade_plan_revision_count") {
+        put("type", JSON_TYPE_INTEGER)
+        put("description", "TradePlan revision count. ENTER starts at 0.")
+        put("default", 0)
+    }
+    putJsonObject("trade_plan_thesis_ja") {
+        put("type", JSON_TYPE_STRING)
+        put("description", "TradePlan thesis in Japanese.")
+    }
+    putStringArraySchema("trade_plan_invalidation_conditions_ja", "TradePlan invalidation conditions.")
+    putDecimalStringSchema("trade_plan_target_price_jpy", "TradePlan target price.")
+    putJsonObject("trade_plan_time_stop_at") {
+        put("type", JSON_TYPE_STRING)
+        put("description", "Optional ISO-8601 time stop.")
+    }
+}
+
 private fun JsonObjectBuilder.putReasonSchema() {
     putJsonObject("reason") {
         put("type", JSON_TYPE_STRING)
@@ -816,6 +1012,88 @@ private fun parseReason(request: CallToolRequest): Result<String> {
         }
 
         reason
+    }
+}
+
+private fun parseDecisionSubmission(
+    request: CallToolRequest,
+    decisionRunContext: DecisionRunContext,
+): Result<DecisionSubmission> {
+    return runCatching {
+        val action = parseDecisionAction(request.stringArgument("action")).getOrThrow()
+
+        DecisionSubmission(
+            invocationId = request.stringArgument("invocation_id") ?: decisionRunContext.decisionRunId,
+            llmProvider = request.stringArgument("llm_provider") ?: decisionRunContext.llmProvider,
+            promptHash = request.stringArgument("prompt_hash") ?: decisionRunContext.promptHash,
+            systemPromptVersion = request.stringArgument("system_prompt_version")
+                ?: decisionRunContext.systemPromptVersion,
+            marketSnapshotId = request.stringArgument("market_snapshot_id") ?: decisionRunContext.marketSnapshotId,
+            action = action,
+            setupTags = request.stringListArgument("setup_tags"),
+            estimatedWinProbability = parseBigDecimalArgument(request, "estimated_win_probability").getOrThrow(),
+            expectedRMultiple = parseOptionalBigDecimalArgument(request, "expected_r_multiple").getOrThrow(),
+            roundTripCostR = parseOptionalBigDecimalArgument(request, "round_trip_cost_r").getOrThrow(),
+            toolEvidenceIds = request.stringListArgument("tool_evidence_ids"),
+            factCheckJson = requiredStringArgument(request, "fact_check"),
+            selfReviewJson = requiredStringArgument(request, "self_review"),
+            reasonJa = requiredStringArgument(request, "reason_ja"),
+            missingDataJa = request.stringListArgument("missing_data_ja"),
+            noTradeConditionsJa = request.stringListArgument("no_trade_conditions_ja"),
+            entryIntent = parseEntryIntentDraft(request, action).getOrThrow(),
+            tradePlan = parseTradePlanDraft(request, action).getOrThrow(),
+        )
+    }
+}
+
+private fun parseFalsificationSubmission(
+    request: CallToolRequest,
+    decisionRunContext: DecisionRunContext,
+): Result<FalsificationSubmission> {
+    return runCatching {
+        FalsificationSubmission(
+            intentId = request.stringArgument("intent_id")?.let { value -> UUID.fromString(value) },
+            verdict = parseFalsificationVerdict(request.stringArgument("verdict")).getOrThrow(),
+            llmProvider = request.stringArgument("llm_provider") ?: decisionRunContext.llmProvider,
+            reasonJa = requiredStringArgument(request, "reason_ja"),
+        )
+    }
+}
+
+private fun parseEntryIntentDraft(request: CallToolRequest, action: DecisionAction): Result<EntryIntentDraft?> {
+    return runCatching {
+        if (action != DecisionAction.ENTER) {
+            return@runCatching null
+        }
+
+        EntryIntentDraft(
+            symbol = parseTradingSymbol(request.stringArgument("symbol")).getOrThrow(),
+            side = parseOrderSide(request.stringArgument("side")).getOrThrow(),
+            orderType = parseOrderType(request.stringArgument("type")).getOrThrow(),
+            sizeBtc = parseBigDecimalArgument(request, "size_btc").getOrThrow(),
+            priceJpy = parseOptionalBigDecimalArgument(request, "price_jpy").getOrThrow(),
+            protectiveStopPriceJpy = parseBigDecimalArgument(request, "protective_stop_price_jpy").getOrThrow(),
+            takeProfitPriceJpy = parseOptionalBigDecimalArgument(request, "take_profit_price_jpy").getOrThrow(),
+        )
+    }
+}
+
+private fun parseTradePlanDraft(request: CallToolRequest, action: DecisionAction): Result<TradePlanDraft?> {
+    return runCatching {
+        if (action != DecisionAction.ENTER) {
+            return@runCatching null
+        }
+
+        TradePlanDraft(
+            parentTradePlanId = request.stringArgument("parent_trade_plan_id")?.let { value -> UUID.fromString(value) },
+            revisionCount = request.intArgument("trade_plan_revision_count", defaultValue = 0),
+            symbol = parseTradingSymbol(request.stringArgument("symbol")).getOrThrow(),
+            thesisJa = requiredStringArgument(request, "trade_plan_thesis_ja"),
+            invalidationConditionsJa = request.stringListArgument("trade_plan_invalidation_conditions_ja"),
+            targetPriceJpy = parseOptionalBigDecimalArgument(request, "trade_plan_target_price_jpy").getOrThrow(),
+            timeStopAt = request.stringArgument("trade_plan_time_stop_at")?.let { value -> Instant.parse(value) },
+            setupTags = request.stringListArgument("setup_tags"),
+        )
     }
 }
 
@@ -901,6 +1179,30 @@ private fun parseOrderType(rawType: String?): Result<OrderType> {
     }
 }
 
+private fun parseDecisionAction(rawAction: String?): Result<DecisionAction> {
+    return runCatching {
+        val actionText = rawAction?.trim().orEmpty()
+
+        require(actionText.isNotBlank()) {
+            "action is required."
+        }
+
+        DecisionAction.valueOf(actionText.uppercase())
+    }
+}
+
+private fun parseFalsificationVerdict(rawVerdict: String?): Result<FalsificationVerdict> {
+    return runCatching {
+        val verdictText = rawVerdict?.trim().orEmpty()
+
+        require(verdictText.isNotBlank()) {
+            "verdict is required."
+        }
+
+        FalsificationVerdict.valueOf(verdictText.uppercase())
+    }
+}
+
 private fun parseBigDecimalArgument(request: CallToolRequest, name: String): Result<BigDecimal> {
     return runCatching {
         val value = request.stringArgument(name).orEmpty()
@@ -939,6 +1241,38 @@ private fun CallToolRequest.stringArgument(name: String): String? {
         ?.get(name)
         ?.jsonPrimitive
         ?.contentOrNull
+}
+
+private fun requiredStringArgument(request: CallToolRequest, name: String): String {
+    val value = request.stringArgument(name).orEmpty()
+
+    require(value.isNotBlank()) {
+        "$name is required."
+    }
+
+    return value
+}
+
+private fun CallToolRequest.stringListArgument(name: String): List<String> {
+    val value = arguments?.get(name) ?: return emptyList()
+
+    return value.jsonArray.map { element ->
+        val text = element.jsonPrimitive.contentOrNull.orEmpty()
+
+        require(text.isNotBlank()) {
+            "$name must not contain blank values."
+        }
+
+        text
+    }
+}
+
+private fun CallToolRequest.intArgument(name: String, defaultValue: Int): Int {
+    return arguments
+        ?.get(name)
+        ?.jsonPrimitive
+        ?.intOrNull
+        ?: defaultValue
 }
 
 private fun parseDelayMs(request: CallToolRequest): Result<Long> {
@@ -1011,6 +1345,34 @@ private fun tradeResult(result: PaperTradeResult): CallToolResult {
                     put("hard_halt_required", violation.hardHaltRequired)
                 }
             }
+        },
+    )
+}
+
+private fun decisionSubmissionResult(result: DecisionSubmissionResult): CallToolResult {
+    return jsonObjectResult(
+        buildJsonObject {
+            put("accepted", true)
+            put("decision_id", result.decision.decisionId.toString())
+            put("action", result.decision.submission.action.name)
+            result.tradeIntent?.let { intent ->
+                put("intent_id", intent.intentId.toString())
+            }
+            result.tradePlan?.let { tradePlan ->
+                put("trade_plan_id", tradePlan.tradePlanId.toString())
+                put("revision_count", tradePlan.draft.revisionCount)
+            }
+        },
+    )
+}
+
+private fun falsificationResult(result: FalsificationRecord): CallToolResult {
+    return jsonObjectResult(
+        buildJsonObject {
+            put("accepted", true)
+            put("falsification_id", result.falsificationId.toString())
+            put("intent_id", result.intentId.toString())
+            put("verdict", result.verdict.name)
         },
     )
 }
