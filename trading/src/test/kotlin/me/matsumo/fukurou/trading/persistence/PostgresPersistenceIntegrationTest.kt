@@ -7,6 +7,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import org.testcontainers.DockerClientFactory
@@ -17,6 +18,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
@@ -59,6 +61,35 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun bootstrap_initializes_empty_paper_account() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val runtime = TradingRuntimeFactory.postgres(
+            config = tradingDatabaseConfig(),
+            clock = fixedClock(),
+        )
+
+        try {
+            val broker = runtime.broker
+            val balance = broker.getBalance().getOrThrow()
+            val accountStatus = broker.getAccountStatus().getOrThrow()
+            val riskState = ExposedRiskStateRepository(database).current().getOrThrow()
+
+            assertEquals(TradingMode.PAPER, balance.mode)
+            assertEquals("100000.00000000", balance.cashJpy)
+            assertEquals("100000.00000000", balance.totalEquityJpy)
+            assertEquals("100000.00000000", balance.equityPeakJpy)
+            assertEquals("100000.00000000", riskState.equityPeak.toPlainString())
+            assertEquals("100000.00000000", accountStatus.currentEquityJpy)
+            assertEquals("0", accountStatus.todayRealizedPnlJpy)
+            assertEquals(0, broker.getPositions().getOrThrow().size)
+            assertEquals(0, broker.getOpenOrders().getOrThrow().size)
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
     fun runtime_postgres_verifies_schema_without_running_ddl() = runPostgresTest {
         val missingSchemaResult = runCatching {
             TradingRuntimeFactory.postgres(
@@ -75,6 +106,8 @@ class PostgresPersistenceIntegrationTest {
             config = tradingDatabaseConfig(),
             clock = fixedClock(),
         )
+
+        assertTrue(runtime.broker.getBalance().isSuccess)
 
         runtime.close()
     }

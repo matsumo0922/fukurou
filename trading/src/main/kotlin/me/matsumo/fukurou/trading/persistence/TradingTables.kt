@@ -9,6 +9,11 @@ import java.math.BigDecimal
 internal const val RISK_STATE_SINGLE_ROW_ID = 1
 
 /**
+ * paper_account single row の固定 ID。
+ */
+internal const val PAPER_ACCOUNT_SINGLE_ROW_ID = 1
+
+/**
  * risk_state single row を表す Exposed table。
  */
 object RiskStateTable : Table("risk_state") {
@@ -56,6 +61,409 @@ object RiskStateTable : Table("risk_state") {
      * 最終更新時刻。epoch millis で保存する。
      */
     val updatedAt = long("updated_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * paper account の現在状態を表す Exposed table。
+ */
+object PaperAccountTable : Table("paper_account") {
+    /**
+     * single row を固定する primary key。
+     */
+    val id = integer("id")
+
+    /**
+     * 取引 mode。
+     */
+    val mode = varchar("mode", length = 16)
+
+    /**
+     * 初期 JPY 残高。
+     */
+    val initialCashJpy = decimal("initial_cash_jpy", precision = 24, scale = 8)
+
+    /**
+     * JPY 現金残高。
+     */
+    val cashJpy = decimal("cash_jpy", precision = 24, scale = 8)
+
+    /**
+     * BTC 保有数量。
+     */
+    val btcQuantity = decimal("btc_quantity", precision = 24, scale = 12).default(BigDecimal.ZERO)
+
+    /**
+     * BTC 評価価格。
+     */
+    val btcMarkPriceJpy = decimal("btc_mark_price_jpy", precision = 24, scale = 8).default(BigDecimal.ZERO)
+
+    /**
+     * 総評価額。
+     */
+    val totalEquityJpy = decimal("total_equity_jpy", precision = 24, scale = 8)
+
+    /**
+     * 総評価額の過去ピーク。
+     */
+    val equityPeakJpy = decimal("equity_peak_jpy", precision = 24, scale = 8)
+
+    /**
+     * equityPeakJpy からの drawdown。
+     */
+    val drawdownRatio = decimal("drawdown_ratio", precision = 20, scale = 10).default(BigDecimal.ZERO)
+
+    /**
+     * 作成時刻。epoch millis で保存する。
+     */
+    val createdAt = long("created_at")
+
+    /**
+     * 最終更新時刻。epoch millis で保存する。
+     */
+    val updatedAt = long("updated_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * bot-managed position ledger を表す Exposed table。
+ */
+object PositionsTable : Table("positions") {
+    /**
+     * position ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * group 単位リスク評価用 ID。
+     */
+    val tradeGroupId = uuid("trade_group_id")
+
+    /**
+     * 取引 mode。
+     */
+    val mode = varchar("mode", length = 16)
+
+    /**
+     * 取引対象 symbol。
+     */
+    val symbol = varchar("symbol", length = 32)
+
+    /**
+     * position side。
+     */
+    val side = varchar("side", length = 16)
+
+    /**
+     * position 状態。
+     */
+    val status = varchar("status", length = 16)
+
+    /**
+     * 開設時刻。epoch millis で保存する。
+     */
+    val openedAt = long("opened_at")
+
+    /**
+     * 決済時刻。epoch millis で保存する。
+     */
+    val closedAt = long("closed_at").nullable()
+
+    /**
+     * BTC 数量。
+     */
+    val sizeBtc = decimal("size_btc", precision = 24, scale = 12)
+
+    /**
+     * 平均取得単価。
+     */
+    val averageEntryPriceJpy = decimal("average_entry_price_jpy", precision = 24, scale = 8)
+
+    /**
+     * 現在評価価格。
+     */
+    val currentPriceJpy = decimal("current_price_jpy", precision = 24, scale = 8)
+
+    /**
+     * 現在の保護 STOP 価格。
+     */
+    val currentStopLossJpy = decimal("current_stop_loss_jpy", precision = 24, scale = 8).nullable()
+
+    /**
+     * 現在の virtual TP 価格。
+     */
+    val currentTakeProfitJpy = decimal("current_take_profit_jpy", precision = 24, scale = 8).nullable()
+
+    /**
+     * 未実現損益。
+     */
+    val unrealizedPnlJpy = decimal("unrealized_pnl_jpy", precision = 24, scale = 8).default(BigDecimal.ZERO)
+
+    /**
+     * 未実現 R。
+     */
+    val unrealizedR = decimal("unrealized_r", precision = 12, scale = 6).default(BigDecimal.ZERO)
+
+    /**
+     * ピラミッディング追加回数。
+     */
+    val pyramidAddCount = integer("pyramid_add_count").default(0)
+
+    /**
+     * entry 以降の最高値。
+     */
+    val highestPriceSinceEntryJpy = decimal("highest_price_since_entry_jpy", precision = 24, scale = 8)
+
+    /**
+     * decision run ID。
+     */
+    val decisionRunId = varchar("decision_run_id", length = 128).nullable()
+
+    /**
+     * tool call ID。
+     */
+    val toolCallId = varchar("tool_call_id", length = 128).nullable()
+
+    /**
+     * client request ID。
+     */
+    val clientRequestId = varchar("client_request_id", length = 128).nullable()
+
+    /**
+     * LLM provider。
+     */
+    val llmProvider = varchar("llm_provider", length = 64).nullable()
+
+    /**
+     * prompt hash。
+     */
+    val promptHash = varchar("prompt_hash", length = 128).nullable()
+
+    /**
+     * system prompt version。
+     */
+    val systemPromptVersion = varchar("system_prompt_version", length = 128).nullable()
+
+    /**
+     * market snapshot ID。
+     */
+    val marketSnapshotId = varchar("market_snapshot_id", length = 128).nullable()
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * paper / exchange 注文 ledger を表す Exposed table。
+ */
+object OrdersTable : Table("orders") {
+    /**
+     * 注文 ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * 関連 position ID。
+     */
+    val positionId = uuid("position_id").nullable()
+
+    /**
+     * 関連 trade group ID。
+     */
+    val tradeGroupId = uuid("trade_group_id").nullable()
+
+    /**
+     * 取引 mode。
+     */
+    val mode = varchar("mode", length = 16)
+
+    /**
+     * 取引対象 symbol。
+     */
+    val symbol = varchar("symbol", length = 32)
+
+    /**
+     * 注文 side。
+     */
+    val side = varchar("side", length = 8)
+
+    /**
+     * 注文種別。
+     */
+    val orderType = varchar("order_type", length = 16)
+
+    /**
+     * 注文状態。
+     */
+    val status = varchar("status", length = 32)
+
+    /**
+     * 注文数量。
+     */
+    val sizeBtc = decimal("size_btc", precision = 24, scale = 12)
+
+    /**
+     * 指値価格。
+     */
+    val limitPriceJpy = decimal("limit_price_jpy", precision = 24, scale = 8).nullable()
+
+    /**
+     * STOP trigger 価格。
+     */
+    val triggerPriceJpy = decimal("trigger_price_jpy", precision = 24, scale = 8).nullable()
+
+    /**
+     * 判断理由。
+     */
+    val reasonJa = text("reason_ja").nullable()
+
+    /**
+     * decision run ID。
+     */
+    val decisionRunId = varchar("decision_run_id", length = 128).nullable()
+
+    /**
+     * tool call ID。
+     */
+    val toolCallId = varchar("tool_call_id", length = 128).nullable()
+
+    /**
+     * client request ID。
+     */
+    val clientRequestId = varchar("client_request_id", length = 128).nullable()
+
+    /**
+     * LLM provider。
+     */
+    val llmProvider = varchar("llm_provider", length = 64).nullable()
+
+    /**
+     * prompt hash。
+     */
+    val promptHash = varchar("prompt_hash", length = 128).nullable()
+
+    /**
+     * system prompt version。
+     */
+    val systemPromptVersion = varchar("system_prompt_version", length = 128).nullable()
+
+    /**
+     * market snapshot ID。
+     */
+    val marketSnapshotId = varchar("market_snapshot_id", length = 128).nullable()
+
+    /**
+     * 作成時刻。epoch millis で保存する。
+     */
+    val createdAt = long("created_at")
+
+    /**
+     * 最終更新時刻。epoch millis で保存する。
+     */
+    val updatedAt = long("updated_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * 約定 ledger を表す Exposed table。
+ */
+object ExecutionsTable : Table("executions") {
+    /**
+     * 約定 ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * 関連注文 ID。
+     */
+    val orderId = uuid("order_id").nullable()
+
+    /**
+     * 関連 position ID。
+     */
+    val positionId = uuid("position_id").nullable()
+
+    /**
+     * 取引 mode。
+     */
+    val mode = varchar("mode", length = 16)
+
+    /**
+     * 取引対象 symbol。
+     */
+    val symbol = varchar("symbol", length = 32)
+
+    /**
+     * 約定 side。
+     */
+    val side = varchar("side", length = 8)
+
+    /**
+     * 約定価格。
+     */
+    val priceJpy = decimal("price_jpy", precision = 24, scale = 8)
+
+    /**
+     * 約定数量。
+     */
+    val sizeBtc = decimal("size_btc", precision = 24, scale = 12)
+
+    /**
+     * 手数料。
+     */
+    val feeJpy = decimal("fee_jpy", precision = 24, scale = 8)
+
+    /**
+     * 実現損益。
+     */
+    val realizedPnlJpy = decimal("realized_pnl_jpy", precision = 24, scale = 8).default(BigDecimal.ZERO)
+
+    /**
+     * maker / taker 区分。
+     */
+    val liquidity = varchar("liquidity", length = 16)
+
+    /**
+     * 約定時刻。epoch millis で保存する。
+     */
+    val executedAt = long("executed_at")
+
+    /**
+     * decision run ID。
+     */
+    val decisionRunId = varchar("decision_run_id", length = 128).nullable()
+
+    /**
+     * tool call ID。
+     */
+    val toolCallId = varchar("tool_call_id", length = 128).nullable()
+
+    /**
+     * client request ID。
+     */
+    val clientRequestId = varchar("client_request_id", length = 128).nullable()
+
+    /**
+     * LLM provider。
+     */
+    val llmProvider = varchar("llm_provider", length = 64).nullable()
+
+    /**
+     * prompt hash。
+     */
+    val promptHash = varchar("prompt_hash", length = 128).nullable()
+
+    /**
+     * system prompt version。
+     */
+    val systemPromptVersion = varchar("system_prompt_version", length = 128).nullable()
+
+    /**
+     * market snapshot ID。
+     */
+    val marketSnapshotId = varchar("market_snapshot_id", length = 128).nullable()
 
     override val primaryKey = PrimaryKey(id)
 }
