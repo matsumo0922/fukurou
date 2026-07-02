@@ -5,18 +5,23 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.lock.TradingLockLease
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import me.matsumo.fukurou.trading.risk.RiskState
+import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -41,6 +46,7 @@ class ProtectionReconcilerTest {
         assertEquals(1, lock.acquisitionCount)
         assertEquals(fixedInstant(), status.snapshot().lastReconciledAt)
         assertTrue(status.snapshot().startupFullReconcileCompleted)
+        assertEquals(fixedInstant(), status.snapshot().lastMarketDataAt)
         assertTrue(eventLog.events().any { event -> event.eventType == CommandEventType.RECONCILER_PASS_COMPLETED })
     }
 
@@ -65,6 +71,46 @@ class ProtectionReconcilerTest {
 
         assertTrue(status.snapshot().startupFullReconcileCompleted)
         assertTrue(lock.acquisitionCount >= 2)
+    }
+
+    @Test
+    fun run_loop_retries_startup_full_pass_until_success() = runBlocking {
+        val riskStateRepository = FlakyRiskStateRepository(failuresBeforeSuccess = 1)
+        val status = MutableReconcilerStatus()
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            status = status,
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(10))
+        }
+
+        withTimeout(500) {
+            while (!status.snapshot().startupFullReconcileCompleted) {
+                delay(10)
+            }
+        }
+        job.cancelAndJoin()
+
+        assertTrue(riskStateRepository.currentCallCount >= 2)
+        assertTrue(status.snapshot().startupFullReconcileCompleted)
+    }
+
+    @Test
+    fun audit_append_failure_does_not_advance_reconciler_status() = runBlocking {
+        val status = MutableReconcilerStatus()
+        val reconciler = createReconciler(
+            eventLog = FailingCommandEventLog,
+            status = status,
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.STARTUP_FULL)
+        val snapshot = status.snapshot()
+
+        assertTrue(result.isFailure)
+        assertFalse(snapshot.startupFullReconcileCompleted)
+        assertEquals(null, snapshot.lastReconciledAt)
+        assertEquals(null, snapshot.lastMarketDataAt)
     }
 }
 
@@ -96,14 +142,17 @@ private class CountingTradingLock(
  * ProtectionReconciler test 用の reconciler を作る。
  */
 private fun createReconciler(
-    eventLog: InMemoryCommandEventLog = InMemoryCommandEventLog(),
+    eventLog: CommandEventLog = InMemoryCommandEventLog(),
     lock: TradingLock = InMemoryTradingLock(fixedClock()),
     status: MutableReconcilerStatus = MutableReconcilerStatus(),
+    riskStateRepository: RiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+    tickStream: TickStream = FixedTickStream,
 ): ProtectionReconciler {
     return ProtectionReconciler(
-        riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+        riskStateRepository = riskStateRepository,
         commandEventLog = eventLog,
         tradingLock = lock,
+        tickStream = tickStream,
         status = status,
         clock = fixedClock(),
     )
@@ -121,4 +170,61 @@ private fun fixedInstant(): Instant {
  */
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+/**
+ * 指定回数だけ current() に失敗する risk_state repository。
+ */
+private class FlakyRiskStateRepository(
+    private val failuresBeforeSuccess: Int,
+) : RiskStateRepository {
+
+    private val delegate = InMemoryRiskStateRepository(clock = fixedClock())
+
+    /**
+     * current() 呼び出し回数。
+     */
+    var currentCallCount: Int = 0
+        private set
+
+    override suspend fun current(): Result<RiskState> {
+        currentCallCount += 1
+
+        if (currentCallCount <= failuresBeforeSuccess) {
+            return Result.failure(IllegalStateException("risk_state unavailable"))
+        }
+
+        return delegate.current()
+    }
+
+    override suspend fun setHardHalt(reason: String, at: Instant): Result<RiskState> {
+        return delegate.setHardHalt(reason, at)
+    }
+
+    override suspend fun resume(reason: String, at: Instant): Result<RiskState> {
+        return delegate.resume(reason, at)
+    }
+}
+
+/**
+ * append に必ず失敗する command_event_log。
+ */
+private object FailingCommandEventLog : CommandEventLog {
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        return Result.failure(IllegalStateException("audit append failed"))
+    }
+}
+
+/**
+ * 固定時刻の tick を返す TickStream。
+ */
+private object FixedTickStream : TickStream {
+    override suspend fun latestTick(): Result<TickSnapshot?> {
+        return Result.success(
+            TickSnapshot(
+                symbol = "BTC",
+                observedAt = fixedInstant(),
+            ),
+        )
+    }
 }

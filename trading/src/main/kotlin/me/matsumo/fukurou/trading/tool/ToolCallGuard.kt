@@ -1,8 +1,6 @@
 package me.matsumo.fukurou.trading.tool
 
 import kotlinx.coroutines.CancellationException
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -65,7 +63,7 @@ class ToolCallGuard(
         reason: String,
         cause: Throwable? = null,
     ): Result<Unit> {
-        val payload = buildFailurePayload(reason, cause)
+        val payload = buildNoTradeFailurePayload(reason, cause)
 
         return commandEventLog.append(
             CommandEvent(
@@ -116,7 +114,7 @@ class ToolCallGuard(
         haltReason: String?,
         cause: Throwable,
     ): Result<Unit> {
-        val payload = buildFailurePayload(
+        val payload = buildNoTradeFailurePayload(
             reason = haltReason ?: "hard_halt",
             cause = cause,
         )
@@ -133,19 +131,4 @@ class ToolCallGuard(
             ),
         )
     }
-}
-
-/**
- * no-trade 系 failure payload を JSON 文字列として組み立てる。
- */
-private fun buildFailurePayload(reason: String, cause: Throwable?): String {
-    val causeName = cause?.javaClass?.simpleName ?: "none"
-    val message = cause?.message ?: ""
-
-    return buildJsonObject {
-        put("reason", reason)
-        put("cause", causeName)
-        put("message", message)
-        put("noTrade", true)
-    }.toString()
 }

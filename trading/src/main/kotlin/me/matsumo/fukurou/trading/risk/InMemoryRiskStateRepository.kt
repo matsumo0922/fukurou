@@ -56,4 +56,15 @@ class InMemoryRiskStateRepository(
             }
         }
     }
+
+    /**
+     * command audit 失敗時の rollback 用に risk_state snapshot を復元する。
+     */
+    suspend fun restore(state: RiskState): Result<Unit> {
+        return mutex.withLock {
+            runCatching {
+                storedState = state
+            }
+        }
+    }
 }

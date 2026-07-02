@@ -21,7 +21,7 @@ class ReconcilerFreshnessReadinessProbeTest {
         status.markReconciled(
             reconciledAt = Instant.parse("2026-07-02T00:00:00Z"),
             startupFullReconcileCompleted = true,
-            lastMarketDataAt = null,
+            lastMarketDataAt = Instant.parse("2026-07-02T00:00:00Z"),
         )
         val probe = createProbe(status)
 
@@ -34,7 +34,20 @@ class ReconcilerFreshnessReadinessProbeTest {
         status.markReconciled(
             reconciledAt = Instant.parse("2026-07-01T23:59:00Z"),
             startupFullReconcileCompleted = true,
-            lastMarketDataAt = null,
+            lastMarketDataAt = Instant.parse("2026-07-02T00:00:00Z"),
+        )
+        val probe = createProbe(status)
+
+        assertFalse(probe.isReady())
+    }
+
+    @Test
+    fun not_ready_when_market_data_is_stale() = runBlocking {
+        val status = MutableReconcilerStatus()
+        status.markReconciled(
+            reconciledAt = Instant.parse("2026-07-02T00:00:00Z"),
+            startupFullReconcileCompleted = true,
+            lastMarketDataAt = Instant.parse("2026-07-01T23:59:00Z"),
         )
         val probe = createProbe(status)
 

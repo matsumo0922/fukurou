@@ -34,9 +34,12 @@ class ReconcilerFreshnessReadinessProbe(
 
         val status = reconcilerStatusProvider.snapshot()
         val lastReconciledAt = status.lastReconciledAt ?: return false
-        val freshEnough = lastReconciledAt.isFreshEnough(Instant.now(clock), staleAfter)
+        val lastMarketDataAt = status.lastMarketDataAt ?: return false
+        val now = Instant.now(clock)
+        val reconcilerFreshEnough = lastReconciledAt.isFreshEnough(now, staleAfter)
+        val marketDataFreshEnough = lastMarketDataAt.isFreshEnough(now, staleAfter)
 
-        return status.startupFullReconcileCompleted && freshEnough
+        return status.startupFullReconcileCompleted && reconcilerFreshEnough && marketDataFreshEnough
     }
 }
 

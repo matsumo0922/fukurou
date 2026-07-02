@@ -67,7 +67,15 @@ class ProtectionReconciler(
      * 起動時 full pass を実行した後、cancel されるまで loop pass を続ける。
      */
     suspend fun runLoop(interval: Duration) {
-        reconcileOnce(ReconcilePassKind.STARTUP_FULL)
+        while (currentCoroutineContext().isActive) {
+            val startupResult = reconcileOnce(ReconcilePassKind.STARTUP_FULL)
+
+            if (startupResult.isSuccess) {
+                break
+            }
+
+            delay(interval.toMillis())
+        }
 
         while (currentCoroutineContext().isActive) {
             delay(interval.toMillis())
@@ -84,16 +92,11 @@ class ProtectionReconciler(
                 runCatching {
                     riskStateRepository.current().getOrThrow()
 
-                    val tickSnapshot = tickStream.latestTick().getOrNull()
+                    val tickSnapshot = tickStream.latestTick().getOrThrow()
                     val reconciledAt = Instant.now(clock)
                     val isStartupFullPass = passKind == ReconcilePassKind.STARTUP_FULL
                     val payload = if (isStartupFullPass) STARTUP_FULL_PAYLOAD else LOOP_PAYLOAD
 
-                    status.markReconciled(
-                        reconciledAt = reconciledAt,
-                        startupFullReconcileCompleted = isStartupFullPass,
-                        lastMarketDataAt = tickSnapshot?.observedAt,
-                    )
                     commandEventLog.append(
                         CommandEvent(
                             decisionRunContext = DecisionRunContext.fromEnvironment(emptyMap()),
@@ -105,6 +108,11 @@ class ProtectionReconciler(
                             occurredAt = reconciledAt,
                         ),
                     ).getOrThrow()
+                    status.markReconciled(
+                        reconciledAt = reconciledAt,
+                        startupFullReconcileCompleted = isStartupFullPass,
+                        lastMarketDataAt = tickSnapshot?.observedAt,
+                    )
                 }
             }
         } catch (throwable: CancellationException) {

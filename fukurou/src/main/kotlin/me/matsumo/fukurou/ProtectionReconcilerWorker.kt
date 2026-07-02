@@ -10,13 +10,14 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
-import me.matsumo.fukurou.trading.reconciler.EmptyTickStream
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ProtectionReconciler
+import me.matsumo.fukurou.trading.reconciler.RestPollingTickStream
 import java.time.Clock
 import java.time.Duration
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -87,7 +88,10 @@ internal fun startProtectionReconcilerWorker(
         riskStateRepository = riskStateRepository,
         commandEventLog = commandEventLog,
         tradingLock = tradingLock,
-        tickStream = EmptyTickStream,
+        tickStream = RestPollingTickStream(
+            marketDataSource = GmoPublicMarketDataSource(),
+            clock = clock,
+        ),
         status = status,
         clock = clock,
     )

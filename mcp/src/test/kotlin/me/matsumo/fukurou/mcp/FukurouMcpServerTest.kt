@@ -1,10 +1,13 @@
 package me.matsumo.fukurou.mcp
 
+import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import kotlin.test.Test
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 
 /**
@@ -20,6 +23,13 @@ class FukurouMcpServerTest {
         )
 
         assertNotNull(server)
+    }
+
+    @Test
+    fun tradingRuntimeFactory_failsClosedWhenDatabaseEnvironmentIsMissing() {
+        assertFailsWith<IllegalArgumentException> {
+            TradingRuntimeFactory.fromEnvironment(environment = emptyMap())
+        }
     }
 }
 
@@ -38,6 +48,20 @@ private object FakeMarketDataSource : MarketDataSource {
                 low = "90",
                 volume = "1.0",
                 timestamp = "2026-07-01T00:00:00Z",
+            ),
+        )
+    }
+
+    override suspend fun getRecentTrades(symbol: TradingSymbol): Result<List<RecentTrade>> {
+        return Result.success(
+            listOf(
+                RecentTrade(
+                    symbol = symbol.apiSymbol,
+                    price = "100",
+                    size = "0.01",
+                    side = TradeSide.BUY,
+                    timestamp = "2026-07-01T00:00:00Z",
+                ),
             ),
         )
     }

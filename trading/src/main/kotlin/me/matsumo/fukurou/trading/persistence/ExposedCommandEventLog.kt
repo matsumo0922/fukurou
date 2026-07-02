@@ -53,7 +53,7 @@ class ExposedCommandEventLog(
 /**
  * command_event_log へ 1 行追加する。
  */
-private fun JdbcTransaction.insertEvent(event: CommandEvent) {
+internal fun JdbcTransaction.insertEvent(event: CommandEvent) {
     jdbcConnection().prepareStatement(INSERT_COMMAND_EVENT_SQL).use { statement ->
         statement.setObject(1, event.id)
         statement.setNullableString(2, event.decisionRunContext.decisionRunId)

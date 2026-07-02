@@ -1,6 +1,8 @@
 package me.matsumo.fukurou.trading.risk
 
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
@@ -40,7 +42,8 @@ class RiskStateCommandServiceTest {
     @Test
     fun resume_updates_state_and_logs_audit_event() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
-        val service = createService(eventLog)
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val service = createService(eventLog, riskStateRepository)
 
         service.setHardHalt(
             reason = "max drawdown exceeded",
@@ -62,14 +65,35 @@ class RiskStateCommandServiceTest {
         assertEquals(2, events.size)
         assertTrue(resumeEvent.payload.contains("operator confirmed recovery"))
     }
+
+    @Test
+    fun resume_rolls_back_state_when_audit_append_fails() = runBlocking {
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val service = createService(FailingCommandEventLog, riskStateRepository)
+
+        riskStateRepository.setHardHalt("max drawdown exceeded", fixedInstant()).getOrThrow()
+
+        val result = service.resume(
+            reason = "operator confirmed recovery",
+            decisionRunContext = createDecisionRunContext(),
+        )
+        val riskState = riskStateRepository.current().getOrThrow()
+
+        assertTrue(result.isFailure)
+        assertTrue(riskState.hardHalt)
+        assertEquals("max drawdown exceeded", riskState.haltReason)
+    }
 }
 
 /**
  * RiskStateCommandService test 用の service を作る。
  */
-private fun createService(eventLog: InMemoryCommandEventLog): RiskStateCommandService {
-    return RiskStateCommandService(
-        riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+private fun createService(
+    eventLog: CommandEventLog,
+    riskStateRepository: InMemoryRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+): RiskStateCommandService {
+    return InMemoryRiskStateCommandService(
+        riskStateRepository = riskStateRepository,
         commandEventLog = eventLog,
         clock = fixedClock(),
     )
@@ -100,4 +124,13 @@ private fun fixedInstant(): Instant {
  */
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+/**
+ * append に必ず失敗する command_event_log。
+ */
+private object FailingCommandEventLog : CommandEventLog {
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        return Result.failure(IllegalStateException("audit append failed"))
+    }
 }

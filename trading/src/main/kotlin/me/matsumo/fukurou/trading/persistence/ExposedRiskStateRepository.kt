@@ -116,7 +116,7 @@ class ExposedRiskStateRepository(
 /**
  * risk_state を SELECT する。
  */
-private fun JdbcTransaction.selectRiskState(forUpdate: Boolean): RiskState {
+internal fun JdbcTransaction.selectRiskState(forUpdate: Boolean): RiskState {
     val sql = if (forUpdate) SELECT_RISK_STATE_FOR_UPDATE_SQL else SELECT_RISK_STATE_SQL
 
     return jdbcConnection().prepareStatement(sql).use { statement ->
@@ -132,7 +132,7 @@ private fun JdbcTransaction.selectRiskState(forUpdate: Boolean): RiskState {
 /**
  * HARD_HALT を reason 付きで更新する。
  */
-private fun JdbcTransaction.updateHardHalt(reason: String, at: Instant) {
+internal fun JdbcTransaction.updateHardHalt(reason: String, at: Instant) {
     jdbcConnection().prepareStatement(UPDATE_HARD_HALT_SQL).use { statement ->
         statement.setBoolean(1, true)
         statement.setString(2, reason)
@@ -146,7 +146,7 @@ private fun JdbcTransaction.updateHardHalt(reason: String, at: Instant) {
 /**
  * 手動再開を reason 付きで更新する。
  */
-private fun JdbcTransaction.updateResume(reason: String, at: Instant) {
+internal fun JdbcTransaction.updateResume(reason: String, at: Instant) {
     jdbcConnection().prepareStatement(UPDATE_RESUME_SQL).use { statement ->
         statement.setBoolean(1, false)
         statement.setLong(2, at.toEpochMilli())

@@ -7,11 +7,15 @@ import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
+import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import me.matsumo.fukurou.trading.tool.CallerNoTradeGuard
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import java.time.Clock
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -45,16 +49,20 @@ private const val INITIALIZATION_FAIL_TIMEOUT = -1L
  * trading module が提供する runtime repository 一式。
  *
  * @param riskStateRepository risk_state repository
+ * @param riskStateCommandService risk_state 更新と audit をまとめる command service
  * @param commandEventLog command_event_log repository
  * @param tradingLock global trading lock
  * @param toolCallGuard MCP tool call guard
+ * @param callerNoTradeGuard MCP caller boundary guard
  * @param close runtime resource cleanup
  */
 data class TradingRuntime(
     val riskStateRepository: RiskStateRepository,
+    val riskStateCommandService: RiskStateCommandService,
     val commandEventLog: CommandEventLog,
     val tradingLock: TradingLock,
     val toolCallGuard: ToolCallGuard,
+    val callerNoTradeGuard: CallerNoTradeGuard,
     val close: () -> Unit,
 ) {
     /**
@@ -105,16 +113,14 @@ data class TradingDatabaseConfig(
 object TradingRuntimeFactory {
 
     /**
-     * DB 設定があれば Postgres/Exposed runtime、なければ in-memory runtime を返す。
+     * 環境変数から DB-backed runtime を構築する。DB 設定が欠けている場合は fail closed する。
      */
-    fun fromEnvironmentOrInMemory(
+    fun fromEnvironment(
         environment: Map<String, String> = System.getenv(),
         clock: Clock = Clock.systemUTC(),
     ): TradingRuntime {
-        val databaseConfig = TradingDatabaseConfig.fromEnvironment(environment)
-
-        if (databaseConfig == null) {
-            return inMemory(clock)
+        val databaseConfig = requireNotNull(TradingDatabaseConfig.fromEnvironment(environment)) {
+            "DB_URL, DB_USER, and DB_PASSWORD are required for trading runtime."
         }
 
         return postgres(databaseConfig, clock)
@@ -126,7 +132,13 @@ object TradingRuntimeFactory {
     fun inMemory(clock: Clock = Clock.systemUTC()): TradingRuntime {
         val riskStateRepository = InMemoryRiskStateRepository(clock)
         val commandEventLog = InMemoryCommandEventLog()
+        val riskStateCommandService = InMemoryRiskStateCommandService(
+            riskStateRepository = riskStateRepository,
+            commandEventLog = commandEventLog,
+            clock = clock,
+        )
         val tradingLock = InMemoryTradingLock(clock)
+        val callerNoTradeGuard = CallerNoTradeGuard(commandEventLog, clock)
         val toolCallGuard = ToolCallGuard(
             riskStateRepository = riskStateRepository,
             commandEventLog = commandEventLog,
@@ -136,9 +148,11 @@ object TradingRuntimeFactory {
 
         return TradingRuntime(
             riskStateRepository = riskStateRepository,
+            riskStateCommandService = riskStateCommandService,
             commandEventLog = commandEventLog,
             tradingLock = tradingLock,
             toolCallGuard = toolCallGuard,
+            callerNoTradeGuard = callerNoTradeGuard,
             close = {},
         )
     }
@@ -153,7 +167,9 @@ object TradingRuntimeFactory {
 
         val riskStateRepository = ExposedRiskStateRepository(database, clock)
         val commandEventLog = ExposedCommandEventLog(database)
+        val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
         val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
+        val callerNoTradeGuard = CallerNoTradeGuard(commandEventLog, clock)
         val toolCallGuard = ToolCallGuard(
             riskStateRepository = riskStateRepository,
             commandEventLog = commandEventLog,
@@ -163,9 +179,11 @@ object TradingRuntimeFactory {
 
         return TradingRuntime(
             riskStateRepository = riskStateRepository,
+            riskStateCommandService = riskStateCommandService,
             commandEventLog = commandEventLog,
             tradingLock = tradingLock,
             toolCallGuard = toolCallGuard,
+            callerNoTradeGuard = callerNoTradeGuard,
             close = { dataSource.close() },
         )
     }

@@ -122,7 +122,7 @@ fun main() {
  */
 class FukurouMcpServer(
     private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource(),
-    private val tradingRuntime: TradingRuntime = TradingRuntimeFactory.fromEnvironmentOrInMemory(),
+    private val tradingRuntime: TradingRuntime = TradingRuntimeFactory.fromEnvironment(),
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
 ) {
 
