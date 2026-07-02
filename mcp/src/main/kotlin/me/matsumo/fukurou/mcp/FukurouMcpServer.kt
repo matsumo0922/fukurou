@@ -32,7 +32,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
-import me.matsumo.fukurou.mcp.gmo.FixedGmoCoinKlineRequestBudgetHook
+import me.matsumo.fukurou.mcp.gmo.DescribedGmoCoinKlineRequestBudgetHook
 import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolErrorResponse
 import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolExecutor
 import me.matsumo.fukurou.mcp.gmo.registerGmoCoinMarketTools
@@ -251,7 +251,7 @@ class FukurouMcpServer(
                 toolCallGuard = tradingRuntime.toolCallGuard,
                 decisionRunContext = decisionRunContext,
             ),
-            klineRequestBudgetHook = FixedGmoCoinKlineRequestBudgetHook(GMO_MAX_DAILY_KLINE_REQUESTS),
+            klineRequestBudgetHook = DescribedGmoCoinKlineRequestBudgetHook(GMO_MAX_DAILY_KLINE_REQUESTS),
         )
         server.registerBalanceTool(tradingRuntime, decisionRunContext)
         server.registerPositionsTool(tradingRuntime, decisionRunContext)

@@ -14,7 +14,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.io.asSink
 import kotlinx.io.asSource
 import kotlinx.io.buffered
-import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoUnlimitedDailyKlineRequestBudget
 import me.matsumo.fukurou.trading.market.MarketDataSource
@@ -94,10 +94,10 @@ class GmoCoinMcpServer(
 }
 
 private fun defaultStandaloneMarketDataSource(): MarketDataSource {
-    val tradingConfig = TradingBotConfig.fromEnvironment()
+    val gmoPublicClientConfig = GmoPublicClientConfig.fromEnvironment()
 
     return GmoPublicMarketDataSource.fromConfig(
-        config = tradingConfig.gmoPublicClient,
+        config = gmoPublicClientConfig,
         dailyKlineRequestBudget = GmoUnlimitedDailyKlineRequestBudget,
     )
 }

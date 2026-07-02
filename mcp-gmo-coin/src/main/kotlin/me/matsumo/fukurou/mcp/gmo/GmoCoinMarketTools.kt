@@ -233,11 +233,15 @@ object NoopGmoCoinKlineRequestBudgetHook : GmoCoinKlineRequestBudgetHook {
 }
 
 /**
- * 固定の短期足 kline request 上限を tool description と hook 境界に渡す hook。
+ * 短期足 kline request 上限を tool description と hook 境界に渡す hook。
+ *
+ * 実際の stitching request 数の強制は `GmoPublicMarketDataSource` に注入する
+ * `GmoDailyKlineRequestBudget` が担う。この hook は MCP tool 登録境界で
+ * fukurou 埋め込み時の上限表示と将来の呼び出し前検証を差し込むために使う。
  *
  * @param dailyKlineRequestLimit 短期足 stitching の request 上限
  */
-class FixedGmoCoinKlineRequestBudgetHook(
+class DescribedGmoCoinKlineRequestBudgetHook(
     override val dailyKlineRequestLimit: Int,
 ) : GmoCoinKlineRequestBudgetHook {
     init {
