@@ -33,6 +33,9 @@ data class PaperAccountConfig(
         require(initialCashJpy > BigDecimal.ZERO) {
             "$FUKUROU_PAPER_INITIAL_CASH_JPY_ENV must be greater than 0."
         }
+        require(mode == TradingMode.PAPER) {
+            "$FUKUROU_TRADING_MODE_ENV=LIVE is reserved until live broker is implemented."
+        }
     }
 
     companion object {

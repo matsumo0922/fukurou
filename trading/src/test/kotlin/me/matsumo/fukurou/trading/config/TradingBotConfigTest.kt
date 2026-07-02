@@ -32,14 +32,14 @@ class TradingBotConfigTest {
                 "FUKUROU_TRADING_MODE" to "paper",
                 "FUKUROU_PAPER_INITIAL_CASH_JPY" to "250000",
                 "FUKUROU_MARKET_SLIPPAGE_BPS" to "7",
-                "FUKUROU_FALLBACK_MAKER_FEE_RATE" to "-0.0002",
+                "FUKUROU_FALLBACK_MAKER_FEE_RATE" to "0.0000",
                 "FUKUROU_FALLBACK_TAKER_FEE_RATE" to "0.0006",
                 "FUKUROU_MAX_RISK_PER_TRADE_RATIO" to "0.015",
                 "FUKUROU_MAX_DRAWDOWN_RATIO" to "-0.12",
                 "FUKUROU_MAX_TOTAL_EXPOSURE_RATIO" to "0.70",
-                "FUKUROU_MIN_EXPECTED_VALUE_R" to "0.05",
-                "FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO" to "2.5",
-                "FUKUROU_MAX_TAKER_FEE_RATIO" to "0.002",
+                "FUKUROU_MIN_EXPECTED_VALUE_R" to "0.12",
+                "FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO" to "3.5",
+                "FUKUROU_MAX_TAKER_FEE_RATIO" to "0.0008",
                 "FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS" to "8",
                 "FUKUROU_GMO_PUBLIC_BASE_URL" to "https://example.test/public",
                 "FUKUROU_GMO_CONNECT_TIMEOUT_MS" to "3000",
@@ -58,14 +58,14 @@ class TradingBotConfigTest {
         assertEquals(TradingMode.PAPER, config.mode)
         assertEquals(BigDecimal("250000"), config.paperAccount.initialCashJpy)
         assertEquals(BigDecimal("7"), config.paperExecution.marketSlippageBps)
-        assertEquals(BigDecimal("-0.0002"), config.paperMarket.fallbackMakerFeeRate)
+        assertEquals(BigDecimal("0.0000"), config.paperMarket.fallbackMakerFeeRate)
         assertEquals(BigDecimal("0.0006"), config.paperMarket.fallbackTakerFeeRate)
         assertEquals(BigDecimal("0.015"), config.safetyFloor.maxRiskPerTradeRatio)
         assertEquals(BigDecimal("-0.12"), config.safetyFloor.maxDrawdownRatio)
         assertEquals(BigDecimal("0.70"), config.safetyFloor.maxTotalExposureRatio)
-        assertEquals(BigDecimal("0.05"), config.safetyFloor.minExpectedValueR)
-        assertEquals(BigDecimal("2.5"), config.safetyFloor.minExpectedMoveToCostRatio)
-        assertEquals(BigDecimal("0.002"), config.safetyFloor.maxTakerFeeRatio)
+        assertEquals(BigDecimal("0.12"), config.safetyFloor.minExpectedValueR)
+        assertEquals(BigDecimal("3.5"), config.safetyFloor.minExpectedMoveToCostRatio)
+        assertEquals(BigDecimal("0.0008"), config.safetyFloor.maxTakerFeeRatio)
         assertEquals(BigDecimal("8"), config.safetyFloor.marketSlippageReserveBps)
         assertEquals("https://example.test/public", config.gmoPublicClient.baseUrl)
         assertEquals(Duration.ofMillis(3000), config.gmoPublicClient.connectTimeout)
@@ -88,17 +88,56 @@ class TradingBotConfigTest {
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_FALLBACK_MAKER_FEE_RATE" to "-0.0002"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_FALLBACK_TAKER_FEE_RATE" to "-0.0001"),
             )
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_MAX_RISK_PER_TRADE_RATIO" to "1.5"),
+                mapOf("FUKUROU_MAX_RISK_PER_TRADE_RATIO" to "0.03"),
             )
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_MIN_EXPECTED_VALUE_R" to "-0.01"),
+                mapOf("FUKUROU_MAX_DRAWDOWN_RATIO" to "-0.20"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_MAX_TOTAL_EXPOSURE_RATIO" to "0.90"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_MIN_EXPECTED_VALUE_R" to "0"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO" to "2.5"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_MAX_TAKER_FEE_RATIO" to "0.002"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS" to "0"),
+            )
+        }
+    }
+
+    @Test
+    fun fromEnvironment_rejectsLiveModeUntilLiveBrokerExists() {
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_TRADING_MODE" to "LIVE"),
             )
         }
     }

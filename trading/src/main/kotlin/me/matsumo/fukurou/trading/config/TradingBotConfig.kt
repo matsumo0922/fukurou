@@ -33,6 +33,9 @@ data class TradingBotConfig(
     val gmoPublicClient: GmoPublicClientConfig = GmoPublicClientConfig(),
 ) {
     init {
+        require(mode == TradingMode.PAPER) {
+            "TradingBotConfig.mode LIVE is reserved until live broker is implemented."
+        }
         require(paperAccount.mode == mode) {
             "paperAccount.mode must match TradingBotConfig.mode."
         }
@@ -88,14 +91,18 @@ data class TradingBotConfig(
  * @param fallbackSpreadBps ticker がない検証で使う spread 目安
  */
 data class PaperMarketConfig(
-    val fallbackMinOrderSize: BigDecimal = BigDecimal("0.0001"),
-    val fallbackSizeStep: BigDecimal = BigDecimal("0.0001"),
-    val fallbackTickSize: BigDecimal = BigDecimal("1"),
-    val fallbackMakerFeeRate: BigDecimal = BigDecimal("-0.0001"),
-    val fallbackTakerFeeRate: BigDecimal = BigDecimal("0.0005"),
-    val fallbackSpreadBps: BigDecimal = BigDecimal("2.0"),
+    val fallbackMinOrderSize: BigDecimal = DEFAULT_FALLBACK_MIN_ORDER_SIZE,
+    val fallbackSizeStep: BigDecimal = DEFAULT_FALLBACK_SIZE_STEP,
+    val fallbackTickSize: BigDecimal = DEFAULT_FALLBACK_TICK_SIZE,
+    val fallbackMakerFeeRate: BigDecimal = DEFAULT_FALLBACK_MAKER_FEE_RATE,
+    val fallbackTakerFeeRate: BigDecimal = DEFAULT_FALLBACK_TAKER_FEE_RATE,
+    val fallbackSpreadBps: BigDecimal = DEFAULT_FALLBACK_SPREAD_BPS,
 ) {
     init {
+        val fallbackMakerFeeIsConservative = fallbackMakerFeeRate >= DEFAULT_FALLBACK_MAKER_FEE_RATE
+        val fallbackTakerFeeIsConservative = fallbackTakerFeeRate >= DEFAULT_FALLBACK_TAKER_FEE_RATE
+        val fallbackSpreadIsConservative = fallbackSpreadBps >= DEFAULT_FALLBACK_SPREAD_BPS
+
         require(fallbackMinOrderSize > BigDecimal.ZERO) {
             "fallbackMinOrderSize must be greater than 0."
         }
@@ -105,11 +112,14 @@ data class PaperMarketConfig(
         require(fallbackTickSize > BigDecimal.ZERO) {
             "fallbackTickSize must be greater than 0."
         }
-        require(fallbackTakerFeeRate >= BigDecimal.ZERO) {
-            "fallbackTakerFeeRate must be greater than or equal to 0."
+        require(fallbackMakerFeeIsConservative) {
+            "fallbackMakerFeeRate must be greater than or equal to -0.0001."
         }
-        require(fallbackSpreadBps >= BigDecimal.ZERO) {
-            "fallbackSpreadBps must be greater than or equal to 0."
+        require(fallbackTakerFeeIsConservative) {
+            "fallbackTakerFeeRate must be greater than or equal to 0.0005."
+        }
+        require(fallbackSpreadIsConservative) {
+            "fallbackSpreadBps must be greater than or equal to 2.0."
         }
     }
 
@@ -258,10 +268,46 @@ private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("100000")
  */
 private val DEFAULT_MARKET_SLIPPAGE_BPS = BigDecimal("5")
 
+/**
+ * fallback 最小発注数量の既定値。
+ */
+private val DEFAULT_FALLBACK_MIN_ORDER_SIZE = BigDecimal("0.0001")
+
+/**
+ * fallback 数量刻みの既定値。
+ */
+private val DEFAULT_FALLBACK_SIZE_STEP = BigDecimal("0.0001")
+
+/**
+ * fallback tick size の既定値。
+ */
+private val DEFAULT_FALLBACK_TICK_SIZE = BigDecimal("1")
+
+/**
+ * fallback maker 手数料率の既定値。
+ */
+private val DEFAULT_FALLBACK_MAKER_FEE_RATE = BigDecimal("-0.0001")
+
+/**
+ * fallback taker 手数料率の既定値。
+ */
+private val DEFAULT_FALLBACK_TAKER_FEE_RATE = BigDecimal("0.0005")
+
+/**
+ * fallback spread bps の既定値。
+ */
+private val DEFAULT_FALLBACK_SPREAD_BPS = BigDecimal("2.0")
+
 private fun Map<String, String>.readTradingMode(): TradingMode {
     val rawMode = readOptional(FUKUROU_TRADING_MODE_ENV) ?: return TradingMode.PAPER
 
-    return TradingMode.valueOf(rawMode.uppercase())
+    val mode = TradingMode.valueOf(rawMode.uppercase())
+
+    require(mode == TradingMode.PAPER) {
+        "$FUKUROU_TRADING_MODE_ENV=LIVE is reserved until live broker is implemented."
+    }
+
+    return mode
 }
 
 private fun Map<String, String>.readTradingSymbol(): TradingSymbol {
@@ -279,15 +325,15 @@ private fun Map<String, String>.readPaperMarketConfig(): PaperMarketConfig {
     return PaperMarketConfig(
         fallbackMakerFeeRate = readDecimal(
             name = FUKUROU_FALLBACK_MAKER_FEE_RATE_ENV,
-            defaultValue = BigDecimal("-0.0001"),
+            defaultValue = DEFAULT_FALLBACK_MAKER_FEE_RATE,
         ),
         fallbackTakerFeeRate = readDecimal(
             name = FUKUROU_FALLBACK_TAKER_FEE_RATE_ENV,
-            defaultValue = BigDecimal("0.0005"),
+            defaultValue = DEFAULT_FALLBACK_TAKER_FEE_RATE,
         ),
         fallbackSpreadBps = readDecimal(
             name = FUKUROU_FALLBACK_SPREAD_BPS_ENV,
-            defaultValue = BigDecimal("2.0"),
+            defaultValue = DEFAULT_FALLBACK_SPREAD_BPS,
         ),
     )
 }

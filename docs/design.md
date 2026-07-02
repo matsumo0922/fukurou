@@ -3373,7 +3373,7 @@ security:
 
 ### 13.2.1 Step6実装状態
 
-[実装済み: 2026-07-02] runtime config は `TradingBotConfig` を正本とし、symbol / mode / paper 初期残高 / paper slippage / fallback fee / SafetyFloor thresholds / GMO Public REST timeout・rate-limit・retry を typed config として集約する。既存 env contract の `FUKUROU_TRADING_MODE` と `FUKUROU_PAPER_INITIAL_CASH_JPY` は維持し、新しい `FUKUROU_*` env は未設定なら既定値へ戻る。
+[実装済み: 2026-07-02] runtime config は `TradingBotConfig` を正本とし、symbol / mode / paper 初期残高 / paper slippage / fallback fee / SafetyFloor thresholds / GMO Public REST timeout・rate-limit・retry を typed config として集約する。既存 env contract の `FUKUROU_TRADING_MODE` と `FUKUROU_PAPER_INITIAL_CASH_JPY` は維持し、新しい `FUKUROU_*` env は未設定なら既定値へ戻る。`LIVE` は typed model の予約値だが、`LiveGmoBroker` 実装前は env 起動を fail closed する。SafetyFloor thresholds と fallback fee / spread は既定値と同等またはより保守的な値だけ受理する。
 
 [実装済み: 2026-07-02] GMO Public market data client は `:trading.exchange.gmo` 境界で、client-side token bucket、指数 backoff retry、request timeout、temporary/permanent の typed error 分類を行う。`:mcp` は error response に分類を載せるだけで、rate-limit や retry の業務ロジックは持たない。
 

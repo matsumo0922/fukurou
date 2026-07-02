@@ -69,7 +69,7 @@ make detekt
 make build
 ```
 
-runtime config は `.env.example` の `FUKUROU_*` で上書きできます。既定は BTC 現物 / `PAPER` / 仮想 10 万円で、`LIVE` は予約値です。実資金を動かす機能はまだ有効化されません。
+runtime config は `.env.example` の `FUKUROU_*` で上書きできます。既定は BTC 現物 / `PAPER` / 仮想 10 万円で、`LIVE` は予約値です。live broker 実装前は `LIVE` 起動を拒否し、実資金を動かす機能はまだ有効化されません。
 
 ## Deployment
 
