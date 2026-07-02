@@ -26,6 +26,8 @@ import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import me.matsumo.fukurou.trading.safety.SafetyFloorRule
+import me.matsumo.fukurou.trading.safety.SafetyViolation
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
@@ -62,6 +64,11 @@ private const val DELETE_RISK_STATE_ROW_SQL = "DELETE FROM risk_state WHERE id =
  * command_event_log table を削除する SQL。
  */
 private const val DROP_COMMAND_EVENT_LOG_TABLE_SQL = "DROP TABLE command_event_log"
+
+/**
+ * safety_violations 件数を読む SQL。
+ */
+private const val SELECT_SAFETY_VIOLATION_COUNT_SQL = "SELECT COUNT(*) FROM safety_violations"
 
 /**
  * test 用 reconciler 完了 event の payload。
@@ -138,6 +145,7 @@ private const val INSERT_TEST_ORDER_SQL = """
         trigger_price_jpy,
         protective_stop_price_jpy,
         take_profit_price_jpy,
+        estimated_win_probability,
         reason_ja,
         created_at,
         updated_at
@@ -154,6 +162,7 @@ private const val INSERT_TEST_ORDER_SQL = """
         0.010000000000,
         NULL,
         9800000.00000000,
+        NULL,
         NULL,
         NULL,
         'test',
@@ -296,6 +305,31 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun safety_violation_repository_persists_rejection_audit() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        ExposedSafetyViolationRepository(database).append(
+            SafetyViolation(
+                rule = SafetyFloorRule.MAX_RISK_PER_TRADE,
+                messageJa = "test violation",
+                measuredValue = "2001",
+                limitValue = "2000",
+                commandName = "place_order",
+                commandId = UUID.randomUUID(),
+                orderId = null,
+                decisionRunId = "run-1",
+                toolCallId = "tool-1",
+                clientRequestId = "client-1",
+                hardHaltRequired = false,
+                payloadJson = """{"rule":"MAX_RISK_PER_TRADE"}""",
+                createdAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+
+        assertEquals(1, selectSafetyViolationCount(database))
+    }
+
+    @Test
     fun paper_ledger_repository_filters_rows_by_account_mode() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -379,6 +413,32 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(firstResult.positionIds, secondResult.positionIds)
         assertEquals(firstResult.executionIds, secondResult.executionIds)
         assertEquals(1, executions.size)
+    }
+
+    @Test
+    fun paper_execution_persists_estimated_win_probability_for_resting_entry() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        broker.placeOrder(
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+                estimatedWinProbability = BigDecimal("0.73"),
+            ),
+        ).getOrThrow()
+
+        val openOrder = repository.getOpenOrders().getOrThrow().single()
+
+        assertEquals("0.7300000000", openOrder.estimatedWinProbability)
     }
 
     @Test
@@ -516,18 +576,23 @@ private class PostgresTestContext(
 }
 
 private fun postgresEntryCommand(
+    orderType: OrderType = OrderType.MARKET,
+    priceJpy: BigDecimal? = null,
     takeProfitPriceJpy: BigDecimal,
+    estimatedWinProbability: BigDecimal = BigDecimal("0.95"),
     clientRequestId: String? = null,
 ): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
-        orderType = OrderType.MARKET,
+        orderType = orderType,
         sizeBtc = BigDecimal("0.0050"),
-        priceJpy = null,
+        priceJpy = priceJpy,
+        tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
         takeProfitPriceJpy = takeProfitPriceJpy,
+        estimatedWinProbability = estimatedWinProbability,
         reasonJa = "integration entry",
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
@@ -710,6 +775,21 @@ private fun dropCommandEventLogTable(database: ExposedDatabase) {
     exposedTransaction(database) {
         jdbcConnection().prepareStatement(DROP_COMMAND_EVENT_LOG_TABLE_SQL).use { statement ->
             statement.executeUpdate()
+        }
+    }
+}
+
+/**
+ * safety_violations 件数を読む。
+ */
+private fun selectSafetyViolationCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_SAFETY_VIOLATION_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "safety_violations count did not return a row." }
+
+                resultSet.getInt(1)
+            }
         }
     }
 }

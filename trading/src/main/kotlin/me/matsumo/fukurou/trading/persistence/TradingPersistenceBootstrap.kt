@@ -150,6 +150,7 @@ private const val VERIFY_ORDERS_SCHEMA_SQL = """
         trigger_price_jpy,
         protective_stop_price_jpy,
         take_profit_price_jpy,
+        estimated_win_probability,
         reason_ja,
         decision_run_id,
         tool_call_id,
@@ -193,6 +194,29 @@ private const val VERIFY_EXECUTIONS_SCHEMA_SQL = """
 """
 
 /**
+ * safety_violations schema の存在を確認する SQL。
+ */
+private const val VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL = """
+    SELECT
+        id,
+        decision_run_id,
+        tool_call_id,
+        client_request_id,
+        tool_name,
+        command_id,
+        order_id,
+        rule,
+        message_ja,
+        measured_value,
+        limit_value,
+        hard_halt_required,
+        payload,
+        created_at
+    FROM safety_violations
+    LIMIT 0
+"""
+
+/**
  * trading persistence の最小 schema を起動時に用意する bootstrapper。
  *
  * @param database Exposed database
@@ -219,6 +243,7 @@ class TradingPersistenceBootstrap(
                     OrdersTable,
                     ExecutionsTable,
                     CommandEventLogTable,
+                    SafetyViolationsTable,
                     withLogs = false,
                 )
                 val now = Instant.now(clock)
@@ -241,6 +266,7 @@ class TradingPersistenceBootstrap(
                 verifyPositionsSchema()
                 verifyOrdersSchema()
                 verifyExecutionsSchema()
+                verifySafetyViolationsSchema()
                 selectRiskState(forUpdate = false)
                 selectPaperAccount()
             }
@@ -296,6 +322,16 @@ internal fun JdbcTransaction.verifyExecutionsSchema() {
     verifySchemaBySql(
         sql = VERIFY_EXECUTIONS_SCHEMA_SQL,
         missingMessage = "executions schema was not initialized.",
+    )
+}
+
+/**
+ * safety_violations schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifySafetyViolationsSchema() {
+    verifySchemaBySql(
+        sql = VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL,
+        missingMessage = "safety_violations schema was not initialized.",
     )
 }
 

@@ -211,6 +211,7 @@ data class Position(
  * @param triggerPriceJpy STOP trigger 価格
  * @param protectiveStopPriceJpy entry intent に紐づく保護 STOP 価格
  * @param takeProfitPriceJpy entry intent に紐づく virtual TP 価格
+ * @param estimatedWinProbability entry intent で LLM が申告した推定勝率
  * @param reasonJa LLM / system の判断理由
  * @param clientRequestId 呼び出し元が渡した冪等化・追跡用 ID
  * @param createdAt 作成時刻
@@ -231,6 +232,7 @@ data class Order(
     val triggerPriceJpy: String?,
     val protectiveStopPriceJpy: String?,
     val takeProfitPriceJpy: String?,
+    val estimatedWinProbability: String? = null,
     val reasonJa: String?,
     val clientRequestId: String?,
     val createdAt: String,

@@ -324,6 +324,11 @@ object OrdersTable : Table("orders") {
     val takeProfitPriceJpy = decimal("take_profit_price_jpy", precision = 24, scale = 8).nullable()
 
     /**
+     * entry intent で LLM が申告した推定勝率。
+     */
+    val estimatedWinProbability = decimal("estimated_win_probability", precision = 20, scale = 10).nullable()
+
+    /**
      * 判断理由。
      */
     val reasonJa = text("reason_ja").nullable()
@@ -541,6 +546,83 @@ object CommandEventLogTable : Table("command_event_log") {
      * market snapshot ID。
      */
     val marketSnapshotId = varchar("market_snapshot_id", length = 128).nullable()
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * SafetyFloor の拒否監査を表す Exposed table。
+ */
+object SafetyViolationsTable : Table("safety_violations") {
+    /**
+     * violation ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * decision run ID。
+     */
+    val decisionRunId = varchar("decision_run_id", length = 128).nullable()
+
+    /**
+     * tool call ID。
+     */
+    val toolCallId = varchar("tool_call_id", length = 128).nullable()
+
+    /**
+     * client request ID。
+     */
+    val clientRequestId = varchar("client_request_id", length = 128).nullable()
+
+    /**
+     * tool / command 名。
+     */
+    val toolName = varchar("tool_name", length = 128)
+
+    /**
+     * command ID。
+     */
+    val commandId = uuid("command_id").nullable()
+
+    /**
+     * 関連 order ID。
+     */
+    val orderId = uuid("order_id").nullable()
+
+    /**
+     * 違反した rule。
+     */
+    val rule = varchar("rule", length = 96)
+
+    /**
+     * 呼び出し元向け日本語 message。
+     */
+    val messageJa = text("message_ja")
+
+    /**
+     * 実測または申告された値。
+     */
+    val measuredValue = varchar("measured_value", length = 256)
+
+    /**
+     * 安全床の上限または下限。
+     */
+    val limitValue = varchar("limit_value", length = 256)
+
+    /**
+     * HARD_HALT 掃引が必要な違反か。
+     */
+    val hardHaltRequired = bool("hard_halt_required").default(false)
+
+    /**
+     * JSON payload。
+     */
+    val payload = text("payload")
+
+    /**
+     * 作成時刻。epoch millis で保存する。
+     */
+    val createdAt = long("created_at")
 
     override val primaryKey = PrimaryKey(id)
 }

@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import java.math.BigDecimal
 import java.time.Instant
@@ -55,8 +56,10 @@ data class PaperTradeAuditContext(
  * @param orderType 注文種別
  * @param sizeBtc 注文数量
  * @param priceJpy LIMIT / STOP entry の価格
+ * @param tradeGroupId 買い増し対象の trade group ID。null の場合は新規 group
  * @param protectiveStopPriceJpy entry 後に必ず置く保護 STOP 価格
  * @param takeProfitPriceJpy virtual TP 価格
+ * @param estimatedWinProbability LLM が申告した推定勝率。EV は SafetyFloor がこの値から計算する
  * @param reasonJa 判断理由
  * @param auditContext audit context
  */
@@ -67,8 +70,10 @@ data class PlaceOrderCommand(
     val orderType: OrderType,
     val sizeBtc: BigDecimal,
     val priceJpy: BigDecimal?,
+    val tradeGroupId: UUID?,
     val protectiveStopPriceJpy: BigDecimal,
     val takeProfitPriceJpy: BigDecimal?,
+    val estimatedWinProbability: BigDecimal,
     val reasonJa: String,
     val auditContext: PaperTradeAuditContext,
 )
@@ -156,6 +161,7 @@ data class SimulatedFill(
  * @param positionIds command で作成・更新した position IDs
  * @param executionIds command で作成した execution IDs
  * @param messageJa 呼び出し元へ返す日本語 message
+ * @param safetyViolation SafetyFloor による拒否内容
  */
 data class PaperTradeResult(
     val accepted: Boolean,
@@ -164,6 +170,7 @@ data class PaperTradeResult(
     val positionIds: List<String>,
     val executionIds: List<String>,
     val messageJa: String,
+    val safetyViolation: SafetyViolation? = null,
 )
 
 /**

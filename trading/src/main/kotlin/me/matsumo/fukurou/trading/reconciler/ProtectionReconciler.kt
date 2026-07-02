@@ -13,7 +13,9 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
+import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -55,6 +57,11 @@ private const val START_AUDIT_FAILURE_LOG_KEY = "protection-reconciler-start-aud
 private val RECONCILER_LOGGER = Logger.getLogger(ProtectionReconciler::class.java.name)
 
 /**
+ * Reconciler が HARD_HALT 掃引を実行する理由。
+ */
+private const val HARD_HALT_SWEEP_REASON = "ProtectionReconciler HARD_HALT sweep"
+
+/**
  * ProtectionReconciler の pass 種別。
  */
 enum class ReconcilePassKind {
@@ -73,6 +80,7 @@ enum class ReconcilePassKind {
  * LLM 起動の合間にも保護状態を前進させる常駐 reconciler の骨格。
  *
  * @param riskStateRepository risk_state repository
+ * @param riskStateCommandService risk_state 更新と audit をまとめる command service
  * @param commandEventLog command_event_log repository
  * @param tradingLock trade 系 tool と共有する global lock
  * @param tickStream 市場データ tick stream 抽象
@@ -83,6 +91,7 @@ enum class ReconcilePassKind {
  */
 class ProtectionReconciler(
     private val riskStateRepository: RiskStateRepository,
+    private val riskStateCommandService: RiskStateCommandService? = null,
     private val commandEventLog: CommandEventLog,
     private val tradingLock: TradingLock,
     private val tickStream: TickStream = EmptyTickStream,
@@ -158,13 +167,16 @@ class ProtectionReconciler(
 
     private suspend fun reconcileWithTransitionAudit(passKind: ReconcilePassKind): Result<Unit> {
         val passResult = runCatching {
-            riskStateRepository.current().getOrThrow()
-
             val reconciledAt = Instant.now(clock)
             val tickSnapshot = readTickSnapshot()
 
             if (tickSnapshot != null) {
-                broker?.reconcile(tickSnapshot)?.getOrThrow()
+                val sweptBeforeReconcile = enforceHardHaltSweepIfNeeded(tickSnapshot)
+
+                if (!sweptBeforeReconcile) {
+                    broker?.reconcile(tickSnapshot)?.getOrThrow()
+                    enforceHardHaltSweepIfNeeded(tickSnapshot)
+                }
             }
 
             markSuccessfulPass(passKind, tickSnapshot, reconciledAt).getOrThrow()
@@ -202,6 +214,30 @@ class ProtectionReconciler(
         }
 
         return tickResult.getOrNull()
+    }
+
+    private suspend fun enforceHardHaltSweepIfNeeded(tickSnapshot: TickSnapshot): Boolean {
+        val currentRiskState = riskStateRepository.current().getOrThrow()
+        val hardHaltReached = currentRiskState.drawdownRatio <= SafetyFloorDefaults.maxDrawdownRatio
+        val shouldSweep = currentRiskState.hardHalt || hardHaltReached
+
+        if (!shouldSweep) {
+            return false
+        }
+
+        val reason = currentRiskState.haltReason ?: HARD_HALT_SWEEP_REASON
+
+        if (!currentRiskState.hardHalt) {
+            if (riskStateCommandService != null) {
+                riskStateCommandService.setHardHalt(reason, DecisionRunContext.EMPTY).getOrThrow()
+            } else {
+                riskStateRepository.setHardHalt(reason, Instant.now(clock)).getOrThrow()
+            }
+        }
+
+        broker?.sweepHardHalt(reason, tickSnapshot)?.getOrThrow()
+
+        return true
     }
 
     private suspend fun recordStarted(): Result<Unit> {

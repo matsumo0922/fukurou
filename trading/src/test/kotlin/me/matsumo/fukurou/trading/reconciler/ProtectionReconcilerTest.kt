@@ -291,6 +291,88 @@ class ProtectionReconcilerTest {
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertEquals(2, repository.getExecutions().getOrThrow().size)
     }
+
+    @Test
+    fun reconcile_pass_sweeps_existing_hard_halt_without_trade_tool_guard() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("12000000"))).getOrThrow()
+        riskStateRepository.setHardHalt("test hard halt", fixedInstant()).getOrThrow()
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+        val riskState = riskStateRepository.current().getOrThrow()
+
+        assertTrue(result.isSuccess)
+        assertTrue(riskState.hardHalt)
+        assertEquals(0, broker.getPositions().getOrThrow().size)
+        assertEquals(0, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun reconcile_pass_cancels_open_entry_before_fill_when_hard_halt() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(restingReconcilerEntryCommand()).getOrThrow()
+        riskStateRepository.setHardHalt("test hard halt", fixedInstant()).getOrThrow()
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+
+        assertTrue(result.isSuccess)
+        assertEquals(0, broker.getPositions().getOrThrow().size)
+        assertEquals(0, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(0, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun reconcile_pass_cancels_open_entry_before_fill_when_tick_reaches_drawdown_halt() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("12000000"))).getOrThrow()
+        broker.placeOrder(restingReconcilerEntryCommand(sizeBtc = BigDecimal("0.0010"))).getOrThrow()
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(drawdownHaltTickSnapshot())),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+        val riskState = riskStateRepository.current().getOrThrow()
+
+        assertTrue(result.isSuccess)
+        assertTrue(riskState.hardHalt)
+        assertEquals(0, broker.getPositions().getOrThrow().size)
+        assertEquals(0, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
 }
 
 /**
@@ -479,6 +561,28 @@ private fun takeProfitTickSnapshot(): TickSnapshot {
     )
 }
 
+private fun neutralBtcTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "10000000",
+        bidPrice = "9990000",
+        askPrice = "10000000",
+        symbolRules = reconcilerSymbolRules(),
+    )
+}
+
+private fun drawdownHaltTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "6000000",
+        bidPrice = "5990000",
+        askPrice = "6000000",
+        symbolRules = reconcilerSymbolRules(),
+    )
+}
+
 private fun reconcilerEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = java.util.UUID.randomUUID(),
@@ -487,9 +591,28 @@ private fun reconcilerEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderCo
         orderType = OrderType.MARKET,
         sizeBtc = BigDecimal("0.0050"),
         priceJpy = null,
+        tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
         takeProfitPriceJpy = takeProfitPriceJpy,
+        estimatedWinProbability = BigDecimal("0.95"),
         reasonJa = "test entry",
+        auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+private fun restingReconcilerEntryCommand(sizeBtc: BigDecimal = BigDecimal("0.0050")): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = java.util.UUID.randomUUID(),
+        symbol = TradingSymbol.BTC,
+        side = OrderSide.BUY,
+        orderType = OrderType.LIMIT,
+        sizeBtc = sizeBtc,
+        priceJpy = BigDecimal("10000000"),
+        tradeGroupId = null,
+        protectiveStopPriceJpy = BigDecimal("9700000"),
+        takeProfitPriceJpy = BigDecimal("12000000"),
+        estimatedWinProbability = BigDecimal("0.95"),
+        reasonJa = "test resting entry",
         auditContext = PaperTradeAuditContext.EMPTY,
     )
 }

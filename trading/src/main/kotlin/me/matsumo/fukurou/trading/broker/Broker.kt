@@ -54,4 +54,9 @@ interface Broker {
      * tick をもとに paper ledger を決定的に前進させる。
      */
     suspend fun reconcile(tickSnapshot: TickSnapshot): Result<PaperReconcileResult>
+
+    /**
+     * HARD_HALT 到達時の内部掃引を実行する。
+     */
+    suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult>
 }
