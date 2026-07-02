@@ -6,6 +6,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
@@ -28,11 +31,13 @@ private val DEFAULT_RECONCILER_INTERVAL = Duration.ofSeconds(5)
  *
  * @param reconciler 実行する ProtectionReconciler
  * @param interval loop 間隔
+ * @param bootstrap reconciler loop 開始前に必要な DB schema 初期化
  * @param scope worker coroutine scope
  */
 class ProtectionReconcilerWorker(
     private val reconciler: ProtectionReconciler,
     private val interval: Duration = DEFAULT_RECONCILER_INTERVAL,
+    private val bootstrap: () -> Result<Unit> = { Result.success(Unit) },
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
 ) : AutoCloseable {
 
@@ -45,7 +50,16 @@ class ProtectionReconcilerWorker(
         require(job == null) { "ProtectionReconcilerWorker is already started." }
 
         job = scope.launch {
-            reconciler.runLoop(interval)
+            while (currentCoroutineContext().isActive) {
+                val bootstrapResult = bootstrap()
+
+                if (bootstrapResult.isSuccess) {
+                    reconciler.runLoop(interval)
+                    return@launch
+                }
+
+                delay(interval.toMillis())
+            }
         }
 
         return this
@@ -66,8 +80,6 @@ internal fun startProtectionReconcilerWorker(
     status: MutableReconcilerStatus,
     clock: Clock = Clock.systemUTC(),
 ): ProtectionReconcilerWorker {
-    TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
-
     val riskStateRepository = ExposedRiskStateRepository(database, clock)
     val commandEventLog = ExposedCommandEventLog(database)
     val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
@@ -80,5 +92,8 @@ internal fun startProtectionReconcilerWorker(
         clock = clock,
     )
 
-    return ProtectionReconcilerWorker(reconciler = reconciler).start()
+    return ProtectionReconcilerWorker(
+        reconciler = reconciler,
+        bootstrap = { TradingPersistenceBootstrap(database, clock).ensureSchema() },
+    ).start()
 }

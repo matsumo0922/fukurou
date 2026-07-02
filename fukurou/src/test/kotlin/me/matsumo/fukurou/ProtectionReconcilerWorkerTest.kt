@@ -12,6 +12,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -49,6 +50,45 @@ class ProtectionReconcilerWorkerTest {
         }
 
         assertNotNull(status.snapshot().lastReconciledAt)
+        assertTrue(status.snapshot().startupFullReconcileCompleted)
+    }
+
+    @Test
+    fun worker_retries_bootstrap_before_reconciler_loop() = runBlocking {
+        val clock = Clock.fixed(Instant.parse("2026-07-02T00:00:00Z"), ZoneOffset.UTC)
+        val status = MutableReconcilerStatus()
+        val attempts = AtomicInteger(0)
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = clock),
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = InMemoryTradingLock(clock),
+            status = status,
+            clock = clock,
+        )
+        val worker = ProtectionReconcilerWorker(
+            reconciler = reconciler,
+            interval = Duration.ofMillis(10),
+            bootstrap = {
+                if (attempts.incrementAndGet() == 1) {
+                    Result.failure(IllegalStateException("database is not ready"))
+                } else {
+                    Result.success(Unit)
+                }
+            },
+        )
+
+        try {
+            worker.start()
+            withTimeout(500) {
+                while (status.snapshot().lastReconciledAt == null) {
+                    delay(10)
+                }
+            }
+        } finally {
+            worker.close()
+        }
+
+        assertTrue(attempts.get() >= 2)
         assertTrue(status.snapshot().startupFullReconcileCompleted)
     }
 }
