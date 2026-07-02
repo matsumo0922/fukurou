@@ -1,6 +1,8 @@
 package me.matsumo.fukurou.trading.tool
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -39,16 +41,16 @@ class ToolCallGuard(
         return tradingLock.withLock(call.toolName) {
             val riskState = riskStateRepository.current()
                 .getOrElse { throwable ->
-                    recordNoTradeExit(call, "risk_state_unavailable", throwable).getOrThrow()
+                    val auditResult = recordNoTradeExitNonCancellable(call, "risk_state_unavailable", throwable)
 
-                    return@withLock Result.failure(throwable)
+                    return@withLock Result.failure(throwable.withSuppressedFailure(auditResult))
                 }
 
             if (riskState.hardHalt) {
                 val exception = HardHaltTradingRejectedException("HARD_HALT is enabled in risk_state.")
-                recordHardHaltRejection(call, riskState.haltReason, exception).getOrThrow()
+                val auditResult = recordHardHaltRejectionNonCancellable(call, riskState.haltReason, exception)
 
-                return@withLock Result.failure(exception)
+                return@withLock Result.failure(exception.withSuppressedFailure(auditResult))
             }
 
             runAndAudit(call, block)
@@ -81,17 +83,21 @@ class ToolCallGuard(
     private suspend fun <T> runAndAudit(call: GuardedToolCall, block: suspend () -> T): Result<T> {
         return try {
             val value = block()
-            recordToolCompleted(call).getOrThrow()
+            val auditResult = recordToolCompleted(call)
 
-            Result.success(value)
+            auditResult.fold(
+                onSuccess = { Result.success(value) },
+                onFailure = { throwable -> Result.failure(throwable) },
+            )
         } catch (throwable: CancellationException) {
-            recordNoTradeExit(call, "tool_call_cancelled", throwable).getOrThrow()
+            val auditResult = recordNoTradeExitNonCancellable(call, "tool_call_cancelled", throwable)
+            throwable.withSuppressedFailure(auditResult)
 
             throw throwable
         } catch (throwable: Throwable) {
-            recordNoTradeExit(call, "tool_call_failed", throwable).getOrThrow()
+            val auditResult = recordNoTradeExitNonCancellable(call, "tool_call_failed", throwable)
 
-            Result.failure(throwable)
+            Result.failure(throwable.withSuppressedFailure(auditResult))
         }
     }
 
@@ -130,5 +136,25 @@ class ToolCallGuard(
                 occurredAt = Instant.now(clock),
             ),
         )
+    }
+
+    private suspend fun recordNoTradeExitNonCancellable(
+        call: GuardedToolCall,
+        reason: String,
+        cause: Throwable,
+    ): Result<Unit> {
+        return withContext(NonCancellable) {
+            recordNoTradeExit(call, reason, cause)
+        }
+    }
+
+    private suspend fun recordHardHaltRejectionNonCancellable(
+        call: GuardedToolCall,
+        haltReason: String?,
+        cause: Throwable,
+    ): Result<Unit> {
+        return withContext(NonCancellable) {
+            recordHardHaltRejection(call, haltReason, cause)
+        }
     }
 }

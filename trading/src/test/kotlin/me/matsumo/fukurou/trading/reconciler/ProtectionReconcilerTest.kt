@@ -74,6 +74,20 @@ class ProtectionReconcilerTest {
     }
 
     @Test
+    fun steady_loop_success_does_not_append_heartbeat_events() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val reconciler = createReconciler(eventLog = eventLog)
+
+        reconciler.reconcileOnce(ReconcilePassKind.STARTUP_FULL).getOrThrow()
+        reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
+        reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
+
+        val eventTypes = eventLog.events().map { event -> event.eventType }
+
+        assertEquals(listOf(CommandEventType.RECONCILER_PASS_COMPLETED), eventTypes)
+    }
+
+    @Test
     fun run_loop_retries_startup_full_pass_until_success() = runBlocking {
         val riskStateRepository = FlakyRiskStateRepository(failuresBeforeSuccess = 1)
         val status = MutableReconcilerStatus()
@@ -94,6 +108,36 @@ class ProtectionReconcilerTest {
 
         assertTrue(riskStateRepository.currentCallCount >= 2)
         assertTrue(status.snapshot().startupFullReconcileCompleted)
+    }
+
+    @Test
+    fun loop_failure_and_recovery_are_logged_only_on_transitions() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val tickStream = SwitchableTickStream(Result.success(fixedTickSnapshot()))
+        val reconciler = createReconciler(
+            eventLog = eventLog,
+            tickStream = tickStream,
+        )
+
+        reconciler.reconcileOnce(ReconcilePassKind.STARTUP_FULL).getOrThrow()
+
+        tickStream.nextResult = Result.failure(IllegalStateException("market data unavailable"))
+        assertTrue(reconciler.reconcileOnce(ReconcilePassKind.LOOP).isFailure)
+        assertTrue(reconciler.reconcileOnce(ReconcilePassKind.LOOP).isFailure)
+
+        tickStream.nextResult = Result.success(fixedTickSnapshot())
+        reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
+
+        val eventTypes = eventLog.events().map { event -> event.eventType }
+
+        assertEquals(
+            listOf(
+                CommandEventType.RECONCILER_PASS_COMPLETED,
+                CommandEventType.RECONCILER_PASS_FAILED,
+                CommandEventType.RECONCILER_PASS_RECOVERED,
+            ),
+            eventTypes,
+        )
     }
 
     @Test
@@ -220,11 +264,27 @@ private object FailingCommandEventLog : CommandEventLog {
  */
 private object FixedTickStream : TickStream {
     override suspend fun latestTick(): Result<TickSnapshot?> {
-        return Result.success(
-            TickSnapshot(
-                symbol = "BTC",
-                observedAt = fixedInstant(),
-            ),
-        )
+        return Result.success(fixedTickSnapshot())
     }
+}
+
+/**
+ * 次に返す結果を切り替えられる TickStream。
+ */
+private class SwitchableTickStream(
+    var nextResult: Result<TickSnapshot?>,
+) : TickStream {
+    override suspend fun latestTick(): Result<TickSnapshot?> {
+        return nextResult
+    }
+}
+
+/**
+ * 固定時刻の tick snapshot を返す。
+ */
+private fun fixedTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+    )
 }

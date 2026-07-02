@@ -1,9 +1,13 @@
 package me.matsumo.fukurou.trading.tool
 
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
@@ -57,6 +61,25 @@ class CallerNoTradeGuardTest {
         assertTrue(event.payload.contains("caller_failed"))
         assertTrue(event.payload.contains("MCP process failed before connect"))
     }
+
+    @Test
+    fun caller_cancellation_records_no_trade_exit_with_context_switching_audit_log() = runBlocking {
+        val eventLog = CallerContextSwitchingCommandEventLog()
+        val guard = CallerNoTradeGuard(eventLog, fixedClock())
+
+        val result = runCatching {
+            guard.run(createInvocation()) {
+                withTimeout(10) {
+                    delay(1_000)
+                }
+            }
+        }
+        val event = eventLog.events().single()
+
+        assertTrue(result.exceptionOrNull() is TimeoutCancellationException)
+        assertEquals(CommandEventType.NO_TRADE_EXIT, event.eventType)
+        assertTrue(event.payload.contains("caller_cancelled"))
+    }
 }
 
 /**
@@ -88,4 +111,27 @@ private fun fixedInstant(): Instant {
  */
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+/**
+ * DB-backed append と同じく dispatcher を切り替える command_event_log。
+ */
+private class CallerContextSwitchingCommandEventLog : CommandEventLog {
+
+    private val storedEvents = mutableListOf<CommandEvent>()
+
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            storedEvents += event
+
+            Result.success(Unit)
+        }
+    }
+
+    /**
+     * 保存済みイベントの snapshot を返す。
+     */
+    fun events(): List<CommandEvent> {
+        return storedEvents.toList()
+    }
 }

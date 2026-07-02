@@ -1,6 +1,8 @@
 package me.matsumo.fukurou.trading.tool
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -25,13 +27,14 @@ class CallerNoTradeGuard(
         return try {
             Result.success(block())
         } catch (throwable: CancellationException) {
-            recordNoTradeExit(invocation, "caller_cancelled", throwable).getOrThrow()
+            val auditResult = recordNoTradeExitNonCancellable(invocation, "caller_cancelled", throwable)
+            throwable.withSuppressedFailure(auditResult)
 
             throw throwable
         } catch (throwable: Throwable) {
-            recordNoTradeExit(invocation, "caller_failed", throwable).getOrThrow()
+            val auditResult = recordNoTradeExitNonCancellable(invocation, "caller_failed", throwable)
 
-            Result.failure(throwable)
+            Result.failure(throwable.withSuppressedFailure(auditResult))
         }
     }
 
@@ -56,6 +59,16 @@ class CallerNoTradeGuard(
                 occurredAt = clock.instant(),
             ),
         )
+    }
+
+    private suspend fun recordNoTradeExitNonCancellable(
+        invocation: CallerInvocation,
+        reason: String,
+        cause: Throwable,
+    ): Result<Unit> {
+        return withContext(NonCancellable) {
+            recordNoTradeExit(invocation, reason, cause)
+        }
     }
 }
 

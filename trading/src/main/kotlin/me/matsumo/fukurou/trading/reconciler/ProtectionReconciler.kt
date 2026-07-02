@@ -4,6 +4,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -22,12 +24,12 @@ private const val RECONCILER_LOCK_OWNER = "protection-reconciler"
 /**
  * startup full reconcile pass の payload。
  */
-private const val STARTUP_FULL_PAYLOAD = """{"pass":"startup_full"}"""
+private const val STARTUP_FULL_COMPLETED_PAYLOAD = """{"pass":"startup_full","state":"completed"}"""
 
 /**
- * loop reconcile pass の payload。
+ * loop reconcile pass が回復したことを示す payload。
  */
-private const val LOOP_PAYLOAD = """{"pass":"loop"}"""
+private const val LOOP_RECOVERED_PAYLOAD = """{"pass":"loop","state":"recovered"}"""
 
 /**
  * ProtectionReconciler の pass 種別。
@@ -63,6 +65,8 @@ class ProtectionReconciler(
     private val clock: Clock = Clock.systemUTC(),
 ) {
 
+    private var previousPassFailed = false
+
     /**
      * 起動時 full pass を実行した後、cancel されるまで loop pass を続ける。
      */
@@ -89,31 +93,7 @@ class ProtectionReconciler(
     suspend fun reconcileOnce(passKind: ReconcilePassKind): Result<Unit> {
         return try {
             tradingLock.withLock(RECONCILER_LOCK_OWNER) {
-                runCatching {
-                    riskStateRepository.current().getOrThrow()
-
-                    val tickSnapshot = tickStream.latestTick().getOrThrow()
-                    val reconciledAt = Instant.now(clock)
-                    val isStartupFullPass = passKind == ReconcilePassKind.STARTUP_FULL
-                    val payload = if (isStartupFullPass) STARTUP_FULL_PAYLOAD else LOOP_PAYLOAD
-
-                    commandEventLog.append(
-                        CommandEvent(
-                            decisionRunContext = DecisionRunContext.fromEnvironment(emptyMap()),
-                            toolName = RECONCILER_LOCK_OWNER,
-                            toolCallId = null,
-                            clientRequestId = null,
-                            eventType = CommandEventType.RECONCILER_PASS_COMPLETED,
-                            payload = payload,
-                            occurredAt = reconciledAt,
-                        ),
-                    ).getOrThrow()
-                    status.markReconciled(
-                        reconciledAt = reconciledAt,
-                        startupFullReconcileCompleted = isStartupFullPass,
-                        lastMarketDataAt = tickSnapshot?.observedAt,
-                    )
-                }
+                reconcileWithTransitionAudit(passKind)
             }
         } catch (throwable: CancellationException) {
             throw throwable
@@ -127,5 +107,126 @@ class ProtectionReconciler(
      */
     fun snapshot(): ReconcilerStatus {
         return status.snapshot()
+    }
+
+    private suspend fun reconcileWithTransitionAudit(passKind: ReconcilePassKind): Result<Unit> {
+        val passResult = runCatching {
+            riskStateRepository.current().getOrThrow()
+
+            val tickSnapshot = tickStream.latestTick().getOrThrow()
+            val reconciledAt = Instant.now(clock)
+
+            markSuccessfulPass(passKind, tickSnapshot, reconciledAt).getOrThrow()
+        }
+
+        if (passResult.isSuccess) {
+            previousPassFailed = false
+
+            return Result.success(Unit)
+        }
+
+        val throwable = requireNotNull(passResult.exceptionOrNull())
+        val auditResult = recordFailureTransition(passKind, throwable)
+
+        if (auditResult.isSuccess) {
+            previousPassFailed = true
+        } else {
+            auditResult.exceptionOrNull()?.let { auditThrowable -> throwable.addSuppressed(auditThrowable) }
+        }
+
+        return Result.failure(throwable)
+    }
+
+    private suspend fun markSuccessfulPass(
+        passKind: ReconcilePassKind,
+        tickSnapshot: TickSnapshot?,
+        reconciledAt: Instant,
+    ): Result<Unit> {
+        val isStartupFullPass = passKind == ReconcilePassKind.STARTUP_FULL
+        val auditResult = recordSuccessTransition(passKind, reconciledAt)
+
+        if (auditResult.isFailure) {
+            return auditResult
+        }
+
+        status.markReconciled(
+            reconciledAt = reconciledAt,
+            startupFullReconcileCompleted = isStartupFullPass,
+            lastMarketDataAt = tickSnapshot?.observedAt,
+        )
+
+        return Result.success(Unit)
+    }
+
+    private suspend fun recordSuccessTransition(passKind: ReconcilePassKind, occurredAt: Instant): Result<Unit> {
+        if (passKind == ReconcilePassKind.STARTUP_FULL) {
+            return appendReconcilerEvent(
+                eventType = CommandEventType.RECONCILER_PASS_COMPLETED,
+                payload = STARTUP_FULL_COMPLETED_PAYLOAD,
+                occurredAt = occurredAt,
+            )
+        }
+
+        if (!previousPassFailed) {
+            return Result.success(Unit)
+        }
+
+        return appendReconcilerEvent(
+            eventType = CommandEventType.RECONCILER_PASS_RECOVERED,
+            payload = LOOP_RECOVERED_PAYLOAD,
+            occurredAt = occurredAt,
+        )
+    }
+
+    private suspend fun recordFailureTransition(passKind: ReconcilePassKind, throwable: Throwable): Result<Unit> {
+        if (previousPassFailed) {
+            return Result.success(Unit)
+        }
+
+        return appendReconcilerEvent(
+            eventType = CommandEventType.RECONCILER_PASS_FAILED,
+            payload = buildPassFailurePayload(passKind, throwable),
+            occurredAt = Instant.now(clock),
+        )
+    }
+
+    private suspend fun appendReconcilerEvent(
+        eventType: CommandEventType,
+        payload: String,
+        occurredAt: Instant,
+    ): Result<Unit> {
+        return commandEventLog.append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext.fromEnvironment(emptyMap()),
+                toolName = RECONCILER_LOCK_OWNER,
+                toolCallId = null,
+                clientRequestId = null,
+                eventType = eventType,
+                payload = payload,
+                occurredAt = occurredAt,
+            ),
+        )
+    }
+}
+
+/**
+ * 失敗した reconcile pass の payload を組み立てる。
+ */
+private fun buildPassFailurePayload(passKind: ReconcilePassKind, throwable: Throwable): String {
+    return buildJsonObject {
+        put("pass", passKind.payloadName())
+        put("state", "failed")
+        put("cause", throwable.javaClass.simpleName)
+        put("message", throwable.message.orEmpty())
+    }.toString()
+}
+
+/**
+ * audit payload に使う pass 名を返す。
+ */
+private fun ReconcilePassKind.payloadName(): String {
+    return when (this) {
+        ReconcilePassKind.STARTUP_FULL -> "startup_full"
+        ReconcilePassKind.LOOP -> "loop"
     }
 }

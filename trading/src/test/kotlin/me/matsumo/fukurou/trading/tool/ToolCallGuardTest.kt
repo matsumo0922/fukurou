@@ -1,9 +1,15 @@
 package me.matsumo.fukurou.trading.tool
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
@@ -111,6 +117,39 @@ class ToolCallGuardTest {
         assertEquals(CommandEventType.NO_TRADE_EXIT, noTradeEvent.eventType)
         assertTrue(noTradeEvent.payload.contains("\"noTrade\":true"))
     }
+
+    @Test
+    fun cancellation_records_no_trade_exit_with_context_switching_audit_log() = runBlocking {
+        val eventLog = ToolContextSwitchingCommandEventLog()
+        val guard = createGuard(eventLog = eventLog)
+
+        val result = runCatching {
+            guard.runReadOnlyTool(createCall(toolName = "read.slow")) {
+                withTimeout(10) {
+                    delay(1_000)
+                }
+            }
+        }
+        val event = eventLog.events().single()
+
+        assertTrue(result.exceptionOrNull() is TimeoutCancellationException)
+        assertEquals(CommandEventType.NO_TRADE_EXIT, event.eventType)
+        assertTrue(event.payload.contains("tool_call_cancelled"))
+    }
+
+    @Test
+    fun no_trade_audit_failure_preserves_original_tool_failure() = runBlocking {
+        val guard = createGuard(eventLog = FailingCommandEventLog)
+
+        val result = guard.runTradeTool(createCall(toolName = "trade.place_order")) {
+            throw NoTradeExitException("caller timed out before trade")
+        }
+        val throwable = requireNotNull(result.exceptionOrNull())
+
+        assertTrue(throwable is NoTradeExitException)
+        assertEquals("caller timed out before trade", throwable.message)
+        assertTrue(throwable.suppressed.any { suppressed -> suppressed.message == "audit append failed" })
+    }
 }
 
 /**
@@ -146,7 +185,7 @@ private fun fixedClock(): Clock {
  * ToolCallGuard test 用の guard を作る。
  */
 private fun createGuard(
-    eventLog: InMemoryCommandEventLog = InMemoryCommandEventLog(),
+    eventLog: CommandEventLog = InMemoryCommandEventLog(),
     riskStateRepository: InMemoryRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
 ): ToolCallGuard {
     return ToolCallGuard(
@@ -172,4 +211,36 @@ private fun createCall(
         decisionRunContext = context,
         payload = "{}",
     )
+}
+
+/**
+ * DB-backed append と同じく dispatcher を切り替える command_event_log。
+ */
+private class ToolContextSwitchingCommandEventLog : CommandEventLog {
+
+    private val storedEvents = mutableListOf<CommandEvent>()
+
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            storedEvents += event
+
+            Result.success(Unit)
+        }
+    }
+
+    /**
+     * 保存済みイベントの snapshot を返す。
+     */
+    fun events(): List<CommandEvent> {
+        return storedEvents.toList()
+    }
+}
+
+/**
+ * append に必ず失敗する command_event_log。
+ */
+private object FailingCommandEventLog : CommandEventLog {
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        return Result.failure(IllegalStateException("audit append failed"))
+    }
 }

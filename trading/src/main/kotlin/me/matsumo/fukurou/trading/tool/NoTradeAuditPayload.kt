@@ -17,3 +17,12 @@ internal fun buildNoTradeFailurePayload(reason: String, cause: Throwable?): Stri
         put("noTrade", true)
     }.toString()
 }
+
+/**
+ * audit 失敗を元の失敗に添付し、呼び出し元へ返す主原因を保つ。
+ */
+internal fun Throwable.withSuppressedFailure(result: Result<Unit>): Throwable {
+    result.exceptionOrNull()?.let { throwable -> addSuppressed(throwable) }
+
+    return this
+}

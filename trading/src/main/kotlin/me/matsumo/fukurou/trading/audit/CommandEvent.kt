@@ -33,6 +33,16 @@ enum class CommandEventType {
     RECONCILER_PASS_COMPLETED,
 
     /**
+     * ProtectionReconciler の pass が失敗状態へ遷移した。
+     */
+    RECONCILER_PASS_FAILED,
+
+    /**
+     * ProtectionReconciler の pass が失敗状態から回復した。
+     */
+    RECONCILER_PASS_RECOVERED,
+
+    /**
      * HARD_HALT を DB 上で有効化した。
      */
     HARD_HALT_SET,
