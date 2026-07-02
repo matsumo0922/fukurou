@@ -172,14 +172,16 @@ class ProtectionReconciler(
 
     private suspend fun reconcileWithTransitionAudit(passKind: ReconcilePassKind): Result<Unit> {
         val passResult = runCatching {
-            val riskState = riskStateRepository.current().getOrThrow()
-
             val reconciledAt = Instant.now(clock)
             val tickSnapshot = readTickSnapshot()
 
             if (tickSnapshot != null) {
-                broker?.reconcile(tickSnapshot)?.getOrThrow()
-                enforceHardHaltSweepIfNeeded(riskState.hardHalt, tickSnapshot)
+                val sweptBeforeReconcile = enforceHardHaltSweepIfNeeded(tickSnapshot)
+
+                if (!sweptBeforeReconcile) {
+                    broker?.reconcile(tickSnapshot)?.getOrThrow()
+                    enforceHardHaltSweepIfNeeded(tickSnapshot)
+                }
             }
 
             markSuccessfulPass(passKind, tickSnapshot, reconciledAt).getOrThrow()
@@ -219,13 +221,13 @@ class ProtectionReconciler(
         return tickResult.getOrNull()
     }
 
-    private suspend fun enforceHardHaltSweepIfNeeded(wasHardHalt: Boolean, tickSnapshot: TickSnapshot) {
+    private suspend fun enforceHardHaltSweepIfNeeded(tickSnapshot: TickSnapshot): Boolean {
         val currentRiskState = riskStateRepository.current().getOrThrow()
         val hardHaltReached = currentRiskState.drawdownRatio <= HARD_HALT_DRAWDOWN_RATIO
-        val shouldSweep = wasHardHalt || currentRiskState.hardHalt || hardHaltReached
+        val shouldSweep = currentRiskState.hardHalt || hardHaltReached
 
         if (!shouldSweep) {
-            return
+            return false
         }
 
         val reason = currentRiskState.haltReason ?: HARD_HALT_SWEEP_REASON
@@ -239,6 +241,8 @@ class ProtectionReconciler(
         }
 
         broker?.sweepHardHalt(reason, tickSnapshot)?.getOrThrow()
+
+        return true
     }
 
     private suspend fun recordStarted(): Result<Unit> {

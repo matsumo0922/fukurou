@@ -319,6 +319,32 @@ class ProtectionReconcilerTest {
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertEquals(2, repository.getExecutions().getOrThrow().size)
     }
+
+    @Test
+    fun reconcile_pass_cancels_open_entry_before_fill_when_hard_halt() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(restingReconcilerEntryCommand()).getOrThrow()
+        riskStateRepository.setHardHalt("test hard halt", fixedInstant()).getOrThrow()
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+
+        assertTrue(result.isSuccess)
+        assertEquals(0, broker.getPositions().getOrThrow().size)
+        assertEquals(0, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(0, repository.getExecutions().getOrThrow().size)
+    }
 }
 
 /**
@@ -531,6 +557,23 @@ private fun reconcilerEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderCo
         takeProfitPriceJpy = takeProfitPriceJpy,
         estimatedWinProbability = BigDecimal("0.95"),
         reasonJa = "test entry",
+        auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+private fun restingReconcilerEntryCommand(): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = java.util.UUID.randomUUID(),
+        symbol = TradingSymbol.BTC,
+        side = OrderSide.BUY,
+        orderType = OrderType.LIMIT,
+        sizeBtc = BigDecimal("0.0050"),
+        priceJpy = BigDecimal("10000000"),
+        tradeGroupId = null,
+        protectiveStopPriceJpy = BigDecimal("9700000"),
+        takeProfitPriceJpy = BigDecimal("12000000"),
+        estimatedWinProbability = BigDecimal("0.95"),
+        reasonJa = "test resting entry",
         auditContext = PaperTradeAuditContext.EMPTY,
     )
 }
