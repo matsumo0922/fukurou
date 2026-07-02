@@ -1,13 +1,16 @@
 # MCP runtime / Docker 配線メモ
 
-Step6 時点の `gmo-coin-mcp` runtime と Docker 配線の正本メモ。
+Step6 時点の `fukurou-mcp` runtime と Docker 配線の正本メモ。
 
 ## 現在の構成
 
 - `:mcp` は stdio server として `mcp/build/libs/fukurou-mcp-all.jar` を生成する。
-- Docker image には Ktor 用 `/app/app.jar` と MCP 用 `/app/fukurou-mcp-all.jar` を同梱する。
+- `:mcp-gmo-coin` は GMO Coin Public API の market read tools を提供する library module で、standalone 用に `mcp-gmo-coin/build/libs/gmo-coin-mcp-all.jar` も生成できる。
+- Docker image には Ktor 用 `/app/app.jar`、fukurou MCP 用 `/app/fukurou-mcp-all.jar`、standalone GMO Coin MCP 用 `/app/gmo-coin-mcp-all.jar` を同梱する。
 - container の entrypoint は Ktor のまま。daemon / CLI 実装時は、同一 image 内の MCP fat jar を `java -jar /app/fukurou-mcp-all.jar` で stdio 子プロセスとして起動する。
-- `:mcp` は tool schema、引数 parse、`:trading` への委譲だけを持つ。rate-limit / retry / error 分類は `:trading.exchange.gmo` の GMO Public client 境界で行う。
+- production runtime の MCP server process は `fukurou-mcp` 1 つだけ。`:mcp` は `:mcp-gmo-coin` の market tools を同一 `Server` に埋め込み、account / trade / test tools と一緒に公開する。
+- `:mcp-gmo-coin` は tool schema、引数 parse、`:trading` への委譲だけを持つ。rate-limit / retry / error 分類は `:trading.exchange.gmo` の GMO Public client 境界で行う。
+- fukurou 埋め込み時の短期足 kline request 予算は `GMO_MAX_DAILY_KLINE_REQUESTS` で強制する。standalone 起動時はこの fukurou 固有予算を注入しない。
 
 ## local smoke
 
@@ -15,6 +18,7 @@ MCP fat jar と stdio smoke:
 
 ```sh
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp:buildFatJar
+JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp-gmo-coin:buildFatJar
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp:smokeStdio
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp:timeoutStdio
 ```
@@ -25,7 +29,7 @@ Docker image に MCP fat jar が入ることの確認:
 
 ```sh
 docker build -t fukurou:step6 .
-docker run --rm --entrypoint /bin/sh fukurou:step6 -lc 'test -f /app/fukurou-mcp-all.jar'
+docker run --rm --entrypoint /bin/sh fukurou:step6 -lc 'test -f /app/fukurou-mcp-all.jar && test -f /app/gmo-coin-mcp-all.jar'
 ```
 
 CLI から stdio MCP を登録する場合の command / args:

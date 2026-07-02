@@ -84,7 +84,7 @@ run_claude_timeout_check() {
       --mcp-config "${REPO_ROOT}/.mcp.json" \
       --strict-mcp-config \
       --permission-mode dontAsk \
-      --allowedTools mcp__fukurou-gmo-coin-mcp__simulate_tool_timeout \
+      --allowedTools mcp__fukurou-mcp__simulate_tool_timeout \
       --verbose \
       --output-format stream-json \
       --no-session-persistence
@@ -100,9 +100,9 @@ run_codex_timeout_check() {
       --ignore-user-config \
       --sandbox read-only \
       -c "approval_policy=\"never\"" \
-      -c "mcp_servers.fukurou-gmo-coin-mcp.command=\"java\"" \
-      -c "mcp_servers.fukurou-gmo-coin-mcp.args=[\"-jar\",\"${JAR_PATH}\"]" \
-      "Use the fukurou-gmo-coin-mcp simulate_tool_timeout MCP tool with delay_ms=${SIMULATED_DELAY_MS}. Wait for the tool result before answering. Do not run shell commands and do not edit files."
+      -c "mcp_servers.fukurou-mcp.command=\"java\"" \
+      -c "mcp_servers.fukurou-mcp.args=[\"-jar\",\"${JAR_PATH}\"]" \
+      "Use the fukurou-mcp simulate_tool_timeout MCP tool with delay_ms=${SIMULATED_DELAY_MS}. Wait for the tool result before answering. Do not run shell commands and do not edit files."
 }
 
 main() {

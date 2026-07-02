@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "fukurou-gmo-coin-mcp": {
+    "fukurou-mcp": {
       "command": "java",
       "args": [
         "-jar",

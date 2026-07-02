@@ -6,11 +6,8 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
-import me.matsumo.fukurou.trading.exchange.gmo.GmoRateLimitConfig
-import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import java.math.BigDecimal
-import java.time.Duration
 
 /**
  * 取引 bot 全体で共有する typed config。
@@ -209,56 +206,6 @@ private const val FUKUROU_MAX_TAKER_FEE_RATIO_ENV = "FUKUROU_MAX_TAKER_FEE_RATIO
 private const val FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS_ENV = "FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS"
 
 /**
- * GMO Public API base URL の環境変数名。
- */
-private const val FUKUROU_GMO_PUBLIC_BASE_URL_ENV = "FUKUROU_GMO_PUBLIC_BASE_URL"
-
-/**
- * GMO Public API connect timeout ms の環境変数名。
- */
-private const val FUKUROU_GMO_CONNECT_TIMEOUT_MS_ENV = "FUKUROU_GMO_CONNECT_TIMEOUT_MS"
-
-/**
- * GMO Public API request timeout ms の環境変数名。
- */
-private const val FUKUROU_GMO_REQUEST_TIMEOUT_MS_ENV = "FUKUROU_GMO_REQUEST_TIMEOUT_MS"
-
-/**
- * GMO symbol rules cache TTL seconds の環境変数名。
- */
-private const val FUKUROU_GMO_SYMBOL_RULES_CACHE_TTL_SECONDS_ENV = "FUKUROU_GMO_SYMBOL_RULES_CACHE_TTL_SECONDS"
-
-/**
- * GMO Public REST per-second limit の環境変数名。
- */
-private const val FUKUROU_GMO_PUBLIC_REST_PER_SECOND_ENV = "FUKUROU_GMO_PUBLIC_REST_PER_SECOND"
-
-/**
- * GMO Public REST burst limit の環境変数名。
- */
-private const val FUKUROU_GMO_PUBLIC_REST_BURST_ENV = "FUKUROU_GMO_PUBLIC_REST_BURST"
-
-/**
- * GMO retry max attempts の環境変数名。
- */
-private const val FUKUROU_GMO_RETRY_MAX_ATTEMPTS_ENV = "FUKUROU_GMO_RETRY_MAX_ATTEMPTS"
-
-/**
- * GMO retry initial backoff ms の環境変数名。
- */
-private const val FUKUROU_GMO_RETRY_INITIAL_BACKOFF_MS_ENV = "FUKUROU_GMO_RETRY_INITIAL_BACKOFF_MS"
-
-/**
- * GMO retry max backoff ms の環境変数名。
- */
-private const val FUKUROU_GMO_RETRY_MAX_BACKOFF_MS_ENV = "FUKUROU_GMO_RETRY_MAX_BACKOFF_MS"
-
-/**
- * GMO retry backoff multiplier の環境変数名。
- */
-private const val FUKUROU_GMO_RETRY_BACKOFF_MULTIPLIER_ENV = "FUKUROU_GMO_RETRY_BACKOFF_MULTIPLIER"
-
-/**
  * paper 初期残高の既定値。
  */
 private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("100000")
@@ -372,78 +319,11 @@ private fun Map<String, String>.readSafetyFloorConfig(): SafetyFloorConfig {
 }
 
 private fun Map<String, String>.readGmoPublicClientConfig(): GmoPublicClientConfig {
-    val permitsPerSecond = readInt(
-        name = FUKUROU_GMO_PUBLIC_REST_PER_SECOND_ENV,
-        defaultValue = 10,
-    )
-    val burstSize = readInt(
-        name = FUKUROU_GMO_PUBLIC_REST_BURST_ENV,
-        defaultValue = permitsPerSecond,
-    )
-
-    return GmoPublicClientConfig(
-        baseUrl = readOptional(FUKUROU_GMO_PUBLIC_BASE_URL_ENV) ?: "https://api.coin.z.com/public",
-        connectTimeout = readDurationMillis(
-            name = FUKUROU_GMO_CONNECT_TIMEOUT_MS_ENV,
-            defaultValue = Duration.ofSeconds(5),
-        ),
-        requestTimeout = readDurationMillis(
-            name = FUKUROU_GMO_REQUEST_TIMEOUT_MS_ENV,
-            defaultValue = Duration.ofSeconds(10),
-        ),
-        symbolRulesCacheTtl = readDurationSeconds(
-            name = FUKUROU_GMO_SYMBOL_RULES_CACHE_TTL_SECONDS_ENV,
-            defaultValue = Duration.ofMinutes(10),
-        ),
-        rateLimit = GmoRateLimitConfig(
-            permitsPerSecond = permitsPerSecond,
-            burstSize = burstSize,
-        ),
-        retry = GmoRetryConfig(
-            maxAttempts = readInt(
-                name = FUKUROU_GMO_RETRY_MAX_ATTEMPTS_ENV,
-                defaultValue = 3,
-            ),
-            initialBackoff = readDurationMillis(
-                name = FUKUROU_GMO_RETRY_INITIAL_BACKOFF_MS_ENV,
-                defaultValue = Duration.ofMillis(200),
-            ),
-            maxBackoff = readDurationMillis(
-                name = FUKUROU_GMO_RETRY_MAX_BACKOFF_MS_ENV,
-                defaultValue = Duration.ofSeconds(2),
-            ),
-            backoffMultiplier = readLong(
-                name = FUKUROU_GMO_RETRY_BACKOFF_MULTIPLIER_ENV,
-                defaultValue = 2,
-            ),
-        ),
-    )
+    return GmoPublicClientConfig.fromEnvironment(this)
 }
 
 private fun Map<String, String>.readDecimal(name: String, defaultValue: BigDecimal): BigDecimal {
     return readOptional(name)?.toBigDecimal() ?: defaultValue
-}
-
-private fun Map<String, String>.readInt(name: String, defaultValue: Int): Int {
-    return readOptional(name)?.toInt() ?: defaultValue
-}
-
-private fun Map<String, String>.readLong(name: String, defaultValue: Long): Long {
-    return readOptional(name)?.toLong() ?: defaultValue
-}
-
-private fun Map<String, String>.readDurationMillis(name: String, defaultValue: Duration): Duration {
-    return readOptional(name)
-        ?.toLong()
-        ?.let { millis -> Duration.ofMillis(millis) }
-        ?: defaultValue
-}
-
-private fun Map<String, String>.readDurationSeconds(name: String, defaultValue: Duration): Duration {
-    return readOptional(name)
-        ?.toLong()
-        ?.let { seconds -> Duration.ofSeconds(seconds) }
-        ?: defaultValue
 }
 
 private fun Map<String, String>.readOptional(name: String): String? {
