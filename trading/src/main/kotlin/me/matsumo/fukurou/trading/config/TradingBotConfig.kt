@@ -95,6 +95,24 @@ data class PaperMarketConfig(
     val fallbackTakerFeeRate: BigDecimal = BigDecimal("0.0005"),
     val fallbackSpreadBps: BigDecimal = BigDecimal("2.0"),
 ) {
+    init {
+        require(fallbackMinOrderSize > BigDecimal.ZERO) {
+            "fallbackMinOrderSize must be greater than 0."
+        }
+        require(fallbackSizeStep > BigDecimal.ZERO) {
+            "fallbackSizeStep must be greater than 0."
+        }
+        require(fallbackTickSize > BigDecimal.ZERO) {
+            "fallbackTickSize must be greater than 0."
+        }
+        require(fallbackTakerFeeRate >= BigDecimal.ZERO) {
+            "fallbackTakerFeeRate must be greater than or equal to 0."
+        }
+        require(fallbackSpreadBps >= BigDecimal.ZERO) {
+            "fallbackSpreadBps must be greater than or equal to 0."
+        }
+    }
+
     /**
      * fallback 値を `SymbolRules` に変換する。
      */

@@ -114,7 +114,36 @@ data class SafetyFloorConfig(
     val minExpectedMoveToCostRatio: BigDecimal = DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO,
     val maxTakerFeeRatio: BigDecimal = DEFAULT_MAX_TAKER_FEE_RATIO,
     val marketSlippageReserveBps: BigDecimal = DEFAULT_MARKET_SLIPPAGE_RESERVE_BPS,
-)
+) {
+    init {
+        val maxRiskPerTradeInRange = maxRiskPerTradeRatio > BigDecimal.ZERO && maxRiskPerTradeRatio <= BigDecimal.ONE
+        val maxDrawdownInRange = maxDrawdownRatio >= MIN_DRAWDOWN_RATIO && maxDrawdownRatio < BigDecimal.ZERO
+        val maxTotalExposureInRange = maxTotalExposureRatio > BigDecimal.ZERO && maxTotalExposureRatio <= BigDecimal.ONE
+        val maxTakerFeeInRange = maxTakerFeeRatio >= BigDecimal.ZERO && maxTakerFeeRatio <= MAX_TAKER_FEE_CONFIG_RATIO
+
+        require(maxRiskPerTradeInRange) {
+            "maxRiskPerTradeRatio must be greater than 0 and less than or equal to 1."
+        }
+        require(maxDrawdownInRange) {
+            "maxDrawdownRatio must be greater than or equal to -1 and less than 0."
+        }
+        require(maxTotalExposureInRange) {
+            "maxTotalExposureRatio must be greater than 0 and less than or equal to 1."
+        }
+        require(minExpectedValueR >= BigDecimal.ZERO) {
+            "minExpectedValueR must be greater than or equal to 0."
+        }
+        require(minExpectedMoveToCostRatio > BigDecimal.ZERO) {
+            "minExpectedMoveToCostRatio must be greater than 0."
+        }
+        require(maxTakerFeeInRange) {
+            "maxTakerFeeRatio must be greater than or equal to 0 and less than or equal to 0.01."
+        }
+        require(marketSlippageReserveBps >= BigDecimal.ZERO) {
+            "marketSlippageReserveBps must be greater than or equal to 0."
+        }
+    }
+}
 
 /**
  * SafetyFloor 検証に必要な最新状態。
@@ -875,3 +904,13 @@ private val DEFAULT_MAX_TAKER_FEE_RATIO = BigDecimal("0.0010")
  * 片道 slippage reserve。
  */
 private val DEFAULT_MARKET_SLIPPAGE_RESERVE_BPS = BigDecimal("5")
+
+/**
+ * 設定として許容する drawdown 下限。
+ */
+private val MIN_DRAWDOWN_RATIO = BigDecimal("-1")
+
+/**
+ * 設定として許容する taker fee 上限。
+ */
+private val MAX_TAKER_FEE_CONFIG_RATIO = BigDecimal("0.01")

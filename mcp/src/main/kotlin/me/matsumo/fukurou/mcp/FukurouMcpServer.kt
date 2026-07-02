@@ -173,7 +173,12 @@ private const val SIMULATE_TOOL_TIMEOUT_TOOL = "simulate_tool_timeout"
 /**
  * MCP stdio smoke で DB なし in-memory runtime を明示許可する環境変数名。
  */
-private const val FUKUROU_MCP_IN_MEMORY_RUNTIME_ENV = "FUKUROU_MCP_IN_MEMORY_RUNTIME"
+private const val FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME_ENV = "FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME"
+
+/**
+ * MCP stdio smoke で DB なし in-memory runtime を明示許可する system property 名。
+ */
+private const val FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME_PROPERTY = "fukurou.mcp.testInMemoryRuntime"
 
 /**
  * JSON schema の string 型。
@@ -348,11 +353,7 @@ private fun defaultTradingRuntime(
     tradingConfig: TradingBotConfig,
     marketDataSource: MarketDataSource,
 ): TradingRuntime {
-    val useInMemoryRuntime = System.getenv(FUKUROU_MCP_IN_MEMORY_RUNTIME_ENV)
-        ?.toBooleanStrictOrNull()
-        ?: false
-
-    if (useInMemoryRuntime) {
+    if (useTestInMemoryRuntime()) {
         return TradingRuntimeFactory.inMemory(
             marketDataSource = marketDataSource,
             tradingConfig = tradingConfig,
@@ -363,6 +364,17 @@ private fun defaultTradingRuntime(
         marketDataSource = marketDataSource,
         tradingConfig = tradingConfig,
     )
+}
+
+private fun useTestInMemoryRuntime(): Boolean {
+    val environmentEnabled = System.getenv(FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME_ENV)
+        ?.toBooleanStrictOrNull()
+        ?: false
+    val propertyEnabled = System.getProperty(FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME_PROPERTY)
+        ?.toBooleanStrictOrNull()
+        ?: false
+
+    return environmentEnabled && propertyEnabled
 }
 
 private fun Server.registerPlaceOrderTool(

@@ -16,7 +16,13 @@ import java.util.UUID
  */
 data class PaperExecutionConfig(
     val marketSlippageBps: BigDecimal = DEFAULT_MARKET_SLIPPAGE_BPS,
-)
+) {
+    init {
+        require(marketSlippageBps >= BigDecimal.ZERO) {
+            "marketSlippageBps must be greater than or equal to 0."
+        }
+    }
+}
 
 /**
  * paper execution の価格・手数料を決定する simulator。

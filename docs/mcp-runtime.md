@@ -19,7 +19,7 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp:smokeStdio
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp:timeoutStdio
 ```
 
-`:mcp:smokeStdio` と `:mcp:timeoutStdio` は、子プロセスに `FUKUROU_MCP_IN_MEMORY_RUNTIME=true` を渡して DB なしの no-trade smoke として実行する。通常の MCP jar 起動ではこの env を付けず、DB env が欠けていれば fail closed する。
+`:mcp:smokeStdio` と `:mcp:timeoutStdio` は、子プロセスに `-Dfukurou.mcp.testInMemoryRuntime=true` と `FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME=true` を渡して DB なしの no-trade smoke として実行する。通常の MCP jar 起動ではこの二重 opt-in を付けず、DB env が欠けていれば fail closed する。
 
 Docker image に MCP fat jar が入ることの確認:
 

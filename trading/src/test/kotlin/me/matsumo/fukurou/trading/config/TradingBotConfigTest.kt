@@ -6,6 +6,7 @@ import java.math.BigDecimal
 import java.time.Duration
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 
 /**
  * TradingBotConfig の env override を検証するテスト。
@@ -76,5 +77,29 @@ class TradingBotConfigTest {
         assertEquals(Duration.ofMillis(50), config.gmoPublicClient.retry.initialBackoff)
         assertEquals(Duration.ofMillis(500), config.gmoPublicClient.retry.maxBackoff)
         assertEquals(3, config.gmoPublicClient.retry.backoffMultiplier)
+    }
+
+    @Test
+    fun fromEnvironment_rejectsUnsafeTradingOverrides() {
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_MARKET_SLIPPAGE_BPS" to "-1"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_FALLBACK_TAKER_FEE_RATE" to "-0.0001"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_MAX_RISK_PER_TRADE_RATIO" to "1.5"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_MIN_EXPECTED_VALUE_R" to "-0.01"),
+            )
+        }
     }
 }
