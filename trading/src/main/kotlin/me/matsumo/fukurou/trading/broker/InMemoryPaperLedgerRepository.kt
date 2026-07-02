@@ -556,6 +556,7 @@ private fun PlaceOrderCommand.toEntryOrder(
 ): Order {
     return Order(
         orderId = orderId.toString(),
+        intentId = intentId?.toString(),
         positionId = positionId?.toString(),
         tradeGroupId = tradeGroupId.toString(),
         symbol = symbol.apiSymbol,
@@ -579,6 +580,7 @@ private fun PlaceOrderCommand.toEntryOrder(
 private fun PlaceOrderCommand.toProtectiveStopOrder(orderId: UUID, positionId: UUID, tradeGroupId: UUID): Order {
     return Order(
         orderId = orderId.toString(),
+        intentId = null,
         positionId = positionId.toString(),
         tradeGroupId = tradeGroupId.toString(),
         symbol = symbol.apiSymbol,
@@ -626,6 +628,7 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
 
     return PlaceOrderCommand(
         commandId = UUID.fromString(orderId),
+        intentId = intentId?.let { value -> UUID.fromString(value) },
         symbol = TradingSymbol.BTC,
         side = side,
         orderType = orderType,
@@ -675,6 +678,7 @@ private fun SimulatedFill.toExecution(
 private fun closeOrder(orderId: UUID, position: Position, reasonJa: String): Order {
     return Order(
         orderId = orderId.toString(),
+        intentId = null,
         positionId = position.positionId,
         tradeGroupId = position.tradeGroupId,
         symbol = position.symbol,

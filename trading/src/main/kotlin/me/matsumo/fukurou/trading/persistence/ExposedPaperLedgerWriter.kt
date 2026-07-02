@@ -375,31 +375,34 @@ internal class ExposedPaperLedgerWriter(
         prepare(
             """
                 INSERT INTO orders (
-                    id, position_id, trade_group_id, mode, symbol, side, order_type, status,
+                    id, intent_id, position_id, trade_group_id, mode, symbol, side, order_type, status,
                     size_btc, limit_price_jpy, trigger_price_jpy, protective_stop_price_jpy,
                     take_profit_price_jpy, estimated_win_probability, reason_ja,
                     decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
                     system_prompt_version, market_snapshot_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
         ).use { statement ->
-            statement.bindOrderId(orderId, positionId, tradeGroupId)
-            statement.setString(4, TradingMode.PAPER.name)
-            statement.setString(5, command.symbol.apiSymbol)
-            statement.setString(6, command.side.name)
-            statement.setString(7, command.orderType.name)
-            statement.setString(8, status.name)
-            statement.setBigDecimal(9, command.sizeBtc.btcScale())
-            statement.setNullableBigDecimal(10, command.priceJpy.takeIf { command.orderType == OrderType.LIMIT }?.moneyScale())
-            statement.setNullableBigDecimal(11, command.priceJpy.takeIf { command.orderType == OrderType.STOP }?.moneyScale())
-            statement.setBigDecimal(12, command.protectiveStopPriceJpy.moneyScale())
-            statement.setNullableBigDecimal(13, command.takeProfitPriceJpy?.moneyScale())
-            statement.setBigDecimal(14, command.estimatedWinProbability.ratioScale())
-            statement.setString(15, command.reasonJa)
-            statement.bindAudit(16, command.auditContext)
-            statement.setLong(23, nowMillis())
+            statement.setObject(1, orderId)
+            statement.setObject(2, command.intentId)
+            statement.setObject(3, positionId)
+            statement.setObject(4, tradeGroupId)
+            statement.setString(5, TradingMode.PAPER.name)
+            statement.setString(6, command.symbol.apiSymbol)
+            statement.setString(7, command.side.name)
+            statement.setString(8, command.orderType.name)
+            statement.setString(9, status.name)
+            statement.setBigDecimal(10, command.sizeBtc.btcScale())
+            statement.setNullableBigDecimal(11, command.priceJpy.takeIf { command.orderType == OrderType.LIMIT }?.moneyScale())
+            statement.setNullableBigDecimal(12, command.priceJpy.takeIf { command.orderType == OrderType.STOP }?.moneyScale())
+            statement.setBigDecimal(13, command.protectiveStopPriceJpy.moneyScale())
+            statement.setNullableBigDecimal(14, command.takeProfitPriceJpy?.moneyScale())
+            statement.setBigDecimal(15, command.estimatedWinProbability.ratioScale())
+            statement.setString(16, command.reasonJa)
+            statement.bindAudit(17, command.auditContext)
             statement.setLong(24, nowMillis())
+            statement.setLong(25, nowMillis())
             statement.executeUpdate()
         }
     }
@@ -864,6 +867,7 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.fromString(orderId),
         symbol = TradingSymbol.BTC,
+        intentId = intentId?.let { value -> UUID.fromString(value) },
         side = side,
         orderType = orderType,
         sizeBtc = sizeBtc.toBigDecimal(),

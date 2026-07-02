@@ -139,6 +139,7 @@ private const val VERIFY_POSITIONS_SCHEMA_SQL = """
 private const val VERIFY_ORDERS_SCHEMA_SQL = """
     SELECT
         id,
+        intent_id,
         position_id,
         trade_group_id,
         mode,

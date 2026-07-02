@@ -264,6 +264,11 @@ object OrdersTable : Table("orders") {
     val id = uuid("id")
 
     /**
+     * entry intent ID。
+     */
+    val intentId = uuid("intent_id").nullable()
+
+    /**
      * 関連 position ID。
      */
     val positionId = uuid("position_id").nullable()

@@ -51,6 +51,7 @@ data class PaperTradeAuditContext(
  * paper entry 注文 command。
  *
  * @param commandId command ID
+ * @param intentId decision → falsification → order を結ぶ intent ID
  * @param symbol 取引対象 symbol
  * @param side 注文 side
  * @param orderType 注文種別
@@ -65,6 +66,7 @@ data class PaperTradeAuditContext(
  */
 data class PlaceOrderCommand(
     val commandId: UUID,
+    val intentId: UUID? = null,
     val symbol: TradingSymbol,
     val side: OrderSide,
     val orderType: OrderType,

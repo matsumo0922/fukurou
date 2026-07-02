@@ -91,6 +91,7 @@ private const val SELECT_OPEN_POSITIONS_SQL = """
 private const val SELECT_OPEN_ORDERS_SQL = """
     SELECT
         id,
+        intent_id,
         position_id,
         trade_group_id,
         mode,
@@ -124,6 +125,7 @@ private const val SELECT_OPEN_ORDERS_SQL = """
 private const val SELECT_ORDERS_BY_CLIENT_REQUEST_ID_SQL = """
     SELECT
         id,
+        intent_id,
         position_id,
         trade_group_id,
         mode,
@@ -157,6 +159,7 @@ private const val SELECT_ORDERS_BY_CLIENT_REQUEST_ID_SQL = """
 private const val SELECT_ORDERS_BY_TRADE_GROUP_ID_SQL = """
     SELECT
         id,
+        intent_id,
         position_id,
         trade_group_id,
         mode,
@@ -606,6 +609,7 @@ private fun ResultSet.toPosition(): Position {
 private fun ResultSet.toOrder(): Order {
     return Order(
         orderId = getUuid("id").toString(),
+        intentId = getNullableUuid("intent_id")?.toString(),
         positionId = getNullableUuid("position_id")?.toString(),
         tradeGroupId = getNullableUuid("trade_group_id")?.toString(),
         symbol = getString("symbol"),
