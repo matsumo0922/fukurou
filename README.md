@@ -5,7 +5,7 @@
 ## コンセプト
 
 - コードは最低限の「安全床」だけを強制し、判断は LLM に広い裁量を与える
-- 売買能力は自作 MCP サーバー（`gmo-coin-mcp`）としてツール提供し、LLM がツール呼び出しで取引する
+- 売買能力は自作 MCP サーバー（`fukurou-mcp`）としてツール提供し、LLM がツール呼び出しで取引する
 - LLM は CLI（`claude` / `codex`）シェルアウトで実行（サブスク利用）
 - 取引ログは SQLite（機械の真実）＋ Obsidian（人間の知識）の二本立て。振り返りエージェントが知識を育てる
 
@@ -26,7 +26,7 @@ Kotlin/JVM ・ Ktor ・ Exposed ・ PostgreSQL ・ Docker Compose ・ MCP 公式
 
 **Step6（堅牢化 / config / Docker MCP 配線）まで実装済み。** 詳細設計は [`docs/design.md`](docs/design.md)、MCP runtime と Docker 手順は [`docs/mcp-runtime.md`](docs/mcp-runtime.md) を参照。
 
-現時点では、`:trading` の paper account / broker / safety / reconciler / GMO Public market data、`:mcp` の stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 `ProtectionReconciler` worker が実装済みです。daemon scheduler、LlmInvoker 本実装、Falsifier、`decision.submit_decision` 本実装、live 実発注はまだ実装していません。
+現時点では、`:trading` の paper account / broker / safety / reconciler / GMO Public market data、`:mcp-gmo-coin` の GMO Public market tools、`:mcp` の fukurou stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 `ProtectionReconciler` worker が実装済みです。daemon scheduler、LlmInvoker 本実装、Falsifier、`decision.submit_decision` 本実装、live 実発注はまだ実装していません。
 
 ## Backend scaffold
 

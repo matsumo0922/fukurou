@@ -61,7 +61,7 @@ claude -p 'MCP tool get_ticker を必ず使って BTC の ticker を取得し、
   --mcp-config .mcp.json \
   --strict-mcp-config \
   --permission-mode dontAsk \
-  --allowedTools mcp__fukurou-gmo-coin-mcp__get_ticker \
+  --allowedTools mcp__fukurou-mcp__get_ticker \
   --output-format json \
   --no-session-persistence
 ```
@@ -69,7 +69,7 @@ claude -p 'MCP tool get_ticker を必ず使って BTC の ticker を取得し、
 結果:
 
 - 成功。
-- `--permission-mode dontAsk` と `--allowedTools mcp__fukurou-gmo-coin-mcp__get_ticker` で approval prompt なしに `get_ticker` が呼ばれた。
+- `--permission-mode dontAsk` と `--allowedTools mcp__fukurou-mcp__get_ticker` で approval prompt なしに `get_ticker` が呼ばれた。
 - 出力例: `symbol=BTC last=9747365 bid=9742999 ask=9746000 timestamp=2026-07-01T16:46:28.403Z`
 
 判断:
@@ -86,16 +86,16 @@ codex exec \
   --ignore-user-config \
   --sandbox read-only \
   -c 'approval_policy="never"' \
-  -c 'mcp_servers.fukurou-gmo-coin-mcp.command="java"' \
-  -c 'mcp_servers.fukurou-gmo-coin-mcp.args=["-jar","<repo>/mcp/build/libs/fukurou-mcp-all.jar"]' \
-  'Use the fukurou-gmo-coin-mcp get_ticker MCP tool to fetch BTC ticker. Then answer with only symbol, last, bid, ask, timestamp. Do not run shell commands and do not edit files.'
+  -c 'mcp_servers.fukurou-mcp.command="java"' \
+  -c 'mcp_servers.fukurou-mcp.args=["-jar","<repo>/mcp/build/libs/fukurou-mcp-all.jar"]' \
+  'Use the fukurou-mcp get_ticker MCP tool to fetch BTC ticker. Then answer with only symbol, last, bid, ask, timestamp. Do not run shell commands and do not edit files.'
 ```
 
 結果:
 
 - 成功。
-- `mcp: fukurou-gmo-coin-mcp/get_ticker started`
-- `mcp: fukurou-gmo-coin-mcp/get_ticker (completed)`
+- `mcp: fukurou-mcp/get_ticker started`
+- `mcp: fukurou-mcp/get_ticker (completed)`
 - 出力例: `BTC, 9755244, 9749911, 9750600, 2026-07-01T16:34:53.755Z`
 
 ## Codex dummy trade reject
@@ -105,9 +105,9 @@ codex exec \
   --ignore-user-config \
   --sandbox read-only \
   -c 'approval_policy="never"' \
-  -c 'mcp_servers.fukurou-gmo-coin-mcp.command="java"' \
-  -c 'mcp_servers.fukurou-gmo-coin-mcp.args=["-jar","<repo>/mcp/build/libs/fukurou-mcp-all.jar"]' \
-  'Call the fukurou-gmo-coin-mcp reject_dummy_trade MCP tool with reason="headless reject check". Report whether it was rejected. Do not run shell commands and do not edit files.'
+  -c 'mcp_servers.fukurou-mcp.command="java"' \
+  -c 'mcp_servers.fukurou-mcp.args=["-jar","<repo>/mcp/build/libs/fukurou-mcp-all.jar"]' \
+  'Call the fukurou-mcp reject_dummy_trade MCP tool with reason="headless reject check". Report whether it was rejected. Do not run shell commands and do not edit files.'
 ```
 
 結果:
@@ -123,7 +123,7 @@ claude -p 'reject_dummy_trade MCP tool を reason="headless reject check" で呼
   --mcp-config .mcp.json \
   --strict-mcp-config \
   --permission-mode dontAsk \
-  --allowedTools mcp__fukurou-gmo-coin-mcp__reject_dummy_trade \
+  --allowedTools mcp__fukurou-mcp__reject_dummy_trade \
   --output-format json \
   --no-session-persistence
 ```
@@ -151,9 +151,9 @@ codex exec \
   --ignore-user-config \
   --sandbox read-only \
   -c 'approval_policy="never"' \
-  -c 'mcp_servers.fukurou-gmo-coin-mcp.command="java"' \
-  -c 'mcp_servers.fukurou-gmo-coin-mcp.args=["-jar","/tmp/fukurou-missing-mcp.jar"]' \
-  'Try to call fukurou-gmo-coin-mcp get_ticker for BTC. If the MCP server is unavailable, say unavailable and do not use any other tools.'
+  -c 'mcp_servers.fukurou-mcp.command="java"' \
+  -c 'mcp_servers.fukurou-mcp.args=["-jar","/tmp/fukurou-missing-mcp.jar"]' \
+  'Try to call fukurou-mcp get_ticker for BTC. If the MCP server is unavailable, say unavailable and do not use any other tools.'
 ```
 
 結果:
@@ -164,11 +164,11 @@ codex exec \
 Claude headless でも missing jar を指定して実行した。
 
 ```sh
-claude -p 'fukurou-gmo-coin-mcp の get_ticker を使ってみて。MCP server が利用できなければ unavailable とだけ答えて。' \
-  --mcp-config '{"mcpServers":{"fukurou-gmo-coin-mcp":{"command":"java","args":["-jar","/tmp/fukurou-missing-mcp.jar"]}}}' \
+claude -p 'fukurou-mcp の get_ticker を使ってみて。MCP server が利用できなければ unavailable とだけ答えて。' \
+  --mcp-config '{"mcpServers":{"fukurou-mcp":{"command":"java","args":["-jar","/tmp/fukurou-missing-mcp.jar"]}}}' \
   --strict-mcp-config \
   --permission-mode dontAsk \
-  --allowedTools mcp__fukurou-gmo-coin-mcp__get_ticker \
+  --allowedTools mcp__fukurou-mcp__get_ticker \
   --output-format json \
   --no-session-persistence
 ```

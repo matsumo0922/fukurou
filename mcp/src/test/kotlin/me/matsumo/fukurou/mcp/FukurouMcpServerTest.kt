@@ -36,6 +36,36 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun createServer_exposesGmoCoinAndFukurouToolsOnSingleServer() {
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        ).createServer()
+
+        assertEquals(
+            setOf(
+                "get_ticker",
+                "get_candles",
+                "get_orderbook",
+                "get_trades",
+                "get_symbol_rules",
+                "calc_indicator",
+                "get_balance",
+                "get_positions",
+                "get_open_orders",
+                "get_account_status",
+                "place_order",
+                "close_position",
+                "update_protection",
+                "cancel_order",
+                "reject_dummy_trade",
+                "simulate_tool_timeout",
+            ),
+            server.tools.keys,
+        )
+    }
+
+    @Test
     fun tradingRuntimeFactory_failsClosedWhenDatabaseEnvironmentIsMissing() {
         assertFailsWith<IllegalArgumentException> {
             TradingRuntimeFactory.fromEnvironment(environment = emptyMap())

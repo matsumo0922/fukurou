@@ -230,6 +230,55 @@ class GmoPublicMarketDataSourceTest {
     }
 
     @Test
+    fun getCandles_stopsAtInjectedDailyKlineRequestBudget() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf(
+                "symbol=BTC&interval=1hour&date=20260102" to klineResponse("2026-01-02T00:00:00Z"),
+                "symbol=BTC&interval=1hour&date=20260101" to klineResponse("2026-01-01T00:00:00Z"),
+            ),
+        )
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            dailyKlineRequestBudget = GmoFixedDailyKlineRequestBudget(maxRequests = 1),
+        )
+
+        val candles = marketDataSource.getCandles(TradingSymbol.BTC, CandleInterval.ONE_HOUR, limit = 2).getOrThrow()
+
+        assertEquals(listOf("symbol=BTC&interval=1hour&date=20260102"), httpClient.requestQueries)
+        assertEquals(listOf("2026-01-02T00:00:00Z"), candles.map { candle -> candle.openTime })
+    }
+
+    @Test
+    fun getCandles_allowsUnlimitedDailyKlineRequestBudget() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf(
+                "symbol=BTC&interval=1hour&date=20260102" to klineResponse("2026-01-02T00:00:00Z"),
+                "symbol=BTC&interval=1hour&date=20260101" to klineResponse("2026-01-01T00:00:00Z"),
+                "symbol=BTC&interval=1hour&date=20251231" to klineResponse("2025-12-31T00:00:00Z"),
+            ),
+        )
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            dailyKlineRequestBudget = GmoUnlimitedDailyKlineRequestBudget,
+        )
+
+        val candles = marketDataSource.getCandles(TradingSymbol.BTC, CandleInterval.ONE_HOUR, limit = 3).getOrThrow()
+
+        assertEquals(
+            listOf(
+                "symbol=BTC&interval=1hour&date=20260102",
+                "symbol=BTC&interval=1hour&date=20260101",
+                "symbol=BTC&interval=1hour&date=20251231",
+            ),
+            httpClient.requestQueries,
+        )
+        assertEquals(
+            listOf("2025-12-31T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+            candles.map { candle -> candle.openTime },
+        )
+    }
+
+    @Test
     fun getCandles_fetchesPreviousYearForYearRangeIntervals() = runBlocking {
         val httpClient = FakeHttpClient(
             responses = mapOf(
@@ -566,6 +615,9 @@ private fun fakeMarketDataSource(
     clock: Clock = Clock.fixed(Instant.parse("2026-01-02T00:00:00Z"), ZoneOffset.UTC),
     requestRateLimiter: GmoRequestRateLimiter = NoopGmoRequestRateLimiter,
     retryConfig: GmoRetryConfig = GmoRetryConfig(),
+    dailyKlineRequestBudget: GmoDailyKlineRequestBudget = GmoFixedDailyKlineRequestBudget(
+        maxRequests = GMO_MAX_DAILY_KLINE_REQUESTS,
+    ),
     sleeper: GmoSleeper = RecordingSleeper(),
 ): GmoPublicMarketDataSource {
     return GmoPublicMarketDataSource(
@@ -575,6 +627,7 @@ private fun fakeMarketDataSource(
         symbolRulesCacheTtl = Duration.ofMinutes(10),
         requestRateLimiter = requestRateLimiter,
         retryConfig = retryConfig,
+        dailyKlineRequestBudget = dailyKlineRequestBudget,
         sleeper = sleeper,
     )
 }

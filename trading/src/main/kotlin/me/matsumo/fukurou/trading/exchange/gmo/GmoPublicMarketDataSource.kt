@@ -124,7 +124,7 @@ private const val MAX_ORDERBOOK_DEPTH = 100
 private const val MAX_CANDLE_LIMIT = 500
 
 /**
- * 短期足 stitching で 1 回の呼び出し中に許可する最大 request 数。
+ * fukurou 埋め込み時に短期足 stitching で 1 回の呼び出し中に許可する最大 request 数。
  */
 const val GMO_MAX_DAILY_KLINE_REQUESTS = 7
 
@@ -182,6 +182,7 @@ private val GmoMarketZone = ZoneId.of("Asia/Tokyo")
  * @param rateLimitConfig Public REST の token bucket 設定
  * @param retryConfig 一時的な失敗に対する retry 設定
  * @param requestRateLimiter request 前に呼び出す rate limiter
+ * @param dailyKlineRequestBudget 短期足 stitching の request 予算
  * @param sleeper retry / rate-limit 待機に使う sleeper
  */
 class GmoPublicMarketDataSource(
@@ -200,6 +201,9 @@ class GmoPublicMarketDataSource(
     private val requestRateLimiter: GmoRequestRateLimiter = GmoTokenBucketRateLimiter(
         config = rateLimitConfig,
         clock = clock,
+    ),
+    private val dailyKlineRequestBudget: GmoDailyKlineRequestBudget = GmoFixedDailyKlineRequestBudget(
+        maxRequests = GMO_MAX_DAILY_KLINE_REQUESTS,
     ),
     private val sleeper: GmoSleeper = ThreadSleepingGmoSleeper,
 ) : MarketDataSource {
@@ -412,7 +416,7 @@ class GmoPublicMarketDataSource(
         requestCount: Int,
     ): Boolean {
         val needsMoreCandles = candles.size < limit
-        val canRequestMore = requestCount < GMO_MAX_DAILY_KLINE_REQUESTS
+        val canRequestMore = dailyKlineRequestBudget.canRequestMore(requestCount)
 
         return needsMoreCandles && canRequestMore
     }
@@ -481,6 +485,9 @@ class GmoPublicMarketDataSource(
         fun fromConfig(
             config: GmoPublicClientConfig,
             clock: Clock = Clock.systemUTC(),
+            dailyKlineRequestBudget: GmoDailyKlineRequestBudget = GmoFixedDailyKlineRequestBudget(
+                maxRequests = GMO_MAX_DAILY_KLINE_REQUESTS,
+            ),
         ): GmoPublicMarketDataSource {
             return GmoPublicMarketDataSource(
                 connectTimeout = config.connectTimeout,
@@ -490,8 +497,47 @@ class GmoPublicMarketDataSource(
                 symbolRulesCacheTtl = config.symbolRulesCacheTtl,
                 rateLimitConfig = config.rateLimit,
                 retryConfig = config.retry,
+                dailyKlineRequestBudget = dailyKlineRequestBudget,
             )
         }
+    }
+}
+
+/**
+ * 短期足 stitching の日次 kline request 予算。
+ */
+interface GmoDailyKlineRequestBudget {
+    /**
+     * 次の kline request を許可するかを返す。
+     */
+    fun canRequestMore(requestCount: Int): Boolean
+}
+
+/**
+ * 上限なしで短期足 stitching の kline request を許可する予算。
+ */
+object GmoUnlimitedDailyKlineRequestBudget : GmoDailyKlineRequestBudget {
+    override fun canRequestMore(requestCount: Int): Boolean {
+        return true
+    }
+}
+
+/**
+ * 固定回数まで短期足 stitching の kline request を許可する予算。
+ *
+ * @param maxRequests 許可する最大 request 数
+ */
+data class GmoFixedDailyKlineRequestBudget(
+    val maxRequests: Int,
+) : GmoDailyKlineRequestBudget {
+    init {
+        require(maxRequests >= 0) {
+            "maxRequests must be non-negative: $maxRequests"
+        }
+    }
+
+    override fun canRequestMore(requestCount: Int): Boolean {
+        return requestCount < maxRequests
     }
 }
 
