@@ -3,6 +3,7 @@ package me.matsumo.fukurou.mcp
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import kotlin.test.Test
 import kotlin.test.assertNotNull
 
@@ -13,7 +14,10 @@ class FukurouMcpServerTest {
 
     @Test
     fun constructor_acceptsInjectedMarketDataSource() {
-        val server = FukurouMcpServer(FakeMarketDataSource)
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        )
 
         assertNotNull(server)
     }

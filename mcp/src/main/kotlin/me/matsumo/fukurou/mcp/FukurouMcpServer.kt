@@ -30,10 +30,20 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
+import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.risk.AccountStatus
+import me.matsumo.fukurou.trading.risk.AccountStatusService
+import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
+import me.matsumo.fukurou.trading.runtime.TradingRuntime
+import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import me.matsumo.fukurou.trading.tool.GuardedToolCall
+import me.matsumo.fukurou.trading.tool.NoTradeExitException
+import me.matsumo.fukurou.trading.tool.ToolCallGuard
+import java.util.UUID
 
 /**
  * MCP server 名。
@@ -49,6 +59,11 @@ private const val MCP_SERVER_VERSION = "0.1.0"
  * ticker 取得 tool 名。
  */
 private const val GET_TICKER_TOOL = "get_ticker"
+
+/**
+ * account status 取得 tool 名。
+ */
+private const val GET_ACCOUNT_STATUS_TOOL = "get_account_status"
 
 /**
  * trade 風 dummy 拒否 tool 名。
@@ -107,6 +122,8 @@ fun main() {
  */
 class FukurouMcpServer(
     private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource(),
+    private val tradingRuntime: TradingRuntime = TradingRuntimeFactory.fromEnvironmentOrInMemory(),
+    private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
 ) {
 
     /**
@@ -125,13 +142,17 @@ class FukurouMcpServer(
         }
 
         runBlocking {
-            val session = server.createSession(transport)
-            val done = Job()
-            session.onClose {
-                done.complete()
+            try {
+                val session = server.createSession(transport)
+                val done = Job()
+                session.onClose {
+                    done.complete()
+                }
+                done.join()
+            } finally {
+                transportScope.cancel()
+                tradingRuntime.close()
             }
-            done.join()
-            transportScope.cancel()
         }
     }
 
@@ -148,15 +169,20 @@ class FukurouMcpServer(
             ),
         )
 
-        server.registerTickerTool(marketDataSource)
-        server.registerRejectDummyTradeTool()
-        server.registerSimulateToolTimeoutTool()
+        server.registerTickerTool(marketDataSource, tradingRuntime.toolCallGuard, decisionRunContext)
+        server.registerAccountStatusTool(tradingRuntime, decisionRunContext)
+        server.registerRejectDummyTradeTool(tradingRuntime.toolCallGuard, decisionRunContext)
+        server.registerSimulateToolTimeoutTool(tradingRuntime.toolCallGuard, decisionRunContext)
 
         return server
     }
 }
 
-private fun Server.registerTickerTool(marketDataSource: MarketDataSource) {
+private fun Server.registerTickerTool(
+    marketDataSource: MarketDataSource,
+    toolCallGuard: ToolCallGuard,
+    decisionRunContext: DecisionRunContext,
+) {
     addTool(
         name = GET_TICKER_TOOL,
         description = "Get the latest GMO Coin public ticker for BTC spot.",
@@ -171,11 +197,28 @@ private fun Server.registerTickerTool(marketDataSource: MarketDataSource) {
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
-        handleGetTicker(request, marketDataSource)
+        handleGetTicker(request, marketDataSource, toolCallGuard, decisionRunContext)
     }
 }
 
-private fun Server.registerRejectDummyTradeTool() {
+private fun Server.registerAccountStatusTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+) {
+    addTool(
+        name = GET_ACCOUNT_STATUS_TOOL,
+        description = "Get paper account status and DB-backed risk_state.",
+        inputSchema = ToolSchema(),
+        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+    ) { request ->
+        handleGetAccountStatus(request, tradingRuntime, decisionRunContext)
+    }
+}
+
+private fun Server.registerRejectDummyTradeTool(
+    toolCallGuard: ToolCallGuard,
+    decisionRunContext: DecisionRunContext,
+) {
     addTool(
         name = REJECT_DUMMY_TRADE_TOOL,
         description = "Reject-only dummy trade tool for headless approval and no-trade safety checks.",
@@ -189,19 +232,15 @@ private fun Server.registerRejectDummyTradeTool() {
             required = listOf("reason"),
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-    ) {
-        CallToolResult(
-            content = listOf(TextContent("Rejected: Step1 dummy trade never performs side effects.")),
-            structuredContent = buildJsonObject {
-                put("accepted", false)
-                put("reason", "Step1 dummy trade is reject-only.")
-            },
-            isError = true,
-        )
+    ) { request ->
+        handleRejectDummyTrade(request, toolCallGuard, decisionRunContext)
     }
 }
 
-private fun Server.registerSimulateToolTimeoutTool() {
+private fun Server.registerSimulateToolTimeoutTool(
+    toolCallGuard: ToolCallGuard,
+    decisionRunContext: DecisionRunContext,
+) {
     addTool(
         name = SIMULATE_TOOL_TIMEOUT_TOOL,
         description = "Sleep without side effects so headless callers can verify timeout handling ends in no-trade.",
@@ -218,32 +257,101 @@ private fun Server.registerSimulateToolTimeoutTool() {
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
     ) { request ->
-        handleSimulateToolTimeout(request)
+        handleSimulateToolTimeout(request, toolCallGuard, decisionRunContext)
     }
 }
 
-private suspend fun handleGetTicker(request: CallToolRequest, marketDataSource: MarketDataSource): CallToolResult {
-    val symbol = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull)
-        .getOrElse { throwable -> return errorResult("invalid_symbol", throwable.message.orEmpty()) }
-    val ticker = marketDataSource.getTicker(symbol)
-        .getOrElse { throwable -> return errorResult("gmo_public_error", throwable.message.orEmpty()) }
+private suspend fun handleGetTicker(
+    request: CallToolRequest,
+    marketDataSource: MarketDataSource,
+    toolCallGuard: ToolCallGuard,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(GET_TICKER_TOOL, decisionRunContext)
+    val ticker = toolCallGuard.runReadOnlyTool(call) {
+        val symbol = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull).getOrThrow()
 
-    return tickerResult(ticker)
+        marketDataSource.getTicker(symbol).getOrThrow()
+    }
+
+    return ticker.fold(
+        onSuccess = { value -> tickerResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
 }
 
-private suspend fun handleSimulateToolTimeout(request: CallToolRequest): CallToolResult {
-    val delayMs = parseDelayMs(request)
-        .getOrElse { throwable -> return errorResult("invalid_delay_ms", throwable.message.orEmpty()) }
+private suspend fun handleGetAccountStatus(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(GET_ACCOUNT_STATUS_TOOL, decisionRunContext)
+    val accountStatus = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
+        AccountStatusService(tradingRuntime.riskStateRepository).getAccountStatus().getOrThrow()
+    }
 
-    delay(delayMs)
+    return accountStatus.fold(
+        onSuccess = { value -> accountStatusResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
 
-    return CallToolResult(
-        content = listOf(TextContent("Completed simulated wait without side effects.")),
-        structuredContent = buildJsonObject {
-            put("completed", true)
-            put("delay_ms", delayMs)
-            put("side_effects", false)
-        },
+private suspend fun handleRejectDummyTrade(
+    request: CallToolRequest,
+    toolCallGuard: ToolCallGuard,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(REJECT_DUMMY_TRADE_TOOL, decisionRunContext)
+    val rejected = toolCallGuard.runTradeTool(call) {
+        val reason = parseReason(request).getOrThrow()
+
+        throw NoTradeExitException("Step1 dummy trade is reject-only: $reason")
+    }
+
+    return rejected.fold(
+        onSuccess = { value -> value },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
+private suspend fun handleSimulateToolTimeout(
+    request: CallToolRequest,
+    toolCallGuard: ToolCallGuard,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(SIMULATE_TOOL_TIMEOUT_TOOL, decisionRunContext)
+    val result = toolCallGuard.runReadOnlyTool(call) {
+        val delayMs = parseDelayMs(request).getOrThrow()
+
+        delay(delayMs)
+
+        CallToolResult(
+            content = listOf(TextContent("Completed simulated wait without side effects.")),
+            structuredContent = buildJsonObject {
+                put("completed", true)
+                put("delay_ms", delayMs)
+                put("side_effects", false)
+            },
+        )
+    }
+
+    return result.getOrElse { throwable -> throwableResult(throwable) }
+}
+
+private fun toolCallGuard(tradingRuntime: TradingRuntime): ToolCallGuard {
+    return tradingRuntime.toolCallGuard
+}
+
+private fun CallToolRequest.toGuardedToolCall(
+    toolName: String,
+    decisionRunContext: DecisionRunContext,
+): GuardedToolCall {
+    return GuardedToolCall(
+        toolName = toolName,
+        toolCallId = UUID.randomUUID().toString(),
+        clientRequestId = arguments?.get("client_request_id")?.jsonPrimitive?.contentOrNull,
+        decisionRunContext = decisionRunContext,
+        payload = arguments?.toString() ?: "{}",
     )
 }
 
@@ -259,6 +367,22 @@ private fun parseTradingSymbol(rawSymbol: String?): Result<TradingSymbol> {
         }
 
         TradingSymbol.BTC
+    }
+}
+
+private fun parseReason(request: CallToolRequest): Result<String> {
+    return runCatching {
+        val reason = request.arguments
+            ?.get("reason")
+            ?.jsonPrimitive
+            ?.contentOrNull
+            .orEmpty()
+
+        require(reason.isNotBlank()) {
+            "reason is required."
+        }
+
+        reason
     }
 }
 
@@ -287,6 +411,26 @@ private fun tickerResult(ticker: Ticker): CallToolResult {
         content = listOf(TextContent(ToolJson.encodeToString(ticker))),
         structuredContent = structuredContent,
     )
+}
+
+private fun accountStatusResult(accountStatus: AccountStatus): CallToolResult {
+    val structuredContent = ToolJson.encodeToJsonElement(accountStatus).jsonObject
+
+    return CallToolResult(
+        content = listOf(TextContent(ToolJson.encodeToString(accountStatus))),
+        structuredContent = structuredContent,
+    )
+}
+
+private fun throwableResult(throwable: Throwable): CallToolResult {
+    val type = when (throwable) {
+        is HardHaltTradingRejectedException -> "hard_halt"
+        is NoTradeExitException -> "no_trade"
+        is IllegalArgumentException -> "invalid_request"
+        else -> "tool_call_failed"
+    }
+
+    return errorResult(type, throwable.message.orEmpty())
 }
 
 private fun errorResult(type: String, message: String): CallToolResult {
