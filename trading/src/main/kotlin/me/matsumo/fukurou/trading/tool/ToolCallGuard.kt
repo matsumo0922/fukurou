@@ -81,6 +81,21 @@ class ToolCallGuard(
     }
 
     /**
+     * decision 系 tool を global lock と audit の内側で実行する。HARD_HALT 中も decision 記録は通す。
+     */
+    suspend fun <T> runDecisionTool(call: GuardedToolCall, block: suspend () -> T): Result<T> {
+        return try {
+            tradingLock.withLock(call.toolName) {
+                runAndAudit(call, block)
+            }
+        } catch (throwable: SQLTimeoutException) {
+            val auditResult = recordNoTradeExitNonCancellable(call, "trading_lock_unavailable", throwable)
+
+            Result.failure(throwable.withSuppressedFailure(auditResult))
+        }
+    }
+
+    /**
      * 失敗時に no-trade 終了を audit へ記録する。
      */
     suspend fun recordNoTradeExit(
