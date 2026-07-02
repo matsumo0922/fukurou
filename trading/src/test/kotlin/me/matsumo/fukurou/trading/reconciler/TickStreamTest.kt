@@ -1,7 +1,12 @@
 package me.matsumo.fukurou.trading.reconciler
 
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.domain.Candle
+import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.RecentTrade
+import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -29,7 +34,7 @@ class TickStreamTest {
 
         requireNotNull(tickSnapshot)
         assertEquals(1, marketDataSource.tickerCallCount)
-        assertEquals(1, marketDataSource.recentTradesCallCount)
+        assertEquals(1, marketDataSource.tradesCallCount)
         assertEquals("BTC", tickSnapshot.symbol)
         assertEquals("100", tickSnapshot.lastPrice)
         assertEquals(2, tickSnapshot.recentTradeCount)
@@ -49,9 +54,9 @@ private class RecordingMarketDataSource : MarketDataSource {
         private set
 
     /**
-     * recent trades 呼び出し回数。
+     * trades 呼び出し回数。
      */
-    var recentTradesCallCount: Int = 0
+    var tradesCallCount: Int = 0
         private set
 
     override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
@@ -71,13 +76,50 @@ private class RecordingMarketDataSource : MarketDataSource {
         )
     }
 
-    override suspend fun getRecentTrades(symbol: TradingSymbol): Result<List<RecentTrade>> {
-        recentTradesCallCount += 1
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun getOrderbook(
+        symbol: TradingSymbol,
+        depth: Int,
+    ): Result<Orderbook> {
+        return Result.success(
+            Orderbook(
+                symbol = symbol.apiSymbol,
+                bids = listOf(OrderbookLevel("99", "0.1")),
+                asks = listOf(OrderbookLevel("101", "0.1")),
+            ),
+        )
+    }
+
+    override suspend fun getTrades(
+        symbol: TradingSymbol,
+        limit: Int,
+    ): Result<List<RecentTrade>> {
+        tradesCallCount += 1
 
         return Result.success(
             listOf(
                 createRecentTrade(symbol, "100"),
                 createRecentTrade(symbol, "101"),
+            ),
+        )
+    }
+
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
+        return Result.success(
+            SymbolRules(
+                symbol = symbol.apiSymbol,
+                minOrderSize = "0.0001",
+                sizeStep = "0.0001",
+                tickSize = "1",
+                takerFee = "0.0005",
+                makerFee = "-0.0001",
             ),
         )
     }

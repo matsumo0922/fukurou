@@ -46,7 +46,7 @@ class RestPollingTickStream(
     override suspend fun latestTick(): Result<TickSnapshot?> {
         return runCatching {
             val ticker = marketDataSource.getTicker(symbol).getOrThrow()
-            val recentTrades = marketDataSource.getRecentTrades(symbol).getOrThrow()
+            val recentTrades = marketDataSource.getTrades(symbol, RECENT_TRADES_LIMIT).getOrThrow()
 
             TickSnapshot(
                 symbol = symbol.apiSymbol,
@@ -57,6 +57,11 @@ class RestPollingTickStream(
         }
     }
 }
+
+/**
+ * reconciler freshness 確認で取得する直近約定数。
+ */
+private const val RECENT_TRADES_LIMIT = 100
 
 /**
  * test と明示 local injection 用の空 TickStream。
