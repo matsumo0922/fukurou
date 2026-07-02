@@ -9,8 +9,25 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import java.sql.SQLTimeoutException
 import java.time.Clock
 import java.time.Instant
+
+/**
+ * tool 本体は完了したが完了監査の保存に失敗したことを表す例外。
+ *
+ * @param toolName 監査保存に失敗した tool 名
+ * @param cause 監査保存失敗の原因
+ */
+class ToolCompletionAuditFailedException(
+    toolName: String,
+    cause: Throwable,
+) : RuntimeException("Tool call completed but completion audit failed. tool=$toolName executed=true", cause) {
+    /**
+     * tool 本体の副作用が完了していることを呼び出し元へ伝える flag。
+     */
+    val executed: Boolean = true
+}
 
 /**
  * trade 系 tool と read 系 tool の no-trade / HARD_HALT / audit 契約をまとめる guard。
@@ -38,22 +55,28 @@ class ToolCallGuard(
      * trade 系 tool を global lock と HARD_HALT gate の内側で実行する。
      */
     suspend fun <T> runTradeTool(call: GuardedToolCall, block: suspend () -> T): Result<T> {
-        return tradingLock.withLock(call.toolName) {
-            val riskState = riskStateRepository.current()
-                .getOrElse { throwable ->
-                    val auditResult = recordNoTradeExitNonCancellable(call, "risk_state_unavailable", throwable)
+        return try {
+            tradingLock.withLock(call.toolName) {
+                val riskState = riskStateRepository.current()
+                    .getOrElse { throwable ->
+                        val auditResult = recordNoTradeExitNonCancellable(call, "risk_state_unavailable", throwable)
 
-                    return@withLock Result.failure(throwable.withSuppressedFailure(auditResult))
+                        return@withLock Result.failure(throwable.withSuppressedFailure(auditResult))
+                    }
+
+                if (riskState.hardHalt) {
+                    val exception = HardHaltTradingRejectedException("HARD_HALT is enabled in risk_state.")
+                    val auditResult = recordHardHaltRejectionNonCancellable(call, riskState.haltReason, exception)
+
+                    return@withLock Result.failure(exception.withSuppressedFailure(auditResult))
                 }
 
-            if (riskState.hardHalt) {
-                val exception = HardHaltTradingRejectedException("HARD_HALT is enabled in risk_state.")
-                val auditResult = recordHardHaltRejectionNonCancellable(call, riskState.haltReason, exception)
-
-                return@withLock Result.failure(exception.withSuppressedFailure(auditResult))
+                runAndAudit(call, block)
             }
+        } catch (throwable: SQLTimeoutException) {
+            val auditResult = recordNoTradeExitNonCancellable(call, "trading_lock_unavailable", throwable)
 
-            runAndAudit(call, block)
+            Result.failure(throwable.withSuppressedFailure(auditResult))
         }
     }
 
@@ -87,7 +110,7 @@ class ToolCallGuard(
 
             auditResult.fold(
                 onSuccess = { Result.success(value) },
-                onFailure = { throwable -> Result.failure(throwable) },
+                onFailure = { throwable -> Result.failure(ToolCompletionAuditFailedException(call.toolName, throwable)) },
             )
         } catch (throwable: CancellationException) {
             val auditResult = recordNoTradeExitNonCancellable(call, "tool_call_cancelled", throwable)

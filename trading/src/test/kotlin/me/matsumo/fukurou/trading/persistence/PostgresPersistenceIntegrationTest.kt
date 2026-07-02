@@ -350,6 +350,38 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun paper_execution_returns_existing_place_order_for_same_client_request_id() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val firstResult = broker.placeOrder(
+            postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("10500000"),
+                clientRequestId = "entry-1",
+            ),
+        ).getOrThrow()
+        val secondResult = broker.placeOrder(
+            postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("10500000"),
+                clientRequestId = "entry-1",
+            ),
+        ).getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertEquals(firstResult.orderIds, secondResult.orderIds)
+        assertEquals(firstResult.positionIds, secondResult.positionIds)
+        assertEquals(firstResult.executionIds, secondResult.executionIds)
+        assertEquals(1, executions.size)
+    }
+
+    @Test
     fun paper_execution_persists_virtual_take_profit_then_stop_cancel() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -483,7 +515,10 @@ private class PostgresTestContext(
     }
 }
 
-private fun postgresEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderCommand {
+private fun postgresEntryCommand(
+    takeProfitPriceJpy: BigDecimal,
+    clientRequestId: String? = null,
+): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
         symbol = TradingSymbol.BTC,
@@ -494,7 +529,7 @@ private fun postgresEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderComm
         protectiveStopPriceJpy = BigDecimal("9700000"),
         takeProfitPriceJpy = takeProfitPriceJpy,
         reasonJa = "integration entry",
-        auditContext = PaperTradeAuditContext.EMPTY,
+        auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
 }
 

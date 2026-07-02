@@ -263,6 +263,13 @@ internal class ExposedPaperLedgerWriter(
             val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
             val stopOrderId = UUID.randomUUID()
 
+            if (!hasCashForBuyFill(fill)) {
+                updateOrderStatus(order.orderId, OrderStatus.REJECTED, "reconciler entry rejected: insufficient paper cash")
+                triggeredOrderIds += order.orderId
+
+                return@forEach
+            }
+
             updateOrderStatus(order.orderId, OrderStatus.FILLED, order.reasonJa.orEmpty())
             insertPosition(command, fill, positionId, tradeGroupId)
             insertExecution(order.orderId, positionId.toString(), TradingMode.PAPER, order.side, fill, command.auditContext)
@@ -694,6 +701,13 @@ internal class ExposedPaperLedgerWriter(
         updateAccount(cash, btcQuantity, fill.priceJpy)
     }
 
+    private fun JdbcTransaction.hasCashForBuyFill(fill: SimulatedFill): Boolean {
+        val account = selectPaperAccount()
+        val spentCash = fill.priceJpy.multiply(fill.sizeBtc).add(fill.feeJpy).moneyScale()
+
+        return spentCash <= account.cashJpy.toBigDecimal()
+    }
+
     private fun JdbcTransaction.updateAccountAfterSell(fill: SimulatedFill) {
         val account = selectPaperAccount()
         val receivedCash = fill.priceJpy.multiply(fill.sizeBtc).subtract(fill.feeJpy)
@@ -845,7 +859,7 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
         protectiveStopPriceJpy = requireNotNull(protectiveStopPriceJpy).toBigDecimal(),
         takeProfitPriceJpy = takeProfitPriceJpy?.toBigDecimal(),
         reasonJa = reasonJa.orEmpty(),
-        auditContext = PaperTradeAuditContext.EMPTY,
+        auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
 }
 

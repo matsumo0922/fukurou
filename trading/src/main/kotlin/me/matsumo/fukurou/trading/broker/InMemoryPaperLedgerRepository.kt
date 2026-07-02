@@ -71,6 +71,14 @@ class InMemoryPaperLedgerRepository(
         return Result.success(synchronized(lock) { executions.toList() })
     }
 
+    override suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?> {
+        return Result.success(
+            synchronized(lock) {
+                findPlaceOrderResultByClientRequestIdLocked(clientRequestId)
+            },
+        )
+    }
+
     override suspend fun fillMarketEntry(
         command: PlaceOrderCommand,
         fill: SimulatedFill,
@@ -292,6 +300,30 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
+    private fun findPlaceOrderResultByClientRequestIdLocked(clientRequestId: String): PaperTradeResult? {
+        val entryOrder = orders.firstOrNull { order ->
+            order.clientRequestId == clientRequestId && order.side == OrderSide.BUY
+        } ?: return null
+        val tradeGroupId = requireNotNull(entryOrder.tradeGroupId)
+        val relatedOrders = orders.filter { order -> order.tradeGroupId == tradeGroupId }
+        val relatedOrderIds = relatedOrders.map { order -> order.orderId }.toSet()
+        val relatedPositionIds = positions
+            .filter { position -> position.tradeGroupId == tradeGroupId }
+            .map { position -> position.positionId }
+        val relatedExecutionIds = executions
+            .filter { execution -> execution.orderId in relatedOrderIds }
+            .map { execution -> execution.executionId }
+
+        return PaperTradeResult(
+            accepted = true,
+            status = entryOrder.status,
+            orderIds = relatedOrders.map { order -> order.orderId },
+            positionIds = relatedPositionIds,
+            executionIds = relatedExecutionIds,
+            messageJa = "client_request_id に一致する既存 paper entry を返しました。",
+        )
+    }
+
     private fun fillTriggeredEntryOrdersLocked(
         ticker: Ticker,
         rules: SymbolRules,
@@ -310,6 +342,13 @@ class InMemoryPaperLedgerRepository(
             val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
             val stopOrderId = UUID.randomUUID()
             val command = order.toPlaceOrderCommand()
+
+            if (!accountSnapshot.hasCashForBuyFill(fill)) {
+                markOrderStatusLocked(order.orderId, OrderStatus.REJECTED, "reconciler entry rejected: insufficient paper cash")
+                triggeredOrderIds += order.orderId
+
+                return@forEach
+            }
 
             markOrderStatusLocked(order.orderId, OrderStatus.FILLED)
             fillEntryLocked(
@@ -483,11 +522,14 @@ class InMemoryPaperLedgerRepository(
         }
     }
 
-    private fun markOrderStatusLocked(orderId: String, status: OrderStatus) {
+    private fun markOrderStatusLocked(orderId: String, status: OrderStatus, reasonJa: String? = null) {
         val orderIndex = orders.indexOfFirst { order -> order.orderId == orderId }
 
         if (orderIndex >= 0) {
-            orders[orderIndex] = orders[orderIndex].copy(status = status)
+            orders[orderIndex] = orders[orderIndex].copy(
+                status = status,
+                reasonJa = reasonJa ?: orders[orderIndex].reasonJa,
+            )
         }
     }
 
@@ -519,6 +561,7 @@ private fun PlaceOrderCommand.toEntryOrder(
         protectiveStopPriceJpy = protectiveStopPriceJpy.moneyScale().toPlainString(),
         takeProfitPriceJpy = takeProfitPriceJpy?.moneyScale()?.toPlainString(),
         reasonJa = reasonJa,
+        clientRequestId = auditContext.clientRequestId,
         createdAt = fillInstantText(),
         updatedAt = fillInstantText(),
     )
@@ -540,6 +583,7 @@ private fun PlaceOrderCommand.toProtectiveStopOrder(orderId: UUID, positionId: U
         protectiveStopPriceJpy = null,
         takeProfitPriceJpy = null,
         reasonJa = "protective stop: $reasonJa",
+        clientRequestId = auditContext.clientRequestId,
         createdAt = fillInstantText(),
         updatedAt = fillInstantText(),
     )
@@ -580,7 +624,7 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
         protectiveStopPriceJpy = requireNotNull(protectiveStopPriceJpy).toBigDecimal(),
         takeProfitPriceJpy = takeProfitPriceJpy?.toBigDecimal(),
         reasonJa = reasonJa.orEmpty(),
-        auditContext = PaperTradeAuditContext.EMPTY,
+        auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
 }
 
@@ -631,6 +675,7 @@ private fun closeOrder(orderId: UUID, position: Position, reasonJa: String): Ord
         protectiveStopPriceJpy = null,
         takeProfitPriceJpy = null,
         reasonJa = reasonJa,
+        clientRequestId = null,
         createdAt = fillInstantText(),
         updatedAt = fillInstantText(),
     )
@@ -652,6 +697,12 @@ private fun AccountSnapshot.afterBuyFill(fill: SimulatedFill): AccountSnapshot {
     return copy(cashJpy = cash.toPlainString())
         .withBtcQuantity(btcQuantity)
         .withMarkPrice(fill.priceJpy)
+}
+
+private fun AccountSnapshot.hasCashForBuyFill(fill: SimulatedFill): Boolean {
+    val spentCash = fill.priceJpy.multiply(fill.sizeBtc).add(fill.feeJpy).moneyScale()
+
+    return spentCash <= cashJpy.toBigDecimal()
 }
 
 private fun AccountSnapshot.afterSellFill(fill: SimulatedFill): AccountSnapshot {

@@ -16,8 +16,11 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
+import me.matsumo.fukurou.trading.lock.TradingLock
+import me.matsumo.fukurou.trading.lock.TradingLockLease
 import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import java.sql.SQLTimeoutException
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
@@ -156,6 +159,38 @@ class ToolCallGuardTest {
         assertEquals("caller timed out before trade", throwable.message)
         assertTrue(throwable.suppressed.any { suppressed -> suppressed.message == "audit append failed" })
     }
+
+    @Test
+    fun completion_audit_failure_reports_executed_true() = runBlocking {
+        val guard = createGuard(eventLog = FailingCommandEventLog)
+
+        val result = guard.runTradeTool(createCall(toolName = "trade.place_order")) {
+            "executed"
+        }
+        val throwable = requireNotNull(result.exceptionOrNull())
+
+        assertTrue(throwable is ToolCompletionAuditFailedException)
+        assertTrue(throwable.executed)
+        assertTrue(throwable.message.orEmpty().contains("executed=true"))
+    }
+
+    @Test
+    fun lock_timeout_records_no_trade_exit() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val guard = createGuard(
+            eventLog = eventLog,
+            tradingLock = TimeoutTradingLock,
+        )
+
+        val result = guard.runTradeTool(createCall(toolName = "trade.place_order")) {
+            "should not run"
+        }
+        val event = eventLog.events().single()
+
+        assertTrue(result.exceptionOrNull() is SQLTimeoutException)
+        assertEquals(CommandEventType.NO_TRADE_EXIT, event.eventType)
+        assertTrue(event.payload.contains("trading_lock_unavailable"))
+    }
 }
 
 /**
@@ -193,11 +228,12 @@ private fun fixedClock(): Clock {
 private fun createGuard(
     eventLog: CommandEventLog = InMemoryCommandEventLog(),
     riskStateRepository: InMemoryRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+    tradingLock: TradingLock = InMemoryTradingLock(fixedClock()),
 ): ToolCallGuard {
     return ToolCallGuard(
         riskStateRepository = riskStateRepository,
         commandEventLog = eventLog,
-        tradingLock = InMemoryTradingLock(fixedClock()),
+        tradingLock = tradingLock,
         clock = fixedClock(),
     )
 }
@@ -248,5 +284,14 @@ private class ToolContextSwitchingCommandEventLog : CommandEventLog {
 private object FailingCommandEventLog : CommandEventLog {
     override suspend fun append(event: CommandEvent): Result<Unit> {
         return Result.failure(IllegalStateException("audit append failed"))
+    }
+}
+
+/**
+ * lock timeout を再現する test lock。
+ */
+private object TimeoutTradingLock : TradingLock {
+    override suspend fun <T> withLock(owner: String, block: suspend (TradingLockLease) -> T): T {
+        throw SQLTimeoutException("lock timeout")
     }
 }

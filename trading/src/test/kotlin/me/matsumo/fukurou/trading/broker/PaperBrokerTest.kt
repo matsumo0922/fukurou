@@ -150,6 +150,45 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun place_order_returns_existing_result_for_same_client_request_id() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val firstResult = broker.placeOrder(marketEntryCommand(clientRequestId = "entry-1")).getOrThrow()
+        val secondResult = broker.placeOrder(marketEntryCommand(clientRequestId = "entry-1")).getOrThrow()
+        val positions = broker.getPositions().getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertEquals(firstResult.orderIds, secondResult.orderIds)
+        assertEquals(firstResult.positionIds, secondResult.positionIds)
+        assertEquals(firstResult.executionIds, secondResult.executionIds)
+        assertEquals(1, positions.size)
+        assertEquals(1, executions.size)
+    }
+
+    @Test
+    fun place_order_reserves_open_buy_fee_when_checking_cash() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FineStepMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        broker.placeOrder(nearAllCashRestingLimitCommand()).getOrThrow()
+
+        val result = broker.placeOrder(tinyMarketEntryCommand())
+
+        assertTrue(result.isFailure)
+    }
+
+    @Test
     fun update_protection_updates_stop_and_virtual_take_profit() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val broker = PaperBroker(
@@ -228,7 +267,7 @@ class PaperBrokerTest {
     }
 }
 
-private fun marketEntryCommand(): PlaceOrderCommand {
+private fun marketEntryCommand(clientRequestId: String? = null): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
         symbol = TradingSymbol.BTC,
@@ -239,7 +278,7 @@ private fun marketEntryCommand(): PlaceOrderCommand {
         protectiveStopPriceJpy = BigDecimal("9700000"),
         takeProfitPriceJpy = BigDecimal("10500000"),
         reasonJa = "test entry",
-        auditContext = PaperTradeAuditContext.EMPTY,
+        auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
 }
 
@@ -254,6 +293,36 @@ private fun restingLimitCommand(): PlaceOrderCommand {
         protectiveStopPriceJpy = BigDecimal("9700000"),
         takeProfitPriceJpy = null,
         reasonJa = "test resting entry",
+        auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+private fun nearAllCashRestingLimitCommand(): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = UUID.randomUUID(),
+        symbol = TradingSymbol.BTC,
+        side = OrderSide.BUY,
+        orderType = OrderType.LIMIT,
+        sizeBtc = BigDecimal("0.009995"),
+        priceJpy = BigDecimal("10000000"),
+        protectiveStopPriceJpy = BigDecimal("9700000"),
+        takeProfitPriceJpy = null,
+        reasonJa = "test near all cash resting entry",
+        auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+private fun tinyMarketEntryCommand(): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = UUID.randomUUID(),
+        symbol = TradingSymbol.BTC,
+        side = OrderSide.BUY,
+        orderType = OrderType.MARKET,
+        sizeBtc = BigDecimal("0.000001"),
+        priceJpy = null,
+        protectiveStopPriceJpy = BigDecimal("9700000"),
+        takeProfitPriceJpy = null,
+        reasonJa = "test tiny entry",
         auditContext = PaperTradeAuditContext.EMPTY,
     )
 }
@@ -331,6 +400,24 @@ private object FakeMarketDataSource : MarketDataSource {
                 symbol = symbol.apiSymbol,
                 minOrderSize = "0.0001",
                 sizeStep = "0.0001",
+                tickSize = "1",
+                takerFee = "0.0005",
+                makerFee = "-0.0001",
+            ),
+        )
+    }
+}
+
+/**
+ * fee 予約検証用に数量 step を細かくした fake market data。
+ */
+private object FineStepMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
+        return Result.success(
+            SymbolRules(
+                symbol = symbol.apiSymbol,
+                minOrderSize = "0.000001",
+                sizeStep = "0.000001",
                 tickSize = "1",
                 takerFee = "0.0005",
                 makerFee = "-0.0001",
@@ -450,6 +537,7 @@ private fun order(
         protectiveStopPriceJpy = null,
         takeProfitPriceJpy = null,
         reasonJa = "test",
+        clientRequestId = null,
         createdAt = fixedInstant().toString(),
         updatedAt = fixedInstant().toString(),
     )

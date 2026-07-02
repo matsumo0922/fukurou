@@ -74,6 +74,7 @@ import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.NoTradeExitException
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
+import me.matsumo.fukurou.trading.tool.ToolCompletionAuditFailedException
 import java.math.BigDecimal
 import java.util.UUID
 
@@ -1460,6 +1461,7 @@ private fun throwableResult(throwable: Throwable): CallToolResult {
     val type = when (throwable) {
         is HardHaltTradingRejectedException -> "hard_halt"
         is NoTradeExitException -> "no_trade"
+        is ToolCompletionAuditFailedException -> "audit_failed_after_execution"
         is MarketInvalidRequestException -> "invalid_request"
         is GmoRateLimitException -> "rate_limited"
         is GmoApiStatusException -> "gmo_status_error"
@@ -1469,11 +1471,12 @@ private fun throwableResult(throwable: Throwable): CallToolResult {
         is IllegalArgumentException -> "invalid_request"
         else -> "tool_call_failed"
     }
+    val executed = if (throwable is ToolCompletionAuditFailedException) throwable.executed else null
 
-    return errorResult(type, throwable.message.orEmpty())
+    return errorResult(type, throwable.message.orEmpty(), executed)
 }
 
-private fun errorResult(type: String, message: String): CallToolResult {
+private fun errorResult(type: String, message: String, executed: Boolean? = null): CallToolResult {
     val resolvedMessage = message.ifBlank { "unknown error" }
 
     return CallToolResult(
@@ -1482,6 +1485,9 @@ private fun errorResult(type: String, message: String): CallToolResult {
             put("error", true)
             put("type", type)
             put("message", resolvedMessage)
+            if (executed != null) {
+                put("executed", executed)
+            }
         },
         isError = true,
     )

@@ -83,6 +83,10 @@ class PaperBroker(
         return runCatching {
             validatePlaceOrderCommand(command)
 
+            findExistingPlaceOrderResult(command)?.let { existingResult ->
+                return@runCatching existingResult
+            }
+
             val ticker = tickerFor(command.symbol).getOrThrow()
             val symbolRules = symbolRulesFor(command.symbol).getOrThrow()
 
@@ -191,6 +195,13 @@ class PaperBroker(
     }
 }
 
+private suspend fun PaperBroker.findExistingPlaceOrderResult(command: PlaceOrderCommand): PaperTradeResult? {
+    val clientRequestId = command.auditContext.clientRequestId?.takeIf { requestId -> requestId.isNotBlank() }
+        ?: return null
+
+    return ledgerRepository.findPlaceOrderResultByClientRequestId(clientRequestId).getOrThrow()
+}
+
 private suspend fun PaperBroker.tickerFor(symbol: TradingSymbol): Result<Ticker> {
     val marketData = requireNotNull(marketDataSource) {
         "MarketDataSource is required for paper execution."
@@ -294,7 +305,7 @@ private suspend fun PaperBroker.validateCashAvailability(
     val cashJpy = balance.cashJpy.toBigDecimal()
     val reservedCashJpy = openOrders
         .filter { order -> order.side == OrderSide.BUY && order.status == OrderStatus.OPEN }
-        .sumOf { order -> order.estimatedBuyNotionalJpy() }
+        .sumOf { order -> order.estimatedBuyReservationJpy(rules) }
     val requiredCash = command.estimatedRequiredCash(ticker, rules, fillSimulator)
     val availableCash = cashJpy.subtract(reservedCashJpy).moneyScale()
 
@@ -323,12 +334,14 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
     return estimatedNotional.add(estimatedFee).moneyScale()
 }
 
-private fun Order.estimatedBuyNotionalJpy(): BigDecimal {
+private fun Order.estimatedBuyReservationJpy(rules: SymbolRules): BigDecimal {
     val price = limitPriceJpy?.toBigDecimal()
         ?: triggerPriceJpy?.toBigDecimal()
         ?: BigDecimal.ZERO
+    val notional = price.multiply(sizeBtc.toBigDecimal())
+    val fee = notional.multiply(rules.takerFee.toBigDecimal())
 
-    return price.multiply(sizeBtc.toBigDecimal()).moneyScale()
+    return notional.add(fee).moneyScale()
 }
 
 private fun validateProtectionUpdateHasChange(command: UpdateProtectionCommand) {

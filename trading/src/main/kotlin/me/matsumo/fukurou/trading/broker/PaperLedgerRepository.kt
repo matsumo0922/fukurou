@@ -39,6 +39,11 @@ interface PaperLedgerRepository {
     suspend fun getExecutions(): Result<List<Execution>>
 
     /**
+     * client_request_id に対応する既存 place_order 結果を返す。
+     */
+    suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?>
+
+    /**
      * MARKET entry を約定済みとして保存し、保護 STOP を作成する。
      */
     suspend fun fillMarketEntry(
