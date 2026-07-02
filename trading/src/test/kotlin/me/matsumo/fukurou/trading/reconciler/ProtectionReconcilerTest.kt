@@ -9,12 +9,28 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.broker.Broker
+import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
+import me.matsumo.fukurou.trading.broker.PaperBroker
+import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
+import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.domain.Candle
+import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.RecentTrade
+import me.matsumo.fukurou.trading.domain.SymbolRules
+import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.lock.TradingLockLease
+import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -226,6 +242,55 @@ class ProtectionReconcilerTest {
         assertEquals(null, snapshot.lastReconciledAt)
         assertEquals(null, snapshot.lastMarketDataAt)
     }
+
+    @Test
+    fun reconcile_pass_triggers_protective_stop_through_broker() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("10500000"))).getOrThrow()
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(stopTickSnapshot())),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+
+        assertTrue(result.isSuccess)
+        assertEquals(0, broker.getPositions().getOrThrow().size)
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun reconcile_pass_triggers_virtual_take_profit_and_cancels_stop() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("10100000"))).getOrThrow()
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(takeProfitTickSnapshot())),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+
+        assertTrue(result.isSuccess)
+        assertEquals(0, broker.getPositions().getOrThrow().size)
+        assertEquals(0, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
 }
 
 /**
@@ -262,12 +327,14 @@ private fun createReconciler(
     status: MutableReconcilerStatus = MutableReconcilerStatus(),
     riskStateRepository: RiskStateRepository = InMemoryRiskStateRepository(clock = clock),
     tickStream: TickStream = FixedTickStream,
+    broker: Broker? = null,
 ): ProtectionReconciler {
     return ProtectionReconciler(
         riskStateRepository = riskStateRepository,
         commandEventLog = eventLog,
         tradingLock = lock,
         tickStream = tickStream,
+        broker = broker,
         status = status,
         clock = clock,
     )
@@ -385,7 +452,97 @@ private fun fixedTickSnapshot(
         symbol = "BTC",
         observedAt = observedAt,
         lastPrice = "100",
+        bidPrice = "99",
+        askPrice = "101",
     )
+}
+
+private fun stopTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "9700000",
+        bidPrice = "9690000",
+        askPrice = "9700000",
+        symbolRules = reconcilerSymbolRules(),
+    )
+}
+
+private fun takeProfitTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "10100000",
+        bidPrice = "10100000",
+        askPrice = "10110000",
+        symbolRules = reconcilerSymbolRules(),
+    )
+}
+
+private fun reconcilerEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = java.util.UUID.randomUUID(),
+        symbol = TradingSymbol.BTC,
+        side = OrderSide.BUY,
+        orderType = OrderType.MARKET,
+        sizeBtc = BigDecimal("0.0050"),
+        priceJpy = null,
+        protectiveStopPriceJpy = BigDecimal("9700000"),
+        takeProfitPriceJpy = takeProfitPriceJpy,
+        reasonJa = "test entry",
+        auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+private fun reconcilerSymbolRules(): SymbolRules {
+    return SymbolRules(
+        symbol = "BTC",
+        minOrderSize = "0.0001",
+        sizeStep = "0.0001",
+        tickSize = "1",
+        takerFee = "0.0005",
+        makerFee = "-0.0001",
+    )
+}
+
+/**
+ * Reconciler broker integration test 用 fake market data。
+ */
+private object ReconcilerFakeMarketDataSource : MarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return Result.success(
+            Ticker(
+                symbol = symbol.apiSymbol,
+                last = "10000000",
+                bid = "9990000",
+                ask = "10000000",
+                high = "10100000",
+                low = "9900000",
+                volume = "1.0",
+                timestamp = fixedInstant().toString(),
+            ),
+        )
+    }
+
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
+        return Result.success(reconcilerSymbolRules())
+    }
 }
 
 /**

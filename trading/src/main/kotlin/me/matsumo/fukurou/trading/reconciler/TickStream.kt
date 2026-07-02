@@ -1,7 +1,14 @@
 package me.matsumo.fukurou.trading.reconciler
 
+import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.market.IndicatorCalculator
+import me.matsumo.fukurou.trading.market.IndicatorParams
+import me.matsumo.fukurou.trading.market.IndicatorType
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import java.math.BigDecimal
+import java.math.RoundingMode
 import java.time.Clock
 import java.time.Instant
 
@@ -11,13 +18,21 @@ import java.time.Instant
  * @param symbol 取引対象 symbol
  * @param observedAt tick 観測時刻
  * @param lastPrice ticker が返した直近価格
+ * @param bidPrice 最良買気配
+ * @param askPrice 最良売気配
  * @param recentTradeCount 同じ polling pass で取得した直近約定数
+ * @param symbolRules 取引所数量・価格・手数料ルール
+ * @param atr14Jpy 5分足 ATR(14)
  */
 data class TickSnapshot(
     val symbol: String,
     val observedAt: Instant,
     val lastPrice: String?,
+    val bidPrice: String? = null,
+    val askPrice: String? = null,
     val recentTradeCount: Int = 0,
+    val symbolRules: SymbolRules? = null,
+    val atr14Jpy: String? = null,
 )
 
 /**
@@ -47,14 +62,43 @@ class RestPollingTickStream(
         return runCatching {
             val ticker = marketDataSource.getTicker(symbol).getOrThrow()
             val recentTrades = marketDataSource.getTrades(symbol, RECENT_TRADES_LIMIT).getOrThrow()
+            val symbolRules = marketDataSource.getSymbolRules(symbol).getOrThrow()
+            val atr14Jpy = fetchAtr14Jpy()
 
             TickSnapshot(
                 symbol = symbol.apiSymbol,
                 observedAt = clock.instant(),
                 lastPrice = ticker.last,
+                bidPrice = ticker.bid,
+                askPrice = ticker.ask,
                 recentTradeCount = recentTrades.size,
+                symbolRules = symbolRules,
+                atr14Jpy = atr14Jpy,
             )
         }
+    }
+
+    private suspend fun fetchAtr14Jpy(): String? {
+        val candles = marketDataSource.getCandles(
+            symbol = symbol,
+            interval = CandleInterval.FIVE_MINUTES,
+            limit = ATR_CANDLE_LIMIT,
+        )
+            .getOrNull()
+            ?: return null
+        val atr = IndicatorCalculator.calculate(
+            candles = candles,
+            indicator = IndicatorType.ATR,
+            params = IndicatorParams(period = ATR_PERIOD),
+        ).getOrNull() ?: return null
+        val latestAtr = atr.values
+            .lastOrNull { value -> value.value != null }
+            ?.value
+            ?: return null
+
+        return BigDecimal.valueOf(latestAtr)
+            .setScale(ATR_SCALE, RoundingMode.HALF_UP)
+            .toPlainString()
     }
 }
 
@@ -62,6 +106,21 @@ class RestPollingTickStream(
  * reconciler freshness 確認で取得する直近約定数。
  */
 private const val RECENT_TRADES_LIMIT = 100
+
+/**
+ * ATR 算出に取得する 5分足本数。
+ */
+private const val ATR_CANDLE_LIMIT = 64
+
+/**
+ * ATR の期間。
+ */
+private const val ATR_PERIOD = 14
+
+/**
+ * ATR の返却 scale。
+ */
+private const val ATR_SCALE = 8
 
 /**
  * test と明示 local injection 用の空 TickStream。

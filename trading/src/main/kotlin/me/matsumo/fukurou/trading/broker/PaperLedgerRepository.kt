@@ -4,11 +4,13 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import java.math.BigDecimal
 import java.time.LocalDate
+import java.util.UUID
 
 /**
- * paper ledger の読み取り repository。
+ * paper ledger の読み書き repository。
  */
 interface PaperLedgerRepository {
     /**
@@ -35,4 +37,54 @@ interface PaperLedgerRepository {
      * execution ledger の読み取りを返す。
      */
     suspend fun getExecutions(): Result<List<Execution>>
+
+    /**
+     * client_request_id に対応する既存 place_order 結果を返す。
+     */
+    suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?>
+
+    /**
+     * MARKET entry を約定済みとして保存し、保護 STOP を作成する。
+     */
+    suspend fun fillMarketEntry(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        stopOrderId: UUID,
+    ): Result<PaperTradeResult>
+
+    /**
+     * resting entry intent を未約定 order として保存する。
+     */
+    suspend fun createRestingEntryOrder(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+    ): Result<PaperTradeResult>
+
+    /**
+     * position を成行相当で close する。
+     */
+    suspend fun closePosition(
+        command: ClosePositionCommand,
+        positionId: UUID,
+        orderId: UUID,
+        fill: SimulatedFill,
+    ): Result<PaperTradeResult>
+
+    /**
+     * position の STOP / virtual TP を更新する。
+     */
+    suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult>
+
+    /**
+     * open order を cancel する。
+     */
+    suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult>
+
+    /**
+     * tick をもとに resting order / protection を決定的に前進させる。
+     */
+    suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult>
 }

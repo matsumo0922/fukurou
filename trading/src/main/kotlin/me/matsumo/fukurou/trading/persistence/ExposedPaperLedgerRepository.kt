@@ -2,7 +2,15 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import me.matsumo.fukurou.trading.broker.CancelOrderCommand
+import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.broker.PaperReconcileResult
+import me.matsumo.fukurou.trading.broker.PaperTradeResult
+import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.SimulatedFill
+import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
@@ -14,6 +22,7 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
@@ -89,7 +98,10 @@ private const val SELECT_OPEN_ORDERS_SQL = """
         size_btc,
         limit_price_jpy,
         trigger_price_jpy,
+        protective_stop_price_jpy,
+        take_profit_price_jpy,
         reason_ja,
+        client_request_id,
         created_at,
         updated_at
     FROM orders
@@ -100,6 +112,136 @@ private const val SELECT_OPEN_ORDERS_SQL = """
             WHERE id = ?
         )
     ORDER BY created_at ASC
+"""
+
+/**
+ * client_request_id に対応する orders を読む SQL。
+ */
+private const val SELECT_ORDERS_BY_CLIENT_REQUEST_ID_SQL = """
+    SELECT
+        id,
+        position_id,
+        trade_group_id,
+        mode,
+        symbol,
+        side,
+        order_type,
+        status,
+        size_btc,
+        limit_price_jpy,
+        trigger_price_jpy,
+        protective_stop_price_jpy,
+        take_profit_price_jpy,
+        reason_ja,
+        client_request_id,
+        created_at,
+        updated_at
+    FROM orders
+    WHERE client_request_id = ?
+        AND mode = (
+            SELECT mode
+            FROM paper_account
+            WHERE id = ?
+        )
+    ORDER BY created_at ASC
+"""
+
+/**
+ * trade_group_id に対応する orders を読む SQL。
+ */
+private const val SELECT_ORDERS_BY_TRADE_GROUP_ID_SQL = """
+    SELECT
+        id,
+        position_id,
+        trade_group_id,
+        mode,
+        symbol,
+        side,
+        order_type,
+        status,
+        size_btc,
+        limit_price_jpy,
+        trigger_price_jpy,
+        protective_stop_price_jpy,
+        take_profit_price_jpy,
+        reason_ja,
+        client_request_id,
+        created_at,
+        updated_at
+    FROM orders
+    WHERE trade_group_id = ?
+        AND mode = (
+            SELECT mode
+            FROM paper_account
+            WHERE id = ?
+        )
+    ORDER BY created_at ASC
+"""
+
+/**
+ * trade_group_id に対応する positions を読む SQL。
+ */
+private const val SELECT_POSITIONS_BY_TRADE_GROUP_ID_SQL = """
+    SELECT
+        id,
+        trade_group_id,
+        mode,
+        symbol,
+        side,
+        status,
+        opened_at,
+        closed_at,
+        size_btc,
+        average_entry_price_jpy,
+        current_price_jpy,
+        current_stop_loss_jpy,
+        current_take_profit_jpy,
+        unrealized_pnl_jpy,
+        unrealized_r,
+        pyramid_add_count,
+        highest_price_since_entry_jpy
+    FROM positions
+    WHERE trade_group_id = ?
+        AND mode = (
+            SELECT mode
+            FROM paper_account
+            WHERE id = ?
+        )
+    ORDER BY opened_at ASC
+"""
+
+/**
+ * order IDs に対応する executions を読む SQL prefix。
+ */
+private const val SELECT_EXECUTIONS_BY_ORDER_IDS_PREFIX = """
+    SELECT
+        id,
+        order_id,
+        position_id,
+        mode,
+        symbol,
+        side,
+        price_jpy,
+        size_btc,
+        fee_jpy,
+        realized_pnl_jpy,
+        liquidity,
+        executed_at
+    FROM executions
+    WHERE order_id IN (
+"""
+
+/**
+ * order IDs に対応する executions を読む SQL suffix。
+ */
+private const val SELECT_EXECUTIONS_BY_ORDER_IDS_SUFFIX = """
+    )
+        AND mode = (
+            SELECT mode
+            FROM paper_account
+            WHERE id = ?
+        )
+    ORDER BY executed_at ASC
 """
 
 /**
@@ -157,6 +299,8 @@ class ExposedPaperLedgerRepository(
     private val database: ExposedDatabase,
 ) : PaperLedgerRepository {
 
+    private val writer = ExposedPaperLedgerWriter(database)
+
     override suspend fun getAccountSnapshot(): Result<AccountSnapshot> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -206,6 +350,55 @@ class ExposedPaperLedgerRepository(
             }
         }
     }
+
+    override suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    findPlaceOrderResultByClientRequestId(clientRequestId)
+                }
+            }
+        }
+    }
+
+    override suspend fun fillMarketEntry(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        stopOrderId: UUID,
+    ): Result<PaperTradeResult> {
+        return writer.fillMarketEntry(command, fill, positionId, tradeGroupId, stopOrderId)
+    }
+
+    override suspend fun createRestingEntryOrder(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+    ): Result<PaperTradeResult> {
+        return writer.createRestingEntryOrder(command, orderId, tradeGroupId)
+    }
+
+    override suspend fun closePosition(
+        command: ClosePositionCommand,
+        positionId: UUID,
+        orderId: UUID,
+        fill: SimulatedFill,
+    ): Result<PaperTradeResult> {
+        return writer.closePosition(command, positionId, orderId, fill)
+    }
+
+    override suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult> {
+        return writer.updateProtection(command)
+    }
+
+    override suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult> {
+        return writer.cancelOrder(command)
+    }
+
+    override suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult> {
+        return writer.reconcile(tickSnapshot, simulator)
+    }
 }
 
 /**
@@ -222,7 +415,7 @@ internal fun JdbcTransaction.selectPaperAccount(): AccountSnapshot {
     }
 }
 
-private fun JdbcTransaction.selectOpenPositions(): List<Position> {
+internal fun JdbcTransaction.selectOpenPositions(): List<Position> {
     return jdbcConnection().prepareStatement(SELECT_OPEN_POSITIONS_SQL).use { statement ->
         statement.setString(1, PositionStatus.OPEN.name)
         statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
@@ -236,7 +429,7 @@ private fun JdbcTransaction.selectOpenPositions(): List<Position> {
     }
 }
 
-private fun JdbcTransaction.selectOpenOrders(): List<Order> {
+internal fun JdbcTransaction.selectOpenOrders(): List<Order> {
     return jdbcConnection().prepareStatement(SELECT_OPEN_ORDERS_SQL).use { statement ->
         statement.setString(1, OrderStatus.OPEN.name)
         statement.setString(2, OrderStatus.PENDING_CANCEL.name)
@@ -251,6 +444,69 @@ private fun JdbcTransaction.selectOpenOrders(): List<Order> {
     }
 }
 
+private fun JdbcTransaction.findPlaceOrderResultByClientRequestId(clientRequestId: String): PaperTradeResult? {
+    val ordersByClientRequestId = selectOrdersByClientRequestId(clientRequestId)
+    val entryOrder = ordersByClientRequestId.firstOrNull { order -> order.side == OrderSide.BUY }
+        ?: return null
+    val tradeGroupId = requireNotNull(entryOrder.tradeGroupId)
+    val relatedOrders = selectOrdersByTradeGroupId(tradeGroupId)
+    val relatedOrderIds = relatedOrders.map { order -> order.orderId }
+    val relatedPositionIds = selectPositionsByTradeGroupId(tradeGroupId)
+        .map { position -> position.positionId }
+    val relatedExecutionIds = selectExecutionsByOrderIds(relatedOrderIds)
+        .map { execution -> execution.executionId }
+
+    return PaperTradeResult(
+        accepted = true,
+        status = entryOrder.status,
+        orderIds = relatedOrderIds,
+        positionIds = relatedPositionIds,
+        executionIds = relatedExecutionIds,
+        messageJa = "client_request_id に一致する既存 paper entry を返しました。",
+    )
+}
+
+private fun JdbcTransaction.selectOrdersByClientRequestId(clientRequestId: String): List<Order> {
+    return jdbcConnection().prepareStatement(SELECT_ORDERS_BY_CLIENT_REQUEST_ID_SQL).use { statement ->
+        statement.setString(1, clientRequestId)
+        statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet -> resultSet.toOrders() }
+    }
+}
+
+private fun JdbcTransaction.selectOrdersByTradeGroupId(tradeGroupId: String): List<Order> {
+    return jdbcConnection().prepareStatement(SELECT_ORDERS_BY_TRADE_GROUP_ID_SQL).use { statement ->
+        statement.setObject(1, UUID.fromString(tradeGroupId))
+        statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet -> resultSet.toOrders() }
+    }
+}
+
+private fun JdbcTransaction.selectPositionsByTradeGroupId(tradeGroupId: String): List<Position> {
+    return jdbcConnection().prepareStatement(SELECT_POSITIONS_BY_TRADE_GROUP_ID_SQL).use { statement ->
+        statement.setObject(1, UUID.fromString(tradeGroupId))
+        statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet -> resultSet.toPositions() }
+    }
+}
+
+private fun JdbcTransaction.selectExecutionsByOrderIds(orderIds: List<String>): List<Execution> {
+    if (orderIds.isEmpty()) {
+        return emptyList()
+    }
+
+    val placeholders = orderIds.joinToString(separator = ",") { "?" }
+    val sql = "$SELECT_EXECUTIONS_BY_ORDER_IDS_PREFIX$placeholders$SELECT_EXECUTIONS_BY_ORDER_IDS_SUFFIX"
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        orderIds.forEachIndexed { index, orderId ->
+            statement.setObject(index + 1, UUID.fromString(orderId))
+        }
+        statement.setInt(orderIds.size + 1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
+    }
+}
+
 private fun JdbcTransaction.selectExecutions(): List<Execution> {
     return jdbcConnection().prepareStatement(SELECT_EXECUTIONS_SQL).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
@@ -260,6 +516,30 @@ private fun JdbcTransaction.selectExecutions(): List<Execution> {
                     add(resultSet.toExecution())
                 }
             }
+        }
+    }
+}
+
+private fun ResultSet.toOrders(): List<Order> {
+    return buildList {
+        while (next()) {
+            add(toOrder())
+        }
+    }
+}
+
+private fun ResultSet.toPositions(): List<Position> {
+    return buildList {
+        while (next()) {
+            add(toPosition())
+        }
+    }
+}
+
+private fun ResultSet.toExecutions(): List<Execution> {
+    return buildList {
+        while (next()) {
+            add(toExecution())
         }
     }
 }
@@ -328,7 +608,10 @@ private fun ResultSet.toOrder(): Order {
         sizeBtc = getBigDecimal("size_btc").toPlainString(),
         limitPriceJpy = getNullableBigDecimal("limit_price_jpy")?.toPlainString(),
         triggerPriceJpy = getNullableBigDecimal("trigger_price_jpy")?.toPlainString(),
+        protectiveStopPriceJpy = getNullableBigDecimal("protective_stop_price_jpy")?.toPlainString(),
+        takeProfitPriceJpy = getNullableBigDecimal("take_profit_price_jpy")?.toPlainString(),
         reasonJa = getString("reason_ja"),
+        clientRequestId = getString("client_request_id"),
         createdAt = getInstant("created_at").toString(),
         updatedAt = getInstant("updated_at").toString(),
     )

@@ -1,5 +1,9 @@
 package me.matsumo.fukurou.mcp
 
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.Orderbook
@@ -12,6 +16,7 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 
@@ -35,6 +40,22 @@ class FukurouMcpServerTest {
         assertFailsWith<IllegalArgumentException> {
             TradingRuntimeFactory.fromEnvironment(environment = emptyMap())
         }
+    }
+
+    @Test
+    fun updateProtectionTool_allowsNullTakeProfitClearInSchema() {
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        ).createServer()
+        val tool = requireNotNull(server.tools["update_protection"]?.tool)
+        val takeProfitSchema = requireNotNull(tool.inputSchema.properties?.get("new_take_profit_price_jpy"))
+            .jsonObject
+        val typeNames = takeProfitSchema.getValue("type")
+            .jsonArray
+            .map { typeElement -> typeElement.jsonPrimitive.contentOrNull }
+
+        assertEquals(listOf("string", "null"), typeNames)
     }
 }
 

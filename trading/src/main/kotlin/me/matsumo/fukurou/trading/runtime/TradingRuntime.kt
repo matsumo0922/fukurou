@@ -9,6 +9,7 @@ import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
+import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedReconcilerStatusProvider
@@ -128,6 +129,7 @@ object TradingRuntimeFactory {
         environment: Map<String, String> = System.getenv(),
         clock: Clock = Clock.systemUTC(),
         reconcilerStatusProvider: ReconcilerStatusProvider? = null,
+        marketDataSource: MarketDataSource? = null,
     ): TradingRuntime {
         val databaseConfig = requireNotNull(TradingDatabaseConfig.fromEnvironment(environment)) {
             "DB_URL, DB_USER, and DB_PASSWORD are required for trading runtime."
@@ -137,6 +139,7 @@ object TradingRuntimeFactory {
             config = databaseConfig,
             clock = clock,
             reconcilerStatusProvider = reconcilerStatusProvider,
+            marketDataSource = marketDataSource,
         )
     }
 
@@ -146,11 +149,13 @@ object TradingRuntimeFactory {
     fun inMemory(
         clock: Clock = Clock.systemUTC(),
         reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
+        marketDataSource: MarketDataSource? = null,
     ): TradingRuntime {
         val riskStateRepository = InMemoryRiskStateRepository(clock)
         val broker = PaperBroker(
             ledgerRepository = InMemoryPaperLedgerRepository(),
             riskStateRepository = riskStateRepository,
+            marketDataSource = marketDataSource,
             reconcilerStatusProvider = reconcilerStatusProvider,
             clock = clock,
         )
@@ -188,6 +193,7 @@ object TradingRuntimeFactory {
         config: TradingDatabaseConfig,
         clock: Clock = Clock.systemUTC(),
         reconcilerStatusProvider: ReconcilerStatusProvider? = null,
+        marketDataSource: MarketDataSource? = null,
     ): TradingRuntime {
         val dataSource = createDataSource(config)
 
@@ -200,6 +206,7 @@ object TradingRuntimeFactory {
             val broker = PaperBroker(
                 ledgerRepository = ExposedPaperLedgerRepository(database),
                 riskStateRepository = riskStateRepository,
+                marketDataSource = marketDataSource,
                 reconcilerStatusProvider = resolvedReconcilerStatusProvider,
                 clock = clock,
             )

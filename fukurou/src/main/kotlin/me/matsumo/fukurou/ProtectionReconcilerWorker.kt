@@ -10,9 +10,11 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
+import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
@@ -111,14 +113,23 @@ internal fun startProtectionReconcilerWorker(
     val riskStateRepository = ExposedRiskStateRepository(database)
     val commandEventLog = ExposedCommandEventLog(database)
     val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
+    val marketDataSource = GmoPublicMarketDataSource()
+    val broker = PaperBroker(
+        ledgerRepository = ExposedPaperLedgerRepository(database),
+        riskStateRepository = riskStateRepository,
+        marketDataSource = marketDataSource,
+        reconcilerStatusProvider = status,
+        clock = clock,
+    )
     val reconciler = ProtectionReconciler(
         riskStateRepository = riskStateRepository,
         commandEventLog = commandEventLog,
         tradingLock = tradingLock,
         tickStream = RestPollingTickStream(
-            marketDataSource = GmoPublicMarketDataSource(),
+            marketDataSource = marketDataSource,
             clock = clock,
         ),
+        broker = broker,
         status = status,
         clock = clock,
     )

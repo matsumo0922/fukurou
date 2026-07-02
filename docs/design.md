@@ -3579,6 +3579,8 @@ DD -15% は `HARD_HALT`。発動時はDB上の `risk_state.hard_halt=true` をst
 
 [確定] liveではnative STOPがbot停止中も取引所で作動する。一方、paperでは `ProtectionReconciler` 停止中はSTOPが作動しないため、paperの保護はliveより弱い。これは安全側の構造的乖離として文書化し、復旧テストで補う。
 
+[確定] Step4時点のpaper `ProtectionReconciler` はREST pollingで取得したtickerの `lastPrice` をもとにSTOP / virtual TP到達を判定する。polling間のintrabar高安は見ないため、5秒程度のpolling間隔内でSTOP/TPに触れて戻ったケースはlive native STOPや取引所約定履歴と乖離し得る。この制約は #9 のpaper divergence一覧に残し、WebSocket TickStreamまたはtradesベース判定へ差し替えるまで既知のpaper/live乖離として扱う。
+
 ### 15.2 手数料モデル
 
 [設計提案] 手数料率は毎起動または定期的に `market.get_trade_rules` から取得する。取得できない場合のみconfig fallbackを使う。
