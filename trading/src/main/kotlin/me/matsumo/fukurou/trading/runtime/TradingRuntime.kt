@@ -4,9 +4,13 @@ import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.broker.Broker
+import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
+import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
+import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
@@ -51,6 +55,7 @@ private const val INITIALIZATION_FAIL_TIMEOUT = -1L
  * @param riskStateRepository risk_state repository
  * @param riskStateCommandService risk_state 更新と audit をまとめる command service
  * @param commandEventLog command_event_log repository
+ * @param broker account / position ledger 読み取り境界
  * @param tradingLock global trading lock
  * @param toolCallGuard MCP tool call guard
  * @param callerNoTradeGuard MCP caller boundary guard
@@ -60,6 +65,7 @@ data class TradingRuntime(
     val riskStateRepository: RiskStateRepository,
     val riskStateCommandService: RiskStateCommandService,
     val commandEventLog: CommandEventLog,
+    val broker: Broker,
     val tradingLock: TradingLock,
     val toolCallGuard: ToolCallGuard,
     val callerNoTradeGuard: CallerNoTradeGuard,
@@ -131,6 +137,11 @@ object TradingRuntimeFactory {
      */
     fun inMemory(clock: Clock = Clock.systemUTC()): TradingRuntime {
         val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val broker = PaperBroker(
+            ledgerRepository = InMemoryPaperLedgerRepository(),
+            riskStateRepository = riskStateRepository,
+            clock = clock,
+        )
         val commandEventLog = InMemoryCommandEventLog()
         val riskStateCommandService = InMemoryRiskStateCommandService(
             riskStateRepository = riskStateRepository,
@@ -150,6 +161,7 @@ object TradingRuntimeFactory {
             riskStateRepository = riskStateRepository,
             riskStateCommandService = riskStateCommandService,
             commandEventLog = commandEventLog,
+            broker = broker,
             tradingLock = tradingLock,
             toolCallGuard = toolCallGuard,
             callerNoTradeGuard = callerNoTradeGuard,
@@ -168,6 +180,11 @@ object TradingRuntimeFactory {
             TradingPersistenceBootstrap(database, clock).verifySchema().getOrThrow()
 
             val riskStateRepository = ExposedRiskStateRepository(database)
+            val broker = PaperBroker(
+                ledgerRepository = ExposedPaperLedgerRepository(database),
+                riskStateRepository = riskStateRepository,
+                clock = clock,
+            )
             val commandEventLog = ExposedCommandEventLog(database)
             val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
             val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
@@ -183,6 +200,7 @@ object TradingRuntimeFactory {
                 riskStateRepository = riskStateRepository,
                 riskStateCommandService = riskStateCommandService,
                 commandEventLog = commandEventLog,
+                broker = broker,
                 tradingLock = tradingLock,
                 toolCallGuard = toolCallGuard,
                 callerNoTradeGuard = callerNoTradeGuard,

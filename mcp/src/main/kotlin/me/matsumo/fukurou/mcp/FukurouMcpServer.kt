@@ -35,13 +35,18 @@ import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.domain.AccountSnapshot
+import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.exchange.gmo.GMO_MAX_DAILY_KLINE_REQUESTS
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoHttpException
@@ -54,7 +59,6 @@ import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
 import me.matsumo.fukurou.trading.market.MarketNetworkException
-import me.matsumo.fukurou.trading.risk.AccountStatus
 import me.matsumo.fukurou.trading.risk.AccountStatusService
 import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
@@ -103,6 +107,21 @@ private const val GET_SYMBOL_RULES_TOOL = "get_symbol_rules"
  * indicator 計算 tool 名。
  */
 private const val CALC_INDICATOR_TOOL = "calc_indicator"
+
+/**
+ * balance 取得 tool 名。
+ */
+private const val GET_BALANCE_TOOL = "get_balance"
+
+/**
+ * positions 取得 tool 名。
+ */
+private const val GET_POSITIONS_TOOL = "get_positions"
+
+/**
+ * open orders 取得 tool 名。
+ */
+private const val GET_OPEN_ORDERS_TOOL = "get_open_orders"
 
 /**
  * account status 取得 tool 名。
@@ -173,11 +192,6 @@ private const val DEFAULT_INDICATOR_CANDLE_LIMIT = 100
  * indicator 計算で取得する最大 candle 本数。
  */
 private const val MAX_INDICATOR_CANDLE_LIMIT = 500
-
-/**
- * 短期足で取得する最大 GMO 営業日数。
- */
-private const val MAX_DAILY_KLINE_REQUESTS = 7
 
 /**
  * timeout 再現 tool の既定 delay。
@@ -269,6 +283,9 @@ class FukurouMcpServer(
         server.registerTradesTool(marketDataSource, tradingRuntime.toolCallGuard, decisionRunContext)
         server.registerSymbolRulesTool(marketDataSource, tradingRuntime.toolCallGuard, decisionRunContext)
         server.registerCalcIndicatorTool(marketDataSource, tradingRuntime.toolCallGuard, decisionRunContext)
+        server.registerBalanceTool(tradingRuntime, decisionRunContext)
+        server.registerPositionsTool(tradingRuntime, decisionRunContext)
+        server.registerOpenOrdersTool(tradingRuntime, decisionRunContext)
         server.registerAccountStatusTool(tradingRuntime, decisionRunContext)
         server.registerRejectDummyTradeTool(tradingRuntime.toolCallGuard, decisionRunContext)
         server.registerSimulateToolTimeoutTool(tradingRuntime.toolCallGuard, decisionRunContext)
@@ -307,7 +324,7 @@ private fun Server.registerCandlesTool(
 ) {
     addTool(
         name = GET_CANDLES_TOOL,
-        description = "Get recent GMO Coin public candles for BTC spot. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $MAX_DAILY_KLINE_REQUESTS dates, so long 1hour limits may return fewer candles than requested.",
+        description = "Get recent GMO Coin public candles for BTC spot. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $GMO_MAX_DAILY_KLINE_REQUESTS dates, so long 1hour limits may return fewer candles than requested.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putSymbolSchema()
@@ -406,7 +423,7 @@ private fun Server.registerCalcIndicatorTool(
 ) {
     addTool(
         name = CALC_INDICATOR_TOOL,
-        description = "Calculate one technical indicator from GMO Coin public candles. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $MAX_DAILY_KLINE_REQUESTS dates before calculating.",
+        description = "Calculate one technical indicator from GMO Coin public candles. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $GMO_MAX_DAILY_KLINE_REQUESTS dates before calculating.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putSymbolSchema()
@@ -418,7 +435,7 @@ private fun Server.registerCalcIndicatorTool(
                 }
                 putJsonObject("params") {
                     put("type", JSON_TYPE_OBJECT)
-                    put("description", "Indicator params. Use period, fast_period, slow_period, signal_period, and limit as needed. DAY-based candle limits are capped by $MAX_DAILY_KLINE_REQUESTS stitched GMO business dates.")
+                    put("description", "Indicator params. Use period, fast_period, slow_period, signal_period, and limit as needed. DAY-based candle limits are capped by $GMO_MAX_DAILY_KLINE_REQUESTS stitched GMO business dates.")
                 }
             },
             required = listOf("interval", "indicator"),
@@ -426,6 +443,48 @@ private fun Server.registerCalcIndicatorTool(
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
         handleCalcIndicator(request, marketDataSource, toolCallGuard, decisionRunContext)
+    }
+}
+
+private fun Server.registerBalanceTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+) {
+    addTool(
+        name = GET_BALANCE_TOOL,
+        description = "Get paper account balance and equity snapshot.",
+        inputSchema = ToolSchema(),
+        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+    ) { request ->
+        handleGetBalance(request, tradingRuntime, decisionRunContext)
+    }
+}
+
+private fun Server.registerPositionsTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+) {
+    addTool(
+        name = GET_POSITIONS_TOOL,
+        description = "Get open paper positions from the bot-managed position ledger.",
+        inputSchema = ToolSchema(),
+        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+    ) { request ->
+        handleGetPositions(request, tradingRuntime, decisionRunContext)
+    }
+}
+
+private fun Server.registerOpenOrdersTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+) {
+    addTool(
+        name = GET_OPEN_ORDERS_TOOL,
+        description = "Get open paper orders including protective STOP orders.",
+        inputSchema = ToolSchema(),
+        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+    ) { request ->
+        handleGetOpenOrders(request, tradingRuntime, decisionRunContext)
     }
 }
 
@@ -618,6 +677,54 @@ private suspend fun handleGetTicker(
     )
 }
 
+private suspend fun handleGetBalance(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(GET_BALANCE_TOOL, decisionRunContext)
+    val balance = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
+        tradingRuntime.broker.getBalance().getOrThrow()
+    }
+
+    return balance.fold(
+        onSuccess = { value -> balanceResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
+private suspend fun handleGetPositions(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(GET_POSITIONS_TOOL, decisionRunContext)
+    val positions = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
+        tradingRuntime.broker.getPositions().getOrThrow()
+    }
+
+    return positions.fold(
+        onSuccess = { value -> positionsResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
+private suspend fun handleGetOpenOrders(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+): CallToolResult {
+    val call = request.toGuardedToolCall(GET_OPEN_ORDERS_TOOL, decisionRunContext)
+    val openOrders = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
+        tradingRuntime.broker.getOpenOrders().getOrThrow()
+    }
+
+    return openOrders.fold(
+        onSuccess = { value -> openOrdersResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
 private suspend fun handleGetAccountStatus(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
@@ -625,7 +732,7 @@ private suspend fun handleGetAccountStatus(
 ): CallToolResult {
     val call = request.toGuardedToolCall(GET_ACCOUNT_STATUS_TOOL, decisionRunContext)
     val accountStatus = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
-        AccountStatusService(tradingRuntime.riskStateRepository).getAccountStatus().getOrThrow()
+        AccountStatusService(tradingRuntime.broker).getAccountStatus().getOrThrow()
     }
 
     return accountStatus.fold(
@@ -918,6 +1025,30 @@ private fun indicatorResult(output: IndicatorToolOutput): CallToolResult {
             put("indicator", ToolJson.encodeToJsonElement(output.result.indicator))
             put("params", ToolJson.encodeToJsonElement(output.result.params))
             put("values", ToolJson.encodeToJsonElement(output.result.values))
+        },
+    )
+}
+
+private fun balanceResult(balance: AccountSnapshot): CallToolResult {
+    val structuredContent = ToolJson.encodeToJsonElement(balance).jsonObject
+
+    return jsonObjectResult(structuredContent)
+}
+
+private fun positionsResult(positions: List<Position>): CallToolResult {
+    return jsonObjectResult(
+        buildJsonObject {
+            put("count", positions.size)
+            put("positions", ToolJson.encodeToJsonElement(positions))
+        },
+    )
+}
+
+private fun openOrdersResult(openOrders: List<Order>): CallToolResult {
+    return jsonObjectResult(
+        buildJsonObject {
+            put("count", openOrders.size)
+            put("orders", ToolJson.encodeToJsonElement(openOrders))
         },
     )
 }
