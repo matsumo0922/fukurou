@@ -33,6 +33,7 @@ import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import me.matsumo.fukurou.mcp.gmo.FixedGmoCoinKlineRequestBudgetHook
+import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolErrorResponse
 import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolExecutor
 import me.matsumo.fukurou.mcp.gmo.registerGmoCoinMarketTools
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
@@ -285,6 +286,17 @@ private class AuditedGmoCoinMarketToolExecutor(
         val call = request.toGuardedToolCall(toolName, decisionRunContext)
 
         return toolCallGuard.runReadOnlyTool(call, block)
+    }
+
+    override fun errorResponse(throwable: Throwable): GmoCoinMarketToolErrorResponse? {
+        if (throwable !is ToolCompletionAuditFailedException) {
+            return null
+        }
+
+        return GmoCoinMarketToolErrorResponse(
+            type = "audit_failed_after_execution",
+            executed = throwable.executed,
+        )
     }
 }
 

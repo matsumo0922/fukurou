@@ -144,7 +144,25 @@ interface GmoCoinMarketToolExecutor {
         request: CallToolRequest,
         block: suspend () -> T,
     ): Result<T>
+
+    /**
+     * executor 境界で発生した例外の MCP error 応答を上書きする。
+     */
+    fun errorResponse(throwable: Throwable): GmoCoinMarketToolErrorResponse? {
+        return null
+    }
 }
+
+/**
+ * executor 境界で上書きする MCP error 応答。
+ *
+ * @param type MCP structuredContent の error type
+ * @param executed tool 本体の副作用または読み取りが実行済みかどうか
+ */
+data class GmoCoinMarketToolErrorResponse(
+    val type: String,
+    val executed: Boolean? = null,
+)
 
 /**
  * 監査や追加制約なしで market tool を実行する executor。
@@ -444,7 +462,7 @@ private suspend fun handleGetCandles(
 
     return candles.fold(
         onSuccess = { value -> candlesResult(value) },
-        onFailure = { throwable -> throwableResult(throwable) },
+        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
 }
 
@@ -462,7 +480,7 @@ private suspend fun handleGetOrderbook(
 
     return orderbook.fold(
         onSuccess = { value -> orderbookResult(value) },
-        onFailure = { throwable -> throwableResult(throwable) },
+        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
 }
 
@@ -480,7 +498,7 @@ private suspend fun handleGetTrades(
 
     return trades.fold(
         onSuccess = { value -> tradesResult(value) },
-        onFailure = { throwable -> throwableResult(throwable) },
+        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
 }
 
@@ -497,7 +515,7 @@ private suspend fun handleGetSymbolRules(
 
     return symbolRules.fold(
         onSuccess = { value -> symbolRulesResult(value) },
-        onFailure = { throwable -> throwableResult(throwable) },
+        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
 }
 
@@ -535,7 +553,7 @@ private suspend fun handleCalcIndicator(
 
     return indicator.fold(
         onSuccess = { value -> indicatorResult(value) },
-        onFailure = { throwable -> throwableResult(throwable) },
+        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
 }
 
@@ -552,7 +570,7 @@ private suspend fun handleGetTicker(
 
     return ticker.fold(
         onSuccess = { value -> tickerResult(value) },
-        onFailure = { throwable -> throwableResult(throwable) },
+        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
 }
 
@@ -758,8 +776,12 @@ private fun jsonObjectResult(structuredContent: JsonObject): CallToolResult {
     )
 }
 
-private fun throwableResult(throwable: Throwable): CallToolResult {
-    val type = when (throwable) {
+private fun throwableResult(
+    throwable: Throwable,
+    toolExecutor: GmoCoinMarketToolExecutor,
+): CallToolResult {
+    val mappedError = toolExecutor.errorResponse(throwable)
+    val type = mappedError?.type ?: when (throwable) {
         is MarketInvalidRequestException -> "invalid_request"
         is GmoRateLimitException -> "rate_limited"
         is GmoApiStatusException -> "gmo_status_error"
@@ -769,15 +791,17 @@ private fun throwableResult(throwable: Throwable): CallToolResult {
         is IllegalArgumentException -> "invalid_request"
         else -> "tool_call_failed"
     }
+    val executed = mappedError?.executed
 
     val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
 
-    return errorResult(type, throwable.message.orEmpty(), failureKind)
+    return errorResult(type, throwable.message.orEmpty(), executed, failureKind)
 }
 
 private fun errorResult(
     type: String,
     message: String,
+    executed: Boolean? = null,
     failureKind: String? = null,
 ): CallToolResult {
     val resolvedMessage = message.ifBlank { "unknown error" }
@@ -788,6 +812,9 @@ private fun errorResult(
             put("error", true)
             put("type", type)
             put("message", resolvedMessage)
+            if (executed != null) {
+                put("executed", executed)
+            }
             if (failureKind != null) {
                 put("failure_kind", failureKind)
             }
