@@ -126,6 +126,19 @@ class IndicatorCalculatorTest {
             result.getOrThrow()
         }
     }
+
+    @Test
+    fun calculate_keepsMarketDataParseExceptionForInvalidCandleNumber() {
+        val result = IndicatorCalculator.calculate(
+            candles = listOf(invalidNumberCandle()),
+            indicator = IndicatorType.EMA,
+            params = IndicatorParams(period = 1),
+        )
+
+        assertFailsWith<MarketDataParseException> {
+            result.getOrThrow()
+        }
+    }
 }
 
 private fun atrCandles(): List<Candle> {
@@ -163,6 +176,19 @@ private fun candle(
         high = high.toString(),
         low = low.toString(),
         close = close.toString(),
+        volume = "1.0",
+    )
+}
+
+private fun invalidNumberCandle(): Candle {
+    return Candle(
+        symbol = TRADING_SYMBOL_TEXT,
+        interval = CandleInterval.FIVE_MINUTES,
+        openTime = "invalid",
+        open = "100",
+        high = "101",
+        low = "99",
+        close = "not-a-number",
         volume = "1.0",
     )
 }

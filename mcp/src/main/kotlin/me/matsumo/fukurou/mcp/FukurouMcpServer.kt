@@ -175,6 +175,11 @@ private const val DEFAULT_INDICATOR_CANDLE_LIMIT = 100
 private const val MAX_INDICATOR_CANDLE_LIMIT = 500
 
 /**
+ * 短期足で取得する最大 GMO 営業日数。
+ */
+private const val MAX_DAILY_KLINE_REQUESTS = 7
+
+/**
  * timeout 再現 tool の既定 delay。
  */
 private const val DEFAULT_SIMULATED_TIMEOUT_DELAY_MS = 30_000L
@@ -302,7 +307,7 @@ private fun Server.registerCandlesTool(
 ) {
     addTool(
         name = GET_CANDLES_TOOL,
-        description = "Get recent GMO Coin public candles for BTC spot.",
+        description = "Get recent GMO Coin public candles for BTC spot. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $MAX_DAILY_KLINE_REQUESTS dates, so long 1hour limits may return fewer candles than requested.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putSymbolSchema()
@@ -401,7 +406,7 @@ private fun Server.registerCalcIndicatorTool(
 ) {
     addTool(
         name = CALC_INDICATOR_TOOL,
-        description = "Calculate one technical indicator from GMO Coin public candles.",
+        description = "Calculate one technical indicator from GMO Coin public candles. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $MAX_DAILY_KLINE_REQUESTS dates before calculating.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putSymbolSchema()
@@ -413,7 +418,7 @@ private fun Server.registerCalcIndicatorTool(
                 }
                 putJsonObject("params") {
                     put("type", JSON_TYPE_OBJECT)
-                    put("description", "Indicator params. Use period, fast_period, slow_period, signal_period, and limit as needed.")
+                    put("description", "Indicator params. Use period, fast_period, slow_period, signal_period, and limit as needed. DAY-based candle limits are capped by $MAX_DAILY_KLINE_REQUESTS stitched GMO business dates.")
                 }
             },
             required = listOf("interval", "indicator"),

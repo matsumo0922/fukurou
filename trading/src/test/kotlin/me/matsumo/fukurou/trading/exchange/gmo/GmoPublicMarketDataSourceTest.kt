@@ -155,6 +155,74 @@ class GmoPublicMarketDataSourceTest {
     }
 
     @Test
+    fun getCandles_usesGmoBusinessDateBeforeSixAmJst() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf(
+                "symbol=BTC&interval=5min&date=20260101" to klineResponse("2026-01-01T18:00:00Z"),
+            ),
+        )
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            clock = Clock.fixed(Instant.parse("2026-01-01T18:00:00Z"), ZoneOffset.UTC),
+        )
+
+        marketDataSource.getCandles(TradingSymbol.BTC, CandleInterval.FIVE_MINUTES, limit = 1).getOrThrow()
+
+        assertEquals(listOf("symbol=BTC&interval=5min&date=20260101"), httpClient.requestQueries)
+    }
+
+    @Test
+    fun getCandles_treatsKlinesNotFoundAsEmptyAndContinuesStitching() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf(
+                "symbol=BTC&interval=5min&date=20260102" to KLINES_NOT_FOUND_RESPONSE,
+                "symbol=BTC&interval=5min&date=20260101" to klineResponse("2026-01-01T00:00:00Z"),
+                "symbol=BTC&interval=5min&date=20251231" to klineResponse("2025-12-31T23:55:00Z"),
+            ),
+        )
+        val marketDataSource = fakeMarketDataSource(httpClient)
+
+        val candles = marketDataSource.getCandles(TradingSymbol.BTC, CandleInterval.FIVE_MINUTES, limit = 2).getOrThrow()
+
+        assertEquals(
+            listOf(
+                "symbol=BTC&interval=5min&date=20260102",
+                "symbol=BTC&interval=5min&date=20260101",
+                "symbol=BTC&interval=5min&date=20251231",
+            ),
+            httpClient.requestQueries,
+        )
+        assertEquals(listOf("2025-12-31T23:55:00Z", "2026-01-01T00:00:00Z"), candles.map { candle -> candle.openTime })
+    }
+
+    @Test
+    fun getCandles_fetchesMultiplePreviousDaysUntilLimit() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf(
+                "symbol=BTC&interval=1hour&date=20260102" to klineResponse("2026-01-02T00:00:00Z"),
+                "symbol=BTC&interval=1hour&date=20260101" to klineResponse("2026-01-01T00:00:00Z"),
+                "symbol=BTC&interval=1hour&date=20251231" to klineResponse("2025-12-31T00:00:00Z"),
+            ),
+        )
+        val marketDataSource = fakeMarketDataSource(httpClient)
+
+        val candles = marketDataSource.getCandles(TradingSymbol.BTC, CandleInterval.ONE_HOUR, limit = 3).getOrThrow()
+
+        assertEquals(
+            listOf(
+                "symbol=BTC&interval=1hour&date=20260102",
+                "symbol=BTC&interval=1hour&date=20260101",
+                "symbol=BTC&interval=1hour&date=20251231",
+            ),
+            httpClient.requestQueries,
+        )
+        assertEquals(
+            listOf("2025-12-31T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+            candles.map { candle -> candle.openTime },
+        )
+    }
+
+    @Test
     fun getCandles_fetchesPreviousYearForYearRangeIntervals() = runBlocking {
         val httpClient = FakeHttpClient(
             responses = mapOf(
@@ -177,6 +245,23 @@ class GmoPublicMarketDataSourceTest {
             httpClient.requestQueries,
         )
         assertEquals(listOf("2025-12-31T00:00:00Z", "2026-01-01T00:00:00Z"), candles.map { candle -> candle.openTime })
+    }
+
+    @Test
+    fun getCandles_usesPreviousYearBeforeSixAmJstOnNewYear() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf(
+                "symbol=BTC&interval=1day&date=2025" to klineResponse("2025-12-31T00:00:00Z"),
+            ),
+        )
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            clock = Clock.fixed(Instant.parse("2025-12-31T18:00:00Z"), ZoneOffset.UTC),
+        )
+
+        marketDataSource.getCandles(TradingSymbol.BTC, CandleInterval.ONE_DAY, limit = 1).getOrThrow()
+
+        assertEquals(listOf("symbol=BTC&interval=1day&date=2025"), httpClient.requestQueries)
     }
 
     @Test
@@ -257,8 +342,8 @@ private const val RATE_LIMIT_RESPONSE = """
   "status": 9,
   "messages": [
     {
-      "message_code": "ERR-429",
-      "message_string": "rate limit exceeded"
+      "message_code": "ERR-5003",
+      "message_string": "Requests are too many."
     }
   ],
   "data": []
@@ -289,6 +374,22 @@ private const val KLINES_SUCCESS_RESPONSE = """
       "volume": "1.2"
     }
   ]
+}
+"""
+
+/**
+ * klines not found fixture。
+ */
+private const val KLINES_NOT_FOUND_RESPONSE = """
+{
+  "status": 2,
+  "messages": [
+    {
+      "message_code": "ERR-5207",
+      "message_string": "Not found"
+    }
+  ],
+  "data": []
 }
 """
 
@@ -405,11 +506,14 @@ private fun klineResponse(vararg openTimes: String): String {
     """.trimIndent()
 }
 
-private fun fakeMarketDataSource(httpClient: FakeHttpClient): GmoPublicMarketDataSource {
+private fun fakeMarketDataSource(
+    httpClient: FakeHttpClient,
+    clock: Clock = Clock.fixed(Instant.parse("2026-01-02T00:00:00Z"), ZoneOffset.UTC),
+): GmoPublicMarketDataSource {
     return GmoPublicMarketDataSource(
         httpClient = httpClient,
         baseUrl = "https://example.test/public",
-        clock = Clock.fixed(Instant.parse("2026-01-02T00:00:00Z"), ZoneOffset.UTC),
+        clock = clock,
         symbolRulesCacheTtl = Duration.ofMinutes(10),
     )
 }

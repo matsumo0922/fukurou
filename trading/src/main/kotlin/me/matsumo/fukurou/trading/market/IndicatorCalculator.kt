@@ -274,6 +274,10 @@ private const val DEFAULT_MACD_SIGNAL_PERIOD = 9
 
 private fun Result<IndicatorResult>.mapError(): Result<IndicatorResult> {
     return recoverCatching { throwable ->
+        if (throwable is MarketDataParseException) {
+            throw throwable
+        }
+
         throw MarketInvalidRequestException(throwable.message.orEmpty())
     }
 }
@@ -441,5 +445,5 @@ private fun calculateMacdLine(
 }
 
 private fun String.toDoubleValue(fieldName: String): Double {
-    return toDoubleOrNull() ?: throw MarketInvalidRequestException("$fieldName must be a decimal number: $this")
+    return toDoubleOrNull() ?: throw MarketDataParseException("$fieldName must be a decimal number: $this")
 }

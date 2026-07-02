@@ -32,6 +32,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
@@ -86,6 +87,16 @@ private const val HTTP_TOO_MANY_REQUESTS = 429
 private const val GMO_STATUS_OK = 0
 
 /**
+ * GMO API が rate limit 時に返す message_code。
+ */
+private const val GMO_RATE_LIMIT_MESSAGE_CODE = "ERR-5003"
+
+/**
+ * GMO klines が未生成の日付に返す message_code。
+ */
+private const val GMO_KLINES_NOT_FOUND_MESSAGE_CODE = "ERR-5207"
+
+/**
  * trades tool で許可する最大取得数。
  */
 private const val MAX_TRADES_LIMIT = 100
@@ -99,6 +110,16 @@ private const val MAX_ORDERBOOK_DEPTH = 100
  * candles tool で許可する最大取得本数。
  */
 private const val MAX_CANDLE_LIMIT = 500
+
+/**
+ * 短期足 stitching で 1 回の呼び出し中に許可する最大 request 数。
+ */
+private const val MAX_DAILY_KLINE_REQUESTS = 7
+
+/**
+ * GMO の営業日が切り替わる JST 時刻。
+ */
+private const val GMO_BUSINESS_DAY_SWITCH_HOUR = 6
 
 /**
  * GMO klines の最古想定年。
@@ -160,6 +181,7 @@ class GmoPublicMarketDataSource(
     private val symbolRulesCacheTtl: Duration = DEFAULT_SYMBOL_RULES_CACHE_TTL,
 ) : MarketDataSource {
 
+    @Volatile
     private var cachedSymbolRules: CachedSymbolRules? = null
 
     override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> = runMarketRequest {
@@ -280,17 +302,18 @@ class GmoPublicMarketDataSource(
         interval: CandleInterval,
         limit: Int,
     ): List<Candle> {
-        val today = LocalDate.now(clock.withZone(marketDateZone))
-        val todayCandles = fetchKlines(symbol, interval, today.format(KlineDayFormatter))
+        val candles = mutableListOf<Candle>()
+        var date = currentGmoBusinessDate()
+        var requestCount = 0
 
-        if (todayCandles.size >= limit) {
-            return todayCandles.takeLast(limit)
+        while (shouldFetchDay(candles, limit, requestCount)) {
+            val dailyCandles = fetchKlines(symbol, interval, date.format(KlineDayFormatter))
+            candles.addAll(0, dailyCandles)
+            date = date.minusDays(1)
+            requestCount += 1
         }
 
-        val previousDay = today.minusDays(1)
-        val previousDayCandles = fetchKlines(symbol, interval, previousDay.format(KlineDayFormatter))
-
-        return stitchCandles(previousDayCandles + todayCandles, limit)
+        return stitchCandles(candles, limit)
     }
 
     private fun fetchYearRangeCandles(
@@ -298,7 +321,7 @@ class GmoPublicMarketDataSource(
         interval: CandleInterval,
         limit: Int,
     ): List<Candle> {
-        val currentYear = LocalDate.now(clock.withZone(marketDateZone)).year
+        val currentYear = currentGmoBusinessDate().year
         val candles = mutableListOf<Candle>()
         var year = currentYear
         var requestCount = 0
@@ -311,6 +334,17 @@ class GmoPublicMarketDataSource(
         }
 
         return stitchCandles(candles, limit)
+    }
+
+    private fun shouldFetchDay(
+        candles: List<Candle>,
+        limit: Int,
+        requestCount: Int,
+    ): Boolean {
+        val needsMoreCandles = candles.size < limit
+        val canRequestMore = requestCount < MAX_DAILY_KLINE_REQUESTS
+
+        return needsMoreCandles && canRequestMore
     }
 
     private fun shouldFetchYear(
@@ -326,6 +360,12 @@ class GmoPublicMarketDataSource(
         return needsMoreCandles && isSupportedYear && canRequestMore
     }
 
+    private fun currentGmoBusinessDate(): LocalDate {
+        return LocalDateTime.now(clock.withZone(marketDateZone))
+            .minusHours(GMO_BUSINESS_DAY_SWITCH_HOUR.toLong())
+            .toLocalDate()
+    }
+
     private fun fetchKlines(
         symbol: TradingSymbol,
         interval: CandleInterval,
@@ -334,7 +374,13 @@ class GmoPublicMarketDataSource(
         val request = buildKlinesRequest(symbol, interval, date)
         val responseBody = sendRequest(request, "klines")
 
-        return parseKlinesResponse(responseBody, symbol, interval, json)
+        return parseKlinesResponse(
+            responseBody = responseBody,
+            symbol = symbol,
+            interval = interval,
+            json = json,
+            notFoundAsEmpty = true,
+        )
     }
 
     private fun readCachedSymbolRules(symbol: TradingSymbol): SymbolRules? {
@@ -405,8 +451,13 @@ fun parseKlinesResponse(
     symbol: TradingSymbol,
     interval: CandleInterval,
     json: Json = GmoPublicApiJson,
+    notFoundAsEmpty: Boolean = false,
 ): List<Candle> {
     val response = decodeResponse<GmoKlinesResponse>(responseBody, "klines", json)
+
+    if (notFoundAsEmpty && response.isKlinesNotFound()) {
+        return emptyList()
+    }
 
     validateGmoStatus(response.status, response.messages, "klines")
 
@@ -433,8 +484,6 @@ fun parseOrderbookResponse(
     depth: Int,
     json: Json = GmoPublicApiJson,
 ): Orderbook {
-    validateLimit(depth, MAX_ORDERBOOK_DEPTH, "depth")
-
     val response = decodeResponse<GmoOrderbookResponse>(responseBody, "orderbook", json)
 
     validateGmoStatus(response.status, response.messages, "orderbook")
@@ -516,13 +565,20 @@ private fun validateGmoStatus(
     }
 
     val messageText = messages.toMessageText()
-    val isRateLimit = messageText.contains("rate", ignoreCase = true) || messageText.contains("limit", ignoreCase = true)
+    val isRateLimit = messages.hasMessageCode(GMO_RATE_LIMIT_MESSAGE_CODE)
 
     if (isRateLimit) {
         throw GmoRateLimitException("GMO $endpointName response was rate limited: $messageText")
     }
 
     throw GmoApiStatusException(status, "GMO $endpointName response status was $status: $messageText")
+}
+
+private fun GmoKlinesResponse.isKlinesNotFound(): Boolean {
+    val isStatusError = status != GMO_STATUS_OK
+    val isNotFound = messages.hasMessageCode(GMO_KLINES_NOT_FOUND_MESSAGE_CODE)
+
+    return isStatusError && isNotFound
 }
 
 private fun validateLimit(limit: Int, maxLimit: Int, name: String) {
@@ -578,6 +634,10 @@ private fun List<GmoMessage>.toMessageText(): String {
         listOfNotNull(message.messageCode, message.messageString)
             .joinToString(separator = " ")
     }
+}
+
+private fun List<GmoMessage>.hasMessageCode(messageCode: String): Boolean {
+    return any { message -> message.messageCode == messageCode }
 }
 
 /**
