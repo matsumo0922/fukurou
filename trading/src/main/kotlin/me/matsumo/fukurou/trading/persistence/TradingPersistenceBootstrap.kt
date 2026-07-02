@@ -218,6 +218,102 @@ private const val VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL = """
 """
 
 /**
+ * decisions schema の存在を確認する SQL。
+ */
+private const val VERIFY_DECISIONS_SCHEMA_SQL = """
+    SELECT
+        id,
+        invocation_id,
+        llm_provider,
+        prompt_hash,
+        system_prompt_version,
+        market_snapshot_id,
+        action,
+        setup_tags,
+        estimated_win_probability,
+        expected_r_multiple,
+        round_trip_cost_r,
+        tool_evidence_ids,
+        fact_check,
+        self_review,
+        reason_ja,
+        missing_data_ja,
+        no_trade_conditions_ja,
+        created_at
+    FROM decisions
+    LIMIT 0
+"""
+
+/**
+ * trade_plans schema の存在を確認する SQL。
+ */
+private const val VERIFY_TRADE_PLANS_SCHEMA_SQL = """
+    SELECT
+        id,
+        decision_id,
+        parent_trade_plan_id,
+        revision_count,
+        symbol,
+        thesis_ja,
+        invalidation_conditions_ja,
+        target_price_jpy,
+        time_stop_at,
+        setup_tags,
+        created_at
+    FROM trade_plans
+    LIMIT 0
+"""
+
+/**
+ * trade_intents schema の存在を確認する SQL。
+ */
+private const val VERIFY_TRADE_INTENTS_SCHEMA_SQL = """
+    SELECT
+        id,
+        decision_id,
+        trade_plan_id,
+        symbol,
+        side,
+        order_type,
+        size_btc,
+        price_jpy,
+        protective_stop_price_jpy,
+        take_profit_price_jpy,
+        estimated_win_probability,
+        created_at
+    FROM trade_intents
+    LIMIT 0
+"""
+
+/**
+ * falsifications schema の存在を確認する SQL。
+ */
+private const val VERIFY_FALSIFICATIONS_SCHEMA_SQL = """
+    SELECT
+        id,
+        intent_id,
+        verdict,
+        llm_provider,
+        reason_ja,
+        created_at
+    FROM falsifications
+    LIMIT 0
+"""
+
+/**
+ * trade_intent_consumptions schema の存在を確認する SQL。
+ */
+private const val VERIFY_TRADE_INTENT_CONSUMPTIONS_SCHEMA_SQL = """
+    SELECT
+        id,
+        intent_id,
+        order_id,
+        consumed_at
+    FROM trade_intent_consumptions
+    LIMIT 0
+"""
+
+/**
  * trading persistence の最小 schema を起動時に用意する bootstrapper。
  *
  * @param database Exposed database
@@ -245,6 +341,11 @@ class TradingPersistenceBootstrap(
                     ExecutionsTable,
                     CommandEventLogTable,
                     SafetyViolationsTable,
+                    DecisionsTable,
+                    TradePlansTable,
+                    TradeIntentsTable,
+                    FalsificationsTable,
+                    TradeIntentConsumptionsTable,
                     withLogs = false,
                 )
                 val now = Instant.now(clock)
@@ -268,6 +369,11 @@ class TradingPersistenceBootstrap(
                 verifyOrdersSchema()
                 verifyExecutionsSchema()
                 verifySafetyViolationsSchema()
+                verifyDecisionsSchema()
+                verifyTradePlansSchema()
+                verifyTradeIntentsSchema()
+                verifyFalsificationsSchema()
+                verifyTradeIntentConsumptionsSchema()
                 selectRiskState(forUpdate = false)
                 selectPaperAccount()
             }
@@ -333,6 +439,56 @@ internal fun JdbcTransaction.verifySafetyViolationsSchema() {
     verifySchemaBySql(
         sql = VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL,
         missingMessage = "safety_violations schema was not initialized.",
+    )
+}
+
+/**
+ * decisions schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyDecisionsSchema() {
+    verifySchemaBySql(
+        sql = VERIFY_DECISIONS_SCHEMA_SQL,
+        missingMessage = "decisions schema was not initialized.",
+    )
+}
+
+/**
+ * trade_plans schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyTradePlansSchema() {
+    verifySchemaBySql(
+        sql = VERIFY_TRADE_PLANS_SCHEMA_SQL,
+        missingMessage = "trade_plans schema was not initialized.",
+    )
+}
+
+/**
+ * trade_intents schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyTradeIntentsSchema() {
+    verifySchemaBySql(
+        sql = VERIFY_TRADE_INTENTS_SCHEMA_SQL,
+        missingMessage = "trade_intents schema was not initialized.",
+    )
+}
+
+/**
+ * falsifications schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyFalsificationsSchema() {
+    verifySchemaBySql(
+        sql = VERIFY_FALSIFICATIONS_SCHEMA_SQL,
+        missingMessage = "falsifications schema was not initialized.",
+    )
+}
+
+/**
+ * trade_intent_consumptions schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyTradeIntentConsumptionsSchema() {
+    verifySchemaBySql(
+        sql = VERIFY_TRADE_INTENT_CONSUMPTIONS_SCHEMA_SQL,
+        missingMessage = "trade_intent_consumptions schema was not initialized.",
     )
 }
 
