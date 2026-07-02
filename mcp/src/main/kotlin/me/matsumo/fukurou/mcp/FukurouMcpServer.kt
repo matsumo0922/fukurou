@@ -357,12 +357,26 @@ private fun Server.registerPlaceOrderTool(
                 }
                 putDecimalStringSchema("size_btc", "BTC order size.")
                 putDecimalStringSchema("price_jpy", "LIMIT or STOP price. Omit for MARKET.")
+                putJsonObject("trade_group_id") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Optional trade group UUID when adding to an existing group.")
+                }
                 putDecimalStringSchema("protective_stop_price_jpy", "Required protective STOP price after entry fill.")
                 putDecimalStringSchema("take_profit_price_jpy", "Optional virtual take-profit trigger price.")
+                putDecimalStringSchema("expected_value_r", "Expected value in R. Must pass the SafetyFloor EV gate.")
+                putDecimalStringSchema("expected_move_to_cost_ratio", "Expected move divided by round-trip cost.")
                 putReasonSchema()
                 putClientRequestIdSchema()
             },
-            required = listOf("side", "type", "size_btc", "protective_stop_price_jpy", "reason"),
+            required = listOf(
+                "side",
+                "type",
+                "size_btc",
+                "protective_stop_price_jpy",
+                "expected_value_r",
+                "expected_move_to_cost_ratio",
+                "reason",
+            ),
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
     ) { request ->
@@ -1223,8 +1237,11 @@ private fun parsePlaceOrderCommand(request: CallToolRequest, call: GuardedToolCa
             orderType = parseOrderType(request.stringArgument("type")).getOrThrow(),
             sizeBtc = parseBigDecimalArgument(request, "size_btc").getOrThrow(),
             priceJpy = parseOptionalBigDecimalArgument(request, "price_jpy").getOrThrow(),
+            tradeGroupId = request.stringArgument("trade_group_id")?.let { value -> UUID.fromString(value) },
             protectiveStopPriceJpy = parseBigDecimalArgument(request, "protective_stop_price_jpy").getOrThrow(),
             takeProfitPriceJpy = parseOptionalBigDecimalArgument(request, "take_profit_price_jpy").getOrThrow(),
+            expectedValueR = parseBigDecimalArgument(request, "expected_value_r").getOrThrow(),
+            expectedMoveToCostRatio = parseBigDecimalArgument(request, "expected_move_to_cost_ratio").getOrThrow(),
             reasonJa = parseReason(request).getOrThrow(),
             auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
         )
@@ -1446,6 +1463,16 @@ private fun tradeResult(result: PaperTradeResult): CallToolResult {
             put("position_ids", ToolJson.encodeToJsonElement(result.positionIds))
             put("execution_ids", ToolJson.encodeToJsonElement(result.executionIds))
             put("message", result.messageJa)
+            result.safetyViolation?.let { violation ->
+                putJsonObject("safety_violation") {
+                    put("id", violation.id.toString())
+                    put("rule", violation.rule.name)
+                    put("message", violation.messageJa)
+                    put("measured_value", violation.measuredValue)
+                    put("limit_value", violation.limitValue)
+                    put("hard_halt_required", violation.hardHaltRequired)
+                }
+            }
         },
     )
 }

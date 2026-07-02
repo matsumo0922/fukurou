@@ -856,8 +856,11 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
         orderType = orderType,
         sizeBtc = sizeBtc.toBigDecimal(),
         priceJpy = price,
+        tradeGroupId = tradeGroupId?.let { value -> UUID.fromString(value) },
         protectiveStopPriceJpy = requireNotNull(protectiveStopPriceJpy).toBigDecimal(),
         takeProfitPriceJpy = takeProfitPriceJpy?.toBigDecimal(),
+        expectedValueR = DEFAULT_RESTORED_EXPECTED_VALUE_R,
+        expectedMoveToCostRatio = DEFAULT_RESTORED_EXPECTED_MOVE_TO_COST_RATIO,
         reasonJa = reasonJa.orEmpty(),
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
@@ -919,3 +922,13 @@ private const val DRAW_DOWN_SCALE = 10
  * ATR trailing の既定係数。
  */
 private val TRAILING_ATR_MULTIPLIER = BigDecimal("2.0")
+
+/**
+ * resting order 復元時の既定 expected value。
+ */
+private val DEFAULT_RESTORED_EXPECTED_VALUE_R = BigDecimal("1.0")
+
+/**
+ * resting order 復元時の既定 expected move / cost ratio。
+ */
+private val DEFAULT_RESTORED_EXPECTED_MOVE_TO_COST_RATIO = BigDecimal("10.0")

@@ -15,7 +15,9 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
+import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
+import me.matsumo.fukurou.trading.persistence.ExposedSafetyViolationRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
@@ -112,17 +114,22 @@ internal fun startProtectionReconcilerWorker(
 ): ProtectionReconcilerWorker {
     val riskStateRepository = ExposedRiskStateRepository(database)
     val commandEventLog = ExposedCommandEventLog(database)
+    val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
+    val safetyViolationRepository = ExposedSafetyViolationRepository(database)
     val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
     val marketDataSource = GmoPublicMarketDataSource()
     val broker = PaperBroker(
         ledgerRepository = ExposedPaperLedgerRepository(database),
         riskStateRepository = riskStateRepository,
+        riskStateCommandService = riskStateCommandService,
+        safetyViolationRepository = safetyViolationRepository,
         marketDataSource = marketDataSource,
         reconcilerStatusProvider = status,
         clock = clock,
     )
     val reconciler = ProtectionReconciler(
         riskStateRepository = riskStateRepository,
+        riskStateCommandService = riskStateCommandService,
         commandEventLog = commandEventLog,
         tradingLock = tradingLock,
         tickStream = RestPollingTickStream(
