@@ -1,6 +1,11 @@
 package me.matsumo.fukurou.mcp
 
+import me.matsumo.fukurou.trading.domain.Candle
+import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.RecentTrade
+import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -52,7 +57,44 @@ private object FakeMarketDataSource : MarketDataSource {
         )
     }
 
-    override suspend fun getRecentTrades(symbol: TradingSymbol): Result<List<RecentTrade>> {
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return Result.success(
+            listOf(
+                Candle(
+                    symbol = symbol.apiSymbol,
+                    interval = interval,
+                    openTime = "2026-07-01T00:00:00Z",
+                    open = "100",
+                    high = "110",
+                    low = "90",
+                    close = "105",
+                    volume = "1.0",
+                ),
+            ),
+        )
+    }
+
+    override suspend fun getOrderbook(
+        symbol: TradingSymbol,
+        depth: Int,
+    ): Result<Orderbook> {
+        return Result.success(
+            Orderbook(
+                symbol = symbol.apiSymbol,
+                bids = listOf(OrderbookLevel("99", "0.1")),
+                asks = listOf(OrderbookLevel("101", "0.1")),
+            ),
+        )
+    }
+
+    override suspend fun getTrades(
+        symbol: TradingSymbol,
+        limit: Int,
+    ): Result<List<RecentTrade>> {
         return Result.success(
             listOf(
                 RecentTrade(
@@ -62,6 +104,19 @@ private object FakeMarketDataSource : MarketDataSource {
                     side = TradeSide.BUY,
                     timestamp = "2026-07-01T00:00:00Z",
                 ),
+            ),
+        )
+    }
+
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
+        return Result.success(
+            SymbolRules(
+                symbol = symbol.apiSymbol,
+                minOrderSize = "0.0001",
+                sizeStep = "0.0001",
+                tickSize = "1",
+                takerFee = "0.0005",
+                makerFee = "-0.0001",
             ),
         )
     }

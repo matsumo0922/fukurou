@@ -1,8 +1,11 @@
 package me.matsumo.fukurou.trading.domain
 
+import kotlinx.serialization.Serializable
+
 /**
  * 直近約定の売買方向。
  */
+@Serializable
 enum class TradeSide {
     /**
      * 買い約定。
@@ -24,6 +27,7 @@ enum class TradeSide {
  * @param side 売買方向
  * @param timestamp 取引所が返した約定時刻
  */
+@Serializable
 data class RecentTrade(
     val symbol: String,
     val price: String,
