@@ -11,6 +11,8 @@ COPY gradle ./gradle
 COPY settings.gradle.kts build.gradle.kts gradle.properties ./
 COPY build-logic ./build-logic
 COPY fukurou ./fukurou
+COPY mcp ./mcp
+COPY trading ./trading
 
 # Gradle home を BuildKit のキャッシュmountに載せ、再ビルド時の依存DLを省く。
 RUN --mount=type=cache,target=/root/.gradle \
