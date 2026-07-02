@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
+import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
@@ -20,6 +21,7 @@ import me.matsumo.fukurou.trading.reconciler.ProtectionReconciler
 import me.matsumo.fukurou.trading.reconciler.RestPollingTickStream
 import java.time.Clock
 import java.time.Duration
+import java.util.logging.Logger
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
@@ -28,17 +30,34 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 private val DEFAULT_RECONCILER_INTERVAL = Duration.ofSeconds(5)
 
 /**
+ * bootstrap failure log の rate limit key。
+ */
+private const val BOOTSTRAP_FAILURE_LOG_KEY = "protection-reconciler-worker-bootstrap-failure"
+
+/**
+ * ProtectionReconcilerWorker 用 logger。
+ */
+private val WORKER_LOGGER = Logger.getLogger(ProtectionReconcilerWorker::class.java.name)
+
+/**
  * Ktor backend 上で ProtectionReconciler を常駐起動する worker。
  *
  * @param reconciler 実行する ProtectionReconciler
  * @param interval loop 間隔
  * @param bootstrap reconciler loop 開始前に必要な DB schema 初期化
+ * @param clock warning log の rate limit 判定に使う clock
+ * @param warnLogger rate-limited warning logger
  * @param scope worker coroutine scope
  */
 class ProtectionReconcilerWorker(
     private val reconciler: ProtectionReconciler,
     private val interval: Duration = DEFAULT_RECONCILER_INTERVAL,
     private val bootstrap: () -> Result<Unit> = { Result.success(Unit) },
+    clock: Clock = Clock.systemUTC(),
+    private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
+        logger = WORKER_LOGGER,
+        clock = clock,
+    ),
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
 ) : AutoCloseable {
 
@@ -57,6 +76,14 @@ class ProtectionReconcilerWorker(
                 if (bootstrapResult.isSuccess) {
                     reconciler.runLoop(interval)
                     return@launch
+                }
+
+                bootstrapResult.exceptionOrNull()?.let { throwable ->
+                    warnLogger.warn(
+                        key = BOOTSTRAP_FAILURE_LOG_KEY,
+                        message = "ProtectionReconcilerWorker bootstrap failed.",
+                        throwable = throwable,
+                    )
                 }
 
                 delay(interval.toMillis())
@@ -81,7 +108,7 @@ internal fun startProtectionReconcilerWorker(
     status: MutableReconcilerStatus,
     clock: Clock = Clock.systemUTC(),
 ): ProtectionReconcilerWorker {
-    val riskStateRepository = ExposedRiskStateRepository(database, clock)
+    val riskStateRepository = ExposedRiskStateRepository(database)
     val commandEventLog = ExposedCommandEventLog(database)
     val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
     val reconciler = ProtectionReconciler(
@@ -99,5 +126,6 @@ internal fun startProtectionReconcilerWorker(
     return ProtectionReconcilerWorker(
         reconciler = reconciler,
         bootstrap = { TradingPersistenceBootstrap(database, clock).ensureSchema() },
+        clock = clock,
     ).start()
 }

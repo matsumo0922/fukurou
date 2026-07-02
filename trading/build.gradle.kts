@@ -15,4 +15,5 @@ dependencies {
     implementation(libs.exposed.jdbc)
 
     testImplementation(kotlin("test"))
+    testImplementation(libs.testcontainers.postgresql)
 }

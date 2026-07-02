@@ -10,11 +10,13 @@ import java.time.Instant
  *
  * @param symbol 取引対象 symbol
  * @param observedAt tick 観測時刻
+ * @param lastPrice ticker が返した直近価格
  * @param recentTradeCount 同じ polling pass で取得した直近約定数
  */
 data class TickSnapshot(
     val symbol: String,
     val observedAt: Instant,
+    val lastPrice: String?,
     val recentTradeCount: Int = 0,
 )
 
@@ -43,13 +45,13 @@ class RestPollingTickStream(
 
     override suspend fun latestTick(): Result<TickSnapshot?> {
         return runCatching {
-            marketDataSource.getTicker(symbol).getOrThrow()
-
+            val ticker = marketDataSource.getTicker(symbol).getOrThrow()
             val recentTrades = marketDataSource.getRecentTrades(symbol).getOrThrow()
 
             TickSnapshot(
                 symbol = symbol.apiSymbol,
                 observedAt = clock.instant(),
+                lastPrice = ticker.last,
                 recentTradeCount = recentTrades.size,
             )
         }

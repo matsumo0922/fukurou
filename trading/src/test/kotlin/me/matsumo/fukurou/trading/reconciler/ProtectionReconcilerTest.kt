@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -74,6 +75,31 @@ class ProtectionReconcilerTest {
     }
 
     @Test
+    fun run_loop_emits_started_event_once() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val status = MutableReconcilerStatus()
+        val reconciler = createReconciler(
+            eventLog = eventLog,
+            status = status,
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(10))
+        }
+
+        withTimeout(500) {
+            while (status.snapshot().lastReconciledAt == null) {
+                delay(10)
+            }
+        }
+        job.cancelAndJoin()
+
+        val eventTypes = eventLog.events().map { event -> event.eventType }
+
+        assertEquals(CommandEventType.RECONCILER_STARTED, eventTypes.first())
+        assertEquals(1, eventTypes.count { eventType -> eventType == CommandEventType.RECONCILER_STARTED })
+    }
+
+    @Test
     fun steady_loop_success_does_not_append_heartbeat_events() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
         val reconciler = createReconciler(eventLog = eventLog)
@@ -113,19 +139,19 @@ class ProtectionReconcilerTest {
     @Test
     fun loop_failure_and_recovery_are_logged_only_on_transitions() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
-        val tickStream = SwitchableTickStream(Result.success(fixedTickSnapshot()))
+        val riskStateRepository = SwitchableRiskStateRepository()
         val reconciler = createReconciler(
             eventLog = eventLog,
-            tickStream = tickStream,
+            riskStateRepository = riskStateRepository,
         )
 
         reconciler.reconcileOnce(ReconcilePassKind.STARTUP_FULL).getOrThrow()
 
-        tickStream.nextResult = Result.failure(IllegalStateException("market data unavailable"))
+        riskStateRepository.nextResult = Result.failure(IllegalStateException("risk_state unavailable"))
         assertTrue(reconciler.reconcileOnce(ReconcilePassKind.LOOP).isFailure)
         assertTrue(reconciler.reconcileOnce(ReconcilePassKind.LOOP).isFailure)
 
-        tickStream.nextResult = Result.success(fixedTickSnapshot())
+        riskStateRepository.nextResult = null
         reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
 
         val eventTypes = eventLog.events().map { event -> event.eventType }
@@ -138,6 +164,36 @@ class ProtectionReconcilerTest {
             ),
             eventTypes,
         )
+    }
+
+    @Test
+    fun tick_failure_advances_reconciled_freshness_without_market_freshness() = runBlocking {
+        val firstInstant = Instant.parse("2026-07-02T00:00:00Z")
+        val secondInstant = Instant.parse("2026-07-02T00:00:05Z")
+        val clock = MutableTestClock(firstInstant)
+        val eventLog = InMemoryCommandEventLog()
+        val status = MutableReconcilerStatus()
+        val tickStream = SwitchableTickStream(Result.success(fixedTickSnapshot(firstInstant)))
+        val reconciler = createReconciler(
+            clock = clock,
+            eventLog = eventLog,
+            status = status,
+            tickStream = tickStream,
+        )
+
+        reconciler.reconcileOnce(ReconcilePassKind.STARTUP_FULL).getOrThrow()
+
+        clock.currentInstant = secondInstant
+        tickStream.nextResult = Result.failure(IllegalStateException("market data unavailable"))
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+        val snapshot = status.snapshot()
+        val eventTypes = eventLog.events().map { event -> event.eventType }
+
+        assertTrue(result.isSuccess)
+        assertEquals(secondInstant, snapshot.lastReconciledAt)
+        assertEquals(firstInstant, snapshot.lastMarketDataAt)
+        assertEquals(listOf(CommandEventType.RECONCILER_PASS_COMPLETED), eventTypes)
     }
 
     @Test
@@ -186,10 +242,11 @@ private class CountingTradingLock(
  * ProtectionReconciler test 用の reconciler を作る。
  */
 private fun createReconciler(
+    clock: Clock = fixedClock(),
     eventLog: CommandEventLog = InMemoryCommandEventLog(),
-    lock: TradingLock = InMemoryTradingLock(fixedClock()),
+    lock: TradingLock = InMemoryTradingLock(clock),
     status: MutableReconcilerStatus = MutableReconcilerStatus(),
-    riskStateRepository: RiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+    riskStateRepository: RiskStateRepository = InMemoryRiskStateRepository(clock = clock),
     tickStream: TickStream = FixedTickStream,
 ): ProtectionReconciler {
     return ProtectionReconciler(
@@ -198,7 +255,7 @@ private fun createReconciler(
         tradingLock = lock,
         tickStream = tickStream,
         status = status,
-        clock = fixedClock(),
+        clock = clock,
     )
 }
 
@@ -251,6 +308,31 @@ private class FlakyRiskStateRepository(
 }
 
 /**
+ * current() の結果を切り替えられる risk_state repository。
+ */
+private class SwitchableRiskStateRepository : RiskStateRepository {
+
+    private val delegate = InMemoryRiskStateRepository(clock = fixedClock())
+
+    /**
+     * null の場合は delegate の現在値を返す。
+     */
+    var nextResult: Result<RiskState>? = null
+
+    override suspend fun current(): Result<RiskState> {
+        return nextResult ?: delegate.current()
+    }
+
+    override suspend fun setHardHalt(reason: String, at: Instant): Result<RiskState> {
+        return delegate.setHardHalt(reason, at)
+    }
+
+    override suspend fun resume(reason: String, at: Instant): Result<RiskState> {
+        return delegate.resume(reason, at)
+    }
+}
+
+/**
  * append に必ず失敗する command_event_log。
  */
 private object FailingCommandEventLog : CommandEventLog {
@@ -282,9 +364,39 @@ private class SwitchableTickStream(
 /**
  * 固定時刻の tick snapshot を返す。
  */
-private fun fixedTickSnapshot(): TickSnapshot {
+private fun fixedTickSnapshot(
+    observedAt: Instant = fixedInstant(),
+): TickSnapshot {
     return TickSnapshot(
         symbol = "BTC",
-        observedAt = fixedInstant(),
+        observedAt = observedAt,
+        lastPrice = "100",
     )
+}
+
+/**
+ * テスト内で任意時刻へ進められる clock。
+ *
+ * @param currentInstant 現在時刻として返す instant
+ * @param currentZone clock の zone
+ */
+private class MutableTestClock(
+    var currentInstant: Instant,
+    private val currentZone: ZoneId = ZoneOffset.UTC,
+) : Clock() {
+
+    override fun getZone(): ZoneId {
+        return currentZone
+    }
+
+    override fun withZone(zone: ZoneId): Clock {
+        return MutableTestClock(
+            currentInstant = currentInstant,
+            currentZone = zone,
+        )
+    }
+
+    override fun instant(): Instant {
+        return currentInstant
+    }
 }

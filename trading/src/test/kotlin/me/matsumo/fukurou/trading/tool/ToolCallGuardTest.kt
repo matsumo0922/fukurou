@@ -202,7 +202,7 @@ private fun createGuard(
 private fun createCall(
     toolName: String = "trade.place_order",
     toolCallId: String = "tool-call",
-    context: DecisionRunContext = DecisionRunContext.fromEnvironment(emptyMap()),
+    context: DecisionRunContext = DecisionRunContext.EMPTY,
 ): GuardedToolCall {
     return GuardedToolCall(
         toolName = toolName,

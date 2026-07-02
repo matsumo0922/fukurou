@@ -43,6 +43,17 @@ data class DecisionRunContext(
 ) {
     companion object {
         /**
+         * LLM 起動に紐づかない worker / test 用の空コンテキスト。
+         */
+        val EMPTY = DecisionRunContext(
+            decisionRunId = null,
+            llmProvider = null,
+            promptHash = null,
+            systemPromptVersion = null,
+            marketSnapshotId = null,
+        )
+
+        /**
          * 環境変数から decision run context を組み立てる。
          */
         fun fromEnvironment(environment: Map<String, String> = System.getenv()): DecisionRunContext {

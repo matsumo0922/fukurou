@@ -158,34 +158,43 @@ object TradingRuntimeFactory {
     }
 
     /**
-     * Postgres/Exposed runtime を構築し、最小 schema を初期化する。
+     * Postgres/Exposed runtime を構築し、backend bootstrap 済み schema を検証する。
      */
     fun postgres(config: TradingDatabaseConfig, clock: Clock = Clock.systemUTC()): TradingRuntime {
         val dataSource = createDataSource(config)
-        val database = ExposedDatabase.connect(dataSource)
-        TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
 
-        val riskStateRepository = ExposedRiskStateRepository(database, clock)
-        val commandEventLog = ExposedCommandEventLog(database)
-        val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
-        val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
-        val callerNoTradeGuard = CallerNoTradeGuard(commandEventLog, clock)
-        val toolCallGuard = ToolCallGuard(
-            riskStateRepository = riskStateRepository,
-            commandEventLog = commandEventLog,
-            tradingLock = tradingLock,
-            clock = clock,
-        )
+        try {
+            val database = ExposedDatabase.connect(dataSource)
+            TradingPersistenceBootstrap(database, clock).verifySchema().getOrThrow()
 
-        return TradingRuntime(
-            riskStateRepository = riskStateRepository,
-            riskStateCommandService = riskStateCommandService,
-            commandEventLog = commandEventLog,
-            tradingLock = tradingLock,
-            toolCallGuard = toolCallGuard,
-            callerNoTradeGuard = callerNoTradeGuard,
-            close = { dataSource.close() },
-        )
+            val riskStateRepository = ExposedRiskStateRepository(database)
+            val commandEventLog = ExposedCommandEventLog(database)
+            val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
+            val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
+            val callerNoTradeGuard = CallerNoTradeGuard(commandEventLog, clock)
+            val toolCallGuard = ToolCallGuard(
+                riskStateRepository = riskStateRepository,
+                commandEventLog = commandEventLog,
+                tradingLock = tradingLock,
+                clock = clock,
+            )
+
+            return TradingRuntime(
+                riskStateRepository = riskStateRepository,
+                riskStateCommandService = riskStateCommandService,
+                commandEventLog = commandEventLog,
+                tradingLock = tradingLock,
+                toolCallGuard = toolCallGuard,
+                callerNoTradeGuard = callerNoTradeGuard,
+                close = { dataSource.close() },
+            )
+        } catch (throwable: Throwable) {
+            runCatching {
+                dataSource.close()
+            }.exceptionOrNull()?.let { closeThrowable -> throwable.addSuppressed(closeThrowable) }
+
+            throw throwable
+        }
     }
 }
 

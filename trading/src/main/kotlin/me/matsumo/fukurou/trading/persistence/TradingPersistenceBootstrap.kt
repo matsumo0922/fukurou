@@ -25,6 +25,27 @@ private const val INSERT_DEFAULT_RISK_STATE_SQL = """
 """
 
 /**
+ * command_event_log schema の存在を確認する SQL。
+ */
+private const val VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL = """
+    SELECT
+        id,
+        decision_run_id,
+        tool_call_id,
+        client_request_id,
+        tool_name,
+        event_type,
+        payload,
+        ts,
+        llm_provider,
+        prompt_hash,
+        system_prompt_version,
+        market_snapshot_id
+    FROM command_event_log
+    LIMIT 0
+"""
+
+/**
  * trading persistence の最小 schema を起動時に用意する bootstrapper。
  *
  * @param database Exposed database
@@ -49,6 +70,29 @@ class TradingPersistenceBootstrap(
                 )
                 ensureRiskStateRow(Instant.now(clock))
             }
+        }
+    }
+
+    /**
+     * schema と risk_state single row が backend bootstrap 済みであることだけを確認する。
+     */
+    fun verifySchema(): Result<Unit> {
+        return runCatching {
+            exposedTransaction(database) {
+                verifyCommandEventLogSchema()
+                selectRiskState(forUpdate = false)
+            }
+        }
+    }
+}
+
+/**
+ * command_event_log schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyCommandEventLogSchema() {
+    jdbcConnection().prepareStatement(VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            requireNotNull(resultSet.metaData) { "command_event_log schema was not initialized." }
         }
     }
 }

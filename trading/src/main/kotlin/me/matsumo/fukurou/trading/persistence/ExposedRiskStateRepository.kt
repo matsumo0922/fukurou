@@ -7,7 +7,6 @@ import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
-import java.time.Clock
 import java.time.Instant
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
@@ -64,18 +63,15 @@ private const val UPDATE_RESUME_SQL = """
  * Exposed/JDBC で risk_state single row を扱う repository。
  *
  * @param database Exposed database
- * @param clock row が存在しない場合の初期 updatedAt に使う clock
  */
 class ExposedRiskStateRepository(
     private val database: ExposedDatabase,
-    private val clock: Clock = Clock.systemUTC(),
 ) : RiskStateRepository {
 
     override suspend fun current(): Result<RiskState> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    ensureRiskStateRow(Instant.now(clock))
                     selectRiskState(forUpdate = false)
                 }
             }

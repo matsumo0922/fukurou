@@ -31,6 +31,7 @@ class TickStreamTest {
         assertEquals(1, marketDataSource.tickerCallCount)
         assertEquals(1, marketDataSource.recentTradesCallCount)
         assertEquals("BTC", tickSnapshot.symbol)
+        assertEquals("100", tickSnapshot.lastPrice)
         assertEquals(2, tickSnapshot.recentTradeCount)
         assertEquals(fixedInstant(), tickSnapshot.observedAt)
     }

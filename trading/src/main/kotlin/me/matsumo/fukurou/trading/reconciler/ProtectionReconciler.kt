@@ -11,15 +11,22 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.lock.TradingLock
+import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.util.logging.Logger
 
 /**
  * ProtectionReconciler の lock owner 名。
  */
 private const val RECONCILER_LOCK_OWNER = "protection-reconciler"
+
+/**
+ * worker 起動 audit の payload。
+ */
+private const val RECONCILER_STARTED_PAYLOAD = """{"worker":"protection_reconciler","state":"started"}"""
 
 /**
  * startup full reconcile pass の payload。
@@ -30,6 +37,26 @@ private const val STARTUP_FULL_COMPLETED_PAYLOAD = """{"pass":"startup_full","st
  * loop reconcile pass が回復したことを示す payload。
  */
 private const val LOOP_RECOVERED_PAYLOAD = """{"pass":"loop","state":"recovered"}"""
+
+/**
+ * pass failure log の rate limit key。
+ */
+private const val PASS_FAILURE_LOG_KEY = "protection-reconciler-pass-failure"
+
+/**
+ * market data failure log の rate limit key。
+ */
+private const val MARKET_DATA_FAILURE_LOG_KEY = "protection-reconciler-market-data-failure"
+
+/**
+ * start audit failure log の rate limit key。
+ */
+private const val START_AUDIT_FAILURE_LOG_KEY = "protection-reconciler-start-audit-failure"
+
+/**
+ * ProtectionReconciler 用 logger。
+ */
+private val RECONCILER_LOGGER = Logger.getLogger(ProtectionReconciler::class.java.name)
 
 /**
  * ProtectionReconciler の pass 種別。
@@ -55,6 +82,7 @@ enum class ReconcilePassKind {
  * @param tickStream 市場データ tick stream 抽象
  * @param status Reconciler の状態 holder
  * @param clock pass timestamp に使う clock
+ * @param warnLogger rate-limited warning logger
  */
 class ProtectionReconciler(
     private val riskStateRepository: RiskStateRepository,
@@ -63,6 +91,10 @@ class ProtectionReconciler(
     private val tickStream: TickStream = EmptyTickStream,
     private val status: MutableReconcilerStatus = MutableReconcilerStatus(),
     private val clock: Clock = Clock.systemUTC(),
+    private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
+        logger = RECONCILER_LOGGER,
+        clock = clock,
+    ),
 ) {
 
     private var previousPassFailed = false
@@ -71,6 +103,14 @@ class ProtectionReconciler(
      * 起動時 full pass を実行した後、cancel されるまで loop pass を続ける。
      */
     suspend fun runLoop(interval: Duration) {
+        recordStarted().onFailure { throwable ->
+            warnLogger.warn(
+                key = START_AUDIT_FAILURE_LOG_KEY,
+                message = "ProtectionReconciler start audit failed.",
+                throwable = throwable,
+            )
+        }
+
         while (currentCoroutineContext().isActive) {
             val startupResult = reconcileOnce(ReconcilePassKind.STARTUP_FULL)
 
@@ -78,12 +118,21 @@ class ProtectionReconciler(
                 break
             }
 
+            startupResult.exceptionOrNull()?.let { throwable ->
+                logPassFailure(ReconcilePassKind.STARTUP_FULL, throwable)
+            }
+
             delay(interval.toMillis())
         }
 
         while (currentCoroutineContext().isActive) {
             delay(interval.toMillis())
-            reconcileOnce(ReconcilePassKind.LOOP)
+
+            val loopResult = reconcileOnce(ReconcilePassKind.LOOP)
+
+            loopResult.exceptionOrNull()?.let { throwable ->
+                logPassFailure(ReconcilePassKind.LOOP, throwable)
+            }
         }
     }
 
@@ -113,8 +162,8 @@ class ProtectionReconciler(
         val passResult = runCatching {
             riskStateRepository.current().getOrThrow()
 
-            val tickSnapshot = tickStream.latestTick().getOrThrow()
             val reconciledAt = Instant.now(clock)
+            val tickSnapshot = readTickSnapshot()
 
             markSuccessfulPass(passKind, tickSnapshot, reconciledAt).getOrThrow()
         }
@@ -135,6 +184,30 @@ class ProtectionReconciler(
         }
 
         return Result.failure(throwable)
+    }
+
+    private suspend fun readTickSnapshot(): TickSnapshot? {
+        val tickResult = runCatching {
+            tickStream.latestTick().getOrThrow()
+        }
+
+        tickResult.exceptionOrNull()?.let { throwable ->
+            warnLogger.warn(
+                key = MARKET_DATA_FAILURE_LOG_KEY,
+                message = "ProtectionReconciler market data refresh failed.",
+                throwable = throwable,
+            )
+        }
+
+        return tickResult.getOrNull()
+    }
+
+    private suspend fun recordStarted(): Result<Unit> {
+        return appendReconcilerEvent(
+            eventType = CommandEventType.RECONCILER_STARTED,
+            payload = RECONCILER_STARTED_PAYLOAD,
+            occurredAt = Instant.now(clock),
+        )
     }
 
     private suspend fun markSuccessfulPass(
@@ -197,7 +270,7 @@ class ProtectionReconciler(
     ): Result<Unit> {
         return commandEventLog.append(
             CommandEvent(
-                decisionRunContext = DecisionRunContext.fromEnvironment(emptyMap()),
+                decisionRunContext = DecisionRunContext.EMPTY,
                 toolName = RECONCILER_LOCK_OWNER,
                 toolCallId = null,
                 clientRequestId = null,
@@ -205,6 +278,14 @@ class ProtectionReconciler(
                 payload = payload,
                 occurredAt = occurredAt,
             ),
+        )
+    }
+
+    private fun logPassFailure(passKind: ReconcilePassKind, throwable: Throwable) {
+        warnLogger.warn(
+            key = "$PASS_FAILURE_LOG_KEY-${passKind.payloadName()}",
+            message = "ProtectionReconciler ${passKind.payloadName()} pass failed.",
+            throwable = throwable,
         )
     }
 }
