@@ -38,7 +38,7 @@
 - 全エントリーで setup タグと TradePlan を必須化し、振り返りエージェントが setup taxonomy を統合・改廃する。
 - 新規エントリーだけを対象に、Proposer / Falsifier の二権非対称レビューを導入する。Falsifierは拒否権のみを持ち、退出・保護操作はブロックしない。
 - `confidence >= 0.6` の発注ゲートを廃止し、コード計算のEVゲートへ置換する。confidenceは較正とデータ品質防衛の材料に限定する。
-- エントリー時の TradePlan を position の plan-of-record として永続化し、以後の起動は維持・退出・正式修正の3択に拘束する。
+- エントリー時の TradePlan を position の plan-of-record として永続化し、以後の起動は維持・退出・理由必須の正式修正の3択に拘束する。正式修正は既定2回までとする。
 - flat時はイベント発火 + 1時間ハートビートのみとし、15分定期発火を廃止する。保有中は密な保護・判断を維持する。
 - maker-first、日次エントリー上限、想定値幅/往復コスト比、paper初期の実測較正により、安全床6「コスト上限」を実体化する。
 - 経済イベントカレンダー、セッション時間帯、ATRパーセンタイル、要約特徴量中心の情報設計を導入する。
@@ -683,6 +683,8 @@ data class LlmRiskPlan(
 /**
  * エントリー後にpositionへ紐づく計画の正本。
  * 次回以降のLLMはこの計画を前提に、維持・退出・正式修正だけを選ぶ。
+ * 正式修正は理由必須で、revisionCountはrisk.maxTradePlanRevisionsを超えられない。
+ * 上限超過後は維持または退出だけを許可する。
  */
 data class TradePlanSnapshot(
     val tradePlanId: UUID,
@@ -1753,7 +1755,13 @@ canAct = expectedValueR > 0
 
 `CLOSE` / `REDUCE` / `UPDATE_PROTECTION` はリスク低減または保護操作であり、EVゲートやFalsifierでブロックしない。
 
-### 8.5 クロスモデルFalsifier
+### 8.5 TradePlan plan-of-record
+
+[確定事項の改訂: 2026-07-02] エントリー時の TradePlan は position の plan-of-record として永続化し、以後のLLM起動は「維持」「否定条件成立による退出」「理由必須の正式修正」の3択に限定する。正式修正の `revisionCount` は `risk.maxTradePlanRevisions`（既定2）を上限とし、上限超過後は維持または退出だけを許可して再修正を拒否する。
+
+機械検証可能な否定条件は `ProtectionReconciler` が監視し、成立時はLLMを待たずに退出する。正式修正の理由は該当 `decision` の理由・tool audit・TradePlan更新履歴に残し、振り返りで narrative drift の兆候として扱う。
+
+### 8.6 クロスモデルFalsifier
 
 [確定事項の改訂: 2026-07-02] MAGI式の三者合議は採用しない。同一モデルの多数決は相関エラーを消しにくく、コストも3倍になるためである。代わりに、Proposer / Falsifier の二権非対称モデルを採用する。
 
@@ -1772,7 +1780,7 @@ canAct = expectedValueR > 0
 
 headless `claude` → `codex` skill → MCP の成立性は、実装前に小スパイクで検証する。
 
-### 8.6 類似局面・失敗との突き合わせ
+### 8.7 類似局面・失敗との突き合わせ
 
 [設計提案] runtime判断時に読むKnowledgeは軽量にする。
 
@@ -1782,7 +1790,7 @@ headless `claude` → `codex` skill → MCP の成立性は、実装前に小ス
 
 LLMに大量のノートを読ませず、MCP側でfrontmatterと要約を検索し、短いヒットを返す。
 
-### 8.7 1回のCLI起動内で行うこと/振り返りへ回すこと
+### 8.8 1回のCLI起動内で行うこと/振り返りへ回すこと
 
 | 処理 | runtime LLM | reflection agent |
 |---|---:|---:|
@@ -3283,11 +3291,12 @@ risk:
   minExpectedValueR: "0.0"
   minExpectedMoveToCostRatio: "2.0"
   maxDailyEntries: 5
+  maxTradePlanRevisions: 2
   requireStopLoss: true
   noAveragingDown: true
 
 trigger:
-  scheduledIntervalMinutes: 15
+  flatHeartbeatIntervalMinutes: 60
   priceMoveWindowMinutes: 5
   priceMoveThresholdRatio: "0.01"
   cooldownSeconds: 300
@@ -3301,7 +3310,6 @@ llm:
   maxToolCallsPerRun: 30
   maxActToolCallsPerRun: 3
   maxSleepTotalSecondsPerRun: 10
-  confidenceThreshold: "0.60"
   systemPromptPath: "/etc/fukurou/prompts/trading-system.md"
   workingDirectory: "/var/lib/fukurou/llm-workdir"
 
