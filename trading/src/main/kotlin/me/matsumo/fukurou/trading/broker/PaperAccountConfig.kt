@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.broker
 
+import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.TradingMode
 import java.math.BigDecimal
 
@@ -28,6 +29,12 @@ data class PaperAccountConfig(
     val initialCashJpy: BigDecimal = DEFAULT_INITIAL_CASH_JPY,
     val mode: TradingMode = TradingMode.PAPER,
 ) {
+    init {
+        require(initialCashJpy > BigDecimal.ZERO) {
+            "$FUKUROU_PAPER_INITIAL_CASH_JPY_ENV must be greater than 0."
+        }
+    }
+
     companion object {
         /**
          * 環境変数から paper account 設定を読む。
@@ -54,4 +61,22 @@ data class PaperAccountConfig(
             )
         }
     }
+}
+
+/**
+ * paper account config から初期 account snapshot を作る。
+ */
+internal fun PaperAccountConfig.toInitialAccountSnapshot(): AccountSnapshot {
+    val initialCash = initialCashJpy.moneyScale().toPlainString()
+
+    return AccountSnapshot(
+        mode = mode,
+        cashJpy = initialCash,
+        initialCashJpy = initialCash,
+        btcQuantity = BigDecimal.ZERO.btcScale().toPlainString(),
+        btcMarkPriceJpy = BigDecimal.ZERO.moneyScale().toPlainString(),
+        totalEquityJpy = initialCash,
+        equityPeakJpy = initialCash,
+        drawdownRatio = BigDecimal.ZERO.ratioScale().toPlainString(),
+    )
 }

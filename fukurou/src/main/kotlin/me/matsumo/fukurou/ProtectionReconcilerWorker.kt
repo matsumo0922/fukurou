@@ -10,7 +10,9 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.PaperBroker
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
@@ -23,6 +25,7 @@ import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ProtectionReconciler
 import me.matsumo.fukurou.trading.reconciler.RestPollingTickStream
+import me.matsumo.fukurou.trading.safety.SafetyFloor
 import java.time.Clock
 import java.time.Duration
 import java.util.logging.Logger
@@ -112,18 +115,24 @@ internal fun startProtectionReconcilerWorker(
     status: MutableReconcilerStatus,
     clock: Clock = Clock.systemUTC(),
 ): ProtectionReconcilerWorker {
+    val tradingConfig = TradingBotConfig.fromEnvironment()
     val riskStateRepository = ExposedRiskStateRepository(database)
     val commandEventLog = ExposedCommandEventLog(database)
     val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
     val safetyViolationRepository = ExposedSafetyViolationRepository(database)
     val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
-    val marketDataSource = GmoPublicMarketDataSource()
+    val marketDataSource = GmoPublicMarketDataSource.fromConfig(
+        config = tradingConfig.gmoPublicClient,
+        clock = clock,
+    )
     val broker = PaperBroker(
         ledgerRepository = ExposedPaperLedgerRepository(database),
         riskStateRepository = riskStateRepository,
         riskStateCommandService = riskStateCommandService,
         safetyViolationRepository = safetyViolationRepository,
+        safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
         marketDataSource = marketDataSource,
+        fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
         reconcilerStatusProvider = status,
         clock = clock,
     )
@@ -143,7 +152,13 @@ internal fun startProtectionReconcilerWorker(
 
     return ProtectionReconcilerWorker(
         reconciler = reconciler,
-        bootstrap = { TradingPersistenceBootstrap(database, clock).ensureSchema() },
+        bootstrap = {
+            TradingPersistenceBootstrap(
+                database = database,
+                clock = clock,
+                paperAccountConfig = tradingConfig.paperAccount,
+            ).ensureSchema()
+        },
         clock = clock,
     ).start()
 }

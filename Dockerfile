@@ -16,7 +16,7 @@ COPY trading ./trading
 
 # Gradle home を BuildKit のキャッシュmountに載せ、再ビルド時の依存DLを省く。
 RUN --mount=type=cache,target=/root/.gradle \
-    chmod +x gradlew && ./gradlew :fukurou:buildFatJar --no-daemon
+    chmod +x gradlew && ./gradlew :fukurou:buildFatJar :mcp:buildFatJar --no-daemon
 
 # ---- runtime stage: 実行は軽量 JRE のみ ----
 FROM eclipse-temurin:21-jre AS runtime
@@ -26,8 +26,10 @@ WORKDIR /app
 # 非 root 実行ユーザを用意する。
 RUN useradd --system --uid 10001 appuser
 
-# fat JAR は fukurou/build/libs/<name>-all.jar に出力される。
+# Ktor fat JAR は fukurou/build/libs/<name>-all.jar に出力される。
 COPY --from=build /src/fukurou/build/libs/*-all.jar app.jar
+# MCP fat JAR は CLI の stdio 子プロセスとして利用する。
+COPY --from=build /src/mcp/build/libs/fukurou-mcp-all.jar fukurou-mcp-all.jar
 USER appuser
 
 # JVM をコンテナの memory limit に追従させる。

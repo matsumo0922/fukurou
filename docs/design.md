@@ -6,7 +6,7 @@
 - 実行形態: Docker(Linux) 常駐、24時間無人運転
 - 設計日: 2026-07-01
 - 改訂日: 2026-07-02（第3ラウンド根幹レビュー反映）
-- ステータス: Kotlin実装前の詳細設計ドラフト
+- ステータス: Step6（堅牢化 / config / Docker MCP 配線）まで実装済み。daemon scheduler / LlmInvoker 本実装 / live 実発注は未実装
 
 > 本書はソフトウェア設計書であり、投資助言ではない。v1は「学習7 : 利益3」の実験基盤として、ペーパートレードを最初の本番環境として扱う。
 
@@ -3371,6 +3371,16 @@ security:
 
 [確定] secretsは `.env` / 環境変数。コード外・ログに出さない。
 
+### 13.2.1 Step6実装状態
+
+[実装済み: 2026-07-02] runtime config は `TradingBotConfig` を正本とし、symbol / mode / paper 初期残高 / paper slippage / fallback fee / SafetyFloor thresholds / GMO Public REST timeout・rate-limit・retry を typed config として集約する。既存 env contract の `FUKUROU_TRADING_MODE` と `FUKUROU_PAPER_INITIAL_CASH_JPY` は維持し、新しい `FUKUROU_*` env は未設定なら既定値へ戻る。
+
+[実装済み: 2026-07-02] GMO Public market data client は `:trading.exchange.gmo` 境界で、client-side token bucket、指数 backoff retry、request timeout、temporary/permanent の typed error 分類を行う。`:mcp` は error response に分類を載せるだけで、rate-limit や retry の業務ロジックは持たない。
+
+[実装済み: 2026-07-02] Docker image は Ktor 用 `/app/app.jar` に加えて MCP stdio 用 `/app/fukurou-mcp-all.jar` を同梱する。entrypoint は Ktor のままで、将来 daemon / CLI runtime が `java -jar /app/fukurou-mcp-all.jar` を stdio 子プロセスとして起動する。
+
+[実装済み: 2026-07-02] paper / live の構造的乖離は `docs/mcp-runtime.md` に明記する。特に paper STOP は `ProtectionReconciler` 停止中に作動しない一方、live native STOP は取引所側で作動するため、paper の方が保護が弱い。
+
 [設計提案] secrets分離:
 
 | secret | 所有サービス | LLMへ渡すか | 備考 |
@@ -3411,7 +3421,7 @@ services:
       DB_USER: fukurou
       DB_PASSWORD: ${POSTGRES_PASSWORD}
       OBSIDIAN_VAULT_PATH: /vault
-      FUKUROU_MCP_JAR_PATH: /app/mcp/fukurou-mcp-all.jar
+      FUKUROU_MCP_JAR_PATH: /app/fukurou-mcp-all.jar
     volumes:
       - obsidian-vault:/vault
       - ./secrets/codex-auth.json:/auth/codex-auth.json:ro

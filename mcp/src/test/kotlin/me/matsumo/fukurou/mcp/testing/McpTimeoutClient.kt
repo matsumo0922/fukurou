@@ -19,6 +19,9 @@ fun main(args: Array<String>) = runBlocking {
     }
 
     val process = ProcessBuilder("java", "-jar", jarPath)
+        .apply {
+            environment()["FUKUROU_MCP_IN_MEMORY_RUNTIME"] = "true"
+        }
         .redirectError(ProcessBuilder.Redirect.INHERIT)
         .start()
 

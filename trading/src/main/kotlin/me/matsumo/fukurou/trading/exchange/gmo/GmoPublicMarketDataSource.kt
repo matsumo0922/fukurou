@@ -19,6 +19,8 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoHttpException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
+import me.matsumo.fukurou.trading.market.MarketDataException
+import me.matsumo.fukurou.trading.market.MarketDataFailureKind
 import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
@@ -80,6 +82,16 @@ private const val HTTP_OK = 200
  * HTTP rate limit status code。
  */
 private const val HTTP_TOO_MANY_REQUESTS = 429
+
+/**
+ * HTTP request timeout status code。
+ */
+private const val HTTP_REQUEST_TIMEOUT = 408
+
+/**
+ * HTTP server error status code の下限。
+ */
+private const val HTTP_SERVER_ERROR_MIN = 500
 
 /**
  * GMO API が成功時に返す status。
@@ -167,6 +179,10 @@ private val GmoMarketZone = ZoneId.of("Asia/Tokyo")
  * @param clock cache 期限と date stitching に使う clock
  * @param marketDateZone klines の date parameter に使う timezone
  * @param symbolRulesCacheTtl symbol rules の in-memory cache TTL
+ * @param rateLimitConfig Public REST の token bucket 設定
+ * @param retryConfig 一時的な失敗に対する retry 設定
+ * @param requestRateLimiter request 前に呼び出す rate limiter
+ * @param sleeper retry / rate-limit 待機に使う sleeper
  */
 class GmoPublicMarketDataSource(
     connectTimeout: Duration = DEFAULT_CONNECT_TIMEOUT,
@@ -179,6 +195,13 @@ class GmoPublicMarketDataSource(
     private val clock: Clock = Clock.systemUTC(),
     private val marketDateZone: ZoneId = GmoMarketZone,
     private val symbolRulesCacheTtl: Duration = DEFAULT_SYMBOL_RULES_CACHE_TTL,
+    rateLimitConfig: GmoRateLimitConfig = GmoRateLimitConfig(),
+    private val retryConfig: GmoRetryConfig = GmoRetryConfig(),
+    private val requestRateLimiter: GmoRequestRateLimiter = GmoTokenBucketRateLimiter(
+        config = rateLimitConfig,
+        clock = clock,
+    ),
+    private val sleeper: GmoSleeper = ThreadSleepingGmoSleeper,
 ) : MarketDataSource {
 
     @Volatile
@@ -234,10 +257,60 @@ class GmoPublicMarketDataSource(
 
     private suspend fun <T> runMarketRequest(block: () -> T): Result<T> = withContext(Dispatchers.IO) {
         runCatching {
-            block()
+            executeWithRetry(block)
         }.recoverCatching { throwable ->
             throw throwable.toMarketDataException()
         }
+    }
+
+    private fun <T> executeWithRetry(block: () -> T): T {
+        var attemptNumber = 1
+        var nextBackoff = retryConfig.initialBackoff
+        var lastFailure: Throwable? = null
+
+        while (attemptNumber <= retryConfig.maxAttempts) {
+            try {
+                return block()
+            } catch (exception: MarketDataException) {
+                if (!shouldRetry(exception, attemptNumber)) {
+                    throw exception
+                }
+
+                lastFailure = exception
+                sleeper.sleep(nextBackoff)
+                nextBackoff = nextRetryBackoff(nextBackoff)
+                attemptNumber += 1
+            } catch (exception: IllegalArgumentException) {
+                val marketFailure = MarketInvalidRequestException(exception.message.orEmpty(), exception)
+
+                if (!shouldRetry(marketFailure, attemptNumber)) {
+                    throw marketFailure
+                }
+
+                lastFailure = marketFailure
+                sleeper.sleep(nextBackoff)
+                nextBackoff = nextRetryBackoff(nextBackoff)
+                attemptNumber += 1
+            }
+        }
+
+        throw requireNotNull(lastFailure) {
+            "retry exhausted without captured failure."
+        }
+    }
+
+    private fun shouldRetry(throwable: Throwable, attemptNumber: Int): Boolean {
+        val hasAttemptLeft = attemptNumber < retryConfig.maxAttempts
+        val isTemporary = throwable is MarketDataException && throwable.kind == MarketDataFailureKind.TEMPORARY
+
+        return hasAttemptLeft && isTemporary
+    }
+
+    private fun nextRetryBackoff(currentBackoff: Duration): Duration {
+        val multipliedMillis = currentBackoff.toMillis().multiplyExactOrMax(retryConfig.backoffMultiplier)
+        val cappedMillis = minOf(multipliedMillis, retryConfig.maxBackoff.toMillis())
+
+        return Duration.ofMillis(cappedMillis)
     }
 
     private fun buildTickerRequest(symbol: TradingSymbol): HttpRequest {
@@ -274,6 +347,8 @@ class GmoPublicMarketDataSource(
     }
 
     private fun sendRequest(request: HttpRequest, endpointName: String): String {
+        requestRateLimiter.acquirePermit(endpointName)
+
         val response = try {
             httpClient.send(request, HttpResponse.BodyHandlers.ofString())
         } catch (exception: IOException) {
@@ -291,7 +366,11 @@ class GmoPublicMarketDataSource(
         }
 
         if (statusCode != HTTP_OK) {
-            throw GmoHttpException(statusCode, "GMO $endpointName request failed with HTTP $statusCode.")
+            throw GmoHttpException(
+                statusCode = statusCode,
+                kind = statusCode.toFailureKind(),
+                message = "GMO $endpointName request failed with HTTP $statusCode.",
+            )
         }
 
         return response.body()
@@ -402,6 +481,26 @@ class GmoPublicMarketDataSource(
         )
 
         return rules
+    }
+
+    companion object {
+        /**
+         * typed config から GMO Public market data source を構築する。
+         */
+        fun fromConfig(
+            config: GmoPublicClientConfig,
+            clock: Clock = Clock.systemUTC(),
+        ): GmoPublicMarketDataSource {
+            return GmoPublicMarketDataSource(
+                connectTimeout = config.connectTimeout,
+                requestTimeout = config.requestTimeout,
+                baseUrl = config.baseUrl,
+                clock = clock,
+                symbolRulesCacheTtl = config.symbolRulesCacheTtl,
+                rateLimitConfig = config.rateLimit,
+                retryConfig = config.retry,
+            )
+        }
     }
 }
 
@@ -602,9 +701,25 @@ private fun Throwable.toMarketDataException(): Throwable {
         is GmoApiStatusException,
         is MarketDataParseException,
         -> this
-        is IllegalArgumentException -> MarketInvalidRequestException(message.orEmpty())
+        is IllegalArgumentException -> MarketInvalidRequestException(message.orEmpty(), this)
         else -> this
     }
+}
+
+private fun Int.toFailureKind(): MarketDataFailureKind {
+    val isTemporaryStatus = this == HTTP_REQUEST_TIMEOUT || this >= HTTP_SERVER_ERROR_MIN
+
+    return if (isTemporaryStatus) {
+        MarketDataFailureKind.TEMPORARY
+    } else {
+        MarketDataFailureKind.PERMANENT
+    }
+}
+
+private fun Long.multiplyExactOrMax(multiplier: Long): Long {
+    return runCatching {
+        Math.multiplyExact(this, multiplier)
+    }.getOrDefault(Long.MAX_VALUE)
 }
 
 private fun GmoOrderbookLevel.toDomain(): OrderbookLevel {

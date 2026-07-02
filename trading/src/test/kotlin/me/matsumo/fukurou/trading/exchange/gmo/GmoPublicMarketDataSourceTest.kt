@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
+import me.matsumo.fukurou.trading.market.MarketDataFailureKind
 import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
 import java.net.Authenticator
@@ -68,6 +69,12 @@ class GmoPublicMarketDataSourceTest {
         assertFailsWith<GmoRateLimitException> {
             parseTickerResponse(RATE_LIMIT_RESPONSE, TradingSymbol.BTC)
         }
+    }
+
+    @Test
+    fun marketDataExceptions_exposeFailureKind() {
+        assertEquals(MarketDataFailureKind.TEMPORARY, GmoRateLimitException("rate limited").kind)
+        assertEquals(MarketDataFailureKind.PERMANENT, MarketInvalidRequestException("bad request").kind)
     }
 
     @Test
@@ -277,6 +284,54 @@ class GmoPublicMarketDataSourceTest {
         marketDataSource.getSymbolRules(TradingSymbol.BTC).getOrThrow()
 
         assertEquals(listOf(""), httpClient.requestQueries)
+    }
+
+    @Test
+    fun getTicker_acquiresRateLimitPermitBeforeRequest() = runBlocking {
+        val rateLimiter = RecordingRateLimiter()
+        val httpClient = FakeHttpClient(
+            responses = mapOf(
+                "symbol=BTC" to TICKER_SUCCESS_RESPONSE,
+            ),
+        )
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            requestRateLimiter = rateLimiter,
+        )
+
+        marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+
+        assertEquals(listOf("ticker"), rateLimiter.endpointNames)
+        assertEquals(listOf("symbol=BTC"), httpClient.requestQueries)
+    }
+
+    @Test
+    fun getTicker_retriesTemporaryHttpFailure() = runBlocking {
+        val sleeper = RecordingSleeper()
+        val httpClient = FakeHttpClient(
+            responses = mapOf(
+                "symbol=BTC" to TICKER_SUCCESS_RESPONSE,
+            ),
+            statusCodes = mapOf(
+                "symbol=BTC" to listOf(500, 200),
+            ),
+        )
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(
+                maxAttempts = 2,
+                initialBackoff = Duration.ofMillis(25),
+                maxBackoff = Duration.ofMillis(100),
+                backoffMultiplier = 2,
+            ),
+            sleeper = sleeper,
+        )
+
+        val ticker = marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+
+        assertEquals("BTC", ticker.symbol)
+        assertEquals(listOf("symbol=BTC", "symbol=BTC"), httpClient.requestQueries)
+        assertEquals(listOf(Duration.ofMillis(25)), sleeper.durations)
     }
 
     @Test
@@ -509,12 +564,18 @@ private fun klineResponse(vararg openTimes: String): String {
 private fun fakeMarketDataSource(
     httpClient: FakeHttpClient,
     clock: Clock = Clock.fixed(Instant.parse("2026-01-02T00:00:00Z"), ZoneOffset.UTC),
+    requestRateLimiter: GmoRequestRateLimiter = NoopGmoRequestRateLimiter,
+    retryConfig: GmoRetryConfig = GmoRetryConfig(),
+    sleeper: GmoSleeper = RecordingSleeper(),
 ): GmoPublicMarketDataSource {
     return GmoPublicMarketDataSource(
         httpClient = httpClient,
         baseUrl = "https://example.test/public",
         clock = clock,
         symbolRulesCacheTtl = Duration.ofMinutes(10),
+        requestRateLimiter = requestRateLimiter,
+        retryConfig = retryConfig,
+        sleeper = sleeper,
     )
 }
 
@@ -522,15 +583,18 @@ private fun fakeMarketDataSource(
  * request query に応じて固定 response を返す HTTP client。
  *
  * @param responses raw query と response body の対応
+ * @param statusCodes raw query と status code sequence の対応
  */
 private class FakeHttpClient(
     private val responses: Map<String, String>,
+    private val statusCodes: Map<String, List<Int>> = emptyMap(),
 ) : HttpClient() {
 
     /**
      * 呼び出された query の一覧。
      */
     val requestQueries = mutableListOf<String>()
+    private val responseIndexes = mutableMapOf<String, Int>()
 
     override fun cookieHandler(): Optional<CookieHandler> {
         return Optional.empty()
@@ -576,11 +640,15 @@ private class FakeHttpClient(
         val body = requireNotNull(responses[query]) {
             "No fake response for query: $query"
         }
+        val responseIndex = responseIndexes.getOrDefault(query, 0)
+        val queryStatusCodes = statusCodes[query]
+        val statusCode = queryStatusCodes?.getOrElse(responseIndex) { queryStatusCodes.last() } ?: 200
 
         requestQueries += query
+        responseIndexes[query] = responseIndex + 1
 
         @Suppress("UNCHECKED_CAST")
-        return FakeHttpResponse(request, body) as HttpResponse<ResponseBody>
+        return FakeHttpResponse(request, body, statusCode) as HttpResponse<ResponseBody>
     }
 
     override fun <ResponseBody> sendAsync(
@@ -604,14 +672,16 @@ private class FakeHttpClient(
  *
  * @param request 元 request
  * @param body response body
+ * @param statusCode response status code
  */
 private class FakeHttpResponse(
     private val request: HttpRequest,
     private val body: String,
+    private val statusCode: Int,
 ) : HttpResponse<String> {
 
     override fun statusCode(): Int {
-        return 200
+        return statusCode
     }
 
     override fun request(): HttpRequest {
@@ -640,5 +710,33 @@ private class FakeHttpResponse(
 
     override fun version(): HttpClient.Version {
         return HttpClient.Version.HTTP_1_1
+    }
+}
+
+/**
+ * rate limiter 呼び出しを記録する fake。
+ */
+private class RecordingRateLimiter : GmoRequestRateLimiter {
+    /**
+     * permit を要求された endpoint 名。
+     */
+    val endpointNames = mutableListOf<String>()
+
+    override fun acquirePermit(endpointName: String) {
+        endpointNames += endpointName
+    }
+}
+
+/**
+ * retry sleep を記録する fake。
+ */
+private class RecordingSleeper : GmoSleeper {
+    /**
+     * sleep を要求された duration。
+     */
+    val durations = mutableListOf<Duration>()
+
+    override fun sleep(duration: Duration) {
+        durations += duration
     }
 }

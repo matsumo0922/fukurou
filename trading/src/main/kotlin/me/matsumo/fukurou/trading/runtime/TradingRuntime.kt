@@ -5,8 +5,11 @@ import com.zaxxer.hikari.HikariDataSource
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.broker.Broker
+import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
+import me.matsumo.fukurou.trading.broker.toInitialAccountSnapshot
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.market.MarketDataSource
@@ -25,6 +28,7 @@ import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
+import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyViolationRepository
 import me.matsumo.fukurou.trading.tool.CallerNoTradeGuard
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
@@ -135,6 +139,7 @@ object TradingRuntimeFactory {
         clock: Clock = Clock.systemUTC(),
         reconcilerStatusProvider: ReconcilerStatusProvider? = null,
         marketDataSource: MarketDataSource? = null,
+        tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(environment),
     ): TradingRuntime {
         val databaseConfig = requireNotNull(TradingDatabaseConfig.fromEnvironment(environment)) {
             "DB_URL, DB_USER, and DB_PASSWORD are required for trading runtime."
@@ -145,6 +150,7 @@ object TradingRuntimeFactory {
             clock = clock,
             reconcilerStatusProvider = reconcilerStatusProvider,
             marketDataSource = marketDataSource,
+            tradingConfig = tradingConfig,
         )
     }
 
@@ -155,6 +161,7 @@ object TradingRuntimeFactory {
         clock: Clock = Clock.systemUTC(),
         reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
         marketDataSource: MarketDataSource? = null,
+        tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     ): TradingRuntime {
         val riskStateRepository = InMemoryRiskStateRepository(clock)
         val commandEventLog = InMemoryCommandEventLog()
@@ -165,11 +172,16 @@ object TradingRuntimeFactory {
             clock = clock,
         )
         val broker = PaperBroker(
-            ledgerRepository = InMemoryPaperLedgerRepository(),
+            ledgerRepository = InMemoryPaperLedgerRepository(
+                accountSnapshot = tradingConfig.paperAccount.toInitialAccountSnapshot(),
+                fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
+            ),
             riskStateRepository = riskStateRepository,
             riskStateCommandService = riskStateCommandService,
             safetyViolationRepository = safetyViolationRepository,
+            safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
             marketDataSource = marketDataSource,
+            fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
             reconcilerStatusProvider = reconcilerStatusProvider,
             clock = clock,
         )
@@ -203,12 +215,17 @@ object TradingRuntimeFactory {
         clock: Clock = Clock.systemUTC(),
         reconcilerStatusProvider: ReconcilerStatusProvider? = null,
         marketDataSource: MarketDataSource? = null,
+        tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     ): TradingRuntime {
         val dataSource = createDataSource(config)
 
         try {
             val database = ExposedDatabase.connect(dataSource)
-            TradingPersistenceBootstrap(database, clock).verifySchema().getOrThrow()
+            TradingPersistenceBootstrap(
+                database = database,
+                clock = clock,
+                paperAccountConfig = tradingConfig.paperAccount,
+            ).verifySchema().getOrThrow()
 
             val riskStateRepository = ExposedRiskStateRepository(database)
             val commandEventLog = ExposedCommandEventLog(database)
@@ -216,11 +233,16 @@ object TradingRuntimeFactory {
             val safetyViolationRepository = ExposedSafetyViolationRepository(database)
             val resolvedReconcilerStatusProvider = reconcilerStatusProvider ?: ExposedReconcilerStatusProvider(database)
             val broker = PaperBroker(
-                ledgerRepository = ExposedPaperLedgerRepository(database),
+                ledgerRepository = ExposedPaperLedgerRepository(
+                    database = database,
+                    fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
+                ),
                 riskStateRepository = riskStateRepository,
                 riskStateCommandService = riskStateCommandService,
                 safetyViolationRepository = safetyViolationRepository,
+                safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
                 marketDataSource = marketDataSource,
+                fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
                 reconcilerStatusProvider = resolvedReconcilerStatusProvider,
                 clock = clock,
             )

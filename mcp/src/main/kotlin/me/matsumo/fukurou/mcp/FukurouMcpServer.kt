@@ -41,6 +41,7 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Candle
@@ -63,6 +64,7 @@ import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
 import me.matsumo.fukurou.trading.market.IndicatorResult
 import me.matsumo.fukurou.trading.market.IndicatorType
+import me.matsumo.fukurou.trading.market.MarketDataException
 import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
@@ -169,6 +171,11 @@ private const val REJECT_DUMMY_TRADE_TOOL = "reject_dummy_trade"
 private const val SIMULATE_TOOL_TIMEOUT_TOOL = "simulate_tool_timeout"
 
 /**
+ * MCP stdio smoke で DB なし in-memory runtime を明示許可する環境変数名。
+ */
+private const val FUKUROU_MCP_IN_MEMORY_RUNTIME_ENV = "FUKUROU_MCP_IN_MEMORY_RUNTIME"
+
+/**
  * JSON schema の string 型。
  */
 private const val JSON_TYPE_STRING = "string"
@@ -261,13 +268,15 @@ fun main() {
 /**
  * fukurou の MCP stdio server。業務ロジックは `:trading` へ委譲する。
  *
+ * @param tradingConfig 取引 bot 全体の typed config
  * @param marketDataSource 市場データ取得元
+ * @param tradingRuntime 取引 runtime
+ * @param decisionRunContext 呼び出し元の decision run context
  */
 class FukurouMcpServer(
-    private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource(),
-    private val tradingRuntime: TradingRuntime = TradingRuntimeFactory.fromEnvironment(
-        marketDataSource = marketDataSource,
-    ),
+    tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
+    private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource.fromConfig(tradingConfig.gmoPublicClient),
+    private val tradingRuntime: TradingRuntime = defaultTradingRuntime(tradingConfig, marketDataSource),
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
 ) {
 
@@ -333,6 +342,27 @@ class FukurouMcpServer(
 
         return server
     }
+}
+
+private fun defaultTradingRuntime(
+    tradingConfig: TradingBotConfig,
+    marketDataSource: MarketDataSource,
+): TradingRuntime {
+    val useInMemoryRuntime = System.getenv(FUKUROU_MCP_IN_MEMORY_RUNTIME_ENV)
+        ?.toBooleanStrictOrNull()
+        ?: false
+
+    if (useInMemoryRuntime) {
+        return TradingRuntimeFactory.inMemory(
+            marketDataSource = marketDataSource,
+            tradingConfig = tradingConfig,
+        )
+    }
+
+    return TradingRuntimeFactory.fromEnvironment(
+        marketDataSource = marketDataSource,
+        tradingConfig = tradingConfig,
+    )
 }
 
 private fun Server.registerPlaceOrderTool(
@@ -1498,10 +1528,17 @@ private fun throwableResult(throwable: Throwable): CallToolResult {
     }
     val executed = if (throwable is ToolCompletionAuditFailedException) throwable.executed else null
 
-    return errorResult(type, throwable.message.orEmpty(), executed)
+    val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
+
+    return errorResult(type, throwable.message.orEmpty(), executed, failureKind)
 }
 
-private fun errorResult(type: String, message: String, executed: Boolean? = null): CallToolResult {
+private fun errorResult(
+    type: String,
+    message: String,
+    executed: Boolean? = null,
+    failureKind: String? = null,
+): CallToolResult {
     val resolvedMessage = message.ifBlank { "unknown error" }
 
     return CallToolResult(
@@ -1512,6 +1549,9 @@ private fun errorResult(type: String, message: String, executed: Boolean? = null
             put("message", resolvedMessage)
             if (executed != null) {
                 put("executed", executed)
+            }
+            if (failureKind != null) {
+                put("failure_kind", failureKind)
             }
         },
         isError = true,
