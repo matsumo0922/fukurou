@@ -859,8 +859,7 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
         tradeGroupId = tradeGroupId?.let { value -> UUID.fromString(value) },
         protectiveStopPriceJpy = requireNotNull(protectiveStopPriceJpy).toBigDecimal(),
         takeProfitPriceJpy = takeProfitPriceJpy?.toBigDecimal(),
-        expectedValueR = DEFAULT_RESTORED_EXPECTED_VALUE_R,
-        expectedMoveToCostRatio = DEFAULT_RESTORED_EXPECTED_MOVE_TO_COST_RATIO,
+        estimatedWinProbability = DEFAULT_RESTORED_ESTIMATED_WIN_PROBABILITY,
         reasonJa = reasonJa.orEmpty(),
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
@@ -924,11 +923,6 @@ private const val DRAW_DOWN_SCALE = 10
 private val TRAILING_ATR_MULTIPLIER = BigDecimal("2.0")
 
 /**
- * resting order 復元時の既定 expected value。
+ * resting order 復元時の既定推定勝率。
  */
-private val DEFAULT_RESTORED_EXPECTED_VALUE_R = BigDecimal("1.0")
-
-/**
- * resting order 復元時の既定 expected move / cost ratio。
- */
-private val DEFAULT_RESTORED_EXPECTED_MOVE_TO_COST_RATIO = BigDecimal("10.0")
+private val DEFAULT_RESTORED_ESTIMATED_WIN_PROBABILITY = BigDecimal("0.60")

@@ -59,8 +59,7 @@ data class PaperTradeAuditContext(
  * @param tradeGroupId 買い増し対象の trade group ID。null の場合は新規 group
  * @param protectiveStopPriceJpy entry 後に必ず置く保護 STOP 価格
  * @param takeProfitPriceJpy virtual TP 価格
- * @param expectedValueR entry plan の期待値
- * @param expectedMoveToCostRatio 想定値幅 / 往復 cost 比
+ * @param estimatedWinProbability LLM が申告した推定勝率。EV は SafetyFloor がこの値から計算する
  * @param reasonJa 判断理由
  * @param auditContext audit context
  */
@@ -74,8 +73,7 @@ data class PlaceOrderCommand(
     val tradeGroupId: UUID?,
     val protectiveStopPriceJpy: BigDecimal,
     val takeProfitPriceJpy: BigDecimal?,
-    val expectedValueR: BigDecimal,
-    val expectedMoveToCostRatio: BigDecimal,
+    val estimatedWinProbability: BigDecimal,
     val reasonJa: String,
     val auditContext: PaperTradeAuditContext,
 )

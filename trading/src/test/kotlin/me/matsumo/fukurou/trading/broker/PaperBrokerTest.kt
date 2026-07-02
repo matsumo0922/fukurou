@@ -300,7 +300,7 @@ class PaperBrokerTest {
     }
 
     @Test
-    fun safety_floor_rejects_non_positive_expected_value() = runBlocking {
+    fun safety_floor_rejects_calculated_non_positive_expected_value() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository()
         val broker = safetyBroker(repository, violationRepository)
@@ -308,26 +308,43 @@ class PaperBrokerTest {
         val result = broker.placeOrder(
             marketEntryCommand(
                 protectiveStopPriceJpy = BigDecimal("9900000"),
-                takeProfitPriceJpy = BigDecimal("10100000"),
-                expectedValueR = BigDecimal.ZERO,
+                takeProfitPriceJpy = BigDecimal("10500000"),
+                estimatedWinProbability = BigDecimal("0.20"),
             ),
         ).getOrThrow()
 
         assertFalse(result.accepted)
-        assertEquals(SafetyFloorRule.EXPECTED_VALUE_GATE, result.safetyViolation?.rule)
+        assertEquals(SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE, result.safetyViolation?.rule)
     }
 
     @Test
-    fun safety_floor_rejects_expected_move_to_cost_ratio_below_threshold() = runBlocking {
+    fun safety_floor_rejects_missing_take_profit_for_ev_gate() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository()
         val broker = safetyBroker(repository, violationRepository)
 
         val result = broker.placeOrder(
             marketEntryCommand(
-                protectiveStopPriceJpy = BigDecimal("9900000"),
-                takeProfitPriceJpy = BigDecimal("10010000"),
-                expectedMoveToCostRatio = BigDecimal("1.0"),
+                takeProfitPriceJpy = null,
+                estimatedWinProbability = BigDecimal("0.99"),
+            ),
+        ).getOrThrow()
+
+        assertFalse(result.accepted)
+        assertEquals(SafetyFloorRule.MISSING_TARGET_PRICE, result.safetyViolation?.rule)
+    }
+
+    @Test
+    fun safety_floor_rejects_calculated_expected_move_to_cost_ratio_below_threshold() = runBlocking {
+        val violationRepository = InMemorySafetyViolationRepository()
+        val repository = InMemoryPaperLedgerRepository()
+        val broker = safetyBroker(repository, violationRepository)
+
+        val result = broker.placeOrder(
+            marketEntryCommand(
+                protectiveStopPriceJpy = BigDecimal("9700000"),
+                takeProfitPriceJpy = BigDecimal("10062000"),
+                estimatedWinProbability = BigDecimal.ONE,
             ),
         ).getOrThrow()
 
@@ -533,8 +550,7 @@ private fun marketEntryCommand(
     tradeGroupId: UUID? = null,
     protectiveStopPriceJpy: BigDecimal = BigDecimal("9700000"),
     takeProfitPriceJpy: BigDecimal? = BigDecimal("10500000"),
-    expectedValueR: BigDecimal = BigDecimal("1.0"),
-    expectedMoveToCostRatio: BigDecimal = BigDecimal("10.0"),
+    estimatedWinProbability: BigDecimal = BigDecimal("0.60"),
 ): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
@@ -546,8 +562,7 @@ private fun marketEntryCommand(
         tradeGroupId = tradeGroupId,
         protectiveStopPriceJpy = protectiveStopPriceJpy,
         takeProfitPriceJpy = takeProfitPriceJpy,
-        expectedValueR = expectedValueR,
-        expectedMoveToCostRatio = expectedMoveToCostRatio,
+        estimatedWinProbability = estimatedWinProbability,
         reasonJa = "test entry",
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
@@ -563,9 +578,8 @@ private fun restingLimitCommand(): PlaceOrderCommand {
         priceJpy = BigDecimal("9900000"),
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
-        takeProfitPriceJpy = null,
-        expectedValueR = BigDecimal("1.0"),
-        expectedMoveToCostRatio = BigDecimal("10.0"),
+        takeProfitPriceJpy = BigDecimal("10500000"),
+        estimatedWinProbability = BigDecimal("0.60"),
         reasonJa = "test resting entry",
         auditContext = PaperTradeAuditContext.EMPTY,
     )
@@ -581,9 +595,8 @@ private fun nearAllCashRestingLimitCommand(): PlaceOrderCommand {
         priceJpy = BigDecimal("10000000"),
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
-        takeProfitPriceJpy = null,
-        expectedValueR = BigDecimal("1.0"),
-        expectedMoveToCostRatio = BigDecimal("10.0"),
+        takeProfitPriceJpy = BigDecimal("10500000"),
+        estimatedWinProbability = BigDecimal("0.60"),
         reasonJa = "test near all cash resting entry",
         auditContext = PaperTradeAuditContext.EMPTY,
     )
@@ -599,9 +612,8 @@ private fun tinyMarketEntryCommand(): PlaceOrderCommand {
         priceJpy = null,
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
-        takeProfitPriceJpy = null,
-        expectedValueR = BigDecimal("1.0"),
-        expectedMoveToCostRatio = BigDecimal("10.0"),
+        takeProfitPriceJpy = BigDecimal("10500000"),
+        estimatedWinProbability = BigDecimal("0.60"),
         reasonJa = "test tiny entry",
         auditContext = PaperTradeAuditContext.EMPTY,
     )

@@ -363,8 +363,7 @@ private fun Server.registerPlaceOrderTool(
                 }
                 putDecimalStringSchema("protective_stop_price_jpy", "Required protective STOP price after entry fill.")
                 putDecimalStringSchema("take_profit_price_jpy", "Optional virtual take-profit trigger price.")
-                putDecimalStringSchema("expected_value_r", "Expected value in R. Must pass the SafetyFloor EV gate.")
-                putDecimalStringSchema("expected_move_to_cost_ratio", "Expected move divided by round-trip cost.")
+                putDecimalStringSchema("estimated_win_probability", "Estimated win probability from 0 to 1. SafetyFloor calculates EV from this value.")
                 putReasonSchema()
                 putClientRequestIdSchema()
             },
@@ -373,8 +372,7 @@ private fun Server.registerPlaceOrderTool(
                 "type",
                 "size_btc",
                 "protective_stop_price_jpy",
-                "expected_value_r",
-                "expected_move_to_cost_ratio",
+                "estimated_win_probability",
                 "reason",
             ),
         ),
@@ -1240,8 +1238,7 @@ private fun parsePlaceOrderCommand(request: CallToolRequest, call: GuardedToolCa
             tradeGroupId = request.stringArgument("trade_group_id")?.let { value -> UUID.fromString(value) },
             protectiveStopPriceJpy = parseBigDecimalArgument(request, "protective_stop_price_jpy").getOrThrow(),
             takeProfitPriceJpy = parseOptionalBigDecimalArgument(request, "take_profit_price_jpy").getOrThrow(),
-            expectedValueR = parseBigDecimalArgument(request, "expected_value_r").getOrThrow(),
-            expectedMoveToCostRatio = parseBigDecimalArgument(request, "expected_move_to_cost_ratio").getOrThrow(),
+            estimatedWinProbability = parseBigDecimalArgument(request, "estimated_win_probability").getOrThrow(),
             reasonJa = parseReason(request).getOrThrow(),
             auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
         )

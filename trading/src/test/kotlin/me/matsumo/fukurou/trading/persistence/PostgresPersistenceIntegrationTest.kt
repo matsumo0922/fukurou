@@ -561,8 +561,7 @@ private fun postgresEntryCommand(
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
         takeProfitPriceJpy = takeProfitPriceJpy,
-        expectedValueR = BigDecimal("1.0"),
-        expectedMoveToCostRatio = BigDecimal("10.0"),
+        estimatedWinProbability = BigDecimal("0.95"),
         reasonJa = "integration entry",
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )

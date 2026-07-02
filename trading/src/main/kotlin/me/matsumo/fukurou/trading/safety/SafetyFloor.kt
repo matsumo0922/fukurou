@@ -55,7 +55,22 @@ enum class SafetyFloorRule {
     BALANCE_RATE_AND_COST_LIMIT,
 
     /**
-     * entry plan の期待値が正の最小値を満たさなかった。
+     * EV 計算に必要な目標価格がない。
+     */
+    MISSING_TARGET_PRICE,
+
+    /**
+     * コード計算した EV が 0 以下だった。
+     */
+    NON_POSITIVE_EXPECTED_VALUE,
+
+    /**
+     * 推定勝率 p が確率の範囲外だった。
+     */
+    INVALID_WIN_PROBABILITY,
+
+    /**
+     * コード計算した EV が保守的な正の最小値を満たさなかった。
      */
     EXPECTED_VALUE_GATE,
 
@@ -86,7 +101,7 @@ enum class SafetyFloorRule {
  * @param maxRiskPerTradeRatio 1 trade group の最大損失割合
  * @param maxDrawdownRatio HARD_HALT を立てる drawdown
  * @param maxTotalExposureRatio 合計 exposure 上限
- * @param minExpectedValueR entry plan に求める最小 EV
+ * @param minExpectedValueR コード計算した entry plan に求める最小 EV
  * @param minExpectedMoveToCostRatio 想定値幅と往復 cost の最小比率
  * @param maxTakerFeeRatio paper で許容する taker fee 上限
  * @param marketSlippageReserveBps MARKET / STOP の片道 slippage reserve
@@ -195,7 +210,7 @@ class SafetyFloor(
         validateGroupRisk(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateTotalExposure(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateBalanceAndCost(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
-        validateExpectedValue(command)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateExpectedValue(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateExpectedMoveToCost(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
 
         return SafetyFloorVerdict.Accepted
@@ -395,8 +410,57 @@ class SafetyFloor(
         )
     }
 
-    private fun validateExpectedValue(command: PlaceOrderCommand): SafetyViolation? {
-        if (command.expectedValueR >= config.minExpectedValueR) {
+    private fun validateExpectedValue(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
+        val probability = command.estimatedWinProbability
+        val probabilityInRange = probability >= BigDecimal.ZERO && probability <= BigDecimal.ONE
+
+        if (!probabilityInRange) {
+            return violation(
+                commandName = "place_order",
+                command = command,
+                rule = SafetyFloorRule.INVALID_WIN_PROBABILITY,
+                messageJa = "estimated_win_probability は 0 以上 1 以下である必要があります。",
+                measuredValue = probability.toPlainString(),
+                limitValue = "0..1",
+            )
+        }
+
+        val takeProfitPrice = command.takeProfitPriceJpy
+            ?: return violation(
+                commandName = "place_order",
+                command = command,
+                rule = SafetyFloorRule.MISSING_TARGET_PRICE,
+                messageJa = "take_profit_price_jpy がないため、EV を計算できない entry は拒否します。",
+                measuredValue = "null",
+                limitValue = "required",
+            )
+        val entryPrice = estimatedEntryPrice(command, context)
+        val riskAmount = entryRiskAmount(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy)
+        val expectedRMultiple = expectedRMultiple(command.sizeBtc, entryPrice, takeProfitPrice, riskAmount)
+        val roundTripCostR = roundTripCost(
+            sizeBtc = command.sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = command.protectiveStopPriceJpy,
+            context = context,
+        ).divideOrZero(riskAmount)
+        val expectedValueR = probability
+            .multiply(expectedRMultiple)
+            .subtract(BigDecimal.ONE.subtract(probability))
+            .subtract(roundTripCostR)
+            .safetyScale()
+
+        if (expectedValueR <= BigDecimal.ZERO) {
+            return violation(
+                commandName = "place_order",
+                command = command,
+                rule = SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE,
+                messageJa = "推定勝率、目標価格、STOP、往復 cost から計算した EV が 0 以下です。",
+                measuredValue = expectedValueR.toPlainString(),
+                limitValue = ">0",
+            )
+        }
+
+        if (expectedValueR >= config.minExpectedValueR) {
             return null
         }
 
@@ -404,27 +468,16 @@ class SafetyFloor(
             commandName = "place_order",
             command = command,
             rule = SafetyFloorRule.EXPECTED_VALUE_GATE,
-            messageJa = "entry plan の expected_value_r が保守的な初期しきい値を下回っています。",
-            measuredValue = command.expectedValueR.toPlainString(),
+            messageJa = "推定勝率、目標価格、STOP、往復 cost から計算した EV が保守的な初期しきい値を下回っています。",
+            measuredValue = expectedValueR.toPlainString(),
             limitValue = config.minExpectedValueR.toPlainString(),
         )
     }
 
     private fun validateExpectedMoveToCost(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
-        if (command.expectedMoveToCostRatio < config.minExpectedMoveToCostRatio) {
-            return violation(
-                commandName = "place_order",
-                command = command,
-                rule = SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO,
-                messageJa = "想定値幅 / 往復 cost 比が保守的な初期しきい値を下回っています。",
-                measuredValue = command.expectedMoveToCostRatio.toPlainString(),
-                limitValue = config.minExpectedMoveToCostRatio.toPlainString(),
-            )
-        }
-
         val takeProfitPrice = command.takeProfitPriceJpy ?: return null
         val entryPrice = estimatedEntryPrice(command, context)
-        val expectedMove = takeProfitPrice.subtract(entryPrice).abs().multiply(command.sizeBtc)
+        val expectedMove = takeProfitPrice.subtract(entryPrice).maxZero().multiply(command.sizeBtc)
         val roundTripCost = roundTripCost(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy, context)
         val impliedRatio = expectedMove.divideOrZero(roundTripCost)
 
@@ -640,6 +693,31 @@ class SafetyFloor(
         val fee = notional.multiply(context.symbolRules.takerFee.toBigDecimal().abs())
 
         return notional.add(fee).safetyScale()
+    }
+
+    private fun entryRiskAmount(
+        sizeBtc: BigDecimal,
+        entryPrice: BigDecimal,
+        stopPrice: BigDecimal,
+    ): BigDecimal {
+        return entryPrice.subtract(stopPrice)
+            .maxZero()
+            .multiply(sizeBtc)
+            .safetyScale()
+    }
+
+    private fun expectedRMultiple(
+        sizeBtc: BigDecimal,
+        entryPrice: BigDecimal,
+        takeProfitPrice: BigDecimal,
+        riskAmount: BigDecimal,
+    ): BigDecimal {
+        val expectedReward = takeProfitPrice.subtract(entryPrice)
+            .maxZero()
+            .multiply(sizeBtc)
+            .safetyScale()
+
+        return expectedReward.divideOrZero(riskAmount)
     }
 
     private fun roundTripCost(
