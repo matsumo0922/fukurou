@@ -4,6 +4,7 @@ import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import java.math.BigDecimal
+import java.time.Duration
 import java.time.Instant
 import java.util.UUID
 
@@ -257,3 +258,19 @@ data class TradeIntentConsumptionRecord(
     val orderId: UUID?,
     val consumedAt: Instant,
 )
+
+/**
+ * 指定時刻で fresh な APPROVED verdict と見なせるかを返す。
+ */
+fun FalsificationRecord?.isFreshApprovedAt(observedAt: Instant, freshnessWindow: Duration): Boolean {
+    if (this == null) {
+        return false
+    }
+    if (verdict != FalsificationVerdict.APPROVED) {
+        return false
+    }
+
+    val expiresAt = createdAt.plus(freshnessWindow)
+
+    return !expiresAt.isBefore(observedAt)
+}

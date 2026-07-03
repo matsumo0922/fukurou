@@ -225,10 +225,25 @@ class FukurouMcpServerTest {
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
+        val enterRequest = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "submit_decision",
+                arguments = enterDecisionArguments(),
+            ),
+        )
+
+        val enterResult = server.tools.getValue("submit_decision").handler.invoke(TestClientConnection, enterRequest)
+        val parentTradePlanId = assertNotNull(enterResult.structuredContent)
+            .getValue("trade_plan_id")
+            .jsonPrimitive
+            .contentOrNull
         val request = CallToolRequest(
             params = CallToolRequestParams(
                 name = "submit_decision",
-                arguments = tradePlanRevisionDecisionArguments(),
+                arguments = tradePlanRevisionDecisionArguments(
+                    parentTradePlanId = assertNotNull(parentTradePlanId),
+                    revisionCount = 1,
+                ),
             ),
         )
 
@@ -239,8 +254,80 @@ class FukurouMcpServerTest {
         assertTrue(result.isError != true)
         assertEquals("ADJUST_PROTECTION", structuredContent.getValue("action").jsonPrimitive.contentOrNull)
         assertEquals("1", structuredContent.getValue("revision_count").jsonPrimitive.contentOrNull)
-        assertEquals(1, repository.tradePlans().size)
-        assertEquals(0, repository.tradeIntents().size)
+        assertEquals(2, repository.tradePlans().size)
+        assertEquals(1, repository.tradeIntents().size)
+    }
+
+    @Test
+    fun submitDecisionTool_rejectsTradePlanRevisionCountReset() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val enterResult = server.tools.getValue("submit_decision").handler.invoke(
+            TestClientConnection,
+            CallToolRequest(
+                params = CallToolRequestParams(
+                    name = "submit_decision",
+                    arguments = enterDecisionArguments(),
+                ),
+            ),
+        )
+        val firstParentTradePlanId = assertNotNull(enterResult.structuredContent)
+            .getValue("trade_plan_id")
+            .jsonPrimitive
+            .contentOrNull
+        val firstRevisionResult = server.tools.getValue("submit_decision").handler.invoke(
+            TestClientConnection,
+            CallToolRequest(
+                params = CallToolRequestParams(
+                    name = "submit_decision",
+                    arguments = tradePlanRevisionDecisionArguments(
+                        parentTradePlanId = assertNotNull(firstParentTradePlanId),
+                        revisionCount = 1,
+                    ),
+                ),
+            ),
+        )
+        val secondParentTradePlanId = assertNotNull(firstRevisionResult.structuredContent)
+            .getValue("trade_plan_id")
+            .jsonPrimitive
+            .contentOrNull
+        val secondRevisionResult = server.tools.getValue("submit_decision").handler.invoke(
+            TestClientConnection,
+            CallToolRequest(
+                params = CallToolRequestParams(
+                    name = "submit_decision",
+                    arguments = tradePlanRevisionDecisionArguments(
+                        parentTradePlanId = assertNotNull(secondParentTradePlanId),
+                        revisionCount = 2,
+                    ),
+                ),
+            ),
+        )
+        val thirdParentTradePlanId = assertNotNull(secondRevisionResult.structuredContent)
+            .getValue("trade_plan_id")
+            .jsonPrimitive
+            .contentOrNull
+        val resetRevisionResult = server.tools.getValue("submit_decision").handler.invoke(
+            TestClientConnection,
+            CallToolRequest(
+                params = CallToolRequestParams(
+                    name = "submit_decision",
+                    arguments = tradePlanRevisionDecisionArguments(
+                        parentTradePlanId = assertNotNull(thirdParentTradePlanId),
+                        revisionCount = 0,
+                    ),
+                ),
+            ),
+        )
+        val structuredContent = assertNotNull(resetRevisionResult.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(resetRevisionResult.isError == true)
+        assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals(3, repository.tradePlans().size)
     }
 
     @Test
@@ -319,7 +406,7 @@ private fun enterDecisionArguments() = buildJsonObject {
 /**
  * TradePlan 正式修正 decision tool request の引数を作る。
  */
-private fun tradePlanRevisionDecisionArguments() = buildJsonObject {
+private fun tradePlanRevisionDecisionArguments(parentTradePlanId: String, revisionCount: Int) = buildJsonObject {
     put("action", "ADJUST_PROTECTION")
     put("setup_tags", stringArray("breakout", "trend-follow"))
     put("estimated_win_probability", "0.64")
@@ -330,8 +417,8 @@ private fun tradePlanRevisionDecisionArguments() = buildJsonObject {
     put("self_review", """{"reasonsNotToTrade":[]}""")
     put("reason_ja", "否定条件は未成立ですが、保護計画を正式修正します。")
     put("symbol", TradingSymbol.BTC.apiSymbol)
-    put("parent_trade_plan_id", "00000000-0000-0000-0000-000000000001")
-    put("trade_plan_revision_count", 1)
+    put("parent_trade_plan_id", parentTradePlanId)
+    put("trade_plan_revision_count", revisionCount)
     put("trade_plan_thesis_ja", "上昇継続の仮説は維持します。")
     put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ"))
     put("trade_plan_target_price_jpy", "10400000")

@@ -934,14 +934,6 @@ private fun PreparedStatement.bindAudit(startIndex: Int, auditContext: PaperTrad
     setString(startIndex + 6, auditContext.decisionRunContext.marketSnapshotId)
 }
 
-private fun PreparedStatement.setNullableBigDecimal(index: Int, value: BigDecimal?) {
-    if (value == null) {
-        setObject(index, null)
-    } else {
-        setBigDecimal(index, value)
-    }
-}
-
 private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
     return when (orderType) {
         OrderType.MARKET -> false

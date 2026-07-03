@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.decision.DecisionRecord
@@ -16,14 +17,15 @@ import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.MAX_TRADE_PLAN_REVISIONS
 import me.matsumo.fukurou.trading.decision.TradeIntentConsumptionRecord
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
+import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanRecord
+import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
 import me.matsumo.fukurou.trading.decision.validateDecisionSubmission
+import me.matsumo.fukurou.trading.decision.validateTradePlanLineage
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
-import java.math.BigDecimal
-import java.sql.PreparedStatement
 import java.sql.ResultSet
 import java.time.Clock
 import java.time.Duration
@@ -146,6 +148,26 @@ private const val SELECT_TRADE_INTENT_BY_ID_SQL = """
         estimated_win_probability,
         created_at
     FROM trade_intents
+    WHERE id = ?
+"""
+
+/**
+ * TradePlan ID で trade_plans を読む SQL。
+ */
+private const val SELECT_TRADE_PLAN_BY_ID_SQL = """
+    SELECT
+        id,
+        decision_id,
+        parent_trade_plan_id,
+        revision_count,
+        symbol,
+        thesis_ja,
+        invalidation_conditions_ja,
+        target_price_jpy,
+        time_stop_at,
+        setup_tags,
+        created_at
+    FROM trade_plans
     WHERE id = ?
 """
 
@@ -280,6 +302,12 @@ private fun JdbcTransaction.insertDecisionSubmission(
     maxTradePlanRevisions: Int,
 ): DecisionSubmissionResult {
     validateDecisionSubmission(submission, maxTradePlanRevisions)
+
+    val parentTradePlan = submission.tradePlan
+        ?.parentTradePlanId
+        ?.let { parentTradePlanId -> selectTradePlan(parentTradePlanId) }
+
+    validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
 
     val decision = DecisionRecord(
         decisionId = UUID.randomUUID(),
@@ -458,6 +486,15 @@ private fun JdbcTransaction.selectFalsification(intentId: UUID): FalsificationRe
     }
 }
 
+private fun JdbcTransaction.selectTradePlan(tradePlanId: UUID): TradePlanRecord? {
+    return jdbcConnection().prepareStatement(SELECT_TRADE_PLAN_BY_ID_SQL).use { statement ->
+        statement.setObject(1, tradePlanId)
+        statement.executeQuery().use { resultSet ->
+            if (resultSet.next()) resultSet.toTradePlanRecord() else null
+        }
+    }
+}
+
 private fun JdbcTransaction.selectTradeIntentConsumption(intentId: UUID): TradeIntentConsumptionRecord? {
     return jdbcConnection().prepareStatement(SELECT_TRADE_INTENT_CONSUMPTION_BY_INTENT_ID_SQL).use { statement ->
         statement.setObject(1, intentId)
@@ -465,6 +502,24 @@ private fun JdbcTransaction.selectTradeIntentConsumption(intentId: UUID): TradeI
             if (resultSet.next()) resultSet.toTradeIntentConsumptionRecord() else null
         }
     }
+}
+
+private fun ResultSet.toTradePlanRecord(): TradePlanRecord {
+    return TradePlanRecord(
+        tradePlanId = getObject("id", UUID::class.java),
+        decisionId = getObject("decision_id", UUID::class.java),
+        draft = TradePlanDraft(
+            parentTradePlanId = getNullableUuid("parent_trade_plan_id"),
+            revisionCount = getInt("revision_count"),
+            symbol = TradingSymbol.entries.first { symbol -> symbol.apiSymbol == getString("symbol") },
+            thesisJa = getString("thesis_ja"),
+            invalidationConditionsJa = getString("invalidation_conditions_ja").toStringList(),
+            targetPriceJpy = getNullableBigDecimal("target_price_jpy"),
+            timeStopAt = getNullableLong("time_stop_at")?.let { millis -> Instant.ofEpochMilli(millis) },
+            setupTags = getString("setup_tags").toStringList(),
+        ),
+        createdAt = Instant.ofEpochMilli(getLong("created_at")),
+    )
 }
 
 private fun ResultSet.toTradeIntentRecord(): TradeIntentRecord {
@@ -510,52 +565,6 @@ private fun List<String>.toJsonText(): String {
     return DecisionProtocolJson.encodeToString(this)
 }
 
-private fun FalsificationRecord?.isFreshApprovedAt(observedAt: Instant, freshnessWindow: Duration): Boolean {
-    if (this == null) {
-        return false
-    }
-    if (verdict != FalsificationVerdict.APPROVED) {
-        return false
-    }
-
-    return !createdAt.plus(freshnessWindow).isBefore(observedAt)
-}
-
-private fun PreparedStatement.setNullableString(index: Int, value: String?) {
-    if (value == null) {
-        setString(index, null)
-        return
-    }
-
-    setString(index, value)
-}
-
-private fun PreparedStatement.setNullableBigDecimal(index: Int, value: BigDecimal?) {
-    if (value == null) {
-        setObject(index, null)
-        return
-    }
-
-    setBigDecimal(index, value)
-}
-
-private fun PreparedStatement.setNullableLong(index: Int, value: Long?) {
-    if (value == null) {
-        setObject(index, null)
-        return
-    }
-
-    setLong(index, value)
-}
-
-private fun ResultSet.getNullableBigDecimal(columnName: String): BigDecimal? {
-    val value = getBigDecimal(columnName)
-
-    return if (wasNull()) null else value
-}
-
-private fun ResultSet.getNullableUuid(columnName: String): UUID? {
-    val value = getObject(columnName, UUID::class.java)
-
-    return if (wasNull()) null else value
+private fun String.toStringList(): List<String> {
+    return DecisionProtocolJson.decodeFromString(this)
 }

@@ -687,24 +687,6 @@ private fun ResultSet.getUuid(columnName: String): UUID {
     return getObject(columnName, UUID::class.java)
 }
 
-private fun ResultSet.getNullableUuid(columnName: String): UUID? {
-    val value = getObject(columnName, UUID::class.java)
-
-    return if (wasNull()) null else value
-}
-
 private fun ResultSet.getInstant(columnName: String): Instant {
     return Instant.ofEpochMilli(getLong(columnName))
-}
-
-private fun ResultSet.getNullableInstant(columnName: String): Instant? {
-    val epochMillis = getLong(columnName)
-
-    return if (wasNull()) null else Instant.ofEpochMilli(epochMillis)
-}
-
-private fun ResultSet.getNullableBigDecimal(columnName: String): BigDecimal? {
-    val value = getBigDecimal(columnName)
-
-    return if (wasNull()) null else value
 }

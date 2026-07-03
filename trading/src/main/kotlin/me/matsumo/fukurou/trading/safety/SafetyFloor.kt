@@ -917,13 +917,39 @@ private fun BigDecimal?.sameAmountAs(other: BigDecimal?): Boolean {
 }
 
 private fun PlaceOrderCommand.intentComparisonValue(): String {
-    return "symbol=${symbol.apiSymbol},side=${side.name},type=${orderType.name},size=${sizeBtc.toPlainString()}," +
-        "entry=${priceJpy?.toPlainString()},stop=${protectiveStopPriceJpy.toPlainString()}," +
-        "tp=${takeProfitPriceJpy?.toPlainString()}"
+    return intentComparisonValue(
+        symbolText = symbol.apiSymbol,
+        sideText = side.name,
+        orderTypeText = orderType.name,
+        sizeBtc = sizeBtc,
+        priceJpy = priceJpy,
+        protectiveStopPriceJpy = protectiveStopPriceJpy,
+        takeProfitPriceJpy = takeProfitPriceJpy,
+    )
 }
 
 private fun EntryIntentDraft.intentComparisonValue(): String {
-    return "symbol=${symbol.apiSymbol},side=${side.name},type=${orderType.name},size=${sizeBtc.toPlainString()}," +
+    return intentComparisonValue(
+        symbolText = symbol.apiSymbol,
+        sideText = side.name,
+        orderTypeText = orderType.name,
+        sizeBtc = sizeBtc,
+        priceJpy = priceJpy,
+        protectiveStopPriceJpy = protectiveStopPriceJpy,
+        takeProfitPriceJpy = takeProfitPriceJpy,
+    )
+}
+
+private fun intentComparisonValue(
+    symbolText: String,
+    sideText: String,
+    orderTypeText: String,
+    sizeBtc: BigDecimal,
+    priceJpy: BigDecimal?,
+    protectiveStopPriceJpy: BigDecimal,
+    takeProfitPriceJpy: BigDecimal?,
+): String {
+    return "symbol=$symbolText,side=$sideText,type=$orderTypeText,size=${sizeBtc.toPlainString()}," +
         "entry=${priceJpy?.toPlainString()},stop=${protectiveStopPriceJpy.toPlainString()}," +
         "tp=${takeProfitPriceJpy?.toPlainString()}"
 }

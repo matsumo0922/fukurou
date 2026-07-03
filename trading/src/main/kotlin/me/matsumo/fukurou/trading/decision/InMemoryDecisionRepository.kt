@@ -17,7 +17,7 @@ import java.util.UUID
 class InMemoryDecisionRepository(
     private val clock: Clock = Clock.systemUTC(),
     private val maxTradePlanRevisions: Int = MAX_TRADE_PLAN_REVISIONS,
-) : DecisionRepository {
+) : AtomicIntentConsumptionRepository {
 
     private val mutex = Mutex()
     private val decisions = mutableListOf<DecisionRecord>()
@@ -32,6 +32,14 @@ class InMemoryDecisionRepository(
                 validateDecisionSubmission(submission, maxTradePlanRevisions)
 
                 val now = Instant.now(clock)
+                val parentTradePlan = submission.tradePlan
+                    ?.parentTradePlanId
+                    ?.let { parentTradePlanId ->
+                        tradePlans.firstOrNull { tradePlan -> tradePlan.tradePlanId == parentTradePlanId }
+                    }
+
+                validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
+
                 val decision = DecisionRecord(
                     decisionId = UUID.randomUUID(),
                     submission = submission,
@@ -125,24 +133,31 @@ class InMemoryDecisionRepository(
     ): Result<TradeIntentConsumptionRecord> {
         return runCatching {
             mutex.withLock {
-                require(tradeIntents.any { intent -> intent.intentId == intentId }) {
-                    "trade intent was not found."
-                }
-                require(intentConsumptions.none { consumption -> consumption.intentId == intentId }) {
-                    "trade intent was already consumed."
-                }
-
-                val record = TradeIntentConsumptionRecord(
-                    consumptionId = UUID.randomUUID(),
-                    intentId = intentId,
-                    orderId = orderId,
-                    consumedAt = consumedAt,
-                )
-
-                intentConsumptions += record
-
-                record
+                appendIntentConsumptionLocked(intentId, orderId, consumedAt)
             }
+        }
+    }
+
+    override suspend fun <T> consumeIntentAfterLedgerWrite(
+        intentId: UUID,
+        orderId: UUID?,
+        consumedAt: Instant,
+        ledgerBlock: suspend () -> T,
+    ): Result<T> {
+        mutex.lock()
+
+        return try {
+            validateConsumableIntentLocked(intentId)
+
+            val result = ledgerBlock()
+
+            appendIntentConsumptionLocked(intentId, orderId, consumedAt)
+
+            Result.success(result)
+        } catch (throwable: Throwable) {
+            Result.failure(throwable)
+        } finally {
+            mutex.unlock()
         }
     }
 
@@ -180,12 +195,43 @@ class InMemoryDecisionRepository(
     suspend fun intentConsumptions(): List<TradeIntentConsumptionRecord> {
         return mutex.withLock { intentConsumptions.toList() }
     }
+
+    private fun appendIntentConsumptionLocked(
+        intentId: UUID,
+        orderId: UUID?,
+        consumedAt: Instant,
+    ): TradeIntentConsumptionRecord {
+        validateConsumableIntentLocked(intentId)
+
+        val record = TradeIntentConsumptionRecord(
+            consumptionId = UUID.randomUUID(),
+            intentId = intentId,
+            orderId = orderId,
+            consumedAt = consumedAt,
+        )
+
+        intentConsumptions += record
+
+        return record
+    }
+
+    private fun validateConsumableIntentLocked(intentId: UUID) {
+        require(tradeIntents.any { intent -> intent.intentId == intentId }) {
+            "trade intent was not found."
+        }
+        require(intentConsumptions.none { consumption -> consumption.intentId == intentId }) {
+            "trade intent was already consumed."
+        }
+    }
 }
 
 /**
  * decision submission の最小 contract を検証する。
  */
-fun validateDecisionSubmission(submission: DecisionSubmission, maxTradePlanRevisions: Int = MAX_TRADE_PLAN_REVISIONS) {
+fun validateDecisionSubmission(
+    submission: DecisionSubmission,
+    maxTradePlanRevisions: Int = MAX_TRADE_PLAN_REVISIONS,
+) {
     val estimatedProbabilityIsInRange = submission.estimatedWinProbability >= BigDecimal.ZERO &&
         submission.estimatedWinProbability <= BigDecimal.ONE
 
@@ -212,6 +258,46 @@ fun validateDecisionSubmission(submission: DecisionSubmission, maxTradePlanRevis
     }
 }
 
+/**
+ * TradePlan の parent / revision lineage contract を検証する。
+ */
+fun validateTradePlanLineage(
+    submission: DecisionSubmission,
+    parentTradePlan: TradePlanRecord?,
+    maxTradePlanRevisions: Int = MAX_TRADE_PLAN_REVISIONS,
+) {
+    val tradePlan = submission.tradePlan ?: return
+
+    if (submission.action == DecisionAction.ENTER) {
+        require(tradePlan.parentTradePlanId == null) {
+            "ENTER trade_plan must not include parent_trade_plan_id."
+        }
+        require(tradePlan.revisionCount == 0) {
+            "ENTER trade_plan revision_count must be 0."
+        }
+
+        return
+    }
+
+    val parentTradePlanId = requireNotNull(tradePlan.parentTradePlanId) {
+        "trade_plan revision requires parent_trade_plan_id."
+    }
+    val parent = requireNotNull(parentTradePlan) {
+        "parent trade_plan was not found: $parentTradePlanId."
+    }
+    val expectedRevisionCount = parent.draft.revisionCount + 1
+
+    require(tradePlan.symbol == parent.draft.symbol) {
+        "trade_plan revision symbol must match parent trade_plan."
+    }
+    require(tradePlan.revisionCount == expectedRevisionCount) {
+        "trade_plan revision_count must equal parent revision_count + 1."
+    }
+    require(expectedRevisionCount <= maxTradePlanRevisions) {
+        "trade_plan revision_count must be less than or equal to $maxTradePlanRevisions."
+    }
+}
+
 private fun TradePlanDraft.toRecord(decisionId: UUID, createdAt: Instant): TradePlanRecord {
     return TradePlanRecord(
         tradePlanId = UUID.randomUUID(),
@@ -235,19 +321,6 @@ private fun EntryIntentDraft.toRecord(
         estimatedWinProbability = estimatedWinProbability,
         createdAt = createdAt,
     )
-}
-
-private fun FalsificationRecord?.isFreshApprovedAt(observedAt: Instant, freshnessWindow: Duration): Boolean {
-    if (this == null) {
-        return false
-    }
-    if (verdict != FalsificationVerdict.APPROVED) {
-        return false
-    }
-
-    val expiresAt = createdAt.plus(freshnessWindow)
-
-    return !expiresAt.isBefore(observedAt)
 }
 
 /**

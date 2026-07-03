@@ -36,3 +36,18 @@ interface DecisionRepository {
         consumedAt: Instant,
     ): Result<TradeIntentConsumptionRecord>
 }
+
+/**
+ * intent consumption と外部 ledger 書き込みを同じ in-memory lock 内で直列化できる repository。
+ */
+interface AtomicIntentConsumptionRepository : DecisionRepository {
+    /**
+     * intent が未消費であることを検証し、ledgerBlock 成功後に consumption を保存する。
+     */
+    suspend fun <T> consumeIntentAfterLedgerWrite(
+        intentId: UUID,
+        orderId: UUID?,
+        consumedAt: Instant,
+        ledgerBlock: suspend () -> T,
+    ): Result<T>
+}

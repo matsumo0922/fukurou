@@ -456,6 +456,68 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun decision_repository_enforces_trade_plan_revision_lineage() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        val initialPlan = requireNotNull(repository.submitDecision(enterDecisionSubmission()).getOrThrow().tradePlan)
+        val revisionOne = requireNotNull(
+            repository.submitDecision(
+                tradePlanRevisionSubmission(
+                    parentTradePlanId = initialPlan.tradePlanId,
+                    revisionCount = 1,
+                ),
+            ).getOrThrow().tradePlan,
+        )
+        val repeatedZeroDecision = repository.submitDecision(
+            tradePlanRevisionSubmission(
+                parentTradePlanId = revisionOne.tradePlanId,
+                revisionCount = 0,
+            ),
+        )
+        val revisionTwo = requireNotNull(
+            repository.submitDecision(
+                tradePlanRevisionSubmission(
+                    parentTradePlanId = revisionOne.tradePlanId,
+                    revisionCount = 2,
+                ),
+            ).getOrThrow().tradePlan,
+        )
+        val overLimitDecision = repository.submitDecision(
+            tradePlanRevisionSubmission(
+                parentTradePlanId = revisionTwo.tradePlanId,
+                revisionCount = 3,
+            ),
+        )
+        val repeatedTwoDecision = repository.submitDecision(
+            tradePlanRevisionSubmission(
+                parentTradePlanId = revisionTwo.tradePlanId,
+                revisionCount = 2,
+            ),
+        )
+        val missingParentDecision = repository.submitDecision(
+            tradePlanRevisionSubmission(
+                parentTradePlanId = null,
+                revisionCount = 1,
+            ),
+        )
+        val unknownParentDecision = repository.submitDecision(
+            tradePlanRevisionSubmission(
+                parentTradePlanId = UUID.randomUUID(),
+                revisionCount = 1,
+            ),
+        )
+        val counts = selectDecisionProtocolCounts(database)
+
+        assertTrue(repeatedZeroDecision.isFailure)
+        assertTrue(overLimitDecision.isFailure)
+        assertTrue(repeatedTwoDecision.isFailure)
+        assertTrue(missingParentDecision.isFailure)
+        assertTrue(unknownParentDecision.isFailure)
+        assertEquals(DecisionProtocolCounts(3, 3, 1, 0, 0), counts)
+    }
+
+    @Test
     fun paper_ledger_repository_filters_rows_by_account_mode() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -825,6 +887,41 @@ private fun noTradeDecisionSubmission(): DecisionSubmission {
         noTradeConditionsJa = listOf("出来高が戻るまで待つ"),
         entryIntent = null,
         tradePlan = null,
+    )
+}
+
+/**
+ * repository test 用 TradePlan revision decision を作る。
+ */
+private fun tradePlanRevisionSubmission(parentTradePlanId: UUID?, revisionCount: Int): DecisionSubmission {
+    return DecisionSubmission(
+        invocationId = "run-revision",
+        llmProvider = "claude",
+        promptHash = "prompt-hash",
+        systemPromptVersion = "system-prompt-v1",
+        marketSnapshotId = "snapshot-revision",
+        action = DecisionAction.ADJUST_PROTECTION,
+        setupTags = listOf("breakout", "trend-follow"),
+        estimatedWinProbability = BigDecimal("0.64"),
+        expectedRMultiple = BigDecimal("1.20"),
+        roundTripCostR = BigDecimal("0.05"),
+        toolEvidenceIds = listOf("tool-1", "tool-2"),
+        factCheckJson = """{"ticker":true}""",
+        selfReviewJson = """{"reasonsNotToTrade":[]}""",
+        reasonJa = "否定条件は未成立ですが、保護計画を正式修正します。",
+        missingDataJa = emptyList(),
+        noTradeConditionsJa = emptyList(),
+        entryIntent = null,
+        tradePlan = TradePlanDraft(
+            parentTradePlanId = parentTradePlanId,
+            revisionCount = revisionCount,
+            symbol = TradingSymbol.BTC,
+            thesisJa = "上昇継続の仮説は維持します。",
+            invalidationConditionsJa = listOf("直近安値割れ"),
+            targetPriceJpy = BigDecimal("10400000"),
+            timeStopAt = fixedInstant().plusSeconds(7200),
+            setupTags = listOf("breakout", "trend-follow"),
+        ),
     )
 }
 

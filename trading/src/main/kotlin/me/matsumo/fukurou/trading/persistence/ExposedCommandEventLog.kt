@@ -5,7 +5,6 @@ import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
-import java.sql.PreparedStatement
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
@@ -69,16 +68,4 @@ internal fun JdbcTransaction.insertEvent(event: CommandEvent) {
         statement.setNullableString(12, event.decisionRunContext.marketSnapshotId)
         statement.executeUpdate()
     }
-}
-
-/**
- * nullable string parameter を PreparedStatement へ設定する。
- */
-private fun PreparedStatement.setNullableString(parameterIndex: Int, value: String?) {
-    if (value == null) {
-        setString(parameterIndex, null)
-        return
-    }
-
-    setString(parameterIndex, value)
 }
