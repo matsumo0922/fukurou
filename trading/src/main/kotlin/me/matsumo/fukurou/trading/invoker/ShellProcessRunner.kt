@@ -1,6 +1,8 @@
 package me.matsumo.fukurou.trading.invoker
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
@@ -16,41 +18,60 @@ import java.util.concurrent.TimeUnit
 class ShellProcessRunner : ProcessRunner {
 
     override suspend fun run(command: RenderedLlmCommand): Result<ProcessRunResult> {
-        return runCatching {
+        return try {
+            val result = runProcess(command)
+            deleteCleanupPathsNonCancellable(command.cleanupPaths).map { result }
+        } catch (throwable: CancellationException) {
+            val cleanupResult = deleteCleanupPathsNonCancellable(command.cleanupPaths)
+            cleanupResult.exceptionOrNull()?.let { cleanupFailure -> throwable.addSuppressed(cleanupFailure) }
+
+            throw throwable
+        } catch (throwable: Throwable) {
+            val cleanupResult = deleteCleanupPathsNonCancellable(command.cleanupPaths)
+            cleanupResult.exceptionOrNull()?.let { cleanupFailure -> throwable.addSuppressed(cleanupFailure) }
+
+            Result.failure(throwable)
+        }
+    }
+
+    private suspend fun runProcess(command: RenderedLlmCommand): ProcessRunResult {
+        return coroutineScope {
+            val process = startProcess(command)
+
             try {
-                coroutineScope {
-                    val process = startProcess(command)
-                    val stdout = async(Dispatchers.IO) { process.inputStream.bufferedReader().readText() }
-                    val stderr = async(Dispatchers.IO) { process.errorStream.bufferedReader().readText() }
+                val stdout = async(Dispatchers.IO) { process.inputStream.bufferedReader().readText() }
+                val stderr = async(Dispatchers.IO) { process.errorStream.bufferedReader().readText() }
 
-                    writeStdin(process, command.stdin)
+                writeStdin(process, command.stdin)
 
-                    val exitCode = withTimeoutOrNull(command.timeout.toMillis()) {
-                        withContext(Dispatchers.IO) {
-                            process.waitFor()
-                        }
+                val exitCode = withTimeoutOrNull(command.timeout.toMillis()) {
+                    withContext(Dispatchers.IO) {
+                        process.waitFor()
                     }
+                }
 
-                    if (exitCode == null) {
-                        destroyProcessTree(process)
+                if (exitCode == null) {
+                    destroyProcessTreeNonCancellable(process).getOrThrow()
 
-                        return@coroutineScope ProcessRunResult(
-                            status = ProcessRunStatus.TIMED_OUT,
-                            exitCode = null,
-                            stdout = stdout.await(),
-                            stderr = stderr.await(),
-                        )
-                    }
-
-                    ProcessRunResult(
-                        status = ProcessRunStatus.EXITED,
-                        exitCode = exitCode,
+                    return@coroutineScope ProcessRunResult(
+                        status = ProcessRunStatus.TIMED_OUT,
+                        exitCode = null,
                         stdout = stdout.await(),
                         stderr = stderr.await(),
                     )
                 }
-            } finally {
-                deleteCleanupPaths(command.cleanupPaths)
+
+                ProcessRunResult(
+                    status = ProcessRunStatus.EXITED,
+                    exitCode = exitCode,
+                    stdout = stdout.await(),
+                    stderr = stderr.await(),
+                )
+            } catch (throwable: CancellationException) {
+                val destroyResult = destroyProcessTreeNonCancellable(process)
+                destroyResult.exceptionOrNull()?.let { destroyFailure -> throwable.addSuppressed(destroyFailure) }
+
+                throw throwable
             }
         }
     }
@@ -81,6 +102,14 @@ class ShellProcessRunner : ProcessRunner {
         }
     }
 
+    private suspend fun destroyProcessTreeNonCancellable(process: Process): Result<Unit> {
+        return withContext(NonCancellable) {
+            runCatching {
+                destroyProcessTree(process)
+            }
+        }
+    }
+
     private suspend fun writeStdin(process: Process, stdin: String?) {
         withContext(Dispatchers.IO) {
             process.outputStream.bufferedWriter().use { writer ->
@@ -91,9 +120,21 @@ class ShellProcessRunner : ProcessRunner {
         }
     }
 
-    private suspend fun deleteCleanupPaths(paths: List<Path>) {
-        withContext(Dispatchers.IO) {
-            paths.forEach { path -> deleteCleanupPath(path) }
+    private suspend fun deleteCleanupPaths(paths: List<Path>): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                paths.forEach { path -> deleteCleanupPath(path) }
+            }
+        }
+    }
+
+    private suspend fun deleteCleanupPathsNonCancellable(paths: List<Path>): Result<Unit> {
+        if (paths.isEmpty()) {
+            return Result.success(Unit)
+        }
+
+        return withContext(NonCancellable) {
+            deleteCleanupPaths(paths)
         }
     }
 
@@ -105,7 +146,9 @@ class ShellProcessRunner : ProcessRunner {
         }
 
         Files.walk(path).use { paths ->
-            paths.sorted(Comparator.reverseOrder()).forEach { candidate -> Files.deleteIfExists(candidate) }
+            paths
+                .sorted(Comparator.reverseOrder())
+                .forEach { candidate -> Files.deleteIfExists(candidate) }
         }
     }
 }
