@@ -759,6 +759,33 @@ class PaperBrokerTest {
         assertEquals("10100000.00000000", finalPosition.highestPriceSinceEntryJpy)
         assertEquals("9900000.00000000", finalPosition.lowestPriceSinceEntryJpy)
     }
+
+    @Test
+    fun reconcile_folds_gap_stop_fill_into_closed_position_watermark() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        val positionId = broker.getPositions().getOrThrow().single().positionId
+
+        broker.reconcile(stopGapTickSnapshot()).getOrThrow()
+
+        val closedPosition = repository.getAllPositionsForTest()
+            .single { position -> position.positionId == positionId }
+
+        assertEquals(0, broker.getPositions().getOrThrow().size)
+        assertEquals(PositionStatus.CLOSED, closedPosition.status)
+        assertEquals("10005000.00000000", closedPosition.highestPriceSinceEntryJpy)
+        assertEquals("9685155.00000000", closedPosition.lowestPriceSinceEntryJpy)
+        assertEquals("9685155.00000000", closedPosition.currentPriceJpy)
+    }
 }
 
 private fun marketEntryCommand(
@@ -859,6 +886,23 @@ private fun trailingTickSnapshot(): TickSnapshot {
     )
 }
 
+/**
+ * STOP gap fill で watermark を close fill 価格へ fold するための tick。
+ */
+private fun stopGapTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "9700000",
+        bidPrice = "9690000",
+        askPrice = "9700000",
+        symbolRules = defaultSymbolRules(),
+    )
+}
+
+/**
+ * watermark の単調更新検証に使う tick。
+ */
 private fun watermarkTickSnapshot(
     lastPrice: String,
     bidPrice: String = lastPrice,

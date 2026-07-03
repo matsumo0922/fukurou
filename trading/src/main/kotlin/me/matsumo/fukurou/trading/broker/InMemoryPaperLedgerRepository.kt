@@ -56,6 +56,13 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
+    /**
+     * unit test で closed position を含む watermark 確定値を検証するため、全 position を返す。
+     */
+    internal fun getAllPositionsForTest(): List<Position> {
+        return synchronized(lock) { positions.toList() }
+    }
+
     override suspend fun getOpenOrders(): Result<List<Order>> {
         return Result.success(
             synchronized(lock) {

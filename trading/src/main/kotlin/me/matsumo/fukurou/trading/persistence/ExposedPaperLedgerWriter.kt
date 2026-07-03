@@ -454,7 +454,14 @@ internal class ExposedPaperLedgerWriter(
             val tightenedStop = listOfNotNull(currentStop, trailingStop).maxOrNull()
             val unrealizedPnl = lastPrice.subtract(entryPrice).multiply(sizeBtc).moneyScale()
 
-            updatePositionMark(position.positionId, lastPrice, highestPrice, lowestPrice, unrealizedPnl, tightenedStop)
+            updatePositionMark(
+                positionId = position.positionId,
+                lastPrice = lastPrice,
+                highestPrice = highestPrice,
+                lowestPrice = lowestPrice,
+                unrealizedPnl = unrealizedPnl,
+                tightenedStop = tightenedStop,
+            )
 
             if (tightenedStop != null && tightenedStop != currentStop) {
                 updateLinkedStopOrder(position.positionId, tightenedStop, "reconciler atr trailing floor")

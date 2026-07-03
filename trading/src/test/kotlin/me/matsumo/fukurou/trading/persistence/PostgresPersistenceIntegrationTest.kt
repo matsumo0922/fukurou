@@ -211,6 +211,15 @@ private const val INSERT_BACKFILL_POSITION_SQL = """
 """
 
 /**
+ * lowest watermark backfill 冪等性検証用の更新 SQL。
+ */
+private const val UPDATE_LOWEST_WATERMARK_SQL = """
+    UPDATE positions
+    SET lowest_price_since_entry_jpy = ?
+    WHERE id = ?
+"""
+
+/**
  * test 用 reconciler 完了 event の payload。
  */
 private const val TEST_RECONCILER_COMPLETED_PAYLOAD = """
@@ -417,12 +426,15 @@ class PostgresPersistenceIntegrationTest {
         }
 
         bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            updateLowestWatermark(openPositionId, BigDecimal("9700000"))
+        }
         bootstrap.ensureSchema().getOrThrow()
 
         val openWatermark = selectPositionWatermark(database, openPositionId)
         val closedWatermark = selectPositionWatermark(database, closedPositionId)
 
-        assertEquals("9900000.00000000", openWatermark.lowestPriceSinceEntryJpy)
+        assertEquals("9700000.00000000", openWatermark.lowestPriceSinceEntryJpy)
         assertNull(closedWatermark.lowestPriceSinceEntryJpy)
     }
 
@@ -1432,7 +1444,13 @@ private fun postgresEntryCommand(
     )
 }
 
-private suspend fun runWatermarkScenario(broker: PaperBroker, decisionRepository: DecisionRepository): WatermarkScenarioSnapshot {
+/**
+ * InMemory / Postgres の watermark 意味論を同じ操作列で検証する。
+ */
+private suspend fun runWatermarkScenario(
+    broker: PaperBroker,
+    decisionRepository: DecisionRepository,
+): WatermarkScenarioSnapshot {
     val command = approvedPostgresEntryCommand(
         repository = decisionRepository,
         command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
@@ -1492,6 +1510,9 @@ private fun takeProfitTickSnapshot(): TickSnapshot {
     )
 }
 
+/**
+ * HARD_HALT sweep で close fill を watermark に fold するための tick。
+ */
 private fun hardHaltSweepTickSnapshot(): TickSnapshot {
     return TickSnapshot(
         symbol = "BTC",
@@ -1515,6 +1536,9 @@ private fun trailingTickSnapshot(): TickSnapshot {
     )
 }
 
+/**
+ * watermark の単調更新検証に使う tick。
+ */
 private fun watermarkTickSnapshot(
     lastPrice: String,
     bidPrice: String = lastPrice,
@@ -1840,6 +1864,20 @@ private fun JdbcTransaction.insertBackfillPosition(
         statement.setString(3, status)
         statement.setLong(4, fixedInstant().toEpochMilli())
         statement.setBigDecimal(5, currentPriceJpy)
+        statement.executeUpdate()
+    }
+}
+
+/**
+ * backfill 済み lowest watermark を実測値相当に更新する。
+ */
+private fun JdbcTransaction.updateLowestWatermark(
+    positionId: UUID,
+    lowestPriceJpy: BigDecimal,
+) {
+    jdbcConnection().prepareStatement(UPDATE_LOWEST_WATERMARK_SQL).use { statement ->
+        statement.setBigDecimal(1, lowestPriceJpy)
+        statement.setObject(2, positionId)
         statement.executeUpdate()
     }
 }
