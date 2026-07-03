@@ -98,6 +98,39 @@ private const val ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL = """
 """
 
 /**
+ * orders.client_request_id の冪等化 unique index を作る SQL。
+ */
+private const val ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_request_id_unique
+    ON orders (client_request_id)
+    WHERE client_request_id IS NOT NULL
+"""
+
+/**
+ * LLM 起動予約の invocation_id unique index を作る SQL。
+ */
+private const val ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_launch_reservations_invocation_id_unique
+    ON llm_launch_reservations (invocation_id)
+"""
+
+/**
+ * LLM 起動予約の trigger key cadence index を作る SQL。
+ */
+private const val ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_llm_launch_reservations_trigger_key_reserved_at
+    ON llm_launch_reservations (trigger_key, reserved_at)
+"""
+
+/**
+ * LLM 起動予約の status / reserved_at index を作る SQL。
+ */
+private const val ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_llm_launch_reservations_status_reserved_at
+    ON llm_launch_reservations (status, reserved_at)
+"""
+
+/**
  * command_event_log の起動回数集計 index 存在を確認する SQL。
  */
 private const val VERIFY_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL = """
@@ -117,6 +150,33 @@ private const val VERIFY_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL = """
     WHERE schemaname = current_schema()
         AND tablename = 'command_event_log'
         AND indexname = 'idx_command_event_log_run_event_tool'
+"""
+
+/**
+ * orders.client_request_id unique index 存在を確認する SQL。
+ */
+private const val VERIFY_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'orders'
+        AND indexname = 'idx_orders_client_request_id_unique'
+"""
+
+/**
+ * LLM 起動予約 index 存在を確認する SQL。
+ */
+private const val VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'llm_launch_reservations'
+        AND indexname IN (
+            'idx_llm_launch_reservations_invocation_id_unique',
+            'idx_llm_launch_reservations_trigger_key_reserved_at',
+            'idx_llm_launch_reservations_status_reserved_at'
+        )
+    HAVING COUNT(*) = 3
 """
 
 /**
@@ -203,6 +263,23 @@ private const val VERIFY_ORDERS_SCHEMA_SQL = """
         created_at,
         updated_at
     FROM orders
+    LIMIT 0
+"""
+
+/**
+ * llm_launch_reservations schema の存在を確認する SQL。
+ */
+private const val VERIFY_LLM_LAUNCH_RESERVATIONS_SCHEMA_SQL = """
+    SELECT
+        id,
+        invocation_id,
+        trigger_kind,
+        trigger_key,
+        status,
+        reserved_at,
+        finished_at,
+        reason
+    FROM llm_launch_reservations
     LIMIT 0
 """
 
@@ -380,6 +457,7 @@ class TradingPersistenceBootstrap(
                     OrdersTable,
                     ExecutionsTable,
                     CommandEventLogTable,
+                    LlmLaunchReservationsTable,
                     SafetyViolationsTable,
                     DecisionsTable,
                     TradePlansTable,
@@ -389,6 +467,8 @@ class TradingPersistenceBootstrap(
                     withLogs = false,
                 )
                 ensureCommandEventLogIndexes()
+                ensureOrderIndexes()
+                ensureLlmLaunchReservationIndexes()
                 val now = Instant.now(clock)
 
                 ensureRiskStateRow(now, paperAccountConfig.initialCashJpy)
@@ -408,6 +488,7 @@ class TradingPersistenceBootstrap(
                 verifyPaperAccountSchema()
                 verifyPositionsSchema()
                 verifyOrdersSchema()
+                verifyLlmLaunchReservationsSchema()
                 verifyExecutionsSchema()
                 verifySafetyViolationsSchema()
                 verifyDecisionsSchema()
@@ -439,6 +520,22 @@ internal fun JdbcTransaction.verifyCommandEventLogSchema() {
 internal fun JdbcTransaction.ensureCommandEventLogIndexes() {
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL)
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)
+}
+
+/**
+ * orders の追加 index がなければ作成する。
+ */
+internal fun JdbcTransaction.ensureOrderIndexes() {
+    executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
+}
+
+/**
+ * LLM 起動予約 index がなければ作成する。
+ */
+internal fun JdbcTransaction.ensureLlmLaunchReservationIndexes() {
+    executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
+    executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
 }
 
 /**
@@ -482,6 +579,24 @@ internal fun JdbcTransaction.verifyOrdersSchema() {
     verifySchemaBySql(
         sql = VERIFY_ORDERS_SCHEMA_SQL,
         missingMessage = "orders schema was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL,
+        missingMessage = "orders client_request_id unique index was not initialized.",
+    )
+}
+
+/**
+ * llm_launch_reservations schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyLlmLaunchReservationsSchema() {
+    verifySchemaBySql(
+        sql = VERIFY_LLM_LAUNCH_RESERVATIONS_SCHEMA_SQL,
+        missingMessage = "llm_launch_reservations schema was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL,
+        missingMessage = "llm_launch_reservations indexes were not initialized.",
     )
 }
 

@@ -52,6 +52,7 @@ import java.util.UUID
  * @param workingDirectory LLM CLI process の working directory
  * @param mcpJarPath fukurou MCP fat jar path
  * @param cliConfig CLI / MCP server 接続設定
+ * @param invocationId 外部予約済みの runner 起動 ID。未指定時は runner が生成する
  * @param marketSnapshotId 判断前 market snapshot ID。未指定時は invocation ID から生成する
  * @param proposerProvider Proposer provider
  * @param falsifierProvider Falsifier provider
@@ -61,6 +62,7 @@ data class OneShotRunnerRequest(
     val workingDirectory: Path,
     val mcpJarPath: String,
     val cliConfig: OneShotRunnerCliConfig = OneShotRunnerCliConfig(),
+    val invocationId: String? = null,
     val marketSnapshotId: String? = null,
     val proposerProvider: LlmProvider = LlmProvider.CLAUDE,
     val falsifierProvider: LlmProvider = LlmProvider.CODEX,
@@ -209,12 +211,13 @@ class OneShotLlmRunner(
     private val idGenerator: () -> UUID = { UUID.randomUUID() },
     private val logger: (String) -> Unit = { message -> println(message) },
 ) {
+    private val processOutputRedactor = SecretRedactor.fromEnvironment(parentEnvironment)
 
     /**
      * one-shot runner を 1 回実行する。
      */
     suspend fun runOneShot(request: OneShotRunnerRequest): Result<OneShotRunnerResult> {
-        val invocationId = idGenerator().toString()
+        val invocationId = request.invocationId ?: idGenerator().toString()
         val marketSnapshotId = request.marketSnapshotId ?: "manual-$invocationId"
         var failureContext = decisionRunContext(
             invocationId = invocationId,
@@ -234,9 +237,11 @@ class OneShotLlmRunner(
             )
             failureContext = proposerContext
 
-            if (!canLaunch(invocationId, proposerContext)) {
-                recordNoTrade(proposerContext, "max_invocations_per_hour_exceeded", null).getOrThrow()
-                logHuman("launch rejected invocation=$invocationId reason=max_invocations_per_hour_exceeded")
+            val launchEligibility = launchEligibility(invocationId, proposerContext)
+
+            if (!launchEligibility.canLaunch) {
+                recordNoTrade(proposerContext, launchEligibility.rejectionReason, null).getOrThrow()
+                logHuman("launch rejected invocation=$invocationId reason=${launchEligibility.rejectionReason}")
 
                 return Result.success(
                     OneShotRunnerResult(
@@ -390,10 +395,19 @@ class OneShotLlmRunner(
         )
     }
 
-    private suspend fun canLaunch(invocationId: String, context: DecisionRunContext): Boolean {
-        val since = clock.instant().minus(MAX_INVOCATION_COUNT_WINDOW)
-        val currentCount = tradingRuntime.commandEventLog.countDistinctDecisionRunsSince(since).getOrThrow()
-        val canLaunch = currentCount < tradingConfig.runner.maxInvocationsPerHour
+    private suspend fun launchEligibility(invocationId: String, context: DecisionRunContext): RunnerLaunchEligibility {
+        val hourlySince = clock.instant().minus(MAX_INVOCATION_COUNT_WINDOW)
+        val dailySince = clock.instant().minus(MAX_DAILY_INVOCATION_COUNT_WINDOW)
+        val currentHourlyCount = tradingRuntime.commandEventLog.countDistinctDecisionRunsSince(hourlySince).getOrThrow()
+        val currentDailyCount = tradingRuntime.commandEventLog.countDistinctDecisionRunsSince(dailySince).getOrThrow()
+        val hourlyLimitExceeded = currentHourlyCount >= tradingConfig.runner.maxInvocationsPerHour
+        val dailyLimitExceeded = currentDailyCount >= tradingConfig.runner.maxInvocationsPerDay
+        val canLaunch = !hourlyLimitExceeded && !dailyLimitExceeded
+        val rejectionReason = when {
+            hourlyLimitExceeded -> "max_invocations_per_hour_exceeded"
+            dailyLimitExceeded -> "max_invocations_per_day_exceeded"
+            else -> ""
+        }
 
         appendRunnerPhase(
             context = context,
@@ -401,13 +415,18 @@ class OneShotLlmRunner(
             duration = Duration.ZERO,
             details = buildJsonObject {
                 put("invocationId", invocationId)
-                put("currentInvocationCount", currentCount)
+                put("currentHourlyInvocationCount", currentHourlyCount)
+                put("currentDailyInvocationCount", currentDailyCount)
                 put("maxInvocationsPerHour", tradingConfig.runner.maxInvocationsPerHour)
+                put("maxInvocationsPerDay", tradingConfig.runner.maxInvocationsPerDay)
                 put("canLaunch", canLaunch)
             },
         ).getOrThrow()
 
-        return canLaunch
+        return RunnerLaunchEligibility(
+            canLaunch = canLaunch,
+            rejectionReason = rejectionReason,
+        )
     }
 
     private suspend fun invokePhase(
@@ -427,6 +446,10 @@ class OneShotLlmRunner(
                 put("provider", request.provider.name.lowercase())
                 put("status", result.getOrNull()?.processResult?.status?.name ?: "FAILED_TO_START")
                 put("exitCode", result.getOrNull()?.processResult?.exitCode?.toString() ?: "null")
+                result.getOrNull()?.processResult?.let { processResult ->
+                    put("stdout", processOutputRedactor.redactAndTruncate(processResult.stdout))
+                    put("stderr", processOutputRedactor.redactAndTruncate(processResult.stderr))
+                }
             },
         ).getOrThrow()
         logHuman("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
@@ -767,6 +790,22 @@ private const val PROMPT_HASH_UNAVAILABLE = "unavailable"
 val MAX_INVOCATION_COUNT_WINDOW: Duration = Duration.ofHours(1)
 
 /**
+ * daily invocation cap の集計 window。
+ */
+val MAX_DAILY_INVOCATION_COUNT_WINDOW: Duration = Duration.ofDays(1)
+
+/**
+ * runner 起動可否の判定結果。
+ *
+ * @param canLaunch 起動可能なら true
+ * @param rejectionReason 起動できない場合に no-trade audit へ保存する理由
+ */
+private data class RunnerLaunchEligibility(
+    val canLaunch: Boolean,
+    val rejectionReason: String,
+)
+
+/**
  * LLM child process へ渡せる非 secret env 名。
  */
 val CHILD_ENV_ALLOWLIST = setOf(
@@ -782,6 +821,7 @@ val CHILD_ENV_ALLOWLIST = setOf(
     "LANG",
     "LC_ALL",
     "TERM",
+    "XDG_CACHE_HOME",
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
 )

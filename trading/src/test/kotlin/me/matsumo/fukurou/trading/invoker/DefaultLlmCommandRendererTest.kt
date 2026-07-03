@@ -224,15 +224,67 @@ class DefaultLlmCommandRendererTest {
     @Test
     fun configRestrictsCodexFalsifierArgsToExplicitSandboxOptIn() {
         val config = LlmCommandRendererConfig(
+            codexCommandTemplate = listOf("docker", "run", "--rm", "codex-image", "codex"),
             codexFalsifierArgs = listOf("--dangerously-bypass-approvals-and-sandbox"),
         )
 
         assertEquals(listOf("--dangerously-bypass-approvals-and-sandbox"), config.codexFalsifierArgs)
         assertFailsWith<IllegalArgumentException> {
             LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("codex"),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("docker", "run", "--rm", "codex-image", "codex"),
                 codexFalsifierArgs = listOf("-c", "mcp_servers.unsafe.command=\"bash\""),
             )
         }
+    }
+
+    @Test
+    fun configRejectsCodexYoloWithUnsafeContainerTemplateArgs() {
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("docker", "run", "--privileged", "codex-image", "codex"),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("docker", "run", "--network=host", "codex-image", "codex"),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("docker", "run", "--network", "host", "codex-image", "codex"),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("docker", "run", "-v", "/:/hostroot", "codex-image", "codex"),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf(
+                    "docker",
+                    "run",
+                    "--mount=type=bind,target=/hostroot,source=/",
+                    "codex-image",
+                    "codex",
+                ),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        LlmCommandRendererConfig(
+            codexCommandTemplate = listOf("docker", "run", "--network", "none", "codex-image", "codex"),
+            codexFalsifierArgs = listOf("--yolo"),
+        )
     }
 
     private fun request(

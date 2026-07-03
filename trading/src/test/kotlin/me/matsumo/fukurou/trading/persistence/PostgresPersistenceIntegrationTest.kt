@@ -3,15 +3,24 @@ package me.matsumo.fukurou.trading.persistence
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -100,6 +109,32 @@ private const val SELECT_COMMAND_EVENT_LOG_INDEX_COUNT_SQL = """
         AND indexname IN (
             'idx_command_event_log_ts_decision_run',
             'idx_command_event_log_run_event_tool'
+        )
+"""
+
+/**
+ * orders.client_request_id unique index 件数を読む SQL。
+ */
+private const val SELECT_ORDERS_CLIENT_REQUEST_ID_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'orders'
+        AND indexname = 'idx_orders_client_request_id_unique'
+"""
+
+/**
+ * LLM 起動予約 index 件数を読む SQL。
+ */
+private const val SELECT_LLM_LAUNCH_RESERVATION_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'llm_launch_reservations'
+        AND indexname IN (
+            'idx_llm_launch_reservations_invocation_id_unique',
+            'idx_llm_launch_reservations_trigger_key_reserved_at',
+            'idx_llm_launch_reservations_status_reserved_at'
         )
 """
 
@@ -267,6 +302,8 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(bootstrap.verifySchema().isSuccess)
         assertTrue(ExposedRiskStateRepository(database).current().isSuccess)
         assertEquals(2, selectCommandEventLogIndexCount(database))
+        assertEquals(1, selectOrdersClientRequestIdIndexCount(database))
+        assertEquals(3, selectLlmLaunchReservationIndexCount(database))
     }
 
     @Test
@@ -319,6 +356,113 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(runtime.broker.getBalance().isSuccess)
 
         runtime.close()
+    }
+
+    @Test
+    fun llm_launch_reservation_allowsOnlyOneConcurrentRunningReservation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig()
+
+        coroutineScope {
+            val firstReservation = async {
+                repository.tryReserve(llmLaunchReservationRequest("daemon-run-1", config)).getOrThrow()
+            }
+            val secondReservation = async {
+                repository.tryReserve(llmLaunchReservationRequest("daemon-run-2", config)).getOrThrow()
+            }
+            val outcomes = listOf(firstReservation.await(), secondReservation.await())
+            val reservedCount = outcomes.filterIsInstance<LlmLaunchReservationOutcome.Reserved>().size
+            val rejectedReasons = outcomes
+                .filterIsInstance<LlmLaunchReservationOutcome.Rejected>()
+                .map { outcome -> outcome.reason }
+
+            assertEquals(1, reservedCount)
+            assertEquals(listOf(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION), rejectedReasons)
+        }
+    }
+
+    @Test
+    fun llm_launch_reservation_enforcesDailyCapInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig(maxInvocationsPerDay = 1)
+
+        repository.tryReserve(llmLaunchReservationRequest("daemon-run-1", config)).getOrThrow()
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "daemon-run-1",
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = "NO_TRADE_DECISION",
+                finishedAt = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val secondOutcome = repository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "daemon-run-2",
+                config = config,
+                reservedAt = fixedInstant().plus(Duration.ofHours(2)),
+            ),
+        ).getOrThrow()
+
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY),
+            secondOutcome,
+        )
+    }
+
+    @Test
+    fun llm_launch_reservation_reportsFreshRunningReservationInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+
+        repository.tryReserve(llmLaunchReservationRequest("daemon-run-running", LlmRunnerConfig())).getOrThrow()
+        val runningExists = repository.hasFreshRunningReservation(fixedInstant().minus(Duration.ofMinutes(30)))
+            .getOrThrow()
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "daemon-run-running",
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = "NO_TRADE_DECISION",
+                finishedAt = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val runningExistsAfterFinish = repository.hasFreshRunningReservation(fixedInstant().minus(Duration.ofMinutes(30)))
+            .getOrThrow()
+
+        assertEquals(true, runningExists)
+        assertEquals(false, runningExistsAfterFinish)
+    }
+
+    @Test
+    fun llm_launch_reservation_ignoresDaemonLaunchAuditForCapInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        ExposedCommandEventLog(database).append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = "daemon-reservation",
+                    llmProvider = "claude",
+                    promptHash = "hash",
+                    systemPromptVersion = "system-prompt-v1",
+                    marketSnapshotId = "snapshot",
+                ),
+                toolName = "llm-daemon-scheduler",
+                toolCallId = null,
+                clientRequestId = "flat-heartbeat",
+                eventType = CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+                payload = "{}",
+                occurredAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 10)
+        val outcome = repository.tryReserve(llmLaunchReservationRequest("daemon-run-1", config)).getOrThrow()
+
+        assertEquals(LlmLaunchReservationOutcome.Reserved("daemon-run-1"), outcome)
     }
 
     @Test
@@ -626,6 +770,59 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(firstResult.positionIds, secondResult.positionIds)
         assertEquals(firstResult.executionIds, secondResult.executionIds)
         assertEquals(1, executions.size)
+    }
+
+    @Test
+    fun paper_execution_closeAllDoesNotReuseClientRequestIdAcrossCloseOrders() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val firstEntry = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                sizeBtc = BigDecimal("0.0030"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+                clientRequestId = "entry-close-all-1",
+            ),
+        )
+        val secondEntry = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                sizeBtc = BigDecimal("0.0030"),
+                takeProfitPriceJpy = BigDecimal("10600000"),
+                clientRequestId = "entry-close-all-2",
+            ),
+        )
+
+        broker.placeOrder(firstEntry).getOrThrow()
+        broker.placeOrder(secondEntry).getOrThrow()
+        val closeResult = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = null,
+                closeAll = true,
+                reasonJa = "close all integration",
+                auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = "close-all-request"),
+            ),
+        ).getOrThrow()
+        val positions = repository.getOpenPositions().getOrThrow()
+        val closeClientRequestIds = selectClientRequestIdsByOrderIds(database, closeResult.orderIds)
+        val expectedCloseClientRequestIds = closeResult.positionIds
+            .map { positionId -> "close-all-request:$positionId" }
+            .sorted()
+
+        assertTrue(closeResult.accepted)
+        assertEquals(2, closeResult.orderIds.size)
+        assertEquals(expectedCloseClientRequestIds, closeClientRequestIds.filterNotNull().sorted())
+        assertEquals(0, positions.size)
     }
 
     @Test
@@ -961,11 +1158,11 @@ private suspend fun approvedPostgresEntryCommand(
 
 private fun entryDecisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
     return DecisionSubmission(
-        invocationId = "run-entry",
+        invocationId = "run-entry-${command.commandId}",
         llmProvider = "claude",
         promptHash = "prompt-hash",
         systemPromptVersion = "system-prompt-v1",
-        marketSnapshotId = "snapshot-entry",
+        marketSnapshotId = "snapshot-entry-${command.commandId}",
         action = DecisionAction.ENTER,
         setupTags = listOf("integration-entry"),
         estimatedWinProbability = command.estimatedWinProbability,
@@ -1002,6 +1199,7 @@ private fun entryDecisionSubmission(command: PlaceOrderCommand): DecisionSubmiss
 private fun postgresEntryCommand(
     orderType: OrderType = OrderType.MARKET,
     priceJpy: BigDecimal? = null,
+    sizeBtc: BigDecimal = BigDecimal("0.0050"),
     takeProfitPriceJpy: BigDecimal,
     estimatedWinProbability: BigDecimal = BigDecimal("0.95"),
     clientRequestId: String? = null,
@@ -1011,7 +1209,7 @@ private fun postgresEntryCommand(
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
         orderType = orderType,
-        sizeBtc = BigDecimal("0.0050"),
+        sizeBtc = sizeBtc,
         priceJpy = priceJpy,
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
@@ -1019,6 +1217,23 @@ private fun postgresEntryCommand(
         estimatedWinProbability = estimatedWinProbability,
         reasonJa = "integration entry",
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
+    )
+}
+
+private fun llmLaunchReservationRequest(
+    invocationId: String,
+    config: LlmRunnerConfig,
+    reservedAt: Instant = fixedInstant(),
+): LlmLaunchReservationRequest {
+    return LlmLaunchReservationRequest(
+        invocationId = invocationId,
+        triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+        triggerKey = "flat-heartbeat",
+        reservedAt = reservedAt,
+        runnerConfig = config,
+        hourlyWindow = Duration.ofHours(1),
+        dailyWindow = Duration.ofHours(24),
+        activeReservationStaleAfter = Duration.ofMinutes(30),
     )
 }
 
@@ -1247,6 +1462,61 @@ private fun selectCommandEventLogIndexCount(database: ExposedDatabase): Int {
         jdbcConnection().prepareStatement(SELECT_COMMAND_EVENT_LOG_INDEX_COUNT_SQL).use { statement ->
             statement.executeQuery().use { resultSet ->
                 require(resultSet.next()) { "command_event_log index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * orders.client_request_id unique index 件数を読む。
+ */
+private fun selectOrdersClientRequestIdIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_ORDERS_CLIENT_REQUEST_ID_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "orders client_request_id index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * 指定 order IDs の client_request_id を読む。
+ */
+private fun selectClientRequestIdsByOrderIds(database: ExposedDatabase, orderIds: List<String>): List<String?> {
+    return exposedTransaction(database) {
+        val placeholders = orderIds.joinToString(", ") { "?" }
+        val sql = "SELECT client_request_id FROM orders WHERE id IN ($placeholders)"
+
+        jdbcConnection().prepareStatement(sql).use { statement ->
+            orderIds.forEachIndexed { orderIndex, orderId ->
+                statement.setObject(orderIndex + 1, UUID.fromString(orderId))
+            }
+            statement.executeQuery().use { resultSet ->
+                val clientRequestIds = mutableListOf<String?>()
+
+                while (resultSet.next()) {
+                    clientRequestIds += resultSet.getString("client_request_id")
+                }
+
+                clientRequestIds
+            }
+        }
+    }
+}
+
+/**
+ * LLM 起動予約 index 件数を読む。
+ */
+private fun selectLlmLaunchReservationIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_LLM_LAUNCH_RESERVATION_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "llm launch reservation index count did not return a row." }
 
                 resultSet.getInt(1)
             }

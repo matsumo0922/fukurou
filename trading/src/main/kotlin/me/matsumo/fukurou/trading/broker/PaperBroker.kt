@@ -190,6 +190,7 @@ class PaperBroker(
             val openPositions = ledgerRepository.getOpenPositions().getOrThrow()
             val targetPositions = resolveCloseTargets(command, openPositions)
             val results = targetPositions.map { position ->
+                val closeCommand = command.forCloseTarget(position, targetPositions.size)
                 val fill = fillSimulator.marketFill(
                     side = OrderSide.SELL,
                     sizeBtc = position.sizeBtc.toBigDecimal(),
@@ -198,7 +199,7 @@ class PaperBroker(
                 )
 
                 ledgerRepository.closePosition(
-                    command = command,
+                    command = closeCommand,
                     positionId = UUID.fromString(position.positionId),
                     orderId = UUID.randomUUID(),
                     fill = fill,
@@ -554,6 +555,26 @@ class PaperBroker(
     }
 }
 
+private fun ClosePositionCommand.forCloseTarget(position: Position, targetCount: Int): ClosePositionCommand {
+    if (targetCount <= 1) {
+        return this
+    }
+
+    val baseClientRequestId = auditContext.clientRequestId?.takeIf { requestId -> requestId.isNotBlank() }
+        ?: return copy(auditContext = auditContext.copy(clientRequestId = null))
+    val derivedClientRequestId = baseClientRequestId.deriveCloseAllClientRequestId(position.positionId)
+
+    return copy(auditContext = auditContext.copy(clientRequestId = derivedClientRequestId))
+}
+
+private fun String.deriveCloseAllClientRequestId(positionId: String): String {
+    val suffix = "$CLIENT_REQUEST_ID_DERIVATION_SEPARATOR$positionId"
+    val maxBaseLength = (CLIENT_REQUEST_ID_MAX_LENGTH - suffix.length).coerceAtLeast(0)
+    val boundedBase = take(maxBaseLength)
+
+    return boundedBase + suffix
+}
+
 private suspend fun PaperBroker.findExistingPlaceOrderResult(command: PlaceOrderCommand): PaperTradeResult? {
     val clientRequestId = command.auditContext.clientRequestId?.takeIf { requestId -> requestId.isNotBlank() }
         ?: return null
@@ -844,3 +865,13 @@ private const val ATR_PERIOD = 14
  * ATR の返却 scale。
  */
 private const val ATR_SCALE = 8
+
+/**
+ * orders.client_request_id の DB 最大長。
+ */
+private const val CLIENT_REQUEST_ID_MAX_LENGTH = 128
+
+/**
+ * 派生 client_request_id の separator。
+ */
+private const val CLIENT_REQUEST_ID_DERIVATION_SEPARATOR = ":"

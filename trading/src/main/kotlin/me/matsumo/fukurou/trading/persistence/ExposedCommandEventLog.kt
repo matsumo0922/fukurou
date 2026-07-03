@@ -38,6 +38,7 @@ private const val COUNT_DISTINCT_DECISION_RUNS_SINCE_SQL = """
     SELECT COUNT(DISTINCT decision_run_id)
     FROM command_event_log
     WHERE decision_run_id IS NOT NULL
+        AND event_type IN ('RUNNER_PHASE_COMPLETED', 'NO_TRADE_EXIT')
         AND ts >= ?
 """
 

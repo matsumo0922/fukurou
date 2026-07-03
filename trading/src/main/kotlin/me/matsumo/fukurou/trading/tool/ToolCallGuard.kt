@@ -3,6 +3,8 @@ package me.matsumo.fukurou.trading.tool
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -150,8 +152,10 @@ class ToolCallGuard(
 
     private suspend fun <T> runAndAudit(call: GuardedToolCall, block: suspend () -> T): Result<T> {
         return try {
+            val startedAt = System.nanoTime()
             val value = block()
-            val auditResult = recordToolCompleted(call)
+            val durationMillis = java.time.Duration.ofNanos(System.nanoTime() - startedAt).toMillis()
+            val auditResult = recordToolCompleted(call, durationMillis)
 
             auditResult.fold(
                 onSuccess = { Result.success(value) },
@@ -169,7 +173,7 @@ class ToolCallGuard(
         }
     }
 
-    private suspend fun recordToolCompleted(call: GuardedToolCall): Result<Unit> {
+    private suspend fun recordToolCompleted(call: GuardedToolCall, durationMillis: Long): Result<Unit> {
         return commandEventLog.append(
             CommandEvent(
                 decisionRunContext = call.decisionRunContext,
@@ -177,7 +181,7 @@ class ToolCallGuard(
                 toolCallId = call.toolCallId,
                 clientRequestId = call.clientRequestId,
                 eventType = CommandEventType.TOOL_CALL_COMPLETED,
-                payload = call.payload,
+                payload = toolCompletedPayload(call.payload, durationMillis),
                 occurredAt = Instant.now(clock),
             ),
         )
@@ -225,4 +229,11 @@ class ToolCallGuard(
             recordHardHaltRejection(call, haltReason, cause)
         }
     }
+}
+
+private fun toolCompletedPayload(payload: String, durationMillis: Long): String {
+    return buildJsonObject {
+        put("durationMillis", durationMillis)
+        put("payload", payload)
+    }.toString()
 }

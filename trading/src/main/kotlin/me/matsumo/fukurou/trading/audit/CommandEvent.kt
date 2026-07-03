@@ -56,6 +56,26 @@ enum class CommandEventType {
      * one-shot runner の phase が完了した。
      */
     RUNNER_PHASE_COMPLETED,
+
+    /**
+     * LLM daemon scheduler worker が起動した。
+     */
+    DAEMON_STARTED,
+
+    /**
+     * LLM daemon scheduler が起動を skip した。
+     */
+    DAEMON_TRIGGER_SKIPPED,
+
+    /**
+     * LLM daemon scheduler が one-shot 起動予約を取得した。
+     */
+    DAEMON_TRIGGER_LAUNCHED,
+
+    /**
+     * LLM daemon scheduler が one-shot 起動結果を記録した。
+     */
+    DAEMON_INVOCATION_COMPLETED,
 }
 
 /**

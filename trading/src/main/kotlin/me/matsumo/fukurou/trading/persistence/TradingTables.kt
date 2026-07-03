@@ -556,6 +556,53 @@ object CommandEventLogTable : Table("command_event_log") {
 }
 
 /**
+ * LLM daemon scheduler の起動予約を表す Exposed table。
+ */
+object LlmLaunchReservationsTable : Table("llm_launch_reservations") {
+    /**
+     * 予約行 ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * runner 起動 ID。
+     */
+    val invocationId = varchar("invocation_id", length = 128)
+
+    /**
+     * daemon trigger 種別。
+     */
+    val triggerKind = varchar("trigger_kind", length = 64)
+
+    /**
+     * cadence 判定に使う trigger 固有 key。
+     */
+    val triggerKey = varchar("trigger_key", length = 256)
+
+    /**
+     * 予約状態。
+     */
+    val status = varchar("status", length = 32)
+
+    /**
+     * 予約時刻。epoch millis で保存する。
+     */
+    val reservedAt = long("reserved_at")
+
+    /**
+     * 完了時刻。epoch millis で保存する。
+     */
+    val finishedAt = long("finished_at").nullable()
+
+    /**
+     * 失敗や no-trade の補助理由。
+     */
+    val reason = text("reason").nullable()
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
  * SafetyFloor の拒否監査を表す Exposed table。
  */
 object SafetyViolationsTable : Table("safety_violations") {

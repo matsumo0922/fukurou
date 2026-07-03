@@ -230,54 +230,14 @@ object TradingRuntimeFactory {
 
         try {
             val database = ExposedDatabase.connect(dataSource)
-            TradingPersistenceBootstrap(
+            return connectedPostgres(
+                dataSource = dataSource,
                 database = database,
                 clock = clock,
-                paperAccountConfig = tradingConfig.paperAccount,
-            ).verifySchema().getOrThrow()
-
-            val riskStateRepository = ExposedRiskStateRepository(database)
-            val commandEventLog = ExposedCommandEventLog(database)
-            val decisionRepository = ExposedDecisionRepository(database, clock)
-            val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
-            val safetyViolationRepository = ExposedSafetyViolationRepository(database)
-            val resolvedReconcilerStatusProvider = reconcilerStatusProvider ?: ExposedReconcilerStatusProvider(database)
-            val broker = PaperBroker(
-                ledgerRepository = ExposedPaperLedgerRepository(
-                    database = database,
-                    fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
-                ),
-                riskStateRepository = riskStateRepository,
-                riskStateCommandService = riskStateCommandService,
-                decisionRepository = decisionRepository,
-                falsificationFreshnessWindow = tradingConfig.decisionProtocol.falsificationFreshnessWindow,
-                safetyViolationRepository = safetyViolationRepository,
-                safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
+                reconcilerStatusProvider = reconcilerStatusProvider,
                 marketDataSource = marketDataSource,
-                fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
-                reconcilerStatusProvider = resolvedReconcilerStatusProvider,
-                clock = clock,
-            )
-            val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
-            val callerNoTradeGuard = CallerNoTradeGuard(commandEventLog, clock)
-            val toolCallGuard = ToolCallGuard(
-                riskStateRepository = riskStateRepository,
-                commandEventLog = commandEventLog,
-                tradingLock = tradingLock,
-                clock = clock,
-            )
-
-            return TradingRuntime(
-                riskStateRepository = riskStateRepository,
-                riskStateCommandService = riskStateCommandService,
-                commandEventLog = commandEventLog,
-                decisionRepository = decisionRepository,
-                safetyViolationRepository = safetyViolationRepository,
-                broker = broker,
-                tradingLock = tradingLock,
-                toolCallGuard = toolCallGuard,
-                callerNoTradeGuard = callerNoTradeGuard,
-                close = { dataSource.close() },
+                tradingConfig = tradingConfig,
+                closeDataSource = true,
             )
         } catch (throwable: Throwable) {
             runCatching {
@@ -286,6 +246,74 @@ object TradingRuntimeFactory {
 
             throw throwable
         }
+    }
+
+    /**
+     * 既存 DataSource / Exposed database から Postgres runtime を構築する。
+     */
+    fun connectedPostgres(
+        dataSource: HikariDataSource,
+        database: ExposedDatabase,
+        clock: Clock = Clock.systemUTC(),
+        reconcilerStatusProvider: ReconcilerStatusProvider? = null,
+        marketDataSource: MarketDataSource? = null,
+        tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
+        closeDataSource: Boolean = false,
+    ): TradingRuntime {
+        TradingPersistenceBootstrap(
+            database = database,
+            clock = clock,
+            paperAccountConfig = tradingConfig.paperAccount,
+        ).verifySchema().getOrThrow()
+
+        val riskStateRepository = ExposedRiskStateRepository(database)
+        val commandEventLog = ExposedCommandEventLog(database)
+        val decisionRepository = ExposedDecisionRepository(database, clock)
+        val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
+        val safetyViolationRepository = ExposedSafetyViolationRepository(database)
+        val resolvedReconcilerStatusProvider = reconcilerStatusProvider ?: ExposedReconcilerStatusProvider(database)
+        val broker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(
+                database = database,
+                fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
+            ),
+            riskStateRepository = riskStateRepository,
+            riskStateCommandService = riskStateCommandService,
+            decisionRepository = decisionRepository,
+            falsificationFreshnessWindow = tradingConfig.decisionProtocol.falsificationFreshnessWindow,
+            safetyViolationRepository = safetyViolationRepository,
+            safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
+            marketDataSource = marketDataSource,
+            fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
+            reconcilerStatusProvider = resolvedReconcilerStatusProvider,
+            clock = clock,
+        )
+        val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
+        val callerNoTradeGuard = CallerNoTradeGuard(commandEventLog, clock)
+        val toolCallGuard = ToolCallGuard(
+            riskStateRepository = riskStateRepository,
+            commandEventLog = commandEventLog,
+            tradingLock = tradingLock,
+            clock = clock,
+        )
+        val closeAction = if (closeDataSource) {
+            { dataSource.close() }
+        } else {
+            {}
+        }
+
+        return TradingRuntime(
+            riskStateRepository = riskStateRepository,
+            riskStateCommandService = riskStateCommandService,
+            commandEventLog = commandEventLog,
+            decisionRepository = decisionRepository,
+            safetyViolationRepository = safetyViolationRepository,
+            broker = broker,
+            tradingLock = tradingLock,
+            toolCallGuard = toolCallGuard,
+            callerNoTradeGuard = callerNoTradeGuard,
+            close = closeAction,
+        )
     }
 }
 

@@ -21,10 +21,14 @@ class TradingBotConfigTest {
         assertEquals(TradingMode.PAPER, config.mode)
         assertEquals(BigDecimal("100000"), config.paperAccount.initialCashJpy)
         assertEquals(BigDecimal("0.80"), config.safetyFloor.maxTotalExposureRatio)
-        assertEquals(30, config.runner.maxToolCallsPerRun)
+        assertEquals(48, config.runner.maxToolCallsPerRun)
         assertEquals(3, config.runner.maxActToolCallsPerRun)
         assertEquals(Duration.ofSeconds(180), config.runner.perRunTimeout)
-        assertEquals(12, config.runner.maxInvocationsPerHour)
+        assertEquals(4, config.runner.maxInvocationsPerHour)
+        assertEquals(96, config.runner.maxInvocationsPerDay)
+        assertEquals(false, config.daemon.enabled)
+        assertEquals(Duration.ofMinutes(15), config.daemon.flatHeartbeatInterval)
+        assertEquals(Duration.ofMinutes(15), config.daemon.holdingCheckInterval)
         assertEquals(10, config.gmoPublicClient.rateLimit.permitsPerSecond)
     }
 
@@ -59,7 +63,14 @@ class TradingBotConfigTest {
                 "FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT" to "20",
                 "FUKUROU_MCP_ACT_TOOL_CALL_LIMIT" to "2",
                 "FUKUROU_LLM_RUN_TIMEOUT_SECONDS" to "120",
-                "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "8",
+                "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "1",
+                "FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY" to "3",
+                "FUKUROU_LLM_DAEMON_ENABLED" to "true",
+                "FUKUROU_LLM_DAEMON_POLL_SECONDS" to "120",
+                "FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS" to "28800",
+                "FUKUROU_LLM_HOLDING_CHECK_SECONDS" to "14400",
+                "FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC" to
+                    "fomc-20260729|FOMC|2026-07-29T18:00:00Z|60|90",
             ),
         )
 
@@ -90,7 +101,14 @@ class TradingBotConfigTest {
         assertEquals(20, config.runner.maxToolCallsPerRun)
         assertEquals(2, config.runner.maxActToolCallsPerRun)
         assertEquals(Duration.ofSeconds(120), config.runner.perRunTimeout)
-        assertEquals(8, config.runner.maxInvocationsPerHour)
+        assertEquals(1, config.runner.maxInvocationsPerHour)
+        assertEquals(3, config.runner.maxInvocationsPerDay)
+        assertEquals(true, config.daemon.enabled)
+        assertEquals(Duration.ofSeconds(120), config.daemon.pollInterval)
+        assertEquals(Duration.ofHours(8), config.daemon.flatHeartbeatInterval)
+        assertEquals(Duration.ofHours(4), config.daemon.holdingCheckInterval)
+        assertEquals(1, config.safetyFloor.economicEventBlackouts.size)
+        assertEquals("fomc-20260729", config.safetyFloor.economicEventBlackouts.single().eventId)
     }
 
     @Test
@@ -167,7 +185,7 @@ class TradingBotConfigTest {
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT" to "31"),
+                mapOf("FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT" to "49"),
             )
         }
         assertFailsWith<IllegalArgumentException> {
@@ -182,7 +200,32 @@ class TradingBotConfigTest {
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "13"),
+                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "5"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY" to "97"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_DAEMON_POLL_SECONDS" to "30"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS" to "600"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_HOLDING_CHECK_SECONDS" to "600"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC" to "cpi|CPI|2026-07-29T18:00:00+09:00|60|60"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

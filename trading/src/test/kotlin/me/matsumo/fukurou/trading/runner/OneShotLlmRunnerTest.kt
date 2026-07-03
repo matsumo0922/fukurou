@@ -199,6 +199,71 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun daemonLaunchAuditDoesNotCountAgainstRunnerInvocationCap() = runBlocking {
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(maxInvocationsPerHour = 1),
+        )
+        val fixture = runnerFixture(config = config) { cleanExit() }
+        fixture.eventLog.append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = "daemon-reservation",
+                    llmProvider = "claude",
+                    promptHash = "hash",
+                    systemPromptVersion = SystemPromptV1.VERSION,
+                    marketSnapshotId = "snapshot",
+                ),
+                toolName = "llm-daemon-scheduler",
+                toolCallId = null,
+                clientRequestId = "flat-heartbeat",
+                eventType = CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+                payload = "{}",
+                occurredAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(1, fixture.processRunner.launches.size)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
+    }
+
+    @Test
+    fun maxInvocationsPerDayExceeded_rejectsLaunchAndAuditsNoTrade() = runBlocking {
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(
+                maxInvocationsPerHour = 1,
+                maxInvocationsPerDay = 1,
+            ),
+        )
+        val fixture = runnerFixture(config = config) { cleanExit() }
+        fixture.eventLog.append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = "existing-run",
+                    llmProvider = "claude",
+                    promptHash = "hash",
+                    systemPromptVersion = SystemPromptV1.VERSION,
+                    marketSnapshotId = "snapshot",
+                ),
+                toolName = "one_shot_runner",
+                toolCallId = null,
+                clientRequestId = "existing-run",
+                eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+                payload = "{}",
+                occurredAt = fixedInstant().minusSeconds(7_200),
+            ),
+        ).getOrThrow()
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.LAUNCH_REJECTED, result.status)
+        assertEquals(0, fixture.processRunner.launches.size)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("max_invocations_per_day_exceeded"))
+    }
+
+    @Test
     fun runEnvironmentIsRecordedAndTransferredThroughMcpConfig() = runBlocking {
         val fixture = runnerFixture { command ->
             handleEnterAndApprovedFalsifier(fixtureRepository, command)
@@ -365,6 +430,7 @@ class OneShotLlmRunnerTest {
         fixture.runner.runOneShot(defaultRequest()).getOrThrow()
 
         val falsifierCommand = fixture.processRunner.launches.single { command -> command.isFalsifierLaunch() }
+        val proposerCommand = fixture.processRunner.launches.single { command -> command.isProposerLaunch() }
         val joinedArgs = falsifierCommand.args.joinToString(" ")
         val codexConfigContent = falsifierCommand.codexConfigContent()
         val forbiddenNames = listOf(
@@ -383,6 +449,7 @@ class OneShotLlmRunnerTest {
 
         forbiddenNames.forEach { forbiddenName ->
             assertFalse(falsifierCommand.environment.containsKey(forbiddenName), forbiddenName)
+            assertFalse(proposerCommand.environment.containsKey(forbiddenName), forbiddenName)
         }
         secretNames.forEach { secretName ->
             assertFalse(joinedArgs.contains(secretName), secretName)
@@ -394,6 +461,30 @@ class OneShotLlmRunnerTest {
         assertNotNull(falsifierCommand.environment[FUKUROU_FALSIFIER_INTENT_ID_ENV])
 
         Unit
+    }
+
+    @Test
+    fun processOutputAuditRedactsSecretValues() = runBlocking {
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                return@runnerFixture cleanExit(
+                    stdout = "token=test-password",
+                    stderr = "credential=fukurou-token",
+                )
+            }
+
+            cleanExit()
+        }
+
+        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        val phaseEvents = fixture.eventLog.events()
+            .filter { event -> event.eventType == CommandEventType.RUNNER_PHASE_COMPLETED }
+        val proposerPhase = phaseEvents.single { event -> event.payload.contains("\"phase\":\"proposer\"") }
+
+        assertTrue(proposerPhase.payload.contains("[REDACTED]"))
+        assertFalse(proposerPhase.payload.contains("test-password"))
+        assertFalse(proposerPhase.payload.contains("fukurou-token"))
     }
 
     @Test
@@ -628,12 +719,15 @@ private fun RenderedLlmCommand.codexConfigContent(): String {
     return Files.readString(codexHome.resolve("config.toml"))
 }
 
-private fun cleanExit(): ProcessRunResult {
+private fun cleanExit(
+    stdout: String = "",
+    stderr: String = "",
+): ProcessRunResult {
     return ProcessRunResult(
         status = ProcessRunStatus.EXITED,
         exitCode = 0,
-        stdout = "",
-        stderr = "",
+        stdout = stdout,
+        stderr = stderr,
     )
 }
 
@@ -706,6 +800,7 @@ private fun defaultParentEnvironment(): Map<String, String> {
         "DB_URL" to "jdbc:postgresql://localhost:5432/fukurou",
         "DB_USER" to "fukurou",
         "DB_PASSWORD" to "test-password",
+        "FUKUROU_LLM_ACCESS_TOKEN" to "fukurou-token",
     )
 }
 

@@ -6,9 +6,11 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
+import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import java.math.BigDecimal
 import java.time.Duration
+import java.time.Instant
 
 /**
  * 取引 bot 全体で共有する typed config。
@@ -21,6 +23,7 @@ import java.time.Duration
  * @param safetyFloor override 不可の安全床設定
  * @param decisionProtocol decision / Falsifier protocol 設定
  * @param runner LLM one-shot runner の保守的な上限設定
+ * @param daemon Ktor 常駐 daemon scheduler 設定
  * @param gmoPublicClient GMO Public API client 設定
  */
 data class TradingBotConfig(
@@ -32,6 +35,7 @@ data class TradingBotConfig(
     val safetyFloor: SafetyFloorConfig = SafetyFloorConfig(),
     val decisionProtocol: DecisionProtocolConfig = DecisionProtocolConfig(),
     val runner: LlmRunnerConfig = LlmRunnerConfig(),
+    val daemon: LlmDaemonConfig = LlmDaemonConfig(),
     val gmoPublicClient: GmoPublicClientConfig = GmoPublicClientConfig(),
 ) {
     init {
@@ -78,6 +82,7 @@ data class TradingBotConfig(
                 safetyFloor = environment.readSafetyFloorConfig(),
                 decisionProtocol = environment.readDecisionProtocolConfig(),
                 runner = environment.readLlmRunnerConfig(),
+                daemon = environment.readLlmDaemonConfig(),
                 gmoPublicClient = environment.readGmoPublicClientConfig(),
             )
         }
@@ -149,12 +154,14 @@ data class PaperMarketConfig(
  * @param maxActToolCallsPerRun 1 MCP server instance あたりの act 系 tool call 上限
  * @param perRunTimeout 1 LLM CLI 起動の timeout
  * @param maxInvocationsPerHour 直近 1 時間に許可する runner 起動数
+ * @param maxInvocationsPerDay 直近 24 時間に許可する runner 起動数
  */
 data class LlmRunnerConfig(
     val maxToolCallsPerRun: Int = DEFAULT_MAX_TOOL_CALLS_PER_RUN,
     val maxActToolCallsPerRun: Int = DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN,
     val perRunTimeout: Duration = DEFAULT_LLM_PER_RUN_TIMEOUT,
     val maxInvocationsPerHour: Int = DEFAULT_MAX_INVOCATIONS_PER_HOUR,
+    val maxInvocationsPerDay: Int = DEFAULT_MAX_INVOCATIONS_PER_DAY,
 ) {
     init {
         val toolLimitIsConservative = maxToolCallsPerRun in 1..DEFAULT_MAX_TOOL_CALLS_PER_RUN
@@ -162,6 +169,7 @@ data class LlmRunnerConfig(
         val timeoutIsPositive = !perRunTimeout.isNegative && !perRunTimeout.isZero
         val timeoutIsConservative = timeoutIsPositive && perRunTimeout <= DEFAULT_LLM_PER_RUN_TIMEOUT
         val hourlyLimitIsConservative = maxInvocationsPerHour in 1..DEFAULT_MAX_INVOCATIONS_PER_HOUR
+        val dailyLimitIsConservative = maxInvocationsPerDay in 1..DEFAULT_MAX_INVOCATIONS_PER_DAY
         val actLimitFitsTotal = maxActToolCallsPerRun <= maxToolCallsPerRun
 
         require(toolLimitIsConservative) {
@@ -176,8 +184,48 @@ data class LlmRunnerConfig(
         require(hourlyLimitIsConservative) {
             "maxInvocationsPerHour must be between 1 and $DEFAULT_MAX_INVOCATIONS_PER_HOUR."
         }
+        require(dailyLimitIsConservative) {
+            "maxInvocationsPerDay must be between 1 and $DEFAULT_MAX_INVOCATIONS_PER_DAY."
+        }
         require(actLimitFitsTotal) {
             "maxActToolCallsPerRun must be less than or equal to maxToolCallsPerRun."
+        }
+    }
+}
+
+/**
+ * Ktor 常駐 LLM daemon scheduler の保守的な設定。
+ *
+ * @param enabled daemon scheduler を Ktor process 内で起動するか
+ * @param pollInterval daemon loop の確認間隔
+ * @param flatHeartbeatInterval flat 状態で event 条件がない場合の heartbeat 間隔
+ * @param holdingCheckInterval 建玉または open order がある場合の密な LLM 確認間隔
+ * @param launchReservationStaleAfter 異常終了した起動予約を同時起動扱いから外すまでの猶予
+ */
+data class LlmDaemonConfig(
+    val enabled: Boolean = DEFAULT_LLM_DAEMON_ENABLED,
+    val pollInterval: Duration = DEFAULT_LLM_DAEMON_POLL_INTERVAL,
+    val flatHeartbeatInterval: Duration = DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL,
+    val holdingCheckInterval: Duration = DEFAULT_LLM_HOLDING_CHECK_INTERVAL,
+    val launchReservationStaleAfter: Duration = DEFAULT_LLM_LAUNCH_RESERVATION_STALE_AFTER,
+) {
+    init {
+        val pollIntervalIsConservative = pollInterval >= DEFAULT_LLM_DAEMON_POLL_INTERVAL
+        val flatHeartbeatIsConservative = flatHeartbeatInterval >= DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL
+        val holdingCheckIsConservative = holdingCheckInterval >= DEFAULT_LLM_HOLDING_CHECK_INTERVAL
+        val reservationStaleIsPositive = !launchReservationStaleAfter.isNegative && !launchReservationStaleAfter.isZero
+
+        require(pollIntervalIsConservative) {
+            "pollInterval must be greater than or equal to ${DEFAULT_LLM_DAEMON_POLL_INTERVAL.seconds} seconds."
+        }
+        require(flatHeartbeatIsConservative) {
+            "flatHeartbeatInterval must be greater than or equal to ${DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL.toMinutes()} minutes."
+        }
+        require(holdingCheckIsConservative) {
+            "holdingCheckInterval must be greater than or equal to ${DEFAULT_LLM_HOLDING_CHECK_INTERVAL.toMinutes()} minutes."
+        }
+        require(reservationStaleIsPositive) {
+            "launchReservationStaleAfter must be greater than 0."
         }
     }
 }
@@ -266,6 +314,11 @@ private const val FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO_ENV = "FUKUROU_MIN_EXP
 private const val FUKUROU_MAX_TAKER_FEE_RATIO_ENV = "FUKUROU_MAX_TAKER_FEE_RATIO"
 
 /**
+ * 経済イベント blackout static config の環境変数名。
+ */
+private const val FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC_ENV = "FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC"
+
+/**
  * 安全床の片道 slippage reserve bps の環境変数名。
  */
 private const val FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS_ENV = "FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS"
@@ -296,6 +349,31 @@ private const val FUKUROU_LLM_RUN_TIMEOUT_SECONDS_ENV = "FUKUROU_LLM_RUN_TIMEOUT
 private const val FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR_ENV = "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"
 
 /**
+ * 直近 24 時間の runner 起動上限の環境変数名。
+ */
+private const val FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY_ENV = "FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY"
+
+/**
+ * LLM daemon scheduler 有効化の環境変数名。
+ */
+private const val FUKUROU_LLM_DAEMON_ENABLED_ENV = "FUKUROU_LLM_DAEMON_ENABLED"
+
+/**
+ * LLM daemon loop poll 間隔秒数の環境変数名。
+ */
+private const val FUKUROU_LLM_DAEMON_POLL_SECONDS_ENV = "FUKUROU_LLM_DAEMON_POLL_SECONDS"
+
+/**
+ * flat heartbeat 間隔秒数の環境変数名。
+ */
+private const val FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS_ENV = "FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS"
+
+/**
+ * holding dense check 間隔秒数の環境変数名。
+ */
+private const val FUKUROU_LLM_HOLDING_CHECK_SECONDS_ENV = "FUKUROU_LLM_HOLDING_CHECK_SECONDS"
+
+/**
  * paper 初期残高の既定値。
  */
 private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("100000")
@@ -313,7 +391,7 @@ private val DEFAULT_FALSIFICATION_FRESHNESS_WINDOW = Duration.ofSeconds(120)
 /**
  * 1 MCP server instance あたりの既定総 tool call 上限。
  */
-const val DEFAULT_MAX_TOOL_CALLS_PER_RUN = 30
+const val DEFAULT_MAX_TOOL_CALLS_PER_RUN = 48
 
 /**
  * 1 MCP server instance あたりの既定 act 系 tool call 上限。
@@ -328,7 +406,37 @@ val DEFAULT_LLM_PER_RUN_TIMEOUT: Duration = Duration.ofSeconds(180)
 /**
  * 直近 1 時間の既定 runner 起動上限。
  */
-const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 12
+const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 4
+
+/**
+ * 直近 24 時間の既定 runner 起動上限。
+ */
+const val DEFAULT_MAX_INVOCATIONS_PER_DAY = 96
+
+/**
+ * LLM daemon scheduler 有効化の既定値。
+ */
+const val DEFAULT_LLM_DAEMON_ENABLED = false
+
+/**
+ * LLM daemon loop poll 間隔の既定値。
+ */
+val DEFAULT_LLM_DAEMON_POLL_INTERVAL: Duration = Duration.ofMinutes(1)
+
+/**
+ * flat 状態 heartbeat 間隔の既定値。
+ */
+val DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL: Duration = Duration.ofMinutes(15)
+
+/**
+ * holding 状態 LLM 確認間隔の既定値。
+ */
+val DEFAULT_LLM_HOLDING_CHECK_INTERVAL: Duration = Duration.ofMinutes(15)
+
+/**
+ * LLM 起動予約を stale とみなす既定時間。
+ */
+val DEFAULT_LLM_LAUNCH_RESERVATION_STALE_AFTER: Duration = Duration.ofMinutes(30)
 
 /**
  * fallback 最小発注数量の既定値。
@@ -426,6 +534,7 @@ private fun Map<String, String>.readSafetyFloorConfig(): SafetyFloorConfig {
             name = FUKUROU_MAX_TAKER_FEE_RATIO_ENV,
             defaultValue = BigDecimal("0.0010"),
         ),
+        economicEventBlackouts = readEconomicEventBlackouts(),
         marketSlippageReserveBps = readDecimal(
             name = FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS_ENV,
             defaultValue = DEFAULT_MARKET_SLIPPAGE_BPS,
@@ -459,11 +568,68 @@ private fun Map<String, String>.readLlmRunnerConfig(): LlmRunnerConfig {
         maxInvocationsPerHour = readOptional(FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR_ENV)
             ?.toInt()
             ?: DEFAULT_MAX_INVOCATIONS_PER_HOUR,
+        maxInvocationsPerDay = readOptional(FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY_ENV)
+            ?.toInt()
+            ?: DEFAULT_MAX_INVOCATIONS_PER_DAY,
+    )
+}
+
+private fun Map<String, String>.readLlmDaemonConfig(): LlmDaemonConfig {
+    return LlmDaemonConfig(
+        enabled = readOptional(FUKUROU_LLM_DAEMON_ENABLED_ENV)?.toBooleanStrictOrNull()
+            ?: DEFAULT_LLM_DAEMON_ENABLED,
+        pollInterval = Duration.ofSeconds(
+            readOptional(FUKUROU_LLM_DAEMON_POLL_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_LLM_DAEMON_POLL_INTERVAL.seconds,
+        ),
+        flatHeartbeatInterval = Duration.ofSeconds(
+            readOptional(FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL.seconds,
+        ),
+        holdingCheckInterval = Duration.ofSeconds(
+            readOptional(FUKUROU_LLM_HOLDING_CHECK_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_LLM_HOLDING_CHECK_INTERVAL.seconds,
+        ),
     )
 }
 
 private fun Map<String, String>.readGmoPublicClientConfig(): GmoPublicClientConfig {
     return GmoPublicClientConfig.fromEnvironment(this)
+}
+
+private fun Map<String, String>.readEconomicEventBlackouts(): List<EconomicEventBlackout> {
+    val rawValue = readOptional(FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC_ENV) ?: return emptyList()
+
+    return rawValue
+        .split(";")
+        .map { entry -> entry.trim() }
+        .filter { entry -> entry.isNotBlank() }
+        .map { entry -> entry.toEconomicEventBlackout() }
+}
+
+private fun String.toEconomicEventBlackout(): EconomicEventBlackout {
+    val parts = split("|")
+
+    require(parts.size == ECONOMIC_EVENT_BLACKOUT_PART_COUNT) {
+        "$FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC_ENV entry must be id|name|eventAtUtc|beforeMinutes|afterMinutes."
+    }
+
+    val eventAtRaw = parts[2].trim()
+
+    require(eventAtRaw.endsWith("Z")) {
+        "$FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC_ENV eventAtUtc must use UTC Z timestamp."
+    }
+
+    return EconomicEventBlackout(
+        eventId = parts[0].trim(),
+        eventName = parts[1].trim(),
+        eventAt = Instant.parse(eventAtRaw),
+        blackoutBefore = Duration.ofMinutes(parts[3].trim().toLong()),
+        blackoutAfter = Duration.ofMinutes(parts[4].trim().toLong()),
+    )
 }
 
 private fun Map<String, String>.readDecimal(name: String, defaultValue: BigDecimal): BigDecimal {
@@ -475,3 +641,8 @@ private fun Map<String, String>.readOptional(name: String): String? {
         ?.trim()
         ?.takeIf { value -> value.isNotBlank() }
 }
+
+/**
+ * 経済イベント blackout 1 件を構成する field 数。
+ */
+private const val ECONOMIC_EVENT_BLACKOUT_PART_COUNT = 5

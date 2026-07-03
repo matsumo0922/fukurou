@@ -47,6 +47,7 @@ import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import java.time.Instant
 import kotlin.test.Test
@@ -496,6 +497,51 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun defaultToolCallLimitAllowsMeasuredEnterPathBudget() = runBlocking {
+        val decisionRunContext = DecisionRunContext(
+            decisionRunId = "measured-enter-run",
+            llmProvider = "codex",
+            promptHash = "hash",
+            systemPromptVersion = "system-prompt-v1",
+            marketSnapshotId = "snapshot",
+        )
+        val runtime = TradingRuntimeFactory.inMemory()
+        val eventLog = runtime.commandEventLog as InMemoryCommandEventLog
+        val limiter = McpToolCallLimiter(
+            config = TradingBotConfig().runner,
+            toolCallGuard = runtime.toolCallGuard,
+            countedToolNames = setOf("get_ticker"),
+        )
+
+        repeat(MEASURED_PROPOSER_TOOL_CALLS + MEASURED_FALSIFIER_TOOL_CALLS) { callIndex ->
+            eventLog.append(
+                CommandEvent(
+                    decisionRunContext = decisionRunContext,
+                    toolName = "get_ticker",
+                    toolCallId = "prior-tool-call-$callIndex",
+                    clientRequestId = "prior-tool-call-$callIndex",
+                    eventType = CommandEventType.TOOL_CALL_COMPLETED,
+                    payload = "{}",
+                    occurredAt = Instant.parse("2026-07-03T00:00:00Z"),
+                ),
+            ).getOrThrow()
+        }
+
+        val result = limiter.acquire(
+            call = GuardedToolCall(
+                toolName = "get_ticker",
+                toolCallId = "current-tool-call",
+                clientRequestId = "current-tool-call",
+                decisionRunContext = decisionRunContext,
+                payload = "{}",
+            ),
+            kind = McpToolCallKind.READ_ONLY,
+        )
+
+        assertTrue(result.isSuccess)
+    }
+
+    @Test
     fun toolCallLimitCountUnavailable_returnsToolErrorAndNoTradeAudit() = runBlocking {
         val decisionRunContext = DecisionRunContext(
             decisionRunId = "count-failure-run",
@@ -607,6 +653,16 @@ class FukurouMcpServerTest {
         assertTrue(noTradeEvent.payload.contains("mcp_tool_not_allowed"))
     }
 }
+
+/**
+ * #19 で観測した Proposer tool call 数。
+ */
+private const val MEASURED_PROPOSER_TOOL_CALLS = 16
+
+/**
+ * #19 で観測した Falsifier tool call 数。
+ */
+private const val MEASURED_FALSIFIER_TOOL_CALLS = 17
 
 /**
  * NO_TRADE decision tool request の引数を作る。

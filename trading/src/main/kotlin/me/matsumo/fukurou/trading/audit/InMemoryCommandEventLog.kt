@@ -25,6 +25,7 @@ class InMemoryCommandEventLog : CommandEventLog {
             mutex.withLock {
                 storedEvents
                     .filter { event -> !event.occurredAt.isBefore(since) }
+                    .filter { event -> event.eventType in DECISION_RUN_COUNTED_EVENT_TYPES }
                     .mapNotNull { event -> event.decisionRunContext.decisionRunId }
                     .distinct()
                     .size
@@ -63,5 +64,13 @@ class InMemoryCommandEventLog : CommandEventLog {
 private val TOOL_CALL_COUNTED_EVENT_TYPES = setOf(
     CommandEventType.TOOL_CALL_COMPLETED,
     CommandEventType.TOOL_CALL_REJECTED_BY_HARD_HALT,
+    CommandEventType.NO_TRADE_EXIT,
+)
+
+/**
+ * LLM 起動回数として扱う監査イベント種別。
+ */
+private val DECISION_RUN_COUNTED_EVENT_TYPES = setOf(
+    CommandEventType.RUNNER_PHASE_COMPLETED,
     CommandEventType.NO_TRADE_EXIT,
 )
