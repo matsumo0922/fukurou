@@ -525,6 +525,7 @@ data class PositionSnapshot(
     val unrealizedR: BigDecimal,
     val pyramidAddCount: Int,
     val highestPriceSinceEntryJpy: BigDecimal,
+    val lowestPriceSinceEntryJpy: BigDecimal?,
 )
 
 /**
@@ -2102,7 +2103,8 @@ ops.get_runtime_limits
       "unrealizedPnlJpy": "500",
       "unrealizedR": "0.25",
       "pyramidAddCount": 0,
-      "highestPriceSinceEntryJpy": "10080000"
+      "highestPriceSinceEntryJpy": "10080000",
+      "lowestPriceSinceEntryJpy": "9980000"
     }
   ]
 }
@@ -2847,6 +2849,7 @@ object PositionSnapshotsTable : UUIDTable("position_snapshots") {
     val mfeJpy = decimal("mfe_jpy", 24, 8).nullable()
     val pyramidAddCount = integer("pyramid_add_count")
     val highestPriceSinceEntryJpy = decimal("highest_price_since_entry_jpy", 24, 8)
+    val lowestPriceSinceEntryJpy = decimal("lowest_price_since_entry_jpy", 24, 8).nullable()
 }
 
 /**

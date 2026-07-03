@@ -443,6 +443,8 @@ internal class ExposedPaperLedgerWriter(
             val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
             val sizeBtc = position.sizeBtc.toBigDecimal()
             val highestPrice = maxOf(position.highestPriceSinceEntryJpy.toBigDecimal(), lastPrice)
+            val currentLowestPrice = position.lowestPriceSinceEntryJpy?.toBigDecimal() ?: lastPrice
+            val lowestPrice = minOf(currentLowestPrice, lastPrice)
             val trailingStop = atr14Jpy?.let { atrValue ->
                 highestPrice
                     .subtract(atrValue.multiply(SafetyFloorDefaults.trailingAtrMultiplier))
@@ -452,7 +454,14 @@ internal class ExposedPaperLedgerWriter(
             val tightenedStop = listOfNotNull(currentStop, trailingStop).maxOrNull()
             val unrealizedPnl = lastPrice.subtract(entryPrice).multiply(sizeBtc).moneyScale()
 
-            updatePositionMark(position.positionId, lastPrice, highestPrice, unrealizedPnl, tightenedStop)
+            updatePositionMark(
+                positionId = position.positionId,
+                lastPrice = lastPrice,
+                highestPrice = highestPrice,
+                lowestPrice = lowestPrice,
+                unrealizedPnl = unrealizedPnl,
+                tightenedStop = tightenedStop,
+            )
 
             if (tightenedStop != null && tightenedStop != currentStop) {
                 updateLinkedStopOrder(position.positionId, tightenedStop, "reconciler atr trailing floor")
@@ -585,11 +594,11 @@ internal class ExposedPaperLedgerWriter(
                     id, trade_group_id, mode, symbol, side, status, opened_at, closed_at,
                     size_btc, average_entry_price_jpy, current_price_jpy, current_stop_loss_jpy,
                     current_take_profit_jpy, unrealized_pnl_jpy, unrealized_r, pyramid_add_count,
-                    highest_price_since_entry_jpy, decision_run_id, tool_call_id,
+                    highest_price_since_entry_jpy, lowest_price_since_entry_jpy, decision_run_id, tool_call_id,
                     client_request_id, llm_provider, prompt_hash, system_prompt_version,
                     market_snapshot_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
         ).use { statement ->
             statement.setObject(1, positionId)
@@ -608,7 +617,8 @@ internal class ExposedPaperLedgerWriter(
             statement.setBigDecimal(14, BigDecimal.ZERO)
             statement.setInt(15, 0)
             statement.setBigDecimal(16, fill.priceJpy.moneyScale())
-            statement.bindAudit(17, command.auditContext)
+            statement.setBigDecimal(17, fill.priceJpy.moneyScale())
+            statement.bindAudit(18, command.auditContext)
             statement.executeUpdate()
         }
     }
@@ -653,6 +663,7 @@ internal class ExposedPaperLedgerWriter(
         positionId: String,
         lastPrice: BigDecimal,
         highestPrice: BigDecimal,
+        lowestPrice: BigDecimal,
         unrealizedPnl: BigDecimal,
         tightenedStop: BigDecimal?,
     ) {
@@ -662,7 +673,8 @@ internal class ExposedPaperLedgerWriter(
                 SET current_price_jpy = ?,
                     current_stop_loss_jpy = COALESCE(?, current_stop_loss_jpy),
                     unrealized_pnl_jpy = ?,
-                    highest_price_since_entry_jpy = ?
+                    highest_price_since_entry_jpy = ?,
+                    lowest_price_since_entry_jpy = ?
                 WHERE id = ?
             """,
         ).use { statement ->
@@ -670,7 +682,8 @@ internal class ExposedPaperLedgerWriter(
             statement.setNullableBigDecimal(2, tightenedStop?.moneyScale())
             statement.setBigDecimal(3, unrealizedPnl.moneyScale())
             statement.setBigDecimal(4, highestPrice.moneyScale())
-            statement.setObject(5, UUID.fromString(positionId))
+            statement.setBigDecimal(5, lowestPrice.moneyScale())
+            statement.setObject(6, UUID.fromString(positionId))
             statement.executeUpdate()
         }
     }
@@ -710,6 +723,10 @@ internal class ExposedPaperLedgerWriter(
     }
 
     private fun JdbcTransaction.closePositionRow(position: Position, fill: SimulatedFill) {
+        val highestPrice = maxOf(position.highestPriceSinceEntryJpy.toBigDecimal(), fill.priceJpy)
+        val currentLowestPrice = position.lowestPriceSinceEntryJpy?.toBigDecimal() ?: fill.priceJpy
+        val lowestPrice = minOf(currentLowestPrice, fill.priceJpy)
+
         prepare(
             """
                 UPDATE positions
@@ -719,7 +736,9 @@ internal class ExposedPaperLedgerWriter(
                     current_stop_loss_jpy = NULL,
                     current_take_profit_jpy = NULL,
                     unrealized_pnl_jpy = 0,
-                    unrealized_r = 0
+                    unrealized_r = 0,
+                    highest_price_since_entry_jpy = ?,
+                    lowest_price_since_entry_jpy = ?
                 WHERE id = ?
                     AND status = ?
             """,
@@ -727,8 +746,10 @@ internal class ExposedPaperLedgerWriter(
             statement.setString(1, PositionStatus.CLOSED.name)
             statement.setLong(2, fill.executedAt.toEpochMilli())
             statement.setBigDecimal(3, fill.priceJpy.moneyScale())
-            statement.setObject(4, UUID.fromString(position.positionId))
-            statement.setString(5, PositionStatus.OPEN.name)
+            statement.setBigDecimal(4, highestPrice.moneyScale())
+            statement.setBigDecimal(5, lowestPrice.moneyScale())
+            statement.setObject(6, UUID.fromString(position.positionId))
+            statement.setString(7, PositionStatus.OPEN.name)
             statement.executeUpdate()
         }
     }
