@@ -5,7 +5,7 @@
 - 実装言語: Kotlin/JVM
 - 実行形態: Docker(Linux) 常駐、24時間無人運転
 - 設計日: 2026-07-01
-- 改訂日: 2026-07-02（第3ラウンド根幹レビュー反映）
+- 改訂日: 2026-07-03（daemon 学習期 cadence 改訂）
 - ステータス: Step6（堅牢化 / config / Docker MCP 配線）まで実装済み。daemon scheduler / LlmInvoker 本実装 / live 実発注は未実装
 
 > 本書はソフトウェア設計書であり、投資助言ではない。v1は「学習7 : 利益3」の実験基盤として、ペーパートレードを最初の本番環境として扱う。
@@ -39,10 +39,19 @@
 - 新規エントリーだけを対象に、Proposer / Falsifier の二権非対称レビューを導入する。Falsifierは拒否権のみを持ち、退出・保護操作はブロックしない。
 - `confidence >= 0.6` の発注ゲートを廃止し、コード計算のEVゲートへ置換する。confidenceは較正とデータ品質防衛の材料に限定する。
 - エントリー時の TradePlan を position の plan-of-record として永続化し、以後の起動は維持・退出・理由必須の正式修正の3択に拘束する。正式修正は既定2回までとする。
-- flat時はイベント発火 + 1時間ハートビートのみとし、15分定期発火を廃止する。保有中は密な保護・判断を維持する。
+- 2026-07-02 時点では flat時をイベント発火 + 1時間ハートビートに抑え、15分定期発火を廃止する保守案へ改訂した。ただし、2026-07-03 の追加改訂により、学習期の daemon 初期値は flat / 保有中とも 15分 cadence へ戻す。
 - maker-first、日次エントリー上限、想定値幅/往復コスト比、paper初期の実測較正により、安全床6「コスト上限」を実体化する。
 - 経済イベントカレンダー、セッション時間帯、ATRパーセンタイル、要約特徴量中心の情報設計を導入する。
 - buy&hold / no-trade ベンチマーク、kill基準、MAE/MFE、相場局面の偏り確認を評価設計に追加する。
+
+### 1.2.1 daemon 学習期 cadence の追加改訂
+
+[確定事項の改訂: 2026-07-03] 2026-07-02 の「flat時15分定期発火廃止」は、サブスク枠の実数が未確定な段階で token 消費を抑えるための保守運用案だった。Claude Max / Codex Pro 20x の Usage UI と #28 の token / cost 集計で消費を別途監視する前提で、学習データ収集を優先し、daemon 学習期は flat / 保有中とも 15分 cadence を暫定採用する。
+
+- 既定値は flat heartbeat 15分、保有中 check 15分、max invocations per hour 4、daily cap 96 とする。
+- 経済イベント trigger も同じ hourly / daily 予算を消費し、heartbeat とは別枠にしない。
+- flat 15分運転では rolling 1時間予算が heartbeat で飽和しやすいため、経済イベント trigger は最大約15分遅延して heartbeat 枠を置き換える可能性がある。
+- 96起動/日 x 実測 token は日次消費が大きいため、Usage UI と #28 の集計で過剰消費が見えた場合は cadence を再調整する。
 
 ### 1.3 本設計の方針
 
@@ -122,7 +131,7 @@ flowchart LR
 |---|---|---|
 | Kotlin Daemon | `:fukurou` background worker / 将来 `:trading.daemon` | 常駐、定期発火、イベント発火、CLI起動、タイムアウト、キルスイッチ、復旧、通知 |
 | ProtectionReconciler | `:trading.reconciler` + `:fukurou` background worker | LLM起動の合間の保護、paper約定判定、virtual TP、HARD_HALT掃引、DBロック取得 |
-| Trigger Engine | `:trading.trigger` | flat時のイベント発火 + 1時間ハートビート、保有中の密発火、クールダウン制御 |
+| Trigger Engine | `:trading.trigger` | flat / 保有中の15分 cadence、経済イベント発火、クールダウン制御 |
 | LLM CLI Runner | `:trading.llm` / `:fukurou` caller | `claude` / `codex` をワンショット起動し、runId・MCP設定・初期プロンプトを渡す |
 | MCP Server | `:mcp` | read系/act系ツール、risk preview、安全床強制、決定記録。業務ロジックは`:trading`へ委譲 |
 | Safety Floor | `:trading.safety` + `:mcp` | 発注・保護更新・買い増し・overrideをサーバー側で検証し拒否ログを残す |
@@ -1270,16 +1279,16 @@ interface GmoSymbolMapper {
 
 ### 6.1 発火条件
 
-[確定事項の改訂: 2026-07-02] 発火はハイブリッドだが、flat時の15分定期発火は廃止する。flat時はイベント `±1%/5分` などの構造発火 + 1時間ハートビートのみ、保有中は密、クールダウン既定5分とする。
+[確定事項の改訂: 2026-07-03] 発火はハイブリッドだが、学習期は flat / 保有中とも 15分 cadence を暫定採用する。サブスク枠と token 消費は Usage UI と #28 の集計で監視し、必要なら #28 で cadence を再調整する。経済イベント trigger も同じ hourly / daily 予算を消費し、heartbeat とは別枠にしない。
 
 [設計提案] v1の具体条件は次の通り。
 
 | 発火 | 条件 | cooldown | 備考 |
 |---|---|---:|---|
-| flatハートビート | ポジションなしで1時間ごと、JST基準で毎時00分 | 適用 | 生存確認・地合い更新。新規判断は控えめに扱う |
+| flatハートビート | ポジションなしで15分ごと | 適用 | 学習データ収集と地合い更新。token / サブスク枠は #28 で監視する |
 | 価格急変 | 5分前midから `abs(change) >= 1.0%` | 適用。ただし保有中STOP接近は bypass | 急変時の確認 |
 | 構造イベント | 1時間足の新高値/新安値、主要レンジ抜けなど | 適用 | 静かなトレンド取り逃しの緩和。daemon設計時に条件を追加 |
-| 保有中密 | ポジションありなら1分ごと | 5分ではなく1分。LLM呼び出しは条件付き | STOP/TP近接、1R到達、ATR床更新 |
+| 保有中check | open position / open order があれば15分ごと | 適用 | STOP/TP近接、1R到達、ATR床更新。保護・約定判定は `ProtectionReconciler` が短周期で継続する |
 | 起動時復旧 | プロセス起動直後 | bypass | DB/取引所/ペーパー台帳の整合性確認 |
 | 安全バックストップ | DD閾値、STOP到達、データ不整合 | bypass | LLMを呼ばずコードで守る場合あり |
 | 手動 | WebUI/CLIで明示発火 | bypass可能 | 理由必須 |
@@ -1359,7 +1368,7 @@ suspend fun handleTrigger(
 
 [確定] daemonはCLI起動時に `FUKUROU_INVOCATION_ID`（= `decisionRunId`）を環境変数へ注入する。MCPは全tool callへこのIDを自動付与し、`decision_run_id` / `tool_call_id` / `client_request_id` / `llm_provider` / `prompt_hash` / `system_prompt_version` / `market_snapshot_id` をauditとして保存する。
 
-[確定事項の改訂: 2026-07-02] flat時15分定期発火（96起動/日）は廃止し、1時間ハートビート（24起動/日）+ イベント発火へ変更する。Step1スパイクでは、1起動あたりの実測token・所要時間・tool call数を記録し、daemonのcadence設計とサブスク枠見積もりの入力にする。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
+[確定事項の改訂: 2026-07-03] 2026-07-02 の「flat時15分定期発火廃止」は保守運用案として扱い、学習期は flat時15分定期発火（96起動/日）を暫定採用する。既定上限は 4/hour、96/day とする。Step1スパイクと #19 の実測値を入力にしつつ、#28 で実運用 token・所要時間・tool call数・サブスク枠消費を集計して見直す。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
 
 ### 6.4 1起動内で許可すること/禁止すること
 
@@ -1367,7 +1376,7 @@ suspend fun handleTrigger(
 |---|---|---|
 | データ取得 | MCPでticker/candles/orderbook/trades/account/knowledge取得 | 外部サイトを勝手にブラウズして根拠不明データで売買 |
 | 数秒待機 | 1起動内で最大2回、各3〜5秒程度の再取得 | 分単位sleep、自己再スケジュール |
-| ツール呼び出し | 既定最大30回/起動 | 無制限ループ |
+| ツール呼び出し | 既定最大48回/起動 | 無制限ループ |
 | 判断提出 | `decision.submit_decision` を1回だけ | 複数の矛盾する最終判断 |
 | 発注 | `risk.preview_order` 後にact系ツール | previewなしのact系ツール |
 
@@ -1375,10 +1384,11 @@ suspend fun handleTrigger(
 
 [設計提案] 既定値:
 
-- LLM最大呼び出し回数: 12回/時
-- LLM通常目標: flat時は1時間ハートビート + イベント発火、保有中は状態に応じて15分以下
+- LLM最大呼び出し回数: 4回/時
+- LLM最大呼び出し回数: 96回/日
+- LLM通常目標: 学習期は flat / 保有中とも15分 cadence + 経済イベント発火
 - 1起動の最大実行時間: 180秒
-- 1起動のMCP tool call上限: 30回
+- 1起動のMCP tool call上限: 48回
 - act系tool call上限: 3回/起動
 - 1起動内のsleep合計: 最大10秒
 
