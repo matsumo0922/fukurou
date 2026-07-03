@@ -277,7 +277,7 @@ class InMemoryPaperLedgerRepository(
 
         val realizedFill = fill.withRealizedPnl(position)
         val closeOrder = closeOrder(orderId, position, reasonJa)
-        val closedPosition = position.copy(
+        val closedPosition = position.withWatermarkPrice(realizedFill.priceJpy).copy(
             status = PositionStatus.CLOSED,
             closedAt = realizedFill.executedAt.toString(),
             currentPriceJpy = realizedFill.priceJpy.toPlainString(),
@@ -473,6 +473,8 @@ class InMemoryPaperLedgerRepository(
             val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
             val sizeBtc = position.sizeBtc.toBigDecimal()
             val highestPrice = maxOf(position.highestPriceSinceEntryJpy.toBigDecimal(), lastPrice)
+            val currentLowestPrice = position.lowestPriceSinceEntryJpy?.toBigDecimal() ?: lastPrice
+            val lowestPrice = minOf(currentLowestPrice, lastPrice)
             val trailingStop = atr14Jpy?.let { atrValue ->
                 highestPrice
                     .subtract(atrValue.multiply(SafetyFloorDefaults.trailingAtrMultiplier))
@@ -491,6 +493,7 @@ class InMemoryPaperLedgerRepository(
                 currentStopLossJpy = tightenedStop?.moneyScale()?.toPlainString(),
                 unrealizedPnlJpy = unrealizedPnl.toPlainString(),
                 highestPriceSinceEntryJpy = highestPrice.moneyScale().toPlainString(),
+                lowestPriceSinceEntryJpy = lowestPrice.moneyScale().toPlainString(),
             )
         }
 
@@ -620,6 +623,7 @@ private fun PlaceOrderCommand.toOpenPosition(positionId: UUID, tradeGroupId: UUI
         unrealizedR = BigDecimal.ZERO.toPlainString(),
         pyramidAddCount = 0,
         highestPriceSinceEntryJpy = fill.priceJpy.moneyScale().toPlainString(),
+        lowestPriceSinceEntryJpy = fill.priceJpy.moneyScale().toPlainString(),
     )
 }
 
@@ -704,6 +708,17 @@ private fun SimulatedFill.withRealizedPnl(position: Position): SimulatedFill {
     val realizedPnl = grossPnl.subtract(feeJpy).moneyScale()
 
     return copy(realizedPnlJpy = realizedPnl)
+}
+
+private fun Position.withWatermarkPrice(priceJpy: BigDecimal): Position {
+    val highestPrice = maxOf(highestPriceSinceEntryJpy.toBigDecimal(), priceJpy)
+    val currentLowestPrice = lowestPriceSinceEntryJpy?.toBigDecimal() ?: priceJpy
+    val lowestPrice = minOf(currentLowestPrice, priceJpy)
+
+    return copy(
+        highestPriceSinceEntryJpy = highestPrice.moneyScale().toPlainString(),
+        lowestPriceSinceEntryJpy = lowestPrice.moneyScale().toPlainString(),
+    )
 }
 
 private fun AccountSnapshot.afterBuyFill(fill: SimulatedFill): AccountSnapshot {

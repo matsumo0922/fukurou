@@ -227,6 +227,7 @@ private fun protectedPosition(positionId: UUID): Position {
         unrealizedR = "0.5000000000",
         pyramidAddCount = 0,
         highestPriceSinceEntryJpy = "10080000.00000000",
+        lowestPriceSinceEntryJpy = "10000000.00000000",
     )
 }
 

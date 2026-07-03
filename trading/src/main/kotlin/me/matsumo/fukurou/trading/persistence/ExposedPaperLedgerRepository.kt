@@ -74,7 +74,8 @@ private const val SELECT_OPEN_POSITIONS_SQL = """
         unrealized_pnl_jpy,
         unrealized_r,
         pyramid_add_count,
-        highest_price_since_entry_jpy
+        highest_price_since_entry_jpy,
+        lowest_price_since_entry_jpy
     FROM positions
     WHERE status = ?
         AND mode = (
@@ -208,7 +209,8 @@ private const val SELECT_POSITIONS_BY_TRADE_GROUP_ID_SQL = """
         unrealized_pnl_jpy,
         unrealized_r,
         pyramid_add_count,
-        highest_price_since_entry_jpy
+        highest_price_since_entry_jpy,
+        lowest_price_since_entry_jpy
     FROM positions
     WHERE trade_group_id = ?
         AND mode = (
@@ -639,6 +641,7 @@ private fun ResultSet.toPosition(): Position {
         unrealizedR = getBigDecimal("unrealized_r").toPlainString(),
         pyramidAddCount = getInt("pyramid_add_count"),
         highestPriceSinceEntryJpy = getBigDecimal("highest_price_since_entry_jpy").toPlainString(),
+        lowestPriceSinceEntryJpy = getNullableBigDecimal("lowest_price_since_entry_jpy")?.toPlainString(),
     )
 }
 

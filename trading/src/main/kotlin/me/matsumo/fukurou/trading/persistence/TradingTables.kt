@@ -217,6 +217,11 @@ object PositionsTable : Table("positions") {
     val highestPriceSinceEntryJpy = decimal("highest_price_since_entry_jpy", precision = 24, scale = 8)
 
     /**
+     * entry 以降の最安値。null は記録開始前で MAE 評価対象外。
+     */
+    val lowestPriceSinceEntryJpy = decimal("lowest_price_since_entry_jpy", precision = 24, scale = 8).nullable()
+
+    /**
      * decision run ID。
      */
     val decisionRunId = varchar("decision_run_id", length = 128).nullable()

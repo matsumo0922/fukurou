@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
@@ -27,6 +28,7 @@ import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -40,6 +42,7 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
@@ -57,6 +60,7 @@ import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
@@ -152,6 +156,61 @@ private const val SELECT_NO_TRADE_DECISION_SQL = """
 """
 
 /**
+ * position watermark を読む SQL。
+ */
+private const val SELECT_POSITION_WATERMARK_SQL = """
+    SELECT
+        highest_price_since_entry_jpy,
+        lowest_price_since_entry_jpy
+    FROM positions
+    WHERE id = ?
+"""
+
+/**
+ * lowest watermark backfill test 用 position 行を追加する SQL。
+ */
+private const val INSERT_BACKFILL_POSITION_SQL = """
+    INSERT INTO positions (
+        id,
+        trade_group_id,
+        mode,
+        symbol,
+        side,
+        status,
+        opened_at,
+        closed_at,
+        size_btc,
+        average_entry_price_jpy,
+        current_price_jpy,
+        current_stop_loss_jpy,
+        current_take_profit_jpy,
+        unrealized_pnl_jpy,
+        unrealized_r,
+        pyramid_add_count,
+        highest_price_since_entry_jpy
+    )
+    VALUES (
+        ?,
+        ?,
+        'PAPER',
+        'BTC',
+        'LONG',
+        ?,
+        ?,
+        NULL,
+        0.010000000000,
+        10000000.00000000,
+        ?,
+        9800000.00000000,
+        NULL,
+        0.00000000,
+        0,
+        0,
+        10100000.00000000
+    )
+"""
+
+/**
  * test 用 reconciler 完了 event の payload。
  */
 private const val TEST_RECONCILER_COMPLETED_PAYLOAD = """
@@ -185,7 +244,8 @@ private const val INSERT_TEST_POSITION_SQL = """
         unrealized_pnl_jpy,
         unrealized_r,
         pyramid_add_count,
-        highest_price_since_entry_jpy
+        highest_price_since_entry_jpy,
+        lowest_price_since_entry_jpy
     )
     VALUES (
         ?,
@@ -204,7 +264,8 @@ private const val INSERT_TEST_POSITION_SQL = """
         1000.00000000,
         0.500000,
         0,
-        10100000.00000000
+        10100000.00000000,
+        10000000.00000000
     )
 """
 
@@ -333,6 +394,36 @@ class PostgresPersistenceIntegrationTest {
         } finally {
             runtime.close()
         }
+    }
+
+    @Test
+    fun bootstrap_backfills_open_position_lowest_watermark_idempotently() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        val openPositionId = UUID.randomUUID()
+        val closedPositionId = UUID.randomUUID()
+
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            insertBackfillPosition(
+                positionId = openPositionId,
+                status = "OPEN",
+                currentPriceJpy = BigDecimal("9900000"),
+            )
+            insertBackfillPosition(
+                positionId = closedPositionId,
+                status = "CLOSED",
+                currentPriceJpy = BigDecimal("9800000"),
+            )
+        }
+
+        bootstrap.ensureSchema().getOrThrow()
+        bootstrap.ensureSchema().getOrThrow()
+
+        val openWatermark = selectPositionWatermark(database, openPositionId)
+        val closedWatermark = selectPositionWatermark(database, closedPositionId)
+
+        assertEquals("9900000.00000000", openWatermark.lowestPriceSinceEntryJpy)
+        assertNull(closedWatermark.lowestPriceSinceEntryJpy)
     }
 
     @Test
@@ -704,6 +795,40 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun paper_watermark_scenario_matches_in_memory_and_postgres_repositories() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val postgresDecisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val postgresBroker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(database),
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = postgresDecisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val inMemoryDecisionRepository = InMemoryDecisionRepository(fixedClock())
+        val inMemoryBroker = PaperBroker(
+            ledgerRepository = InMemoryPaperLedgerRepository(),
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = inMemoryDecisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val postgresSnapshot = runWatermarkScenario(postgresBroker, postgresDecisionRepository)
+        val inMemorySnapshot = runWatermarkScenario(inMemoryBroker, inMemoryDecisionRepository)
+        val expectedSnapshot = WatermarkScenarioSnapshot(
+            currentPriceJpy = "10050000.00000000",
+            unrealizedPnlJpy = "225.00000000",
+            highestPriceSinceEntryJpy = "10100000.00000000",
+            lowestPriceSinceEntryJpy = "9900000.00000000",
+        )
+
+        assertEquals(expectedSnapshot, postgresSnapshot)
+        assertEquals(expectedSnapshot, inMemorySnapshot)
+    }
+
+    @Test
     fun paper_execution_persists_market_entry_then_stop_trigger() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -722,18 +847,23 @@ class PostgresPersistenceIntegrationTest {
         )
 
         broker.placeOrder(command).getOrThrow()
+        val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
+
         repository.reconcile(stopTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
 
         val balance = broker.getBalance().getOrThrow()
         val positions = broker.getPositions().getOrThrow()
         val openOrders = broker.getOpenOrders().getOrThrow()
         val executions = repository.getExecutions().getOrThrow()
+        val watermark = selectPositionWatermark(database, positionId)
 
         assertEquals(0, balance.btcQuantity.toBigDecimal().compareTo(BigDecimal.ZERO))
         assertEquals(0, positions.size)
         assertEquals(0, openOrders.size)
         assertEquals(2, executions.size)
         assertEquals(listOf(OrderSide.BUY, OrderSide.SELL), executions.map { execution -> execution.side })
+        assertEquals("10005000.00000000", watermark.highestPriceSinceEntryJpy)
+        assertEquals("9685155.00000000", watermark.lowestPriceSinceEntryJpy)
     }
 
     @Test
@@ -818,11 +948,26 @@ class PostgresPersistenceIntegrationTest {
         val expectedCloseClientRequestIds = closeResult.positionIds
             .map { positionId -> "close-all-request:$positionId" }
             .sorted()
+        val watermarks = closeResult.positionIds
+            .map { positionId ->
+                selectPositionWatermark(
+                    database = database,
+                    positionId = UUID.fromString(positionId),
+                )
+            }
 
         assertTrue(closeResult.accepted)
         assertEquals(2, closeResult.orderIds.size)
         assertEquals(expectedCloseClientRequestIds, closeClientRequestIds.filterNotNull().sorted())
         assertEquals(0, positions.size)
+        assertEquals(
+            listOf("10005000.00000000", "10005000.00000000"),
+            watermarks.map { watermark -> watermark.highestPriceSinceEntryJpy },
+        )
+        assertEquals(
+            listOf("9985005.00000000", "9985005.00000000"),
+            watermarks.map { watermark -> watermark.lowestPriceSinceEntryJpy },
+        )
     }
 
     @Test
@@ -874,15 +1019,56 @@ class PostgresPersistenceIntegrationTest {
         )
 
         broker.placeOrder(command).getOrThrow()
+        val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
+
         repository.reconcile(takeProfitTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
 
         val positions = broker.getPositions().getOrThrow()
         val openOrders = broker.getOpenOrders().getOrThrow()
         val executions = repository.getExecutions().getOrThrow()
+        val watermark = selectPositionWatermark(database, positionId)
 
         assertEquals(0, positions.size)
         assertEquals(0, openOrders.size)
         assertEquals(2, executions.size)
+        assertEquals("10100000.00000000", watermark.highestPriceSinceEntryJpy)
+        assertEquals("10005000.00000000", watermark.lowestPriceSinceEntryJpy)
+    }
+
+    @Test
+    fun paper_execution_hard_halt_sweep_folds_close_fill_into_watermark() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+        val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
+
+        broker.sweepHardHalt(
+            reasonJa = "integration hard halt",
+            tickSnapshot = hardHaltSweepTickSnapshot(),
+        ).getOrThrow()
+
+        val positions = broker.getPositions().getOrThrow()
+        val openOrders = broker.getOpenOrders().getOrThrow()
+        val watermark = selectPositionWatermark(database, positionId)
+
+        assertEquals(0, positions.size)
+        assertEquals(0, openOrders.size)
+        assertEquals("10005000.00000000", watermark.highestPriceSinceEntryJpy)
+        assertEquals("9885055.00000000", watermark.lowestPriceSinceEntryJpy)
     }
 
     @Test
@@ -1031,6 +1217,32 @@ private data class NoTradeDecisionRow(
     val reasonJa: String,
     val missingDataJa: String,
     val noTradeConditionsJa: String,
+)
+
+/**
+ * position watermark の確認行。
+ *
+ * @param highestPriceSinceEntryJpy entry 以降の最高値
+ * @param lowestPriceSinceEntryJpy entry 以降の最安値。null は記録開始前。
+ */
+private data class PositionWatermarkRow(
+    val highestPriceSinceEntryJpy: String,
+    val lowestPriceSinceEntryJpy: String?,
+)
+
+/**
+ * repository 実装間で比較する watermark scenario の結果。
+ *
+ * @param currentPriceJpy 現在価格
+ * @param unrealizedPnlJpy 未実現損益
+ * @param highestPriceSinceEntryJpy entry 以降の最高値
+ * @param lowestPriceSinceEntryJpy entry 以降の最安値
+ */
+private data class WatermarkScenarioSnapshot(
+    val currentPriceJpy: String,
+    val unrealizedPnlJpy: String,
+    val highestPriceSinceEntryJpy: String,
+    val lowestPriceSinceEntryJpy: String?,
 )
 
 /**
@@ -1220,6 +1432,27 @@ private fun postgresEntryCommand(
     )
 }
 
+private suspend fun runWatermarkScenario(broker: PaperBroker, decisionRepository: DecisionRepository): WatermarkScenarioSnapshot {
+    val command = approvedPostgresEntryCommand(
+        repository = decisionRepository,
+        command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+    )
+
+    broker.placeOrder(command).getOrThrow()
+    broker.reconcile(watermarkTickSnapshot("9900000")).getOrThrow()
+    broker.reconcile(watermarkTickSnapshot("10100000")).getOrThrow()
+    broker.reconcile(watermarkTickSnapshot("10050000")).getOrThrow()
+
+    val position = broker.getPositions().getOrThrow().single()
+
+    return WatermarkScenarioSnapshot(
+        currentPriceJpy = position.currentPriceJpy,
+        unrealizedPnlJpy = position.unrealizedPnlJpy,
+        highestPriceSinceEntryJpy = position.highestPriceSinceEntryJpy,
+        lowestPriceSinceEntryJpy = position.lowestPriceSinceEntryJpy,
+    )
+}
+
 private fun llmLaunchReservationRequest(
     invocationId: String,
     config: LlmRunnerConfig,
@@ -1259,6 +1492,17 @@ private fun takeProfitTickSnapshot(): TickSnapshot {
     )
 }
 
+private fun hardHaltSweepTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "9900000",
+        bidPrice = "9890000",
+        askPrice = "9900000",
+        symbolRules = postgresSymbolRules(),
+    )
+}
+
 private fun trailingTickSnapshot(): TickSnapshot {
     return TickSnapshot(
         symbol = "BTC",
@@ -1268,6 +1512,21 @@ private fun trailingTickSnapshot(): TickSnapshot {
         askPrice = "10110000",
         symbolRules = trailingSymbolRules(),
         atr14Jpy = "123.456789",
+    )
+}
+
+private fun watermarkTickSnapshot(
+    lastPrice: String,
+    bidPrice: String = lastPrice,
+    askPrice: String = lastPrice,
+): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = lastPrice,
+        bidPrice = bidPrice,
+        askPrice = askPrice,
+        symbolRules = postgresSymbolRules(),
     )
 }
 
@@ -1541,6 +1800,47 @@ private fun selectNoTradeDecision(database: ExposedDatabase): NoTradeDecisionRow
                 )
             }
         }
+    }
+}
+
+/**
+ * position watermark を読む。
+ */
+private fun selectPositionWatermark(database: ExposedDatabase, positionId: UUID): PositionWatermarkRow {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_POSITION_WATERMARK_SQL).use { statement ->
+            statement.setObject(1, positionId)
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "position watermark did not return a row." }
+
+                PositionWatermarkRow(
+                    highestPriceSinceEntryJpy = resultSet
+                        .getBigDecimal("highest_price_since_entry_jpy")
+                        .toPlainString(),
+                    lowestPriceSinceEntryJpy = resultSet
+                        .getBigDecimal("lowest_price_since_entry_jpy")
+                        ?.toPlainString(),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * backfill 検証用 position 行を lowest なしで追加する。
+ */
+private fun JdbcTransaction.insertBackfillPosition(
+    positionId: UUID,
+    status: String,
+    currentPriceJpy: BigDecimal,
+) {
+    jdbcConnection().prepareStatement(INSERT_BACKFILL_POSITION_SQL).use { statement ->
+        statement.setObject(1, positionId)
+        statement.setObject(2, UUID.randomUUID())
+        statement.setString(3, status)
+        statement.setLong(4, fixedInstant().toEpochMilli())
+        statement.setBigDecimal(5, currentPriceJpy)
+        statement.executeUpdate()
     }
 }
 

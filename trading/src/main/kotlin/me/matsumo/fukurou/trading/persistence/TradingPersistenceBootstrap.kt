@@ -60,6 +60,16 @@ private const val INSERT_DEFAULT_PAPER_ACCOUNT_SQL = """
 """
 
 /**
+ * 既存 OPEN position の lowest watermark を記録開始時点の保守値で埋める SQL。
+ */
+private const val BACKFILL_OPEN_POSITION_LOWEST_PRICE_SQL = """
+    UPDATE positions
+    SET lowest_price_since_entry_jpy = LEAST(average_entry_price_jpy, current_price_jpy)
+    WHERE status = 'OPEN'
+        AND lowest_price_since_entry_jpy IS NULL
+"""
+
+/**
  * command_event_log schema の存在を確認する SQL。
  */
 private const val VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL = """
@@ -221,6 +231,7 @@ private const val VERIFY_POSITIONS_SCHEMA_SQL = """
         unrealized_r,
         pyramid_add_count,
         highest_price_since_entry_jpy,
+        lowest_price_since_entry_jpy,
         decision_run_id,
         tool_call_id,
         client_request_id,
@@ -469,6 +480,7 @@ class TradingPersistenceBootstrap(
                 ensureCommandEventLogIndexes()
                 ensureOrderIndexes()
                 ensureLlmLaunchReservationIndexes()
+                backfillOpenPositionLowestPrice()
                 val now = Instant.now(clock)
 
                 ensureRiskStateRow(now, paperAccountConfig.initialCashJpy)
@@ -536,6 +548,13 @@ internal fun JdbcTransaction.ensureLlmLaunchReservationIndexes() {
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
+}
+
+/**
+ * 既存 OPEN position に lowest watermark がなければ backfill する。
+ */
+internal fun JdbcTransaction.backfillOpenPositionLowestPrice() {
+    executeUpdate(BACKFILL_OPEN_POSITION_LOWEST_PRICE_SQL)
 }
 
 /**

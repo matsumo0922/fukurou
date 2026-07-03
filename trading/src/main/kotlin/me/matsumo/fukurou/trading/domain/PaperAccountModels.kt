@@ -173,6 +173,7 @@ data class AccountSnapshot(
  * @param unrealizedR 未実現 R
  * @param pyramidAddCount ピラミッディング追加回数
  * @param highestPriceSinceEntryJpy entry 以降の最高値
+ * @param lowestPriceSinceEntryJpy entry 以降の最安値。null は記録開始前で #28 の MAE 評価対象外であることを表す。
  */
 @Serializable
 data class Position(
@@ -193,6 +194,7 @@ data class Position(
     val unrealizedR: String,
     val pyramidAddCount: Int,
     val highestPriceSinceEntryJpy: String,
+    val lowestPriceSinceEntryJpy: String?,
 )
 
 /**

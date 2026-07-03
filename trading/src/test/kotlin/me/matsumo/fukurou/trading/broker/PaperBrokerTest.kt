@@ -160,6 +160,8 @@ class PaperBrokerTest {
         assertEquals(1, positions.size)
         assertEquals("9700000.00000000", positions.single().currentStopLossJpy)
         assertEquals("10500000.00000000", positions.single().currentTakeProfitJpy)
+        assertEquals("10005000.00000000", positions.single().highestPriceSinceEntryJpy)
+        assertEquals("10005000.00000000", positions.single().lowestPriceSinceEntryJpy)
         assertEquals(listOf(OrderType.STOP), orders.map { order -> order.orderType })
         assertEquals(1, executions.size)
     }
@@ -724,6 +726,38 @@ class PaperBrokerTest {
 
         assertEquals("10099750.00000000", position.currentStopLossJpy)
         assertEquals("10099750.00000000", stopOrder.triggerPriceJpy)
+        assertEquals("10100000.00000000", position.highestPriceSinceEntryJpy)
+        assertEquals("10005000.00000000", position.lowestPriceSinceEntryJpy)
+    }
+
+    @Test
+    fun reconcile_tracks_lowest_and_highest_watermarks_monotonically() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+        broker.reconcile(watermarkTickSnapshot("9900000")).getOrThrow()
+
+        val lowerMarkedPosition = broker.getPositions().getOrThrow().single()
+
+        assertEquals("10005000.00000000", lowerMarkedPosition.highestPriceSinceEntryJpy)
+        assertEquals("9900000.00000000", lowerMarkedPosition.lowestPriceSinceEntryJpy)
+        assertEquals("-525.00000000", lowerMarkedPosition.unrealizedPnlJpy)
+
+        broker.reconcile(watermarkTickSnapshot("10100000")).getOrThrow()
+        broker.reconcile(watermarkTickSnapshot("10050000")).getOrThrow()
+
+        val finalPosition = broker.getPositions().getOrThrow().single()
+
+        assertEquals("10100000.00000000", finalPosition.highestPriceSinceEntryJpy)
+        assertEquals("9900000.00000000", finalPosition.lowestPriceSinceEntryJpy)
     }
 }
 
@@ -822,6 +856,32 @@ private fun trailingTickSnapshot(): TickSnapshot {
         askPrice = "10110000",
         symbolRules = trailingSymbolRules(),
         atr14Jpy = "123.456789",
+    )
+}
+
+private fun watermarkTickSnapshot(
+    lastPrice: String,
+    bidPrice: String = lastPrice,
+    askPrice: String = lastPrice,
+): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = lastPrice,
+        bidPrice = bidPrice,
+        askPrice = askPrice,
+        symbolRules = defaultSymbolRules(),
+    )
+}
+
+private fun defaultSymbolRules(): SymbolRules {
+    return SymbolRules(
+        symbol = "BTC",
+        minOrderSize = "0.0001",
+        sizeStep = "0.0001",
+        tickSize = "1",
+        takerFee = "0.0005",
+        makerFee = "-0.0001",
     )
 }
 
@@ -969,6 +1029,7 @@ private fun losingPosition(tradeGroupId: String): Position {
         currentPriceJpy = "9900000.00000000",
         unrealizedPnlJpy = "-500.00000000",
         highestPriceSinceEntryJpy = "10000000.00000000",
+        lowestPriceSinceEntryJpy = "9900000.00000000",
     )
 }
 
@@ -995,6 +1056,7 @@ private fun position(
         unrealizedR = "0.500000",
         pyramidAddCount = 0,
         highestPriceSinceEntryJpy = "10100000.00000000",
+        lowestPriceSinceEntryJpy = "10000000.00000000",
     )
 }
 
