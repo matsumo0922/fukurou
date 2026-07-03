@@ -25,7 +25,7 @@ class TradingBotConfigTest {
         assertEquals(3, config.runner.maxActToolCallsPerRun)
         assertEquals(Duration.ofSeconds(180), config.runner.perRunTimeout)
         assertEquals(1, config.runner.maxInvocationsPerHour)
-        assertEquals(4, config.runner.maxInvocationsPerDay)
+        assertEquals(10, config.runner.maxInvocationsPerDay)
         assertEquals(false, config.daemon.enabled)
         assertEquals(Duration.ofHours(6), config.daemon.flatHeartbeatInterval)
         assertEquals(Duration.ofHours(3), config.daemon.holdingCheckInterval)
@@ -205,7 +205,7 @@ class TradingBotConfigTest {
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY" to "5"),
+                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY" to "11"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

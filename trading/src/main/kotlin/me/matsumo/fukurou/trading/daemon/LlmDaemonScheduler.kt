@@ -1,9 +1,11 @@
 package me.matsumo.fukurou.trading.daemon
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
@@ -12,6 +14,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.runner.MAX_DAILY_INVOCATION_COUNT_WINDOW
 import me.matsumo.fukurou.trading.runner.MAX_INVOCATION_COUNT_WINDOW
@@ -22,6 +25,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import java.util.logging.Logger
 
 /**
  * daemon scheduler が参照する open risk 状態。
@@ -87,6 +91,7 @@ sealed interface LlmDaemonTickResult {
  * @param launchOneShot one-shot runner 起動境界
  * @param clock cadence と監査時刻に使う clock
  * @param idGenerator invocation ID generator
+ * @param warnLogger tick 失敗の rate-limited warning logger
  */
 class LlmDaemonScheduler(
     private val tradingConfig: TradingBotConfig,
@@ -98,6 +103,10 @@ class LlmDaemonScheduler(
     private val launchOneShot: suspend (OneShotRunnerRequest) -> Result<OneShotRunnerResult>,
     private val clock: Clock = Clock.systemUTC(),
     private val idGenerator: () -> UUID = { UUID.randomUUID() },
+    private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
+        logger = Logger.getLogger(LlmDaemonScheduler::class.java.name),
+        clock = clock,
+    ),
 ) {
     private val daemonConfig: LlmDaemonConfig = tradingConfig.daemon
 
@@ -118,6 +127,25 @@ class LlmDaemonScheduler(
      */
     suspend fun tick(): LlmDaemonTickResult {
         val observedAt = Instant.now(clock)
+        val result = runCatching { tickUnsafe(observedAt) }
+
+        return result.getOrElse { throwable ->
+            if (throwable is CancellationException) {
+                throw throwable
+            }
+
+            warnLogger.warn(
+                key = DAEMON_TICK_FAILURE_LOG_KEY,
+                message = "LlmDaemonScheduler tick failed.",
+                throwable = throwable,
+            )
+            appendTickFailure(throwable, observedAt)
+
+            LlmDaemonTickResult.Skipped(DAEMON_SKIP_TICK_FAILED, null)
+        }
+    }
+
+    private suspend fun tickUnsafe(observedAt: Instant): LlmDaemonTickResult {
         val hardHalt = riskStateRepository.current().getOrThrow().hardHalt
 
         if (hardHalt) {
@@ -188,6 +216,24 @@ class LlmDaemonScheduler(
         val failure = result.exceptionOrNull()
 
         if (failure is CancellationException) {
+            withContext(NonCancellable) {
+                runCatching {
+                    finishReservedInvocation(
+                        trigger = trigger,
+                        invocationId = invocationId,
+                        status = LlmLaunchReservationStatus.FAILED,
+                        reason = failure.javaClass.simpleName,
+                        finishedAt = Instant.now(clock),
+                    )
+                }.onFailure { finishFailure ->
+                    warnLogger.warn(
+                        key = DAEMON_CANCELLATION_FINISH_FAILURE_LOG_KEY,
+                        message = "LlmDaemonScheduler failed to finish cancelled invocation.",
+                        throwable = finishFailure,
+                    )
+                }
+            }
+
             throw failure
         }
 
@@ -199,15 +245,7 @@ class LlmDaemonScheduler(
         }
         val reason = runnerResult?.status?.name ?: failure?.javaClass?.simpleName
 
-        launchReservationRepository.finish(
-            LlmLaunchReservationFinish(
-                invocationId = invocationId,
-                status = status,
-                reason = reason,
-                finishedAt = finishedAt,
-            ),
-        ).getOrThrow()
-        appendCompleted(trigger, invocationId, reason ?: "unknown", finishedAt).getOrThrow()
+        finishReservedInvocation(trigger, invocationId, status, reason, finishedAt)
 
         if (failure != null) {
             return LlmDaemonTickResult.Failed(
@@ -259,10 +297,10 @@ class LlmDaemonScheduler(
             key = "economic-event:${activeEvent.eventId}:${activeEvent.eventAt}",
             eventName = activeEvent.eventName,
         )
-        val alreadyLaunchedForEvent = launchReservationRepository.latestReservedAt(trigger.key)
+        val alreadyCompletedForEvent = launchReservationRepository.latestFinishedReservedAt(trigger.key)
             .getOrThrow() != null
 
-        return if (alreadyLaunchedForEvent) null else trigger
+        return if (alreadyCompletedForEvent) null else trigger
     }
 
     private suspend fun flatHeartbeatTriggerIfDue(observedAt: Instant): LlmDaemonTrigger? {
@@ -375,6 +413,48 @@ class LlmDaemonScheduler(
             ),
         )
     }
+
+    private suspend fun finishReservedInvocation(
+        trigger: LlmDaemonTrigger,
+        invocationId: String,
+        status: LlmLaunchReservationStatus,
+        reason: String?,
+        finishedAt: Instant,
+    ) {
+        launchReservationRepository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = invocationId,
+                status = status,
+                reason = reason,
+                finishedAt = finishedAt,
+            ),
+        ).getOrThrow()
+        appendCompleted(trigger, invocationId, reason ?: "unknown", finishedAt).getOrThrow()
+    }
+
+    private suspend fun appendTickFailure(throwable: Throwable, observedAt: Instant) {
+        commandEventLog.append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext.EMPTY,
+                toolName = DAEMON_TOOL_NAME,
+                toolCallId = null,
+                clientRequestId = null,
+                eventType = CommandEventType.DAEMON_TRIGGER_SKIPPED,
+                payload = buildJsonObject {
+                    put("reason", DAEMON_SKIP_TICK_FAILED)
+                    put("errorType", throwable.javaClass.simpleName)
+                    put("observedAt", observedAt.toString())
+                }.toString(),
+                occurredAt = observedAt,
+            ),
+        ).onFailure { auditFailure ->
+            warnLogger.warn(
+                key = DAEMON_TICK_AUDIT_FAILURE_LOG_KEY,
+                message = "LlmDaemonScheduler failed to audit tick failure.",
+                throwable = auditFailure,
+            )
+        }
+    }
 }
 
 private fun daemonDecisionRunContext(invocationId: String): DecisionRunContext {
@@ -433,6 +513,26 @@ private const val DAEMON_SKIP_NO_TRIGGER = "no_trigger_due"
  * HARD_HALT 中で起動しなかった理由。
  */
 private const val DAEMON_SKIP_HARD_HALT = "hard_halt"
+
+/**
+ * daemon tick 失敗で起動しなかった理由。
+ */
+private const val DAEMON_SKIP_TICK_FAILED = "tick_failed"
+
+/**
+ * daemon tick failure log の rate limit key。
+ */
+private const val DAEMON_TICK_FAILURE_LOG_KEY = "llm-daemon-scheduler-tick-failure"
+
+/**
+ * daemon tick failure audit failure log の rate limit key。
+ */
+private const val DAEMON_TICK_AUDIT_FAILURE_LOG_KEY = "llm-daemon-scheduler-tick-audit-failure"
+
+/**
+ * daemon cancellation finish failure log の rate limit key。
+ */
+private const val DAEMON_CANCELLATION_FINISH_FAILURE_LOG_KEY = "llm-daemon-scheduler-cancellation-finish-failure"
 
 /**
  * OneShotLlmRunner を launchOneShot lambda として渡す helper。

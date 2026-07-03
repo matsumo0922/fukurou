@@ -135,6 +135,9 @@ enum class LlmLaunchReservationRejectionReason {
 
 /**
  * daemon scheduler の起動予約 repository。
+ *
+ * daemon 経路の起動予算と同時起動の正本であり、DB 実装では予約行と runner 完了 audit を合算して数える。
+ * runner preflight は手動 one-shot も含む最後の防衛線として残す。
  */
 interface LlmLaunchReservationRepository {
     /**
@@ -151,6 +154,11 @@ interface LlmLaunchReservationRepository {
      * trigger key ごとの最後の予約時刻を返す。
      */
     suspend fun latestReservedAt(triggerKey: String): Result<Instant?>
+
+    /**
+     * trigger key ごとの最後に正常完了した予約時刻を返す。
+     */
+    suspend fun latestFinishedReservedAt(triggerKey: String): Result<Instant?>
 }
 
 /**
@@ -168,45 +176,7 @@ class InMemoryLlmLaunchReservationRepository(
     override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
         return runCatching {
             mutex.withLock {
-                val riskState = riskStateRepository.current().getOrThrow()
-
-                if (riskState.hardHalt) {
-                    return@withLock LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.HARD_HALT)
-                }
-
-                activeReservation(request)?.let {
-                    return@withLock LlmLaunchReservationOutcome.Rejected(
-                        LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION,
-                    )
-                }
-
-                val hourlyCount = countReservationsSince(request.reservedAt.minus(request.hourlyWindow))
-                val dailyCount = countReservationsSince(request.reservedAt.minus(request.dailyWindow))
-                val hourlyExceeded = hourlyCount >= request.runnerConfig.maxInvocationsPerHour
-                val dailyExceeded = dailyCount >= request.runnerConfig.maxInvocationsPerDay
-
-                if (hourlyExceeded) {
-                    return@withLock LlmLaunchReservationOutcome.Rejected(
-                        LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR,
-                    )
-                }
-                if (dailyExceeded) {
-                    return@withLock LlmLaunchReservationOutcome.Rejected(
-                        LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY,
-                    )
-                }
-
-                reservations += LlmLaunchReservationRecord(
-                    invocationId = request.invocationId,
-                    triggerKind = request.triggerKind,
-                    triggerKey = request.triggerKey,
-                    status = LlmLaunchReservationStatus.RUNNING,
-                    reservedAt = request.reservedAt,
-                    finishedAt = null,
-                    reason = null,
-                )
-
-                LlmLaunchReservationOutcome.Reserved(request.invocationId)
+                tryReserveLocked(request)
             }
         }
     }
@@ -240,6 +210,17 @@ class InMemoryLlmLaunchReservationRepository(
         }
     }
 
+    override suspend fun latestFinishedReservedAt(triggerKey: String): Result<Instant?> {
+        return runCatching {
+            mutex.withLock {
+                reservations
+                    .filter { reservation -> reservation.triggerKey == triggerKey }
+                    .filter { reservation -> reservation.status == LlmLaunchReservationStatus.FINISHED }
+                    .maxOfOrNull { reservation -> reservation.reservedAt }
+            }
+        }
+    }
+
     private fun activeReservation(request: LlmLaunchReservationRequest): LlmLaunchReservationRecord? {
         val activeSince = request.reservedAt.minus(request.activeReservationStaleAfter)
 
@@ -249,6 +230,42 @@ class InMemoryLlmLaunchReservationRepository(
 
             activeStatus && freshEnough
         }
+    }
+
+    private suspend fun tryReserveLocked(request: LlmLaunchReservationRequest): LlmLaunchReservationOutcome {
+        val riskState = riskStateRepository.current().getOrThrow()
+
+        if (riskState.hardHalt) {
+            return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.HARD_HALT)
+        }
+
+        activeReservation(request)?.let {
+            return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION)
+        }
+
+        val hourlyCount = countReservationsSince(request.reservedAt.minus(request.hourlyWindow))
+        val dailyCount = countReservationsSince(request.reservedAt.minus(request.dailyWindow))
+        val hourlyExceeded = hourlyCount >= request.runnerConfig.maxInvocationsPerHour
+        val dailyExceeded = dailyCount >= request.runnerConfig.maxInvocationsPerDay
+
+        if (hourlyExceeded) {
+            return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR)
+        }
+        if (dailyExceeded) {
+            return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY)
+        }
+
+        reservations += LlmLaunchReservationRecord(
+            invocationId = request.invocationId,
+            triggerKind = request.triggerKind,
+            triggerKey = request.triggerKey,
+            status = LlmLaunchReservationStatus.RUNNING,
+            reservedAt = request.reservedAt,
+            finishedAt = null,
+            reason = null,
+        )
+
+        return LlmLaunchReservationOutcome.Reserved(request.invocationId)
     }
 
     private fun countReservationsSince(since: Instant): Int {

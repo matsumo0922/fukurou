@@ -81,6 +81,16 @@ private const val SELECT_LATEST_LLM_LAUNCH_RESERVED_AT_SQL = """
 """
 
 /**
+ * trigger key ごとの最後に正常完了した予約時刻を読む SQL。
+ */
+private const val SELECT_LATEST_FINISHED_LLM_LAUNCH_RESERVED_AT_SQL = """
+    SELECT MAX(reserved_at)
+    FROM llm_launch_reservations
+    WHERE trigger_key = ?
+        AND status = ?
+"""
+
+/**
  * Exposed/JDBC で LLM daemon scheduler の起動予約を扱う repository。
  *
  * @param database Exposed database
@@ -114,6 +124,16 @@ class ExposedLlmLaunchReservationRepository(
             runCatching {
                 exposedTransaction(database) {
                     latestReservedAtInTransaction(triggerKey)
+                }
+            }
+        }
+    }
+
+    override suspend fun latestFinishedReservedAt(triggerKey: String): Result<Instant?> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    latestFinishedReservedAtInTransaction(triggerKey)
                 }
             }
         }
@@ -202,6 +222,22 @@ private fun JdbcTransaction.finishInTransaction(finish: LlmLaunchReservationFini
 private fun JdbcTransaction.latestReservedAtInTransaction(triggerKey: String): Instant? {
     return jdbcConnection().prepareStatement(SELECT_LATEST_LLM_LAUNCH_RESERVED_AT_SQL).use { statement ->
         statement.setString(1, triggerKey)
+        statement.executeQuery().use { resultSet ->
+            if (!resultSet.next()) {
+                return@use null
+            }
+
+            val epochMillis = resultSet.getLong(1)
+
+            if (resultSet.wasNull()) null else Instant.ofEpochMilli(epochMillis)
+        }
+    }
+}
+
+private fun JdbcTransaction.latestFinishedReservedAtInTransaction(triggerKey: String): Instant? {
+    return jdbcConnection().prepareStatement(SELECT_LATEST_FINISHED_LLM_LAUNCH_RESERVED_AT_SQL).use { statement ->
+        statement.setString(1, triggerKey)
+        statement.setString(2, LlmLaunchReservationStatus.FINISHED.name)
         statement.executeQuery().use { resultSet ->
             if (!resultSet.next()) {
                 return@use null

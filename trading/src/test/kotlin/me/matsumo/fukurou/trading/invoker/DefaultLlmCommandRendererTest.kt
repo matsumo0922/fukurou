@@ -243,6 +243,40 @@ class DefaultLlmCommandRendererTest {
         }
     }
 
+    @Test
+    fun configRejectsCodexYoloWithUnsafeContainerTemplateArgs() {
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("docker", "run", "--privileged", "codex-image", "codex"),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("docker", "run", "--network=host", "codex-image", "codex"),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("docker", "run", "-v", "/:/hostroot", "codex-image", "codex"),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf(
+                    "docker",
+                    "run",
+                    "--mount=type=bind,target=/hostroot,source=/",
+                    "codex-image",
+                    "codex",
+                ),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+    }
+
     private fun request(
         provider: LlmProvider,
         phase: LlmInvocationPhase,

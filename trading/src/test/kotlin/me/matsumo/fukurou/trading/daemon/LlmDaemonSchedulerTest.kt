@@ -6,6 +6,7 @@ import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
+import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
@@ -109,6 +110,10 @@ class LlmDaemonSchedulerTest {
         assertEquals("hard_halt", haltedResult.reason)
         assertIs<LlmDaemonTickResult.Launched>(resumedResult)
         assertEquals(1, fixture.launches.size)
+        assertTrue(
+            fixture.eventLog.events()
+                .any { event -> event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED },
+        )
     }
 
     @Test
@@ -187,11 +192,75 @@ class LlmDaemonSchedulerTest {
         assertIs<LlmDaemonTickResult.Launched>(resumedResult)
         assertEquals(2, fixture.launches.size)
     }
+
+    @Test
+    fun transientTickFailureIsAuditedAndNextCycleContinues() = runBlocking {
+        var readCount = 0
+        val fixture = schedulerFixture(
+            openRiskReader = LlmDaemonOpenRiskReader {
+                readCount += 1
+
+                if (readCount == 1) {
+                    Result.failure(IllegalStateException("temporary broker read failure"))
+                } else {
+                    Result.success(false)
+                }
+            },
+        )
+
+        val failedResult = fixture.scheduler.tick()
+        val resumedResult = fixture.scheduler.tick()
+        val skippedEvents = fixture.eventLog.events()
+            .filter { event -> event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED }
+
+        assertIs<LlmDaemonTickResult.Skipped>(failedResult)
+        assertEquals("tick_failed", failedResult.reason)
+        assertIs<LlmDaemonTickResult.Launched>(resumedResult)
+        assertEquals(1, fixture.launches.size)
+        assertTrue(skippedEvents.any { event -> event.payload.contains("tick_failed") })
+    }
+
+    @Test
+    fun failedEconomicEventLaunchCanRetryWithinSameWindow() = runBlocking {
+        var runnerCallCount = 0
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                events = listOf(
+                    EconomicEventBlackout(
+                        eventId = "cpi-20260703",
+                        eventName = "CPI",
+                        eventAt = fixedInstant(),
+                        blackoutBefore = Duration.ZERO,
+                        blackoutAfter = Duration.ofHours(2),
+                    ),
+                ),
+            ),
+            launchHandler = { request ->
+                runnerCallCount += 1
+
+                if (runnerCallCount == 1) {
+                    error("temporary cli failure")
+                }
+
+                successfulRunnerResult(request)
+            },
+        )
+
+        val failedResult = fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofMinutes(61))
+        val retriedResult = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Failed>(failedResult)
+        assertIs<LlmDaemonTickResult.Launched>(retriedResult)
+        assertEquals(2, fixture.launches.size)
+        assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, retriedResult.triggerKind)
+    }
 }
 
 private fun schedulerFixture(
     tradingConfig: TradingBotConfig = tradingConfig(),
     hasOpenRisk: Boolean = false,
+    openRiskReader: LlmDaemonOpenRiskReader = LlmDaemonOpenRiskReader { Result.success(hasOpenRisk) },
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): SchedulerFixture {
     val clock = MutableClock(fixedInstant())
@@ -204,7 +273,7 @@ private fun schedulerFixture(
         riskStateRepository = riskStateRepository,
         commandEventLog = eventLog,
         launchReservationRepository = reservations,
-        openRiskReader = LlmDaemonOpenRiskReader { Result.success(hasOpenRisk) },
+        openRiskReader = openRiskReader,
         requestBase = OneShotRunnerRequest(
             repositoryRoot = Path.of(".").toAbsolutePath().normalize(),
             workingDirectory = Path.of(".").toAbsolutePath().normalize(),
@@ -227,8 +296,12 @@ private fun schedulerFixture(
     )
 }
 
-private fun tradingConfig(events: List<EconomicEventBlackout> = emptyList()): TradingBotConfig {
+private fun tradingConfig(
+    runner: LlmRunnerConfig = LlmRunnerConfig(),
+    events: List<EconomicEventBlackout> = emptyList(),
+): TradingBotConfig {
     return TradingBotConfig(
+        runner = runner,
         safetyFloor = SafetyFloorConfig(economicEventBlackouts = events),
         daemon = LlmDaemonConfig(enabled = true),
     )

@@ -189,6 +189,11 @@ class PaperBroker(
 
             val openPositions = ledgerRepository.getOpenPositions().getOrThrow()
             val targetPositions = resolveCloseTargets(command, openPositions)
+            val closeCommand = if (targetPositions.size > 1) {
+                command.withoutClientRequestId()
+            } else {
+                command
+            }
             val results = targetPositions.map { position ->
                 val fill = fillSimulator.marketFill(
                     side = OrderSide.SELL,
@@ -198,7 +203,7 @@ class PaperBroker(
                 )
 
                 ledgerRepository.closePosition(
-                    command = command,
+                    command = closeCommand,
                     positionId = UUID.fromString(position.positionId),
                     orderId = UUID.randomUUID(),
                     fill = fill,
@@ -552,6 +557,10 @@ class PaperBroker(
             riskStateRepository.setHardHalt(reason, Instant.now(clock)).getOrThrow()
         }
     }
+}
+
+private fun ClosePositionCommand.withoutClientRequestId(): ClosePositionCommand {
+    return copy(auditContext = auditContext.copy(clientRequestId = null))
 }
 
 private suspend fun PaperBroker.findExistingPlaceOrderResult(command: PlaceOrderCommand): PaperTradeResult? {

@@ -411,7 +411,7 @@ const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 1
 /**
  * 直近 24 時間の既定 runner 起動上限。
  */
-const val DEFAULT_MAX_INVOCATIONS_PER_DAY = 4
+const val DEFAULT_MAX_INVOCATIONS_PER_DAY = 10
 
 /**
  * LLM daemon scheduler 有効化の既定値。

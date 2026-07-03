@@ -41,6 +41,7 @@ data class LlmCommandRendererConfig(
             argument in CODEX_FALSIFIER_ARG_ALLOWLIST
         }
         val codexSandboxTemplateConfigured = codexCommandTemplate.usesExternalSandboxTemplate()
+        val unsafeCodexSandboxTemplateArgs = codexCommandTemplate.unsafeExternalSandboxTemplateArgs()
 
         require(claudeCommandTemplate.isNotEmpty()) {
             "claudeCommandTemplate must not be empty."
@@ -59,6 +60,9 @@ data class LlmCommandRendererConfig(
         }
         require(!codexFalsifierBypassesSandbox || codexSandboxTemplateConfigured) {
             "codexFalsifierArgs sandbox bypass requires an external sandbox/container command template."
+        }
+        require(!codexFalsifierBypassesSandbox || unsafeCodexSandboxTemplateArgs.isEmpty()) {
+            "codexFalsifierArgs sandbox bypass forbids unsafe sandbox template args: $unsafeCodexSandboxTemplateArgs"
         }
     }
 
@@ -562,6 +566,65 @@ private fun List<String>.usesExternalSandboxTemplate(): Boolean {
     return executable in EXTERNAL_SANDBOX_COMMANDS
 }
 
+private fun List<String>.unsafeExternalSandboxTemplateArgs(): List<String> {
+    val executable = firstOrNull()?.substringAfterLast("/") ?: return emptyList()
+
+    if (executable !in CONTAINER_SANDBOX_COMMANDS) {
+        return emptyList()
+    }
+
+    return mapIndexedNotNull { index, argument ->
+        val nextArgument = getOrNull(index + 1)
+
+        when {
+            argument in UNSAFE_CONTAINER_FLAGS -> argument
+            argument.hasUnsafeNetworkMode() -> argument
+            argument.hasInlineRootBindMount() -> argument
+            argument.expectsSeparateMountValue() && nextArgument.hasRootBindMount() -> "$argument $nextArgument"
+            else -> null
+        }
+    }
+}
+
+private fun String.hasUnsafeNetworkMode(): Boolean {
+    return startsWith("--net=host") || startsWith("--network=host")
+}
+
+private fun String.expectsSeparateMountValue(): Boolean {
+    return this == "-v" || this == "--volume" || this == "--mount"
+}
+
+private fun String?.hasRootBindMount(): Boolean {
+    val value = this ?: return false
+    val rootVolumeBind = value == "/" || value.startsWith("/:")
+    val rootMountBind = value.mountSourceIsRoot()
+
+    return rootVolumeBind || rootMountBind
+}
+
+private fun String.hasInlineRootBindMount(): Boolean {
+    val rootVolumeBind = startsWith("-v/:") || startsWith("--volume=/:")
+    val rootMountBind = substringAfter("--mount=", missingDelimiterValue = "").mountSourceIsRoot()
+
+    return rootVolumeBind || rootMountBind
+}
+
+private fun String.mountSourceIsRoot(): Boolean {
+    val source = split(",")
+        .mapNotNull { value -> value.mountSourceValue() }
+        .firstOrNull()
+
+    return source == "/"
+}
+
+private fun String.mountSourceValue(): String? {
+    val key = substringBefore("=", missingDelimiterValue = "")
+    val value = substringAfter("=", missingDelimiterValue = "")
+    val isSourceKey = key == "source" || key == "src"
+
+    return if (isSourceKey) value else null
+}
+
 /**
  * Codex `--yolo` opt-in を許可する外部 sandbox / container command。
  */
@@ -570,4 +633,21 @@ private val EXTERNAL_SANDBOX_COMMANDS = setOf(
     "podman",
     "bwrap",
     "firejail",
+)
+
+/**
+ * deny-list 検査を適用する container 系 sandbox command。
+ */
+private val CONTAINER_SANDBOX_COMMANDS = setOf(
+    "docker",
+    "podman",
+)
+
+/**
+ * Codex `--yolo` と併用しない container flag。
+ */
+private val UNSAFE_CONTAINER_FLAGS = setOf(
+    "--privileged",
+    "--net",
+    "--network",
 )

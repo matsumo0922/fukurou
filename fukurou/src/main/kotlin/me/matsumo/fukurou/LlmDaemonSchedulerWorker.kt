@@ -1,6 +1,7 @@
 package me.matsumo.fukurou
 
 import com.zaxxer.hikari.HikariDataSource
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -85,20 +86,25 @@ class LlmDaemonSchedulerWorker(
 
         job = scope.launch {
             while (currentCoroutineContext().isActive) {
-                val bootstrapResult = bootstrap()
-
-                if (bootstrapResult.isSuccess) {
+                val loopResult = bootstrap().mapCatching {
                     schedulerFactory().getOrThrow().runLoop(interval)
-                    return@launch
                 }
 
-                bootstrapResult.exceptionOrNull()?.let { throwable ->
-                    warnLogger.warn(
-                        key = DAEMON_BOOTSTRAP_FAILURE_LOG_KEY,
-                        message = "LlmDaemonSchedulerWorker bootstrap failed.",
-                        throwable = throwable,
-                    )
+                if (loopResult.isSuccess) {
+                    continue
                 }
+
+                val throwable = requireNotNull(loopResult.exceptionOrNull())
+
+                if (throwable is CancellationException) {
+                    throw throwable
+                }
+
+                warnLogger.warn(
+                    key = DAEMON_BOOTSTRAP_FAILURE_LOG_KEY,
+                    message = "LlmDaemonSchedulerWorker bootstrap or scheduler loop failed.",
+                    throwable = throwable,
+                )
 
                 delay(interval.toMillis())
             }
@@ -197,11 +203,15 @@ private fun createLlmDaemonScheduler(
 
 private fun me.matsumo.fukurou.trading.runtime.TradingRuntime.openRiskReader(): LlmDaemonOpenRiskReader {
     return LlmDaemonOpenRiskReader {
-        val positions = broker.getPositions().getOrThrow()
-        val openOrders = broker.getOpenOrders().getOrThrow()
-
-        Result.success(positions.isNotEmpty() || openOrders.isNotEmpty())
+        runCatching { hasOpenRisk() }
     }
+}
+
+private suspend fun me.matsumo.fukurou.trading.runtime.TradingRuntime.hasOpenRisk(): Boolean {
+    val positions = broker.getPositions().getOrThrow()
+    val openOrders = broker.getOpenOrders().getOrThrow()
+
+    return positions.isNotEmpty() || openOrders.isNotEmpty()
 }
 
 private fun oneShotRequestFromEnvironment(environment: Map<String, String>): OneShotRunnerRequest {

@@ -3,15 +3,24 @@ package me.matsumo.fukurou.trading.persistence
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -350,6 +359,89 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun llm_launch_reservation_allowsOnlyOneConcurrentRunningReservation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig()
+
+        coroutineScope {
+            val firstReservation = async {
+                repository.tryReserve(llmLaunchReservationRequest("daemon-run-1", config)).getOrThrow()
+            }
+            val secondReservation = async {
+                repository.tryReserve(llmLaunchReservationRequest("daemon-run-2", config)).getOrThrow()
+            }
+            val outcomes = listOf(firstReservation.await(), secondReservation.await())
+            val reservedCount = outcomes.filterIsInstance<LlmLaunchReservationOutcome.Reserved>().size
+            val rejectedReasons = outcomes
+                .filterIsInstance<LlmLaunchReservationOutcome.Rejected>()
+                .map { outcome -> outcome.reason }
+
+            assertEquals(1, reservedCount)
+            assertEquals(listOf(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION), rejectedReasons)
+        }
+    }
+
+    @Test
+    fun llm_launch_reservation_enforcesDailyCapInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig(maxInvocationsPerDay = 1)
+
+        repository.tryReserve(llmLaunchReservationRequest("daemon-run-1", config)).getOrThrow()
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "daemon-run-1",
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = "NO_TRADE_DECISION",
+                finishedAt = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val secondOutcome = repository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "daemon-run-2",
+                config = config,
+                reservedAt = fixedInstant().plus(Duration.ofHours(2)),
+            ),
+        ).getOrThrow()
+
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY),
+            secondOutcome,
+        )
+    }
+
+    @Test
+    fun llm_launch_reservation_ignoresDaemonLaunchAuditForCapInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        ExposedCommandEventLog(database).append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = "daemon-reservation",
+                    llmProvider = "claude",
+                    promptHash = "hash",
+                    systemPromptVersion = "system-prompt-v1",
+                    marketSnapshotId = "snapshot",
+                ),
+                toolName = "llm-daemon-scheduler",
+                toolCallId = null,
+                clientRequestId = "flat-heartbeat",
+                eventType = CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+                payload = "{}",
+                occurredAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 10)
+        val outcome = repository.tryReserve(llmLaunchReservationRequest("daemon-run-1", config)).getOrThrow()
+
+        assertEquals(LlmLaunchReservationOutcome.Reserved("daemon-run-1"), outcome)
+    }
+
+    @Test
     fun runtime_postgres_reads_reconciler_freshness_from_command_event_log() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         ExposedCommandEventLog(database).append(
@@ -654,6 +746,54 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(firstResult.positionIds, secondResult.positionIds)
         assertEquals(firstResult.executionIds, secondResult.executionIds)
         assertEquals(1, executions.size)
+    }
+
+    @Test
+    fun paper_execution_closeAllDoesNotReuseClientRequestIdAcrossCloseOrders() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val firstEntry = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                sizeBtc = BigDecimal("0.0030"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+                clientRequestId = "entry-close-all-1",
+            ),
+        )
+        val secondEntry = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                sizeBtc = BigDecimal("0.0030"),
+                takeProfitPriceJpy = BigDecimal("10600000"),
+                clientRequestId = "entry-close-all-2",
+            ),
+        )
+
+        broker.placeOrder(firstEntry).getOrThrow()
+        broker.placeOrder(secondEntry).getOrThrow()
+        val closeResult = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = null,
+                closeAll = true,
+                reasonJa = "close all integration",
+                auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = "close-all-request"),
+            ),
+        ).getOrThrow()
+        val positions = repository.getOpenPositions().getOrThrow()
+
+        assertTrue(closeResult.accepted)
+        assertEquals(2, closeResult.orderIds.size)
+        assertEquals(0, positions.size)
     }
 
     @Test
@@ -989,11 +1129,11 @@ private suspend fun approvedPostgresEntryCommand(
 
 private fun entryDecisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
     return DecisionSubmission(
-        invocationId = "run-entry",
+        invocationId = "run-entry-${command.commandId}",
         llmProvider = "claude",
         promptHash = "prompt-hash",
         systemPromptVersion = "system-prompt-v1",
-        marketSnapshotId = "snapshot-entry",
+        marketSnapshotId = "snapshot-entry-${command.commandId}",
         action = DecisionAction.ENTER,
         setupTags = listOf("integration-entry"),
         estimatedWinProbability = command.estimatedWinProbability,
@@ -1030,6 +1170,7 @@ private fun entryDecisionSubmission(command: PlaceOrderCommand): DecisionSubmiss
 private fun postgresEntryCommand(
     orderType: OrderType = OrderType.MARKET,
     priceJpy: BigDecimal? = null,
+    sizeBtc: BigDecimal = BigDecimal("0.0050"),
     takeProfitPriceJpy: BigDecimal,
     estimatedWinProbability: BigDecimal = BigDecimal("0.95"),
     clientRequestId: String? = null,
@@ -1039,7 +1180,7 @@ private fun postgresEntryCommand(
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
         orderType = orderType,
-        sizeBtc = BigDecimal("0.0050"),
+        sizeBtc = sizeBtc,
         priceJpy = priceJpy,
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
@@ -1047,6 +1188,23 @@ private fun postgresEntryCommand(
         estimatedWinProbability = estimatedWinProbability,
         reasonJa = "integration entry",
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
+    )
+}
+
+private fun llmLaunchReservationRequest(
+    invocationId: String,
+    config: LlmRunnerConfig,
+    reservedAt: Instant = fixedInstant(),
+): LlmLaunchReservationRequest {
+    return LlmLaunchReservationRequest(
+        invocationId = invocationId,
+        triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+        triggerKey = "flat-heartbeat",
+        reservedAt = reservedAt,
+        runnerConfig = config,
+        hourlyWindow = Duration.ofHours(1),
+        dailyWindow = Duration.ofHours(24),
+        activeReservationStaleAfter = Duration.ofMinutes(30),
     )
 }
 
