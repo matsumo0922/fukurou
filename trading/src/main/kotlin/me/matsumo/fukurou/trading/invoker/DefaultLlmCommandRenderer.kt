@@ -10,6 +10,7 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.PosixFilePermission
+import java.util.Comparator
 
 /**
  * CLI command renderer の設定。
@@ -60,23 +61,23 @@ data class LlmCommandRendererConfig(
          */
         fun fromEnvironment(environment: Map<String, String> = System.getenv()): LlmCommandRendererConfig {
             return LlmCommandRendererConfig(
-                claudeCommandTemplate = environment.readCommandTemplate(
+                claudeCommandTemplate = environment.readCommandTemplateEnv(
                     name = FUKUROU_CLAUDE_COMMAND_TEMPLATE_ENV,
                     defaultValue = DEFAULT_CLAUDE_COMMAND_TEMPLATE,
                 ),
-                codexCommandTemplate = environment.readCommandTemplate(
+                codexCommandTemplate = environment.readCommandTemplateEnv(
                     name = FUKUROU_CODEX_COMMAND_TEMPLATE_ENV,
                     defaultValue = DEFAULT_CODEX_COMMAND_TEMPLATE,
                 ),
-                claudeModel = environment.readOptional(FUKUROU_CLAUDE_MODEL_ENV),
-                codexModel = environment.readOptional(FUKUROU_CODEX_MODEL_ENV),
-                claudeCommonArgs = environment.readOptional(FUKUROU_CLAUDE_COMMON_ARGS_ENV)
+                claudeModel = environment.readOptionalEnv(FUKUROU_CLAUDE_MODEL_ENV),
+                codexModel = environment.readOptionalEnv(FUKUROU_CODEX_MODEL_ENV),
+                claudeCommonArgs = environment.readOptionalEnv(FUKUROU_CLAUDE_COMMON_ARGS_ENV)
                     ?.splitCommandTemplate()
                     ?: DEFAULT_CLAUDE_COMMON_ARGS,
-                codexCommonArgs = environment.readOptional(FUKUROU_CODEX_COMMON_ARGS_ENV)
+                codexCommonArgs = environment.readOptionalEnv(FUKUROU_CODEX_COMMON_ARGS_ENV)
                     ?.splitCommandTemplate()
                     ?: DEFAULT_CODEX_COMMON_ARGS,
-                codexFalsifierArgs = environment.readOptional(FUKUROU_CODEX_FALSIFIER_ARGS_ENV)
+                codexFalsifierArgs = environment.readOptionalEnv(FUKUROU_CODEX_FALSIFIER_ARGS_ENV)
                     ?.splitCommandTemplate()
                     ?: DEFAULT_CODEX_FALSIFIER_ARGS,
             )
@@ -122,14 +123,20 @@ class DefaultLlmCommandRenderer(
         )
         val args = baseArgs + mcpArgs + ENFORCED_CLAUDE_COMMON_ARGS
 
-        return config.claudeCommandTemplate.toRenderedCommand(
-            args = args,
-            environment = request.environment,
-            workingDirectory = request.workingDirectory,
-            timeout = request.timeout,
-            stdin = null,
-            cleanupPaths = mcpConfigFile.cleanupPaths,
-        )
+        return runCatching {
+            config.claudeCommandTemplate.toRenderedCommand(
+                args = args,
+                environment = request.environment,
+                workingDirectory = request.workingDirectory,
+                timeout = request.timeout,
+                stdin = null,
+                cleanupPaths = mcpConfigFile.cleanupPaths,
+            )
+        }.getOrElse { throwable ->
+            mcpConfigFile.cleanupPaths.deleteGeneratedPaths()
+
+            throw throwable
+        }
     }
 
     private fun renderCodex(request: LlmInvocationRequest): RenderedLlmCommand {
@@ -147,14 +154,20 @@ class DefaultLlmCommandRenderer(
             phaseArgs +
             request.prompt
 
-        return config.codexCommandTemplate.toRenderedCommand(
-            args = args,
-            environment = commandEnvironment,
-            workingDirectory = request.workingDirectory,
-            timeout = request.timeout,
-            stdin = null,
-            cleanupPaths = codexHome.cleanupPaths,
-        )
+        return runCatching {
+            config.codexCommandTemplate.toRenderedCommand(
+                args = args,
+                environment = commandEnvironment,
+                workingDirectory = request.workingDirectory,
+                timeout = request.timeout,
+                stdin = null,
+                cleanupPaths = codexHome.cleanupPaths,
+            )
+        }.getOrElse { throwable ->
+            codexHome.cleanupPaths.deleteGeneratedPaths()
+
+            throw throwable
+        }
     }
 }
 
@@ -253,20 +266,26 @@ private fun writeCodexHome(
     val directory = Files.createTempDirectory("fukurou-codex-home-")
     directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
 
-    val configFile = directory.resolve("config.toml")
-    Files.writeString(
-        configFile,
-        mcpServer.toCodexConfigToml(),
-        StandardOpenOption.CREATE_NEW,
-        StandardOpenOption.WRITE,
-    )
-    configFile.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
-    val authFile = copyCodexAuthFile(environment, directory)
+    return runCatching {
+        val configFile = directory.resolve("config.toml")
+        Files.writeString(
+            configFile,
+            mcpServer.toCodexConfigToml(),
+            StandardOpenOption.CREATE_NEW,
+            StandardOpenOption.WRITE,
+        )
+        configFile.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
+        val authFile = copyCodexAuthFile(environment, directory)
 
-    return PrivateConfigPath(
-        path = directory,
-        cleanupPaths = listOfNotNull(configFile, authFile, directory),
-    )
+        PrivateConfigPath(
+            path = directory,
+            cleanupPaths = listOfNotNull(configFile, authFile, directory),
+        )
+    }.getOrElse { throwable ->
+        directory.deleteGeneratedPath()
+
+        throw throwable
+    }
 }
 
 private fun copyCodexAuthFile(
@@ -287,8 +306,8 @@ private fun copyCodexAuthFile(
 }
 
 private fun Map<String, String>.codexAuthFilePath(): Path? {
-    val configuredCodexHome = readOptional(CODEX_HOME_ENV)?.let { value -> Path.of(value) }
-    val fallbackCodexHome = readOptional(HOME_ENV)?.let { value ->
+    val configuredCodexHome = readOptionalEnv(CODEX_HOME_ENV)?.let { value -> Path.of(value) }
+    val fallbackCodexHome = readOptionalEnv(HOME_ENV)?.let { value ->
         Path.of(value).resolve(DEFAULT_CODEX_HOME_DIRECTORY)
     }
     val codexHome = configuredCodexHome ?: fallbackCodexHome ?: return null
@@ -304,24 +323,50 @@ private fun writePrivateConfigFile(
     val directory = Files.createTempDirectory("fukurou-llm-config-")
     directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
 
-    val file = Files.createTempFile(directory, prefix, suffix)
-    Files.writeString(
-        file,
-        content,
-        StandardOpenOption.TRUNCATE_EXISTING,
-        StandardOpenOption.WRITE,
-    )
-    file.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
+    return runCatching {
+        val file = Files.createTempFile(directory, prefix, suffix)
+        Files.writeString(
+            file,
+            content,
+            StandardOpenOption.TRUNCATE_EXISTING,
+            StandardOpenOption.WRITE,
+        )
+        file.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
 
-    return PrivateConfigPath(
-        path = file,
-        cleanupPaths = listOf(file, directory),
-    )
+        PrivateConfigPath(
+            path = file,
+            cleanupPaths = listOf(file, directory),
+        )
+    }.getOrElse { throwable ->
+        directory.deleteGeneratedPath()
+
+        throw throwable
+    }
 }
 
 private fun Path.setOwnerOnlyPermissions(permissions: Set<PosixFilePermission>) {
     runCatching {
         Files.setPosixFilePermissions(this, permissions)
+    }
+}
+
+private fun List<Path>.deleteGeneratedPaths() {
+    forEach { path -> path.deleteGeneratedPath() }
+}
+
+private fun Path.deleteGeneratedPath() {
+    runCatching {
+        val directory = Files.isDirectory(this)
+
+        if (directory) {
+            Files.walk(this).use { paths ->
+                paths
+                    .sorted(Comparator.reverseOrder())
+                    .forEach { path -> Files.deleteIfExists(path) }
+            }
+        } else {
+            Files.deleteIfExists(this)
+        }
     }
 }
 
@@ -486,19 +531,6 @@ const val FUKUROU_CODEX_COMMON_ARGS_ENV = "FUKUROU_CODEX_COMMON_ARGS"
  */
 const val FUKUROU_CODEX_FALSIFIER_ARGS_ENV = "FUKUROU_CODEX_FALSIFIER_ARGS"
 
-private fun Map<String, String>.readCommandTemplate(
-    name: String,
-    defaultValue: List<String>,
-): List<String> {
-    return readOptional(name)?.splitCommandTemplate() ?: defaultValue
-}
-
-private fun Map<String, String>.readOptional(name: String): String? {
-    return this[name]
-        ?.trim()
-        ?.takeIf { value -> value.isNotBlank() }
-}
-
 private fun List<String>.filterUnsafeArgs(forbiddenFlags: Set<String>): List<String> {
     return filter { argument ->
         forbiddenFlags.any { forbiddenFlag -> argument.matchesForbiddenFlag(forbiddenFlag) }
@@ -515,62 +547,4 @@ private fun String.matchesForbiddenFlag(forbiddenFlag: String): Boolean {
 
 private fun String.isShortFlag(): Boolean {
     return startsWith("-") && !startsWith("--")
-}
-
-private fun String.splitCommandTemplate(): List<String> {
-    val parts = mutableListOf<String>()
-    val currentPart = StringBuilder()
-    var quote: Char? = null
-    var escaping = false
-
-    forEach { character ->
-        val quoteClosed = quoteMatches(quote, character)
-        val quoteOpened = quoteOpens(quote, character)
-
-        when {
-            escaping -> {
-                currentPart.append(character)
-                escaping = false
-            }
-            character == '\\' -> escaping = true
-            quoteClosed -> quote = null
-            quote != null -> currentPart.append(character)
-            quoteOpened -> quote = character
-            character.isWhitespace() -> {
-                if (currentPart.isNotEmpty()) {
-                    parts += currentPart.toString()
-                    currentPart.clear()
-                }
-            }
-            else -> currentPart.append(character)
-        }
-    }
-
-    require(!escaping) {
-        "command template must not end with an escape character."
-    }
-    require(quote == null) {
-        "command template quote was not closed."
-    }
-    if (currentPart.isNotEmpty()) {
-        parts += currentPart.toString()
-    }
-
-    require(parts.isNotEmpty()) {
-        "command template must not be empty."
-    }
-
-    return parts
-}
-
-private fun quoteMatches(quote: Char?, character: Char): Boolean {
-    return quote != null && character == quote
-}
-
-private fun quoteOpens(quote: Char?, character: Char): Boolean {
-    return quote == null && character.isCommandQuote()
-}
-
-private fun Char.isCommandQuote(): Boolean {
-    return this == '"' || this == '\''
 }

@@ -17,6 +17,19 @@ import kotlin.test.assertTrue
 class DefaultLlmCommandRendererTest {
 
     @Test
+    fun configFromEnvironment_splitsQuotedCommandTemplates() {
+        val config = LlmCommandRendererConfig.fromEnvironment(
+            mapOf(
+                FUKUROU_CLAUDE_COMMAND_TEMPLATE_ENV to """docker run "claude image" claude""",
+                FUKUROU_CODEX_COMMAND_TEMPLATE_ENV to """docker run 'codex image' codex""",
+            ),
+        )
+
+        assertEquals(listOf("docker", "run", "claude image", "claude"), config.claudeCommandTemplate)
+        assertEquals(listOf("docker", "run", "codex image", "codex"), config.codexCommandTemplate)
+    }
+
+    @Test
     fun renderCodex_usesConfiguredCommandTemplateModelAndRequestMcpServerName() {
         val renderer = DefaultLlmCommandRenderer(
             config = LlmCommandRendererConfig(

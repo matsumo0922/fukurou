@@ -90,6 +90,20 @@ private const val SELECT_DECISION_PROTOCOL_COUNTS_SQL = """
 """
 
 /**
+ * command_event_log 集計 index 件数を読む SQL。
+ */
+private const val SELECT_COMMAND_EVENT_LOG_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'command_event_log'
+        AND indexname IN (
+            'idx_command_event_log_ts_decision_run',
+            'idx_command_event_log_run_event_tool'
+        )
+"""
+
+/**
  * NO_TRADE decision の保存内容を読む SQL。
  */
 private const val SELECT_NO_TRADE_DECISION_SQL = """
@@ -252,6 +266,7 @@ class PostgresPersistenceIntegrationTest {
 
         assertTrue(bootstrap.verifySchema().isSuccess)
         assertTrue(ExposedRiskStateRepository(database).current().isSuccess)
+        assertEquals(2, selectCommandEventLogIndexCount(database))
     }
 
     @Test
@@ -1219,6 +1234,21 @@ private fun selectDecisionProtocolCounts(database: ExposedDatabase): DecisionPro
                     falsifications = resultSet.getInt(4),
                     tradeIntentConsumptions = resultSet.getInt(5),
                 )
+            }
+        }
+    }
+}
+
+/**
+ * command_event_log 集計 index 件数を読む。
+ */
+private fun selectCommandEventLogIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_COMMAND_EVENT_LOG_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "command_event_log index count did not return a row." }
+
+                resultSet.getInt(1)
             }
         }
     }

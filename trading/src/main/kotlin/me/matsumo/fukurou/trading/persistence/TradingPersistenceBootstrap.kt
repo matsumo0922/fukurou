@@ -81,6 +81,45 @@ private const val VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL = """
 """
 
 /**
+ * command_event_log の起動回数集計 index を作る SQL。
+ */
+private const val ENSURE_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_command_event_log_ts_decision_run
+    ON command_event_log (ts, decision_run_id)
+    WHERE decision_run_id IS NOT NULL
+"""
+
+/**
+ * command_event_log の tool call 集計 index を作る SQL。
+ */
+private const val ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_command_event_log_run_event_tool
+    ON command_event_log (decision_run_id, event_type, tool_name)
+"""
+
+/**
+ * command_event_log の起動回数集計 index 存在を確認する SQL。
+ */
+private const val VERIFY_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'command_event_log'
+        AND indexname = 'idx_command_event_log_ts_decision_run'
+"""
+
+/**
+ * command_event_log の tool call 集計 index 存在を確認する SQL。
+ */
+private const val VERIFY_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'command_event_log'
+        AND indexname = 'idx_command_event_log_run_event_tool'
+"""
+
+/**
  * paper_account schema の存在を確認する SQL。
  */
 private const val VERIFY_PAPER_ACCOUNT_SCHEMA_SQL = """
@@ -349,6 +388,7 @@ class TradingPersistenceBootstrap(
                     TradeIntentConsumptionsTable,
                     withLogs = false,
                 )
+                ensureCommandEventLogIndexes()
                 val now = Instant.now(clock)
 
                 ensureRiskStateRow(now, paperAccountConfig.initialCashJpy)
@@ -386,11 +426,33 @@ class TradingPersistenceBootstrap(
  * command_event_log schema が存在することを確認する。
  */
 internal fun JdbcTransaction.verifyCommandEventLogSchema() {
-    jdbcConnection().prepareStatement(VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL).use { statement ->
-        statement.executeQuery().use { resultSet ->
-            requireNotNull(resultSet.metaData) { "command_event_log schema was not initialized." }
-        }
-    }
+    verifySchemaBySql(
+        sql = VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL,
+        missingMessage = "command_event_log schema was not initialized.",
+    )
+    verifyCommandEventLogIndexes()
+}
+
+/**
+ * command_event_log の集計 index がなければ作成する。
+ */
+internal fun JdbcTransaction.ensureCommandEventLogIndexes() {
+    executeUpdate(ENSURE_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL)
+    executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)
+}
+
+/**
+ * command_event_log の集計 index が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyCommandEventLogIndexes() {
+    verifyExistsBySql(
+        sql = VERIFY_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL,
+        missingMessage = "command_event_log ts/decision_run_id index was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL,
+        missingMessage = "command_event_log run/event/tool index was not initialized.",
+    )
 }
 
 /**
@@ -498,6 +560,20 @@ private fun JdbcTransaction.verifySchemaBySql(sql: String, missingMessage: Strin
         statement.executeQuery().use { resultSet ->
             requireNotNull(resultSet.metaData) { missingMessage }
         }
+    }
+}
+
+private fun JdbcTransaction.verifyExistsBySql(sql: String, missingMessage: String) {
+    jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) { missingMessage }
+        }
+    }
+}
+
+private fun JdbcTransaction.executeUpdate(sql: String) {
+    jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.executeUpdate()
     }
 }
 

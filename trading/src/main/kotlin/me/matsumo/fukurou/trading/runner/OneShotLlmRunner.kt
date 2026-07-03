@@ -33,6 +33,8 @@ import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import me.matsumo.fukurou.trading.invoker.readOptionalEnv
+import me.matsumo.fukurou.trading.invoker.splitCommandTemplate
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.tool.CallerInvocation
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
@@ -122,14 +124,14 @@ data class OneShotRunnerCliConfig(
          * 環境変数から CLI 設定を構築する。
          */
         fun fromEnvironment(environment: Map<String, String> = System.getenv()): OneShotRunnerCliConfig {
-            val serverName = environment.readOptional(FUKUROU_MCP_SERVER_NAME_ENV)
+            val serverName = environment.readOptionalEnv(FUKUROU_MCP_SERVER_NAME_ENV)
                 ?: DEFAULT_RUNNER_MCP_SERVER_NAME
-            val mcpArgs = environment.readOptional(FUKUROU_MCP_SERVER_ARGS_ENV)
+            val mcpArgs = environment.readOptionalEnv(FUKUROU_MCP_SERVER_ARGS_ENV)
                 ?.splitCommandTemplate()
 
             return OneShotRunnerCliConfig(
                 mcpServerName = serverName,
-                mcpServerCommand = environment.readOptional(FUKUROU_MCP_SERVER_COMMAND_ENV)
+                mcpServerCommand = environment.readOptionalEnv(FUKUROU_MCP_SERVER_COMMAND_ENV)
                     ?: DEFAULT_RUNNER_MCP_SERVER_COMMAND,
                 mcpServerArgs = mcpArgs,
                 proposerAllowedTools = environment.readToolAllowlist(
@@ -938,18 +940,12 @@ private fun shortMcpToolNames(allowedTools: List<String>): List<String> {
 }
 
 private fun Map<String, String>.readToolAllowlist(name: String, defaultValue: List<String>): List<String> {
-    return readOptional(name)
+    return readOptionalEnv(name)
         ?.split(",")
         ?.map { value -> value.trim() }
         ?.filter { value -> value.isNotBlank() }
         ?.takeIf { values -> values.isNotEmpty() }
         ?: defaultValue
-}
-
-private fun Map<String, String>.readOptional(name: String): String? {
-    return this[name]
-        ?.trim()
-        ?.takeIf { value -> value.isNotBlank() }
 }
 
 private fun isForbiddenSecretEnvKey(key: String): Boolean {
@@ -981,61 +977,3 @@ private val SECRET_KEY_PATTERNS = listOf(
     "PASSWORD",
     "CREDENTIAL",
 )
-
-private fun String.splitCommandTemplate(): List<String> {
-    val parts = mutableListOf<String>()
-    val currentPart = StringBuilder()
-    var quote: Char? = null
-    var escaping = false
-
-    forEach { character ->
-        val quoteClosed = quoteMatches(quote, character)
-        val quoteOpened = quoteOpens(quote, character)
-
-        when {
-            escaping -> {
-                currentPart.append(character)
-                escaping = false
-            }
-            character == '\\' -> escaping = true
-            quoteClosed -> quote = null
-            quote != null -> currentPart.append(character)
-            quoteOpened -> quote = character
-            character.isWhitespace() -> {
-                if (currentPart.isNotEmpty()) {
-                    parts += currentPart.toString()
-                    currentPart.clear()
-                }
-            }
-            else -> currentPart.append(character)
-        }
-    }
-
-    require(!escaping) {
-        "command template must not end with an escape character."
-    }
-    require(quote == null) {
-        "command template quote was not closed."
-    }
-    if (currentPart.isNotEmpty()) {
-        parts += currentPart.toString()
-    }
-
-    require(parts.isNotEmpty()) {
-        "command template must not be empty."
-    }
-
-    return parts
-}
-
-private fun quoteMatches(quote: Char?, character: Char): Boolean {
-    return quote != null && character == quote
-}
-
-private fun quoteOpens(quote: Char?, character: Char): Boolean {
-    return quote == null && character.isCommandQuote()
-}
-
-private fun Char.isCommandQuote(): Boolean {
-    return this == '"' || this == '\''
-}

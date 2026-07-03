@@ -422,12 +422,57 @@ private fun mcpAllowedToolNamesFromEnvironment(): Set<String>? {
         ?.takeIf { toolNames -> toolNames.isNotEmpty() }
 }
 
+private fun Server.addLimitedTool(
+    name: String,
+    description: String,
+    inputSchema: ToolSchema,
+    toolAnnotations: ToolAnnotations,
+    kind: McpToolCallKind,
+    decisionRunContext: DecisionRunContext,
+    toolCallLimiter: McpToolCallLimiter,
+    handler: suspend (CallToolRequest, GuardedToolCall) -> CallToolResult,
+) {
+    addTool(
+        name = name,
+        description = description,
+        inputSchema = inputSchema,
+        toolAnnotations = toolAnnotations,
+    ) { request ->
+        handleLimitedTool(
+            request = request,
+            toolName = name,
+            decisionRunContext = decisionRunContext,
+            toolCallLimiter = toolCallLimiter,
+            kind = kind,
+            handler = handler,
+        )
+    }
+}
+
+private suspend fun handleLimitedTool(
+    request: CallToolRequest,
+    toolName: String,
+    decisionRunContext: DecisionRunContext,
+    toolCallLimiter: McpToolCallLimiter,
+    kind: McpToolCallKind,
+    handler: suspend (CallToolRequest, GuardedToolCall) -> CallToolResult,
+): CallToolResult {
+    val call = request.toGuardedToolCall(toolName, decisionRunContext)
+    val limitError = limitErrorOrNull(toolCallLimiter, call, kind)
+
+    if (limitError != null) {
+        return limitError
+    }
+
+    return handler(request, call)
+}
+
 private fun Server.registerSubmitDecisionTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = SUBMIT_DECISION_TOOL,
         description = "Submit the structured LLM decision. ENTER creates a trade intent and TradePlan.",
         inputSchema = ToolSchema(
@@ -469,8 +514,11 @@ private fun Server.registerSubmitDecisionTool(
             ),
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-    ) { request ->
-        handleSubmitDecision(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.DECISION,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handleSubmitDecision(request, tradingRuntime, decisionRunContext, call)
     }
 }
 
@@ -479,7 +527,7 @@ private fun Server.registerSubmitFalsificationTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = SUBMIT_FALSIFICATION_TOOL,
         description = "Submit an APPROVED or REJECTED Falsifier verdict for one trade intent.",
         inputSchema = ToolSchema(
@@ -506,8 +554,11 @@ private fun Server.registerSubmitFalsificationTool(
             required = listOf("intent_id", "verdict", "reason_ja"),
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-    ) { request ->
-        handleSubmitFalsification(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.DECISION,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handleSubmitFalsification(request, tradingRuntime, decisionRunContext, call)
     }
 }
 
@@ -516,7 +567,7 @@ private fun Server.registerPlaceOrderTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = PLACE_ORDER_TOOL,
         description = "Place a paper BTC entry order with a fresh approved intent. intent_id, protective_stop_price_jpy, and reason are required.",
         inputSchema = ToolSchema(
@@ -560,8 +611,11 @@ private fun Server.registerPlaceOrderTool(
             ),
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-    ) { request ->
-        handlePlaceOrder(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.TRADE,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handlePlaceOrder(request, tradingRuntime, call)
     }
 }
 
@@ -570,7 +624,7 @@ private fun Server.registerClosePositionTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = CLOSE_POSITION_TOOL,
         description = "Close one open paper position, or all open paper positions when all=true. reason is required.",
         inputSchema = ToolSchema(
@@ -590,8 +644,11 @@ private fun Server.registerClosePositionTool(
             required = listOf("reason"),
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-    ) { request ->
-        handleClosePosition(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.TRADE,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handleClosePosition(request, tradingRuntime, call)
     }
 }
 
@@ -600,7 +657,7 @@ private fun Server.registerUpdateProtectionTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = UPDATE_PROTECTION_TOOL,
         description = "Update a paper position protective STOP and/or virtual TP. reason is required.",
         inputSchema = ToolSchema(
@@ -617,8 +674,11 @@ private fun Server.registerUpdateProtectionTool(
             required = listOf("position_id", "reason"),
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-    ) { request ->
-        handleUpdateProtection(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.TRADE,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handleUpdateProtection(request, tradingRuntime, call)
     }
 }
 
@@ -627,7 +687,7 @@ private fun Server.registerCancelOrderTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = CANCEL_ORDER_TOOL,
         description = "Cancel an open paper order. Protective STOP cancellation is rejected; use update_protection or close_position.",
         inputSchema = ToolSchema(
@@ -642,8 +702,11 @@ private fun Server.registerCancelOrderTool(
             required = listOf("order_id", "reason"),
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-    ) { request ->
-        handleCancelOrder(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.TRADE,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handleCancelOrder(request, tradingRuntime, call)
     }
 }
 
@@ -652,13 +715,16 @@ private fun Server.registerBalanceTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = GET_BALANCE_TOOL,
         description = "Get paper account balance and equity snapshot.",
         inputSchema = ToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-    ) { request ->
-        handleGetBalance(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.READ_ONLY,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { _, call ->
+        handleGetBalance(tradingRuntime, call)
     }
 }
 
@@ -667,13 +733,16 @@ private fun Server.registerPositionsTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = GET_POSITIONS_TOOL,
         description = "Get open paper positions from the bot-managed position ledger.",
         inputSchema = ToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-    ) { request ->
-        handleGetPositions(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.READ_ONLY,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { _, call ->
+        handleGetPositions(tradingRuntime, call)
     }
 }
 
@@ -682,13 +751,16 @@ private fun Server.registerOpenOrdersTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = GET_OPEN_ORDERS_TOOL,
         description = "Get open paper orders including protective STOP orders.",
         inputSchema = ToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-    ) { request ->
-        handleGetOpenOrders(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.READ_ONLY,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { _, call ->
+        handleGetOpenOrders(tradingRuntime, call)
     }
 }
 
@@ -697,13 +769,16 @@ private fun Server.registerAccountStatusTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = GET_ACCOUNT_STATUS_TOOL,
         description = "Get paper account status and DB-backed risk_state.",
         inputSchema = ToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-    ) { request ->
-        handleGetAccountStatus(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.READ_ONLY,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { _, call ->
+        handleGetAccountStatus(tradingRuntime, call)
     }
 }
 
@@ -712,7 +787,7 @@ private fun Server.registerTradeIntentTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = GET_TRADE_INTENT_TOOL,
         description = "Get a persisted trade intent and its TradePlan by intent_id for Falsifier review.",
         inputSchema = ToolSchema(
@@ -725,8 +800,11 @@ private fun Server.registerTradeIntentTool(
             required = listOf("intent_id"),
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-    ) { request ->
-        handleGetTradeIntent(request, tradingRuntime, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.READ_ONLY,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handleGetTradeIntent(request, tradingRuntime, call)
     }
 }
 
@@ -735,7 +813,7 @@ private fun Server.registerRejectDummyTradeTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = REJECT_DUMMY_TRADE_TOOL,
         description = "Reject-only dummy trade tool for headless approval and no-trade safety checks.",
         inputSchema = ToolSchema(
@@ -748,8 +826,11 @@ private fun Server.registerRejectDummyTradeTool(
             required = listOf("reason"),
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-    ) { request ->
-        handleRejectDummyTrade(request, toolCallGuard, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.TRADE,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handleRejectDummyTrade(request, toolCallGuard, call)
     }
 }
 
@@ -758,7 +839,7 @@ private fun Server.registerSimulateToolTimeoutTool(
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
-    addTool(
+    addLimitedTool(
         name = SIMULATE_TOOL_TIMEOUT_TOOL,
         description = "Sleep without side effects so headless callers can verify timeout handling ends in no-trade.",
         inputSchema = ToolSchema(
@@ -773,19 +854,18 @@ private fun Server.registerSimulateToolTimeoutTool(
             },
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-    ) { request ->
-        handleSimulateToolTimeout(request, toolCallGuard, decisionRunContext, toolCallLimiter)
+        kind = McpToolCallKind.READ_ONLY,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handleSimulateToolTimeout(request, toolCallGuard, call)
     }
 }
 
 private suspend fun handleGetBalance(
-    request: CallToolRequest,
     tradingRuntime: TradingRuntime,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(GET_BALANCE_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.READ_ONLY)?.let { result -> return result }
     val balance = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
         tradingRuntime.broker.getBalance().getOrThrow()
     }
@@ -797,13 +877,9 @@ private suspend fun handleGetBalance(
 }
 
 private suspend fun handleGetPositions(
-    request: CallToolRequest,
     tradingRuntime: TradingRuntime,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(GET_POSITIONS_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.READ_ONLY)?.let { result -> return result }
     val positions = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
         tradingRuntime.broker.getPositions().getOrThrow()
     }
@@ -815,13 +891,9 @@ private suspend fun handleGetPositions(
 }
 
 private suspend fun handleGetOpenOrders(
-    request: CallToolRequest,
     tradingRuntime: TradingRuntime,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(GET_OPEN_ORDERS_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.READ_ONLY)?.let { result -> return result }
     val openOrders = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
         tradingRuntime.broker.getOpenOrders().getOrThrow()
     }
@@ -833,13 +905,9 @@ private suspend fun handleGetOpenOrders(
 }
 
 private suspend fun handleGetAccountStatus(
-    request: CallToolRequest,
     tradingRuntime: TradingRuntime,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(GET_ACCOUNT_STATUS_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.READ_ONLY)?.let { result -> return result }
     val accountStatus = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
         AccountStatusService(tradingRuntime.broker).getAccountStatus().getOrThrow()
     }
@@ -853,11 +921,8 @@ private suspend fun handleGetAccountStatus(
 private suspend fun handleGetTradeIntent(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(GET_TRADE_INTENT_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.READ_ONLY)?.let { result -> return result }
     val snapshot = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
         val intentId = parseUuidArgument(request, "intent_id").getOrThrow()
 
@@ -876,10 +941,8 @@ private suspend fun handleSubmitDecision(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(SUBMIT_DECISION_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.DECISION)?.let { result -> return result }
     val result = tradingRuntime.toolCallGuard.runDecisionTool(call) {
         val submission = parseDecisionSubmission(request, decisionRunContext).getOrThrow()
 
@@ -896,10 +959,8 @@ private suspend fun handleSubmitFalsification(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(SUBMIT_FALSIFICATION_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.DECISION)?.let { result -> return result }
     val result = tradingRuntime.toolCallGuard.runDecisionTool(call) {
         val submission = parseFalsificationSubmission(request, decisionRunContext).getOrThrow()
 
@@ -915,11 +976,8 @@ private suspend fun handleSubmitFalsification(
 private suspend fun handlePlaceOrder(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(PLACE_ORDER_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.TRADE)?.let { result -> return result }
     val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
         val command = parsePlaceOrderCommand(request, call).getOrThrow()
 
@@ -935,11 +993,8 @@ private suspend fun handlePlaceOrder(
 private suspend fun handleClosePosition(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(CLOSE_POSITION_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.TRADE)?.let { result -> return result }
     val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
         val command = parseClosePositionCommand(request, call).getOrThrow()
 
@@ -955,11 +1010,8 @@ private suspend fun handleClosePosition(
 private suspend fun handleUpdateProtection(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(UPDATE_PROTECTION_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.TRADE)?.let { result -> return result }
     val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
         val command = parseUpdateProtectionCommand(request, call).getOrThrow()
 
@@ -975,11 +1027,8 @@ private suspend fun handleUpdateProtection(
 private suspend fun handleCancelOrder(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(CANCEL_ORDER_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.TRADE)?.let { result -> return result }
     val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
         val command = parseCancelOrderCommand(request, call).getOrThrow()
 
@@ -995,11 +1044,8 @@ private suspend fun handleCancelOrder(
 private suspend fun handleRejectDummyTrade(
     request: CallToolRequest,
     toolCallGuard: ToolCallGuard,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(REJECT_DUMMY_TRADE_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.TRADE)?.let { result -> return result }
     val rejected = toolCallGuard.runTradeTool(call) {
         val reason = parseReason(request).getOrThrow()
 
@@ -1015,11 +1061,8 @@ private suspend fun handleRejectDummyTrade(
 private suspend fun handleSimulateToolTimeout(
     request: CallToolRequest,
     toolCallGuard: ToolCallGuard,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    call: GuardedToolCall,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(SIMULATE_TOOL_TIMEOUT_TOOL, decisionRunContext)
-    limitErrorOrNull(toolCallLimiter, call, McpToolCallKind.READ_ONLY)?.let { result -> return result }
     val result = toolCallGuard.runReadOnlyTool(call) {
         val delayMs = parseDelayMs(request).getOrThrow()
 

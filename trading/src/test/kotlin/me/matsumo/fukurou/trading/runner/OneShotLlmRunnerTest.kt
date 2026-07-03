@@ -66,6 +66,17 @@ import kotlin.test.assertTrue
 class OneShotLlmRunnerTest {
 
     @Test
+    fun cliConfigFromEnvironment_splitsQuotedMcpServerArgs() {
+        val config = OneShotRunnerCliConfig.fromEnvironment(
+            mapOf(
+                FUKUROU_MCP_SERVER_ARGS_ENV to """-jar "/app/fukurou mcp.jar"""",
+            ),
+        )
+
+        assertEquals(listOf("-jar", "/app/fukurou mcp.jar"), config.mcpServerArgs)
+    }
+
+    @Test
     fun proposerNoTrade_savesDecisionAndDoesNotLaunchFalsifier() = runBlocking {
         val fixture = runnerFixture { command ->
             if (command.isProposerLaunch()) {
