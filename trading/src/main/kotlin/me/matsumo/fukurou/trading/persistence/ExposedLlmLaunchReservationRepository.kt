@@ -54,6 +54,7 @@ private const val COUNT_DISTINCT_LLM_LAUNCHES_SINCE_SQL = """
         SELECT decision_run_id AS launch_id
         FROM command_event_log
         WHERE decision_run_id IS NOT NULL
+            AND event_type IN ('RUNNER_PHASE_COMPLETED', 'NO_TRADE_EXIT')
             AND ts >= ?
     ) AS launch_ids
 """

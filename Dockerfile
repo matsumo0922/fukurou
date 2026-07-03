@@ -25,7 +25,12 @@ ARG FUKUROU_REVISION=unknown
 WORKDIR /app
 
 # 非 root 実行ユーザを用意する。
-RUN useradd --system --uid 10001 appuser
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git nodejs npm \
+    && npm install -g @anthropic-ai/claude-code @openai/codex \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 appuser
 
 # Ktor fat JAR は fukurou/build/libs/<name>-all.jar に出力される。
 COPY --from=build /src/fukurou/build/libs/*-all.jar app.jar

@@ -199,6 +199,37 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun daemonLaunchAuditDoesNotCountAgainstRunnerInvocationCap() = runBlocking {
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(maxInvocationsPerHour = 1),
+        )
+        val fixture = runnerFixture(config = config) { cleanExit() }
+        fixture.eventLog.append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = "daemon-reservation",
+                    llmProvider = "claude",
+                    promptHash = "hash",
+                    systemPromptVersion = SystemPromptV1.VERSION,
+                    marketSnapshotId = "snapshot",
+                ),
+                toolName = "llm-daemon-scheduler",
+                toolCallId = null,
+                clientRequestId = "flat-heartbeat",
+                eventType = CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+                payload = "{}",
+                occurredAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(1, fixture.processRunner.launches.size)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
+    }
+
+    @Test
     fun maxInvocationsPerDayExceeded_rejectsLaunchAndAuditsNoTrade() = runBlocking {
         val config = TradingBotConfig(
             runner = LlmRunnerConfig(

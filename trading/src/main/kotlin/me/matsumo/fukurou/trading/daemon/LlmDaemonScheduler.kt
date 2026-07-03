@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.daemon
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -47,6 +48,19 @@ sealed interface LlmDaemonTickResult {
         val invocationId: String,
         val triggerKind: LlmDaemonTriggerKind,
         val status: String,
+    ) : LlmDaemonTickResult
+
+    /**
+     * one-shot runner は起動したが失敗として完了した。
+     *
+     * @param invocationId 起動 ID
+     * @param triggerKind 起動 trigger 種別
+     * @param reason 失敗理由
+     */
+    data class Failed(
+        val invocationId: String,
+        val triggerKind: LlmDaemonTriggerKind,
+        val reason: String,
     ) : LlmDaemonTickResult
 
     /**
@@ -167,9 +181,16 @@ class LlmDaemonScheduler(
             invocationId = invocationId,
             marketSnapshotId = "daemon-${trigger.key}-$invocationId",
         )
-        val result = launchOneShot(request)
+        val result = runCatching {
+            launchOneShot(request).getOrThrow()
+        }
         val runnerResult = result.getOrNull()
         val failure = result.exceptionOrNull()
+
+        if (failure is CancellationException) {
+            throw failure
+        }
+
         val finishedAt = Instant.now(clock)
         val status = if (failure == null) {
             LlmLaunchReservationStatus.FINISHED
@@ -189,7 +210,11 @@ class LlmDaemonScheduler(
         appendCompleted(trigger, invocationId, reason ?: "unknown", finishedAt).getOrThrow()
 
         if (failure != null) {
-            throw failure
+            return LlmDaemonTickResult.Failed(
+                invocationId = invocationId,
+                triggerKind = trigger.kind,
+                reason = reason ?: "unknown",
+            )
         }
 
         return LlmDaemonTickResult.Launched(

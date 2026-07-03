@@ -164,6 +164,29 @@ class LlmDaemonSchedulerTest {
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED.name, firstResult.status)
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED.name, secondResult.status)
     }
+
+    @Test
+    fun oneShotFailureIsAuditedAndNextCycleContinues() = runBlocking {
+        var runnerCallCount = 0
+        val fixture = schedulerFixture { request ->
+            runnerCallCount += 1
+
+            if (runnerCallCount == 1) {
+                error("cli auth expired")
+            }
+
+            successfulRunnerResult(request)
+        }
+
+        val failedResult = fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofHours(6))
+        val resumedResult = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Failed>(failedResult)
+        assertEquals("IllegalStateException", failedResult.reason)
+        assertIs<LlmDaemonTickResult.Launched>(resumedResult)
+        assertEquals(2, fixture.launches.size)
+    }
 }
 
 private fun schedulerFixture(
