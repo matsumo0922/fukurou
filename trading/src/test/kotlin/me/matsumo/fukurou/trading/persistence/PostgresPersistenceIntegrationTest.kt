@@ -414,6 +414,30 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun llm_launch_reservation_reportsFreshRunningReservationInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+
+        repository.tryReserve(llmLaunchReservationRequest("daemon-run-running", LlmRunnerConfig())).getOrThrow()
+        val runningExists = repository.hasFreshRunningReservation(fixedInstant().minus(Duration.ofMinutes(30)))
+            .getOrThrow()
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "daemon-run-running",
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = "NO_TRADE_DECISION",
+                finishedAt = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val runningExistsAfterFinish = repository.hasFreshRunningReservation(fixedInstant().minus(Duration.ofMinutes(30)))
+            .getOrThrow()
+
+        assertEquals(true, runningExists)
+        assertEquals(false, runningExistsAfterFinish)
+    }
+
+    @Test
     fun llm_launch_reservation_ignoresDaemonLaunchAuditForCapInPostgresPath() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -790,9 +814,14 @@ class PostgresPersistenceIntegrationTest {
             ),
         ).getOrThrow()
         val positions = repository.getOpenPositions().getOrThrow()
+        val closeClientRequestIds = selectClientRequestIdsByOrderIds(database, closeResult.orderIds)
+        val expectedCloseClientRequestIds = closeResult.positionIds
+            .map { positionId -> "close-all-request:$positionId" }
+            .sorted()
 
         assertTrue(closeResult.accepted)
         assertEquals(2, closeResult.orderIds.size)
+        assertEquals(expectedCloseClientRequestIds, closeClientRequestIds.filterNotNull().sorted())
         assertEquals(0, positions.size)
     }
 
@@ -1450,6 +1479,31 @@ private fun selectOrdersClientRequestIdIndexCount(database: ExposedDatabase): In
                 require(resultSet.next()) { "orders client_request_id index count did not return a row." }
 
                 resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * 指定 order IDs の client_request_id を読む。
+ */
+private fun selectClientRequestIdsByOrderIds(database: ExposedDatabase, orderIds: List<String>): List<String?> {
+    return exposedTransaction(database) {
+        val placeholders = orderIds.joinToString(", ") { "?" }
+        val sql = "SELECT client_request_id FROM orders WHERE id IN ($placeholders)"
+
+        jdbcConnection().prepareStatement(sql).use { statement ->
+            orderIds.forEachIndexed { orderIndex, orderId ->
+                statement.setObject(orderIndex + 1, UUID.fromString(orderId))
+            }
+            statement.executeQuery().use { resultSet ->
+                val clientRequestIds = mutableListOf<String?>()
+
+                while (resultSet.next()) {
+                    clientRequestIds += resultSet.getString("client_request_id")
+                }
+
+                clientRequestIds
             }
         }
     }

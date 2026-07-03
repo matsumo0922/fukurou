@@ -219,10 +219,10 @@ data class LlmDaemonConfig(
             "pollInterval must be greater than or equal to ${DEFAULT_LLM_DAEMON_POLL_INTERVAL.seconds} seconds."
         }
         require(flatHeartbeatIsConservative) {
-            "flatHeartbeatInterval must be greater than or equal to ${DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL.toHours()} hours."
+            "flatHeartbeatInterval must be greater than or equal to ${DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL.toMinutes()} minutes."
         }
         require(holdingCheckIsConservative) {
-            "holdingCheckInterval must be greater than or equal to ${DEFAULT_LLM_HOLDING_CHECK_INTERVAL.toHours()} hours."
+            "holdingCheckInterval must be greater than or equal to ${DEFAULT_LLM_HOLDING_CHECK_INTERVAL.toMinutes()} minutes."
         }
         require(reservationStaleIsPositive) {
             "launchReservationStaleAfter must be greater than 0."
@@ -406,12 +406,12 @@ val DEFAULT_LLM_PER_RUN_TIMEOUT: Duration = Duration.ofSeconds(180)
 /**
  * 直近 1 時間の既定 runner 起動上限。
  */
-const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 1
+const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 4
 
 /**
  * 直近 24 時間の既定 runner 起動上限。
  */
-const val DEFAULT_MAX_INVOCATIONS_PER_DAY = 10
+const val DEFAULT_MAX_INVOCATIONS_PER_DAY = 96
 
 /**
  * LLM daemon scheduler 有効化の既定値。
@@ -426,12 +426,12 @@ val DEFAULT_LLM_DAEMON_POLL_INTERVAL: Duration = Duration.ofMinutes(1)
 /**
  * flat 状態 heartbeat 間隔の既定値。
  */
-val DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL: Duration = Duration.ofHours(6)
+val DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL: Duration = Duration.ofMinutes(15)
 
 /**
  * holding 状態 LLM 確認間隔の既定値。
  */
-val DEFAULT_LLM_HOLDING_CHECK_INTERVAL: Duration = Duration.ofHours(3)
+val DEFAULT_LLM_HOLDING_CHECK_INTERVAL: Duration = Duration.ofMinutes(15)
 
 /**
  * LLM 起動予約を stale とみなす既定時間。

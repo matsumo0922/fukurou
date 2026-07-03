@@ -159,6 +159,11 @@ interface LlmLaunchReservationRepository {
      * trigger key ごとの最後に正常完了した予約時刻を返す。
      */
     suspend fun latestFinishedReservedAt(triggerKey: String): Result<Instant?>
+
+    /**
+     * stale ではない RUNNING 予約が存在するか返す。
+     */
+    suspend fun hasFreshRunningReservation(activeSince: Instant): Result<Boolean>
 }
 
 /**
@@ -217,6 +222,19 @@ class InMemoryLlmLaunchReservationRepository(
                     .filter { reservation -> reservation.triggerKey == triggerKey }
                     .filter { reservation -> reservation.status == LlmLaunchReservationStatus.FINISHED }
                     .maxOfOrNull { reservation -> reservation.reservedAt }
+            }
+        }
+    }
+
+    override suspend fun hasFreshRunningReservation(activeSince: Instant): Result<Boolean> {
+        return runCatching {
+            mutex.withLock {
+                reservations.any { reservation ->
+                    val activeStatus = reservation.status == LlmLaunchReservationStatus.RUNNING
+                    val freshEnough = !reservation.reservedAt.isBefore(activeSince)
+
+                    activeStatus && freshEnough
+                }
             }
         }
     }

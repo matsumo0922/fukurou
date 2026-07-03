@@ -259,6 +259,12 @@ class DefaultLlmCommandRendererTest {
         }
         assertFailsWith<IllegalArgumentException> {
             LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("docker", "run", "--network", "host", "codex-image", "codex"),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
                 codexCommandTemplate = listOf("docker", "run", "-v", "/:/hostroot", "codex-image", "codex"),
                 codexFalsifierArgs = listOf("--yolo"),
             )
@@ -275,6 +281,10 @@ class DefaultLlmCommandRendererTest {
                 codexFalsifierArgs = listOf("--yolo"),
             )
         }
+        LlmCommandRendererConfig(
+            codexCommandTemplate = listOf("docker", "run", "--network", "none", "codex-image", "codex"),
+            codexFalsifierArgs = listOf("--yolo"),
+        )
     }
 
     private fun request(

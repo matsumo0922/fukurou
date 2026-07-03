@@ -138,6 +138,16 @@ class ExposedLlmLaunchReservationRepository(
             }
         }
     }
+
+    override suspend fun hasFreshRunningReservation(activeSince: Instant): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    countActiveReservations(activeSince) > 0
+                }
+            }
+        }
+    }
 }
 
 private fun JdbcTransaction.tryReserveInTransaction(

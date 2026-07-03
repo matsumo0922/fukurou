@@ -158,6 +158,10 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped(DAEMON_SKIP_HARD_HALT, null)
         }
 
+        if (hasFreshRunningReservation(observedAt)) {
+            return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
+        }
+
         val trigger = selectTrigger(observedAt)
 
         if (trigger == null) {
@@ -165,6 +169,12 @@ class LlmDaemonScheduler(
         }
 
         return reserveAndLaunch(trigger, observedAt)
+    }
+
+    private suspend fun hasFreshRunningReservation(observedAt: Instant): Boolean {
+        val activeSince = observedAt.minus(daemonConfig.launchReservationStaleAfter)
+
+        return launchReservationRepository.hasFreshRunningReservation(activeSince).getOrThrow()
     }
 
     private suspend fun reserveAndLaunch(

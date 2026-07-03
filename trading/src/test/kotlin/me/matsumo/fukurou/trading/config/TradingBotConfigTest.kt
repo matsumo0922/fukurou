@@ -24,11 +24,11 @@ class TradingBotConfigTest {
         assertEquals(48, config.runner.maxToolCallsPerRun)
         assertEquals(3, config.runner.maxActToolCallsPerRun)
         assertEquals(Duration.ofSeconds(180), config.runner.perRunTimeout)
-        assertEquals(1, config.runner.maxInvocationsPerHour)
-        assertEquals(10, config.runner.maxInvocationsPerDay)
+        assertEquals(4, config.runner.maxInvocationsPerHour)
+        assertEquals(96, config.runner.maxInvocationsPerDay)
         assertEquals(false, config.daemon.enabled)
-        assertEquals(Duration.ofHours(6), config.daemon.flatHeartbeatInterval)
-        assertEquals(Duration.ofHours(3), config.daemon.holdingCheckInterval)
+        assertEquals(Duration.ofMinutes(15), config.daemon.flatHeartbeatInterval)
+        assertEquals(Duration.ofMinutes(15), config.daemon.holdingCheckInterval)
         assertEquals(10, config.gmoPublicClient.rateLimit.permitsPerSecond)
     }
 
@@ -200,12 +200,12 @@ class TradingBotConfigTest {
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "2"),
+                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "5"),
             )
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY" to "11"),
+                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY" to "97"),
             )
         }
         assertFailsWith<IllegalArgumentException> {
@@ -215,12 +215,12 @@ class TradingBotConfigTest {
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS" to "3600"),
+                mapOf("FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS" to "600"),
             )
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_LLM_HOLDING_CHECK_SECONDS" to "3600"),
+                mapOf("FUKUROU_LLM_HOLDING_CHECK_SECONDS" to "600"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

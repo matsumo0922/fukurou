@@ -32,13 +32,13 @@ import kotlin.test.assertTrue
 class LlmDaemonSchedulerTest {
 
     @Test
-    fun flatState_launchesOnlyOnSixHourHeartbeatWhenNoEventExists() = runBlocking {
+    fun flatState_launchesOnlyOnFifteenMinuteHeartbeatWhenNoEventExists() = runBlocking {
         val fixture = schedulerFixture()
 
         val firstResult = fixture.scheduler.tick()
-        fixture.clock.advance(Duration.ofHours(5))
+        fixture.clock.advance(Duration.ofMinutes(14))
         val waitingResult = fixture.scheduler.tick()
-        fixture.clock.advance(Duration.ofHours(1))
+        fixture.clock.advance(Duration.ofMinutes(1))
         val secondResult = fixture.scheduler.tick()
 
         assertIs<LlmDaemonTickResult.Launched>(firstResult)
@@ -50,10 +50,38 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun eventTriggerLaunchesAndBudgetSkipIsAudited() = runBlocking {
+    fun eventTriggerLaunchesWithinFifteenMinuteBudget() = runBlocking {
         val eventAt = fixedInstant().plus(Duration.ofMinutes(10))
         val fixture = schedulerFixture(
             tradingConfig = tradingConfig(
+                events = listOf(
+                    EconomicEventBlackout(
+                        eventId = "cpi-20260703",
+                        eventName = "CPI",
+                        eventAt = eventAt,
+                        blackoutBefore = Duration.ZERO,
+                        blackoutAfter = Duration.ofMinutes(60),
+                    ),
+                ),
+            ),
+        )
+
+        val heartbeatResult = fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofMinutes(10))
+        val eventResult = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(heartbeatResult)
+        assertIs<LlmDaemonTickResult.Launched>(eventResult)
+        assertEquals(2, fixture.launches.size)
+        assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, eventResult.triggerKind)
+    }
+
+    @Test
+    fun eventTriggerUsesSameHourlyBudgetWhenCapIsLowered() = runBlocking {
+        val eventAt = fixedInstant().plus(Duration.ofMinutes(10))
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                runner = LlmRunnerConfig(maxInvocationsPerHour = 1),
                 events = listOf(
                     EconomicEventBlackout(
                         eventId = "cpi-20260703",
@@ -80,13 +108,13 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun holdingStateUsesDenseThreeHourCadence() = runBlocking {
+    fun holdingStateUsesDenseFifteenMinuteCadence() = runBlocking {
         val fixture = schedulerFixture(hasOpenRisk = true)
 
         val firstResult = fixture.scheduler.tick()
-        fixture.clock.advance(Duration.ofHours(2))
+        fixture.clock.advance(Duration.ofMinutes(14))
         val waitingResult = fixture.scheduler.tick()
-        fixture.clock.advance(Duration.ofHours(1))
+        fixture.clock.advance(Duration.ofMinutes(1))
         val secondResult = fixture.scheduler.tick()
 
         assertIs<LlmDaemonTickResult.Launched>(firstResult)
@@ -117,7 +145,7 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun concurrentTriggerResultsInExactlyOneInvocation() = runBlocking {
+    fun freshRunningReservationSuppressesRepeatedTriggerAudit() = runBlocking {
         val eventAt = fixedInstant().plus(Duration.ofMinutes(5))
         val launchStarted = CompletableDeferred<Unit>()
         val releaseLaunch = CompletableDeferred<Unit>()
@@ -144,13 +172,16 @@ class LlmDaemonSchedulerTest {
         launchStarted.await()
         fixture.clock.advance(Duration.ofMinutes(5))
         val secondResult = fixture.scheduler.tick()
+        val skipEvents = fixture.eventLog.events()
+            .filter { event -> event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED }
 
         releaseLaunch.complete(Unit)
         firstTick.await()
 
         assertIs<LlmDaemonTickResult.Skipped>(secondResult)
-        assertEquals("concurrent_invocation", secondResult.reason)
+        assertEquals("no_trigger_due", secondResult.reason)
         assertEquals(1, fixture.launches.size)
+        assertTrue(skipEvents.none { event -> event.payload.contains("concurrent_invocation") })
     }
 
     @Test
@@ -160,7 +191,7 @@ class LlmDaemonSchedulerTest {
         }
 
         val firstResult = fixture.scheduler.tick()
-        fixture.clock.advance(Duration.ofHours(6))
+        fixture.clock.advance(Duration.ofMinutes(15))
         val secondResult = fixture.scheduler.tick()
 
         assertIs<LlmDaemonTickResult.Launched>(firstResult)
@@ -184,7 +215,7 @@ class LlmDaemonSchedulerTest {
         }
 
         val failedResult = fixture.scheduler.tick()
-        fixture.clock.advance(Duration.ofHours(6))
+        fixture.clock.advance(Duration.ofMinutes(15))
         val resumedResult = fixture.scheduler.tick()
 
         assertIs<LlmDaemonTickResult.Failed>(failedResult)
@@ -247,7 +278,7 @@ class LlmDaemonSchedulerTest {
         )
 
         val failedResult = fixture.scheduler.tick()
-        fixture.clock.advance(Duration.ofMinutes(61))
+        fixture.clock.advance(Duration.ofMinutes(15))
         val retriedResult = fixture.scheduler.tick()
 
         assertIs<LlmDaemonTickResult.Failed>(failedResult)

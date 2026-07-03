@@ -578,6 +578,7 @@ private fun List<String>.unsafeExternalSandboxTemplateArgs(): List<String> {
 
         when {
             argument in UNSAFE_CONTAINER_FLAGS -> argument
+            argument.expectsSeparateNetworkValue() && nextArgument.isHostNetworkMode() -> "$argument $nextArgument"
             argument.hasUnsafeNetworkMode() -> argument
             argument.hasInlineRootBindMount() -> argument
             argument.expectsSeparateMountValue() && nextArgument.hasRootBindMount() -> "$argument $nextArgument"
@@ -588,6 +589,14 @@ private fun List<String>.unsafeExternalSandboxTemplateArgs(): List<String> {
 
 private fun String.hasUnsafeNetworkMode(): Boolean {
     return startsWith("--net=host") || startsWith("--network=host")
+}
+
+private fun String.expectsSeparateNetworkValue(): Boolean {
+    return this == "--net" || this == "--network"
+}
+
+private fun String?.isHostNetworkMode(): Boolean {
+    return this == "host"
 }
 
 private fun String.expectsSeparateMountValue(): Boolean {
@@ -648,6 +657,4 @@ private val CONTAINER_SANDBOX_COMMANDS = setOf(
  */
 private val UNSAFE_CONTAINER_FLAGS = setOf(
     "--privileged",
-    "--net",
-    "--network",
 )
