@@ -5,6 +5,7 @@ import java.nio.file.Path
 import java.time.Duration
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -20,7 +21,7 @@ class DefaultLlmCommandRendererTest {
                 codexCommandTemplate = listOf("docker", "run", "--rm", "codex-image", "codex"),
                 codexModel = "gpt-5-codex-test",
                 codexCommonArgs = listOf("--headless-test"),
-                codexFalsifierArgs = listOf("--sandbox-test"),
+                codexFalsifierArgs = listOf("--yolo"),
             ),
         )
         val request = request(
@@ -36,7 +37,7 @@ class DefaultLlmCommandRendererTest {
         assertEquals(listOf("run", "--rm", "codex-image", "codex", "exec"), command.args.take(5))
         assertTrue(joinedArgs.contains("-m gpt-5-codex-test"))
         assertTrue(joinedArgs.contains("--headless-test"))
-        assertTrue(joinedArgs.contains("--sandbox-test"))
+        assertTrue(joinedArgs.contains("--yolo"))
         assertTrue(joinedArgs.contains("mcp_servers.custom-mcp.command"))
         assertFalse(joinedArgs.contains("mcp_servers.fukurou-mcp.command"))
     }
@@ -81,6 +82,44 @@ class DefaultLlmCommandRendererTest {
         val joinedArgs = command.args.joinToString(" ")
 
         assertFalse(joinedArgs.contains("--dangerously-bypass-approvals-and-sandbox"))
+    }
+
+    @Test
+    fun configRejectsCommonArgsThatOverrideSafetyBoundary() {
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                claudeCommonArgs = listOf("--allowedTools", "Bash"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                claudeCommonArgs = listOf("--mcp-config=unsafe.json"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommonArgs = listOf("-c", "approval_policy=\"on-request\""),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommonArgs = listOf("--dangerously-bypass-approvals-and-sandbox"),
+            )
+        }
+    }
+
+    @Test
+    fun configRestrictsCodexFalsifierArgsToExplicitSandboxOptIn() {
+        val config = LlmCommandRendererConfig(
+            codexFalsifierArgs = listOf("--dangerously-bypass-approvals-and-sandbox"),
+        )
+
+        assertEquals(listOf("--dangerously-bypass-approvals-and-sandbox"), config.codexFalsifierArgs)
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexFalsifierArgs = listOf("-c", "mcp_servers.unsafe.command=\"bash\""),
+            )
+        }
     }
 
     private fun request(

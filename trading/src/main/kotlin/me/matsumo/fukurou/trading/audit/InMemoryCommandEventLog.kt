@@ -32,6 +32,23 @@ class InMemoryCommandEventLog : CommandEventLog {
         }
     }
 
+    override suspend fun countToolCallEvents(
+        decisionRunId: String,
+        toolNames: Set<String>,
+    ): Result<Int> {
+        return runCatching {
+            mutex.withLock {
+                storedEvents.count { event ->
+                    val decisionRunMatched = event.decisionRunContext.decisionRunId == decisionRunId
+                    val toolNameMatched = event.toolName in toolNames
+                    val eventTypeMatched = event.eventType in TOOL_CALL_COUNTED_EVENT_TYPES
+
+                    decisionRunMatched && toolNameMatched && eventTypeMatched
+                }
+            }
+        }
+    }
+
     /**
      * 保存済みイベントの snapshot を返す。
      */
@@ -39,3 +56,12 @@ class InMemoryCommandEventLog : CommandEventLog {
         return mutex.withLock { storedEvents.toList() }
     }
 }
+
+/**
+ * tool call 数として扱う監査イベント種別。
+ */
+private val TOOL_CALL_COUNTED_EVENT_TYPES = setOf(
+    CommandEventType.TOOL_CALL_COMPLETED,
+    CommandEventType.TOOL_CALL_REJECTED_BY_HARD_HALT,
+    CommandEventType.NO_TRADE_EXIT,
+)

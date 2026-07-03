@@ -94,4 +94,12 @@ interface CommandEventLog {
      * 指定時刻以降に audit へ現れた distinct decision run ID 数を返す。
      */
     suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int>
+
+    /**
+     * 指定 decision run ID に紐づく tool call 監査イベント数を返す。
+     */
+    suspend fun countToolCallEvents(
+        decisionRunId: String,
+        toolNames: Set<String>,
+    ): Result<Int>
 }

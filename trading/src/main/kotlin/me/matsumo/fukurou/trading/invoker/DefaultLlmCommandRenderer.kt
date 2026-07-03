@@ -27,11 +27,25 @@ data class LlmCommandRendererConfig(
     val codexFalsifierArgs: List<String> = DEFAULT_CODEX_FALSIFIER_ARGS,
 ) {
     init {
+        val unsafeClaudeArgs = claudeCommonArgs.filterUnsafeArgs(CLAUDE_COMMON_ARG_FORBIDDEN_FLAGS)
+        val unsafeCodexCommonArgs = codexCommonArgs.filterUnsafeArgs(CODEX_COMMON_ARG_FORBIDDEN_FLAGS)
+        val unsafeCodexFalsifierArgs = codexFalsifierArgs
+            .filterNot { argument -> argument in CODEX_FALSIFIER_ARG_ALLOWLIST }
+
         require(claudeCommandTemplate.isNotEmpty()) {
             "claudeCommandTemplate must not be empty."
         }
         require(codexCommandTemplate.isNotEmpty()) {
             "codexCommandTemplate must not be empty."
+        }
+        require(unsafeClaudeArgs.isEmpty()) {
+            "claudeCommonArgs must not override MCP or permission flags: $unsafeClaudeArgs"
+        }
+        require(unsafeCodexCommonArgs.isEmpty()) {
+            "codexCommonArgs must not override sandbox, config, or approval flags: $unsafeCodexCommonArgs"
+        }
+        require(unsafeCodexFalsifierArgs.isEmpty()) {
+            "codexFalsifierArgs may only include explicit Falsifier sandbox opt-in flags: $unsafeCodexFalsifierArgs"
         }
     }
 
@@ -93,7 +107,7 @@ class DefaultLlmCommandRenderer(
             "--strict-mcp-config",
             "--allowedTools",
             allowedTools,
-        ) + config.claudeModelArgs() + config.claudeCommonArgs
+        ) + config.claudeModelArgs() + ENFORCED_CLAUDE_COMMON_ARGS + config.claudeCommonArgs
 
         return config.claudeCommandTemplate.toRenderedCommand(
             args = args,
@@ -112,6 +126,7 @@ class DefaultLlmCommandRenderer(
         }
         val args = listOf("exec") +
             config.codexModelArgs() +
+            ENFORCED_CODEX_COMMON_ARGS +
             config.codexCommonArgs +
             phaseArgs +
             request.mcpServer.toCodexConfigArgs(request.mcpServer.name) +
@@ -213,7 +228,12 @@ val DEFAULT_CODEX_COMMAND_TEMPLATE = listOf("codex")
 /**
  * Claude headless 実行の既定共通引数。
  */
-val DEFAULT_CLAUDE_COMMON_ARGS = listOf(
+val DEFAULT_CLAUDE_COMMON_ARGS = emptyList<String>()
+
+/**
+ * Claude headless 実行で常に付ける安全側引数。
+ */
+val ENFORCED_CLAUDE_COMMON_ARGS = listOf(
     "--permission-mode",
     "dontAsk",
     "--output-format",
@@ -224,7 +244,12 @@ val DEFAULT_CLAUDE_COMMON_ARGS = listOf(
 /**
  * Codex headless 実行の既定共通引数。
  */
-val DEFAULT_CODEX_COMMON_ARGS = listOf(
+val DEFAULT_CODEX_COMMON_ARGS = emptyList<String>()
+
+/**
+ * Codex headless 実行で常に付ける安全側引数。
+ */
+val ENFORCED_CODEX_COMMON_ARGS = listOf(
     "--ignore-user-config",
     "--sandbox",
     "read-only",
@@ -238,6 +263,36 @@ val DEFAULT_CODEX_COMMON_ARGS = listOf(
  * 外部 sandbox の実体は運用設定で差し替えるため、既定では危険側の bypass 引数を付けない。
  */
 val DEFAULT_CODEX_FALSIFIER_ARGS = emptyList<String>()
+
+/**
+ * Claude common args で上書きさせない安全境界 flag。
+ */
+val CLAUDE_COMMON_ARG_FORBIDDEN_FLAGS = setOf(
+    "--mcp-config",
+    "--allowedTools",
+    "--permission-mode",
+    "--dangerously-skip-permissions",
+)
+
+/**
+ * Codex common args で上書きさせない安全境界 flag。
+ */
+val CODEX_COMMON_ARG_FORBIDDEN_FLAGS = setOf(
+    "-c",
+    "--config",
+    "--sandbox",
+    "--ask-for-approval",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--yolo",
+)
+
+/**
+ * Falsifier 専用 args で許可する明示的な外部 sandbox opt-in flag。
+ */
+val CODEX_FALSIFIER_ARG_ALLOWLIST = setOf(
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--yolo",
+)
 
 /**
  * Claude CLI command template の環境変数名。
@@ -285,6 +340,12 @@ private fun Map<String, String>.readOptional(name: String): String? {
     return this[name]
         ?.trim()
         ?.takeIf { value -> value.isNotBlank() }
+}
+
+private fun List<String>.filterUnsafeArgs(forbiddenFlags: Set<String>): List<String> {
+    return filter { argument ->
+        argument in forbiddenFlags || forbiddenFlags.any { forbiddenFlag -> argument.startsWith("$forbiddenFlag=") }
+    }
 }
 
 private fun String.splitCommandTemplate(): List<String> {

@@ -162,6 +162,42 @@ private const val REJECT_DUMMY_TRADE_TOOL = "reject_dummy_trade"
 private const val SIMULATE_TOOL_TIMEOUT_TOOL = "simulate_tool_timeout"
 
 /**
+ * MCP server が公開する tool 名一覧。
+ */
+private val MCP_TOOL_NAMES = setOf(
+    "get_ticker",
+    "get_candles",
+    "get_orderbook",
+    "get_trades",
+    "get_symbol_rules",
+    "calc_indicator",
+    GET_BALANCE_TOOL,
+    GET_POSITIONS_TOOL,
+    GET_OPEN_ORDERS_TOOL,
+    GET_ACCOUNT_STATUS_TOOL,
+    GET_TRADE_INTENT_TOOL,
+    SUBMIT_DECISION_TOOL,
+    SUBMIT_FALSIFICATION_TOOL,
+    PLACE_ORDER_TOOL,
+    CLOSE_POSITION_TOOL,
+    UPDATE_PROTECTION_TOOL,
+    CANCEL_ORDER_TOOL,
+    REJECT_DUMMY_TRADE_TOOL,
+    SIMULATE_TOOL_TIMEOUT_TOOL,
+)
+
+/**
+ * act tool call 上限として数える tool 名一覧。
+ */
+private val MCP_ACT_TOOL_NAMES = setOf(
+    PLACE_ORDER_TOOL,
+    CLOSE_POSITION_TOOL,
+    UPDATE_PROTECTION_TOOL,
+    CANCEL_ORDER_TOOL,
+    REJECT_DUMMY_TRADE_TOOL,
+)
+
+/**
  * MCP stdio smoke で DB なし in-memory runtime を明示許可する環境変数名。
  */
 private const val FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME_ENV = "FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME"
@@ -238,6 +274,8 @@ class FukurouMcpServer(
         config = tradingConfig.runner,
         toolCallGuard = tradingRuntime.toolCallGuard,
         allowedToolNames = mcpAllowedToolNamesFromEnvironment(),
+        countedToolNames = MCP_TOOL_NAMES,
+        actToolNames = MCP_ACT_TOOL_NAMES,
     ),
 ) {
 
@@ -1606,6 +1644,7 @@ private fun throwableResult(throwable: Throwable): CallToolResult {
         is HardHaltTradingRejectedException -> "hard_halt"
         is NoTradeExitException -> "no_trade"
         is ToolCallLimitExceededException -> "tool_call_limit_exceeded"
+        is ToolCallLimitUnavailableException -> "tool_call_limit_unavailable"
         is ToolCallNotAllowedException -> "tool_call_not_allowed"
         is ToolCompletionAuditFailedException -> "audit_failed_after_execution"
         is MarketInvalidRequestException -> "invalid_request"
