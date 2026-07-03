@@ -3,27 +3,27 @@ package me.matsumo.fukurou.trading.audit
 /**
  * daemon が MCP 子プロセスへ渡す decision run id の環境変数名。
  */
-private const val FUKUROU_INVOCATION_ID_ENV = "FUKUROU_INVOCATION_ID"
+const val FUKUROU_INVOCATION_ID_ENV = "FUKUROU_INVOCATION_ID"
 
 /**
  * LLM provider 名を監査ログへ伝播する環境変数名。
  */
-private const val FUKUROU_LLM_PROVIDER_ENV = "FUKUROU_LLM_PROVIDER"
+const val FUKUROU_LLM_PROVIDER_ENV = "FUKUROU_LLM_PROVIDER"
 
 /**
  * prompt hash を監査ログへ伝播する環境変数名。
  */
-private const val FUKUROU_PROMPT_HASH_ENV = "FUKUROU_PROMPT_HASH"
+const val FUKUROU_PROMPT_HASH_ENV = "FUKUROU_PROMPT_HASH"
 
 /**
  * system prompt version を監査ログへ伝播する環境変数名。
  */
-private const val FUKUROU_SYSTEM_PROMPT_VERSION_ENV = "FUKUROU_SYSTEM_PROMPT_VERSION"
+const val FUKUROU_SYSTEM_PROMPT_VERSION_ENV = "FUKUROU_SYSTEM_PROMPT_VERSION"
 
 /**
  * market snapshot id を監査ログへ伝播する環境変数名。
  */
-private const val FUKUROU_MARKET_SNAPSHOT_ID_ENV = "FUKUROU_MARKET_SNAPSHOT_ID"
+const val FUKUROU_MARKET_SNAPSHOT_ID_ENV = "FUKUROU_MARKET_SNAPSHOT_ID"
 
 /**
  * 1 回の LLM 起動に紐づく監査コンテキスト。

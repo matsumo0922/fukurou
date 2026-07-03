@@ -19,6 +19,21 @@ interface DecisionRepository {
     suspend fun submitFalsification(submission: FalsificationSubmission): Result<FalsificationRecord>
 
     /**
+     * invocation ID に紐づく最新 decision と付随する intent / TradePlan を取得する。
+     */
+    suspend fun latestDecisionByInvocationId(invocationId: String): Result<DecisionSubmissionResult?>
+
+    /**
+     * intent ID に紐づく最新 falsification を取得する。
+     */
+    suspend fun latestFalsification(intentId: UUID): Result<FalsificationRecord?>
+
+    /**
+     * Falsifier review 用に intent と TradePlan を読み直す。
+     */
+    suspend fun tradeIntentReviewSnapshot(intentId: UUID): Result<TradeIntentReviewSnapshot?>
+
+    /**
      * SafetyFloor 用に intent / falsification / consumption の snapshot を取得する。
      */
     suspend fun entryIntentSafetySnapshot(

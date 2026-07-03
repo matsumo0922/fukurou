@@ -96,6 +96,16 @@ class ToolCallGuard(
         )
     }
 
+    /**
+     * 指定 decision run ID の tool call 監査イベント数を返す。
+     */
+    suspend fun countToolCallEvents(
+        decisionRunId: String,
+        toolNames: Set<String>,
+    ): Result<Int> {
+        return commandEventLog.countToolCallEvents(decisionRunId, toolNames)
+    }
+
     private suspend fun <T> runLockedTool(
         call: GuardedToolCall,
         enforceHardHalt: Boolean,

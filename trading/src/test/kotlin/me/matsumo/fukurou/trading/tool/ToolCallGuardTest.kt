@@ -290,6 +290,17 @@ private class ToolContextSwitchingCommandEventLog : CommandEventLog {
         }
     }
 
+    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+        return Result.success(0)
+    }
+
+    override suspend fun countToolCallEvents(
+        decisionRunId: String,
+        toolNames: Set<String>,
+    ): Result<Int> {
+        return Result.success(0)
+    }
+
     /**
      * 保存済みイベントの snapshot を返す。
      */
@@ -304,6 +315,17 @@ private class ToolContextSwitchingCommandEventLog : CommandEventLog {
 private object FailingCommandEventLog : CommandEventLog {
     override suspend fun append(event: CommandEvent): Result<Unit> {
         return Result.failure(IllegalStateException("audit append failed"))
+    }
+
+    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+        return Result.failure(IllegalStateException("audit count failed"))
+    }
+
+    override suspend fun countToolCallEvents(
+        decisionRunId: String,
+        toolNames: Set<String>,
+    ): Result<Int> {
+        return Result.failure(IllegalStateException("audit count failed"))
     }
 }
 

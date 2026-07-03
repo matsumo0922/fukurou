@@ -245,6 +245,17 @@ data class EntryIntentSafetySnapshot(
 )
 
 /**
+ * Falsifier が intent ID だけから読み直す review 用 snapshot。
+ *
+ * @param tradeIntent intent 宣言
+ * @param tradePlan intent に紐づく TradePlan
+ */
+data class TradeIntentReviewSnapshot(
+    val tradeIntent: TradeIntentRecord,
+    val tradePlan: TradePlanRecord?,
+)
+
+/**
  * intent 消費記録。
  *
  * @param consumptionId consumption ID

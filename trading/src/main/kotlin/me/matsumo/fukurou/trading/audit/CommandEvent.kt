@@ -51,6 +51,11 @@ enum class CommandEventType {
      * 手動再開の骨格が reason 付きで実行された。
      */
     MANUAL_RESUME_REQUESTED,
+
+    /**
+     * one-shot runner の phase が完了した。
+     */
+    RUNNER_PHASE_COMPLETED,
 }
 
 /**
@@ -84,4 +89,17 @@ interface CommandEventLog {
      * event を append-only で保存する。
      */
     suspend fun append(event: CommandEvent): Result<Unit>
+
+    /**
+     * 指定時刻以降に audit へ現れた distinct decision run ID 数を返す。
+     */
+    suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int>
+
+    /**
+     * 指定 decision run ID に紐づく tool call 監査イベント数を返す。
+     */
+    suspend fun countToolCallEvents(
+        decisionRunId: String,
+        toolNames: Set<String>,
+    ): Result<Int>
 }

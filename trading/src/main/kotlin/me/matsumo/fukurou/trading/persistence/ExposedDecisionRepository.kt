@@ -17,6 +17,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.MAX_TRADE_PLAN_REVISIONS
 import me.matsumo.fukurou.trading.decision.TradeIntentConsumptionRecord
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
+import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanRecord
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
@@ -152,6 +153,29 @@ private const val SELECT_TRADE_INTENT_BY_ID_SQL = """
 """
 
 /**
+ * decision ID で trade_intents を読む SQL。
+ */
+private const val SELECT_TRADE_INTENT_BY_DECISION_ID_SQL = """
+    SELECT
+        id,
+        decision_id,
+        trade_plan_id,
+        symbol,
+        side,
+        order_type,
+        size_btc,
+        price_jpy,
+        protective_stop_price_jpy,
+        take_profit_price_jpy,
+        estimated_win_probability,
+        created_at
+    FROM trade_intents
+    WHERE decision_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+"""
+
+/**
  * TradePlan ID で trade_plans を読む SQL。
  */
 private const val SELECT_TRADE_PLAN_BY_ID_SQL = """
@@ -172,6 +196,57 @@ private const val SELECT_TRADE_PLAN_BY_ID_SQL = """
 """
 
 /**
+ * decision ID で trade_plans を読む SQL。
+ */
+private const val SELECT_TRADE_PLAN_BY_DECISION_ID_SQL = """
+    SELECT
+        id,
+        decision_id,
+        parent_trade_plan_id,
+        revision_count,
+        symbol,
+        thesis_ja,
+        invalidation_conditions_ja,
+        target_price_jpy,
+        time_stop_at,
+        setup_tags,
+        created_at
+    FROM trade_plans
+    WHERE decision_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+"""
+
+/**
+ * invocation ID で latest decision を読む SQL。
+ */
+private const val SELECT_LATEST_DECISION_BY_INVOCATION_ID_SQL = """
+    SELECT
+        id,
+        invocation_id,
+        llm_provider,
+        prompt_hash,
+        system_prompt_version,
+        market_snapshot_id,
+        action,
+        setup_tags,
+        estimated_win_probability,
+        expected_r_multiple,
+        round_trip_cost_r,
+        tool_evidence_ids,
+        fact_check,
+        self_review,
+        reason_ja,
+        missing_data_ja,
+        no_trade_conditions_ja,
+        created_at
+    FROM decisions
+    WHERE invocation_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+"""
+
+/**
  * intent ID で falsifications を読む SQL。
  */
 private const val SELECT_FALSIFICATION_BY_INTENT_ID_SQL = """
@@ -184,7 +259,8 @@ private const val SELECT_FALSIFICATION_BY_INTENT_ID_SQL = """
         created_at
     FROM falsifications
     WHERE intent_id = ?
-    ORDER BY created_at ASC
+    ORDER BY created_at DESC
+    LIMIT 1
 """
 
 /**
@@ -237,6 +313,50 @@ class ExposedDecisionRepository(
             runCatching {
                 exposedTransaction(database) {
                     insertFalsificationSubmission(submission, clock.instant())
+                }
+            }
+        }
+    }
+
+    override suspend fun latestDecisionByInvocationId(invocationId: String): Result<DecisionSubmissionResult?> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    val decision = selectLatestDecisionByInvocationId(invocationId) ?: return@exposedTransaction null
+                    val tradeIntent = selectTradeIntentByDecisionId(decision.decisionId)
+                    val tradePlan = selectTradePlanByDecisionId(decision.decisionId)
+
+                    DecisionSubmissionResult(
+                        decision = decision,
+                        tradeIntent = tradeIntent,
+                        tradePlan = tradePlan,
+                    )
+                }
+            }
+        }
+    }
+
+    override suspend fun latestFalsification(intentId: UUID): Result<FalsificationRecord?> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    selectFalsification(intentId)
+                }
+            }
+        }
+    }
+
+    override suspend fun tradeIntentReviewSnapshot(intentId: UUID): Result<TradeIntentReviewSnapshot?> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    val intent = selectTradeIntent(intentId) ?: return@exposedTransaction null
+                    val tradePlan = selectTradePlan(intent.tradePlanId)
+
+                    TradeIntentReviewSnapshot(
+                        tradeIntent = intent,
+                        tradePlan = tradePlan,
+                    )
                 }
             }
         }
@@ -477,11 +597,29 @@ private fun JdbcTransaction.selectTradeIntent(intentId: UUID): TradeIntentRecord
     }
 }
 
+private fun JdbcTransaction.selectTradeIntentByDecisionId(decisionId: UUID): TradeIntentRecord? {
+    return jdbcConnection().prepareStatement(SELECT_TRADE_INTENT_BY_DECISION_ID_SQL).use { statement ->
+        statement.setObject(1, decisionId)
+        statement.executeQuery().use { resultSet ->
+            if (resultSet.next()) resultSet.toTradeIntentRecord() else null
+        }
+    }
+}
+
 private fun JdbcTransaction.selectFalsification(intentId: UUID): FalsificationRecord? {
     return jdbcConnection().prepareStatement(SELECT_FALSIFICATION_BY_INTENT_ID_SQL).use { statement ->
         statement.setObject(1, intentId)
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.toFalsificationRecord() else null
+        }
+    }
+}
+
+private fun JdbcTransaction.selectLatestDecisionByInvocationId(invocationId: String): DecisionRecord? {
+    return jdbcConnection().prepareStatement(SELECT_LATEST_DECISION_BY_INVOCATION_ID_SQL).use { statement ->
+        statement.setString(1, invocationId)
+        statement.executeQuery().use { resultSet ->
+            if (resultSet.next()) resultSet.toDecisionRecord() else null
         }
     }
 }
@@ -495,6 +633,15 @@ private fun JdbcTransaction.selectTradePlan(tradePlanId: UUID): TradePlanRecord?
     }
 }
 
+private fun JdbcTransaction.selectTradePlanByDecisionId(decisionId: UUID): TradePlanRecord? {
+    return jdbcConnection().prepareStatement(SELECT_TRADE_PLAN_BY_DECISION_ID_SQL).use { statement ->
+        statement.setObject(1, decisionId)
+        statement.executeQuery().use { resultSet ->
+            if (resultSet.next()) resultSet.toTradePlanRecord() else null
+        }
+    }
+}
+
 private fun JdbcTransaction.selectTradeIntentConsumption(intentId: UUID): TradeIntentConsumptionRecord? {
     return jdbcConnection().prepareStatement(SELECT_TRADE_INTENT_CONSUMPTION_BY_INTENT_ID_SQL).use { statement ->
         statement.setObject(1, intentId)
@@ -502,6 +649,33 @@ private fun JdbcTransaction.selectTradeIntentConsumption(intentId: UUID): TradeI
             if (resultSet.next()) resultSet.toTradeIntentConsumptionRecord() else null
         }
     }
+}
+
+private fun ResultSet.toDecisionRecord(): DecisionRecord {
+    return DecisionRecord(
+        decisionId = getObject("id", UUID::class.java),
+        submission = DecisionSubmission(
+            invocationId = getString("invocation_id"),
+            llmProvider = getString("llm_provider"),
+            promptHash = getString("prompt_hash"),
+            systemPromptVersion = getString("system_prompt_version"),
+            marketSnapshotId = getString("market_snapshot_id"),
+            action = me.matsumo.fukurou.trading.decision.DecisionAction.valueOf(getString("action")),
+            setupTags = getString("setup_tags").toStringList(),
+            estimatedWinProbability = getBigDecimal("estimated_win_probability"),
+            expectedRMultiple = getNullableBigDecimal("expected_r_multiple"),
+            roundTripCostR = getNullableBigDecimal("round_trip_cost_r"),
+            toolEvidenceIds = getString("tool_evidence_ids").toStringList(),
+            factCheckJson = getString("fact_check"),
+            selfReviewJson = getString("self_review"),
+            reasonJa = getString("reason_ja"),
+            missingDataJa = getString("missing_data_ja").toStringList(),
+            noTradeConditionsJa = getString("no_trade_conditions_ja").toStringList(),
+            entryIntent = null,
+            tradePlan = null,
+        ),
+        createdAt = Instant.ofEpochMilli(getLong("created_at")),
+    )
 }
 
 private fun ResultSet.toTradePlanRecord(): TradePlanRecord {

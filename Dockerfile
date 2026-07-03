@@ -33,6 +33,8 @@ COPY --from=build /src/fukurou/build/libs/*-all.jar app.jar
 COPY --from=build /src/mcp/build/libs/fukurou-mcp-all.jar fukurou-mcp-all.jar
 # standalone GMO Coin MCP fat JAR は分離検証や再利用用に同梱するが、entrypoint では起動しない。
 COPY --from=build /src/mcp-gmo-coin/build/libs/gmo-coin-mcp-all.jar gmo-coin-mcp-all.jar
+# one-shot runner が system prompt hash を計算するため、prompt 正本を同梱する。
+COPY prompts ./prompts
 USER appuser
 
 # JVM をコンテナの memory limit に追従させる。

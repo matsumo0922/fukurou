@@ -21,6 +21,10 @@ class TradingBotConfigTest {
         assertEquals(TradingMode.PAPER, config.mode)
         assertEquals(BigDecimal("100000"), config.paperAccount.initialCashJpy)
         assertEquals(BigDecimal("0.80"), config.safetyFloor.maxTotalExposureRatio)
+        assertEquals(30, config.runner.maxToolCallsPerRun)
+        assertEquals(3, config.runner.maxActToolCallsPerRun)
+        assertEquals(Duration.ofSeconds(180), config.runner.perRunTimeout)
+        assertEquals(12, config.runner.maxInvocationsPerHour)
         assertEquals(10, config.gmoPublicClient.rateLimit.permitsPerSecond)
     }
 
@@ -52,6 +56,10 @@ class TradingBotConfigTest {
                 "FUKUROU_GMO_RETRY_INITIAL_BACKOFF_MS" to "50",
                 "FUKUROU_GMO_RETRY_MAX_BACKOFF_MS" to "500",
                 "FUKUROU_GMO_RETRY_BACKOFF_MULTIPLIER" to "3",
+                "FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT" to "20",
+                "FUKUROU_MCP_ACT_TOOL_CALL_LIMIT" to "2",
+                "FUKUROU_LLM_RUN_TIMEOUT_SECONDS" to "120",
+                "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "8",
             ),
         )
 
@@ -79,6 +87,10 @@ class TradingBotConfigTest {
         assertEquals(Duration.ofMillis(50), config.gmoPublicClient.retry.initialBackoff)
         assertEquals(Duration.ofMillis(500), config.gmoPublicClient.retry.maxBackoff)
         assertEquals(3, config.gmoPublicClient.retry.backoffMultiplier)
+        assertEquals(20, config.runner.maxToolCallsPerRun)
+        assertEquals(2, config.runner.maxActToolCallsPerRun)
+        assertEquals(Duration.ofSeconds(120), config.runner.perRunTimeout)
+        assertEquals(8, config.runner.maxInvocationsPerHour)
     }
 
     @Test
@@ -151,6 +163,34 @@ class TradingBotConfigTest {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_GMO_PUBLIC_REST_BURST" to "11"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT" to "31"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_MCP_ACT_TOOL_CALL_LIMIT" to "4"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_RUN_TIMEOUT_SECONDS" to "181"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "13"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf(
+                    "FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT" to "1",
+                    "FUKUROU_MCP_ACT_TOOL_CALL_LIMIT" to "2",
+                ),
             )
         }
     }
