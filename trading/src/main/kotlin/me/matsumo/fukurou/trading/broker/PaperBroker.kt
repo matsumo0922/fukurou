@@ -67,13 +67,16 @@ class PaperBroker(
     private val decisionRepository: DecisionRepository = InMemoryDecisionRepository(),
     private val falsificationFreshnessWindow: Duration = DecisionProtocolConfig().falsificationFreshnessWindow,
     private val safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
-    private val safetyFloor: SafetyFloor = SafetyFloor(),
+    safetyFloor: SafetyFloor? = null,
     internal val marketDataSource: MarketDataSource? = null,
-    internal val fillSimulator: FillSimulator = FillSimulator(),
+    fillSimulator: FillSimulator? = null,
     private val reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
     private val clock: Clock = Clock.systemUTC(),
     private val tradingDateZone: ZoneId = TRADING_DATE_ZONE,
 ) : Broker {
+
+    private val safetyFloor = safetyFloor ?: SafetyFloor(clock = clock)
+    internal val fillSimulator = fillSimulator ?: FillSimulator(clock = clock)
 
     init {
         val hasAtomicLedgerRepository = ledgerRepository is IntentConsumingPaperLedgerRepository
@@ -337,6 +340,7 @@ class PaperBroker(
             } else {
                 null
             },
+            marketDataObservedAt = observedAt,
         )
     }
 

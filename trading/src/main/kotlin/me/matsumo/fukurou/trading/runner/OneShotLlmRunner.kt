@@ -27,6 +27,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
+import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
@@ -437,6 +438,11 @@ class OneShotLlmRunner(
         val startedAt = System.nanoTime()
         val result = llmInvoker.invoke(request)
         val duration = Duration.ofNanos(System.nanoTime() - startedAt)
+        val invocationResult = result.getOrNull()
+        val processResult = invocationResult?.processResult
+        val usage = processResult?.let { completedProcess ->
+            usageForAudit(request.provider, completedProcess.stdout)
+        }
 
         appendRunnerPhase(
             context = context,
@@ -444,17 +450,19 @@ class OneShotLlmRunner(
             duration = duration,
             details = buildJsonObject {
                 put("provider", request.provider.name.lowercase())
-                put("status", result.getOrNull()?.processResult?.status?.name ?: "FAILED_TO_START")
-                put("exitCode", result.getOrNull()?.processResult?.exitCode?.toString() ?: "null")
-                result.getOrNull()?.processResult?.let { processResult ->
-                    put("stdout", processOutputRedactor.redactAndTruncate(processResult.stdout))
-                    put("stderr", processOutputRedactor.redactAndTruncate(processResult.stderr))
+                put("status", processResult?.status?.name ?: "FAILED_TO_START")
+                put("exitCode", processResult?.exitCode?.toString() ?: "null")
+                processResult?.let { completedProcess ->
+                    put("stdout", processOutputRedactor.redactAndTruncate(completedProcess.stdout))
+                    put("stderr", processOutputRedactor.redactAndTruncate(completedProcess.stderr))
+                }
+                usage?.let { parsedUsage ->
+                    put("usage", LlmUsageParser.toJsonObject(parsedUsage))
                 }
             },
         ).getOrThrow()
         logHuman("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
 
-        val processResult = result.getOrNull()?.processResult
         val timedOut = processResult?.status == ProcessRunStatus.TIMED_OUT
         val nonZeroExit = processResult?.exitCode?.let { exitCode -> exitCode != 0 } ?: false
         val processFailed = when {
@@ -756,6 +764,11 @@ class OneShotLlmRunner(
 
     private fun logHuman(message: String) {
         logger("[fukurou-runner] $message")
+    }
+
+    private fun usageForAudit(provider: LlmProvider, stdout: String) = when (provider) {
+        LlmProvider.CLAUDE -> LlmUsageParser.parseClaudeStdout(stdout)
+        LlmProvider.CODEX -> null
     }
 }
 

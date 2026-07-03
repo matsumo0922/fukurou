@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
@@ -40,6 +41,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -876,6 +878,59 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf(OrderSide.BUY, OrderSide.SELL), executions.map { execution -> execution.side })
         assertEquals("10005000.00000000", watermark.highestPriceSinceEntryJpy)
         assertEquals("9685155.00000000", watermark.lowestPriceSinceEntryJpy)
+    }
+
+    @Test
+    fun evaluation_repository_readsClosedTradeFactAndKillStatsFromPostgresLedger() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+        repository.reconcile(
+            tickSnapshot = takeProfitTickSnapshot(),
+            simulator = FillSimulator(clock = fixedClock()),
+        ).getOrThrow()
+
+        val evaluationRepository = ExposedEvaluationRepository(database)
+        val tradeResult = evaluationRepository.fetchClosedTrades(
+            EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val trade = tradeResult.trades.single()
+        val executions = repository.getExecutions().getOrThrow()
+        val expectedPnl = executions
+            .filter { execution -> execution.side == OrderSide.SELL }
+            .sumOf { execution -> execution.realizedPnlJpy.toBigDecimal() }
+            .subtract(
+                executions
+                    .filter { execution -> execution.side == OrderSide.BUY }
+                    .sumOf { execution -> execution.feeJpy.toBigDecimal() },
+            )
+        val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
+
+        assertEquals(false, tradeResult.truncated)
+        assertEquals(listOf("integration-entry"), trade.setupTags)
+        assertEquals("9700000.00000000", trade.initialProtectiveStopPriceJpy?.toPlainString())
+        assertEquals("10100000.00000000", trade.highestPriceSinceEntryJpy.toPlainString())
+        assertEquals("10005000.00000000", trade.lowestPriceSinceEntryJpy?.toPlainString())
+        assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
+        assertEquals(1, killStats.closedTrades)
+        assertNull(killStats.profitFactor)
     }
 
     @Test

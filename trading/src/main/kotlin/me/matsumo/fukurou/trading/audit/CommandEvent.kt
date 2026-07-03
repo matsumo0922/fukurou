@@ -48,6 +48,11 @@ enum class CommandEventType {
     HARD_HALT_SET,
 
     /**
+     * 評価成績が kill 基準に到達した。
+     */
+    KILL_CRITERION_BREACHED,
+
+    /**
      * 手動再開の骨格が reason 付きで実行された。
      */
     MANUAL_RESUME_REQUESTED,
