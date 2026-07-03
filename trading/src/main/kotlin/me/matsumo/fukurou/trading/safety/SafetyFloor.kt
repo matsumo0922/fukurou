@@ -4,6 +4,8 @@ import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
+import me.matsumo.fukurou.trading.decision.EntryIntentDraft
+import me.matsumo.fukurou.trading.decision.EntryIntentSafetySnapshot
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -93,6 +95,21 @@ enum class SafetyFloorRule {
      * STOP が即時約定方向の価格だった。
      */
     IMMEDIATE_STOP_TRIGGER,
+
+    /**
+     * 新規 entry に fresh APPROVED falsification がない。
+     */
+    MISSING_FRESH_FALSIFICATION,
+
+    /**
+     * entry intent が既に order に消費されている。
+     */
+    INTENT_CONSUMED,
+
+    /**
+     * entry intent 宣言値と place_order 実引数が一致しない。
+     */
+    INTENT_MISMATCH,
 }
 
 /**
@@ -162,6 +179,7 @@ data class SafetyFloorConfig(
  * @param openOrders open order 一覧
  * @param ticker 最新 ticker
  * @param symbolRules 取引所 symbol rule
+ * @param entryIntent entry intent / falsification / consumption snapshot
  * @param atr14Jpy 5分足 ATR(14)
  */
 data class SafetyFloorContext(
@@ -171,6 +189,7 @@ data class SafetyFloorContext(
     val openOrders: List<Order>,
     val ticker: Ticker,
     val symbolRules: SymbolRules,
+    val entryIntent: EntryIntentSafetySnapshot? = null,
     val atr14Jpy: BigDecimal? = null,
 )
 
@@ -244,6 +263,7 @@ class SafetyFloor(
      */
     fun evaluatePlaceOrder(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyFloorVerdict {
         detectHardHalt(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateFalsifierGate(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateStopLoss(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateNoAveragingDown(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateGroupRisk(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
@@ -334,6 +354,84 @@ class SafetyFloor(
             measuredValue = measuredDrawdown.toPlainString(),
             limitValue = config.maxDrawdownRatio.toPlainString(),
             hardHaltRequired = true,
+        )
+    }
+
+    private fun validateFalsifierGate(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
+        val intentId = command.intentId
+            ?: return violation(
+                commandName = "place_order",
+                command = command,
+                rule = SafetyFloorRule.MISSING_FRESH_FALSIFICATION,
+                messageJa = "intent_id がないため、新規 entry は拒否します。",
+                measuredValue = "null",
+                limitValue = "fresh_approved_intent_required",
+            )
+        val snapshot = context.entryIntent
+            ?: return violation(
+                commandName = "place_order",
+                command = command,
+                rule = SafetyFloorRule.MISSING_FRESH_FALSIFICATION,
+                messageJa = "指定された intent_id に対応する fresh APPROVED falsification がありません。",
+                measuredValue = intentId.toString(),
+                limitValue = "fresh_approved_intent_required",
+            )
+
+        if (snapshot.consumed) {
+            return violation(
+                commandName = "place_order",
+                command = command,
+                rule = SafetyFloorRule.INTENT_CONSUMED,
+                messageJa = "指定された intent_id は既に消費済みです。",
+                measuredValue = intentId.toString(),
+                limitValue = "unused_intent_required",
+            )
+        }
+        if (!snapshot.freshApproved) {
+            val verdict = snapshot.falsification?.verdict?.name ?: "none"
+
+            return violation(
+                commandName = "place_order",
+                command = command,
+                rule = SafetyFloorRule.MISSING_FRESH_FALSIFICATION,
+                messageJa = "fresh な APPROVED falsification がないため、新規 entry は拒否します。",
+                measuredValue = verdict,
+                limitValue = "fresh_approved",
+            )
+        }
+
+        return validateIntentMatchesCommand(command, snapshot.tradeIntent.draft)
+    }
+
+    private fun validateIntentMatchesCommand(command: PlaceOrderCommand, intent: EntryIntentDraft): SafetyViolation? {
+        val symbolMatches = command.symbol == intent.symbol
+        val sideMatches = command.side == intent.side
+        val orderTypeMatches = command.orderType == intent.orderType
+        val sizeMatches = command.sizeBtc.sameAmountAs(intent.sizeBtc)
+        val entryPriceMatches = command.priceJpy.sameAmountAs(intent.priceJpy)
+        val stopPriceMatches = command.protectiveStopPriceJpy.sameAmountAs(intent.protectiveStopPriceJpy)
+        val takeProfitPriceMatches = command.takeProfitPriceJpy.sameAmountAs(intent.takeProfitPriceJpy)
+        val intentMatches = listOf(
+            symbolMatches,
+            sideMatches,
+            orderTypeMatches,
+            sizeMatches,
+            entryPriceMatches,
+            stopPriceMatches,
+            takeProfitPriceMatches,
+        ).all { matched -> matched }
+
+        if (intentMatches) {
+            return null
+        }
+
+        return violation(
+            commandName = "place_order",
+            command = command,
+            rule = SafetyFloorRule.INTENT_MISMATCH,
+            messageJa = "entry intent の宣言値と place_order の実引数が一致しません。",
+            measuredValue = command.intentComparisonValue(),
+            limitValue = intent.intentComparisonValue(),
         )
     }
 
@@ -808,6 +906,52 @@ private fun Position.isLosingLong(): Boolean {
     val belowEntry = currentPriceJpy.toBigDecimal() < averageEntryPriceJpy.toBigDecimal()
 
     return unrealizedLoss || belowEntry
+}
+
+private fun BigDecimal?.sameAmountAs(other: BigDecimal?): Boolean {
+    if (this == null || other == null) {
+        return this == null && other == null
+    }
+
+    return compareTo(other) == 0
+}
+
+private fun PlaceOrderCommand.intentComparisonValue(): String {
+    return intentComparisonValue(
+        symbolText = symbol.apiSymbol,
+        sideText = side.name,
+        orderTypeText = orderType.name,
+        sizeBtc = sizeBtc,
+        priceJpy = priceJpy,
+        protectiveStopPriceJpy = protectiveStopPriceJpy,
+        takeProfitPriceJpy = takeProfitPriceJpy,
+    )
+}
+
+private fun EntryIntentDraft.intentComparisonValue(): String {
+    return intentComparisonValue(
+        symbolText = symbol.apiSymbol,
+        sideText = side.name,
+        orderTypeText = orderType.name,
+        sizeBtc = sizeBtc,
+        priceJpy = priceJpy,
+        protectiveStopPriceJpy = protectiveStopPriceJpy,
+        takeProfitPriceJpy = takeProfitPriceJpy,
+    )
+}
+
+private fun intentComparisonValue(
+    symbolText: String,
+    sideText: String,
+    orderTypeText: String,
+    sizeBtc: BigDecimal,
+    priceJpy: BigDecimal?,
+    protectiveStopPriceJpy: BigDecimal,
+    takeProfitPriceJpy: BigDecimal?,
+): String {
+    return "symbol=$symbolText,side=$sideText,type=$orderTypeText,size=${sizeBtc.toPlainString()}," +
+        "entry=${priceJpy?.toPlainString()},stop=${protectiveStopPriceJpy.toPlainString()}," +
+        "tp=${takeProfitPriceJpy?.toPlainString()}"
 }
 
 private fun BigDecimal.maxZero(): BigDecimal {

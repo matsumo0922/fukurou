@@ -34,6 +34,7 @@ import java.math.BigDecimal
 import java.math.RoundingMode
 import java.sql.PreparedStatement
 import java.time.Clock
+import java.time.Instant
 import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
@@ -81,6 +82,57 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    insertEntryOrder(command, orderId, null, tradeGroupId, OrderStatus.OPEN)
+
+                    PaperTradeResult(
+                        accepted = true,
+                        status = OrderStatus.OPEN,
+                        orderIds = listOf(orderId.toString()),
+                        positionIds = emptyList(),
+                        executionIds = emptyList(),
+                        messageJa = "resting entry intent を保存しました。",
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * MARKET entry と intent consumption を同一 transaction で保存する。
+     */
+    suspend fun fillMarketEntryAndConsumeIntent(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        stopOrderId: UUID,
+        intentId: UUID,
+        consumedAt: Instant,
+    ): Result<PaperTradeResult> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    insertTradeIntentConsumption(intentId, command.commandId, consumedAt)
+                    insertEntryFill(command, fill, positionId, tradeGroupId, command.commandId, stopOrderId)
+                }
+            }
+        }
+    }
+
+    /**
+     * resting entry order と intent consumption を同一 transaction で保存する。
+     */
+    suspend fun createRestingEntryOrderAndConsumeIntent(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+        intentId: UUID,
+        consumedAt: Instant,
+    ): Result<PaperTradeResult> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    insertTradeIntentConsumption(intentId, orderId, consumedAt)
                     insertEntryOrder(command, orderId, null, tradeGroupId, OrderStatus.OPEN)
 
                     PaperTradeResult(
@@ -251,6 +303,51 @@ internal class ExposedPaperLedgerWriter(
         )
     }
 
+    private fun JdbcTransaction.insertTradeIntentConsumption(
+        intentId: UUID,
+        orderId: UUID,
+        consumedAt: Instant,
+    ) {
+        require(tradeIntentExists(intentId)) {
+            "trade intent was not found."
+        }
+        require(!tradeIntentConsumed(intentId)) {
+            "trade intent was already consumed."
+        }
+
+        prepare(
+            """
+                INSERT INTO trade_intent_consumptions (
+                    id,
+                    intent_id,
+                    order_id,
+                    consumed_at
+                )
+                VALUES (?, ?, ?, ?)
+            """,
+        ).use { statement ->
+            statement.setObject(1, UUID.randomUUID())
+            statement.setObject(2, intentId)
+            statement.setObject(3, orderId)
+            statement.setLong(4, consumedAt.toEpochMilli())
+            statement.executeUpdate()
+        }
+    }
+
+    private fun JdbcTransaction.tradeIntentExists(intentId: UUID): Boolean {
+        return prepare("SELECT 1 FROM trade_intents WHERE id = ?").use { statement ->
+            statement.setObject(1, intentId)
+            statement.executeQuery().use { resultSet -> resultSet.next() }
+        }
+    }
+
+    private fun JdbcTransaction.tradeIntentConsumed(intentId: UUID): Boolean {
+        return prepare("SELECT 1 FROM trade_intent_consumptions WHERE intent_id = ?").use { statement ->
+            statement.setObject(1, intentId)
+            statement.executeQuery().use { resultSet -> resultSet.next() }
+        }
+    }
+
     private fun JdbcTransaction.fillTriggeredEntryOrders(
         ticker: Ticker,
         rules: SymbolRules,
@@ -375,31 +472,34 @@ internal class ExposedPaperLedgerWriter(
         prepare(
             """
                 INSERT INTO orders (
-                    id, position_id, trade_group_id, mode, symbol, side, order_type, status,
+                    id, intent_id, position_id, trade_group_id, mode, symbol, side, order_type, status,
                     size_btc, limit_price_jpy, trigger_price_jpy, protective_stop_price_jpy,
                     take_profit_price_jpy, estimated_win_probability, reason_ja,
                     decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
                     system_prompt_version, market_snapshot_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
         ).use { statement ->
-            statement.bindOrderId(orderId, positionId, tradeGroupId)
-            statement.setString(4, TradingMode.PAPER.name)
-            statement.setString(5, command.symbol.apiSymbol)
-            statement.setString(6, command.side.name)
-            statement.setString(7, command.orderType.name)
-            statement.setString(8, status.name)
-            statement.setBigDecimal(9, command.sizeBtc.btcScale())
-            statement.setNullableBigDecimal(10, command.priceJpy.takeIf { command.orderType == OrderType.LIMIT }?.moneyScale())
-            statement.setNullableBigDecimal(11, command.priceJpy.takeIf { command.orderType == OrderType.STOP }?.moneyScale())
-            statement.setBigDecimal(12, command.protectiveStopPriceJpy.moneyScale())
-            statement.setNullableBigDecimal(13, command.takeProfitPriceJpy?.moneyScale())
-            statement.setBigDecimal(14, command.estimatedWinProbability.ratioScale())
-            statement.setString(15, command.reasonJa)
-            statement.bindAudit(16, command.auditContext)
-            statement.setLong(23, nowMillis())
+            statement.setObject(1, orderId)
+            statement.setObject(2, command.intentId)
+            statement.setObject(3, positionId)
+            statement.setObject(4, tradeGroupId)
+            statement.setString(5, TradingMode.PAPER.name)
+            statement.setString(6, command.symbol.apiSymbol)
+            statement.setString(7, command.side.name)
+            statement.setString(8, command.orderType.name)
+            statement.setString(9, status.name)
+            statement.setBigDecimal(10, command.sizeBtc.btcScale())
+            statement.setNullableBigDecimal(11, command.priceJpy.takeIf { command.orderType == OrderType.LIMIT }?.moneyScale())
+            statement.setNullableBigDecimal(12, command.priceJpy.takeIf { command.orderType == OrderType.STOP }?.moneyScale())
+            statement.setBigDecimal(13, command.protectiveStopPriceJpy.moneyScale())
+            statement.setNullableBigDecimal(14, command.takeProfitPriceJpy?.moneyScale())
+            statement.setBigDecimal(15, command.estimatedWinProbability.ratioScale())
+            statement.setString(16, command.reasonJa)
+            statement.bindAudit(17, command.auditContext)
             statement.setLong(24, nowMillis())
+            statement.setLong(25, nowMillis())
             statement.executeUpdate()
         }
     }
@@ -834,14 +934,6 @@ private fun PreparedStatement.bindAudit(startIndex: Int, auditContext: PaperTrad
     setString(startIndex + 6, auditContext.decisionRunContext.marketSnapshotId)
 }
 
-private fun PreparedStatement.setNullableBigDecimal(index: Int, value: BigDecimal?) {
-    if (value == null) {
-        setObject(index, null)
-    } else {
-        setBigDecimal(index, value)
-    }
-}
-
 private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
     return when (orderType) {
         OrderType.MARKET -> false
@@ -864,6 +956,7 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.fromString(orderId),
         symbol = TradingSymbol.BTC,
+        intentId = intentId?.let { value -> UUID.fromString(value) },
         side = side,
         orderType = orderType,
         sizeBtc = sizeBtc.toBigDecimal(),

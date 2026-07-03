@@ -19,6 +19,8 @@ import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import io.modelcontextprotocol.kotlin.sdk.types.ResourceUpdatedNotification
 import io.modelcontextprotocol.kotlin.sdk.types.ServerNotification
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
@@ -27,6 +29,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
+import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.Orderbook
@@ -79,6 +83,8 @@ class FukurouMcpServerTest {
                 "get_positions",
                 "get_open_orders",
                 "get_account_status",
+                "submit_decision",
+                "submit_falsification",
                 "place_order",
                 "close_position",
                 "update_protection",
@@ -114,6 +120,217 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun submitDecisionTool_recordsNoTradeInMemoryRuntime() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val request = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "submit_decision",
+                arguments = noTradeDecisionArguments(),
+            ),
+        )
+
+        val result = server.tools.getValue("submit_decision").handler.invoke(TestClientConnection, request)
+        val structuredContent = assertNotNull(result.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+        val decisions = repository.decisions()
+
+        assertTrue(result.isError != true)
+        assertEquals("NO_TRADE", structuredContent.getValue("action").jsonPrimitive.contentOrNull)
+        assertEquals(1, decisions.size)
+        assertEquals("材料不足のため見送ります。", decisions.single().submission.reasonJa)
+    }
+
+    @Test
+    fun submitFalsificationTool_recordsVerdictForEnterIntentInMemoryRuntime() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val decisionRequest = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "submit_decision",
+                arguments = enterDecisionArguments(),
+            ),
+        )
+
+        val decisionResult = server.tools.getValue("submit_decision").handler.invoke(TestClientConnection, decisionRequest)
+        val intentId = assertNotNull(decisionResult.structuredContent)
+            .getValue("intent_id")
+            .jsonPrimitive
+            .contentOrNull
+        val falsificationRequest = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "submit_falsification",
+                arguments = buildJsonObject {
+                    put("intent_id", intentId)
+                    put("verdict", FalsificationVerdict.APPROVED.name)
+                    put("llm_provider", "codex")
+                    put("reason_ja", "反証しても拒否理由が不足しています。")
+                },
+            ),
+        )
+
+        val falsificationResult = server.tools.getValue("submit_falsification")
+            .handler
+            .invoke(TestClientConnection, falsificationRequest)
+        val duplicateResult = server.tools.getValue("submit_falsification")
+            .handler
+            .invoke(TestClientConnection, falsificationRequest)
+        val structuredContent = assertNotNull(falsificationResult.structuredContent)
+        val duplicateContent = assertNotNull(duplicateResult.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(falsificationResult.isError != true)
+        assertEquals(FalsificationVerdict.APPROVED.name, structuredContent.getValue("verdict").jsonPrimitive.contentOrNull)
+        assertEquals(1, repository.tradeIntents().size)
+        assertEquals(1, repository.falsifications().size)
+        assertTrue(duplicateResult.isError == true)
+        assertEquals("invalid_request", duplicateContent.getValue("type").jsonPrimitive.contentOrNull)
+    }
+
+    @Test
+    fun submitFalsificationTool_rejectsMissingIntentId() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val request = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "submit_falsification",
+                arguments = buildJsonObject {
+                    put("verdict", FalsificationVerdict.APPROVED.name)
+                    put("llm_provider", "codex")
+                    put("reason_ja", "intent がないため拒否されます。")
+                },
+            ),
+        )
+
+        val result = server.tools.getValue("submit_falsification").handler.invoke(TestClientConnection, request)
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertTrue(result.isError == true)
+        assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+    }
+
+    @Test
+    fun submitDecisionTool_recordsTradePlanRevisionForNonEnterAction() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val enterRequest = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "submit_decision",
+                arguments = enterDecisionArguments(),
+            ),
+        )
+
+        val enterResult = server.tools.getValue("submit_decision").handler.invoke(TestClientConnection, enterRequest)
+        val parentTradePlanId = assertNotNull(enterResult.structuredContent)
+            .getValue("trade_plan_id")
+            .jsonPrimitive
+            .contentOrNull
+        val request = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "submit_decision",
+                arguments = tradePlanRevisionDecisionArguments(
+                    parentTradePlanId = assertNotNull(parentTradePlanId),
+                    revisionCount = 1,
+                ),
+            ),
+        )
+
+        val result = server.tools.getValue("submit_decision").handler.invoke(TestClientConnection, request)
+        val structuredContent = assertNotNull(result.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(result.isError != true)
+        assertEquals("ADJUST_PROTECTION", structuredContent.getValue("action").jsonPrimitive.contentOrNull)
+        assertEquals("1", structuredContent.getValue("revision_count").jsonPrimitive.contentOrNull)
+        assertEquals(2, repository.tradePlans().size)
+        assertEquals(1, repository.tradeIntents().size)
+    }
+
+    @Test
+    fun submitDecisionTool_rejectsTradePlanRevisionCountReset() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val enterResult = server.tools.getValue("submit_decision").handler.invoke(
+            TestClientConnection,
+            CallToolRequest(
+                params = CallToolRequestParams(
+                    name = "submit_decision",
+                    arguments = enterDecisionArguments(),
+                ),
+            ),
+        )
+        val firstParentTradePlanId = assertNotNull(enterResult.structuredContent)
+            .getValue("trade_plan_id")
+            .jsonPrimitive
+            .contentOrNull
+        val firstRevisionResult = server.tools.getValue("submit_decision").handler.invoke(
+            TestClientConnection,
+            CallToolRequest(
+                params = CallToolRequestParams(
+                    name = "submit_decision",
+                    arguments = tradePlanRevisionDecisionArguments(
+                        parentTradePlanId = assertNotNull(firstParentTradePlanId),
+                        revisionCount = 1,
+                    ),
+                ),
+            ),
+        )
+        val secondParentTradePlanId = assertNotNull(firstRevisionResult.structuredContent)
+            .getValue("trade_plan_id")
+            .jsonPrimitive
+            .contentOrNull
+        val secondRevisionResult = server.tools.getValue("submit_decision").handler.invoke(
+            TestClientConnection,
+            CallToolRequest(
+                params = CallToolRequestParams(
+                    name = "submit_decision",
+                    arguments = tradePlanRevisionDecisionArguments(
+                        parentTradePlanId = assertNotNull(secondParentTradePlanId),
+                        revisionCount = 2,
+                    ),
+                ),
+            ),
+        )
+        val thirdParentTradePlanId = assertNotNull(secondRevisionResult.structuredContent)
+            .getValue("trade_plan_id")
+            .jsonPrimitive
+            .contentOrNull
+        val resetRevisionResult = server.tools.getValue("submit_decision").handler.invoke(
+            TestClientConnection,
+            CallToolRequest(
+                params = CallToolRequestParams(
+                    name = "submit_decision",
+                    arguments = tradePlanRevisionDecisionArguments(
+                        parentTradePlanId = assertNotNull(thirdParentTradePlanId),
+                        revisionCount = 0,
+                    ),
+                ),
+            ),
+        )
+        val structuredContent = assertNotNull(resetRevisionResult.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(resetRevisionResult.isError == true)
+        assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals(3, repository.tradePlans().size)
+    }
+
+    @Test
     fun embeddedMarketTool_preservesAuditCompletionFailureResponse() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val failingRuntime = runtime.copy(
@@ -144,6 +361,75 @@ class FukurouMcpServerTest {
         assertEquals("audit_failed_after_execution", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertEquals("true", structuredContent.getValue("executed").jsonPrimitive.contentOrNull)
     }
+}
+
+/**
+ * NO_TRADE decision tool request の引数を作る。
+ */
+private fun noTradeDecisionArguments() = buildJsonObject {
+    put("action", "NO_TRADE")
+    put("estimated_win_probability", "0.12")
+    put("tool_evidence_ids", stringArray("tool-1"))
+    put("fact_check", """{"ticker":true}""")
+    put("self_review", """{"reasonsNotToTrade":["出来高不足"]}""")
+    put("reason_ja", "材料不足のため見送ります。")
+    put("missing_data_ja", stringArray("orderbook"))
+    put("no_trade_conditions_ja", stringArray("出来高が戻るまで待つ"))
+}
+
+/**
+ * ENTER decision tool request の引数を作る。
+ */
+private fun enterDecisionArguments() = buildJsonObject {
+    put("action", "ENTER")
+    put("setup_tags", stringArray("breakout", "trend-follow"))
+    put("estimated_win_probability", "0.73")
+    put("expected_r_multiple", "1.80")
+    put("round_trip_cost_r", "0.05")
+    put("tool_evidence_ids", stringArray("tool-1", "tool-2"))
+    put("fact_check", """{"ticker":true}""")
+    put("self_review", """{"reasonsNotToTrade":["spread"]}""")
+    put("reason_ja", "ブレイク継続を狙います。")
+    put("symbol", TradingSymbol.BTC.apiSymbol)
+    put("side", "BUY")
+    put("type", "MARKET")
+    put("size_btc", "0.0050")
+    put("protective_stop_price_jpy", "9700000")
+    put("take_profit_price_jpy", "10500000")
+    put("trade_plan_revision_count", 0)
+    put("trade_plan_thesis_ja", "1時間足の上昇継続に乗る。")
+    put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ", "出来高急減"))
+    put("trade_plan_target_price_jpy", "10500000")
+    put("trade_plan_time_stop_at", "2026-07-02T01:00:00Z")
+}
+
+/**
+ * TradePlan 正式修正 decision tool request の引数を作る。
+ */
+private fun tradePlanRevisionDecisionArguments(parentTradePlanId: String, revisionCount: Int) = buildJsonObject {
+    put("action", "ADJUST_PROTECTION")
+    put("setup_tags", stringArray("breakout", "trend-follow"))
+    put("estimated_win_probability", "0.64")
+    put("expected_r_multiple", "1.20")
+    put("round_trip_cost_r", "0.05")
+    put("tool_evidence_ids", stringArray("tool-1", "tool-2"))
+    put("fact_check", """{"ticker":true}""")
+    put("self_review", """{"reasonsNotToTrade":[]}""")
+    put("reason_ja", "否定条件は未成立ですが、保護計画を正式修正します。")
+    put("symbol", TradingSymbol.BTC.apiSymbol)
+    put("parent_trade_plan_id", parentTradePlanId)
+    put("trade_plan_revision_count", revisionCount)
+    put("trade_plan_thesis_ja", "上昇継続の仮説は維持します。")
+    put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ"))
+    put("trade_plan_target_price_jpy", "10400000")
+    put("trade_plan_time_stop_at", "2026-07-02T02:00:00Z")
+}
+
+/**
+ * JSON string array を作る。
+ */
+private fun stringArray(vararg values: String) = buildJsonArray {
+    values.forEach { value -> add(value) }
 }
 
 /**

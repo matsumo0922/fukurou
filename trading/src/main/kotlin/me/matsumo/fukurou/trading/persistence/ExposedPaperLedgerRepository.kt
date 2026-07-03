@@ -5,7 +5,7 @@ import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.FillSimulator
-import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.broker.IntentConsumingPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
@@ -91,6 +91,7 @@ private const val SELECT_OPEN_POSITIONS_SQL = """
 private const val SELECT_OPEN_ORDERS_SQL = """
     SELECT
         id,
+        intent_id,
         position_id,
         trade_group_id,
         mode,
@@ -124,6 +125,7 @@ private const val SELECT_OPEN_ORDERS_SQL = """
 private const val SELECT_ORDERS_BY_CLIENT_REQUEST_ID_SQL = """
     SELECT
         id,
+        intent_id,
         position_id,
         trade_group_id,
         mode,
@@ -157,6 +159,7 @@ private const val SELECT_ORDERS_BY_CLIENT_REQUEST_ID_SQL = """
 private const val SELECT_ORDERS_BY_TRADE_GROUP_ID_SQL = """
     SELECT
         id,
+        intent_id,
         position_id,
         trade_group_id,
         mode,
@@ -305,7 +308,7 @@ private val TradingDateZone = ZoneId.of("Asia/Tokyo")
 class ExposedPaperLedgerRepository(
     private val database: ExposedDatabase,
     fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
-) : PaperLedgerRepository {
+) : IntentConsumingPaperLedgerRepository {
 
     private val writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules)
 
@@ -385,6 +388,42 @@ class ExposedPaperLedgerRepository(
         tradeGroupId: UUID,
     ): Result<PaperTradeResult> {
         return writer.createRestingEntryOrder(command, orderId, tradeGroupId)
+    }
+
+    override suspend fun fillMarketEntryAndConsumeIntent(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        stopOrderId: UUID,
+        intentId: UUID,
+        consumedAt: Instant,
+    ): Result<PaperTradeResult> {
+        return writer.fillMarketEntryAndConsumeIntent(
+            command = command,
+            fill = fill,
+            positionId = positionId,
+            tradeGroupId = tradeGroupId,
+            stopOrderId = stopOrderId,
+            intentId = intentId,
+            consumedAt = consumedAt,
+        )
+    }
+
+    override suspend fun createRestingEntryOrderAndConsumeIntent(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+        intentId: UUID,
+        consumedAt: Instant,
+    ): Result<PaperTradeResult> {
+        return writer.createRestingEntryOrderAndConsumeIntent(
+            command = command,
+            orderId = orderId,
+            tradeGroupId = tradeGroupId,
+            intentId = intentId,
+            consumedAt = consumedAt,
+        )
     }
 
     override suspend fun closePosition(
@@ -606,6 +645,7 @@ private fun ResultSet.toPosition(): Position {
 private fun ResultSet.toOrder(): Order {
     return Order(
         orderId = getUuid("id").toString(),
+        intentId = getNullableUuid("intent_id")?.toString(),
         positionId = getNullableUuid("position_id")?.toString(),
         tradeGroupId = getNullableUuid("trade_group_id")?.toString(),
         symbol = getString("symbol"),
@@ -647,24 +687,6 @@ private fun ResultSet.getUuid(columnName: String): UUID {
     return getObject(columnName, UUID::class.java)
 }
 
-private fun ResultSet.getNullableUuid(columnName: String): UUID? {
-    val value = getObject(columnName, UUID::class.java)
-
-    return if (wasNull()) null else value
-}
-
 private fun ResultSet.getInstant(columnName: String): Instant {
     return Instant.ofEpochMilli(getLong(columnName))
-}
-
-private fun ResultSet.getNullableInstant(columnName: String): Instant? {
-    val epochMillis = getLong(columnName)
-
-    return if (wasNull()) null else Instant.ofEpochMilli(epochMillis)
-}
-
-private fun ResultSet.getNullableBigDecimal(columnName: String): BigDecimal? {
-    val value = getBigDecimal(columnName)
-
-    return if (wasNull()) null else value
 }

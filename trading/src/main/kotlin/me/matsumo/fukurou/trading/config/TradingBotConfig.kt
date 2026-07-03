@@ -8,6 +8,7 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import java.math.BigDecimal
+import java.time.Duration
 
 /**
  * 取引 bot 全体で共有する typed config。
@@ -18,6 +19,7 @@ import java.math.BigDecimal
  * @param paperExecution paper 約定近似設定
  * @param paperMarket paper fallback 取引ルール設定
  * @param safetyFloor override 不可の安全床設定
+ * @param decisionProtocol decision / Falsifier protocol 設定
  * @param gmoPublicClient GMO Public API client 設定
  */
 data class TradingBotConfig(
@@ -27,6 +29,7 @@ data class TradingBotConfig(
     val paperExecution: PaperExecutionConfig = PaperExecutionConfig(),
     val paperMarket: PaperMarketConfig = PaperMarketConfig(),
     val safetyFloor: SafetyFloorConfig = SafetyFloorConfig(),
+    val decisionProtocol: DecisionProtocolConfig = DecisionProtocolConfig(),
     val gmoPublicClient: GmoPublicClientConfig = GmoPublicClientConfig(),
 ) {
     init {
@@ -71,6 +74,7 @@ data class TradingBotConfig(
                 ),
                 paperMarket = paperMarket,
                 safetyFloor = environment.readSafetyFloorConfig(),
+                decisionProtocol = environment.readDecisionProtocolConfig(),
                 gmoPublicClient = environment.readGmoPublicClientConfig(),
             )
         }
@@ -132,6 +136,24 @@ data class PaperMarketConfig(
             takerFee = fallbackTakerFeeRate.toPlainString(),
             makerFee = fallbackMakerFeeRate.toPlainString(),
         )
+    }
+}
+
+/**
+ * decision / Falsifier protocol の保守的な設定。
+ *
+ * @param falsificationFreshnessWindow fresh APPROVED とみなす時間窓
+ */
+data class DecisionProtocolConfig(
+    val falsificationFreshnessWindow: Duration = DEFAULT_FALSIFICATION_FRESHNESS_WINDOW,
+) {
+    init {
+        val windowIsPositive = !falsificationFreshnessWindow.isNegative && !falsificationFreshnessWindow.isZero
+        val windowIsAtOrBelowDefault = falsificationFreshnessWindow <= DEFAULT_FALSIFICATION_FRESHNESS_WINDOW
+
+        require(windowIsPositive && windowIsAtOrBelowDefault) {
+            "falsificationFreshnessWindow must be greater than 0 and less than or equal to 120 seconds."
+        }
     }
 }
 
@@ -206,6 +228,11 @@ private const val FUKUROU_MAX_TAKER_FEE_RATIO_ENV = "FUKUROU_MAX_TAKER_FEE_RATIO
 private const val FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS_ENV = "FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS"
 
 /**
+ * fresh falsification 判定 window 秒数の環境変数名。
+ */
+private const val FUKUROU_FALSIFICATION_FRESHNESS_SECONDS_ENV = "FUKUROU_FALSIFICATION_FRESHNESS_SECONDS"
+
+/**
  * paper 初期残高の既定値。
  */
 private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("100000")
@@ -214,6 +241,11 @@ private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("100000")
  * MARKET / STOP の既定 slippage bps。
  */
 private val DEFAULT_MARKET_SLIPPAGE_BPS = BigDecimal("5")
+
+/**
+ * fresh falsification の既定 window。
+ */
+private val DEFAULT_FALSIFICATION_FRESHNESS_WINDOW = Duration.ofSeconds(120)
 
 /**
  * fallback 最小発注数量の既定値。
@@ -314,6 +346,16 @@ private fun Map<String, String>.readSafetyFloorConfig(): SafetyFloorConfig {
         marketSlippageReserveBps = readDecimal(
             name = FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS_ENV,
             defaultValue = DEFAULT_MARKET_SLIPPAGE_BPS,
+        ),
+    )
+}
+
+private fun Map<String, String>.readDecisionProtocolConfig(): DecisionProtocolConfig {
+    return DecisionProtocolConfig(
+        falsificationFreshnessWindow = Duration.ofSeconds(
+            readOptional(FUKUROU_FALSIFICATION_FRESHNESS_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_FALSIFICATION_FRESHNESS_WINDOW.seconds,
         ),
     )
 }

@@ -12,6 +12,13 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.decision.DecisionRepository
+import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.EntryIntentDraft
+import me.matsumo.fukurou.trading.decision.FalsificationSubmission
+import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -69,6 +76,31 @@ private const val DROP_COMMAND_EVENT_LOG_TABLE_SQL = "DROP TABLE command_event_l
  * safety_violations 件数を読む SQL。
  */
 private const val SELECT_SAFETY_VIOLATION_COUNT_SQL = "SELECT COUNT(*) FROM safety_violations"
+
+/**
+ * decision protocol table の件数を読む SQL。
+ */
+private const val SELECT_DECISION_PROTOCOL_COUNTS_SQL = """
+    SELECT
+        (SELECT COUNT(*) FROM decisions),
+        (SELECT COUNT(*) FROM trade_plans),
+        (SELECT COUNT(*) FROM trade_intents),
+        (SELECT COUNT(*) FROM falsifications),
+        (SELECT COUNT(*) FROM trade_intent_consumptions)
+"""
+
+/**
+ * NO_TRADE decision の保存内容を読む SQL。
+ */
+private const val SELECT_NO_TRADE_DECISION_SQL = """
+    SELECT
+        estimated_win_probability,
+        reason_ja,
+        missing_data_ja,
+        no_trade_conditions_ja
+    FROM decisions
+    WHERE action = 'NO_TRADE'
+"""
 
 /**
  * test 用 reconciler 完了 event の payload。
@@ -330,6 +362,162 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun decision_repository_persists_append_only_protocol_rows() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        val enterResult = repository.submitDecision(enterDecisionSubmission()).getOrThrow()
+        val intentId = requireNotNull(enterResult.tradeIntent?.intentId)
+
+        val initialSnapshot = repository.entryIntentSafetySnapshot(
+            intentId = intentId,
+            observedAt = fixedInstant(),
+            freshnessWindow = Duration.ofSeconds(120),
+        ).getOrThrow()
+        val falsification = repository.submitFalsification(
+            FalsificationSubmission(
+                intentId = intentId,
+                verdict = FalsificationVerdict.APPROVED,
+                llmProvider = "codex",
+                reasonJa = "反証観点でも entry を拒否する理由が不足しています。",
+            ),
+        ).getOrThrow()
+        val duplicateFalsification = repository.submitFalsification(
+            FalsificationSubmission(
+                intentId = intentId,
+                verdict = FalsificationVerdict.REJECTED,
+                llmProvider = "codex",
+                reasonJa = "二重提出です。",
+            ),
+        )
+        val approvedSnapshot = repository.entryIntentSafetySnapshot(
+            intentId = intentId,
+            observedAt = fixedInstant(),
+            freshnessWindow = Duration.ofSeconds(120),
+        ).getOrThrow()
+
+        repository.appendIntentConsumption(intentId, UUID.randomUUID(), fixedInstant()).getOrThrow()
+        repository.submitDecision(noTradeDecisionSubmission()).getOrThrow()
+
+        val consumedFalsification = repository.submitFalsification(
+            FalsificationSubmission(
+                intentId = intentId,
+                verdict = FalsificationVerdict.REJECTED,
+                llmProvider = "codex",
+                reasonJa = "消費済み intent です。",
+            ),
+        )
+        val consumedSnapshot = repository.entryIntentSafetySnapshot(
+            intentId = intentId,
+            observedAt = fixedInstant(),
+            freshnessWindow = Duration.ofSeconds(120),
+        ).getOrThrow()
+        val missingIntentFalsification = repository.submitFalsification(
+            FalsificationSubmission(
+                intentId = null,
+                verdict = FalsificationVerdict.APPROVED,
+                llmProvider = "codex",
+                reasonJa = "intent がありません。",
+            ),
+        )
+        val unknownIntentFalsification = repository.submitFalsification(
+            FalsificationSubmission(
+                intentId = UUID.randomUUID(),
+                verdict = FalsificationVerdict.APPROVED,
+                llmProvider = "codex",
+                reasonJa = "未知の intent です。",
+            ),
+        )
+        val overRevisionSubmission = enterDecisionSubmission()
+        val overRevisionDecision = repository.submitDecision(
+            overRevisionSubmission.copy(
+                tradePlan = requireNotNull(overRevisionSubmission.tradePlan).copy(
+                    revisionCount = 3,
+                ),
+            ),
+        )
+        val counts = selectDecisionProtocolCounts(database)
+        val noTradeRow = selectNoTradeDecision(database)
+
+        assertEquals(false, initialSnapshot?.freshApproved)
+        assertEquals(FalsificationVerdict.APPROVED, falsification.verdict)
+        assertTrue(duplicateFalsification.isFailure)
+        assertEquals(true, approvedSnapshot?.freshApproved)
+        assertEquals(true, consumedSnapshot?.consumed)
+        assertTrue(consumedFalsification.isFailure)
+        assertTrue(missingIntentFalsification.isFailure)
+        assertTrue(unknownIntentFalsification.isFailure)
+        assertTrue(overRevisionDecision.isFailure)
+        assertEquals(DecisionProtocolCounts(2, 1, 1, 1, 1), counts)
+        assertEquals("0.1200000000", noTradeRow.estimatedWinProbability)
+        assertEquals("材料不足のため見送ります。", noTradeRow.reasonJa)
+        assertTrue(noTradeRow.missingDataJa.contains("orderbook"))
+        assertTrue(noTradeRow.noTradeConditionsJa.contains("出来高が戻るまで待つ"))
+    }
+
+    @Test
+    fun decision_repository_enforces_trade_plan_revision_lineage() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        val initialPlan = requireNotNull(repository.submitDecision(enterDecisionSubmission()).getOrThrow().tradePlan)
+        val revisionOne = requireNotNull(
+            repository.submitDecision(
+                tradePlanRevisionSubmission(
+                    parentTradePlanId = initialPlan.tradePlanId,
+                    revisionCount = 1,
+                ),
+            ).getOrThrow().tradePlan,
+        )
+        val repeatedZeroDecision = repository.submitDecision(
+            tradePlanRevisionSubmission(
+                parentTradePlanId = revisionOne.tradePlanId,
+                revisionCount = 0,
+            ),
+        )
+        val revisionTwo = requireNotNull(
+            repository.submitDecision(
+                tradePlanRevisionSubmission(
+                    parentTradePlanId = revisionOne.tradePlanId,
+                    revisionCount = 2,
+                ),
+            ).getOrThrow().tradePlan,
+        )
+        val overLimitDecision = repository.submitDecision(
+            tradePlanRevisionSubmission(
+                parentTradePlanId = revisionTwo.tradePlanId,
+                revisionCount = 3,
+            ),
+        )
+        val repeatedTwoDecision = repository.submitDecision(
+            tradePlanRevisionSubmission(
+                parentTradePlanId = revisionTwo.tradePlanId,
+                revisionCount = 2,
+            ),
+        )
+        val missingParentDecision = repository.submitDecision(
+            tradePlanRevisionSubmission(
+                parentTradePlanId = null,
+                revisionCount = 1,
+            ),
+        )
+        val unknownParentDecision = repository.submitDecision(
+            tradePlanRevisionSubmission(
+                parentTradePlanId = UUID.randomUUID(),
+                revisionCount = 1,
+            ),
+        )
+        val counts = selectDecisionProtocolCounts(database)
+
+        assertTrue(repeatedZeroDecision.isFailure)
+        assertTrue(overLimitDecision.isFailure)
+        assertTrue(repeatedTwoDecision.isFailure)
+        assertTrue(missingParentDecision.isFailure)
+        assertTrue(unknownParentDecision.isFailure)
+        assertEquals(DecisionProtocolCounts(3, 3, 1, 0, 0), counts)
+    }
+
+    @Test
     fun paper_ledger_repository_filters_rows_by_account_mode() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -361,14 +549,20 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
 
-        broker.placeOrder(postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000"))).getOrThrow()
+        broker.placeOrder(command).getOrThrow()
         repository.reconcile(stopTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
 
         val balance = broker.getBalance().getOrThrow()
@@ -388,19 +582,23 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
-
-        val firstResult = broker.placeOrder(
-            postgresEntryCommand(
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
                 takeProfitPriceJpy = BigDecimal("10500000"),
                 clientRequestId = "entry-1",
             ),
-        ).getOrThrow()
+        )
+
+        val firstResult = broker.placeOrder(command).getOrThrow()
         val secondResult = broker.placeOrder(
             postgresEntryCommand(
                 takeProfitPriceJpy = BigDecimal("10500000"),
@@ -420,21 +618,25 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
-
-        broker.placeOrder(
-            postgresEntryCommand(
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
                 orderType = OrderType.LIMIT,
                 priceJpy = BigDecimal("9900000"),
                 takeProfitPriceJpy = BigDecimal("10500000"),
                 estimatedWinProbability = BigDecimal("0.73"),
             ),
-        ).getOrThrow()
+        )
+
+        broker.placeOrder(command).getOrThrow()
 
         val openOrder = repository.getOpenOrders().getOrThrow().single()
 
@@ -446,14 +648,20 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        )
 
-        broker.placeOrder(postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000"))).getOrThrow()
+        broker.placeOrder(command).getOrThrow()
         repository.reconcile(takeProfitTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
 
         val positions = broker.getPositions().getOrThrow()
@@ -470,14 +678,20 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
 
-        broker.placeOrder(postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000"))).getOrThrow()
+        broker.placeOrder(command).getOrThrow()
         repository.reconcile(trailingTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
 
         val position = broker.getPositions().getOrThrow().single()
@@ -573,6 +787,201 @@ private class PostgresTestContext(
             password = container.password,
         )
     }
+}
+
+/**
+ * decision protocol 各 table の件数。
+ *
+ * @param decisions decisions 件数
+ * @param tradePlans trade_plans 件数
+ * @param tradeIntents trade_intents 件数
+ * @param falsifications falsifications 件数
+ * @param tradeIntentConsumptions trade_intent_consumptions 件数
+ */
+private data class DecisionProtocolCounts(
+    val decisions: Int,
+    val tradePlans: Int,
+    val tradeIntents: Int,
+    val falsifications: Int,
+    val tradeIntentConsumptions: Int,
+)
+
+/**
+ * NO_TRADE decision の保存確認行。
+ *
+ * @param estimatedWinProbability 推定勝率
+ * @param reasonJa 判断理由
+ * @param missingDataJa 不足データ JSON
+ * @param noTradeConditionsJa 見送り条件 JSON
+ */
+private data class NoTradeDecisionRow(
+    val estimatedWinProbability: String,
+    val reasonJa: String,
+    val missingDataJa: String,
+    val noTradeConditionsJa: String,
+)
+
+/**
+ * repository test 用 ENTER decision を作る。
+ */
+private fun enterDecisionSubmission(): DecisionSubmission {
+    return DecisionSubmission(
+        invocationId = "run-1",
+        llmProvider = "claude",
+        promptHash = "prompt-hash",
+        systemPromptVersion = "system-prompt-v1",
+        marketSnapshotId = "snapshot-1",
+        action = DecisionAction.ENTER,
+        setupTags = listOf("breakout", "trend-follow"),
+        estimatedWinProbability = BigDecimal("0.73"),
+        expectedRMultiple = BigDecimal("1.80"),
+        roundTripCostR = BigDecimal("0.05"),
+        toolEvidenceIds = listOf("tool-1", "tool-2"),
+        factCheckJson = """{"ticker":true}""",
+        selfReviewJson = """{"reasonsNotToTrade":["spread"]}""",
+        reasonJa = "ブレイク継続を狙います。",
+        missingDataJa = emptyList(),
+        noTradeConditionsJa = emptyList(),
+        entryIntent = EntryIntentDraft(
+            symbol = TradingSymbol.BTC,
+            side = OrderSide.BUY,
+            orderType = OrderType.MARKET,
+            sizeBtc = BigDecimal("0.0050"),
+            priceJpy = null,
+            protectiveStopPriceJpy = BigDecimal("9700000"),
+            takeProfitPriceJpy = BigDecimal("10500000"),
+        ),
+        tradePlan = TradePlanDraft(
+            parentTradePlanId = null,
+            revisionCount = 0,
+            symbol = TradingSymbol.BTC,
+            thesisJa = "1時間足の上昇継続に乗る。",
+            invalidationConditionsJa = listOf("直近安値割れ", "出来高急減"),
+            targetPriceJpy = BigDecimal("10500000"),
+            timeStopAt = fixedInstant().plusSeconds(3600),
+            setupTags = listOf("breakout", "trend-follow"),
+        ),
+    )
+}
+
+/**
+ * repository test 用 NO_TRADE decision を作る。
+ */
+private fun noTradeDecisionSubmission(): DecisionSubmission {
+    return DecisionSubmission(
+        invocationId = "run-2",
+        llmProvider = "claude",
+        promptHash = "prompt-hash",
+        systemPromptVersion = "system-prompt-v1",
+        marketSnapshotId = "snapshot-2",
+        action = DecisionAction.NO_TRADE,
+        setupTags = emptyList(),
+        estimatedWinProbability = BigDecimal("0.12"),
+        expectedRMultiple = null,
+        roundTripCostR = null,
+        toolEvidenceIds = listOf("tool-3"),
+        factCheckJson = """{"ticker":true}""",
+        selfReviewJson = """{"reasonsNotToTrade":["出来高不足"]}""",
+        reasonJa = "材料不足のため見送ります。",
+        missingDataJa = listOf("orderbook"),
+        noTradeConditionsJa = listOf("出来高が戻るまで待つ"),
+        entryIntent = null,
+        tradePlan = null,
+    )
+}
+
+/**
+ * repository test 用 TradePlan revision decision を作る。
+ */
+private fun tradePlanRevisionSubmission(parentTradePlanId: UUID?, revisionCount: Int): DecisionSubmission {
+    return DecisionSubmission(
+        invocationId = "run-revision",
+        llmProvider = "claude",
+        promptHash = "prompt-hash",
+        systemPromptVersion = "system-prompt-v1",
+        marketSnapshotId = "snapshot-revision",
+        action = DecisionAction.ADJUST_PROTECTION,
+        setupTags = listOf("breakout", "trend-follow"),
+        estimatedWinProbability = BigDecimal("0.64"),
+        expectedRMultiple = BigDecimal("1.20"),
+        roundTripCostR = BigDecimal("0.05"),
+        toolEvidenceIds = listOf("tool-1", "tool-2"),
+        factCheckJson = """{"ticker":true}""",
+        selfReviewJson = """{"reasonsNotToTrade":[]}""",
+        reasonJa = "否定条件は未成立ですが、保護計画を正式修正します。",
+        missingDataJa = emptyList(),
+        noTradeConditionsJa = emptyList(),
+        entryIntent = null,
+        tradePlan = TradePlanDraft(
+            parentTradePlanId = parentTradePlanId,
+            revisionCount = revisionCount,
+            symbol = TradingSymbol.BTC,
+            thesisJa = "上昇継続の仮説は維持します。",
+            invalidationConditionsJa = listOf("直近安値割れ"),
+            targetPriceJpy = BigDecimal("10400000"),
+            timeStopAt = fixedInstant().plusSeconds(7200),
+            setupTags = listOf("breakout", "trend-follow"),
+        ),
+    )
+}
+
+private suspend fun approvedPostgresEntryCommand(
+    repository: DecisionRepository,
+    command: PlaceOrderCommand,
+): PlaceOrderCommand {
+    val decisionResult = repository.submitDecision(entryDecisionSubmission(command)).getOrThrow()
+    val intentId = requireNotNull(decisionResult.tradeIntent?.intentId)
+
+    repository.submitFalsification(
+        FalsificationSubmission(
+            intentId = intentId,
+            verdict = FalsificationVerdict.APPROVED,
+            llmProvider = "codex",
+            reasonJa = "integration test では反証後に承認します。",
+        ),
+    ).getOrThrow()
+
+    return command.copy(intentId = intentId)
+}
+
+private fun entryDecisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
+    return DecisionSubmission(
+        invocationId = "run-entry",
+        llmProvider = "claude",
+        promptHash = "prompt-hash",
+        systemPromptVersion = "system-prompt-v1",
+        marketSnapshotId = "snapshot-entry",
+        action = DecisionAction.ENTER,
+        setupTags = listOf("integration-entry"),
+        estimatedWinProbability = command.estimatedWinProbability,
+        expectedRMultiple = BigDecimal("1.80"),
+        roundTripCostR = BigDecimal("0.05"),
+        toolEvidenceIds = listOf("tool-entry"),
+        factCheckJson = """{"ticker":true}""",
+        selfReviewJson = """{"reasonsNotToTrade":[]}""",
+        reasonJa = command.reasonJa,
+        missingDataJa = emptyList(),
+        noTradeConditionsJa = emptyList(),
+        entryIntent = EntryIntentDraft(
+            symbol = command.symbol,
+            side = command.side,
+            orderType = command.orderType,
+            sizeBtc = command.sizeBtc,
+            priceJpy = command.priceJpy,
+            protectiveStopPriceJpy = command.protectiveStopPriceJpy,
+            takeProfitPriceJpy = command.takeProfitPriceJpy,
+        ),
+        tradePlan = TradePlanDraft(
+            parentTradePlanId = null,
+            revisionCount = 0,
+            symbol = command.symbol,
+            thesisJa = "integration entry の仮説です。",
+            invalidationConditionsJa = listOf("保護 stop 到達"),
+            targetPriceJpy = command.takeProfitPriceJpy,
+            timeStopAt = fixedInstant().plusSeconds(3600),
+            setupTags = listOf("integration-entry"),
+        ),
+    )
 }
 
 private fun postgresEntryCommand(
@@ -789,6 +1198,47 @@ private fun selectSafetyViolationCount(database: ExposedDatabase): Int {
                 require(resultSet.next()) { "safety_violations count did not return a row." }
 
                 resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * decision protocol 各 table の件数を読む。
+ */
+private fun selectDecisionProtocolCounts(database: ExposedDatabase): DecisionProtocolCounts {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_DECISION_PROTOCOL_COUNTS_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "decision protocol counts did not return a row." }
+
+                DecisionProtocolCounts(
+                    decisions = resultSet.getInt(1),
+                    tradePlans = resultSet.getInt(2),
+                    tradeIntents = resultSet.getInt(3),
+                    falsifications = resultSet.getInt(4),
+                    tradeIntentConsumptions = resultSet.getInt(5),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * NO_TRADE decision の保存内容を読む。
+ */
+private fun selectNoTradeDecision(database: ExposedDatabase): NoTradeDecisionRow {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_NO_TRADE_DECISION_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "NO_TRADE decision did not return a row." }
+
+                NoTradeDecisionRow(
+                    estimatedWinProbability = resultSet.getBigDecimal("estimated_win_probability").toPlainString(),
+                    reasonJa = resultSet.getString("reason_ja"),
+                    missingDataJa = resultSet.getString("missing_data_ja"),
+                    noTradeConditionsJa = resultSet.getString("no_trade_conditions_ja"),
+                )
             }
         }
     }

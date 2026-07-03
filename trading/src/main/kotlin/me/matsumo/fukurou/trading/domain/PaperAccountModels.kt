@@ -199,6 +199,7 @@ data class Position(
  * 注文 ledger の読み取り model。
  *
  * @param orderId 注文 ID
+ * @param intentId entry intent ID
  * @param positionId 関連 position ID
  * @param tradeGroupId 関連 trade group ID
  * @param symbol 取引対象 symbol
@@ -220,6 +221,7 @@ data class Position(
 @Serializable
 data class Order(
     val orderId: String,
+    val intentId: String? = null,
     val positionId: String?,
     val tradeGroupId: String?,
     val symbol: String,

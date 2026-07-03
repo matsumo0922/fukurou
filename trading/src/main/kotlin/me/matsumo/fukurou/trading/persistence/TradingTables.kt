@@ -264,6 +264,11 @@ object OrdersTable : Table("orders") {
     val id = uuid("id")
 
     /**
+     * entry intent ID。
+     */
+    val intentId = uuid("intent_id").nullable()
+
+    /**
      * 関連 position ID。
      */
     val positionId = uuid("position_id").nullable()
@@ -623,6 +628,296 @@ object SafetyViolationsTable : Table("safety_violations") {
      * 作成時刻。epoch millis で保存する。
      */
     val createdAt = long("created_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * LLM の最終判断を append-only で保存する Exposed table。
+ */
+object DecisionsTable : Table("decisions") {
+    /**
+     * decision ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * daemon / CLI 起動単位の ID。
+     */
+    val invocationId = varchar("invocation_id", length = 128).nullable()
+
+    /**
+     * LLM provider。
+     */
+    val llmProvider = varchar("llm_provider", length = 64).nullable()
+
+    /**
+     * prompt hash。
+     */
+    val promptHash = varchar("prompt_hash", length = 128).nullable()
+
+    /**
+     * system prompt version。
+     */
+    val systemPromptVersion = varchar("system_prompt_version", length = 128).nullable()
+
+    /**
+     * market snapshot ID。
+     */
+    val marketSnapshotId = varchar("market_snapshot_id", length = 128).nullable()
+
+    /**
+     * 最終 action。
+     */
+    val action = varchar("action", length = 32)
+
+    /**
+     * setup tag 一覧 JSON。
+     */
+    val setupTags = text("setup_tags")
+
+    /**
+     * LLM 申告の推定勝率。
+     */
+    val estimatedWinProbability = decimal("estimated_win_probability", precision = 20, scale = 10)
+
+    /**
+     * 期待 R 倍率。
+     */
+    val expectedRMultiple = decimal("expected_r_multiple", precision = 20, scale = 10).nullable()
+
+    /**
+     * 往復 cost の R 換算。
+     */
+    val roundTripCostR = decimal("round_trip_cost_r", precision = 20, scale = 10).nullable()
+
+    /**
+     * 判断根拠 tool call ID 一覧 JSON。
+     */
+    val toolEvidenceIds = text("tool_evidence_ids")
+
+    /**
+     * fact check JSON。
+     */
+    val factCheck = text("fact_check")
+
+    /**
+     * self review JSON。
+     */
+    val selfReview = text("self_review")
+
+    /**
+     * 判断理由。
+     */
+    val reasonJa = text("reason_ja")
+
+    /**
+     * 不足データ一覧 JSON。
+     */
+    val missingDataJa = text("missing_data_ja")
+
+    /**
+     * 見送り条件一覧 JSON。
+     */
+    val noTradeConditionsJa = text("no_trade_conditions_ja")
+
+    /**
+     * 作成時刻。epoch millis で保存する。
+     */
+    val createdAt = long("created_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * TradePlan を append-only で保存する Exposed table。
+ */
+object TradePlansTable : Table("trade_plans") {
+    /**
+     * TradePlan ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * 紐づく decision ID。
+     */
+    val decisionId = uuid("decision_id")
+
+    /**
+     * 改訂元 TradePlan ID。
+     */
+    val parentTradePlanId = uuid("parent_trade_plan_id").nullable()
+
+    /**
+     * 正式修正の revision count。
+     */
+    val revisionCount = integer("revision_count")
+
+    /**
+     * 取引対象 symbol。
+     */
+    val symbol = varchar("symbol", length = 32)
+
+    /**
+     * 取引仮説。
+     */
+    val thesisJa = text("thesis_ja")
+
+    /**
+     * 否定条件一覧 JSON。
+     */
+    val invalidationConditionsJa = text("invalidation_conditions_ja")
+
+    /**
+     * 目標価格。
+     */
+    val targetPriceJpy = decimal("target_price_jpy", precision = 24, scale = 8).nullable()
+
+    /**
+     * 時間切れ条件。epoch millis で保存する。
+     */
+    val timeStopAt = long("time_stop_at").nullable()
+
+    /**
+     * setup tag 一覧 JSON。
+     */
+    val setupTags = text("setup_tags")
+
+    /**
+     * 作成時刻。epoch millis で保存する。
+     */
+    val createdAt = long("created_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * ENTER decision から発行された intent を append-only で保存する Exposed table。
+ */
+object TradeIntentsTable : Table("trade_intents") {
+    /**
+     * intent ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * 紐づく decision ID。
+     */
+    val decisionId = uuid("decision_id")
+
+    /**
+     * 紐づく TradePlan ID。
+     */
+    val tradePlanId = uuid("trade_plan_id")
+
+    /**
+     * 取引対象 symbol。
+     */
+    val symbol = varchar("symbol", length = 32)
+
+    /**
+     * 注文 side。
+     */
+    val side = varchar("side", length = 8)
+
+    /**
+     * 注文種別。
+     */
+    val orderType = varchar("order_type", length = 16)
+
+    /**
+     * 注文数量。
+     */
+    val sizeBtc = decimal("size_btc", precision = 24, scale = 12)
+
+    /**
+     * LIMIT / STOP entry 価格。
+     */
+    val priceJpy = decimal("price_jpy", precision = 24, scale = 8).nullable()
+
+    /**
+     * 保護 STOP 価格。
+     */
+    val protectiveStopPriceJpy = decimal("protective_stop_price_jpy", precision = 24, scale = 8)
+
+    /**
+     * virtual TP 価格。
+     */
+    val takeProfitPriceJpy = decimal("take_profit_price_jpy", precision = 24, scale = 8).nullable()
+
+    /**
+     * LLM 申告の推定勝率。
+     */
+    val estimatedWinProbability = decimal("estimated_win_probability", precision = 20, scale = 10)
+
+    /**
+     * 作成時刻。epoch millis で保存する。
+     */
+    val createdAt = long("created_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * Falsifier verdict を append-only で保存する Exposed table。
+ */
+object FalsificationsTable : Table("falsifications") {
+    /**
+     * falsification ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * 対象 intent ID。
+     */
+    val intentId = uuid("intent_id").uniqueIndex()
+
+    /**
+     * verdict。
+     */
+    val verdict = varchar("verdict", length = 16)
+
+    /**
+     * Falsifier provider。
+     */
+    val llmProvider = varchar("llm_provider", length = 64).nullable()
+
+    /**
+     * 判定理由。
+     */
+    val reasonJa = text("reason_ja")
+
+    /**
+     * 作成時刻。epoch millis で保存する。
+     */
+    val createdAt = long("created_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * trade intent の消費を append-only で保存する Exposed table。
+ */
+object TradeIntentConsumptionsTable : Table("trade_intent_consumptions") {
+    /**
+     * consumption ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * 対象 intent ID。
+     */
+    val intentId = uuid("intent_id").uniqueIndex()
+
+    /**
+     * 消費元 order ID。
+     */
+    val orderId = uuid("order_id").nullable()
+
+    /**
+     * 消費時刻。epoch millis で保存する。
+     */
+    val consumedAt = long("consumed_at")
 
     override val primaryKey = PrimaryKey(id)
 }

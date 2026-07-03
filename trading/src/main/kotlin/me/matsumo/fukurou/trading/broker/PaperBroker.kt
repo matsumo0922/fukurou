@@ -1,5 +1,9 @@
 package me.matsumo.fukurou.trading.broker
 
+import me.matsumo.fukurou.trading.config.DecisionProtocolConfig
+import me.matsumo.fukurou.trading.decision.AtomicIntentConsumptionRepository
+import me.matsumo.fukurou.trading.decision.DecisionRepository
+import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -34,6 +38,7 @@ import me.matsumo.fukurou.trading.safety.SafetyViolationRepository
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -45,6 +50,8 @@ import java.util.UUID
  * @param ledgerRepository paper ledger repository
  * @param riskStateRepository risk_state repository
  * @param riskStateCommandService risk_state 更新と audit をまとめる service
+ * @param decisionRepository decision / intent / falsification repository
+ * @param falsificationFreshnessWindow fresh APPROVED falsification とみなす時間窓
  * @param safetyViolationRepository SafetyFloor violation repository
  * @param safetyFloor Broker 副作用前に実行する SafetyFloor
  * @param marketDataSource paper 約定に使う市場データ source
@@ -57,6 +64,8 @@ class PaperBroker(
     internal val ledgerRepository: PaperLedgerRepository,
     private val riskStateRepository: RiskStateRepository,
     private val riskStateCommandService: RiskStateCommandService? = null,
+    private val decisionRepository: DecisionRepository = InMemoryDecisionRepository(),
+    private val falsificationFreshnessWindow: Duration = DecisionProtocolConfig().falsificationFreshnessWindow,
     private val safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
     private val safetyFloor: SafetyFloor = SafetyFloor(),
     internal val marketDataSource: MarketDataSource? = null,
@@ -65,6 +74,16 @@ class PaperBroker(
     private val clock: Clock = Clock.systemUTC(),
     private val tradingDateZone: ZoneId = TRADING_DATE_ZONE,
 ) : Broker {
+
+    init {
+        val hasAtomicLedgerRepository = ledgerRepository is IntentConsumingPaperLedgerRepository
+        val hasAtomicDecisionRepository = decisionRepository is AtomicIntentConsumptionRepository
+        val hasAtomicIntentConsumption = hasAtomicLedgerRepository || hasAtomicDecisionRepository
+
+        require(hasAtomicIntentConsumption) {
+            "PaperBroker requires atomic intent consumption support."
+        }
+    }
 
     override suspend fun getBalance(): Result<AccountSnapshot> {
         return ledgerRepository.getAccountSnapshot()
@@ -110,7 +129,11 @@ class PaperBroker(
 
             val ticker = tickerFor(command.symbol).getOrThrow()
             val symbolRules = symbolRulesFor(command.symbol).getOrThrow()
-            val context = safetyContext(ticker, symbolRules)
+            val context = safetyContext(
+                ticker = ticker,
+                symbolRules = symbolRules,
+                intentId = command.intentId,
+            )
             val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
             val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
 
@@ -127,21 +150,25 @@ class PaperBroker(
 
             if (resolvedCommand.orderType == OrderType.MARKET) {
                 val fill = fillSimulator.marketFill(resolvedCommand.side, resolvedCommand.sizeBtc, ticker, symbolRules)
+                val entryOrderId = resolvedCommand.commandId
 
-                return@runCatching ledgerRepository.fillMarketEntry(
+                return@runCatching fillMarketEntryAndConsumeIntent(
                     command = resolvedCommand,
                     fill = fill,
                     positionId = UUID.randomUUID(),
                     tradeGroupId = resolvedTradeGroupId,
+                    entryOrderId = entryOrderId,
                     stopOrderId = UUID.randomUUID(),
-                ).getOrThrow()
+                )
             }
 
-            ledgerRepository.createRestingEntryOrder(
+            val orderId = UUID.randomUUID()
+
+            createRestingEntryOrderAndConsumeIntent(
                 command = resolvedCommand,
-                orderId = UUID.randomUUID(),
+                orderId = orderId,
                 tradeGroupId = resolvedTradeGroupId,
-            ).getOrThrow()
+            )
         }
     }
 
@@ -285,7 +312,17 @@ class PaperBroker(
         ticker: Ticker,
         symbolRules: SymbolRules,
         includeAtr: Boolean = false,
+        intentId: UUID? = null,
     ): SafetyFloorContext {
+        val observedAt = Instant.now(clock)
+        val entryIntent = intentId?.let { requestedIntentId ->
+            decisionRepository.entryIntentSafetySnapshot(
+                intentId = requestedIntentId,
+                observedAt = observedAt,
+                freshnessWindow = falsificationFreshnessWindow,
+            ).getOrThrow()
+        }
+
         return SafetyFloorContext(
             account = ledgerRepository.getAccountSnapshot().getOrThrow(),
             riskState = riskStateRepository.current().getOrThrow(),
@@ -293,12 +330,92 @@ class PaperBroker(
             openOrders = ledgerRepository.getOpenOrders().getOrThrow(),
             ticker = ticker,
             symbolRules = symbolRules,
+            entryIntent = entryIntent,
             atr14Jpy = if (includeAtr) {
                 atr14JpyFor(TradingSymbol.BTC)
             } else {
                 null
             },
         )
+    }
+
+    private fun requireEntryIntentId(command: PlaceOrderCommand): UUID {
+        return requireNotNull(command.intentId) {
+            "intentId is required for entry order."
+        }
+    }
+
+    private suspend fun fillMarketEntryAndConsumeIntent(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        entryOrderId: UUID,
+        stopOrderId: UUID,
+    ): PaperTradeResult {
+        val intentId = requireEntryIntentId(command)
+        val consumedAt = Instant.now(clock)
+        val atomicRepository = ledgerRepository as? IntentConsumingPaperLedgerRepository
+
+        if (atomicRepository != null) {
+            return atomicRepository.fillMarketEntryAndConsumeIntent(
+                command = command,
+                fill = fill,
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                stopOrderId = stopOrderId,
+                intentId = intentId,
+                consumedAt = consumedAt,
+            ).getOrThrow()
+        }
+
+        return atomicDecisionRepository().consumeIntentAfterLedgerWrite(
+            intentId = intentId,
+            orderId = entryOrderId,
+            consumedAt = consumedAt,
+        ) {
+            ledgerRepository.fillMarketEntry(
+                command = command,
+                fill = fill,
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                stopOrderId = stopOrderId,
+            ).getOrThrow()
+        }.getOrThrow()
+    }
+
+    private suspend fun createRestingEntryOrderAndConsumeIntent(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+    ): PaperTradeResult {
+        val intentId = requireEntryIntentId(command)
+        val consumedAt = Instant.now(clock)
+        val atomicRepository = ledgerRepository as? IntentConsumingPaperLedgerRepository
+
+        if (atomicRepository != null) {
+            return atomicRepository.createRestingEntryOrderAndConsumeIntent(
+                command = command,
+                orderId = orderId,
+                tradeGroupId = tradeGroupId,
+                intentId = intentId,
+                consumedAt = consumedAt,
+            ).getOrThrow()
+        }
+
+        return atomicDecisionRepository().consumeIntentAfterLedgerWrite(
+            intentId = intentId,
+            orderId = orderId,
+            consumedAt = consumedAt,
+        ) {
+            ledgerRepository.createRestingEntryOrder(command, orderId, tradeGroupId).getOrThrow()
+        }.getOrThrow()
+    }
+
+    private fun atomicDecisionRepository(): AtomicIntentConsumptionRepository {
+        return requireNotNull(decisionRepository as? AtomicIntentConsumptionRepository) {
+            "PaperBroker requires AtomicIntentConsumptionRepository for non-transactional ledger repositories."
+        }
     }
 
     private suspend fun atr14JpyFor(symbol: TradingSymbol): BigDecimal? {

@@ -2,6 +2,14 @@ package me.matsumo.fukurou.trading.broker
 
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.decision.DecisionRepository
+import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.EntryIntentDraft
+import me.matsumo.fukurou.trading.decision.FalsificationSubmission
+import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -131,14 +139,16 @@ class PaperBrokerTest {
     @Test
     fun place_order_market_entry_creates_position_stop_execution_and_updates_account() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
         )
 
-        val result = broker.placeOrder(marketEntryCommand()).getOrThrow()
+        val result = broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
         val balance = broker.getBalance().getOrThrow()
         val positions = broker.getPositions().getOrThrow()
         val orders = broker.getOpenOrders().getOrThrow()
@@ -157,15 +167,18 @@ class PaperBrokerTest {
     @Test
     fun place_order_returns_existing_result_for_same_client_request_id() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
         )
 
-        val firstResult = broker.placeOrder(marketEntryCommand(clientRequestId = "entry-1")).getOrThrow()
-        val secondResult = broker.placeOrder(marketEntryCommand(clientRequestId = "entry-1")).getOrThrow()
+        val command = approvedCommand(decisionRepository, marketEntryCommand(clientRequestId = "entry-1"))
+        val firstResult = broker.placeOrder(command).getOrThrow()
+        val secondResult = broker.placeOrder(command).getOrThrow()
         val positions = broker.getPositions().getOrThrow()
         val executions = repository.getExecutions().getOrThrow()
 
@@ -177,18 +190,156 @@ class PaperBrokerTest {
     }
 
     @Test
-    fun place_order_reserves_open_buy_fee_when_checking_cash() = runBlocking {
-        val repository = InMemoryPaperLedgerRepository(accountSnapshot = highEquityLowCashAccountSnapshot())
+    fun place_order_rejects_entry_without_approved_falsification() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val violationRepository = InMemorySafetyViolationRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = intentCommand(decisionRepository, marketEntryCommand())
+
+        val result = broker.placeOrder(command).getOrThrow()
+
+        assertFalse(result.accepted)
+        assertEquals(SafetyFloorRule.MISSING_FRESH_FALSIFICATION, result.safetyViolation?.rule)
+        assertEquals(0, repository.getExecutions().getOrThrow().size)
+        assertEquals(1, violationRepository.violations().size)
+    }
+
+    @Test
+    fun place_order_rejects_entry_with_stale_approved_falsification() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val violationRepository = InMemorySafetyViolationRepository()
+        val staleClock = Clock.fixed(fixedInstant().minusSeconds(121), ZoneOffset.UTC)
+        val decisionRepository = InMemoryDecisionRepository(staleClock)
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(decisionRepository, marketEntryCommand())
+
+        val result = broker.placeOrder(command).getOrThrow()
+
+        assertFalse(result.accepted)
+        assertEquals(SafetyFloorRule.MISSING_FRESH_FALSIFICATION, result.safetyViolation?.rule)
+        assertEquals(0, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun place_order_rejects_entry_when_intent_declared_values_do_not_match() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val violationRepository = InMemorySafetyViolationRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val approvedCommand = approvedCommand(decisionRepository, marketEntryCommand())
+        val mismatchedCommand = approvedCommand.copy(sizeBtc = BigDecimal("0.0060"))
+
+        val result = broker.placeOrder(mismatchedCommand).getOrThrow()
+
+        assertFalse(result.accepted)
+        assertEquals(SafetyFloorRule.INTENT_MISMATCH, result.safetyViolation?.rule)
+        assertEquals(0, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun place_order_rejects_entry_when_intent_is_consumed() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val violationRepository = InMemorySafetyViolationRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(decisionRepository, marketEntryCommand())
+
+        val firstResult = broker.placeOrder(command).getOrThrow()
+        val secondResult = broker.placeOrder(command).getOrThrow()
+
+        assertTrue(firstResult.accepted)
+        assertFalse(secondResult.accepted)
+        assertEquals(SafetyFloorRule.INTENT_CONSUMED, secondResult.safetyViolation?.rule)
+        assertEquals(1, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun place_order_accepts_entry_with_fresh_approved_falsification() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val violationRepository = InMemorySafetyViolationRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+
+        val result = broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        assertTrue(result.accepted)
+        assertEquals(1, repository.getExecutions().getOrThrow().size)
+        assertEquals(0, violationRepository.violations().size)
+    }
+
+    @Test
+    fun place_order_does_not_consume_intent_when_ledger_write_fails() = runBlocking {
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = FailingPlaceOrderLedgerRepository(),
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedCommand(decisionRepository, marketEntryCommand())
+
+        val result = broker.placeOrder(command)
+
+        assertTrue(result.isFailure)
+        assertEquals(0, decisionRepository.intentConsumptions().size)
+    }
+
+    @Test
+    fun close_position_and_update_protection_do_not_require_falsification() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc(),
+            positions = listOf(protectedPosition()),
+            openOrders = listOf(linkedStopOrder()),
+        )
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val updateResult = broker.updateProtection(
+            UpdateProtectionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                newStopPriceJpy = BigDecimal("9900000"),
+                takeProfitPriceSpecified = false,
+                newTakeProfitPriceJpy = null,
+                reasonJa = "test update without falsification",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val closeResult = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                closeAll = false,
+                reasonJa = "test close without falsification",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+
+        assertTrue(updateResult.accepted)
+        assertTrue(closeResult.accepted)
+    }
+
+    @Test
+    fun place_order_reserves_open_buy_fee_when_checking_cash() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(accountSnapshot = highEquityLowCashAccountSnapshot())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
             marketDataSource = FineStepMarketDataSource,
             clock = fixedClock(),
         )
 
-        broker.placeOrder(nearAllCashRestingLimitCommand()).getOrThrow()
+        broker.placeOrder(approvedCommand(decisionRepository, nearAllCashRestingLimitCommand())).getOrThrow()
 
-        val result = broker.placeOrder(tinyMarketEntryCommand()).getOrThrow()
+        val result = broker.placeOrder(approvedCommand(decisionRepository, tinyMarketEntryCommand())).getOrThrow()
 
         assertFalse(result.accepted)
         assertEquals(SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT, result.safetyViolation?.rule)
@@ -198,14 +349,17 @@ class PaperBrokerTest {
     fun safety_floor_rejects_group_risk_over_two_percent_before_side_effect() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository()
-        val broker = safetyBroker(repository, violationRepository)
-
-        val result = broker.placeOrder(
-            marketEntryCommand(
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
                 protectiveStopPriceJpy = BigDecimal("9000000"),
                 takeProfitPriceJpy = BigDecimal("10500000"),
             ),
-        ).getOrThrow()
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
         val violations = violationRepository.violations()
 
         assertFalse(result.accepted)
@@ -219,14 +373,17 @@ class PaperBrokerTest {
     fun safety_floor_rejects_entry_without_valid_stop_loss() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository()
-        val broker = safetyBroker(repository, violationRepository)
-
-        val result = broker.placeOrder(
-            marketEntryCommand(
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
                 protectiveStopPriceJpy = BigDecimal("10010000"),
                 takeProfitPriceJpy = BigDecimal("10500000"),
             ),
-        ).getOrThrow()
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
 
         assertFalse(result.accepted)
         assertEquals(SafetyFloorRule.STOP_LOSS_REQUIRED, result.safetyViolation?.rule)
@@ -242,15 +399,18 @@ class PaperBrokerTest {
             positions = listOf(losingPosition(tradeGroupId.toString())),
             openOrders = listOf(linkedStopOrder(tradeGroupId.toString())),
         )
-        val broker = safetyBroker(repository, violationRepository)
-
-        val result = broker.placeOrder(
-            marketEntryCommand(
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
                 tradeGroupId = tradeGroupId,
                 protectiveStopPriceJpy = BigDecimal("9900000"),
                 takeProfitPriceJpy = BigDecimal("10100000"),
             ),
-        ).getOrThrow()
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
 
         assertFalse(result.accepted)
         assertEquals(SafetyFloorRule.NO_AVERAGING_DOWN, result.safetyViolation?.rule)
@@ -261,15 +421,18 @@ class PaperBrokerTest {
     fun safety_floor_rejects_total_exposure_over_eighty_percent() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository()
-        val broker = safetyBroker(repository, violationRepository)
-
-        val result = broker.placeOrder(
-            marketEntryCommand(
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
                 sizeBtc = BigDecimal("0.0090"),
                 protectiveStopPriceJpy = BigDecimal("9900000"),
                 takeProfitPriceJpy = BigDecimal("10100000"),
             ),
-        ).getOrThrow()
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
 
         assertFalse(result.accepted)
         assertEquals(SafetyFloorRule.MAX_TOTAL_EXPOSURE, result.safetyViolation?.rule)
@@ -280,19 +443,23 @@ class PaperBrokerTest {
     fun safety_floor_rejects_cash_shortage_after_existing_buy_reservation() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository(accountSnapshot = highEquityLowCashAccountSnapshot())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = safetyBroker(
             repository = repository,
             violationRepository = violationRepository,
+            decisionRepository = decisionRepository,
             marketDataSource = FineStepMarketDataSource,
         )
-
-        val result = broker.placeOrder(
-            marketEntryCommand(
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
                 sizeBtc = BigDecimal("0.0120"),
                 protectiveStopPriceJpy = BigDecimal("9950000"),
                 takeProfitPriceJpy = BigDecimal("10100000"),
             ),
-        ).getOrThrow()
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
 
         assertFalse(result.accepted)
         assertEquals(SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT, result.safetyViolation?.rule)
@@ -303,15 +470,18 @@ class PaperBrokerTest {
     fun safety_floor_rejects_calculated_non_positive_expected_value() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository()
-        val broker = safetyBroker(repository, violationRepository)
-
-        val result = broker.placeOrder(
-            marketEntryCommand(
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
                 protectiveStopPriceJpy = BigDecimal("9900000"),
                 takeProfitPriceJpy = BigDecimal("10500000"),
                 estimatedWinProbability = BigDecimal("0.20"),
             ),
-        ).getOrThrow()
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
 
         assertFalse(result.accepted)
         assertEquals(SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE, result.safetyViolation?.rule)
@@ -321,14 +491,17 @@ class PaperBrokerTest {
     fun safety_floor_rejects_missing_take_profit_for_ev_gate() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository()
-        val broker = safetyBroker(repository, violationRepository)
-
-        val result = broker.placeOrder(
-            marketEntryCommand(
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
                 takeProfitPriceJpy = null,
                 estimatedWinProbability = BigDecimal("0.99"),
             ),
-        ).getOrThrow()
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
 
         assertFalse(result.accepted)
         assertEquals(SafetyFloorRule.MISSING_TARGET_PRICE, result.safetyViolation?.rule)
@@ -338,15 +511,18 @@ class PaperBrokerTest {
     fun safety_floor_rejects_calculated_expected_move_to_cost_ratio_below_threshold() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository()
-        val broker = safetyBroker(repository, violationRepository)
-
-        val result = broker.placeOrder(
-            marketEntryCommand(
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
                 protectiveStopPriceJpy = BigDecimal("9700000"),
                 takeProfitPriceJpy = BigDecimal("10062000"),
                 estimatedWinProbability = BigDecimal.ONE,
             ),
-        ).getOrThrow()
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
 
         assertFalse(result.accepted)
         assertEquals(SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO, result.safetyViolation?.rule)
@@ -431,8 +607,9 @@ class PaperBrokerTest {
     fun safety_floor_rejects_stop_loosen_but_allows_take_profit_clear() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository()
-        val broker = safetyBroker(repository, violationRepository)
-        broker.placeOrder(marketEntryCommand()).getOrThrow()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
         val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
 
         val loosenResult = broker.updateProtection(
@@ -467,13 +644,15 @@ class PaperBrokerTest {
     @Test
     fun update_protection_updates_stop_and_virtual_take_profit() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
         )
-        broker.placeOrder(marketEntryCommand()).getOrThrow()
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
         val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
 
         val result = broker.updateProtection(
@@ -499,17 +678,19 @@ class PaperBrokerTest {
     @Test
     fun cancel_order_rejects_protective_stop_and_allows_resting_entry_cancel() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
         )
-        broker.placeOrder(restingLimitCommand()).getOrThrow()
+        broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand())).getOrThrow()
         val restingOrderId = UUID.fromString(broker.getOpenOrders().getOrThrow().single().orderId)
         val cancelRestingResult = broker.cancelOrder(cancelCommand(restingOrderId)).getOrThrow()
 
-        broker.placeOrder(marketEntryCommand()).getOrThrow()
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
         val stopOrderId = UUID.fromString(
             broker.getOpenOrders()
                 .getOrThrow()
@@ -526,13 +707,15 @@ class PaperBrokerTest {
     @Test
     fun reconcile_rounds_atr_trailing_stop_down_to_tick_size() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
         )
-        broker.placeOrder(marketEntryCommand()).getOrThrow()
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
 
         broker.reconcile(trailingTickSnapshot()).getOrThrow()
 
@@ -545,6 +728,7 @@ class PaperBrokerTest {
 }
 
 private fun marketEntryCommand(
+    intentId: UUID? = null,
     clientRequestId: String? = null,
     sizeBtc: BigDecimal = BigDecimal("0.0050"),
     tradeGroupId: UUID? = null,
@@ -554,6 +738,7 @@ private fun marketEntryCommand(
 ): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
+        intentId = intentId,
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
         orderType = OrderType.MARKET,
@@ -897,14 +1082,115 @@ private fun order(
 private fun safetyBroker(
     repository: InMemoryPaperLedgerRepository,
     violationRepository: InMemorySafetyViolationRepository,
+    decisionRepository: DecisionRepository = InMemoryDecisionRepository(fixedClock()),
     marketDataSource: MarketDataSource = FakeMarketDataSource,
 ): PaperBroker {
     return PaperBroker(
         ledgerRepository = repository,
         riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+        decisionRepository = decisionRepository,
         safetyViolationRepository = violationRepository,
         marketDataSource = marketDataSource,
         clock = fixedClock(),
+    )
+}
+
+/**
+ * place_order ledger 書き込みだけ失敗させる repository。
+ */
+private class FailingPlaceOrderLedgerRepository(
+    private val delegate: PaperLedgerRepository = InMemoryPaperLedgerRepository(),
+) : PaperLedgerRepository by delegate {
+
+    override suspend fun fillMarketEntry(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        stopOrderId: UUID,
+    ): Result<PaperTradeResult> {
+        return Result.failure(IllegalStateException("ledger write failed"))
+    }
+
+    override suspend fun createRestingEntryOrder(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+    ): Result<PaperTradeResult> {
+        return Result.failure(IllegalStateException("ledger write failed"))
+    }
+}
+
+private suspend fun approvedCommand(
+    repository: DecisionRepository,
+    command: PlaceOrderCommand,
+): PlaceOrderCommand {
+    val intentId = submitIntent(repository, command)
+
+    repository.submitFalsification(
+        FalsificationSubmission(
+            intentId = intentId,
+            verdict = FalsificationVerdict.APPROVED,
+            llmProvider = "test-falsifier",
+            reasonJa = "test approved",
+        ),
+    ).getOrThrow()
+
+    return command.copy(intentId = intentId)
+}
+
+private suspend fun intentCommand(
+    repository: DecisionRepository,
+    command: PlaceOrderCommand,
+): PlaceOrderCommand {
+    val intentId = submitIntent(repository, command)
+
+    return command.copy(intentId = intentId)
+}
+
+private suspend fun submitIntent(repository: DecisionRepository, command: PlaceOrderCommand): UUID {
+    val decisionResult = repository.submitDecision(decisionSubmission(command)).getOrThrow()
+
+    return requireNotNull(decisionResult.tradeIntent?.intentId)
+}
+
+private fun decisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
+    return DecisionSubmission(
+        invocationId = "test-invocation",
+        llmProvider = "test-proposer",
+        promptHash = "test-prompt-hash",
+        systemPromptVersion = "system-prompt-v1",
+        marketSnapshotId = "test-market-snapshot",
+        action = DecisionAction.ENTER,
+        setupTags = listOf("test-setup"),
+        estimatedWinProbability = command.estimatedWinProbability,
+        expectedRMultiple = BigDecimal("2.0"),
+        roundTripCostR = BigDecimal("0.1"),
+        toolEvidenceIds = listOf("tool-1"),
+        factCheckJson = "{}",
+        selfReviewJson = "{}",
+        reasonJa = "test decision",
+        missingDataJa = emptyList(),
+        noTradeConditionsJa = emptyList(),
+        entryIntent = EntryIntentDraft(
+            symbol = command.symbol,
+            side = command.side,
+            orderType = command.orderType,
+            sizeBtc = command.sizeBtc,
+            priceJpy = command.priceJpy,
+            protectiveStopPriceJpy = command.protectiveStopPriceJpy,
+            takeProfitPriceJpy = command.takeProfitPriceJpy,
+        ),
+        tradePlan = TradePlanDraft(
+            parentTradePlanId = null,
+            revisionCount = 0,
+            symbol = command.symbol,
+            thesisJa = "test thesis",
+            invalidationConditionsJa = listOf("test invalidation"),
+            targetPriceJpy = command.takeProfitPriceJpy,
+            timeStopAt = null,
+            setupTags = listOf("test-setup"),
+        ),
     )
 }
 
