@@ -126,6 +126,7 @@ class ToolCallGuardTest {
         assertEquals("run-123", event.decisionRunContext.decisionRunId)
         assertEquals("codex", event.decisionRunContext.llmProvider)
         assertEquals(CommandEventType.TOOL_CALL_COMPLETED, event.eventType)
+        assertTrue(event.payload.contains("durationMillis"))
     }
 
     @Test

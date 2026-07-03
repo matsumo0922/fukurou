@@ -19,6 +19,7 @@ import me.matsumo.fukurou.trading.risk.RiskState
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import java.util.UUID
 
@@ -110,6 +111,55 @@ enum class SafetyFloorRule {
      * entry intent 宣言値と place_order 実引数が一致しない。
      */
     INTENT_MISMATCH,
+
+    /**
+     * 高影響経済イベントの blackout window 内で新規 entry しようとした。
+     */
+    ECONOMIC_EVENT_BLACKOUT,
+}
+
+/**
+ * 高影響経済イベントの新規 entry blackout 設定。
+ *
+ * @param eventId 手動設定で安定して使うイベント ID
+ * @param eventName 人間が読むイベント名
+ * @param eventAt イベント発生時刻。UTC の Instant として扱う
+ * @param blackoutBefore eventAt より前に新規 entry を止める時間
+ * @param blackoutAfter eventAt より後に新規 entry を止める時間
+ */
+data class EconomicEventBlackout(
+    val eventId: String,
+    val eventName: String,
+    val eventAt: Instant,
+    val blackoutBefore: Duration,
+    val blackoutAfter: Duration,
+) {
+    init {
+        require(eventId.isNotBlank()) {
+            "eventId must not be blank."
+        }
+        require(eventName.isNotBlank()) {
+            "eventName must not be blank."
+        }
+        require(!blackoutBefore.isNegative) {
+            "blackoutBefore must be greater than or equal to 0."
+        }
+        require(!blackoutAfter.isNegative) {
+            "blackoutAfter must be greater than or equal to 0."
+        }
+    }
+
+    /**
+     * 指定時刻が blackout window 内なら true を返す。
+     */
+    fun contains(observedAt: Instant): Boolean {
+        val startsAt = eventAt.minus(blackoutBefore)
+        val endsAt = eventAt.plus(blackoutAfter)
+        val beforeStart = observedAt.isBefore(startsAt)
+        val afterEnd = observedAt.isAfter(endsAt)
+
+        return !beforeStart && !afterEnd
+    }
 }
 
 /**
@@ -121,6 +171,7 @@ enum class SafetyFloorRule {
  * @param minExpectedValueR コード計算した entry plan に求める最小 EV
  * @param minExpectedMoveToCostRatio 想定値幅と往復 cost の最小比率
  * @param maxTakerFeeRatio paper で許容する taker fee 上限
+ * @param economicEventBlackouts 高影響経済イベントの新規 entry blackout 一覧
  * @param marketSlippageReserveBps MARKET / STOP の片道 slippage reserve
  */
 data class SafetyFloorConfig(
@@ -130,6 +181,7 @@ data class SafetyFloorConfig(
     val minExpectedValueR: BigDecimal = DEFAULT_MIN_EXPECTED_VALUE_R,
     val minExpectedMoveToCostRatio: BigDecimal = DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO,
     val maxTakerFeeRatio: BigDecimal = DEFAULT_MAX_TAKER_FEE_RATIO,
+    val economicEventBlackouts: List<EconomicEventBlackout> = emptyList(),
     val marketSlippageReserveBps: BigDecimal = DEFAULT_MARKET_SLIPPAGE_RESERVE_BPS,
 ) {
     init {
@@ -263,6 +315,7 @@ class SafetyFloor(
      */
     fun evaluatePlaceOrder(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyFloorVerdict {
         detectHardHalt(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateEconomicEventBlackout(command)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateFalsifierGate(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateStopLoss(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateNoAveragingDown(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
@@ -724,6 +777,21 @@ class SafetyFloor(
             hardHaltRequired = hardHaltRequired,
             payloadJson = violationPayload(rule, measuredValue, limitValue, hardHaltRequired),
             createdAt = Instant.now(clock),
+        )
+    }
+
+    private fun validateEconomicEventBlackout(command: PlaceOrderCommand): SafetyViolation? {
+        val observedAt = Instant.now(clock)
+        val activeEvent = config.economicEventBlackouts.firstOrNull { event -> event.contains(observedAt) }
+            ?: return null
+
+        return violation(
+            commandName = "place_order",
+            command = command,
+            rule = SafetyFloorRule.ECONOMIC_EVENT_BLACKOUT,
+            messageJa = "高影響経済イベント ${activeEvent.eventName} の blackout window 中のため、新規 entry は拒否します。",
+            measuredValue = observedAt.toString(),
+            limitValue = "${activeEvent.eventAt.minus(activeEvent.blackoutBefore)}..${activeEvent.eventAt.plus(activeEvent.blackoutAfter)}",
         )
     }
 

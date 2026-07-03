@@ -37,6 +37,10 @@ data class LlmCommandRendererConfig(
         val unsafeCodexCommonArgs = codexCommonArgs.filterUnsafeArgs(CODEX_COMMON_ARG_FORBIDDEN_FLAGS)
         val unsafeCodexFalsifierArgs = codexFalsifierArgs
             .filterNot { argument -> argument in CODEX_FALSIFIER_ARG_ALLOWLIST }
+        val codexFalsifierBypassesSandbox = codexFalsifierArgs.any { argument ->
+            argument in CODEX_FALSIFIER_ARG_ALLOWLIST
+        }
+        val codexSandboxTemplateConfigured = codexCommandTemplate.usesExternalSandboxTemplate()
 
         require(claudeCommandTemplate.isNotEmpty()) {
             "claudeCommandTemplate must not be empty."
@@ -52,6 +56,9 @@ data class LlmCommandRendererConfig(
         }
         require(unsafeCodexFalsifierArgs.isEmpty()) {
             "codexFalsifierArgs may only include explicit Falsifier sandbox opt-in flags: $unsafeCodexFalsifierArgs"
+        }
+        require(!codexFalsifierBypassesSandbox || codexSandboxTemplateConfigured) {
+            "codexFalsifierArgs sandbox bypass requires an external sandbox/container command template."
         }
     }
 
@@ -548,3 +555,19 @@ private fun String.matchesForbiddenFlag(forbiddenFlag: String): Boolean {
 private fun String.isShortFlag(): Boolean {
     return startsWith("-") && !startsWith("--")
 }
+
+private fun List<String>.usesExternalSandboxTemplate(): Boolean {
+    val executable = firstOrNull()?.substringAfterLast("/") ?: return false
+
+    return executable in EXTERNAL_SANDBOX_COMMANDS
+}
+
+/**
+ * Codex `--yolo` opt-in を許可する外部 sandbox / container command。
+ */
+private val EXTERNAL_SANDBOX_COMMANDS = setOf(
+    "docker",
+    "podman",
+    "bwrap",
+    "firejail",
+)

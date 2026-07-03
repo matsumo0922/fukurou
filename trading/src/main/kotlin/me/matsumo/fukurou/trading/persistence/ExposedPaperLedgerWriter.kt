@@ -522,6 +522,8 @@ internal class ExposedPaperLedgerWriter(
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
         ).use { statement ->
+            val protectiveStopAuditContext = command.auditContext.copy(clientRequestId = null)
+
             statement.bindOrderId(stopOrderId, positionId, tradeGroupId)
             statement.setString(4, TradingMode.PAPER.name)
             statement.setString(5, command.symbol.apiSymbol)
@@ -531,7 +533,7 @@ internal class ExposedPaperLedgerWriter(
             statement.setBigDecimal(9, command.sizeBtc.btcScale())
             statement.setBigDecimal(10, command.protectiveStopPriceJpy.moneyScale())
             statement.setString(11, "protective stop: ${command.reasonJa}")
-            statement.bindAudit(12, command.auditContext)
+            statement.bindAudit(12, protectiveStopAuditContext)
             statement.setLong(19, nowMillis())
             statement.setLong(20, nowMillis())
             statement.executeUpdate()

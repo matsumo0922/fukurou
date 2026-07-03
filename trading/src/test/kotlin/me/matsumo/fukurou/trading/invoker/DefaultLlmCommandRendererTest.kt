@@ -224,12 +224,20 @@ class DefaultLlmCommandRendererTest {
     @Test
     fun configRestrictsCodexFalsifierArgsToExplicitSandboxOptIn() {
         val config = LlmCommandRendererConfig(
+            codexCommandTemplate = listOf("docker", "run", "--rm", "codex-image", "codex"),
             codexFalsifierArgs = listOf("--dangerously-bypass-approvals-and-sandbox"),
         )
 
         assertEquals(listOf("--dangerously-bypass-approvals-and-sandbox"), config.codexFalsifierArgs)
         assertFailsWith<IllegalArgumentException> {
             LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("codex"),
+                codexFalsifierArgs = listOf("--yolo"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommandTemplate = listOf("docker", "run", "--rm", "codex-image", "codex"),
                 codexFalsifierArgs = listOf("-c", "mcp_servers.unsafe.command=\"bash\""),
             )
         }

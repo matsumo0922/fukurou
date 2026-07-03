@@ -77,9 +77,19 @@ fun Application.module(
     } else {
         null
     }
+    val llmDaemonWorker = if (databaseDataSource != null && database != null) {
+        startLlmDaemonSchedulerWorker(
+            dataSource = databaseDataSource,
+            database = database,
+            clock = clock,
+        )
+    } else {
+        null
+    }
 
-    if (databaseDataSource != null || reconcilerWorker != null) {
+    if (databaseDataSource != null || reconcilerWorker != null || llmDaemonWorker != null) {
         monitor.subscribe(ApplicationStopped) {
+            llmDaemonWorker?.close()
             reconcilerWorker?.close()
             databaseDataSource?.close()
         }

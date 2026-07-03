@@ -104,6 +104,32 @@ private const val SELECT_COMMAND_EVENT_LOG_INDEX_COUNT_SQL = """
 """
 
 /**
+ * orders.client_request_id unique index 件数を読む SQL。
+ */
+private const val SELECT_ORDERS_CLIENT_REQUEST_ID_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'orders'
+        AND indexname = 'idx_orders_client_request_id_unique'
+"""
+
+/**
+ * LLM 起動予約 index 件数を読む SQL。
+ */
+private const val SELECT_LLM_LAUNCH_RESERVATION_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'llm_launch_reservations'
+        AND indexname IN (
+            'idx_llm_launch_reservations_invocation_id_unique',
+            'idx_llm_launch_reservations_trigger_key_reserved_at',
+            'idx_llm_launch_reservations_status_reserved_at'
+        )
+"""
+
+/**
  * NO_TRADE decision の保存内容を読む SQL。
  */
 private const val SELECT_NO_TRADE_DECISION_SQL = """
@@ -267,6 +293,8 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(bootstrap.verifySchema().isSuccess)
         assertTrue(ExposedRiskStateRepository(database).current().isSuccess)
         assertEquals(2, selectCommandEventLogIndexCount(database))
+        assertEquals(1, selectOrdersClientRequestIdIndexCount(database))
+        assertEquals(3, selectLlmLaunchReservationIndexCount(database))
     }
 
     @Test
@@ -1247,6 +1275,36 @@ private fun selectCommandEventLogIndexCount(database: ExposedDatabase): Int {
         jdbcConnection().prepareStatement(SELECT_COMMAND_EVENT_LOG_INDEX_COUNT_SQL).use { statement ->
             statement.executeQuery().use { resultSet ->
                 require(resultSet.next()) { "command_event_log index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * orders.client_request_id unique index 件数を読む。
+ */
+private fun selectOrdersClientRequestIdIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_ORDERS_CLIENT_REQUEST_ID_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "orders client_request_id index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * LLM 起動予約 index 件数を読む。
+ */
+private fun selectLlmLaunchReservationIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_LLM_LAUNCH_RESERVATION_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "llm launch reservation index count did not return a row." }
 
                 resultSet.getInt(1)
             }
