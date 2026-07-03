@@ -26,7 +26,7 @@ Kotlin/JVM ・ Ktor ・ Exposed ・ PostgreSQL ・ Docker Compose ・ MCP 公式
 
 **Step6（堅牢化 / config / Docker MCP 配線）まで実装済み。** 詳細設計は [`docs/design.md`](docs/design.md)、MCP runtime と Docker 手順は [`docs/mcp-runtime.md`](docs/mcp-runtime.md) を参照。
 
-現時点では、`:trading` の paper account / broker / safety / reconciler / GMO Public market data、`:mcp-gmo-coin` の GMO Public market tools、`:mcp` の fukurou stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 `ProtectionReconciler` worker が実装済みです。daemon scheduler、LlmInvoker 本実装、Falsifier、`decision.submit_decision` 本実装、live 実発注はまだ実装していません。
+現時点では、`:trading` の paper account / broker / safety / reconciler / decision protocol / GMO Public market data、`:mcp-gmo-coin` の GMO Public market tools、`:mcp` の fukurou stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 `ProtectionReconciler` worker が実装済みです。daemon scheduler、LlmInvoker 本実装、Falsifier 実行ループ、live 実発注はまだ実装していません。
 
 ## Backend scaffold
 

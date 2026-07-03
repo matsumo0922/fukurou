@@ -13,6 +13,7 @@ import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
@@ -411,6 +412,30 @@ class PostgresPersistenceIntegrationTest {
             observedAt = fixedInstant(),
             freshnessWindow = Duration.ofSeconds(120),
         ).getOrThrow()
+        val missingIntentFalsification = repository.submitFalsification(
+            FalsificationSubmission(
+                intentId = null,
+                verdict = FalsificationVerdict.APPROVED,
+                llmProvider = "codex",
+                reasonJa = "intent がありません。",
+            ),
+        )
+        val unknownIntentFalsification = repository.submitFalsification(
+            FalsificationSubmission(
+                intentId = UUID.randomUUID(),
+                verdict = FalsificationVerdict.APPROVED,
+                llmProvider = "codex",
+                reasonJa = "未知の intent です。",
+            ),
+        )
+        val overRevisionSubmission = enterDecisionSubmission()
+        val overRevisionDecision = repository.submitDecision(
+            overRevisionSubmission.copy(
+                tradePlan = requireNotNull(overRevisionSubmission.tradePlan).copy(
+                    revisionCount = 3,
+                ),
+            ),
+        )
         val counts = selectDecisionProtocolCounts(database)
         val noTradeRow = selectNoTradeDecision(database)
 
@@ -420,6 +445,9 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(true, approvedSnapshot?.freshApproved)
         assertEquals(true, consumedSnapshot?.consumed)
         assertTrue(consumedFalsification.isFailure)
+        assertTrue(missingIntentFalsification.isFailure)
+        assertTrue(unknownIntentFalsification.isFailure)
+        assertTrue(overRevisionDecision.isFailure)
         assertEquals(DecisionProtocolCounts(2, 1, 1, 1, 1), counts)
         assertEquals("0.1200000000", noTradeRow.estimatedWinProbability)
         assertEquals("材料不足のため見送ります。", noTradeRow.reasonJa)
@@ -459,14 +487,20 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
 
-        broker.placeOrder(postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000"))).getOrThrow()
+        broker.placeOrder(command).getOrThrow()
         repository.reconcile(stopTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
 
         val balance = broker.getBalance().getOrThrow()
@@ -486,19 +520,23 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
-
-        val firstResult = broker.placeOrder(
-            postgresEntryCommand(
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
                 takeProfitPriceJpy = BigDecimal("10500000"),
                 clientRequestId = "entry-1",
             ),
-        ).getOrThrow()
+        )
+
+        val firstResult = broker.placeOrder(command).getOrThrow()
         val secondResult = broker.placeOrder(
             postgresEntryCommand(
                 takeProfitPriceJpy = BigDecimal("10500000"),
@@ -518,21 +556,25 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
-
-        broker.placeOrder(
-            postgresEntryCommand(
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
                 orderType = OrderType.LIMIT,
                 priceJpy = BigDecimal("9900000"),
                 takeProfitPriceJpy = BigDecimal("10500000"),
                 estimatedWinProbability = BigDecimal("0.73"),
             ),
-        ).getOrThrow()
+        )
+
+        broker.placeOrder(command).getOrThrow()
 
         val openOrder = repository.getOpenOrders().getOrThrow().single()
 
@@ -544,14 +586,20 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        )
 
-        broker.placeOrder(postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000"))).getOrThrow()
+        broker.placeOrder(command).getOrThrow()
         repository.reconcile(takeProfitTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
 
         val positions = broker.getPositions().getOrThrow()
@@ -568,14 +616,20 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
 
-        broker.placeOrder(postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000"))).getOrThrow()
+        broker.placeOrder(command).getOrThrow()
         repository.reconcile(trailingTickSnapshot(), me.matsumo.fukurou.trading.broker.FillSimulator()).getOrThrow()
 
         val position = broker.getPositions().getOrThrow().single()
@@ -771,6 +825,65 @@ private fun noTradeDecisionSubmission(): DecisionSubmission {
         noTradeConditionsJa = listOf("出来高が戻るまで待つ"),
         entryIntent = null,
         tradePlan = null,
+    )
+}
+
+private suspend fun approvedPostgresEntryCommand(
+    repository: DecisionRepository,
+    command: PlaceOrderCommand,
+): PlaceOrderCommand {
+    val decisionResult = repository.submitDecision(entryDecisionSubmission(command)).getOrThrow()
+    val intentId = requireNotNull(decisionResult.tradeIntent?.intentId)
+
+    repository.submitFalsification(
+        FalsificationSubmission(
+            intentId = intentId,
+            verdict = FalsificationVerdict.APPROVED,
+            llmProvider = "codex",
+            reasonJa = "integration test では反証後に承認します。",
+        ),
+    ).getOrThrow()
+
+    return command.copy(intentId = intentId)
+}
+
+private fun entryDecisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
+    return DecisionSubmission(
+        invocationId = "run-entry",
+        llmProvider = "claude",
+        promptHash = "prompt-hash",
+        systemPromptVersion = "system-prompt-v1",
+        marketSnapshotId = "snapshot-entry",
+        action = DecisionAction.ENTER,
+        setupTags = listOf("integration-entry"),
+        estimatedWinProbability = command.estimatedWinProbability,
+        expectedRMultiple = BigDecimal("1.80"),
+        roundTripCostR = BigDecimal("0.05"),
+        toolEvidenceIds = listOf("tool-entry"),
+        factCheckJson = """{"ticker":true}""",
+        selfReviewJson = """{"reasonsNotToTrade":[]}""",
+        reasonJa = command.reasonJa,
+        missingDataJa = emptyList(),
+        noTradeConditionsJa = emptyList(),
+        entryIntent = EntryIntentDraft(
+            symbol = command.symbol,
+            side = command.side,
+            orderType = command.orderType,
+            sizeBtc = command.sizeBtc,
+            priceJpy = command.priceJpy,
+            protectiveStopPriceJpy = command.protectiveStopPriceJpy,
+            takeProfitPriceJpy = command.takeProfitPriceJpy,
+        ),
+        tradePlan = TradePlanDraft(
+            parentTradePlanId = null,
+            revisionCount = 0,
+            symbol = command.symbol,
+            thesisJa = "integration entry の仮説です。",
+            invalidationConditionsJa = listOf("保護 stop 到達"),
+            targetPriceJpy = command.takeProfitPriceJpy,
+            timeStopAt = fixedInstant().plusSeconds(3600),
+            setupTags = listOf("integration-entry"),
+        ),
     )
 }
 

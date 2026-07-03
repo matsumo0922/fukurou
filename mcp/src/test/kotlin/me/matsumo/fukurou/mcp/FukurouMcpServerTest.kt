@@ -178,13 +178,44 @@ class FukurouMcpServerTest {
         val falsificationResult = server.tools.getValue("submit_falsification")
             .handler
             .invoke(TestClientConnection, falsificationRequest)
+        val duplicateResult = server.tools.getValue("submit_falsification")
+            .handler
+            .invoke(TestClientConnection, falsificationRequest)
         val structuredContent = assertNotNull(falsificationResult.structuredContent)
+        val duplicateContent = assertNotNull(duplicateResult.structuredContent)
         val repository = runtime.decisionRepository as InMemoryDecisionRepository
 
         assertTrue(falsificationResult.isError != true)
         assertEquals(FalsificationVerdict.APPROVED.name, structuredContent.getValue("verdict").jsonPrimitive.contentOrNull)
         assertEquals(1, repository.tradeIntents().size)
         assertEquals(1, repository.falsifications().size)
+        assertTrue(duplicateResult.isError == true)
+        assertEquals("invalid_request", duplicateContent.getValue("type").jsonPrimitive.contentOrNull)
+    }
+
+    @Test
+    fun submitFalsificationTool_rejectsMissingIntentId() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val request = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "submit_falsification",
+                arguments = buildJsonObject {
+                    put("verdict", FalsificationVerdict.APPROVED.name)
+                    put("llm_provider", "codex")
+                    put("reason_ja", "intent がないため拒否されます。")
+                },
+            ),
+        )
+
+        val result = server.tools.getValue("submit_falsification").handler.invoke(TestClientConnection, request)
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertTrue(result.isError == true)
+        assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
     }
 
     @Test

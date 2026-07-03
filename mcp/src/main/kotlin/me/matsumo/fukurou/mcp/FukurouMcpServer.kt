@@ -444,9 +444,13 @@ private fun Server.registerPlaceOrderTool(
 ) {
     addTool(
         name = PLACE_ORDER_TOOL,
-        description = "Place a paper BTC entry order. protective_stop_price_jpy and reason are required.",
+        description = "Place a paper BTC entry order with a fresh approved intent. intent_id, protective_stop_price_jpy, and reason are required.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
+                putJsonObject("intent_id") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Trade intent UUID approved by submit_falsification.")
+                }
                 putSymbolSchema()
                 putJsonObject("side") {
                     put("type", JSON_TYPE_STRING)
@@ -471,6 +475,7 @@ private fun Server.registerPlaceOrderTool(
                 putClientRequestIdSchema()
             },
             required = listOf(
+                "intent_id",
                 "side",
                 "type",
                 "size_btc",
@@ -1101,6 +1106,7 @@ private fun parsePlaceOrderCommand(request: CallToolRequest, call: GuardedToolCa
     return runCatching {
         PlaceOrderCommand(
             commandId = UUID.randomUUID(),
+            intentId = UUID.fromString(requireNotNull(request.stringArgument("intent_id")) { "intent_id is required." }),
             symbol = parseTradingSymbol(request.stringArgument("symbol")).getOrThrow(),
             side = parseOrderSide(request.stringArgument("side")).getOrThrow(),
             orderType = parseOrderType(request.stringArgument("type")).getOrThrow(),

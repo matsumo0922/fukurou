@@ -14,6 +14,14 @@ import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.decision.DecisionRepository
+import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.EntryIntentDraft
+import me.matsumo.fukurou.trading.decision.FalsificationSubmission
+import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -247,13 +255,20 @@ class ProtectionReconcilerTest {
     fun reconcile_pass_triggers_protective_stop_through_broker() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
             marketDataSource = ReconcilerFakeMarketDataSource,
             clock = fixedClock(),
         )
-        broker.placeOrder(reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("10500000"))).getOrThrow()
+        broker.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+            ),
+        ).getOrThrow()
         val reconciler = createReconciler(
             riskStateRepository = riskStateRepository,
             broker = broker,
@@ -271,13 +286,20 @@ class ProtectionReconcilerTest {
     fun reconcile_pass_triggers_virtual_take_profit_and_cancels_stop() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
             marketDataSource = ReconcilerFakeMarketDataSource,
             clock = fixedClock(),
         )
-        broker.placeOrder(reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("10100000"))).getOrThrow()
+        broker.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+            ),
+        ).getOrThrow()
         val reconciler = createReconciler(
             riskStateRepository = riskStateRepository,
             broker = broker,
@@ -296,13 +318,20 @@ class ProtectionReconcilerTest {
     fun reconcile_pass_sweeps_existing_hard_halt_without_trade_tool_guard() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
             marketDataSource = ReconcilerFakeMarketDataSource,
             clock = fixedClock(),
         )
-        broker.placeOrder(reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("12000000"))).getOrThrow()
+        broker.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("12000000")),
+            ),
+        ).getOrThrow()
         riskStateRepository.setHardHalt("test hard halt", fixedInstant()).getOrThrow()
         val reconciler = createReconciler(
             riskStateRepository = riskStateRepository,
@@ -324,13 +353,20 @@ class ProtectionReconcilerTest {
     fun reconcile_pass_cancels_open_entry_before_fill_when_hard_halt() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
             marketDataSource = ReconcilerFakeMarketDataSource,
             clock = fixedClock(),
         )
-        broker.placeOrder(restingReconcilerEntryCommand()).getOrThrow()
+        broker.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = restingReconcilerEntryCommand(),
+            ),
+        ).getOrThrow()
         riskStateRepository.setHardHalt("test hard halt", fixedInstant()).getOrThrow()
         val reconciler = createReconciler(
             riskStateRepository = riskStateRepository,
@@ -350,14 +386,26 @@ class ProtectionReconcilerTest {
     fun reconcile_pass_cancels_open_entry_before_fill_when_tick_reaches_drawdown_halt() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
             marketDataSource = ReconcilerFakeMarketDataSource,
             clock = fixedClock(),
         )
-        broker.placeOrder(reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("12000000"))).getOrThrow()
-        broker.placeOrder(restingReconcilerEntryCommand(sizeBtc = BigDecimal("0.0010"))).getOrThrow()
+        broker.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("12000000")),
+            ),
+        ).getOrThrow()
+        broker.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = restingReconcilerEntryCommand(sizeBtc = BigDecimal("0.0010")),
+            ),
+        ).getOrThrow()
         val reconciler = createReconciler(
             riskStateRepository = riskStateRepository,
             broker = broker,
@@ -580,6 +628,65 @@ private fun drawdownHaltTickSnapshot(): TickSnapshot {
         bidPrice = "5990000",
         askPrice = "6000000",
         symbolRules = reconcilerSymbolRules(),
+    )
+}
+
+private suspend fun approvedReconcilerEntryCommand(
+    repository: DecisionRepository,
+    command: PlaceOrderCommand,
+): PlaceOrderCommand {
+    val decisionResult = repository.submitDecision(reconcilerDecisionSubmission(command)).getOrThrow()
+    val intentId = requireNotNull(decisionResult.tradeIntent?.intentId)
+
+    repository.submitFalsification(
+        FalsificationSubmission(
+            intentId = intentId,
+            verdict = FalsificationVerdict.APPROVED,
+            llmProvider = "test-falsifier",
+            reasonJa = "reconciler test では反証後に承認します。",
+        ),
+    ).getOrThrow()
+
+    return command.copy(intentId = intentId)
+}
+
+private fun reconcilerDecisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
+    return DecisionSubmission(
+        invocationId = "reconciler-test",
+        llmProvider = "test-proposer",
+        promptHash = "prompt-hash",
+        systemPromptVersion = "system-prompt-v1",
+        marketSnapshotId = "snapshot-1",
+        action = DecisionAction.ENTER,
+        setupTags = listOf("reconciler-test"),
+        estimatedWinProbability = command.estimatedWinProbability,
+        expectedRMultiple = BigDecimal("2.0"),
+        roundTripCostR = BigDecimal("0.1"),
+        toolEvidenceIds = listOf("tool-1"),
+        factCheckJson = "{}",
+        selfReviewJson = "{}",
+        reasonJa = command.reasonJa,
+        missingDataJa = emptyList(),
+        noTradeConditionsJa = emptyList(),
+        entryIntent = EntryIntentDraft(
+            symbol = command.symbol,
+            side = command.side,
+            orderType = command.orderType,
+            sizeBtc = command.sizeBtc,
+            priceJpy = command.priceJpy,
+            protectiveStopPriceJpy = command.protectiveStopPriceJpy,
+            takeProfitPriceJpy = command.takeProfitPriceJpy,
+        ),
+        tradePlan = TradePlanDraft(
+            parentTradePlanId = null,
+            revisionCount = 0,
+            symbol = command.symbol,
+            thesisJa = "reconciler test entry の仮説です。",
+            invalidationConditionsJa = listOf("protective stop 到達"),
+            targetPriceJpy = command.takeProfitPriceJpy,
+            timeStopAt = fixedInstant().plusSeconds(3600),
+            setupTags = listOf("reconciler-test"),
+        ),
     )
 }
 

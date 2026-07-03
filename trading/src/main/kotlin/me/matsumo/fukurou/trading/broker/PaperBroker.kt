@@ -1,5 +1,8 @@
 package me.matsumo.fukurou.trading.broker
 
+import me.matsumo.fukurou.trading.config.DecisionProtocolConfig
+import me.matsumo.fukurou.trading.decision.DecisionRepository
+import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -34,6 +37,7 @@ import me.matsumo.fukurou.trading.safety.SafetyViolationRepository
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -45,6 +49,8 @@ import java.util.UUID
  * @param ledgerRepository paper ledger repository
  * @param riskStateRepository risk_state repository
  * @param riskStateCommandService risk_state 更新と audit をまとめる service
+ * @param decisionRepository decision / intent / falsification repository
+ * @param falsificationFreshnessWindow fresh APPROVED falsification とみなす時間窓
  * @param safetyViolationRepository SafetyFloor violation repository
  * @param safetyFloor Broker 副作用前に実行する SafetyFloor
  * @param marketDataSource paper 約定に使う市場データ source
@@ -57,6 +63,8 @@ class PaperBroker(
     internal val ledgerRepository: PaperLedgerRepository,
     private val riskStateRepository: RiskStateRepository,
     private val riskStateCommandService: RiskStateCommandService? = null,
+    private val decisionRepository: DecisionRepository = InMemoryDecisionRepository(),
+    private val falsificationFreshnessWindow: Duration = DecisionProtocolConfig().falsificationFreshnessWindow,
     private val safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
     private val safetyFloor: SafetyFloor = SafetyFloor(),
     internal val marketDataSource: MarketDataSource? = null,
@@ -110,7 +118,11 @@ class PaperBroker(
 
             val ticker = tickerFor(command.symbol).getOrThrow()
             val symbolRules = symbolRulesFor(command.symbol).getOrThrow()
-            val context = safetyContext(ticker, symbolRules)
+            val context = safetyContext(
+                ticker = ticker,
+                symbolRules = symbolRules,
+                intentId = command.intentId,
+            )
             val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
             val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
 
@@ -127,6 +139,9 @@ class PaperBroker(
 
             if (resolvedCommand.orderType == OrderType.MARKET) {
                 val fill = fillSimulator.marketFill(resolvedCommand.side, resolvedCommand.sizeBtc, ticker, symbolRules)
+                val entryOrderId = resolvedCommand.commandId
+
+                consumeEntryIntent(resolvedCommand, entryOrderId)
 
                 return@runCatching ledgerRepository.fillMarketEntry(
                     command = resolvedCommand,
@@ -137,9 +152,13 @@ class PaperBroker(
                 ).getOrThrow()
             }
 
+            val orderId = UUID.randomUUID()
+
+            consumeEntryIntent(resolvedCommand, orderId)
+
             ledgerRepository.createRestingEntryOrder(
                 command = resolvedCommand,
-                orderId = UUID.randomUUID(),
+                orderId = orderId,
                 tradeGroupId = resolvedTradeGroupId,
             ).getOrThrow()
         }
@@ -285,7 +304,17 @@ class PaperBroker(
         ticker: Ticker,
         symbolRules: SymbolRules,
         includeAtr: Boolean = false,
+        intentId: UUID? = null,
     ): SafetyFloorContext {
+        val observedAt = Instant.now(clock)
+        val entryIntent = intentId?.let { requestedIntentId ->
+            decisionRepository.entryIntentSafetySnapshot(
+                intentId = requestedIntentId,
+                observedAt = observedAt,
+                freshnessWindow = falsificationFreshnessWindow,
+            ).getOrThrow()
+        }
+
         return SafetyFloorContext(
             account = ledgerRepository.getAccountSnapshot().getOrThrow(),
             riskState = riskStateRepository.current().getOrThrow(),
@@ -293,12 +322,25 @@ class PaperBroker(
             openOrders = ledgerRepository.getOpenOrders().getOrThrow(),
             ticker = ticker,
             symbolRules = symbolRules,
+            entryIntent = entryIntent,
             atr14Jpy = if (includeAtr) {
                 atr14JpyFor(TradingSymbol.BTC)
             } else {
                 null
             },
         )
+    }
+
+    private suspend fun consumeEntryIntent(command: PlaceOrderCommand, orderId: UUID) {
+        val intentId = requireNotNull(command.intentId) {
+            "intentId is required for entry order."
+        }
+
+        decisionRepository.appendIntentConsumption(
+            intentId = intentId,
+            orderId = orderId,
+            consumedAt = Instant.now(clock),
+        ).getOrThrow()
     }
 
     private suspend fun atr14JpyFor(symbol: TradingSymbol): BigDecimal? {
