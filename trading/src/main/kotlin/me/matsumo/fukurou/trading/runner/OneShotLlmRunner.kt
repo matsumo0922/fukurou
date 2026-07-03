@@ -1,6 +1,8 @@
 package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -257,7 +259,9 @@ class OneShotLlmRunner(
 
             Result.success(result)
         } catch (throwable: CancellationException) {
-            val auditResult = recordNoTrade(failureContext, "caller_cancelled", throwable)
+            val auditResult = withContext(NonCancellable) {
+                recordNoTrade(failureContext, "caller_cancelled", throwable)
+            }
             throwable.withSuppressedFailure(auditResult)
 
             throw throwable

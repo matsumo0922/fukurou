@@ -1,5 +1,7 @@
 package me.matsumo.fukurou.trading.invoker
 
+import kotlinx.coroutines.CancellationException
+
 /**
  * LLM CLI の起動境界。
  */
@@ -42,14 +44,20 @@ class ShellLlmInvoker(
 ) : LlmInvoker {
 
     override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
-        return runCatching {
+        return try {
             val command = commandRenderer.render(request).getOrThrow()
             val processResult = processRunner.run(command).getOrThrow()
 
-            LlmInvocationResult(
-                request = request,
-                processResult = processResult,
+            Result.success(
+                LlmInvocationResult(
+                    request = request,
+                    processResult = processResult,
+                ),
             )
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            Result.failure(throwable)
         }
     }
 }

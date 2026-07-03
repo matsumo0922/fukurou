@@ -1,5 +1,9 @@
 package me.matsumo.fukurou.trading.runner
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -391,6 +395,27 @@ class OneShotLlmRunnerTest {
         assertTrue(result.isFailure)
         assertTrue(fixture.eventLog.events().containsNoTradeReason("caller_failed"))
         assertEquals(0, fixture.processRunner.launches.size)
+    }
+
+    @Test
+    fun callerCancellation_recordsNoTradeAudit() = runBlocking {
+        val launchStarted = CompletableDeferred<Unit>()
+        val fixture = runnerFixture {
+            launchStarted.complete(Unit)
+
+            awaitCancellation()
+        }
+        val runnerDeferred = async {
+            fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        }
+
+        launchStarted.await()
+        runnerDeferred.cancel()
+
+        assertFailsWith<CancellationException> {
+            runnerDeferred.await()
+        }
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("caller_cancelled"))
     }
 }
 
