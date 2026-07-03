@@ -108,12 +108,14 @@ class McpToolCallLimiter(
                 val totalCount = if (countedToolNames.isEmpty()) {
                     0
                 } else {
-                    toolCallGuard.countToolCallEvents(decisionRunId, countedToolNames).getOrThrow()
+                    toolCallGuard.countToolCallEvents(decisionRunId, countedToolNames)
+                        .getOrElse { throwable -> return@withLock Result.failure(throwable) }
                 }
                 val actCount = if (actToolNames.isEmpty()) {
                     0
                 } else {
-                    toolCallGuard.countToolCallEvents(decisionRunId, actToolNames).getOrThrow()
+                    toolCallGuard.countToolCallEvents(decisionRunId, actToolNames)
+                        .getOrElse { throwable -> return@withLock Result.failure(throwable) }
                 }
 
                 McpToolCallCounts(

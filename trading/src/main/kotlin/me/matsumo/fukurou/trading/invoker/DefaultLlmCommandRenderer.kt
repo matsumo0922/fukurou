@@ -7,6 +7,7 @@ import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.PosixFilePermission
 
@@ -108,15 +109,18 @@ class DefaultLlmCommandRenderer(
             suffix = ".json",
             content = request.mcpServer.toClaudeMcpConfigJson(),
         )
-        val args = listOf(
+        val baseArgs = listOf(
             "-p",
             request.prompt,
+        ) + config.claudeModelArgs() + config.claudeCommonArgs
+        val mcpArgs = listOf(
             "--mcp-config",
             mcpConfigFile.path.toString(),
             "--strict-mcp-config",
             "--allowedTools",
             allowedTools,
-        ) + config.claudeModelArgs() + ENFORCED_CLAUDE_COMMON_ARGS + config.claudeCommonArgs
+        )
+        val args = baseArgs + mcpArgs + ENFORCED_CLAUDE_COMMON_ARGS
 
         return config.claudeCommandTemplate.toRenderedCommand(
             args = args,
@@ -134,12 +138,12 @@ class DefaultLlmCommandRenderer(
         } else {
             emptyList()
         }
-        val codexHome = writeCodexHome(request.mcpServer)
+        val codexHome = writeCodexHome(request.mcpServer, request.environment)
         val commandEnvironment = request.environment + (CODEX_HOME_ENV to codexHome.path.toString())
         val args = listOf("exec") +
             config.codexModelArgs() +
-            ENFORCED_CODEX_COMMON_ARGS +
             config.codexCommonArgs +
+            ENFORCED_CODEX_COMMON_ARGS +
             phaseArgs +
             request.prompt
 
@@ -242,7 +246,10 @@ private fun String.tomlKey(): String {
     return tomlQuoted()
 }
 
-private fun writeCodexHome(mcpServer: LlmMcpServerConfig): PrivateConfigPath {
+private fun writeCodexHome(
+    mcpServer: LlmMcpServerConfig,
+    environment: Map<String, String>,
+): PrivateConfigPath {
     val directory = Files.createTempDirectory("fukurou-codex-home-")
     directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
 
@@ -254,11 +261,39 @@ private fun writeCodexHome(mcpServer: LlmMcpServerConfig): PrivateConfigPath {
         StandardOpenOption.WRITE,
     )
     configFile.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
+    val authFile = copyCodexAuthFile(environment, directory)
 
     return PrivateConfigPath(
         path = directory,
-        cleanupPaths = listOf(configFile, directory),
+        cleanupPaths = listOfNotNull(configFile, authFile, directory),
     )
+}
+
+private fun copyCodexAuthFile(
+    environment: Map<String, String>,
+    targetDirectory: Path,
+): Path? {
+    val sourcePath = environment.codexAuthFilePath() ?: return null
+
+    if (!Files.isRegularFile(sourcePath)) {
+        return null
+    }
+
+    val targetPath = targetDirectory.resolve(CODEX_AUTH_FILE_NAME)
+    Files.copy(sourcePath, targetPath, StandardCopyOption.COPY_ATTRIBUTES)
+    targetPath.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
+
+    return targetPath
+}
+
+private fun Map<String, String>.codexAuthFilePath(): Path? {
+    val configuredCodexHome = readOptional(CODEX_HOME_ENV)?.let { value -> Path.of(value) }
+    val fallbackCodexHome = readOptional(HOME_ENV)?.let { value ->
+        Path.of(value).resolve(DEFAULT_CODEX_HOME_DIRECTORY)
+    }
+    val codexHome = configuredCodexHome ?: fallbackCodexHome ?: return null
+
+    return codexHome.resolve(CODEX_AUTH_FILE_NAME)
 }
 
 private fun writePrivateConfigFile(
@@ -385,6 +420,21 @@ val CODEX_FALSIFIER_ARG_ALLOWLIST = setOf(
 const val CODEX_HOME_ENV = "CODEX_HOME"
 
 /**
+ * home directory path を渡す環境変数名。
+ */
+const val HOME_ENV = "HOME"
+
+/**
+ * Codex CLI の既定 home directory 名。
+ */
+const val DEFAULT_CODEX_HOME_DIRECTORY = ".codex"
+
+/**
+ * Codex CLI 認証ファイル名。
+ */
+const val CODEX_AUTH_FILE_NAME = "auth.json"
+
+/**
  * 秘密値を含む一時ファイルの POSIX permission。
  */
 private val PRIVATE_FILE_PERMISSIONS = setOf(
@@ -451,8 +501,20 @@ private fun Map<String, String>.readOptional(name: String): String? {
 
 private fun List<String>.filterUnsafeArgs(forbiddenFlags: Set<String>): List<String> {
     return filter { argument ->
-        argument in forbiddenFlags || forbiddenFlags.any { forbiddenFlag -> argument.startsWith("$forbiddenFlag=") }
+        forbiddenFlags.any { forbiddenFlag -> argument.matchesForbiddenFlag(forbiddenFlag) }
     }
+}
+
+private fun String.matchesForbiddenFlag(forbiddenFlag: String): Boolean {
+    val exactMatch = this == forbiddenFlag
+    val equalsValueMatch = startsWith("$forbiddenFlag=")
+    val fusedShortOption = forbiddenFlag.isShortFlag() && startsWith(forbiddenFlag)
+
+    return exactMatch || equalsValueMatch || fusedShortOption
+}
+
+private fun String.isShortFlag(): Boolean {
+    return startsWith("-") && !startsWith("--")
 }
 
 private fun String.splitCommandTemplate(): List<String> {

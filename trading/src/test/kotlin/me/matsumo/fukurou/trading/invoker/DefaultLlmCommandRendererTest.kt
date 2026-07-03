@@ -36,12 +36,15 @@ class DefaultLlmCommandRendererTest {
         val joinedArgs = command.args.joinToString(" ")
         val configPath = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV])).resolve("config.toml")
         val configContent = Files.readString(configPath)
+        val userArgIndex = command.args.indexOf("--headless-test")
+        val sandboxArgIndex = command.args.indexOf("--sandbox")
 
         assertEquals("docker", command.executable)
         assertEquals(listOf("run", "--rm", "codex-image", "codex", "exec"), command.args.take(5))
         assertTrue(joinedArgs.contains("-m gpt-5-codex-test"))
         assertTrue(joinedArgs.contains("--headless-test"))
         assertTrue(joinedArgs.contains("--yolo"))
+        assertTrue(userArgIndex < sandboxArgIndex)
         assertFalse(joinedArgs.contains("mcp_servers.fukurou-mcp.command"))
         assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\"]"))
         assertTrue(configContent.contains("command = \"java\""))
@@ -67,11 +70,14 @@ class DefaultLlmCommandRendererTest {
 
         val command = renderer.render(request).getOrThrow()
         val joinedArgs = command.args.joinToString(" ")
+        val userArgIndex = command.args.indexOf("--headless-test")
+        val permissionArgIndex = command.args.indexOf("--permission-mode")
 
         assertEquals("sandbox", command.executable)
         assertEquals("claude", command.args.first())
         assertTrue(joinedArgs.contains("--model claude-test-model"))
         assertTrue(joinedArgs.contains("--headless-test"))
+        assertTrue(userArgIndex < permissionArgIndex)
         assertTrue(joinedArgs.contains("custom-mcp"))
         assertTrue(joinedArgs.contains("mcp__custom-mcp__submit_decision"))
 
@@ -146,6 +152,34 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
+    fun renderCodex_copiesParentAuthJsonToPrivateCodexHome() {
+        val parentCodexHome = Files.createTempDirectory("fukurou-parent-codex-home")
+        val parentAuthFile = parentCodexHome.resolve(CODEX_AUTH_FILE_NAME)
+        Files.writeString(parentAuthFile, """{"token":"test-auth-token"}""")
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            environment = mapOf(CODEX_HOME_ENV to parentCodexHome.toString()),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val joinedArgs = command.args.joinToString(" ")
+        val privateCodexHome = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV]))
+        val copiedAuthFile = privateCodexHome.resolve(CODEX_AUTH_FILE_NAME)
+        val copiedAuthContent = Files.readString(copiedAuthFile)
+
+        assertFalse(privateCodexHome == parentCodexHome)
+        assertFalse(joinedArgs.contains("test-auth-token"))
+        assertEquals("""{"token":"test-auth-token"}""", copiedAuthContent)
+
+        command.deleteCleanupPaths()
+        Files.deleteIfExists(parentAuthFile)
+        Files.deleteIfExists(parentCodexHome)
+    }
+
+    @Test
     fun configRejectsCommonArgsThatOverrideSafetyBoundary() {
         assertFailsWith<IllegalArgumentException> {
             LlmCommandRendererConfig(
@@ -160,6 +194,11 @@ class DefaultLlmCommandRendererTest {
         assertFailsWith<IllegalArgumentException> {
             LlmCommandRendererConfig(
                 codexCommonArgs = listOf("-c", "approval_policy=\"on-request\""),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommonArgs = listOf("-csandbox_mode=\"danger-full-access\""),
             )
         }
         assertFailsWith<IllegalArgumentException> {
@@ -189,6 +228,7 @@ class DefaultLlmCommandRendererTest {
         mcpServerName: String,
         allowedTools: List<String> = emptyList(),
         mcpEnvironment: Map<String, String> = mapOf("FUKUROU_INVOCATION_ID" to "invocation-test"),
+        environment: Map<String, String> = emptyMap(),
     ): LlmInvocationRequest {
         return LlmInvocationRequest(
             invocationId = "invocation-test",
@@ -210,7 +250,7 @@ class DefaultLlmCommandRendererTest {
                 args = listOf("-jar", "mcp.jar"),
                 environment = mcpEnvironment,
             ),
-            environment = emptyMap(),
+            environment = environment,
             allowedTools = allowedTools,
         )
     }

@@ -496,6 +496,48 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun toolCallLimitCountUnavailable_returnsToolErrorAndNoTradeAudit() = runBlocking {
+        val decisionRunContext = DecisionRunContext(
+            decisionRunId = "count-failure-run",
+            llmProvider = "codex",
+            promptHash = "hash",
+            systemPromptVersion = "system-prompt-v1",
+            marketSnapshotId = "snapshot",
+        )
+        val baseRuntime = TradingRuntimeFactory.inMemory()
+        val eventLog = CountFailingCommandEventLog(baseRuntime.commandEventLog as InMemoryCommandEventLog)
+        val runtime = baseRuntime.copy(
+            commandEventLog = eventLog,
+            toolCallGuard = ToolCallGuard(
+                riskStateRepository = baseRuntime.riskStateRepository,
+                commandEventLog = eventLog,
+                tradingLock = baseRuntime.tradingLock,
+            ),
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+            decisionRunContext = decisionRunContext,
+        ).createServer()
+        val request = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "get_balance",
+                arguments = buildJsonObject {},
+            ),
+        )
+
+        val result = server.tools.getValue("get_balance").handler.invoke(TestClientConnection, request)
+        val structuredContent = assertNotNull(result.structuredContent)
+        val noTradeEvent = eventLog.events().single { event ->
+            event.eventType == CommandEventType.NO_TRADE_EXIT
+        }
+
+        assertTrue(result.isError == true)
+        assertEquals("tool_call_limit_unavailable", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertTrue(noTradeEvent.payload.contains("mcp_tool_call_count_unavailable"))
+    }
+
+    @Test
     fun actToolCallLimitExceeded_doesNotRejectReadOnlyToolWhenTotalBudgetRemains() = runBlocking {
         val config = TradingBotConfig(
             runner = LlmRunnerConfig(
@@ -652,6 +694,34 @@ private object FailingCommandEventLog : CommandEventLog {
         toolNames: Set<String>,
     ): Result<Int> {
         return Result.failure(IllegalStateException("audit count failed"))
+    }
+}
+
+/**
+ * tool call count だけに失敗する command_event_log。
+ *
+ * @param delegate append の保存先
+ */
+private class CountFailingCommandEventLog(
+    private val delegate: InMemoryCommandEventLog,
+) : CommandEventLog {
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        return delegate.append(event)
+    }
+
+    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+        return delegate.countDistinctDecisionRunsSince(since)
+    }
+
+    override suspend fun countToolCallEvents(
+        decisionRunId: String,
+        toolNames: Set<String>,
+    ): Result<Int> {
+        return Result.failure(IllegalStateException("audit count failed"))
+    }
+
+    suspend fun events(): List<CommandEvent> {
+        return delegate.events()
     }
 }
 
