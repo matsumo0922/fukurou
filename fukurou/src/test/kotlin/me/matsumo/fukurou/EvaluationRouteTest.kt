@@ -104,6 +104,30 @@ class EvaluationRouteTest {
             actual = marketDataSource.requestedLimits,
         )
     }
+
+    @Test
+    fun evaluationRoutes_returnBadRequestWhenDailyCandleLimitExceedsMaximum() = testApplication {
+        val marketDataSource = RecordingEvaluationMarketDataSource()
+
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = FakeEvaluationRepository,
+                evaluationMarketDataSource = marketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/evaluation/benchmark?from=2024-01-01&to=2024-01-02")
+
+        assertEquals(HttpStatusCode.BadRequest, response.status)
+        assertTrue(response.bodyAsText().contains("maximum is 500"))
+        assertEquals(
+            expected = emptyList(),
+            actual = marketDataSource.requestedLimits,
+        )
+    }
 }
 
 /**

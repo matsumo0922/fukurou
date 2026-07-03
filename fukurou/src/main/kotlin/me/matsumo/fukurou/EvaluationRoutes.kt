@@ -10,6 +10,7 @@ import io.ktor.server.routing.openapi.describe
 import io.ktor.utils.io.ExperimentalKtorApi
 import kotlinx.serialization.Serializable
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.evaluation.BenchmarkPoint
 import me.matsumo.fukurou.trading.evaluation.BenchmarkResult
@@ -30,7 +31,6 @@ import java.time.Clock
 import java.time.Duration
 import java.time.LocalDate
 import java.time.ZoneId
-import kotlin.math.min
 
 /**
  * 評価系エンドポイントを分類する OpenAPI タグ。
@@ -74,7 +74,11 @@ internal fun Route.evaluationRoutes(
         val tradeResult = evaluationRepository.fetchClosedTrades(period).getOrThrow()
         val runCount = evaluationRepository.countDecisionRuns(period).getOrThrow()
         val actionCounts = evaluationRepository.countDecisionsByAction(period).getOrThrow()
-        val candles = marketDataSource.fetchDailyCandlesOrEmpty(tradingConfig, dateRange)
+        val candles = call.fetchDailyCandlesOrEmpty(
+            marketDataSource = marketDataSource,
+            tradingConfig = tradingConfig,
+            dateRange = dateRange,
+        ) ?: return@get
         val regimes = EvaluationMath.classifyMarketRegimes(candles, EvaluationZone)
 
         call.respond(
@@ -115,7 +119,11 @@ internal fun Route.evaluationRoutes(
         val evaluationRepository = call.requireEvaluationRepository(repository) ?: return@get
         val period = dateRange.toPeriod()
         val tradeResult = evaluationRepository.fetchClosedTrades(period).getOrThrow()
-        val candles = marketDataSource.fetchDailyCandlesOrEmpty(tradingConfig, dateRange)
+        val candles = call.fetchDailyCandlesOrEmpty(
+            marketDataSource = marketDataSource,
+            tradingConfig = tradingConfig,
+            dateRange = dateRange,
+        ) ?: return@get
         val regimes = EvaluationMath.classifyMarketRegimes(candles, EvaluationZone)
 
         call.respond(
@@ -195,10 +203,11 @@ internal fun Route.evaluationRoutes(
         val priorPnlJpy = evaluationRepository.sumTradePnlBefore(period.from).getOrThrow()
         val baselineEquityJpy = initialCashJpy.add(priorPnlJpy)
         val dailyPnl = evaluationRepository.fetchDailyTradePnl(period).getOrThrow()
+        val dailyCandleLimit = call.requireDailyCandleLimit(dateRange) ?: return@get
         val candles = evaluationMarketDataSource.getCandles(
             symbol = tradingConfig.symbol,
             interval = CandleInterval.ONE_DAY,
-            limit = dateRange.dailyCandleLimit(),
+            limit = dailyCandleLimit,
         ).getOrThrow()
         val benchmark = EvaluationMath.benchmark(
             candles = candles,
@@ -331,17 +340,38 @@ private fun ApplicationCall.parseDateParameter(name: String, defaultValue: Local
     return runCatching { LocalDate.parse(rawValue) }
 }
 
-private suspend fun MarketDataSource?.fetchDailyCandlesOrEmpty(
+private suspend fun ApplicationCall.fetchDailyCandlesOrEmpty(
+    marketDataSource: MarketDataSource?,
     tradingConfig: TradingBotConfig,
     dateRange: EvaluationDateRange,
-) = this
-    ?.getCandles(
+): List<Candle>? {
+    val evaluationMarketDataSource = marketDataSource ?: return emptyList()
+    val dailyCandleLimit = requireDailyCandleLimit(dateRange) ?: return null
+
+    return evaluationMarketDataSource.getCandles(
         symbol = tradingConfig.symbol,
         interval = CandleInterval.ONE_DAY,
-        limit = dateRange.dailyCandleLimit(),
+        limit = dailyCandleLimit,
     )
-    ?.getOrDefault(emptyList())
-    .orEmpty()
+        .getOrDefault(emptyList())
+}
+
+private suspend fun ApplicationCall.requireDailyCandleLimit(dateRange: EvaluationDateRange): Int? {
+    val dailyCandleLimit = dateRange.dailyCandleLimit()
+    val withinLimit = dailyCandleLimit <= MAX_DAILY_CANDLE_LIMIT.toLong()
+
+    if (withinLimit) {
+        return dailyCandleLimit.toInt()
+    }
+
+    val errorResponse = ErrorResponse(
+        "from/to window requires $dailyCandleLimit daily candles; maximum is $MAX_DAILY_CANDLE_LIMIT",
+    )
+
+    respond(HttpStatusCode.BadRequest, errorResponse)
+
+    return null
+}
 
 /**
  * 評価 API の日付範囲。
@@ -370,16 +400,15 @@ private data class EvaluationDateRange(
         )
     }
 
-    fun dailyCandleLimit(): Int {
+    fun dailyCandleLimit(): Long {
         val lookbackStartDate = fromDate.minusDays(DAILY_CANDLE_LOOKBACK_PADDING.toLong())
         val latestNeededDate = maxOf(toDate, referenceDate)
         val days = Duration.between(
             lookbackStartDate.atStartOfDay(EvaluationZone),
             latestNeededDate.plusDays(1).atStartOfDay(EvaluationZone),
         ).toDays()
-        val requestedLimit = days.toInt()
 
-        return min(requestedLimit, MAX_DAILY_CANDLE_LIMIT)
+        return days
     }
 }
 
