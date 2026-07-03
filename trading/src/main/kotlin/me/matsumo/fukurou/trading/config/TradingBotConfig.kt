@@ -20,6 +20,7 @@ import java.time.Duration
  * @param paperMarket paper fallback 取引ルール設定
  * @param safetyFloor override 不可の安全床設定
  * @param decisionProtocol decision / Falsifier protocol 設定
+ * @param runner LLM one-shot runner の保守的な上限設定
  * @param gmoPublicClient GMO Public API client 設定
  */
 data class TradingBotConfig(
@@ -30,6 +31,7 @@ data class TradingBotConfig(
     val paperMarket: PaperMarketConfig = PaperMarketConfig(),
     val safetyFloor: SafetyFloorConfig = SafetyFloorConfig(),
     val decisionProtocol: DecisionProtocolConfig = DecisionProtocolConfig(),
+    val runner: LlmRunnerConfig = LlmRunnerConfig(),
     val gmoPublicClient: GmoPublicClientConfig = GmoPublicClientConfig(),
 ) {
     init {
@@ -75,6 +77,7 @@ data class TradingBotConfig(
                 paperMarket = paperMarket,
                 safetyFloor = environment.readSafetyFloorConfig(),
                 decisionProtocol = environment.readDecisionProtocolConfig(),
+                runner = environment.readLlmRunnerConfig(),
                 gmoPublicClient = environment.readGmoPublicClientConfig(),
             )
         }
@@ -136,6 +139,46 @@ data class PaperMarketConfig(
             takerFee = fallbackTakerFeeRate.toPlainString(),
             makerFee = fallbackMakerFeeRate.toPlainString(),
         )
+    }
+}
+
+/**
+ * LLM one-shot runner の保守的な上限設定。
+ *
+ * @param maxToolCallsPerRun 1 MCP server instance あたりの総 tool call 上限
+ * @param maxActToolCallsPerRun 1 MCP server instance あたりの act 系 tool call 上限
+ * @param perRunTimeout 1 LLM CLI 起動の timeout
+ * @param maxInvocationsPerHour 直近 1 時間に許可する runner 起動数
+ */
+data class LlmRunnerConfig(
+    val maxToolCallsPerRun: Int = DEFAULT_MAX_TOOL_CALLS_PER_RUN,
+    val maxActToolCallsPerRun: Int = DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN,
+    val perRunTimeout: Duration = DEFAULT_LLM_PER_RUN_TIMEOUT,
+    val maxInvocationsPerHour: Int = DEFAULT_MAX_INVOCATIONS_PER_HOUR,
+) {
+    init {
+        val toolLimitIsConservative = maxToolCallsPerRun in 1..DEFAULT_MAX_TOOL_CALLS_PER_RUN
+        val actLimitIsConservative = maxActToolCallsPerRun in 1..DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN
+        val timeoutIsPositive = !perRunTimeout.isNegative && !perRunTimeout.isZero
+        val timeoutIsConservative = timeoutIsPositive && perRunTimeout <= DEFAULT_LLM_PER_RUN_TIMEOUT
+        val hourlyLimitIsConservative = maxInvocationsPerHour in 1..DEFAULT_MAX_INVOCATIONS_PER_HOUR
+        val actLimitFitsTotal = maxActToolCallsPerRun <= maxToolCallsPerRun
+
+        require(toolLimitIsConservative) {
+            "maxToolCallsPerRun must be between 1 and $DEFAULT_MAX_TOOL_CALLS_PER_RUN."
+        }
+        require(actLimitIsConservative) {
+            "maxActToolCallsPerRun must be between 1 and $DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN."
+        }
+        require(timeoutIsConservative) {
+            "perRunTimeout must be greater than 0 and less than or equal to ${DEFAULT_LLM_PER_RUN_TIMEOUT.seconds} seconds."
+        }
+        require(hourlyLimitIsConservative) {
+            "maxInvocationsPerHour must be between 1 and $DEFAULT_MAX_INVOCATIONS_PER_HOUR."
+        }
+        require(actLimitFitsTotal) {
+            "maxActToolCallsPerRun must be less than or equal to maxToolCallsPerRun."
+        }
     }
 }
 
@@ -233,6 +276,26 @@ private const val FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS_ENV = "FUKUROU_MARKET_SLIP
 private const val FUKUROU_FALSIFICATION_FRESHNESS_SECONDS_ENV = "FUKUROU_FALSIFICATION_FRESHNESS_SECONDS"
 
 /**
+ * 1 MCP server instance あたりの総 tool call 上限の環境変数名。
+ */
+const val FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT_ENV = "FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT"
+
+/**
+ * 1 MCP server instance あたりの act 系 tool call 上限の環境変数名。
+ */
+const val FUKUROU_MCP_ACT_TOOL_CALL_LIMIT_ENV = "FUKUROU_MCP_ACT_TOOL_CALL_LIMIT"
+
+/**
+ * LLM CLI 1 起動 timeout 秒数の環境変数名。
+ */
+private const val FUKUROU_LLM_RUN_TIMEOUT_SECONDS_ENV = "FUKUROU_LLM_RUN_TIMEOUT_SECONDS"
+
+/**
+ * 直近 1 時間の runner 起動上限の環境変数名。
+ */
+private const val FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR_ENV = "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"
+
+/**
  * paper 初期残高の既定値。
  */
 private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("100000")
@@ -246,6 +309,26 @@ private val DEFAULT_MARKET_SLIPPAGE_BPS = BigDecimal("5")
  * fresh falsification の既定 window。
  */
 private val DEFAULT_FALSIFICATION_FRESHNESS_WINDOW = Duration.ofSeconds(120)
+
+/**
+ * 1 MCP server instance あたりの既定総 tool call 上限。
+ */
+const val DEFAULT_MAX_TOOL_CALLS_PER_RUN = 30
+
+/**
+ * 1 MCP server instance あたりの既定 act 系 tool call 上限。
+ */
+const val DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN = 3
+
+/**
+ * LLM CLI 1 起動の既定 timeout。
+ */
+val DEFAULT_LLM_PER_RUN_TIMEOUT: Duration = Duration.ofSeconds(180)
+
+/**
+ * 直近 1 時間の既定 runner 起動上限。
+ */
+const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 12
 
 /**
  * fallback 最小発注数量の既定値。
@@ -357,6 +440,25 @@ private fun Map<String, String>.readDecisionProtocolConfig(): DecisionProtocolCo
                 ?.toLong()
                 ?: DEFAULT_FALSIFICATION_FRESHNESS_WINDOW.seconds,
         ),
+    )
+}
+
+private fun Map<String, String>.readLlmRunnerConfig(): LlmRunnerConfig {
+    return LlmRunnerConfig(
+        maxToolCallsPerRun = readOptional(FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT_ENV)
+            ?.toInt()
+            ?: DEFAULT_MAX_TOOL_CALLS_PER_RUN,
+        maxActToolCallsPerRun = readOptional(FUKUROU_MCP_ACT_TOOL_CALL_LIMIT_ENV)
+            ?.toInt()
+            ?: DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN,
+        perRunTimeout = Duration.ofSeconds(
+            readOptional(FUKUROU_LLM_RUN_TIMEOUT_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_LLM_PER_RUN_TIMEOUT.seconds,
+        ),
+        maxInvocationsPerHour = readOptional(FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR_ENV)
+            ?.toInt()
+            ?: DEFAULT_MAX_INVOCATIONS_PER_HOUR,
     )
 }
 

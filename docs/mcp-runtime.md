@@ -43,6 +43,84 @@ CLI から stdio MCP を登録する場合の command / args:
 
 ローカル checkout の jar を使う場合は `args` を `["-jar", "mcp/build/libs/fukurou-mcp-all.jar"]` に差し替える。
 
+## one-shot runner
+
+手動の 1 回実行は `:trading` の JavaExec task から起動する。新規 module は作らず、runner core は `:trading` の `me.matsumo.fukurou.trading.invoker` / `me.matsumo.fukurou.trading.runner` に置く。
+
+```sh
+JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp:buildFatJar
+DB_URL=jdbc:postgresql://localhost:5432/fukurou \
+DB_USER=fukurou \
+DB_PASSWORD=<local password> \
+JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :trading:runOneShotLlm
+```
+
+container image 内で同じ runner main を使う場合は、Ktor fat jar を classpath として指定し、MCP は同梱済み fat jar を stdio 子プロセスとして登録する。
+
+```sh
+java -cp /app/app.jar me.matsumo.fukurou.trading.runner.OneShotRunnerMainKt
+```
+
+このとき runner は `FUKUROU_MCP_JAR_PATH` が未指定なら local checkout 用の `mcp/build/libs/fukurou-mcp-all.jar` を使う。container では次のように `/app/fukurou-mcp-all.jar` を明示する。
+
+```sh
+FUKUROU_MCP_JAR_PATH=/app/fukurou-mcp-all.jar \
+FUKUROU_REPOSITORY_ROOT=/app \
+FUKUROU_LLM_WORKING_DIRECTORY=/tmp/fukurou-llm \
+java -cp /app/app.jar me.matsumo.fukurou.trading.runner.OneShotRunnerMainKt
+```
+
+LLM CLI / MCP 登録は env から差し替えられる。server 名、tool allowlist、model 名、sandbox wrapper は renderer に直書きせず、次の設定で渡す。
+
+```sh
+FUKUROU_MCP_SERVER_NAME=fukurou-mcp
+FUKUROU_MCP_SERVER_COMMAND=java
+FUKUROU_MCP_SERVER_ARGS='-jar ${mcpJarPath}'
+FUKUROU_CLAUDE_COMMAND_TEMPLATE=claude
+FUKUROU_CODEX_COMMAND_TEMPLATE=codex
+FUKUROU_CLAUDE_MODEL=
+FUKUROU_CODEX_MODEL=
+FUKUROU_PROPOSER_ALLOWED_TOOLS=
+FUKUROU_FALSIFIER_ALLOWED_TOOLS=
+FUKUROU_CLAUDE_COMMON_ARGS=
+FUKUROU_CODEX_COMMON_ARGS=
+FUKUROU_CODEX_FALSIFIER_ARGS=
+```
+
+`FUKUROU_MCP_SERVER_ARGS` では `${mcpJarPath}` を `FUKUROU_MCP_JAR_PATH` / request の jar path に置き換える。Codex を外部 sandbox で包む場合は、例えば `FUKUROU_CODEX_COMMAND_TEMPLATE='docker run --rm ... codex'` のように command template 側へ prefix を持たせる。local 開発では既定どおり素の `codex` 起動にできる。
+
+runner の成功判定は DB が唯一の正本であり、LLM の stdout や exit code から decision は parse しない。Proposer 終了後に `FUKUROU_INVOCATION_ID` に紐づく `decisions` 行を読み、行がなければ `CallerNoTradeGuard` で no-trade audit を残して fail closed する。`ENTER` decision の場合だけ Falsifier を起動し、fresh な `APPROVED` が DB にあるときだけ persisted `trade_intents` の宣言値から `PlaceOrderCommand` を組み立て、`ToolCallGuard.runTradeTool -> PaperBroker -> SafetyFloor` の既存経路へ流す。order placement 用の第三 LLM session は起動しない。
+
+runner が CLI に渡す MCP config は、MCP server env を親 process 継承任せにしない。少なくとも以下を `mcp-config` の `env` へ明示する。
+
+```json
+{
+  "mcpServers": {
+    "fukurou-mcp": {
+      "command": "java",
+      "args": ["-jar", "/app/fukurou-mcp-all.jar"],
+      "env": {
+        "DB_URL": "jdbc:postgresql://postgres:5432/fukurou",
+        "DB_USER": "fukurou",
+        "DB_PASSWORD": "<from runtime env>",
+        "FUKUROU_INVOCATION_ID": "<runner invocation id>",
+        "FUKUROU_LLM_PROVIDER": "claude|codex",
+        "FUKUROU_PROMPT_HASH": "<sha256>",
+        "FUKUROU_SYSTEM_PROMPT_VERSION": "system-prompt-v1",
+        "FUKUROU_MARKET_SNAPSHOT_ID": "<snapshot id>",
+        "FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT": "30",
+        "FUKUROU_MCP_ACT_TOOL_CALL_LIMIT": "3",
+        "FUKUROU_MCP_ALLOWED_TOOLS": "get_ticker,get_candles,...,submit_decision"
+      }
+    }
+  }
+}
+```
+
+Claude Proposer は既定 allowlist で `submit_decision` までを許可し、`place_order` は許可しない。runner は同じ allowlist を MCP server env の `FUKUROU_MCP_ALLOWED_TOOLS` に短い tool 名で渡すため、CLI 側の tool gating が provider / version 差で効かない場合でも MCP server が allowlist 外 tool を no-trade audit 付きで拒否する。`FUKUROU_PROPOSER_ALLOWED_TOOLS` / `FUKUROU_FALSIFIER_ALLOWED_TOOLS` は `mcp__<server-name>__<tool-name>` 形式だけを受け付け、Claude / Codex の組み込み tool 名は許可しない。Codex Falsifier は `intent_id` だけを入力として受け取り、Proposer の理由・thesis・ナラティブは prompt/env に渡さない。Falsifier process env は非 secret の CLI 起動 env、run env 5 変数、`FUKUROU_FALSIFIER_INTENT_ID` に限定し、DB 接続は MCP server env にだけ明示する。GMO API key/secret や LLM credential env は CLI process / MCP server env のどちらにも渡さない。CLI 認証は env ではなく read-only mount 済み auth file を使う前提にする。
+
+Codex Falsifier は headless の非対話実行を使う。既定 renderer は user config を無視し、read-only sandbox と `approval_policy="never"` を指定する。`--dangerously-bypass-approvals-and-sandbox` 相当の引数は既定では付けず、外部 sandbox / container で filesystem / network / secret mount を閉じた場合だけ `FUKUROU_CODEX_FALSIFIER_ARGS` で明示的に opt-in する。
+
 ## config
 
 既定値は `.env.example` に記載する。主な env override:
@@ -58,8 +136,23 @@ CLI から stdio MCP を登録する場合の command / args:
 | `FUKUROU_MAX_TOTAL_EXPOSURE_RATIO` | `0.80` | 合計 exposure 上限 |
 | `FUKUROU_GMO_PUBLIC_REST_PER_SECOND` | `10` | GMO Public REST client-side limit。10 以下だけ許可 |
 | `FUKUROU_GMO_RETRY_MAX_ATTEMPTS` | `3` | 一時失敗 retry 回数 |
+| `FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT` | `30` | 1 MCP server instance あたりの総 tool call 上限 |
+| `FUKUROU_MCP_ACT_TOOL_CALL_LIMIT` | `3` | 1 MCP server instance あたりの trade 系 tool call 上限 |
+| `FUKUROU_LLM_RUN_TIMEOUT_SECONDS` | `180` | 1 CLI 起動 timeout |
+| `FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR` | `12` | runner が audit / DB から数える 1 時間起動上限 |
+| `FUKUROU_MCP_JAR_PATH` | `mcp/build/libs/fukurou-mcp-all.jar` | one-shot runner が stdio 子プロセスとして起動する MCP fat jar |
+| `FUKUROU_MCP_SERVER_NAME` | `fukurou-mcp` | Claude / Codex に登録する MCP server 名 |
+| `FUKUROU_MCP_SERVER_COMMAND` | `java` | MCP server 起動 command |
+| `FUKUROU_MCP_SERVER_ARGS` | 未指定 | MCP server 起動引数。未指定時は `-jar <FUKUROU_MCP_JAR_PATH>` |
+| `FUKUROU_CLAUDE_COMMAND_TEMPLATE` | `claude` | Claude CLI 起動 command template |
+| `FUKUROU_CODEX_COMMAND_TEMPLATE` | `codex` | Codex CLI 起動 command template。sandbox wrapper prefix を含められる |
+| `FUKUROU_CLAUDE_MODEL` | 未指定 | Claude CLI に渡す model 名 |
+| `FUKUROU_CODEX_MODEL` | 未指定 | Codex CLI に渡す model 名 |
+| `FUKUROU_MCP_ALLOWED_TOOLS` | runner が設定 | MCP server instance 内で許可する short tool 名。通常は手動設定しない |
 
 SafetyFloor 系 env と fallback fee / spread は、既定値と同等またはより保守的な値だけ許可する。GMO Public REST の rate-limit も既定 10 req/s / burst 10 以下だけ許可する。GMO Public REST の timeout / retry backoff も `.env.example` から上書きできる。GMO `/public/v1/symbols` が取得できる場合、paper 手数料は取引所 rule を優先する。
+
+runner 上限も保守側の override だけを許可する。総 tool call は 30 以下、trade 系 tool call は 3 以下、timeout は 180 秒以下、起動数は 12 回/時以下だけを受け入れる。上限超過時、MCP server instance counter は tool error を返し、no-trade audit を残す。
 
 ## secrets / CLI auth
 

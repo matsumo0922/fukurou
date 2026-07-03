@@ -103,6 +103,50 @@ class InMemoryDecisionRepository(
         }
     }
 
+    override suspend fun latestDecisionByInvocationId(invocationId: String): Result<DecisionSubmissionResult?> {
+        return runCatching {
+            mutex.withLock {
+                val decision = decisions
+                    .filter { record -> record.submission.invocationId == invocationId }
+                    .maxByOrNull { record -> record.createdAt }
+                    ?: return@withLock null
+                val tradeIntent = tradeIntents.firstOrNull { intent -> intent.decisionId == decision.decisionId }
+                val tradePlan = tradePlans.firstOrNull { plan -> plan.decisionId == decision.decisionId }
+
+                DecisionSubmissionResult(
+                    decision = decision,
+                    tradeIntent = tradeIntent,
+                    tradePlan = tradePlan,
+                )
+            }
+        }
+    }
+
+    override suspend fun latestFalsification(intentId: UUID): Result<FalsificationRecord?> {
+        return runCatching {
+            mutex.withLock {
+                falsifications
+                    .filter { falsification -> falsification.intentId == intentId }
+                    .maxByOrNull { falsification -> falsification.createdAt }
+            }
+        }
+    }
+
+    override suspend fun tradeIntentReviewSnapshot(intentId: UUID): Result<TradeIntentReviewSnapshot?> {
+        return runCatching {
+            mutex.withLock {
+                val intent = tradeIntents.firstOrNull { candidate -> candidate.intentId == intentId }
+                    ?: return@withLock null
+                val tradePlan = tradePlans.firstOrNull { candidate -> candidate.tradePlanId == intent.tradePlanId }
+
+                TradeIntentReviewSnapshot(
+                    tradeIntent = intent,
+                    tradePlan = tradePlan,
+                )
+            }
+        }
+    }
+
     override suspend fun entryIntentSafetySnapshot(
         intentId: UUID,
         observedAt: Instant,

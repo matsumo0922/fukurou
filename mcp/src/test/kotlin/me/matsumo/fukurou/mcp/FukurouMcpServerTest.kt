@@ -29,6 +29,10 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
+import me.matsumo.fukurou.trading.audit.CommandEventType
+import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.Candle
@@ -43,6 +47,7 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
+import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -83,6 +88,7 @@ class FukurouMcpServerTest {
                 "get_positions",
                 "get_open_orders",
                 "get_account_status",
+                "get_trade_intent",
                 "submit_decision",
                 "submit_falsification",
                 "place_order",
@@ -191,6 +197,44 @@ class FukurouMcpServerTest {
         assertEquals(1, repository.falsifications().size)
         assertTrue(duplicateResult.isError == true)
         assertEquals("invalid_request", duplicateContent.getValue("type").jsonPrimitive.contentOrNull)
+    }
+
+    @Test
+    fun getTradeIntentTool_returnsIntentAndTradePlanForFalsifierReview() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val decisionRequest = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "submit_decision",
+                arguments = enterDecisionArguments(),
+            ),
+        )
+
+        val decisionResult = server.tools.getValue("submit_decision").handler.invoke(TestClientConnection, decisionRequest)
+        val intentId = assertNotNull(decisionResult.structuredContent)
+            .getValue("intent_id")
+            .jsonPrimitive
+            .contentOrNull
+        val reviewRequest = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "get_trade_intent",
+                arguments = buildJsonObject {
+                    put("intent_id", intentId)
+                },
+            ),
+        )
+
+        val reviewResult = server.tools.getValue("get_trade_intent").handler.invoke(TestClientConnection, reviewRequest)
+        val structuredContent = assertNotNull(reviewResult.structuredContent)
+        val tradePlan = structuredContent.getValue("trade_plan").jsonObject
+
+        assertTrue(reviewResult.isError != true)
+        assertEquals(intentId, structuredContent.getValue("intent_id").jsonPrimitive.contentOrNull)
+        assertEquals("0.0050", structuredContent.getValue("size_btc").jsonPrimitive.contentOrNull)
+        assertEquals("1時間足の上昇継続に乗る。", tradePlan.getValue("thesis_ja").jsonPrimitive.contentOrNull)
     }
 
     @Test
@@ -361,6 +405,71 @@ class FukurouMcpServerTest {
         assertEquals("audit_failed_after_execution", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertEquals("true", structuredContent.getValue("executed").jsonPrimitive.contentOrNull)
     }
+
+    @Test
+    fun toolCallLimitExceeded_returnsToolErrorAndNoTradeAudit() = runBlocking {
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(
+                maxToolCallsPerRun = 1,
+                maxActToolCallsPerRun = 1,
+            ),
+        )
+        val runtime = TradingRuntimeFactory.inMemory(tradingConfig = config)
+        val server = FukurouMcpServer(
+            tradingConfig = config,
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val request = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "get_balance",
+                arguments = buildJsonObject {},
+            ),
+        )
+
+        server.tools.getValue("get_balance").handler.invoke(TestClientConnection, request)
+        val limitedResult = server.tools.getValue("get_balance").handler.invoke(TestClientConnection, request)
+        val structuredContent = assertNotNull(limitedResult.structuredContent)
+        val eventLog = runtime.commandEventLog as InMemoryCommandEventLog
+        val noTradeEvent = eventLog.events().single { event ->
+            event.eventType == CommandEventType.NO_TRADE_EXIT
+        }
+
+        assertTrue(limitedResult.isError == true)
+        assertEquals("tool_call_limit_exceeded", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertTrue(noTradeEvent.payload.contains("mcp_total_tool_call_limit_exceeded"))
+    }
+
+    @Test
+    fun toolAllowlistDenied_returnsToolErrorAndNoTradeAudit() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+            toolCallLimiter = McpToolCallLimiter(
+                config = TradingBotConfig().runner,
+                toolCallGuard = runtime.toolCallGuard,
+                allowedToolNames = setOf("get_balance"),
+            ),
+        ).createServer()
+        val request = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "get_positions",
+                arguments = buildJsonObject {},
+            ),
+        )
+
+        val deniedResult = server.tools.getValue("get_positions").handler.invoke(TestClientConnection, request)
+        val structuredContent = assertNotNull(deniedResult.structuredContent)
+        val eventLog = runtime.commandEventLog as InMemoryCommandEventLog
+        val noTradeEvent = eventLog.events().single { event ->
+            event.eventType == CommandEventType.NO_TRADE_EXIT
+        }
+
+        assertTrue(deniedResult.isError == true)
+        assertEquals("tool_call_not_allowed", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertTrue(noTradeEvent.payload.contains("mcp_tool_not_allowed"))
+    }
 }
 
 /**
@@ -438,6 +547,10 @@ private fun stringArray(vararg values: String) = buildJsonArray {
 private object FailingCommandEventLog : CommandEventLog {
     override suspend fun append(event: CommandEvent): Result<Unit> {
         return Result.failure(IllegalStateException("audit append failed"))
+    }
+
+    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+        return Result.failure(IllegalStateException("audit count failed"))
     }
 }
 

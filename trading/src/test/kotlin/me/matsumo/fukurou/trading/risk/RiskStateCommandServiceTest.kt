@@ -133,4 +133,8 @@ private object FailingCommandEventLog : CommandEventLog {
     override suspend fun append(event: CommandEvent): Result<Unit> {
         return Result.failure(IllegalStateException("audit append failed"))
     }
+
+    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+        return Result.failure(IllegalStateException("audit count failed"))
+    }
 }

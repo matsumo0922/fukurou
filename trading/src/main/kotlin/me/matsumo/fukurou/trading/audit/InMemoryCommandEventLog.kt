@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.audit
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.time.Instant
 
 /**
  * unit test と DB 未構成時のための in-memory command event log。
@@ -17,6 +18,18 @@ class InMemoryCommandEventLog : CommandEventLog {
         }
 
         return Result.success(Unit)
+    }
+
+    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+        return runCatching {
+            mutex.withLock {
+                storedEvents
+                    .filter { event -> !event.occurredAt.isBefore(since) }
+                    .mapNotNull { event -> event.decisionRunContext.decisionRunId }
+                    .distinct()
+                    .size
+            }
+        }
     }
 
     /**

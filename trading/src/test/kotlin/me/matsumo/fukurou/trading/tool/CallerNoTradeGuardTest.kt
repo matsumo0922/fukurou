@@ -136,6 +136,10 @@ private class CallerContextSwitchingCommandEventLog : CommandEventLog {
         }
     }
 
+    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+        return Result.success(0)
+    }
+
     /**
      * 保存済みイベントの snapshot を返す。
      */

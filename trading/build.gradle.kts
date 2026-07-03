@@ -17,3 +17,20 @@ dependencies {
     testImplementation(kotlin("test"))
     testImplementation(libs.testcontainers.postgresql)
 }
+
+tasks.register<JavaExec>("runOneShotLlm") {
+    val mcpJarPath = rootProject.layout.projectDirectory
+        .file("mcp/build/libs/fukurou-mcp-all.jar")
+        .asFile
+        .absolutePath
+
+    group = "application"
+    description = "Runs the manual one-shot Proposer -> Falsifier -> paper-entry LLM runner."
+    dependsOn(":mcp:buildFatJar", tasks.named("classes"))
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("me.matsumo.fukurou.trading.runner.OneShotRunnerMainKt")
+    workingDir = rootProject.projectDir
+    environment("FUKUROU_REPOSITORY_ROOT", rootProject.projectDir.absolutePath)
+    environment("FUKUROU_LLM_WORKING_DIRECTORY", rootProject.projectDir.absolutePath)
+    environment("FUKUROU_MCP_JAR_PATH", mcpJarPath)
+}

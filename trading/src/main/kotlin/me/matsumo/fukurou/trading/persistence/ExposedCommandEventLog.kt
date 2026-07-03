@@ -5,6 +5,7 @@ import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import java.time.Instant
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
@@ -30,6 +31,16 @@ private const val INSERT_COMMAND_EVENT_SQL = """
 """
 
 /**
+ * audit log に現れた distinct decision run ID 数を数える SQL。
+ */
+private const val COUNT_DISTINCT_DECISION_RUNS_SINCE_SQL = """
+    SELECT COUNT(DISTINCT decision_run_id)
+    FROM command_event_log
+    WHERE decision_run_id IS NOT NULL
+        AND ts >= ?
+"""
+
+/**
  * Exposed/JDBC で command_event_log を扱う repository。
  *
  * @param database Exposed database
@@ -43,6 +54,21 @@ class ExposedCommandEventLog(
             runCatching {
                 exposedTransaction(database) {
                     insertEvent(event)
+                }
+            }
+        }
+    }
+
+    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    jdbcConnection().prepareStatement(COUNT_DISTINCT_DECISION_RUNS_SINCE_SQL).use { statement ->
+                        statement.setLong(1, since.toEpochMilli())
+                        statement.executeQuery().use { resultSet ->
+                            if (resultSet.next()) resultSet.getInt(1) else 0
+                        }
+                    }
                 }
             }
         }
