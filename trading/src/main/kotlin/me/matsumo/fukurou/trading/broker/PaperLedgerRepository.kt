@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import java.math.BigDecimal
+import java.time.Instant
 import java.time.LocalDate
 import java.util.UUID
 
@@ -87,4 +88,33 @@ interface PaperLedgerRepository {
      * tick をもとに resting order / protection を決定的に前進させる。
      */
     suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult>
+}
+
+/**
+ * entry order と intent consumption を同一 commit 境界で保存できる paper ledger repository。
+ */
+interface IntentConsumingPaperLedgerRepository : PaperLedgerRepository {
+    /**
+     * MARKET entry と intent consumption を同一 commit 境界で保存する。
+     */
+    suspend fun fillMarketEntryAndConsumeIntent(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        stopOrderId: UUID,
+        intentId: UUID,
+        consumedAt: Instant,
+    ): Result<PaperTradeResult>
+
+    /**
+     * resting entry order と intent consumption を同一 commit 境界で保存する。
+     */
+    suspend fun createRestingEntryOrderAndConsumeIntent(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+        intentId: UUID,
+        consumedAt: Instant,
+    ): Result<PaperTradeResult>
 }

@@ -269,6 +269,24 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun place_order_does_not_consume_intent_when_ledger_write_fails() = runBlocking {
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = FailingPlaceOrderLedgerRepository(),
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedCommand(decisionRepository, marketEntryCommand())
+
+        val result = broker.placeOrder(command)
+
+        assertTrue(result.isFailure)
+        assertEquals(0, decisionRepository.intentConsumptions().size)
+    }
+
+    @Test
     fun close_position_and_update_protection_do_not_require_falsification() = runBlocking {
         val repository = InMemoryPaperLedgerRepository(
             accountSnapshot = accountSnapshotWithBtc(),
@@ -1075,6 +1093,32 @@ private fun safetyBroker(
         marketDataSource = marketDataSource,
         clock = fixedClock(),
     )
+}
+
+/**
+ * place_order ledger 書き込みだけ失敗させる repository。
+ */
+private class FailingPlaceOrderLedgerRepository(
+    private val delegate: PaperLedgerRepository = InMemoryPaperLedgerRepository(),
+) : PaperLedgerRepository by delegate {
+
+    override suspend fun fillMarketEntry(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        stopOrderId: UUID,
+    ): Result<PaperTradeResult> {
+        return Result.failure(IllegalStateException("ledger write failed"))
+    }
+
+    override suspend fun createRestingEntryOrder(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+    ): Result<PaperTradeResult> {
+        return Result.failure(IllegalStateException("ledger write failed"))
+    }
 }
 
 private suspend fun approvedCommand(

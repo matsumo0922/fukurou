@@ -24,6 +24,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.encodeToJsonElement
@@ -1085,7 +1086,17 @@ private fun parseEntryIntentDraft(request: CallToolRequest, action: DecisionActi
 
 private fun parseTradePlanDraft(request: CallToolRequest, action: DecisionAction): Result<TradePlanDraft?> {
     return runCatching {
-        if (action != DecisionAction.ENTER) {
+        val tradePlanRequired = action == DecisionAction.ENTER
+        val tradePlanSpecified = request.hasAnyArgument(
+            "parent_trade_plan_id",
+            "trade_plan_revision_count",
+            "trade_plan_thesis_ja",
+            "trade_plan_invalidation_conditions_ja",
+            "trade_plan_target_price_jpy",
+            "trade_plan_time_stop_at",
+        )
+
+        if (!tradePlanRequired && !tradePlanSpecified) {
             return@runCatching null
         }
 
@@ -1247,6 +1258,20 @@ private fun CallToolRequest.stringArgument(name: String): String? {
         ?.get(name)
         ?.jsonPrimitive
         ?.contentOrNull
+}
+
+private fun CallToolRequest.hasAnyArgument(vararg names: String): Boolean {
+    val requestArguments = arguments ?: return false
+
+    return names.any { name ->
+        val value = requestArguments[name] ?: return@any false
+
+        if (value is JsonPrimitive) {
+            value.contentOrNull?.isNotBlank() ?: true
+        } else {
+            true
+        }
+    }
 }
 
 private fun requiredStringArgument(request: CallToolRequest, name: String): String {

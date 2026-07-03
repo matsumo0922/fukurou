@@ -141,26 +141,23 @@ class PaperBroker(
                 val fill = fillSimulator.marketFill(resolvedCommand.side, resolvedCommand.sizeBtc, ticker, symbolRules)
                 val entryOrderId = resolvedCommand.commandId
 
-                consumeEntryIntent(resolvedCommand, entryOrderId)
-
-                return@runCatching ledgerRepository.fillMarketEntry(
+                return@runCatching fillMarketEntryAndConsumeIntent(
                     command = resolvedCommand,
                     fill = fill,
                     positionId = UUID.randomUUID(),
                     tradeGroupId = resolvedTradeGroupId,
+                    entryOrderId = entryOrderId,
                     stopOrderId = UUID.randomUUID(),
-                ).getOrThrow()
+                )
             }
 
             val orderId = UUID.randomUUID()
 
-            consumeEntryIntent(resolvedCommand, orderId)
-
-            ledgerRepository.createRestingEntryOrder(
+            createRestingEntryOrderAndConsumeIntent(
                 command = resolvedCommand,
                 orderId = orderId,
                 tradeGroupId = resolvedTradeGroupId,
-            ).getOrThrow()
+            )
         }
     }
 
@@ -332,15 +329,82 @@ class PaperBroker(
     }
 
     private suspend fun consumeEntryIntent(command: PlaceOrderCommand, orderId: UUID) {
-        val intentId = requireNotNull(command.intentId) {
-            "intentId is required for entry order."
-        }
+        val intentId = requireEntryIntentId(command)
 
         decisionRepository.appendIntentConsumption(
             intentId = intentId,
             orderId = orderId,
             consumedAt = Instant.now(clock),
         ).getOrThrow()
+    }
+
+    private fun requireEntryIntentId(command: PlaceOrderCommand): UUID {
+        return requireNotNull(command.intentId) {
+            "intentId is required for entry order."
+        }
+    }
+
+    private suspend fun fillMarketEntryAndConsumeIntent(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        entryOrderId: UUID,
+        stopOrderId: UUID,
+    ): PaperTradeResult {
+        val intentId = requireEntryIntentId(command)
+        val consumedAt = Instant.now(clock)
+        val atomicRepository = ledgerRepository as? IntentConsumingPaperLedgerRepository
+
+        if (atomicRepository != null) {
+            return atomicRepository.fillMarketEntryAndConsumeIntent(
+                command = command,
+                fill = fill,
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                stopOrderId = stopOrderId,
+                intentId = intentId,
+                consumedAt = consumedAt,
+            ).getOrThrow()
+        }
+
+        val result = ledgerRepository.fillMarketEntry(
+            command = command,
+            fill = fill,
+            positionId = positionId,
+            tradeGroupId = tradeGroupId,
+            stopOrderId = stopOrderId,
+        ).getOrThrow()
+
+        consumeEntryIntent(command, entryOrderId)
+
+        return result
+    }
+
+    private suspend fun createRestingEntryOrderAndConsumeIntent(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+    ): PaperTradeResult {
+        val intentId = requireEntryIntentId(command)
+        val consumedAt = Instant.now(clock)
+        val atomicRepository = ledgerRepository as? IntentConsumingPaperLedgerRepository
+
+        if (atomicRepository != null) {
+            return atomicRepository.createRestingEntryOrderAndConsumeIntent(
+                command = command,
+                orderId = orderId,
+                tradeGroupId = tradeGroupId,
+                intentId = intentId,
+                consumedAt = consumedAt,
+            ).getOrThrow()
+        }
+
+        val result = ledgerRepository.createRestingEntryOrder(command, orderId, tradeGroupId).getOrThrow()
+
+        consumeEntryIntent(command, orderId)
+
+        return result
     }
 
     private suspend fun atr14JpyFor(symbol: TradingSymbol): BigDecimal? {

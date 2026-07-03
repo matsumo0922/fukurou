@@ -5,7 +5,7 @@ import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.FillSimulator
-import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.broker.IntentConsumingPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
@@ -308,7 +308,7 @@ private val TradingDateZone = ZoneId.of("Asia/Tokyo")
 class ExposedPaperLedgerRepository(
     private val database: ExposedDatabase,
     fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
-) : PaperLedgerRepository {
+) : IntentConsumingPaperLedgerRepository {
 
     private val writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules)
 
@@ -388,6 +388,42 @@ class ExposedPaperLedgerRepository(
         tradeGroupId: UUID,
     ): Result<PaperTradeResult> {
         return writer.createRestingEntryOrder(command, orderId, tradeGroupId)
+    }
+
+    override suspend fun fillMarketEntryAndConsumeIntent(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        stopOrderId: UUID,
+        intentId: UUID,
+        consumedAt: Instant,
+    ): Result<PaperTradeResult> {
+        return writer.fillMarketEntryAndConsumeIntent(
+            command = command,
+            fill = fill,
+            positionId = positionId,
+            tradeGroupId = tradeGroupId,
+            stopOrderId = stopOrderId,
+            intentId = intentId,
+            consumedAt = consumedAt,
+        )
+    }
+
+    override suspend fun createRestingEntryOrderAndConsumeIntent(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+        intentId: UUID,
+        consumedAt: Instant,
+    ): Result<PaperTradeResult> {
+        return writer.createRestingEntryOrderAndConsumeIntent(
+            command = command,
+            orderId = orderId,
+            tradeGroupId = tradeGroupId,
+            intentId = intentId,
+            consumedAt = consumedAt,
+        )
     }
 
     override suspend fun closePosition(

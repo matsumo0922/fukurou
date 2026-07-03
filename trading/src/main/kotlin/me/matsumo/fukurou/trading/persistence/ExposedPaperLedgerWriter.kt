@@ -34,6 +34,7 @@ import java.math.BigDecimal
 import java.math.RoundingMode
 import java.sql.PreparedStatement
 import java.time.Clock
+import java.time.Instant
 import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
@@ -81,6 +82,57 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    insertEntryOrder(command, orderId, null, tradeGroupId, OrderStatus.OPEN)
+
+                    PaperTradeResult(
+                        accepted = true,
+                        status = OrderStatus.OPEN,
+                        orderIds = listOf(orderId.toString()),
+                        positionIds = emptyList(),
+                        executionIds = emptyList(),
+                        messageJa = "resting entry intent を保存しました。",
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * MARKET entry と intent consumption を同一 transaction で保存する。
+     */
+    suspend fun fillMarketEntryAndConsumeIntent(
+        command: PlaceOrderCommand,
+        fill: SimulatedFill,
+        positionId: UUID,
+        tradeGroupId: UUID,
+        stopOrderId: UUID,
+        intentId: UUID,
+        consumedAt: Instant,
+    ): Result<PaperTradeResult> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    insertTradeIntentConsumption(intentId, command.commandId, consumedAt)
+                    insertEntryFill(command, fill, positionId, tradeGroupId, command.commandId, stopOrderId)
+                }
+            }
+        }
+    }
+
+    /**
+     * resting entry order と intent consumption を同一 transaction で保存する。
+     */
+    suspend fun createRestingEntryOrderAndConsumeIntent(
+        command: PlaceOrderCommand,
+        orderId: UUID,
+        tradeGroupId: UUID,
+        intentId: UUID,
+        consumedAt: Instant,
+    ): Result<PaperTradeResult> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    insertTradeIntentConsumption(intentId, orderId, consumedAt)
                     insertEntryOrder(command, orderId, null, tradeGroupId, OrderStatus.OPEN)
 
                     PaperTradeResult(
@@ -249,6 +301,51 @@ internal class ExposedPaperLedgerWriter(
             executionIds = listOf(fill.executionId.toString()),
             messageJa = "paper entry を約定し、保護 STOP を作成しました。",
         )
+    }
+
+    private fun JdbcTransaction.insertTradeIntentConsumption(
+        intentId: UUID,
+        orderId: UUID,
+        consumedAt: Instant,
+    ) {
+        require(tradeIntentExists(intentId)) {
+            "trade intent was not found."
+        }
+        require(!tradeIntentConsumed(intentId)) {
+            "trade intent was already consumed."
+        }
+
+        prepare(
+            """
+                INSERT INTO trade_intent_consumptions (
+                    id,
+                    intent_id,
+                    order_id,
+                    consumed_at
+                )
+                VALUES (?, ?, ?, ?)
+            """,
+        ).use { statement ->
+            statement.setObject(1, UUID.randomUUID())
+            statement.setObject(2, intentId)
+            statement.setObject(3, orderId)
+            statement.setLong(4, consumedAt.toEpochMilli())
+            statement.executeUpdate()
+        }
+    }
+
+    private fun JdbcTransaction.tradeIntentExists(intentId: UUID): Boolean {
+        return prepare("SELECT 1 FROM trade_intents WHERE id = ?").use { statement ->
+            statement.setObject(1, intentId)
+            statement.executeQuery().use { resultSet -> resultSet.next() }
+        }
+    }
+
+    private fun JdbcTransaction.tradeIntentConsumed(intentId: UUID): Boolean {
+        return prepare("SELECT 1 FROM trade_intent_consumptions WHERE intent_id = ?").use { statement ->
+            statement.setObject(1, intentId)
+            statement.executeQuery().use { resultSet -> resultSet.next() }
+        }
     }
 
     private fun JdbcTransaction.fillTriggeredEntryOrders(

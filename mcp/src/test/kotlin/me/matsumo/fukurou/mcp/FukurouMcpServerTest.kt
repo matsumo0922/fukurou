@@ -219,6 +219,31 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun submitDecisionTool_recordsTradePlanRevisionForNonEnterAction() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val request = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "submit_decision",
+                arguments = tradePlanRevisionDecisionArguments(),
+            ),
+        )
+
+        val result = server.tools.getValue("submit_decision").handler.invoke(TestClientConnection, request)
+        val structuredContent = assertNotNull(result.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(result.isError != true)
+        assertEquals("ADJUST_PROTECTION", structuredContent.getValue("action").jsonPrimitive.contentOrNull)
+        assertEquals("1", structuredContent.getValue("revision_count").jsonPrimitive.contentOrNull)
+        assertEquals(1, repository.tradePlans().size)
+        assertEquals(0, repository.tradeIntents().size)
+    }
+
+    @Test
     fun embeddedMarketTool_preservesAuditCompletionFailureResponse() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val failingRuntime = runtime.copy(
@@ -289,6 +314,28 @@ private fun enterDecisionArguments() = buildJsonObject {
     put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ", "出来高急減"))
     put("trade_plan_target_price_jpy", "10500000")
     put("trade_plan_time_stop_at", "2026-07-02T01:00:00Z")
+}
+
+/**
+ * TradePlan 正式修正 decision tool request の引数を作る。
+ */
+private fun tradePlanRevisionDecisionArguments() = buildJsonObject {
+    put("action", "ADJUST_PROTECTION")
+    put("setup_tags", stringArray("breakout", "trend-follow"))
+    put("estimated_win_probability", "0.64")
+    put("expected_r_multiple", "1.20")
+    put("round_trip_cost_r", "0.05")
+    put("tool_evidence_ids", stringArray("tool-1", "tool-2"))
+    put("fact_check", """{"ticker":true}""")
+    put("self_review", """{"reasonsNotToTrade":[]}""")
+    put("reason_ja", "否定条件は未成立ですが、保護計画を正式修正します。")
+    put("symbol", TradingSymbol.BTC.apiSymbol)
+    put("parent_trade_plan_id", "00000000-0000-0000-0000-000000000001")
+    put("trade_plan_revision_count", 1)
+    put("trade_plan_thesis_ja", "上昇継続の仮説は維持します。")
+    put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ"))
+    put("trade_plan_target_price_jpy", "10400000")
+    put("trade_plan_time_stop_at", "2026-07-02T02:00:00Z")
 }
 
 /**
