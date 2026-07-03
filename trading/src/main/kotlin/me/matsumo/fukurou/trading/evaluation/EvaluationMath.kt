@@ -201,21 +201,14 @@ object EvaluationMath {
     ): List<MarketRegimePerformance> {
         val regimeByDate = regimes.associateBy { regime -> regime.date }
         val groupedTrades = trades.groupBy { fact ->
-            val entryDate = fact.openedAt.atZone(zoneId).toLocalDate()
-            val label = regimeByDate[entryDate]
-
-            label ?: MarketRegimeLabel(
-                date = entryDate,
-                trend = TrendRegime.UNKNOWN,
-                volatility = VolatilityRegime.UNKNOWN,
-            )
+            fact.marketRegimeBucketKey(regimeByDate, zoneId)
         }
 
         return groupedTrades
-            .map { (label, bucketTrades) ->
+            .map { (bucketKey, bucketTrades) ->
                 MarketRegimePerformance(
-                    trend = label.trend,
-                    volatility = label.volatility,
+                    trend = bucketKey.trend,
+                    volatility = bucketKey.volatility,
                     stats = summarizeTrades(bucketTrades),
                 )
             }
@@ -279,6 +272,17 @@ private data class DailyOhlcPoint(
     val highJpy: BigDecimal,
     val lowJpy: BigDecimal,
     val closeJpy: BigDecimal,
+)
+
+/**
+ * 相場局面成績の集計 key。
+ *
+ * @param trend トレンド区分
+ * @param volatility ボラティリティ区分
+ */
+private data class MarketRegimeBucketKey(
+    val trend: TrendRegime,
+    val volatility: VolatilityRegime,
 )
 
 private fun summarizeEvaluatedTrades(trades: List<EvaluatedTrade>): TradePerformanceStats {
@@ -386,6 +390,19 @@ private fun Candle.toDailyOhlcOrNull(zoneId: ZoneId): DailyOhlcPoint? {
         highJpy = highJpy,
         lowJpy = lowJpy,
         closeJpy = closeJpy,
+    )
+}
+
+private fun ClosedTradeFact.marketRegimeBucketKey(
+    regimeByDate: Map<LocalDate, MarketRegimeLabel>,
+    zoneId: ZoneId,
+): MarketRegimeBucketKey {
+    val entryDate = openedAt.atZone(zoneId).toLocalDate()
+    val label = regimeByDate[entryDate]
+
+    return MarketRegimeBucketKey(
+        trend = label?.trend ?: TrendRegime.UNKNOWN,
+        volatility = label?.volatility ?: VolatilityRegime.UNKNOWN,
     )
 }
 

@@ -81,6 +81,29 @@ class EvaluationRouteTest {
         assertEquals(HttpStatusCode.BadRequest, response.status)
         assertTrue(response.bodyAsText().contains("ISO-8601"))
     }
+
+    @Test
+    fun evaluationRoutes_requestHistoricalCandlesFromReferenceDate() = testApplication {
+        val marketDataSource = RecordingEvaluationMarketDataSource()
+
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = FakeEvaluationRepository,
+                evaluationMarketDataSource = marketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/evaluation/benchmark?from=2026-01-01&to=2026-01-02")
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertEquals(
+            expected = listOf(224),
+            actual = marketDataSource.requestedLimits,
+        )
+    }
 }
 
 /**
@@ -170,6 +193,69 @@ private object FakeEvaluationMarketDataSource : MarketDataSource {
                     symbol = "BTC",
                     interval = CandleInterval.ONE_DAY,
                     openTime = "2026-07-02T00:00:00Z",
+                    open = "10000000",
+                    high = "10200000",
+                    low = "9900000",
+                    close = "10100000",
+                    volume = "1.0",
+                ),
+            ),
+        )
+    }
+
+    override suspend fun getOrderbook(
+        symbol: TradingSymbol,
+        depth: Int,
+    ): Result<Orderbook> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun getTrades(
+        symbol: TradingSymbol,
+        limit: Int,
+    ): Result<List<RecentTrade>> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+}
+
+/**
+ * 日足取得 limit を記録する route test 用 market data source。
+ */
+private class RecordingEvaluationMarketDataSource : MarketDataSource {
+
+    val requestedLimits = mutableListOf<Int>()
+
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        requestedLimits += limit
+
+        return Result.success(
+            listOf(
+                Candle(
+                    symbol = "BTC",
+                    interval = CandleInterval.ONE_DAY,
+                    openTime = "2026-01-01T00:00:00Z",
+                    open = "10000000",
+                    high = "10100000",
+                    low = "9900000",
+                    close = "10000000",
+                    volume = "1.0",
+                ),
+                Candle(
+                    symbol = "BTC",
+                    interval = CandleInterval.ONE_DAY,
+                    openTime = "2026-01-02T00:00:00Z",
                     open = "10000000",
                     high = "10200000",
                     low = "9900000",

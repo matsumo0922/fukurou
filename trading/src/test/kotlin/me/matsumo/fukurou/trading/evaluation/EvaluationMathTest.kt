@@ -145,10 +145,46 @@ class EvaluationMathTest {
         assertEquals(TrendRegime.TREND_UP, labels.last().trend)
         assertEquals(VolatilityRegime.HIGH_VOL, labels.last().volatility)
     }
+
+    @Test
+    fun summarizeByMarketRegimeMergesSameRegimeAcrossEntryDates() {
+        val stats = EvaluationMath.summarizeByMarketRegime(
+            trades = listOf(
+                trade(
+                    pnlJpy = "10",
+                    openedAt = Instant.parse("2026-07-01T00:00:00Z"),
+                ),
+                trade(
+                    pnlJpy = "20",
+                    openedAt = Instant.parse("2026-07-02T00:00:00Z"),
+                ),
+            ),
+            regimes = listOf(
+                MarketRegimeLabel(
+                    date = LocalDate.parse("2026-07-01"),
+                    trend = TrendRegime.TREND_UP,
+                    volatility = VolatilityRegime.HIGH_VOL,
+                ),
+                MarketRegimeLabel(
+                    date = LocalDate.parse("2026-07-02"),
+                    trend = TrendRegime.TREND_UP,
+                    volatility = VolatilityRegime.HIGH_VOL,
+                ),
+            ),
+            zoneId = ZoneId.of("UTC"),
+        )
+        val bucket = stats.single()
+
+        assertEquals(TrendRegime.TREND_UP, bucket.trend)
+        assertEquals(VolatilityRegime.HIGH_VOL, bucket.volatility)
+        assertEquals(2, bucket.stats.tradeCount)
+        assertEquals("30.0000000000", bucket.stats.totalPnlJpy.toPlainString())
+    }
 }
 
 private fun trade(
     pnlJpy: String,
+    openedAt: Instant = Instant.parse("2026-07-01T00:00:00Z"),
     probability: BigDecimal = BigDecimal("0.50"),
     setupTags: List<String> = listOf("setup"),
     initialProtectiveStopPriceJpy: BigDecimal? = BigDecimal("90"),
@@ -157,7 +193,7 @@ private fun trade(
 ): ClosedTradeFact {
     return ClosedTradeFact(
         positionId = UUID.randomUUID(),
-        openedAt = Instant.parse("2026-07-01T00:00:00Z"),
+        openedAt = openedAt,
         closedAt = Instant.parse("2026-07-02T00:00:00Z"),
         sizeBtc = BigDecimal.ONE,
         averageEntryPriceJpy = BigDecimal("100"),

@@ -321,6 +321,7 @@ private suspend fun ApplicationCall.parseEvaluationDateRange(clock: Clock): Eval
     return EvaluationDateRange(
         fromDate = fromDate,
         toDate = toDate,
+        referenceDate = today,
     )
 }
 
@@ -347,10 +348,12 @@ private suspend fun MarketDataSource?.fetchDailyCandlesOrEmpty(
  *
  * @param fromDate 開始日
  * @param toDate 終了日
+ * @param referenceDate 最新 N 本の日足取得で到達すべき基準日
  */
 private data class EvaluationDateRange(
     val fromDate: LocalDate,
     val toDate: LocalDate,
+    val referenceDate: LocalDate,
 ) {
     fun toPeriod(): EvaluationPeriod {
         return EvaluationPeriod(
@@ -368,11 +371,13 @@ private data class EvaluationDateRange(
     }
 
     fun dailyCandleLimit(): Int {
+        val lookbackStartDate = fromDate.minusDays(DAILY_CANDLE_LOOKBACK_PADDING.toLong())
+        val latestNeededDate = maxOf(toDate, referenceDate)
         val days = Duration.between(
-            fromDate.atStartOfDay(EvaluationZone),
-            toDate.plusDays(1).atStartOfDay(EvaluationZone),
+            lookbackStartDate.atStartOfDay(EvaluationZone),
+            latestNeededDate.plusDays(1).atStartOfDay(EvaluationZone),
         ).toDays()
-        val requestedLimit = days.toInt() + DAILY_CANDLE_LOOKBACK_PADDING
+        val requestedLimit = days.toInt()
 
         return min(requestedLimit, MAX_DAILY_CANDLE_LIMIT)
     }
