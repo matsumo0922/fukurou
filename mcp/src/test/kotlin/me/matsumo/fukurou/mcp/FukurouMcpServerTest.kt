@@ -496,6 +496,45 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun actToolCallLimitExceeded_doesNotRejectReadOnlyToolWhenTotalBudgetRemains() = runBlocking {
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(
+                maxToolCallsPerRun = 5,
+                maxActToolCallsPerRun = 1,
+            ),
+        )
+        val runtime = TradingRuntimeFactory.inMemory(tradingConfig = config)
+        val server = FukurouMcpServer(
+            tradingConfig = config,
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val tradeRequest = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "reject_dummy_trade",
+                arguments = buildJsonObject {
+                    put("reason", "act limit test")
+                },
+            ),
+        )
+        val readRequest = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "get_balance",
+                arguments = buildJsonObject {},
+            ),
+        )
+
+        server.tools.getValue("reject_dummy_trade").handler.invoke(TestClientConnection, tradeRequest)
+        val tradeLimitedResult = server.tools.getValue("reject_dummy_trade").handler.invoke(TestClientConnection, tradeRequest)
+        val readResult = server.tools.getValue("get_balance").handler.invoke(TestClientConnection, readRequest)
+        val tradeLimitedContent = assertNotNull(tradeLimitedResult.structuredContent)
+
+        assertTrue(tradeLimitedResult.isError == true)
+        assertEquals("tool_call_limit_exceeded", tradeLimitedContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertTrue(readResult.isError != true)
+    }
+
+    @Test
     fun toolAllowlistDenied_returnsToolErrorAndNoTradeAudit() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(

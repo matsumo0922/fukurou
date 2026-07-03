@@ -66,7 +66,8 @@ class McpToolCallLimiter(
         val totalCount = currentInitialCounts.totalToolCallCount + localTotalCount
         val actCount = currentInitialCounts.actToolCallCount + localActCount
         val totalExceeded = totalCount > config.maxToolCallsPerRun
-        val actExceeded = actCount > config.maxActToolCallsPerRun
+        val actLimitTarget = kind == McpToolCallKind.TRADE
+        val actExceeded = actLimitTarget && actCount > config.maxActToolCallsPerRun
 
         if (!totalExceeded && !actExceeded) {
             return Result.success(Unit)

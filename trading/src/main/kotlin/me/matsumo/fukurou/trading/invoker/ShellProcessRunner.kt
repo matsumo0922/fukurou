@@ -5,6 +5,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.Comparator
 import java.util.concurrent.TimeUnit
 
 /**
@@ -14,36 +17,40 @@ class ShellProcessRunner : ProcessRunner {
 
     override suspend fun run(command: RenderedLlmCommand): Result<ProcessRunResult> {
         return runCatching {
-            coroutineScope {
-                val process = startProcess(command)
-                val stdout = async(Dispatchers.IO) { process.inputStream.bufferedReader().readText() }
-                val stderr = async(Dispatchers.IO) { process.errorStream.bufferedReader().readText() }
+            try {
+                coroutineScope {
+                    val process = startProcess(command)
+                    val stdout = async(Dispatchers.IO) { process.inputStream.bufferedReader().readText() }
+                    val stderr = async(Dispatchers.IO) { process.errorStream.bufferedReader().readText() }
 
-                writeStdin(process, command.stdin)
+                    writeStdin(process, command.stdin)
 
-                val exitCode = withTimeoutOrNull(command.timeout.toMillis()) {
-                    withContext(Dispatchers.IO) {
-                        process.waitFor()
+                    val exitCode = withTimeoutOrNull(command.timeout.toMillis()) {
+                        withContext(Dispatchers.IO) {
+                            process.waitFor()
+                        }
                     }
-                }
 
-                if (exitCode == null) {
-                    destroyProcessTree(process)
+                    if (exitCode == null) {
+                        destroyProcessTree(process)
 
-                    return@coroutineScope ProcessRunResult(
-                        status = ProcessRunStatus.TIMED_OUT,
-                        exitCode = null,
+                        return@coroutineScope ProcessRunResult(
+                            status = ProcessRunStatus.TIMED_OUT,
+                            exitCode = null,
+                            stdout = stdout.await(),
+                            stderr = stderr.await(),
+                        )
+                    }
+
+                    ProcessRunResult(
+                        status = ProcessRunStatus.EXITED,
+                        exitCode = exitCode,
                         stdout = stdout.await(),
                         stderr = stderr.await(),
                     )
                 }
-
-                ProcessRunResult(
-                    status = ProcessRunStatus.EXITED,
-                    exitCode = exitCode,
-                    stdout = stdout.await(),
-                    stderr = stderr.await(),
-                )
+            } finally {
+                deleteCleanupPaths(command.cleanupPaths)
             }
         }
     }
@@ -81,6 +88,24 @@ class ShellProcessRunner : ProcessRunner {
                     writer.write(stdin)
                 }
             }
+        }
+    }
+
+    private suspend fun deleteCleanupPaths(paths: List<Path>) {
+        withContext(Dispatchers.IO) {
+            paths.forEach { path -> deleteCleanupPath(path) }
+        }
+    }
+
+    private fun deleteCleanupPath(path: Path) {
+        if (!Files.isDirectory(path)) {
+            Files.deleteIfExists(path)
+
+            return
+        }
+
+        Files.walk(path).use { paths ->
+            paths.sorted(Comparator.reverseOrder()).forEach { candidate -> Files.deleteIfExists(candidate) }
         }
     }
 }

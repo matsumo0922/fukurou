@@ -31,6 +31,7 @@ import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
@@ -195,7 +196,7 @@ class OneShotLlmRunnerTest {
             event.decisionRunContext.decisionRunId == decision.submission.invocationId
         }
         val proposerCommand = fixture.processRunner.launches.first()
-        val joinedArgs = proposerCommand.args.joinToString(" ")
+        val mcpConfigContent = proposerCommand.claudeMcpConfigContent()
 
         assertEquals("claude", decision.submission.llmProvider)
         assertEquals(SystemPromptV1.VERSION, decision.submission.systemPromptVersion)
@@ -203,11 +204,11 @@ class OneShotLlmRunnerTest {
         assertNotNull(decision.submission.promptHash)
         assertNotNull(decision.submission.marketSnapshotId)
         assertEquals(decision.submission.invocationId, auditEvent.decisionRunContext.decisionRunId)
-        assertTrue(joinedArgs.contains(FUKUROU_INVOCATION_ID_ENV))
-        assertTrue(joinedArgs.contains(FUKUROU_LLM_PROVIDER_ENV))
-        assertTrue(joinedArgs.contains(FUKUROU_PROMPT_HASH_ENV))
-        assertTrue(joinedArgs.contains(FUKUROU_SYSTEM_PROMPT_VERSION_ENV))
-        assertTrue(joinedArgs.contains(FUKUROU_MARKET_SNAPSHOT_ID_ENV))
+        assertTrue(mcpConfigContent.contains(FUKUROU_INVOCATION_ID_ENV))
+        assertTrue(mcpConfigContent.contains(FUKUROU_LLM_PROVIDER_ENV))
+        assertTrue(mcpConfigContent.contains(FUKUROU_PROMPT_HASH_ENV))
+        assertTrue(mcpConfigContent.contains(FUKUROU_SYSTEM_PROMPT_VERSION_ENV))
+        assertTrue(mcpConfigContent.contains(FUKUROU_MARKET_SNAPSHOT_ID_ENV))
     }
 
     @Test
@@ -237,9 +238,10 @@ class OneShotLlmRunnerTest {
 
         val proposerCommand = fixture.processRunner.launches.single()
         val joinedArgs = proposerCommand.args.joinToString(" ")
+        val mcpConfigContent = proposerCommand.claudeMcpConfigContent()
 
-        assertTrue(joinedArgs.contains(customServerName))
-        assertTrue(joinedArgs.contains("custom-java"))
+        assertTrue(mcpConfigContent.contains(customServerName))
+        assertTrue(mcpConfigContent.contains("custom-java"))
         assertTrue(joinedArgs.contains(customSubmitDecisionTool))
         assertFalse(joinedArgs.contains("mcp__fukurou-mcp__submit_decision"))
     }
@@ -272,9 +274,7 @@ class OneShotLlmRunnerTest {
         fixture.runner.runOneShot(defaultRequest()).getOrThrow()
 
         val falsifierCommand = fixture.processRunner.launches.single { command -> command.isFalsifierLaunch() }
-        val allowedToolsConfig = falsifierCommand.args.single { argument ->
-            argument.contains(FUKUROU_MCP_ALLOWED_TOOLS_ENV)
-        }
+        val allowedToolsConfig = falsifierCommand.codexConfigContent()
 
         assertTrue(allowedToolsConfig.contains("submit_falsification"))
         assertTrue(allowedToolsConfig.contains("get_trade_intent"))
@@ -351,6 +351,7 @@ class OneShotLlmRunnerTest {
 
         val falsifierCommand = fixture.processRunner.launches.single { command -> command.isFalsifierLaunch() }
         val joinedArgs = falsifierCommand.args.joinToString(" ")
+        val codexConfigContent = falsifierCommand.codexConfigContent()
         val forbiddenNames = listOf(
             "DB_URL",
             "DB_USER",
@@ -371,12 +372,25 @@ class OneShotLlmRunnerTest {
         secretNames.forEach { secretName ->
             assertFalse(joinedArgs.contains(secretName), secretName)
         }
-        assertTrue(joinedArgs.contains("mcp_servers.fukurou-mcp.env.DB_URL"))
-        assertTrue(joinedArgs.contains("mcp_servers.fukurou-mcp.env.DB_USER"))
-        assertTrue(joinedArgs.contains("mcp_servers.fukurou-mcp.env.DB_PASSWORD"))
+        assertFalse(joinedArgs.contains("DB_PASSWORD"))
+        assertTrue(codexConfigContent.contains("DB_URL"))
+        assertTrue(codexConfigContent.contains("DB_USER"))
+        assertTrue(codexConfigContent.contains("DB_PASSWORD"))
         assertNotNull(falsifierCommand.environment[FUKUROU_FALSIFIER_INTENT_ID_ENV])
 
         Unit
+    }
+
+    @Test
+    fun unexpectedRunnerFailure_recordsCallerNoTradeAudit() = runBlocking {
+        val missingPromptRoot = Files.createTempDirectory("fukurou-missing-prompt")
+        val fixture = runnerFixture { cleanExit() }
+
+        val result = fixture.runner.runOneShot(defaultRequest().copy(repositoryRoot = missingPromptRoot))
+
+        assertTrue(result.isFailure)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("caller_failed"))
+        assertEquals(0, fixture.processRunner.launches.size)
     }
 }
 
@@ -566,6 +580,18 @@ private fun RenderedLlmCommand.isFalsifierLaunch(): Boolean {
     return environment[FUKUROU_FALSIFIER_INTENT_ID_ENV] != null
 }
 
+private fun RenderedLlmCommand.claudeMcpConfigContent(): String {
+    val configPath = Path.of(args[args.indexOf("--mcp-config") + 1])
+
+    return Files.readString(configPath)
+}
+
+private fun RenderedLlmCommand.codexConfigContent(): String {
+    val codexHome = Path.of(requireNotNull(environment[CODEX_HOME_ENV]))
+
+    return Files.readString(codexHome.resolve("config.toml"))
+}
+
 private fun cleanExit(): ProcessRunResult {
     return ProcessRunResult(
         status = ProcessRunStatus.EXITED,
@@ -647,6 +673,9 @@ private fun defaultParentEnvironment(): Map<String, String> {
     )
 }
 
+/**
+ * runner test 用の固定 market data source。
+ */
 private object FakeMarketDataSource : MarketDataSource {
     override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
         return Result.success(

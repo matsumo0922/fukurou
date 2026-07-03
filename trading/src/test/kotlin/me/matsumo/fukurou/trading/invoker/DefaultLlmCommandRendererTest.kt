@@ -1,12 +1,14 @@
 package me.matsumo.fukurou.trading.invoker
 
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -32,14 +34,19 @@ class DefaultLlmCommandRendererTest {
 
         val command = renderer.render(request).getOrThrow()
         val joinedArgs = command.args.joinToString(" ")
+        val configPath = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV])).resolve("config.toml")
+        val configContent = Files.readString(configPath)
 
         assertEquals("docker", command.executable)
         assertEquals(listOf("run", "--rm", "codex-image", "codex", "exec"), command.args.take(5))
         assertTrue(joinedArgs.contains("-m gpt-5-codex-test"))
         assertTrue(joinedArgs.contains("--headless-test"))
         assertTrue(joinedArgs.contains("--yolo"))
-        assertTrue(joinedArgs.contains("mcp_servers.custom-mcp.command"))
         assertFalse(joinedArgs.contains("mcp_servers.fukurou-mcp.command"))
+        assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\"]"))
+        assertTrue(configContent.contains("command = \"java\""))
+
+        command.deleteCleanupPaths()
     }
 
     @Test
@@ -67,6 +74,8 @@ class DefaultLlmCommandRendererTest {
         assertTrue(joinedArgs.contains("--headless-test"))
         assertTrue(joinedArgs.contains("custom-mcp"))
         assertTrue(joinedArgs.contains("mcp__custom-mcp__submit_decision"))
+
+        command.deleteCleanupPaths()
     }
 
     @Test
@@ -82,6 +91,58 @@ class DefaultLlmCommandRendererTest {
         val joinedArgs = command.args.joinToString(" ")
 
         assertFalse(joinedArgs.contains("--dangerously-bypass-approvals-and-sandbox"))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderClaude_writesMcpConfigToPrivateFileWithoutArgvSecret() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CLAUDE,
+            phase = LlmInvocationPhase.PROPOSER,
+            mcpServerName = "custom-mcp",
+            mcpEnvironment = mapOf(
+                "DB_URL" to "jdbc:postgresql://localhost:5432/fukurou",
+                "DB_PASSWORD" to "secret-password",
+            ),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val joinedArgs = command.args.joinToString(" ")
+        val configPath = Path.of(command.args[command.args.indexOf("--mcp-config") + 1])
+        val configContent = Files.readString(configPath)
+
+        assertFalse(joinedArgs.contains("secret-password"))
+        assertTrue(configContent.contains("secret-password"))
+        assertTrue(Files.exists(configPath))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderCodex_writesMcpConfigToPrivateCodexHomeWithoutArgvSecret() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            mcpEnvironment = mapOf(
+                "DB_URL" to "jdbc:postgresql://localhost:5432/fukurou",
+                "DB_PASSWORD" to "secret-password",
+            ),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val joinedArgs = command.args.joinToString(" ")
+        val codexHome = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV]))
+        val configContent = Files.readString(codexHome.resolve("config.toml"))
+
+        assertFalse(joinedArgs.contains("secret-password"))
+        assertFalse(command.environment.containsKey("DB_PASSWORD"))
+        assertTrue(configContent.contains("secret-password"))
+
+        command.deleteCleanupPaths()
     }
 
     @Test
@@ -127,6 +188,7 @@ class DefaultLlmCommandRendererTest {
         phase: LlmInvocationPhase,
         mcpServerName: String,
         allowedTools: List<String> = emptyList(),
+        mcpEnvironment: Map<String, String> = mapOf("FUKUROU_INVOCATION_ID" to "invocation-test"),
     ): LlmInvocationRequest {
         return LlmInvocationRequest(
             invocationId = "invocation-test",
@@ -146,10 +208,14 @@ class DefaultLlmCommandRendererTest {
                 name = mcpServerName,
                 command = "java",
                 args = listOf("-jar", "mcp.jar"),
-                environment = mapOf("FUKUROU_INVOCATION_ID" to "invocation-test"),
+                environment = mcpEnvironment,
             ),
             environment = emptyMap(),
             allowedTools = allowedTools,
         )
     }
+}
+
+private fun RenderedLlmCommand.deleteCleanupPaths() {
+    cleanupPaths.forEach { path -> Files.deleteIfExists(path) }
 }

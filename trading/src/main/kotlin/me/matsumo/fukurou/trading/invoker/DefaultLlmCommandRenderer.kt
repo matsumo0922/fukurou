@@ -5,6 +5,10 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.PosixFilePermission
 
 /**
  * CLI command renderer の設定。
@@ -99,11 +103,16 @@ class DefaultLlmCommandRenderer(
 
     private fun renderClaude(request: LlmInvocationRequest): RenderedLlmCommand {
         val allowedTools = request.allowedTools.joinToString(",")
+        val mcpConfigFile = writePrivateConfigFile(
+            prefix = "claude-mcp-config",
+            suffix = ".json",
+            content = request.mcpServer.toClaudeMcpConfigJson(),
+        )
         val args = listOf(
             "-p",
             request.prompt,
             "--mcp-config",
-            request.mcpServer.toClaudeMcpConfigJson(),
+            mcpConfigFile.path.toString(),
             "--strict-mcp-config",
             "--allowedTools",
             allowedTools,
@@ -115,6 +124,7 @@ class DefaultLlmCommandRenderer(
             workingDirectory = request.workingDirectory,
             timeout = request.timeout,
             stdin = null,
+            cleanupPaths = mcpConfigFile.cleanupPaths,
         )
     }
 
@@ -124,20 +134,22 @@ class DefaultLlmCommandRenderer(
         } else {
             emptyList()
         }
+        val codexHome = writeCodexHome(request.mcpServer)
+        val commandEnvironment = request.environment + (CODEX_HOME_ENV to codexHome.path.toString())
         val args = listOf("exec") +
             config.codexModelArgs() +
             ENFORCED_CODEX_COMMON_ARGS +
             config.codexCommonArgs +
             phaseArgs +
-            request.mcpServer.toCodexConfigArgs(request.mcpServer.name) +
             request.prompt
 
         return config.codexCommandTemplate.toRenderedCommand(
             args = args,
-            environment = request.environment,
+            environment = commandEnvironment,
             workingDirectory = request.workingDirectory,
             timeout = request.timeout,
             stdin = null,
+            cleanupPaths = codexHome.cleanupPaths,
         )
     }
 }
@@ -160,6 +172,7 @@ private fun List<String>.toRenderedCommand(
     workingDirectory: java.nio.file.Path,
     timeout: java.time.Duration,
     stdin: String?,
+    cleanupPaths: List<Path>,
 ): RenderedLlmCommand {
     return RenderedLlmCommand(
         executable = first(),
@@ -168,6 +181,7 @@ private fun List<String>.toRenderedCommand(
         workingDirectory = workingDirectory,
         timeout = timeout,
         stdin = stdin,
+        cleanupPaths = cleanupPaths,
     )
 }
 
@@ -187,21 +201,30 @@ private fun LlmMcpServerConfig.toClaudeMcpConfigJson(): String {
     }.toString()
 }
 
-private fun LlmMcpServerConfig.toCodexConfigArgs(serverName: String): List<String> {
-    val commandArgs = listOf(
-        "-c",
-        "mcp_servers.$serverName.command=${command.tomlQuoted()}",
-        "-c",
-        "mcp_servers.$serverName.args=${args.toTomlArray()}",
-    )
-    val environmentArgs = environment.flatMap { (key, value) ->
-        listOf(
-            "-c",
-            "mcp_servers.$serverName.env.$key=${value.tomlQuoted()}",
-        )
-    }
+private fun LlmMcpServerConfig.toCodexConfigToml(): String {
+    return buildString {
+        append("[mcp_servers.")
+        append(name.tomlKey())
+        append("]\n")
+        append("command = ")
+        append(command.tomlQuoted())
+        append("\n")
+        append("args = ")
+        append(args.toTomlArray())
+        append("\n")
 
-    return commandArgs + environmentArgs
+        if (environment.isNotEmpty()) {
+            append("[mcp_servers.")
+            append(name.tomlKey())
+            append(".env]\n")
+            environment.forEach { (key, value) ->
+                append(key.tomlKey())
+                append(" = ")
+                append(value.tomlQuoted())
+                append("\n")
+            }
+        }
+    }
 }
 
 private fun List<String>.toTomlArray(): String {
@@ -214,6 +237,69 @@ private fun List<String>.toTomlArray(): String {
 private fun String.tomlQuoted(): String {
     return "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 }
+
+private fun String.tomlKey(): String {
+    return tomlQuoted()
+}
+
+private fun writeCodexHome(mcpServer: LlmMcpServerConfig): PrivateConfigPath {
+    val directory = Files.createTempDirectory("fukurou-codex-home-")
+    directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
+
+    val configFile = directory.resolve("config.toml")
+    Files.writeString(
+        configFile,
+        mcpServer.toCodexConfigToml(),
+        StandardOpenOption.CREATE_NEW,
+        StandardOpenOption.WRITE,
+    )
+    configFile.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
+
+    return PrivateConfigPath(
+        path = directory,
+        cleanupPaths = listOf(configFile, directory),
+    )
+}
+
+private fun writePrivateConfigFile(
+    prefix: String,
+    suffix: String,
+    content: String,
+): PrivateConfigPath {
+    val directory = Files.createTempDirectory("fukurou-llm-config-")
+    directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
+
+    val file = Files.createTempFile(directory, prefix, suffix)
+    Files.writeString(
+        file,
+        content,
+        StandardOpenOption.TRUNCATE_EXISTING,
+        StandardOpenOption.WRITE,
+    )
+    file.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
+
+    return PrivateConfigPath(
+        path = file,
+        cleanupPaths = listOf(file, directory),
+    )
+}
+
+private fun Path.setOwnerOnlyPermissions(permissions: Set<PosixFilePermission>) {
+    runCatching {
+        Files.setPosixFilePermissions(this, permissions)
+    }
+}
+
+/**
+ * runner が生成した秘密値を含む一時設定 path。
+ *
+ * @param path CLI に渡す path
+ * @param cleanupPaths process 終了後に削除する path
+ */
+private data class PrivateConfigPath(
+    val path: Path,
+    val cleanupPaths: List<Path>,
+)
 
 /**
  * 既定 Claude CLI command template。
@@ -250,7 +336,6 @@ val DEFAULT_CODEX_COMMON_ARGS = emptyList<String>()
  * Codex headless 実行で常に付ける安全側引数。
  */
 val ENFORCED_CODEX_COMMON_ARGS = listOf(
-    "--ignore-user-config",
     "--sandbox",
     "read-only",
     "-c",
@@ -292,6 +377,28 @@ val CODEX_COMMON_ARG_FORBIDDEN_FLAGS = setOf(
 val CODEX_FALSIFIER_ARG_ALLOWLIST = setOf(
     "--dangerously-bypass-approvals-and-sandbox",
     "--yolo",
+)
+
+/**
+ * Codex CLI home path を渡す環境変数名。
+ */
+const val CODEX_HOME_ENV = "CODEX_HOME"
+
+/**
+ * 秘密値を含む一時ファイルの POSIX permission。
+ */
+private val PRIVATE_FILE_PERMISSIONS = setOf(
+    PosixFilePermission.OWNER_READ,
+    PosixFilePermission.OWNER_WRITE,
+)
+
+/**
+ * 秘密値を含む一時ディレクトリの POSIX permission。
+ */
+private val PRIVATE_DIRECTORY_PERMISSIONS = setOf(
+    PosixFilePermission.OWNER_READ,
+    PosixFilePermission.OWNER_WRITE,
+    PosixFilePermission.OWNER_EXECUTE,
 )
 
 /**

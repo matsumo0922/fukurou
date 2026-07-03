@@ -40,6 +40,34 @@ class ShellProcessRunnerTest {
         assertFalse(ProcessHandle.of(childPid).map { processHandle -> processHandle.isAlive }.orElse(false))
     }
 
+    @Test
+    fun run_deletesCleanupPathsAfterProcessExit() = runBlocking {
+        val shellPath = Path.of("/bin/sh")
+        if (!Files.isExecutable(shellPath)) {
+            return@runBlocking
+        }
+
+        val tempDirectory = Files.createTempDirectory("fukurou-process-runner-cleanup-test")
+        val cleanupFile = Files.createTempFile(tempDirectory, "secret-config", ".json")
+        val cacheFile = Files.createTempFile(tempDirectory, "codex-cache", ".json")
+        val command = RenderedLlmCommand(
+            executable = shellPath.toString(),
+            args = listOf("-c", "true"),
+            environment = emptyMap(),
+            workingDirectory = tempDirectory,
+            timeout = Duration.ofSeconds(1),
+            stdin = null,
+            cleanupPaths = listOf(cleanupFile, tempDirectory),
+        )
+
+        val result = ShellProcessRunner().run(command).getOrThrow()
+
+        assertEquals(ProcessRunStatus.EXITED, result.status)
+        assertFalse(Files.exists(cleanupFile))
+        assertFalse(Files.exists(cacheFile))
+        assertFalse(Files.exists(tempDirectory))
+    }
+
     private suspend fun waitForChildPid(childPidFile: Path): Long {
         repeat(CHILD_PID_FILE_WAIT_ATTEMPTS) {
             if (Files.exists(childPidFile)) {

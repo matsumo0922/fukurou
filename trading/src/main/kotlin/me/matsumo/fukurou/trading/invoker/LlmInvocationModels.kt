@@ -85,6 +85,7 @@ data class LlmInvocationRequest(
  * @param workingDirectory CLI process の working directory
  * @param timeout process timeout
  * @param stdin 標準入力へ渡す文字列
+ * @param cleanupPaths process 終了後に削除する runner 生成ファイル
  */
 data class RenderedLlmCommand(
     val executable: String,
@@ -93,6 +94,7 @@ data class RenderedLlmCommand(
     val workingDirectory: Path,
     val timeout: Duration,
     val stdin: String?,
+    val cleanupPaths: List<Path> = emptyList(),
 )
 
 /**
