@@ -43,6 +43,9 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import java.util.UUID
+import java.util.logging.Handler
+import java.util.logging.LogRecord
+import java.util.logging.Logger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -201,6 +204,48 @@ class PaperBrokerTest {
         assertFalse(result.accepted)
         assertEquals(SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE, result.safetyViolation?.rule)
         assertTrue(result.safetyViolation?.messageJa.orEmpty().contains("データ鮮度劣化により p を 0.50 に cap"))
+    }
+
+    @Test
+    fun place_order_capsProbabilityFromBrokenTickerTimestamp() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val logHandler = CapturingLogHandler()
+        val logger = Logger.getLogger(PaperBroker::class.java.name)
+        logger.addHandler(logHandler)
+
+        try {
+            val broker = PaperBroker(
+                ledgerRepository = repository,
+                riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                decisionRepository = decisionRepository,
+                safetyFloor = SafetyFloor(
+                    config = SafetyFloorConfig(
+                        dataQualityCap = DataQualityCapConfig(
+                            staleAfter = Duration.ofSeconds(60),
+                            cappedProbability = BigDecimal("0.50"),
+                        ),
+                    ),
+                    clock = fixedClock(),
+                ),
+                marketDataSource = BrokenTimestampMarketDataSource,
+                clock = fixedClock(),
+            )
+            val command = marketEntryCommand(
+                sizeBtc = BigDecimal("0.0040"),
+                takeProfitPriceJpy = BigDecimal("10300000"),
+                estimatedWinProbability = BigDecimal("0.95"),
+            )
+
+            val result = broker.placeOrder(approvedCommand(decisionRepository, command)).getOrThrow()
+
+            assertFalse(result.accepted)
+            assertEquals(SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE, result.safetyViolation?.rule)
+            assertTrue(result.safetyViolation?.messageJa.orEmpty().contains("データ鮮度劣化により p を 0.50 に cap"))
+            assertTrue(logHandler.messages.any { message -> message.contains("could not parse ticker timestamp") })
+        } finally {
+            logger.removeHandler(logHandler)
+        }
     }
 
     @Test
@@ -1035,6 +1080,32 @@ private object StaleTickerMarketDataSource : MarketDataSource by FakeMarketDataS
             ticker.copy(timestamp = fixedInstant().minusSeconds(61).toString())
         }
     }
+}
+
+/**
+ * 壊れた ticker timestamp を返す fake market data。
+ */
+private object BrokenTimestampMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return FakeMarketDataSource.getTicker(symbol).map { ticker ->
+            ticker.copy(timestamp = "not-a-timestamp")
+        }
+    }
+}
+
+/**
+ * warn log を test 内で捕捉する handler。
+ */
+private class CapturingLogHandler : Handler() {
+    val messages = mutableListOf<String>()
+
+    override fun publish(record: LogRecord) {
+        messages += record.message
+    }
+
+    override fun flush() = Unit
+
+    override fun close() = Unit
 }
 
 /**

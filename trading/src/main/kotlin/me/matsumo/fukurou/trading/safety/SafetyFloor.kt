@@ -988,9 +988,14 @@ class SafetyFloor(
         probability: BigDecimal,
         context: SafetyFloorContext,
     ): BigDecimal? {
-        val marketDataObservedAt = context.marketDataObservedAt ?: return null
-        val staleDuration = Duration.between(marketDataObservedAt, Instant.now(clock))
-        val stale = staleDuration > config.dataQualityCap.staleAfter
+        val marketDataObservedAt = context.marketDataObservedAt
+        val stale = if (marketDataObservedAt == null) {
+            true
+        } else {
+            val staleDuration = Duration.between(marketDataObservedAt, Instant.now(clock))
+
+            staleDuration > config.dataQualityCap.staleAfter
+        }
         val capWouldReduceProbability = probability > config.dataQualityCap.cappedProbability
 
         if (!stale || !capWouldReduceProbability) {

@@ -4,6 +4,7 @@ import io.modelcontextprotocol.kotlin.sdk.server.ClientConnection
 import io.modelcontextprotocol.kotlin.sdk.shared.RequestOptions
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequestParams
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.CreateMessageRequest
 import io.modelcontextprotocol.kotlin.sdk.types.CreateMessageResult
 import io.modelcontextprotocol.kotlin.sdk.types.ElicitRequest
@@ -19,41 +20,65 @@ import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import io.modelcontextprotocol.kotlin.sdk.types.ResourceUpdatedNotification
 import io.modelcontextprotocol.kotlin.sdk.types.ServerNotification
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.Broker
+import me.matsumo.fukurou.trading.broker.CancelOrderCommand
+import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.OpenOrdersWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.PaperReconcileResult
+import me.matsumo.fukurou.trading.broker.PaperTradeResult
+import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.domain.AccountSnapshot
+import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
+import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.domain.ProtectionStatus
 import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradeSide
+import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
+import java.time.Clock
 import java.time.Instant
+import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -101,6 +126,250 @@ class FukurouMcpServerTest {
                 "simulate_tool_timeout",
             ),
             server.tools.keys,
+        )
+    }
+
+    @Test
+    fun getBalanceTool_returnsFreshnessMetadataFromPaperAccountUpdatedAt() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_balance")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = fixedInstant().toString(),
+            stalenessMs = 0L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getPositionsTool_returnsFreshnessMetadataFromPaperAccountUpdatedAt() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_positions")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = fixedInstant().toString(),
+            stalenessMs = 0L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getOpenOrdersTool_returnsFreshnessMetadataFromPaperAccountUpdatedAt() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_open_orders")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = fixedInstant().toString(),
+            stalenessMs = 0L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getAccountStatusTool_returnsFreshnessMetadataFromPaperAccountUpdatedAt() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_account_status")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = fixedInstant().toString(),
+            stalenessMs = 0L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getBalanceTool_usesSingleAccountSnapshotForBodyAndFreshnessTimestamp() = runBlocking {
+        val sourceTimestamp = fixedInstant().minusSeconds(3)
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock()).copy(
+            broker = SnapshotOnlyBroker(
+                balance = AccountSnapshotWithUpdatedAt(
+                    accountSnapshot = accountSnapshot(totalEquityJpy = "123456.00000000"),
+                    updatedAt = sourceTimestamp,
+                ),
+                accountStatus = AccountStatusWithUpdatedAt(
+                    accountStatus = accountStatus(currentEquityJpy = "123456.00000000"),
+                    updatedAt = sourceTimestamp,
+                ),
+            ),
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_balance")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertEquals("123456.00000000", structuredContent.getValue("totalEquityJpy").jsonPrimitive.contentOrNull)
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = sourceTimestamp.toString(),
+            stalenessMs = 3_000L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getPositionsTool_usesSingleLedgerSnapshotForBodyAndFreshnessTimestamp() = runBlocking {
+        val sourceTimestamp = fixedInstant().minusSeconds(3)
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock()).copy(
+            broker = SnapshotOnlyBroker(
+                balance = AccountSnapshotWithUpdatedAt(
+                    accountSnapshot = accountSnapshot(),
+                    updatedAt = fixedInstant(),
+                ),
+                accountStatus = AccountStatusWithUpdatedAt(
+                    accountStatus = accountStatus(),
+                    updatedAt = fixedInstant(),
+                ),
+                positions = PositionsWithUpdatedAt(
+                    positions = emptyList(),
+                    updatedAt = sourceTimestamp,
+                ),
+            ),
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_positions")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertEquals(0L, structuredContent.getValue("count").jsonPrimitive.longOrNull)
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = sourceTimestamp.toString(),
+            stalenessMs = 3_000L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getOpenOrdersTool_usesSingleLedgerSnapshotForBodyAndFreshnessTimestamp() = runBlocking {
+        val sourceTimestamp = fixedInstant().minusSeconds(3)
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock()).copy(
+            broker = SnapshotOnlyBroker(
+                balance = AccountSnapshotWithUpdatedAt(
+                    accountSnapshot = accountSnapshot(),
+                    updatedAt = fixedInstant(),
+                ),
+                accountStatus = AccountStatusWithUpdatedAt(
+                    accountStatus = accountStatus(),
+                    updatedAt = fixedInstant(),
+                ),
+                openOrders = OpenOrdersWithUpdatedAt(
+                    openOrders = emptyList(),
+                    updatedAt = sourceTimestamp,
+                ),
+            ),
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_open_orders")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertEquals(0L, structuredContent.getValue("count").jsonPrimitive.longOrNull)
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = sourceTimestamp.toString(),
+            stalenessMs = 3_000L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getAccountStatusTool_usesSingleAccountSnapshotForBodyAndFreshnessTimestamp() = runBlocking {
+        val sourceTimestamp = fixedInstant().minusSeconds(3)
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock()).copy(
+            broker = SnapshotOnlyBroker(
+                balance = AccountSnapshotWithUpdatedAt(
+                    accountSnapshot = accountSnapshot(totalEquityJpy = "654321.00000000"),
+                    updatedAt = sourceTimestamp,
+                ),
+                accountStatus = AccountStatusWithUpdatedAt(
+                    accountStatus = accountStatus(currentEquityJpy = "654321.00000000"),
+                    updatedAt = sourceTimestamp,
+                ),
+            ),
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_account_status")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertEquals("654321.00000000", structuredContent.getValue("currentEquityJpy").jsonPrimitive.contentOrNull)
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = sourceTimestamp.toString(),
+            stalenessMs = 3_000L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
         )
     }
 
@@ -726,6 +995,44 @@ private fun tradePlanRevisionDecisionArguments(parentTradePlanId: String, revisi
     put("trade_plan_time_stop_at", "2026-07-02T02:00:00Z")
 }
 
+private suspend fun callTool(
+    server: io.modelcontextprotocol.kotlin.sdk.server.Server,
+    toolName: String,
+    arguments: JsonObject = buildJsonObject {},
+): CallToolResult {
+    val request = CallToolRequest(
+        params = CallToolRequestParams(
+            name = toolName,
+            arguments = arguments,
+        ),
+    )
+
+    return server.tools.getValue(toolName).handler.invoke(TestClientConnection, request)
+}
+
+private fun assertFreshness(
+    structuredContent: JsonObject,
+    fetchedAt: String,
+    sourceTimestamp: String?,
+    stalenessMs: Long,
+    staleAfterMs: Long,
+    stale: Boolean,
+    source: String,
+) {
+    val freshness = structuredContent.getValue("freshness").jsonObject
+
+    assertEquals(fetchedAt, freshness.getValue("fetchedAt").jsonPrimitive.contentOrNull)
+    if (sourceTimestamp == null) {
+        assertNull(freshness.getValue("sourceTimestamp").jsonPrimitive.contentOrNull)
+    } else {
+        assertEquals(sourceTimestamp, freshness.getValue("sourceTimestamp").jsonPrimitive.contentOrNull)
+    }
+    assertEquals(stalenessMs, freshness.getValue("stalenessMs").jsonPrimitive.longOrNull)
+    assertEquals(staleAfterMs, freshness.getValue("staleAfterMs").jsonPrimitive.longOrNull)
+    assertEquals(stale, freshness.getValue("stale").jsonPrimitive.booleanOrNull)
+    assertEquals(source, freshness.getValue("source").jsonPrimitive.contentOrNull)
+}
+
 /**
  * JSON string array を作る。
  */
@@ -779,6 +1086,122 @@ private class CountFailingCommandEventLog(
     suspend fun events(): List<CommandEvent> {
         return delegate.events()
     }
+}
+
+/**
+ * account tool が snapshot 付き読み取りだけを使うことを検証する fake broker。
+ *
+ * @param balance get_balance 用の snapshot と更新時刻
+ * @param accountStatus get_account_status 用の status と更新時刻
+ * @param positions get_positions 用の一覧と更新時刻
+ * @param openOrders get_open_orders 用の一覧と更新時刻
+ */
+private class SnapshotOnlyBroker(
+    private val balance: AccountSnapshotWithUpdatedAt,
+    private val accountStatus: AccountStatusWithUpdatedAt,
+    private val positions: PositionsWithUpdatedAt = PositionsWithUpdatedAt(
+        positions = emptyList(),
+        updatedAt = fixedInstant(),
+    ),
+    private val openOrders: OpenOrdersWithUpdatedAt = OpenOrdersWithUpdatedAt(
+        openOrders = emptyList(),
+        updatedAt = fixedInstant(),
+    ),
+) : Broker {
+
+    override suspend fun getBalance(): Result<AccountSnapshot> {
+        return Result.failure(UnsupportedOperationException("getBalance must not be used for account freshness."))
+    }
+
+    override suspend fun getBalanceWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
+        return Result.success(balance)
+    }
+
+    override suspend fun getPositions(): Result<List<Position>> {
+        return Result.failure(UnsupportedOperationException("getPositions must not be used for account freshness."))
+    }
+
+    override suspend fun getPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt> {
+        return Result.success(positions)
+    }
+
+    override suspend fun getOpenOrders(): Result<List<Order>> {
+        return Result.failure(UnsupportedOperationException("getOpenOrders must not be used for account freshness."))
+    }
+
+    override suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt> {
+        return Result.success(openOrders)
+    }
+
+    override suspend fun getAccountStatus(): Result<AccountStatus> {
+        return Result.failure(UnsupportedOperationException("getAccountStatus must not be used for account freshness."))
+    }
+
+    override suspend fun getAccountStatusWithUpdatedAt(): Result<AccountStatusWithUpdatedAt> {
+        return Result.success(accountStatus)
+    }
+
+    override suspend fun placeOrder(command: PlaceOrderCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun closePosition(command: ClosePositionCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun reconcile(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+}
+
+private fun accountSnapshot(
+    totalEquityJpy: String = "100000.00000000",
+): AccountSnapshot {
+    return AccountSnapshot(
+        mode = TradingMode.PAPER,
+        cashJpy = totalEquityJpy,
+        initialCashJpy = "100000.00000000",
+        btcQuantity = "0.000000000000",
+        btcMarkPriceJpy = "0.00000000",
+        totalEquityJpy = totalEquityJpy,
+        equityPeakJpy = totalEquityJpy,
+        drawdownRatio = "0.00000000",
+    )
+}
+
+private fun accountStatus(
+    currentEquityJpy: String = "100000.00000000",
+): AccountStatus {
+    return AccountStatus(
+        mode = TradingMode.PAPER,
+        riskState = "RUNNING",
+        drawdownRatio = "0.00000000",
+        hardHalt = false,
+        currentEquityJpy = currentEquityJpy,
+        todayRealizedPnlJpy = "0.00000000",
+        protectionStatus = ProtectionStatus(
+            protectedPositionCount = 0,
+            unprotectedPositionCount = 0,
+            orphanStopCount = 0,
+            orphanTakeProfitCount = 0,
+            pendingCancelCount = 0,
+            lastReconciledAt = null,
+            lastMarketDataAt = null,
+            tradingLockOwner = null,
+        ),
+    )
 }
 
 /**
@@ -924,4 +1347,12 @@ private object FakeMarketDataSource : MarketDataSource {
             ),
         )
     }
+}
+
+private fun fixedClock(): Clock {
+    return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+private fun fixedInstant(): Instant {
+    return Instant.parse("2026-07-04T12:00:00Z")
 }

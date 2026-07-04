@@ -3,12 +3,16 @@ package me.matsumo.fukurou.trading.evaluation
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.OpenOrdersWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.KillCriterionConfig
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
@@ -230,15 +234,41 @@ private class FakeBroker : Broker {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 
+    override suspend fun getBalanceWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
     override suspend fun getPositions(): Result<List<Position>> {
         return Result.success(emptyList())
+    }
+
+    override suspend fun getPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt> {
+        return Result.success(
+            PositionsWithUpdatedAt(
+                positions = emptyList(),
+                updatedAt = fixedInstant(),
+            ),
+        )
     }
 
     override suspend fun getOpenOrders(): Result<List<Order>> {
         return Result.success(emptyList())
     }
 
+    override suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt> {
+        return Result.success(
+            OpenOrdersWithUpdatedAt(
+                openOrders = emptyList(),
+                updatedAt = fixedInstant(),
+            ),
+        )
+    }
+
     override suspend fun getAccountStatus(): Result<AccountStatus> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun getAccountStatusWithUpdatedAt(): Result<AccountStatusWithUpdatedAt> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 

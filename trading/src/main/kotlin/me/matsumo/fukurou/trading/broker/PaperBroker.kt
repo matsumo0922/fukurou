@@ -17,6 +17,7 @@ import me.matsumo.fukurou.trading.domain.ProtectionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
 import me.matsumo.fukurou.trading.market.IndicatorType
@@ -42,7 +43,9 @@ import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.format.DateTimeParseException
 import java.util.UUID
+import java.util.logging.Logger
 
 /**
  * paper ledger を読み取る Broker 実装。
@@ -73,6 +76,10 @@ class PaperBroker(
     private val reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
     private val clock: Clock = Clock.systemUTC(),
     private val tradingDateZone: ZoneId = TRADING_DATE_ZONE,
+    private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
+        logger = paperBrokerLogger,
+        clock = clock,
+    ),
 ) : Broker {
 
     private val safetyFloor = safetyFloor ?: SafetyFloor(clock = clock)
@@ -92,17 +99,34 @@ class PaperBroker(
         return ledgerRepository.getAccountSnapshot()
     }
 
+    override suspend fun getBalanceWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
+        return ledgerRepository.getAccountSnapshotWithUpdatedAt()
+    }
+
     override suspend fun getPositions(): Result<List<Position>> {
         return ledgerRepository.getOpenPositions()
+    }
+
+    override suspend fun getPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt> {
+        return ledgerRepository.getOpenPositionsWithUpdatedAt()
     }
 
     override suspend fun getOpenOrders(): Result<List<Order>> {
         return ledgerRepository.getOpenOrders()
     }
 
+    override suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt> {
+        return ledgerRepository.getOpenOrdersWithUpdatedAt()
+    }
+
     override suspend fun getAccountStatus(): Result<AccountStatus> {
+        return getAccountStatusWithUpdatedAt().map { statusWithUpdatedAt -> statusWithUpdatedAt.accountStatus }
+    }
+
+    override suspend fun getAccountStatusWithUpdatedAt(): Result<AccountStatusWithUpdatedAt> {
         return runCatching {
-            val accountSnapshot = ledgerRepository.getAccountSnapshot().getOrThrow()
+            val accountSnapshotWithUpdatedAt = ledgerRepository.getAccountSnapshotWithUpdatedAt().getOrThrow()
+            val accountSnapshot = accountSnapshotWithUpdatedAt.accountSnapshot
             val riskState = riskStateRepository.current().getOrThrow()
             val positions = ledgerRepository.getOpenPositions().getOrThrow()
             val openOrders = ledgerRepository.getOpenOrders().getOrThrow()
@@ -110,14 +134,17 @@ class PaperBroker(
             val today = LocalDate.now(clock.withZone(tradingDateZone))
             val todayRealizedPnlJpy = ledgerRepository.getRealizedPnlForDate(today).getOrThrow()
 
-            AccountStatus(
-                mode = accountSnapshot.mode,
-                riskState = if (riskState.hardHalt) "HARD_HALT" else "RUNNING",
-                drawdownRatio = riskState.drawdownRatio.toPlainString(),
-                hardHalt = riskState.hardHalt,
-                currentEquityJpy = accountSnapshot.totalEquityJpy,
-                todayRealizedPnlJpy = todayRealizedPnlJpy.toPlainString(),
-                protectionStatus = protectionStatus(positions, openOrders, reconcilerStatus),
+            AccountStatusWithUpdatedAt(
+                accountStatus = AccountStatus(
+                    mode = accountSnapshot.mode,
+                    riskState = if (riskState.hardHalt) "HARD_HALT" else "RUNNING",
+                    drawdownRatio = riskState.drawdownRatio.toPlainString(),
+                    hardHalt = riskState.hardHalt,
+                    currentEquityJpy = accountSnapshot.totalEquityJpy,
+                    todayRealizedPnlJpy = todayRealizedPnlJpy.toPlainString(),
+                    protectionStatus = protectionStatus(positions, openOrders, reconcilerStatus),
+                ),
+                updatedAt = accountSnapshotWithUpdatedAt.updatedAt,
             )
         }
     }
@@ -345,7 +372,16 @@ class PaperBroker(
     }
 
     private fun Ticker.marketDataObservedAtOrNull(): Instant? {
-        return runCatching { Instant.parse(timestamp) }.getOrNull()
+        return try {
+            Instant.parse(timestamp)
+        } catch (exception: DateTimeParseException) {
+            warnLogger.warn(
+                key = "paper-broker-ticker-timestamp-parse-failure",
+                message = "PaperBroker could not parse ticker timestamp. Data quality probability cap will fail closed.",
+                throwable = exception,
+            )
+            null
+        }
     }
 
     private fun requireEntryIntentId(command: PlaceOrderCommand): UUID {
@@ -562,6 +598,8 @@ class PaperBroker(
         }
     }
 }
+
+private val paperBrokerLogger: Logger = Logger.getLogger(PaperBroker::class.java.name)
 
 private fun ClosePositionCommand.forCloseTarget(position: Position, targetCount: Int): ClosePositionCommand {
     if (targetCount <= 1) {

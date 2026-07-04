@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.risk
 
+import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.domain.AccountStatus
 
@@ -15,5 +16,12 @@ class AccountStatusService(
      */
     suspend fun getAccountStatus(): Result<AccountStatus> {
         return broker.getAccountStatus()
+    }
+
+    /**
+     * DB risk_state と同一 paper account snapshot 由来の更新時刻をまとめて返す。
+     */
+    suspend fun getAccountStatusWithUpdatedAt(): Result<AccountStatusWithUpdatedAt> {
+        return broker.getAccountStatusWithUpdatedAt()
     }
 }

@@ -20,14 +20,29 @@ interface PaperLedgerRepository {
     suspend fun getAccountSnapshot(): Result<AccountSnapshot>
 
     /**
+     * paper account の残高 snapshot と更新時刻を同一読み取り由来で返す。
+     */
+    suspend fun getAccountSnapshotWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt>
+
+    /**
      * open position 一覧を返す。
      */
     suspend fun getOpenPositions(): Result<List<Position>>
 
     /**
+     * open position 一覧と paper account 更新時刻を同一読み取り由来で返す。
+     */
+    suspend fun getOpenPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt>
+
+    /**
      * open order 一覧を返す。
      */
     suspend fun getOpenOrders(): Result<List<Order>>
+
+    /**
+     * open order 一覧と paper account 更新時刻を同一読み取り由来で返す。
+     */
+    suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt>
 
     /**
      * 指定日の実現損益合計を返す。

@@ -7,7 +7,6 @@ import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.types.ToolAnnotations
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
@@ -26,6 +25,9 @@ import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.market.FreshnessDefaults
+import me.matsumo.fukurou.trading.market.FreshnessMetadata
+import me.matsumo.fukurou.trading.market.FreshnessSource
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoHttpException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
@@ -38,6 +40,11 @@ import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
 import me.matsumo.fukurou.trading.market.MarketNetworkException
+import me.matsumo.fukurou.trading.market.withFreshness
+import java.time.Clock
+import java.time.Duration
+import java.time.Instant
+import java.time.format.DateTimeParseException
 
 /**
  * ticker 取得 tool 名。
@@ -275,30 +282,58 @@ data class GmoCoinKlineRequest(
  * @param toolExecutor market tool の実行境界
  * @param indicatorCalculator indicator 計算境界
  * @param klineRequestBudgetHook kline 取得を伴う tool 呼び出しの予算 hook
+ * @param clock response 鮮度 metadata を作る clock
  */
 fun Server.registerGmoCoinMarketTools(
     marketDataSource: MarketDataSource,
     toolExecutor: GmoCoinMarketToolExecutor = DirectGmoCoinMarketToolExecutor,
     indicatorCalculator: GmoCoinIndicatorCalculator = DefaultGmoCoinIndicatorCalculator,
     klineRequestBudgetHook: GmoCoinKlineRequestBudgetHook = NoopGmoCoinKlineRequestBudgetHook,
+    clock: Clock = Clock.systemUTC(),
 ) {
     val dailyKlineRequestLimit = klineRequestBudgetHook.dailyKlineRequestLimit
 
-    registerTickerTool(marketDataSource, toolExecutor)
-    registerCandlesTool(marketDataSource, toolExecutor, klineRequestBudgetHook, dailyKlineRequestLimit)
-    registerOrderbookTool(marketDataSource, toolExecutor)
-    registerTradesTool(marketDataSource, toolExecutor)
+    registerTickerTool(
+        marketDataSource = marketDataSource,
+        toolExecutor = toolExecutor,
+        clock = clock,
+    )
+    registerCandlesTool(
+        marketDataSource = marketDataSource,
+        toolExecutor = toolExecutor,
+        klineRequestBudgetHook = klineRequestBudgetHook,
+        dailyKlineRequestLimit = dailyKlineRequestLimit,
+        clock = clock,
+    )
+    registerOrderbookTool(
+        marketDataSource = marketDataSource,
+        toolExecutor = toolExecutor,
+        clock = clock,
+    )
+    registerTradesTool(
+        marketDataSource = marketDataSource,
+        toolExecutor = toolExecutor,
+        clock = clock,
+    )
     registerSymbolRulesTool(marketDataSource, toolExecutor)
-    registerCalcIndicatorTool(marketDataSource, toolExecutor, indicatorCalculator, klineRequestBudgetHook, dailyKlineRequestLimit)
+    registerCalcIndicatorTool(
+        marketDataSource = marketDataSource,
+        toolExecutor = toolExecutor,
+        indicatorCalculator = indicatorCalculator,
+        klineRequestBudgetHook = klineRequestBudgetHook,
+        dailyKlineRequestLimit = dailyKlineRequestLimit,
+        clock = clock,
+    )
 }
 
 private fun Server.registerTickerTool(
     marketDataSource: MarketDataSource,
     toolExecutor: GmoCoinMarketToolExecutor,
+    clock: Clock,
 ) {
     addTool(
         name = GET_TICKER_TOOL,
-        description = "Get the latest GMO Coin public ticker for BTC spot.",
+        description = "Get the latest GMO Coin public ticker for BTC spot. Response includes freshness metadata.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("symbol") {
@@ -310,7 +345,12 @@ private fun Server.registerTickerTool(
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
-        handleGetTicker(request, marketDataSource, toolExecutor)
+        handleGetTicker(
+            request = request,
+            marketDataSource = marketDataSource,
+            toolExecutor = toolExecutor,
+            clock = clock,
+        )
     }
 }
 
@@ -319,6 +359,7 @@ private fun Server.registerCandlesTool(
     toolExecutor: GmoCoinMarketToolExecutor,
     klineRequestBudgetHook: GmoCoinKlineRequestBudgetHook,
     dailyKlineRequestLimit: Int?,
+    clock: Clock,
 ) {
     addTool(
         name = GET_CANDLES_TOOL,
@@ -339,17 +380,24 @@ private fun Server.registerCandlesTool(
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
-        handleGetCandles(request, marketDataSource, toolExecutor, klineRequestBudgetHook)
+        handleGetCandles(
+            request = request,
+            marketDataSource = marketDataSource,
+            toolExecutor = toolExecutor,
+            klineRequestBudgetHook = klineRequestBudgetHook,
+            clock = clock,
+        )
     }
 }
 
 private fun Server.registerOrderbookTool(
     marketDataSource: MarketDataSource,
     toolExecutor: GmoCoinMarketToolExecutor,
+    clock: Clock,
 ) {
     addTool(
         name = GET_ORDERBOOK_TOOL,
-        description = "Get GMO Coin public orderbook for BTC spot.",
+        description = "Get GMO Coin public orderbook for BTC spot. Response includes freshness metadata.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putSymbolSchema()
@@ -364,17 +412,23 @@ private fun Server.registerOrderbookTool(
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
-        handleGetOrderbook(request, marketDataSource, toolExecutor)
+        handleGetOrderbook(
+            request = request,
+            marketDataSource = marketDataSource,
+            toolExecutor = toolExecutor,
+            clock = clock,
+        )
     }
 }
 
 private fun Server.registerTradesTool(
     marketDataSource: MarketDataSource,
     toolExecutor: GmoCoinMarketToolExecutor,
+    clock: Clock,
 ) {
     addTool(
         name = GET_TRADES_TOOL,
-        description = "Get recent GMO Coin public trades for BTC spot.",
+        description = "Get recent GMO Coin public trades for BTC spot. Response includes freshness metadata.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putSymbolSchema()
@@ -389,7 +443,12 @@ private fun Server.registerTradesTool(
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
-        handleGetTrades(request, marketDataSource, toolExecutor)
+        handleGetTrades(
+            request = request,
+            marketDataSource = marketDataSource,
+            toolExecutor = toolExecutor,
+            clock = clock,
+        )
     }
 }
 
@@ -417,6 +476,7 @@ private fun Server.registerCalcIndicatorTool(
     indicatorCalculator: GmoCoinIndicatorCalculator,
     klineRequestBudgetHook: GmoCoinKlineRequestBudgetHook,
     dailyKlineRequestLimit: Int?,
+    clock: Clock,
 ) {
     addTool(
         name = CALC_INDICATOR_TOOL,
@@ -439,7 +499,14 @@ private fun Server.registerCalcIndicatorTool(
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
-        handleCalcIndicator(request, marketDataSource, toolExecutor, indicatorCalculator, klineRequestBudgetHook)
+        handleCalcIndicator(
+            request = request,
+            marketDataSource = marketDataSource,
+            toolExecutor = toolExecutor,
+            indicatorCalculator = indicatorCalculator,
+            klineRequestBudgetHook = klineRequestBudgetHook,
+            clock = clock,
+        )
     }
 }
 
@@ -448,7 +515,9 @@ private suspend fun handleGetCandles(
     marketDataSource: MarketDataSource,
     toolExecutor: GmoCoinMarketToolExecutor,
     klineRequestBudgetHook: GmoCoinKlineRequestBudgetHook,
+    clock: Clock,
 ): CallToolResult {
+    var requestedInterval = CandleInterval.FIVE_MINUTES
     val candles = toolExecutor.execute(GET_CANDLES_TOOL, request) {
         val symbol = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull).getOrThrow()
         val interval = parseCandleInterval(request.arguments?.get("interval")?.jsonPrimitive?.contentOrNull).getOrThrow()
@@ -459,13 +528,20 @@ private suspend fun handleGetCandles(
             limit = limit,
         )
 
+        requestedInterval = interval
         klineRequestBudgetHook.check(klineRequest).getOrThrow()
 
         marketDataSource.getCandles(symbol, interval, limit).getOrThrow()
     }
 
     return candles.fold(
-        onSuccess = { value -> candlesResult(value) },
+        onSuccess = { value ->
+            candlesResult(
+                candles = value,
+                interval = requestedInterval,
+                clock = clock,
+            )
+        },
         onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
 }
@@ -474,6 +550,7 @@ private suspend fun handleGetOrderbook(
     request: CallToolRequest,
     marketDataSource: MarketDataSource,
     toolExecutor: GmoCoinMarketToolExecutor,
+    clock: Clock,
 ): CallToolResult {
     val orderbook = toolExecutor.execute(GET_ORDERBOOK_TOOL, request) {
         val symbol = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull).getOrThrow()
@@ -483,7 +560,12 @@ private suspend fun handleGetOrderbook(
     }
 
     return orderbook.fold(
-        onSuccess = { value -> orderbookResult(value) },
+        onSuccess = { value ->
+            orderbookResult(
+                orderbook = value,
+                clock = clock,
+            )
+        },
         onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
 }
@@ -492,6 +574,7 @@ private suspend fun handleGetTrades(
     request: CallToolRequest,
     marketDataSource: MarketDataSource,
     toolExecutor: GmoCoinMarketToolExecutor,
+    clock: Clock,
 ): CallToolResult {
     val trades = toolExecutor.execute(GET_TRADES_TOOL, request) {
         val symbol = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull).getOrThrow()
@@ -501,7 +584,12 @@ private suspend fun handleGetTrades(
     }
 
     return trades.fold(
-        onSuccess = { value -> tradesResult(value) },
+        onSuccess = { value ->
+            tradesResult(
+                trades = value,
+                clock = clock,
+            )
+        },
         onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
 }
@@ -529,6 +617,7 @@ private suspend fun handleCalcIndicator(
     toolExecutor: GmoCoinMarketToolExecutor,
     indicatorCalculator: GmoCoinIndicatorCalculator,
     klineRequestBudgetHook: GmoCoinKlineRequestBudgetHook,
+    clock: Clock,
 ): CallToolResult {
     val indicator = toolExecutor.execute(CALC_INDICATOR_TOOL, request) {
         val symbol = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull).getOrThrow()
@@ -552,6 +641,11 @@ private suspend fun handleCalcIndicator(
             interval = interval,
             candleCount = candles.size,
             result = result,
+            freshness = marketFreshness(
+                clock = clock,
+                sourceTimestamp = finalCandleSourceTimestamp(candles),
+                staleAfter = FreshnessDefaults.candleStaleAfter(interval),
+            ),
         )
     }
 
@@ -565,6 +659,7 @@ private suspend fun handleGetTicker(
     request: CallToolRequest,
     marketDataSource: MarketDataSource,
     toolExecutor: GmoCoinMarketToolExecutor,
+    clock: Clock,
 ): CallToolResult {
     val ticker = toolExecutor.execute(GET_TICKER_TOOL, request) {
         val symbol = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull).getOrThrow()
@@ -573,7 +668,12 @@ private suspend fun handleGetTicker(
     }
 
     return ticker.fold(
-        onSuccess = { value -> tickerResult(value) },
+        onSuccess = { value ->
+            tickerResult(
+                ticker = value,
+                clock = clock,
+            )
+        },
         onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
 }
@@ -721,35 +821,72 @@ private fun JsonObject?.readOptionalInt(
         ?: throw IllegalArgumentException("$secondaryName must be an integer.")
 }
 
-private fun tickerResult(ticker: Ticker): CallToolResult {
-    val structuredContent = ToolJson.encodeToJsonElement(ticker).jsonObject
-
-    return CallToolResult(
-        content = listOf(TextContent(ToolJson.encodeToString(ticker))),
-        structuredContent = structuredContent,
-    )
-}
-
-private fun candlesResult(candles: List<Candle>): CallToolResult {
-    return jsonObjectResult(
-        buildJsonObject {
-            put("count", candles.size)
-            put("candles", ToolJson.encodeToJsonElement(candles))
-        },
-    )
-}
-
-private fun orderbookResult(orderbook: Orderbook): CallToolResult {
-    val structuredContent = ToolJson.encodeToJsonElement(orderbook).jsonObject
+private fun tickerResult(ticker: Ticker, clock: Clock): CallToolResult {
+    val structuredContent = ToolJson.encodeToJsonElement(ticker)
+        .jsonObject
+        .withFreshness(
+            marketFreshness(
+                clock = clock,
+                sourceTimestamp = parseInstantOrNull(ticker.timestamp),
+                staleAfter = FreshnessDefaults.tickerStaleAfter,
+            ),
+        )
 
     return jsonObjectResult(structuredContent)
 }
 
-private fun tradesResult(trades: List<RecentTrade>): CallToolResult {
+private fun candlesResult(
+    candles: List<Candle>,
+    interval: CandleInterval,
+    clock: Clock,
+): CallToolResult {
+    return jsonObjectResult(
+        buildJsonObject {
+            put("count", candles.size)
+            put("candles", ToolJson.encodeToJsonElement(candles))
+            put(
+                "freshness",
+                ToolJson.encodeToJsonElement(
+                    marketFreshness(
+                        clock = clock,
+                        sourceTimestamp = finalCandleSourceTimestamp(candles),
+                        staleAfter = FreshnessDefaults.candleStaleAfter(interval),
+                    ),
+                ),
+            )
+        },
+    )
+}
+
+private fun orderbookResult(orderbook: Orderbook, clock: Clock): CallToolResult {
+    val structuredContent = ToolJson.encodeToJsonElement(orderbook)
+        .jsonObject
+        .withFreshness(
+            marketFreshness(
+                clock = clock,
+                sourceTimestamp = null,
+                staleAfter = FreshnessDefaults.orderbookStaleAfter,
+            ),
+        )
+
+    return jsonObjectResult(structuredContent)
+}
+
+private fun tradesResult(trades: List<RecentTrade>, clock: Clock): CallToolResult {
     return jsonObjectResult(
         buildJsonObject {
             put("count", trades.size)
             put("trades", ToolJson.encodeToJsonElement(trades))
+            put(
+                "freshness",
+                ToolJson.encodeToJsonElement(
+                    marketFreshness(
+                        clock = clock,
+                        sourceTimestamp = latestTradeSourceTimestamp(trades),
+                        staleAfter = FreshnessDefaults.tradesStaleAfter,
+                    ),
+                ),
+            )
         },
     )
 }
@@ -769,8 +906,44 @@ private fun indicatorResult(output: IndicatorToolOutput): CallToolResult {
             put("indicator", ToolJson.encodeToJsonElement(output.result.indicator))
             put("params", ToolJson.encodeToJsonElement(output.result.params))
             put("values", ToolJson.encodeToJsonElement(output.result.values))
+            put("freshness", ToolJson.encodeToJsonElement(output.freshness))
         },
     )
+}
+
+private fun marketFreshness(
+    clock: Clock,
+    sourceTimestamp: Instant?,
+    staleAfter: Duration,
+): FreshnessMetadata {
+    return FreshnessMetadata.build(
+        clock = clock,
+        sourceTimestamp = sourceTimestamp,
+        staleAfter = staleAfter,
+        source = FreshnessSource.GMO_PUBLIC_REST,
+    )
+}
+
+private fun finalCandleSourceTimestamp(candles: List<Candle>): Instant? {
+    return parseInstantOrNull(candles.lastOrNull()?.openTime)
+}
+
+private fun latestTradeSourceTimestamp(trades: List<RecentTrade>): Instant? {
+    return trades
+        .mapNotNull { trade -> parseInstantOrNull(trade.timestamp) }
+        .maxOrNull()
+}
+
+private fun parseInstantOrNull(value: String?): Instant? {
+    if (value == null) {
+        return null
+    }
+
+    return try {
+        Instant.parse(value)
+    } catch (_: DateTimeParseException) {
+        null
+    }
 }
 
 private fun jsonObjectResult(structuredContent: JsonObject): CallToolResult {
@@ -829,17 +1002,17 @@ private fun errorResult(
 
 private fun candlesDescription(dailyKlineRequestLimit: Int?): String {
     return if (dailyKlineRequestLimit == null) {
-        "Get recent GMO Coin public candles for BTC spot. DAY-based intervals use GMO business dates that switch at 06:00 JST."
+        "Get recent GMO Coin public candles for BTC spot. DAY-based intervals use GMO business dates that switch at 06:00 JST. Response includes freshness metadata."
     } else {
-        "Get recent GMO Coin public candles for BTC spot. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $dailyKlineRequestLimit dates, so long 1hour limits may return fewer candles than requested."
+        "Get recent GMO Coin public candles for BTC spot. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $dailyKlineRequestLimit dates, so long 1hour limits may return fewer candles than requested. Response includes freshness metadata."
     }
 }
 
 private fun indicatorDescription(dailyKlineRequestLimit: Int?): String {
     return if (dailyKlineRequestLimit == null) {
-        "Calculate one technical indicator from GMO Coin public candles. DAY-based intervals use GMO business dates that switch at 06:00 JST before calculating."
+        "Calculate one technical indicator from GMO Coin public candles. DAY-based intervals use GMO business dates that switch at 06:00 JST before calculating. Response includes freshness metadata."
     } else {
-        "Calculate one technical indicator from GMO Coin public candles. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $dailyKlineRequestLimit dates before calculating."
+        "Calculate one technical indicator from GMO Coin public candles. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $dailyKlineRequestLimit dates before calculating. Response includes freshness metadata."
     }
 }
 
@@ -858,6 +1031,7 @@ private fun indicatorParamsDescription(dailyKlineRequestLimit: Int?): String {
  * @param interval ローソク足 interval
  * @param candleCount 計算に使った candle 数
  * @param result indicator 計算結果
+ * @param freshness 計算に使った candle data の鮮度
  */
 @Serializable
 private data class IndicatorToolOutput(
@@ -865,4 +1039,5 @@ private data class IndicatorToolOutput(
     val interval: CandleInterval,
     val candleCount: Int,
     val result: IndicatorResult,
+    val freshness: FreshnessMetadata,
 )
