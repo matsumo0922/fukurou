@@ -2,12 +2,15 @@ package me.matsumo.fukurou.trading.persistence
 
 import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import java.math.BigDecimal
 import java.sql.Connection
 import java.time.Clock
 import java.time.Instant
+import java.time.ZoneId
+import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
@@ -60,6 +63,43 @@ private const val INSERT_DEFAULT_PAPER_ACCOUNT_SQL = """
 """
 
 /**
+ * bootstrap equity snapshot を初回だけ作る SQL。
+ */
+private const val INSERT_BOOTSTRAP_EQUITY_SNAPSHOT_SQL = """
+    INSERT INTO equity_snapshots (
+        id,
+        mode,
+        reason,
+        trading_date,
+        captured_at,
+        cash_jpy,
+        btc_quantity,
+        btc_mark_price_jpy,
+        total_equity_jpy,
+        equity_peak_jpy,
+        drawdown_ratio
+    )
+    SELECT
+        ?,
+        mode,
+        ?,
+        ?,
+        ?,
+        cash_jpy,
+        btc_quantity,
+        btc_mark_price_jpy,
+        total_equity_jpy,
+        equity_peak_jpy,
+        drawdown_ratio
+    FROM paper_account
+    WHERE id = ?
+        AND NOT EXISTS (
+            SELECT 1
+            FROM equity_snapshots
+        )
+"""
+
+/**
  * 既存 OPEN position の lowest watermark を記録開始時点の保守値で埋める SQL。
  */
 private const val BACKFILL_OPEN_POSITION_LOWEST_PRICE_SQL = """
@@ -87,6 +127,43 @@ private const val VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL = """
         system_prompt_version,
         market_snapshot_id
     FROM command_event_log
+    LIMIT 0
+"""
+
+/**
+ * llm_runs schema の存在を確認する SQL。
+ */
+private const val VERIFY_LLM_RUNS_SCHEMA_SQL = """
+    SELECT
+        invocation_id,
+        mode,
+        symbol,
+        trigger_kind,
+        status,
+        started_at,
+        finished_at,
+        error_message
+    FROM llm_runs
+    LIMIT 0
+"""
+
+/**
+ * equity_snapshots schema の存在を確認する SQL。
+ */
+private const val VERIFY_EQUITY_SNAPSHOTS_SCHEMA_SQL = """
+    SELECT
+        id,
+        mode,
+        reason,
+        trading_date,
+        captured_at,
+        cash_jpy,
+        btc_quantity,
+        btc_mark_price_jpy,
+        total_equity_jpy,
+        equity_peak_jpy,
+        drawdown_ratio
+    FROM equity_snapshots
     LIMIT 0
 """
 
@@ -141,6 +218,31 @@ private const val ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL = """
 """
 
 /**
+ * llm_runs.started_at index を作る SQL。
+ */
+private const val ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_llm_runs_started_at
+    ON llm_runs (started_at)
+"""
+
+/**
+ * equity_snapshots.captured_at index を作る SQL。
+ */
+private const val ENSURE_EQUITY_SNAPSHOTS_CAPTURED_AT_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_equity_snapshots_captured_at
+    ON equity_snapshots (captured_at)
+"""
+
+/**
+ * equity_snapshots の DAILY 日次一意 index を作る SQL。
+ */
+private const val ENSURE_EQUITY_SNAPSHOTS_DAILY_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_snapshots_daily_unique
+    ON equity_snapshots (mode, trading_date)
+    WHERE reason = 'DAILY'
+"""
+
+/**
  * command_event_log の起動回数集計 index 存在を確認する SQL。
  */
 private const val VERIFY_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL = """
@@ -187,6 +289,32 @@ private const val VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL = """
             'idx_llm_launch_reservations_status_reserved_at'
         )
     HAVING COUNT(*) = 3
+"""
+
+/**
+ * llm_runs index 存在を確認する SQL。
+ */
+private const val VERIFY_LLM_RUNS_INDEX_COUNT_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'llm_runs'
+        AND indexname = 'idx_llm_runs_started_at'
+"""
+
+/**
+ * equity_snapshots index 存在を確認する SQL。
+ */
+private const val VERIFY_EQUITY_SNAPSHOTS_INDEX_COUNT_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'equity_snapshots'
+        AND indexname IN (
+            'idx_equity_snapshots_captured_at',
+            'idx_equity_snapshots_daily_unique'
+        )
+    HAVING COUNT(*) = 2
 """
 
 /**
@@ -442,6 +570,11 @@ private const val VERIFY_TRADE_INTENT_CONSUMPTIONS_SCHEMA_SQL = """
 """
 
 /**
+ * equity snapshot の取引日判定に使う timezone。
+ */
+private val EquitySnapshotTradingDateZone = ZoneId.of("Asia/Tokyo")
+
+/**
  * trading persistence の最小 schema を起動時に用意する bootstrapper。
  *
  * @param database Exposed database
@@ -464,6 +597,8 @@ class TradingPersistenceBootstrap(
                 SchemaUtils.createMissingTablesAndColumns(
                     RiskStateTable,
                     PaperAccountTable,
+                    LlmRunsTable,
+                    EquitySnapshotsTable,
                     PositionsTable,
                     OrdersTable,
                     ExecutionsTable,
@@ -480,12 +615,15 @@ class TradingPersistenceBootstrap(
                 ensureCommandEventLogIndexes()
                 ensureOrderIndexes()
                 ensureLlmLaunchReservationIndexes()
+                ensureLlmRunIndexes()
+                ensureEquitySnapshotIndexes()
                 backfillOpenPositionLowestPrice()
                 val now = Instant.now(clock)
 
                 ensureRiskStateRow(now, paperAccountConfig.initialCashJpy)
                 ensurePaperAccountRow(now, paperAccountConfig)
                 ensureRiskStateEquityPeak(now, paperAccountConfig.initialCashJpy)
+                ensureBootstrapEquitySnapshot(now)
             }
         }
     }
@@ -498,6 +636,8 @@ class TradingPersistenceBootstrap(
             exposedTransaction(database) {
                 verifyCommandEventLogSchema()
                 verifyPaperAccountSchema()
+                verifyLlmRunsSchema()
+                verifyEquitySnapshotsSchema()
                 verifyPositionsSchema()
                 verifyOrdersSchema()
                 verifyLlmLaunchReservationsSchema()
@@ -551,6 +691,21 @@ internal fun JdbcTransaction.ensureLlmLaunchReservationIndexes() {
 }
 
 /**
+ * llm_runs の追加 index がなければ作成する。
+ */
+internal fun JdbcTransaction.ensureLlmRunIndexes() {
+    executeUpdate(ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL)
+}
+
+/**
+ * equity_snapshots の追加 index がなければ作成する。
+ */
+internal fun JdbcTransaction.ensureEquitySnapshotIndexes() {
+    executeUpdate(ENSURE_EQUITY_SNAPSHOTS_CAPTURED_AT_INDEX_SQL)
+    executeUpdate(ENSURE_EQUITY_SNAPSHOTS_DAILY_UNIQUE_INDEX_SQL)
+}
+
+/**
  * 既存 OPEN position に lowest watermark がなければ backfill する。
  */
 internal fun JdbcTransaction.backfillOpenPositionLowestPrice() {
@@ -578,6 +733,34 @@ internal fun JdbcTransaction.verifyPaperAccountSchema() {
     verifySchemaBySql(
         sql = VERIFY_PAPER_ACCOUNT_SCHEMA_SQL,
         missingMessage = "paper_account schema was not initialized.",
+    )
+}
+
+/**
+ * llm_runs schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyLlmRunsSchema() {
+    verifySchemaBySql(
+        sql = VERIFY_LLM_RUNS_SCHEMA_SQL,
+        missingMessage = "llm_runs schema was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_LLM_RUNS_INDEX_COUNT_SQL,
+        missingMessage = "llm_runs indexes were not initialized.",
+    )
+}
+
+/**
+ * equity_snapshots schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyEquitySnapshotsSchema() {
+    verifySchemaBySql(
+        sql = VERIFY_EQUITY_SNAPSHOTS_SCHEMA_SQL,
+        missingMessage = "equity_snapshots schema was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_EQUITY_SNAPSHOTS_INDEX_COUNT_SQL,
+        missingMessage = "equity_snapshots indexes were not initialized.",
     )
 }
 
@@ -753,6 +936,20 @@ internal fun JdbcTransaction.ensureRiskStateEquityPeak(now: Instant, initialEqui
         statement.setBigDecimal(1, initialEquityPeak)
         statement.setLong(2, now.toEpochMilli())
         statement.setInt(3, RISK_STATE_SINGLE_ROW_ID)
+        statement.executeUpdate()
+    }
+}
+
+/**
+ * equity_snapshots が空なら bootstrap snapshot を作成する。
+ */
+internal fun JdbcTransaction.ensureBootstrapEquitySnapshot(now: Instant) {
+    jdbcConnection().prepareStatement(INSERT_BOOTSTRAP_EQUITY_SNAPSHOT_SQL).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setString(2, EquitySnapshotReason.BOOTSTRAP.name)
+        statement.setString(3, now.atZone(EquitySnapshotTradingDateZone).toLocalDate().toString())
+        statement.setLong(4, now.toEpochMilli())
+        statement.setInt(5, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeUpdate()
     }
 }

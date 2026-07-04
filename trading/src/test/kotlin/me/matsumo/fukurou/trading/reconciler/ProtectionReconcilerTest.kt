@@ -31,6 +31,8 @@ import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.lock.TradingLockLease
@@ -42,8 +44,10 @@ import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.ZoneOffset
+import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -235,6 +239,65 @@ class ProtectionReconcilerTest {
     }
 
     @Test
+    fun reconcile_pass_recordsDailyEquitySnapshotOncePerJstDate() = runBlocking {
+        val firstInstant = Instant.parse("2026-07-02T14:59:00Z")
+        val clock = MutableTestClock(firstInstant)
+        val repository = InMemoryPaperLedgerRepository()
+        val tickStream = SwitchableTickStream(Result.success(fixedTickSnapshot(firstInstant)))
+        val recorder = EquitySnapshotRecorder(
+            accountSource = { repository.getAccountSnapshot() },
+            repository = repository.equitySnapshotRepository,
+            clock = clock,
+            idGenerator = deterministicSnapshotIds(),
+        )
+        val reconciler = createReconciler(
+            clock = clock,
+            tickStream = tickStream,
+            equitySnapshotRecorder = recorder,
+        )
+
+        reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
+        clock.currentInstant = firstInstant.plusSeconds(30)
+        tickStream.nextResult = Result.success(fixedTickSnapshot(clock.currentInstant))
+        reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
+        clock.currentInstant = firstInstant.plusSeconds(90)
+        tickStream.nextResult = Result.success(fixedTickSnapshot(clock.currentInstant))
+        reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
+
+        val dailySnapshots = repository.equitySnapshotRepository.findAll().getOrThrow()
+            .filter { snapshot -> snapshot.reason == EquitySnapshotReason.DAILY }
+
+        assertEquals(
+            listOf(LocalDate.of(2026, 7, 2), LocalDate.of(2026, 7, 3)),
+            dailySnapshots.map { snapshot -> snapshot.tradingDate },
+        )
+    }
+
+    @Test
+    fun reconcile_pass_recordsDailyEquitySnapshotWhenMarketDataFails() = runBlocking {
+        val clock = MutableTestClock(Instant.parse("2026-07-02T15:00:00Z"))
+        val repository = InMemoryPaperLedgerRepository()
+        val recorder = EquitySnapshotRecorder(
+            accountSource = { repository.getAccountSnapshot() },
+            repository = repository.equitySnapshotRepository,
+            clock = clock,
+            idGenerator = deterministicSnapshotIds(),
+        )
+        val reconciler = createReconciler(
+            clock = clock,
+            tickStream = SwitchableTickStream(Result.failure(IllegalStateException("market data unavailable"))),
+            equitySnapshotRecorder = recorder,
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+        val dailySnapshots = repository.equitySnapshotRepository.findAll().getOrThrow()
+            .filter { snapshot -> snapshot.reason == EquitySnapshotReason.DAILY }
+
+        assertTrue(result.isSuccess)
+        assertEquals(listOf(LocalDate.of(2026, 7, 3)), dailySnapshots.map { snapshot -> snapshot.tradingDate })
+    }
+
+    @Test
     fun audit_append_failure_does_not_advance_reconciler_status() = runBlocking {
         val status = MutableReconcilerStatus()
         val reconciler = createReconciler(
@@ -280,6 +343,36 @@ class ProtectionReconcilerTest {
         assertTrue(result.isSuccess)
         assertEquals(0, broker.getPositions().getOrThrow().size)
         assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun inMemoryPaperLedger_appendsFillEquitySnapshotsAndSkipsMarkOnlyUpdates() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        broker.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+            ),
+        ).getOrThrow()
+        val fillCountAfterBuy = repository.fillEquitySnapshotCount()
+        broker.reconcile(neutralBtcTickSnapshot()).getOrThrow()
+        val fillCountAfterMarkOnly = repository.fillEquitySnapshotCount()
+        broker.reconcile(stopTickSnapshot()).getOrThrow()
+        val fillCountAfterSell = repository.fillEquitySnapshotCount()
+
+        assertEquals(1, fillCountAfterBuy)
+        assertEquals(1, fillCountAfterMarkOnly)
+        assertEquals(2, fillCountAfterSell)
     }
 
     @Test
@@ -423,6 +516,11 @@ class ProtectionReconcilerTest {
     }
 }
 
+private suspend fun InMemoryPaperLedgerRepository.fillEquitySnapshotCount(): Int {
+    return equitySnapshotRepository.findAll().getOrThrow()
+        .count { snapshot -> snapshot.reason == EquitySnapshotReason.FILL }
+}
+
 /**
  * lock 取得回数を数える test lock。
  */
@@ -458,6 +556,7 @@ private fun createReconciler(
     riskStateRepository: RiskStateRepository = InMemoryRiskStateRepository(clock = clock),
     tickStream: TickStream = FixedTickStream,
     broker: Broker? = null,
+    equitySnapshotRecorder: EquitySnapshotRecorder? = null,
 ): ProtectionReconciler {
     return ProtectionReconciler(
         riskStateRepository = riskStateRepository,
@@ -465,9 +564,19 @@ private fun createReconciler(
         tradingLock = lock,
         tickStream = tickStream,
         broker = broker,
+        equitySnapshotRecorder = equitySnapshotRecorder,
         status = status,
         clock = clock,
     )
+}
+
+private fun deterministicSnapshotIds(): () -> UUID {
+    var nextId = 0L
+
+    return {
+        nextId += 1
+        UUID(0L, nextId)
+    }
 }
 
 /**

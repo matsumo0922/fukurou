@@ -17,6 +17,12 @@ import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -35,8 +41,19 @@ import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.evaluation.InMemoryLlmRunRepository
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
+import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmRunRecord
+import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
+import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
+import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
+import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
+import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ProcessRunner
@@ -56,6 +73,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -93,6 +111,30 @@ class OneShotLlmRunnerTest {
         assertEquals(1, fixture.processRunner.launches.size)
         assertEquals(1, decisions.size)
         assertEquals(DecisionAction.NO_TRADE, decisions.single().submission.action)
+    }
+
+    @Test
+    fun manualRun_recordsRunningThenFinalLlmRunWithoutTriggerKind() = runBlocking {
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        val request = defaultRequest().copy(invocationId = "manual-run")
+
+        val result = fixture.runner.runOneShot(request).getOrThrow()
+        val repository = fixture.runtime.llmRunRepository as InMemoryLlmRunRepository
+        val record = repository.findByInvocationId(result.invocationId).getOrThrow()
+
+        assertEquals(
+            listOf(LLM_RUN_STATUS_RUNNING, OneShotRunnerStatus.NO_TRADE_DECISION.name),
+            repository.statusHistory(result.invocationId),
+        )
+        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION.name, record?.status)
+        assertNull(record?.triggerKind)
+        assertTrue(record?.finishedAt != null)
     }
 
     @Test
@@ -196,6 +238,10 @@ class OneShotLlmRunnerTest {
         assertEquals(OneShotRunnerStatus.LAUNCH_REJECTED, result.status)
         assertEquals(0, fixture.processRunner.launches.size)
         assertTrue(fixture.eventLog.events().containsNoTradeReason("max_invocations_per_hour_exceeded"))
+        assertEquals(
+            OneShotRunnerStatus.LAUNCH_REJECTED.name,
+            fixture.runtime.llmRunRepository.findByInvocationId(result.invocationId).getOrThrow()?.status,
+        )
     }
 
     @Test
@@ -528,12 +574,109 @@ class OneShotLlmRunnerTest {
     fun unexpectedRunnerFailure_recordsCallerNoTradeAudit() = runBlocking {
         val missingPromptRoot = Files.createTempDirectory("fukurou-missing-prompt")
         val fixture = runnerFixture { cleanExit() }
+        val request = defaultRequest().copy(
+            invocationId = "missing-prompt-run",
+            repositoryRoot = missingPromptRoot,
+        )
 
-        val result = fixture.runner.runOneShot(defaultRequest().copy(repositoryRoot = missingPromptRoot))
+        val result = fixture.runner.runOneShot(request)
 
         assertTrue(result.isFailure)
         assertTrue(fixture.eventLog.events().containsNoTradeReason("caller_failed"))
         assertEquals(0, fixture.processRunner.launches.size)
+        assertEquals(
+            LLM_RUN_STATUS_FAILED,
+            fixture.runtime.llmRunRepository.findByInvocationId("missing-prompt-run").getOrThrow()?.status,
+        )
+    }
+
+    @Test
+    fun invokerException_recordsFailedLlmRunWithRedactedErrorMessage() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = FakeMarketDataSource,
+        )
+        val runner = OneShotLlmRunner(
+            tradingRuntime = runtime,
+            tradingConfig = TradingBotConfig(),
+            llmInvoker = ThrowingLlmInvoker("phase failed with test-password"),
+            parentEnvironment = defaultParentEnvironment(),
+            clock = fixedClock(),
+            logger = {},
+        )
+
+        val result = runner.runOneShot(defaultRequest().copy(invocationId = "failed-run"))
+        val record = runtime.llmRunRepository.findByInvocationId("failed-run").getOrThrow()
+        val errorMessage = requireNotNull(record?.errorMessage)
+
+        assertTrue(result.isFailure)
+        assertEquals(LLM_RUN_STATUS_FAILED, record.status)
+        assertTrue(errorMessage.contains("[REDACTED]"))
+        assertFalse(errorMessage.contains("test-password"))
+    }
+
+    @Test
+    fun llmRunRecordFailure_doesNotPreventRunnerCompletion() = runBlocking {
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                runtime.copy(llmRunRepository = FailingLlmRunRepository)
+            },
+        ) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            }
+
+            cleanExit()
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest().copy(invocationId = "record-failure-run"))
+
+        assertTrue(result.isSuccess)
+        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.getOrThrow().status)
+    }
+
+    @Test
+    fun daemonTickLaunch_recordsTriggerKindInLlmRun() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = FakeMarketDataSource,
+        )
+        val decisionRepository = runtime.decisionRepository as InMemoryDecisionRepository
+        val processRunner = FakeProcessRunner { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(decisionRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        val runner = OneShotLlmRunner(
+            tradingRuntime = runtime,
+            tradingConfig = TradingBotConfig(),
+            llmInvoker = ShellLlmInvoker(
+                commandRenderer = DefaultLlmCommandRenderer(),
+                processRunner = processRunner,
+            ),
+            parentEnvironment = defaultParentEnvironment(),
+            clock = fixedClock(),
+            logger = {},
+        )
+        val scheduler = LlmDaemonScheduler(
+            tradingConfig = TradingBotConfig(),
+            riskStateRepository = runtime.riskStateRepository,
+            commandEventLog = runtime.commandEventLog,
+            launchReservationRepository = InMemoryLlmLaunchReservationRepository(runtime.riskStateRepository),
+            openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
+            requestBase = defaultRequest(),
+            launchOneShot = runner.asDaemonLauncher(),
+            clock = fixedClock(),
+            idGenerator = { UUID(0L, 42L) },
+        )
+
+        val tickResult = assertIs<LlmDaemonTickResult.Launched>(scheduler.tick())
+        val record = runtime.llmRunRepository.findByInvocationId(tickResult.invocationId).getOrThrow()
+
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, record?.triggerKind)
+        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION.name, record?.status)
     }
 
     @Test
@@ -544,8 +687,9 @@ class OneShotLlmRunnerTest {
 
             awaitCancellation()
         }
+        val request = defaultRequest().copy(invocationId = "cancelled-run")
         val runnerDeferred = async {
-            fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+            fixture.runner.runOneShot(request).getOrThrow()
         }
 
         launchStarted.await()
@@ -555,6 +699,10 @@ class OneShotLlmRunnerTest {
             runnerDeferred.await()
         }
         assertTrue(fixture.eventLog.events().containsNoTradeReason("caller_cancelled"))
+        assertEquals(
+            LLM_RUN_STATUS_CANCELLED,
+            fixture.runtime.llmRunRepository.findByInvocationId("cancelled-run").getOrThrow()?.status,
+        )
     }
 }
 
@@ -580,12 +728,15 @@ private data class RunnerFixture(
 private fun runnerFixture(
     config: TradingBotConfig = TradingBotConfig(),
     parentEnvironment: Map<String, String> = defaultParentEnvironment(),
+    runtimeTransform: (TradingRuntime) -> TradingRuntime = { runtime -> runtime },
     launchHandler: suspend (RenderedLlmCommand) -> ProcessRunResult,
 ): RunnerFixture {
-    val runtime = TradingRuntimeFactory.inMemory(
-        clock = fixedClock(),
-        marketDataSource = FakeMarketDataSource,
-        tradingConfig = config,
+    val runtime = runtimeTransform(
+        TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = FakeMarketDataSource,
+            tradingConfig = config,
+        ),
     )
     val decisionRepository = runtime.decisionRepository as InMemoryDecisionRepository
     val eventLog = runtime.commandEventLog as InMemoryCommandEventLog
@@ -610,6 +761,40 @@ private fun runnerFixture(
         processRunner = processRunner,
         runner = runner,
     )
+}
+
+/**
+ * LLM 起動時に例外を投げる test double。
+ *
+ * @param message 例外 message
+ */
+private class ThrowingLlmInvoker(
+    private val message: String,
+) : LlmInvoker {
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        require(request.invocationId.isNotBlank()) {
+            "invocationId must not be blank."
+        }
+
+        throw IllegalStateException(message)
+    }
+}
+
+/**
+ * llm_runs 書き込みに必ず失敗する test repository。
+ */
+private object FailingLlmRunRepository : LlmRunRepository {
+    override suspend fun insertRunning(start: LlmRunStart): Result<Unit> {
+        return Result.failure(IllegalStateException("llm run insert failed"))
+    }
+
+    override suspend fun finish(finish: LlmRunFinish): Result<Unit> {
+        return Result.failure(IllegalStateException("llm run finish failed"))
+    }
+
+    override suspend fun findByInvocationId(invocationId: String): Result<LlmRunRecord?> {
+        return Result.failure(IllegalStateException("llm run read failed"))
+    }
 }
 
 /**

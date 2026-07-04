@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.config.FUKUROU_MCP_ACT_TOOL_CALL_LIMIT_ENV
 import me.matsumo.fukurou.trading.config.FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT_ENV
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
 import me.matsumo.fukurou.trading.decision.FalsificationRecord
@@ -27,6 +28,10 @@ import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
+import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -55,6 +60,7 @@ import java.util.UUID
  * @param cliConfig CLI / MCP server 接続設定
  * @param invocationId 外部予約済みの runner 起動 ID。未指定時は runner が生成する
  * @param marketSnapshotId 判断前 market snapshot ID。未指定時は invocation ID から生成する
+ * @param triggerKind daemon trigger 種別。手動起動では null
  * @param proposerProvider Proposer provider
  * @param falsifierProvider Falsifier provider
  */
@@ -65,6 +71,7 @@ data class OneShotRunnerRequest(
     val cliConfig: OneShotRunnerCliConfig = OneShotRunnerCliConfig(),
     val invocationId: String? = null,
     val marketSnapshotId: String? = null,
+    val triggerKind: LlmDaemonTriggerKind? = null,
     val proposerProvider: LlmProvider = LlmProvider.CLAUDE,
     val falsifierProvider: LlmProvider = LlmProvider.CODEX,
 )
@@ -220,12 +227,21 @@ class OneShotLlmRunner(
     suspend fun runOneShot(request: OneShotRunnerRequest): Result<OneShotRunnerResult> {
         val invocationId = request.invocationId ?: idGenerator().toString()
         val marketSnapshotId = request.marketSnapshotId ?: "manual-$invocationId"
+        val llmRunStart = LlmRunStart(
+            invocationId = invocationId,
+            mode = tradingConfig.mode,
+            symbol = tradingConfig.symbol,
+            triggerKind = request.triggerKind,
+            startedAt = clock.instant(),
+        )
         var failureContext = decisionRunContext(
             invocationId = invocationId,
             provider = request.proposerProvider,
             promptHash = PROMPT_HASH_UNAVAILABLE,
             marketSnapshotId = marketSnapshotId,
         )
+
+        recordLlmRunStarted(llmRunStart)
 
         return try {
             val promptContent = readSystemPrompt(request.repositoryRoot)
@@ -239,30 +255,33 @@ class OneShotLlmRunner(
             failureContext = proposerContext
 
             val launchEligibility = launchEligibility(invocationId, proposerContext)
-
-            if (!launchEligibility.canLaunch) {
+            val result = if (!launchEligibility.canLaunch) {
                 recordNoTrade(proposerContext, launchEligibility.rejectionReason, null).getOrThrow()
                 logHuman("launch rejected invocation=$invocationId reason=${launchEligibility.rejectionReason}")
 
-                return Result.success(
-                    OneShotRunnerResult(
-                        invocationId = invocationId,
-                        status = OneShotRunnerStatus.LAUNCH_REJECTED,
-                        decision = null,
-                        intent = null,
-                        tradeResult = null,
-                    ),
+                OneShotRunnerResult(
+                    invocationId = invocationId,
+                    status = OneShotRunnerStatus.LAUNCH_REJECTED,
+                    decision = null,
+                    intent = null,
+                    tradeResult = null,
+                )
+            } else {
+                runOneShotAfterPreflight(
+                    request = request,
+                    invocationId = invocationId,
+                    promptContent = promptContent,
+                    promptHash = promptHash,
+                    marketSnapshotId = marketSnapshotId,
+                    proposerContext = proposerContext,
+                    failureContextUpdated = { context -> failureContext = context },
                 )
             }
 
-            val result = runOneShotAfterPreflight(
-                request = request,
-                invocationId = invocationId,
-                promptContent = promptContent,
-                promptHash = promptHash,
-                marketSnapshotId = marketSnapshotId,
-                proposerContext = proposerContext,
-                failureContextUpdated = { context -> failureContext = context },
+            finalizeLlmRun(
+                start = llmRunStart,
+                status = result.status.name,
+                cause = null,
             )
 
             Result.success(result)
@@ -270,14 +289,70 @@ class OneShotLlmRunner(
             val auditResult = withContext(NonCancellable) {
                 recordNoTrade(failureContext, "caller_cancelled", throwable)
             }
+            val finishResult = withContext(NonCancellable) {
+                finalizeLlmRun(
+                    start = llmRunStart,
+                    status = LLM_RUN_STATUS_CANCELLED,
+                    cause = throwable,
+                )
+            }
             throwable.withSuppressedFailure(auditResult)
+            throwable.withSuppressedFailure(finishResult)
 
             throw throwable
         } catch (throwable: Throwable) {
             val auditResult = recordNoTrade(failureContext, "caller_failed", throwable)
+            val finishResult = finalizeLlmRun(
+                start = llmRunStart,
+                status = LLM_RUN_STATUS_FAILED,
+                cause = throwable,
+            )
 
-            Result.failure(throwable.withSuppressedFailure(auditResult))
+            Result.failure(
+                throwable
+                    .withSuppressedFailure(auditResult)
+                    .withSuppressedFailure(finishResult),
+            )
         }
+    }
+
+    private suspend fun recordLlmRunStarted(start: LlmRunStart) {
+        tradingRuntime.llmRunRepository.insertRunning(start)
+            .onFailure { throwable ->
+                logRunRecordFailure("start", start.invocationId, throwable)
+            }
+    }
+
+    private suspend fun finalizeLlmRun(
+        start: LlmRunStart,
+        status: String,
+        cause: Throwable?,
+    ): Result<Unit> {
+        val finish = LlmRunFinish(
+            invocationId = start.invocationId,
+            status = status,
+            finishedAt = clock.instant(),
+            errorMessage = cause?.redactedErrorMessage(),
+        )
+
+        return tradingRuntime.llmRunRepository.finish(finish)
+            .onFailure { throwable ->
+                logRunRecordFailure("finish", start.invocationId, throwable)
+            }
+    }
+
+    private fun Throwable.redactedErrorMessage(): String {
+        val typeName = javaClass.simpleName
+        val detail = message.orEmpty()
+        val message = if (detail.isBlank()) typeName else "$typeName: $detail"
+
+        return processOutputRedactor.redactAndTruncate(message)
+    }
+
+    private fun logRunRecordFailure(operation: String, invocationId: String, throwable: Throwable) {
+        logHuman(
+            "llm run $operation record failed invocation=$invocationId error=${throwable.javaClass.simpleName}",
+        )
     }
 
     private suspend fun runOneShotAfterPreflight(

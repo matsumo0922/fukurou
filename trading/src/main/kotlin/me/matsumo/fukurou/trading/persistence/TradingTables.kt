@@ -128,6 +128,115 @@ object PaperAccountTable : Table("paper_account") {
 }
 
 /**
+ * LLM runner の run-level 記録を表す Exposed table。
+ */
+object LlmRunsTable : Table("llm_runs") {
+    /**
+     * runner 起動 ID。
+     */
+    val invocationId = varchar("invocation_id", length = 128)
+
+    /**
+     * 取引 mode。
+     */
+    val mode = varchar("mode", length = 16)
+
+    /**
+     * 取引対象 symbol。
+     */
+    val symbol = varchar("symbol", length = 32)
+
+    /**
+     * daemon trigger 種別。手動起動では null。
+     */
+    val triggerKind = varchar("trigger_kind", length = 64).nullable()
+
+    /**
+     * runner status。
+     */
+    val status = varchar("status", length = 32)
+
+    /**
+     * 起動開始時刻。epoch millis で保存する。
+     */
+    val startedAt = long("started_at")
+
+    /**
+     * 終了時刻。epoch millis で保存する。
+     */
+    val finishedAt = long("finished_at").nullable()
+
+    /**
+     * redaction / truncate 済みのエラー message。
+     */
+    val errorMessage = text("error_message").nullable()
+
+    override val primaryKey = PrimaryKey(invocationId)
+}
+
+/**
+ * paper account の equity 履歴を表す Exposed table。
+ */
+object EquitySnapshotsTable : Table("equity_snapshots") {
+    /**
+     * snapshot ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * 取引 mode。
+     */
+    val mode = varchar("mode", length = 16)
+
+    /**
+     * snapshot 追加理由。
+     */
+    val reason = varchar("reason", length = 16)
+
+    /**
+     * JST 取引日。YYYY-MM-DD で保存する。
+     */
+    val tradingDate = varchar("trading_date", length = 10)
+
+    /**
+     * 取得時刻。epoch millis で保存する。
+     */
+    val capturedAt = long("captured_at")
+
+    /**
+     * JPY 現金残高。
+     */
+    val cashJpy = decimal("cash_jpy", precision = 24, scale = 8)
+
+    /**
+     * BTC 保有数量。
+     */
+    val btcQuantity = decimal("btc_quantity", precision = 24, scale = 12)
+
+    /**
+     * BTC 評価価格。
+     */
+    val btcMarkPriceJpy = decimal("btc_mark_price_jpy", precision = 24, scale = 8)
+
+    /**
+     * 総評価額。
+     */
+    val totalEquityJpy = decimal("total_equity_jpy", precision = 24, scale = 8)
+
+    /**
+     * 総評価額の過去ピーク。
+     */
+    val equityPeakJpy = decimal("equity_peak_jpy", precision = 24, scale = 8)
+
+    /**
+     * equityPeakJpy からの drawdown。
+     */
+    val drawdownRatio = decimal("drawdown_ratio", precision = 20, scale = 10)
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
  * bot-managed position ledger を表す Exposed table。
  */
 object PositionsTable : Table("positions") {

@@ -1282,6 +1282,12 @@ interface GmoSymbolMapper {
 
 [確定事項の改訂: 2026-07-03] 評価 API は paper の append-only ledger から読み取り専用で算出する。DB schema、kline 永続化、集計 table、SQL view は追加しない。closed trade fact は `positions` の CLOSED 行を正本にし、最古の BUY order から `trade_intents` / `decisions` / `trade_plans` を辿る。
 
+[確定事項の改訂: 2026-07-04] 2026-07-03 の「評価 API は DB schema を追加しない」は、評価 API 専用の集計 table / SQL view / kline 永続化を増やさないという意味に限定する。`llm_runs` と `equity_snapshots` は評価 API の集計結果ではなく、runner 起動単位と paper equity 推移の一次 append-only 記録であるため追加対象に含める。
+
+`llm_runs` は `invocation_id` を primary key とし、`mode`、`symbol`、nullable な daemon `trigger_kind`、`status`、epoch millis の `started_at` / `finished_at`、redaction / truncate 済み `error_message` だけを保存する。旧スケッチの `provider` は phase ごとの `command_event_log` に残すため run-level には持たない。`stdout_path` / `stderr_path` も持たず、stdout / stderr は従来通り redaction 後の runner phase audit に残す。
+
+`equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP`）、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。旧スケッチからの差分として、日次重複防止のため `reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置き、FILL は paper account 更新と同一 transaction で追加する。
+
 評価式は次の通り。
 
 - `tradePnL = SELL executions.realized_pnl_jpy 合計 - BUY executions.fee_jpy 合計`。SELL 側 realized PnL は exit fee 控除済みなので、entry fee だけを追加控除する。

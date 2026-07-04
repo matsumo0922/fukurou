@@ -14,10 +14,15 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
+import me.matsumo.fukurou.trading.evaluation.InMemoryEquitySnapshotRepository
+import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.math.BigDecimal
+import java.time.Instant
 import java.time.LocalDate
 import java.util.UUID
 
@@ -28,6 +33,7 @@ import java.util.UUID
  * @param positions position 一覧
  * @param openOrders open order 一覧
  * @param executions execution 一覧
+ * @param equitySnapshotRepository equity snapshot 保存先
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  */
 class InMemoryPaperLedgerRepository(
@@ -35,6 +41,7 @@ class InMemoryPaperLedgerRepository(
     positions: List<Position> = emptyList(),
     openOrders: List<Order> = emptyList(),
     executions: List<Execution> = emptyList(),
+    internal val equitySnapshotRepository: InMemoryEquitySnapshotRepository = InMemoryEquitySnapshotRepository(),
     private val fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
 ) : PaperLedgerRepository {
 
@@ -304,6 +311,7 @@ class InMemoryPaperLedgerRepository(
         )
         cancelOpenStopOrdersLocked(position.positionId, reasonJa)
         accountSnapshot = accountSnapshot.afterSellFill(realizedFill)
+        appendFillEquitySnapshot(realizedFill.executedAt)
 
         return PaperTradeResult(
             accepted = true,
@@ -405,6 +413,7 @@ class InMemoryPaperLedgerRepository(
         positions += position
         executions += fill.toExecution(entryOrder.orderId, position.positionId, command)
         accountSnapshot = accountSnapshot.afterBuyFill(fill)
+        appendFillEquitySnapshot(fill.executedAt)
 
         return PaperTradeResult(
             accepted = true,
@@ -555,6 +564,18 @@ class InMemoryPaperLedgerRepository(
         return orders.firstOrNull { order ->
             order.positionId == positionId && order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.status == OrderStatus.OPEN
         }
+    }
+
+    private fun appendFillEquitySnapshot(capturedAt: Instant) {
+        val tradingDate = capturedAt.atZone(EQUITY_SNAPSHOT_TRADING_DATE_ZONE).toLocalDate()
+        val snapshot = accountSnapshot.toEquitySnapshotRecord(
+            id = UUID.randomUUID(),
+            reason = EquitySnapshotReason.FILL,
+            tradingDate = tradingDate,
+            capturedAt = capturedAt,
+        )
+
+        equitySnapshotRepository.appendSnapshot(snapshot)
     }
 }
 

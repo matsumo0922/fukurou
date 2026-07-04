@@ -13,10 +13,12 @@ import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
+import me.matsumo.fukurou.trading.persistence.ExposedEquitySnapshotRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
@@ -124,12 +126,13 @@ internal fun startProtectionReconcilerWorker(
     val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
     val safetyViolationRepository = ExposedSafetyViolationRepository(database)
     val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
+    val ledgerRepository = ExposedPaperLedgerRepository(database)
     val marketDataSource = GmoPublicMarketDataSource.fromConfig(
         config = tradingConfig.gmoPublicClient,
         clock = clock,
     )
     val broker = PaperBroker(
-        ledgerRepository = ExposedPaperLedgerRepository(database),
+        ledgerRepository = ledgerRepository,
         riskStateRepository = riskStateRepository,
         riskStateCommandService = riskStateCommandService,
         safetyViolationRepository = safetyViolationRepository,
@@ -156,6 +159,11 @@ internal fun startProtectionReconcilerWorker(
             commandEventLog = commandEventLog,
             broker = broker,
             statsSource = { evaluationRepository.fetchKillCriterionStats() },
+            clock = clock,
+        ),
+        equitySnapshotRecorder = EquitySnapshotRecorder(
+            accountSource = { ledgerRepository.getAccountSnapshot() },
+            repository = ExposedEquitySnapshotRepository(database),
             clock = clock,
         ),
         status = status,
