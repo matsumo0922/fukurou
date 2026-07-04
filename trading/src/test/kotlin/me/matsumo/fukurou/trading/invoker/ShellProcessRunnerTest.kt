@@ -11,11 +11,63 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 /**
  * ShellProcessRunner の process tree timeout contract を検証するテスト。
  */
 class ShellProcessRunnerTest {
+
+    @Test
+    fun run_createsMissingNestedWorkingDirectoryBeforeLaunch() = runBlocking {
+        val echoPath = Path.of("/bin/echo")
+        if (!Files.isExecutable(echoPath)) {
+            return@runBlocking
+        }
+
+        val tempDirectory = Files.createTempDirectory("fukurou-process-runner-working-dir-test")
+        val workingDirectory = tempDirectory.resolve("a/b/c")
+        val command = RenderedLlmCommand(
+            executable = echoPath.toString(),
+            args = listOf("created"),
+            environment = emptyMap(),
+            workingDirectory = workingDirectory,
+            timeout = Duration.ofSeconds(1),
+            stdin = null,
+        )
+
+        val result = ShellProcessRunner().run(command).getOrThrow()
+
+        assertEquals(ProcessRunStatus.EXITED, result.status)
+        assertEquals(0, result.exitCode)
+        assertEquals("created\n", result.stdout)
+        assertTrue(Files.isDirectory(workingDirectory))
+    }
+
+    @Test
+    fun run_usesExistingWorkingDirectoryAsBefore() = runBlocking {
+        val echoPath = Path.of("/bin/echo")
+        if (!Files.isExecutable(echoPath)) {
+            return@runBlocking
+        }
+
+        val workingDirectory = Files.createTempDirectory("fukurou-process-runner-existing-dir-test")
+        val command = RenderedLlmCommand(
+            executable = echoPath.toString(),
+            args = listOf("existing"),
+            environment = emptyMap(),
+            workingDirectory = workingDirectory,
+            timeout = Duration.ofSeconds(1),
+            stdin = null,
+        )
+
+        val result = ShellProcessRunner().run(command).getOrThrow()
+
+        assertEquals(ProcessRunStatus.EXITED, result.status)
+        assertEquals(0, result.exitCode)
+        assertEquals("existing\n", result.stdout)
+        assertTrue(Files.isDirectory(workingDirectory))
+    }
 
     @Test
     fun run_timeoutKillsDescendantProcess() = runBlocking {

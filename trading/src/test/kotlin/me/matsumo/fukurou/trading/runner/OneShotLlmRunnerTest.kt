@@ -5,6 +5,10 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
@@ -62,6 +66,7 @@ import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import java.io.IOException
 import java.math.BigDecimal
 import java.nio.file.Files
 import java.nio.file.Path
@@ -207,6 +212,45 @@ class OneShotLlmRunnerTest {
             assertNull(result.decision, failureCase.first)
             assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"), failureCase.first)
         }
+    }
+
+    @Test
+    fun proposerFailedToStart_auditsRedactedErrorAndRecordsNoTradeExit() = runBlocking {
+        val failure = IOException(
+            "Cannot run program \"claude\" (in directory \"/tmp/fukurou-llm\"): " +
+                "error=2, No such file or directory, token=test-password",
+        )
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = FakeMarketDataSource,
+        )
+        val runner = OneShotLlmRunner(
+            tradingRuntime = runtime,
+            tradingConfig = TradingBotConfig(),
+            llmInvoker = FailureResultLlmInvoker(failure),
+            parentEnvironment = defaultParentEnvironment(),
+            clock = fixedClock(),
+            logger = {},
+        )
+
+        val result = runner.runOneShot(defaultRequest()).getOrThrow()
+        val events = (runtime.commandEventLog as InMemoryCommandEventLog).events()
+        val proposerDetails = events.singleRunnerPhaseDetails("proposer")
+        val auditError = proposerDetails.stringValue("error")
+        val noTradePayload = events.singleNoTradePayload()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals("FAILED_TO_START", proposerDetails.stringValue("status"))
+        assertEquals("null", proposerDetails.stringValue("exitCode"))
+        assertTrue(auditError.contains("java.io.IOException"))
+        assertTrue(auditError.contains("Cannot run program \"claude\""))
+        assertTrue(auditError.contains("/tmp/fukurou-llm"))
+        assertTrue(auditError.contains("[REDACTED]"))
+        assertFalse(auditError.contains("test-password"))
+        assertFalse(proposerDetails.containsKey("stdout"))
+        assertFalse(proposerDetails.containsKey("stderr"))
+        assertEquals("proposer_missing_decision", noTradePayload.stringValue("reason"))
+        assertEquals("true", noTradePayload.stringValue("noTrade"))
     }
 
     @Test
@@ -527,7 +571,11 @@ class OneShotLlmRunnerTest {
         val phaseEvents = fixture.eventLog.events()
             .filter { event -> event.eventType == CommandEventType.RUNNER_PHASE_COMPLETED }
         val proposerPhase = phaseEvents.single { event -> event.payload.contains("\"phase\":\"proposer\"") }
+        val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
 
+        assertEquals("EXITED", proposerDetails.stringValue("status"))
+        assertEquals("0", proposerDetails.stringValue("exitCode"))
+        assertFalse(proposerDetails.containsKey("error"))
         assertTrue(proposerPhase.payload.contains("[REDACTED]"))
         assertFalse(proposerPhase.payload.contains("test-password"))
         assertFalse(proposerPhase.payload.contains("fukurou-token"))
@@ -781,6 +829,23 @@ private class ThrowingLlmInvoker(
 }
 
 /**
+ * LLM 起動結果として失敗を返す test double。
+ *
+ * @param failure 起動境界から返す失敗
+ */
+private class FailureResultLlmInvoker(
+    private val failure: Throwable,
+) : LlmInvoker {
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        require(request.invocationId.isNotBlank()) {
+            "invocationId must not be blank."
+        }
+
+        return Result.failure(failure)
+    }
+}
+
+/**
  * llm_runs 書き込みに必ず失敗する test repository。
  */
 private object FailingLlmRunRepository : LlmRunRepository {
@@ -992,6 +1057,36 @@ private fun List<CommandEvent>.containsNoTradeReason(reason: String): Boolean {
 
         noTradeExit && reasonMatched
     }
+}
+
+private fun List<CommandEvent>.singleRunnerPhaseDetails(phase: String): JsonObject {
+    val event = single { event -> event.isRunnerPhaseCompleted(phase) }
+    val payload = event.payloadJsonObject()
+
+    assertEquals(phase, payload.stringValue("phase"))
+
+    return payload.getValue("details").jsonObject
+}
+
+private fun List<CommandEvent>.singleNoTradePayload(): JsonObject {
+    val event = single { event -> event.eventType == CommandEventType.NO_TRADE_EXIT }
+
+    return event.payloadJsonObject()
+}
+
+private fun CommandEvent.isRunnerPhaseCompleted(phase: String): Boolean {
+    val phaseCompleted = eventType == CommandEventType.RUNNER_PHASE_COMPLETED
+    val phaseMatched = payload.contains("\"phase\":\"$phase\"")
+
+    return phaseCompleted && phaseMatched
+}
+
+private fun CommandEvent.payloadJsonObject(): JsonObject {
+    return Json.parseToJsonElement(payload).jsonObject
+}
+
+private fun JsonObject.stringValue(key: String): String {
+    return getValue(key).jsonPrimitive.content
 }
 
 private fun defaultRequest(): OneShotRunnerRequest {

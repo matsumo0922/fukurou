@@ -531,6 +531,9 @@ class OneShotLlmRunner(
         val duration = Duration.ofNanos(System.nanoTime() - startedAt)
         val invocationResult = result.getOrNull()
         val processResult = invocationResult?.processResult
+        val startFailureError = result.exceptionOrNull()
+            ?.takeIf { processResult == null }
+            ?.redactedQualifiedErrorMessage()
         val usage = processResult?.let { completedProcess ->
             usageForAudit(request.provider, completedProcess.stdout)
         }
@@ -543,6 +546,7 @@ class OneShotLlmRunner(
                 put("provider", request.provider.name.lowercase())
                 put("status", processResult?.status?.name ?: "FAILED_TO_START")
                 put("exitCode", processResult?.exitCode?.toString() ?: "null")
+                startFailureError?.let { error -> put("error", error) }
                 processResult?.let { completedProcess ->
                     put("stdout", processOutputRedactor.redactAndTruncate(completedProcess.stdout))
                     put("stderr", processOutputRedactor.redactAndTruncate(completedProcess.stderr))
@@ -698,6 +702,13 @@ class OneShotLlmRunner(
                 occurredAt = clock.instant(),
             ),
         )
+    }
+
+    private fun Throwable.redactedQualifiedErrorMessage(): String {
+        val detail = message.orEmpty()
+        val auditMessage = "${javaClass.name}: $detail"
+
+        return processOutputRedactor.redactAndTruncate(auditMessage)
     }
 
     private fun llmRequest(
