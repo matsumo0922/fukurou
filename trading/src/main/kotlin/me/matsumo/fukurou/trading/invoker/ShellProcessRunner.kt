@@ -77,6 +77,8 @@ class ShellProcessRunner : ProcessRunner {
     }
 
     private fun startProcess(command: RenderedLlmCommand): Process {
+        Files.createDirectories(command.workingDirectory)
+
         val builder = ProcessBuilder(listOf(command.executable) + command.args)
             .directory(command.workingDirectory.toFile())
         val environment = builder.environment()
