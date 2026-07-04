@@ -175,6 +175,30 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
+    fun renderCodex_deduplicatesSkipGitRepoCheckFromConfiguredCommonArgs() {
+        val renderer = DefaultLlmCommandRenderer(
+            config = LlmCommandRendererConfig(
+                codexCommonArgs = listOf("--skip-git-repo-check", "--headless-test"),
+            ),
+        )
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "fukurou-mcp",
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val skipGitRepoCheckCount = command.args.count { argument ->
+            argument == "--skip-git-repo-check"
+        }
+
+        assertEquals(1, skipGitRepoCheckCount)
+        assertTrue(command.args.contains("--headless-test"))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
     fun renderCodex_emptyAutoApprovedToolsPreservesConfigWithoutToolStanza() {
         val renderer = DefaultLlmCommandRenderer()
         val request = request(
