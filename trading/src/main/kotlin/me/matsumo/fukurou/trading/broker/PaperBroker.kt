@@ -17,6 +17,7 @@ import me.matsumo.fukurou.trading.domain.ProtectionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
 import me.matsumo.fukurou.trading.market.IndicatorType
@@ -44,7 +45,6 @@ import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeParseException
 import java.util.UUID
-import java.util.logging.Level
 import java.util.logging.Logger
 
 /**
@@ -76,6 +76,10 @@ class PaperBroker(
     private val reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
     private val clock: Clock = Clock.systemUTC(),
     private val tradingDateZone: ZoneId = TRADING_DATE_ZONE,
+    private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
+        logger = paperBrokerLogger,
+        clock = clock,
+    ),
 ) : Broker {
 
     private val safetyFloor = safetyFloor ?: SafetyFloor(clock = clock)
@@ -99,16 +103,20 @@ class PaperBroker(
         return ledgerRepository.getAccountSnapshotWithUpdatedAt()
     }
 
-    override suspend fun getAccountUpdatedAt(): Result<Instant> {
-        return ledgerRepository.getAccountUpdatedAt()
-    }
-
     override suspend fun getPositions(): Result<List<Position>> {
         return ledgerRepository.getOpenPositions()
     }
 
+    override suspend fun getPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt> {
+        return ledgerRepository.getOpenPositionsWithUpdatedAt()
+    }
+
     override suspend fun getOpenOrders(): Result<List<Order>> {
         return ledgerRepository.getOpenOrders()
+    }
+
+    override suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt> {
+        return ledgerRepository.getOpenOrdersWithUpdatedAt()
     }
 
     override suspend fun getAccountStatus(): Result<AccountStatus> {
@@ -367,10 +375,10 @@ class PaperBroker(
         return try {
             Instant.parse(timestamp)
         } catch (exception: DateTimeParseException) {
-            paperBrokerLogger.log(
-                Level.WARNING,
-                "PaperBroker could not parse ticker timestamp. Data quality probability cap will fail closed.",
-                exception,
+            warnLogger.warn(
+                key = "paper-broker-ticker-timestamp-parse-failure",
+                message = "PaperBroker could not parse ticker timestamp. Data quality probability cap will fail closed.",
+                throwable = exception,
             )
             null
         }

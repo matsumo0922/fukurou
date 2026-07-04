@@ -1,6 +1,11 @@
 package me.matsumo.fukurou.trading.market
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import java.time.Clock
 import java.time.Duration
@@ -40,7 +45,9 @@ data class FreshnessMetadata(
         ): FreshnessMetadata {
             val fetchedAt = Instant.now(clock)
             val freshnessBaseAt = sourceTimestamp ?: fetchedAt
-            val stalenessMs = Duration.between(freshnessBaseAt, fetchedAt).toMillis()
+            val stalenessMs = Duration.between(freshnessBaseAt, fetchedAt)
+                .toMillis()
+                .coerceAtLeast(0)
             val staleAfterMs = staleAfter.toMillis()
 
             return FreshnessMetadata(
@@ -52,6 +59,18 @@ data class FreshnessMetadata(
                 source = source,
             )
         }
+    }
+}
+
+/**
+ * JSON object に freshness metadata を additive に付与する。
+ */
+fun JsonObject.withFreshness(freshness: FreshnessMetadata): JsonObject {
+    return buildJsonObject {
+        this@withFreshness.forEach { fieldName, value ->
+            put(fieldName, value)
+        }
+        put("freshness", Json.encodeToJsonElement(freshness))
     }
 }
 

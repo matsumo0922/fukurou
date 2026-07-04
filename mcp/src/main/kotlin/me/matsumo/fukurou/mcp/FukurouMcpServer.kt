@@ -44,9 +44,11 @@ import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.OpenOrdersWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -58,10 +60,8 @@ import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
-import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
-import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GMO_MAX_DAILY_KLINE_REQUESTS
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
@@ -76,6 +76,7 @@ import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
 import me.matsumo.fukurou.trading.market.MarketNetworkException
+import me.matsumo.fukurou.trading.market.withFreshness
 import me.matsumo.fukurou.trading.risk.AccountStatusService
 import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
@@ -941,13 +942,13 @@ private suspend fun handleGetPositions(
     clock: Clock,
 ): CallToolResult {
     val positions = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
-        tradingRuntime.broker.getPositions().getOrThrow()
+        tradingRuntime.broker.getPositionsWithUpdatedAt().getOrThrow()
     }
 
     return positions.fold(
         onSuccess = { value ->
             positionsResult(
-                positions = value,
+                output = value,
                 clock = clock,
             )
         },
@@ -961,13 +962,13 @@ private suspend fun handleGetOpenOrders(
     clock: Clock,
 ): CallToolResult {
     val openOrders = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
-        tradingRuntime.broker.getOpenOrders().getOrThrow()
+        tradingRuntime.broker.getOpenOrdersWithUpdatedAt().getOrThrow()
     }
 
     return openOrders.fold(
         onSuccess = { value ->
             openOrdersResult(
-                openOrders = value,
+                output = value,
                 clock = clock,
             )
         },
@@ -1625,40 +1626,32 @@ private fun balanceResult(output: AccountSnapshotWithUpdatedAt, clock: Clock): C
     return jsonObjectResult(structuredContent)
 }
 
-private fun positionsResult(positions: List<Position>, clock: Clock): CallToolResult {
-    return jsonObjectResult(
-        buildJsonObject {
-            put("count", positions.size)
-            put("positions", ToolJson.encodeToJsonElement(positions))
-            put(
-                "freshness",
-                ToolJson.encodeToJsonElement(
-                    paperLedgerFreshness(
-                        clock = clock,
-                        sourceTimestamp = null,
-                    ),
-                ),
-            )
-        },
+private fun positionsResult(output: PositionsWithUpdatedAt, clock: Clock): CallToolResult {
+    val structuredContent = buildJsonObject {
+        put("count", output.positions.size)
+        put("positions", ToolJson.encodeToJsonElement(output.positions))
+    }.withFreshness(
+        paperLedgerFreshness(
+            clock = clock,
+            sourceTimestamp = output.updatedAt,
+        ),
     )
+
+    return jsonObjectResult(structuredContent)
 }
 
-private fun openOrdersResult(openOrders: List<Order>, clock: Clock): CallToolResult {
-    return jsonObjectResult(
-        buildJsonObject {
-            put("count", openOrders.size)
-            put("orders", ToolJson.encodeToJsonElement(openOrders))
-            put(
-                "freshness",
-                ToolJson.encodeToJsonElement(
-                    paperLedgerFreshness(
-                        clock = clock,
-                        sourceTimestamp = null,
-                    ),
-                ),
-            )
-        },
+private fun openOrdersResult(output: OpenOrdersWithUpdatedAt, clock: Clock): CallToolResult {
+    val structuredContent = buildJsonObject {
+        put("count", output.openOrders.size)
+        put("orders", ToolJson.encodeToJsonElement(output.openOrders))
+    }.withFreshness(
+        paperLedgerFreshness(
+            clock = clock,
+            sourceTimestamp = output.updatedAt,
+        ),
     )
+
+    return jsonObjectResult(structuredContent)
 }
 
 private fun accountStatusResult(output: AccountStatusWithUpdatedAt, clock: Clock): CallToolResult {
@@ -1770,15 +1763,6 @@ private fun jsonObjectResult(structuredContent: JsonObject): CallToolResult {
         content = listOf(TextContent(structuredContent.toString())),
         structuredContent = structuredContent,
     )
-}
-
-private fun JsonObject.withFreshness(freshness: FreshnessMetadata): JsonObject {
-    return buildJsonObject {
-        this@withFreshness.forEach { fieldName, value ->
-            put(fieldName, value)
-        }
-        put("freshness", ToolJson.encodeToJsonElement(freshness))
-    }
 }
 
 private fun paperLedgerFreshness(clock: Clock, sourceTimestamp: Instant?): FreshnessMetadata {

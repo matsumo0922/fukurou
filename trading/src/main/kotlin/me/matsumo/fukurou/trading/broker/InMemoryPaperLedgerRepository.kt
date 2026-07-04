@@ -67,14 +67,21 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
-    override suspend fun getAccountUpdatedAt(): Result<Instant> {
-        return Result.success(synchronized(lock) { accountUpdatedAt })
-    }
-
     override suspend fun getOpenPositions(): Result<List<Position>> {
         return Result.success(
             synchronized(lock) {
-                positions.filter { position -> position.status == PositionStatus.OPEN }
+                openPositionsLocked()
+            },
+        )
+    }
+
+    override suspend fun getOpenPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt> {
+        return Result.success(
+            synchronized(lock) {
+                PositionsWithUpdatedAt(
+                    positions = openPositionsLocked(),
+                    updatedAt = accountUpdatedAt,
+                )
             },
         )
     }
@@ -89,7 +96,18 @@ class InMemoryPaperLedgerRepository(
     override suspend fun getOpenOrders(): Result<List<Order>> {
         return Result.success(
             synchronized(lock) {
-                orders.filter { order -> order.status == OrderStatus.OPEN || order.status == OrderStatus.PENDING_CANCEL }
+                openOrdersLocked()
+            },
+        )
+    }
+
+    override suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt> {
+        return Result.success(
+            synchronized(lock) {
+                OpenOrdersWithUpdatedAt(
+                    openOrders = openOrdersLocked(),
+                    updatedAt = accountUpdatedAt,
+                )
             },
         )
     }
@@ -592,6 +610,16 @@ class InMemoryPaperLedgerRepository(
     private fun linkedStopOrder(positionId: String): Order? {
         return orders.firstOrNull { order ->
             order.positionId == positionId && order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.status == OrderStatus.OPEN
+        }
+    }
+
+    private fun openPositionsLocked(): List<Position> {
+        return positions.filter { position -> position.status == PositionStatus.OPEN }
+    }
+
+    private fun openOrdersLocked(): List<Order> {
+        return orders.filter { order ->
+            order.status == OrderStatus.OPEN || order.status == OrderStatus.PENDING_CANCEL
         }
     }
 

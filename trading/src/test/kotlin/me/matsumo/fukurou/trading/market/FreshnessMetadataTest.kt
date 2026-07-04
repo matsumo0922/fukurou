@@ -69,6 +69,19 @@ class FreshnessMetadataTest {
     }
 
     @Test
+    fun build_clampsFutureSourceTimestampStalenessToZero() {
+        val metadata = FreshnessMetadata.build(
+            clock = fixedClock(),
+            sourceTimestamp = fixedInstant().plusSeconds(3),
+            staleAfter = FreshnessDefaults.tickerStaleAfter,
+            source = FreshnessSource.GMO_PUBLIC_REST,
+        )
+
+        assertEquals(0L, metadata.stalenessMs)
+        assertFalse(metadata.stale)
+    }
+
+    @Test
     fun candleStaleAfter_usesIntervalDurationAndGrace() {
         assertEquals(
             Duration.ofMinutes(5).plusSeconds(90),

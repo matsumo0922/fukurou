@@ -7,7 +7,6 @@ import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.types.ToolAnnotations
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
@@ -41,6 +40,7 @@ import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
 import me.matsumo.fukurou.trading.market.MarketNetworkException
+import me.matsumo.fukurou.trading.market.withFreshness
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -832,10 +832,7 @@ private fun tickerResult(ticker: Ticker, clock: Clock): CallToolResult {
             ),
         )
 
-    return CallToolResult(
-        content = listOf(TextContent(ToolJson.encodeToString(ticker))),
-        structuredContent = structuredContent,
-    )
+    return jsonObjectResult(structuredContent)
 }
 
 private fun candlesResult(
@@ -912,15 +909,6 @@ private fun indicatorResult(output: IndicatorToolOutput): CallToolResult {
             put("freshness", ToolJson.encodeToJsonElement(output.freshness))
         },
     )
-}
-
-private fun JsonObject.withFreshness(freshness: FreshnessMetadata): JsonObject {
-    return buildJsonObject {
-        this@withFreshness.forEach { fieldName, value ->
-            put(fieldName, value)
-        }
-        put("freshness", ToolJson.encodeToJsonElement(freshness))
-    }
 }
 
 private fun marketFreshness(

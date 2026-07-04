@@ -30,6 +30,28 @@ data class AccountStatusWithUpdatedAt(
 )
 
 /**
+ * open position 一覧と、同一読み取りで取得した paper account 更新時刻。
+ *
+ * @param positions open position 一覧
+ * @param updatedAt paper_account.updated_at
+ */
+data class PositionsWithUpdatedAt(
+    val positions: List<Position>,
+    val updatedAt: Instant,
+)
+
+/**
+ * open order 一覧と、同一読み取りで取得した paper account 更新時刻。
+ *
+ * @param openOrders open order 一覧
+ * @param updatedAt paper_account.updated_at
+ */
+data class OpenOrdersWithUpdatedAt(
+    val openOrders: List<Order>,
+    val updatedAt: Instant,
+)
+
+/**
  * paper broker の読み取り・副作用境界。
  */
 interface Broker {
@@ -44,19 +66,24 @@ interface Broker {
     suspend fun getBalanceWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt>
 
     /**
-     * paper account single row の更新時刻を返す。
-     */
-    suspend fun getAccountUpdatedAt(): Result<Instant>
-
-    /**
      * 現在の open position 一覧を返す。
      */
     suspend fun getPositions(): Result<List<Position>>
 
     /**
+     * 現在の open position 一覧と paper account 更新時刻を同一読み取り由来で返す。
+     */
+    suspend fun getPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt>
+
+    /**
      * 現在の open order 一覧を返す。
      */
     suspend fun getOpenOrders(): Result<List<Order>>
+
+    /**
+     * 現在の open order 一覧と paper account 更新時刻を同一読み取り由来で返す。
+     */
+    suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt>
 
     /**
      * 口座と safety 状態をまとめた status を返す。

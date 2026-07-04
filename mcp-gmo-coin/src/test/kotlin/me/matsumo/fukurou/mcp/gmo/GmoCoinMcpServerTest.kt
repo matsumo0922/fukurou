@@ -23,7 +23,9 @@ import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import io.modelcontextprotocol.kotlin.sdk.types.ResourceUpdatedNotification
 import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import io.modelcontextprotocol.kotlin.sdk.types.ServerNotification
+import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
@@ -129,9 +131,19 @@ class GmoCoinMcpServerTest {
 
         val result = callTool(server, "get_ticker")
         val structuredContent = assertNotNull(result.structuredContent)
+        val textContent = assertTextJsonObject(result)
 
         assertFreshness(
             structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = fixedInstant().minusSeconds(3).toString(),
+            stalenessMs = 3_000L,
+            staleAfterMs = 5_000L,
+            stale = false,
+            source = "GMO_PUBLIC_REST",
+        )
+        assertFreshness(
+            structuredContent = textContent,
             fetchedAt = fixedInstant().toString(),
             sourceTimestamp = fixedInstant().minusSeconds(3).toString(),
             stalenessMs = 3_000L,
@@ -329,6 +341,12 @@ private fun assertFreshness(
     assertEquals(staleAfterMs, freshness.getValue("staleAfterMs").jsonPrimitive.longOrNull)
     assertEquals(stale, freshness.getValue("stale").jsonPrimitive.booleanOrNull)
     assertEquals(source, freshness.getValue("source").jsonPrimitive.contentOrNull)
+}
+
+private fun assertTextJsonObject(result: CallToolResult): JsonObject {
+    val textContent = assertNotNull(result.content.singleOrNull() as? TextContent)
+
+    return Json.parseToJsonElement(textContent.text).jsonObject
 }
 
 /**

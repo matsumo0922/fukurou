@@ -7,9 +7,11 @@ import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.IntentConsumingPaperLedgerRepository
+import me.matsumo.fukurou.trading.broker.OpenOrdersWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.PaperMarketConfig
@@ -56,16 +58,6 @@ private const val SELECT_PAPER_ACCOUNT_SQL = """
 """
 
 /**
- * paper account single row の updated_at を読む SQL。
- */
-private const val SELECT_PAPER_ACCOUNT_UPDATED_AT_SQL = """
-    SELECT
-        updated_at
-    FROM paper_account
-    WHERE id = ?
-"""
-
-/**
  * open positions を読む SQL。
  */
 private const val SELECT_OPEN_POSITIONS_SQL = """
@@ -96,6 +88,38 @@ private const val SELECT_OPEN_POSITIONS_SQL = """
             WHERE id = ?
         )
     ORDER BY opened_at ASC
+"""
+
+/**
+ * open positions と paper_account updated_at を同一結果で読む SQL。
+ */
+private const val SELECT_OPEN_POSITIONS_WITH_ACCOUNT_UPDATED_AT_SQL = """
+    SELECT
+        paper_account.updated_at AS account_updated_at,
+        positions.id,
+        positions.trade_group_id,
+        positions.mode,
+        positions.symbol,
+        positions.side,
+        positions.status,
+        positions.opened_at,
+        positions.closed_at,
+        positions.size_btc,
+        positions.average_entry_price_jpy,
+        positions.current_price_jpy,
+        positions.current_stop_loss_jpy,
+        positions.current_take_profit_jpy,
+        positions.unrealized_pnl_jpy,
+        positions.unrealized_r,
+        positions.pyramid_add_count,
+        positions.highest_price_since_entry_jpy,
+        positions.lowest_price_since_entry_jpy
+    FROM paper_account
+    LEFT JOIN positions
+        ON positions.status = ?
+        AND positions.mode = paper_account.mode
+    WHERE paper_account.id = ?
+    ORDER BY positions.opened_at ASC NULLS LAST
 """
 
 /**
@@ -130,6 +154,39 @@ private const val SELECT_OPEN_ORDERS_SQL = """
             WHERE id = ?
         )
     ORDER BY created_at ASC
+"""
+
+/**
+ * open orders と paper_account updated_at を同一結果で読む SQL。
+ */
+private const val SELECT_OPEN_ORDERS_WITH_ACCOUNT_UPDATED_AT_SQL = """
+    SELECT
+        paper_account.updated_at AS account_updated_at,
+        orders.id,
+        orders.intent_id,
+        orders.position_id,
+        orders.trade_group_id,
+        orders.mode,
+        orders.symbol,
+        orders.side,
+        orders.order_type,
+        orders.status,
+        orders.size_btc,
+        orders.limit_price_jpy,
+        orders.trigger_price_jpy,
+        orders.protective_stop_price_jpy,
+        orders.take_profit_price_jpy,
+        orders.estimated_win_probability,
+        orders.reason_ja,
+        orders.client_request_id,
+        orders.created_at,
+        orders.updated_at
+    FROM paper_account
+    LEFT JOIN orders
+        ON orders.status IN (?, ?)
+        AND orders.mode = paper_account.mode
+    WHERE paper_account.id = ?
+    ORDER BY orders.created_at ASC NULLS LAST
 """
 
 /**
@@ -346,16 +403,6 @@ class ExposedPaperLedgerRepository(
         }
     }
 
-    override suspend fun getAccountUpdatedAt(): Result<Instant> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    selectPaperAccountUpdatedAt()
-                }
-            }
-        }
-    }
-
     override suspend fun getOpenPositions(): Result<List<Position>> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -366,11 +413,31 @@ class ExposedPaperLedgerRepository(
         }
     }
 
+    override suspend fun getOpenPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    selectOpenPositionsWithUpdatedAt()
+                }
+            }
+        }
+    }
+
     override suspend fun getOpenOrders(): Result<List<Order>> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
                     selectOpenOrders()
+                }
+            }
+        }
+    }
+
+    override suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    selectOpenOrdersWithUpdatedAt()
                 }
             }
         }
@@ -513,20 +580,6 @@ internal fun JdbcTransaction.selectPaperAccountWithUpdatedAt(): AccountSnapshotW
     }
 }
 
-/**
- * paper_account single row の updated_at だけを SELECT する。
- */
-internal fun JdbcTransaction.selectPaperAccountUpdatedAt(): Instant {
-    return jdbcConnection().prepareStatement(SELECT_PAPER_ACCOUNT_UPDATED_AT_SQL).use { statement ->
-        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
-        statement.executeQuery().use { resultSet ->
-            require(resultSet.next()) { "paper_account single row was not initialized." }
-
-            resultSet.getInstant("updated_at")
-        }
-    }
-}
-
 internal fun JdbcTransaction.selectOpenPositions(): List<Position> {
     return jdbcConnection().prepareStatement(SELECT_OPEN_POSITIONS_SQL).use { statement ->
         statement.setString(1, PositionStatus.OPEN.name)
@@ -537,6 +590,24 @@ internal fun JdbcTransaction.selectOpenPositions(): List<Position> {
                     add(resultSet.toPosition())
                 }
             }
+        }
+    }
+}
+
+internal fun JdbcTransaction.selectOpenPositionsWithUpdatedAt(): PositionsWithUpdatedAt {
+    return jdbcConnection().prepareStatement(SELECT_OPEN_POSITIONS_WITH_ACCOUNT_UPDATED_AT_SQL).use { statement ->
+        statement.setString(1, PositionStatus.OPEN.name)
+        statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) { "paper_account single row was not initialized." }
+
+            val updatedAt = resultSet.getInstant("account_updated_at")
+            val positions = resultSet.toNullablePositions()
+
+            PositionsWithUpdatedAt(
+                positions = positions,
+                updatedAt = updatedAt,
+            )
         }
     }
 }
@@ -552,6 +623,25 @@ internal fun JdbcTransaction.selectOpenOrders(): List<Order> {
                     add(resultSet.toOrder())
                 }
             }
+        }
+    }
+}
+
+internal fun JdbcTransaction.selectOpenOrdersWithUpdatedAt(): OpenOrdersWithUpdatedAt {
+    return jdbcConnection().prepareStatement(SELECT_OPEN_ORDERS_WITH_ACCOUNT_UPDATED_AT_SQL).use { statement ->
+        statement.setString(1, OrderStatus.OPEN.name)
+        statement.setString(2, OrderStatus.PENDING_CANCEL.name)
+        statement.setInt(3, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) { "paper_account single row was not initialized." }
+
+            val updatedAt = resultSet.getInstant("account_updated_at")
+            val openOrders = resultSet.toNullableOrders()
+
+            OpenOrdersWithUpdatedAt(
+                openOrders = openOrders,
+                updatedAt = updatedAt,
+            )
         }
     }
 }
@@ -653,6 +743,30 @@ private fun ResultSet.toExecutions(): List<Execution> {
         while (next()) {
             add(toExecution())
         }
+    }
+}
+
+private fun ResultSet.toNullablePositions(): List<Position> {
+    return buildList {
+        do {
+            val hasPositionRow = getObject("id") != null
+
+            if (hasPositionRow) {
+                add(toPosition())
+            }
+        } while (next())
+    }
+}
+
+private fun ResultSet.toNullableOrders(): List<Order> {
+    return buildList {
+        do {
+            val hasOrderRow = getObject("id") != null
+
+            if (hasOrderRow) {
+                add(toOrder())
+            }
+        } while (next())
     }
 }
 
