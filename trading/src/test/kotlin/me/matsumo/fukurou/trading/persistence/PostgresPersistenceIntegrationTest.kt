@@ -177,7 +177,8 @@ private const val SELECT_EQUITY_SNAPSHOT_INDEX_COUNT_SQL = """
         AND tablename = 'equity_snapshots'
         AND indexname IN (
             'idx_equity_snapshots_captured_at',
-            'idx_equity_snapshots_daily_unique'
+            'idx_equity_snapshots_daily_unique',
+            'idx_equity_snapshots_bootstrap_unique'
         )
 """
 
@@ -425,7 +426,24 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, selectOrdersClientRequestIdIndexCount(database))
         assertEquals(3, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))
-        assertEquals(2, selectEquitySnapshotIndexCount(database))
+        assertEquals(3, selectEquitySnapshotIndexCount(database))
+        assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
+    }
+
+    @Test
+    fun bootstrap_equitySnapshotRejectsDuplicateBootstrapRowsInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        val repository = ExposedEquitySnapshotRepository(database)
+        val duplicateBootstrap = account.toEquitySnapshotRecord(
+            id = UUID.randomUUID(),
+            reason = EquitySnapshotReason.BOOTSTRAP,
+            tradingDate = LocalDate.of(2026, 7, 2),
+            capturedAt = fixedInstant().plusSeconds(60),
+        )
+
+        assertTrue(repository.append(duplicateBootstrap).isFailure)
         assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
     }
 

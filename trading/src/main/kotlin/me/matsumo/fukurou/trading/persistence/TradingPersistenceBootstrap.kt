@@ -97,6 +97,7 @@ private const val INSERT_BOOTSTRAP_EQUITY_SNAPSHOT_SQL = """
             SELECT 1
             FROM equity_snapshots
         )
+    ON CONFLICT (reason) WHERE reason = 'BOOTSTRAP' DO NOTHING
 """
 
 /**
@@ -243,6 +244,15 @@ private const val ENSURE_EQUITY_SNAPSHOTS_DAILY_UNIQUE_INDEX_SQL = """
 """
 
 /**
+ * equity_snapshots の BOOTSTRAP 一意 index を作る SQL。
+ */
+private const val ENSURE_EQUITY_SNAPSHOTS_BOOTSTRAP_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_snapshots_bootstrap_unique
+    ON equity_snapshots (reason)
+    WHERE reason = 'BOOTSTRAP'
+"""
+
+/**
  * command_event_log の起動回数集計 index 存在を確認する SQL。
  */
 private const val VERIFY_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL = """
@@ -312,9 +322,10 @@ private const val VERIFY_EQUITY_SNAPSHOTS_INDEX_COUNT_SQL = """
         AND tablename = 'equity_snapshots'
         AND indexname IN (
             'idx_equity_snapshots_captured_at',
-            'idx_equity_snapshots_daily_unique'
+            'idx_equity_snapshots_daily_unique',
+            'idx_equity_snapshots_bootstrap_unique'
         )
-    HAVING COUNT(*) = 2
+    HAVING COUNT(*) = 3
 """
 
 /**
@@ -703,6 +714,7 @@ internal fun JdbcTransaction.ensureLlmRunIndexes() {
 internal fun JdbcTransaction.ensureEquitySnapshotIndexes() {
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_CAPTURED_AT_INDEX_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_DAILY_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_EQUITY_SNAPSHOTS_BOOTSTRAP_UNIQUE_INDEX_SQL)
 }
 
 /**
