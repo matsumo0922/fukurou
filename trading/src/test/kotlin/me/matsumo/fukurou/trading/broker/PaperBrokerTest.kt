@@ -31,6 +31,7 @@ import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
@@ -74,6 +75,23 @@ class PaperBrokerTest {
         assertEquals(0, accountStatus.protectionStatus.protectedPositionCount)
         assertEquals(0, accountStatus.protectionStatus.unprotectedPositionCount)
         assertEquals(0, accountStatus.protectionStatus.orphanStopCount)
+    }
+
+    @Test
+    fun get_account_status_returns_soft_halt_state_name() = runBlocking {
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = InMemoryPaperLedgerRepository(),
+            riskStateRepository = riskStateRepository,
+            clock = fixedClock(),
+        )
+
+        riskStateRepository.setSoftHalt("operator pause", fixedInstant()).getOrThrow()
+
+        val accountStatus = broker.getAccountStatus().getOrThrow()
+
+        assertEquals(RiskHaltState.SOFT_HALT.name, accountStatus.riskState)
+        assertFalse(accountStatus.hardHalt)
     }
 
     @Test
@@ -350,6 +368,64 @@ class PaperBrokerTest {
         assertTrue(result.accepted)
         assertEquals(1, repository.getExecutions().getOrThrow().size)
         assertEquals(0, violationRepository.violations().size)
+    }
+
+    @Test
+    fun soft_halt_rejects_place_order_but_allows_close_update_and_cancel() = runBlocking {
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val violationRepository = InMemorySafetyViolationRepository()
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc(),
+            positions = listOf(protectedPosition()),
+            openOrders = listOf(linkedStopOrder(), orphanTakeProfitOrder()),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            safetyViolationRepository = violationRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        riskStateRepository.setSoftHalt("operator pause", fixedInstant()).getOrThrow()
+
+        val placeResult = broker.placeOrder(marketEntryCommand()).getOrThrow()
+        val updateResult = broker.updateProtection(
+            UpdateProtectionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                newStopPriceJpy = BigDecimal("9900000"),
+                takeProfitPriceSpecified = false,
+                newTakeProfitPriceJpy = null,
+                reasonJa = "tighten protection during soft halt",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val cancelResult = broker.cancelOrder(
+            CancelOrderCommand(
+                commandId = UUID.randomUUID(),
+                orderId = UUID.fromString("20000000-0000-0000-0000-000000000002"),
+                reasonJa = "cancel stale take profit during soft halt",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val closeResult = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                closeAll = false,
+                reasonJa = "close during soft halt",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+
+        assertFalse(placeResult.accepted)
+        assertEquals(SafetyFloorRule.SOFT_HALT_ENTRY_BLOCKED, placeResult.safetyViolation?.rule)
+        assertTrue(updateResult.accepted)
+        assertTrue(cancelResult.accepted)
+        assertTrue(closeResult.accepted)
+        assertEquals(1, violationRepository.violations().size)
+        assertEquals(0, broker.getPositions().getOrThrow().size)
     }
 
     @Test
@@ -647,7 +723,7 @@ class PaperBrokerTest {
         val riskState = riskStateRepository.current().getOrThrow()
 
         assertFalse(result.accepted)
-        assertTrue(riskState.hardHalt)
+        assertEquals(RiskHaltState.HARD_HALT, riskState.state)
         assertEquals(SafetyFloorRule.MAX_DRAWDOWN_HALT, result.safetyViolation?.rule)
         assertEquals(0, broker.getPositions().getOrThrow().size)
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
@@ -660,7 +736,7 @@ class PaperBrokerTest {
         val riskStateRepository = InMemoryRiskStateRepository(
             clock = fixedClock(),
             initialState = RiskState(
-                hardHalt = true,
+                state = RiskHaltState.HARD_HALT,
                 drawdownRatio = BigDecimal.ZERO,
                 equityPeak = BigDecimal("100000"),
                 haltReason = "test hard halt",
@@ -681,7 +757,7 @@ class PaperBrokerTest {
         val riskState = riskStateRepository.current().getOrThrow()
 
         assertFalse(result.accepted)
-        assertTrue(riskState.hardHalt)
+        assertEquals(RiskHaltState.HARD_HALT, riskState.state)
         assertEquals(SafetyFloorRule.MAX_DRAWDOWN_HALT, result.safetyViolation?.rule)
         assertEquals(1, violationRepository.violations().size)
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)

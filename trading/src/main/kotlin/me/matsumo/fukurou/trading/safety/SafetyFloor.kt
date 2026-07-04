@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -116,6 +117,11 @@ enum class SafetyFloorRule {
      * 高影響経済イベントの blackout window 内で新規 entry しようとした。
      */
     ECONOMIC_EVENT_BLACKOUT,
+
+    /**
+     * SOFT_HALT 中に新規 entry しようとした。
+     */
+    SOFT_HALT_ENTRY_BLOCKED,
 }
 
 /**
@@ -344,6 +350,7 @@ class SafetyFloor(
      */
     fun evaluatePlaceOrder(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyFloorVerdict {
         detectHardHalt(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        detectSoftHalt(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateEconomicEventBlackout(command)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateFalsifierGate(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateStopLoss(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
@@ -422,7 +429,8 @@ class SafetyFloor(
         val accountDrawdown = context.account.drawdownRatio.toBigDecimal()
         val riskStateDrawdown = context.riskState.drawdownRatio
         val measuredDrawdown = minOf(accountDrawdown, riskStateDrawdown)
-        val hardHaltReached = context.riskState.hardHalt || measuredDrawdown <= config.maxDrawdownRatio
+        val hardHaltEnabled = context.riskState.state == RiskHaltState.HARD_HALT
+        val hardHaltReached = hardHaltEnabled || measuredDrawdown <= config.maxDrawdownRatio
 
         if (!hardHaltReached) {
             return null
@@ -436,6 +444,21 @@ class SafetyFloor(
             measuredValue = measuredDrawdown.toPlainString(),
             limitValue = config.maxDrawdownRatio.toPlainString(),
             hardHaltRequired = true,
+        )
+    }
+
+    private fun detectSoftHalt(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
+        if (context.riskState.state != RiskHaltState.SOFT_HALT) {
+            return null
+        }
+
+        return violation(
+            commandName = "place_order",
+            command = command,
+            rule = SafetyFloorRule.SOFT_HALT_ENTRY_BLOCKED,
+            messageJa = "SOFT_HALT 中のため、新規 entry は拒否します。",
+            measuredValue = RiskHaltState.SOFT_HALT.name,
+            limitValue = RiskHaltState.RUNNING.name,
         )
     }
 

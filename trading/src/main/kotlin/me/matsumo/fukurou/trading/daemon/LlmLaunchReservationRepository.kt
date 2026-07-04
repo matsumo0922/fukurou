@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.daemon
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Duration
 import java.time.Instant
@@ -263,7 +264,7 @@ class InMemoryLlmLaunchReservationRepository(
     private suspend fun tryReserveLocked(request: LlmLaunchReservationRequest): LlmLaunchReservationOutcome {
         val riskState = riskStateRepository.current().getOrThrow()
 
-        if (riskState.hardHalt) {
+        if (riskState.state == RiskHaltState.HARD_HALT) {
             return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.HARD_HALT)
         }
 

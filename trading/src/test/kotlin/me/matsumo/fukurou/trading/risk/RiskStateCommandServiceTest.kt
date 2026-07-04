@@ -11,7 +11,6 @@ import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -30,13 +29,55 @@ class RiskStateCommandServiceTest {
         ).getOrThrow()
         val event = eventLog.events().single()
 
-        assertTrue(riskState.hardHalt)
+        assertEquals(RiskHaltState.HARD_HALT, riskState.state)
         assertEquals("max drawdown exceeded", riskState.haltReason)
         assertEquals(fixedInstant(), riskState.haltAt)
         assertEquals(CommandEventType.HARD_HALT_SET, event.eventType)
         assertEquals("risk_state", event.toolName)
         assertEquals("run-456", event.decisionRunContext.decisionRunId)
         assertTrue(event.payload.contains("max drawdown exceeded"))
+    }
+
+    @Test
+    fun set_soft_halt_updates_state_and_logs_audit_event() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val service = createService(eventLog)
+
+        val riskState = service.setSoftHalt(
+            reason = "operator pause",
+            decisionRunContext = createDecisionRunContext(),
+        ).getOrThrow()
+        val event = eventLog.events().single()
+
+        assertEquals(RiskHaltState.SOFT_HALT, riskState.state)
+        assertEquals("operator pause", riskState.haltReason)
+        assertEquals(fixedInstant(), riskState.haltAt)
+        assertEquals(CommandEventType.SOFT_HALT_SET, event.eventType)
+        assertEquals("risk_state", event.toolName)
+        assertTrue(event.payload.contains("operator pause"))
+        assertTrue(event.payload.contains(RiskHaltState.RUNNING.name))
+    }
+
+    @Test
+    fun set_soft_halt_fails_when_current_state_is_hard_halt() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val service = createService(eventLog, riskStateRepository)
+
+        service.setHardHalt(
+            reason = "max drawdown exceeded",
+            decisionRunContext = createDecisionRunContext(),
+        ).getOrThrow()
+
+        val result = service.setSoftHalt(
+            reason = "operator pause",
+            decisionRunContext = createDecisionRunContext(),
+        )
+        val riskState = riskStateRepository.current().getOrThrow()
+
+        assertTrue(result.isFailure)
+        assertEquals(RiskHaltState.HARD_HALT, riskState.state)
+        assertEquals(listOf(CommandEventType.HARD_HALT_SET), eventLog.events().map { event -> event.eventType })
     }
 
     @Test
@@ -57,13 +98,14 @@ class RiskStateCommandServiceTest {
         val events = eventLog.events()
         val resumeEvent = events.last()
 
-        assertFalse(riskState.hardHalt)
+        assertEquals(RiskHaltState.RUNNING, riskState.state)
         assertEquals("operator confirmed recovery", riskState.resumedReason)
         assertEquals(fixedInstant(), riskState.resumedAt)
         assertEquals(CommandEventType.MANUAL_RESUME_REQUESTED, resumeEvent.eventType)
         assertEquals("risk_state", resumeEvent.toolName)
         assertEquals(2, events.size)
         assertTrue(resumeEvent.payload.contains("operator confirmed recovery"))
+        assertTrue(resumeEvent.payload.contains(RiskHaltState.HARD_HALT.name))
     }
 
     @Test
@@ -80,7 +122,7 @@ class RiskStateCommandServiceTest {
         val riskState = riskStateRepository.current().getOrThrow()
 
         assertTrue(result.isFailure)
-        assertTrue(riskState.hardHalt)
+        assertEquals(RiskHaltState.HARD_HALT, riskState.state)
         assertEquals("max drawdown exceeded", riskState.haltReason)
     }
 }

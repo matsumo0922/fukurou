@@ -29,7 +29,27 @@ class InMemoryRiskStateRepository(
                 require(reason.isNotBlank()) { "HARD_HALT reason is required." }
 
                 storedState = storedState.copy(
-                    hardHalt = true,
+                    state = RiskHaltState.HARD_HALT,
+                    haltReason = reason,
+                    haltAt = at,
+                    updatedAt = at,
+                )
+
+                storedState
+            }
+        }
+    }
+
+    override suspend fun setSoftHalt(reason: String, at: Instant): Result<RiskState> {
+        return mutex.withLock {
+            runCatching {
+                require(reason.isNotBlank()) { "SOFT_HALT reason is required." }
+                require(storedState.state != RiskHaltState.HARD_HALT) {
+                    "SOFT_HALT cannot downgrade HARD_HALT."
+                }
+
+                storedState = storedState.copy(
+                    state = RiskHaltState.SOFT_HALT,
                     haltReason = reason,
                     haltAt = at,
                     updatedAt = at,
@@ -46,7 +66,7 @@ class InMemoryRiskStateRepository(
                 require(reason.isNotBlank()) { "manual resume reason is required." }
 
                 storedState = storedState.copy(
-                    hardHalt = false,
+                    state = RiskHaltState.RUNNING,
                     resumedAt = at,
                     resumedReason = reason,
                     updatedAt = at,

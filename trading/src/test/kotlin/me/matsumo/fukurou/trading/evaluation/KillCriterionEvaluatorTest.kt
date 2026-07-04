@@ -23,6 +23,7 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import java.math.BigDecimal
@@ -32,7 +33,6 @@ import java.time.ZoneId
 import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -57,7 +57,7 @@ class KillCriterionEvaluatorTest {
             ),
             eventTypes,
         )
-        assertTrue(fixture.riskStateRepository.current().getOrThrow().hardHalt)
+        assertEquals(RiskHaltState.HARD_HALT, fixture.riskStateRepository.current().getOrThrow().state)
         assertEquals(1, fixture.broker.sweepCount)
     }
 
@@ -80,6 +80,21 @@ class KillCriterionEvaluatorTest {
     }
 
     @Test
+    fun evaluate_escalatesSoftHaltToHardHaltWhenCriterionBreaches() = kotlinx.coroutines.runBlocking {
+        val fixture = evaluatorFixture(
+            statsSource = { Result.success(KillCriterionStats(closedTrades = 2, profitFactor = BigDecimal("0.70"))) },
+        )
+
+        fixture.riskStateRepository.setSoftHalt("operator pause", fixedInstant()).getOrThrow()
+        fixture.evaluator.evaluate(tickSnapshot()).getOrThrow()
+
+        val riskState = fixture.riskStateRepository.current().getOrThrow()
+
+        assertEquals(RiskHaltState.HARD_HALT, riskState.state)
+        assertEquals(1, fixture.broker.sweepCount)
+    }
+
+    @Test
     fun evaluate_doesNotFireForInsufficientTradesOrNullProfitFactor() = kotlinx.coroutines.runBlocking {
         val insufficientTrades = evaluatorFixture(
             statsSource = { Result.success(KillCriterionStats(closedTrades = 1, profitFactor = BigDecimal("0.70"))) },
@@ -91,8 +106,8 @@ class KillCriterionEvaluatorTest {
         insufficientTrades.evaluator.evaluate(tickSnapshot()).getOrThrow()
         nullProfitFactor.evaluator.evaluate(tickSnapshot()).getOrThrow()
 
-        assertFalse(insufficientTrades.riskStateRepository.current().getOrThrow().hardHalt)
-        assertFalse(nullProfitFactor.riskStateRepository.current().getOrThrow().hardHalt)
+        assertEquals(RiskHaltState.RUNNING, insufficientTrades.riskStateRepository.current().getOrThrow().state)
+        assertEquals(RiskHaltState.RUNNING, nullProfitFactor.riskStateRepository.current().getOrThrow().state)
     }
 
     @Test
@@ -124,7 +139,7 @@ class KillCriterionEvaluatorTest {
         val result = fixture.evaluator.evaluate(tickSnapshot())
 
         assertTrue(result.isSuccess)
-        assertFalse(fixture.riskStateRepository.current().getOrThrow().hardHalt)
+        assertEquals(RiskHaltState.RUNNING, fixture.riskStateRepository.current().getOrThrow().state)
         assertEquals(0, fixture.broker.sweepCount)
     }
 
@@ -153,7 +168,7 @@ class KillCriterionEvaluatorTest {
         assertTrue(firstResult.isFailure)
         assertTrue(secondResult.isSuccess)
         assertEquals(2, statsCallCount)
-        assertTrue(fixture.riskStateRepository.current().getOrThrow().hardHalt)
+        assertEquals(RiskHaltState.HARD_HALT, fixture.riskStateRepository.current().getOrThrow().state)
         assertEquals(1, fixture.broker.sweepCount)
     }
 
@@ -336,6 +351,13 @@ private class FailingOnceRiskStateCommandService(
         }
 
         return delegate.setHardHalt(reason, decisionRunContext)
+    }
+
+    override suspend fun setSoftHalt(
+        reason: String,
+        decisionRunContext: DecisionRunContext,
+    ): Result<RiskState> {
+        return delegate.setSoftHalt(reason, decisionRunContext)
     }
 
     override suspend fun resume(

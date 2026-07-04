@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.sql.SQLTimeoutException
 import java.time.Clock
@@ -140,7 +141,7 @@ class ToolCallGuard(
                 return Result.failure(throwable.withSuppressedFailure(auditResult))
             }
 
-        if (!riskState.hardHalt) {
+        if (riskState.state != RiskHaltState.HARD_HALT) {
             return null
         }
 

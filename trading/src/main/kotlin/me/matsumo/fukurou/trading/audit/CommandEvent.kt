@@ -48,6 +48,11 @@ enum class CommandEventType {
     HARD_HALT_SET,
 
     /**
+     * SOFT_HALT を DB 上で有効化した。
+     */
+    SOFT_HALT_SET,
+
+    /**
      * 評価成績が kill 基準に到達した。
      */
     KILL_CRITERION_BREACHED,

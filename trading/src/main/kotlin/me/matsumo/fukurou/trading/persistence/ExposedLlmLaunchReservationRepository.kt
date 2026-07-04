@@ -8,6 +8,7 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Instant
 import java.util.UUID
@@ -155,7 +156,7 @@ private fun JdbcTransaction.tryReserveInTransaction(
 ): LlmLaunchReservationOutcome {
     val riskState = selectRiskState(forUpdate = true)
 
-    if (riskState.hardHalt) {
+    if (riskState.state == RiskHaltState.HARD_HALT) {
         return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.HARD_HALT)
     }
 

@@ -17,8 +17,10 @@ import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
+import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Clock
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -40,6 +42,7 @@ fun interface ReadinessProbe {
  * @param evaluationRepository 評価 API 用 repository。null なら DB 設定から構築する
  * @param evaluationRiskStateRepository 評価 API 用 risk_state repository。null なら DB 設定から構築する
  * @param evaluationMarketDataSource 評価 API 用 market data source。null なら DB 設定時だけ GMO source を構築する
+ * @param opsRiskStateCommandService ops API 用 risk_state command service。null なら DB 設定から構築する
  * @param tradingConfig trading runtime config
  */
 fun Application.module(
@@ -50,6 +53,7 @@ fun Application.module(
     evaluationRepository: EvaluationRepository? = null,
     evaluationRiskStateRepository: RiskStateRepository? = null,
     evaluationMarketDataSource: MarketDataSource? = null,
+    opsRiskStateCommandService: RiskStateCommandService? = null,
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
 ) {
     val databaseDataSource = createDataSourceIfConfigured(readinessProbe)
@@ -59,6 +63,12 @@ fun Application.module(
     }
     val resolvedEvaluationRiskStateRepository = evaluationRiskStateRepository ?: database?.let { connectedDatabase ->
         ExposedRiskStateRepository(connectedDatabase)
+    }
+    val resolvedOpsRiskStateCommandService = opsRiskStateCommandService ?: database?.let { connectedDatabase ->
+        ExposedRiskStateCommandService(
+            database = connectedDatabase,
+            clock = clock,
+        )
     }
     val resolvedEvaluationMarketDataSource = evaluationMarketDataSource ?: database?.let {
         GmoPublicMarketDataSource.fromConfig(
@@ -97,6 +107,10 @@ fun Application.module(
             marketDataSource = resolvedEvaluationMarketDataSource,
             tradingConfig = tradingConfig,
             clock = clock,
+        )
+        opsRoutes(
+            riskStateRepository = resolvedEvaluationRiskStateRepository,
+            riskStateCommandService = resolvedOpsRiskStateCommandService,
         )
         apiDocumentationRoutes()
     }

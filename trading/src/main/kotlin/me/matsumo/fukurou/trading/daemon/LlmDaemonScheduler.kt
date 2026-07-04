@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.FreshnessDefaults
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.runner.MAX_DAILY_INVOCATION_COUNT_WINDOW
 import me.matsumo.fukurou.trading.runner.MAX_INVOCATION_COUNT_WINDOW
@@ -189,9 +190,9 @@ class LlmDaemonScheduler(
     }
 
     private suspend fun tickUnsafe(observedAt: Instant): LlmDaemonTickResult {
-        val hardHalt = riskStateRepository.current().getOrThrow().hardHalt
+        val riskState = riskStateRepository.current().getOrThrow()
 
-        if (hardHalt) {
+        if (riskState.state == RiskHaltState.HARD_HALT) {
             appendSkip(
                 reason = DAEMON_SKIP_HARD_HALT,
                 trigger = null,
@@ -205,7 +206,19 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
         }
 
-        val trigger = selectTrigger(observedAt)
+        val hasOpenRisk = openRiskReader.hasOpenRisk().getOrThrow()
+
+        if (riskState.state == RiskHaltState.SOFT_HALT && !hasOpenRisk) {
+            appendSkip(
+                reason = DAEMON_SKIP_SOFT_HALT_FLAT,
+                trigger = null,
+                observedAt = observedAt,
+            ).getOrThrow()
+
+            return LlmDaemonTickResult.Skipped(DAEMON_SKIP_SOFT_HALT_FLAT, null)
+        }
+
+        val trigger = selectTrigger(hasOpenRisk, observedAt)
 
         if (trigger == null) {
             return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
@@ -316,9 +329,7 @@ class LlmDaemonScheduler(
         )
     }
 
-    private suspend fun selectTrigger(observedAt: Instant): LlmDaemonTrigger? {
-        val hasOpenRisk = openRiskReader.hasOpenRisk().getOrThrow()
-
+    private suspend fun selectTrigger(hasOpenRisk: Boolean, observedAt: Instant): LlmDaemonTrigger? {
         if (hasOpenRisk) {
             val marketEvaluation = marketEvaluationIfNeeded(hasOpenRisk, observedAt)
 
@@ -891,6 +902,11 @@ private const val DAEMON_SKIP_NO_TRIGGER = "no_trigger_due"
  * HARD_HALT 中で起動しなかった理由。
  */
 private const val DAEMON_SKIP_HARD_HALT = "hard_halt"
+
+/**
+ * SOFT_HALT 中かつ flat のため起動しなかった理由。
+ */
+private const val DAEMON_SKIP_SOFT_HALT_FLAT = "soft_halt_flat"
 
 /**
  * daemon tick 失敗で起動しなかった理由。

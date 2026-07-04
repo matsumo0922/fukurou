@@ -4,6 +4,7 @@ import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import java.math.BigDecimal
@@ -20,13 +21,24 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 private const val INSERT_DEFAULT_RISK_STATE_SQL = """
     INSERT INTO risk_state (
         id,
+        state,
         hard_halt,
         drawdown_ratio,
         equity_peak,
         updated_at
     )
-    VALUES (?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT (id) DO NOTHING
+"""
+
+/**
+ * rollback 用 hard_halt から state を補正する SQL。
+ */
+private const val BACKFILL_RISK_STATE_HARD_HALT_SQL = """
+    UPDATE risk_state
+    SET state = ?
+    WHERE hard_halt = TRUE
+        AND state = ?
 """
 
 /**
@@ -36,6 +48,10 @@ private const val UPDATE_EMPTY_RISK_STATE_EQUITY_PEAK_SQL = """
     UPDATE risk_state
     SET
         equity_peak = ?,
+        hard_halt = CASE
+            WHEN state = 'HARD_HALT' THEN TRUE
+            ELSE FALSE
+        END,
         updated_at = ?
     WHERE id = ?
         AND equity_peak = 0
@@ -128,6 +144,25 @@ private const val VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL = """
         system_prompt_version,
         market_snapshot_id
     FROM command_event_log
+    LIMIT 0
+"""
+
+/**
+ * risk_state schema の存在を確認する SQL。
+ */
+private const val VERIFY_RISK_STATE_SCHEMA_SQL = """
+    SELECT
+        id,
+        state,
+        hard_halt,
+        drawdown_ratio,
+        equity_peak,
+        halt_reason,
+        halt_at,
+        resumed_at,
+        resumed_reason,
+        updated_at
+    FROM risk_state
     LIMIT 0
 """
 
@@ -630,6 +665,7 @@ class TradingPersistenceBootstrap(
                 val now = Instant.now(clock)
 
                 ensureRiskStateRow(now, paperAccountConfig.initialCashJpy)
+                backfillRiskStateHardHalt()
                 ensurePaperAccountRow(now, paperAccountConfig)
                 ensureRiskStateEquityPeak(now, paperAccountConfig.initialCashJpy)
                 ensureBootstrapEquitySnapshot(now)
@@ -643,6 +679,7 @@ class TradingPersistenceBootstrap(
     fun verifySchema(): Result<Unit> {
         return runCatching {
             exposedTransaction(database) {
+                verifyRiskStateSchema()
                 verifyCommandEventLogSchema()
                 verifyPaperAccountSchema()
                 verifyLlmRunsSchema()
@@ -662,6 +699,27 @@ class TradingPersistenceBootstrap(
             }
         }
     }
+}
+
+/**
+ * rollback 用 hard_halt から state を補正する。
+ */
+internal fun JdbcTransaction.backfillRiskStateHardHalt() {
+    jdbcConnection().prepareStatement(BACKFILL_RISK_STATE_HARD_HALT_SQL).use { statement ->
+        statement.setString(1, RiskHaltState.HARD_HALT.name)
+        statement.setString(2, RiskHaltState.RUNNING.name)
+        statement.executeUpdate()
+    }
+}
+
+/**
+ * risk_state schema が存在することを確認する。
+ */
+internal fun JdbcTransaction.verifyRiskStateSchema() {
+    verifySchemaBySql(
+        sql = VERIFY_RISK_STATE_SCHEMA_SQL,
+        missingMessage = "risk_state schema was not initialized.",
+    )
 }
 
 /**
@@ -910,10 +968,11 @@ private fun JdbcTransaction.executeUpdate(sql: String) {
 internal fun JdbcTransaction.ensureRiskStateRow(now: Instant, initialEquityPeak: BigDecimal = BigDecimal.ZERO) {
     jdbcConnection().prepareStatement(INSERT_DEFAULT_RISK_STATE_SQL).use { statement ->
         statement.setInt(1, RISK_STATE_SINGLE_ROW_ID)
-        statement.setBoolean(2, false)
-        statement.setBigDecimal(3, BigDecimal.ZERO)
-        statement.setBigDecimal(4, initialEquityPeak)
-        statement.setLong(5, now.toEpochMilli())
+        statement.setString(2, RiskHaltState.RUNNING.name)
+        statement.setBoolean(3, false)
+        statement.setBigDecimal(4, BigDecimal.ZERO)
+        statement.setBigDecimal(5, initialEquityPeak)
+        statement.setLong(6, now.toEpochMilli())
         statement.executeUpdate()
     }
 }

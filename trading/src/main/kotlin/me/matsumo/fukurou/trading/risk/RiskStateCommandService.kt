@@ -22,6 +22,14 @@ interface RiskStateCommandService {
     ): Result<RiskState>
 
     /**
+     * SOFT_HALT を有効化し、reason 付きで audit log に残す。
+     */
+    suspend fun setSoftHalt(
+        reason: String,
+        decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
+    ): Result<RiskState>
+
+    /**
      * 手動再開を reason 付きで記録し、audit log に残す。
      */
     suspend fun resume(
@@ -53,6 +61,19 @@ class InMemoryRiskStateCommandService(
             eventType = CommandEventType.HARD_HALT_SET,
         ) { commandReason, occurredAt ->
             riskStateRepository.setHardHalt(commandReason, occurredAt)
+        }
+    }
+
+    override suspend fun setSoftHalt(
+        reason: String,
+        decisionRunContext: DecisionRunContext,
+    ): Result<RiskState> {
+        return mutateAndAudit(
+            reason = reason,
+            decisionRunContext = decisionRunContext,
+            eventType = CommandEventType.SOFT_HALT_SET,
+        ) { commandReason, occurredAt ->
+            riskStateRepository.setSoftHalt(commandReason, occurredAt)
         }
     }
 
@@ -88,7 +109,7 @@ class InMemoryRiskStateCommandService(
                         toolCallId = null,
                         clientRequestId = null,
                         eventType = eventType,
-                        payload = buildRiskStateCommandPayload(reason),
+                        payload = buildRiskStateCommandPayload(reason, previousState),
                         occurredAt = occurredAt,
                     ),
                 ).getOrThrow()
@@ -111,8 +132,9 @@ private const val RISK_STATE_COMMAND_NAME = "risk_state"
 /**
  * reason 付きの risk_state 状態変更 payload を組み立てる。
  */
-private fun buildRiskStateCommandPayload(reason: String): String {
+private fun buildRiskStateCommandPayload(reason: String, previousState: RiskState): String {
     return buildJsonObject {
         put("reason", reason)
+        put("previousState", previousState.state.name)
     }.toString()
 }

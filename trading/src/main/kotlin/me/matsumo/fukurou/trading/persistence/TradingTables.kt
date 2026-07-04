@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.persistence
 
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import org.jetbrains.exposed.v1.core.Table
 import java.math.BigDecimal
 
@@ -26,6 +27,11 @@ object RiskStateTable : Table("risk_state") {
      * sticky HARD_HALT flag。
      */
     val hardHalt = bool("hard_halt").default(false)
+
+    /**
+     * 現在の取引停止状態。
+     */
+    val state = varchar("state", length = 32).default(RiskHaltState.RUNNING.name)
 
     /**
      * drawdown ratio。

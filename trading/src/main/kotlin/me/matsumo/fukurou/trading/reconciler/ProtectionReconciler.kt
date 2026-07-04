@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
@@ -231,7 +232,8 @@ class ProtectionReconciler(
     private suspend fun enforceHardHaltSweepIfNeeded(tickSnapshot: TickSnapshot): Boolean {
         val currentRiskState = riskStateRepository.current().getOrThrow()
         val hardHaltReached = currentRiskState.drawdownRatio <= SafetyFloorDefaults.maxDrawdownRatio
-        val shouldSweep = currentRiskState.hardHalt || hardHaltReached
+        val hardHaltEnabled = currentRiskState.state == RiskHaltState.HARD_HALT
+        val shouldSweep = hardHaltEnabled || hardHaltReached
 
         if (!shouldSweep) {
             return false
@@ -239,7 +241,7 @@ class ProtectionReconciler(
 
         val reason = currentRiskState.haltReason ?: HARD_HALT_SWEEP_REASON
 
-        if (!currentRiskState.hardHalt) {
+        if (!hardHaltEnabled) {
             if (riskStateCommandService != null) {
                 riskStateCommandService.setHardHalt(reason, DecisionRunContext.EMPTY).getOrThrow()
             } else {
