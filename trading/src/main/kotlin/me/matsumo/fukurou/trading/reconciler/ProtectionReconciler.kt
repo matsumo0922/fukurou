@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.Broker
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
@@ -87,6 +88,7 @@ enum class ReconcilePassKind {
  * @param tickStream 市場データ tick stream 抽象
  * @param broker tick ごとに paper ledger を前進させる broker
  * @param killCriterionEvaluator 評価成績による HARD_HALT evaluator
+ * @param equitySnapshotRecorder 日次 equity snapshot recorder
  * @param status Reconciler の状態 holder
  * @param clock pass timestamp に使う clock
  * @param warnLogger rate-limited warning logger
@@ -99,6 +101,7 @@ class ProtectionReconciler(
     private val tickStream: TickStream = EmptyTickStream,
     private val broker: Broker? = null,
     private val killCriterionEvaluator: KillCriterionEvaluator? = null,
+    private val equitySnapshotRecorder: EquitySnapshotRecorder? = null,
     private val status: MutableReconcilerStatus = MutableReconcilerStatus(),
     private val clock: Clock = Clock.systemUTC(),
     private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
@@ -171,6 +174,7 @@ class ProtectionReconciler(
     private suspend fun reconcileWithTransitionAudit(passKind: ReconcilePassKind): Result<Unit> {
         val passResult = runCatching {
             val reconciledAt = Instant.now(clock)
+
             val tickSnapshot = readTickSnapshot()
 
             if (tickSnapshot != null) {
@@ -186,6 +190,7 @@ class ProtectionReconciler(
                 }
             }
 
+            equitySnapshotRecorder?.recordDailyIfNeeded()
             markSuccessfulPass(passKind, tickSnapshot, reconciledAt).getOrThrow()
         }
 

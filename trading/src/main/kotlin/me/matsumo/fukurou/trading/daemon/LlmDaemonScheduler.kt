@@ -218,6 +218,7 @@ class LlmDaemonScheduler(
         val request = requestBase.copy(
             invocationId = invocationId,
             marketSnapshotId = "daemon-${trigger.key}-$invocationId",
+            triggerKind = trigger.kind,
         )
         val result = runCatching {
             launchOneShot(request).getOrThrow()

@@ -12,11 +12,16 @@ import me.matsumo.fukurou.trading.broker.toInitialAccountSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRepository
+import me.matsumo.fukurou.trading.evaluation.InMemoryLlmRunRepository
+import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
+import me.matsumo.fukurou.trading.persistence.ExposedEquitySnapshotRepository
+import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedReconcilerStatusProvider
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
@@ -69,6 +74,8 @@ private const val INITIALIZATION_FAIL_TIMEOUT = -1L
  * @param riskStateRepository risk_state repository
  * @param riskStateCommandService risk_state 更新と audit をまとめる command service
  * @param commandEventLog command_event_log repository
+ * @param llmRunRepository llm_runs repository
+ * @param equitySnapshotRepository equity_snapshots repository
  * @param decisionRepository decision protocol repository
  * @param safetyViolationRepository SafetyFloor violation repository
  * @param broker account / position ledger 読み取り境界
@@ -81,6 +88,8 @@ data class TradingRuntime(
     val riskStateRepository: RiskStateRepository,
     val riskStateCommandService: RiskStateCommandService,
     val commandEventLog: CommandEventLog,
+    val llmRunRepository: LlmRunRepository,
+    val equitySnapshotRepository: EquitySnapshotRepository,
     val decisionRepository: DecisionRepository,
     val safetyViolationRepository: SafetyViolationRepository,
     val broker: Broker,
@@ -170,6 +179,7 @@ object TradingRuntimeFactory {
     ): TradingRuntime {
         val riskStateRepository = InMemoryRiskStateRepository(clock)
         val commandEventLog = InMemoryCommandEventLog()
+        val llmRunRepository = InMemoryLlmRunRepository()
         val decisionRepository = InMemoryDecisionRepository(clock)
         val safetyViolationRepository = InMemorySafetyViolationRepository()
         val riskStateCommandService = InMemoryRiskStateCommandService(
@@ -177,11 +187,12 @@ object TradingRuntimeFactory {
             commandEventLog = commandEventLog,
             clock = clock,
         )
+        val ledgerRepository = InMemoryPaperLedgerRepository(
+            accountSnapshot = tradingConfig.paperAccount.toInitialAccountSnapshot(),
+            fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
+        )
         val broker = PaperBroker(
-            ledgerRepository = InMemoryPaperLedgerRepository(
-                accountSnapshot = tradingConfig.paperAccount.toInitialAccountSnapshot(),
-                fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
-            ),
+            ledgerRepository = ledgerRepository,
             riskStateRepository = riskStateRepository,
             riskStateCommandService = riskStateCommandService,
             decisionRepository = decisionRepository,
@@ -206,6 +217,8 @@ object TradingRuntimeFactory {
             riskStateRepository = riskStateRepository,
             riskStateCommandService = riskStateCommandService,
             commandEventLog = commandEventLog,
+            llmRunRepository = llmRunRepository,
+            equitySnapshotRepository = ledgerRepository.equitySnapshotRepository,
             decisionRepository = decisionRepository,
             safetyViolationRepository = safetyViolationRepository,
             broker = broker,
@@ -268,6 +281,8 @@ object TradingRuntimeFactory {
 
         val riskStateRepository = ExposedRiskStateRepository(database)
         val commandEventLog = ExposedCommandEventLog(database)
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val equitySnapshotRepository = ExposedEquitySnapshotRepository(database)
         val decisionRepository = ExposedDecisionRepository(database, clock)
         val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
         val safetyViolationRepository = ExposedSafetyViolationRepository(database)
@@ -306,6 +321,8 @@ object TradingRuntimeFactory {
             riskStateRepository = riskStateRepository,
             riskStateCommandService = riskStateCommandService,
             commandEventLog = commandEventLog,
+            llmRunRepository = llmRunRepository,
+            equitySnapshotRepository = equitySnapshotRepository,
             decisionRepository = decisionRepository,
             safetyViolationRepository = safetyViolationRepository,
             broker = broker,

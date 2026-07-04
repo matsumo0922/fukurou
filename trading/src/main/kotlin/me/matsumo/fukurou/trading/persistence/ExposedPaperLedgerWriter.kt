@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.broker.btcScale
 import me.matsumo.fukurou.trading.broker.floorToStep
 import me.matsumo.fukurou.trading.broker.moneyScale
 import me.matsumo.fukurou.trading.broker.ratioScale
+import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
@@ -26,6 +27,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
@@ -828,8 +830,13 @@ internal class ExposedPaperLedgerWriter(
         val spentCash = fill.priceJpy.multiply(fill.sizeBtc).add(fill.feeJpy)
         val cash = account.cashJpy.toBigDecimal().subtract(spentCash).moneyScale()
         val btcQuantity = account.btcQuantity.toBigDecimal().add(fill.sizeBtc).btcScale()
+        val updatedAccount = updateAccount(
+            cash = cash,
+            btcQuantity = btcQuantity,
+            markPrice = fill.priceJpy,
+        )
 
-        updateAccount(cash, btcQuantity, fill.priceJpy)
+        appendFillEquitySnapshot(updatedAccount, fill.executedAt)
     }
 
     private fun JdbcTransaction.hasCashForBuyFill(fill: SimulatedFill): Boolean {
@@ -844,21 +851,45 @@ internal class ExposedPaperLedgerWriter(
         val receivedCash = fill.priceJpy.multiply(fill.sizeBtc).subtract(fill.feeJpy)
         val cash = account.cashJpy.toBigDecimal().add(receivedCash).moneyScale()
         val btcQuantity = account.btcQuantity.toBigDecimal().subtract(fill.sizeBtc).btcScale()
+        val updatedAccount = updateAccount(
+            cash = cash,
+            btcQuantity = btcQuantity,
+            markPrice = fill.priceJpy,
+        )
 
-        updateAccount(cash, btcQuantity, fill.priceJpy)
+        appendFillEquitySnapshot(updatedAccount, fill.executedAt)
     }
 
     private fun JdbcTransaction.updateAccountMark(markPrice: BigDecimal) {
         val account = selectPaperAccount()
 
-        updateAccount(account.cashJpy.toBigDecimal(), account.btcQuantity.toBigDecimal(), markPrice)
+        updateAccount(
+            cash = account.cashJpy.toBigDecimal(),
+            btcQuantity = account.btcQuantity.toBigDecimal(),
+            markPrice = markPrice,
+        )
     }
 
-    private fun JdbcTransaction.updateAccount(cash: BigDecimal, btcQuantity: BigDecimal, markPrice: BigDecimal) {
+    private fun JdbcTransaction.updateAccount(
+        cash: BigDecimal,
+        btcQuantity: BigDecimal,
+        markPrice: BigDecimal,
+    ): AccountSnapshot {
         val account = selectPaperAccount()
-        val totalEquity = cash.add(btcQuantity.multiply(markPrice)).moneyScale()
+        val scaledCash = cash.moneyScale()
+        val scaledBtcQuantity = btcQuantity.btcScale()
+        val scaledMarkPrice = markPrice.moneyScale()
+        val totalEquity = scaledCash.add(scaledBtcQuantity.multiply(scaledMarkPrice)).moneyScale()
         val equityPeak = maxOf(account.equityPeakJpy.toBigDecimal(), totalEquity).moneyScale()
         val drawdownRatio = drawdownRatio(totalEquity, equityPeak)
+        val updatedAccount = account.copy(
+            cashJpy = scaledCash.toPlainString(),
+            btcQuantity = scaledBtcQuantity.toPlainString(),
+            btcMarkPriceJpy = scaledMarkPrice.toPlainString(),
+            totalEquityJpy = totalEquity.toPlainString(),
+            equityPeakJpy = equityPeak.toPlainString(),
+            drawdownRatio = drawdownRatio.toPlainString(),
+        )
 
         prepare(
             """
@@ -873,9 +904,9 @@ internal class ExposedPaperLedgerWriter(
                 WHERE id = ?
             """,
         ).use { statement ->
-            statement.setBigDecimal(1, cash.moneyScale())
-            statement.setBigDecimal(2, btcQuantity.btcScale())
-            statement.setBigDecimal(3, markPrice.moneyScale())
+            statement.setBigDecimal(1, scaledCash)
+            statement.setBigDecimal(2, scaledBtcQuantity)
+            statement.setBigDecimal(3, scaledMarkPrice)
             statement.setBigDecimal(4, totalEquity)
             statement.setBigDecimal(5, equityPeak)
             statement.setBigDecimal(6, drawdownRatio)
@@ -885,6 +916,17 @@ internal class ExposedPaperLedgerWriter(
         }
 
         syncRiskStateEquity(equityPeak, drawdownRatio)
+
+        return updatedAccount
+    }
+
+    private fun JdbcTransaction.appendFillEquitySnapshot(account: AccountSnapshot, capturedAt: Instant) {
+        val snapshot = account.toFillEquitySnapshotRecord(
+            id = UUID.randomUUID(),
+            capturedAt = capturedAt,
+        )
+
+        insertEquitySnapshot(snapshot, INSERT_EQUITY_SNAPSHOT_SQL)
     }
 
     private fun JdbcTransaction.syncRiskStateEquity(equityPeak: BigDecimal, drawdownRatio: BigDecimal) {

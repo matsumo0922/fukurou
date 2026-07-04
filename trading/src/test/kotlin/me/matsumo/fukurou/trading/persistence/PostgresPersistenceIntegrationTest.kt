@@ -31,6 +31,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -41,7 +42,12 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
+import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -86,6 +92,16 @@ private const val DELETE_RISK_STATE_ROW_SQL = "DELETE FROM risk_state WHERE id =
  * command_event_log table を削除する SQL。
  */
 private const val DROP_COMMAND_EVENT_LOG_TABLE_SQL = "DROP TABLE command_event_log"
+
+/**
+ * llm_runs table を削除する SQL。
+ */
+private const val DROP_LLM_RUNS_TABLE_SQL = "DROP TABLE llm_runs"
+
+/**
+ * equity_snapshots table を削除する SQL。
+ */
+private const val DROP_EQUITY_SNAPSHOTS_TABLE_SQL = "DROP TABLE equity_snapshots"
 
 /**
  * safety_violations 件数を読む SQL。
@@ -142,6 +158,41 @@ private const val SELECT_LLM_LAUNCH_RESERVATION_INDEX_COUNT_SQL = """
             'idx_llm_launch_reservations_trigger_key_reserved_at',
             'idx_llm_launch_reservations_status_reserved_at'
         )
+"""
+
+/**
+ * llm_runs index 件数を読む SQL。
+ */
+private const val SELECT_LLM_RUN_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'llm_runs'
+        AND indexname = 'idx_llm_runs_started_at'
+"""
+
+/**
+ * equity_snapshots index 件数を読む SQL。
+ */
+private const val SELECT_EQUITY_SNAPSHOT_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'equity_snapshots'
+        AND indexname IN (
+            'idx_equity_snapshots_captured_at',
+            'idx_equity_snapshots_daily_unique',
+            'idx_equity_snapshots_bootstrap_unique'
+        )
+"""
+
+/**
+ * reason 別 equity_snapshots 件数を読む SQL。
+ */
+private const val SELECT_EQUITY_SNAPSHOT_COUNT_BY_REASON_SQL = """
+    SELECT COUNT(*)
+    FROM equity_snapshots
+    WHERE reason = ?
 """
 
 /**
@@ -369,13 +420,90 @@ class PostgresPersistenceIntegrationTest {
 
         assertTrue(bootstrap.verifySchema().isFailure)
 
-        bootstrap.ensureSchema().getOrThrow()
+        repeat(3) {
+            bootstrap.ensureSchema().getOrThrow()
+        }
 
         assertTrue(bootstrap.verifySchema().isSuccess)
         assertTrue(ExposedRiskStateRepository(database).current().isSuccess)
         assertEquals(2, selectCommandEventLogIndexCount(database))
         assertEquals(1, selectOrdersClientRequestIdIndexCount(database))
         assertEquals(3, selectLlmLaunchReservationIndexCount(database))
+        assertEquals(1, selectLlmRunIndexCount(database))
+        assertEquals(3, selectEquitySnapshotIndexCount(database))
+        assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
+    }
+
+    @Test
+    fun bootstrap_equitySnapshotRejectsDuplicateBootstrapRowsInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        val repository = ExposedEquitySnapshotRepository(database)
+        val duplicateBootstrap = account.toEquitySnapshotRecord(
+            id = UUID.randomUUID(),
+            reason = EquitySnapshotReason.BOOTSTRAP,
+            tradingDate = LocalDate.of(2026, 7, 2),
+            capturedAt = fixedInstant().plusSeconds(60),
+        )
+
+        assertTrue(repository.append(duplicateBootstrap).isFailure)
+        assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
+    }
+
+    @Test
+    fun llm_run_repository_roundTripsStartedAndFinishedRunInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmRunRepository(database)
+        val startedAt = fixedInstant()
+        val finishedAt = fixedInstant().plusSeconds(12)
+        val start = LlmRunStart(
+            invocationId = "postgres-llm-run-round-trip",
+            mode = TradingMode.PAPER,
+            symbol = TradingSymbol.BTC,
+            triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+            startedAt = startedAt,
+        )
+        val finish = LlmRunFinish(
+            invocationId = start.invocationId,
+            mode = start.mode,
+            symbol = start.symbol,
+            triggerKind = start.triggerKind,
+            status = "NO_TRADE",
+            startedAt = start.startedAt,
+            finishedAt = finishedAt,
+            errorMessage = "redacted-error",
+        )
+
+        repository.insertRunning(start).getOrThrow()
+        repository.finish(finish).getOrThrow()
+
+        val record = requireNotNull(repository.findByInvocationId(start.invocationId).getOrThrow())
+
+        assertEquals(start.invocationId, record.invocationId)
+        assertEquals(start.mode, record.mode)
+        assertEquals(start.symbol, record.symbol)
+        assertEquals(start.triggerKind, record.triggerKind)
+        assertEquals(finish.status, record.status)
+        assertEquals(startedAt, record.startedAt)
+        assertEquals(finishedAt, record.finishedAt)
+        assertEquals(finish.errorMessage, record.errorMessage)
+    }
+
+    @Test
+    fun verify_schema_fails_closed_when_new_primary_record_tables_are_missing() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+
+        bootstrap.ensureSchema().getOrThrow()
+        dropLlmRunsTable(database)
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+
+        bootstrap.ensureSchema().getOrThrow()
+        dropEquitySnapshotsTable(database)
+
+        assertTrue(bootstrap.verifySchema().isFailure)
     }
 
     @Test
@@ -878,6 +1006,74 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf(OrderSide.BUY, OrderSide.SELL), executions.map { execution -> execution.side })
         assertEquals("10005000.00000000", watermark.highestPriceSinceEntryJpy)
         assertEquals("9685155.00000000", watermark.lowestPriceSinceEntryJpy)
+    }
+
+    @Test
+    fun paper_execution_appendsFillEquitySnapshotsAndSkipsMarkOnlyUpdates() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+        val fillCountAfterBuy = selectEquitySnapshotCountByReason(database, EquitySnapshotReason.FILL)
+        val accountAfterBuy = repository.getAccountSnapshot().getOrThrow()
+        val fillSnapshotAfterBuy = ExposedEquitySnapshotRepository(database).findAll().getOrThrow()
+            .single { snapshot -> snapshot.reason == EquitySnapshotReason.FILL }
+        repository.reconcile(
+            tickSnapshot = trailingTickSnapshot(),
+            simulator = FillSimulator(clock = fixedClock()),
+        ).getOrThrow()
+        val fillCountAfterMarkOnly = selectEquitySnapshotCountByReason(database, EquitySnapshotReason.FILL)
+        repository.reconcile(
+            tickSnapshot = stopTickSnapshot(),
+            simulator = FillSimulator(clock = fixedClock()),
+        ).getOrThrow()
+        val fillCountAfterSell = selectEquitySnapshotCountByReason(database, EquitySnapshotReason.FILL)
+
+        assertEquals(1, fillCountAfterBuy)
+        assertEquals(1, fillCountAfterMarkOnly)
+        assertEquals(2, fillCountAfterSell)
+        assertEquitySnapshotMatchesAccount(fillSnapshotAfterBuy, accountAfterBuy)
+    }
+
+    @Test
+    fun equity_snapshot_repository_ignoresDuplicateDailySnapshotsInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        val repository = ExposedEquitySnapshotRepository(database)
+        val tradingDate = LocalDate.of(2026, 7, 2)
+        val firstSnapshot = account.toEquitySnapshotRecord(
+            id = UUID.randomUUID(),
+            reason = EquitySnapshotReason.DAILY,
+            tradingDate = tradingDate,
+            capturedAt = fixedInstant(),
+        )
+        val secondSnapshot = firstSnapshot.copy(
+            id = UUID.randomUUID(),
+            capturedAt = fixedInstant().plusSeconds(60),
+        )
+
+        repository.appendDailyIfAbsent(firstSnapshot).getOrThrow()
+        repository.appendDailyIfAbsent(secondSnapshot).getOrThrow()
+
+        val dailySnapshots = repository.findAll().getOrThrow()
+            .filter { snapshot -> snapshot.reason == EquitySnapshotReason.DAILY }
+
+        assertEquals(1, dailySnapshots.size)
+        assertEquals(tradingDate, dailySnapshots.single().tradingDate)
     }
 
     @Test
@@ -1803,6 +1999,28 @@ private fun dropCommandEventLogTable(database: ExposedDatabase) {
 }
 
 /**
+ * llm_runs table を削除する。
+ */
+private fun dropLlmRunsTable(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(DROP_LLM_RUNS_TABLE_SQL).use { statement ->
+            statement.executeUpdate()
+        }
+    }
+}
+
+/**
+ * equity_snapshots table を削除する。
+ */
+private fun dropEquitySnapshotsTable(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(DROP_EQUITY_SNAPSHOTS_TABLE_SQL).use { statement ->
+            statement.executeUpdate()
+        }
+    }
+}
+
+/**
  * safety_violations 件数を読む。
  */
 private fun selectSafetyViolationCount(database: ExposedDatabase): Int {
@@ -1901,6 +2119,68 @@ private fun selectLlmLaunchReservationIndexCount(database: ExposedDatabase): Int
         jdbcConnection().prepareStatement(SELECT_LLM_LAUNCH_RESERVATION_INDEX_COUNT_SQL).use { statement ->
             statement.executeQuery().use { resultSet ->
                 require(resultSet.next()) { "llm launch reservation index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * llm_runs index 件数を読む。
+ */
+private fun selectLlmRunIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_LLM_RUN_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "llm_runs index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * equity_snapshots index 件数を読む。
+ */
+private fun selectEquitySnapshotIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_EQUITY_SNAPSHOT_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "equity_snapshots index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+private fun assertEquitySnapshotMatchesAccount(snapshot: EquitySnapshotRecord, account: AccountSnapshot) {
+    assertDecimalStringEquals("cash_jpy", account.cashJpy, snapshot.cashJpy)
+    assertDecimalStringEquals("btc_quantity", account.btcQuantity, snapshot.btcQuantity)
+    assertDecimalStringEquals("btc_mark_price_jpy", account.btcMarkPriceJpy, snapshot.btcMarkPriceJpy)
+    assertDecimalStringEquals("total_equity_jpy", account.totalEquityJpy, snapshot.totalEquityJpy)
+    assertDecimalStringEquals("equity_peak_jpy", account.equityPeakJpy, snapshot.equityPeakJpy)
+    assertDecimalStringEquals("drawdown_ratio", account.drawdownRatio, snapshot.drawdownRatio)
+}
+
+private fun assertDecimalStringEquals(fieldName: String, expected: String, actual: BigDecimal) {
+    assertEquals(0, actual.compareTo(expected.toBigDecimal()), "$fieldName mismatch")
+}
+
+/**
+ * reason 別 equity_snapshots 件数を読む。
+ */
+private fun selectEquitySnapshotCountByReason(
+    database: ExposedDatabase,
+    reason: EquitySnapshotReason,
+): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_EQUITY_SNAPSHOT_COUNT_BY_REASON_SQL).use { statement ->
+            statement.setString(1, reason.name)
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "equity_snapshots count did not return a row." }
 
                 resultSet.getInt(1)
             }
