@@ -155,6 +155,35 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
+    fun softHaltSkipsFlatLaunchWithAuditReason() = runBlocking {
+        val fixture = schedulerFixture()
+
+        fixture.riskStateRepository.setSoftHalt("operator pause", fixedInstant()).getOrThrow()
+
+        val result = fixture.scheduler.tick()
+        val skipEvents = fixture.eventLog.events()
+            .filter { event -> event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED }
+
+        assertIs<LlmDaemonTickResult.Skipped>(result)
+        assertEquals("soft_halt_flat", result.reason)
+        assertEquals(0, fixture.launches.size)
+        assertTrue(skipEvents.single().payload.contains("soft_halt_flat"))
+    }
+
+    @Test
+    fun softHaltAllowsHoldingLaunch() = runBlocking {
+        val fixture = schedulerFixture(hasOpenRisk = true)
+
+        fixture.riskStateRepository.setSoftHalt("operator pause", fixedInstant()).getOrThrow()
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, result.triggerKind)
+        assertEquals(1, fixture.launches.size)
+    }
+
+    @Test
     fun freshRunningReservationSuppressesRepeatedTriggerAudit() = runBlocking {
         val eventAt = fixedInstant().plus(Duration.ofMinutes(5))
         val launchStarted = CompletableDeferred<Unit>()

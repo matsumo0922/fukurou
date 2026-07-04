@@ -17,6 +17,11 @@ interface RiskStateRepository {
     suspend fun setHardHalt(reason: String, at: Instant): Result<RiskState>
 
     /**
+     * SOFT_HALT を reason 付きで立てる。
+     */
+    suspend fun setSoftHalt(reason: String, at: Instant): Result<RiskState>
+
+    /**
      * 手動再開を reason 付きで記録する。
      */
     suspend fun resume(reason: String, at: Instant): Result<RiskState>

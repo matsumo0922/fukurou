@@ -40,6 +40,7 @@ import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.lock.TradingLockLease
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.math.BigDecimal
@@ -440,10 +441,43 @@ class ProtectionReconcilerTest {
         val riskState = riskStateRepository.current().getOrThrow()
 
         assertTrue(result.isSuccess)
-        assertTrue(riskState.hardHalt)
+        assertEquals(RiskHaltState.HARD_HALT, riskState.state)
         assertEquals(0, broker.getPositions().getOrThrow().size)
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun reconcile_pass_does_not_sweep_soft_halt() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("12000000")),
+            ),
+        ).getOrThrow()
+        riskStateRepository.setSoftHalt("operator pause", fixedInstant()).getOrThrow()
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+
+        assertTrue(result.isSuccess)
+        assertEquals(1, broker.getPositions().getOrThrow().size)
+        assertEquals(1, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(1, repository.getExecutions().getOrThrow().size)
     }
 
     @Test
@@ -513,7 +547,7 @@ class ProtectionReconcilerTest {
         val riskState = riskStateRepository.current().getOrThrow()
 
         assertTrue(result.isSuccess)
-        assertTrue(riskState.hardHalt)
+        assertEquals(RiskHaltState.HARD_HALT, riskState.state)
         assertEquals(0, broker.getPositions().getOrThrow().size)
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertEquals(2, repository.getExecutions().getOrThrow().size)
@@ -639,6 +673,10 @@ private class FlakyRiskStateRepository(
         return delegate.setHardHalt(reason, at)
     }
 
+    override suspend fun setSoftHalt(reason: String, at: Instant): Result<RiskState> {
+        return delegate.setSoftHalt(reason, at)
+    }
+
     override suspend fun resume(reason: String, at: Instant): Result<RiskState> {
         return delegate.resume(reason, at)
     }
@@ -662,6 +700,10 @@ private class SwitchableRiskStateRepository : RiskStateRepository {
 
     override suspend fun setHardHalt(reason: String, at: Instant): Result<RiskState> {
         return delegate.setHardHalt(reason, at)
+    }
+
+    override suspend fun setSoftHalt(reason: String, at: Instant): Result<RiskState> {
+        return delegate.setSoftHalt(reason, at)
     }
 
     override suspend fun resume(reason: String, at: Instant): Result<RiskState> {

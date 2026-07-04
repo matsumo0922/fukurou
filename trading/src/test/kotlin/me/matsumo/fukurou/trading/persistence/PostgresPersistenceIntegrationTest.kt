@@ -52,6 +52,7 @@ import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
@@ -88,6 +89,33 @@ private const val HIKARI_POOL_SIZE = 4
  * risk_state single row を削除する SQL。
  */
 private const val DELETE_RISK_STATE_ROW_SQL = "DELETE FROM risk_state WHERE id = ?"
+
+/**
+ * risk_state の state column を削除する SQL。
+ */
+private const val DROP_RISK_STATE_STATE_COLUMN_SQL = "ALTER TABLE risk_state DROP COLUMN state"
+
+/**
+ * risk_state の rollback 互換列を意図的に古い状態へ戻す SQL。
+ */
+private const val FORCE_RISK_STATE_COLUMNS_SQL = """
+    UPDATE risk_state
+    SET
+        state = ?,
+        hard_halt = ?
+    WHERE id = ?
+"""
+
+/**
+ * risk_state の state / hard_halt を読む SQL。
+ */
+private const val SELECT_RISK_STATE_COLUMNS_SQL = """
+    SELECT
+        state,
+        hard_halt
+    FROM risk_state
+    WHERE id = ?
+"""
 
 /**
  * command_event_log table を削除する SQL。
@@ -515,6 +543,99 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, selectLlmRunIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
         assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
+    }
+
+    @Test
+    fun bootstrap_backfills_legacy_hard_halt_state_idempotently() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+
+        bootstrap.ensureSchema().getOrThrow()
+        forceRiskStateColumns(
+            database = database,
+            state = RiskHaltState.RUNNING,
+            hardHalt = true,
+        )
+
+        repeat(2) {
+            bootstrap.ensureSchema().getOrThrow()
+        }
+
+        val columns = selectRiskStateColumns(database)
+
+        assertEquals(RiskHaltState.HARD_HALT, columns.state)
+        assertEquals(true, columns.hardHalt)
+    }
+
+    @Test
+    fun verify_schema_fails_closed_when_risk_state_state_column_is_missing() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+
+        bootstrap.ensureSchema().getOrThrow()
+        dropRiskStateStateColumn(database)
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
+    fun risk_state_command_service_dual_writes_state_and_legacy_hard_halt() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val service = ExposedRiskStateCommandService(database, fixedClock())
+
+        service.setHardHalt("manual hard halt", DecisionRunContext.EMPTY).getOrThrow()
+        assertEquals(
+            expected = RiskStateColumns(RiskHaltState.HARD_HALT, hardHalt = true),
+            actual = selectRiskStateColumns(database),
+        )
+
+        service.resume("operator confirmed recovery", DecisionRunContext.EMPTY).getOrThrow()
+        assertEquals(
+            expected = RiskStateColumns(RiskHaltState.RUNNING, hardHalt = false),
+            actual = selectRiskStateColumns(database),
+        )
+
+        service.setSoftHalt("manual soft halt", DecisionRunContext.EMPTY).getOrThrow()
+        assertEquals(
+            expected = RiskStateColumns(RiskHaltState.SOFT_HALT, hardHalt = false),
+            actual = selectRiskStateColumns(database),
+        )
+
+        service.resume("soft halt recovery", DecisionRunContext.EMPTY).getOrThrow()
+        assertEquals(
+            expected = RiskStateColumns(RiskHaltState.RUNNING, hardHalt = false),
+            actual = selectRiskStateColumns(database),
+        )
+    }
+
+    @Test
+    fun paper_ledger_writer_resynchronizes_legacy_hard_halt_from_state() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        forceRiskStateColumns(
+            database = database,
+            state = RiskHaltState.RUNNING,
+            hardHalt = true,
+        )
+
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(database),
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+
+        val columns = selectRiskStateColumns(database)
+
+        assertEquals(RiskHaltState.RUNNING, columns.state)
+        assertEquals(false, columns.hardHalt)
     }
 
     @Test
@@ -1628,7 +1749,7 @@ class PostgresPersistenceIntegrationTest {
         val riskState = repository.current().getOrThrow()
 
         assertTrue(resumeResult.isFailure)
-        assertTrue(riskState.hardHalt)
+        assertEquals(RiskHaltState.HARD_HALT, riskState.state)
     }
 
     @Test
@@ -1732,6 +1853,17 @@ private data class NoTradeDecisionRow(
 private data class PositionWatermarkRow(
     val highestPriceSinceEntryJpy: String,
     val lowestPriceSinceEntryJpy: String?,
+)
+
+/**
+ * risk_state の rollback 互換列確認行。
+ *
+ * @param state state column の値
+ * @param hardHalt legacy hard_halt column の値
+ */
+private data class RiskStateColumns(
+    val state: RiskHaltState,
+    val hardHalt: Boolean,
 )
 
 /**
@@ -2178,6 +2310,54 @@ private fun deleteRiskStateRow(database: ExposedDatabase) {
         jdbcConnection().prepareStatement(DELETE_RISK_STATE_ROW_SQL).use { statement ->
             statement.setInt(1, RISK_STATE_SINGLE_ROW_ID)
             statement.executeUpdate()
+        }
+    }
+}
+
+/**
+ * risk_state state column を削除する。
+ */
+private fun dropRiskStateStateColumn(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(DROP_RISK_STATE_STATE_COLUMN_SQL).use { statement ->
+            statement.executeUpdate()
+        }
+    }
+}
+
+/**
+ * risk_state の state / hard_halt を意図的に設定する。
+ */
+private fun forceRiskStateColumns(
+    database: ExposedDatabase,
+    state: RiskHaltState,
+    hardHalt: Boolean,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(FORCE_RISK_STATE_COLUMNS_SQL).use { statement ->
+            statement.setString(1, state.name)
+            statement.setBoolean(2, hardHalt)
+            statement.setInt(3, RISK_STATE_SINGLE_ROW_ID)
+            statement.executeUpdate()
+        }
+    }
+}
+
+/**
+ * risk_state の state / hard_halt を読む。
+ */
+private fun selectRiskStateColumns(database: ExposedDatabase): RiskStateColumns {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_RISK_STATE_COLUMNS_SQL).use { statement ->
+            statement.setInt(1, RISK_STATE_SINGLE_ROW_ID)
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "risk_state columns did not return a row." }
+
+                RiskStateColumns(
+                    state = RiskHaltState.valueOf(resultSet.getString("state")),
+                    hardHalt = resultSet.getBoolean("hard_halt"),
+                )
+            }
         }
     }
 }

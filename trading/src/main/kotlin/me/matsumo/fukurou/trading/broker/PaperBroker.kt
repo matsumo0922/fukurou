@@ -27,6 +27,7 @@ import me.matsumo.fukurou.trading.reconciler.ReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.requireTicker
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
@@ -137,9 +138,9 @@ class PaperBroker(
             AccountStatusWithUpdatedAt(
                 accountStatus = AccountStatus(
                     mode = accountSnapshot.mode,
-                    riskState = if (riskState.hardHalt) "HARD_HALT" else "RUNNING",
+                    riskState = riskState.state.name,
                     drawdownRatio = riskState.drawdownRatio.toPlainString(),
-                    hardHalt = riskState.hardHalt,
+                    hardHalt = riskState.state == RiskHaltState.HARD_HALT,
                     currentEquityJpy = accountSnapshot.totalEquityJpy,
                     todayRealizedPnlJpy = todayRealizedPnlJpy.toPlainString(),
                     protectionStatus = protectionStatus(positions, openOrders, reconcilerStatus),
@@ -585,7 +586,7 @@ class PaperBroker(
 
         val riskState = riskStateRepository.current().getOrThrow()
 
-        if (riskState.hardHalt) {
+        if (riskState.state == RiskHaltState.HARD_HALT) {
             return
         }
 

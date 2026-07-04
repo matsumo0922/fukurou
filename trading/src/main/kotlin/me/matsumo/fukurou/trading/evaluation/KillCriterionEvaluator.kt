@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.config.KillCriterionConfig
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Clock
@@ -50,7 +51,7 @@ class KillCriterionEvaluator(
         return try {
             val currentRiskState = riskStateRepository.current().getOrThrow()
 
-            if (currentRiskState.hardHalt) {
+            if (currentRiskState.state == RiskHaltState.HARD_HALT) {
                 return Result.success(Unit)
             }
             if (throttled()) {

@@ -27,6 +27,7 @@ import me.matsumo.fukurou.trading.evaluation.MarketRegimePerformance
 import me.matsumo.fukurou.trading.evaluation.SetupPerformance
 import me.matsumo.fukurou.trading.evaluation.TradePerformanceStats
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.math.BigDecimal
 import java.time.Clock
@@ -96,7 +97,7 @@ internal fun Route.evaluationRoutes(
                     stats = killStats,
                     minClosedTrades = tradingConfig.killCriterion.minClosedTrades,
                     minProfitFactor = tradingConfig.killCriterion.minProfitFactor,
-                    hardHalt = riskState.hardHalt,
+                    hardHalt = riskState.state == RiskHaltState.HARD_HALT,
                 ),
                 runRates = EvaluationRunRatesResponse.fromStats(EvaluationMath.decisionRunRates(runCount, actionCounts)),
                 marketRegimes = EvaluationMath.summarizeByMarketRegime(

@@ -7,8 +7,10 @@ import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
+import me.matsumo.fukurou.trading.risk.SoftHaltDowngradeRejectedException
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Clock
 import java.time.Instant
@@ -35,8 +37,26 @@ class ExposedRiskStateCommandService(
             decisionRunContext = decisionRunContext,
             eventType = CommandEventType.HARD_HALT_SET,
             blankReasonMessage = "HARD_HALT reason is required.",
-        ) { commandReason, occurredAt ->
+        ) { commandReason, occurredAt, _ ->
             updateHardHalt(commandReason, occurredAt)
+        }
+    }
+
+    override suspend fun setSoftHalt(
+        reason: String,
+        decisionRunContext: DecisionRunContext,
+    ): Result<RiskState> {
+        return mutateAndAudit(
+            reason = reason,
+            decisionRunContext = decisionRunContext,
+            eventType = CommandEventType.SOFT_HALT_SET,
+            blankReasonMessage = "SOFT_HALT reason is required.",
+        ) { commandReason, occurredAt, previousState ->
+            if (previousState.state == RiskHaltState.HARD_HALT) {
+                throw SoftHaltDowngradeRejectedException()
+            }
+
+            updateSoftHalt(commandReason, occurredAt)
         }
     }
 
@@ -49,7 +69,7 @@ class ExposedRiskStateCommandService(
             decisionRunContext = decisionRunContext,
             eventType = CommandEventType.MANUAL_RESUME_REQUESTED,
             blankReasonMessage = "manual resume reason is required.",
-        ) { commandReason, occurredAt ->
+        ) { commandReason, occurredAt, _ ->
             updateResume(commandReason, occurredAt)
         }
     }
@@ -59,7 +79,7 @@ class ExposedRiskStateCommandService(
         decisionRunContext: DecisionRunContext,
         eventType: CommandEventType,
         blankReasonMessage: String,
-        mutation: JdbcTransaction.(String, Instant) -> Unit,
+        mutation: JdbcTransaction.(String, Instant, RiskState) -> Unit,
     ): Result<RiskState> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -69,8 +89,9 @@ class ExposedRiskStateCommandService(
 
                 exposedTransaction(database) {
                     ensureRiskStateRow(occurredAt)
-                    selectRiskState(forUpdate = true)
-                    mutation(reason, occurredAt)
+                    val previousState = selectRiskState(forUpdate = true)
+
+                    mutation(reason, occurredAt, previousState)
 
                     val riskState = selectRiskState(forUpdate = true)
                     insertEvent(
@@ -80,7 +101,7 @@ class ExposedRiskStateCommandService(
                             toolCallId = null,
                             clientRequestId = null,
                             eventType = eventType,
-                            payload = buildRiskStateCommandPayload(reason),
+                            payload = buildRiskStateCommandPayload(reason, previousState),
                             occurredAt = occurredAt,
                         ),
                     )
@@ -100,8 +121,9 @@ private const val RISK_STATE_COMMAND_NAME = "risk_state"
 /**
  * reason 付きの risk_state 状態変更 payload を組み立てる。
  */
-private fun buildRiskStateCommandPayload(reason: String): String {
+private fun buildRiskStateCommandPayload(reason: String, previousState: RiskState): String {
     return buildJsonObject {
         put("reason", reason)
+        put("previousState", previousState.state.name)
     }.toString()
 }

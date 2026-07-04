@@ -935,6 +935,10 @@ internal class ExposedPaperLedgerWriter(
                 UPDATE risk_state
                 SET equity_peak = ?,
                     drawdown_ratio = ?,
+                    hard_halt = CASE
+                        WHEN state = 'HARD_HALT' THEN TRUE
+                        ELSE FALSE
+                    END,
                     updated_at = ?
                 WHERE id = ?
             """,
