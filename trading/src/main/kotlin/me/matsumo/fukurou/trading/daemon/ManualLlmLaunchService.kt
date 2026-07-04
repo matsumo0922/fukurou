@@ -26,6 +26,7 @@ import me.matsumo.fukurou.trading.runner.OneShotRunnerResult
 import java.time.Clock
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.logging.Logger
 
 /**
@@ -167,14 +168,39 @@ class DefaultManualLlmLaunchService(
             reason = reason,
             observedAt = observedAt,
         ).getOrThrow()
-        scope.launch {
-            runReservedInvocation(reservedOutcome.invocationId)
-        }
+        launchReservedInvocation(reservedOutcome.invocationId)
 
         return ManualLlmLaunchResult.Accepted(
             invocationId = reservedOutcome.invocationId,
             triggerKind = LlmDaemonTriggerKind.MANUAL,
         )
+    }
+
+    private fun launchReservedInvocation(invocationId: String) {
+        val started = AtomicBoolean(false)
+        val job = scope.launch {
+            started.set(true)
+            runReservedInvocation(invocationId)
+        }
+
+        job.invokeOnCompletion { throwable ->
+            val cancellation = throwable as? CancellationException ?: return@invokeOnCompletion
+
+            if (!started.get()) {
+                finishCancelledBeforeStart(invocationId, cancellation)
+            }
+        }
+    }
+
+    private fun finishCancelledBeforeStart(invocationId: String, cancellation: CancellationException) {
+        runBlocking {
+            finishReservedInvocation(
+                invocationId = invocationId,
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = cancellation.javaClass.simpleName,
+                finishedAt = Instant.now(clock),
+            )
+        }
     }
 
     private suspend fun runReservedInvocation(invocationId: String) {

@@ -2,8 +2,14 @@ package me.matsumo.fukurou.trading.daemon
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
@@ -21,7 +27,9 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.concurrent.thread
+import kotlin.coroutines.CoroutineContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -272,6 +280,68 @@ class ManualLlmLaunchServiceTest {
     }
 
     @Test
+    fun manualLaunch_finishesReservationWhenCloseCancelsBeforeChildStarts() = runBlocking {
+        val clock = ManualTestClock(fixedInstant())
+        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val queuedDispatcher = QueuedCoroutineDispatcher()
+        val scopeJob = SupervisorJob()
+        val runnerStarted = CompletableDeferred<Unit>()
+        val reservations = RecordingLlmLaunchReservationRepository(
+            delegate = InMemoryLlmLaunchReservationRepository(riskStateRepository),
+        )
+        val fixture = manualFixture(
+            clock = clock,
+            riskStateRepository = riskStateRepository,
+            reservations = reservations,
+            scope = CoroutineScope(scopeJob + queuedDispatcher),
+            launchHandler = { request ->
+                runnerStarted.complete(Unit)
+                successfulRunnerResult(request)
+            },
+        )
+
+        val launchResult = fixture.service.launch("shutdown before child starts").getOrThrow()
+        val hasFreshRunningReservationBeforeClose = fixture.reservations
+            .hasFreshRunningReservation(fixedInstant().minus(Duration.ofHours(1)))
+            .getOrThrow()
+        val closeStarted = CompletableDeferred<Unit>()
+        val closeResult = CompletableDeferred<Throwable?>()
+        val closeThread = thread(
+            start = true,
+            name = "manual-llm-close-before-start-test",
+        ) {
+            closeStarted.complete(Unit)
+            closeResult.complete(runCatching { fixture.service.close() }.exceptionOrNull())
+        }
+        closeStarted.await()
+        withTimeout(FINISH_TIMEOUT_MILLIS) {
+            while (!scopeJob.isCancelled) {
+                yield()
+            }
+        }
+
+        assertEquals(false, closeResult.isCompleted)
+
+        queuedDispatcher.runQueuedTasks()
+        closeThread.join(CLOSE_THREAD_JOIN_TIMEOUT_MILLIS)
+        val finish = withTimeout(FINISH_TIMEOUT_MILLIS) {
+            fixture.reservations.nextFinish()
+        }
+        val hasFreshRunningReservationAfterClose = fixture.reservations
+            .hasFreshRunningReservation(fixedInstant().minus(Duration.ofHours(1)))
+            .getOrThrow()
+
+        assertIs<ManualLlmLaunchResult.Accepted>(launchResult)
+        assertEquals(true, hasFreshRunningReservationBeforeClose)
+        assertEquals(false, runnerStarted.isCompleted)
+        assertEquals(false, closeThread.isAlive)
+        assertEquals(null, closeResult.await())
+        assertEquals(LlmLaunchReservationStatus.FAILED, finish.status)
+        assertTrue(requireNotNull(finish.reason).contains("Cancellation"))
+        assertEquals(false, hasFreshRunningReservationAfterClose)
+    }
+
+    @Test
     fun manualLaunch_worksWhenDaemonConfigIsDisabled() = runBlocking {
         val fixture = manualFixture(
             tradingConfig = tradingConfig(
@@ -298,6 +368,7 @@ private fun manualFixture(
     launches: MutableList<OneShotRunnerRequest> = mutableListOf(),
     idGenerator: () -> UUID = deterministicIds(),
     hasOpenRisk: Boolean = false,
+    scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): ManualFixture {
     val service = manualService(
@@ -309,6 +380,7 @@ private fun manualFixture(
         launches = launches,
         idGenerator = idGenerator,
         hasOpenRisk = hasOpenRisk,
+        scope = scope,
         launchHandler = launchHandler,
     )
 
@@ -331,6 +403,7 @@ private fun manualService(
     launches: MutableList<OneShotRunnerRequest>,
     idGenerator: () -> UUID,
     hasOpenRisk: Boolean = false,
+    scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): DefaultManualLlmLaunchService {
     return DefaultManualLlmLaunchService(
@@ -346,6 +419,7 @@ private fun manualService(
         },
         clock = clock,
         idGenerator = idGenerator,
+        scope = scope,
     )
 }
 
@@ -490,9 +564,34 @@ private class ManualTestClock(
     }
 }
 
+/**
+ * dispatch された coroutine を test が明示的に実行するまで開始しない dispatcher。
+ */
+private class QueuedCoroutineDispatcher : CoroutineDispatcher() {
+
+    private val tasks = ConcurrentLinkedQueue<Runnable>()
+
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        tasks.add(block)
+    }
+
+    /**
+     * queue に残っている task をすべて実行する。
+     */
+    fun runQueuedTasks() {
+        generateSequence { tasks.poll() }
+            .forEach { task -> task.run() }
+    }
+}
+
 private fun fixedInstant(): Instant {
     return Instant.parse("2026-07-03T00:00:00Z")
 }
+
+/**
+ * finish 完了待ちの test timeout milliseconds。
+ */
+private const val FINISH_TIMEOUT_MILLIS = 1_000L
 
 /**
  * close() 待機 thread の test timeout milliseconds。
