@@ -17,7 +17,9 @@ import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
+import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Clock
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
@@ -36,6 +38,7 @@ fun interface ReadinessProbe {
  * @param reconcilerStatus ProtectionReconciler の状態 holder
  * @param clock Reconciler readiness の鮮度判定に使う clock
  * @param evaluationRepository 評価 API 用 repository。null なら DB 設定から構築する
+ * @param evaluationRiskStateRepository 評価 API 用 risk_state repository。null なら DB 設定から構築する
  * @param evaluationMarketDataSource 評価 API 用 market data source。null なら DB 設定時だけ GMO source を構築する
  * @param tradingConfig trading runtime config
  */
@@ -45,6 +48,7 @@ fun Application.module(
     reconcilerStatus: MutableReconcilerStatus = MutableReconcilerStatus(),
     clock: Clock = Clock.systemUTC(),
     evaluationRepository: EvaluationRepository? = null,
+    evaluationRiskStateRepository: RiskStateRepository? = null,
     evaluationMarketDataSource: MarketDataSource? = null,
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
 ) {
@@ -52,6 +56,9 @@ fun Application.module(
     val database = databaseDataSource?.let { dataSource -> ExposedDatabase.connect(dataSource) }
     val resolvedEvaluationRepository = evaluationRepository ?: database?.let { connectedDatabase ->
         ExposedEvaluationRepository(connectedDatabase)
+    }
+    val resolvedEvaluationRiskStateRepository = evaluationRiskStateRepository ?: database?.let { connectedDatabase ->
+        ExposedRiskStateRepository(connectedDatabase)
     }
     val resolvedEvaluationMarketDataSource = evaluationMarketDataSource ?: database?.let {
         GmoPublicMarketDataSource.fromConfig(
@@ -86,6 +93,7 @@ fun Application.module(
         revisionRoute(revision)
         evaluationRoutes(
             repository = resolvedEvaluationRepository,
+            riskStateRepository = resolvedEvaluationRiskStateRepository,
             marketDataSource = resolvedEvaluationMarketDataSource,
             tradingConfig = tradingConfig,
             clock = clock,

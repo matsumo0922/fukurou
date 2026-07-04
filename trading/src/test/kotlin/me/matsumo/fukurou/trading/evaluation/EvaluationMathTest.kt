@@ -47,6 +47,17 @@ class EvaluationMathTest {
     }
 
     @Test
+    fun summarizeTrades_returnsEmptyStatsForNoTrades() {
+        val stats = EvaluationMath.summarizeTrades(emptyList())
+
+        assertEquals(0, stats.tradeCount)
+        assertEquals("0.0000000000", stats.totalPnlJpy.toPlainString())
+        assertNull(stats.profitFactor)
+        assertNull(stats.winRate)
+        assertNull(stats.expectedR)
+    }
+
+    @Test
     fun evaluateTrade_calculatesMaeMfeAndTracksUnavailableCounts() {
         val normal = trade(
             pnlJpy = "20",
@@ -76,6 +87,20 @@ class EvaluationMathTest {
     }
 
     @Test
+    fun evaluateTrade_clampsNegativeMaeAndMfeToZero() {
+        val evaluatedTrade = EvaluationMath.evaluateTrade(
+            trade(
+                pnlJpy = "20",
+                highestPriceSinceEntryJpy = BigDecimal("95"),
+                lowestPriceSinceEntryJpy = BigDecimal("105"),
+            ),
+        )
+
+        assertEquals("0.0000000000", evaluatedTrade.maeR?.toPlainString())
+        assertEquals("0.0000000000", evaluatedTrade.mfeR?.toPlainString())
+    }
+
+    @Test
     fun calibrationBinsHandlesEdgesAndDuplicateSetupTags() {
         val calibration = EvaluationMath.calibrationBySetup(
             listOf(
@@ -94,6 +119,23 @@ class EvaluationMathTest {
         assertEquals(2, topBin.tradeCount)
         assertEquals("0.5000000000", topBin.realizedWinRate?.toPlainString())
         assertEquals(1, trend.bins[0].tradeCount)
+    }
+
+    @Test
+    fun calibrationByProviderSeparatesProviderGroups() {
+        val calibration = EvaluationMath.calibrationByProvider(
+            listOf(
+                trade("10", probability = BigDecimal("0.20"), llmProvider = "claude"),
+                trade("-10", probability = BigDecimal("0.20"), llmProvider = "codex"),
+            ),
+        )
+        val claude = calibration.single { group -> group.groupKey == "claude" }
+        val codex = calibration.single { group -> group.groupKey == "codex" }
+
+        assertEquals(1, claude.bins[2].tradeCount)
+        assertEquals("1.0000000000", claude.bins[2].realizedWinRate?.toPlainString())
+        assertEquals(1, codex.bins[2].tradeCount)
+        assertEquals("0.0000000000", codex.bins[2].realizedWinRate?.toPlainString())
     }
 
     @Test
@@ -117,6 +159,8 @@ class EvaluationMathTest {
         )
 
         assertEquals(3, result.points.size)
+        assertEquals("1000.0000000000", result.points[0].botEquityJpy.toPlainString())
+        assertEquals("1010.0000000000", result.points[1].botEquityJpy.toPlainString())
         assertEquals("1200.0000000000", result.points.last().buyAndHoldEquityJpy.toPlainString())
         assertEquals("1000.0000000000", result.points.last().noTradeEquityJpy.toPlainString())
         assertEquals("1010.0000000000", result.points.last().botEquityJpy.toPlainString())
@@ -144,6 +188,35 @@ class EvaluationMathTest {
         assertEquals(VolatilityRegime.UNKNOWN, labels.first().volatility)
         assertEquals(TrendRegime.TREND_UP, labels.last().trend)
         assertEquals(VolatilityRegime.HIGH_VOL, labels.last().volatility)
+    }
+
+    @Test
+    fun classifyMarketRegimesProducesTrendDownRangeAndLowVolatility() {
+        val downTrendCandles = (1..25).map { day ->
+            val close = BigDecimal("200").subtract(BigDecimal(day))
+            val range = if (day <= 14) BigDecimal("8") else BigDecimal("2")
+
+            dailyCandle(
+                date = "2026-08-${day.toString().padStart(2, '0')}",
+                close = close.toPlainString(),
+                high = close.add(range).toPlainString(),
+                low = close.subtract(range).toPlainString(),
+            )
+        }
+        val rangeCandles = (1..25).map { day ->
+            dailyCandle(
+                date = "2026-09-${day.toString().padStart(2, '0')}",
+                close = "100",
+                high = "102",
+                low = "98",
+            )
+        }
+        val downLabels = EvaluationMath.classifyMarketRegimes(downTrendCandles, ZoneId.of("Asia/Tokyo"))
+        val rangeLabels = EvaluationMath.classifyMarketRegimes(rangeCandles, ZoneId.of("Asia/Tokyo"))
+
+        assertEquals(TrendRegime.TREND_DOWN, downLabels.last().trend)
+        assertEquals(VolatilityRegime.LOW_VOL, downLabels.last().volatility)
+        assertEquals(TrendRegime.RANGE, rangeLabels.last().trend)
     }
 
     @Test
@@ -180,6 +253,43 @@ class EvaluationMathTest {
         assertEquals(2, bucket.stats.tradeCount)
         assertEquals("30.0000000000", bucket.stats.totalPnlJpy.toPlainString())
     }
+
+    @Test
+    fun summarizeLlmCostsCountsOnlyInvocationPhases() {
+        val stats = EvaluationMath.summarizeLlmCosts(
+            listOf(
+                llmUsageFact(phase = "preflight", provider = null, usage = null),
+                llmUsageFact(
+                    phase = "proposer",
+                    provider = "claude",
+                    usage = LlmUsageDetails(
+                        totalCostUsd = BigDecimal("0.25"),
+                        numTurns = 1,
+                        durationMs = 1000,
+                        usage = null,
+                        modelUsages = listOf(
+                            LlmModelUsage(
+                                model = "claude-sonnet-5",
+                                usage = LlmTokenUsage(
+                                    inputTokens = 10,
+                                    outputTokens = 20,
+                                    cacheCreationInputTokens = null,
+                                    cacheReadInputTokens = null,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+                llmUsageFact(phase = "falsifier", provider = "codex", usage = null),
+            ),
+        )
+
+        assertEquals(2, stats.phaseCount)
+        assertEquals(1, stats.missingUsagePhaseCount)
+        assertEquals("0.2500000000", stats.totalCostUsd.toPlainString())
+        assertEquals(listOf("claude", "codex"), stats.byProvider.map { provider -> provider.provider })
+        assertEquals(10L, stats.byModel.single().inputTokens)
+    }
 }
 
 private fun trade(
@@ -187,6 +297,7 @@ private fun trade(
     openedAt: Instant = Instant.parse("2026-07-01T00:00:00Z"),
     probability: BigDecimal = BigDecimal("0.50"),
     setupTags: List<String> = listOf("setup"),
+    llmProvider: String? = "claude",
     initialProtectiveStopPriceJpy: BigDecimal? = BigDecimal("90"),
     highestPriceSinceEntryJpy: BigDecimal = BigDecimal("120"),
     lowestPriceSinceEntryJpy: BigDecimal? = BigDecimal("90"),
@@ -203,7 +314,21 @@ private fun trade(
         tradePnlJpy = BigDecimal(pnlJpy),
         estimatedWinProbability = probability,
         setupTags = setupTags,
-        llmProvider = "claude",
+        llmProvider = llmProvider,
+    )
+}
+
+private fun llmUsageFact(
+    phase: String?,
+    provider: String?,
+    usage: LlmUsageDetails?,
+): LlmPhaseUsageFact {
+    return LlmPhaseUsageFact(
+        decisionRunId = "run-1",
+        provider = provider,
+        phase = phase,
+        occurredAt = Instant.parse("2026-07-02T00:00:00Z"),
+        usage = usage,
     )
 }
 

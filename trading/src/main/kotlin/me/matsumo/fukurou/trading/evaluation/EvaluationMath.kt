@@ -219,9 +219,10 @@ object EvaluationMath {
      * runner phase usage fact を cost 集計へ変換する。
      */
     fun summarizeLlmCosts(facts: List<LlmPhaseUsageFact>): LlmCostStats {
-        val missingUsageCount = facts.count { fact -> fact.usage == null }
-        val totalCost = facts.sumOfBigDecimal { fact -> fact.usage?.totalCostUsd ?: BigDecimal.ZERO }
-        val byProvider = facts
+        val llmFacts = facts.filter { fact -> fact.isLlmInvocationPhase() }
+        val missingUsageCount = llmFacts.count { fact -> fact.usage == null }
+        val totalCost = llmFacts.sumOfBigDecimal { fact -> fact.usage?.totalCostUsd ?: BigDecimal.ZERO }
+        val byProvider = llmFacts
             .groupBy { fact -> fact.provider ?: UNKNOWN_PROVIDER }
             .map { (provider, providerFacts) ->
                 LlmProviderCostStats(
@@ -232,14 +233,14 @@ object EvaluationMath {
                 )
             }
             .sortedBy { stats -> stats.provider }
-        val byModel = facts
+        val byModel = llmFacts
             .flatMap { fact -> fact.usage?.modelUsages.orEmpty() }
             .groupBy { usage -> usage.model }
             .map { (model, modelUsages) -> modelUsages.toModelTokenStats(model) }
             .sortedBy { stats -> stats.model }
 
         return LlmCostStats(
-            phaseCount = facts.size,
+            phaseCount = llmFacts.size,
             missingUsagePhaseCount = missingUsageCount,
             totalCostUsd = totalCost.evaluationScale(),
             byProvider = byProvider,
@@ -336,7 +337,7 @@ private fun calibrationBins(trades: List<ClosedTradeFact>): List<CalibrationBinS
         CalibrationBinStats(
             binIndex = binIndex,
             lowerBoundInclusive = binLowerBound(binIndex),
-            upperBoundInclusive = binUpperBound(binIndex),
+            upperBound = binUpperBound(binIndex),
             tradeCount = binTrades.size,
             averageEstimatedProbability = averageOrNull(binTrades.mapNotNull { fact -> fact.estimatedWinProbability }),
             realizedWinRate = rateOrNull(winCount, binTrades.size),
@@ -407,9 +408,11 @@ private fun ClosedTradeFact.marketRegimeBucketKey(
 }
 
 private fun String.toLocalDateOrNull(zoneId: ZoneId): LocalDate? {
-    return runCatching {
+    val parsedDate = runCatching {
         java.time.Instant.parse(this).atZone(zoneId).toLocalDate()
-    }.getOrNull()
+    }
+
+    return parsedDate.getOrNull()
 }
 
 private fun trendRegime(points: List<DailyOhlcPoint>, currentIndex: Int): TrendRegime {
@@ -533,9 +536,7 @@ private fun <T> Iterable<T>.sumOfBigDecimal(selector: (T) -> BigDecimal): BigDec
 }
 
 private fun BigDecimal.divideEvaluation(other: BigDecimal): BigDecimal {
-    if (other.compareTo(BigDecimal.ZERO) == 0) {
-        return BigDecimal.ZERO
-    }
+    require(other.compareTo(BigDecimal.ZERO) != 0) { "evaluation divisor must not be zero." }
 
     return divide(other, EVALUATION_SCALE, RoundingMode.HALF_UP)
 }
@@ -561,6 +562,16 @@ private const val UNCLASSIFIED_SETUP_TAG = "unclassified"
  * 不明 provider 名。
  */
 private const val UNKNOWN_PROVIDER = "unknown"
+
+/**
+ * proposer phase 名。
+ */
+private const val PROPOSER_PHASE = "proposer"
+
+/**
+ * falsifier phase 名。
+ */
+private const val FALSIFIER_PHASE = "falsifier"
 
 /**
  * 較正 bin 数。
@@ -591,3 +602,7 @@ private const val VOLATILITY_WINDOW = 14
  * RANGE 判定の close 比率。
  */
 private val RANGE_THRESHOLD_RATIO = BigDecimal("0.005")
+
+private fun LlmPhaseUsageFact.isLlmInvocationPhase(): Boolean {
+    return phase == PROPOSER_PHASE || phase == FALSIFIER_PHASE
+}

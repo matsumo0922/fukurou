@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.evaluation
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 
 /**
@@ -61,5 +62,33 @@ class LlmUsageParserTest {
         assertEquals("0.01", details?.totalCostUsd?.toPlainString())
         assertEquals(2, details?.numTurns)
         assertNull(details?.usage)
+    }
+
+    @Test
+    fun toJsonObject_keepsOnlyNumericUsageAndModelNames() {
+        val details = LlmUsageParser.parseClaudeStdout(
+            """
+                {
+                  "total_cost_usd": 0.01,
+                  "num_turns": 2,
+                  "session_id": "secret-session",
+                  "transcript_path": "/tmp/secret-token",
+                  "modelUsage": {
+                    "claude-sonnet": {
+                      "input_tokens": 10,
+                      "output_tokens": 4,
+                      "unexpected_string": "secret-value"
+                    }
+                  }
+                }
+            """.trimIndent(),
+        )
+
+        val savedJson = LlmUsageParser.toJsonObject(requireNotNull(details)).toString()
+
+        assertFalse(savedJson.contains("secret-session"))
+        assertFalse(savedJson.contains("secret-token"))
+        assertFalse(savedJson.contains("secret-value"))
+        assertEquals("""{"totalCostUsd":"0.01","numTurns":2,"modelUsage":{"claude-sonnet":{"inputTokens":10,"outputTokens":4}}}""", savedJson)
     }
 }

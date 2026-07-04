@@ -260,7 +260,7 @@ data class DataQualityCapConfig(
  * @param symbolRules 取引所 symbol rule
  * @param entryIntent entry intent / falsification / consumption snapshot
  * @param atr14Jpy 5分足 ATR(14)
- * @param marketDataObservedAt EV 判定に使った市場データ取得時刻
+ * @param marketDataObservedAt EV 判定に使った ticker が取引所から返した時刻
  */
 data class SafetyFloorContext(
     val account: AccountSnapshot,

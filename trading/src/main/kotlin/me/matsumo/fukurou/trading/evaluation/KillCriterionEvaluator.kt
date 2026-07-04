@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.evaluation
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
@@ -46,28 +47,41 @@ class KillCriterionEvaluator(
      * kill 基準を評価し、到達時は audit -> HARD_HALT -> sweep の順で実行する。
      */
     suspend fun evaluate(tickSnapshot: TickSnapshot): Result<Unit> {
-        return runCatching {
+        return try {
             val currentRiskState = riskStateRepository.current().getOrThrow()
 
             if (currentRiskState.hardHalt) {
-                return@runCatching
+                return Result.success(Unit)
             }
             if (throttled()) {
-                return@runCatching
+                return Result.success(Unit)
             }
 
+            val previousEvaluatedAt = lastEvaluatedAt
             lastEvaluatedAt = Instant.now(clock)
             val stats = statsSource().getOrElse { throwable ->
                 logger.log(Level.WARNING, "KillCriterionEvaluator stats source failed.", throwable)
 
-                return@runCatching
+                return Result.success(Unit)
             }
             val breached = breached(stats)
 
             if (!breached) {
-                return@runCatching
+                return Result.success(Unit)
             }
 
+            enforceBreach(stats, tickSnapshot).onFailure {
+                lastEvaluatedAt = previousEvaluatedAt
+            }
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            Result.failure(throwable)
+        }
+    }
+
+    private suspend fun enforceBreach(stats: KillCriterionStats, tickSnapshot: TickSnapshot): Result<Unit> {
+        return runCatching {
             val reason = breachReason(stats)
 
             appendBreachAudit(stats, reason)

@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.evaluation
 
 import me.matsumo.fukurou.trading.audit.CommandEventType
+import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
@@ -18,6 +19,8 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import me.matsumo.fukurou.trading.risk.RiskState
+import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Instant
@@ -120,6 +123,48 @@ class KillCriterionEvaluatorTest {
         assertFalse(fixture.riskStateRepository.current().getOrThrow().hardHalt)
         assertEquals(0, fixture.broker.sweepCount)
     }
+
+    @Test
+    fun evaluate_retriesImmediatelyWhenHardHaltCommandFailsAfterBreach() = kotlinx.coroutines.runBlocking {
+        var statsCallCount = 0
+        val clock = MutableTestClock(fixedInstant())
+        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val eventLog = InMemoryCommandEventLog()
+        val commandService = FailingOnceRiskStateCommandService(riskStateRepository, eventLog, clock)
+        val fixture = evaluatorFixture(
+            clock = clock,
+            riskStateRepository = riskStateRepository,
+            commandEventLog = eventLog,
+            riskStateCommandService = commandService,
+            statsSource = {
+                statsCallCount += 1
+
+                Result.success(KillCriterionStats(closedTrades = 2, profitFactor = BigDecimal("0.70")))
+            },
+        )
+
+        val firstResult = fixture.evaluator.evaluate(tickSnapshot())
+        val secondResult = fixture.evaluator.evaluate(tickSnapshot())
+
+        assertTrue(firstResult.isFailure)
+        assertTrue(secondResult.isSuccess)
+        assertEquals(2, statsCallCount)
+        assertTrue(fixture.riskStateRepository.current().getOrThrow().hardHalt)
+        assertEquals(1, fixture.broker.sweepCount)
+    }
+
+    @Test
+    fun evaluate_rethrowsCancellationException() {
+        kotlinx.coroutines.runBlocking {
+            val fixture = evaluatorFixture(
+                statsSource = { throw kotlinx.coroutines.CancellationException("stop") },
+            )
+
+            kotlin.test.assertFailsWith<kotlinx.coroutines.CancellationException> {
+                fixture.evaluator.evaluate(tickSnapshot())
+            }
+        }
+    }
 }
 
 /**
@@ -139,15 +184,15 @@ private data class KillEvaluatorFixture(
 
 private fun evaluatorFixture(
     clock: Clock = fixedClock(),
+    riskStateRepository: InMemoryRiskStateRepository = InMemoryRiskStateRepository(clock),
+    commandEventLog: InMemoryCommandEventLog = InMemoryCommandEventLog(),
+    riskStateCommandService: RiskStateCommandService = InMemoryRiskStateCommandService(
+        riskStateRepository = riskStateRepository,
+        commandEventLog = commandEventLog,
+        clock = clock,
+    ),
     statsSource: suspend () -> Result<KillCriterionStats>,
 ): KillEvaluatorFixture {
-    val riskStateRepository = InMemoryRiskStateRepository(clock)
-    val eventLog = InMemoryCommandEventLog()
-    val riskStateCommandService = InMemoryRiskStateCommandService(
-        riskStateRepository = riskStateRepository,
-        commandEventLog = eventLog,
-        clock = clock,
-    )
     val broker = FakeBroker()
     val evaluator = KillCriterionEvaluator(
         config = KillCriterionConfig(
@@ -156,7 +201,7 @@ private fun evaluatorFixture(
         ),
         riskStateRepository = riskStateRepository,
         riskStateCommandService = riskStateCommandService,
-        commandEventLog = eventLog,
+        commandEventLog = commandEventLog,
         broker = broker,
         statsSource = statsSource,
         clock = clock,
@@ -165,7 +210,7 @@ private fun evaluatorFixture(
     return KillEvaluatorFixture(
         evaluator = evaluator,
         riskStateRepository = riskStateRepository,
-        eventLog = eventLog,
+        eventLog = commandEventLog,
         broker = broker,
     )
 }
@@ -231,6 +276,43 @@ private class FakeBroker : Broker {
                 safetyViolation = null,
             ),
         )
+    }
+}
+
+/**
+ * 初回だけ HARD_HALT 設定に失敗する fake command service。
+ *
+ * @param riskStateRepository 共有する risk_state repository
+ * @param commandEventLog command event log
+ * @param clock 状態変更時刻に使う clock
+ */
+private class FailingOnceRiskStateCommandService(
+    riskStateRepository: InMemoryRiskStateRepository,
+    commandEventLog: InMemoryCommandEventLog,
+    clock: Clock,
+) : RiskStateCommandService {
+
+    private val delegate = InMemoryRiskStateCommandService(riskStateRepository, commandEventLog, clock)
+    private var shouldFail = true
+
+    override suspend fun setHardHalt(
+        reason: String,
+        decisionRunContext: DecisionRunContext,
+    ): Result<RiskState> {
+        if (shouldFail) {
+            shouldFail = false
+
+            return Result.failure(IllegalStateException("temporary halt failure"))
+        }
+
+        return delegate.setHardHalt(reason, decisionRunContext)
+    }
+
+    override suspend fun resume(
+        reason: String,
+        decisionRunContext: DecisionRunContext,
+    ): Result<RiskState> {
+        return delegate.resume(reason, decisionRunContext)
     }
 }
 

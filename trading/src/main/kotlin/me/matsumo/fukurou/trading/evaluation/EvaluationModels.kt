@@ -33,6 +33,17 @@ data class EvaluationTradeQueryResult(
 )
 
 /**
+ * LLM phase usage fact の取得結果。
+ *
+ * @param facts 取得した phase usage fact
+ * @param truncated 取得上限を超えたため切り詰めたか
+ */
+data class EvaluationLlmUsageQueryResult(
+    val facts: List<LlmPhaseUsageFact>,
+    val truncated: Boolean,
+)
+
+/**
  * DB から読み出した closed trade の評価用 fact。
  *
  * setup tag が複数ある trade は setup 別集計で各 tag へ重複計上する。
@@ -125,7 +136,7 @@ data class SetupPerformance(
  *
  * @param binIndex 0.1 幅 bin の index
  * @param lowerBoundInclusive 下限
- * @param upperBoundInclusive 上限。最後の bin だけ 1.0 を含む
+ * @param upperBound 上限。最後の bin だけ 1.0 を含む
  * @param tradeCount trade 数
  * @param averageEstimatedProbability 平均申告 p
  * @param realizedWinRate 実現勝率
@@ -133,7 +144,7 @@ data class SetupPerformance(
 data class CalibrationBinStats(
     val binIndex: Int,
     val lowerBoundInclusive: BigDecimal,
-    val upperBoundInclusive: BigDecimal,
+    val upperBound: BigDecimal,
     val tradeCount: Int,
     val averageEstimatedProbability: BigDecimal?,
     val realizedWinRate: BigDecimal?,

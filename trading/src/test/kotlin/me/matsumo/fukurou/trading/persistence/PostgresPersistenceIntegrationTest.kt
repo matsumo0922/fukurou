@@ -934,6 +934,52 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun evaluation_repository_readsLlmUsageFromInvocationPhasesWithFallbackAndLimit() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val eventLog = ExposedCommandEventLog(database)
+        eventLog.append(runnerPhaseEvent(phase = "preflight", provider = null, occurredAt = fixedInstant())).getOrThrow()
+        eventLog.append(
+            runnerPhaseEvent(
+                phase = "proposer",
+                provider = "claude",
+                occurredAt = fixedInstant().plusMillis(1),
+                stdout = """{"total_cost_usd":0.20,"modelUsage":{"claude-sonnet":{"input_tokens":10,"output_tokens":4}}}""",
+            ),
+        ).getOrThrow()
+        eventLog.append(
+            runnerPhaseEvent(
+                phase = "falsifier",
+                provider = "codex",
+                occurredAt = fixedInstant().plusMillis(2),
+                stdout = "codex text output",
+            ),
+        ).getOrThrow()
+        eventLog.append(
+            runnerPhaseEvent(
+                phase = "proposer",
+                provider = "claude",
+                occurredAt = fixedInstant().plusMillis(3),
+                stdout = """{"total_cost_usd":0.30}""",
+            ),
+        ).getOrThrow()
+
+        val evaluationRepository = ExposedEvaluationRepository(database)
+        val usageResult = evaluationRepository.fetchLlmPhaseUsages(
+            period = EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(1),
+            ),
+            limit = 2,
+        ).getOrThrow()
+
+        assertTrue(usageResult.truncated)
+        assertEquals(listOf("proposer", "falsifier"), usageResult.facts.map { fact -> fact.phase })
+        assertEquals("0.20", usageResult.facts.first().usage?.totalCostUsd?.toPlainString())
+        assertEquals(null, usageResult.facts[1].usage)
+    }
+
+    @Test
     fun paper_execution_returns_existing_place_order_for_same_client_request_id() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -2007,6 +2053,36 @@ private fun JdbcTransaction.insertTestExecution(
         statement.setLong(5, fixedInstant().toEpochMilli())
         statement.executeUpdate()
     }
+}
+
+private fun runnerPhaseEvent(
+    phase: String,
+    provider: String?,
+    occurredAt: Instant,
+    stdout: String? = null,
+): CommandEvent {
+    val escapedStdout = stdout?.replace("\"", "\\\"")
+    val details = if (escapedStdout == null) {
+        "{}"
+    } else {
+        """{"stdout":"$escapedStdout"}"""
+    }
+
+    return CommandEvent(
+        decisionRunContext = DecisionRunContext(
+            decisionRunId = "run-$phase-${occurredAt.toEpochMilli()}",
+            llmProvider = provider,
+            promptHash = null,
+            systemPromptVersion = null,
+            marketSnapshotId = null,
+        ),
+        toolName = "one_shot_runner",
+        toolCallId = null,
+        clientRequestId = null,
+        eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+        payload = """{"phase":"$phase","details":$details}""",
+        occurredAt = occurredAt,
+    )
 }
 
 /**

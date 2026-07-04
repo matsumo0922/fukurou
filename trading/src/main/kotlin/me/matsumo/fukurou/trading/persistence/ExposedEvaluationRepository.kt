@@ -11,11 +11,13 @@ import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
+import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationTradeQueryResult
 import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
 import me.matsumo.fukurou.trading.evaluation.LlmPhaseUsageFact
+import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
@@ -197,7 +199,9 @@ private const val SELECT_LLM_PHASE_USAGE_SQL = """
     WHERE event_type = 'RUNNER_PHASE_COMPLETED'
         AND ts >= ?
         AND ts < ?
+        AND payload::jsonb->>'phase' IN ('proposer', 'falsifier')
     ORDER BY ts ASC
+    LIMIT ?
 """
 
 /**
@@ -302,11 +306,14 @@ class ExposedEvaluationRepository(
         }
     }
 
-    override suspend fun fetchLlmPhaseUsages(period: EvaluationPeriod): Result<List<LlmPhaseUsageFact>> {
+    override suspend fun fetchLlmPhaseUsages(
+        period: EvaluationPeriod,
+        limit: Int,
+    ): Result<EvaluationLlmUsageQueryResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    selectLlmPhaseUsages(period)
+                    selectLlmPhaseUsages(period, limit)
                 }
             }
         }
@@ -420,16 +427,28 @@ private fun JdbcTransaction.selectInitialCashJpy(): BigDecimal {
     }
 }
 
-private fun JdbcTransaction.selectLlmPhaseUsages(period: EvaluationPeriod): List<LlmPhaseUsageFact> {
+private fun JdbcTransaction.selectLlmPhaseUsages(
+    period: EvaluationPeriod,
+    limit: Int,
+): EvaluationLlmUsageQueryResult {
+    val fetchLimit = limit + 1
+
     return jdbcConnection().prepareStatement(SELECT_LLM_PHASE_USAGE_SQL).use { statement ->
         statement.setLong(1, period.from.toEpochMilli())
         statement.setLong(2, period.toExclusive.toEpochMilli())
+        statement.setInt(3, fetchLimit)
         statement.executeQuery().use { resultSet ->
-            buildList {
+            val facts = buildList {
                 while (resultSet.next()) {
                     add(resultSet.toLlmPhaseUsageFact())
                 }
             }
+            val truncated = facts.size > limit
+
+            EvaluationLlmUsageQueryResult(
+                facts = facts.take(limit),
+                truncated = truncated,
+            )
         }
     }
 }
@@ -478,9 +497,7 @@ private fun ResultSet.toLlmPhaseUsageFact(): LlmPhaseUsageFact {
     val payload = parsePayload(getString("payload"))
     val phase = payload?.get("phase")?.jsonPrimitive?.contentOrNull
     val details = payload?.get("details") as? JsonObject
-    val usage = details
-        ?.get("usage")
-        ?.let { element -> LlmUsageParser.parseUsageElement(element) }
+    val usage = details.parseUsageOrStdout()
 
     return LlmPhaseUsageFact(
         decisionRunId = getNullableString("decision_run_id"),
@@ -489,6 +506,21 @@ private fun ResultSet.toLlmPhaseUsageFact(): LlmPhaseUsageFact {
         occurredAt = getInstant("ts"),
         usage = usage,
     )
+}
+
+private fun JsonObject?.parseUsageOrStdout(): LlmUsageDetails? {
+    if (this == null) {
+        return null
+    }
+
+    val structuredUsage = get("usage")?.let { element -> LlmUsageParser.parseUsageElement(element) }
+    if (structuredUsage != null) {
+        return structuredUsage
+    }
+
+    val stdout = get("stdout")?.jsonPrimitive?.contentOrNull ?: return null
+
+    return LlmUsageParser.parseClaudeStdout(stdout)
 }
 
 private fun parsePayload(payload: String): JsonObject? {

@@ -15,12 +15,13 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
+import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationTradeQueryResult
 import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
-import me.matsumo.fukurou.trading.evaluation.LlmPhaseUsageFact
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Instant
@@ -42,6 +43,7 @@ class EvaluationRouteTest {
                 readinessProbe = { true },
                 clock = fixedClock(),
                 evaluationRepository = FakeEvaluationRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
                 evaluationMarketDataSource = FakeEvaluationMarketDataSource,
                 tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
             )
@@ -62,6 +64,12 @@ class EvaluationRouteTest {
             assertEquals(HttpStatusCode.OK, response.status, path)
             assertTrue(body.contains("\"period\""), path)
         }
+
+        val summaryBody = client.get("/evaluation/summary").bodyAsText()
+        val costsBody = client.get("/evaluation/costs").bodyAsText()
+
+        assertTrue(summaryBody.contains("\"killCriterion\""))
+        assertTrue(costsBody.contains("\"truncated\""))
     }
 
     @Test
@@ -71,6 +79,7 @@ class EvaluationRouteTest {
                 readinessProbe = { true },
                 clock = fixedClock(),
                 evaluationRepository = FakeEvaluationRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
                 evaluationMarketDataSource = FakeEvaluationMarketDataSource,
                 tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
             )
@@ -91,6 +100,7 @@ class EvaluationRouteTest {
                 readinessProbe = { true },
                 clock = fixedClock(),
                 evaluationRepository = FakeEvaluationRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
                 evaluationMarketDataSource = marketDataSource,
                 tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
             )
@@ -114,6 +124,7 @@ class EvaluationRouteTest {
                 readinessProbe = { true },
                 clock = fixedClock(),
                 evaluationRepository = FakeEvaluationRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
                 evaluationMarketDataSource = marketDataSource,
                 tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
             )
@@ -179,8 +190,16 @@ private object FakeEvaluationRepository : EvaluationRepository {
         return Result.success(BigDecimal("100000"))
     }
 
-    override suspend fun fetchLlmPhaseUsages(period: EvaluationPeriod): Result<List<LlmPhaseUsageFact>> {
-        return Result.success(emptyList())
+    override suspend fun fetchLlmPhaseUsages(
+        period: EvaluationPeriod,
+        limit: Int,
+    ): Result<EvaluationLlmUsageQueryResult> {
+        return Result.success(
+            EvaluationLlmUsageQueryResult(
+                facts = emptyList(),
+                truncated = false,
+            ),
+        )
     }
 
     override suspend fun fetchKillCriterionStats(): Result<KillCriterionStats> {

@@ -340,8 +340,12 @@ class PaperBroker(
             } else {
                 null
             },
-            marketDataObservedAt = observedAt,
+            marketDataObservedAt = ticker.marketDataObservedAtOrNull(),
         )
+    }
+
+    private fun Ticker.marketDataObservedAtOrNull(): Instant? {
+        return runCatching { Instant.parse(timestamp) }.getOrNull()
     }
 
     private fun requireEntryIntentId(command: PlaceOrderCommand): UUID {

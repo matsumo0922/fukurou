@@ -43,7 +43,10 @@ interface EvaluationRepository {
     /**
      * runner phase ごとの LLM usage fact を取得する。
      */
-    suspend fun fetchLlmPhaseUsages(period: EvaluationPeriod): Result<List<LlmPhaseUsageFact>>
+    suspend fun fetchLlmPhaseUsages(
+        period: EvaluationPeriod,
+        limit: Int = DEFAULT_EVALUATION_QUERY_LIMIT,
+    ): Result<EvaluationLlmUsageQueryResult>
 
     /**
      * kill 基準に必要な closed trade 数と PF を取得する。

@@ -1256,7 +1256,7 @@ interface GmoSymbolMapper {
 | 日足 | JST更新時刻を考慮 | 地合い判断のみ |
 | account/position | 10秒超 | act系ツール前に再取得必須 |
 
-[確定事項の改訂: 2026-07-03] entry EV の計算直前に、データ鮮度劣化時の probability cap を適用する。`FUKUROU_DATA_QUALITY_STALE_AFTER_SECONDS` の既定は60秒、`FUKUROU_DATA_QUALITY_CAPPED_PROBABILITY` の既定は0.5である。申告 `estimated_win_probability` は decisions / orders に生値で保存し、Safety Floor の EV 計算だけで `min(申告p, cappedProbability)` を使う。cap が発動して EV 拒否になった場合は、拒否 message に cap 済み p を残す。
+[確定事項の改訂: 2026-07-03] entry EV の計算直前に、データ鮮度劣化時の probability cap を適用する。鮮度シグナルは paper broker が Safety Floor へ渡す ticker の取引所 timestamp とし、単なるローカル fetch 時刻では判定しない。`FUKUROU_DATA_QUALITY_STALE_AFTER_SECONDS` の既定は60秒、`FUKUROU_DATA_QUALITY_CAPPED_PROBABILITY` の既定は0.5である。申告 `estimated_win_probability` は decisions / orders に生値で保存し、Safety Floor の EV 計算だけで `min(申告p, cappedProbability)` を使う。cap が発動して EV 拒否になった場合は、拒否 message に cap 済み p を残す。
 
 ### 5.5 指標計算
 
@@ -1297,7 +1297,7 @@ kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `K
 
 公開 API は次の5本とする。`from` / `to` は ISO-8601 日付を JST として解釈し、省略時は直近30日を返す。
 
-- `GET /evaluation/summary`
+- `GET /evaluation/summary`: 期間成績、行動率、相場局面別成績に加え、kill 基準への近接度（closedTrades、currentPF、閾値、残り trade 数、breached、HARD_HALT 状態）を返す。
 - `GET /evaluation/setups`
 - `GET /evaluation/calibration`
 - `GET /evaluation/benchmark`
@@ -1305,7 +1305,7 @@ kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `K
 
 benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は期間開始時点の paper equity（paper 初期資金 + 期間開始前の累計 realized trade PnL）とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
 
-LLM cost は `RUNNER_PHASE_COMPLETED` audit の `details.usage` を集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、Codex phase や parse 不能 phase は usage 欠落として数える。
+LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`proposer` / `falsifier`）だけを集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、保存済み `details.usage` がない過去行は redacted `details.stdout` から可能な範囲で fallback parse する。Codex phase や parse 不能 phase は usage 欠落として数える。取得は既定 20,000 行で bounded にし、超過時は `/evaluation/costs` の `truncated` で示す。
 
 ## 6. 発火エンジンと呼び出しモデル（A-7）
 

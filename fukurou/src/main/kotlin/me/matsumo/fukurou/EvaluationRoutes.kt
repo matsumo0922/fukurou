@@ -20,12 +20,14 @@ import me.matsumo.fukurou.trading.evaluation.DecisionRunRateStats
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
+import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
 import me.matsumo.fukurou.trading.evaluation.LlmModelTokenStats
 import me.matsumo.fukurou.trading.evaluation.LlmProviderCostStats
 import me.matsumo.fukurou.trading.evaluation.MarketRegimePerformance
 import me.matsumo.fukurou.trading.evaluation.SetupPerformance
 import me.matsumo.fukurou.trading.evaluation.TradePerformanceStats
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
@@ -63,6 +65,7 @@ private val EvaluationZone = ZoneId.of("Asia/Tokyo")
 @OptIn(ExperimentalKtorApi::class)
 internal fun Route.evaluationRoutes(
     repository: EvaluationRepository?,
+    riskStateRepository: RiskStateRepository?,
     marketDataSource: MarketDataSource?,
     tradingConfig: TradingBotConfig,
     clock: Clock = Clock.systemUTC(),
@@ -70,10 +73,13 @@ internal fun Route.evaluationRoutes(
     get("/evaluation/summary") {
         val dateRange = call.parseEvaluationDateRange(clock) ?: return@get
         val evaluationRepository = call.requireEvaluationRepository(repository) ?: return@get
+        val evaluationRiskStateRepository = call.requireRiskStateRepository(riskStateRepository) ?: return@get
         val period = dateRange.toPeriod()
         val tradeResult = evaluationRepository.fetchClosedTrades(period).getOrThrow()
         val runCount = evaluationRepository.countDecisionRuns(period).getOrThrow()
         val actionCounts = evaluationRepository.countDecisionsByAction(period).getOrThrow()
+        val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
+        val riskState = evaluationRiskStateRepository.current().getOrThrow()
         val candles = call.fetchDailyCandlesOrEmpty(
             marketDataSource = marketDataSource,
             tradingConfig = tradingConfig,
@@ -86,6 +92,12 @@ internal fun Route.evaluationRoutes(
                 period = dateRange.toResponsePeriod(),
                 truncated = tradeResult.truncated,
                 performance = EvaluationPerformanceResponse.fromStats(EvaluationMath.summarizeTrades(tradeResult.trades)),
+                killCriterion = EvaluationKillCriterionResponse.fromStats(
+                    stats = killStats,
+                    minClosedTrades = tradingConfig.killCriterion.minClosedTrades,
+                    minProfitFactor = tradingConfig.killCriterion.minProfitFactor,
+                    hardHalt = riskState.hardHalt,
+                ),
                 runRates = EvaluationRunRatesResponse.fromStats(EvaluationMath.decisionRunRates(runCount, actionCounts)),
                 marketRegimes = EvaluationMath.summarizeByMarketRegime(
                     trades = tradeResult.trades,
@@ -250,13 +262,13 @@ internal fun Route.evaluationRoutes(
     get("/evaluation/costs") {
         val dateRange = call.parseEvaluationDateRange(clock) ?: return@get
         val evaluationRepository = call.requireEvaluationRepository(repository) ?: return@get
-        val costs = EvaluationMath.summarizeLlmCosts(
-            evaluationRepository.fetchLlmPhaseUsages(dateRange.toPeriod()).getOrThrow(),
-        )
+        val usageResult = evaluationRepository.fetchLlmPhaseUsages(dateRange.toPeriod()).getOrThrow()
+        val costs = EvaluationMath.summarizeLlmCosts(usageResult.facts)
 
         call.respond(
             EvaluationCostsResponse(
                 period = dateRange.toResponsePeriod(),
+                truncated = usageResult.truncated,
                 phaseCount = costs.phaseCount,
                 missingUsagePhaseCount = costs.missingUsagePhaseCount,
                 totalCostUsd = costs.totalCostUsd.toDecimalString(),
@@ -291,6 +303,16 @@ private suspend fun ApplicationCall.requireEvaluationRepository(repository: Eval
     }
 
     respond(HttpStatusCode.InternalServerError, ErrorResponse("evaluation repository is not configured"))
+
+    return null
+}
+
+private suspend fun ApplicationCall.requireRiskStateRepository(repository: RiskStateRepository?): RiskStateRepository? {
+    if (repository != null) {
+        return repository
+    }
+
+    respond(HttpStatusCode.InternalServerError, ErrorResponse("risk state repository is not configured"))
 
     return null
 }
@@ -432,6 +454,7 @@ data class EvaluationPeriodResponse(
  * @param period 評価対象期間
  * @param truncated closed trade fact が取得上限で切り詰められたか
  * @param performance 全体成績
+ * @param killCriterion kill 基準への近接度
  * @param runRates 起動数に対する action rate
  * @param marketRegimes 相場局面別成績
  */
@@ -440,9 +463,56 @@ data class EvaluationSummaryResponse(
     val period: EvaluationPeriodResponse,
     val truncated: Boolean,
     val performance: EvaluationPerformanceResponse,
+    val killCriterion: EvaluationKillCriterionResponse,
     val runRates: EvaluationRunRatesResponse,
     val marketRegimes: List<EvaluationMarketRegimeResponse>,
 )
+
+/**
+ * kill 基準への近接度レスポンス。
+ *
+ * @param closedTrades closed trade 数
+ * @param currentProfitFactor 現在の PF
+ * @param minClosedTrades kill 判定に必要な最小 closed trade 数
+ * @param minProfitFactor kill 判定の PF 下限
+ * @param remainingTrades minClosedTrades までの残り trade 数
+ * @param breached 現在の stats が kill 基準へ到達しているか
+ * @param hardHalt 現在 sticky HARD_HALT 中か
+ */
+@Serializable
+data class EvaluationKillCriterionResponse(
+    val closedTrades: Int,
+    val currentProfitFactor: String?,
+    val minClosedTrades: Int,
+    val minProfitFactor: String,
+    val remainingTrades: Int,
+    val breached: Boolean,
+    val hardHalt: Boolean,
+) {
+    companion object {
+        fun fromStats(
+            stats: KillCriterionStats,
+            minClosedTrades: Int,
+            minProfitFactor: BigDecimal,
+            hardHalt: Boolean,
+        ): EvaluationKillCriterionResponse {
+            val remainingTrades = (minClosedTrades - stats.closedTrades).coerceAtLeast(0)
+            val profitFactor = stats.profitFactor
+            val enoughTrades = stats.closedTrades >= minClosedTrades
+            val breached = profitFactor != null && enoughTrades && profitFactor < minProfitFactor
+
+            return EvaluationKillCriterionResponse(
+                closedTrades = stats.closedTrades,
+                currentProfitFactor = profitFactor?.toDecimalString(),
+                minClosedTrades = minClosedTrades,
+                minProfitFactor = minProfitFactor.toDecimalString(),
+                remainingTrades = remainingTrades,
+                breached = breached,
+                hardHalt = hardHalt,
+            )
+        }
+    }
+}
 
 /**
  * 成績指標レスポンス。
@@ -655,7 +725,7 @@ data class EvaluationCalibrationBinResponse(
             return EvaluationCalibrationBinResponse(
                 binIndex = stats.binIndex,
                 lowerBoundInclusive = stats.lowerBoundInclusive.toDecimalString(),
-                upperBoundInclusive = stats.upperBoundInclusive.toDecimalString(),
+                upperBoundInclusive = stats.upperBound.toDecimalString(),
                 tradeCount = stats.tradeCount,
                 averageEstimatedProbability = stats.averageEstimatedProbability?.toDecimalString(),
                 realizedWinRate = stats.realizedWinRate?.toDecimalString(),
@@ -737,6 +807,7 @@ data class EvaluationBenchmarkReturnResponse(
  * LLM cost レスポンス。
  *
  * @param period 評価対象期間
+ * @param truncated phase usage fact が取得上限で切り詰められたか
  * @param phaseCount phase 数
  * @param missingUsagePhaseCount usage 欠落 phase 数
  * @param totalCostUsd 合計 cost USD
@@ -746,6 +817,7 @@ data class EvaluationBenchmarkReturnResponse(
 @Serializable
 data class EvaluationCostsResponse(
     val period: EvaluationPeriodResponse,
+    val truncated: Boolean,
     val phaseCount: Int,
     val missingUsagePhaseCount: Int,
     val totalCostUsd: String,
