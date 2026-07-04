@@ -773,6 +773,7 @@ private fun parseIndicatorParams(request: CallToolRequest): Result<IndicatorPara
 
         IndicatorParams(
             period = paramsObject.readOptionalInt("period"),
+            lookback = paramsObject.readOptionalInt("lookback"),
             fastPeriod = paramsObject.readOptionalInt("fast_period", "fastPeriod"),
             slowPeriod = paramsObject.readOptionalInt("slow_period", "slowPeriod"),
             signalPeriod = paramsObject.readOptionalInt("signal_period", "signalPeriod"),
@@ -1018,9 +1019,9 @@ private fun indicatorDescription(dailyKlineRequestLimit: Int?): String {
 
 private fun indicatorParamsDescription(dailyKlineRequestLimit: Int?): String {
     return if (dailyKlineRequestLimit == null) {
-        "Indicator params. Use period, fast_period, slow_period, signal_period, and limit as needed."
+        "Indicator params. Use period, lookback, fast_period, slow_period, signal_period, and limit as needed."
     } else {
-        "Indicator params. Use period, fast_period, slow_period, signal_period, and limit as needed. DAY-based candle limits are capped by $dailyKlineRequestLimit stitched GMO business dates."
+        "Indicator params. Use period, lookback, fast_period, slow_period, signal_period, and limit as needed. DAY-based candle limits are capped by $dailyKlineRequestLimit stitched GMO business dates."
     }
 }
 

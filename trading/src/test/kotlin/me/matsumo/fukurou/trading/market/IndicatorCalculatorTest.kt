@@ -98,11 +98,207 @@ class IndicatorCalculatorTest {
     }
 
     @Test
+    fun calculate_returnsAtrPercentileWithFullLookbackWindow() {
+        val result = IndicatorCalculator.calculate(
+            candles = trueRangeCandles(2.0, 4.0, 6.0, 2.0, 8.0, 0.0),
+            indicator = IndicatorType.ATR_PERCENTILE,
+            params = IndicatorParams(
+                period = 2,
+                lookback = 3,
+            ),
+        ).getOrThrow()
+
+        val values = result.values.map { value -> value.value }
+
+        assertEquals(listOf(null, null, null), values.take(3))
+        assertClose(2.0 / 3.0, values[3])
+        assertClose(1.0, values[4])
+        assertClose(1.0 / 3.0, values[5])
+    }
+
+    @Test
+    fun calculate_returnsVwapSessionCumulativeValues() {
+        val result = IndicatorCalculator.calculate(
+            candles = listOf(
+                candle(
+                    openTime = "2026-07-01T21:00:00Z",
+                    high = 12.0,
+                    low = 6.0,
+                    close = 9.0,
+                    volume = 2.0,
+                ),
+                candle(
+                    openTime = "2026-07-01T21:05:00Z",
+                    high = 15.0,
+                    low = 9.0,
+                    close = 12.0,
+                    volume = 1.0,
+                ),
+                candle(
+                    openTime = "2026-07-01T21:10:00Z",
+                    high = 18.0,
+                    low = 12.0,
+                    close = 15.0,
+                    volume = 3.0,
+                ),
+            ),
+            indicator = IndicatorType.VWAP_SESSION,
+        ).getOrThrow()
+
+        val values = result.values.map { value -> value.value }
+
+        assertClose(9.0, values[0])
+        assertClose(10.0, values[1])
+        assertClose(12.5, values[2])
+    }
+
+    @Test
+    fun calculate_resetsVwapSessionAcrossGmoKlineBoundary() {
+        val result = IndicatorCalculator.calculate(
+            candles = listOf(
+                candle(
+                    openTime = "2026-07-01T20:55:00Z",
+                    high = 9.0,
+                    low = 3.0,
+                    close = 6.0,
+                    volume = 2.0,
+                ),
+                candle(
+                    openTime = "2026-07-01T21:00:00Z",
+                    high = 33.0,
+                    low = 27.0,
+                    close = 30.0,
+                    volume = 1.0,
+                ),
+                candle(
+                    openTime = "2026-07-01T21:05:00Z",
+                    high = 63.0,
+                    low = 57.0,
+                    close = 60.0,
+                    volume = 3.0,
+                ),
+            ),
+            indicator = IndicatorType.VWAP_SESSION,
+        ).getOrThrow()
+
+        val values = result.values.map { value -> value.value }
+
+        assertClose(6.0, values[0])
+        assertClose(30.0, values[1])
+        assertClose(52.5, values[2])
+    }
+
+    @Test
+    fun calculate_returnsMissingVwapWhileSessionVolumeIsZero() {
+        val result = IndicatorCalculator.calculate(
+            candles = listOf(
+                candle(
+                    openTime = "2026-07-01T21:00:00Z",
+                    high = 12.0,
+                    low = 6.0,
+                    close = 9.0,
+                    volume = 0.0,
+                ),
+                candle(
+                    openTime = "2026-07-01T21:05:00Z",
+                    high = 15.0,
+                    low = 9.0,
+                    close = 12.0,
+                    volume = 2.0,
+                ),
+            ),
+            indicator = IndicatorType.VWAP_SESSION,
+        ).getOrThrow()
+
+        val values = result.values.map { value -> value.value }
+
+        assertEquals(null, values[0])
+        assertClose(12.0, values[1])
+    }
+
+    @Test
+    fun calculate_returnsVolumeZScoreWithPopulationStandardDeviation() {
+        val result = IndicatorCalculator.calculate(
+            candles = volumeCandles(1.0, 2.0, 3.0, 2.0, 1.0),
+            indicator = IndicatorType.VOLUME_Z_SCORE,
+            params = IndicatorParams(period = 3),
+        ).getOrThrow()
+
+        val values = result.values.map { value -> value.value }
+
+        assertEquals(listOf(null, null), values.take(2))
+        assertClose(1.2247448714, values[2])
+        assertClose(-0.7071067812, values[3])
+        assertClose(-1.2247448714, values[4])
+    }
+
+    @Test
+    fun calculate_returnsMissingVolumeZScoreWhenStandardDeviationIsZero() {
+        val result = IndicatorCalculator.calculate(
+            candles = volumeCandles(5.0, 5.0, 5.0),
+            indicator = IndicatorType.VOLUME_Z_SCORE,
+            params = IndicatorParams(period = 3),
+        ).getOrThrow()
+
+        val values = result.values.map { value -> value.value }
+
+        assertEquals(listOf(null, null, null), values)
+    }
+
+    @Test
+    fun calculate_resolvesNewIndicatorDefaults() {
+        val atrPercentile = IndicatorCalculator.calculate(
+            candles = closeCandles(1.0),
+            indicator = IndicatorType.ATR_PERCENTILE,
+        ).getOrThrow()
+        val volumeZScore = IndicatorCalculator.calculate(
+            candles = closeCandles(1.0),
+            indicator = IndicatorType.VOLUME_Z_SCORE,
+        ).getOrThrow()
+
+        assertEquals(14, atrPercentile.params.period)
+        assertEquals(100, atrPercentile.params.lookback)
+        assertEquals(20, volumeZScore.params.period)
+    }
+
+    @Test
     fun calculate_rejectsInvalidPeriod() {
         val result = IndicatorCalculator.calculate(
             candles = closeCandles(1.0, 2.0, 3.0),
             indicator = IndicatorType.EMA,
             params = IndicatorParams(period = 0),
+        )
+
+        assertFailsWith<MarketInvalidRequestException> {
+            result.getOrThrow()
+        }
+    }
+
+    @Test
+    fun calculate_rejectsInvalidLookback() {
+        val result = IndicatorCalculator.calculate(
+            candles = closeCandles(1.0, 2.0, 3.0),
+            indicator = IndicatorType.ATR_PERCENTILE,
+            params = IndicatorParams(
+                period = 2,
+                lookback = 0,
+            ),
+        )
+
+        assertFailsWith<MarketInvalidRequestException> {
+            result.getOrThrow()
+        }
+    }
+
+    @Test
+    fun calculate_rejectsAtrPercentileWindowBeyondMcpCandleLimit() {
+        val result = IndicatorCalculator.calculate(
+            candles = closeCandles(1.0, 2.0, 3.0),
+            indicator = IndicatorType.ATR_PERCENTILE,
+            params = IndicatorParams(
+                period = 400,
+                lookback = 101,
+            ),
         )
 
         assertFailsWith<MarketInvalidRequestException> {
@@ -151,6 +347,17 @@ private fun atrCandles(): List<Candle> {
     )
 }
 
+private fun trueRangeCandles(vararg trueRangeValues: Double): List<Candle> {
+    return trueRangeValues.mapIndexed { trueRangeIndex, trueRangeValue ->
+        candle(
+            openTime = trueRangeIndex.toString(),
+            high = 100.0 + trueRangeValue / 2.0,
+            low = 100.0 - trueRangeValue / 2.0,
+            close = 100.0,
+        )
+    }
+}
+
 private fun closeCandles(vararg closes: Double): List<Candle> {
     return closes.mapIndexed { closeIndex, close ->
         candle(
@@ -162,11 +369,24 @@ private fun closeCandles(vararg closes: Double): List<Candle> {
     }
 }
 
+private fun volumeCandles(vararg volumes: Double): List<Candle> {
+    return volumes.mapIndexed { volumeIndex, volume ->
+        candle(
+            openTime = volumeIndex.toString(),
+            high = 11.0,
+            low = 9.0,
+            close = 10.0,
+            volume = volume,
+        )
+    }
+}
+
 private fun candle(
     openTime: String,
     high: Double,
     low: Double,
     close: Double,
+    volume: Double = 1.0,
 ): Candle {
     return Candle(
         symbol = TRADING_SYMBOL_TEXT,
@@ -176,7 +396,7 @@ private fun candle(
         high = high.toString(),
         low = low.toString(),
         close = close.toString(),
-        volume = "1.0",
+        volume = volume.toString(),
     )
 }
 

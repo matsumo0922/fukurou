@@ -30,6 +30,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
@@ -43,11 +45,13 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.market.IndicatorType
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import kotlin.math.abs
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -93,6 +97,25 @@ class GmoCoinMcpServerTest {
             ),
             server.tools.keys,
         )
+    }
+
+    @Test
+    fun calcIndicatorSchema_exposesIndicatorTypeEntries() {
+        val server = testServer()
+
+        server.registerGmoCoinMarketTools(FakeMarketDataSource)
+
+        val tool = server.tools.getValue("calc_indicator").tool
+        val properties = assertNotNull(tool.inputSchema.properties)
+        val indicatorSchema = properties.getValue("indicator").jsonObject
+        val enumValues = indicatorSchema.getValue("enum")
+            .jsonArray
+            .map { enumValue -> enumValue.jsonPrimitive.contentOrNull }
+
+        assertEquals(IndicatorType.entries.map { indicator -> indicator.name }, enumValues)
+        assertTrue(enumValues.contains("ATR_PERCENTILE"))
+        assertTrue(enumValues.contains("VWAP_SESSION"))
+        assertTrue(enumValues.contains("VOLUME_Z_SCORE"))
     }
 
     @Test
@@ -257,6 +280,57 @@ class GmoCoinMcpServerTest {
     }
 
     @Test
+    fun calcIndicator_returnsExpandedIndicatorResults() = runBlocking {
+        val server = testServer()
+
+        server.registerGmoCoinMarketTools(IndicatorMarketDataSource(expandedIndicatorCandles()))
+
+        val atrPercentile = callTool(
+            server = server,
+            toolName = "calc_indicator",
+            arguments = indicatorArguments(
+                indicator = "ATR_PERCENTILE",
+                period = 2,
+                lookback = 3,
+                limit = 6,
+            ),
+        )
+        val vwapSession = callTool(
+            server = server,
+            toolName = "calc_indicator",
+            arguments = indicatorArguments(
+                indicator = "VWAP_SESSION",
+                limit = 6,
+            ),
+        )
+        val volumeZScore = callTool(
+            server = server,
+            toolName = "calc_indicator",
+            arguments = indicatorArguments(
+                indicator = "VOLUME_Z_SCORE",
+                period = 3,
+                limit = 6,
+            ),
+        )
+
+        val atrContent = assertNotNull(atrPercentile.structuredContent)
+        val atrParams = atrContent.getValue("params").jsonObject
+        val vwapContent = assertNotNull(vwapSession.structuredContent)
+        val volumeContent = assertNotNull(volumeZScore.structuredContent)
+
+        assertEquals("ATR_PERCENTILE", atrContent.getValue("indicator").jsonPrimitive.contentOrNull)
+        assertEquals(2, atrParams.getValue("period").jsonPrimitive.longOrNull?.toInt())
+        assertEquals(3, atrParams.getValue("lookback").jsonPrimitive.longOrNull?.toInt())
+        assertClose(1.0 / 3.0, indicatorValueAt(atrContent, 5))
+
+        assertEquals("VWAP_SESSION", vwapContent.getValue("indicator").jsonPrimitive.contentOrNull)
+        assertClose(100.0, indicatorValueAt(vwapContent, 1))
+
+        assertEquals("VOLUME_Z_SCORE", volumeContent.getValue("indicator").jsonPrimitive.contentOrNull)
+        assertClose(1.2247448714, indicatorValueAt(volumeContent, 2))
+    }
+
+    @Test
     fun calcIndicator_returnsFreshnessMetadataFromUnderlyingCandles() = runBlocking {
         val server = testServer()
         server.registerGmoCoinMarketTools(
@@ -320,6 +394,39 @@ private suspend fun callTool(
     return server.tools.getValue(toolName).handler.invoke(TestClientConnection, request)
 }
 
+private fun indicatorArguments(
+    indicator: String,
+    period: Int? = null,
+    lookback: Int? = null,
+    limit: Int,
+): JsonObject {
+    return buildJsonObject {
+        put("interval", CandleInterval.FIVE_MINUTES.apiValue)
+        put("indicator", indicator)
+        put(
+            "params",
+            buildJsonObject {
+                if (period != null) {
+                    put("period", period)
+                }
+                if (lookback != null) {
+                    put("lookback", lookback)
+                }
+                put("limit", limit)
+            },
+        )
+    }
+}
+
+private fun indicatorValueAt(structuredContent: JsonObject, valueIndex: Int): Double? {
+    return structuredContent.getValue("values")
+        .jsonArray[valueIndex]
+        .jsonObject
+        .getValue("value")
+        .jsonPrimitive
+        .doubleOrNull
+}
+
 private fun assertFreshness(
     structuredContent: JsonObject,
     fetchedAt: String,
@@ -347,6 +454,12 @@ private fun assertTextJsonObject(result: CallToolResult): JsonObject {
     val textContent = assertNotNull(result.content.singleOrNull() as? TextContent)
 
     return Json.parseToJsonElement(textContent.text).jsonObject
+}
+
+private fun assertClose(expected: Double, actual: Double?) {
+    requireNotNull(actual)
+
+    assertTrue(abs(expected - actual) < 0.0000001, "expected <$expected>, actual <$actual>")
 }
 
 /**
@@ -508,6 +621,46 @@ private class FreshnessMarketDataSource(
 }
 
 /**
+ * indicator handler 検証用に任意の candle を返す fake market data source。
+ *
+ * @param candles 返却する candle 一覧
+ */
+private class IndicatorMarketDataSource(
+    private val candles: List<Candle>,
+) : MarketDataSource {
+
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return FakeMarketDataSource.getTicker(symbol)
+    }
+
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return Result.success(candles.take(limit))
+    }
+
+    override suspend fun getOrderbook(
+        symbol: TradingSymbol,
+        depth: Int,
+    ): Result<Orderbook> {
+        return FakeMarketDataSource.getOrderbook(symbol, depth)
+    }
+
+    override suspend fun getTrades(
+        symbol: TradingSymbol,
+        limit: Int,
+    ): Result<List<RecentTrade>> {
+        return FakeMarketDataSource.getTrades(symbol, limit)
+    }
+
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
+        return FakeMarketDataSource.getSymbolRules(symbol)
+    }
+}
+
+/**
  * GMO Coin MCP test 用の fake market data source。
  */
 private object FakeMarketDataSource : MarketDataSource {
@@ -587,6 +740,32 @@ private object FakeMarketDataSource : MarketDataSource {
                 takerFee = "0.0005",
                 makerFee = "-0.0001",
             ),
+        )
+    }
+}
+
+private fun expandedIndicatorCandles(): List<Candle> {
+    val trueRangeValues = listOf(2.0, 4.0, 6.0, 2.0, 8.0, 0.0)
+    val volumeValues = listOf(1.0, 2.0, 3.0, 2.0, 1.0, 4.0)
+    val openTimes = listOf(
+        "2026-07-01T20:55:00Z",
+        "2026-07-01T21:00:00Z",
+        "2026-07-01T21:05:00Z",
+        "2026-07-01T21:10:00Z",
+        "2026-07-01T21:15:00Z",
+        "2026-07-01T21:20:00Z",
+    )
+
+    return trueRangeValues.mapIndexed { candleIndex, trueRangeValue ->
+        Candle(
+            symbol = TradingSymbol.BTC.apiSymbol,
+            interval = CandleInterval.FIVE_MINUTES,
+            openTime = openTimes[candleIndex],
+            open = "100.0",
+            high = (100.0 + trueRangeValue / 2.0).toString(),
+            low = (100.0 - trueRangeValue / 2.0).toString(),
+            close = "100.0",
+            volume = volumeValues[candleIndex].toString(),
         )
     }
 }
