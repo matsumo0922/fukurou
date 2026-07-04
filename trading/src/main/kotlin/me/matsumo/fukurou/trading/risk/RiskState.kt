@@ -52,3 +52,10 @@ data class RiskState(
 class HardHaltTradingRejectedException(
     message: String,
 ) : RuntimeException(message)
+
+/**
+ * HARD_HALT から SOFT_HALT へ downgrade しようとしたことを表す例外。
+ */
+class SoftHaltDowngradeRejectedException(
+    message: String = "SOFT_HALT cannot downgrade HARD_HALT.",
+) : RuntimeException(message)

@@ -63,6 +63,7 @@ class OpsRouteTest {
             contentType(ContentType.Application.Json)
             setBody("""{"reason":"operator confirmed recovery"}""")
         }
+        val resumeResponseBody = resumeResponse.bodyAsText()
         val events = eventLog.events()
         val eventTypes = events.map { event -> event.eventType }
 
@@ -74,7 +75,8 @@ class OpsRouteTest {
         assertTrue(hardResponse.bodyAsText().contains(""""state":"HARD_HALT""""))
         assertEquals(HttpStatusCode.Conflict, conflictResponse.status)
         assertEquals(HttpStatusCode.OK, resumeResponse.status)
-        assertTrue(resumeResponse.bodyAsText().contains(""""state":"RUNNING""""))
+        assertTrue(resumeResponseBody.contains(""""state":"RUNNING""""))
+        assertTrue(resumeResponseBody.contains("operator confirmed recovery"))
         assertEquals(
             listOf(
                 CommandEventType.SOFT_HALT_SET,

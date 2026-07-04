@@ -5,6 +5,7 @@ import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import me.matsumo.fukurou.trading.risk.SoftHaltDowngradeRejectedException
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
@@ -119,8 +120,8 @@ class ExposedRiskStateRepository(
                     ensureRiskStateRow(at)
                     val currentState = selectRiskState(forUpdate = true)
 
-                    require(currentState.state != RiskHaltState.HARD_HALT) {
-                        "SOFT_HALT cannot downgrade HARD_HALT."
+                    if (currentState.state == RiskHaltState.HARD_HALT) {
+                        throw SoftHaltDowngradeRejectedException()
                     }
 
                     updateSoftHalt(reason, at)

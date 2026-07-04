@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
+import me.matsumo.fukurou.trading.risk.SoftHaltDowngradeRejectedException
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Clock
 import java.time.Instant
@@ -51,8 +52,8 @@ class ExposedRiskStateCommandService(
             eventType = CommandEventType.SOFT_HALT_SET,
             blankReasonMessage = "SOFT_HALT reason is required.",
         ) { commandReason, occurredAt, previousState ->
-            require(previousState.state != RiskHaltState.HARD_HALT) {
-                "SOFT_HALT cannot downgrade HARD_HALT."
+            if (previousState.state == RiskHaltState.HARD_HALT) {
+                throw SoftHaltDowngradeRejectedException()
             }
 
             updateSoftHalt(commandReason, occurredAt)

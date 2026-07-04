@@ -16,16 +16,12 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import me.matsumo.fukurou.trading.risk.SoftHaltDowngradeRejectedException
 
 /**
  * ops API の OpenAPI tag。
  */
 private const val OPS_TAG = "ops"
-
-/**
- * SOFT_HALT が HARD_HALT を downgrade しようとした時の内部エラー文。
- */
-private const val SOFT_HALT_DOWNGRADE_ERROR = "SOFT_HALT cannot downgrade HARD_HALT."
 
 /**
  * halt request の level。
@@ -72,6 +68,7 @@ data class OpsResumeRequest(
  * @param haltReason 最後に halt した理由
  * @param haltAt 最後に halt した時刻
  * @param resumedAt 最後に resume した時刻
+ * @param resumedReason 最後に resume した理由
  * @param drawdownRatio 現在の drawdown ratio
  */
 @Serializable
@@ -80,6 +77,7 @@ data class OpsRiskStateResponse(
     val haltReason: String?,
     val haltAt: String?,
     val resumedAt: String?,
+    val resumedReason: String?,
     val drawdownRatio: String,
 )
 
@@ -240,8 +238,10 @@ private suspend fun ApplicationCall.respondConflictOrThrow(result: Result<RiskSt
 
     val throwable = requireNotNull(result.exceptionOrNull())
 
-    if (throwable.message == SOFT_HALT_DOWNGRADE_ERROR) {
-        respond(HttpStatusCode.Conflict, ErrorResponse(SOFT_HALT_DOWNGRADE_ERROR))
+    if (throwable is SoftHaltDowngradeRejectedException) {
+        val errorMessage = requireNotNull(throwable.message)
+
+        respond(HttpStatusCode.Conflict, ErrorResponse(errorMessage))
 
         return null
     }
@@ -255,6 +255,7 @@ private fun RiskState.toOpsRiskStateResponse(): OpsRiskStateResponse {
         haltReason = haltReason,
         haltAt = haltAt?.toString(),
         resumedAt = resumedAt?.toString(),
+        resumedReason = resumedReason,
         drawdownRatio = drawdownRatio.toPlainString(),
     )
 }

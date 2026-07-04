@@ -44,8 +44,9 @@ class InMemoryRiskStateRepository(
         return mutex.withLock {
             runCatching {
                 require(reason.isNotBlank()) { "SOFT_HALT reason is required." }
-                require(storedState.state != RiskHaltState.HARD_HALT) {
-                    "SOFT_HALT cannot downgrade HARD_HALT."
+
+                if (storedState.state == RiskHaltState.HARD_HALT) {
+                    throw SoftHaltDowngradeRejectedException()
                 }
 
                 storedState = storedState.copy(
