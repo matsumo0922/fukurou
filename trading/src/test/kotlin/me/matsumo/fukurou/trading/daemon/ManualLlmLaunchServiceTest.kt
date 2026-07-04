@@ -21,6 +21,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.UUID
+import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -212,6 +213,65 @@ class ManualLlmLaunchServiceTest {
     }
 
     @Test
+    fun manualLaunch_closeWaitsForCancellationFinishBeforeReturning() = runBlocking {
+        val clock = ManualTestClock(fixedInstant())
+        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val runnerStarted = CompletableDeferred<Unit>()
+        val releaseRunner = CompletableDeferred<Unit>()
+        val finishStarted = CompletableDeferred<Unit>()
+        val releaseFinish = CompletableDeferred<Unit>()
+        val finishCompleted = CompletableDeferred<Unit>()
+        val reservations = RecordingLlmLaunchReservationRepository(
+            delegate = InMemoryLlmLaunchReservationRepository(riskStateRepository),
+            beforeFinish = {
+                finishStarted.complete(Unit)
+                releaseFinish.await()
+            },
+            afterSuccessfulFinish = {
+                finishCompleted.complete(Unit)
+            },
+        )
+        val fixture = manualFixture(
+            clock = clock,
+            riskStateRepository = riskStateRepository,
+            reservations = reservations,
+            launchHandler = { request ->
+                runnerStarted.complete(Unit)
+                releaseRunner.await()
+                successfulRunnerResult(request)
+            },
+        )
+
+        val launchResult = fixture.service.launch("shutdown cancellation").getOrThrow()
+        runnerStarted.await()
+        val closeResult = CompletableDeferred<Throwable?>()
+        val closeThread = thread(
+            start = true,
+            name = "manual-llm-close-test",
+        ) {
+            closeResult.complete(runCatching { fixture.service.close() }.exceptionOrNull())
+        }
+        finishStarted.await()
+
+        assertIs<ManualLlmLaunchResult.Accepted>(launchResult)
+        assertEquals(false, closeResult.isCompleted)
+
+        releaseFinish.complete(Unit)
+        finishCompleted.await()
+        closeThread.join(CLOSE_THREAD_JOIN_TIMEOUT_MILLIS)
+        val finish = fixture.reservations.nextFinish()
+        val hasFreshRunningReservation = fixture.reservations
+            .hasFreshRunningReservation(fixedInstant().minus(Duration.ofHours(1)))
+            .getOrThrow()
+
+        assertEquals(false, closeThread.isAlive)
+        assertEquals(null, closeResult.await())
+        assertEquals(LlmLaunchReservationStatus.FAILED, finish.status)
+        assertTrue(requireNotNull(finish.reason).contains("Cancellation"))
+        assertEquals(false, hasFreshRunningReservation)
+    }
+
+    @Test
     fun manualLaunch_worksWhenDaemonConfigIsDisabled() = runBlocking {
         val fixture = manualFixture(
             tradingConfig = tradingConfig(
@@ -353,9 +413,13 @@ private data class ManualFixture(
  * finish 呼び出しを観測できる LLM 起動予約 repository。
  *
  * @param delegate 実際の reservation 判定を行う repository
+ * @param beforeFinish delegate に渡す前の finish hook
+ * @param afterSuccessfulFinish delegate 更新後の finish hook
  */
 private class RecordingLlmLaunchReservationRepository(
     private val delegate: LlmLaunchReservationRepository,
+    private val beforeFinish: suspend (LlmLaunchReservationFinish) -> Unit = {},
+    private val afterSuccessfulFinish: suspend (LlmLaunchReservationFinish) -> Unit = {},
 ) : LlmLaunchReservationRepository {
 
     private val finishes = Channel<LlmLaunchReservationFinish>(Channel.UNLIMITED)
@@ -365,10 +429,13 @@ private class RecordingLlmLaunchReservationRepository(
     }
 
     override suspend fun finish(finish: LlmLaunchReservationFinish): Result<Unit> {
+        beforeFinish(finish)
+
         val result = delegate.finish(finish)
 
         if (result.isSuccess) {
             finishes.send(finish)
+            afterSuccessfulFinish(finish)
         }
 
         return result
@@ -426,3 +493,8 @@ private class ManualTestClock(
 private fun fixedInstant(): Instant {
     return Instant.parse("2026-07-03T00:00:00Z")
 }
+
+/**
+ * close() 待機 thread の test timeout milliseconds。
+ */
+private const val CLOSE_THREAD_JOIN_TIMEOUT_MILLIS = 5_000L

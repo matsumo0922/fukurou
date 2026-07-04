@@ -3,10 +3,11 @@ package me.matsumo.fukurou.trading.daemon
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -107,7 +108,13 @@ class DefaultManualLlmLaunchService(
     }
 
     override fun close() {
-        scope.cancel()
+        val scopeJob = scope.coroutineContext[Job] ?: return
+
+        scopeJob.cancel()
+
+        runBlocking {
+            scopeJob.join()
+        }
     }
 
     private suspend fun launchUnsafe(reason: String): ManualLlmLaunchResult {
