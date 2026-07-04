@@ -20,7 +20,6 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.io.asSink
 import kotlinx.io.asSource
 import kotlinx.io.buffered
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -66,6 +65,9 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GMO_MAX_DAILY_KLINE_REQUESTS
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
+import me.matsumo.fukurou.trading.market.FreshnessDefaults
+import me.matsumo.fukurou.trading.market.FreshnessMetadata
+import me.matsumo.fukurou.trading.market.FreshnessSource
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoHttpException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
@@ -83,6 +85,7 @@ import me.matsumo.fukurou.trading.tool.NoTradeExitException
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import me.matsumo.fukurou.trading.tool.ToolCompletionAuditFailedException
 import java.math.BigDecimal
+import java.time.Clock
 import java.time.Instant
 import java.util.UUID
 
@@ -262,13 +265,19 @@ fun main() {
  *
  * @param tradingConfig 取引 bot 全体の typed config
  * @param marketDataSource 市場データ取得元
+ * @param clock response 鮮度 metadata と default runtime を作る clock
  * @param tradingRuntime 取引 runtime
  * @param decisionRunContext 呼び出し元の decision run context
  */
 class FukurouMcpServer(
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource.fromConfig(tradingConfig.gmoPublicClient),
-    private val tradingRuntime: TradingRuntime = defaultTradingRuntime(tradingConfig, marketDataSource),
+    private val clock: Clock = Clock.systemUTC(),
+    private val tradingRuntime: TradingRuntime = defaultTradingRuntime(
+        tradingConfig = tradingConfig,
+        marketDataSource = marketDataSource,
+        clock = clock,
+    ),
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
     private val toolCallLimiter: McpToolCallLimiter = McpToolCallLimiter(
         config = tradingConfig.runner,
@@ -330,11 +339,32 @@ class FukurouMcpServer(
                 toolCallLimiter = toolCallLimiter,
             ),
             klineRequestBudgetHook = DescribedGmoCoinKlineRequestBudgetHook(GMO_MAX_DAILY_KLINE_REQUESTS),
+            clock = clock,
         )
-        server.registerBalanceTool(tradingRuntime, decisionRunContext, toolCallLimiter)
-        server.registerPositionsTool(tradingRuntime, decisionRunContext, toolCallLimiter)
-        server.registerOpenOrdersTool(tradingRuntime, decisionRunContext, toolCallLimiter)
-        server.registerAccountStatusTool(tradingRuntime, decisionRunContext, toolCallLimiter)
+        server.registerBalanceTool(
+            tradingRuntime = tradingRuntime,
+            decisionRunContext = decisionRunContext,
+            toolCallLimiter = toolCallLimiter,
+            clock = clock,
+        )
+        server.registerPositionsTool(
+            tradingRuntime = tradingRuntime,
+            decisionRunContext = decisionRunContext,
+            toolCallLimiter = toolCallLimiter,
+            clock = clock,
+        )
+        server.registerOpenOrdersTool(
+            tradingRuntime = tradingRuntime,
+            decisionRunContext = decisionRunContext,
+            toolCallLimiter = toolCallLimiter,
+            clock = clock,
+        )
+        server.registerAccountStatusTool(
+            tradingRuntime = tradingRuntime,
+            decisionRunContext = decisionRunContext,
+            toolCallLimiter = toolCallLimiter,
+            clock = clock,
+        )
         server.registerTradeIntentTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerSubmitDecisionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerSubmitFalsificationTool(tradingRuntime, decisionRunContext, toolCallLimiter)
@@ -388,17 +418,20 @@ private class AuditedGmoCoinMarketToolExecutor(
 private fun defaultTradingRuntime(
     tradingConfig: TradingBotConfig,
     marketDataSource: MarketDataSource,
+    clock: Clock,
 ): TradingRuntime {
     if (useTestInMemoryRuntime()) {
         return TradingRuntimeFactory.inMemory(
             marketDataSource = marketDataSource,
             tradingConfig = tradingConfig,
+            clock = clock,
         )
     }
 
     return TradingRuntimeFactory.fromEnvironment(
         marketDataSource = marketDataSource,
         tradingConfig = tradingConfig,
+        clock = clock,
     )
 }
 
@@ -714,17 +747,22 @@ private fun Server.registerBalanceTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    clock: Clock,
 ) {
     addLimitedTool(
         name = GET_BALANCE_TOOL,
-        description = "Get paper account balance and equity snapshot.",
+        description = "Get paper account balance and equity snapshot. Response includes paper ledger freshness metadata.",
         inputSchema = ToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
         kind = McpToolCallKind.READ_ONLY,
         decisionRunContext = decisionRunContext,
         toolCallLimiter = toolCallLimiter,
     ) { _, call ->
-        handleGetBalance(tradingRuntime, call)
+        handleGetBalance(
+            tradingRuntime = tradingRuntime,
+            call = call,
+            clock = clock,
+        )
     }
 }
 
@@ -732,17 +770,22 @@ private fun Server.registerPositionsTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    clock: Clock,
 ) {
     addLimitedTool(
         name = GET_POSITIONS_TOOL,
-        description = "Get open paper positions from the bot-managed position ledger.",
+        description = "Get open paper positions from the bot-managed position ledger. Response includes paper ledger freshness metadata.",
         inputSchema = ToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
         kind = McpToolCallKind.READ_ONLY,
         decisionRunContext = decisionRunContext,
         toolCallLimiter = toolCallLimiter,
     ) { _, call ->
-        handleGetPositions(tradingRuntime, call)
+        handleGetPositions(
+            tradingRuntime = tradingRuntime,
+            call = call,
+            clock = clock,
+        )
     }
 }
 
@@ -750,17 +793,22 @@ private fun Server.registerOpenOrdersTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    clock: Clock,
 ) {
     addLimitedTool(
         name = GET_OPEN_ORDERS_TOOL,
-        description = "Get open paper orders including protective STOP orders.",
+        description = "Get open paper orders including protective STOP orders. Response includes paper ledger freshness metadata.",
         inputSchema = ToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
         kind = McpToolCallKind.READ_ONLY,
         decisionRunContext = decisionRunContext,
         toolCallLimiter = toolCallLimiter,
     ) { _, call ->
-        handleGetOpenOrders(tradingRuntime, call)
+        handleGetOpenOrders(
+            tradingRuntime = tradingRuntime,
+            call = call,
+            clock = clock,
+        )
     }
 }
 
@@ -768,17 +816,22 @@ private fun Server.registerAccountStatusTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    clock: Clock,
 ) {
     addLimitedTool(
         name = GET_ACCOUNT_STATUS_TOOL,
-        description = "Get paper account status and DB-backed risk_state.",
+        description = "Get paper account status and DB-backed risk_state. Response includes paper ledger freshness metadata.",
         inputSchema = ToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
         kind = McpToolCallKind.READ_ONLY,
         decisionRunContext = decisionRunContext,
         toolCallLimiter = toolCallLimiter,
     ) { _, call ->
-        handleGetAccountStatus(tradingRuntime, call)
+        handleGetAccountStatus(
+            tradingRuntime = tradingRuntime,
+            call = call,
+            clock = clock,
+        )
     }
 }
 
@@ -865,13 +918,22 @@ private fun Server.registerSimulateToolTimeoutTool(
 private suspend fun handleGetBalance(
     tradingRuntime: TradingRuntime,
     call: GuardedToolCall,
+    clock: Clock,
 ): CallToolResult {
     val balance = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
-        tradingRuntime.broker.getBalance().getOrThrow()
+        BalanceToolOutput(
+            balance = tradingRuntime.broker.getBalance().getOrThrow(),
+            sourceTimestamp = tradingRuntime.broker.getAccountUpdatedAt().getOrThrow(),
+        )
     }
 
     return balance.fold(
-        onSuccess = { value -> balanceResult(value) },
+        onSuccess = { value ->
+            balanceResult(
+                output = value,
+                clock = clock,
+            )
+        },
         onFailure = { throwable -> throwableResult(throwable) },
     )
 }
@@ -879,13 +941,19 @@ private suspend fun handleGetBalance(
 private suspend fun handleGetPositions(
     tradingRuntime: TradingRuntime,
     call: GuardedToolCall,
+    clock: Clock,
 ): CallToolResult {
     val positions = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
         tradingRuntime.broker.getPositions().getOrThrow()
     }
 
     return positions.fold(
-        onSuccess = { value -> positionsResult(value) },
+        onSuccess = { value ->
+            positionsResult(
+                positions = value,
+                clock = clock,
+            )
+        },
         onFailure = { throwable -> throwableResult(throwable) },
     )
 }
@@ -893,13 +961,19 @@ private suspend fun handleGetPositions(
 private suspend fun handleGetOpenOrders(
     tradingRuntime: TradingRuntime,
     call: GuardedToolCall,
+    clock: Clock,
 ): CallToolResult {
     val openOrders = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
         tradingRuntime.broker.getOpenOrders().getOrThrow()
     }
 
     return openOrders.fold(
-        onSuccess = { value -> openOrdersResult(value) },
+        onSuccess = { value ->
+            openOrdersResult(
+                openOrders = value,
+                clock = clock,
+            )
+        },
         onFailure = { throwable -> throwableResult(throwable) },
     )
 }
@@ -907,13 +981,22 @@ private suspend fun handleGetOpenOrders(
 private suspend fun handleGetAccountStatus(
     tradingRuntime: TradingRuntime,
     call: GuardedToolCall,
+    clock: Clock,
 ): CallToolResult {
     val accountStatus = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
-        AccountStatusService(tradingRuntime.broker).getAccountStatus().getOrThrow()
+        AccountStatusToolOutput(
+            accountStatus = AccountStatusService(tradingRuntime.broker).getAccountStatus().getOrThrow(),
+            sourceTimestamp = tradingRuntime.broker.getAccountUpdatedAt().getOrThrow(),
+        )
     }
 
     return accountStatus.fold(
-        onSuccess = { value -> accountStatusResult(value) },
+        onSuccess = { value ->
+            accountStatusResult(
+                output = value,
+                clock = clock,
+            )
+        },
         onFailure = { throwable -> throwableResult(throwable) },
     )
 }
@@ -1535,37 +1618,88 @@ private fun parseDelayMs(request: CallToolRequest): Result<Long> {
     }
 }
 
-private fun balanceResult(balance: AccountSnapshot): CallToolResult {
-    val structuredContent = ToolJson.encodeToJsonElement(balance).jsonObject
+/**
+ * get_balance tool の内部出力。
+ *
+ * @param balance paper account snapshot
+ * @param sourceTimestamp paper_account.updated_at 由来の source timestamp
+ */
+private data class BalanceToolOutput(
+    val balance: AccountSnapshot,
+    val sourceTimestamp: Instant,
+)
+
+/**
+ * get_account_status tool の内部出力。
+ *
+ * @param accountStatus account status
+ * @param sourceTimestamp paper_account.updated_at 由来の source timestamp
+ */
+private data class AccountStatusToolOutput(
+    val accountStatus: AccountStatus,
+    val sourceTimestamp: Instant,
+)
+
+private fun balanceResult(output: BalanceToolOutput, clock: Clock): CallToolResult {
+    val structuredContent = ToolJson.encodeToJsonElement(output.balance)
+        .jsonObject
+        .withFreshness(
+            paperLedgerFreshness(
+                clock = clock,
+                sourceTimestamp = output.sourceTimestamp,
+            ),
+        )
 
     return jsonObjectResult(structuredContent)
 }
 
-private fun positionsResult(positions: List<Position>): CallToolResult {
+private fun positionsResult(positions: List<Position>, clock: Clock): CallToolResult {
     return jsonObjectResult(
         buildJsonObject {
             put("count", positions.size)
             put("positions", ToolJson.encodeToJsonElement(positions))
+            put(
+                "freshness",
+                ToolJson.encodeToJsonElement(
+                    paperLedgerFreshness(
+                        clock = clock,
+                        sourceTimestamp = null,
+                    ),
+                ),
+            )
         },
     )
 }
 
-private fun openOrdersResult(openOrders: List<Order>): CallToolResult {
+private fun openOrdersResult(openOrders: List<Order>, clock: Clock): CallToolResult {
     return jsonObjectResult(
         buildJsonObject {
             put("count", openOrders.size)
             put("orders", ToolJson.encodeToJsonElement(openOrders))
+            put(
+                "freshness",
+                ToolJson.encodeToJsonElement(
+                    paperLedgerFreshness(
+                        clock = clock,
+                        sourceTimestamp = null,
+                    ),
+                ),
+            )
         },
     )
 }
 
-private fun accountStatusResult(accountStatus: AccountStatus): CallToolResult {
-    val structuredContent = ToolJson.encodeToJsonElement(accountStatus).jsonObject
+private fun accountStatusResult(output: AccountStatusToolOutput, clock: Clock): CallToolResult {
+    val structuredContent = ToolJson.encodeToJsonElement(output.accountStatus)
+        .jsonObject
+        .withFreshness(
+            paperLedgerFreshness(
+                clock = clock,
+                sourceTimestamp = output.sourceTimestamp,
+            ),
+        )
 
-    return CallToolResult(
-        content = listOf(TextContent(ToolJson.encodeToString(accountStatus))),
-        structuredContent = structuredContent,
-    )
+    return jsonObjectResult(structuredContent)
 }
 
 private fun tradeIntentResult(snapshot: TradeIntentReviewSnapshot): CallToolResult {
@@ -1663,6 +1797,24 @@ private fun jsonObjectResult(structuredContent: JsonObject): CallToolResult {
     return CallToolResult(
         content = listOf(TextContent(structuredContent.toString())),
         structuredContent = structuredContent,
+    )
+}
+
+private fun JsonObject.withFreshness(freshness: FreshnessMetadata): JsonObject {
+    return buildJsonObject {
+        this@withFreshness.forEach { fieldName, value ->
+            put(fieldName, value)
+        }
+        put("freshness", ToolJson.encodeToJsonElement(freshness))
+    }
+}
+
+private fun paperLedgerFreshness(clock: Clock, sourceTimestamp: Instant?): FreshnessMetadata {
+    return FreshnessMetadata.build(
+        clock = clock,
+        sourceTimestamp = sourceTimestamp,
+        staleAfter = FreshnessDefaults.paperLedgerStaleAfter,
+        source = FreshnessSource.PAPER_LEDGER,
     )
 }
 

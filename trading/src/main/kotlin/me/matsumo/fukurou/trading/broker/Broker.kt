@@ -5,6 +5,7 @@ import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import java.time.Instant
 
 /**
  * paper broker の読み取り・副作用境界。
@@ -14,6 +15,11 @@ interface Broker {
      * 現在の残高 snapshot を返す。
      */
     suspend fun getBalance(): Result<AccountSnapshot>
+
+    /**
+     * paper account single row の更新時刻を返す。
+     */
+    suspend fun getAccountUpdatedAt(): Result<Instant>
 
     /**
      * 現在の open position 一覧を返す。

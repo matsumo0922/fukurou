@@ -230,6 +230,10 @@ private class FakeBroker : Broker {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 
+    override suspend fun getAccountUpdatedAt(): Result<Instant> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
     override suspend fun getPositions(): Result<List<Position>> {
         return Result.success(emptyList())
     }

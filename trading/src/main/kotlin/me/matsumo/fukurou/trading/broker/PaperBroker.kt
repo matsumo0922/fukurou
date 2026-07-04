@@ -42,7 +42,10 @@ import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.format.DateTimeParseException
 import java.util.UUID
+import java.util.logging.Level
+import java.util.logging.Logger
 
 /**
  * paper ledger を読み取る Broker 実装。
@@ -90,6 +93,10 @@ class PaperBroker(
 
     override suspend fun getBalance(): Result<AccountSnapshot> {
         return ledgerRepository.getAccountSnapshot()
+    }
+
+    override suspend fun getAccountUpdatedAt(): Result<Instant> {
+        return ledgerRepository.getAccountUpdatedAt()
     }
 
     override suspend fun getPositions(): Result<List<Position>> {
@@ -345,7 +352,16 @@ class PaperBroker(
     }
 
     private fun Ticker.marketDataObservedAtOrNull(): Instant? {
-        return runCatching { Instant.parse(timestamp) }.getOrNull()
+        return try {
+            Instant.parse(timestamp)
+        } catch (exception: DateTimeParseException) {
+            paperBrokerLogger.log(
+                Level.WARNING,
+                "PaperBroker could not parse ticker timestamp. Data quality probability cap will fail closed.",
+                exception,
+            )
+            null
+        }
     }
 
     private fun requireEntryIntentId(command: PlaceOrderCommand): UUID {
@@ -562,6 +578,8 @@ class PaperBroker(
         }
     }
 }
+
+private val paperBrokerLogger: Logger = Logger.getLogger(PaperBroker::class.java.name)
 
 private fun ClosePositionCommand.forCloseTarget(position: Position, targetCount: Int): ClosePositionCommand {
     if (targetCount <= 1) {

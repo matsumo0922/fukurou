@@ -41,6 +41,7 @@ import me.matsumo.fukurou.trading.safety.SafetyViolationRepository
 import me.matsumo.fukurou.trading.tool.CallerNoTradeGuard
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import java.time.Clock
+import java.time.Instant
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
@@ -189,6 +190,7 @@ object TradingRuntimeFactory {
         )
         val ledgerRepository = InMemoryPaperLedgerRepository(
             accountSnapshot = tradingConfig.paperAccount.toInitialAccountSnapshot(),
+            accountUpdatedAt = Instant.now(clock),
             fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
         )
         val broker = PaperBroker(

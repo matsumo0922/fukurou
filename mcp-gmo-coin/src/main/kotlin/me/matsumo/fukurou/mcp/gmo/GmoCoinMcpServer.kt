@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoUnlimitedDailyKlineRequestBudget
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import java.time.Clock
 
 /**
  * standalone GMO Coin MCP server 名。
@@ -40,9 +41,11 @@ fun main() {
  * GMO Coin Public API の read-only tools だけを公開する MCP stdio server。
  *
  * @param marketDataSource 市場データ取得元
+ * @param clock response 鮮度 metadata を作る clock
  */
 class GmoCoinMcpServer(
     private val marketDataSource: MarketDataSource = defaultStandaloneMarketDataSource(),
+    private val clock: Clock = Clock.systemUTC(),
 ) {
 
     /**
@@ -87,7 +90,10 @@ class GmoCoinMcpServer(
             ),
         )
 
-        server.registerGmoCoinMarketTools(marketDataSource)
+        server.registerGmoCoinMarketTools(
+            marketDataSource = marketDataSource,
+            clock = clock,
+        )
 
         return server
     }

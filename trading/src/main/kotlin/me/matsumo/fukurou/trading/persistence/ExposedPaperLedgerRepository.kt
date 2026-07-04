@@ -54,6 +54,16 @@ private const val SELECT_PAPER_ACCOUNT_SQL = """
 """
 
 /**
+ * paper account single row の updated_at を読む SQL。
+ */
+private const val SELECT_PAPER_ACCOUNT_UPDATED_AT_SQL = """
+    SELECT
+        updated_at
+    FROM paper_account
+    WHERE id = ?
+"""
+
+/**
  * open positions を読む SQL。
  */
 private const val SELECT_OPEN_POSITIONS_SQL = """
@@ -324,6 +334,16 @@ class ExposedPaperLedgerRepository(
         }
     }
 
+    override suspend fun getAccountUpdatedAt(): Result<Instant> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    selectPaperAccountUpdatedAt()
+                }
+            }
+        }
+    }
+
     override suspend fun getOpenPositions(): Result<List<Position>> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -460,6 +480,17 @@ internal fun JdbcTransaction.selectPaperAccount(): AccountSnapshot {
             require(resultSet.next()) { "paper_account single row was not initialized." }
 
             resultSet.toAccountSnapshot()
+        }
+    }
+}
+
+internal fun JdbcTransaction.selectPaperAccountUpdatedAt(): Instant {
+    return jdbcConnection().prepareStatement(SELECT_PAPER_ACCOUNT_UPDATED_AT_SQL).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) { "paper_account single row was not initialized." }
+
+            resultSet.getInstant("updated_at")
         }
     }
 }

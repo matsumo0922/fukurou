@@ -28,6 +28,7 @@ import java.util.UUID
  * unit test と明示 injection 用の mutable paper ledger repository。
  *
  * @param accountSnapshot 残高 snapshot
+ * @param accountUpdatedAt paper account 更新時刻
  * @param positions position 一覧
  * @param openOrders open order 一覧
  * @param executions execution 一覧
@@ -36,6 +37,7 @@ import java.util.UUID
  */
 class InMemoryPaperLedgerRepository(
     accountSnapshot: AccountSnapshot = PaperAccountConfig().toInitialAccountSnapshot(),
+    accountUpdatedAt: Instant = Instant.EPOCH,
     positions: List<Position> = emptyList(),
     openOrders: List<Order> = emptyList(),
     executions: List<Execution> = emptyList(),
@@ -45,12 +47,17 @@ class InMemoryPaperLedgerRepository(
 
     private val lock = Any()
     private var accountSnapshot: AccountSnapshot = accountSnapshot
+    private var accountUpdatedAt: Instant = accountUpdatedAt
     private val positions = positions.toMutableList()
     private val orders = openOrders.toMutableList()
     private val executions = executions.toMutableList()
 
     override suspend fun getAccountSnapshot(): Result<AccountSnapshot> {
         return Result.success(synchronized(lock) { accountSnapshot })
+    }
+
+    override suspend fun getAccountUpdatedAt(): Result<Instant> {
+        return Result.success(synchronized(lock) { accountUpdatedAt })
     }
 
     override suspend fun getOpenPositions(): Result<List<Position>> {
@@ -252,7 +259,12 @@ class InMemoryPaperLedgerRepository(
                 val closedPositionIds = mutableListOf<String>()
                 val executionIds = mutableListOf<String>()
 
-                updateMarksLocked(lastPrice, tickSnapshot.atr14Jpy?.toBigDecimal(), rules)
+                updateMarksLocked(
+                    lastPrice = lastPrice,
+                    atr14Jpy = tickSnapshot.atr14Jpy?.toBigDecimal(),
+                    rules = rules,
+                    updatedAt = tickSnapshot.observedAt,
+                )
 
                 if (!accountSnapshot.isHardHaltDrawdownReached()) {
                     fillTriggeredEntryOrdersLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, executionIds)
@@ -309,6 +321,7 @@ class InMemoryPaperLedgerRepository(
         )
         cancelOpenStopOrdersLocked(position.positionId, reasonJa)
         accountSnapshot = accountSnapshot.afterSellFill(realizedFill)
+        accountUpdatedAt = realizedFill.executedAt
         appendFillEquitySnapshot(realizedFill.executedAt)
 
         return PaperTradeResult(
@@ -411,6 +424,7 @@ class InMemoryPaperLedgerRepository(
         positions += position
         executions += fill.toExecution(entryOrder.orderId, position.positionId, command)
         accountSnapshot = accountSnapshot.afterBuyFill(fill)
+        accountUpdatedAt = fill.executedAt
         appendFillEquitySnapshot(fill.executedAt)
 
         return PaperTradeResult(
@@ -478,7 +492,12 @@ class InMemoryPaperLedgerRepository(
         }
     }
 
-    private fun updateMarksLocked(lastPrice: BigDecimal, atr14Jpy: BigDecimal?, rules: SymbolRules) {
+    private fun updateMarksLocked(
+        lastPrice: BigDecimal,
+        atr14Jpy: BigDecimal?,
+        rules: SymbolRules,
+        updatedAt: Instant,
+    ) {
         positions.replaceAll { position ->
             if (position.status != PositionStatus.OPEN) {
                 return@replaceAll position
@@ -512,6 +531,7 @@ class InMemoryPaperLedgerRepository(
         }
 
         accountSnapshot = accountSnapshot.withMarkPrice(lastPrice)
+        accountUpdatedAt = updatedAt
     }
 
     private fun updateLinkedStopOrderLocked(positionId: String, stopPrice: BigDecimal, reasonJa: String) {

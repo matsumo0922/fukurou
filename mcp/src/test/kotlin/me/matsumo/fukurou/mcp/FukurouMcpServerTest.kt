@@ -4,6 +4,7 @@ import io.modelcontextprotocol.kotlin.sdk.server.ClientConnection
 import io.modelcontextprotocol.kotlin.sdk.shared.RequestOptions
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequestParams
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.CreateMessageRequest
 import io.modelcontextprotocol.kotlin.sdk.types.CreateMessageResult
 import io.modelcontextprotocol.kotlin.sdk.types.ElicitRequest
@@ -19,13 +20,16 @@ import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import io.modelcontextprotocol.kotlin.sdk.types.ResourceUpdatedNotification
 import io.modelcontextprotocol.kotlin.sdk.types.ServerNotification
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
@@ -49,11 +53,14 @@ import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
+import java.time.Clock
 import java.time.Instant
+import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -101,6 +108,98 @@ class FukurouMcpServerTest {
                 "simulate_tool_timeout",
             ),
             server.tools.keys,
+        )
+    }
+
+    @Test
+    fun getBalanceTool_returnsFreshnessMetadataFromPaperAccountUpdatedAt() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_balance")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = fixedInstant().toString(),
+            stalenessMs = 0L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getPositionsTool_returnsFreshnessMetadataWithoutSourceTimestamp() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_positions")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = null,
+            stalenessMs = 0L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getOpenOrdersTool_returnsFreshnessMetadataWithoutSourceTimestamp() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_open_orders")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = null,
+            stalenessMs = 0L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getAccountStatusTool_returnsFreshnessMetadataFromPaperAccountUpdatedAt() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_account_status")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = fixedInstant().toString(),
+            stalenessMs = 0L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
         )
     }
 
@@ -726,6 +825,44 @@ private fun tradePlanRevisionDecisionArguments(parentTradePlanId: String, revisi
     put("trade_plan_time_stop_at", "2026-07-02T02:00:00Z")
 }
 
+private suspend fun callTool(
+    server: io.modelcontextprotocol.kotlin.sdk.server.Server,
+    toolName: String,
+    arguments: JsonObject = buildJsonObject {},
+): CallToolResult {
+    val request = CallToolRequest(
+        params = CallToolRequestParams(
+            name = toolName,
+            arguments = arguments,
+        ),
+    )
+
+    return server.tools.getValue(toolName).handler.invoke(TestClientConnection, request)
+}
+
+private fun assertFreshness(
+    structuredContent: JsonObject,
+    fetchedAt: String,
+    sourceTimestamp: String?,
+    stalenessMs: Long,
+    staleAfterMs: Long,
+    stale: Boolean,
+    source: String,
+) {
+    val freshness = structuredContent.getValue("freshness").jsonObject
+
+    assertEquals(fetchedAt, freshness.getValue("fetchedAt").jsonPrimitive.contentOrNull)
+    if (sourceTimestamp == null) {
+        assertNull(freshness.getValue("sourceTimestamp").jsonPrimitive.contentOrNull)
+    } else {
+        assertEquals(sourceTimestamp, freshness.getValue("sourceTimestamp").jsonPrimitive.contentOrNull)
+    }
+    assertEquals(stalenessMs, freshness.getValue("stalenessMs").jsonPrimitive.longOrNull)
+    assertEquals(staleAfterMs, freshness.getValue("staleAfterMs").jsonPrimitive.longOrNull)
+    assertEquals(stale, freshness.getValue("stale").jsonPrimitive.booleanOrNull)
+    assertEquals(source, freshness.getValue("source").jsonPrimitive.contentOrNull)
+}
+
 /**
  * JSON string array を作る。
  */
@@ -924,4 +1061,12 @@ private object FakeMarketDataSource : MarketDataSource {
             ),
         )
     }
+}
+
+private fun fixedClock(): Clock {
+    return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+private fun fixedInstant(): Instant {
+    return Instant.parse("2026-07-04T12:00:00Z")
 }

@@ -20,6 +20,11 @@ interface PaperLedgerRepository {
     suspend fun getAccountSnapshot(): Result<AccountSnapshot>
 
     /**
+     * paper account single row の更新時刻を返す。
+     */
+    suspend fun getAccountUpdatedAt(): Result<Instant>
+
+    /**
      * open position 一覧を返す。
      */
     suspend fun getOpenPositions(): Result<List<Position>>
