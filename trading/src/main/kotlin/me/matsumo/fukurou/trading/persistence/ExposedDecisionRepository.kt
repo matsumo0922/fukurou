@@ -26,6 +26,7 @@ import me.matsumo.fukurou.trading.decision.validateTradePlanLineage
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.ResultSet
 import java.time.Clock
@@ -247,6 +248,58 @@ private const val SELECT_LATEST_DECISION_BY_INVOCATION_ID_SQL = """
 """
 
 /**
+ * 作成時刻範囲で decisions を読む SQL。
+ */
+private const val SELECT_DECISIONS_CREATED_BETWEEN_SQL = """
+    SELECT
+        latest_decisions.id,
+        latest_decisions.invocation_id,
+        latest_decisions.llm_provider,
+        latest_decisions.prompt_hash,
+        latest_decisions.system_prompt_version,
+        latest_decisions.market_snapshot_id,
+        latest_decisions.action,
+        latest_decisions.setup_tags,
+        latest_decisions.estimated_win_probability,
+        latest_decisions.expected_r_multiple,
+        latest_decisions.round_trip_cost_r,
+        latest_decisions.tool_evidence_ids,
+        latest_decisions.fact_check,
+        latest_decisions.self_review,
+        latest_decisions.reason_ja,
+        latest_decisions.missing_data_ja,
+        latest_decisions.no_trade_conditions_ja,
+        latest_decisions.created_at
+    FROM (
+        SELECT
+            id,
+            invocation_id,
+            llm_provider,
+            prompt_hash,
+            system_prompt_version,
+            market_snapshot_id,
+            action,
+            setup_tags,
+            estimated_win_probability,
+            expected_r_multiple,
+            round_trip_cost_r,
+            tool_evidence_ids,
+            fact_check,
+            self_review,
+            reason_ja,
+            missing_data_ja,
+            no_trade_conditions_ja,
+            created_at
+        FROM decisions
+        WHERE created_at >= ?
+            AND created_at < ?
+        ORDER BY created_at DESC
+        LIMIT ?
+    ) latest_decisions
+    ORDER BY latest_decisions.created_at ASC
+"""
+
+/**
  * intent ID で falsifications を読む SQL。
  */
 private const val SELECT_FALSIFICATION_BY_INTENT_ID_SQL = """
@@ -331,6 +384,36 @@ class ExposedDecisionRepository(
                         tradeIntent = tradeIntent,
                         tradePlan = tradePlan,
                     )
+                }
+            }
+        }
+    }
+
+    override suspend fun findDecisionsCreatedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<DecisionJournalRecord>> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+
+                exposedTransaction(database) {
+                    selectDecisionsCreatedBetween(from, toExclusive, limit)
+                        .map { decision ->
+                            val tradeIntent = selectTradeIntentByDecisionId(decision.decisionId)
+                            val tradePlan = selectTradePlanByDecisionId(decision.decisionId)
+                            val falsification = tradeIntent?.let { intent -> selectFalsification(intent.intentId) }
+
+                            DecisionJournalRecord(
+                                decision = decision,
+                                tradeIntent = tradeIntent,
+                                tradePlan = tradePlan,
+                                falsification = falsification,
+                            )
+                        }
                 }
             }
         }
@@ -620,6 +703,25 @@ private fun JdbcTransaction.selectLatestDecisionByInvocationId(invocationId: Str
         statement.setString(1, invocationId)
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.toDecisionRecord() else null
+        }
+    }
+}
+
+private fun JdbcTransaction.selectDecisionsCreatedBetween(
+    from: Instant,
+    toExclusive: Instant,
+    limit: Int,
+): List<DecisionRecord> {
+    return jdbcConnection().prepareStatement(SELECT_DECISIONS_CREATED_BETWEEN_SQL).use { statement ->
+        statement.setLong(1, from.toEpochMilli())
+        statement.setLong(2, toExclusive.toEpochMilli())
+        statement.setInt(3, limit)
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(resultSet.toDecisionRecord())
+                }
+            }
         }
     }
 }

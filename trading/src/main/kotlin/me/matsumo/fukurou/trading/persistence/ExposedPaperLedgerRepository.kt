@@ -28,6 +28,7 @@ import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
@@ -120,6 +121,66 @@ private const val SELECT_OPEN_POSITIONS_WITH_ACCOUNT_UPDATED_AT_SQL = """
         AND positions.mode = paper_account.mode
     WHERE paper_account.id = ?
     ORDER BY positions.opened_at ASC NULLS LAST
+"""
+
+/**
+ * 指定範囲で close された positions を読む SQL。
+ */
+private const val SELECT_CLOSED_POSITIONS_CLOSED_BETWEEN_SQL = """
+    SELECT
+        latest_positions.id,
+        latest_positions.trade_group_id,
+        latest_positions.mode,
+        latest_positions.symbol,
+        latest_positions.side,
+        latest_positions.status,
+        latest_positions.opened_at,
+        latest_positions.closed_at,
+        latest_positions.size_btc,
+        latest_positions.average_entry_price_jpy,
+        latest_positions.current_price_jpy,
+        latest_positions.current_stop_loss_jpy,
+        latest_positions.current_take_profit_jpy,
+        latest_positions.unrealized_pnl_jpy,
+        latest_positions.unrealized_r,
+        latest_positions.pyramid_add_count,
+        latest_positions.highest_price_since_entry_jpy,
+        latest_positions.lowest_price_since_entry_jpy,
+        latest_positions.decision_run_id
+    FROM (
+        SELECT
+            id,
+            trade_group_id,
+            mode,
+            symbol,
+            side,
+            status,
+            opened_at,
+            closed_at,
+            size_btc,
+            average_entry_price_jpy,
+            current_price_jpy,
+            current_stop_loss_jpy,
+            current_take_profit_jpy,
+            unrealized_pnl_jpy,
+            unrealized_r,
+            pyramid_add_count,
+            highest_price_since_entry_jpy,
+            lowest_price_since_entry_jpy,
+            decision_run_id
+        FROM positions
+        WHERE status = ?
+            AND closed_at >= ?
+            AND closed_at < ?
+            AND mode = (
+                SELECT mode
+                FROM paper_account
+                WHERE id = ?
+            )
+        ORDER BY closed_at DESC
+        LIMIT ?
+    ) latest_positions
+    ORDER BY latest_positions.closed_at ASC
 """
 
 /**
@@ -325,6 +386,57 @@ private const val SELECT_EXECUTIONS_BY_ORDER_IDS_SUFFIX = """
 """
 
 /**
+ * position IDs に対応する executions を読む SQL prefix。
+ */
+private const val SELECT_EXECUTIONS_BY_POSITION_IDS_PREFIX = """
+    SELECT
+        bounded_executions.id,
+        bounded_executions.order_id,
+        bounded_executions.position_id,
+        bounded_executions.mode,
+        bounded_executions.symbol,
+        bounded_executions.side,
+        bounded_executions.price_jpy,
+        bounded_executions.size_btc,
+        bounded_executions.fee_jpy,
+        bounded_executions.realized_pnl_jpy,
+        bounded_executions.liquidity,
+        bounded_executions.executed_at
+    FROM (
+        SELECT
+            id,
+            order_id,
+            position_id,
+            mode,
+            symbol,
+            side,
+            price_jpy,
+            size_btc,
+            fee_jpy,
+            realized_pnl_jpy,
+            liquidity,
+            executed_at,
+            ROW_NUMBER() OVER (PARTITION BY position_id ORDER BY executed_at ASC) AS position_execution_number
+        FROM executions
+        WHERE position_id IN (
+"""
+
+/**
+ * position IDs に対応する executions を読む SQL suffix。
+ */
+private const val SELECT_EXECUTIONS_BY_POSITION_IDS_SUFFIX = """
+        )
+            AND mode = (
+                SELECT mode
+                FROM paper_account
+                WHERE id = ?
+            )
+    ) bounded_executions
+    WHERE bounded_executions.position_execution_number <= ?
+    ORDER BY bounded_executions.executed_at ASC
+"""
+
+/**
  * execution ledger を読む SQL。
  */
 private const val SELECT_EXECUTIONS_SQL = """
@@ -369,6 +481,11 @@ private const val SELECT_REALIZED_PNL_FOR_RANGE_SQL = """
  * 取引日判定に使う timezone。
  */
 private val TradingDateZone = ZoneId.of("Asia/Tokyo")
+
+/**
+ * closed position 1 件から読む executions の保守的な上限。
+ */
+private const val MAX_EXECUTIONS_PER_CLOSED_POSITION = 32
 
 /**
  * Exposed/JDBC で paper ledger を読む repository。
@@ -458,6 +575,28 @@ class ExposedPaperLedgerRepository(
             runCatching {
                 exposedTransaction(database) {
                     selectExecutions()
+                }
+            }
+        }
+    }
+
+    override suspend fun findClosedPositionsClosedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<ClosedPaperPosition>> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+
+                exposedTransaction(database) {
+                    selectClosedPositionsClosedBetween(
+                        from = from,
+                        toExclusive = toExclusive,
+                        limit = limit,
+                    )
                 }
             }
         }
@@ -612,6 +751,48 @@ internal fun JdbcTransaction.selectOpenPositionsWithUpdatedAt(): PositionsWithUp
     }
 }
 
+private fun JdbcTransaction.selectClosedPositionsClosedBetween(
+    from: Instant,
+    toExclusive: Instant,
+    limit: Int,
+): List<ClosedPaperPosition> {
+    val positionRows = selectClosedPositionRows(from, toExclusive, limit)
+    val positionIds = positionRows.map { row -> row.first.positionId }
+    val executionsByPositionId = selectExecutionsByPositionIds(positionIds)
+        .groupBy { execution -> execution.positionId }
+
+    return positionRows.map { row ->
+        val position = row.first
+
+        ClosedPaperPosition(
+            position = position,
+            decisionRunId = row.second,
+            executions = executionsByPositionId[position.positionId].orEmpty(),
+        )
+    }
+}
+
+private fun JdbcTransaction.selectClosedPositionRows(
+    from: Instant,
+    toExclusive: Instant,
+    limit: Int,
+): List<Pair<Position, String?>> {
+    return jdbcConnection().prepareStatement(SELECT_CLOSED_POSITIONS_CLOSED_BETWEEN_SQL).use { statement ->
+        statement.setString(1, PositionStatus.CLOSED.name)
+        statement.setLong(2, from.toEpochMilli())
+        statement.setLong(3, toExclusive.toEpochMilli())
+        statement.setInt(4, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.setInt(5, limit)
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(resultSet.toPosition() to resultSet.getString("decision_run_id"))
+                }
+            }
+        }
+    }
+}
+
 internal fun JdbcTransaction.selectOpenOrders(): List<Order> {
     return jdbcConnection().prepareStatement(SELECT_OPEN_ORDERS_SQL).use { statement ->
         statement.setString(1, OrderStatus.OPEN.name)
@@ -705,6 +886,24 @@ private fun JdbcTransaction.selectExecutionsByOrderIds(orderIds: List<String>): 
             statement.setObject(index + 1, UUID.fromString(orderId))
         }
         statement.setInt(orderIds.size + 1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
+    }
+}
+
+private fun JdbcTransaction.selectExecutionsByPositionIds(positionIds: List<String>): List<Execution> {
+    if (positionIds.isEmpty()) {
+        return emptyList()
+    }
+
+    val placeholders = positionIds.joinToString(separator = ",") { "?" }
+    val sql = "$SELECT_EXECUTIONS_BY_POSITION_IDS_PREFIX$placeholders$SELECT_EXECUTIONS_BY_POSITION_IDS_SUFFIX"
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        positionIds.forEachIndexed { index, positionId ->
+            statement.setObject(index + 1, UUID.fromString(positionId))
+        }
+        statement.setInt(positionIds.size + 1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.setInt(positionIds.size + 2, MAX_EXECUTIONS_PER_CLOSED_POSITION)
         statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
     }
 }

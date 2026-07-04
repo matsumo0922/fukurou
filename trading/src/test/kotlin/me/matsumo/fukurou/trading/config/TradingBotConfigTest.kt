@@ -31,6 +31,9 @@ class TradingBotConfigTest {
         assertEquals(false, config.daemon.enabled)
         assertEquals(Duration.ofMinutes(15), config.daemon.flatHeartbeatInterval)
         assertEquals(Duration.ofMinutes(15), config.daemon.holdingCheckInterval)
+        assertEquals(false, config.obsidian.enabled)
+        assertEquals("/vault", config.obsidian.vaultPath)
+        assertEquals(Duration.ofMinutes(5), config.obsidian.writeInterval)
         assertEquals(100, config.killCriterion.minClosedTrades)
         assertEquals(BigDecimal("0.8"), config.killCriterion.minProfitFactor)
         assertEquals(10, config.gmoPublicClient.rateLimit.permitsPerSecond)
@@ -75,6 +78,9 @@ class TradingBotConfigTest {
                 "FUKUROU_LLM_DAEMON_POLL_SECONDS" to "120",
                 "FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS" to "28800",
                 "FUKUROU_LLM_HOLDING_CHECK_SECONDS" to "14400",
+                "FUKUROU_OBSIDIAN_ENABLED" to "true",
+                "FUKUROU_OBSIDIAN_VAULT_PATH" to "/srv/fukurou/obsidian-vault",
+                "FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS" to "600",
                 "FUKUROU_KILL_MIN_CLOSED_TRADES" to "50",
                 "FUKUROU_KILL_MIN_PROFIT_FACTOR" to "0.9",
                 "FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC" to
@@ -117,6 +123,9 @@ class TradingBotConfigTest {
         assertEquals(Duration.ofSeconds(120), config.daemon.pollInterval)
         assertEquals(Duration.ofHours(8), config.daemon.flatHeartbeatInterval)
         assertEquals(Duration.ofHours(4), config.daemon.holdingCheckInterval)
+        assertEquals(true, config.obsidian.enabled)
+        assertEquals("/srv/fukurou/obsidian-vault", config.obsidian.vaultPath)
+        assertEquals(Duration.ofMinutes(10), config.obsidian.writeInterval)
         assertEquals(50, config.killCriterion.minClosedTrades)
         assertEquals(BigDecimal("0.9"), config.killCriterion.minProfitFactor)
         assertEquals(1, config.safetyFloor.economicEventBlackouts.size)
@@ -243,6 +252,11 @@ class TradingBotConfigTest {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_LLM_HOLDING_CHECK_SECONDS" to "600"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS" to "30"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

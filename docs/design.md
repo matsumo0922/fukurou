@@ -2995,6 +2995,14 @@ Instruments/BTC.md
 00_MOC/Knowledge Index.md
 ```
 
+#### 2026-07-04 A-2 Obsidian Writer 実装補足
+
+[実装済み: 2026-07-04] A-2 の Obsidian Writer は、PostgreSQL を正本として Daily / Trade Markdown を機械的に再生成する。生成対象は frontmatter、DB から直接導出できる数値、decision / TradePlan / falsification / execution の保存済み文字列、空の振り返り見出しだけに限定する。相場解釈、良し悪しの判断、教訓、失敗パターン、Knowledge note 本文、calibration 文は A-3 reflection runner の責務であり、A-2 では生成しない。
+
+[実装済み: 2026-07-04] outbox table と `knowledge_notes` table は A-2 では追加しない。note は DB 状態の純粋な派生物として扱い、writer tick ごとに同じ入力から同じ Markdown を組み立てる。既存 file と内容が同じ場合は書き換えず、差分がある場合だけ同一 directory 内の一時 file へ書いてから atomic replace を試みる。vault 書き込みに失敗しても trading / DB record には影響させず、次 tick で自然復旧させる。vault を削除した場合も、DB から復元できる。
+
+[実装済み: 2026-07-04] 実装 package は新 module `:trading.knowledge` ではなく、既存 `:trading` module の `me.matsumo.fukurou.trading.knowledge` とする。A-2 は既存 repository と typed config に薄く乗るだけで、module 分割による依存境界を増やす段階ではないため。
+
 ### 11.4 Trade note frontmatter例
 
 ```markdown
