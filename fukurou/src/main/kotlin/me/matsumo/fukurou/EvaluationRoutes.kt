@@ -410,7 +410,10 @@ private data class EvaluationDateRange(
     fun toPeriod(): EvaluationPeriod {
         return EvaluationPeriod(
             from = fromDate.atStartOfDay(EvaluationZone).toInstant(),
-            toExclusive = toDate.plusDays(1).atStartOfDay(EvaluationZone).toInstant(),
+            toExclusive = toDate
+                .plusDays(1)
+                .atStartOfDay(EvaluationZone)
+                .toInstant(),
         )
     }
 

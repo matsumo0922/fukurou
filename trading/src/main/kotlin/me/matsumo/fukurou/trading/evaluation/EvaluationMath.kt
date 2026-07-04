@@ -409,7 +409,9 @@ private fun ClosedTradeFact.marketRegimeBucketKey(
 
 private fun String.toLocalDateOrNull(zoneId: ZoneId): LocalDate? {
     val parsedDate = runCatching {
-        java.time.Instant.parse(this).atZone(zoneId).toLocalDate()
+        java.time.Instant.parse(this)
+            .atZone(zoneId)
+            .toLocalDate()
     }
 
     return parsedDate.getOrNull()
