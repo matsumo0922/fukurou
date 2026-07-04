@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.decision
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
@@ -122,6 +123,27 @@ class InMemoryDecisionRepository(
         }
     }
 
+    override suspend fun findDecisionsCreatedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<DecisionJournalRecord>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            mutex.withLock {
+                decisions
+                    .filter { decision -> decision.createdAt >= from && decision.createdAt < toExclusive }
+                    .sortedByDescending { decision -> decision.createdAt }
+                    .take(limit)
+                    .sortedBy { decision -> decision.createdAt }
+                    .map { decision -> decision.toJournalRecordLocked() }
+            }
+        }
+    }
+
     override suspend fun latestFalsification(intentId: UUID): Result<FalsificationRecord?> {
         return runCatching {
             mutex.withLock {
@@ -238,6 +260,23 @@ class InMemoryDecisionRepository(
      */
     suspend fun intentConsumptions(): List<TradeIntentConsumptionRecord> {
         return mutex.withLock { intentConsumptions.toList() }
+    }
+
+    private fun DecisionRecord.toJournalRecordLocked(): DecisionJournalRecord {
+        val tradeIntent = tradeIntents.firstOrNull { intent -> intent.decisionId == decisionId }
+        val tradePlan = tradePlans.firstOrNull { plan -> plan.decisionId == decisionId }
+        val falsification = tradeIntent?.let { intent ->
+            falsifications
+                .filter { candidate -> candidate.intentId == intent.intentId }
+                .maxByOrNull { candidate -> candidate.createdAt }
+        }
+
+        return DecisionJournalRecord(
+            decision = this,
+            tradeIntent = tradeIntent,
+            tradePlan = tradePlan,
+            falsification = falsification,
+        )
     }
 
     private fun appendIntentConsumptionLocked(

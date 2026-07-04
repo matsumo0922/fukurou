@@ -46,6 +46,9 @@ services:
       FUKUROU_LLM_DAEMON_POLL_SECONDS: ${FUKUROU_LLM_DAEMON_POLL_SECONDS:-60}
       FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS: ${FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS:-900}
       FUKUROU_LLM_HOLDING_CHECK_SECONDS: ${FUKUROU_LLM_HOLDING_CHECK_SECONDS:-900}
+      FUKUROU_OBSIDIAN_ENABLED: ${FUKUROU_OBSIDIAN_ENABLED:-false}
+      FUKUROU_OBSIDIAN_VAULT_PATH: ${FUKUROU_OBSIDIAN_VAULT_PATH:-/vault}
+      FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS: ${FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS:-300}
       FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC: ${FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC:-}
       FUKUROU_MCP_JAR_PATH: ${FUKUROU_MCP_JAR_PATH:-/app/fukurou-mcp-all.jar}
       FUKUROU_MCP_SERVER_NAME: ${FUKUROU_MCP_SERVER_NAME:-fukurou-mcp}
@@ -77,6 +80,9 @@ services:
         source: ${FUKUROU_CODEX_AUTH_FILE:-/srv/fukurou/codex/auth.json}
         target: /run/fukurou-codex-auth/auth.json
         read_only: true
+      - type: bind
+        source: ${FUKUROU_OBSIDIAN_VAULT_PATH_HOST:-/srv/fukurou/obsidian-vault}
+        target: /vault
     networks:
       - edge
       - data

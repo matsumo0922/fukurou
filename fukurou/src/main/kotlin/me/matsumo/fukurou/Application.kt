@@ -120,9 +120,18 @@ fun Application.module(
     } else {
         null
     }
+    val obsidianWriterWorker = if (databaseDataSource != null && database != null) {
+        startObsidianWriterWorker(
+            database = database,
+            clock = clock,
+        )
+    } else {
+        null
+    }
 
-    if (databaseDataSource != null || reconcilerWorker != null || llmDaemonWorker != null) {
+    if (databaseDataSource != null || reconcilerWorker != null || llmDaemonWorker != null || obsidianWriterWorker != null) {
         monitor.subscribe(ApplicationStopped) {
+            obsidianWriterWorker?.close()
             llmDaemonWorker?.close()
             reconcilerWorker?.close()
             databaseDataSource?.close()

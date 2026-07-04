@@ -45,6 +45,7 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
@@ -410,6 +411,88 @@ private const val INSERT_TEST_EXECUTION_SQL = """
 """
 
 /**
+ * Obsidian range query test 用 closed position 行を追加する SQL。
+ */
+private const val INSERT_OBSIDIAN_CLOSED_POSITION_SQL = """
+    INSERT INTO positions (
+        id,
+        trade_group_id,
+        mode,
+        symbol,
+        side,
+        status,
+        opened_at,
+        closed_at,
+        size_btc,
+        average_entry_price_jpy,
+        current_price_jpy,
+        current_stop_loss_jpy,
+        current_take_profit_jpy,
+        unrealized_pnl_jpy,
+        unrealized_r,
+        pyramid_add_count,
+        highest_price_since_entry_jpy,
+        lowest_price_since_entry_jpy,
+        decision_run_id
+    )
+    VALUES (
+        ?,
+        ?,
+        'PAPER',
+        'BTC',
+        'LONG',
+        'CLOSED',
+        ?,
+        ?,
+        0.005000000000,
+        10000000.00000000,
+        10100000.00000000,
+        NULL,
+        NULL,
+        0.00000000,
+        0,
+        0,
+        10100000.00000000,
+        10000000.00000000,
+        ?
+    )
+"""
+
+/**
+ * Obsidian range query test 用 execution 行を追加する SQL。
+ */
+private const val INSERT_OBSIDIAN_EXECUTION_SQL = """
+    INSERT INTO executions (
+        id,
+        order_id,
+        position_id,
+        mode,
+        symbol,
+        side,
+        price_jpy,
+        size_btc,
+        fee_jpy,
+        realized_pnl_jpy,
+        liquidity,
+        executed_at
+    )
+    VALUES (
+        ?,
+        ?,
+        ?,
+        'PAPER',
+        'BTC',
+        ?,
+        ?,
+        0.005000000000,
+        ?,
+        ?,
+        'TAKER',
+        ?
+    )
+"""
+
+/**
  * Exposed/Postgres 実装の DB 契約を実 Postgres で検証するテスト。
  */
 class PostgresPersistenceIntegrationTest {
@@ -489,6 +572,118 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(startedAt, record.startedAt)
         assertEquals(finishedAt, record.finishedAt)
         assertEquals(finish.errorMessage, record.errorMessage)
+    }
+
+    @Test
+    fun obsidian_range_queries_filterOrderLimitAndReturnFieldValuesInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val firstDecisionRepository = ExposedDecisionRepository(database, Clock.fixed(fixedInstant(), ZoneOffset.UTC))
+        val firstDecisionResult = firstDecisionRepository
+            .submitDecision(enterDecisionSubmission().copy(invocationId = "range-run-1"))
+            .getOrThrow()
+        firstDecisionRepository.submitFalsification(
+            FalsificationSubmission(
+                intentId = requireNotNull(firstDecisionResult.tradeIntent?.intentId),
+                verdict = FalsificationVerdict.APPROVED,
+                llmProvider = "codex",
+                reasonJa = "反証観点でも entry を拒否する理由が不足しています。",
+            ),
+        ).getOrThrow()
+        ExposedDecisionRepository(database, Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC))
+            .submitDecision(noTradeDecisionSubmission().copy(invocationId = "range-run-2"))
+            .getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        llmRunRepository.finish(
+            LlmRunFinish(
+                invocationId = "range-llm-1",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                status = LLM_RUN_STATUS_FAILED,
+                startedAt = fixedInstant(),
+                finishedAt = fixedInstant().plusSeconds(1),
+                errorMessage = "failure 1",
+            ),
+        ).getOrThrow()
+        llmRunRepository.finish(
+            LlmRunFinish(
+                invocationId = "range-llm-2",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                status = "NO_TRADE",
+                startedAt = fixedInstant().plusSeconds(60),
+                finishedAt = fixedInstant().plusSeconds(61),
+                errorMessage = null,
+            ),
+        ).getOrThrow()
+        val firstPositionId = UUID.randomUUID()
+        val secondPositionId = UUID.randomUUID()
+        insertObsidianClosedPositionRows(
+            database = database,
+            positionId = firstPositionId,
+            decisionRunId = "range-run-1",
+            closedAt = fixedInstant().plusSeconds(10),
+            realizedPnlJpy = BigDecimal("440"),
+        )
+        insertObsidianClosedPositionRows(
+            database = database,
+            positionId = secondPositionId,
+            decisionRunId = "range-run-2",
+            closedAt = fixedInstant().plusSeconds(70),
+            realizedPnlJpy = BigDecimal("-120"),
+        )
+
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val decisions = decisionRepository.findDecisionsCreatedBetween(
+            from = fixedInstant().minusSeconds(1),
+            toExclusive = fixedInstant().plusSeconds(120),
+            limit = 2,
+        ).getOrThrow()
+        val limitedDecisions = decisionRepository.findDecisionsCreatedBetween(
+            from = fixedInstant().minusSeconds(1),
+            toExclusive = fixedInstant().plusSeconds(120),
+            limit = 1,
+        ).getOrThrow()
+        val llmRuns = llmRunRepository.findRunsStartedBetween(
+            from = fixedInstant().minusSeconds(1),
+            toExclusive = fixedInstant().plusSeconds(120),
+            limit = 2,
+        ).getOrThrow()
+        val closedPositions = ExposedPaperLedgerRepository(database).findClosedPositionsClosedBetween(
+            from = fixedInstant(),
+            toExclusive = fixedInstant().plusSeconds(120),
+            limit = 2,
+        ).getOrThrow()
+        val limitedClosedPositions = ExposedPaperLedgerRepository(database).findClosedPositionsClosedBetween(
+            from = fixedInstant(),
+            toExclusive = fixedInstant().plusSeconds(120),
+            limit = 1,
+        ).getOrThrow()
+
+        assertEquals(listOf("range-run-1", "range-run-2"), decisions.map { decision -> decision.decision.submission.invocationId })
+        assertEquals(listOf("breakout", "trend-follow"), decisions.first().decision.submission.setupTags)
+        assertEquals("ブレイク継続を狙います。", decisions.first().decision.submission.reasonJa)
+        assertEquals(OrderSide.BUY, decisions.first().tradeIntent?.draft?.side)
+        assertEquals(BigDecimal("10500000.00000000"), decisions.first().tradePlan?.draft?.targetPriceJpy)
+        assertEquals(FalsificationVerdict.APPROVED, decisions.first().falsification?.verdict)
+        assertEquals("反証観点でも entry を拒否する理由が不足しています。", decisions.first().falsification?.reasonJa)
+        assertEquals(listOf("range-run-2"), limitedDecisions.map { decision -> decision.decision.submission.invocationId })
+        assertEquals(listOf("range-llm-1", "range-llm-2"), llmRuns.map { run -> run.invocationId })
+        assertEquals(
+            listOf("range-llm-2"),
+            llmRunRepository.findRunsStartedBetween(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(120),
+                limit = 1,
+            ).getOrThrow().map { run -> run.invocationId },
+        )
+        assertEquals(LLM_RUN_STATUS_FAILED, llmRuns.first().status)
+        assertEquals(listOf(firstPositionId.toString(), secondPositionId.toString()), closedPositions.map { position -> position.position.positionId })
+        assertEquals("range-run-1", closedPositions.first().decisionRunId)
+        assertEquals("10100000.00000000", closedPositions.first().executions.last().priceJpy)
+        assertEquals(listOf(secondPositionId.toString()), limitedClosedPositions.map { position -> position.position.positionId })
     }
 
     @Test
@@ -2278,6 +2473,87 @@ private fun insertLedgerRows(
         insertTestPosition(positionId, tradeGroupId, mode)
         insertTestOrder(positionId, tradeGroupId, mode)
         insertTestExecution(positionId, mode, realizedPnlJpy)
+    }
+}
+
+/**
+ * Obsidian range query 検証用 closed position と約定を追加する。
+ */
+private fun insertObsidianClosedPositionRows(
+    database: ExposedDatabase,
+    positionId: UUID,
+    decisionRunId: String,
+    closedAt: Instant,
+    realizedPnlJpy: BigDecimal,
+) {
+    exposedTransaction(database) {
+        val tradeGroupId = UUID.randomUUID()
+
+        insertObsidianClosedPosition(
+            positionId = positionId,
+            tradeGroupId = tradeGroupId,
+            decisionRunId = decisionRunId,
+            closedAt = closedAt,
+        )
+        insertObsidianExecution(
+            positionId = positionId,
+            side = OrderSide.BUY,
+            priceJpy = BigDecimal("10000000"),
+            feeJpy = BigDecimal("50"),
+            realizedPnlJpy = BigDecimal.ZERO,
+            executedAt = fixedInstant(),
+        )
+        insertObsidianExecution(
+            positionId = positionId,
+            side = OrderSide.SELL,
+            priceJpy = BigDecimal("10100000"),
+            feeJpy = BigDecimal("60"),
+            realizedPnlJpy = realizedPnlJpy,
+            executedAt = closedAt,
+        )
+    }
+}
+
+/**
+ * Obsidian range query 検証用 closed position 行を追加する。
+ */
+private fun JdbcTransaction.insertObsidianClosedPosition(
+    positionId: UUID,
+    tradeGroupId: UUID,
+    decisionRunId: String,
+    closedAt: Instant,
+) {
+    jdbcConnection().prepareStatement(INSERT_OBSIDIAN_CLOSED_POSITION_SQL).use { statement ->
+        statement.setObject(1, positionId)
+        statement.setObject(2, tradeGroupId)
+        statement.setLong(3, fixedInstant().toEpochMilli())
+        statement.setLong(4, closedAt.toEpochMilli())
+        statement.setString(5, decisionRunId)
+        statement.executeUpdate()
+    }
+}
+
+/**
+ * Obsidian range query 検証用 execution 行を追加する。
+ */
+private fun JdbcTransaction.insertObsidianExecution(
+    positionId: UUID,
+    side: OrderSide,
+    priceJpy: BigDecimal,
+    feeJpy: BigDecimal,
+    realizedPnlJpy: BigDecimal,
+    executedAt: Instant,
+) {
+    jdbcConnection().prepareStatement(INSERT_OBSIDIAN_EXECUTION_SQL).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setObject(2, UUID.randomUUID())
+        statement.setObject(3, positionId)
+        statement.setString(4, side.name)
+        statement.setBigDecimal(5, priceJpy)
+        statement.setBigDecimal(6, feeJpy)
+        statement.setBigDecimal(7, realizedPnlJpy)
+        statement.setLong(8, executedAt.toEpochMilli())
+        statement.executeUpdate()
     }
 }
 

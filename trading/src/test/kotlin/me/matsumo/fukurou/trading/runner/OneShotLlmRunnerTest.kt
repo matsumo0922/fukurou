@@ -795,6 +795,14 @@ private object FailingLlmRunRepository : LlmRunRepository {
     override suspend fun findByInvocationId(invocationId: String): Result<LlmRunRecord?> {
         return Result.failure(IllegalStateException("llm run read failed"))
     }
+
+    override suspend fun findRunsStartedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<LlmRunRecord>> {
+        return Result.failure(IllegalStateException("llm run range read failed"))
+    }
 }
 
 /**

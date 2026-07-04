@@ -2,7 +2,7 @@
 
 Fukurou の最小 Ktor backend を NAS 上で常時稼働させ、Cloudflare Tunnel + Access で公開・保護するための運用手順。
 
-この scaffold では `ktor` + `postgres` + `cloudflared` の 3 サービスを扱う。Step6 時点では Ktor backend、paper trading runtime、常駐 `ProtectionReconciler`、MCP stdio fat jar の image 同梱まで実装済み。daemon scheduler、LlmInvoker 本実装、Obsidian knowledge layer、live 実発注はまだ実装しない。
+この scaffold では `ktor` + `postgres` + `cloudflared` の 3 サービスを扱う。Step6 時点では Ktor backend、paper trading runtime、常駐 `ProtectionReconciler`、MCP stdio fat jar の image 同梱まで実装済み。daemon scheduler と Obsidian Writer は設定で有効化できる。LlmInvoker 本実装、Obsidian reflection runner、Knowledge note 育成、live 実発注はまだ実装しない。
 
 ## 全体像
 
@@ -59,6 +59,12 @@ deploy root を root 所有で作成する。
 sudo install -d -m 0755 /srv/fukurou
 ```
 
+Obsidian Writer を有効化する場合に備え、vault 用 directory を作成する。Ktor container は非 root の `appuser`（UID `10001`）で動くため、bind mount 元は UID `10001` が書き込める必要がある。
+
+```sh
+sudo install -d -m 0750 -o 10001 -g 10001 /srv/fukurou/obsidian-vault
+```
+
 root checkout を作成する。private repository の場合は read-only deploy key を先に登録しておく。
 
 ```sh
@@ -82,6 +88,11 @@ CLOUDFLARED_TUNNEL_TOKEN=
 POSTGRES_DB=fukurou
 POSTGRES_USER=fukurou
 POSTGRES_PASSWORD=
+
+FUKUROU_OBSIDIAN_ENABLED=false
+FUKUROU_OBSIDIAN_VAULT_PATH=/vault
+FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS=300
+# FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
 ```
 
 Cloudflare Access の `CF-Access-Client-Id` / `CF-Access-Client-Secret` は手元の検証環境で使う credential であり、NAS の `.env` には保存しない。

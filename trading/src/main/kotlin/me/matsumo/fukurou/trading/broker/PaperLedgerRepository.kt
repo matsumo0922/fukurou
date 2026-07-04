@@ -4,6 +4,7 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import java.math.BigDecimal
 import java.time.Instant
@@ -53,6 +54,15 @@ interface PaperLedgerRepository {
      * execution ledger の読み取りを返す。
      */
     suspend fun getExecutions(): Result<List<Execution>>
+
+    /**
+     * 指定範囲に close された position と関連 executions を返す。
+     */
+    suspend fun findClosedPositionsClosedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<ClosedPaperPosition>>
 
     /**
      * client_request_id に対応する既存 place_order 結果を返す。

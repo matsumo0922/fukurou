@@ -74,6 +74,38 @@ private const val SELECT_LLM_RUN_BY_INVOCATION_ID_SQL = """
 """
 
 /**
+ * started_at 範囲で llm_runs を読む SQL。
+ */
+private const val SELECT_LLM_RUNS_STARTED_BETWEEN_SQL = """
+    SELECT
+        latest_runs.invocation_id,
+        latest_runs.mode,
+        latest_runs.symbol,
+        latest_runs.trigger_kind,
+        latest_runs.status,
+        latest_runs.started_at,
+        latest_runs.finished_at,
+        latest_runs.error_message
+    FROM (
+        SELECT
+            invocation_id,
+            mode,
+            symbol,
+            trigger_kind,
+            status,
+            started_at,
+            finished_at,
+            error_message
+        FROM llm_runs
+        WHERE started_at >= ?
+            AND started_at < ?
+        ORDER BY started_at DESC
+        LIMIT ?
+    ) latest_runs
+    ORDER BY latest_runs.started_at ASC
+"""
+
+/**
  * Exposed/JDBC で llm_runs を保存する repository。
  *
  * @param database Exposed database
@@ -107,6 +139,28 @@ class ExposedLlmRunRepository(
             runCatching {
                 exposedTransaction(database) {
                     selectLlmRun(invocationId)
+                }
+            }
+        }
+    }
+
+    override suspend fun findRunsStartedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<LlmRunRecord>> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+
+                exposedTransaction(database) {
+                    selectLlmRunsStartedBetween(
+                        from = from,
+                        toExclusive = toExclusive,
+                        limit = limit,
+                    )
                 }
             }
         }
@@ -147,6 +201,25 @@ private fun JdbcTransaction.selectLlmRun(invocationId: String): LlmRunRecord? {
                 resultSet.toLlmRunRecord()
             } else {
                 null
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectLlmRunsStartedBetween(
+    from: Instant,
+    toExclusive: Instant,
+    limit: Int,
+): List<LlmRunRecord> {
+    return jdbcConnection().prepareStatement(SELECT_LLM_RUNS_STARTED_BETWEEN_SQL).use { statement ->
+        statement.setLong(1, from.toEpochMilli())
+        statement.setLong(2, toExclusive.toEpochMilli())
+        statement.setInt(3, limit)
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(resultSet.toLlmRunRecord())
+                }
             }
         }
     }

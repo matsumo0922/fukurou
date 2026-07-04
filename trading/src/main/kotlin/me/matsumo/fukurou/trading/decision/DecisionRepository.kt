@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.decision
 
+import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
@@ -22,6 +23,15 @@ interface DecisionRepository {
      * invocation ID に紐づく最新 decision と付随する intent / TradePlan を取得する。
      */
     suspend fun latestDecisionByInvocationId(invocationId: String): Result<DecisionSubmissionResult?>
+
+    /**
+     * 指定範囲に作成された decision を Obsidian note 用に取得する。
+     */
+    suspend fun findDecisionsCreatedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<DecisionJournalRecord>>
 
     /**
      * intent ID に紐づく最新 falsification を取得する。

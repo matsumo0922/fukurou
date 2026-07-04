@@ -16,6 +16,7 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.InMemoryEquitySnapshotRepository
 import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
+import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
@@ -32,6 +33,7 @@ import java.util.UUID
  * @param positions position 一覧
  * @param openOrders open order 一覧
  * @param executions execution 一覧
+ * @param decisionRunIdsByPositionId position ID と LLM invocation ID の対応
  * @param equitySnapshotRepository equity snapshot 保存先
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  */
@@ -41,6 +43,7 @@ class InMemoryPaperLedgerRepository(
     positions: List<Position> = emptyList(),
     openOrders: List<Order> = emptyList(),
     executions: List<Execution> = emptyList(),
+    decisionRunIdsByPositionId: Map<String, String?> = emptyMap(),
     internal val equitySnapshotRepository: InMemoryEquitySnapshotRepository = InMemoryEquitySnapshotRepository(),
     private val fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
 ) : PaperLedgerRepository {
@@ -51,6 +54,7 @@ class InMemoryPaperLedgerRepository(
     private val positions = positions.toMutableList()
     private val orders = openOrders.toMutableList()
     private val executions = executions.toMutableList()
+    private val decisionRunIdsByPositionId = decisionRunIdsByPositionId.toMutableMap()
 
     override suspend fun getAccountSnapshot(): Result<AccountSnapshot> {
         return Result.success(synchronized(lock) { accountSnapshot })
@@ -122,6 +126,52 @@ class InMemoryPaperLedgerRepository(
 
     override suspend fun getExecutions(): Result<List<Execution>> {
         return Result.success(synchronized(lock) { executions.toList() })
+    }
+
+    override suspend fun findClosedPositionsClosedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<ClosedPaperPosition>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            synchronized(lock) {
+                positions
+                    .filter { position -> position.status == PositionStatus.CLOSED }
+                    .mapNotNull { position -> position.toClosedPositionWithParsedInstantOrNull() }
+                    .filter { closedPosition ->
+                        val closedAt = closedPosition.closedAt
+
+                        closedAt >= from && closedAt < toExclusive
+                    }
+                    .sortedByDescending { closedPosition -> closedPosition.closedAt }
+                    .take(limit)
+                    .sortedBy { closedPosition -> closedPosition.closedAt }
+                    .map { closedPosition ->
+                        val position = closedPosition.position
+
+                        ClosedPaperPosition(
+                            position = position,
+                            decisionRunId = decisionRunIdsByPositionId[position.positionId],
+                            executions = executions
+                                .filter { execution -> execution.positionId == position.positionId }
+                                .sortedBy { execution -> Instant.parse(execution.executedAt) },
+                        )
+                    }
+            }
+        }
+    }
+
+    private fun Position.toClosedPositionWithParsedInstantOrNull(): ClosedPositionWithParsedInstant? {
+        val closedAtText = closedAt ?: return null
+
+        return ClosedPositionWithParsedInstant(
+            position = this,
+            closedAt = Instant.parse(closedAtText),
+        )
     }
 
     override suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?> {
@@ -451,6 +501,7 @@ class InMemoryPaperLedgerRepository(
         }
         orders += stopOrder
         positions += position
+        decisionRunIdsByPositionId[position.positionId] = command.auditContext.decisionRunContext.decisionRunId
         executions += fill.toExecution(entryOrder.orderId, position.positionId, command)
         accountSnapshot = accountSnapshot.afterBuyFill(fill)
         accountUpdatedAt = fill.executedAt
@@ -874,6 +925,17 @@ private fun Order.createEntryFill(ticker: Ticker, rules: SymbolRules, simulator:
 private fun fillInstantText(): String {
     return java.time.Instant.EPOCH.toString()
 }
+
+/**
+ * closed position と parsed closed_at の組。
+ *
+ * @param position closed position 本体
+ * @param closedAt parsed close instant
+ */
+private data class ClosedPositionWithParsedInstant(
+    val position: Position,
+    val closedAt: Instant,
+)
 
 /**
  * resting order 復元時の既定推定勝率。

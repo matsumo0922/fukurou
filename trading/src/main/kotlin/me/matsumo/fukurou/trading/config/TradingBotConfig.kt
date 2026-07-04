@@ -25,6 +25,7 @@ import java.time.Instant
  * @param decisionProtocol decision / Falsifier protocol 設定
  * @param runner LLM one-shot runner の保守的な上限設定
  * @param daemon Ktor 常駐 daemon scheduler 設定
+ * @param obsidian Obsidian vault への機械生成 note writer 設定
  * @param killCriterion 評価成績による HARD_HALT 基準
  * @param gmoPublicClient GMO Public API client 設定
  */
@@ -38,6 +39,7 @@ data class TradingBotConfig(
     val decisionProtocol: DecisionProtocolConfig = DecisionProtocolConfig(),
     val runner: LlmRunnerConfig = LlmRunnerConfig(),
     val daemon: LlmDaemonConfig = LlmDaemonConfig(),
+    val obsidian: ObsidianConfig = ObsidianConfig(),
     val killCriterion: KillCriterionConfig = KillCriterionConfig(),
     val gmoPublicClient: GmoPublicClientConfig = GmoPublicClientConfig(),
 ) {
@@ -86,9 +88,29 @@ data class TradingBotConfig(
                 decisionProtocol = environment.readDecisionProtocolConfig(),
                 runner = environment.readLlmRunnerConfig(),
                 daemon = environment.readLlmDaemonConfig(),
+                obsidian = environment.readObsidianConfig(),
                 killCriterion = environment.readKillCriterionConfig(),
                 gmoPublicClient = environment.readGmoPublicClientConfig(),
             )
+        }
+    }
+}
+
+/**
+ * Obsidian vault へ DB 由来の Markdown note を再生成する writer 設定。
+ *
+ * @param enabled writer を Ktor process 内で起動するか
+ * @param vaultPath container 内で writer が書き込む vault path
+ * @param writeInterval writer loop の確認間隔
+ */
+data class ObsidianConfig(
+    val enabled: Boolean = DEFAULT_OBSIDIAN_ENABLED,
+    val vaultPath: String = DEFAULT_OBSIDIAN_VAULT_PATH,
+    val writeInterval: Duration = DEFAULT_OBSIDIAN_WRITE_INTERVAL,
+) {
+    init {
+        require(writeInterval >= MIN_OBSIDIAN_WRITE_INTERVAL) {
+            "writeInterval must be greater than or equal to ${MIN_OBSIDIAN_WRITE_INTERVAL.seconds} seconds."
         }
     }
 }
@@ -411,6 +433,21 @@ private const val FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS_ENV = "FUKUROU_LLM_FLAT_HEA
 private const val FUKUROU_LLM_HOLDING_CHECK_SECONDS_ENV = "FUKUROU_LLM_HOLDING_CHECK_SECONDS"
 
 /**
+ * Obsidian writer 有効化の環境変数名。
+ */
+private const val FUKUROU_OBSIDIAN_ENABLED_ENV = "FUKUROU_OBSIDIAN_ENABLED"
+
+/**
+ * Obsidian vault path の環境変数名。
+ */
+private const val FUKUROU_OBSIDIAN_VAULT_PATH_ENV = "FUKUROU_OBSIDIAN_VAULT_PATH"
+
+/**
+ * Obsidian writer 間隔秒数の環境変数名。
+ */
+private const val FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS_ENV = "FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS"
+
+/**
  * kill 基準の最小 closed trade 数の環境変数名。
  */
 private const val FUKUROU_KILL_MIN_CLOSED_TRADES_ENV = "FUKUROU_KILL_MIN_CLOSED_TRADES"
@@ -484,6 +521,26 @@ val DEFAULT_LLM_HOLDING_CHECK_INTERVAL: Duration = Duration.ofMinutes(15)
  * LLM 起動予約を stale とみなす既定時間。
  */
 val DEFAULT_LLM_LAUNCH_RESERVATION_STALE_AFTER: Duration = Duration.ofMinutes(30)
+
+/**
+ * Obsidian writer 有効化の既定値。
+ */
+const val DEFAULT_OBSIDIAN_ENABLED = false
+
+/**
+ * Obsidian vault path の既定値。
+ */
+const val DEFAULT_OBSIDIAN_VAULT_PATH = "/vault"
+
+/**
+ * Obsidian writer loop 間隔の既定値。
+ */
+val DEFAULT_OBSIDIAN_WRITE_INTERVAL: Duration = Duration.ofMinutes(5)
+
+/**
+ * Obsidian writer loop 間隔の最小値。
+ */
+val MIN_OBSIDIAN_WRITE_INTERVAL: Duration = Duration.ofMinutes(1)
 
 /**
  * kill 基準の既定最小 closed trade 数。
@@ -664,6 +721,20 @@ private fun Map<String, String>.readLlmDaemonConfig(): LlmDaemonConfig {
             readOptional(FUKUROU_LLM_HOLDING_CHECK_SECONDS_ENV)
                 ?.toLong()
                 ?: DEFAULT_LLM_HOLDING_CHECK_INTERVAL.seconds,
+        ),
+    )
+}
+
+private fun Map<String, String>.readObsidianConfig(): ObsidianConfig {
+    return ObsidianConfig(
+        enabled = readOptional(FUKUROU_OBSIDIAN_ENABLED_ENV)?.toBooleanStrictOrNull()
+            ?: DEFAULT_OBSIDIAN_ENABLED,
+        vaultPath = readOptional(FUKUROU_OBSIDIAN_VAULT_PATH_ENV)
+            ?: DEFAULT_OBSIDIAN_VAULT_PATH,
+        writeInterval = Duration.ofSeconds(
+            readOptional(FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_OBSIDIAN_WRITE_INTERVAL.seconds,
         ),
     )
 }

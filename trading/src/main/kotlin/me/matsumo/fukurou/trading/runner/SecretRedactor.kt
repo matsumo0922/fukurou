@@ -23,15 +23,22 @@ class SecretRedactor(
      * 秘密値を `[REDACTED]` に置換し、長すぎる出力を切り詰める。
      */
     fun redactAndTruncate(value: String): String {
-        val redacted = secretValues.fold(value) { currentValue, secretValue ->
-            currentValue.replace(secretValue, REDACTION_PLACEHOLDER)
-        }
+        val redacted = redact(value)
 
         if (redacted.length <= maxOutputLength) {
             return redacted
         }
 
         return redacted.take(maxOutputLength) + TRUNCATED_SUFFIX
+    }
+
+    /**
+     * 秘密値を `[REDACTED]` に置換し、文字数は維持する。
+     */
+    fun redact(value: String): String {
+        return secretValues.fold(value) { currentValue, secretValue ->
+            currentValue.replace(secretValue, REDACTION_PLACEHOLDER)
+        }
     }
 
     companion object {

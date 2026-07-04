@@ -101,6 +101,15 @@ interface LlmRunRepository {
      * invocation_id で run-level 記録を取得する。
      */
     suspend fun findByInvocationId(invocationId: String): Result<LlmRunRecord?>
+
+    /**
+     * 指定範囲に開始した run-level 記録を取得する。
+     */
+    suspend fun findRunsStartedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<LlmRunRecord>>
 }
 
 /**
@@ -167,6 +176,26 @@ class InMemoryLlmRunRepository : LlmRunRepository {
                 records[invocationId]
             },
         )
+    }
+
+    override suspend fun findRunsStartedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<LlmRunRecord>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            synchronized(lock) {
+                records.values
+                    .filter { record -> record.startedAt >= from && record.startedAt < toExclusive }
+                    .sortedByDescending { record -> record.startedAt }
+                    .take(limit)
+                    .sortedBy { record -> record.startedAt }
+            }
+        }
     }
 
     /**
