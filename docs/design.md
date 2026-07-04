@@ -1333,6 +1333,8 @@ LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`
 | 安全バックストップ | DD閾値、STOP到達、データ不整合 | bypass | LLMを呼ばずコードで守る場合あり |
 | 手動 | WebUI/CLIで明示発火 | bypass可能 | 理由必須 |
 
+[実装済み: #55] `PRICE_MOVE` は GMO ticker の5分 window 変化率が1%以上のとき、`STOP_PROXIMITY` は保有中 LONG position の残り R が0.3以下のときに daemon reservation 経路で発火する。ticker が取得不能・stale・timestamp parse 不能な tick では市場系 trigger だけを見送り、flat heartbeat / holding dense check は従来通り fallback として残す。
+
 ### 6.2 daemonの責務
 
 [確定] daemonが唯一のマクロ・スケジューラである。`schedule_next_check` のようなLLM自己スケジュールは採用しない。

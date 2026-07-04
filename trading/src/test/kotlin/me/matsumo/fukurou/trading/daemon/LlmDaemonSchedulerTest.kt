@@ -3,17 +3,27 @@ package me.matsumo.fukurou.trading.daemon
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.domain.PositionSide
+import me.matsumo.fukurou.trading.domain.PositionStatus
+import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
 import me.matsumo.fukurou.trading.runner.OneShotRunnerResult
 import me.matsumo.fukurou.trading.runner.OneShotRunnerStatus
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
+import java.math.BigDecimal
 import java.nio.file.Path
 import java.time.Clock
 import java.time.Duration
@@ -286,25 +296,465 @@ class LlmDaemonSchedulerTest {
         assertEquals(2, fixture.launches.size)
         assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, retriedResult.triggerKind)
     }
+
+    @Test
+    fun priceMoveTriggerLaunchesForUpAndDownMovesWithAuditDetails() = runBlocking {
+        val upFixture = schedulerFixture()
+        upFixture.scheduler.tick()
+        upFixture.clock.advance(Duration.ofSeconds(300))
+        upFixture.tickerReader.currentPriceJpy = BigDecimal("10100000")
+
+        val upResult = upFixture.scheduler.tick()
+        val upPayload = upFixture.launchedPayload(LlmDaemonTriggerKind.PRICE_MOVE)
+        val upDetails = upPayload.getValue("details").jsonObject
+
+        assertIs<LlmDaemonTickResult.Launched>(upResult)
+        assertEquals(LlmDaemonTriggerKind.PRICE_MOVE, upResult.triggerKind)
+        assertEquals("price-move", upPayload.stringValue("triggerKey"))
+        assertEquals("0.01000000", upDetails.stringValue("changeRatio"))
+        assertEquals("300", upDetails.stringValue("windowSeconds"))
+        assertEquals("10000000", upDetails.stringValue("basePriceJpy"))
+        assertEquals("10100000", upDetails.stringValue("currentPriceJpy"))
+
+        val downFixture = schedulerFixture()
+        downFixture.scheduler.tick()
+        downFixture.clock.advance(Duration.ofSeconds(300))
+        downFixture.tickerReader.currentPriceJpy = BigDecimal("9900000")
+
+        val downResult = downFixture.scheduler.tick()
+        val downPayload = downFixture.launchedPayload(LlmDaemonTriggerKind.PRICE_MOVE)
+        val downDetails = downPayload.getValue("details").jsonObject
+
+        assertIs<LlmDaemonTickResult.Launched>(downResult)
+        assertEquals(LlmDaemonTriggerKind.PRICE_MOVE, downResult.triggerKind)
+        assertEquals("price-move", downPayload.stringValue("triggerKey"))
+        assertEquals("-0.01000000", downDetails.stringValue("changeRatio"))
+        assertEquals("10000000", downDetails.stringValue("basePriceJpy"))
+        assertEquals("9900000", downDetails.stringValue("currentPriceJpy"))
+    }
+
+    @Test
+    fun priceMoveKeepsWindowAgedBaseSampleAcrossTickJitter() = runBlocking {
+        val fixture = schedulerFixture()
+
+        fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofSeconds(301))
+        fixture.tickerReader.currentPriceJpy = BigDecimal("10100000")
+        val result = fixture.scheduler.tick()
+        val payload = fixture.launchedPayload(LlmDaemonTriggerKind.PRICE_MOVE)
+        val details = payload.getValue("details").jsonObject
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.PRICE_MOVE, result.triggerKind)
+        assertEquals("0.01000000", details.stringValue("changeRatio"))
+        assertEquals("10000000", details.stringValue("basePriceJpy"))
+        assertEquals("10100000", details.stringValue("currentPriceJpy"))
+    }
+
+    @Test
+    fun priceMoveBelowThresholdFallsBackToFlatHeartbeatWhenHeartbeatIsDue() = runBlocking {
+        val fixture = schedulerFixture()
+
+        fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofSeconds(300))
+        fixture.tickerReader.currentPriceJpy = BigDecimal("10090000")
+        val belowThresholdResult = fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofSeconds(300))
+        val waitingResult = fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofSeconds(300))
+        val heartbeatResult = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Skipped>(belowThresholdResult)
+        assertIs<LlmDaemonTickResult.Skipped>(waitingResult)
+        assertIs<LlmDaemonTickResult.Launched>(heartbeatResult)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, heartbeatResult.triggerKind)
+        assertEquals(2, fixture.launches.size)
+    }
+
+    @Test
+    fun priceMoveDoesNotFireUntilRestartedSchedulerAccumulatesWindowAgedSamples() = runBlocking {
+        val firstFixture = schedulerFixture()
+        firstFixture.scheduler.tick()
+        firstFixture.clock.advance(Duration.ofSeconds(60))
+        firstFixture.tickerReader.currentPriceJpy = BigDecimal("12000000")
+        val restartedFixture = schedulerFixture(
+            clock = firstFixture.clock,
+            riskStateRepository = firstFixture.riskStateRepository,
+            eventLog = firstFixture.eventLog,
+            reservations = firstFixture.reservations,
+            launches = firstFixture.launches,
+            idGenerator = firstFixture.idGenerator,
+        )
+        restartedFixture.tickerReader.currentPriceJpy = BigDecimal("12000000")
+
+        val restartedResult = restartedFixture.scheduler.tick()
+        restartedFixture.clock.advance(Duration.ofSeconds(240))
+        restartedFixture.tickerReader.currentPriceJpy = BigDecimal("12100000")
+        val beforeWindowResult = restartedFixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Skipped>(restartedResult)
+        assertIs<LlmDaemonTickResult.Skipped>(beforeWindowResult)
+        assertEquals(1, restartedFixture.launches.size)
+    }
+
+    @Test
+    fun priceMoveCooldownUsesPersistedReservationsAcrossSchedulerInstances() = runBlocking {
+        val fixture = schedulerFixture()
+        fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofSeconds(300))
+        fixture.tickerReader.currentPriceJpy = BigDecimal("10100000")
+        val firstPriceMoveResult = fixture.scheduler.tick()
+        val restartedFixture = schedulerFixture(
+            clock = fixture.clock,
+            riskStateRepository = fixture.riskStateRepository,
+            eventLog = fixture.eventLog,
+            reservations = fixture.reservations,
+            launches = fixture.launches,
+            idGenerator = fixture.idGenerator,
+        )
+
+        restartedFixture.tickerReader.currentPriceJpy = BigDecimal("10000000")
+        restartedFixture.scheduler.tick()
+        restartedFixture.clock.advance(Duration.ofSeconds(300))
+        restartedFixture.tickerReader.currentPriceJpy = BigDecimal("10200000")
+        val withinCooldownResult = restartedFixture.scheduler.tick()
+        restartedFixture.clock.advance(Duration.ofSeconds(300))
+        restartedFixture.tickerReader.currentPriceJpy = BigDecimal("10400000")
+        val afterCooldownResult = restartedFixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(firstPriceMoveResult)
+        assertEquals(LlmDaemonTriggerKind.PRICE_MOVE, firstPriceMoveResult.triggerKind)
+        assertIs<LlmDaemonTickResult.Skipped>(withinCooldownResult)
+        assertIs<LlmDaemonTickResult.Launched>(afterCooldownResult)
+        assertEquals(LlmDaemonTriggerKind.PRICE_MOVE, afterCooldownResult.triggerKind)
+        assertEquals(3, restartedFixture.launches.size)
+    }
+
+    @Test
+    fun stopProximityTriggerLaunchesForHoldingPositionWithAuditDetails() = runBlocking {
+        val positionsReader = FakePositionsReader()
+        positionsReader.currentPositions = listOf(
+            position(
+                positionId = "position-close-to-stop",
+                averageEntryPriceJpy = "100",
+                currentStopLossJpy = "90",
+            ),
+        )
+        val fixture = schedulerFixture(
+            hasOpenRisk = true,
+            positionsReader = positionsReader,
+        )
+        fixture.tickerReader.currentPriceJpy = BigDecimal("93")
+
+        val result = fixture.scheduler.tick()
+        val payload = fixture.launchedPayload(LlmDaemonTriggerKind.STOP_PROXIMITY)
+        val details = payload.getValue("details").jsonObject
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.STOP_PROXIMITY, result.triggerKind)
+        assertEquals("stop-proximity", payload.stringValue("triggerKey"))
+        assertEquals("position-close-to-stop", details.stringValue("positionId"))
+        assertEquals("0.30000000", details.stringValue("remainingR"))
+        assertEquals("90", details.stringValue("stopLossJpy"))
+        assertEquals("93", details.stringValue("currentPriceJpy"))
+    }
+
+    @Test
+    fun stopProximityAboveThresholdFallsBackToHoldingDenseCheck() = runBlocking {
+        val positionsReader = FakePositionsReader()
+        positionsReader.currentPositions = listOf(
+            position(
+                averageEntryPriceJpy = "100",
+                currentStopLossJpy = "90",
+            ),
+        )
+        val fixture = schedulerFixture(
+            hasOpenRisk = true,
+            positionsReader = positionsReader,
+        )
+        fixture.tickerReader.currentPriceJpy = BigDecimal("94")
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, result.triggerKind)
+    }
+
+    @Test
+    fun flatStateDoesNotEvaluateStopProximity() = runBlocking {
+        val positionsReader = FakePositionsReader()
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    priceMoveTriggerEnabled = false,
+                    stopProximityTriggerEnabled = true,
+                ),
+            ),
+            hasOpenRisk = false,
+            positionsReader = positionsReader,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
+        assertEquals(0, positionsReader.callCount)
+        assertEquals(0, fixture.tickerReader.callCount)
+    }
+
+    @Test
+    fun stopProximitySkipsMissingStopAndInvalidOneR() = runBlocking {
+        val positionsReader = FakePositionsReader()
+        positionsReader.currentPositions = listOf(
+            position(
+                positionId = "no-stop",
+                averageEntryPriceJpy = "100",
+                currentStopLossJpy = null,
+            ),
+            position(
+                positionId = "invalid-one-r",
+                averageEntryPriceJpy = "100",
+                currentStopLossJpy = "100",
+            ),
+        )
+        val fixture = schedulerFixture(
+            hasOpenRisk = true,
+            positionsReader = positionsReader,
+        )
+        fixture.tickerReader.currentPriceJpy = BigDecimal("100")
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, result.triggerKind)
+    }
+
+    @Test
+    fun holdingPriorityChoosesStopProximityBeforePriceMove() = runBlocking {
+        val positionsReader = FakePositionsReader()
+        positionsReader.currentPositions = listOf(
+            position(
+                averageEntryPriceJpy = "100",
+                currentStopLossJpy = "80",
+            ),
+        )
+        val fixture = schedulerFixture(
+            hasOpenRisk = true,
+            positionsReader = positionsReader,
+        )
+        fixture.tickerReader.currentPriceJpy = BigDecimal("100")
+        fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofSeconds(300))
+        positionsReader.currentPositions = listOf(
+            position(
+                averageEntryPriceJpy = "100",
+                currentStopLossJpy = "90",
+            ),
+        )
+        fixture.tickerReader.currentPriceJpy = BigDecimal("93")
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.STOP_PROXIMITY, result.triggerKind)
+    }
+
+    @Test
+    fun flatPriorityChoosesEconomicEventBeforePriceMove() = runBlocking {
+        val eventAt = fixedInstant().plus(Duration.ofSeconds(300))
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                events = listOf(
+                    EconomicEventBlackout(
+                        eventId = "cpi-20260703",
+                        eventName = "CPI",
+                        eventAt = eventAt,
+                        blackoutBefore = Duration.ZERO,
+                        blackoutAfter = Duration.ofMinutes(60),
+                    ),
+                ),
+            ),
+        )
+        fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofSeconds(300))
+        fixture.tickerReader.currentPriceJpy = BigDecimal("10100000")
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, result.triggerKind)
+    }
+
+    @Test
+    fun tickerFetchFailureFallsBackToFlatHeartbeat() = runBlocking {
+        val fixture = schedulerFixture()
+        fixture.tickerReader.forcedResult = Result.failure(IllegalStateException("ticker unavailable"))
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
+        assertEquals(1, fixture.tickerReader.callCount)
+    }
+
+    @Test
+    fun tickerReaderThrowFallsBackToFlatHeartbeat() = runBlocking {
+        val fixture = schedulerFixture()
+        fixture.tickerReader.forcedThrowable = IllegalStateException("ticker reader crashed")
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
+        assertEquals(1, fixture.tickerReader.callCount)
+    }
+
+    @Test
+    fun positionsReaderThrowFallsBackToHoldingDenseCheck() = runBlocking {
+        val positionsReader = FakePositionsReader()
+        positionsReader.forcedThrowable = IllegalStateException("positions reader crashed")
+        val fixture = schedulerFixture(
+            hasOpenRisk = true,
+            positionsReader = positionsReader,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, result.triggerKind)
+        assertEquals(1, positionsReader.callCount)
+    }
+
+    @Test
+    fun tickerTimestampParseFailureFallsBackToFlatHeartbeat() = runBlocking {
+        val fixture = schedulerFixture()
+        fixture.tickerReader.sourceTimestamp = null
+        fixture.tickerReader.forcedResult = Result.success(
+            LlmDaemonTickerSnapshot(
+                lastPriceJpy = BigDecimal("10000000"),
+                sourceTimestamp = null,
+            ),
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
+    }
+
+    @Test
+    fun staleTickerFallsBackToFlatHeartbeat() = runBlocking {
+        val fixture = schedulerFixture()
+        fixture.tickerReader.sourceTimestamp = fixedInstant().minus(Duration.ofSeconds(6))
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
+    }
+
+    @Test
+    fun disabledMarketTriggersDoNotFetchTicker() = runBlocking {
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    priceMoveTriggerEnabled = false,
+                    stopProximityTriggerEnabled = false,
+                ),
+            ),
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
+        assertEquals(0, fixture.tickerReader.callCount)
+    }
+
+    @Test
+    fun priceMoveDoesNotBypassDailyLaunchCap() = runBlocking {
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                runner = LlmRunnerConfig(maxInvocationsPerDay = 1),
+            ),
+        )
+        fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofSeconds(300))
+        fixture.tickerReader.currentPriceJpy = BigDecimal("10100000")
+
+        val result = fixture.scheduler.tick()
+        val skipEvents = fixture.eventLog.events()
+            .filter { event -> event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED }
+
+        assertIs<LlmDaemonTickResult.Skipped>(result)
+        assertEquals(LlmDaemonTriggerKind.PRICE_MOVE, result.triggerKind)
+        assertEquals("max_invocations_per_day_exceeded", result.reason)
+        assertTrue(skipEvents.any { event -> event.payload.contains("max_invocations_per_day_exceeded") })
+    }
+}
+
+private suspend fun SchedulerFixture.launchedPayload(triggerKind: LlmDaemonTriggerKind): JsonObject {
+    return eventLog.events()
+        .filter { event -> event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED }
+        .map { event -> Json.parseToJsonElement(event.payload).jsonObject }
+        .last { payload -> payload.stringValue("triggerKind") == triggerKind.name }
+}
+
+private fun JsonObject.stringValue(fieldName: String): String {
+    return getValue(fieldName).jsonPrimitive.content
+}
+
+private fun position(
+    positionId: String = "position-1",
+    averageEntryPriceJpy: String,
+    currentStopLossJpy: String?,
+): Position {
+    return Position(
+        positionId = positionId,
+        tradeGroupId = "trade-group-1",
+        symbol = TradingSymbol.BTC.apiSymbol,
+        mode = TradingMode.PAPER,
+        side = PositionSide.LONG,
+        status = PositionStatus.OPEN,
+        openedAt = fixedInstant().toString(),
+        closedAt = null,
+        sizeBtc = "0.01",
+        averageEntryPriceJpy = averageEntryPriceJpy,
+        currentPriceJpy = averageEntryPriceJpy,
+        currentStopLossJpy = currentStopLossJpy,
+        currentTakeProfitJpy = null,
+        unrealizedPnlJpy = "0",
+        unrealizedR = "0",
+        pyramidAddCount = 0,
+        highestPriceSinceEntryJpy = averageEntryPriceJpy,
+        lowestPriceSinceEntryJpy = averageEntryPriceJpy,
+    )
 }
 
 private fun schedulerFixture(
     tradingConfig: TradingBotConfig = tradingConfig(),
+    clock: MutableClock = MutableClock(fixedInstant()),
+    riskStateRepository: InMemoryRiskStateRepository = InMemoryRiskStateRepository(clock),
+    eventLog: InMemoryCommandEventLog = InMemoryCommandEventLog(),
+    reservations: InMemoryLlmLaunchReservationRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository),
+    launches: MutableList<OneShotRunnerRequest> = mutableListOf(),
+    idGenerator: () -> UUID = deterministicIds(),
     hasOpenRisk: Boolean = false,
     openRiskReader: LlmDaemonOpenRiskReader = LlmDaemonOpenRiskReader { Result.success(hasOpenRisk) },
+    tickerReader: FakeTickerReader = FakeTickerReader(clock),
+    positionsReader: FakePositionsReader = FakePositionsReader(),
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): SchedulerFixture {
-    val clock = MutableClock(fixedInstant())
-    val riskStateRepository = InMemoryRiskStateRepository(clock)
-    val eventLog = InMemoryCommandEventLog()
-    val reservations = InMemoryLlmLaunchReservationRepository(riskStateRepository)
-    val launches = mutableListOf<OneShotRunnerRequest>()
     val scheduler = LlmDaemonScheduler(
         tradingConfig = tradingConfig,
         riskStateRepository = riskStateRepository,
         commandEventLog = eventLog,
         launchReservationRepository = reservations,
         openRiskReader = openRiskReader,
+        tickerReader = tickerReader,
+        positionsReader = positionsReader,
         requestBase = OneShotRunnerRequest(
             repositoryRoot = Path.of(".").toAbsolutePath().normalize(),
             workingDirectory = Path.of(".").toAbsolutePath().normalize(),
@@ -315,7 +765,7 @@ private fun schedulerFixture(
             Result.success(launchHandler(request))
         },
         clock = clock,
-        idGenerator = deterministicIds(),
+        idGenerator = idGenerator,
     )
 
     return SchedulerFixture(
@@ -323,18 +773,23 @@ private fun schedulerFixture(
         clock = clock,
         riskStateRepository = riskStateRepository,
         eventLog = eventLog,
+        reservations = reservations,
         launches = launches,
+        idGenerator = idGenerator,
+        tickerReader = tickerReader,
+        positionsReader = positionsReader,
     )
 }
 
 private fun tradingConfig(
     runner: LlmRunnerConfig = LlmRunnerConfig(),
     events: List<EconomicEventBlackout> = emptyList(),
+    daemon: LlmDaemonConfig = LlmDaemonConfig(enabled = true),
 ): TradingBotConfig {
     return TradingBotConfig(
         runner = runner,
         safetyFloor = SafetyFloorConfig(economicEventBlackouts = events),
-        daemon = LlmDaemonConfig(enabled = true),
+        daemon = daemon,
     )
 }
 
@@ -367,15 +822,68 @@ private fun deterministicIds(): () -> UUID {
  * @param clock 可変 clock
  * @param riskStateRepository risk_state repository
  * @param eventLog command event log
+ * @param reservations LLM 起動予約 repository
  * @param launches one-shot 起動 request 一覧
+ * @param idGenerator deterministic invocation ID generator
+ * @param tickerReader fake ticker reader
+ * @param positionsReader fake positions reader
  */
 private data class SchedulerFixture(
     val scheduler: LlmDaemonScheduler,
     val clock: MutableClock,
     val riskStateRepository: InMemoryRiskStateRepository,
     val eventLog: InMemoryCommandEventLog,
+    val reservations: InMemoryLlmLaunchReservationRepository,
     val launches: MutableList<OneShotRunnerRequest>,
+    val idGenerator: () -> UUID,
+    val tickerReader: FakeTickerReader,
+    val positionsReader: FakePositionsReader,
 )
+
+/**
+ * scheduler test 用 fake ticker reader。
+ *
+ * @param clock source timestamp の既定値に使う clock
+ */
+private class FakeTickerReader(
+    private val clock: Clock,
+) : LlmDaemonTickerReader {
+
+    var currentPriceJpy: BigDecimal = BigDecimal("10000000")
+    var sourceTimestamp: Instant? = null
+    var forcedResult: Result<LlmDaemonTickerSnapshot>? = null
+    var forcedThrowable: Throwable? = null
+    var callCount: Int = 0
+
+    override suspend fun latestTicker(): Result<LlmDaemonTickerSnapshot> {
+        callCount += 1
+        forcedThrowable?.let { throwable -> throw throwable }
+
+        return forcedResult ?: Result.success(
+            LlmDaemonTickerSnapshot(
+                lastPriceJpy = currentPriceJpy,
+                sourceTimestamp = sourceTimestamp ?: clock.instant(),
+            ),
+        )
+    }
+}
+
+/**
+ * scheduler test 用 fake position reader。
+ */
+private class FakePositionsReader : LlmDaemonPositionsReader {
+
+    var currentPositions: List<Position> = emptyList()
+    var forcedThrowable: Throwable? = null
+    var callCount: Int = 0
+
+    override suspend fun positions(): Result<List<Position>> {
+        callCount += 1
+        forcedThrowable?.let { throwable -> throw throwable }
+
+        return Result.success(currentPositions)
+    }
+}
 
 /**
  * fake clock。

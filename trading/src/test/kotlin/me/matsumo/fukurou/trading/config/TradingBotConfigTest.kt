@@ -31,6 +31,13 @@ class TradingBotConfigTest {
         assertEquals(false, config.daemon.enabled)
         assertEquals(Duration.ofMinutes(15), config.daemon.flatHeartbeatInterval)
         assertEquals(Duration.ofMinutes(15), config.daemon.holdingCheckInterval)
+        assertEquals(true, config.daemon.priceMoveTriggerEnabled)
+        assertEquals(Duration.ofSeconds(300), config.daemon.priceMoveWindow)
+        assertEquals(BigDecimal("0.01"), config.daemon.priceMoveThresholdRatio)
+        assertEquals(Duration.ofSeconds(600), config.daemon.priceMoveCooldown)
+        assertEquals(true, config.daemon.stopProximityTriggerEnabled)
+        assertEquals(BigDecimal("0.3"), config.daemon.stopProximityRemainingRThreshold)
+        assertEquals(Duration.ofSeconds(900), config.daemon.stopProximityCooldown)
         assertEquals(false, config.obsidian.enabled)
         assertEquals("/vault", config.obsidian.vaultPath)
         assertEquals(Duration.ofMinutes(5), config.obsidian.writeInterval)
@@ -78,6 +85,13 @@ class TradingBotConfigTest {
                 "FUKUROU_LLM_DAEMON_POLL_SECONDS" to "120",
                 "FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS" to "28800",
                 "FUKUROU_LLM_HOLDING_CHECK_SECONDS" to "14400",
+                "FUKUROU_LLM_TRIGGER_PRICE_MOVE_ENABLED" to "false",
+                "FUKUROU_LLM_TRIGGER_PRICE_MOVE_WINDOW_SECONDS" to "600",
+                "FUKUROU_LLM_TRIGGER_PRICE_MOVE_THRESHOLD_RATIO" to "0.02",
+                "FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS" to "1200",
+                "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED" to "false",
+                "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_REMAINING_R_THRESHOLD" to "0.4",
+                "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_COOLDOWN_SECONDS" to "1800",
                 "FUKUROU_OBSIDIAN_ENABLED" to "true",
                 "FUKUROU_OBSIDIAN_VAULT_PATH" to "/srv/fukurou/obsidian-vault",
                 "FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS" to "600",
@@ -123,6 +137,13 @@ class TradingBotConfigTest {
         assertEquals(Duration.ofSeconds(120), config.daemon.pollInterval)
         assertEquals(Duration.ofHours(8), config.daemon.flatHeartbeatInterval)
         assertEquals(Duration.ofHours(4), config.daemon.holdingCheckInterval)
+        assertEquals(false, config.daemon.priceMoveTriggerEnabled)
+        assertEquals(Duration.ofSeconds(600), config.daemon.priceMoveWindow)
+        assertEquals(BigDecimal("0.02"), config.daemon.priceMoveThresholdRatio)
+        assertEquals(Duration.ofSeconds(1200), config.daemon.priceMoveCooldown)
+        assertEquals(false, config.daemon.stopProximityTriggerEnabled)
+        assertEquals(BigDecimal("0.4"), config.daemon.stopProximityRemainingRThreshold)
+        assertEquals(Duration.ofSeconds(1800), config.daemon.stopProximityCooldown)
         assertEquals(true, config.obsidian.enabled)
         assertEquals("/srv/fukurou/obsidian-vault", config.obsidian.vaultPath)
         assertEquals(Duration.ofMinutes(10), config.obsidian.writeInterval)
@@ -252,6 +273,31 @@ class TradingBotConfigTest {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_LLM_HOLDING_CHECK_SECONDS" to "600"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_TRIGGER_PRICE_MOVE_THRESHOLD_RATIO" to "0"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_TRIGGER_PRICE_MOVE_WINDOW_SECONDS" to "30"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS" to "30"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_REMAINING_R_THRESHOLD" to "0"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_COOLDOWN_SECONDS" to "30"),
             )
         }
         assertFailsWith<IllegalArgumentException> {
