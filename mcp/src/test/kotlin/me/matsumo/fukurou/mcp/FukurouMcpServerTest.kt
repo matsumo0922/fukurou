@@ -36,20 +36,36 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.Broker
+import me.matsumo.fukurou.trading.broker.CancelOrderCommand
+import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.PaperReconcileResult
+import me.matsumo.fukurou.trading.broker.PaperTradeResult
+import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.domain.AccountSnapshot
+import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
+import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.domain.ProtectionStatus
 import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradeSide
+import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
@@ -197,6 +213,78 @@ class FukurouMcpServerTest {
             fetchedAt = fixedInstant().toString(),
             sourceTimestamp = fixedInstant().toString(),
             stalenessMs = 0L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getBalanceTool_usesSingleAccountSnapshotForBodyAndFreshnessTimestamp() = runBlocking {
+        val sourceTimestamp = fixedInstant().minusSeconds(3)
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock()).copy(
+            broker = SnapshotOnlyBroker(
+                balance = AccountSnapshotWithUpdatedAt(
+                    accountSnapshot = accountSnapshot(totalEquityJpy = "123456.00000000"),
+                    updatedAt = sourceTimestamp,
+                ),
+                accountStatus = AccountStatusWithUpdatedAt(
+                    accountStatus = accountStatus(currentEquityJpy = "123456.00000000"),
+                    updatedAt = sourceTimestamp,
+                ),
+            ),
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_balance")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertEquals("123456.00000000", structuredContent.getValue("totalEquityJpy").jsonPrimitive.contentOrNull)
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = sourceTimestamp.toString(),
+            stalenessMs = 3_000L,
+            staleAfterMs = 10_000L,
+            stale = false,
+            source = "PAPER_LEDGER",
+        )
+    }
+
+    @Test
+    fun getAccountStatusTool_usesSingleAccountSnapshotForBodyAndFreshnessTimestamp() = runBlocking {
+        val sourceTimestamp = fixedInstant().minusSeconds(3)
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock()).copy(
+            broker = SnapshotOnlyBroker(
+                balance = AccountSnapshotWithUpdatedAt(
+                    accountSnapshot = accountSnapshot(totalEquityJpy = "654321.00000000"),
+                    updatedAt = sourceTimestamp,
+                ),
+                accountStatus = AccountStatusWithUpdatedAt(
+                    accountStatus = accountStatus(currentEquityJpy = "654321.00000000"),
+                    updatedAt = sourceTimestamp,
+                ),
+            ),
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(server, "get_account_status")
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertEquals("654321.00000000", structuredContent.getValue("currentEquityJpy").jsonPrimitive.contentOrNull)
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = sourceTimestamp.toString(),
+            stalenessMs = 3_000L,
             staleAfterMs = 10_000L,
             stale = false,
             source = "PAPER_LEDGER",
@@ -916,6 +1004,108 @@ private class CountFailingCommandEventLog(
     suspend fun events(): List<CommandEvent> {
         return delegate.events()
     }
+}
+
+/**
+ * account tool が snapshot 付き読み取りだけを使うことを検証する fake broker。
+ *
+ * @param balance get_balance 用の snapshot と更新時刻
+ * @param accountStatus get_account_status 用の status と更新時刻
+ */
+private class SnapshotOnlyBroker(
+    private val balance: AccountSnapshotWithUpdatedAt,
+    private val accountStatus: AccountStatusWithUpdatedAt,
+) : Broker {
+
+    override suspend fun getBalance(): Result<AccountSnapshot> {
+        return Result.failure(UnsupportedOperationException("getBalance must not be used for account freshness."))
+    }
+
+    override suspend fun getBalanceWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
+        return Result.success(balance)
+    }
+
+    override suspend fun getAccountUpdatedAt(): Result<Instant> {
+        return Result.failure(UnsupportedOperationException("getAccountUpdatedAt must not be used separately."))
+    }
+
+    override suspend fun getPositions(): Result<List<Position>> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun getOpenOrders(): Result<List<Order>> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun getAccountStatus(): Result<AccountStatus> {
+        return Result.failure(UnsupportedOperationException("getAccountStatus must not be used for account freshness."))
+    }
+
+    override suspend fun getAccountStatusWithUpdatedAt(): Result<AccountStatusWithUpdatedAt> {
+        return Result.success(accountStatus)
+    }
+
+    override suspend fun placeOrder(command: PlaceOrderCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun closePosition(command: ClosePositionCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun reconcile(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+}
+
+private fun accountSnapshot(
+    totalEquityJpy: String = "100000.00000000",
+): AccountSnapshot {
+    return AccountSnapshot(
+        mode = TradingMode.PAPER,
+        cashJpy = totalEquityJpy,
+        initialCashJpy = "100000.00000000",
+        btcQuantity = "0.000000000000",
+        btcMarkPriceJpy = "0.00000000",
+        totalEquityJpy = totalEquityJpy,
+        equityPeakJpy = totalEquityJpy,
+        drawdownRatio = "0.00000000",
+    )
+}
+
+private fun accountStatus(
+    currentEquityJpy: String = "100000.00000000",
+): AccountStatus {
+    return AccountStatus(
+        mode = TradingMode.PAPER,
+        riskState = "RUNNING",
+        drawdownRatio = "0.00000000",
+        hardHalt = false,
+        currentEquityJpy = currentEquityJpy,
+        todayRealizedPnlJpy = "0.00000000",
+        protectionStatus = ProtectionStatus(
+            protectedPositionCount = 0,
+            unprotectedPositionCount = 0,
+            orphanStopCount = 0,
+            orphanTakeProfitCount = 0,
+            pendingCancelCount = 0,
+            lastReconciledAt = null,
+            lastMarketDataAt = null,
+            tradingLockOwner = null,
+        ),
+    )
 }
 
 /**

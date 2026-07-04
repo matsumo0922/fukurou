@@ -95,6 +95,10 @@ class PaperBroker(
         return ledgerRepository.getAccountSnapshot()
     }
 
+    override suspend fun getBalanceWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
+        return ledgerRepository.getAccountSnapshotWithUpdatedAt()
+    }
+
     override suspend fun getAccountUpdatedAt(): Result<Instant> {
         return ledgerRepository.getAccountUpdatedAt()
     }
@@ -108,8 +112,13 @@ class PaperBroker(
     }
 
     override suspend fun getAccountStatus(): Result<AccountStatus> {
+        return getAccountStatusWithUpdatedAt().map { statusWithUpdatedAt -> statusWithUpdatedAt.accountStatus }
+    }
+
+    override suspend fun getAccountStatusWithUpdatedAt(): Result<AccountStatusWithUpdatedAt> {
         return runCatching {
-            val accountSnapshot = ledgerRepository.getAccountSnapshot().getOrThrow()
+            val accountSnapshotWithUpdatedAt = ledgerRepository.getAccountSnapshotWithUpdatedAt().getOrThrow()
+            val accountSnapshot = accountSnapshotWithUpdatedAt.accountSnapshot
             val riskState = riskStateRepository.current().getOrThrow()
             val positions = ledgerRepository.getOpenPositions().getOrThrow()
             val openOrders = ledgerRepository.getOpenOrders().getOrThrow()
@@ -117,14 +126,17 @@ class PaperBroker(
             val today = LocalDate.now(clock.withZone(tradingDateZone))
             val todayRealizedPnlJpy = ledgerRepository.getRealizedPnlForDate(today).getOrThrow()
 
-            AccountStatus(
-                mode = accountSnapshot.mode,
-                riskState = if (riskState.hardHalt) "HARD_HALT" else "RUNNING",
-                drawdownRatio = riskState.drawdownRatio.toPlainString(),
-                hardHalt = riskState.hardHalt,
-                currentEquityJpy = accountSnapshot.totalEquityJpy,
-                todayRealizedPnlJpy = todayRealizedPnlJpy.toPlainString(),
-                protectionStatus = protectionStatus(positions, openOrders, reconcilerStatus),
+            AccountStatusWithUpdatedAt(
+                accountStatus = AccountStatus(
+                    mode = accountSnapshot.mode,
+                    riskState = if (riskState.hardHalt) "HARD_HALT" else "RUNNING",
+                    drawdownRatio = riskState.drawdownRatio.toPlainString(),
+                    hardHalt = riskState.hardHalt,
+                    currentEquityJpy = accountSnapshot.totalEquityJpy,
+                    todayRealizedPnlJpy = todayRealizedPnlJpy.toPlainString(),
+                    protectionStatus = protectionStatus(positions, openOrders, reconcilerStatus),
+                ),
+                updatedAt = accountSnapshotWithUpdatedAt.updatedAt,
             )
         }
     }

@@ -40,6 +40,8 @@ import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolErrorResponse
 import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolExecutor
 import me.matsumo.fukurou.mcp.gmo.registerGmoCoinMarketTools
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
@@ -56,8 +58,6 @@ import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
-import me.matsumo.fukurou.trading.domain.AccountSnapshot
-import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
@@ -921,10 +921,7 @@ private suspend fun handleGetBalance(
     clock: Clock,
 ): CallToolResult {
     val balance = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
-        BalanceToolOutput(
-            balance = tradingRuntime.broker.getBalance().getOrThrow(),
-            sourceTimestamp = tradingRuntime.broker.getAccountUpdatedAt().getOrThrow(),
-        )
+        tradingRuntime.broker.getBalanceWithUpdatedAt().getOrThrow()
     }
 
     return balance.fold(
@@ -984,10 +981,7 @@ private suspend fun handleGetAccountStatus(
     clock: Clock,
 ): CallToolResult {
     val accountStatus = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
-        AccountStatusToolOutput(
-            accountStatus = AccountStatusService(tradingRuntime.broker).getAccountStatus().getOrThrow(),
-            sourceTimestamp = tradingRuntime.broker.getAccountUpdatedAt().getOrThrow(),
-        )
+        AccountStatusService(tradingRuntime.broker).getAccountStatusWithUpdatedAt().getOrThrow()
     }
 
     return accountStatus.fold(
@@ -1618,35 +1612,13 @@ private fun parseDelayMs(request: CallToolRequest): Result<Long> {
     }
 }
 
-/**
- * get_balance tool の内部出力。
- *
- * @param balance paper account snapshot
- * @param sourceTimestamp paper_account.updated_at 由来の source timestamp
- */
-private data class BalanceToolOutput(
-    val balance: AccountSnapshot,
-    val sourceTimestamp: Instant,
-)
-
-/**
- * get_account_status tool の内部出力。
- *
- * @param accountStatus account status
- * @param sourceTimestamp paper_account.updated_at 由来の source timestamp
- */
-private data class AccountStatusToolOutput(
-    val accountStatus: AccountStatus,
-    val sourceTimestamp: Instant,
-)
-
-private fun balanceResult(output: BalanceToolOutput, clock: Clock): CallToolResult {
-    val structuredContent = ToolJson.encodeToJsonElement(output.balance)
+private fun balanceResult(output: AccountSnapshotWithUpdatedAt, clock: Clock): CallToolResult {
+    val structuredContent = ToolJson.encodeToJsonElement(output.accountSnapshot)
         .jsonObject
         .withFreshness(
             paperLedgerFreshness(
                 clock = clock,
-                sourceTimestamp = output.sourceTimestamp,
+                sourceTimestamp = output.updatedAt,
             ),
         )
 
@@ -1689,13 +1661,13 @@ private fun openOrdersResult(openOrders: List<Order>, clock: Clock): CallToolRes
     )
 }
 
-private fun accountStatusResult(output: AccountStatusToolOutput, clock: Clock): CallToolResult {
+private fun accountStatusResult(output: AccountStatusWithUpdatedAt, clock: Clock): CallToolResult {
     val structuredContent = ToolJson.encodeToJsonElement(output.accountStatus)
         .jsonObject
         .withFreshness(
             paperLedgerFreshness(
                 clock = clock,
-                sourceTimestamp = output.sourceTimestamp,
+                sourceTimestamp = output.updatedAt,
             ),
         )
 

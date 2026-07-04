@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.FillSimulator
@@ -48,7 +49,8 @@ private const val SELECT_PAPER_ACCOUNT_SQL = """
         btc_mark_price_jpy,
         total_equity_jpy,
         equity_peak_jpy,
-        drawdown_ratio
+        drawdown_ratio,
+        updated_at
     FROM paper_account
     WHERE id = ?
 """
@@ -334,6 +336,16 @@ class ExposedPaperLedgerRepository(
         }
     }
 
+    override suspend fun getAccountSnapshotWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    selectPaperAccountWithUpdatedAt()
+                }
+            }
+        }
+    }
+
     override suspend fun getAccountUpdatedAt(): Result<Instant> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -484,6 +496,26 @@ internal fun JdbcTransaction.selectPaperAccount(): AccountSnapshot {
     }
 }
 
+/**
+ * paper_account single row と updated_at を同一 SELECT で取得する。
+ */
+internal fun JdbcTransaction.selectPaperAccountWithUpdatedAt(): AccountSnapshotWithUpdatedAt {
+    return jdbcConnection().prepareStatement(SELECT_PAPER_ACCOUNT_SQL).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) { "paper_account single row was not initialized." }
+
+            AccountSnapshotWithUpdatedAt(
+                accountSnapshot = resultSet.toAccountSnapshot(),
+                updatedAt = resultSet.getInstant("updated_at"),
+            )
+        }
+    }
+}
+
+/**
+ * paper_account single row の updated_at だけを SELECT する。
+ */
 internal fun JdbcTransaction.selectPaperAccountUpdatedAt(): Instant {
     return jdbcConnection().prepareStatement(SELECT_PAPER_ACCOUNT_UPDATED_AT_SQL).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)

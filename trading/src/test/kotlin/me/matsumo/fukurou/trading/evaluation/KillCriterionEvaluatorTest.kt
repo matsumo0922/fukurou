@@ -3,6 +3,8 @@ package me.matsumo.fukurou.trading.evaluation
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
@@ -230,6 +232,10 @@ private class FakeBroker : Broker {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 
+    override suspend fun getBalanceWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
     override suspend fun getAccountUpdatedAt(): Result<Instant> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
@@ -243,6 +249,10 @@ private class FakeBroker : Broker {
     }
 
     override suspend fun getAccountStatus(): Result<AccountStatus> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun getAccountStatusWithUpdatedAt(): Result<AccountStatusWithUpdatedAt> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 

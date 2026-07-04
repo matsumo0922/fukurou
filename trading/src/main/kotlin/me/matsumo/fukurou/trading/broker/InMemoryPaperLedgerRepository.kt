@@ -56,6 +56,17 @@ class InMemoryPaperLedgerRepository(
         return Result.success(synchronized(lock) { accountSnapshot })
     }
 
+    override suspend fun getAccountSnapshotWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
+        return Result.success(
+            synchronized(lock) {
+                AccountSnapshotWithUpdatedAt(
+                    accountSnapshot = accountSnapshot,
+                    updatedAt = accountUpdatedAt,
+                )
+            },
+        )
+    }
+
     override suspend fun getAccountUpdatedAt(): Result<Instant> {
         return Result.success(synchronized(lock) { accountUpdatedAt })
     }

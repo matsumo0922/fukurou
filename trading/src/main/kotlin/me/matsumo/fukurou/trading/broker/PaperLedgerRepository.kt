@@ -20,6 +20,11 @@ interface PaperLedgerRepository {
     suspend fun getAccountSnapshot(): Result<AccountSnapshot>
 
     /**
+     * paper account の残高 snapshot と更新時刻を同一読み取り由来で返す。
+     */
+    suspend fun getAccountSnapshotWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt>
+
+    /**
      * paper account single row の更新時刻を返す。
      */
     suspend fun getAccountUpdatedAt(): Result<Instant>
