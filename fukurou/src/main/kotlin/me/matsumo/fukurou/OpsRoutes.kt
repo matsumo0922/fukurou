@@ -106,6 +106,11 @@ internal fun Route.opsRoutes(
         summary = "取引停止状態を設定する"
         description = "SOFT_HALT または HARD_HALT を reason 付きで設定し、command_event_log に監査イベントを残します。"
         tag(OPS_TAG)
+        requestBody {
+            description = "停止 level と停止理由です。"
+            required = true
+            schema = jsonSchema<OpsHaltRequest>()
+        }
         responses {
             HttpStatusCode.OK {
                 description = "更新後の risk_state です。"
@@ -137,6 +142,11 @@ internal fun Route.opsRoutes(
         summary = "取引停止状態を解除する"
         description = "SOFT_HALT または HARD_HALT を RUNNING へ戻し、手動再開理由を監査イベントへ残します。"
         tag(OPS_TAG)
+        requestBody {
+            description = "再開理由です。"
+            required = true
+            schema = jsonSchema<OpsResumeRequest>()
+        }
         responses {
             HttpStatusCode.OK {
                 description = "更新後の risk_state です。"

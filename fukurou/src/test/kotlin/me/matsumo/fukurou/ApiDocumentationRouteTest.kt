@@ -63,6 +63,16 @@ class ApiDocumentationRouteTest {
             summary = "稼働中サーバーのリビジョンを取得する",
             tag = "リビジョン",
         )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/halt",
+            schemaRef = "#/components/schemas/OpsHaltRequest",
+        )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/resume",
+            schemaRef = "#/components/schemas/OpsResumeRequest",
+        )
     }
 
     private fun assertOperation(
@@ -83,5 +93,27 @@ class ApiDocumentationRouteTest {
 
         assertEquals(summary, operation.getValue("summary").jsonPrimitive.content)
         assertTrue(tags.contains(tag))
+    }
+
+    private fun assertPostRequestBodySchema(
+        paths: JsonObject,
+        path: String,
+        schemaRef: String,
+    ) {
+        val schema = paths
+            .getValue(path)
+            .jsonObject
+            .getValue("post")
+            .jsonObject
+            .getValue("requestBody")
+            .jsonObject
+            .getValue("content")
+            .jsonObject
+            .getValue("application/json")
+            .jsonObject
+            .getValue("schema")
+            .jsonObject
+
+        assertEquals(schemaRef, schema.getValue("\$ref").jsonPrimitive.content)
     }
 }
