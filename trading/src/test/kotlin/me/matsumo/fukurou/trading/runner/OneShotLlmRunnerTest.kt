@@ -58,9 +58,11 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
+import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ProcessRunner
@@ -508,6 +510,62 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun runnerAutoApprovesOnlyCodexFalsifierWriteTool() = runBlocking {
+        val fixture = requestCapturingRunnerFixture()
+
+        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        val proposerRequest = fixture.invoker.requests.single { request ->
+            request.phase == LlmInvocationPhase.PROPOSER
+        }
+        val falsifierRequest = fixture.invoker.requests.single { request ->
+            request.phase == LlmInvocationPhase.FALSIFIER
+        }
+
+        assertEquals(emptyList(), proposerRequest.mcpServer.autoApprovedTools)
+        assertEquals(listOf("submit_falsification"), falsifierRequest.mcpServer.autoApprovedTools)
+    }
+
+    @Test
+    fun runnerAutoApprovesCodexProposerWriteTool() = runBlocking {
+        val fixture = requestCapturingRunnerFixture(
+            proposerAction = DecisionAction.NO_TRADE,
+        )
+
+        fixture.runner.runOneShot(
+            defaultRequest().copy(
+                proposerProvider = LlmProvider.CODEX,
+            ),
+        ).getOrThrow()
+
+        val proposerRequest = fixture.invoker.requests.single()
+
+        assertEquals(LlmProvider.CODEX, proposerRequest.provider)
+        assertEquals(listOf("submit_decision"), proposerRequest.mcpServer.autoApprovedTools)
+    }
+
+    @Test
+    fun runnerDoesNotAutoApproveWhenFalsifierWriteToolIsNotAllowed() = runBlocking {
+        val readOnlyFalsifierTools = defaultFalsifierAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME)
+            .filterNot { toolName -> toolName.endsWith("__submit_falsification") }
+        val fixture = requestCapturingRunnerFixture()
+
+        fixture.runner.runOneShot(
+            defaultRequest().copy(
+                cliConfig = OneShotRunnerCliConfig(
+                    falsifierAllowedTools = readOnlyFalsifierTools,
+                ),
+            ),
+        ).getOrThrow()
+
+        val falsifierRequest = fixture.invoker.requests.single { request ->
+            request.phase == LlmInvocationPhase.FALSIFIER
+        }
+
+        assertEquals(emptyList(), falsifierRequest.mcpServer.autoApprovedTools)
+    }
+
+    @Test
     fun cliConfigRejectsFalsifierTradeToolOverride() {
         assertFailsWith<IllegalArgumentException> {
             OneShotRunnerCliConfig(
@@ -837,6 +895,17 @@ private data class RunnerFixture(
     val runner: OneShotLlmRunner,
 )
 
+/**
+ * request capture 用 runner fixture。
+ *
+ * @param invoker request capture 用 LLM invoker
+ * @param runner test target runner
+ */
+private data class RequestCapturingRunnerFixture(
+    val invoker: RequestCapturingLlmInvoker,
+    val runner: OneShotLlmRunner,
+)
+
 private fun runnerFixture(
     config: TradingBotConfig = TradingBotConfig(),
     parentEnvironment: Map<String, String> = defaultParentEnvironment(),
@@ -876,6 +945,34 @@ private fun runnerFixture(
     )
 }
 
+private fun requestCapturingRunnerFixture(
+    proposerAction: DecisionAction = DecisionAction.ENTER,
+    parentEnvironment: Map<String, String> = defaultParentEnvironment(),
+): RequestCapturingRunnerFixture {
+    val runtime = TradingRuntimeFactory.inMemory(
+        clock = fixedClock(),
+        marketDataSource = FakeMarketDataSource,
+    )
+    val decisionRepository = runtime.decisionRepository as InMemoryDecisionRepository
+    val invoker = RequestCapturingLlmInvoker(
+        repository = decisionRepository,
+        proposerAction = proposerAction,
+    )
+    val runner = OneShotLlmRunner(
+        tradingRuntime = runtime,
+        tradingConfig = TradingBotConfig(),
+        llmInvoker = invoker,
+        parentEnvironment = parentEnvironment,
+        clock = fixedClock(),
+        logger = {},
+    )
+
+    return RequestCapturingRunnerFixture(
+        invoker = invoker,
+        runner = runner,
+    )
+}
+
 /**
  * LLM 起動時に例外を投げる test double。
  *
@@ -907,6 +1004,37 @@ private class FailureResultLlmInvoker(
         }
 
         return Result.failure(failure)
+    }
+}
+
+/**
+ * 起動 request を保存しつつ in-memory repository に判断結果を入れる test double。
+ *
+ * @param repository 判断保存先 repository
+ * @param proposerAction Proposer が保存する action
+ */
+private class RequestCapturingLlmInvoker(
+    private val repository: DecisionRepository,
+    private val proposerAction: DecisionAction,
+) : LlmInvoker {
+    val requests = mutableListOf<LlmInvocationRequest>()
+
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        requests += request
+
+        when (request.phase) {
+            LlmInvocationPhase.PROPOSER -> submitDecisionFromRequest(repository, request, proposerAction).getOrThrow()
+            LlmInvocationPhase.FALSIFIER -> {
+                submitFalsificationFromRequest(repository, request, FalsificationVerdict.APPROVED).getOrThrow()
+            }
+        }
+
+        return Result.success(
+            LlmInvocationResult(
+                request = request,
+                processResult = cleanExit(),
+            ),
+        )
     }
 }
 
@@ -993,6 +1121,17 @@ private suspend fun submitDecision(
     )
 }
 
+private suspend fun submitDecisionFromRequest(
+    repository: DecisionRepository,
+    request: LlmInvocationRequest,
+    action: DecisionAction,
+): Result<Unit> {
+    return repository.submitDecision(decisionSubmissionFromRequest(request, action)).fold(
+        onSuccess = { Result.success(Unit) },
+        onFailure = { throwable -> Result.failure(throwable) },
+    )
+}
+
 private suspend fun submitFalsification(
     repository: DecisionRepository,
     command: RenderedLlmCommand,
@@ -1011,6 +1150,24 @@ private suspend fun submitFalsification(
     )
 }
 
+private suspend fun submitFalsificationFromRequest(
+    repository: DecisionRepository,
+    request: LlmInvocationRequest,
+    verdict: FalsificationVerdict,
+): Result<Unit> {
+    return repository.submitFalsification(
+        FalsificationSubmission(
+            intentId = UUID.fromString(requireNotNull(request.environment[FUKUROU_FALSIFIER_INTENT_ID_ENV])),
+            verdict = verdict,
+            llmProvider = request.decisionRunContext.llmProvider,
+            reasonJa = "runner test falsifier verdict",
+        ),
+    ).fold(
+        onSuccess = { Result.success(Unit) },
+        onFailure = { throwable -> Result.failure(throwable) },
+    )
+}
+
 private fun decisionSubmission(command: RenderedLlmCommand, action: DecisionAction): DecisionSubmission {
     return DecisionSubmission(
         invocationId = command.environment[FUKUROU_INVOCATION_ID_ENV],
@@ -1018,6 +1175,31 @@ private fun decisionSubmission(command: RenderedLlmCommand, action: DecisionActi
         promptHash = command.environment[FUKUROU_PROMPT_HASH_ENV],
         systemPromptVersion = command.environment[FUKUROU_SYSTEM_PROMPT_VERSION_ENV],
         marketSnapshotId = command.environment[FUKUROU_MARKET_SNAPSHOT_ID_ENV],
+        action = action,
+        setupTags = if (action == DecisionAction.ENTER) listOf("runner-test") else emptyList(),
+        estimatedWinProbability = BigDecimal("0.60"),
+        expectedRMultiple = if (action == DecisionAction.ENTER) BigDecimal("2.0") else null,
+        roundTripCostR = if (action == DecisionAction.ENTER) BigDecimal("0.1") else null,
+        toolEvidenceIds = listOf("tool-1"),
+        factCheckJson = "{}",
+        selfReviewJson = "{}",
+        reasonJa = "runner test decision",
+        missingDataJa = emptyList(),
+        noTradeConditionsJa = emptyList(),
+        entryIntent = if (action == DecisionAction.ENTER) entryIntentDraft() else null,
+        tradePlan = if (action == DecisionAction.ENTER) tradePlanDraft() else null,
+    )
+}
+
+private fun decisionSubmissionFromRequest(request: LlmInvocationRequest, action: DecisionAction): DecisionSubmission {
+    val context = request.decisionRunContext
+
+    return DecisionSubmission(
+        invocationId = context.decisionRunId,
+        llmProvider = context.llmProvider,
+        promptHash = context.promptHash,
+        systemPromptVersion = context.systemPromptVersion,
+        marketSnapshotId = context.marketSnapshotId,
         action = action,
         setupTags = if (action == DecisionAction.ENTER) listOf("runner-test") else emptyList(),
         estimatedWinProbability = BigDecimal("0.60"),

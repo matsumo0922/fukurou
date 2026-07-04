@@ -115,6 +115,26 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
+    fun renderClaude_ignoresCodexAutoApprovedTools() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CLAUDE,
+            phase = LlmInvocationPhase.PROPOSER,
+            mcpServerName = "custom-mcp",
+            autoApprovedTools = listOf("submit_decision"),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val configPath = Path.of(command.args[command.args.indexOf("--mcp-config") + 1])
+        val configContent = Files.readString(configPath)
+
+        assertFalse(configContent.contains("approval_mode"))
+        assertFalse(configContent.contains("tools"))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
     fun renderCodex_defaultFalsifierArgsDoNotBypassSandbox() {
         val renderer = DefaultLlmCommandRenderer()
         val request = request(
@@ -127,6 +147,101 @@ class DefaultLlmCommandRendererTest {
         val joinedArgs = command.args.joinToString(" ")
 
         assertFalse(joinedArgs.contains("--dangerously-bypass-approvals-and-sandbox"))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderCodex_includesSkipGitRepoCheckAndAutoApprovesOnlyRequestedWriteTool() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "fukurou-mcp",
+            autoApprovedTools = listOf("submit_falsification"),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val codexHome = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV]))
+        val configContent = Files.readString(codexHome.resolve(CODEX_CONFIG_FILE_NAME))
+
+        assertTrue(command.args.contains("--skip-git-repo-check"))
+        assertTrue(configContent.contains("[mcp_servers.\"fukurou-mcp\".tools.\"submit_falsification\"]"))
+        assertTrue(configContent.contains("approval_mode = \"approve\""))
+        assertFalse(configContent.contains("[mcp_servers.\"fukurou-mcp\".tools.\"get_ticker\"]"))
+        assertFalse(configContent.contains("default_tools_approval_mode"))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderCodex_deduplicatesSkipGitRepoCheckFromConfiguredCommonArgs() {
+        val renderer = DefaultLlmCommandRenderer(
+            config = LlmCommandRendererConfig(
+                codexCommonArgs = listOf("--skip-git-repo-check", "--headless-test"),
+            ),
+        )
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "fukurou-mcp",
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val skipGitRepoCheckCount = command.args.count { argument ->
+            argument == "--skip-git-repo-check"
+        }
+
+        assertEquals(1, skipGitRepoCheckCount)
+        assertTrue(command.args.contains("--headless-test"))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderCodex_emptyAutoApprovedToolsPreservesConfigWithoutToolStanza() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            mcpEnvironment = emptyMap(),
+            autoApprovedTools = emptyList(),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val codexHome = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV]))
+        val configContent = Files.readString(codexHome.resolve(CODEX_CONFIG_FILE_NAME))
+        val expectedConfigContent = """
+            |[mcp_servers."custom-mcp"]
+            |command = "java"
+            |args = ["-jar", "mcp.jar"]
+            |
+        """.trimMargin()
+
+        assertEquals(expectedConfigContent, configContent)
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderCodex_autoApprovedToolsWorkWithoutEnvironmentTable() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            mcpEnvironment = emptyMap(),
+            autoApprovedTools = listOf("submit_falsification"),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val codexHome = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV]))
+        val configContent = Files.readString(codexHome.resolve(CODEX_CONFIG_FILE_NAME))
+
+        assertFalse(configContent.contains("[mcp_servers.\"custom-mcp\".env]"))
+        assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\".tools.\"submit_falsification\"]"))
+        assertTrue(configContent.contains("approval_mode = \"approve\""))
 
         command.deleteCleanupPaths()
     }
@@ -145,6 +260,7 @@ class DefaultLlmCommandRendererTest {
             provider = LlmProvider.CODEX,
             phase = LlmInvocationPhase.FALSIFIER,
             mcpServerName = "custom-mcp",
+            autoApprovedTools = listOf("submit_falsification"),
         )
 
         val firstCommand = renderer.render(request).getOrThrow()
@@ -155,6 +271,7 @@ class DefaultLlmCommandRendererTest {
         assertEquals(persistentCodexHome.toString(), firstCommand.environment[CODEX_HOME_ENV])
         assertEquals(persistentCodexHome.toString(), secondCommand.environment[CODEX_HOME_ENV])
         assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\"]"))
+        assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\".tools.\"submit_falsification\"]"))
         assertTrue(Files.exists(configPath))
         assertEquals("""{"token":"persistent-auth-token"}""", Files.readString(authFile))
         assertFalse(firstCommand.cleanupPaths.contains(authFile))
@@ -363,6 +480,7 @@ class DefaultLlmCommandRendererTest {
         allowedTools: List<String> = emptyList(),
         mcpEnvironment: Map<String, String> = mapOf("FUKUROU_INVOCATION_ID" to "invocation-test"),
         environment: Map<String, String> = emptyMap(),
+        autoApprovedTools: List<String> = emptyList(),
     ): LlmInvocationRequest {
         return LlmInvocationRequest(
             invocationId = "invocation-test",
@@ -383,6 +501,7 @@ class DefaultLlmCommandRendererTest {
                 command = "java",
                 args = listOf("-jar", "mcp.jar"),
                 environment = mcpEnvironment,
+                autoApprovedTools = autoApprovedTools,
             ),
             environment = environment,
             allowedTools = allowedTools,

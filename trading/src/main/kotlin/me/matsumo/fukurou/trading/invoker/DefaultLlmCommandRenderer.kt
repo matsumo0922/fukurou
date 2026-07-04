@@ -166,9 +166,10 @@ class DefaultLlmCommandRenderer(
             persistentHome = config.codexPersistentHome,
         )
         val commandEnvironment = request.environment + (CODEX_HOME_ENV to codexHome.path.toString())
+        val codexCommonArgs = config.codexCommonArgs.withoutDuplicatedEnforcedCodexArgs()
         val args = listOf("exec") +
             config.codexModelArgs() +
-            config.codexCommonArgs +
+            codexCommonArgs +
             ENFORCED_CODEX_COMMON_ARGS +
             phaseArgs +
             request.prompt
@@ -259,6 +260,15 @@ private fun LlmMcpServerConfig.toCodexConfigToml(): String {
                 append(value.tomlQuoted())
                 append("\n")
             }
+        }
+
+        autoApprovedTools.forEach { toolName ->
+            append("[mcp_servers.")
+            append(name.tomlKey())
+            append(".tools.")
+            append(toolName.tomlKey())
+            append("]\n")
+            append("approval_mode = \"approve\"\n")
         }
     }
 }
@@ -464,10 +474,20 @@ val DEFAULT_CODEX_COMMON_ARGS = emptyList<String>()
  * Codex headless 実行で常に付ける安全側引数。
  */
 val ENFORCED_CODEX_COMMON_ARGS = listOf(
+    "--skip-git-repo-check",
     "--sandbox",
     "read-only",
     "-c",
     "approval_policy=\"never\"",
+)
+
+/**
+ * operator 設定から除外する Codex enforced 引数。
+ *
+ * renderer が同じ flag を強制付与するため、CLI へ二重渡ししない。
+ */
+val DEDUPED_ENFORCED_CODEX_COMMON_FLAGS = setOf(
+    "--skip-git-repo-check",
 )
 
 /**
@@ -595,6 +615,14 @@ const val FUKUROU_CODEX_PERSISTENT_HOME_ENV = "FUKUROU_CODEX_PERSISTENT_HOME"
 private fun List<String>.filterUnsafeArgs(forbiddenFlags: Set<String>): List<String> {
     return filter { argument ->
         forbiddenFlags.any { forbiddenFlag -> argument.matchesForbiddenFlag(forbiddenFlag) }
+    }
+}
+
+private fun List<String>.withoutDuplicatedEnforcedCodexArgs(): List<String> {
+    return filterNot { argument ->
+        DEDUPED_ENFORCED_CODEX_COMMON_FLAGS.any { enforcedFlag ->
+            argument.matchesForbiddenFlag(enforcedFlag)
+        }
     }
 }
 

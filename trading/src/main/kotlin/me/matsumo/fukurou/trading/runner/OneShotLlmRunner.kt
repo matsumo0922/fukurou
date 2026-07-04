@@ -743,6 +743,7 @@ class OneShotLlmRunner(
                 context = decisionRunContext,
                 cliConfig = request.cliConfig,
                 allowedTools = allowedTools,
+                provider = provider,
             ),
             environment = childEnvironment(decisionRunContext, intentId),
             allowedTools = allowedTools,
@@ -754,6 +755,7 @@ class OneShotLlmRunner(
         context: DecisionRunContext,
         cliConfig: OneShotRunnerCliConfig,
         allowedTools: List<String>,
+        provider: LlmProvider,
     ): LlmMcpServerConfig {
         return LlmMcpServerConfig(
             name = cliConfig.mcpServerName,
@@ -763,6 +765,7 @@ class OneShotLlmRunner(
                 context = context,
                 allowedTools = allowedTools,
             ),
+            autoApprovedTools = autoApprovedTools(provider, allowedTools),
         )
     }
 
@@ -870,6 +873,16 @@ class OneShotLlmRunner(
             LlmInvocationPhase.PROPOSER -> cliConfig.proposerAllowedTools
             LlmInvocationPhase.FALSIFIER -> cliConfig.falsifierAllowedTools
         }
+    }
+
+    private fun autoApprovedTools(provider: LlmProvider, allowedTools: List<String>): List<String> {
+        if (provider != LlmProvider.CODEX) {
+            return emptyList()
+        }
+
+        return shortMcpToolNames(allowedTools)
+            .filter { toolName -> toolName in CODEX_AUTO_APPROVED_WRITE_TOOL_NAMES }
+            .distinct()
     }
 
     private fun logHuman(message: String) {
@@ -1073,7 +1086,7 @@ private val DEFAULT_PROPOSER_TOOL_NAMES = listOf(
     "get_positions",
     "get_open_orders",
     "get_account_status",
-    "submit_decision",
+    SUBMIT_DECISION_TOOL_NAME,
 )
 
 /**
@@ -1091,14 +1104,32 @@ private val DEFAULT_FALSIFIER_TOOL_NAMES = listOf(
     "get_positions",
     "get_open_orders",
     "get_account_status",
-    "submit_falsification",
+    SUBMIT_FALSIFICATION_TOOL_NAME,
+)
+
+/**
+ * Proposer の最終判断を保存する write tool 名。
+ */
+private const val SUBMIT_DECISION_TOOL_NAME = "submit_decision"
+
+/**
+ * Falsifier の反証結果を保存する write tool 名。
+ */
+private const val SUBMIT_FALSIFICATION_TOOL_NAME = "submit_falsification"
+
+/**
+ * Codex の tool 単位承認免除を許可する write tool 名。
+ */
+private val CODEX_AUTO_APPROVED_WRITE_TOOL_NAMES = setOf(
+    SUBMIT_DECISION_TOOL_NAME,
+    SUBMIT_FALSIFICATION_TOOL_NAME,
 )
 
 /**
  * Proposer に許可してはいけない tool の短い名前。
  */
 private val PROPOSER_FORBIDDEN_TOOL_NAMES = setOf(
-    "submit_falsification",
+    SUBMIT_FALSIFICATION_TOOL_NAME,
     "place_order",
     "close_position",
     "update_protection",
@@ -1110,7 +1141,7 @@ private val PROPOSER_FORBIDDEN_TOOL_NAMES = setOf(
  * Falsifier に許可してはいけない tool の短い名前。
  */
 private val FALSIFIER_FORBIDDEN_TOOL_NAMES = setOf(
-    "submit_decision",
+    SUBMIT_DECISION_TOOL_NAME,
     "place_order",
     "close_position",
     "update_protection",
