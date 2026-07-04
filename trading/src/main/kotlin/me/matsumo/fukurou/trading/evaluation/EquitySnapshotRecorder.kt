@@ -5,15 +5,9 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import java.time.Clock
 import java.time.Instant
 import java.time.LocalDate
-import java.time.ZoneId
 import java.util.UUID
 import java.util.logging.Level
 import java.util.logging.Logger
-
-/**
- * equity snapshot の取引日判定に使う timezone。
- */
-val EQUITY_SNAPSHOT_TRADING_DATE_ZONE: ZoneId = ZoneId.of("Asia/Tokyo")
 
 /**
  * Reconciler pass 内で JST 日次 equity snapshot を一度だけ保存する recorder。
@@ -54,14 +48,32 @@ class EquitySnapshotRecorder(
 
                 return Result.success(Unit)
             }
-            val snapshot = accountSnapshot.toEquitySnapshotRecord(
-                id = idGenerator(),
-                reason = EquitySnapshotReason.DAILY,
-                tradingDate = tradingDate,
-                capturedAt = capturedAt,
-            )
+            val snapshot = runCatching {
+                accountSnapshot.toEquitySnapshotRecord(
+                    id = idGenerator(),
+                    reason = EquitySnapshotReason.DAILY,
+                    tradingDate = tradingDate,
+                    capturedAt = capturedAt,
+                )
+            }.getOrElse { throwable ->
+                lastRecordedDate = previousRecordedDate
+                logger.log(Level.WARNING, "EquitySnapshotRecorder daily snapshot build failed.", throwable)
 
-            repository.appendDailyIfAbsent(snapshot).onFailure { throwable ->
+                return Result.success(Unit)
+            }
+
+            val appendResult = try {
+                repository.appendDailyIfAbsent(snapshot)
+            } catch (throwable: CancellationException) {
+                throw throwable
+            } catch (throwable: Throwable) {
+                lastRecordedDate = previousRecordedDate
+                logger.log(Level.WARNING, "EquitySnapshotRecorder daily snapshot append failed.", throwable)
+
+                return Result.success(Unit)
+            }
+
+            appendResult.onFailure { throwable ->
                 lastRecordedDate = previousRecordedDate
                 logger.log(Level.WARNING, "EquitySnapshotRecorder daily snapshot append failed.", throwable)
             }
@@ -70,7 +82,9 @@ class EquitySnapshotRecorder(
         } catch (throwable: CancellationException) {
             throw throwable
         } catch (throwable: Throwable) {
-            Result.failure(throwable)
+            logger.log(Level.WARNING, "EquitySnapshotRecorder daily snapshot record failed.", throwable)
+
+            Result.success(Unit)
         }
     }
 }

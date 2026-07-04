@@ -5,7 +5,13 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import java.math.BigDecimal
 import java.time.Instant
 import java.time.LocalDate
+import java.time.ZoneId
 import java.util.UUID
+
+/**
+ * equity snapshot の取引日判定に使う timezone。
+ */
+val EQUITY_SNAPSHOT_TRADING_DATE_ZONE: ZoneId = ZoneId.of("Asia/Tokyo")
 
 /**
  * equity_snapshots を追加する理由。
@@ -61,7 +67,9 @@ data class EquitySnapshotRecord(
  */
 interface EquitySnapshotRepository {
     /**
-     * FILL / BOOTSTRAP snapshot を append-only で保存する。
+     * append-only snapshot を保存する。
+     *
+     * FILL / BOOTSTRAP は重複防御なしで保存し、DAILY は [appendDailyIfAbsent] を使う。
      */
     suspend fun append(snapshot: EquitySnapshotRecord): Result<Unit>
 
@@ -97,6 +105,20 @@ fun AccountSnapshot.toEquitySnapshotRecord(
         totalEquityJpy = totalEquityJpy.toBigDecimal(),
         equityPeakJpy = equityPeakJpy.toBigDecimal(),
         drawdownRatio = drawdownRatio.toBigDecimal(),
+    )
+}
+
+/**
+ * 約定時の account snapshot を FILL snapshot record に変換する。
+ */
+fun AccountSnapshot.toFillEquitySnapshotRecord(id: UUID, capturedAt: Instant): EquitySnapshotRecord {
+    val tradingDate = capturedAt.atZone(EQUITY_SNAPSHOT_TRADING_DATE_ZONE).toLocalDate()
+
+    return toEquitySnapshotRecord(
+        id = id,
+        reason = EquitySnapshotReason.FILL,
+        tradingDate = tradingDate,
+        capturedAt = capturedAt,
     )
 }
 

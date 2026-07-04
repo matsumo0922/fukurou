@@ -41,13 +41,21 @@ data class LlmRunStart(
  * LLM runner の終了記録。
  *
  * @param invocationId runner 起動 ID
+ * @param mode 取引 mode
+ * @param symbol 取引対象 symbol
+ * @param triggerKind daemon trigger 種別。手動起動では null
  * @param status 最終 status
+ * @param startedAt 起動開始時刻
  * @param finishedAt 終了時刻
  * @param errorMessage redaction / truncate 済みのエラー message
  */
 data class LlmRunFinish(
     val invocationId: String,
+    val mode: TradingMode,
+    val symbol: TradingSymbol,
+    val triggerKind: LlmDaemonTriggerKind?,
     val status: String,
+    val startedAt: Instant,
     val finishedAt: Instant,
     val errorMessage: String?,
 )
@@ -133,6 +141,17 @@ class InMemoryLlmRunRepository : LlmRunRepository {
                 if (currentRecord != null) {
                     records[finish.invocationId] = currentRecord.copy(
                         status = finish.status,
+                        finishedAt = finish.finishedAt,
+                        errorMessage = finish.errorMessage,
+                    )
+                } else {
+                    records[finish.invocationId] = LlmRunRecord(
+                        invocationId = finish.invocationId,
+                        mode = finish.mode,
+                        symbol = finish.symbol,
+                        triggerKind = finish.triggerKind,
+                        status = finish.status,
+                        startedAt = finish.startedAt,
                         finishedAt = finish.finishedAt,
                         errorMessage = finish.errorMessage,
                     )

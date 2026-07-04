@@ -27,9 +27,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
-import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
-import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
-import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
+import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
@@ -923,11 +921,8 @@ internal class ExposedPaperLedgerWriter(
     }
 
     private fun JdbcTransaction.appendFillEquitySnapshot(account: AccountSnapshot, capturedAt: Instant) {
-        val tradingDate = capturedAt.atZone(EQUITY_SNAPSHOT_TRADING_DATE_ZONE).toLocalDate()
-        val snapshot = account.toEquitySnapshotRecord(
+        val snapshot = account.toFillEquitySnapshotRecord(
             id = UUID.randomUUID(),
-            reason = EquitySnapshotReason.FILL,
-            tradingDate = tradingDate,
             capturedAt = capturedAt,
         )
 

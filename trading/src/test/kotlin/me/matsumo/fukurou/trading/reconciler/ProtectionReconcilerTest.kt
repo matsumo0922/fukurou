@@ -22,6 +22,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -32,6 +33,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
@@ -292,9 +294,11 @@ class ProtectionReconcilerTest {
         val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
         val dailySnapshots = repository.equitySnapshotRepository.findAll().getOrThrow()
             .filter { snapshot -> snapshot.reason == EquitySnapshotReason.DAILY }
+        val accountSnapshot = repository.getAccountSnapshot().getOrThrow()
 
         assertTrue(result.isSuccess)
         assertEquals(listOf(LocalDate.of(2026, 7, 3)), dailySnapshots.map { snapshot -> snapshot.tradingDate })
+        assertEquitySnapshotMatchesAccount(dailySnapshots.single(), accountSnapshot)
     }
 
     @Test
@@ -519,6 +523,19 @@ class ProtectionReconcilerTest {
 private suspend fun InMemoryPaperLedgerRepository.fillEquitySnapshotCount(): Int {
     return equitySnapshotRepository.findAll().getOrThrow()
         .count { snapshot -> snapshot.reason == EquitySnapshotReason.FILL }
+}
+
+private fun assertEquitySnapshotMatchesAccount(snapshot: EquitySnapshotRecord, account: AccountSnapshot) {
+    assertDecimalStringEquals("cash_jpy", account.cashJpy, snapshot.cashJpy)
+    assertDecimalStringEquals("btc_quantity", account.btcQuantity, snapshot.btcQuantity)
+    assertDecimalStringEquals("btc_mark_price_jpy", account.btcMarkPriceJpy, snapshot.btcMarkPriceJpy)
+    assertDecimalStringEquals("total_equity_jpy", account.totalEquityJpy, snapshot.totalEquityJpy)
+    assertDecimalStringEquals("equity_peak_jpy", account.equityPeakJpy, snapshot.equityPeakJpy)
+    assertDecimalStringEquals("drawdown_ratio", account.drawdownRatio, snapshot.drawdownRatio)
+}
+
+private fun assertDecimalStringEquals(fieldName: String, expected: String, actual: BigDecimal) {
+    assertEquals(0, actual.compareTo(expected.toBigDecimal()), "$fieldName mismatch")
 }
 
 /**

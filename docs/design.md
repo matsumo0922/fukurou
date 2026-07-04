@@ -1286,7 +1286,7 @@ interface GmoSymbolMapper {
 
 `llm_runs` は `invocation_id` を primary key とし、`mode`、`symbol`、nullable な daemon `trigger_kind`、`status`、epoch millis の `started_at` / `finished_at`、redaction / truncate 済み `error_message` だけを保存する。旧スケッチの `provider` は phase ごとの `command_event_log` に残すため run-level には持たない。`stdout_path` / `stderr_path` も持たず、stdout / stderr は従来通り redaction 後の runner phase audit に残す。
 
-`equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP`）、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。旧スケッチからの差分として、日次重複防止のため `reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置き、BOOTSTRAP は並行 bootstrap でも 1 件に収まるよう `reason = 'BOOTSTRAP'` の partial unique index で防御する。FILL は paper account 更新と同一 transaction で追加する。
+`equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP`）、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。旧スケッチからの差分として、日次重複防止のため JST 日付を物理列 `trading_date` として持ち、`reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置く。`drawdown_ratio` は旧案の decimal(12,8) ではなく、正本である `paper_account` と同じ decimal(20,10) に揃える。BOOTSTRAP は並行 bootstrap でも mode ごとに 1 件に収まるよう `reason = 'BOOTSTRAP'` に限定した `(mode, reason)` partial unique index で防御する。FILL は paper account 更新と同一 transaction で追加する。
 
 評価式は次の通り。
 

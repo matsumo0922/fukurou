@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.persistence
 
 import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
@@ -9,7 +10,6 @@ import java.math.BigDecimal
 import java.sql.Connection
 import java.time.Clock
 import java.time.Instant
-import java.time.ZoneId
 import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
@@ -97,7 +97,7 @@ private const val INSERT_BOOTSTRAP_EQUITY_SNAPSHOT_SQL = """
             SELECT 1
             FROM equity_snapshots
         )
-    ON CONFLICT (reason) WHERE reason = 'BOOTSTRAP' DO NOTHING
+    ON CONFLICT (mode, reason) WHERE reason = 'BOOTSTRAP' DO NOTHING
 """
 
 /**
@@ -248,7 +248,7 @@ private const val ENSURE_EQUITY_SNAPSHOTS_DAILY_UNIQUE_INDEX_SQL = """
  */
 private const val ENSURE_EQUITY_SNAPSHOTS_BOOTSTRAP_UNIQUE_INDEX_SQL = """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_snapshots_bootstrap_unique
-    ON equity_snapshots (reason)
+    ON equity_snapshots (mode, reason)
     WHERE reason = 'BOOTSTRAP'
 """
 
@@ -583,8 +583,6 @@ private const val VERIFY_TRADE_INTENT_CONSUMPTIONS_SCHEMA_SQL = """
 /**
  * equity snapshot の取引日判定に使う timezone。
  */
-private val EquitySnapshotTradingDateZone = ZoneId.of("Asia/Tokyo")
-
 /**
  * trading persistence の最小 schema を起動時に用意する bootstrapper。
  *
@@ -959,7 +957,7 @@ internal fun JdbcTransaction.ensureBootstrapEquitySnapshot(now: Instant) {
     jdbcConnection().prepareStatement(INSERT_BOOTSTRAP_EQUITY_SNAPSHOT_SQL).use { statement ->
         statement.setObject(1, UUID.randomUUID())
         statement.setString(2, EquitySnapshotReason.BOOTSTRAP.name)
-        statement.setString(3, now.atZone(EquitySnapshotTradingDateZone).toLocalDate().toString())
+        statement.setString(3, now.atZone(EQUITY_SNAPSHOT_TRADING_DATE_ZONE).toLocalDate().toString())
         statement.setLong(4, now.toEpochMilli())
         statement.setInt(5, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeUpdate()

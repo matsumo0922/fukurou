@@ -175,8 +175,6 @@ class ProtectionReconciler(
         val passResult = runCatching {
             val reconciledAt = Instant.now(clock)
 
-            equitySnapshotRecorder?.recordDailyIfNeeded()?.getOrThrow()
-
             val tickSnapshot = readTickSnapshot()
 
             if (tickSnapshot != null) {
@@ -192,6 +190,7 @@ class ProtectionReconciler(
                 }
             }
 
+            equitySnapshotRecorder?.recordDailyIfNeeded()
             markSuccessfulPass(passKind, tickSnapshot, reconciledAt).getOrThrow()
         }
 

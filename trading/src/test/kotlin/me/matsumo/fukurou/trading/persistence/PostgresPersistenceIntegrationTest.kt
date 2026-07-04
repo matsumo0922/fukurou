@@ -31,6 +31,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -42,7 +43,10 @@ import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
+import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
@@ -445,6 +449,46 @@ class PostgresPersistenceIntegrationTest {
 
         assertTrue(repository.append(duplicateBootstrap).isFailure)
         assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
+    }
+
+    @Test
+    fun llm_run_repository_roundTripsStartedAndFinishedRunInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmRunRepository(database)
+        val startedAt = fixedInstant()
+        val finishedAt = fixedInstant().plusSeconds(12)
+        val start = LlmRunStart(
+            invocationId = "postgres-llm-run-round-trip",
+            mode = TradingMode.PAPER,
+            symbol = TradingSymbol.BTC,
+            triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+            startedAt = startedAt,
+        )
+        val finish = LlmRunFinish(
+            invocationId = start.invocationId,
+            mode = start.mode,
+            symbol = start.symbol,
+            triggerKind = start.triggerKind,
+            status = "NO_TRADE",
+            startedAt = start.startedAt,
+            finishedAt = finishedAt,
+            errorMessage = "redacted-error",
+        )
+
+        repository.insertRunning(start).getOrThrow()
+        repository.finish(finish).getOrThrow()
+
+        val record = requireNotNull(repository.findByInvocationId(start.invocationId).getOrThrow())
+
+        assertEquals(start.invocationId, record.invocationId)
+        assertEquals(start.mode, record.mode)
+        assertEquals(start.symbol, record.symbol)
+        assertEquals(start.triggerKind, record.triggerKind)
+        assertEquals(finish.status, record.status)
+        assertEquals(startedAt, record.startedAt)
+        assertEquals(finishedAt, record.finishedAt)
+        assertEquals(finish.errorMessage, record.errorMessage)
     }
 
     @Test
@@ -984,6 +1028,9 @@ class PostgresPersistenceIntegrationTest {
 
         broker.placeOrder(command).getOrThrow()
         val fillCountAfterBuy = selectEquitySnapshotCountByReason(database, EquitySnapshotReason.FILL)
+        val accountAfterBuy = repository.getAccountSnapshot().getOrThrow()
+        val fillSnapshotAfterBuy = ExposedEquitySnapshotRepository(database).findAll().getOrThrow()
+            .single { snapshot -> snapshot.reason == EquitySnapshotReason.FILL }
         repository.reconcile(
             tickSnapshot = trailingTickSnapshot(),
             simulator = FillSimulator(clock = fixedClock()),
@@ -998,6 +1045,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, fillCountAfterBuy)
         assertEquals(1, fillCountAfterMarkOnly)
         assertEquals(2, fillCountAfterSell)
+        assertEquitySnapshotMatchesAccount(fillSnapshotAfterBuy, accountAfterBuy)
     }
 
     @Test
@@ -2106,6 +2154,19 @@ private fun selectEquitySnapshotIndexCount(database: ExposedDatabase): Int {
             }
         }
     }
+}
+
+private fun assertEquitySnapshotMatchesAccount(snapshot: EquitySnapshotRecord, account: AccountSnapshot) {
+    assertDecimalStringEquals("cash_jpy", account.cashJpy, snapshot.cashJpy)
+    assertDecimalStringEquals("btc_quantity", account.btcQuantity, snapshot.btcQuantity)
+    assertDecimalStringEquals("btc_mark_price_jpy", account.btcMarkPriceJpy, snapshot.btcMarkPriceJpy)
+    assertDecimalStringEquals("total_equity_jpy", account.totalEquityJpy, snapshot.totalEquityJpy)
+    assertDecimalStringEquals("equity_peak_jpy", account.equityPeakJpy, snapshot.equityPeakJpy)
+    assertDecimalStringEquals("drawdown_ratio", account.drawdownRatio, snapshot.drawdownRatio)
+}
+
+private fun assertDecimalStringEquals(fieldName: String, expected: String, actual: BigDecimal) {
+    assertEquals(0, actual.compareTo(expected.toBigDecimal()), "$fieldName mismatch")
 }
 
 /**

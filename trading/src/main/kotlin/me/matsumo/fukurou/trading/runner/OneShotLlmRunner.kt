@@ -241,9 +241,9 @@ class OneShotLlmRunner(
             marketSnapshotId = marketSnapshotId,
         )
 
-        recordLlmRunStarted(llmRunStart)
-
         return try {
+            recordLlmRunStarted(llmRunStart)
+
             val promptContent = readSystemPrompt(request.repositoryRoot)
             val promptHash = SystemPromptV1.calculateContentHash(promptContent)
             val proposerContext = decisionRunContext(
@@ -319,7 +319,11 @@ class OneShotLlmRunner(
     private suspend fun recordLlmRunStarted(start: LlmRunStart) {
         tradingRuntime.llmRunRepository.insertRunning(start)
             .onFailure { throwable ->
-                logRunRecordFailure("start", start.invocationId, throwable)
+                logRunRecordFailure(
+                    operation = "start",
+                    invocationId = start.invocationId,
+                    throwable = throwable,
+                )
             }
     }
 
@@ -330,14 +334,22 @@ class OneShotLlmRunner(
     ): Result<Unit> {
         val finish = LlmRunFinish(
             invocationId = start.invocationId,
+            mode = start.mode,
+            symbol = start.symbol,
+            triggerKind = start.triggerKind,
             status = status,
+            startedAt = start.startedAt,
             finishedAt = clock.instant(),
             errorMessage = cause?.redactedErrorMessage(),
         )
 
         return tradingRuntime.llmRunRepository.finish(finish)
             .onFailure { throwable ->
-                logRunRecordFailure("finish", start.invocationId, throwable)
+                logRunRecordFailure(
+                    operation = "finish",
+                    invocationId = start.invocationId,
+                    throwable = throwable,
+                )
             }
     }
 
@@ -349,7 +361,11 @@ class OneShotLlmRunner(
         return processOutputRedactor.redactAndTruncate(message)
     }
 
-    private fun logRunRecordFailure(operation: String, invocationId: String, throwable: Throwable) {
+    private fun logRunRecordFailure(
+        operation: String,
+        invocationId: String,
+        throwable: Throwable,
+    ) {
         logHuman(
             "llm run $operation record failed invocation=$invocationId error=${throwable.javaClass.simpleName}",
         )
