@@ -22,6 +22,16 @@ enum class LlmDaemonTriggerKind {
     ECONOMIC_EVENT,
 
     /**
+     * 短時間の価格急変による発火。
+     */
+    PRICE_MOVE,
+
+    /**
+     * 保有中 position の STOP 接近による発火。
+     */
+    STOP_PROXIMITY,
+
+    /**
      * 建玉または open order がある場合の密な確認。
      */
     HOLDING_DENSE_CHECK,

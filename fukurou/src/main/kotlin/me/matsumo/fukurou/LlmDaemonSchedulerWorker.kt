@@ -13,7 +13,10 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
@@ -28,9 +31,11 @@ import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
 import me.matsumo.fukurou.trading.runner.OneShotRunnerCliConfig
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import java.math.BigDecimal
 import java.nio.file.Path
 import java.time.Clock
 import java.time.Duration
+import java.time.Instant
 import java.util.logging.Logger
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
@@ -195,6 +200,8 @@ private fun createLlmDaemonScheduler(
         commandEventLog = tradingRuntime.commandEventLog,
         launchReservationRepository = ExposedLlmLaunchReservationRepository(database),
         openRiskReader = tradingRuntime.openRiskReader(),
+        tickerReader = marketDataSource.tickerReader(tradingConfig),
+        positionsReader = tradingRuntime.positionsReader(),
         requestBase = oneShotRequestFromEnvironment(environment),
         launchOneShot = runner.asDaemonLauncher(),
         clock = clock,
@@ -212,6 +219,23 @@ private suspend fun me.matsumo.fukurou.trading.runtime.TradingRuntime.hasOpenRis
     val openOrders = broker.getOpenOrders().getOrThrow()
 
     return positions.isNotEmpty() || openOrders.isNotEmpty()
+}
+
+private fun GmoPublicMarketDataSource.tickerReader(tradingConfig: TradingBotConfig): LlmDaemonTickerReader {
+    return LlmDaemonTickerReader {
+        getTicker(tradingConfig.symbol).map { ticker ->
+            LlmDaemonTickerSnapshot(
+                lastPriceJpy = BigDecimal(ticker.last),
+                sourceTimestamp = runCatching { Instant.parse(ticker.timestamp) }.getOrNull(),
+            )
+        }
+    }
+}
+
+private fun me.matsumo.fukurou.trading.runtime.TradingRuntime.positionsReader(): LlmDaemonPositionsReader {
+    return LlmDaemonPositionsReader {
+        broker.getPositions()
+    }
 }
 
 private fun oneShotRequestFromEnvironment(environment: Map<String, String>): OneShotRunnerRequest {

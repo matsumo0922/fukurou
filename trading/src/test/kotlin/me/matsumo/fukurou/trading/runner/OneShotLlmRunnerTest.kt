@@ -23,8 +23,11 @@ import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -766,6 +769,15 @@ class OneShotLlmRunnerTest {
             commandEventLog = runtime.commandEventLog,
             launchReservationRepository = InMemoryLlmLaunchReservationRepository(runtime.riskStateRepository),
             openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
+            tickerReader = LlmDaemonTickerReader {
+                Result.success(
+                    LlmDaemonTickerSnapshot(
+                        lastPriceJpy = BigDecimal("10000000"),
+                        sourceTimestamp = fixedClock().instant(),
+                    ),
+                )
+            },
+            positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
             requestBase = defaultRequest(),
             launchOneShot = runner.asDaemonLauncher(),
             clock = fixedClock(),

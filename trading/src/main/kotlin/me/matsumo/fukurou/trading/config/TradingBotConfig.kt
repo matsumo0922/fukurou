@@ -227,6 +227,13 @@ data class LlmRunnerConfig(
  * @param flatHeartbeatInterval flat 状態で event 条件がない場合の heartbeat 間隔
  * @param holdingCheckInterval 建玉または open order がある場合の密な LLM 確認間隔
  * @param launchReservationStaleAfter 異常終了した起動予約を同時起動扱いから外すまでの猶予
+ * @param priceMoveTriggerEnabled 価格急変 trigger を有効にするか
+ * @param priceMoveWindow 価格急変判定に使う観測 window
+ * @param priceMoveThresholdRatio 価格急変とみなす絶対変化率
+ * @param priceMoveCooldown 価格急変 trigger の cooldown
+ * @param stopProximityTriggerEnabled STOP 接近 trigger を有効にするか
+ * @param stopProximityRemainingRThreshold STOP 接近とみなす残り R
+ * @param stopProximityCooldown STOP 接近 trigger の cooldown
  */
 data class LlmDaemonConfig(
     val enabled: Boolean = DEFAULT_LLM_DAEMON_ENABLED,
@@ -234,12 +241,24 @@ data class LlmDaemonConfig(
     val flatHeartbeatInterval: Duration = DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL,
     val holdingCheckInterval: Duration = DEFAULT_LLM_HOLDING_CHECK_INTERVAL,
     val launchReservationStaleAfter: Duration = DEFAULT_LLM_LAUNCH_RESERVATION_STALE_AFTER,
+    val priceMoveTriggerEnabled: Boolean = DEFAULT_LLM_PRICE_MOVE_TRIGGER_ENABLED,
+    val priceMoveWindow: Duration = DEFAULT_LLM_PRICE_MOVE_WINDOW,
+    val priceMoveThresholdRatio: BigDecimal = DEFAULT_LLM_PRICE_MOVE_THRESHOLD_RATIO,
+    val priceMoveCooldown: Duration = DEFAULT_LLM_PRICE_MOVE_COOLDOWN,
+    val stopProximityTriggerEnabled: Boolean = DEFAULT_LLM_STOP_PROXIMITY_TRIGGER_ENABLED,
+    val stopProximityRemainingRThreshold: BigDecimal = DEFAULT_LLM_STOP_PROXIMITY_REMAINING_R_THRESHOLD,
+    val stopProximityCooldown: Duration = DEFAULT_LLM_STOP_PROXIMITY_COOLDOWN,
 ) {
     init {
         val pollIntervalIsConservative = pollInterval >= DEFAULT_LLM_DAEMON_POLL_INTERVAL
         val flatHeartbeatIsConservative = flatHeartbeatInterval >= DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL
         val holdingCheckIsConservative = holdingCheckInterval >= DEFAULT_LLM_HOLDING_CHECK_INTERVAL
         val reservationStaleIsPositive = !launchReservationStaleAfter.isNegative && !launchReservationStaleAfter.isZero
+        val priceMoveThresholdIsPositive = priceMoveThresholdRatio > BigDecimal.ZERO
+        val priceMoveWindowFitsPoll = priceMoveWindow >= pollInterval
+        val priceMoveCooldownFitsPoll = priceMoveCooldown >= pollInterval
+        val stopProximityThresholdIsPositive = stopProximityRemainingRThreshold > BigDecimal.ZERO
+        val stopProximityCooldownFitsPoll = stopProximityCooldown >= pollInterval
 
         require(pollIntervalIsConservative) {
             "pollInterval must be greater than or equal to ${DEFAULT_LLM_DAEMON_POLL_INTERVAL.seconds} seconds."
@@ -252,6 +271,21 @@ data class LlmDaemonConfig(
         }
         require(reservationStaleIsPositive) {
             "launchReservationStaleAfter must be greater than 0."
+        }
+        require(priceMoveThresholdIsPositive) {
+            "priceMoveThresholdRatio must be greater than 0."
+        }
+        require(priceMoveWindowFitsPoll) {
+            "priceMoveWindow must be greater than or equal to pollInterval."
+        }
+        require(priceMoveCooldownFitsPoll) {
+            "priceMoveCooldown must be greater than or equal to pollInterval."
+        }
+        require(stopProximityThresholdIsPositive) {
+            "stopProximityRemainingRThreshold must be greater than 0."
+        }
+        require(stopProximityCooldownFitsPoll) {
+            "stopProximityCooldown must be greater than or equal to pollInterval."
         }
     }
 }
@@ -433,6 +467,47 @@ private const val FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS_ENV = "FUKUROU_LLM_FLAT_HEA
 private const val FUKUROU_LLM_HOLDING_CHECK_SECONDS_ENV = "FUKUROU_LLM_HOLDING_CHECK_SECONDS"
 
 /**
+ * 価格急変 trigger 有効化の環境変数名。
+ */
+private const val FUKUROU_LLM_TRIGGER_PRICE_MOVE_ENABLED_ENV = "FUKUROU_LLM_TRIGGER_PRICE_MOVE_ENABLED"
+
+/**
+ * 価格急変 trigger の window 秒数の環境変数名。
+ */
+private const val FUKUROU_LLM_TRIGGER_PRICE_MOVE_WINDOW_SECONDS_ENV =
+    "FUKUROU_LLM_TRIGGER_PRICE_MOVE_WINDOW_SECONDS"
+
+/**
+ * 価格急変 trigger の絶対変化率しきい値の環境変数名。
+ */
+private const val FUKUROU_LLM_TRIGGER_PRICE_MOVE_THRESHOLD_RATIO_ENV =
+    "FUKUROU_LLM_TRIGGER_PRICE_MOVE_THRESHOLD_RATIO"
+
+/**
+ * 価格急変 trigger の cooldown 秒数の環境変数名。
+ */
+private const val FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS_ENV =
+    "FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS"
+
+/**
+ * STOP 接近 trigger 有効化の環境変数名。
+ */
+private const val FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED_ENV =
+    "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED"
+
+/**
+ * STOP 接近 trigger の残り R しきい値の環境変数名。
+ */
+private const val FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_REMAINING_R_THRESHOLD_ENV =
+    "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_REMAINING_R_THRESHOLD"
+
+/**
+ * STOP 接近 trigger の cooldown 秒数の環境変数名。
+ */
+private const val FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_COOLDOWN_SECONDS_ENV =
+    "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_COOLDOWN_SECONDS"
+
+/**
  * Obsidian writer 有効化の環境変数名。
  */
 private const val FUKUROU_OBSIDIAN_ENABLED_ENV = "FUKUROU_OBSIDIAN_ENABLED"
@@ -521,6 +596,41 @@ val DEFAULT_LLM_HOLDING_CHECK_INTERVAL: Duration = Duration.ofMinutes(15)
  * LLM 起動予約を stale とみなす既定時間。
  */
 val DEFAULT_LLM_LAUNCH_RESERVATION_STALE_AFTER: Duration = Duration.ofMinutes(30)
+
+/**
+ * 価格急変 trigger 有効化の既定値。
+ */
+const val DEFAULT_LLM_PRICE_MOVE_TRIGGER_ENABLED = true
+
+/**
+ * 価格急変 trigger の既定 window。
+ */
+val DEFAULT_LLM_PRICE_MOVE_WINDOW: Duration = Duration.ofSeconds(300)
+
+/**
+ * 価格急変 trigger の既定絶対変化率しきい値。
+ */
+val DEFAULT_LLM_PRICE_MOVE_THRESHOLD_RATIO: BigDecimal = BigDecimal("0.01")
+
+/**
+ * 価格急変 trigger の既定 cooldown。
+ */
+val DEFAULT_LLM_PRICE_MOVE_COOLDOWN: Duration = Duration.ofSeconds(600)
+
+/**
+ * STOP 接近 trigger 有効化の既定値。
+ */
+const val DEFAULT_LLM_STOP_PROXIMITY_TRIGGER_ENABLED = true
+
+/**
+ * STOP 接近 trigger の既定残り R しきい値。
+ */
+val DEFAULT_LLM_STOP_PROXIMITY_REMAINING_R_THRESHOLD: BigDecimal = BigDecimal("0.3")
+
+/**
+ * STOP 接近 trigger の既定 cooldown。
+ */
+val DEFAULT_LLM_STOP_PROXIMITY_COOLDOWN: Duration = Duration.ofSeconds(900)
 
 /**
  * Obsidian writer 有効化の既定値。
@@ -721,6 +831,34 @@ private fun Map<String, String>.readLlmDaemonConfig(): LlmDaemonConfig {
             readOptional(FUKUROU_LLM_HOLDING_CHECK_SECONDS_ENV)
                 ?.toLong()
                 ?: DEFAULT_LLM_HOLDING_CHECK_INTERVAL.seconds,
+        ),
+        priceMoveTriggerEnabled = readOptional(FUKUROU_LLM_TRIGGER_PRICE_MOVE_ENABLED_ENV)?.toBooleanStrictOrNull()
+            ?: DEFAULT_LLM_PRICE_MOVE_TRIGGER_ENABLED,
+        priceMoveWindow = Duration.ofSeconds(
+            readOptional(FUKUROU_LLM_TRIGGER_PRICE_MOVE_WINDOW_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_LLM_PRICE_MOVE_WINDOW.seconds,
+        ),
+        priceMoveThresholdRatio = readDecimal(
+            name = FUKUROU_LLM_TRIGGER_PRICE_MOVE_THRESHOLD_RATIO_ENV,
+            defaultValue = DEFAULT_LLM_PRICE_MOVE_THRESHOLD_RATIO,
+        ),
+        priceMoveCooldown = Duration.ofSeconds(
+            readOptional(FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_LLM_PRICE_MOVE_COOLDOWN.seconds,
+        ),
+        stopProximityTriggerEnabled = readOptional(FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED_ENV)
+            ?.toBooleanStrictOrNull()
+            ?: DEFAULT_LLM_STOP_PROXIMITY_TRIGGER_ENABLED,
+        stopProximityRemainingRThreshold = readDecimal(
+            name = FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_REMAINING_R_THRESHOLD_ENV,
+            defaultValue = DEFAULT_LLM_STOP_PROXIMITY_REMAINING_R_THRESHOLD,
+        ),
+        stopProximityCooldown = Duration.ofSeconds(
+            readOptional(FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_COOLDOWN_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_LLM_STOP_PROXIMITY_COOLDOWN.seconds,
         ),
     )
 }
