@@ -65,21 +65,12 @@ services:
       FUKUROU_CLAUDE_COMMON_ARGS: ${FUKUROU_CLAUDE_COMMON_ARGS:-}
       FUKUROU_CODEX_COMMON_ARGS: ${FUKUROU_CODEX_COMMON_ARGS:-}
       FUKUROU_CODEX_FALSIFIER_ARGS: ${FUKUROU_CODEX_FALSIFIER_ARGS:-}
+      FUKUROU_CODEX_PERSISTENT_HOME: /tmp/fukurou-cli-home/.codex
       HOME: /tmp/fukurou-cli-home
       XDG_CACHE_HOME: /tmp/fukurou-cli-cache
-      CLAUDE_CONFIG_DIR: /run/fukurou-claude-auth
-      CODEX_HOME: /run/fukurou-codex-auth
     volumes:
       - llm-home:/tmp/fukurou-cli-home
       - llm-cache:/tmp/fukurou-cli-cache
-      - type: bind
-        source: ${FUKUROU_CLAUDE_CREDENTIALS_FILE:-/srv/fukurou/claude/.credentials.json}
-        target: /run/fukurou-claude-auth/.credentials.json
-        read_only: true
-      - type: bind
-        source: ${FUKUROU_CODEX_AUTH_FILE:-/srv/fukurou/codex/auth.json}
-        target: /run/fukurou-codex-auth/auth.json
-        read_only: true
       - type: bind
         source: ${FUKUROU_OBSIDIAN_VAULT_PATH_HOST:-/srv/fukurou/obsidian-vault}
         target: /vault

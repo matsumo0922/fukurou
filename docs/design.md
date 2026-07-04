@@ -3448,17 +3448,21 @@ security:
 | `GMO_API_KEY` | MCP / `:trading.exchange.gmo` | いいえ | private REST用 |
 | `GMO_SECRET_KEY` | MCP / `:trading.exchange.gmo` | いいえ | HMAC署名用 |
 | `MCP_BEARER_TOKEN` | daemon + MCP | run tokenのみ | LLMには短命token。stdio-onlyの間は未使用でもよい |
-| Claude/Codex認証 | CLI runtimeのread-only auth mount | はい、CLI実行に必要 | exchange secretとは隔離 |
+| Claude/Codex認証 | CLI runtime container の `llm-home` volume | はい、CLI実行に必要 | exchange secretとは隔離 |
 | PostgreSQL接続情報 | daemon/MCP/Reconciler | いいえ | secret値は環境変数で渡す |
 
 LLM CLI実行環境にはGMO API keyを置かない。LLMが発注する唯一の経路はMCP act toolであり、MCPが安全床を強制する。
 
 ### 13.3 CLI認証の扱い
 
-[設計提案]
+[実装済み: 2026-07-04 / issue #53]
 
-- `claude` / `codex` のログインは、ホスト側または専用管理環境で事前に手動で行う。
-- trade runtime へ渡す認証ファイルはread-only mountを既定とし、CLI home/cache/session書き込み先は別の一時領域に分離する。
+- `claude` / `codex` のログインは、production container 内で手動により行う。
+- CLI login state は production compose の `llm-home` volume に保存し、container restart / redeploy で維持する。
+- Claude は `HOME=/tmp/fukurou-cli-home` の `~/.claude` を使う。
+- Codex は `FUKUROU_CODEX_PERSISTENT_HOME=/tmp/fukurou-cli-home/.codex` を明示した場合だけ、その場の `CODEX_HOME/config.toml` を renderer が上書きする。`HOME` から永続 mode を推測しないことで、local 開発者の実 `~/.codex/config.toml` を誤って汚さない。
+- 旧来の auth file bind mount と NAS `.env` の auth file path は使わない。
+- CLI process が認証失敗らしい非 0 exit を返した場合、runner は `RUNNER_PHASE_COMPLETED.details.authFailureSuspected = "true"` と login runbook の warn log を追加する。fail-closed の no-trade 動作は変えない。
 - daemon / CLI runtime はexchange secretを持たない。
 - `fukurou-mcp` はLLM CLI認証を持たない。Private API secretを扱うのはMCP / trading境界だけに限定する。
 - CLIが任意shell実行できるリスクに備え、working directoryは空、read-only filesystem、Docker socketなし、最小権限、ネットワークegress制限を行う。
@@ -3482,10 +3486,13 @@ services:
       DB_PASSWORD: ${POSTGRES_PASSWORD}
       OBSIDIAN_VAULT_PATH: /vault
       FUKUROU_MCP_JAR_PATH: /app/fukurou-mcp-all.jar
+      FUKUROU_CODEX_PERSISTENT_HOME: /tmp/fukurou-cli-home/.codex
+      HOME: /tmp/fukurou-cli-home
+      XDG_CACHE_HOME: /tmp/fukurou-cli-cache
     volumes:
       - obsidian-vault:/vault
-      - ./secrets/codex-auth.json:/auth/codex-auth.json:ro
-      - ./secrets/claude-credentials.json:/auth/claude-credentials.json:ro
+      - llm-home:/tmp/fukurou-cli-home
+      - llm-cache:/tmp/fukurou-cli-cache
       - ./prompts:/etc/fukurou/prompts:ro
     depends_on:
       postgres:
@@ -3513,6 +3520,8 @@ services:
 volumes:
   postgres-data:
   obsidian-vault:
+  llm-home:
+  llm-cache:
 ```
 
 MCPはStep1時点ではCLIからfat jarをstdio子プロセスとして起動する。Streamable HTTP transportを有効化する場合だけ、別サービス化を再検討する。
