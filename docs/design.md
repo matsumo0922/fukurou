@@ -1830,6 +1830,12 @@ canAct = expectedValueR > 0
 
 headless `claude` → `codex` skill → MCP の成立性は、実装前に小スパイクで検証する。
 
+#### 実装ノート: Codex MCP tool 単位承認
+
+[実装済み: 2026-07-04 / issue #57] production の Codex Falsifier は `CODEX_HOME/config.toml` に `mcp_servers."<server>".tools."<tool>".approval_mode = "approve"` を生成し、MCP 承認ゲートを write tool 単位で通す。対象は phase allowlist と write tool 定数の交差だけであり、Falsifier では `submit_falsification`、Codex Proposer では `submit_decision` のみを許可する。read tool は承認免除しない。
+
+この構成では `--sandbox read-only` と `approval_policy="never"` を維持するため、shell 実行や filesystem 側の安全境界は広げない。Codex の `default_tools_approval_mode = "approve"` は server 配下の全 tool を広げすぎるため採用しない。`--yolo` 系 flag の validation は、外部 sandbox / container で明示 opt-in する退避経路の防御として残す。
+
 ### 8.7 類似局面・失敗との突き合わせ
 
 [設計提案] runtime判断時に読むKnowledgeは軽量にする。

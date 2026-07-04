@@ -260,6 +260,15 @@ private fun LlmMcpServerConfig.toCodexConfigToml(): String {
                 append("\n")
             }
         }
+
+        autoApprovedTools.forEach { toolName ->
+            append("[mcp_servers.")
+            append(name.tomlKey())
+            append(".tools.")
+            append(toolName.tomlKey())
+            append("]\n")
+            append("approval_mode = \"approve\"\n")
+        }
     }
 }
 
@@ -464,6 +473,7 @@ val DEFAULT_CODEX_COMMON_ARGS = emptyList<String>()
  * Codex headless 実行で常に付ける安全側引数。
  */
 val ENFORCED_CODEX_COMMON_ARGS = listOf(
+    "--skip-git-repo-check",
     "--sandbox",
     "read-only",
     "-c",

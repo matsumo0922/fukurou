@@ -41,12 +41,15 @@ enum class LlmInvocationPhase {
  * @param command MCP server 起動 command
  * @param args MCP server 起動引数
  * @param environment MCP server 子プロセスへ明示的に渡す環境変数
+ * @param autoApprovedTools codex の MCP 承認ゲートを approve で通す tool 名。
+ * write tool を phase 単位で最小限指定する
  */
 data class LlmMcpServerConfig(
     val name: String,
     val command: String,
     val args: List<String>,
     val environment: Map<String, String>,
+    val autoApprovedTools: List<String> = emptyList(),
 )
 
 /**

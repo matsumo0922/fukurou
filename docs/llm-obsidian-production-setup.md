@@ -149,8 +149,8 @@ ssh dxp4800plus 'docker logs --since 10m fukurou-ktor | tail -200'
 - Claude / Codex CLI は access token を自動 refresh する。refresh token 自体が失効または revoke された場合だけ、container 内で再ログインする。
 - Runner は CLI process が非 0 exit で認証失敗らしい stdout / stderr を出した場合、`RUNNER_PHASE_COMPLETED.details.authFailureSuspected = "true"` と login runbook の warn log を残す。これは運用上の発見シグナルであり、runner は従来どおり no-trade に fail closed する。
 - Codex の低コスト model 名は account / CLI の対応に依存する。未確認の model を `FUKUROU_CODEX_MODEL` に入れると Falsifier phase が fail-closed する。
-- 既定の Codex Falsifier は `--sandbox read-only` と `approval_policy="never"` で起動する。ENTER 時に `submit_falsification` まで進めたい場合、この既定構成では write tool が承認されず fail-closed する可能性がある。paper entry まで自動で進めるには、外部 sandbox / container command template と `FUKUROU_CODEX_FALSIFIER_ARGS` の明示 opt-in を別途設計・検証する。
-- `FUKUROU_CODEX_FALSIFIER_ARGS="--yolo"` や `--dangerously-bypass-approvals-and-sandbox` は、host の素の `codex` command template では使わない。必ず外部 sandbox で filesystem / network / secret mount を閉じてから使う。
+- 既定の Codex Falsifier は `--skip-git-repo-check`、`--sandbox read-only`、`approval_policy="never"` で起動し、`CODEX_HOME/config.toml` に `submit_falsification` だけを tool 単位で `approval_mode = "approve"` として書く。これにより shell sandbox は保ったまま、ENTER 時の Falsifier verdict 保存まで進める。
+- `FUKUROU_CODEX_FALSIFIER_ARGS="--yolo"` や `--dangerously-bypass-approvals-and-sandbox` は通常運用には不要である。外部 sandbox で filesystem / network / secret mount を閉じた command template を明示 opt-in する場合の防御的 validation としてのみ残す。
 - live 実発注は未実装であり、production でも `PAPER` mode を維持する。
 
 ## Cleanup
