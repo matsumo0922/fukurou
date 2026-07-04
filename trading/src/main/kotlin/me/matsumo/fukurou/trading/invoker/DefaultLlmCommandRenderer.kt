@@ -22,6 +22,7 @@ import java.util.Comparator
  * @param claudeCommonArgs Claude CLI 共通引数
  * @param codexCommonArgs Codex CLI 共通引数
  * @param codexFalsifierArgs Codex Falsifier にだけ渡す強権実行引数
+ * @param codexPersistentHome Codex CLI の永続 home。明示設定時だけ in-place 更新する。
  */
 data class LlmCommandRendererConfig(
     val claudeCommandTemplate: List<String> = DEFAULT_CLAUDE_COMMAND_TEMPLATE,
@@ -31,6 +32,7 @@ data class LlmCommandRendererConfig(
     val claudeCommonArgs: List<String> = DEFAULT_CLAUDE_COMMON_ARGS,
     val codexCommonArgs: List<String> = DEFAULT_CODEX_COMMON_ARGS,
     val codexFalsifierArgs: List<String> = DEFAULT_CODEX_FALSIFIER_ARGS,
+    val codexPersistentHome: Path? = null,
 ) {
     init {
         val unsafeClaudeArgs = claudeCommonArgs.filterUnsafeArgs(CLAUDE_COMMON_ARG_FORBIDDEN_FLAGS)
@@ -91,6 +93,8 @@ data class LlmCommandRendererConfig(
                 codexFalsifierArgs = environment.readOptionalEnv(FUKUROU_CODEX_FALSIFIER_ARGS_ENV)
                     ?.splitCommandTemplate()
                     ?: DEFAULT_CODEX_FALSIFIER_ARGS,
+                codexPersistentHome = environment.readOptionalEnv(FUKUROU_CODEX_PERSISTENT_HOME_ENV)
+                    ?.let { value -> Path.of(value) },
             )
         }
     }
@@ -156,7 +160,11 @@ class DefaultLlmCommandRenderer(
         } else {
             emptyList()
         }
-        val codexHome = writeCodexHome(request.mcpServer, request.environment)
+        val codexHome = writeCodexHome(
+            mcpServer = request.mcpServer,
+            environment = request.environment,
+            persistentHome = config.codexPersistentHome,
+        )
         val commandEnvironment = request.environment + (CODEX_HOME_ENV to codexHome.path.toString())
         val args = listOf("exec") +
             config.codexModelArgs() +
@@ -273,12 +281,41 @@ private fun String.tomlKey(): String {
 private fun writeCodexHome(
     mcpServer: LlmMcpServerConfig,
     environment: Map<String, String>,
+    persistentHome: Path?,
 ): PrivateConfigPath {
+    if (persistentHome != null) {
+        return writePersistentCodexHome(mcpServer, persistentHome)
+    }
+
+    return writeTemporaryCodexHome(mcpServer, environment)
+}
+
+private fun writePersistentCodexHome(mcpServer: LlmMcpServerConfig, directory: Path): PrivateConfigPath {
+    Files.createDirectories(directory)
+    directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
+
+    val configFile = directory.resolve(CODEX_CONFIG_FILE_NAME)
+    Files.writeString(
+        configFile,
+        mcpServer.toCodexConfigToml(),
+        StandardOpenOption.CREATE,
+        StandardOpenOption.TRUNCATE_EXISTING,
+        StandardOpenOption.WRITE,
+    )
+    configFile.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
+
+    return PrivateConfigPath(
+        path = directory,
+        cleanupPaths = emptyList(),
+    )
+}
+
+private fun writeTemporaryCodexHome(mcpServer: LlmMcpServerConfig, environment: Map<String, String>): PrivateConfigPath {
     val directory = Files.createTempDirectory("fukurou-codex-home-")
     directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
 
     return runCatching {
-        val configFile = directory.resolve("config.toml")
+        val configFile = directory.resolve(CODEX_CONFIG_FILE_NAME)
         Files.writeString(
             configFile,
             mcpServer.toCodexConfigToml(),
@@ -486,6 +523,11 @@ const val HOME_ENV = "HOME"
 const val DEFAULT_CODEX_HOME_DIRECTORY = ".codex"
 
 /**
+ * Codex CLI 設定ファイル名。
+ */
+const val CODEX_CONFIG_FILE_NAME = "config.toml"
+
+/**
  * Codex CLI 認証ファイル名。
  */
 const val CODEX_AUTH_FILE_NAME = "auth.json"
@@ -541,6 +583,14 @@ const val FUKUROU_CODEX_COMMON_ARGS_ENV = "FUKUROU_CODEX_COMMON_ARGS"
  * Codex Falsifier 引数の環境変数名。
  */
 const val FUKUROU_CODEX_FALSIFIER_ARGS_ENV = "FUKUROU_CODEX_FALSIFIER_ARGS"
+
+/**
+ * Codex CLI の永続 home path を明示する Fukurou 専用環境変数名。
+ *
+ * local 開発者の実 `HOME/.codex/config.toml` を誤って上書きしないため、
+ * 永続 in-place mode はこの値がある場合だけ有効にし、`HOME` からは推測しない。
+ */
+const val FUKUROU_CODEX_PERSISTENT_HOME_ENV = "FUKUROU_CODEX_PERSISTENT_HOME"
 
 private fun List<String>.filterUnsafeArgs(forbiddenFlags: Set<String>): List<String> {
     return filter { argument ->

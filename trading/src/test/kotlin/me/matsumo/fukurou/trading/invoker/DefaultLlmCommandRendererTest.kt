@@ -9,6 +9,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -27,6 +28,22 @@ class DefaultLlmCommandRendererTest {
 
         assertEquals(listOf("docker", "run", "claude image", "claude"), config.claudeCommandTemplate)
         assertEquals(listOf("docker", "run", "codex image", "codex"), config.codexCommandTemplate)
+    }
+
+    @Test
+    fun configFromEnvironment_readsPersistentCodexHomeOnlyWhenExplicitlySet() {
+        val persistentCodexHome = Files.createTempDirectory("fukurou-persistent-codex-home")
+        val explicitConfig = LlmCommandRendererConfig.fromEnvironment(
+            mapOf(
+                FUKUROU_CODEX_PERSISTENT_HOME_ENV to persistentCodexHome.toString(),
+            ),
+        )
+        val unsetConfig = LlmCommandRendererConfig.fromEnvironment(emptyMap())
+
+        assertEquals(persistentCodexHome, explicitConfig.codexPersistentHome)
+        assertNull(unsetConfig.codexPersistentHome)
+
+        Files.deleteIfExists(persistentCodexHome)
     }
 
     @Test
@@ -115,6 +132,48 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
+    fun renderCodex_persistentHomeWritesConfigInPlaceAndPreservesAuthJson() {
+        val persistentCodexHome = Files.createTempDirectory("fukurou-persistent-codex-home")
+        val authFile = persistentCodexHome.resolve(CODEX_AUTH_FILE_NAME)
+        Files.writeString(authFile, """{"token":"persistent-auth-token"}""")
+        val renderer = DefaultLlmCommandRenderer(
+            config = LlmCommandRendererConfig(
+                codexPersistentHome = persistentCodexHome,
+            ),
+        )
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+        )
+
+        val firstCommand = renderer.render(request).getOrThrow()
+        val secondCommand = renderer.render(request).getOrThrow()
+        val configPath = persistentCodexHome.resolve(CODEX_CONFIG_FILE_NAME)
+        val configContent = Files.readString(configPath)
+
+        assertEquals(persistentCodexHome.toString(), firstCommand.environment[CODEX_HOME_ENV])
+        assertEquals(persistentCodexHome.toString(), secondCommand.environment[CODEX_HOME_ENV])
+        assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\"]"))
+        assertTrue(Files.exists(configPath))
+        assertEquals("""{"token":"persistent-auth-token"}""", Files.readString(authFile))
+        assertFalse(firstCommand.cleanupPaths.contains(authFile))
+        assertFalse(firstCommand.cleanupPaths.contains(configPath))
+        assertFalse(firstCommand.cleanupPaths.contains(persistentCodexHome))
+
+        firstCommand.deleteCleanupPaths()
+        secondCommand.deleteCleanupPaths()
+
+        assertEquals("""{"token":"persistent-auth-token"}""", Files.readString(authFile))
+        assertTrue(Files.exists(configPath))
+        assertTrue(Files.exists(persistentCodexHome))
+
+        Files.deleteIfExists(configPath)
+        Files.deleteIfExists(authFile)
+        Files.deleteIfExists(persistentCodexHome)
+    }
+
+    @Test
     fun renderClaude_writesMcpConfigToPrivateFileWithoutArgvSecret() {
         val renderer = DefaultLlmCommandRenderer()
         val request = request(
@@ -181,13 +240,23 @@ class DefaultLlmCommandRendererTest {
         val joinedArgs = command.args.joinToString(" ")
         val privateCodexHome = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV]))
         val copiedAuthFile = privateCodexHome.resolve(CODEX_AUTH_FILE_NAME)
+        val privateConfigFile = privateCodexHome.resolve(CODEX_CONFIG_FILE_NAME)
         val copiedAuthContent = Files.readString(copiedAuthFile)
 
         assertFalse(privateCodexHome == parentCodexHome)
         assertFalse(joinedArgs.contains("test-auth-token"))
         assertEquals("""{"token":"test-auth-token"}""", copiedAuthContent)
+        assertTrue(Files.exists(privateConfigFile))
+        assertTrue(command.cleanupPaths.contains(privateConfigFile))
+        assertTrue(command.cleanupPaths.contains(copiedAuthFile))
+        assertTrue(command.cleanupPaths.contains(privateCodexHome))
 
         command.deleteCleanupPaths()
+
+        assertFalse(Files.exists(copiedAuthFile))
+        assertFalse(Files.exists(privateConfigFile))
+        assertFalse(Files.exists(privateCodexHome))
+
         Files.deleteIfExists(parentAuthFile)
         Files.deleteIfExists(parentCodexHome)
     }

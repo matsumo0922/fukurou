@@ -215,6 +215,58 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun proposerAuthFailureExit_addsOperationalSignalAndKeepsNoTradeAudit() = runBlocking {
+        val humanLogs = mutableListOf<String>()
+        val fixture = runnerFixture(
+            logger = { message -> humanLogs += message },
+        ) {
+            nonZeroExit(stdout = "API Error: 401 Invalid authentication credentials")
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals("true", proposerDetails.stringValue("authFailureSuspected"))
+        assertEquals("1", proposerDetails.stringValue("exitCode"))
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
+        assertTrue(humanLogs.any { message -> message.isAuthFailureRunbookLog() })
+    }
+
+    @Test
+    fun proposerUnrelatedExitFailure_omitsAuthFailureSignal() = runBlocking {
+        val humanLogs = mutableListOf<String>()
+        val fixture = runnerFixture(
+            logger = { message -> humanLogs += message },
+        ) {
+            nonZeroExit(stdout = "network retry exhausted")
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
+        val authFailureLogFound = humanLogs.any { message -> message.contains("LLM CLI authentication failure suspected.") }
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertFalse(proposerDetails.containsKey("authFailureSuspected"))
+        assertEquals("1", proposerDetails.stringValue("exitCode"))
+        assertFalse(authFailureLogFound)
+    }
+
+    @Test
+    fun proposerSuccess_omitsAuthFailureSignalEvenWhenOutputMentionsAuthText() = runBlocking {
+        val fixture = runnerFixture {
+            cleanExit(stdout = "API Error: 401 Invalid authentication credentials")
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertFalse(proposerDetails.containsKey("authFailureSuspected"))
+        assertEquals("0", proposerDetails.stringValue("exitCode"))
+    }
+
+    @Test
     fun proposerFailedToStart_auditsRedactedErrorAndRecordsNoTradeExit() = runBlocking {
         val failure = IOException(
             "Cannot run program \"claude\" (in directory \"/tmp/fukurou-llm\"): " +
@@ -777,6 +829,7 @@ private fun runnerFixture(
     config: TradingBotConfig = TradingBotConfig(),
     parentEnvironment: Map<String, String> = defaultParentEnvironment(),
     runtimeTransform: (TradingRuntime) -> TradingRuntime = { runtime -> runtime },
+    logger: (String) -> Unit = {},
     launchHandler: suspend (RenderedLlmCommand) -> ProcessRunResult,
 ): RunnerFixture {
     val runtime = runtimeTransform(
@@ -798,7 +851,7 @@ private fun runnerFixture(
         ),
         parentEnvironment = parentEnvironment,
         clock = fixedClock(),
-        logger = {},
+        logger = logger,
     )
     fixtureRepository = decisionRepository
 
@@ -1026,12 +1079,15 @@ private fun cleanExit(
     )
 }
 
-private fun nonZeroExit(): ProcessRunResult {
+private fun nonZeroExit(
+    stdout: String = "",
+    stderr: String = "failed",
+): ProcessRunResult {
     return ProcessRunResult(
         status = ProcessRunStatus.EXITED,
         exitCode = 1,
-        stdout = "",
-        stderr = "failed",
+        stdout = stdout,
+        stderr = stderr,
     )
 }
 
@@ -1057,6 +1113,13 @@ private fun List<CommandEvent>.containsNoTradeReason(reason: String): Boolean {
 
         noTradeExit && reasonMatched
     }
+}
+
+private fun String.isAuthFailureRunbookLog(): Boolean {
+    val hasAuthFailureMessage = contains("LLM CLI authentication failure suspected.")
+    val hasCodexRunbook = contains("codex login --device-auth")
+
+    return hasAuthFailureMessage && hasCodexRunbook
 }
 
 private fun List<CommandEvent>.singleRunnerPhaseDetails(phase: String): JsonObject {

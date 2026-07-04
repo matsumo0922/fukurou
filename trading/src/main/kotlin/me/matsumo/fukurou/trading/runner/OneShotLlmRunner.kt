@@ -38,6 +38,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.readOptionalEnv
 import me.matsumo.fukurou.trading.invoker.splitCommandTemplate
@@ -537,6 +538,7 @@ class OneShotLlmRunner(
         val usage = processResult?.let { completedProcess ->
             usageForAudit(request.provider, completedProcess.stdout)
         }
+        val authFailureSuspected = processResult?.authFailureSuspected() ?: false
 
         appendRunnerPhase(
             context = context,
@@ -551,12 +553,18 @@ class OneShotLlmRunner(
                     put("stdout", processOutputRedactor.redactAndTruncate(completedProcess.stdout))
                     put("stderr", processOutputRedactor.redactAndTruncate(completedProcess.stderr))
                 }
+                if (authFailureSuspected) {
+                    put("authFailureSuspected", "true")
+                }
                 usage?.let { parsedUsage ->
                     put("usage", LlmUsageParser.toJsonObject(parsedUsage))
                 }
             },
         ).getOrThrow()
         logHuman("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
+        if (authFailureSuspected) {
+            logHuman(LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE)
+        }
 
         val timedOut = processResult?.status == ProcessRunStatus.TIMED_OUT
         val nonZeroExit = processResult?.exitCode?.let { exitCode -> exitCode != 0 } ?: false
@@ -872,7 +880,41 @@ class OneShotLlmRunner(
         LlmProvider.CLAUDE -> LlmUsageParser.parseClaudeStdout(stdout)
         LlmProvider.CODEX -> null
     }
+
+    private fun ProcessRunResult.authFailureSuspected(): Boolean {
+        val exitFailed = exitCode?.let { completedExitCode -> completedExitCode != 0 } ?: false
+        val combinedOutput = "$stdout\n$stderr"
+        val outputContainsAuthFailure = LLM_CLI_AUTH_FAILURE_PATTERNS.any { pattern ->
+            combinedOutput.contains(pattern, ignoreCase = true)
+        }
+
+        return exitFailed && outputContainsAuthFailure
+    }
 }
+
+/**
+ * LLM CLI 認証失敗の可能性を運用ログへ伝える案内。
+ */
+private const val LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE =
+    "LLM CLI authentication failure suspected. Login runbook: " +
+        "docs/llm-obsidian-production-setup.md" +
+        "（claude: docker exec -it fukurou-ktor claude → /login、" +
+        "codex: docker exec -it fukurou-ktor codex login --device-auth）"
+
+/**
+ * LLM CLI 認証失敗を疑うための出力断片。
+ *
+ * stdout / stderr の raw output に対する推定シグナルであり、provider や CLI version によっては
+ * false positive を含みうる。fail-closed の挙動は変えず、運用上の気づきだけを追加する。
+ */
+private val LLM_CLI_AUTH_FAILURE_PATTERNS = listOf(
+    "invalid authentication",
+    "401",
+    "unauthorized",
+    "not logged in",
+    "token expired",
+    "please run /login",
+)
 
 /**
  * Falsifier へ intent ID だけを渡す環境変数名。
