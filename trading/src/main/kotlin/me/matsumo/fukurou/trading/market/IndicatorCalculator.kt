@@ -2,8 +2,13 @@ package me.matsumo.fukurou.trading.market
 
 import kotlinx.serialization.Serializable
 import me.matsumo.fukurou.trading.domain.Candle
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeParseException
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.sqrt
 
 /**
  * 計算可能な technical indicator。
@@ -34,18 +39,35 @@ enum class IndicatorType {
      * Moving Average Convergence Divergence。
      */
     MACD,
+
+    /**
+     * ATR を直近 lookback 本の中で百分位化した値。
+     */
+    ATR_PERCENTILE,
+
+    /**
+     * GMO kline の営業日境界で累積する session VWAP。
+     */
+    VWAP_SESSION,
+
+    /**
+     * 出来高を直近期間の平均との差で標準化した z-score。
+     */
+    VOLUME_Z_SCORE,
 }
 
 /**
  * indicator 計算に使う parameter。
  *
- * @param period ATR / EMA / RSI / SMA の期間
+ * @param period ATR / ATR_PERCENTILE / EMA / RSI / SMA / VOLUME_Z_SCORE の期間
+ * @param lookback ATR_PERCENTILE の比較に使う ATR 本数
  * @param fastPeriod MACD の短期 EMA 期間
  * @param slowPeriod MACD の長期 EMA 期間
  * @param signalPeriod MACD signal EMA 期間
  */
 data class IndicatorParams(
     val period: Int? = null,
+    val lookback: Int? = null,
     val fastPeriod: Int? = null,
     val slowPeriod: Int? = null,
     val signalPeriod: Int? = null,
@@ -68,7 +90,8 @@ data class IndicatorResult(
 /**
  * indicator 計算で確定した parameter。
  *
- * @param period ATR / EMA / RSI / SMA の期間
+ * @param period ATR / ATR_PERCENTILE / EMA / RSI / SMA / VOLUME_Z_SCORE の期間
+ * @param lookback ATR_PERCENTILE の比較に使った ATR 本数
  * @param fastPeriod MACD の短期 EMA 期間
  * @param slowPeriod MACD の長期 EMA 期間
  * @param signalPeriod MACD signal EMA 期間
@@ -76,6 +99,7 @@ data class IndicatorResult(
 @Serializable
 data class IndicatorResolvedParams(
     val period: Int? = null,
+    val lookback: Int? = null,
     val fastPeriod: Int? = null,
     val slowPeriod: Int? = null,
     val signalPeriod: Int? = null,
@@ -123,6 +147,9 @@ object IndicatorCalculator {
                 IndicatorType.RSI -> calculateRsi(candles, params)
                 IndicatorType.SMA -> calculateSma(candles, params)
                 IndicatorType.MACD -> calculateMacd(candles, params)
+                IndicatorType.ATR_PERCENTILE -> calculateAtrPercentile(candles, params)
+                IndicatorType.VWAP_SESSION -> calculateVwapSession(candles)
+                IndicatorType.VOLUME_Z_SCORE -> calculateVolumeZScore(candles, params)
             }
         }.mapError()
     }
@@ -235,12 +262,104 @@ object IndicatorCalculator {
             values = values,
         )
     }
+
+    private fun calculateAtrPercentile(candles: List<Candle>, params: IndicatorParams): IndicatorResult {
+        val period = validatePeriod(params.period ?: DEFAULT_ATR_PERCENTILE_PERIOD, "period")
+        val lookback = validateLookback(params.lookback ?: DEFAULT_ATR_PERCENTILE_LOOKBACK)
+        val requiredCandleLimit = period.toLong() + lookback.toLong()
+        val isWithinCandleLimit = requiredCandleLimit <= MAX_INDICATOR_CANDLE_LIMIT.toLong()
+
+        require(isWithinCandleLimit) {
+            "period + lookback must be less than or equal to $MAX_INDICATOR_CANDLE_LIMIT."
+        }
+
+        val trueRanges = candles.mapIndexed { candleIndex, candle -> trueRange(candles, candleIndex, candle) }
+        val atrValues = wilderAverage(trueRanges, period)
+        val percentileValues = percentileRank(atrValues, lookback)
+        val values = candles.mapIndexed { candleIndex, candle ->
+            IndicatorValue(
+                openTime = candle.openTime,
+                value = percentileValues[candleIndex],
+            )
+        }
+
+        return IndicatorResult(
+            indicator = IndicatorType.ATR_PERCENTILE,
+            params = IndicatorResolvedParams(
+                period = period,
+                lookback = lookback,
+            ),
+            values = values,
+        )
+    }
+
+    private fun calculateVwapSession(candles: List<Candle>): IndicatorResult {
+        var currentSessionDate: LocalDate? = null
+        var cumulativePriceVolume = 0.0
+        var cumulativeVolume = 0.0
+        val values = mutableListOf<IndicatorValue>()
+
+        for (candle in candles) {
+            val sessionDate = candle.openTime.toGmoKlineSessionDate()
+
+            if (sessionDate != currentSessionDate) {
+                currentSessionDate = sessionDate
+                cumulativePriceVolume = 0.0
+                cumulativeVolume = 0.0
+            }
+
+            val typicalPrice = candle.typicalPrice()
+            val volume = candle.volume.toDoubleValue("volume")
+
+            cumulativePriceVolume += typicalPrice * volume
+            cumulativeVolume += volume
+
+            values += IndicatorValue(
+                openTime = candle.openTime,
+                value = vwapValue(cumulativePriceVolume, cumulativeVolume),
+            )
+        }
+
+        return IndicatorResult(
+            indicator = IndicatorType.VWAP_SESSION,
+            params = IndicatorResolvedParams(),
+            values = values,
+        )
+    }
+
+    private fun calculateVolumeZScore(candles: List<Candle>, params: IndicatorParams): IndicatorResult {
+        val period = validatePeriod(params.period ?: DEFAULT_VOLUME_Z_SCORE_PERIOD, "period")
+        val volumeValues = candles.map { candle -> candle.volume.toDoubleValue("volume") }
+        val zScoreValues = zScore(volumeValues, period)
+        val values = candles.mapIndexed { candleIndex, candle ->
+            IndicatorValue(
+                openTime = candle.openTime,
+                value = zScoreValues[candleIndex],
+            )
+        }
+
+        return IndicatorResult(
+            indicator = IndicatorType.VOLUME_Z_SCORE,
+            params = IndicatorResolvedParams(period = period),
+            values = values,
+        )
+    }
 }
 
 /**
  * ATR の既定期間。
  */
 private const val DEFAULT_ATR_PERIOD = 14
+
+/**
+ * ATR_PERCENTILE の既定 ATR 期間。
+ */
+private const val DEFAULT_ATR_PERCENTILE_PERIOD = 14
+
+/**
+ * ATR_PERCENTILE の既定 lookback 本数。
+ */
+private const val DEFAULT_ATR_PERCENTILE_LOOKBACK = 100
 
 /**
  * EMA の既定期間。
@@ -272,6 +391,26 @@ private const val DEFAULT_MACD_SLOW_PERIOD = 26
  */
 private const val DEFAULT_MACD_SIGNAL_PERIOD = 9
 
+/**
+ * VOLUME_Z_SCORE の既定期間。
+ */
+private const val DEFAULT_VOLUME_Z_SCORE_PERIOD = 20
+
+/**
+ * calc_indicator MCP の最大取得本数と同じ、indicator 計算側の検証上限。
+ */
+private const val MAX_INDICATOR_CANDLE_LIMIT = 500
+
+/**
+ * GMO kline の営業日が切り替わる JST 時刻。
+ */
+private const val GMO_KLINE_SESSION_BOUNDARY_HOUR = 6
+
+/**
+ * GMO kline の営業日境界判定に使う timezone。
+ */
+private val GmoKlineSessionZone = ZoneId.of("Asia/Tokyo")
+
 private fun Result<IndicatorResult>.mapError(): Result<IndicatorResult> {
     return recoverCatching { throwable ->
         if (throwable is MarketDataParseException) {
@@ -288,6 +427,14 @@ private fun validatePeriod(period: Int, name: String): Int {
     }
 
     return period
+}
+
+private fun validateLookback(lookback: Int): Int {
+    require(lookback > 0) {
+        "lookback must be greater than 0."
+    }
+
+    return lookback
 }
 
 private fun trueRange(
@@ -325,6 +472,58 @@ private fun sma(values: List<Double>, period: Int): List<Double?> {
     }
 
     return result
+}
+
+private fun percentileRank(values: List<Double?>, lookback: Int): List<Double?> {
+    val result = MutableList<Double?>(values.size) { null }
+
+    for (valueIndex in values.indices) {
+        val currentValue = values[valueIndex] ?: continue
+        val windowStartIndex = valueIndex - lookback + 1
+
+        if (windowStartIndex < 0) {
+            continue
+        }
+
+        val window = values.subList(windowStartIndex, valueIndex + 1)
+        val hasMissingValue = window.any { windowValue -> windowValue == null }
+
+        if (hasMissingValue) {
+            continue
+        }
+
+        val lessOrEqualCount = window.count { windowValue -> requireNotNull(windowValue) <= currentValue }
+        result[valueIndex] = lessOrEqualCount.toDouble() / lookback
+    }
+
+    return result
+}
+
+private fun zScore(values: List<Double>, period: Int): List<Double?> {
+    val result = MutableList<Double?>(values.size) { null }
+
+    for (valueIndex in period - 1 until values.size) {
+        val window = values.subList(valueIndex - period + 1, valueIndex + 1)
+        val mean = window.average()
+        val variance = window.sumOf { value -> (value - mean) * (value - mean) } / period
+        val standardDeviation = sqrt(variance)
+
+        if (standardDeviation == 0.0) {
+            continue
+        }
+
+        result[valueIndex] = (values[valueIndex] - mean) / standardDeviation
+    }
+
+    return result
+}
+
+private fun vwapValue(cumulativePriceVolume: Double, cumulativeVolume: Double): Double? {
+    if (cumulativeVolume == 0.0) {
+        return null
+    }
+
+    return cumulativePriceVolume / cumulativeVolume
 }
 
 private fun ema(values: List<Double>, period: Int): List<Double?> {
@@ -441,6 +640,29 @@ private fun calculateMacdLine(
         } else {
             fastEma - slowEma
         }
+    }
+}
+
+private fun Candle.typicalPrice(): Double {
+    val high = high.toDoubleValue("high")
+    val low = low.toDoubleValue("low")
+    val close = close.toDoubleValue("close")
+
+    return (high + low + close) / 3.0
+}
+
+private fun String.toGmoKlineSessionDate(): LocalDate {
+    return toInstantValue("openTime")
+        .atZone(GmoKlineSessionZone)
+        .minusHours(GMO_KLINE_SESSION_BOUNDARY_HOUR.toLong())
+        .toLocalDate()
+}
+
+private fun String.toInstantValue(fieldName: String): Instant {
+    return try {
+        Instant.parse(this)
+    } catch (_: DateTimeParseException) {
+        throw MarketDataParseException("$fieldName must be an ISO-8601 instant: $this")
     }
 }
 

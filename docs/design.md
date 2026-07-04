@@ -1278,6 +1278,12 @@ interface GmoSymbolMapper {
 | Order book imbalance | tick | 短期需給確認 |
 | ATR percentile | 5m/1h/1d | 現在ボラの相対化、低ボラ時のコスト比警告 |
 
+[実装済み: issue #61] `calc_indicator` は `ATR` / `EMA` / `RSI` / `SMA` / `MACD` に加えて、`ATR_PERCENTILE` / `VWAP_SESSION` / `VOLUME_Z_SCORE` を `IndicatorCalculator` 経由で返す。レスポンス形状は既存の `IndicatorResult(indicator, params, values)` を維持し、新指標も単一値は `IndicatorValue.value` に格納する。
+
+- `ATR_PERCENTILE` は `period` で算出した ATR series に対し、直近 `lookback` 本の ATR のうち current ATR 以下の割合を `0.0..1.0` で返す。`lookback` は additive parameter であり、既定は `100`、`period + lookback` は `calc_indicator` の最大 candle 取得本数 `500` 以下に制限する。
+- `VWAP_SESSION` は session cumulative VWAP として `sum(typical price * volume) / sum(volume)` を返す。session 境界は GMO kline の日次境界に合わせ、JST 06:00 で切り替える。実装根拠は `GmoPublicMarketDataSource.fetchDayRangeCandles()` が `currentGmoBusinessDate()` を `GET /public/v1/klines` の `date=yyyyMMdd` に使い、`currentGmoBusinessDate()` が `LocalDateTime.now(clock.withZone(marketDateZone)).minusHours(GMO_BUSINESS_DAY_SWITCH_HOUR.toLong()).toLocalDate()` で営業日を決めていること、および `GMO_BUSINESS_DAY_SWITCH_HOUR = 6`、既定 `marketDateZone = Asia/Tokyo` であること。
+- `VOLUME_Z_SCORE` は直近 `period` 本の出来高について、population standard deviation を用いた `(current volume - mean) / stddev` を返す。既定 `period` は `20`、window 未充足または標準偏差が `0` の場合は `value = null` とする。
+
 ---
 
 ### 5.6 評価系と benchmark
