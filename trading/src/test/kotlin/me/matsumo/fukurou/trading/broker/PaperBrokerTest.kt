@@ -32,10 +32,14 @@ import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskState
+import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
+import me.matsumo.fukurou.trading.safety.SafetyFloor
+import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import java.math.BigDecimal
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import java.util.UUID
@@ -164,6 +168,39 @@ class PaperBrokerTest {
         assertEquals("10005000.00000000", positions.single().lowestPriceSinceEntryJpy)
         assertEquals(listOf(OrderType.STOP), orders.map { order -> order.orderType })
         assertEquals(1, executions.size)
+    }
+
+    @Test
+    fun place_order_capsProbabilityFromStaleTickerTimestamp() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            safetyFloor = SafetyFloor(
+                config = SafetyFloorConfig(
+                    dataQualityCap = DataQualityCapConfig(
+                        staleAfter = Duration.ofSeconds(60),
+                        cappedProbability = BigDecimal("0.50"),
+                    ),
+                ),
+                clock = fixedClock(),
+            ),
+            marketDataSource = StaleTickerMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = marketEntryCommand(
+            sizeBtc = BigDecimal("0.0040"),
+            takeProfitPriceJpy = BigDecimal("10300000"),
+            estimatedWinProbability = BigDecimal("0.95"),
+        )
+
+        val result = broker.placeOrder(approvedCommand(decisionRepository, command)).getOrThrow()
+
+        assertFalse(result.accepted)
+        assertEquals(SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE, result.safetyViolation?.rule)
+        assertTrue(result.safetyViolation?.messageJa.orEmpty().contains("データ鮮度劣化により p を 0.50 に cap"))
     }
 
     @Test
@@ -986,6 +1023,17 @@ private object FakeMarketDataSource : MarketDataSource {
                 makerFee = "-0.0001",
             ),
         )
+    }
+}
+
+/**
+ * stale ticker timestamp を返す fake market data。
+ */
+private object StaleTickerMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return FakeMarketDataSource.getTicker(symbol).map { ticker ->
+            ticker.copy(timestamp = fixedInstant().minusSeconds(61).toString())
+        }
     }
 }
 

@@ -13,9 +13,11 @@ import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
+import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
@@ -118,6 +120,7 @@ internal fun startProtectionReconcilerWorker(
     val tradingConfig = TradingBotConfig.fromEnvironment()
     val riskStateRepository = ExposedRiskStateRepository(database)
     val commandEventLog = ExposedCommandEventLog(database)
+    val evaluationRepository = ExposedEvaluationRepository(database)
     val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
     val safetyViolationRepository = ExposedSafetyViolationRepository(database)
     val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
@@ -146,6 +149,15 @@ internal fun startProtectionReconcilerWorker(
             clock = clock,
         ),
         broker = broker,
+        killCriterionEvaluator = KillCriterionEvaluator(
+            config = tradingConfig.killCriterion,
+            riskStateRepository = riskStateRepository,
+            riskStateCommandService = riskStateCommandService,
+            commandEventLog = commandEventLog,
+            broker = broker,
+            statsSource = { evaluationRepository.fetchKillCriterionStats() },
+            clock = clock,
+        ),
         status = status,
         clock = clock,
     )

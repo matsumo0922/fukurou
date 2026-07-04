@@ -170,6 +170,7 @@ data class EconomicEventBlackout(
  * @param maxTotalExposureRatio 合計 exposure 上限
  * @param minExpectedValueR コード計算した entry plan に求める最小 EV
  * @param minExpectedMoveToCostRatio 想定値幅と往復 cost の最小比率
+ * @param dataQualityCap 市場データ鮮度劣化時の p cap 設定
  * @param maxTakerFeeRatio paper で許容する taker fee 上限
  * @param economicEventBlackouts 高影響経済イベントの新規 entry blackout 一覧
  * @param marketSlippageReserveBps MARKET / STOP の片道 slippage reserve
@@ -180,6 +181,7 @@ data class SafetyFloorConfig(
     val maxTotalExposureRatio: BigDecimal = DEFAULT_MAX_TOTAL_EXPOSURE_RATIO,
     val minExpectedValueR: BigDecimal = DEFAULT_MIN_EXPECTED_VALUE_R,
     val minExpectedMoveToCostRatio: BigDecimal = DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO,
+    val dataQualityCap: DataQualityCapConfig = DataQualityCapConfig(),
     val maxTakerFeeRatio: BigDecimal = DEFAULT_MAX_TAKER_FEE_RATIO,
     val economicEventBlackouts: List<EconomicEventBlackout> = emptyList(),
     val marketSlippageReserveBps: BigDecimal = DEFAULT_MARKET_SLIPPAGE_RESERVE_BPS,
@@ -223,6 +225,31 @@ data class SafetyFloorConfig(
 }
 
 /**
+ * 市場データ鮮度劣化時に EV 計算だけへ適用する probability cap。
+ *
+ * @param staleAfter この時間を超えて古い市場データを stale とみなす
+ * @param cappedProbability stale 時に EV 計算へ使う p の上限
+ */
+data class DataQualityCapConfig(
+    val staleAfter: Duration = DEFAULT_DATA_QUALITY_STALE_AFTER,
+    val cappedProbability: BigDecimal = DEFAULT_DATA_QUALITY_CAPPED_PROBABILITY,
+) {
+    init {
+        val staleAfterIsPositive = !staleAfter.isNegative && !staleAfter.isZero
+        val staleAfterIsConservative = staleAfterIsPositive && staleAfter <= DEFAULT_DATA_QUALITY_STALE_AFTER
+        val cappedProbabilityInRange = cappedProbability >= BigDecimal.ZERO && cappedProbability <= BigDecimal.ONE
+        val cappedProbabilityIsConservative = cappedProbabilityInRange && cappedProbability <= DEFAULT_DATA_QUALITY_CAPPED_PROBABILITY
+
+        require(staleAfterIsConservative) {
+            "staleAfter must be greater than 0 and less than or equal to ${DEFAULT_DATA_QUALITY_STALE_AFTER.seconds} seconds."
+        }
+        require(cappedProbabilityIsConservative) {
+            "cappedProbability must be between 0 and ${DEFAULT_DATA_QUALITY_CAPPED_PROBABILITY.toPlainString()}."
+        }
+    }
+}
+
+/**
  * SafetyFloor 検証に必要な最新状態。
  *
  * @param account paper account snapshot
@@ -233,6 +260,7 @@ data class SafetyFloorConfig(
  * @param symbolRules 取引所 symbol rule
  * @param entryIntent entry intent / falsification / consumption snapshot
  * @param atr14Jpy 5分足 ATR(14)
+ * @param marketDataObservedAt EV 判定に使った ticker が取引所から返した時刻
  */
 data class SafetyFloorContext(
     val account: AccountSnapshot,
@@ -243,6 +271,7 @@ data class SafetyFloorContext(
     val symbolRules: SymbolRules,
     val entryIntent: EntryIntentSafetySnapshot? = null,
     val atr14Jpy: BigDecimal? = null,
+    val marketDataObservedAt: Instant? = null,
 )
 
 /**
@@ -624,6 +653,9 @@ class SafetyFloor(
                 measuredValue = "null",
                 limitValue = "required",
             )
+        val cappedProbability = cappedProbabilityOrNull(probability, context)
+        val probabilityForExpectedValue = cappedProbability ?: probability
+        val probabilityCapSuffix = probabilityCapSuffix(cappedProbability)
         val entryPrice = estimatedEntryPrice(command, context)
         val riskAmount = entryRiskAmount(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy)
         val expectedRMultiple = expectedRMultiple(command.sizeBtc, entryPrice, takeProfitPrice, riskAmount)
@@ -633,9 +665,9 @@ class SafetyFloor(
             stopPrice = command.protectiveStopPriceJpy,
             context = context,
         ).divideOrZero(riskAmount)
-        val expectedValueR = probability
+        val expectedValueR = probabilityForExpectedValue
             .multiply(expectedRMultiple)
-            .subtract(BigDecimal.ONE.subtract(probability))
+            .subtract(BigDecimal.ONE.subtract(probabilityForExpectedValue))
             .subtract(roundTripCostR)
             .safetyScale()
 
@@ -644,7 +676,7 @@ class SafetyFloor(
                 commandName = "place_order",
                 command = command,
                 rule = SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE,
-                messageJa = "推定勝率、目標価格、STOP、往復 cost から計算した EV が 0 以下です。",
+                messageJa = "推定勝率、目標価格、STOP、往復 cost から計算した EV が 0 以下です。$probabilityCapSuffix",
                 measuredValue = expectedValueR.toPlainString(),
                 limitValue = ">0",
             )
@@ -658,7 +690,7 @@ class SafetyFloor(
             commandName = "place_order",
             command = command,
             rule = SafetyFloorRule.EXPECTED_VALUE_GATE,
-            messageJa = "推定勝率、目標価格、STOP、往復 cost から計算した EV が保守的な初期しきい値を下回っています。",
+            messageJa = "推定勝率、目標価格、STOP、往復 cost から計算した EV が保守的な初期しきい値を下回っています。$probabilityCapSuffix",
             measuredValue = expectedValueR.toPlainString(),
             limitValue = config.minExpectedValueR.toPlainString(),
         )
@@ -951,6 +983,30 @@ class SafetyFloor(
     private fun slippageRatio(): BigDecimal {
         return config.marketSlippageReserveBps.divide(BPS_DIVISOR, SAFETY_SCALE, RoundingMode.HALF_UP)
     }
+
+    private fun cappedProbabilityOrNull(
+        probability: BigDecimal,
+        context: SafetyFloorContext,
+    ): BigDecimal? {
+        val marketDataObservedAt = context.marketDataObservedAt ?: return null
+        val staleDuration = Duration.between(marketDataObservedAt, Instant.now(clock))
+        val stale = staleDuration > config.dataQualityCap.staleAfter
+        val capWouldReduceProbability = probability > config.dataQualityCap.cappedProbability
+
+        if (!stale || !capWouldReduceProbability) {
+            return null
+        }
+
+        return config.dataQualityCap.cappedProbability
+    }
+
+    private fun probabilityCapSuffix(cappedProbability: BigDecimal?): String {
+        if (cappedProbability == null) {
+            return ""
+        }
+
+        return "データ鮮度劣化により p を ${cappedProbability.toPlainString()} に cap しました。"
+    }
 }
 
 private fun List<Position>.filterTargetPositions(tradeGroupId: String?): List<Position> {
@@ -1124,3 +1180,13 @@ private val DEFAULT_MAX_TAKER_FEE_RATIO = BigDecimal("0.0010")
  * 片道 slippage reserve。
  */
 private val DEFAULT_MARKET_SLIPPAGE_RESERVE_BPS = BigDecimal("5")
+
+/**
+ * データ品質 p cap の既定 stale 秒数。
+ */
+private val DEFAULT_DATA_QUALITY_STALE_AFTER = Duration.ofSeconds(60)
+
+/**
+ * データ品質 p cap の既定 probability 上限。
+ */
+private val DEFAULT_DATA_QUALITY_CAPPED_PROBABILITY = BigDecimal("0.5")

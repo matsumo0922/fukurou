@@ -21,6 +21,8 @@ class TradingBotConfigTest {
         assertEquals(TradingMode.PAPER, config.mode)
         assertEquals(BigDecimal("100000"), config.paperAccount.initialCashJpy)
         assertEquals(BigDecimal("0.80"), config.safetyFloor.maxTotalExposureRatio)
+        assertEquals(Duration.ofSeconds(60), config.safetyFloor.dataQualityCap.staleAfter)
+        assertEquals(BigDecimal("0.5"), config.safetyFloor.dataQualityCap.cappedProbability)
         assertEquals(48, config.runner.maxToolCallsPerRun)
         assertEquals(3, config.runner.maxActToolCallsPerRun)
         assertEquals(Duration.ofSeconds(180), config.runner.perRunTimeout)
@@ -29,6 +31,8 @@ class TradingBotConfigTest {
         assertEquals(false, config.daemon.enabled)
         assertEquals(Duration.ofMinutes(15), config.daemon.flatHeartbeatInterval)
         assertEquals(Duration.ofMinutes(15), config.daemon.holdingCheckInterval)
+        assertEquals(100, config.killCriterion.minClosedTrades)
+        assertEquals(BigDecimal("0.8"), config.killCriterion.minProfitFactor)
         assertEquals(10, config.gmoPublicClient.rateLimit.permitsPerSecond)
     }
 
@@ -47,6 +51,8 @@ class TradingBotConfigTest {
                 "FUKUROU_MAX_TOTAL_EXPOSURE_RATIO" to "0.70",
                 "FUKUROU_MIN_EXPECTED_VALUE_R" to "0.12",
                 "FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO" to "3.5",
+                "FUKUROU_DATA_QUALITY_STALE_AFTER_SECONDS" to "30",
+                "FUKUROU_DATA_QUALITY_CAPPED_PROBABILITY" to "0.4",
                 "FUKUROU_MAX_TAKER_FEE_RATIO" to "0.0008",
                 "FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS" to "8",
                 "FUKUROU_FALSIFICATION_FRESHNESS_SECONDS" to "90",
@@ -69,6 +75,8 @@ class TradingBotConfigTest {
                 "FUKUROU_LLM_DAEMON_POLL_SECONDS" to "120",
                 "FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS" to "28800",
                 "FUKUROU_LLM_HOLDING_CHECK_SECONDS" to "14400",
+                "FUKUROU_KILL_MIN_CLOSED_TRADES" to "50",
+                "FUKUROU_KILL_MIN_PROFIT_FACTOR" to "0.9",
                 "FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC" to
                     "fomc-20260729|FOMC|2026-07-29T18:00:00Z|60|90",
             ),
@@ -85,6 +93,8 @@ class TradingBotConfigTest {
         assertEquals(BigDecimal("0.70"), config.safetyFloor.maxTotalExposureRatio)
         assertEquals(BigDecimal("0.12"), config.safetyFloor.minExpectedValueR)
         assertEquals(BigDecimal("3.5"), config.safetyFloor.minExpectedMoveToCostRatio)
+        assertEquals(Duration.ofSeconds(30), config.safetyFloor.dataQualityCap.staleAfter)
+        assertEquals(BigDecimal("0.4"), config.safetyFloor.dataQualityCap.cappedProbability)
         assertEquals(BigDecimal("0.0008"), config.safetyFloor.maxTakerFeeRatio)
         assertEquals(BigDecimal("8"), config.safetyFloor.marketSlippageReserveBps)
         assertEquals(Duration.ofSeconds(90), config.decisionProtocol.falsificationFreshnessWindow)
@@ -107,6 +117,8 @@ class TradingBotConfigTest {
         assertEquals(Duration.ofSeconds(120), config.daemon.pollInterval)
         assertEquals(Duration.ofHours(8), config.daemon.flatHeartbeatInterval)
         assertEquals(Duration.ofHours(4), config.daemon.holdingCheckInterval)
+        assertEquals(50, config.killCriterion.minClosedTrades)
+        assertEquals(BigDecimal("0.9"), config.killCriterion.minProfitFactor)
         assertEquals(1, config.safetyFloor.economicEventBlackouts.size)
         assertEquals("fomc-20260729", config.safetyFloor.economicEventBlackouts.single().eventId)
     }
@@ -151,6 +163,16 @@ class TradingBotConfigTest {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO" to "2.5"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_DATA_QUALITY_STALE_AFTER_SECONDS" to "61"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_DATA_QUALITY_CAPPED_PROBABILITY" to "0.6"),
             )
         }
         assertFailsWith<IllegalArgumentException> {
@@ -221,6 +243,16 @@ class TradingBotConfigTest {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_LLM_HOLDING_CHECK_SECONDS" to "600"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_KILL_MIN_CLOSED_TRADES" to "101"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_KILL_MIN_PROFIT_FACTOR" to "0.7"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

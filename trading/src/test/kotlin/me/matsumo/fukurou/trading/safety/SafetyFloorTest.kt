@@ -4,6 +4,11 @@ import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
+import me.matsumo.fukurou.trading.decision.EntryIntentDraft
+import me.matsumo.fukurou.trading.decision.EntryIntentSafetySnapshot
+import me.matsumo.fukurou.trading.decision.FalsificationRecord
+import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -25,6 +30,7 @@ import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertTrue
 
 /**
  * SafetyFloor の rule 判定を検証するテスト。
@@ -151,27 +157,94 @@ class SafetyFloorTest {
         assertEquals("10030000", rejected.violation.measuredValue)
         assertEquals(">=10040000.00000000", rejected.violation.limitValue)
     }
+
+    @Test
+    fun place_order_capsProbabilityForStaleMarketDataBeforeEvGate() {
+        val command = entryCommand(
+            sizeBtc = BigDecimal("0.0040"),
+            takeProfitPriceJpy = BigDecimal("10300000"),
+            estimatedWinProbability = BigDecimal("0.95"),
+        )
+        val verdict = SafetyFloor(
+            config = SafetyFloorConfig(
+                dataQualityCap = DataQualityCapConfig(
+                    staleAfter = Duration.ofSeconds(60),
+                    cappedProbability = BigDecimal("0.50"),
+                ),
+            ),
+            clock = fixedClock(),
+        ).evaluatePlaceOrder(
+            command = command,
+            context = safetyContext(
+                positions = emptyList(),
+                atr14Jpy = null,
+                entryIntent = approvedIntentSnapshot(command),
+                marketDataObservedAt = fixedInstant().minusSeconds(61),
+            ),
+        )
+
+        val rejected = assertIs<SafetyFloorVerdict.Rejected>(verdict)
+
+        assertTrue(rejected.violation.messageJa.contains("データ鮮度劣化により p を 0.50 に cap"))
+    }
+
+    @Test
+    fun place_order_doesNotCapProbabilityForFreshMarketData() {
+        val command = entryCommand(
+            sizeBtc = BigDecimal("0.0040"),
+            takeProfitPriceJpy = BigDecimal("10300000"),
+            estimatedWinProbability = BigDecimal("0.95"),
+        )
+        val verdict = SafetyFloor(
+            config = SafetyFloorConfig(
+                dataQualityCap = DataQualityCapConfig(
+                    staleAfter = Duration.ofSeconds(60),
+                    cappedProbability = BigDecimal("0.50"),
+                ),
+            ),
+            clock = fixedClock(),
+        ).evaluatePlaceOrder(
+            command = command,
+            context = safetyContext(
+                positions = emptyList(),
+                atr14Jpy = null,
+                entryIntent = approvedIntentSnapshot(command),
+                marketDataObservedAt = fixedInstant(),
+            ),
+        )
+
+        assertIs<SafetyFloorVerdict.Accepted>(verdict)
+    }
 }
 
-private fun entryCommand(): PlaceOrderCommand {
+private fun entryCommand(
+    sizeBtc: BigDecimal = BigDecimal("0.0050"),
+    takeProfitPriceJpy: BigDecimal = BigDecimal("10500000"),
+    estimatedWinProbability: BigDecimal = BigDecimal("0.60"),
+): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
         intentId = UUID.randomUUID(),
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
         orderType = OrderType.MARKET,
-        sizeBtc = BigDecimal("0.0050"),
+        sizeBtc = sizeBtc,
         priceJpy = null,
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
-        takeProfitPriceJpy = BigDecimal("10500000"),
-        estimatedWinProbability = BigDecimal("0.60"),
+        takeProfitPriceJpy = takeProfitPriceJpy,
+        estimatedWinProbability = estimatedWinProbability,
         reasonJa = "test entry during blackout",
         auditContext = PaperTradeAuditContext.EMPTY,
     )
 }
 
-private fun safetyContext(positions: List<Position>, atr14Jpy: BigDecimal?): SafetyFloorContext {
+private fun safetyContext(
+    positions: List<Position>,
+    atr14Jpy: BigDecimal?,
+    entryIntent: EntryIntentSafetySnapshot? = null,
+    marketDataObservedAt: Instant? = null,
+): SafetyFloorContext {
     return SafetyFloorContext(
         account = AccountSnapshot(
             mode = TradingMode.PAPER,
@@ -204,7 +277,42 @@ private fun safetyContext(positions: List<Position>, atr14Jpy: BigDecimal?): Saf
             takerFee = "0.0005",
             makerFee = "-0.0001",
         ),
+        entryIntent = entryIntent,
         atr14Jpy = atr14Jpy,
+        marketDataObservedAt = marketDataObservedAt,
+    )
+}
+
+private fun approvedIntentSnapshot(command: PlaceOrderCommand): EntryIntentSafetySnapshot {
+    val intentId = requireNotNull(command.intentId)
+
+    return EntryIntentSafetySnapshot(
+        tradeIntent = TradeIntentRecord(
+            intentId = intentId,
+            decisionId = UUID.randomUUID(),
+            tradePlanId = UUID.randomUUID(),
+            draft = EntryIntentDraft(
+                symbol = command.symbol,
+                side = command.side,
+                orderType = command.orderType,
+                sizeBtc = command.sizeBtc,
+                priceJpy = command.priceJpy,
+                protectiveStopPriceJpy = command.protectiveStopPriceJpy,
+                takeProfitPriceJpy = command.takeProfitPriceJpy,
+            ),
+            estimatedWinProbability = command.estimatedWinProbability,
+            createdAt = fixedInstant(),
+        ),
+        falsification = FalsificationRecord(
+            falsificationId = UUID.randomUUID(),
+            intentId = intentId,
+            verdict = FalsificationVerdict.APPROVED,
+            llmProvider = "codex",
+            reasonJa = "test approved",
+            createdAt = fixedInstant(),
+        ),
+        consumed = false,
+        freshApproved = true,
     )
 }
 

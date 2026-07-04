@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
+import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import java.math.BigDecimal
@@ -24,6 +25,7 @@ import java.time.Instant
  * @param decisionProtocol decision / Falsifier protocol 設定
  * @param runner LLM one-shot runner の保守的な上限設定
  * @param daemon Ktor 常駐 daemon scheduler 設定
+ * @param killCriterion 評価成績による HARD_HALT 基準
  * @param gmoPublicClient GMO Public API client 設定
  */
 data class TradingBotConfig(
@@ -36,6 +38,7 @@ data class TradingBotConfig(
     val decisionProtocol: DecisionProtocolConfig = DecisionProtocolConfig(),
     val runner: LlmRunnerConfig = LlmRunnerConfig(),
     val daemon: LlmDaemonConfig = LlmDaemonConfig(),
+    val killCriterion: KillCriterionConfig = KillCriterionConfig(),
     val gmoPublicClient: GmoPublicClientConfig = GmoPublicClientConfig(),
 ) {
     init {
@@ -83,6 +86,7 @@ data class TradingBotConfig(
                 decisionProtocol = environment.readDecisionProtocolConfig(),
                 runner = environment.readLlmRunnerConfig(),
                 daemon = environment.readLlmDaemonConfig(),
+                killCriterion = environment.readKillCriterionConfig(),
                 gmoPublicClient = environment.readGmoPublicClientConfig(),
             )
         }
@@ -231,6 +235,29 @@ data class LlmDaemonConfig(
 }
 
 /**
+ * 評価成績による kill 基準の保守的な設定。
+ *
+ * @param minClosedTrades 判定に必要な最小 closed trade 数
+ * @param minProfitFactor これを下回る PF で HARD_HALT する
+ */
+data class KillCriterionConfig(
+    val minClosedTrades: Int = DEFAULT_KILL_MIN_CLOSED_TRADES,
+    val minProfitFactor: BigDecimal = DEFAULT_KILL_MIN_PROFIT_FACTOR,
+) {
+    init {
+        val closedTradesIsConservative = minClosedTrades in 1..DEFAULT_KILL_MIN_CLOSED_TRADES
+        val profitFactorIsConservative = minProfitFactor >= DEFAULT_KILL_MIN_PROFIT_FACTOR
+
+        require(closedTradesIsConservative) {
+            "minClosedTrades must be between 1 and $DEFAULT_KILL_MIN_CLOSED_TRADES."
+        }
+        require(profitFactorIsConservative) {
+            "minProfitFactor must be greater than or equal to ${DEFAULT_KILL_MIN_PROFIT_FACTOR.toPlainString()}."
+        }
+    }
+}
+
+/**
  * decision / Falsifier protocol の保守的な設定。
  *
  * @param falsificationFreshnessWindow fresh APPROVED とみなす時間窓
@@ -324,6 +351,16 @@ private const val FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC_ENV = "FUKUROU_ECONOMIC_E
 private const val FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS_ENV = "FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS"
 
 /**
+ * data quality p cap の stale 秒数の環境変数名。
+ */
+private const val FUKUROU_DATA_QUALITY_STALE_AFTER_SECONDS_ENV = "FUKUROU_DATA_QUALITY_STALE_AFTER_SECONDS"
+
+/**
+ * data quality p cap の probability 上限の環境変数名。
+ */
+private const val FUKUROU_DATA_QUALITY_CAPPED_PROBABILITY_ENV = "FUKUROU_DATA_QUALITY_CAPPED_PROBABILITY"
+
+/**
  * fresh falsification 判定 window 秒数の環境変数名。
  */
 private const val FUKUROU_FALSIFICATION_FRESHNESS_SECONDS_ENV = "FUKUROU_FALSIFICATION_FRESHNESS_SECONDS"
@@ -372,6 +409,16 @@ private const val FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS_ENV = "FUKUROU_LLM_FLAT_HEA
  * holding dense check 間隔秒数の環境変数名。
  */
 private const val FUKUROU_LLM_HOLDING_CHECK_SECONDS_ENV = "FUKUROU_LLM_HOLDING_CHECK_SECONDS"
+
+/**
+ * kill 基準の最小 closed trade 数の環境変数名。
+ */
+private const val FUKUROU_KILL_MIN_CLOSED_TRADES_ENV = "FUKUROU_KILL_MIN_CLOSED_TRADES"
+
+/**
+ * kill 基準の最小 PF の環境変数名。
+ */
+private const val FUKUROU_KILL_MIN_PROFIT_FACTOR_ENV = "FUKUROU_KILL_MIN_PROFIT_FACTOR"
 
 /**
  * paper 初期残高の既定値。
@@ -437,6 +484,16 @@ val DEFAULT_LLM_HOLDING_CHECK_INTERVAL: Duration = Duration.ofMinutes(15)
  * LLM 起動予約を stale とみなす既定時間。
  */
 val DEFAULT_LLM_LAUNCH_RESERVATION_STALE_AFTER: Duration = Duration.ofMinutes(30)
+
+/**
+ * kill 基準の既定最小 closed trade 数。
+ */
+const val DEFAULT_KILL_MIN_CLOSED_TRADES = 100
+
+/**
+ * kill 基準の既定最小 PF。
+ */
+val DEFAULT_KILL_MIN_PROFIT_FACTOR: BigDecimal = BigDecimal("0.8")
 
 /**
  * fallback 最小発注数量の既定値。
@@ -530,6 +587,7 @@ private fun Map<String, String>.readSafetyFloorConfig(): SafetyFloorConfig {
             name = FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO_ENV,
             defaultValue = BigDecimal("3.0"),
         ),
+        dataQualityCap = readDataQualityCapConfig(),
         maxTakerFeeRatio = readDecimal(
             name = FUKUROU_MAX_TAKER_FEE_RATIO_ENV,
             defaultValue = BigDecimal("0.0010"),
@@ -538,6 +596,20 @@ private fun Map<String, String>.readSafetyFloorConfig(): SafetyFloorConfig {
         marketSlippageReserveBps = readDecimal(
             name = FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS_ENV,
             defaultValue = DEFAULT_MARKET_SLIPPAGE_BPS,
+        ),
+    )
+}
+
+private fun Map<String, String>.readDataQualityCapConfig(): DataQualityCapConfig {
+    return DataQualityCapConfig(
+        staleAfter = Duration.ofSeconds(
+            readOptional(FUKUROU_DATA_QUALITY_STALE_AFTER_SECONDS_ENV)
+                ?.toLong()
+                ?: DataQualityCapConfig().staleAfter.seconds,
+        ),
+        cappedProbability = readDecimal(
+            name = FUKUROU_DATA_QUALITY_CAPPED_PROBABILITY_ENV,
+            defaultValue = DataQualityCapConfig().cappedProbability,
         ),
     )
 }
@@ -592,6 +664,18 @@ private fun Map<String, String>.readLlmDaemonConfig(): LlmDaemonConfig {
             readOptional(FUKUROU_LLM_HOLDING_CHECK_SECONDS_ENV)
                 ?.toLong()
                 ?: DEFAULT_LLM_HOLDING_CHECK_INTERVAL.seconds,
+        ),
+    )
+}
+
+private fun Map<String, String>.readKillCriterionConfig(): KillCriterionConfig {
+    return KillCriterionConfig(
+        minClosedTrades = readOptional(FUKUROU_KILL_MIN_CLOSED_TRADES_ENV)
+            ?.toInt()
+            ?: DEFAULT_KILL_MIN_CLOSED_TRADES,
+        minProfitFactor = readDecimal(
+            name = FUKUROU_KILL_MIN_PROFIT_FACTOR_ENV,
+            defaultValue = DEFAULT_KILL_MIN_PROFIT_FACTOR,
         ),
     )
 }

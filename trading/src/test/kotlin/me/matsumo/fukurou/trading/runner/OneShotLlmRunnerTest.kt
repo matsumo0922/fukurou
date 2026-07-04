@@ -488,6 +488,43 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun claudePhaseAuditStoresUsageButCodexPhaseDoesNot() = runBlocking {
+        val usageStdout = """
+            {
+              "total_cost_usd": 0.02,
+              "num_turns": 2,
+              "duration_ms": 1000,
+              "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50
+              }
+            }
+        """.trimIndent()
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.ENTER).getOrThrow()
+
+                return@runnerFixture cleanExit(stdout = usageStdout)
+            }
+
+            submitFalsification(fixtureRepository, command, FalsificationVerdict.APPROVED).getOrThrow()
+
+            cleanExit(stdout = usageStdout)
+        }
+
+        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        val phaseEvents = fixture.eventLog.events()
+            .filter { event -> event.eventType == CommandEventType.RUNNER_PHASE_COMPLETED }
+        val proposerPhase = phaseEvents.single { event -> event.payload.contains("\"phase\":\"proposer\"") }
+        val falsifierPhase = phaseEvents.single { event -> event.payload.contains("\"phase\":\"falsifier\"") }
+
+        assertTrue(proposerPhase.payload.contains("\"usage\""))
+        assertTrue(proposerPhase.payload.contains("\"totalCostUsd\":\"0.02\""))
+        assertFalse(falsifierPhase.payload.contains("\"usage\""))
+    }
+
+    @Test
     fun unexpectedRunnerFailure_recordsCallerNoTradeAudit() = runBlocking {
         val missingPromptRoot = Files.createTempDirectory("fukurou-missing-prompt")
         val fixture = runnerFixture { cleanExit() }

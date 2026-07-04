@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
@@ -40,6 +41,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -876,6 +878,105 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf(OrderSide.BUY, OrderSide.SELL), executions.map { execution -> execution.side })
         assertEquals("10005000.00000000", watermark.highestPriceSinceEntryJpy)
         assertEquals("9685155.00000000", watermark.lowestPriceSinceEntryJpy)
+    }
+
+    @Test
+    fun evaluation_repository_readsClosedTradeFactAndKillStatsFromPostgresLedger() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+        repository.reconcile(
+            tickSnapshot = takeProfitTickSnapshot(),
+            simulator = FillSimulator(clock = fixedClock()),
+        ).getOrThrow()
+
+        val evaluationRepository = ExposedEvaluationRepository(database)
+        val tradeResult = evaluationRepository.fetchClosedTrades(
+            EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val trade = tradeResult.trades.single()
+        val executions = repository.getExecutions().getOrThrow()
+        val expectedPnl = executions
+            .filter { execution -> execution.side == OrderSide.SELL }
+            .sumOf { execution -> execution.realizedPnlJpy.toBigDecimal() }
+            .subtract(
+                executions
+                    .filter { execution -> execution.side == OrderSide.BUY }
+                    .sumOf { execution -> execution.feeJpy.toBigDecimal() },
+            )
+        val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
+
+        assertEquals(false, tradeResult.truncated)
+        assertEquals(listOf("integration-entry"), trade.setupTags)
+        assertEquals("9700000.00000000", trade.initialProtectiveStopPriceJpy?.toPlainString())
+        assertEquals("10100000.00000000", trade.highestPriceSinceEntryJpy.toPlainString())
+        assertEquals("10005000.00000000", trade.lowestPriceSinceEntryJpy?.toPlainString())
+        assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
+        assertEquals(1, killStats.closedTrades)
+        assertNull(killStats.profitFactor)
+    }
+
+    @Test
+    fun evaluation_repository_readsLlmUsageFromInvocationPhasesWithFallbackAndLimit() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val eventLog = ExposedCommandEventLog(database)
+        eventLog.append(runnerPhaseEvent(phase = "preflight", provider = null, occurredAt = fixedInstant())).getOrThrow()
+        eventLog.append(
+            runnerPhaseEvent(
+                phase = "proposer",
+                provider = "claude",
+                occurredAt = fixedInstant().plusMillis(1),
+                stdout = """{"total_cost_usd":0.20,"modelUsage":{"claude-sonnet":{"input_tokens":10,"output_tokens":4}}}""",
+            ),
+        ).getOrThrow()
+        eventLog.append(
+            runnerPhaseEvent(
+                phase = "falsifier",
+                provider = "codex",
+                occurredAt = fixedInstant().plusMillis(2),
+                stdout = "codex text output",
+            ),
+        ).getOrThrow()
+        eventLog.append(
+            runnerPhaseEvent(
+                phase = "proposer",
+                provider = "claude",
+                occurredAt = fixedInstant().plusMillis(3),
+                stdout = """{"total_cost_usd":0.30}""",
+            ),
+        ).getOrThrow()
+
+        val evaluationRepository = ExposedEvaluationRepository(database)
+        val usageResult = evaluationRepository.fetchLlmPhaseUsages(
+            period = EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(1),
+            ),
+            limit = 2,
+        ).getOrThrow()
+
+        assertTrue(usageResult.truncated)
+        assertEquals(listOf("proposer", "falsifier"), usageResult.facts.map { fact -> fact.phase })
+        assertEquals("0.20", usageResult.facts.first().usage?.totalCostUsd?.toPlainString())
+        assertEquals(null, usageResult.facts[1].usage)
     }
 
     @Test
@@ -1952,6 +2053,36 @@ private fun JdbcTransaction.insertTestExecution(
         statement.setLong(5, fixedInstant().toEpochMilli())
         statement.executeUpdate()
     }
+}
+
+private fun runnerPhaseEvent(
+    phase: String,
+    provider: String?,
+    occurredAt: Instant,
+    stdout: String? = null,
+): CommandEvent {
+    val escapedStdout = stdout?.replace("\"", "\\\"")
+    val details = if (escapedStdout == null) {
+        "{}"
+    } else {
+        """{"stdout":"$escapedStdout"}"""
+    }
+
+    return CommandEvent(
+        decisionRunContext = DecisionRunContext(
+            decisionRunId = "run-$phase-${occurredAt.toEpochMilli()}",
+            llmProvider = provider,
+            promptHash = null,
+            systemPromptVersion = null,
+            marketSnapshotId = null,
+        ),
+        toolName = "one_shot_runner",
+        toolCallId = null,
+        clientRequestId = null,
+        eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+        payload = """{"phase":"$phase","details":$details}""",
+        occurredAt = occurredAt,
+    )
 }
 
 /**

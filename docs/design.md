@@ -1256,6 +1256,8 @@ interface GmoSymbolMapper {
 | 日足 | JST更新時刻を考慮 | 地合い判断のみ |
 | account/position | 10秒超 | act系ツール前に再取得必須 |
 
+[確定事項の改訂: 2026-07-03] entry EV の計算直前に、データ鮮度劣化時の probability cap を適用する。鮮度シグナルは paper broker が Safety Floor へ渡す ticker の取引所 timestamp とし、単なるローカル fetch 時刻では判定しない。`FUKUROU_DATA_QUALITY_STALE_AFTER_SECONDS` の既定は60秒、`FUKUROU_DATA_QUALITY_CAPPED_PROBABILITY` の既定は0.5である。申告 `estimated_win_probability` は decisions / orders に生値で保存し、Safety Floor の EV 計算だけで `min(申告p, cappedProbability)` を使う。cap が発動して EV 拒否になった場合は、拒否 message に cap 済み p を残す。
+
 ### 5.5 指標計算
 
 [確定] 損切りはATRベース、既定ATR期間14、係数 `k = 2.0`。
@@ -1275,6 +1277,35 @@ interface GmoSymbolMapper {
 | ATR percentile | 5m/1h/1d | 現在ボラの相対化、低ボラ時のコスト比警告 |
 
 ---
+
+### 5.6 評価系と benchmark
+
+[確定事項の改訂: 2026-07-03] 評価 API は paper の append-only ledger から読み取り専用で算出する。DB schema、kline 永続化、集計 table、SQL view は追加しない。closed trade fact は `positions` の CLOSED 行を正本にし、最古の BUY order から `trade_intents` / `decisions` / `trade_plans` を辿る。
+
+評価式は次の通り。
+
+- `tradePnL = SELL executions.realized_pnl_jpy 合計 - BUY executions.fee_jpy 合計`。SELL 側 realized PnL は exit fee 控除済みなので、entry fee だけを追加控除する。
+- `1R価格幅 = average_entry_price_jpy - entry BUY orders.protective_stop_price_jpy`。`positions.current_stop_loss_jpy` は trailing で動くため使わない。
+- `realized_R = tradePnL / (1R価格幅 * size_btc)`。
+- `MFE_R = max(highest_price_since_entry_jpy - entry, 0) / 1R価格幅`。
+- `MAE_R = max(entry - lowest_price_since_entry_jpy, 0) / 1R価格幅`。`lowest_price_since_entry_jpy` が null の trade は MAE 集計から除外する。
+- `PF = 勝ち trade PnL 合計 / abs(負け trade PnL 合計)`。負け trade がなければ null とし、kill 判定は非到達にする。
+- `winRate = PnL > 0 の trade 数 / 全 closed trade 数`。`PnL == 0` は勝ちに含めない。
+- 較正 curve は closed position に到達した ENTER decision の申告 p を0.1幅の10 binへ分類し、件数、平均申告 p、実現勝率を返す。setup tag が複数ある場合は各 tag に重複計上する。
+
+kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `KILL_CRITERION_BREACHED` audit、`RiskStateCommandService.setHardHalt(reason)`、`Broker.sweepHardHalt(reasonJa, tickSnapshot)` の順で既存 HARD_HALT 経路へ接続する。既定値は `minClosedTrades = 100`、`minProfitFactor = 0.8`。`FUKUROU_KILL_MIN_CLOSED_TRADES` は下げる方向のみ、`FUKUROU_KILL_MIN_PROFIT_FACTOR` は上げる方向のみ override できる。無効化スイッチは持たない。
+
+公開 API は次の5本とする。`from` / `to` は ISO-8601 日付を JST として解釈し、省略時は直近30日を返す。
+
+- `GET /evaluation/summary`: 期間成績、行動率、相場局面別成績に加え、kill 基準への近接度（closedTrades、currentPF、閾値、残り trade 数、breached、HARD_HALT 状態）を返す。
+- `GET /evaluation/setups`
+- `GET /evaluation/calibration`
+- `GET /evaluation/benchmark`
+- `GET /evaluation/costs`
+
+benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は期間開始時点の paper equity（paper 初期資金 + 期間開始前の累計 realized trade PnL）とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
+
+LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`proposer` / `falsifier`）だけを集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、保存済み `details.usage` がない過去行は redacted `details.stdout` から可能な範囲で fallback parse する。Codex phase や parse 不能 phase は usage 欠落として数える。取得は既定 20,000 行で bounded にし、超過時は `/evaluation/costs` の `truncated` で示す。
 
 ## 6. 発火エンジンと呼び出しモデル（A-7）
 
