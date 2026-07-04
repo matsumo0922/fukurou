@@ -307,6 +307,22 @@ class IndicatorCalculatorTest {
     }
 
     @Test
+    fun calculate_rejectsAtrPercentileWindowWhenIntAdditionWouldOverflow() {
+        val result = IndicatorCalculator.calculate(
+            candles = closeCandles(1.0, 2.0, 3.0),
+            indicator = IndicatorType.ATR_PERCENTILE,
+            params = IndicatorParams(
+                period = Int.MAX_VALUE,
+                lookback = Int.MAX_VALUE,
+            ),
+        )
+
+        assertFailsWith<MarketInvalidRequestException> {
+            result.getOrThrow()
+        }
+    }
+
+    @Test
     fun calculate_rejectsInvalidMacdPeriodOrder() {
         val result = IndicatorCalculator.calculate(
             candles = closeCandles(1.0, 2.0, 3.0, 4.0),

@@ -266,8 +266,10 @@ object IndicatorCalculator {
     private fun calculateAtrPercentile(candles: List<Candle>, params: IndicatorParams): IndicatorResult {
         val period = validatePeriod(params.period ?: DEFAULT_ATR_PERCENTILE_PERIOD, "period")
         val lookback = validateLookback(params.lookback ?: DEFAULT_ATR_PERCENTILE_LOOKBACK)
+        val requiredCandleLimit = period.toLong() + lookback.toLong()
+        val isWithinCandleLimit = requiredCandleLimit <= MAX_INDICATOR_CANDLE_LIMIT.toLong()
 
-        require(period + lookback <= MAX_INDICATOR_CANDLE_LIMIT) {
+        require(isWithinCandleLimit) {
             "period + lookback must be less than or equal to $MAX_INDICATOR_CANDLE_LIMIT."
         }
 
