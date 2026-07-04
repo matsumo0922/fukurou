@@ -12,11 +12,23 @@ import io.ktor.server.routing.post
 import io.ktor.utils.io.ExperimentalKtorApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.Serializable
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
+import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
+import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
+import me.matsumo.fukurou.trading.decision.DecisionRepository
+import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.risk.SoftHaltDowngradeRejectedException
+import java.time.Clock
+import java.time.Instant
 
 /**
  * ops API の OpenAPI tag。
@@ -62,6 +74,28 @@ data class OpsResumeRequest(
 )
 
 /**
+ * manual trigger API の request body。
+ *
+ * @param reason 手動起動理由
+ */
+@Serializable
+data class OpsTriggerRequest(
+    val reason: String,
+)
+
+/**
+ * manual trigger API の response body。
+ *
+ * @param invocationId 予約した runner 起動 ID
+ * @param triggerKind 起動 trigger 種別
+ */
+@Serializable
+data class OpsTriggerResponse(
+    val invocationId: String,
+    val triggerKind: String,
+)
+
+/**
  * risk_state API の response body。
  *
  * @param state 現在の halt state
@@ -82,12 +116,89 @@ data class OpsRiskStateResponse(
 )
 
 /**
+ * decisions raw feed API の response body。
+ *
+ * @param decisions 新しい順の decision 一覧
+ */
+@Serializable
+data class OpsDecisionsResponse(
+    val decisions: List<OpsDecisionResponse>,
+)
+
+/**
+ * decisions raw feed API の decision 要素。
+ *
+ * @param id decision ID
+ * @param action LLM が提出した action
+ * @param setupTags setup tag 一覧
+ * @param estimatedWinProbability LLM 申告の推定勝率
+ * @param reasonJa 判断理由
+ * @param noTradeConditionsJa 見送り条件
+ * @param createdAt 作成時刻
+ */
+@Serializable
+data class OpsDecisionResponse(
+    val id: String,
+    val action: String,
+    val setupTags: List<String>,
+    val estimatedWinProbability: String,
+    val reasonJa: String,
+    val noTradeConditionsJa: List<String>,
+    val createdAt: String,
+)
+
+/**
+ * positions raw feed API の response body。
+ *
+ * @param positions open position 一覧
+ * @param openOrders open order 一覧
+ */
+@Serializable
+data class OpsPositionsResponse(
+    val positions: List<Position>,
+    val openOrders: List<Order>,
+)
+
+/**
+ * audit raw feed API の response body。
+ *
+ * @param events 新しい順の audit event 一覧
+ */
+@Serializable
+data class OpsAuditResponse(
+    val events: List<OpsAuditEventResponse>,
+)
+
+/**
+ * audit raw feed API の event 要素。
+ *
+ * @param id event ID
+ * @param eventType event 種別
+ * @param toolName tool または worker の論理名
+ * @param payload JSON payload
+ * @param occurredAt 発生時刻
+ */
+@Serializable
+data class OpsAuditEventResponse(
+    val id: String,
+    val eventType: String,
+    val toolName: String,
+    val payload: String,
+    val occurredAt: String,
+)
+
+/**
  * 運用系 route を定義する。
  */
 @OptIn(ExperimentalKtorApi::class)
 internal fun Route.opsRoutes(
     riskStateRepository: RiskStateRepository?,
     riskStateCommandService: RiskStateCommandService?,
+    manualLlmLaunchService: ManualLlmLaunchService?,
+    decisionRepository: DecisionRepository?,
+    paperLedgerRepository: PaperLedgerRepository?,
+    commandEventFeedReader: CommandEventFeedReader?,
+    clock: Clock = Clock.systemUTC(),
 ) {
     post("/ops/halt") {
         val request = call.receiveBodyOrBadRequest<OpsHaltRequest>() ?: return@post
@@ -181,6 +292,159 @@ internal fun Route.opsRoutes(
             }
         }
     }
+
+    post("/ops/trigger") {
+        val request = call.receiveBodyOrBadRequest<OpsTriggerRequest>() ?: return@post
+        val reason = call.requireReason(request.reason) ?: return@post
+        val service = call.requireManualLlmLaunchService(manualLlmLaunchService) ?: return@post
+        val result = service.launch(reason).getOrThrow()
+
+        when (result) {
+            is ManualLlmLaunchResult.Accepted -> call.respond(
+                HttpStatusCode.Accepted,
+                OpsTriggerResponse(
+                    invocationId = result.invocationId,
+                    triggerKind = result.triggerKind.name,
+                ),
+            )
+            is ManualLlmLaunchResult.Rejected -> call.respond(
+                HttpStatusCode.Conflict,
+                ErrorResponse(result.reason),
+            )
+        }
+    }.describe {
+        summary = "LLM one-shot を手動起動する"
+        description = "reason 付きで MANUAL trigger の起動予約を取得し、runner を HTTP 応答後に非同期実行します。"
+        tag(OPS_TAG)
+        requestBody {
+            description = "手動起動理由です。"
+            required = true
+            schema = jsonSchema<OpsTriggerRequest>()
+        }
+        responses {
+            HttpStatusCode.Accepted {
+                description = "起動予約を取得し、runner を非同期開始しました。"
+                schema = jsonSchema<OpsTriggerResponse>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "request body または reason が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.Conflict {
+                description = "起動予約または停止状態により手動起動を拒否しました。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "manual LLM launch service が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    get("/ops/decisions") {
+        val limit = call.requireLimit(
+            defaultLimit = DEFAULT_DECISIONS_LIMIT,
+            maxLimit = MAX_DECISIONS_LIMIT,
+        ) ?: return@get
+        val repository = call.requireDecisionRepository(decisionRepository) ?: return@get
+        val decisions = repository.findDecisionsCreatedBetween(
+            from = Instant.EPOCH,
+            toExclusive = Instant.now(clock),
+            limit = limit,
+        )
+            .getOrThrow()
+            .sortedByDescending { record -> record.decision.createdAt }
+
+        call.respond(
+            OpsDecisionsResponse(
+                decisions = decisions.map { record -> record.toOpsDecisionResponse() },
+            ),
+        )
+    }.describe {
+        summary = "LLM decision の raw feed を取得する"
+        description = "最新 decision を集計せずに新しい順で返します。limit は既定 20、最大 100 です。"
+        tag(OPS_TAG)
+        responses {
+            HttpStatusCode.OK {
+                description = "decision raw feed です。"
+                schema = jsonSchema<OpsDecisionsResponse>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "limit が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "decision repository が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    get("/ops/positions") {
+        val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
+        val positions = repository.getOpenPositions().getOrThrow()
+        val openOrders = repository.getOpenOrders().getOrThrow()
+
+        call.respond(
+            OpsPositionsResponse(
+                positions = positions,
+                openOrders = openOrders,
+            ),
+        )
+    }.describe {
+        summary = "open position と open order の raw feed を取得する"
+        description = "paper ledger の open position と open order を集計せずに返します。"
+        tag(OPS_TAG)
+        responses {
+            HttpStatusCode.OK {
+                description = "open position と open order の raw feed です。"
+                schema = jsonSchema<OpsPositionsResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "paper ledger repository が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    get("/ops/audit") {
+        val limit = call.requireLimit(
+            defaultLimit = DEFAULT_AUDIT_LIMIT,
+            maxLimit = MAX_AUDIT_LIMIT,
+        ) ?: return@get
+        val eventTypeParameter = call.request.queryParameters["eventType"]
+        val eventType = if (eventTypeParameter == null) {
+            null
+        } else {
+            call.requireCommandEventType(eventTypeParameter) ?: return@get
+        }
+        val reader = call.requireCommandEventFeedReader(commandEventFeedReader) ?: return@get
+        val events = reader.findEvents(limit, eventType).getOrThrow()
+
+        call.respond(
+            OpsAuditResponse(
+                events = events.map { event -> event.toOpsAuditEventResponse() },
+            ),
+        )
+    }.describe {
+        summary = "command_event_log の raw feed を取得する"
+        description = "監査イベントを新しい順で返します。limit は既定 50、最大 200、eventType で任意に絞り込めます。"
+        tag(OPS_TAG)
+        responses {
+            HttpStatusCode.OK {
+                description = "audit raw feed です。"
+                schema = jsonSchema<OpsAuditResponse>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "limit または eventType が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "command event feed reader が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
 }
 
 private suspend inline fun <reified T : Any> ApplicationCall.receiveBodyOrBadRequest(): T? {
@@ -229,6 +493,79 @@ private suspend fun ApplicationCall.requireRiskStateCommandService(
     return null
 }
 
+private suspend fun ApplicationCall.requireManualLlmLaunchService(
+    service: ManualLlmLaunchService?,
+): ManualLlmLaunchService? {
+    if (service != null) {
+        return service
+    }
+
+    respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("manual LLM launch service is not configured"))
+
+    return null
+}
+
+private suspend fun ApplicationCall.requireDecisionRepository(repository: DecisionRepository?): DecisionRepository? {
+    if (repository != null) {
+        return repository
+    }
+
+    respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("decision repository is not configured"))
+
+    return null
+}
+
+private suspend fun ApplicationCall.requirePaperLedgerRepository(
+    repository: PaperLedgerRepository?,
+): PaperLedgerRepository? {
+    if (repository != null) {
+        return repository
+    }
+
+    respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("paper ledger repository is not configured"))
+
+    return null
+}
+
+private suspend fun ApplicationCall.requireCommandEventFeedReader(
+    reader: CommandEventFeedReader?,
+): CommandEventFeedReader? {
+    if (reader != null) {
+        return reader
+    }
+
+    respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("command event feed reader is not configured"))
+
+    return null
+}
+
+private suspend fun ApplicationCall.requireLimit(defaultLimit: Int, maxLimit: Int): Int? {
+    val rawLimit = request.queryParameters["limit"]?.trim() ?: return defaultLimit
+    val parsedLimit = rawLimit.toIntOrNull()
+    val limitIsValid = parsedLimit != null && parsedLimit > 0
+
+    if (limitIsValid) {
+        return requireNotNull(parsedLimit).coerceAtMost(maxLimit)
+    }
+
+    respond(HttpStatusCode.BadRequest, ErrorResponse("limit must be a positive integer"))
+
+    return null
+}
+
+private suspend fun ApplicationCall.requireCommandEventType(rawEventType: String): CommandEventType? {
+    val eventTypeName = rawEventType.trim()
+    val eventType = CommandEventType.entries.firstOrNull { candidate -> candidate.name == eventTypeName }
+
+    if (eventType != null) {
+        return eventType
+    }
+
+    respond(HttpStatusCode.BadRequest, ErrorResponse("eventType is invalid"))
+
+    return null
+}
+
 private suspend fun ApplicationCall.respondConflictOrThrow(result: Result<RiskState>): RiskState? {
     val riskState = result.getOrNull()
 
@@ -259,3 +596,47 @@ private fun RiskState.toOpsRiskStateResponse(): OpsRiskStateResponse {
         drawdownRatio = drawdownRatio.toPlainString(),
     )
 }
+
+private fun DecisionJournalRecord.toOpsDecisionResponse(): OpsDecisionResponse {
+    val submission = decision.submission
+
+    return OpsDecisionResponse(
+        id = decision.decisionId.toString(),
+        action = submission.action.name,
+        setupTags = submission.setupTags,
+        estimatedWinProbability = submission.estimatedWinProbability.toPlainString(),
+        reasonJa = submission.reasonJa,
+        noTradeConditionsJa = submission.noTradeConditionsJa,
+        createdAt = decision.createdAt.toString(),
+    )
+}
+
+private fun CommandEvent.toOpsAuditEventResponse(): OpsAuditEventResponse {
+    return OpsAuditEventResponse(
+        id = id.toString(),
+        eventType = eventType.name,
+        toolName = toolName,
+        payload = payload,
+        occurredAt = occurredAt.toString(),
+    )
+}
+
+/**
+ * decisions feed の既定 limit。
+ */
+private const val DEFAULT_DECISIONS_LIMIT = 20
+
+/**
+ * decisions feed の最大 limit。
+ */
+private const val MAX_DECISIONS_LIMIT = 100
+
+/**
+ * audit feed の既定 limit。
+ */
+private const val DEFAULT_AUDIT_LIMIT = 50
+
+/**
+ * audit feed の最大 limit。
+ */
+private const val MAX_AUDIT_LIMIT = 200

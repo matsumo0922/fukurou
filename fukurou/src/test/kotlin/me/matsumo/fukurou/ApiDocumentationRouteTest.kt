@@ -73,6 +73,29 @@ class ApiDocumentationRouteTest {
             path = "/ops/resume",
             schemaRef = "#/components/schemas/OpsResumeRequest",
         )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/trigger",
+            schemaRef = "#/components/schemas/OpsTriggerRequest",
+        )
+        assertOperation(
+            paths = paths,
+            path = "/ops/decisions",
+            summary = "LLM decision の raw feed を取得する",
+            tag = "ops",
+        )
+        assertOperation(
+            paths = paths,
+            path = "/ops/positions",
+            summary = "open position と open order の raw feed を取得する",
+            tag = "ops",
+        )
+        assertOperation(
+            paths = paths,
+            path = "/ops/audit",
+            summary = "command_event_log の raw feed を取得する",
+            tag = "ops",
+        )
     }
 
     private fun assertOperation(

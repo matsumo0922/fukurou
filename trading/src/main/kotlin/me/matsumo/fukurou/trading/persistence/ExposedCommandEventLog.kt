@@ -3,10 +3,14 @@ package me.matsumo.fukurou.trading.persistence
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
+import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import java.sql.ResultSet
 import java.time.Instant
+import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
@@ -61,13 +65,58 @@ private const val COUNT_TOOL_CALL_EVENTS_SQL_TOOL_CONDITION = """
 """
 
 /**
+ * command_event_log を新しい順で読む SQL。
+ */
+private const val SELECT_COMMAND_EVENTS_SQL = """
+    SELECT
+        id,
+        decision_run_id,
+        tool_call_id,
+        client_request_id,
+        tool_name,
+        event_type,
+        payload,
+        ts,
+        llm_provider,
+        prompt_hash,
+        system_prompt_version,
+        market_snapshot_id
+    FROM command_event_log
+    ORDER BY ts DESC
+    LIMIT ?
+"""
+
+/**
+ * command_event_log を event_type で絞って新しい順で読む SQL。
+ */
+private const val SELECT_COMMAND_EVENTS_BY_TYPE_SQL = """
+    SELECT
+        id,
+        decision_run_id,
+        tool_call_id,
+        client_request_id,
+        tool_name,
+        event_type,
+        payload,
+        ts,
+        llm_provider,
+        prompt_hash,
+        system_prompt_version,
+        market_snapshot_id
+    FROM command_event_log
+    WHERE event_type = ?
+    ORDER BY ts DESC
+    LIMIT ?
+"""
+
+/**
  * Exposed/JDBC で command_event_log を扱う repository。
  *
  * @param database Exposed database
  */
 class ExposedCommandEventLog(
     private val database: ExposedDatabase,
-) : CommandEventLog {
+) : CommandEventLog, CommandEventFeedReader {
 
     override suspend fun append(event: CommandEvent): Result<Unit> {
         return withContext(Dispatchers.IO) {
@@ -135,6 +184,20 @@ class ExposedCommandEventLog(
             }
         }
     }
+
+    override suspend fun findEvents(limit: Int, eventType: CommandEventType?): Result<List<CommandEvent>> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+
+                exposedTransaction(database) {
+                    selectEvents(limit, eventType)
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -171,6 +234,46 @@ private fun countToolCallEventsSql(eventTypeCount: Int, toolNameCount: Int): Str
 
 private fun placeholders(count: Int): String {
     return List(count) { "?" }.joinToString(", ")
+}
+
+private fun JdbcTransaction.selectEvents(limit: Int, eventType: CommandEventType?): List<CommandEvent> {
+    val sql = if (eventType == null) SELECT_COMMAND_EVENTS_SQL else SELECT_COMMAND_EVENTS_BY_TYPE_SQL
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        if (eventType == null) {
+            statement.setInt(1, limit)
+        } else {
+            statement.setString(1, eventType.name)
+            statement.setInt(2, limit)
+        }
+
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(resultSet.toCommandEvent())
+                }
+            }
+        }
+    }
+}
+
+private fun ResultSet.toCommandEvent(): CommandEvent {
+    return CommandEvent(
+        id = getObject("id", UUID::class.java),
+        decisionRunContext = DecisionRunContext(
+            decisionRunId = getString("decision_run_id"),
+            llmProvider = getString("llm_provider"),
+            promptHash = getString("prompt_hash"),
+            systemPromptVersion = getString("system_prompt_version"),
+            marketSnapshotId = getString("market_snapshot_id"),
+        ),
+        toolName = getString("tool_name"),
+        toolCallId = getString("tool_call_id"),
+        clientRequestId = getString("client_request_id"),
+        eventType = CommandEventType.valueOf(getString("event_type")),
+        payload = getString("payload"),
+        occurredAt = Instant.ofEpochMilli(getLong("ts")),
+    )
 }
 
 /**

@@ -1015,6 +1015,38 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun command_event_log_readsRawFeedWithLimitFilterAndDescendingOrderInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val eventLog = ExposedCommandEventLog(database)
+        eventLog.append(commandEvent("tool-old", CommandEventType.TOOL_CALL_COMPLETED, fixedInstant())).getOrThrow()
+        eventLog.append(
+            commandEvent(
+                toolName = "daemon-new",
+                eventType = CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+                occurredAt = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+        eventLog.append(
+            commandEvent(
+                toolName = "daemon-latest",
+                eventType = CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+                occurredAt = fixedInstant().plusSeconds(2),
+            ),
+        ).getOrThrow()
+
+        val allEvents = eventLog.findEvents(limit = 2, eventType = null).getOrThrow()
+        val filteredEvents = eventLog.findEvents(
+            limit = 1,
+            eventType = CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+        ).getOrThrow()
+
+        assertEquals(listOf("daemon-latest", "daemon-new"), allEvents.map { event -> event.toolName })
+        assertEquals(listOf("daemon-latest"), filteredEvents.map { event -> event.toolName })
+        assertEquals(CommandEventType.DAEMON_TRIGGER_LAUNCHED, filteredEvents.single().eventType)
+    }
+
+    @Test
     fun runtime_postgres_reads_reconciler_freshness_from_command_event_log() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         ExposedCommandEventLog(database).append(
@@ -2789,6 +2821,22 @@ private fun JdbcTransaction.insertTestExecution(
         statement.setLong(5, fixedInstant().toEpochMilli())
         statement.executeUpdate()
     }
+}
+
+private fun commandEvent(
+    toolName: String,
+    eventType: CommandEventType,
+    occurredAt: Instant,
+): CommandEvent {
+    return CommandEvent(
+        decisionRunContext = DecisionRunContext.EMPTY,
+        toolName = toolName,
+        toolCallId = null,
+        clientRequestId = null,
+        eventType = eventType,
+        payload = """{"toolName":"$toolName"}""",
+        occurredAt = occurredAt,
+    )
 }
 
 private fun runnerPhaseEvent(

@@ -12,11 +12,18 @@ import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
+import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
+import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
+import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
+import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
@@ -43,6 +50,10 @@ fun interface ReadinessProbe {
  * @param evaluationRiskStateRepository 評価 API 用 risk_state repository。null なら DB 設定から構築する
  * @param evaluationMarketDataSource 評価 API 用 market data source。null なら DB 設定時だけ GMO source を構築する
  * @param opsRiskStateCommandService ops API 用 risk_state command service。null なら DB 設定から構築する
+ * @param opsManualLlmLaunchService ops API 用 manual LLM launch service。null なら DB と runner env から構築する
+ * @param opsDecisionRepository ops API 用 decision repository。null なら DB 設定から構築する
+ * @param opsPaperLedgerRepository ops API 用 paper ledger repository。null なら DB 設定から構築する
+ * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
  * @param tradingConfig trading runtime config
  */
 fun Application.module(
@@ -54,8 +65,13 @@ fun Application.module(
     evaluationRiskStateRepository: RiskStateRepository? = null,
     evaluationMarketDataSource: MarketDataSource? = null,
     opsRiskStateCommandService: RiskStateCommandService? = null,
+    opsManualLlmLaunchService: ManualLlmLaunchService? = null,
+    opsDecisionRepository: DecisionRepository? = null,
+    opsPaperLedgerRepository: PaperLedgerRepository? = null,
+    opsCommandEventFeedReader: CommandEventFeedReader? = null,
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
 ) {
+    val environment = System.getenv()
     val databaseDataSource = createDataSourceIfConfigured(readinessProbe)
     val database = databaseDataSource?.let { dataSource -> ExposedDatabase.connect(dataSource) }
     val resolvedEvaluationRepository = evaluationRepository ?: database?.let { connectedDatabase ->
@@ -70,6 +86,31 @@ fun Application.module(
             clock = clock,
         )
     }
+    val resolvedOpsDecisionRepository = opsDecisionRepository ?: database?.let { connectedDatabase ->
+        ExposedDecisionRepository(
+            database = connectedDatabase,
+            clock = clock,
+        )
+    }
+    val resolvedOpsPaperLedgerRepository = opsPaperLedgerRepository ?: database?.let { connectedDatabase ->
+        ExposedPaperLedgerRepository(connectedDatabase)
+    }
+    val resolvedOpsCommandEventFeedReader = opsCommandEventFeedReader ?: database?.let { connectedDatabase ->
+        ExposedCommandEventLog(connectedDatabase)
+    }
+    val shouldCreateManualLlmLaunchService = opsManualLlmLaunchService == null && databaseDataSource != null && database != null
+    val createdManualLlmLaunchService = if (shouldCreateManualLlmLaunchService) {
+        createManualLlmLaunchService(
+            dataSource = databaseDataSource,
+            database = database,
+            environment = environment,
+            tradingConfig = tradingConfig,
+            clock = clock,
+        )
+    } else {
+        null
+    }
+    val resolvedOpsManualLlmLaunchService = opsManualLlmLaunchService ?: createdManualLlmLaunchService
     val resolvedEvaluationMarketDataSource = evaluationMarketDataSource ?: database?.let {
         GmoPublicMarketDataSource.fromConfig(
             config = tradingConfig.gmoPublicClient,
@@ -111,6 +152,11 @@ fun Application.module(
         opsRoutes(
             riskStateRepository = resolvedEvaluationRiskStateRepository,
             riskStateCommandService = resolvedOpsRiskStateCommandService,
+            manualLlmLaunchService = resolvedOpsManualLlmLaunchService,
+            decisionRepository = resolvedOpsDecisionRepository,
+            paperLedgerRepository = resolvedOpsPaperLedgerRepository,
+            commandEventFeedReader = resolvedOpsCommandEventFeedReader,
+            clock = clock,
         )
         apiDocumentationRoutes()
     }
@@ -142,11 +188,14 @@ fun Application.module(
     } else {
         null
     }
+    val hasBackgroundWorker = reconcilerWorker != null || llmDaemonWorker != null || obsidianWriterWorker != null
+    val hasClosableResource = databaseDataSource != null || hasBackgroundWorker || createdManualLlmLaunchService != null
 
-    if (databaseDataSource != null || reconcilerWorker != null || llmDaemonWorker != null || obsidianWriterWorker != null) {
+    if (hasClosableResource) {
         monitor.subscribe(ApplicationStopped) {
             obsidianWriterWorker?.close()
             llmDaemonWorker?.close()
+            createdManualLlmLaunchService?.close()
             reconcilerWorker?.close()
             databaseDataSource?.close()
         }

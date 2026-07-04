@@ -194,12 +194,12 @@ class LlmDaemonScheduler(
 
         if (riskState.state == RiskHaltState.HARD_HALT) {
             appendSkip(
-                reason = DAEMON_SKIP_HARD_HALT,
+                reason = LLM_DAEMON_SKIP_HARD_HALT,
                 trigger = null,
                 observedAt = observedAt,
             ).getOrThrow()
 
-            return LlmDaemonTickResult.Skipped(DAEMON_SKIP_HARD_HALT, null)
+            return LlmDaemonTickResult.Skipped(LLM_DAEMON_SKIP_HARD_HALT, null)
         }
 
         if (hasFreshRunningReservation(observedAt)) {
@@ -210,12 +210,12 @@ class LlmDaemonScheduler(
 
         if (riskState.state == RiskHaltState.SOFT_HALT && !hasOpenRisk) {
             appendSkip(
-                reason = DAEMON_SKIP_SOFT_HALT_FLAT,
+                reason = LLM_DAEMON_SKIP_SOFT_HALT_FLAT,
                 trigger = null,
                 observedAt = observedAt,
             ).getOrThrow()
 
-            return LlmDaemonTickResult.Skipped(DAEMON_SKIP_SOFT_HALT_FLAT, null)
+            return LlmDaemonTickResult.Skipped(LLM_DAEMON_SKIP_SOFT_HALT_FLAT, null)
         }
 
         val trigger = selectTrigger(hasOpenRisk, observedAt)
@@ -775,15 +775,6 @@ private fun daemonDecisionRunContext(invocationId: String): DecisionRunContext {
     )
 }
 
-private fun LlmLaunchReservationRejectionReason.toDaemonSkipReason(): String {
-    return when (this) {
-        LlmLaunchReservationRejectionReason.HARD_HALT -> DAEMON_SKIP_HARD_HALT
-        LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION -> "concurrent_invocation"
-        LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR -> "max_invocations_per_hour_exceeded"
-        LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY -> "max_invocations_per_day_exceeded"
-    }
-}
-
 private fun priceMoveDetails(
     changeRatio: BigDecimal,
     windowSeconds: Long,
@@ -897,16 +888,6 @@ private const val PRICE_SAMPLE_BUFFER_LIMIT = 1024
  * 通常 cadence 待ちで起動しなかった理由。
  */
 private const val DAEMON_SKIP_NO_TRIGGER = "no_trigger_due"
-
-/**
- * HARD_HALT 中で起動しなかった理由。
- */
-private const val DAEMON_SKIP_HARD_HALT = "hard_halt"
-
-/**
- * SOFT_HALT 中かつ flat のため起動しなかった理由。
- */
-private const val DAEMON_SKIP_SOFT_HALT_FLAT = "soft_halt_flat"
 
 /**
  * daemon tick 失敗で起動しなかった理由。

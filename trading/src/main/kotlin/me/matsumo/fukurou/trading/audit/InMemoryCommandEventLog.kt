@@ -7,7 +7,7 @@ import java.time.Instant
 /**
  * unit test と DB 未構成時のための in-memory command event log。
  */
-class InMemoryCommandEventLog : CommandEventLog {
+class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
 
     private val mutex = Mutex()
     private val storedEvents = mutableListOf<CommandEvent>()
@@ -50,12 +50,31 @@ class InMemoryCommandEventLog : CommandEventLog {
         }
     }
 
+    override suspend fun findEvents(limit: Int, eventType: CommandEventType?): Result<List<CommandEvent>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            mutex.withLock {
+                storedEvents
+                    .filter { event -> event.matchesEventType(eventType) }
+                    .sortedByDescending { event -> event.occurredAt }
+                    .take(limit)
+            }
+        }
+    }
+
     /**
      * 保存済みイベントの snapshot を返す。
      */
     suspend fun events(): List<CommandEvent> {
         return mutex.withLock { storedEvents.toList() }
     }
+}
+
+private fun CommandEvent.matchesEventType(eventType: CommandEventType?): Boolean {
+    return eventType == null || this.eventType == eventType
 }
 
 /**

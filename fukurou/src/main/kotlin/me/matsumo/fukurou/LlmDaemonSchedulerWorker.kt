@@ -12,6 +12,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
@@ -30,6 +31,8 @@ import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_JAR_PATH_ENV
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
 import me.matsumo.fukurou.trading.runner.OneShotRunnerCliConfig
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
+import me.matsumo.fukurou.trading.runner.OneShotRunnerResult
+import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import java.math.BigDecimal
 import java.nio.file.Path
@@ -170,6 +173,70 @@ private fun createLlmDaemonScheduler(
     tradingConfig: TradingBotConfig,
     clock: Clock,
 ): LlmDaemonScheduler {
+    val requestBase = oneShotRequestFromEnvironment(environment)
+    val components = createLlmLaunchRuntimeComponents(
+        dataSource = dataSource,
+        database = database,
+        clock = clock,
+        environment = environment,
+        tradingConfig = tradingConfig,
+        requestBase = requestBase,
+    )
+
+    return LlmDaemonScheduler(
+        tradingConfig = tradingConfig,
+        riskStateRepository = components.tradingRuntime.riskStateRepository,
+        commandEventLog = components.tradingRuntime.commandEventLog,
+        launchReservationRepository = components.launchReservationRepository,
+        openRiskReader = components.tradingRuntime.openRiskReader(),
+        tickerReader = components.marketDataSource.tickerReader(tradingConfig),
+        positionsReader = components.tradingRuntime.positionsReader(),
+        requestBase = components.requestBase,
+        launchOneShot = components.launchOneShot,
+        clock = clock,
+    )
+}
+
+/**
+ * DB runtime から manual LLM launch service を構築する。
+ */
+internal fun createManualLlmLaunchService(
+    dataSource: HikariDataSource,
+    database: ExposedDatabase,
+    environment: Map<String, String>,
+    tradingConfig: TradingBotConfig,
+    clock: Clock,
+): DefaultManualLlmLaunchService? {
+    val requestBase = oneShotRequestFromRequiredEnvironment(environment) ?: return null
+    val components = createLlmLaunchRuntimeComponents(
+        dataSource = dataSource,
+        database = database,
+        clock = clock,
+        environment = environment,
+        tradingConfig = tradingConfig,
+        requestBase = requestBase,
+    )
+
+    return DefaultManualLlmLaunchService(
+        tradingConfig = tradingConfig,
+        riskStateRepository = components.tradingRuntime.riskStateRepository,
+        commandEventLog = components.tradingRuntime.commandEventLog,
+        launchReservationRepository = components.launchReservationRepository,
+        openRiskReader = components.tradingRuntime.openRiskReader(),
+        requestBase = components.requestBase,
+        launchOneShot = components.launchOneShot,
+        clock = clock,
+    )
+}
+
+private fun createLlmLaunchRuntimeComponents(
+    dataSource: HikariDataSource,
+    database: ExposedDatabase,
+    clock: Clock,
+    environment: Map<String, String>,
+    tradingConfig: TradingBotConfig,
+    requestBase: OneShotRunnerRequest,
+): LlmLaunchRuntimeComponents {
     val marketDataSource = GmoPublicMarketDataSource.fromConfig(
         config = tradingConfig.gmoPublicClient,
         clock = clock,
@@ -194,17 +261,12 @@ private fun createLlmDaemonScheduler(
         clock = clock,
     )
 
-    return LlmDaemonScheduler(
-        tradingConfig = tradingConfig,
-        riskStateRepository = tradingRuntime.riskStateRepository,
-        commandEventLog = tradingRuntime.commandEventLog,
+    return LlmLaunchRuntimeComponents(
+        tradingRuntime = tradingRuntime,
+        marketDataSource = marketDataSource,
         launchReservationRepository = ExposedLlmLaunchReservationRepository(database),
-        openRiskReader = tradingRuntime.openRiskReader(),
-        tickerReader = marketDataSource.tickerReader(tradingConfig),
-        positionsReader = tradingRuntime.positionsReader(),
-        requestBase = oneShotRequestFromEnvironment(environment),
+        requestBase = requestBase,
         launchOneShot = runner.asDaemonLauncher(),
-        clock = clock,
     )
 }
 
@@ -253,3 +315,45 @@ private fun oneShotRequestFromEnvironment(environment: Map<String, String>): One
         cliConfig = OneShotRunnerCliConfig.fromEnvironment(environment),
     )
 }
+
+private fun oneShotRequestFromRequiredEnvironment(environment: Map<String, String>): OneShotRunnerRequest? {
+    val repositoryRoot = environment.requiredPath(FUKUROU_REPOSITORY_ROOT_ENV) ?: return null
+    val workingDirectory = environment.requiredPath(FUKUROU_LLM_WORKING_DIRECTORY_ENV) ?: return null
+    val mcpJarPath = environment.requiredString(FUKUROU_MCP_JAR_PATH_ENV) ?: return null
+
+    return OneShotRunnerRequest(
+        repositoryRoot = repositoryRoot,
+        workingDirectory = workingDirectory,
+        mcpJarPath = mcpJarPath,
+        cliConfig = OneShotRunnerCliConfig.fromEnvironment(environment),
+    )
+}
+
+private fun Map<String, String>.requiredPath(name: String): Path? {
+    val rawValue = requiredString(name) ?: return null
+
+    return Path.of(rawValue)
+        .toAbsolutePath()
+        .normalize()
+}
+
+private fun Map<String, String>.requiredString(name: String): String? {
+    return this[name]?.trim()?.takeIf { value -> value.isNotEmpty() }
+}
+
+/**
+ * LLM 起動に必要な runtime component 群。
+ *
+ * @param tradingRuntime DB 接続済み trading runtime
+ * @param marketDataSource GMO public market data source
+ * @param launchReservationRepository 起動予約 repository
+ * @param requestBase one-shot runner の固定 request
+ * @param launchOneShot one-shot runner 起動境界
+ */
+private data class LlmLaunchRuntimeComponents(
+    val tradingRuntime: TradingRuntime,
+    val marketDataSource: GmoPublicMarketDataSource,
+    val launchReservationRepository: ExposedLlmLaunchReservationRepository,
+    val requestBase: OneShotRunnerRequest,
+    val launchOneShot: suspend (OneShotRunnerRequest) -> Result<OneShotRunnerResult>,
+)
