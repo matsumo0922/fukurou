@@ -364,8 +364,9 @@ class LlmDaemonScheduler(
     }
 
     private suspend fun freshTickerSnapshotOrNull(observedAt: Instant): LlmDaemonTickerSnapshot? {
-        val tickerResult = tickerReader.latestTicker()
-        val tickerSnapshot = tickerResult.getOrElse { throwable ->
+        val tickerSnapshot = runCatching {
+            tickerReader.latestTicker().getOrThrow()
+        }.getOrElse { throwable ->
             if (throwable is CancellationException) {
                 throw throwable
             }
@@ -434,8 +435,13 @@ class LlmDaemonScheduler(
 
     private fun prunePriceSamples(observedAt: Instant) {
         val earliestAllowedAt = observedAt.minus(daemonConfig.priceMoveWindow)
+        val baseCandidate = priceSamples.lastOrNull { sample -> !sample.observedAt.isAfter(earliestAllowedAt) }
 
         priceSamples.removeAll { sample -> sample.observedAt.isBefore(earliestAllowedAt) }
+
+        if (baseCandidate != null && priceSamples.firstOrNull()?.observedAt != baseCandidate.observedAt) {
+            priceSamples.add(0, baseCandidate)
+        }
     }
 
     private fun trimPriceSamplesToLimit() {
@@ -478,9 +484,9 @@ class LlmDaemonScheduler(
     }
 
     private suspend fun positionsForStopProximity(): List<Position>? {
-        val positionsResult = positionsReader.positions()
-
-        return positionsResult.getOrElse { throwable ->
+        return runCatching {
+            positionsReader.positions().getOrThrow()
+        }.getOrElse { throwable ->
             if (throwable is CancellationException) {
                 throw throwable
             }

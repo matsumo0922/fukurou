@@ -334,6 +334,24 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
+    fun priceMoveKeepsWindowAgedBaseSampleAcrossTickJitter() = runBlocking {
+        val fixture = schedulerFixture()
+
+        fixture.scheduler.tick()
+        fixture.clock.advance(Duration.ofSeconds(301))
+        fixture.tickerReader.currentPriceJpy = BigDecimal("10100000")
+        val result = fixture.scheduler.tick()
+        val payload = fixture.launchedPayload(LlmDaemonTriggerKind.PRICE_MOVE)
+        val details = payload.getValue("details").jsonObject
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.PRICE_MOVE, result.triggerKind)
+        assertEquals("0.01000000", details.stringValue("changeRatio"))
+        assertEquals("10000000", details.stringValue("basePriceJpy"))
+        assertEquals("10100000", details.stringValue("currentPriceJpy"))
+    }
+
+    @Test
     fun priceMoveBelowThresholdFallsBackToFlatHeartbeatWhenHeartbeatIsDue() = runBlocking {
         val fixture = schedulerFixture()
 
@@ -581,6 +599,34 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
+    fun tickerReaderThrowFallsBackToFlatHeartbeat() = runBlocking {
+        val fixture = schedulerFixture()
+        fixture.tickerReader.forcedThrowable = IllegalStateException("ticker reader crashed")
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
+        assertEquals(1, fixture.tickerReader.callCount)
+    }
+
+    @Test
+    fun positionsReaderThrowFallsBackToHoldingDenseCheck() = runBlocking {
+        val positionsReader = FakePositionsReader()
+        positionsReader.forcedThrowable = IllegalStateException("positions reader crashed")
+        val fixture = schedulerFixture(
+            hasOpenRisk = true,
+            positionsReader = positionsReader,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, result.triggerKind)
+        assertEquals(1, positionsReader.callCount)
+    }
+
+    @Test
     fun tickerTimestampParseFailureFallsBackToFlatHeartbeat() = runBlocking {
         val fixture = schedulerFixture()
         fixture.tickerReader.sourceTimestamp = null
@@ -806,10 +852,12 @@ private class FakeTickerReader(
     var currentPriceJpy: BigDecimal = BigDecimal("10000000")
     var sourceTimestamp: Instant? = null
     var forcedResult: Result<LlmDaemonTickerSnapshot>? = null
+    var forcedThrowable: Throwable? = null
     var callCount: Int = 0
 
     override suspend fun latestTicker(): Result<LlmDaemonTickerSnapshot> {
         callCount += 1
+        forcedThrowable?.let { throwable -> throw throwable }
 
         return forcedResult ?: Result.success(
             LlmDaemonTickerSnapshot(
@@ -826,10 +874,12 @@ private class FakeTickerReader(
 private class FakePositionsReader : LlmDaemonPositionsReader {
 
     var currentPositions: List<Position> = emptyList()
+    var forcedThrowable: Throwable? = null
     var callCount: Int = 0
 
     override suspend fun positions(): Result<List<Position>> {
         callCount += 1
+        forcedThrowable?.let { throwable -> throw throwable }
 
         return Result.success(currentPositions)
     }
