@@ -7,7 +7,7 @@
 - コードは最低限の「安全床」だけを強制し、判断は LLM に広い裁量を与える
 - 売買能力は自作 MCP サーバー（`fukurou-mcp`）としてツール提供し、LLM がツール呼び出しで取引する
 - LLM は CLI（`claude` / `codex`）シェルアウトで実行（サブスク利用）
-- 取引ログは SQLite（機械の真実）＋ Obsidian（人間の知識）の二本立て。振り返りエージェントが知識を育てる
+- 取引・監査ログは PostgreSQL を正本にし、Obsidian Writer が人間向けノートを生成する
 
 ## 安全床
 
@@ -20,23 +20,25 @@
 
 ## 技術スタック
 
-Kotlin/JVM ・ Ktor ・ Exposed ・ PostgreSQL ・ Docker Compose ・ MCP 公式 Kotlin SDK ・ GMO コイン API
+Kotlin/JVM ・ Ktor ・ Exposed ・ PostgreSQL ・ Docker Compose ・ MCP 公式 Kotlin SDK ・ GMO コイン API ・ React ・ TypeScript ・ Vite
 
 ## ステータス
 
-**Step6（堅牢化 / config / Docker MCP 配線）まで実装済み。** 詳細設計は [`docs/design.md`](docs/design.md)、MCP runtime と Docker 手順は [`docs/mcp-runtime.md`](docs/mcp-runtime.md) を参照。
+詳細設計は [`docs/design.md`](docs/design.md)、MCP runtime と Docker 手順は [`docs/mcp-runtime.md`](docs/mcp-runtime.md) を参照。
 
-現時点では、`:trading` の paper account / broker / safety / reconciler / decision protocol / GMO Public market data、`:mcp-gmo-coin` の GMO Public market tools、`:mcp` の fukurou stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 `ProtectionReconciler` worker が実装済みです。daemon scheduler、LlmInvoker 本実装、Falsifier 実行ループ、live 実発注はまだ実装していません。
+現時点では、`:trading` の paper account / broker / safety / reconciler / decision protocol / evaluation / knowledge writer / GMO Public market data、`:mcp-gmo-coin` の GMO Public market tools、`:mcp` の fukurou stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 worker、`web/` の Vite + React + TypeScript foundation が実装済みです。
 
-## Backend scaffold
+## Backend / API
 
 Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 
-公開済みの placeholder endpoint:
+公開済みの Ktor API:
 
 - `GET /revision`
 - `GET /health/live`
 - `GET /health/ready`
+- `/evaluation/*`
+- `/ops/*`
 - `GET /swagger`
 - `GET /openapi.json`
 
@@ -69,7 +71,31 @@ make detekt
 make build
 ```
 
-runtime config は `.env.example` の `FUKUROU_*` で上書きできます。既定は BTC 現物 / `PAPER` / 仮想 10 万円で、`LIVE` は予約値です。live broker 実装前は `LIVE` 起動を拒否し、実資金を動かす機能はまだ有効化されません。
+runtime config は `.env.example` の `FUKUROU_*` で上書きできます。既定は BTC 現物 / `PAPER` / 仮想 10 万円です。
+
+## Web development
+
+`web/` は Vite + React + TypeScript のローカル Web 基盤です。Ktor を `make run` で起動した状態で Vite dev server を使います。
+
+```sh
+npm --prefix web ci
+npm --prefix web run dev
+```
+
+Vite dev server は既定で `http://localhost:8080` の Ktor API へ proxy します。接続先は `VITE_FUKUROU_API_TARGET` で上書きできます。
+
+Web 側の検証は次を使います。
+
+```sh
+npm --prefix web run verify
+```
+
+OpenAPI 型は committed snapshot の `web/openapi/fukurou.openapi.json` から生成します。Ktor API contract を変更した場合は、Ktor を起動して snapshot と生成型を更新します。
+
+```sh
+curl -fsS http://localhost:8080/openapi.json -o web/openapi/fukurou.openapi.json
+npm --prefix web run generate:api
+```
 
 ## Deployment
 
