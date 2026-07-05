@@ -3,6 +3,7 @@ import Activity from "lucide-react/dist/esm/icons/activity.mjs";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import {
   activityTimelineQuery,
+  newestFirstActivityTimelineEvents,
   type ActivityTimelineEvent,
   type ActivityTimelineSnapshot,
   type ActivityTimelineSource,
@@ -77,7 +78,8 @@ function ActivityError({ error, retried }: { error: unknown; retried: () => void
 }
 
 function ActivityTimeline({ timeline }: { timeline: ActivityTimelineSnapshot }) {
-  const { events, fetchedAt, limits } = timeline;
+  const { fetchedAt, limits } = timeline;
+  const events = newestFirstActivityTimelineEvents(timeline.events);
 
   if (events.length === 0) {
     return <EmptyState title="No activity recorded" description="The decision, audit, and execution feeds are empty." />;

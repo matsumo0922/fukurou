@@ -96,10 +96,10 @@ async function fetchActivityTimeline(): Promise<ActivityTimelineSnapshot> {
     ...decisionsResponse.decisions.map(decisionToTimelineEvent),
     ...auditResponse.events.map(auditEventToTimelineEvent),
     ...executionsResponse.executions.map(executionToTimelineEvent),
-  ].sort(compareTimelineEvents);
+  ];
 
   return {
-    events,
+    events: newestFirstActivityTimelineEvents(events),
     fetchedAt: new Date().toISOString(),
     limits: {
       decisions: ACTIVITY_TIMELINE_DECISIONS_LIMIT,
@@ -108,6 +108,10 @@ async function fetchActivityTimeline(): Promise<ActivityTimelineSnapshot> {
       total: ACTIVITY_TIMELINE_TOTAL_LIMIT,
     },
   };
+}
+
+export function newestFirstActivityTimelineEvents(events: ActivityTimelineEvent[]): ActivityTimelineEvent[] {
+  return [...events].sort(compareTimelineEvents);
 }
 
 function decisionToTimelineEvent(decision: OpsDecisionResponse): ActivityTimelineEvent {
