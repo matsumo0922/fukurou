@@ -1285,6 +1285,66 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun paper_ledger_repository_reads_recent_executions_with_limit_and_account_mode() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val oldestPaperPositionId = insertLedgerRows(
+            database = database,
+            mode = "PAPER",
+            realizedPnlJpy = "10.00000000",
+            executedAt = fixedInstant().plusSeconds(60),
+        )
+        val newestLivePositionId = insertLedgerRows(
+            database = database,
+            mode = "LIVE",
+            realizedPnlJpy = "99.00000000",
+            executedAt = fixedInstant().plusSeconds(240),
+        )
+        val middlePaperPositionId = insertLedgerRows(
+            database = database,
+            mode = "PAPER",
+            realizedPnlJpy = "20.00000000",
+            executedAt = fixedInstant().plusSeconds(120),
+        )
+        val newestPaperPositionId = insertLedgerRows(
+            database = database,
+            mode = "PAPER",
+            realizedPnlJpy = "30.00000000",
+            executedAt = fixedInstant().plusSeconds(180),
+        )
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val executions = repository.getRecentExecutions(2).getOrThrow()
+
+        assertEquals(2, executions.size)
+        assertEquals(
+            listOf(newestPaperPositionId.toString(), middlePaperPositionId.toString()),
+            executions.map { execution -> execution.positionId },
+        )
+        assertEquals(
+            listOf(TradingMode.PAPER, TradingMode.PAPER),
+            executions.map { execution -> execution.mode },
+        )
+        assertEquals(
+            listOf("30.00000000", "20.00000000"),
+            executions.map { execution -> execution.realizedPnlJpy },
+        )
+        assertEquals(
+            listOf(
+                fixedInstant().plusSeconds(180).toString(),
+                fixedInstant().plusSeconds(120).toString(),
+            ),
+            executions.map { execution -> execution.executedAt },
+        )
+        assertTrue(
+            executions.none { execution -> execution.positionId == oldestPaperPositionId.toString() },
+        )
+        assertTrue(
+            executions.none { execution -> execution.positionId == newestLivePositionId.toString() },
+        )
+    }
+
+    @Test
     fun paper_watermark_scenario_matches_in_memory_and_postgres_repositories() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -2671,21 +2731,29 @@ private fun JdbcTransaction.updateLowestWatermark(
 }
 
 /**
- * mode filter 検証用 ledger 行を追加する。
+ * execution を含む ledger fixture 行を追加する。
  */
 private fun insertLedgerRows(
     database: ExposedDatabase,
     mode: String,
     realizedPnlJpy: String,
-) {
+    executedAt: Instant = fixedInstant(),
+): UUID {
     val positionId = UUID.randomUUID()
     val tradeGroupId = UUID.randomUUID()
 
     exposedTransaction(database) {
         insertTestPosition(positionId, tradeGroupId, mode)
         insertTestOrder(positionId, tradeGroupId, mode)
-        insertTestExecution(positionId, mode, realizedPnlJpy)
+        insertTestExecution(
+            positionId = positionId,
+            mode = mode,
+            realizedPnlJpy = realizedPnlJpy,
+            executedAt = executedAt,
+        )
     }
+
+    return positionId
 }
 
 /**
@@ -2812,13 +2880,14 @@ private fun JdbcTransaction.insertTestExecution(
     positionId: UUID,
     mode: String,
     realizedPnlJpy: String,
+    executedAt: Instant = fixedInstant(),
 ) {
     jdbcConnection().prepareStatement(INSERT_TEST_EXECUTION_SQL).use { statement ->
         statement.setObject(1, UUID.randomUUID())
         statement.setObject(2, positionId)
         statement.setString(3, mode)
         statement.setBigDecimal(4, realizedPnlJpy.toBigDecimal())
-        statement.setLong(5, fixedInstant().toEpochMilli())
+        statement.setLong(5, executedAt.toEpochMilli())
         statement.executeUpdate()
     }
 }
