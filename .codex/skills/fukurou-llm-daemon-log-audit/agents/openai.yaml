@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fukurou LLM Log Audit"
+  short_description: "Audit Fukurou LLM daemon logs"
+  default_prompt: "Use $fukurou-llm-daemon-log-audit to summarize Fukurou LLM daemon and paper trading status since the last observed run."
