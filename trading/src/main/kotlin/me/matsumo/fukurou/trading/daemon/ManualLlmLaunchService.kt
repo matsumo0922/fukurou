@@ -163,7 +163,7 @@ class DefaultManualLlmLaunchService(
 
         val reservedOutcome = reservationOutcome as LlmLaunchReservationOutcome.Reserved
 
-        appendLaunched(
+        appendLaunchedOrFinishReservation(
             invocationId = reservedOutcome.invocationId,
             reason = reason,
             observedAt = observedAt,
@@ -190,6 +190,30 @@ class DefaultManualLlmLaunchService(
                 finishCancelledBeforeStart(invocationId, cancellation)
             }
         }
+    }
+
+    private suspend fun appendLaunchedOrFinishReservation(
+        invocationId: String,
+        reason: String,
+        observedAt: Instant,
+    ): Result<Unit> {
+        val appendResult = appendLaunched(
+            invocationId = invocationId,
+            reason = reason,
+            observedAt = observedAt,
+        )
+        val appendFailure = appendResult.exceptionOrNull()
+
+        if (appendFailure != null) {
+            finishReservedInvocation(
+                invocationId = invocationId,
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = appendFailure.javaClass.simpleName,
+                finishedAt = Instant.now(clock),
+            )
+        }
+
+        return appendResult
     }
 
     private fun finishCancelledBeforeStart(invocationId: String, cancellation: CancellationException) {

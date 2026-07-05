@@ -42,6 +42,7 @@ import java.time.ZoneId
 import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -226,11 +227,13 @@ class OpsRouteTest {
         }
 
         val response = client.get("/ops/decisions?limit=1")
-        val responseBody = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        val responseText = response.bodyAsText()
+        val responseBody = Json.parseToJsonElement(responseText).jsonObject
         val decisions = responseBody.getValue("decisions").jsonArray
         val decision = decisions.single().jsonObject
 
         assertEquals(HttpStatusCode.OK, response.status)
+        assertNoSecretLikeText(responseText)
         assertEquals("NO_TRADE", decision.getValue("action").jsonPrimitive.content)
         assertEquals("new reason", decision.getValue("reasonJa").jsonPrimitive.content)
         assertEquals("0.42", decision.getValue("estimatedWinProbability").jsonPrimitive.content)
@@ -254,11 +257,13 @@ class OpsRouteTest {
         }
 
         val response = client.get("/ops/positions")
-        val responseBody = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        val responseText = response.bodyAsText()
+        val responseBody = Json.parseToJsonElement(responseText).jsonObject
         val positions = responseBody.getValue("positions").jsonArray
         val openOrders = responseBody.getValue("openOrders").jsonArray
 
         assertEquals(HttpStatusCode.OK, response.status)
+        assertNoSecretLikeText(responseText)
         assertEquals("position-1", positions.single().jsonObject.getValue("positionId").jsonPrimitive.content)
         assertEquals("order-1", openOrders.single().jsonObject.getValue("orderId").jsonPrimitive.content)
     }
@@ -292,10 +297,12 @@ class OpsRouteTest {
 
         val response = client.get("/ops/audit?limit=1&eventType=DAEMON_TRIGGER_LAUNCHED")
         val invalidEventTypeResponse = client.get("/ops/audit?eventType=UNKNOWN")
-        val responseBody = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        val responseText = response.bodyAsText()
+        val responseBody = Json.parseToJsonElement(responseText).jsonObject
         val event = responseBody.getValue("events").jsonArray.single().jsonObject
 
         assertEquals(HttpStatusCode.OK, response.status)
+        assertNoSecretLikeText(responseText)
         assertEquals("DAEMON_TRIGGER_LAUNCHED", event.getValue("eventType").jsonPrimitive.content)
         assertEquals("daemon-latest", event.getValue("toolName").jsonPrimitive.content)
         assertEquals(HttpStatusCode.BadRequest, invalidEventTypeResponse.status)
@@ -436,6 +443,22 @@ private fun auditEvent(
         occurredAt = occurredAt,
     )
 }
+
+private fun assertNoSecretLikeText(responseText: String) {
+    SECRET_FIXTURE_TEXTS.forEach { secretText ->
+        assertFalse(responseText.contains(secretText), secretText)
+    }
+}
+
+/**
+ * read API response に混入してはいけない secret-like fixture。
+ */
+private val SECRET_FIXTURE_TEXTS = setOf(
+    "postgres://secret-db-host/fukurou",
+    "gmo-secret-api-key",
+    "cloudflare-secret-token",
+    "anthropic-secret-token",
+)
 
 /**
  * manual trigger route test 用 fake service。

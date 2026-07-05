@@ -10,6 +10,8 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
@@ -32,6 +34,7 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.CoroutineContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
@@ -221,6 +224,37 @@ class ManualLlmLaunchServiceTest {
     }
 
     @Test
+    fun manualLaunch_finishesReservationWhenLaunchedAuditFails() = runBlocking {
+        val clock = ManualTestClock(fixedInstant())
+        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val reservations = RecordingLlmLaunchReservationRepository(
+            delegate = InMemoryLlmLaunchReservationRepository(riskStateRepository),
+        )
+        val launches = mutableListOf<OneShotRunnerRequest>()
+        val service = manualService(
+            tradingConfig = tradingConfig(),
+            clock = clock,
+            riskStateRepository = riskStateRepository,
+            eventLog = FailingLaunchedCommandEventLog(),
+            reservations = reservations,
+            launches = launches,
+            idGenerator = deterministicIds(),
+        )
+
+        val result = service.launch("audit write failure")
+        val finish = reservations.nextFinish()
+        val hasFreshRunningReservation = reservations
+            .hasFreshRunningReservation(fixedInstant().minus(Duration.ofHours(1)))
+            .getOrThrow()
+
+        assertTrue(result.isFailure)
+        assertEquals(emptyList(), launches)
+        assertEquals(LlmLaunchReservationStatus.FAILED, finish.status)
+        assertEquals("IllegalStateException", finish.reason)
+        assertFalse(hasFreshRunningReservation)
+    }
+
+    @Test
     fun manualLaunch_closeWaitsForCancellationFinishBeforeReturning() = runBlocking {
         val clock = ManualTestClock(fixedInstant())
         val riskStateRepository = InMemoryRiskStateRepository(clock)
@@ -398,7 +432,7 @@ private fun manualService(
     tradingConfig: TradingBotConfig,
     clock: Clock,
     riskStateRepository: InMemoryRiskStateRepository,
-    eventLog: InMemoryCommandEventLog,
+    eventLog: CommandEventLog,
     reservations: RecordingLlmLaunchReservationRepository,
     launches: MutableList<OneShotRunnerRequest>,
     idGenerator: () -> UUID,
@@ -421,6 +455,31 @@ private fun manualService(
         idGenerator = idGenerator,
         scope = scope,
     )
+}
+
+/**
+ * launch 監査だけを失敗させる command event log。
+ */
+private class FailingLaunchedCommandEventLog : CommandEventLog {
+
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        if (event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED) {
+            return Result.failure(IllegalStateException("audit write failed"))
+        }
+
+        return Result.success(Unit)
+    }
+
+    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+        return Result.success(0)
+    }
+
+    override suspend fun countToolCallEvents(
+        decisionRunId: String,
+        toolNames: Set<String>,
+    ): Result<Int> {
+        return Result.success(0)
+    }
 }
 
 private fun tradingConfig(
