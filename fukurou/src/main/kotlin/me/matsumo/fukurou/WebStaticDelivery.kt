@@ -29,8 +29,6 @@ private val ProtectedWebFallbackPrefixes = listOf(
     "/ops",
     "/evaluation",
     "/health",
-    "/health/live",
-    "/health/ready",
     "/revision",
     "/swagger",
     "/openapi.json",

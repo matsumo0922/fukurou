@@ -84,10 +84,33 @@ class WebStaticDeliveryTest {
 
         assertEquals(HttpStatusCode.NotFound, unknownOpsResponse.status)
         assertNotIndexHtml(unknownOpsResponse.bodyAsText())
+        assertJsonNotFound(unknownOpsResponse.bodyAsText())
         assertEquals(HttpStatusCode.NotFound, unknownEvaluationResponse.status)
         assertNotIndexHtml(unknownEvaluationResponse.bodyAsText())
+        assertJsonNotFound(unknownEvaluationResponse.bodyAsText())
         assertEquals(HttpStatusCode.NotFound, unknownPostResponse.status)
         assertNotIndexHtml(unknownPostResponse.bodyAsText())
+        assertJsonNotFound(unknownPostResponse.bodyAsText())
+    }
+
+    @Test
+    fun webStaticDelivery_doesNotServeFilesOutsideWebRoot() = testApplication {
+        val webRoot = createWebRoot()
+        val outsideFile = createOutsideWebRootFile(webRoot)
+
+        application {
+            module(
+                readinessProbe = { true },
+                webRoot = webRoot,
+            )
+        }
+
+        val traversalResponse = client.get("/../${outsideFile.name}")
+        val responseBody = traversalResponse.bodyAsText()
+
+        assertEquals(HttpStatusCode.OK, traversalResponse.status)
+        assertFalse(responseBody.contains(outsideFile.readText()))
+        assertTrue(responseBody.contains("Fukurou Web Test"))
     }
 
     private fun createWebRoot(): File {
@@ -104,5 +127,17 @@ class WebStaticDeliveryTest {
 
     private fun assertNotIndexHtml(responseBody: String) {
         assertFalse(responseBody.contains("Fukurou Web Test"))
+    }
+
+    private fun assertJsonNotFound(responseBody: String) {
+        assertTrue(responseBody.contains(""""message":"not found""""))
+    }
+
+    private fun createOutsideWebRootFile(webRoot: File): File {
+        val outsideFile = File(webRoot.parentFile, "fukurou-outside-${System.nanoTime()}.txt")
+
+        outsideFile.writeText("outside secret")
+
+        return outsideFile
     }
 }
