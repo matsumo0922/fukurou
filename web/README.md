@@ -20,3 +20,15 @@ Vite + React + TypeScript のローカル Web foundation です。
 curl -fsS http://localhost:8080/openapi.json -o web/openapi/fukurou.openapi.json
 npm --prefix web run generate:api
 ```
+
+## Local API Proxy
+
+`npm run dev` では Vite dev server から Ktor へ同一 origin 相当で API を呼び出せます。既定の proxy 先は `http://localhost:8080` で、`VITE_FUKUROU_API_TARGET` で上書きできます。
+
+Proxy 対象:
+
+- `/evaluation`
+- `/health`
+- `/openapi.json`
+- `/ops`
+- `/revision`

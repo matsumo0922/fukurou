@@ -9,11 +9,19 @@ export default defineConfig({
   ],
   server: {
     proxy: {
+      "/evaluation": {
+        target: backendTarget,
+        changeOrigin: true,
+      },
       "/health": {
         target: backendTarget,
         changeOrigin: true,
       },
       "/openapi.json": {
+        target: backendTarget,
+        changeOrigin: true,
+      },
+      "/ops": {
         target: backendTarget,
         changeOrigin: true,
       },
