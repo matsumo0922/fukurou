@@ -29,6 +29,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import java.io.File
 import java.time.Clock
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
@@ -55,6 +56,7 @@ fun interface ReadinessProbe {
  * @param opsPaperLedgerRepository ops API 用 paper ledger repository。null なら DB 設定から構築する
  * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
  * @param tradingConfig trading runtime config
+ * @param webRoot WebUI の build output を配信する filesystem root。null なら Web 配信を無効にする
  */
 fun Application.module(
     readinessProbe: ReadinessProbe? = null,
@@ -70,6 +72,7 @@ fun Application.module(
     opsPaperLedgerRepository: PaperLedgerRepository? = null,
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
+    webRoot: File? = webRootFromEnv(),
 ) {
     val environment = System.getenv()
     val databaseDataSource = createDataSourceIfConfigured(readinessProbe)
@@ -136,6 +139,15 @@ fun Application.module(
         exception<Throwable> { call, cause ->
             call.application.log.error("Unhandled exception while processing request", cause)
             call.respond(HttpStatusCode.InternalServerError, ErrorResponse("internal server error"))
+        }
+        status(HttpStatusCode.NotFound) { call, status ->
+            val respondedWithWebUi = call.respondWebStaticFallback(webRoot)
+
+            if (respondedWithWebUi) {
+                return@status
+            }
+
+            call.respond(status, ErrorResponse("not found"))
         }
     }
 

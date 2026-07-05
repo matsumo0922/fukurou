@@ -19,6 +19,17 @@ COPY trading ./trading
 RUN --mount=type=cache,target=/root/.gradle \
     chmod +x gradlew && ./gradlew :fukurou:buildFatJar :mcp:buildFatJar :mcp-gmo-coin:buildFatJar --no-daemon
 
+# ---- web build stage: Vite SPA を production asset としてビルドする ----
+FROM node:22-bookworm-slim AS web-build
+WORKDIR /src/web
+
+COPY web/package.json web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+
+COPY web ./
+RUN npm run build
+
 # ---- runtime stage: 実行は軽量 JRE のみ ----
 FROM eclipse-temurin:21-jre AS runtime
 ARG FUKUROU_REVISION=unknown
@@ -40,10 +51,13 @@ COPY --from=build /src/mcp/build/libs/fukurou-mcp-all.jar fukurou-mcp-all.jar
 COPY --from=build /src/mcp-gmo-coin/build/libs/gmo-coin-mcp-all.jar gmo-coin-mcp-all.jar
 # one-shot runner が system prompt hash を計算するため、prompt 正本を同梱する。
 COPY prompts ./prompts
+# Vite SPA の production build output を Ktor から配信する。
+COPY --from=web-build /src/web/dist ./web
 USER appuser
 
 # JVM をコンテナの memory limit に追従させる。
 ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
 ENV FUKUROU_REVISION=$FUKUROU_REVISION
+ENV FUKUROU_WEB_ROOT=/app/web
 EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]
