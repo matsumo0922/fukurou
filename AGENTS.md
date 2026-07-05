@@ -58,6 +58,12 @@ DB を使うローカル起動では、`docker compose -f docker-compose.yml -f 
 - コードを編集したときは、可能な範囲で `mcp__idea.get_file_problems` を使い、対象ファイルに warning が出ていないか確認する。必要に応じて `mcp__idea.build_project` も使う。
 - IntelliJ MCP が使えない場合は、`make detekt` や関連テストなど、変更内容に応じた代替手段で確認する。
 
+## Repo-local Skills
+
+- Fukurou 固有の運用手順や production DB schema に依存する skill は `.codex/skills/` に置く。
+- Fukurou 固有 skill を汎用の personal Skills repo へ公開しない。
+- LLM daemon / paper trading の時系列確認は `.codex/skills/fukurou-llm-daemon-log-audit/` を使う。
+
 ## Worktree 運用
 
 実装を行う場合は、必ず worktree を作成し、デフォルトディレクトリを汚さない。
