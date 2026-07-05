@@ -28,7 +28,21 @@ export type ActivityTimelineEvent = {
 export type ActivityTimelineSnapshot = {
   events: ActivityTimelineEvent[];
   fetchedAt: string;
+  limits: ActivityTimelineLimits;
 };
+
+export type ActivityTimelineLimits = {
+  decisions: number;
+  audit: number;
+  executions: number;
+  total: number;
+};
+
+const ACTIVITY_TIMELINE_DECISIONS_LIMIT = 20;
+const ACTIVITY_TIMELINE_AUDIT_LIMIT = 50;
+const ACTIVITY_TIMELINE_EXECUTIONS_LIMIT = 20;
+const ACTIVITY_TIMELINE_TOTAL_LIMIT =
+  ACTIVITY_TIMELINE_DECISIONS_LIMIT + ACTIVITY_TIMELINE_AUDIT_LIMIT + ACTIVITY_TIMELINE_EXECUTIONS_LIMIT;
 
 export const opsRiskStateQuery = queryOptions({
   queryKey: ["ops", "risk-state"],
@@ -74,9 +88,9 @@ export const activityTimelineQuery = queryOptions({
 
 async function fetchActivityTimeline(): Promise<ActivityTimelineSnapshot> {
   const [decisionsResponse, auditResponse, executionsResponse] = await Promise.all([
-    getJson("/ops/decisions"),
-    getJson("/ops/audit"),
-    getJson("/ops/executions"),
+    getJson(`/ops/decisions?limit=${ACTIVITY_TIMELINE_DECISIONS_LIMIT}`),
+    getJson(`/ops/audit?limit=${ACTIVITY_TIMELINE_AUDIT_LIMIT}`),
+    getJson(`/ops/executions?limit=${ACTIVITY_TIMELINE_EXECUTIONS_LIMIT}`),
   ]);
   const events = [
     ...decisionsResponse.decisions.map(decisionToTimelineEvent),
@@ -87,6 +101,12 @@ async function fetchActivityTimeline(): Promise<ActivityTimelineSnapshot> {
   return {
     events,
     fetchedAt: new Date().toISOString(),
+    limits: {
+      decisions: ACTIVITY_TIMELINE_DECISIONS_LIMIT,
+      audit: ACTIVITY_TIMELINE_AUDIT_LIMIT,
+      executions: ACTIVITY_TIMELINE_EXECUTIONS_LIMIT,
+      total: ACTIVITY_TIMELINE_TOTAL_LIMIT,
+    },
   };
 }
 

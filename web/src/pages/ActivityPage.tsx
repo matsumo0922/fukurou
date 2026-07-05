@@ -1,7 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import Activity from "lucide-react/dist/esm/icons/activity.mjs";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
-import { activityTimelineQuery, type ActivityTimelineEvent, type ActivityTimelineSource } from "../api/ops";
+import {
+  activityTimelineQuery,
+  type ActivityTimelineEvent,
+  type ActivityTimelineSnapshot,
+  type ActivityTimelineSource,
+} from "../api/ops";
 import { EmptyState } from "../ui/components/EmptyState";
 import { Panel } from "../ui/components/Panel";
 import { SectionHeader } from "../ui/components/SectionHeader";
@@ -41,7 +46,7 @@ export function ActivityPage() {
         </div>
         {timelineQuery.isPending ? <ActivityLoading /> : null}
         {timelineQuery.isError ? <ActivityError error={timelineQuery.error} retried={() => void timelineQuery.refetch()} /> : null}
-        {timelineQuery.data ? <ActivityTimeline events={timelineQuery.data.events} fetchedAt={timelineQuery.data.fetchedAt} /> : null}
+        {timelineQuery.data ? <ActivityTimeline timeline={timelineQuery.data} /> : null}
       </Panel>
     </div>
   );
@@ -71,14 +76,19 @@ function ActivityError({ error, retried }: { error: unknown; retried: () => void
   );
 }
 
-function ActivityTimeline({ events, fetchedAt }: { events: ActivityTimelineEvent[]; fetchedAt: string }) {
+function ActivityTimeline({ timeline }: { timeline: ActivityTimelineSnapshot }) {
+  const { events, fetchedAt, limits } = timeline;
+
   if (events.length === 0) {
     return <EmptyState title="No activity recorded" description="The decision, audit, and execution feeds are empty." />;
   }
 
   return (
     <>
-      <p className="timeline__freshness">Updated {formatDateTime(fetchedAt)}</p>
+      <p className="timeline__freshness">
+        Updated {formatDateTime(fetchedAt)} · newest first · {events.length}/{limits.total} records · decisions{" "}
+        {limits.decisions} / audit {limits.audit} / executions {limits.executions}
+      </p>
       <ol className="timeline" aria-label="Activity timeline">
         {events.map((event) => (
           <li className="timeline__item" key={event.id}>
