@@ -56,6 +56,11 @@ interface PaperLedgerRepository {
     suspend fun getExecutions(): Result<List<Execution>>
 
     /**
+     * execution ledger の最新行を指定上限で返す。
+     */
+    suspend fun getRecentExecutions(limit: Int): Result<List<Execution>>
+
+    /**
      * 指定範囲に close された position と関連 executions を返す。
      */
     suspend fun findClosedPositionsClosedBetween(

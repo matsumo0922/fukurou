@@ -463,6 +463,33 @@ private const val SELECT_EXECUTIONS_SQL = """
 """
 
 /**
+ * execution ledger の最新行を指定上限で読む SQL。
+ */
+private const val SELECT_RECENT_EXECUTIONS_SQL = """
+    SELECT
+        id,
+        order_id,
+        position_id,
+        mode,
+        symbol,
+        side,
+        price_jpy,
+        size_btc,
+        fee_jpy,
+        realized_pnl_jpy,
+        liquidity,
+        executed_at
+    FROM executions
+    WHERE mode = (
+        SELECT mode
+        FROM paper_account
+        WHERE id = ?
+    )
+    ORDER BY executed_at DESC
+    LIMIT ?
+"""
+
+/**
  * 指定日実現損益を集計する SQL。
  */
 private const val SELECT_REALIZED_PNL_FOR_RANGE_SQL = """
@@ -575,6 +602,20 @@ class ExposedPaperLedgerRepository(
             runCatching {
                 exposedTransaction(database) {
                     selectExecutions()
+                }
+            }
+        }
+    }
+
+    override suspend fun getRecentExecutions(limit: Int): Result<List<Execution>> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+
+                exposedTransaction(database) {
+                    selectRecentExecutions(limit)
                 }
             }
         }
@@ -918,6 +959,14 @@ private fun JdbcTransaction.selectExecutions(): List<Execution> {
                 }
             }
         }
+    }
+}
+
+private fun JdbcTransaction.selectRecentExecutions(limit: Int): List<Execution> {
+    return jdbcConnection().prepareStatement(SELECT_RECENT_EXECUTIONS_SQL).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.setInt(2, limit)
+        statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
     }
 }
 

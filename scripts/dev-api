@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+fail() {
+  echo "${SCRIPT_NAME}: $*" >&2
+  exit 1
+}
+
+require_dotenvx() {
+  command -v dotenvx >/dev/null 2>&1 || fail "dotenvx is required. Install dotenvx or use exported DB_* env vars with ./gradlew :fukurou:run."
+}
+
+main() {
+  cd "${REPO_ROOT}"
+
+  [[ -f ".env" ]] || fail ".env is missing. Copy .env.example to .env and fill local values first."
+
+  require_dotenvx
+  "${SCRIPT_DIR}/dev-db"
+
+  exec dotenvx run -- bash -c '
+    set -Eeuo pipefail
+
+    if [[ -z "${DB_URL:-}" ]]; then
+      : "${POSTGRES_DB:?POSTGRES_DB is required when DB_URL is unset}"
+      export DB_URL="jdbc:postgresql://localhost:5432/${POSTGRES_DB}"
+    fi
+
+    if [[ -z "${DB_USER:-}" ]]; then
+      : "${POSTGRES_USER:?POSTGRES_USER is required when DB_USER is unset}"
+      export DB_USER="${POSTGRES_USER}"
+    fi
+
+    if [[ -z "${DB_PASSWORD:-}" ]]; then
+      : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required when DB_PASSWORD is unset}"
+      export DB_PASSWORD="${POSTGRES_PASSWORD}"
+    fi
+
+    exec ./gradlew :fukurou:run
+  '
+}
+
+main "$@"

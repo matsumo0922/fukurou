@@ -733,6 +733,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ops/account": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * paper account snapshot を取得する
+         * @description paper ledger の account snapshot と更新時刻を返します。fake/demo 値は返しません。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description paper account snapshot です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsAccountResponse"];
+                    };
+                };
+                /** @description paper ledger repository が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ops/decisions": {
         parameters: {
             query?: never;
@@ -772,6 +820,66 @@ export interface paths {
                     };
                 };
                 /** @description decision repository が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/executions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * paper execution の raw feed を取得する
+         * @description paper ledger の execution を新しい順で返します。limit は既定 20、最大 100 です。
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description 取得件数です。既定 20、最大 100 です。 */
+                    limit?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description paper execution raw feed です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsExecutionsResponse"];
+                    };
+                };
+                /** @description limit が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description paper ledger repository が利用できません。 */
                 503: {
                     headers: {
                         [name: string]: unknown;
@@ -1077,6 +1185,18 @@ export interface components {
             invocationId: string;
             triggerKind: string;
         };
+        /** OpsAccountResponse */
+        OpsAccountResponse: {
+            mode: string;
+            cashJpy: string;
+            initialCashJpy: string;
+            btcQuantity: string;
+            btcMarkPriceJpy: string;
+            totalEquityJpy: string;
+            equityPeakJpy: string;
+            drawdownRatio: string;
+            updatedAt: string;
+        };
         /** OpsDecisionResponse */
         OpsDecisionResponse: {
             id: string;
@@ -1090,6 +1210,25 @@ export interface components {
         /** OpsDecisionsResponse */
         OpsDecisionsResponse: {
             decisions: components["schemas"]["OpsDecisionResponse"][];
+        };
+        /** OpsExecutionResponse */
+        OpsExecutionResponse: {
+            executionId: string;
+            orderId?: string | null;
+            positionId?: string | null;
+            mode: string;
+            symbol: string;
+            side: string;
+            priceJpy: string;
+            sizeBtc: string;
+            feeJpy: string;
+            realizedPnlJpy: string;
+            liquidity: string;
+            executedAt: string;
+        };
+        /** OpsExecutionsResponse */
+        OpsExecutionsResponse: {
+            executions: components["schemas"]["OpsExecutionResponse"][];
         };
         /** Position */
         Position: {

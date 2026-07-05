@@ -56,6 +56,7 @@ type JsonResponse<Path extends JsonGetPath> = JsonPayload<
 >;
 
 type ApiRequestInit = Omit<RequestInit, "body" | "method">;
+type ApiPathWithSearch<Path extends string> = Path | `${Path}?${string}`;
 
 export type ApiResponse<Payload> = {
   status: number;
@@ -72,15 +73,15 @@ export class ApiClientError extends Error {
   }
 }
 
-export async function getText<Path extends TextGetPath>(
-  path: Path,
+export async function getText<Path extends TextGetPath & string>(
+  path: ApiPathWithSearch<Path>,
   init: ApiRequestInit = {},
 ): Promise<TextResponse<Path>> {
   return (await getTextResponse(path, [200], init)).data;
 }
 
-export async function getJson<Path extends JsonGetPath>(
-  path: Path,
+export async function getJson<Path extends JsonGetPath & string>(
+  path: ApiPathWithSearch<Path>,
   init: ApiRequestInit = {},
 ): Promise<JsonResponse<Path>> {
   return (await getJsonResponse(path, [200], init)).data;
@@ -90,8 +91,8 @@ export function fetchRevision(): Promise<TextResponse<"/revision">> {
   return getText("/revision");
 }
 
-export async function getTextResponse<Path extends TextGetPath>(
-  path: Path,
+export async function getTextResponse<Path extends TextGetPath & string>(
+  path: ApiPathWithSearch<Path>,
   allowedStatuses: readonly number[] = [200],
   init: ApiRequestInit = {},
 ): Promise<ApiResponse<TextResponse<Path>>> {
@@ -103,8 +104,8 @@ export async function getTextResponse<Path extends TextGetPath>(
   };
 }
 
-export async function getJsonResponse<Path extends JsonGetPath>(
-  path: Path,
+export async function getJsonResponse<Path extends JsonGetPath & string>(
+  path: ApiPathWithSearch<Path>,
   allowedStatuses: readonly number[] = [200],
   init: ApiRequestInit = {},
 ): Promise<ApiResponse<JsonResponse<Path>>> {

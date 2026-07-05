@@ -128,6 +128,20 @@ class InMemoryPaperLedgerRepository(
         return Result.success(synchronized(lock) { executions.toList() })
     }
 
+    override suspend fun getRecentExecutions(limit: Int): Result<List<Execution>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            synchronized(lock) {
+                executions
+                    .sortedByDescending { execution -> Instant.parse(execution.executedAt) }
+                    .take(limit)
+            }
+        }
+    }
+
     override suspend fun findClosedPositionsClosedBetween(
         from: Instant,
         toExclusive: Instant,
