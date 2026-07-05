@@ -3,6 +3,10 @@ import { getJson } from "./client";
 import type { components } from "./openapi-types";
 
 export type EvaluationSummaryResponse = components["schemas"]["EvaluationSummaryResponse"];
+export type EvaluationSetupsResponse = components["schemas"]["EvaluationSetupsResponse"];
+export type EvaluationCalibrationResponse = components["schemas"]["EvaluationCalibrationResponse"];
+export type EvaluationBenchmarkResponse = components["schemas"]["EvaluationBenchmarkResponse"];
+export type EvaluationCostsResponse = components["schemas"]["EvaluationCostsResponse"];
 export type OpsAccountResponse = components["schemas"]["OpsAccountResponse"];
 export type OpsAuditEventResponse = components["schemas"]["OpsAuditEventResponse"];
 export type OpsDecisionResponse = components["schemas"]["OpsDecisionResponse"];
@@ -75,6 +79,34 @@ export const opsPositionsQuery = queryOptions({
 export const evaluationSummaryQuery = queryOptions({
   queryKey: ["evaluation", "summary"],
   queryFn: () => getJson("/evaluation/summary"),
+  staleTime: 60_000,
+  refetchInterval: 60_000,
+});
+
+export const evaluationSetupsQuery = queryOptions({
+  queryKey: ["evaluation", "setups"],
+  queryFn: () => getJson("/evaluation/setups"),
+  staleTime: 60_000,
+  refetchInterval: 60_000,
+});
+
+export const evaluationCalibrationQuery = queryOptions({
+  queryKey: ["evaluation", "calibration"],
+  queryFn: () => getJson("/evaluation/calibration"),
+  staleTime: 60_000,
+  refetchInterval: 60_000,
+});
+
+export const evaluationBenchmarkQuery = queryOptions({
+  queryKey: ["evaluation", "benchmark"],
+  queryFn: () => getJson("/evaluation/benchmark"),
+  staleTime: 60_000,
+  refetchInterval: 60_000,
+});
+
+export const evaluationCostsQuery = queryOptions({
+  queryKey: ["evaluation", "costs"],
+  queryFn: () => getJson("/evaluation/costs"),
   staleTime: 60_000,
   refetchInterval: 60_000,
 });

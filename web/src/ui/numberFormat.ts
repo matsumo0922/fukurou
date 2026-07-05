@@ -27,6 +27,17 @@ const decimalFormatter = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 0,
 });
 
+const integerFormatter = new Intl.NumberFormat("en-US", {
+  maximumFractionDigits: 0,
+});
+
+const usdFormatter = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  maximumFractionDigits: 4,
+  minimumFractionDigits: 0,
+});
+
 export function formatJpy(value: string | null | undefined): string {
   const number = parseNumericValue(value);
 
@@ -55,6 +66,16 @@ export function formatDecimal(value: string | null | undefined): string {
   const number = parseNumericValue(value);
 
   return number === null ? "not reported" : decimalFormatter.format(number);
+}
+
+export function formatInteger(value: number | null | undefined): string {
+  return value === null || value === undefined ? "not reported" : integerFormatter.format(value);
+}
+
+export function formatUsd(value: string | null | undefined): string {
+  const number = parseNumericValue(value);
+
+  return number === null ? "not reported" : usdFormatter.format(number);
 }
 
 function parseNumericValue(value: string | null | undefined): number | null {

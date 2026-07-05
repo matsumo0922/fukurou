@@ -10,7 +10,7 @@ describe("App", () => {
     window.history.replaceState({}, "", "/");
   });
 
-  it("redirects root to overview and shows only implemented routes", async () => {
+  it("redirects root to overview and shows implemented routes", async () => {
     stubSystemFetch();
     window.history.pushState({}, "", "/");
 
@@ -22,15 +22,15 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Overview/ })).toHaveAttribute("href", "/app/overview");
     expect(screen.getByRole("link", { name: /Activity/ })).toHaveAttribute("href", "/app/activity");
+    expect(screen.getByRole("link", { name: /Evaluation/ })).toHaveAttribute("href", "/app/evaluation");
     expect(screen.getByRole("link", { name: /System/ })).toHaveAttribute("href", "/app/system");
-    expect(screen.queryByText("Evaluation")).not.toBeInTheDocument();
     expect(screen.queryByText("Controls")).not.toBeInTheDocument();
     expect(screen.queryByText("Notes")).not.toBeInTheDocument();
   });
 
   it("redirects unimplemented app deep links to overview", async () => {
     stubSystemFetch();
-    window.history.pushState({}, "", "/app/evaluation");
+    window.history.pushState({}, "", "/app/controls");
 
     render(<App />);
 
@@ -77,6 +77,44 @@ describe("App", () => {
     expect(screen.getAllByText("NO_TRADE").length).toBeGreaterThan(0);
     expect(screen.getByText("¥195,000")).toBeInTheDocument();
     expect(screen.getByText("within bounds")).toBeInTheDocument();
+  });
+
+  it("shows evaluation data from the read APIs", async () => {
+    const fetchMock = stubSystemFetch();
+    window.history.pushState({}, "", "/app/evaluation");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Evaluation" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Evaluation/ })).toHaveAttribute("href", "/app/evaluation");
+    expect((await screen.findAllByText("trend-breakout")).length).toBeGreaterThan(0);
+    expect(screen.getByRole("heading", { name: "Setup performance" })).toBeInTheDocument();
+    expect(screen.getAllByText("claude").length).toBeGreaterThan(0);
+    expect(screen.getByText("claude-sonnet-4")).toBeInTheDocument();
+    expect(screen.getByText("Bot realized")).toBeInTheDocument();
+    expect(screen.getAllByText("¥101,000").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("$0.1234").length).toBeGreaterThan(0);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/evaluation/summary",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/evaluation/setups",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/evaluation/calibration",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/evaluation/benchmark",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/evaluation/costs",
+      expect.objectContaining({ method: "GET" }),
+    );
   });
 
   it("shows merged activity timeline records newest first from bounded feeds", async () => {
@@ -291,6 +329,176 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
             noTradeRate: "0.8",
           },
           marketRegimes: [],
+        });
+      case "/evaluation/setups":
+        return jsonResponse({
+          period: {
+            from: "2026-06-05",
+            to: "2026-07-05",
+            timezone: "Asia/Tokyo",
+          },
+          truncated: false,
+          setups: [
+            {
+              setupTag: "trend-breakout",
+              performance: {
+                tradeCount: 2,
+                totalPnlJpy: "1800",
+                profitFactor: "1.8",
+                winRate: "0.5",
+                expectedR: "0.3",
+                averageMaeR: "0.12",
+                averageMfeR: "0.4",
+                rUnavailableCount: 0,
+                maeUnavailableCount: 0,
+                mfeUnavailableCount: 0,
+              },
+            },
+            {
+              setupTag: "range-fade",
+              performance: {
+                tradeCount: 1,
+                totalPnlJpy: "-600",
+                profitFactor: "0.8",
+                winRate: "0",
+                expectedR: "-0.1",
+                averageMaeR: "0.2",
+                averageMfeR: "0.1",
+                rUnavailableCount: 0,
+                maeUnavailableCount: 0,
+                mfeUnavailableCount: 0,
+              },
+            },
+          ],
+          marketRegimes: [
+            {
+              trend: "TREND",
+              volatility: "HIGH",
+              performance: {
+                tradeCount: 2,
+                totalPnlJpy: "1800",
+                profitFactor: "1.8",
+                winRate: "0.5",
+                expectedR: "0.3",
+                averageMaeR: "0.12",
+                averageMfeR: "0.4",
+                rUnavailableCount: 0,
+                maeUnavailableCount: 0,
+                mfeUnavailableCount: 0,
+              },
+            },
+          ],
+        });
+      case "/evaluation/calibration":
+        return jsonResponse({
+          period: {
+            from: "2026-06-05",
+            to: "2026-07-05",
+            timezone: "Asia/Tokyo",
+          },
+          truncated: false,
+          bySetup: [
+            {
+              groupKey: "trend-breakout",
+              bins: [
+                {
+                  binIndex: 4,
+                  lowerBoundInclusive: "0.4",
+                  upperBoundInclusive: "0.5",
+                  tradeCount: 1,
+                  averageEstimatedProbability: "0.45",
+                  realizedWinRate: "0",
+                },
+                {
+                  binIndex: 6,
+                  lowerBoundInclusive: "0.6",
+                  upperBoundInclusive: "0.7",
+                  tradeCount: 1,
+                  averageEstimatedProbability: "0.64",
+                  realizedWinRate: "1",
+                },
+              ],
+            },
+          ],
+          byProvider: [
+            {
+              groupKey: "claude",
+              bins: [
+                {
+                  binIndex: 5,
+                  lowerBoundInclusive: "0.5",
+                  upperBoundInclusive: "0.6",
+                  tradeCount: 2,
+                  averageEstimatedProbability: "0.55",
+                  realizedWinRate: "0.5",
+                },
+              ],
+            },
+          ],
+        });
+      case "/evaluation/benchmark":
+        return jsonResponse({
+          period: {
+            from: "2026-06-05",
+            to: "2026-07-05",
+            timezone: "Asia/Tokyo",
+          },
+          assumptionsJa: "buy & hold は初期残高で BTC を購入し、no-trade は現金維持として比較します。",
+          baselineEquityJpy: "100000",
+          points: [
+            {
+              date: "2026-07-03",
+              buyAndHoldEquityJpy: "100000",
+              noTradeEquityJpy: "100000",
+              botEquityJpy: "100000",
+            },
+            {
+              date: "2026-07-04",
+              buyAndHoldEquityJpy: "103000",
+              noTradeEquityJpy: "100000",
+              botEquityJpy: "104000",
+            },
+            {
+              date: "2026-07-05",
+              buyAndHoldEquityJpy: "102000",
+              noTradeEquityJpy: "100000",
+              botEquityJpy: "101000",
+            },
+          ],
+          returns: {
+            buyAndHoldReturn: "0.02",
+            noTradeReturn: "0",
+            botReturn: "0.01",
+          },
+        });
+      case "/evaluation/costs":
+        return jsonResponse({
+          period: {
+            from: "2026-06-05",
+            to: "2026-07-05",
+            timezone: "Asia/Tokyo",
+          },
+          truncated: false,
+          phaseCount: 4,
+          missingUsagePhaseCount: 1,
+          totalCostUsd: "0.1234",
+          byProvider: [
+            {
+              provider: "claude",
+              totalCostUsd: "0.1234",
+              phaseCount: 4,
+              missingUsagePhaseCount: 1,
+            },
+          ],
+          byModel: [
+            {
+              model: "claude-sonnet-4",
+              inputTokens: 1200,
+              outputTokens: 450,
+              cacheCreationInputTokens: 80,
+              cacheReadInputTokens: 320,
+            },
+          ],
         });
       default:
         return jsonResponse({ message: "not found" }, { status: 404 });
