@@ -1,13 +1,13 @@
 :root {
-  --canvas: #f5f2ea;
-  --surface: #fffdf8;
-  --surface-muted: #f8f6ef;
+  --canvas: #f4f6f3;
+  --surface: #fbfcf8;
+  --surface-muted: #f1f4ef;
   --surface-raised: #ffffff;
-  --line: #ddd6c7;
-  --line-strong: #c8bfad;
-  --ink: #1f2933;
-  --ink-muted: #60706a;
-  --ink-faint: #7d897f;
+  --line: #dfe5dd;
+  --line-strong: #c5d0c5;
+  --ink: #171a16;
+  --ink-muted: #657267;
+  --ink-faint: #7f8a80;
   --green: #237c5b;
   --green-soft: #e3f1e9;
   --amber: #a76515;
@@ -21,5 +21,5 @@
     Consolas,
     "Liberation Mono",
     monospace;
-  --shadow-soft: 0 16px 32px rgb(44 38 27 / 8%);
+  --shadow-soft: 0 16px 32px rgb(27 38 31 / 8%);
 }

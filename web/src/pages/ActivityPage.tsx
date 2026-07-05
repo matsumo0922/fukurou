@@ -1,4 +1,4 @@
-import { Activity } from "lucide-react";
+import Activity from "lucide-react/dist/esm/icons/activity.mjs";
 import { EmptyState } from "../ui/components/EmptyState";
 import { Panel } from "../ui/components/Panel";
 import { SectionHeader } from "../ui/components/SectionHeader";

@@ -43,8 +43,8 @@ a:focus-visible {
   grid-template-columns: 236px minmax(0, 1fr);
   min-height: 100vh;
   background:
-    linear-gradient(90deg, rgb(221 214 199 / 42%) 1px, transparent 1px),
-    linear-gradient(180deg, rgb(221 214 199 / 36%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(213 222 212 / 42%) 1px, transparent 1px),
+    linear-gradient(180deg, rgb(213 222 212 / 36%) 1px, transparent 1px),
     var(--canvas);
   background-size: 28px 28px;
 }
@@ -63,7 +63,7 @@ a:focus-visible {
   gap: 26px;
   height: 100vh;
   border-right: 1px solid var(--line-strong);
-  background: rgb(255 253 248 / 86%);
+  background: rgb(251 252 248 / 88%);
   padding: 20px 14px;
 }
 
@@ -134,7 +134,7 @@ a:focus-visible {
   gap: 16px;
   min-height: 58px;
   border-bottom: 1px solid var(--line-strong);
-  background: rgb(255 253 248 / 88%);
+  background: rgb(251 252 248 / 90%);
   padding: 10px 22px;
 }
 

@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { Activity, ServerCog } from "lucide-react";
+import Activity from "lucide-react/dist/esm/icons/activity.mjs";
+import ServerCog from "lucide-react/dist/esm/icons/server-cog.mjs";
 import { systemStatusQuery, type SystemStatusSnapshot } from "../api/system";
 import { DataStrip } from "../ui/components/DataStrip";
 import { EmptyState } from "../ui/components/EmptyState";

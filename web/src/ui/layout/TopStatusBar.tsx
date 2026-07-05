@@ -1,9 +1,9 @@
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
-import { RefreshCw } from "lucide-react";
+import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import { useEffect, useState } from "react";
 import { systemStatusQuery, type SystemStatusSnapshot } from "../../api/system";
 import { StatusPill, type StatusTone } from "../components/StatusPill";
-import { describeError, formatTime } from "../format";
+import { describeError, formatTime, formatUtcClock } from "../format";
 
 export function TopStatusBar() {
   const statusQuery = useQuery(systemStatusQuery);
@@ -26,7 +26,7 @@ export function TopStatusBar() {
       </div>
 
       <div className="top-status-bar__group top-status-bar__group--right">
-        <span className="top-status-bar__clock">{currentClock.toLocaleTimeString()}</span>
+        <span className="top-status-bar__clock">{formatUtcClock(currentClock)}</span>
         <button
           className="icon-text-button"
           type="button"

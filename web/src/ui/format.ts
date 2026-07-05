@@ -9,7 +9,17 @@ export function formatDateTime(value: string | null | undefined): string {
     return value;
   }
 
-  return date.toLocaleString();
+  return date.toLocaleString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZoneName: "short",
+    timeZone: "UTC",
+  });
 }
 
 export function formatTime(value: string | null | undefined): string {
@@ -23,7 +33,11 @@ export function formatTime(value: string | null | undefined): string {
     return value;
   }
 
-  return date.toLocaleTimeString();
+  return formatUtcTime(date);
+}
+
+export function formatUtcClock(date: Date): string {
+  return formatUtcTime(date);
 }
 
 export function describeError(error: unknown): string {
@@ -32,4 +46,15 @@ export function describeError(error: unknown): string {
   }
 
   return "Unknown API error";
+}
+
+function formatUtcTime(date: Date): string {
+  return date.toLocaleTimeString("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZone: "UTC",
+    timeZoneName: "short",
+  });
 }

@@ -1,5 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, RefreshCw, ServerCog } from "lucide-react";
+import AlertTriangle from "lucide-react/dist/esm/icons/alert-triangle.mjs";
+import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
+import ServerCog from "lucide-react/dist/esm/icons/server-cog.mjs";
 import { systemStatusQuery, type SystemStatusSnapshot } from "../api/system";
 import { DataStrip } from "../ui/components/DataStrip";
 import { EmptyState } from "../ui/components/EmptyState";

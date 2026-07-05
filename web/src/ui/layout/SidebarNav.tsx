@@ -1,5 +1,7 @@
-import { Activity, LayoutDashboard, ServerCog } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import Activity from "lucide-react/dist/esm/icons/activity.mjs";
+import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.mjs";
+import ServerCog from "lucide-react/dist/esm/icons/server-cog.mjs";
 import { NavLink } from "react-router";
 
 type NavigationItem = {

@@ -5,6 +5,7 @@ import App from "./App";
 describe("App", () => {
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     window.history.replaceState({}, "", "/");
   });
@@ -25,6 +26,18 @@ describe("App", () => {
     expect(screen.queryByText("Evaluation")).not.toBeInTheDocument();
     expect(screen.queryByText("Controls")).not.toBeInTheDocument();
     expect(screen.queryByText("Notes")).not.toBeInTheDocument();
+  });
+
+  it("redirects unimplemented app deep links to overview", async () => {
+    stubSystemFetch();
+    window.history.pushState({}, "", "/app/evaluation");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/app/overview");
+    });
+    expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
   });
 
   it("shows system endpoint data from the real health and revision routes", async () => {
@@ -50,6 +63,7 @@ describe("App", () => {
     expect(screen.getByText("status=ok")).toBeInTheDocument();
     expect(screen.getByText("status=ready")).toBeInTheDocument();
     expect(screen.getAllByText("local-sha").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/UTC/).length).toBeGreaterThan(1);
   });
 
   it("shows a loading state while system endpoints are pending", () => {
