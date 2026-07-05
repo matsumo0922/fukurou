@@ -194,7 +194,9 @@ FROM paper_account;
 SELECT
     'RISK'
     || '|hard_halt=' || hard_halt
+    || '|state=' || state
     || '|dd=' || drawdown_ratio
+    || '|halt_reason=' || COALESCE(replace(regexp_replace(halt_reason, '\\s+', ' ', 'g'), '|', '/'), '<none>')
     || '|updated_jst=' || to_char(to_timestamp(updated_at / 1000.0) AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS')
 FROM risk_state;
 
@@ -204,6 +206,7 @@ SELECT
     || '|positions=' || (SELECT count(*) FROM positions)
     || '|executions=' || (SELECT count(*) FROM executions)
     || '|intents=' || (SELECT count(*) FROM trade_intents)
-    || '|falsifications=' || (SELECT count(*) FROM falsifications);
+    || '|falsifications=' || (SELECT count(*) FROM falsifications)
+    || '|safety_violations=' || (SELECT count(*) FROM safety_violations);
 COMMIT;
 SQL

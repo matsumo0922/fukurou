@@ -60,7 +60,9 @@ DB を使うローカル起動では、`docker compose -f docker-compose.yml -f 
 
 ## Repo-local Skills
 
-- Fukurou 固有の運用手順や production DB schema に依存する skill は `.codex/skills/` に置く。
+- Fukurou 固有の運用手順や production DB schema に依存する skill は `.codex/skills/` を正本として置く。
+- Claude Code から使うため、`.claude/skills/<skill>/SKILL.md` を正本 SKILL.md への symlink として配置する。script 等の実体は `.codex/` 側だけに置き、二重管理しない。
+- skill の内容は特定 agent の CLI に依存させず、repo root からの相対パスで手順を書く。
 - Fukurou 固有 skill を汎用の personal Skills repo へ公開しない。
 - LLM daemon / paper trading の時系列確認は `.codex/skills/fukurou-llm-daemon-log-audit/` を使う。
 
