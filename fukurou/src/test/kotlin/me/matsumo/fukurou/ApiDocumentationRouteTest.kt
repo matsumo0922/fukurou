@@ -96,6 +96,12 @@ class ApiDocumentationRouteTest {
             summary = "paper execution の raw feed を取得する",
             tag = "ops",
         )
+        assertGetQueryParameter(
+            paths = paths,
+            path = "/ops/executions",
+            name = "limit",
+            type = "integer",
+        )
         assertOperation(
             paths = paths,
             path = "/ops/positions",
@@ -150,5 +156,29 @@ class ApiDocumentationRouteTest {
             .jsonObject
 
         assertEquals(schemaRef, schema.getValue("\$ref").jsonPrimitive.content)
+    }
+
+    private fun assertGetQueryParameter(
+        paths: JsonObject,
+        path: String,
+        name: String,
+        type: String,
+    ) {
+        val parameters = paths
+            .getValue(path)
+            .jsonObject
+            .getValue("get")
+            .jsonObject
+            .getValue("parameters")
+            .jsonArray
+        val parameter = parameters
+            .map { parameterElement -> parameterElement.jsonObject }
+            .single { parameterObject -> parameterObject.getValue("name").jsonPrimitive.content == name }
+        val schema = parameter
+            .getValue("schema")
+            .jsonObject
+
+        assertEquals("query", parameter.getValue("in").jsonPrimitive.content)
+        assertEquals(type, schema.getValue("type").jsonPrimitive.content)
     }
 }

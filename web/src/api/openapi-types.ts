@@ -851,7 +851,10 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description 取得件数です。既定 20、最大 100 です。 */
+                    limit?: number;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;

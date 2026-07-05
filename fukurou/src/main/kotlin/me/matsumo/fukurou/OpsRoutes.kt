@@ -477,10 +477,7 @@ internal fun Route.opsRoutes(
             maxLimit = MAX_EXECUTIONS_LIMIT,
         ) ?: return@get
         val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
-        val executions = repository.getExecutions()
-            .getOrThrow()
-            .sortedByDescending { execution -> Instant.parse(execution.executedAt) }
-            .take(limit)
+        val executions = repository.getRecentExecutions(limit).getOrThrow()
 
         call.respond(
             OpsExecutionsResponse(
@@ -491,6 +488,12 @@ internal fun Route.opsRoutes(
         summary = "paper execution の raw feed を取得する"
         description = "paper ledger の execution を新しい順で返します。limit は既定 20、最大 100 です。"
         tag(OPS_TAG)
+        parameters {
+            query("limit") {
+                description = "取得件数です。既定 20、最大 100 です。"
+                schema = jsonSchema<Int>()
+            }
+        }
         responses {
             HttpStatusCode.OK {
                 description = "paper execution raw feed です。"
