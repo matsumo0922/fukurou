@@ -24,6 +24,9 @@ import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.domain.AccountSnapshot
+import me.matsumo.fukurou.trading.domain.Execution
+import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
@@ -209,6 +212,38 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_accountReturnsCurrentSnapshotWithUpdatedAt() = testApplication {
+        val ledgerRepository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshot(),
+            accountUpdatedAt = fixedInstant().plusSeconds(30),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsPaperLedgerRepository = ledgerRepository,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/account")
+        val responseText = response.bodyAsText()
+        val responseBody = Json.parseToJsonElement(responseText).jsonObject
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertNoSecretLikeText(responseText)
+        assertEquals("PAPER", responseBody.getValue("mode").jsonPrimitive.content)
+        assertEquals("94000", responseBody.getValue("cashJpy").jsonPrimitive.content)
+        assertEquals("100000", responseBody.getValue("initialCashJpy").jsonPrimitive.content)
+        assertEquals("0.01000000", responseBody.getValue("btcQuantity").jsonPrimitive.content)
+        assertEquals("10100000", responseBody.getValue("btcMarkPriceJpy").jsonPrimitive.content)
+        assertEquals("195000", responseBody.getValue("totalEquityJpy").jsonPrimitive.content)
+        assertEquals("200000", responseBody.getValue("equityPeakJpy").jsonPrimitive.content)
+        assertEquals("0.025", responseBody.getValue("drawdownRatio").jsonPrimitive.content)
+        assertEquals("2026-07-02T01:00:30Z", responseBody.getValue("updatedAt").jsonPrimitive.content)
+    }
+
+    @Test
     fun opsRoutes_decisionsReturnsLimitedDescendingRawFeed() = testApplication {
         val clock = MutableClock(fixedInstant())
         val decisionRepository = InMemoryDecisionRepository(clock)
@@ -266,6 +301,54 @@ class OpsRouteTest {
         assertNoSecretLikeText(responseText)
         assertEquals("position-1", positions.single().jsonObject.getValue("positionId").jsonPrimitive.content)
         assertEquals("order-1", openOrders.single().jsonObject.getValue("orderId").jsonPrimitive.content)
+    }
+
+    @Test
+    fun opsRoutes_executionsReturnsLimitedDescendingRawFeedAndRejectsInvalidLimit() = testApplication {
+        val ledgerRepository = InMemoryPaperLedgerRepository(
+            executions = listOf(
+                execution(
+                    executionId = "execution-old",
+                    executedAt = fixedInstant(),
+                    realizedPnlJpy = "0",
+                ),
+                execution(
+                    executionId = "execution-new",
+                    executedAt = fixedInstant().plusSeconds(5),
+                    realizedPnlJpy = "1200",
+                ),
+            ),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsPaperLedgerRepository = ledgerRepository,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/executions?limit=1")
+        val invalidLimitResponse = client.get("/ops/executions?limit=0")
+        val responseText = response.bodyAsText()
+        val responseBody = Json.parseToJsonElement(responseText).jsonObject
+        val execution = responseBody.getValue("executions").jsonArray.single().jsonObject
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertNoSecretLikeText(responseText)
+        assertEquals("execution-new", execution.getValue("executionId").jsonPrimitive.content)
+        assertEquals("order-execution-new", execution.getValue("orderId").jsonPrimitive.content)
+        assertEquals("position-execution-new", execution.getValue("positionId").jsonPrimitive.content)
+        assertEquals("PAPER", execution.getValue("mode").jsonPrimitive.content)
+        assertEquals("BTC", execution.getValue("symbol").jsonPrimitive.content)
+        assertEquals("BUY", execution.getValue("side").jsonPrimitive.content)
+        assertEquals("10100000", execution.getValue("priceJpy").jsonPrimitive.content)
+        assertEquals("0.01000000", execution.getValue("sizeBtc").jsonPrimitive.content)
+        assertEquals("10", execution.getValue("feeJpy").jsonPrimitive.content)
+        assertEquals("1200", execution.getValue("realizedPnlJpy").jsonPrimitive.content)
+        assertEquals("TAKER", execution.getValue("liquidity").jsonPrimitive.content)
+        assertEquals("2026-07-02T01:00:05Z", execution.getValue("executedAt").jsonPrimitive.content)
+        assertEquals(HttpStatusCode.BadRequest, invalidLimitResponse.status)
     }
 
     @Test
@@ -330,16 +413,20 @@ class OpsRouteTest {
             contentType(ContentType.Application.Json)
             setBody("""{"reason":"operator check"}""")
         }
+        val accountResponse = client.get("/ops/account")
         val decisionsResponse = client.get("/ops/decisions")
         val positionsResponse = client.get("/ops/positions")
+        val executionsResponse = client.get("/ops/executions")
         val auditResponse = client.get("/ops/audit")
 
         assertEquals(HttpStatusCode.ServiceUnavailable, getResponse.status)
         assertEquals(HttpStatusCode.ServiceUnavailable, haltResponse.status)
         assertEquals(HttpStatusCode.ServiceUnavailable, resumeResponse.status)
         assertEquals(HttpStatusCode.ServiceUnavailable, triggerResponse.status)
+        assertEquals(HttpStatusCode.ServiceUnavailable, accountResponse.status)
         assertEquals(HttpStatusCode.ServiceUnavailable, decisionsResponse.status)
         assertEquals(HttpStatusCode.ServiceUnavailable, positionsResponse.status)
+        assertEquals(HttpStatusCode.ServiceUnavailable, executionsResponse.status)
         assertEquals(HttpStatusCode.ServiceUnavailable, auditResponse.status)
     }
 }
@@ -378,6 +465,19 @@ private fun noTradeSubmission(invocationId: String, reasonJa: String): DecisionS
         noTradeConditionsJa = listOf("ボラティリティが不足しています。"),
         entryIntent = null,
         tradePlan = null,
+    )
+}
+
+private fun accountSnapshot(): AccountSnapshot {
+    return AccountSnapshot(
+        mode = TradingMode.PAPER,
+        cashJpy = "94000",
+        initialCashJpy = "100000",
+        btcQuantity = "0.01000000",
+        btcMarkPriceJpy = "10100000",
+        totalEquityJpy = "195000",
+        equityPeakJpy = "200000",
+        drawdownRatio = "0.025",
     )
 }
 
@@ -425,6 +525,27 @@ private fun openOrder(): Order {
         clientRequestId = "client-request-1",
         createdAt = fixedInstant().toString(),
         updatedAt = fixedInstant().toString(),
+    )
+}
+
+private fun execution(
+    executionId: String,
+    executedAt: Instant,
+    realizedPnlJpy: String,
+): Execution {
+    return Execution(
+        executionId = executionId,
+        orderId = "order-$executionId",
+        positionId = "position-$executionId",
+        symbol = "BTC",
+        mode = TradingMode.PAPER,
+        side = OrderSide.BUY,
+        priceJpy = "10100000",
+        sizeBtc = "0.01000000",
+        feeJpy = "10",
+        realizedPnlJpy = realizedPnlJpy,
+        liquidity = ExecutionLiquidity.TAKER,
+        executedAt = executedAt.toString(),
     )
 }
 

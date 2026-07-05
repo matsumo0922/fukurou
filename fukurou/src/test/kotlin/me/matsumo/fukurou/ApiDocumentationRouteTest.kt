@@ -80,8 +80,20 @@ class ApiDocumentationRouteTest {
         )
         assertOperation(
             paths = paths,
+            path = "/ops/account",
+            summary = "paper account snapshot を取得する",
+            tag = "ops",
+        )
+        assertOperation(
+            paths = paths,
             path = "/ops/decisions",
             summary = "LLM decision の raw feed を取得する",
+            tag = "ops",
+        )
+        assertOperation(
+            paths = paths,
+            path = "/ops/executions",
+            summary = "paper execution の raw feed を取得する",
             tag = "ops",
         )
         assertOperation(

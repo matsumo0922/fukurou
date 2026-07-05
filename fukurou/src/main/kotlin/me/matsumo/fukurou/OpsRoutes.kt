@@ -16,10 +16,12 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
 import me.matsumo.fukurou.trading.decision.DecisionRepository
+import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
@@ -188,6 +190,74 @@ data class OpsAuditEventResponse(
 )
 
 /**
+ * account snapshot API の response body。
+ *
+ * @param mode 取引 mode
+ * @param cashJpy JPY 現金残高
+ * @param initialCashJpy 初期 JPY 残高
+ * @param btcQuantity BTC 保有数量
+ * @param btcMarkPriceJpy BTC 評価価格
+ * @param totalEquityJpy 総評価額
+ * @param equityPeakJpy 総評価額の過去ピーク
+ * @param drawdownRatio equityPeakJpy からの下落率
+ * @param updatedAt paper account 更新時刻
+ */
+@Serializable
+data class OpsAccountResponse(
+    val mode: String,
+    val cashJpy: String,
+    val initialCashJpy: String,
+    val btcQuantity: String,
+    val btcMarkPriceJpy: String,
+    val totalEquityJpy: String,
+    val equityPeakJpy: String,
+    val drawdownRatio: String,
+    val updatedAt: String,
+)
+
+/**
+ * executions raw feed API の response body。
+ *
+ * @param executions 新しい順の execution 一覧
+ */
+@Serializable
+data class OpsExecutionsResponse(
+    val executions: List<OpsExecutionResponse>,
+)
+
+/**
+ * executions raw feed API の execution 要素。
+ *
+ * @param executionId execution ID
+ * @param orderId 関連 order ID
+ * @param positionId 関連 position ID
+ * @param mode 取引 mode
+ * @param symbol 取引対象 symbol
+ * @param side execution side
+ * @param priceJpy 約定価格
+ * @param sizeBtc 約定数量
+ * @param feeJpy 手数料
+ * @param realizedPnlJpy 実現損益
+ * @param liquidity maker / taker 区分
+ * @param executedAt 約定時刻
+ */
+@Serializable
+data class OpsExecutionResponse(
+    val executionId: String,
+    val orderId: String?,
+    val positionId: String?,
+    val mode: String,
+    val symbol: String,
+    val side: String,
+    val priceJpy: String,
+    val sizeBtc: String,
+    val feeJpy: String,
+    val realizedPnlJpy: String,
+    val liquidity: String,
+    val executedAt: String,
+)
+
+/**
  * 運用系 route を定義する。
  */
 @OptIn(ExperimentalKtorApi::class)
@@ -341,6 +411,27 @@ internal fun Route.opsRoutes(
         }
     }
 
+    get("/ops/account") {
+        val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
+        val accountSnapshot = repository.getAccountSnapshotWithUpdatedAt().getOrThrow()
+
+        call.respond(accountSnapshot.toOpsAccountResponse())
+    }.describe {
+        summary = "paper account snapshot を取得する"
+        description = "paper ledger の account snapshot と更新時刻を返します。fake/demo 値は返しません。"
+        tag(OPS_TAG)
+        responses {
+            HttpStatusCode.OK {
+                description = "paper account snapshot です。"
+                schema = jsonSchema<OpsAccountResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "paper ledger repository が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
     get("/ops/decisions") {
         val limit = call.requireLimit(
             defaultLimit = DEFAULT_DECISIONS_LIMIT,
@@ -375,6 +466,42 @@ internal fun Route.opsRoutes(
             }
             HttpStatusCode.ServiceUnavailable {
                 description = "decision repository が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    get("/ops/executions") {
+        val limit = call.requireLimit(
+            defaultLimit = DEFAULT_EXECUTIONS_LIMIT,
+            maxLimit = MAX_EXECUTIONS_LIMIT,
+        ) ?: return@get
+        val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
+        val executions = repository.getExecutions()
+            .getOrThrow()
+            .sortedByDescending { execution -> Instant.parse(execution.executedAt) }
+            .take(limit)
+
+        call.respond(
+            OpsExecutionsResponse(
+                executions = executions.map { execution -> execution.toOpsExecutionResponse() },
+            ),
+        )
+    }.describe {
+        summary = "paper execution の raw feed を取得する"
+        description = "paper ledger の execution を新しい順で返します。limit は既定 20、最大 100 です。"
+        tag(OPS_TAG)
+        responses {
+            HttpStatusCode.OK {
+                description = "paper execution raw feed です。"
+                schema = jsonSchema<OpsExecutionsResponse>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "limit が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "paper ledger repository が利用できません。"
                 schema = jsonSchema<ErrorResponse>()
             }
         }
@@ -621,6 +748,39 @@ private fun CommandEvent.toOpsAuditEventResponse(): OpsAuditEventResponse {
     )
 }
 
+private fun AccountSnapshotWithUpdatedAt.toOpsAccountResponse(): OpsAccountResponse {
+    val snapshot = accountSnapshot
+
+    return OpsAccountResponse(
+        mode = snapshot.mode.name,
+        cashJpy = snapshot.cashJpy,
+        initialCashJpy = snapshot.initialCashJpy,
+        btcQuantity = snapshot.btcQuantity,
+        btcMarkPriceJpy = snapshot.btcMarkPriceJpy,
+        totalEquityJpy = snapshot.totalEquityJpy,
+        equityPeakJpy = snapshot.equityPeakJpy,
+        drawdownRatio = snapshot.drawdownRatio,
+        updatedAt = updatedAt.toString(),
+    )
+}
+
+private fun Execution.toOpsExecutionResponse(): OpsExecutionResponse {
+    return OpsExecutionResponse(
+        executionId = executionId,
+        orderId = orderId,
+        positionId = positionId,
+        mode = mode.name,
+        symbol = symbol,
+        side = side.name,
+        priceJpy = priceJpy,
+        sizeBtc = sizeBtc,
+        feeJpy = feeJpy,
+        realizedPnlJpy = realizedPnlJpy,
+        liquidity = liquidity.name,
+        executedAt = executedAt,
+    )
+}
+
 /**
  * decisions feed の既定 limit。
  */
@@ -640,3 +800,13 @@ private const val DEFAULT_AUDIT_LIMIT = 50
  * audit feed の最大 limit。
  */
 private const val MAX_AUDIT_LIMIT = 200
+
+/**
+ * executions feed の既定 limit。
+ */
+private const val DEFAULT_EXECUTIONS_LIMIT = 20
+
+/**
+ * executions feed の最大 limit。
+ */
+private const val MAX_EXECUTIONS_LIMIT = 100
