@@ -133,3 +133,13 @@ interface CommandEventLog {
         toolNames: Set<String>,
     ): Result<Int>
 }
+
+/**
+ * command_event_log を raw feed として読むための狭い read repository。
+ */
+interface CommandEventFeedReader {
+    /**
+     * 新しい順で command_event_log の event を読む。
+     */
+    suspend fun findEvents(limit: Int, eventType: CommandEventType?): Result<List<CommandEvent>>
+}

@@ -36,6 +36,11 @@ enum class LlmDaemonTriggerKind {
      * 建玉または open order がある場合の密な確認。
      */
     HOLDING_DENSE_CHECK,
+
+    /**
+     * 運用者の手動 API による即時起動。
+     */
+    MANUAL,
 }
 
 /**
