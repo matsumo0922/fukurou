@@ -1,6 +1,7 @@
 package me.matsumo.fukurou
 
 import com.zaxxer.hikari.HikariDataSource
+import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
@@ -11,6 +12,7 @@ import io.ktor.server.plugins.calllogging.CallLogging
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondText
 import io.ktor.server.routing.routing
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
@@ -29,6 +31,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import java.io.File
 import java.time.Clock
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
@@ -55,6 +58,7 @@ fun interface ReadinessProbe {
  * @param opsPaperLedgerRepository ops API 用 paper ledger repository。null なら DB 設定から構築する
  * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
  * @param tradingConfig trading runtime config
+ * @param webRoot WebUI の build output を配信する filesystem root。null なら Web 配信を無効にする
  */
 fun Application.module(
     readinessProbe: ReadinessProbe? = null,
@@ -70,6 +74,7 @@ fun Application.module(
     opsPaperLedgerRepository: PaperLedgerRepository? = null,
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
+    webRoot: File? = webRootFromEnv(),
 ) {
     val environment = System.getenv()
     val databaseDataSource = createDataSourceIfConfigured(readinessProbe)
@@ -136,6 +141,15 @@ fun Application.module(
         exception<Throwable> { call, cause ->
             call.application.log.error("Unhandled exception while processing request", cause)
             call.respond(HttpStatusCode.InternalServerError, ErrorResponse("internal server error"))
+        }
+        status(HttpStatusCode.NotFound) { call, status ->
+            val respondedWithWebUi = call.respondWebStaticFallback(webRoot)
+
+            if (respondedWithWebUi) {
+                return@status
+            }
+
+            call.respondText("Not Found", ContentType.Text.Plain, status)
         }
     }
 

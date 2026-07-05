@@ -3,6 +3,8 @@
 build/
 fukurou/build/
 build-logic/build/
+web/dist/
+web/node_modules/
 
 # VCS / IDE
 .git/
