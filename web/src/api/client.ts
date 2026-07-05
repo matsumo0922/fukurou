@@ -57,6 +57,11 @@ type JsonResponse<Path extends JsonGetPath> = JsonPayload<
 
 type ApiRequestInit = Omit<RequestInit, "body" | "method">;
 
+export type ApiResponse<Payload> = {
+  status: number;
+  data: Payload;
+};
+
 export class ApiClientError extends Error {
   constructor(
     readonly path: string,
@@ -71,26 +76,52 @@ export async function getText<Path extends TextGetPath>(
   path: Path,
   init: ApiRequestInit = {},
 ): Promise<TextResponse<Path>> {
-  const response = await get(path, "text/plain", init);
-  const text = await response.text();
-
-  return text as TextResponse<Path>;
+  return (await getTextResponse(path, [200], init)).data;
 }
 
 export async function getJson<Path extends JsonGetPath>(
   path: Path,
   init: ApiRequestInit = {},
 ): Promise<JsonResponse<Path>> {
-  const response = await get(path, "application/json", init);
-
-  return (await response.json()) as JsonResponse<Path>;
+  return (await getJsonResponse(path, [200], init)).data;
 }
 
 export function fetchRevision(): Promise<TextResponse<"/revision">> {
   return getText("/revision");
 }
 
-async function get(path: string, accept: string, init: ApiRequestInit): Promise<Response> {
+export async function getTextResponse<Path extends TextGetPath>(
+  path: Path,
+  allowedStatuses: readonly number[] = [200],
+  init: ApiRequestInit = {},
+): Promise<ApiResponse<TextResponse<Path>>> {
+  const response = await get(path, "text/plain", allowedStatuses, init);
+
+  return {
+    status: response.status,
+    data: (await response.text()) as TextResponse<Path>,
+  };
+}
+
+export async function getJsonResponse<Path extends JsonGetPath>(
+  path: Path,
+  allowedStatuses: readonly number[] = [200],
+  init: ApiRequestInit = {},
+): Promise<ApiResponse<JsonResponse<Path>>> {
+  const response = await get(path, "application/json", allowedStatuses, init);
+
+  return {
+    status: response.status,
+    data: (await response.json()) as JsonResponse<Path>,
+  };
+}
+
+async function get(
+  path: string,
+  accept: string,
+  allowedStatuses: readonly number[],
+  init: ApiRequestInit,
+): Promise<Response> {
   const headers = new Headers(init.headers);
 
   if (!headers.has("Accept")) {
@@ -103,7 +134,7 @@ async function get(path: string, accept: string, init: ApiRequestInit): Promise<
     headers,
   });
 
-  if (!response.ok) {
+  if (!allowedStatuses.includes(response.status)) {
     throw new ApiClientError(path, response.status, await response.text());
   }
 

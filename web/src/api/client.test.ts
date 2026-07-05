@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchRevision, getText } from "./client";
+import { fetchRevision, getJsonResponse, getText } from "./client";
 
 describe("api client", () => {
   afterEach(() => {
@@ -27,6 +27,28 @@ describe("api client", () => {
       path: "/revision",
       status: 503,
       responseText: "nope",
+    });
+  });
+
+  it("returns allowed non-200 JSON responses with their status", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ status: "not_ready" }), {
+            status: 503,
+            headers: {
+              "Content-Type": "application/json",
+            },
+          }),
+      ),
+    );
+
+    await expect(getJsonResponse("/health/ready", [200, 503])).resolves.toEqual({
+      status: 503,
+      data: {
+        status: "not_ready",
+      },
     });
   });
 });

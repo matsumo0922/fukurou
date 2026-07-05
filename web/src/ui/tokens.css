@@ -1,0 +1,25 @@
+:root {
+  --canvas: #f4f6f3;
+  --surface: #fbfcf8;
+  --surface-muted: #f1f4ef;
+  --surface-raised: #ffffff;
+  --line: #dfe5dd;
+  --line-strong: #c5d0c5;
+  --ink: #171a16;
+  --ink-muted: #657267;
+  --ink-faint: #7f8a80;
+  --green: #237c5b;
+  --green-soft: #e3f1e9;
+  --amber: #a76515;
+  --amber-soft: #f5ead6;
+  --red: #aa3c2f;
+  --red-soft: #f4dfdb;
+  --blue: #305f86;
+  --blue-soft: #e1edf4;
+  --mono:
+    "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
+  --shadow-soft: 0 16px 32px rgb(27 38 31 / 8%);
+}
