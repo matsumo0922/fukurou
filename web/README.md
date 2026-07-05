@@ -8,6 +8,8 @@ Vite + React + TypeScript のローカル Web foundation です。
 - `npm run generate:api`
 - `npm run verify`
 
+Repository root から起動する場合は、Ktor API を `make dev-api`、Vite dev server を `make dev-web` で起動できます。
+
 `npm run verify` は `typecheck` / `lint` / `test` / `build` / API 型再生成 / 生成型の差分確認をまとめて実行します。
 
 ## API Types

@@ -75,12 +75,20 @@ runtime config は `.env.example` の `FUKUROU_*` で上書きできます。既
 
 ## Web development
 
-`web/` は Vite + React + TypeScript のローカル Web 基盤です。Ktor を `make run` で起動した状態で Vite dev server を使います。
+`web/` は Vite + React + TypeScript のローカル Web 基盤です。Ktor API を `make dev-api` で起動した状態で Vite dev server を使います。
+
+```sh
+make dev-api
+```
+
+別 terminal で Web UI を起動します。
 
 ```sh
 npm --prefix web ci
-npm --prefix web run dev
+make dev-web
 ```
+
+`make dev-api` は `.env` を dotenvx で読み込み、ローカル PostgreSQL 向けの `DB_URL` / `DB_USER` / `DB_PASSWORD` を補完して Ktor を起動します。
 
 Vite dev server は既定で `http://localhost:8080` の Ktor API へ proxy します。接続先は `VITE_FUKUROU_API_TARGET` で上書きできます。
 
