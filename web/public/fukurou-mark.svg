@@ -1,0 +1,9 @@
+<svg width="96" height="96" viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Fukurou">
+  <rect width="96" height="96" rx="20" fill="#1f2933"/>
+  <path d="M26 30C31.6 22.8 40 19 48 19C56 19 64.4 22.8 70 30V61C70 72.6 60.2 80 48 80C35.8 80 26 72.6 26 61V30Z" fill="#f7faf7"/>
+  <path d="M33 34C37.5 29.4 42.5 28 48 28C53.5 28 58.5 29.4 63 34L55.8 45.2C53.6 42.4 51 41 48 41C45 41 42.4 42.4 40.2 45.2L33 34Z" fill="#3fbf8f"/>
+  <circle cx="39" cy="47" r="5" fill="#1f2933"/>
+  <circle cx="57" cy="47" r="5" fill="#1f2933"/>
+  <path d="M45 57H51L48 63L45 57Z" fill="#d97706"/>
+  <path d="M35 65C42 69.8 54 69.8 61 65" stroke="#1f2933" stroke-width="4" stroke-linecap="round"/>
+</svg>
