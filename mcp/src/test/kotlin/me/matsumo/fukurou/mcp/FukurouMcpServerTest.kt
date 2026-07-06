@@ -397,6 +397,17 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun submitDecisionTool_requiresExpectedRMultipleInSchema() {
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        ).createServer()
+        val tool = requireNotNull(server.tools["submit_decision"]?.tool)
+
+        assertTrue(tool.inputSchema.required?.contains("expected_r_multiple") == true)
+    }
+
+    @Test
     fun submitDecisionTool_recordsNoTradeInMemoryRuntime() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
@@ -419,6 +430,51 @@ class FukurouMcpServerTest {
         assertEquals("NO_TRADE", structuredContent.getValue("action").jsonPrimitive.contentOrNull)
         assertEquals(1, decisions.size)
         assertEquals("材料不足のため見送ります。", decisions.single().submission.reasonJa)
+    }
+
+    @Test
+    fun submitDecisionTool_rejectsMissingExpectedRMultiple() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = noTradeDecisionArguments(expectedRMultiple = null),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(result.isError == true)
+        assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals(
+            "expected_r_multiple is required.",
+            structuredContent.getValue("message").jsonPrimitive.contentOrNull,
+        )
+        assertEquals(0, repository.decisions().size)
+    }
+
+    @Test
+    fun submitDecisionTool_acceptsNegativeExpectedRMultiple() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = noTradeDecisionArguments(expectedRMultiple = "-0.25"),
+        )
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+        val noTradeExpectedRMultiple = repository.decisions().single().submission.expectedRMultiple
+
+        assertTrue(result.isError != true)
+        assertEquals("-0.25", noTradeExpectedRMultiple?.toPlainString())
     }
 
     @Test
@@ -935,10 +991,17 @@ private const val MEASURED_FALSIFIER_TOOL_CALLS = 17
 
 /**
  * NO_TRADE decision tool request の引数を作る。
+ *
+ * @param expectedRMultiple expected_r_multiple。null の場合は欠落ケースを作る。
  */
-private fun noTradeDecisionArguments() = buildJsonObject {
+private fun noTradeDecisionArguments(
+    expectedRMultiple: String? = "0",
+) = buildJsonObject {
     put("action", "NO_TRADE")
     put("estimated_win_probability", "0.12")
+    if (expectedRMultiple != null) {
+        put("expected_r_multiple", expectedRMultiple)
+    }
     put("tool_evidence_ids", stringArray("tool-1"))
     put("fact_check", """{"ticker":true}""")
     put("self_review", """{"reasonsNotToTrade":["出来高不足"]}""")
