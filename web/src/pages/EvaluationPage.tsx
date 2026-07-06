@@ -18,6 +18,8 @@ import {
   type EvaluationSetupsResponse,
   type EvaluationSummaryResponse,
 } from "../api/ops";
+import type { MessageKey } from "../i18n/messages";
+import { useI18n } from "../i18n/useI18n";
 import { DataStrip } from "../ui/components/DataStrip";
 import { EmptyState } from "../ui/components/EmptyState";
 import { Metric } from "../ui/components/Metric";
@@ -32,8 +34,10 @@ type MarketRegime = EvaluationSummaryResponse["marketRegimes"][number];
 type CalibrationGroup = EvaluationCalibrationResponse["bySetup"][number];
 type CalibrationBin = CalibrationGroup["bins"][number];
 type BenchmarkPoint = EvaluationBenchmarkResponse["points"][number];
+type Translate = (key: MessageKey) => string;
 
 export function EvaluationPage() {
+  const { t } = useI18n();
   const summaryQuery = useQuery(evaluationSummaryQuery);
   const setupsQuery = useQuery(evaluationSetupsQuery);
   const calibrationQuery = useQuery(evaluationCalibrationQuery);
@@ -52,7 +56,7 @@ export function EvaluationPage() {
       <SectionHeader
         eyebrow="App"
         title="Evaluation"
-        description="Model quality, paper-trading performance, calibration, benchmark, kill criterion, and LLM cost."
+        description={t("evaluation.description")}
         action={
           <button
             className="icon-text-button icon-text-button--prominent"
@@ -61,7 +65,7 @@ export function EvaluationPage() {
             disabled={isRefreshing}
           >
             <RefreshCw size={16} aria-hidden="true" />
-            {isRefreshing ? "Refreshing" : "Refresh"}
+            {isRefreshing ? t("common.refreshing") : t("common.refresh")}
           </button>
         }
       />
@@ -89,27 +93,41 @@ function EvaluationSignalMetrics({
   benchmarkQuery: UseQueryResult<EvaluationBenchmarkResponse, Error>;
   costsQuery: UseQueryResult<EvaluationCostsResponse, Error>;
 }) {
+  const { t } = useI18n();
+
   return (
     <div className="metric-grid">
       <Metric
-        label="Profit factor"
-        value={queryValue(summaryQuery, (data) => formatDecimal(data.performance.profitFactor))}
-        detail={summaryQuery.data ? `${formatInteger(summaryQuery.data.performance.tradeCount)} closed trades` : queryDetail(summaryQuery)}
+        label={t("evaluation.metric.profitFactor")}
+        value={queryValue(summaryQuery, (data) => formatDecimal(data.performance.profitFactor), t)}
+        detail={
+          summaryQuery.data
+            ? `${formatInteger(summaryQuery.data.performance.tradeCount)} ${t("evaluation.detail.closedTrades")}`
+            : queryDetail(summaryQuery, t)
+        }
       />
       <Metric
-        label="Win rate"
-        value={queryValue(summaryQuery, (data) => formatRatioAsPercent(data.performance.winRate))}
-        detail={summaryQuery.data ? `expected R ${formatDecimal(summaryQuery.data.performance.expectedR)}` : queryDetail(summaryQuery)}
+        label={t("evaluation.metric.winRate")}
+        value={queryValue(summaryQuery, (data) => formatRatioAsPercent(data.performance.winRate), t)}
+        detail={
+          summaryQuery.data
+            ? `${t("evaluation.detail.expectedR")} ${formatDecimal(summaryQuery.data.performance.expectedR)}`
+            : queryDetail(summaryQuery, t)
+        }
       />
       <Metric
-        label="Bot drawdown"
-        value={queryValue(benchmarkQuery, (data) => formatRatioAsPercent(calculateWorstBotDrawdown(data.points)))}
-        detail={benchmarkQuery.data ? `${formatInteger(benchmarkQuery.data.points.length)} benchmark points` : queryDetail(benchmarkQuery)}
+        label={t("evaluation.metric.botDrawdown")}
+        value={queryValue(benchmarkQuery, (data) => formatRatioAsPercent(calculateWorstBotDrawdown(data.points)), t)}
+        detail={
+          benchmarkQuery.data
+            ? `${formatInteger(benchmarkQuery.data.points.length)} ${t("evaluation.detail.benchmarkPoints")}`
+            : queryDetail(benchmarkQuery, t)
+        }
       />
       <Metric
-        label="LLM cost"
-        value={queryValue(costsQuery, (data) => formatUsd(data.totalCostUsd))}
-        detail={costsQuery.data ? `${formatInteger(costsQuery.data.phaseCount)} phases` : queryDetail(costsQuery)}
+        label={t("evaluation.metric.llmCost")}
+        value={queryValue(costsQuery, (data) => formatUsd(data.totalCostUsd), t)}
+        detail={costsQuery.data ? `${formatInteger(costsQuery.data.phaseCount)} ${t("evaluation.detail.phases")}` : queryDetail(costsQuery, t)}
       />
     </div>
   );
@@ -120,53 +138,55 @@ function EvaluationSummaryPanel({
 }: {
   summaryQuery: UseQueryResult<EvaluationSummaryResponse, Error>;
 }) {
+  const { t } = useI18n();
+
   if (summaryQuery.isPending) {
-    return <PanelLoading title="Evaluation summary" label="Loading evaluation summary" Icon={Activity} />;
+    return <PanelLoading title={t("evaluation.panel.summary")} label={t("evaluation.loading.summary")} Icon={Activity} />;
   }
 
   if (summaryQuery.isError) {
-    return <PanelError title="Evaluation summary unavailable" error={summaryQuery.error} retried={() => void summaryQuery.refetch()} />;
+    return <PanelError title={t("evaluation.error.summary")} error={summaryQuery.error} retried={() => void summaryQuery.refetch()} />;
   }
 
   const { performance, runRates, period } = summaryQuery.data;
 
   return (
     <Panel>
-      <PanelHeading Icon={Activity} title="Evaluation summary">
+      <PanelHeading Icon={Activity} title={t("evaluation.panel.summary")}>
         <FreshnessPill isStale={summaryQuery.isStale} />
         <TruncationPill truncated={summaryQuery.data.truncated} />
       </PanelHeading>
       <DataStrip
         items={[
           {
-            label: "period",
-            value: periodLabel(period),
+            label: t("evaluation.label.period"),
+            value: periodLabel(period, t),
             detail: period.timezone,
           },
           {
-            label: "total PnL",
+            label: t("evaluation.label.totalPnl"),
             value: formatSignedJpy(performance.totalPnlJpy),
-            detail: `${formatInteger(performance.tradeCount)} trades`,
+            detail: `${formatInteger(performance.tradeCount)} ${t("evaluation.detail.trades")}`,
           },
           {
-            label: "profit factor",
+            label: t("evaluation.label.profitFactor"),
             value: formatDecimal(performance.profitFactor),
-            detail: `win ${formatRatioAsPercent(performance.winRate)}`,
+            detail: `${t("evaluation.detail.win")} ${formatRatioAsPercent(performance.winRate)}`,
           },
           {
-            label: "expected R",
+            label: t("evaluation.label.expectedR"),
             value: formatDecimal(performance.expectedR),
-            detail: `missing R ${formatInteger(performance.rUnavailableCount)}`,
+            detail: `${t("evaluation.detail.missingR")} ${formatInteger(performance.rUnavailableCount)}`,
           },
           {
-            label: "MAE / MFE",
+            label: t("evaluation.label.maeMfe"),
             value: `${formatDecimal(performance.averageMaeR)} / ${formatDecimal(performance.averageMfeR)}`,
-            detail: `missing ${formatInteger(performance.maeUnavailableCount)} / ${formatInteger(performance.mfeUnavailableCount)}`,
+            detail: `${t("evaluation.detail.missing")} ${formatInteger(performance.maeUnavailableCount)} / ${formatInteger(performance.mfeUnavailableCount)}`,
           },
           {
-            label: "decision runs",
+            label: t("evaluation.label.decisionRuns"),
             value: formatInteger(runRates.decisionRunCount),
-            detail: `entry ${formatRatioAsPercent(runRates.entryRate)} / no-trade ${formatRatioAsPercent(runRates.noTradeRate)}`,
+            detail: `${t("evaluation.detail.entry")} ${formatRatioAsPercent(runRates.entryRate)} / ${t("evaluation.label.noTrade")} ${formatRatioAsPercent(runRates.noTradeRate)}`,
           },
         ]}
       />
@@ -177,12 +197,14 @@ function EvaluationSummaryPanel({
 }
 
 function ActionCounts({ actionCounts }: { actionCounts: EvaluationSummaryResponse["runRates"]["actionCounts"] }) {
+  const { t } = useI18n();
+
   if (actionCounts.length === 0) {
-    return <EmptyState title="No action counts" description="The evaluation summary did not return decision action counts." />;
+    return <EmptyState title={t("evaluation.empty.actionCounts.title")} description={t("evaluation.empty.actionCounts.description")} />;
   }
 
   return (
-    <div className="evaluation-action-grid" aria-label="Decision action counts">
+    <div className="evaluation-action-grid" aria-label={t("evaluation.label.decisionRuns")}>
       {actionCounts.map((actionCount) => (
         <div className="evaluation-action-grid__item" key={actionCount.action}>
           <span>{actionCount.action}</span>
@@ -194,20 +216,22 @@ function ActionCounts({ actionCounts }: { actionCounts: EvaluationSummaryRespons
 }
 
 function MarketRegimeTable({ regimes }: { regimes: MarketRegime[] }) {
+  const { t } = useI18n();
+
   if (regimes.length === 0) {
-    return <p className="evaluation-note">No market regime slices reported for this period.</p>;
+    return <p className="evaluation-note">{t("evaluation.empty.marketRegimes")}</p>;
   }
 
   return (
     <div className="evaluation-subsection">
-      <h3>Market regimes</h3>
-      <div className="evaluation-table evaluation-table--regimes" role="table" aria-label="Market regime performance">
+      <h3>{t("evaluation.table.marketRegimes")}</h3>
+      <div className="evaluation-table evaluation-table--regimes" role="table" aria-label={t("evaluation.table.marketRegimePerformance")}>
         <div className="evaluation-table__row evaluation-table__row--head" role="row">
-          <span role="columnheader">Regime</span>
-          <span role="columnheader">Trades</span>
-          <span role="columnheader">PnL</span>
-          <span role="columnheader">PF</span>
-          <span role="columnheader">Win</span>
+          <span role="columnheader">{t("evaluation.table.regime")}</span>
+          <span role="columnheader">{t("evaluation.table.trades")}</span>
+          <span role="columnheader">{t("evaluation.table.pnl")}</span>
+          <span role="columnheader">{t("evaluation.table.pf")}</span>
+          <span role="columnheader">{t("evaluation.table.win")}</span>
         </div>
         {regimes.map((regime) => (
           <div className="evaluation-table__row" role="row" key={`${regime.trend}:${regime.volatility}`}>
@@ -228,12 +252,14 @@ function KillCriterionPanel({
 }: {
   summaryQuery: UseQueryResult<EvaluationSummaryResponse, Error>;
 }) {
+  const { t } = useI18n();
+
   if (summaryQuery.isPending) {
-    return <PanelLoading title="Kill criterion" label="Loading kill criterion" Icon={ShieldAlert} />;
+    return <PanelLoading title={t("evaluation.panel.killCriterion")} label={t("evaluation.loading.killCriterion")} Icon={ShieldAlert} />;
   }
 
   if (summaryQuery.isError) {
-    return <PanelError title="Kill criterion unavailable" error={summaryQuery.error} retried={() => void summaryQuery.refetch()} />;
+    return <PanelError title={t("evaluation.error.killCriterion")} error={summaryQuery.error} retried={() => void summaryQuery.refetch()} />;
   }
 
   const killCriterion = summaryQuery.data.killCriterion;
@@ -241,46 +267,47 @@ function KillCriterionPanel({
 
   return (
     <Panel>
-      <PanelHeading Icon={ShieldAlert} title="Kill criterion">
-        <StatusPill label={killCriterionLabel(killCriterion)} tone={killCriterionTone(killCriterion)} />
+      <PanelHeading Icon={ShieldAlert} title={t("evaluation.panel.killCriterion")}>
+        <StatusPill label={killCriterionLabel(killCriterion, t)} tone={killCriterionTone(killCriterion)} />
         <FreshnessPill isStale={summaryQuery.isStale} />
       </PanelHeading>
       <DataStrip
         items={[
           {
-            label: "closed trades",
+            label: t("evaluation.label.closedTrades"),
             value: `${formatInteger(killCriterion.closedTrades)} / ${formatInteger(killCriterion.minClosedTrades)}`,
-            detail: `${formatInteger(killCriterion.remainingTrades)} remaining`,
+            detail: `${formatInteger(killCriterion.remainingTrades)} ${t("evaluation.detail.remaining")}`,
           },
           {
-            label: "profit factor",
+            label: t("evaluation.label.profitFactor"),
             value: formatDecimal(killCriterion.currentProfitFactor),
-            detail: `floor ${formatDecimal(killCriterion.minProfitFactor)}`,
+            detail: `${t("evaluation.detail.floor")} ${formatDecimal(killCriterion.minProfitFactor)}`,
           },
           {
-            label: "breached",
-            value: killCriterion.breached ? "yes" : "no",
+            label: t("evaluation.label.breached"),
+            value: killCriterion.breached ? t("common.yes") : t("common.no"),
           },
           {
-            label: "hard halt",
-            value: killCriterion.hardHalt ? "yes" : "no",
+            label: t("evaluation.label.hardHalt"),
+            value: killCriterion.hardHalt ? t("common.yes") : t("common.no"),
           },
           {
-            label: "total PnL",
+            label: t("evaluation.label.totalPnl"),
             value: formatSignedJpy(summaryQuery.data.performance.totalPnlJpy),
           },
           {
-            label: "NO_TRADE rate",
+            label: t("evaluation.label.noTradeRate"),
             value: formatRatioAsPercent(summaryQuery.data.runRates.noTradeRate),
           },
         ]}
       />
-      <div className="evaluation-progress" aria-label="Kill criterion trade progress">
+      <div className="evaluation-progress" aria-label={t("evaluation.panel.killCriterion")}>
         <div className="evaluation-progress__track">
           <span className="evaluation-progress__bar" style={{ width: ratioWidth(progressRatio) }} />
         </div>
         <span>
-          {formatInteger(killCriterion.closedTrades)} closed / {formatInteger(killCriterion.minClosedTrades)} required before PF floor is decisive
+          {formatInteger(killCriterion.closedTrades)} {t("evaluation.detail.closedTrades")} / {formatInteger(killCriterion.minClosedTrades)}{" "}
+          {t("evaluation.detail.requiredBeforeFloor")}
         </span>
       </div>
     </Panel>
@@ -292,36 +319,38 @@ function SetupPerformancePanel({
 }: {
   setupsQuery: UseQueryResult<EvaluationSetupsResponse, Error>;
 }) {
+  const { t } = useI18n();
+
   if (setupsQuery.isPending) {
-    return <PanelLoading title="Setup performance" label="Loading setup performance" Icon={AlertTriangle} isWide />;
+    return <PanelLoading title={t("evaluation.panel.setupPerformance")} label={t("evaluation.loading.setupPerformance")} Icon={AlertTriangle} isWide />;
   }
 
   if (setupsQuery.isError) {
-    return <PanelError title="Setup performance unavailable" error={setupsQuery.error} retried={() => void setupsQuery.refetch()} isWide />;
+    return <PanelError title={t("evaluation.error.setupPerformance")} error={setupsQuery.error} retried={() => void setupsQuery.refetch()} isWide />;
   }
 
   return (
     <Panel className="panel--wide">
-      <PanelHeading Icon={AlertTriangle} title="Setup performance">
+      <PanelHeading Icon={AlertTriangle} title={t("evaluation.panel.setupPerformance")}>
         <FreshnessPill isStale={setupsQuery.isStale} />
         <TruncationPill truncated={setupsQuery.data.truncated} />
       </PanelHeading>
       <p className="evaluation-note">
-        {periodLabel(setupsQuery.data.period)} / {setupsQuery.data.period.timezone}
+        {periodLabel(setupsQuery.data.period, t)} / {setupsQuery.data.period.timezone}
       </p>
       {setupsQuery.data.setups.length === 0 ? (
-        <EmptyState title="No setup trades" description="The evaluation API returned no setup-level closed trade rows." />
+        <EmptyState title={t("evaluation.empty.setupTrades.title")} description={t("evaluation.empty.setupTrades.description")} />
       ) : (
-        <div className="evaluation-table evaluation-table--setups" role="table" aria-label="Setup performance">
+        <div className="evaluation-table evaluation-table--setups" role="table" aria-label={t("evaluation.panel.setupPerformance")}>
           <div className="evaluation-table__row evaluation-table__row--head" role="row">
-            <span role="columnheader">Setup</span>
-            <span role="columnheader">Trades</span>
-            <span role="columnheader">PnL</span>
-            <span role="columnheader">PF</span>
-            <span role="columnheader">Win</span>
-            <span role="columnheader">Expected R</span>
-            <span role="columnheader">MAE / MFE</span>
-            <span role="columnheader">Missing</span>
+            <span role="columnheader">{t("evaluation.table.setup")}</span>
+            <span role="columnheader">{t("evaluation.table.trades")}</span>
+            <span role="columnheader">{t("evaluation.table.pnl")}</span>
+            <span role="columnheader">{t("evaluation.table.pf")}</span>
+            <span role="columnheader">{t("evaluation.table.win")}</span>
+            <span role="columnheader">{t("evaluation.table.expectedR")}</span>
+            <span role="columnheader">{t("evaluation.table.maeMfe")}</span>
+            <span role="columnheader">{t("evaluation.table.missing")}</span>
           </div>
           {setupsQuery.data.setups.map((setup) => (
             <div className="evaluation-table__row" role="row" key={setup.setupTag}>
@@ -334,7 +363,7 @@ function SetupPerformancePanel({
               <span role="cell">{formatRatioAsPercent(setup.performance.winRate)}</span>
               <span role="cell">{formatDecimal(setup.performance.expectedR)}</span>
               <span role="cell">{`${formatDecimal(setup.performance.averageMaeR)} / ${formatDecimal(setup.performance.averageMfeR)}`}</span>
-              <span role="cell">{missingPerformanceLabel(setup.performance)}</span>
+              <span role="cell">{missingPerformanceLabel(setup.performance, t)}</span>
             </div>
           ))}
         </div>
@@ -349,43 +378,47 @@ function CalibrationPanel({
 }: {
   calibrationQuery: UseQueryResult<EvaluationCalibrationResponse, Error>;
 }) {
+  const { t } = useI18n();
+
   if (calibrationQuery.isPending) {
-    return <PanelLoading title="Calibration" label="Loading calibration bins" Icon={Activity} isWide />;
+    return <PanelLoading title={t("evaluation.panel.calibration")} label={t("evaluation.loading.calibration")} Icon={Activity} isWide />;
   }
 
   if (calibrationQuery.isError) {
-    return <PanelError title="Calibration unavailable" error={calibrationQuery.error} retried={() => void calibrationQuery.refetch()} isWide />;
+    return <PanelError title={t("evaluation.error.calibration")} error={calibrationQuery.error} retried={() => void calibrationQuery.refetch()} isWide />;
   }
 
   const hasGroups = calibrationQuery.data.bySetup.length > 0 || calibrationQuery.data.byProvider.length > 0;
 
   return (
     <Panel className="panel--wide">
-      <PanelHeading Icon={Activity} title="Calibration">
+      <PanelHeading Icon={Activity} title={t("evaluation.panel.calibration")}>
         <FreshnessPill isStale={calibrationQuery.isStale} />
         <TruncationPill truncated={calibrationQuery.data.truncated} />
       </PanelHeading>
       <p className="evaluation-note">
-        {periodLabel(calibrationQuery.data.period)} / {calibrationQuery.data.period.timezone}
+        {periodLabel(calibrationQuery.data.period, t)} / {calibrationQuery.data.period.timezone}
       </p>
       {hasGroups ? (
         <div className="calibration-layout">
-          <CalibrationGroupList title="By setup" groups={calibrationQuery.data.bySetup} />
-          <CalibrationGroupList title="By provider" groups={calibrationQuery.data.byProvider} />
+          <CalibrationGroupList title={t("evaluation.table.bySetup")} groups={calibrationQuery.data.bySetup} />
+          <CalibrationGroupList title={t("evaluation.table.byProvider")} groups={calibrationQuery.data.byProvider} />
         </div>
       ) : (
-        <EmptyState title="No calibration bins" description="Closed ENTER decisions did not produce setup or provider calibration bins." />
+        <EmptyState title={t("evaluation.empty.calibrationBins.title")} description={t("evaluation.empty.calibrationBins.description")} />
       )}
     </Panel>
   );
 }
 
 function CalibrationGroupList({ title, groups }: { title: string; groups: CalibrationGroup[] }) {
+  const { t } = useI18n();
+
   if (groups.length === 0) {
     return (
       <div className="calibration-groups">
         <h3>{title}</h3>
-        <EmptyState title="No groups" description="This calibration dimension has no bins for the selected period." />
+        <EmptyState title={t("evaluation.empty.groups.title")} description={t("evaluation.empty.groups.description")} />
       </div>
     );
   }
@@ -397,7 +430,7 @@ function CalibrationGroupList({ title, groups }: { title: string; groups: Calibr
         <div className="calibration-group" key={`${title}:${group.groupKey}`}>
           <div className="calibration-group__heading">
             <strong>{group.groupKey}</strong>
-            <span>{formatInteger(sumBinTrades(group.bins))} trades</span>
+            <span>{formatInteger(sumBinTrades(group.bins))} {t("evaluation.detail.trades")}</span>
           </div>
           <div className="calibration-bin-list">
             {group.bins.map((bin) => (
@@ -411,19 +444,21 @@ function CalibrationGroupList({ title, groups }: { title: string; groups: Calibr
 }
 
 function CalibrationBinRow({ bin }: { bin: CalibrationBin }) {
+  const { t } = useI18n();
+
   return (
     <div className="calibration-bin">
       <div className="calibration-bin__label">
         <span>{`${formatRatioAsPercent(bin.lowerBoundInclusive)}-${formatRatioAsPercent(bin.upperBoundInclusive)}`}</span>
-        <span>{formatInteger(bin.tradeCount)} trades</span>
+        <span>{formatInteger(bin.tradeCount)} {t("evaluation.detail.trades")}</span>
       </div>
       <div className="calibration-bin__bars" aria-hidden="true">
         <span className="calibration-bin__bar calibration-bin__bar--estimated" style={{ width: probabilityWidth(bin.averageEstimatedProbability) }} />
         <span className="calibration-bin__bar calibration-bin__bar--realized" style={{ width: probabilityWidth(bin.realizedWinRate) }} />
       </div>
       <div className="calibration-bin__values">
-        <span>est {formatRatioAsPercent(bin.averageEstimatedProbability)}</span>
-        <span>real {formatRatioAsPercent(bin.realizedWinRate)}</span>
+        <span>{t("evaluation.detail.est")} {formatRatioAsPercent(bin.averageEstimatedProbability)}</span>
+        <span>{t("evaluation.detail.real")} {formatRatioAsPercent(bin.realizedWinRate)}</span>
       </div>
     </div>
   );
@@ -434,56 +469,58 @@ function BenchmarkPanel({
 }: {
   benchmarkQuery: UseQueryResult<EvaluationBenchmarkResponse, Error>;
 }) {
+  const { t } = useI18n();
+
   if (benchmarkQuery.isPending) {
-    return <PanelLoading title="Benchmark comparison" label="Loading benchmark comparison" Icon={Activity} isWide />;
+    return <PanelLoading title={t("evaluation.panel.benchmark")} label={t("evaluation.loading.benchmark")} Icon={Activity} isWide />;
   }
 
   if (benchmarkQuery.isError) {
-    return <PanelError title="Benchmark unavailable" error={benchmarkQuery.error} retried={() => void benchmarkQuery.refetch()} isWide />;
+    return <PanelError title={t("evaluation.error.benchmark")} error={benchmarkQuery.error} retried={() => void benchmarkQuery.refetch()} isWide />;
   }
 
-  const benchmarkRows = benchmarkReturnRows(benchmarkQuery.data);
+  const benchmarkRows = benchmarkReturnRows(benchmarkQuery.data, t);
   const latestPoints = latestBenchmarkPoints(benchmarkQuery.data.points);
 
   return (
     <Panel className="panel--wide">
-      <PanelHeading Icon={Activity} title="Benchmark comparison">
+      <PanelHeading Icon={Activity} title={t("evaluation.panel.benchmark")}>
         <FreshnessPill isStale={benchmarkQuery.isStale} />
         {benchmarkQuery.data.points.length > latestPoints.length ? (
-          <StatusPill label={`latest ${latestPoints.length} of ${benchmarkQuery.data.points.length}`} tone="warning" />
+          <StatusPill label={`${t("evaluation.detail.latest")} ${latestPoints.length} ${t("evaluation.detail.of")} ${benchmarkQuery.data.points.length}`} tone="warning" />
         ) : null}
       </PanelHeading>
       <DataStrip
         items={[
           {
-            label: "period",
-            value: periodLabel(benchmarkQuery.data.period),
+            label: t("evaluation.label.period"),
+            value: periodLabel(benchmarkQuery.data.period, t),
             detail: benchmarkQuery.data.period.timezone,
           },
           {
-            label: "baseline",
+            label: t("evaluation.label.baseline"),
             value: formatJpy(benchmarkQuery.data.baselineEquityJpy),
           },
           {
-            label: "bot return",
+            label: t("evaluation.label.botReturn"),
             value: formatRatioAsPercent(benchmarkQuery.data.returns.botReturn),
           },
           {
-            label: "buy & hold",
+            label: t("evaluation.label.buyAndHold"),
             value: formatRatioAsPercent(benchmarkQuery.data.returns.buyAndHoldReturn),
           },
           {
-            label: "no-trade",
+            label: t("evaluation.label.noTrade"),
             value: formatRatioAsPercent(benchmarkQuery.data.returns.noTradeReturn),
           },
           {
-            label: "bot drawdown",
+            label: t("evaluation.label.botDrawdown"),
             value: formatRatioAsPercent(calculateWorstBotDrawdown(benchmarkQuery.data.points)),
           },
         ]}
       />
       <p className="evaluation-note">{benchmarkQuery.data.assumptionsJa}</p>
-      <div className="benchmark-return-list" aria-label="Benchmark returns">
+      <div className="benchmark-return-list" aria-label={t("evaluation.table.benchmarkReturns")}>
         {benchmarkRows.map((row) => (
           <div className="benchmark-return" key={row.label}>
             <span>{row.label}</span>
@@ -495,14 +532,14 @@ function BenchmarkPanel({
         ))}
       </div>
       {latestPoints.length === 0 ? (
-        <EmptyState title="No benchmark series" description="The benchmark API returned no daily equity points." />
+        <EmptyState title={t("evaluation.empty.benchmarkSeries.title")} description={t("evaluation.empty.benchmarkSeries.description")} />
       ) : (
-        <div className="evaluation-table evaluation-table--benchmark" role="table" aria-label="Latest benchmark equity points">
+        <div className="evaluation-table evaluation-table--benchmark" role="table" aria-label={t("evaluation.table.latestBenchmarkPoints")}>
           <div className="evaluation-table__row evaluation-table__row--head" role="row">
-            <span role="columnheader">Date</span>
-            <span role="columnheader">Bot</span>
-            <span role="columnheader">Buy & hold</span>
-            <span role="columnheader">No-trade</span>
+            <span role="columnheader">{t("evaluation.table.date")}</span>
+            <span role="columnheader">{t("evaluation.table.bot")}</span>
+            <span role="columnheader">{t("evaluation.label.buyAndHold")}</span>
+            <span role="columnheader">{t("evaluation.label.noTrade")}</span>
           </div>
           {latestPoints.map((point) => (
             <div className="evaluation-table__row" role="row" key={point.date}>
@@ -523,35 +560,37 @@ function CostsPanel({
 }: {
   costsQuery: UseQueryResult<EvaluationCostsResponse, Error>;
 }) {
+  const { t } = useI18n();
+
   if (costsQuery.isPending) {
-    return <PanelLoading title="LLM cost / usage" label="Loading LLM cost and usage" Icon={WalletCards} isWide />;
+    return <PanelLoading title={t("evaluation.panel.llmCostUsage")} label={t("evaluation.loading.costs")} Icon={WalletCards} isWide />;
   }
 
   if (costsQuery.isError) {
-    return <PanelError title="LLM cost unavailable" error={costsQuery.error} retried={() => void costsQuery.refetch()} isWide />;
+    return <PanelError title={t("evaluation.error.costs")} error={costsQuery.error} retried={() => void costsQuery.refetch()} isWide />;
   }
 
   return (
     <Panel className="panel--wide">
-      <PanelHeading Icon={WalletCards} title="LLM cost / usage">
+      <PanelHeading Icon={WalletCards} title={t("evaluation.panel.llmCostUsage")}>
         <FreshnessPill isStale={costsQuery.isStale} />
         <TruncationPill truncated={costsQuery.data.truncated} />
       </PanelHeading>
       <DataStrip
         items={[
           {
-            label: "period",
-            value: periodLabel(costsQuery.data.period),
+            label: t("evaluation.label.period"),
+            value: periodLabel(costsQuery.data.period, t),
             detail: costsQuery.data.period.timezone,
           },
           {
-            label: "total cost",
+            label: t("evaluation.label.totalCost"),
             value: formatUsd(costsQuery.data.totalCostUsd),
           },
           {
-            label: "phases",
+            label: t("evaluation.label.phases"),
             value: formatInteger(costsQuery.data.phaseCount),
-            detail: `${formatInteger(costsQuery.data.missingUsagePhaseCount)} missing usage`,
+            detail: `${formatInteger(costsQuery.data.missingUsagePhaseCount)} ${t("evaluation.detail.missingUsage")}`,
           },
         ]}
       />
@@ -562,19 +601,21 @@ function CostsPanel({
 }
 
 function ProviderCostTable({ costs }: { costs: EvaluationCostsResponse["byProvider"] }) {
+  const { t } = useI18n();
+
   if (costs.length === 0) {
-    return <EmptyState title="No provider usage" description="No provider-level LLM usage rows were returned." />;
+    return <EmptyState title={t("evaluation.empty.providerUsage.title")} description={t("evaluation.empty.providerUsage.description")} />;
   }
 
   return (
     <div className="evaluation-subsection">
-      <h3>Provider cost</h3>
-      <div className="evaluation-table evaluation-table--costs" role="table" aria-label="Provider costs">
+      <h3>{t("evaluation.table.providerCost")}</h3>
+      <div className="evaluation-table evaluation-table--costs" role="table" aria-label={t("evaluation.table.providerCosts")}>
         <div className="evaluation-table__row evaluation-table__row--head" role="row">
-          <span role="columnheader">Provider</span>
-          <span role="columnheader">Cost</span>
-          <span role="columnheader">Phases</span>
-          <span role="columnheader">Missing usage</span>
+          <span role="columnheader">{t("evaluation.table.provider")}</span>
+          <span role="columnheader">{t("evaluation.table.cost")}</span>
+          <span role="columnheader">{t("evaluation.label.phases")}</span>
+          <span role="columnheader">{t("evaluation.detail.missingUsage")}</span>
         </div>
         {costs.map((cost) => (
           <div className="evaluation-table__row" role="row" key={cost.provider}>
@@ -590,20 +631,22 @@ function ProviderCostTable({ costs }: { costs: EvaluationCostsResponse["byProvid
 }
 
 function ModelTokenTable({ models }: { models: EvaluationCostsResponse["byModel"] }) {
+  const { t } = useI18n();
+
   if (models.length === 0) {
-    return <EmptyState title="No model tokens" description="No model-level token usage rows were returned." />;
+    return <EmptyState title={t("evaluation.empty.modelTokens.title")} description={t("evaluation.empty.modelTokens.description")} />;
   }
 
   return (
     <div className="evaluation-subsection">
-      <h3>Model tokens</h3>
-      <div className="evaluation-table evaluation-table--models" role="table" aria-label="Model token usage">
+      <h3>{t("evaluation.table.modelTokens")}</h3>
+      <div className="evaluation-table evaluation-table--models" role="table" aria-label={t("evaluation.table.modelTokenUsage")}>
         <div className="evaluation-table__row evaluation-table__row--head" role="row">
-          <span role="columnheader">Model</span>
-          <span role="columnheader">Input</span>
-          <span role="columnheader">Output</span>
-          <span role="columnheader">Cache create</span>
-          <span role="columnheader">Cache read</span>
+          <span role="columnheader">{t("evaluation.table.model")}</span>
+          <span role="columnheader">{t("evaluation.table.input")}</span>
+          <span role="columnheader">{t("evaluation.table.output")}</span>
+          <span role="columnheader">{t("evaluation.table.cacheCreate")}</span>
+          <span role="columnheader">{t("evaluation.table.cacheRead")}</span>
         </div>
         {models.map((model) => (
           <div className="evaluation-table__row" role="row" key={model.model}>
@@ -630,10 +673,12 @@ function PanelHeading({ Icon, title, children }: { Icon: LucideIcon; title: stri
 }
 
 function PanelLoading({ title, label, Icon, isWide = false }: { title: string; label: string; Icon: LucideIcon; isWide?: boolean }) {
+  const { t } = useI18n();
+
   return (
     <Panel className={isWide ? "panel--wide" : undefined}>
       <PanelHeading Icon={Icon} title={title}>
-        <StatusPill label="loading" tone="loading" />
+        <StatusPill label={t("common.loading")} tone="loading" />
       </PanelHeading>
       <div className="loading-row" role="status">
         <span className="loading-dot" aria-hidden="true" />
@@ -644,6 +689,8 @@ function PanelLoading({ title, label, Icon, isWide = false }: { title: string; l
 }
 
 function PanelError({ title, error, retried, isWide = false }: { title: string; error: unknown; retried: () => void; isWide?: boolean }) {
+  const { t } = useI18n();
+
   return (
     <Panel className={isWide ? "panel--wide" : undefined}>
       <EmptyState
@@ -652,7 +699,7 @@ function PanelError({ title, error, retried, isWide = false }: { title: string; 
         action={
           <button className="icon-text-button" type="button" onClick={retried}>
             <RefreshCw size={16} aria-hidden="true" />
-            Retry
+            {t("common.retry")}
           </button>
         }
       />
@@ -661,47 +708,51 @@ function PanelError({ title, error, retried, isWide = false }: { title: string; 
 }
 
 function FreshnessPill({ isStale }: { isStale: boolean }) {
-  return <StatusPill label={isStale ? "stale" : "fresh"} tone={isStale ? "warning" : "positive"} />;
+  const { t } = useI18n();
+
+  return <StatusPill label={isStale ? t("common.stale") : t("common.fresh")} tone={isStale ? "warning" : "positive"} />;
 }
 
 function TruncationPill({ truncated }: { truncated: boolean }) {
-  return truncated ? <StatusPill label="truncated" tone="warning" /> : <StatusPill label="complete" tone="neutral" />;
+  const { t } = useI18n();
+
+  return truncated ? <StatusPill label={t("evaluation.status.truncated")} tone="warning" /> : <StatusPill label={t("evaluation.status.complete")} tone="neutral" />;
 }
 
-function queryValue<TData>(query: UseQueryResult<TData, Error>, selected: (data: TData) => string): string {
+function queryValue<TData>(query: UseQueryResult<TData, Error>, selected: (data: TData) => string, t: Translate): string {
   if (query.isPending) {
-    return "Loading";
+    return t("common.loading");
   }
 
   if (query.isError) {
-    return "Error";
+    return t("common.error");
   }
 
   return selected(query.data);
 }
 
-function queryDetail<TData>(query: UseQueryResult<TData, Error>): string {
+function queryDetail<TData>(query: UseQueryResult<TData, Error>, t: Translate): string {
   if (query.isError) {
     return describeError(query.error);
   }
 
-  return query.isPending ? "waiting for API" : "not reported";
+  return query.isPending ? t("common.waitingForApi") : t("common.notReported");
 }
 
-function periodLabel(period: EvaluationSummaryResponse["period"]): string {
-  return `${period.from} to ${period.to}`;
+function periodLabel(period: EvaluationSummaryResponse["period"], t: Translate): string {
+  return `${period.from} ${t("overview.detail.periodTo")} ${period.to}`;
 }
 
-function missingPerformanceLabel(performance: Performance): string {
-  return `R ${formatInteger(performance.rUnavailableCount)} / MAE ${formatInteger(performance.maeUnavailableCount)} / MFE ${formatInteger(performance.mfeUnavailableCount)}`;
+function missingPerformanceLabel(performance: Performance, t: Translate): string {
+  return `${t("evaluation.detail.missing")} R ${formatInteger(performance.rUnavailableCount)} / MAE ${formatInteger(performance.maeUnavailableCount)} / MFE ${formatInteger(performance.mfeUnavailableCount)}`;
 }
 
-function killCriterionLabel(killCriterion: EvaluationSummaryResponse["killCriterion"]): string {
+function killCriterionLabel(killCriterion: EvaluationSummaryResponse["killCriterion"], t: Translate): string {
   if (killCriterion.hardHalt) {
-    return "hard halt";
+    return t("evaluation.status.hardHalt");
   }
 
-  return killCriterion.breached ? "breached" : "within bounds";
+  return killCriterion.breached ? t("evaluation.status.breached") : t("evaluation.status.withinBounds");
 }
 
 function killCriterionTone(killCriterion: EvaluationSummaryResponse["killCriterion"]): StatusTone {
@@ -736,18 +787,18 @@ function sumBinTrades(bins: CalibrationBin[]): number {
   return bins.reduce((total, bin) => total + bin.tradeCount, 0);
 }
 
-function benchmarkReturnRows(data: EvaluationBenchmarkResponse) {
+function benchmarkReturnRows(data: EvaluationBenchmarkResponse, t: Translate) {
   const rows = [
     {
-      label: "Bot realized",
+      label: t("evaluation.benchmark.botRealized"),
       value: data.returns.botReturn,
     },
     {
-      label: "Buy & hold",
+      label: t("evaluation.label.buyAndHold"),
       value: data.returns.buyAndHoldReturn,
     },
     {
-      label: "No-trade",
+      label: t("evaluation.label.noTrade"),
       value: data.returns.noTradeReturn,
     },
   ];

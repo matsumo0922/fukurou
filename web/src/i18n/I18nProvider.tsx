@@ -11,7 +11,11 @@ export function I18nProvider({ children }: I18nProviderProps) {
 
   useEffect(() => {
     document.documentElement.lang = locale;
-    window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
+    try {
+      window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
+    } catch {
+      // Some browser privacy modes disable storage writes. Keep the in-memory locale usable.
+    }
   }, [locale]);
 
   const value = useMemo(
@@ -31,7 +35,15 @@ function readStoredLocale(): Locale {
     return "en";
   }
 
-  const storedLocale = window.localStorage.getItem(LOCALE_STORAGE_KEY);
+  const storedLocale = readLocalStorageLocale();
 
   return isLocale(storedLocale) ? storedLocale : "en";
+}
+
+function readLocalStorageLocale(): string | null {
+  try {
+    return window.localStorage.getItem(LOCALE_STORAGE_KEY);
+  } catch {
+    return null;
+  }
 }

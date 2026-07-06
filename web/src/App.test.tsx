@@ -8,6 +8,7 @@ describe("App", () => {
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     window.localStorage.clear();
     window.history.replaceState({}, "", "/");
@@ -125,6 +126,55 @@ describe("App", () => {
       expect(screen.getAllByText("NO_TRADE").length).toBeGreaterThan(0);
       expect(screen.getAllByText("PAPER").length).toBeGreaterThan(0);
     });
+  });
+
+  it("localizes evaluation UI copy while keeping operational values unchanged", async () => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, "ja");
+    stubSystemFetch();
+    window.history.pushState({}, "", "/app/evaluation");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Evaluation" })).toBeInTheDocument();
+    expect(screen.getByText("モデル品質、paper trading 成績、キャリブレーション、ベンチマーク、停止判定、LLM コスト。")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "セットアップ成績" })).toBeInTheDocument();
+    expect(await screen.findByText("Bot 実績")).toBeInTheDocument();
+    expect(screen.getAllByText("NO_TRADE").length).toBeGreaterThan(0);
+    expect(screen.getByText("claude-sonnet-4")).toBeInTheDocument();
+  });
+
+  it("localizes controls UI copy while keeping safety states unchanged", async () => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, "ja");
+    stubSystemFetch();
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Controls" })).toBeInTheDocument();
+    expect(screen.getByText("停止、再開、手動 one-shot LLM 起動のための理由付き運用操作。")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "停止操作" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "SOFT_HALT を確認" })).toBeInTheDocument();
+    expect(screen.getByLabelText("再開理由")).toBeInTheDocument();
+    expect(screen.getAllByText("RUNNING").length).toBeGreaterThan(0);
+  });
+
+  it("keeps the selected locale usable when browser storage writes fail", async () => {
+    const storageSetItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("storage disabled");
+    });
+
+    stubSystemFetch();
+    window.history.pushState({}, "", "/app/overview");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "JA" }));
+
+    expect(screen.getByText("安全性、リスク、鮮度、paper 口座の状態。")).toBeInTheDocument();
+    expect(document.documentElement).toHaveAttribute("lang", "ja");
+    expect(storageSetItemSpy).toHaveBeenCalled();
   });
 
   it("formats Japanese date-times with a ja-JP leaning and the JST label", () => {
