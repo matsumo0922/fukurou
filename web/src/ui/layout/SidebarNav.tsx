@@ -2,6 +2,7 @@ import type { LucideIcon } from "lucide-react";
 import Activity from "lucide-react/dist/esm/icons/activity.mjs";
 import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.mjs";
 import ServerCog from "lucide-react/dist/esm/icons/server-cog.mjs";
+import ShieldAlert from "lucide-react/dist/esm/icons/shield-alert.mjs";
 import { NavLink } from "react-router";
 
 type NavigationItem = {
@@ -20,6 +21,11 @@ const navigationItems: NavigationItem[] = [
     label: "Activity",
     path: "/app/activity",
     icon: Activity,
+  },
+  {
+    label: "Evaluation",
+    path: "/app/evaluation",
+    icon: ShieldAlert,
   },
   {
     label: "System",
