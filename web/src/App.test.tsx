@@ -216,6 +216,42 @@ describe("App", () => {
     });
   });
 
+  it("locks every mutating control while one operation is in flight", async () => {
+    const fetchMock = stubSystemFetch({
+      resumeResponse: new Promise<Response>(() => undefined),
+    });
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("Resume reason"), {
+      target: {
+        value: "operator checked safety state",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review resume request" }));
+    fireEvent.change(screen.getByLabelText("HARD_HALT reason"), {
+      target: {
+        value: "emergency safety stop",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review HARD_HALT" }));
+
+    const hardHaltConfirmButton = screen.getByRole("button", { name: "Confirm HARD_HALT" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm resume request" }));
+
+    await waitFor(() => {
+      expect(hardHaltConfirmButton).toBeDisabled();
+    });
+    fireEvent.click(hardHaltConfirmButton);
+
+    expect(postBody(fetchMock, "/ops/resume")).toEqual({
+      reason: "operator checked safety state",
+    });
+    expect(hasPostCall(fetchMock, "/ops/halt")).toBe(false);
+  });
+
   it("submits confirmed halt actions with the selected level", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/controls");
@@ -297,6 +333,7 @@ type SystemFetchFixture = {
   };
   revision?: string;
   readinessStatus?: number;
+  resumeResponse?: Promise<Response>;
   triggerResponse?: {
     status: number;
     body: unknown;
@@ -364,6 +401,10 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         }
 
         const body = requestJson(init) as { reason: string };
+
+        if (fixture.resumeResponse) {
+          return fixture.resumeResponse;
+        }
 
         return jsonResponse({
           state: "RUNNING",

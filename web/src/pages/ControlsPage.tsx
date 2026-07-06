@@ -43,6 +43,7 @@ type SafetyActionFormProps = {
   pendingLabel: string;
   buttonTone: ActionButtonTone;
   isPending: boolean;
+  isDisabled: boolean;
   submitted: (reason: string) => void;
 };
 
@@ -130,6 +131,8 @@ export function ControlsPage() {
     },
   });
   const isRefreshing = riskStateQuery.isFetching || positionsQuery.isFetching;
+  const isOperationInFlight =
+    softHaltMutation.isPending || hardHaltMutation.isPending || resumeMutation.isPending || triggerMutation.isPending;
   const refreshed = () => {
     void riskStateQuery.refetch();
     void positionsQuery.refetch();
@@ -181,6 +184,7 @@ export function ControlsPage() {
             pendingLabel="Setting SOFT_HALT"
             buttonTone="warning"
             isPending={softHaltMutation.isPending}
+            isDisabled={isOperationInFlight}
             submitted={(reason) => softHaltMutation.mutate(reason)}
           />
           <SafetyActionForm
@@ -196,6 +200,7 @@ export function ControlsPage() {
             pendingLabel="Setting HARD_HALT"
             buttonTone="critical"
             isPending={hardHaltMutation.isPending}
+            isDisabled={isOperationInFlight}
             submitted={(reason) => hardHaltMutation.mutate(reason)}
           />
         </div>
@@ -220,6 +225,7 @@ export function ControlsPage() {
             pendingLabel="Requesting resume"
             buttonTone="neutral"
             isPending={resumeMutation.isPending}
+            isDisabled={isOperationInFlight}
             submitted={(reason) => resumeMutation.mutate(reason)}
           />
         </Panel>
@@ -242,6 +248,7 @@ export function ControlsPage() {
             pendingLabel="Requesting trigger"
             buttonTone="neutral"
             isPending={triggerMutation.isPending}
+            isDisabled={isOperationInFlight}
             submitted={(reason) => triggerMutation.mutate(reason)}
           />
         </Panel>
@@ -387,6 +394,7 @@ function SafetyActionForm({
   pendingLabel,
   buttonTone,
   isPending,
+  isDisabled,
   submitted,
 }: SafetyActionFormProps) {
   const [reason, setReason] = useState("");
@@ -402,6 +410,10 @@ function SafetyActionForm({
   const reviewed = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
+    if (isDisabled) {
+      return;
+    }
+
     const trimmedReason = reason.trim();
 
     if (!trimmedReason) {
@@ -415,7 +427,7 @@ function SafetyActionForm({
     setConfirmationReason(trimmedReason);
   };
   const confirmed = () => {
-    if (!confirmationReason) {
+    if (!confirmationReason || isDisabled) {
       return;
     }
 
@@ -444,7 +456,7 @@ function SafetyActionForm({
         rows={4}
         aria-describedby={validationError ? errorId : undefined}
         onChange={reasonChanged}
-        disabled={isPending}
+        disabled={isDisabled}
       />
       {validationError ? (
         <p className="control-action__error" id={errorId} role="alert">
@@ -453,7 +465,7 @@ function SafetyActionForm({
       ) : null}
 
       <div className="control-action__buttons">
-        <button className="icon-text-button" type="submit" disabled={isPending}>
+        <button className="icon-text-button" type="submit" disabled={isDisabled}>
           {isPending ? pendingLabel : reviewLabel}
         </button>
       </div>
@@ -467,7 +479,7 @@ function SafetyActionForm({
               className={confirmButtonClassName(buttonTone)}
               type="button"
               onClick={confirmed}
-              disabled={isPending}
+              disabled={isDisabled}
             >
               {isPending ? pendingLabel : confirmLabel}
             </button>
@@ -475,7 +487,7 @@ function SafetyActionForm({
               className="icon-text-button"
               type="button"
               onClick={() => setConfirmationReason(null)}
-              disabled={isPending}
+              disabled={isDisabled}
             >
               Edit reason
             </button>
