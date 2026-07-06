@@ -14,6 +14,8 @@ import {
   type OpsPositionsResponse,
   type OpsRiskStateResponse,
 } from "../api/ops";
+import type { MessageKey } from "../i18n/messages";
+import { useI18n } from "../i18n/useI18n";
 import { DataStrip } from "../ui/components/DataStrip";
 import { EmptyState } from "../ui/components/EmptyState";
 import { Panel } from "../ui/components/Panel";
@@ -29,6 +31,7 @@ type ControlNotice = {
 };
 
 type ActionButtonTone = "neutral" | "warning" | "critical";
+type Translate = (key: MessageKey) => string;
 
 type SafetyActionFormProps = {
   id: string;
@@ -47,9 +50,8 @@ type SafetyActionFormProps = {
   submitted: (reason: string) => void;
 };
 
-const REQUIRED_REASON_MESSAGE = "Reason is required before this operation can be reviewed.";
-
 export function ControlsPage() {
+  const { t } = useI18n();
   const queryClient = useQueryClient();
   const riskStateQuery = useQuery(opsRiskStateQuery);
   const positionsQuery = useQuery(opsPositionsQuery);
@@ -63,16 +65,18 @@ export function ControlsPage() {
     onSuccess: (riskState) => {
       setNotice({
         tone: "warning",
-        title: "SOFT_HALT set",
-        detail: `Risk state is now ${riskState.state}. Risk, activity, and system views are refreshing.`,
+        title: t("controls.notice.softHaltSet"),
+        detail: formatMessage(t("controls.notice.riskRefreshing"), {
+          state: riskState.state,
+        }),
       });
       refreshAfterSuccess();
     },
     onError: (error) => {
       setNotice({
         tone: "critical",
-        title: "SOFT_HALT failed",
-        detail: describeControlError(error),
+        title: t("controls.notice.softHaltFailed"),
+        detail: describeControlError(error, t),
       });
     },
   });
@@ -81,16 +85,18 @@ export function ControlsPage() {
     onSuccess: (riskState) => {
       setNotice({
         tone: "critical",
-        title: "HARD_HALT set",
-        detail: `Risk state is now ${riskState.state}. Risk, activity, and system views are refreshing.`,
+        title: t("controls.notice.hardHaltSet"),
+        detail: formatMessage(t("controls.notice.riskRefreshing"), {
+          state: riskState.state,
+        }),
       });
       refreshAfterSuccess();
     },
     onError: (error) => {
       setNotice({
         tone: "critical",
-        title: "HARD_HALT failed",
-        detail: describeControlError(error),
+        title: t("controls.notice.hardHaltFailed"),
+        detail: describeControlError(error, t),
       });
     },
   });
@@ -99,16 +105,18 @@ export function ControlsPage() {
     onSuccess: (riskState) => {
       setNotice({
         tone: "positive",
-        title: "Resume requested",
-        detail: `Risk state is now ${riskState.state}. Risk, activity, and system views are refreshing.`,
+        title: t("controls.notice.resumeRequested"),
+        detail: formatMessage(t("controls.notice.riskRefreshing"), {
+          state: riskState.state,
+        }),
       });
       refreshAfterSuccess();
     },
     onError: (error) => {
       setNotice({
         tone: "critical",
-        title: "Resume failed",
-        detail: describeControlError(error),
+        title: t("controls.notice.resumeFailed"),
+        detail: describeControlError(error, t),
       });
     },
   });
@@ -117,16 +125,19 @@ export function ControlsPage() {
     onSuccess: (trigger) => {
       setNotice({
         tone: "positive",
-        title: "Manual trigger accepted",
-        detail: `Invocation ${trigger.invocationId} (${trigger.triggerKind}) was queued. Activity and system views are refreshing.`,
+        title: t("controls.notice.manualTriggerAcceptedTitle"),
+        detail: formatMessage(t("controls.notice.manualTriggerAccepted"), {
+          invocationId: trigger.invocationId,
+          triggerKind: trigger.triggerKind,
+        }),
       });
       refreshAfterSuccess();
     },
     onError: (error) => {
       setNotice({
         tone: "critical",
-        title: "Manual trigger failed",
-        detail: describeControlError(error),
+        title: t("controls.notice.manualTriggerFailed"),
+        detail: describeControlError(error, t),
       });
     },
   });
@@ -143,7 +154,7 @@ export function ControlsPage() {
       <SectionHeader
         eyebrow="Operate"
         title="Controls"
-        description="Reasoned operator actions for halt, resume, and one-shot manual LLM launch."
+        description={t("controls.description")}
         action={
           <button
             className="icon-text-button icon-text-button--prominent"
@@ -152,7 +163,7 @@ export function ControlsPage() {
             disabled={isRefreshing}
           >
             <RefreshCw size={16} aria-hidden="true" />
-            {isRefreshing ? "Refreshing" : "Refresh"}
+            {isRefreshing ? t("common.refreshing") : t("common.refresh")}
           </button>
         }
       />
@@ -167,21 +178,21 @@ export function ControlsPage() {
       <Panel className="panel--wide">
         <div className="panel-heading">
           <ShieldAlert size={18} aria-hidden="true" />
-          <h2>Halt controls</h2>
+          <h2>{t("controls.panel.haltControls")}</h2>
         </div>
         <HaltSemantics />
         <div className="control-action-grid control-action-grid--two">
           <SafetyActionForm
             id="soft-halt"
-            title="Set SOFT_HALT"
-            description="Reject new entry decisions while allowing exits and protective operations to continue."
+            title={t("controls.action.soft.title")}
+            description={t("controls.action.soft.description")}
             badgeLabel="SOFT_HALT"
             badgeTone="warning"
-            reasonLabel="SOFT_HALT reason"
-            reasonPlaceholder="e.g. Pausing new entries while reviewing market regime shift"
-            reviewLabel="Review SOFT_HALT"
-            confirmLabel="Confirm SOFT_HALT"
-            pendingLabel="Setting SOFT_HALT"
+            reasonLabel={t("controls.action.soft.reason")}
+            reasonPlaceholder={t("controls.action.soft.placeholder")}
+            reviewLabel={t("controls.action.soft.review")}
+            confirmLabel={t("controls.action.soft.confirm")}
+            pendingLabel={t("controls.action.soft.pending")}
             buttonTone="warning"
             isPending={softHaltMutation.isPending}
             isDisabled={isOperationInFlight}
@@ -189,15 +200,15 @@ export function ControlsPage() {
           />
           <SafetyActionForm
             id="hard-halt"
-            title="Set HARD_HALT"
-            description="Full stop for trading operations. Use only when the bot must not continue activity."
+            title={t("controls.action.hard.title")}
+            description={t("controls.action.hard.description")}
             badgeLabel="HARD_HALT"
             badgeTone="critical"
-            reasonLabel="HARD_HALT reason"
-            reasonPlaceholder="e.g. Emergency stop after safety breach investigation"
-            reviewLabel="Review HARD_HALT"
-            confirmLabel="Confirm HARD_HALT"
-            pendingLabel="Setting HARD_HALT"
+            reasonLabel={t("controls.action.hard.reason")}
+            reasonPlaceholder={t("controls.action.hard.placeholder")}
+            reviewLabel={t("controls.action.hard.review")}
+            confirmLabel={t("controls.action.hard.confirm")}
+            pendingLabel={t("controls.action.hard.pending")}
             buttonTone="critical"
             isPending={hardHaltMutation.isPending}
             isDisabled={isOperationInFlight}
@@ -210,19 +221,19 @@ export function ControlsPage() {
         <Panel>
           <div className="panel-heading">
             <RefreshCw size={18} aria-hidden="true" />
-            <h2>Resume control</h2>
+            <h2>{t("controls.panel.resumeControl")}</h2>
           </div>
           <SafetyActionForm
             id="resume"
-            title="Request resume"
-            description="Move a halted bot back to RUNNING only after the operator has checked the current state."
+            title={t("controls.action.resume.title")}
+            description={t("controls.action.resume.description")}
             badgeLabel="RUNNING"
             badgeTone="positive"
-            reasonLabel="Resume reason"
-            reasonPlaceholder="e.g. Safety review completed and account state matches expectations"
-            reviewLabel="Review resume request"
-            confirmLabel="Confirm resume request"
-            pendingLabel="Requesting resume"
+            reasonLabel={t("controls.action.resume.reason")}
+            reasonPlaceholder={t("controls.action.resume.placeholder")}
+            reviewLabel={t("controls.action.resume.review")}
+            confirmLabel={t("controls.action.resume.confirm")}
+            pendingLabel={t("controls.action.resume.pending")}
             buttonTone="neutral"
             isPending={resumeMutation.isPending}
             isDisabled={isOperationInFlight}
@@ -233,19 +244,19 @@ export function ControlsPage() {
         <Panel>
           <div className="panel-heading">
             <Activity size={18} aria-hidden="true" />
-            <h2>Manual trigger</h2>
+            <h2>{t("controls.panel.manualTrigger")}</h2>
           </div>
           <SafetyActionForm
             id="manual-trigger"
-            title="Run one-shot LLM"
-            description="Request a single MANUAL LLM launch. The backend may refuse it for halt state, concurrency, or invocation limits."
+            title={t("controls.action.manual.title")}
+            description={t("controls.action.manual.description")}
             badgeLabel="MANUAL"
             badgeTone="neutral"
-            reasonLabel="Manual trigger reason"
-            reasonPlaceholder="e.g. Operator requested one evaluation after deployment smoke check"
-            reviewLabel="Review manual trigger"
-            confirmLabel="Confirm manual trigger"
-            pendingLabel="Requesting trigger"
+            reasonLabel={t("controls.action.manual.reason")}
+            reasonPlaceholder={t("controls.action.manual.placeholder")}
+            reviewLabel={t("controls.action.manual.review")}
+            confirmLabel={t("controls.action.manual.confirm")}
+            pendingLabel={t("controls.action.manual.pending")}
             buttonTone="neutral"
             isPending={triggerMutation.isPending}
             isDisabled={isOperationInFlight}
@@ -278,41 +289,43 @@ function ControlNoticePanel({ notice }: { notice: ControlNotice }) {
 }
 
 function ControlsRiskStatePanel({ riskStateQuery }: { riskStateQuery: UseQueryResult<OpsRiskStateResponse, Error> }) {
+  const { t, locale } = useI18n();
+
   if (riskStateQuery.isPending) {
-    return <PanelLoading label="Loading risk state" />;
+    return <PanelLoading label={t("controls.loading.riskState")} />;
   }
 
   if (riskStateQuery.isError) {
-    return <PanelError title="Risk state unavailable" error={riskStateQuery.error} retried={() => void riskStateQuery.refetch()} />;
+    return <PanelError title={t("controls.error.riskState")} error={riskStateQuery.error} retried={() => void riskStateQuery.refetch()} />;
   }
 
   return (
     <Panel>
       <div className="panel-heading">
         <ShieldAlert size={18} aria-hidden="true" />
-        <h2>Current halt state</h2>
+        <h2>{t("controls.panel.currentHaltState")}</h2>
         <StatusPill label={riskStateQuery.data.state} tone={riskStateTone(riskStateQuery.data.state)} />
-        {riskStateQuery.isStale ? <StatusPill label="stale" tone="warning" /> : <StatusPill label="fresh" tone="positive" />}
+        {riskStateQuery.isStale ? <StatusPill label={t("common.stale")} tone="warning" /> : <StatusPill label={t("common.fresh")} tone="positive" />}
       </div>
       <DataStrip
         items={[
           {
-            label: "state",
+            label: t("controls.label.state"),
             value: riskStateQuery.data.state,
-            detail: riskStateQuery.data.haltReason ?? "no halt reason",
+            detail: riskStateQuery.data.haltReason ?? t("controls.detail.noHaltReason"),
           },
           {
-            label: "drawdown",
+            label: t("controls.label.drawdown"),
             value: formatRatioAsPercent(riskStateQuery.data.drawdownRatio),
           },
           {
-            label: "halted at",
-            value: formatDateTime(riskStateQuery.data.haltAt),
+            label: t("controls.label.haltedAt"),
+            value: formatDateTime(riskStateQuery.data.haltAt, locale),
           },
           {
-            label: "resumed at",
-            value: formatDateTime(riskStateQuery.data.resumedAt),
-            detail: riskStateQuery.data.resumedReason ?? "no resume reason",
+            label: t("controls.label.resumedAt"),
+            value: formatDateTime(riskStateQuery.data.resumedAt, locale),
+            detail: riskStateQuery.data.resumedReason ?? t("controls.detail.noResumeReason"),
           },
         ]}
       />
@@ -321,12 +334,14 @@ function ControlsRiskStatePanel({ riskStateQuery }: { riskStateQuery: UseQueryRe
 }
 
 function ControlsExposurePanel({ positionsQuery }: { positionsQuery: UseQueryResult<OpsPositionsResponse, Error> }) {
+  const { t } = useI18n();
+
   if (positionsQuery.isPending) {
-    return <PanelLoading label="Loading exposure state" />;
+    return <PanelLoading label={t("controls.loading.exposureState")} />;
   }
 
   if (positionsQuery.isError) {
-    return <PanelError title="Exposure state unavailable" error={positionsQuery.error} retried={() => void positionsQuery.refetch()} />;
+    return <PanelError title={t("controls.error.exposureState")} error={positionsQuery.error} retried={() => void positionsQuery.refetch()} />;
   }
 
   const hasOpenRisk = positionsQuery.data.positions.length > 0 || positionsQuery.data.openOrders.length > 0;
@@ -335,47 +350,47 @@ function ControlsExposurePanel({ positionsQuery }: { positionsQuery: UseQueryRes
     <Panel>
       <div className="panel-heading">
         <AlertTriangle size={18} aria-hidden="true" />
-        <h2>Open risk check</h2>
-        <StatusPill label={hasOpenRisk ? "open risk" : "flat"} tone={hasOpenRisk ? "warning" : "positive"} />
-        {positionsQuery.isStale ? <StatusPill label="stale" tone="warning" /> : <StatusPill label="fresh" tone="positive" />}
+        <h2>{t("controls.panel.openRiskCheck")}</h2>
+        <StatusPill label={hasOpenRisk ? t("controls.status.openRisk") : t("controls.status.flat")} tone={hasOpenRisk ? "warning" : "positive"} />
+        {positionsQuery.isStale ? <StatusPill label={t("common.stale")} tone="warning" /> : <StatusPill label={t("common.fresh")} tone="positive" />}
       </div>
       <DataStrip
         items={[
           {
-            label: "positions",
+            label: t("controls.label.positions"),
             value: String(positionsQuery.data.positions.length),
           },
           {
-            label: "open orders",
+            label: t("controls.label.openOrders"),
             value: String(positionsQuery.data.openOrders.length),
           },
           {
-            label: "BTC size",
+            label: t("controls.label.btcSize"),
             value: formatBtc(sumNumbers(positionsQuery.data.positions.map((position) => position.sizeBtc))),
           },
           {
-            label: "unrealized PnL",
+            label: t("controls.label.unrealizedPnl"),
             value: formatSignedJpy(sumNumbers(positionsQuery.data.positions.map((position) => position.unrealizedPnlJpy))),
           },
         ]}
       />
-      <p className="control-panel-note">
-        SOFT_HALT blocks a manual trigger when the account is flat. HARD_HALT blocks manual launch regardless of exposure.
-      </p>
+      <p className="control-panel-note">{t("controls.note.exposure")}</p>
     </Panel>
   );
 }
 
 function HaltSemantics() {
+  const { t } = useI18n();
+
   return (
-    <div className="halt-semantics" aria-label="SOFT_HALT and HARD_HALT semantics">
+    <div className="halt-semantics" aria-label={t("controls.haltSemantics.aria")}>
       <div className="halt-semantics__item halt-semantics__item--soft">
         <StatusPill label="SOFT_HALT" tone="warning" />
-        <p>New entry decisions are rejected. Exits and protective operations keep passing.</p>
+        <p>{t("controls.haltSemantics.soft")}</p>
       </div>
       <div className="halt-semantics__item halt-semantics__item--hard">
         <StatusPill label="HARD_HALT" tone="critical" />
-        <p>Full stop. Trading operations stay blocked until an operator resumes with a reason.</p>
+        <p>{t("controls.haltSemantics.hard")}</p>
       </div>
     </div>
   );
@@ -397,6 +412,7 @@ function SafetyActionForm({
   isDisabled,
   submitted,
 }: SafetyActionFormProps) {
+  const { t } = useI18n();
   const [reason, setReason] = useState("");
   const [validationError, setValidationError] = useState<string | null>(null);
   const [confirmationReason, setConfirmationReason] = useState<string | null>(null);
@@ -417,7 +433,7 @@ function SafetyActionForm({
     const trimmedReason = reason.trim();
 
     if (!trimmedReason) {
-      setValidationError(REQUIRED_REASON_MESSAGE);
+      setValidationError(t("controls.validation.reasonRequired"));
       setConfirmationReason(null);
 
       return;
@@ -471,8 +487,8 @@ function SafetyActionForm({
       </div>
 
       {confirmationReason ? (
-        <div className="confirmation-step" role="group" aria-label={`${confirmLabel} confirmation`}>
-          <p className="confirmation-step__title">Confirm before sending</p>
+        <div className="confirmation-step" role="group" aria-label={`${confirmLabel} ${t("controls.confirm.confirmation")}`}>
+          <p className="confirmation-step__title">{t("controls.confirm.beforeSending")}</p>
           <p className="confirmation-step__reason">{confirmationReason}</p>
           <div className="confirmation-step__buttons">
             <button
@@ -489,7 +505,7 @@ function SafetyActionForm({
               onClick={() => setConfirmationReason(null)}
               disabled={isDisabled}
             >
-              Edit reason
+              {t("controls.confirm.editReason")}
             </button>
           </div>
         </div>
@@ -510,15 +526,17 @@ function PanelLoading({ label }: { label: string }) {
 }
 
 function PanelError({ title, error, retried }: { title: string; error: unknown; retried: () => void }) {
+  const { t } = useI18n();
+
   return (
     <Panel>
       <EmptyState
         title={title}
-        description={describeControlError(error)}
+        description={describeControlError(error, t)}
         action={
           <button className="icon-text-button" type="button" onClick={retried}>
             <RefreshCw size={16} aria-hidden="true" />
-            Retry
+            {t("common.retry")}
           </button>
         }
       />
@@ -562,7 +580,7 @@ function sumNumbers(values: string[]): string | null {
   return String(total);
 }
 
-function describeControlError(error: unknown): string {
+function describeControlError(error: unknown, t: Translate): string {
   if (!(error instanceof ApiClientError)) {
     return describeError(error);
   }
@@ -570,11 +588,15 @@ function describeControlError(error: unknown): string {
   const apiMessage = extractApiErrorMessage(error.responseText);
 
   if (error.path === "/ops/trigger" && error.status === 409) {
-    return `Manual trigger was refused: ${triggerRefusalDescription(apiMessage)}`;
+    return formatMessage(t("controls.error.manualTriggerRefused"), {
+      reason: triggerRefusalDescription(apiMessage, t),
+    });
   }
 
   if (error.path === "/ops/halt" && error.status === 409) {
-    return `Halt request was refused: ${haltRefusalDescription(apiMessage)}`;
+    return formatMessage(t("controls.error.haltRefused"), {
+      reason: haltRefusalDescription(apiMessage, t),
+    });
   }
 
   if (apiMessage) {
@@ -598,27 +620,34 @@ function extractApiErrorMessage(responseText: string): string {
   }
 }
 
-function triggerRefusalDescription(reason: string): string {
+function triggerRefusalDescription(reason: string, t: Translate): string {
   switch (reason) {
     case "hard_halt":
-      return "HARD_HALT is active, so manual launch stays blocked until an operator resumes.";
+      return t("controls.error.hardHaltActive");
     case "soft_halt_flat":
-      return "SOFT_HALT is active and the account is flat, so new entry checks stay blocked.";
+      return t("controls.error.softHaltFlat");
     case "concurrent_invocation":
-      return "another LLM invocation is already running; wait for it to finish before trying again.";
+      return t("controls.error.concurrentInvocation");
     case "max_invocations_per_hour_exceeded":
-      return "the hourly LLM invocation cap has already been reached.";
+      return t("controls.error.hourlyCap");
     case "max_invocations_per_day_exceeded":
-      return "the daily LLM invocation cap has already been reached.";
+      return t("controls.error.dailyCap");
     default:
-      return reason || "the backend did not provide a refusal reason.";
+      return reason || t("controls.error.noRefusalReason");
   }
 }
 
-function haltRefusalDescription(reason: string): string {
+function haltRefusalDescription(reason: string, t: Translate): string {
   if (reason === "SOFT_HALT cannot downgrade HARD_HALT.") {
-    return "HARD_HALT is already active; use resume after operator review before setting SOFT_HALT.";
+    return t("controls.error.cannotDowngradeHardHalt");
   }
 
-  return reason || "the backend did not provide a refusal reason.";
+  return reason || t("controls.error.noRefusalReason");
+}
+
+function formatMessage(template: string, replacements: Record<string, string>): string {
+  return Object.entries(replacements).reduce(
+    (message, [key, value]) => message.replace(`{${key}}`, value),
+    template,
+  );
 }

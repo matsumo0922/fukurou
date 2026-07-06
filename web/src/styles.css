@@ -423,6 +423,45 @@ a:focus-visible {
   color: #ffffff;
 }
 
+.language-toggle {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(36px, 1fr));
+  min-height: 34px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface-raised);
+}
+
+.language-toggle__button {
+  min-width: 36px;
+  border: 0;
+  border-right: 1px solid var(--line-strong);
+  background: transparent;
+  color: var(--ink-muted);
+  cursor: pointer;
+  font-size: 0.74rem;
+  font-weight: 760;
+  padding: 0 8px;
+}
+
+.language-toggle__button:last-child {
+  border-right: 0;
+}
+
+.language-toggle__button:hover {
+  color: var(--blue);
+}
+
+.language-toggle__button--active {
+  background: var(--blue);
+  color: #ffffff;
+}
+
+.language-toggle__button--active:hover {
+  color: #ffffff;
+}
+
 .data-strip {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

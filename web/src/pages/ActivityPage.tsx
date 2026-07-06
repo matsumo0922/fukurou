@@ -8,6 +8,8 @@ import {
   type ActivityTimelineSnapshot,
   type ActivityTimelineSource,
 } from "../api/ops";
+import type { MessageKey } from "../i18n/messages";
+import { useI18n } from "../i18n/useI18n";
 import { EmptyState } from "../ui/components/EmptyState";
 import { Panel } from "../ui/components/Panel";
 import { SectionHeader } from "../ui/components/SectionHeader";
@@ -17,13 +19,14 @@ import { formatJpy, formatRatioAsPercent, formatSignedJpy } from "../ui/numberFo
 
 export function ActivityPage() {
   const timelineQuery = useQuery(activityTimelineQuery);
+  const { t } = useI18n();
 
   return (
     <div className="page-stack">
       <SectionHeader
         eyebrow="App"
         title="Activity"
-        description="Decision, audit, and paper execution timeline."
+        description={t("activity.description")}
         action={
           <button
             className="icon-text-button icon-text-button--prominent"
@@ -32,7 +35,7 @@ export function ActivityPage() {
             disabled={timelineQuery.isFetching}
           >
             <RefreshCw size={16} aria-hidden="true" />
-            {timelineQuery.isFetching ? "Refreshing" : "Refresh"}
+            {timelineQuery.isFetching ? t("common.refreshing") : t("common.refresh")}
           </button>
         }
       />
@@ -40,9 +43,9 @@ export function ActivityPage() {
       <Panel>
         <div className="panel-heading">
           <Activity size={18} aria-hidden="true" />
-          <h2>Timeline</h2>
+          <h2>{t("activity.panel.timeline")}</h2>
           {timelineQuery.data ? (
-            <StatusPill label={timelineQuery.isStale ? "stale" : "fresh"} tone={timelineQuery.isStale ? "warning" : "positive"} />
+            <StatusPill label={timelineQuery.isStale ? t("common.stale") : t("common.fresh")} tone={timelineQuery.isStale ? "warning" : "positive"} />
           ) : null}
         </div>
         {timelineQuery.isPending ? <ActivityLoading /> : null}
@@ -54,23 +57,27 @@ export function ActivityPage() {
 }
 
 function ActivityLoading() {
+  const { t } = useI18n();
+
   return (
     <div className="loading-row" role="status">
       <span className="loading-dot" aria-hidden="true" />
-      <span>Loading activity timeline</span>
+      <span>{t("activity.loading.timeline")}</span>
     </div>
   );
 }
 
 function ActivityError({ error, retried }: { error: unknown; retried: () => void }) {
+  const { locale, t } = useI18n();
+
   return (
     <EmptyState
-      title="Activity timeline unavailable"
-      description={describeError(error)}
+      title={t("activity.error.timeline")}
+      description={describeError(error, locale)}
       action={
         <button className="icon-text-button" type="button" onClick={retried}>
           <RefreshCw size={16} aria-hidden="true" />
-          Retry
+          {t("common.retry")}
         </button>
       }
     />
@@ -78,36 +85,38 @@ function ActivityError({ error, retried }: { error: unknown; retried: () => void
 }
 
 function ActivityTimeline({ timeline }: { timeline: ActivityTimelineSnapshot }) {
+  const { locale, t } = useI18n();
   const { fetchedAt, limits } = timeline;
   const events = newestFirstActivityTimelineEvents(timeline.events);
 
   if (events.length === 0) {
-    return <EmptyState title="No activity recorded" description="The decision, audit, and execution feeds are empty." />;
+    return <EmptyState title={t("activity.empty.title")} description={t("activity.empty.description")} />;
   }
 
   return (
     <>
       <p className="timeline__freshness">
-        Updated {formatDateTime(fetchedAt)} · newest first · {events.length}/{limits.total} records · decisions{" "}
-        {limits.decisions} / audit {limits.audit} / executions {limits.executions}
+        {t("activity.updated")} {formatDateTime(fetchedAt, locale)} · {t("activity.newestFirst")} · {events.length}/{limits.total}{" "}
+        {t("activity.records")} · {t("activity.decisions")} {limits.decisions} / {t("activity.audit")} {limits.audit} /{" "}
+        {t("activity.executions")} {limits.executions}
       </p>
-      <ol className="timeline" aria-label="Activity timeline">
+      <ol className="timeline" aria-label={t("activity.timelineAria")}>
         {events.map((event) => (
           <li className="timeline__item" key={event.id}>
             <div className="timeline__rail" aria-hidden="true" />
             <div className="timeline__body">
               <div className="timeline__header">
-                <StatusPill label={sourceLabel(event.source)} tone={sourceTone(event.source)} />
+                <StatusPill label={sourceLabel(event.source, t)} tone={sourceTone(event.source)} />
                 <StatusPill label={event.kind} tone={eventTone(event)} />
-                <time dateTime={event.occurredAt}>{formatDateTime(event.occurredAt)}</time>
+                <time dateTime={event.occurredAt}>{formatDateTime(event.occurredAt, locale)}</time>
               </div>
               <h2>{event.title}</h2>
-              <p>{formatTimelineDetail(event)}</p>
+              <p>{formatTimelineDetail(event, t)}</p>
               <dl className="timeline__metadata">
                 {event.metadata.map((item) => (
                   <div key={item.label}>
-                    <dt>{item.label}</dt>
-                    <dd>{formatMetadataValue(item.label, item.value)}</dd>
+                    <dt>{metadataLabel(item.label, t)}</dt>
+                    <dd>{formatMetadataValue(item.label, item.value, t)}</dd>
                   </div>
                 ))}
               </dl>
@@ -119,14 +128,14 @@ function ActivityTimeline({ timeline }: { timeline: ActivityTimelineSnapshot }) 
   );
 }
 
-function sourceLabel(source: ActivityTimelineSource): string {
+function sourceLabel(source: ActivityTimelineSource, t: (key: MessageKey) => string): string {
   switch (source) {
     case "audit":
-      return "audit";
+      return t("activity.source.audit");
     case "decision":
-      return "decision";
+      return t("activity.source.decision");
     case "execution":
-      return "execution";
+      return t("activity.source.execution");
   }
 }
 
@@ -157,7 +166,7 @@ function eventTone(event: ActivityTimelineEvent): StatusTone {
   return event.source === "execution" ? "positive" : "warning";
 }
 
-function formatTimelineDetail(event: ActivityTimelineEvent): string {
+function formatTimelineDetail(event: ActivityTimelineEvent, t: (key: MessageKey) => string): string {
   if (event.source !== "execution") {
     return event.detail;
   }
@@ -168,10 +177,33 @@ function formatTimelineDetail(event: ActivityTimelineEvent): string {
     return event.detail;
   }
 
-  return `${sizeBtc} BTC at ${formatJpy(priceJpy.replace(" JPY", ""))}`;
+  return `${sizeBtc} BTC ${t("activity.executionPriceJoin")} ${formatJpy(priceJpy.replace(" JPY", ""))}`;
 }
 
-function formatMetadataValue(label: string, value: string): string {
+function metadataLabel(label: string, t: (key: MessageKey) => string): string {
+  switch (label) {
+    case "estimated p":
+      return t("activity.label.estimatedP");
+    case "setup tags":
+      return t("activity.label.setupTags");
+    case "no-trade conditions":
+      return t("activity.label.noTradeConditions");
+    case "tool":
+      return t("activity.label.tool");
+    case "realized pnl":
+      return t("activity.label.realizedPnl");
+    case "fee":
+      return t("activity.label.fee");
+    case "liquidity":
+      return t("activity.label.liquidity");
+    case "order":
+      return t("activity.label.order");
+    default:
+      return label;
+  }
+}
+
+function formatMetadataValue(label: string, value: string, t: (key: MessageKey) => string): string {
   if (label === "estimated p") {
     return formatRatioAsPercent(value);
   }
@@ -182,6 +214,10 @@ function formatMetadataValue(label: string, value: string): string {
 
   if (label === "fee") {
     return formatJpy(value);
+  }
+
+  if (label === "order" && value === "not linked") {
+    return t("activity.notLinked");
   }
 
   return value;

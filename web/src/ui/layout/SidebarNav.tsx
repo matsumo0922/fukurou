@@ -5,6 +5,8 @@ import Power from "lucide-react/dist/esm/icons/power.mjs";
 import ServerCog from "lucide-react/dist/esm/icons/server-cog.mjs";
 import ShieldAlert from "lucide-react/dist/esm/icons/shield-alert.mjs";
 import { NavLink } from "react-router";
+import type { MessageKey } from "../../i18n/messages";
+import { useI18n } from "../../i18n/useI18n";
 
 type NavigationItem = {
   label: string;
@@ -13,13 +15,13 @@ type NavigationItem = {
 };
 
 type NavigationSection = {
-  label: string;
+  labelKey: MessageKey;
   items: NavigationItem[];
 };
 
 const navigationSections: NavigationSection[] = [
   {
-    label: "Read",
+    labelKey: "sidebar.read",
     items: [
       {
         label: "Overview",
@@ -44,7 +46,7 @@ const navigationSections: NavigationSection[] = [
     ],
   },
   {
-    label: "Operate",
+    labelKey: "sidebar.operate",
     items: [
       {
         label: "Controls",
@@ -56,8 +58,10 @@ const navigationSections: NavigationSection[] = [
 ];
 
 export function SidebarNav() {
+  const { t } = useI18n();
+
   return (
-    <aside className="sidebar" aria-label="Primary navigation">
+    <aside className="sidebar" aria-label={t("sidebar.primaryNavigation")}>
       <div className="sidebar__brand">
         <img className="sidebar__mark" src="/fukurou-mark.svg" alt="" aria-hidden="true" />
         <div>
@@ -66,10 +70,10 @@ export function SidebarNav() {
         </div>
       </div>
 
-      <nav className="sidebar__nav" aria-label="App sections">
+      <nav className="sidebar__nav" aria-label={t("sidebar.appSections")}>
         {navigationSections.map((section) => (
-          <div className="sidebar__section" key={section.label}>
-            <p className="sidebar__section-label">{section.label}</p>
+          <div className="sidebar__section" key={section.labelKey}>
+            <p className="sidebar__section-label">{t(section.labelKey)}</p>
             <div className="sidebar__section-links">
               {section.items.map((item) => (
                 <NavLink className={navLinkClassName} key={item.path} to={item.path}>
