@@ -449,6 +449,9 @@ function BenchmarkPanel({
     <Panel className="panel--wide">
       <PanelHeading Icon={Activity} title="Benchmark comparison">
         <FreshnessPill isStale={benchmarkQuery.isStale} />
+        {benchmarkQuery.data.points.length > latestPoints.length ? (
+          <StatusPill label={`latest ${latestPoints.length} of ${benchmarkQuery.data.points.length}`} tone="warning" />
+        ) : null}
       </PanelHeading>
       <DataStrip
         items={[
@@ -782,7 +785,7 @@ function calculateWorstBotDrawdown(points: BenchmarkPoint[]): string | null {
     }
 
     if (peak > 0) {
-      worstDrawdown = Math.min(worstDrawdown, (equity - peak) / peak);
+      worstDrawdown = Math.max(worstDrawdown, (peak - equity) / peak);
     }
   }
 

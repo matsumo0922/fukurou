@@ -93,6 +93,8 @@ describe("App", () => {
     expect(screen.getByText("claude-sonnet-4")).toBeInTheDocument();
     expect(screen.getByText("Bot realized")).toBeInTheDocument();
     expect(screen.getAllByText("¥101,000").length).toBeGreaterThan(0);
+    expect(screen.getByText("latest 6 of 7")).toBeInTheDocument();
+    expect(screen.getAllByText("2.88%").length).toBeGreaterThan(0);
     expect(screen.getAllByText("$0.1234").length).toBeGreaterThan(0);
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -446,6 +448,30 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
           assumptionsJa: "buy & hold は初期残高で BTC を購入し、no-trade は現金維持として比較します。",
           baselineEquityJpy: "100000",
           points: [
+            {
+              date: "2026-06-29",
+              buyAndHoldEquityJpy: "98000",
+              noTradeEquityJpy: "100000",
+              botEquityJpy: "98000",
+            },
+            {
+              date: "2026-06-30",
+              buyAndHoldEquityJpy: "99000",
+              noTradeEquityJpy: "100000",
+              botEquityJpy: "99000",
+            },
+            {
+              date: "2026-07-01",
+              buyAndHoldEquityJpy: "99500",
+              noTradeEquityJpy: "100000",
+              botEquityJpy: "100000",
+            },
+            {
+              date: "2026-07-02",
+              buyAndHoldEquityJpy: "100500",
+              noTradeEquityJpy: "100000",
+              botEquityJpy: "102000",
+            },
             {
               date: "2026-07-03",
               buyAndHoldEquityJpy: "100000",
