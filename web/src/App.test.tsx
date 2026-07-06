@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
+import { LOCALE_STORAGE_KEY } from "./i18n/messages";
+import { formatDateTime } from "./ui/format";
 
 describe("App", () => {
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    window.localStorage.clear();
     window.history.replaceState({}, "", "/");
   });
 
@@ -85,6 +88,47 @@ describe("App", () => {
     expect(screen.getByText("status=ready")).toBeInTheDocument();
     expect(screen.getAllByText("local-sha").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/JST/).length).toBeGreaterThan(1);
+  });
+
+  it("starts in English and switches supported UI copy to Japanese", async () => {
+    stubSystemFetch();
+    window.history.pushState({}, "", "/app/overview");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
+    expect(screen.getByText("Safety, risk, freshness, and paper account state.")).toBeInTheDocument();
+    expect(document.documentElement).toHaveAttribute("lang", "en");
+
+    fireEvent.click(screen.getByRole("button", { name: "JA" }));
+
+    expect(screen.getByText("安全性、リスク、鮮度、paper 口座の状態。")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "更新" }).length).toBeGreaterThan(0);
+    expect(window.localStorage.getItem(LOCALE_STORAGE_KEY)).toBe("ja");
+    expect(document.documentElement).toHaveAttribute("lang", "ja");
+  });
+
+  it("persists Japanese locale while keeping major titles and operational values unchanged", async () => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, "ja");
+    stubSystemFetch();
+    window.history.pushState({}, "", "/app/overview");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Overview/ })).toHaveAttribute("href", "/app/overview");
+    expect(screen.getByRole("link", { name: /Activity/ })).toHaveAttribute("href", "/app/activity");
+    expect(screen.getByRole("link", { name: /System/ })).toHaveAttribute("href", "/app/system");
+    expect(screen.getByText("安全性、リスク、鮮度、paper 口座の状態。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getAllByText("RUNNING").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("NO_TRADE").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("PAPER").length).toBeGreaterThan(0);
+    });
+  });
+
+  it("formats Japanese date-times with a ja-JP leaning and the JST label", () => {
+    expect(formatDateTime("2026-07-05T12:01:00.000Z", "ja")).toBe("2026/07/05 21:01:00 JST");
   });
 
   it("shows overview operations data from read APIs", async () => {

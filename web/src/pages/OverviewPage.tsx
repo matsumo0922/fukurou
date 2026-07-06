@@ -17,6 +17,8 @@ import {
   type OpsRiskStateResponse,
 } from "../api/ops";
 import { systemStatusQuery, type SystemStatusSnapshot } from "../api/system";
+import type { Locale, MessageKey } from "../i18n/messages";
+import { useI18n } from "../i18n/useI18n";
 import { DataStrip } from "../ui/components/DataStrip";
 import { EmptyState } from "../ui/components/EmptyState";
 import { Metric } from "../ui/components/Metric";
@@ -28,6 +30,7 @@ import { formatBtc, formatDecimal, formatJpy, formatRatioAsPercent, formatSigned
 
 export function OverviewPage() {
   const statusQuery = useQuery(systemStatusQuery);
+  const { t } = useI18n();
   const riskStateQuery = useQuery(opsRiskStateQuery);
   const accountQuery = useQuery(opsAccountQuery);
   const decisionsQuery = useQuery(opsDecisionsQuery);
@@ -46,7 +49,7 @@ export function OverviewPage() {
       <SectionHeader
         eyebrow="App"
         title="Overview"
-        description="Safety, risk, freshness, and paper account state."
+        description={t("overview.description")}
         action={
           <button
             className="icon-text-button icon-text-button--prominent"
@@ -55,7 +58,7 @@ export function OverviewPage() {
             disabled={isRefreshing}
           >
             <RefreshCw size={16} aria-hidden="true" />
-            {isRefreshing ? "Refreshing" : "Refresh"}
+            {isRefreshing ? t("common.refreshing") : t("common.refresh")}
           </button>
         }
       />
@@ -91,40 +94,43 @@ function OverviewSignalMetrics({
   decisionsQuery: UseQueryResult<{ decisions: { action: string; createdAt: string }[] }, Error>;
 }) {
   const latestDecision = decisionsQuery.data?.decisions[0];
+  const { locale, t } = useI18n();
 
   return (
     <div className="metric-grid">
       <Metric
-        label="System"
-        value={queryValue(statusQuery, (data) => data.readiness.status)}
-        detail={statusQuery.data ? `health ${statusQuery.data.health.status}` : queryDetail(statusQuery)}
+        label={t("overview.metric.system")}
+        value={queryValue(statusQuery, (data) => data.readiness.status, t)}
+        detail={statusQuery.data ? `${t("overview.detail.health")} ${statusQuery.data.health.status}` : queryDetail(statusQuery, locale, t)}
       />
       <Metric
-        label="Risk"
-        value={queryValue(riskStateQuery, (data) => data.state)}
-        detail={riskStateQuery.data ? formatRatioAsPercent(riskStateQuery.data.drawdownRatio) : queryDetail(riskStateQuery)}
+        label={t("overview.metric.risk")}
+        value={queryValue(riskStateQuery, (data) => data.state, t)}
+        detail={riskStateQuery.data ? formatRatioAsPercent(riskStateQuery.data.drawdownRatio) : queryDetail(riskStateQuery, locale, t)}
       />
       <Metric
-        label="Freshness"
-        value={accountQuery.data ? formatDateTime(accountQuery.data.updatedAt) : queryValue(accountQuery, () => "Loading")}
-        detail={accountQuery.data ? `account ${accountQuery.data.mode}` : queryDetail(accountQuery)}
+        label={t("overview.metric.freshness")}
+        value={accountQuery.data ? formatDateTime(accountQuery.data.updatedAt, locale) : queryValue(accountQuery, () => t("common.loading"), t)}
+        detail={accountQuery.data ? `${t("overview.detail.account")} ${accountQuery.data.mode}` : queryDetail(accountQuery, locale, t)}
       />
       <Metric
-        label="Latest decision"
-        value={latestDecision?.action ?? queryValue(decisionsQuery, () => "No records")}
-        detail={latestDecision ? formatDateTime(latestDecision.createdAt) : queryDetail(decisionsQuery)}
+        label={t("overview.metric.latestDecision")}
+        value={latestDecision?.action ?? queryValue(decisionsQuery, () => t("common.noRecords"), t)}
+        detail={latestDecision ? formatDateTime(latestDecision.createdAt, locale) : queryDetail(decisionsQuery, locale, t)}
       />
     </div>
   );
 }
 
 function SystemReadinessPanel({ statusQuery }: { statusQuery: UseQueryResult<SystemStatusSnapshot, Error> }) {
+  const { locale, t } = useI18n();
+
   if (statusQuery.isPending) {
-    return <PanelLoading label="Loading system status" />;
+    return <PanelLoading label={t("overview.loading.systemStatus")} />;
   }
 
   if (statusQuery.isError) {
-    return <PanelError title="System status unavailable" error={statusQuery.error} retried={() => void statusQuery.refetch()} />;
+    return <PanelError title={t("overview.error.systemStatus")} error={statusQuery.error} retried={() => void statusQuery.refetch()} />;
   }
 
   const readinessTone = readinessStatusTone(statusQuery.data.readiness.status);
@@ -133,38 +139,38 @@ function SystemReadinessPanel({ statusQuery }: { statusQuery: UseQueryResult<Sys
     <Panel>
       <div className="panel-heading">
         <ServerCog size={18} aria-hidden="true" />
-        <h2>System / readiness</h2>
+        <h2>{t("overview.panel.systemReadiness")}</h2>
         <StatusPill label={statusQuery.data.readiness.status} tone={readinessTone} />
       </div>
       <DataStrip
         items={[
           {
-            label: "health",
+            label: t("overview.label.health"),
             value: statusQuery.data.health.status,
-            detail: statusQuery.data.health.service ?? "service not reported",
+            detail: statusQuery.data.health.service ?? t("overview.detail.serviceNotReported"),
           },
           {
-            label: "readiness",
+            label: t("overview.label.readiness"),
             value: statusQuery.data.readiness.status,
             detail: `HTTP ${statusQuery.data.readinessHttpStatus}`,
           },
           {
-            label: "revision",
+            label: t("overview.label.revision"),
             value: statusQuery.data.revision,
             detail: `HTTP ${statusQuery.data.revisionHttpStatus}`,
           },
           {
-            label: "last reconciled",
-            value: formatDateTime(statusQuery.data.readiness.lastReconciledAt),
+            label: t("overview.label.lastReconciled"),
+            value: formatDateTime(statusQuery.data.readiness.lastReconciledAt, locale),
           },
           {
-            label: "last market data",
-            value: formatDateTime(statusQuery.data.readiness.lastMarketDataAt),
+            label: t("overview.label.lastMarketData"),
+            value: formatDateTime(statusQuery.data.readiness.lastMarketDataAt, locale),
           },
           {
-            label: "snapshot",
-            value: formatDateTime(statusQuery.data.fetchedAt),
-            detail: statusQuery.isStale ? "stale" : "fresh",
+            label: t("overview.label.snapshot"),
+            value: formatDateTime(statusQuery.data.fetchedAt, locale),
+            detail: statusQuery.isStale ? t("common.stale") : t("common.fresh"),
           },
         ]}
       />
@@ -173,40 +179,42 @@ function SystemReadinessPanel({ statusQuery }: { statusQuery: UseQueryResult<Sys
 }
 
 function RiskStatePanel({ riskStateQuery }: { riskStateQuery: UseQueryResult<OpsRiskStateResponse, Error> }) {
+  const { locale, t } = useI18n();
+
   if (riskStateQuery.isPending) {
-    return <PanelLoading label="Loading risk state" />;
+    return <PanelLoading label={t("overview.loading.riskState")} />;
   }
 
   if (riskStateQuery.isError) {
-    return <PanelError title="Risk state unavailable" error={riskStateQuery.error} retried={() => void riskStateQuery.refetch()} />;
+    return <PanelError title={t("overview.error.riskState")} error={riskStateQuery.error} retried={() => void riskStateQuery.refetch()} />;
   }
 
   return (
     <Panel>
       <div className="panel-heading">
         <ShieldAlert size={18} aria-hidden="true" />
-        <h2>Risk state</h2>
+        <h2>{t("overview.panel.riskState")}</h2>
         <StatusPill label={riskStateQuery.data.state} tone={riskStateTone(riskStateQuery.data.state)} />
       </div>
       <DataStrip
         items={[
           {
-            label: "state",
+            label: t("overview.label.state"),
             value: riskStateQuery.data.state,
-            detail: riskStateQuery.data.haltReason ?? "no halt reason",
+            detail: riskStateQuery.data.haltReason ?? t("overview.detail.noHaltReason"),
           },
           {
-            label: "drawdown",
+            label: t("overview.label.drawdown"),
             value: formatRatioAsPercent(riskStateQuery.data.drawdownRatio),
           },
           {
-            label: "halted at",
-            value: formatDateTime(riskStateQuery.data.haltAt),
+            label: t("overview.label.haltedAt"),
+            value: formatDateTime(riskStateQuery.data.haltAt, locale),
           },
           {
-            label: "resumed at",
-            value: formatDateTime(riskStateQuery.data.resumedAt),
-            detail: riskStateQuery.data.resumedReason ?? "no resume reason",
+            label: t("overview.label.resumedAt"),
+            value: formatDateTime(riskStateQuery.data.resumedAt, locale),
+            detail: riskStateQuery.data.resumedReason ?? t("overview.detail.noResumeReason"),
           },
         ]}
       />
@@ -219,12 +227,14 @@ function LatestDecisionPanel({
 }: {
   decisionsQuery: UseQueryResult<{ decisions: { action: string; createdAt: string; estimatedWinProbability: string; reasonJa: string; setupTags: string[]; noTradeConditionsJa: string[] }[] }, Error>;
 }) {
+  const { locale, t } = useI18n();
+
   if (decisionsQuery.isPending) {
-    return <PanelLoading label="Loading latest decision" />;
+    return <PanelLoading label={t("overview.loading.latestDecision")} />;
   }
 
   if (decisionsQuery.isError) {
-    return <PanelError title="Decision feed unavailable" error={decisionsQuery.error} retried={() => void decisionsQuery.refetch()} />;
+    return <PanelError title={t("overview.error.decisionFeed")} error={decisionsQuery.error} retried={() => void decisionsQuery.refetch()} />;
   }
 
   const latestDecision = decisionsQuery.data.decisions[0];
@@ -234,9 +244,9 @@ function LatestDecisionPanel({
       <Panel>
         <div className="panel-heading">
           <Activity size={18} aria-hidden="true" />
-          <h2>Latest decision</h2>
+          <h2>{t("overview.panel.latestDecision")}</h2>
         </div>
-        <EmptyState title="No decisions recorded" description="The decision repository returned an empty feed." />
+        <EmptyState title={t("overview.empty.noDecisions.title")} description={t("overview.empty.noDecisions.description")} />
       </Panel>
     );
   }
@@ -245,31 +255,31 @@ function LatestDecisionPanel({
     <Panel>
       <div className="panel-heading">
         <Activity size={18} aria-hidden="true" />
-        <h2>Latest decision</h2>
+        <h2>{t("overview.panel.latestDecision")}</h2>
         <StatusPill label={latestDecision.action} tone={decisionTone(latestDecision.action)} />
       </div>
       <DataStrip
         items={[
           {
-            label: "action",
+            label: t("overview.label.action"),
             value: latestDecision.action,
-            detail: formatDateTime(latestDecision.createdAt),
+            detail: formatDateTime(latestDecision.createdAt, locale),
           },
           {
-            label: "estimated p",
+            label: t("overview.label.estimatedP"),
             value: formatRatioAsPercent(latestDecision.estimatedWinProbability),
           },
           {
-            label: "setup tags",
-            value: latestDecision.setupTags.length > 0 ? latestDecision.setupTags.join(", ") : "none",
+            label: t("overview.label.setupTags"),
+            value: latestDecision.setupTags.length > 0 ? latestDecision.setupTags.join(", ") : t("common.none"),
           },
           {
-            label: "reason",
+            label: t("overview.label.reason"),
             value: latestDecision.reasonJa,
           },
           {
-            label: "no-trade conditions",
-            value: latestDecision.noTradeConditionsJa.length > 0 ? latestDecision.noTradeConditionsJa.join(" / ") : "none",
+            label: t("overview.label.noTradeConditions"),
+            value: latestDecision.noTradeConditionsJa.length > 0 ? latestDecision.noTradeConditionsJa.join(" / ") : t("common.none"),
           },
         ]}
       />
@@ -278,48 +288,50 @@ function LatestDecisionPanel({
 }
 
 function AccountSnapshotPanel({ accountQuery }: { accountQuery: UseQueryResult<OpsAccountResponse, Error> }) {
+  const { locale, t } = useI18n();
+
   if (accountQuery.isPending) {
-    return <PanelLoading label="Loading account snapshot" />;
+    return <PanelLoading label={t("overview.loading.accountSnapshot")} />;
   }
 
   if (accountQuery.isError) {
-    return <PanelError title="Account snapshot unavailable" error={accountQuery.error} retried={() => void accountQuery.refetch()} />;
+    return <PanelError title={t("overview.error.accountSnapshot")} error={accountQuery.error} retried={() => void accountQuery.refetch()} />;
   }
 
   return (
     <Panel>
       <div className="panel-heading">
         <WalletCards size={18} aria-hidden="true" />
-        <h2>Account snapshot</h2>
+        <h2>{t("overview.panel.accountSnapshot")}</h2>
         <StatusPill label={accountQuery.data.mode} tone="neutral" />
       </div>
       <DataStrip
         items={[
           {
-            label: "cash",
+            label: t("overview.label.cash"),
             value: formatJpy(accountQuery.data.cashJpy),
-            detail: `initial ${formatJpy(accountQuery.data.initialCashJpy)}`,
+            detail: `${t("overview.detail.initial")} ${formatJpy(accountQuery.data.initialCashJpy)}`,
           },
           {
-            label: "total equity",
+            label: t("overview.label.totalEquity"),
             value: formatJpy(accountQuery.data.totalEquityJpy),
-            detail: `peak ${formatJpy(accountQuery.data.equityPeakJpy)}`,
+            detail: `${t("overview.detail.peak")} ${formatJpy(accountQuery.data.equityPeakJpy)}`,
           },
           {
-            label: "drawdown",
+            label: t("overview.label.drawdown"),
             value: formatRatioAsPercent(accountQuery.data.drawdownRatio),
           },
           {
-            label: "BTC quantity",
+            label: t("overview.label.btcQuantity"),
             value: formatBtc(accountQuery.data.btcQuantity),
           },
           {
-            label: "BTC mark",
+            label: t("overview.label.btcMark"),
             value: formatJpy(accountQuery.data.btcMarkPriceJpy),
           },
           {
-            label: "updated",
-            value: formatDateTime(accountQuery.data.updatedAt),
+            label: t("overview.label.updated"),
+            value: formatDateTime(accountQuery.data.updatedAt, locale),
           },
         ]}
       />
@@ -328,12 +340,14 @@ function AccountSnapshotPanel({ accountQuery }: { accountQuery: UseQueryResult<O
 }
 
 function PositionExposurePanel({ positionsQuery }: { positionsQuery: UseQueryResult<OpsPositionsResponse, Error> }) {
+  const { t } = useI18n();
+
   if (positionsQuery.isPending) {
-    return <PanelLoading label="Loading position exposure" />;
+    return <PanelLoading label={t("overview.loading.positionExposure")} />;
   }
 
   if (positionsQuery.isError) {
-    return <PanelError title="Position feed unavailable" error={positionsQuery.error} retried={() => void positionsQuery.refetch()} />;
+    return <PanelError title={t("overview.error.positionFeed")} error={positionsQuery.error} retried={() => void positionsQuery.refetch()} />;
   }
 
   const hasExposure = positionsQuery.data.positions.length > 0 || positionsQuery.data.openOrders.length > 0;
@@ -343,10 +357,10 @@ function PositionExposurePanel({ positionsQuery }: { positionsQuery: UseQueryRes
       <Panel>
         <div className="panel-heading">
           <AlertTriangle size={18} aria-hidden="true" />
-          <h2>Position / exposure</h2>
-          <StatusPill label="flat" tone="positive" />
+          <h2>{t("overview.panel.positionExposure")}</h2>
+          <StatusPill label={t("overview.status.flat")} tone="positive" />
         </div>
-        <EmptyState title="No open exposure" description="The paper ledger returned no open positions or open orders." />
+        <EmptyState title={t("overview.empty.noExposure.title")} description={t("overview.empty.noExposure.description")} />
       </Panel>
     );
   }
@@ -355,25 +369,25 @@ function PositionExposurePanel({ positionsQuery }: { positionsQuery: UseQueryRes
     <Panel>
       <div className="panel-heading">
         <AlertTriangle size={18} aria-hidden="true" />
-        <h2>Position / exposure</h2>
-        <StatusPill label="open" tone="warning" />
+        <h2>{t("overview.panel.positionExposure")}</h2>
+        <StatusPill label={t("overview.status.open")} tone="warning" />
       </div>
       <DataStrip
         items={[
           {
-            label: "positions",
+            label: t("overview.label.positions"),
             value: String(positionsQuery.data.positions.length),
           },
           {
-            label: "open orders",
+            label: t("overview.label.openOrders"),
             value: String(positionsQuery.data.openOrders.length),
           },
           {
-            label: "BTC size",
+            label: t("overview.label.btcSize"),
             value: formatBtc(sumNumbers(positionsQuery.data.positions.map((position) => position.sizeBtc))),
           },
           {
-            label: "unrealized PnL",
+            label: t("overview.label.unrealizedPnl"),
             value: formatSignedJpy(sumNumbers(positionsQuery.data.positions.map((position) => position.unrealizedPnlJpy))),
           },
         ]}
@@ -384,7 +398,9 @@ function PositionExposurePanel({ positionsQuery }: { positionsQuery: UseQueryRes
             <span>{position.symbol}</span>
             <span>{formatBtc(position.sizeBtc)}</span>
             <span>{formatSignedJpy(position.unrealizedPnlJpy)}</span>
-            <span>stop {formatJpy(position.currentStopLossJpy)}</span>
+            <span>
+              {t("overview.detail.stop")} {formatJpy(position.currentStopLossJpy)}
+            </span>
           </div>
         ))}
       </div>
@@ -397,12 +413,14 @@ function KillCriterionPanel({
 }: {
   evaluationQuery: UseQueryResult<EvaluationSummaryResponse, Error>;
 }) {
+  const { t } = useI18n();
+
   if (evaluationQuery.isPending) {
-    return <PanelLoading label="Loading kill criterion" />;
+    return <PanelLoading label={t("overview.loading.killCriterion")} />;
   }
 
   if (evaluationQuery.isError) {
-    return <PanelError title="Evaluation summary unavailable" error={evaluationQuery.error} retried={() => void evaluationQuery.refetch()} />;
+    return <PanelError title={t("overview.error.evaluationSummary")} error={evaluationQuery.error} retried={() => void evaluationQuery.refetch()} />;
   }
 
   const killCriterion = evaluationQuery.data.killCriterion;
@@ -412,37 +430,37 @@ function KillCriterionPanel({
     <Panel>
       <div className="panel-heading">
         <ShieldAlert size={18} aria-hidden="true" />
-        <h2>Kill criterion</h2>
-        <StatusPill label={killCriterion.breached ? "breached" : "within bounds"} tone={killTone} />
+        <h2>{t("overview.panel.killCriterion")}</h2>
+        <StatusPill label={killCriterion.breached ? t("overview.status.breached") : t("overview.status.withinBounds")} tone={killTone} />
       </div>
       <DataStrip
         items={[
           {
-            label: "closed trades",
+            label: t("overview.label.closedTrades"),
             value: `${killCriterion.closedTrades} / ${killCriterion.minClosedTrades}`,
-            detail: `${killCriterion.remainingTrades} remaining`,
+            detail: `${killCriterion.remainingTrades} ${t("overview.detail.remaining")}`,
           },
           {
-            label: "profit factor",
+            label: t("overview.label.profitFactor"),
             value: formatDecimal(killCriterion.currentProfitFactor),
-            detail: `min ${formatDecimal(killCriterion.minProfitFactor)}`,
+            detail: `${t("overview.detail.min")} ${formatDecimal(killCriterion.minProfitFactor)}`,
           },
           {
-            label: "hard halt",
-            value: killCriterion.hardHalt ? "yes" : "no",
+            label: t("overview.label.hardHalt"),
+            value: killCriterion.hardHalt ? t("common.yes") : t("common.no"),
           },
           {
-            label: "total PnL",
+            label: t("overview.label.totalPnl"),
             value: formatSignedJpy(evaluationQuery.data.performance.totalPnlJpy),
-            detail: `${evaluationQuery.data.performance.tradeCount} trades`,
+            detail: `${evaluationQuery.data.performance.tradeCount} ${t("overview.detail.trades")}`,
           },
           {
-            label: "NO_TRADE rate",
+            label: t("overview.label.noTradeRate"),
             value: formatRatioAsPercent(evaluationQuery.data.runRates.noTradeRate),
           },
           {
-            label: "period",
-            value: `${evaluationQuery.data.period.from} to ${evaluationQuery.data.period.to}`,
+            label: t("overview.label.period"),
+            value: `${evaluationQuery.data.period.from} ${t("overview.detail.periodTo")} ${evaluationQuery.data.period.to}`,
             detail: evaluationQuery.data.period.timezone,
           },
         ]}
@@ -463,15 +481,17 @@ function PanelLoading({ label }: { label: string }) {
 }
 
 function PanelError({ title, error, retried }: { title: string; error: unknown; retried: () => void }) {
+  const { locale, t } = useI18n();
+
   return (
     <Panel>
       <EmptyState
         title={title}
-        description={describeError(error)}
+        description={describeError(error, locale)}
         action={
           <button className="icon-text-button" type="button" onClick={retried}>
             <RefreshCw size={16} aria-hidden="true" />
-            Retry
+            {t("common.retry")}
           </button>
         }
       />
@@ -482,24 +502,29 @@ function PanelError({ title, error, retried }: { title: string; error: unknown; 
 function queryValue<TData>(
   query: UseQueryResult<TData, Error>,
   selected: (data: TData) => string,
+  t: (key: MessageKey) => string,
 ): string {
   if (query.isPending) {
-    return "Loading";
+    return t("common.loading");
   }
 
   if (query.isError) {
-    return "Error";
+    return t("common.error");
   }
 
   return selected(query.data);
 }
 
-function queryDetail<TData>(query: UseQueryResult<TData, Error>): string {
+function queryDetail<TData>(
+  query: UseQueryResult<TData, Error>,
+  locale: Locale,
+  t: (key: MessageKey) => string,
+): string {
   if (query.isError) {
-    return describeError(query.error);
+    return describeError(query.error, locale);
   }
 
-  return query.isPending ? "waiting for API" : "not reported";
+  return query.isPending ? t("common.waitingForApi") : t("common.notReported");
 }
 
 function readinessStatusTone(status: string): StatusTone {
