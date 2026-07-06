@@ -573,6 +573,10 @@ function describeControlError(error: unknown): string {
     return `Manual trigger was refused: ${triggerRefusalDescription(apiMessage)}`;
   }
 
+  if (error.path === "/ops/halt" && error.status === 409) {
+    return `Halt request was refused: ${haltRefusalDescription(apiMessage)}`;
+  }
+
   if (apiMessage) {
     return `${apiMessage} (HTTP ${error.status})`;
   }
@@ -609,4 +613,12 @@ function triggerRefusalDescription(reason: string): string {
     default:
       return reason || "the backend did not provide a refusal reason.";
   }
+}
+
+function haltRefusalDescription(reason: string): string {
+  if (reason === "SOFT_HALT cannot downgrade HARD_HALT.") {
+    return "HARD_HALT is already active; use resume after operator review before setting SOFT_HALT.";
+  }
+
+  return reason || "the backend did not provide a refusal reason.";
 }

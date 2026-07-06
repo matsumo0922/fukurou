@@ -298,6 +298,31 @@ describe("App", () => {
     expect(screen.getByText(/hourly LLM invocation cap has already been reached/)).toBeInTheDocument();
   });
 
+  it("shows halt 409 refusal reasons in user-facing language", async () => {
+    stubSystemFetch({
+      haltResponse: {
+        status: 409,
+        body: {
+          message: "SOFT_HALT cannot downgrade HARD_HALT.",
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("SOFT_HALT reason"), {
+      target: {
+        value: "pause new entries after hard halt review",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review SOFT_HALT" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm SOFT_HALT" }));
+
+    expect(await screen.findByText("SOFT_HALT failed")).toBeInTheDocument();
+    expect(screen.getByText(/HARD_HALT is already active/)).toBeInTheDocument();
+  });
+
   it("shows a loading state while system endpoints are pending", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)));
     window.history.pushState({}, "", "/app/system");
@@ -333,6 +358,10 @@ type SystemFetchFixture = {
   };
   revision?: string;
   readinessStatus?: number;
+  haltResponse?: {
+    status: number;
+    body: unknown;
+  };
   resumeResponse?: Promise<Response>;
   triggerResponse?: {
     status: number;
@@ -385,6 +414,10 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
 
         const body = requestJson(init) as { level: "SOFT" | "HARD"; reason: string };
         const state = body.level === "HARD" ? "HARD_HALT" : "SOFT_HALT";
+
+        if (fixture.haltResponse) {
+          return jsonResponse(fixture.haltResponse.body, { status: fixture.haltResponse.status });
+        }
 
         return jsonResponse({
           state,

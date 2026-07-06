@@ -1,6 +1,7 @@
 import type { LucideIcon } from "lucide-react";
 import Activity from "lucide-react/dist/esm/icons/activity.mjs";
 import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.mjs";
+import Power from "lucide-react/dist/esm/icons/power.mjs";
 import ServerCog from "lucide-react/dist/esm/icons/server-cog.mjs";
 import ShieldAlert from "lucide-react/dist/esm/icons/shield-alert.mjs";
 import { NavLink } from "react-router";
@@ -48,7 +49,7 @@ const navigationSections: NavigationSection[] = [
       {
         label: "Controls",
         path: "/app/controls",
-        icon: ShieldAlert,
+        icon: Power,
       },
     ],
   },
