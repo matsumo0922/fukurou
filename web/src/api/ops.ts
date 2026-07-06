@@ -47,6 +47,8 @@ export type ActivityTimelineLimits = {
 const ACTIVITY_TIMELINE_DECISIONS_LIMIT = 20;
 const ACTIVITY_TIMELINE_AUDIT_LIMIT = 50;
 const ACTIVITY_TIMELINE_EXECUTIONS_LIMIT = 20;
+// 5秒毎に記録される reconciler heartbeat は activity timeline を埋め尽くすため除外する。
+const ACTIVITY_TIMELINE_AUDIT_EXCLUDED_EVENT_TYPES = ["RECONCILER_PASS_COMPLETED"];
 const ACTIVITY_TIMELINE_TOTAL_LIMIT =
   ACTIVITY_TIMELINE_DECISIONS_LIMIT + ACTIVITY_TIMELINE_AUDIT_LIMIT + ACTIVITY_TIMELINE_EXECUTIONS_LIMIT;
 
@@ -139,9 +141,12 @@ export async function requestOpsTrigger(reason: string): Promise<OpsTriggerRespo
 }
 
 async function fetchActivityTimeline(): Promise<ActivityTimelineSnapshot> {
+  const auditExcludeParams = ACTIVITY_TIMELINE_AUDIT_EXCLUDED_EVENT_TYPES.map(
+    (eventType) => `&excludeEventType=${eventType}`,
+  ).join("");
   const [decisionsResponse, auditResponse, executionsResponse] = await Promise.all([
     getJson(`/ops/decisions?limit=${ACTIVITY_TIMELINE_DECISIONS_LIMIT}`),
-    getJson(`/ops/audit?limit=${ACTIVITY_TIMELINE_AUDIT_LIMIT}`),
+    getJson(`/ops/audit?limit=${ACTIVITY_TIMELINE_AUDIT_LIMIT}${auditExcludeParams}`),
     getJson(`/ops/executions?limit=${ACTIVITY_TIMELINE_EXECUTIONS_LIMIT}`),
   ]);
   const events = [

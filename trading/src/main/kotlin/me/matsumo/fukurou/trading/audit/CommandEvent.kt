@@ -140,6 +140,12 @@ interface CommandEventLog {
 interface CommandEventFeedReader {
     /**
      * 新しい順で command_event_log の event を読む。
+     *
+     * @param excludeEventTypes 除外する event_type。高頻度な heartbeat（例: RECONCILER_PASS_COMPLETED）を feed から外す用途に使う。
      */
-    suspend fun findEvents(limit: Int, eventType: CommandEventType?): Result<List<CommandEvent>>
+    suspend fun findEvents(
+        limit: Int,
+        eventType: CommandEventType?,
+        excludeEventTypes: Set<CommandEventType> = emptySet(),
+    ): Result<List<CommandEvent>>
 }

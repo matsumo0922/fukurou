@@ -8,6 +8,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import java.sql.PreparedStatement
 import java.sql.ResultSet
 import java.time.Instant
 import java.util.UUID
@@ -65,9 +66,9 @@ private const val COUNT_TOOL_CALL_EVENTS_SQL_TOOL_CONDITION = """
 """
 
 /**
- * command_event_log を新しい順で読む SQL。
+ * command_event_log を読む SELECT の列部分。WHERE 条件は動的に組み立てる。
  */
-private const val SELECT_COMMAND_EVENTS_SQL = """
+private const val SELECT_COMMAND_EVENTS_SQL_PREFIX = """
     SELECT
         id,
         decision_run_id,
@@ -82,29 +83,12 @@ private const val SELECT_COMMAND_EVENTS_SQL = """
         system_prompt_version,
         market_snapshot_id
     FROM command_event_log
-    ORDER BY ts DESC
-    LIMIT ?
 """
 
 /**
- * command_event_log を event_type で絞って新しい順で読む SQL。
+ * command_event_log を読む SELECT の並び順と件数制限。
  */
-private const val SELECT_COMMAND_EVENTS_BY_TYPE_SQL = """
-    SELECT
-        id,
-        decision_run_id,
-        tool_call_id,
-        client_request_id,
-        tool_name,
-        event_type,
-        payload,
-        ts,
-        llm_provider,
-        prompt_hash,
-        system_prompt_version,
-        market_snapshot_id
-    FROM command_event_log
-    WHERE event_type = ?
+private const val SELECT_COMMAND_EVENTS_SQL_SUFFIX = """
     ORDER BY ts DESC
     LIMIT ?
 """
@@ -185,7 +169,11 @@ class ExposedCommandEventLog(
         }
     }
 
-    override suspend fun findEvents(limit: Int, eventType: CommandEventType?): Result<List<CommandEvent>> {
+    override suspend fun findEvents(
+        limit: Int,
+        eventType: CommandEventType?,
+        excludeEventTypes: Set<CommandEventType>,
+    ): Result<List<CommandEvent>> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 require(limit > 0) {
@@ -193,7 +181,7 @@ class ExposedCommandEventLog(
                 }
 
                 exposedTransaction(database) {
-                    selectEvents(limit, eventType)
+                    selectEvents(limit, eventType, excludeEventTypes)
                 }
             }
         }
@@ -236,16 +224,19 @@ private fun placeholders(count: Int): String {
     return List(count) { "?" }.joinToString(", ")
 }
 
-private fun JdbcTransaction.selectEvents(limit: Int, eventType: CommandEventType?): List<CommandEvent> {
-    val sql = if (eventType == null) SELECT_COMMAND_EVENTS_SQL else SELECT_COMMAND_EVENTS_BY_TYPE_SQL
+private fun JdbcTransaction.selectEvents(
+    limit: Int,
+    eventType: CommandEventType?,
+    excludeEventTypes: Set<CommandEventType>,
+): List<CommandEvent> {
+    val sql = buildSelectEventsSql(
+        filterByEventType = eventType != null,
+        excludeEventTypeCount = excludeEventTypes.size,
+    )
 
     return jdbcConnection().prepareStatement(sql).use { statement ->
-        if (eventType == null) {
-            statement.setInt(1, limit)
-        } else {
-            statement.setString(1, eventType.name)
-            statement.setInt(2, limit)
-        }
+        val limitParameterIndex = bindEventFilterParameters(statement, eventType, excludeEventTypes)
+        statement.setInt(limitParameterIndex, limit)
 
         statement.executeQuery().use { resultSet ->
             buildList {
@@ -255,6 +246,55 @@ private fun JdbcTransaction.selectEvents(limit: Int, eventType: CommandEventType
             }
         }
     }
+}
+
+/**
+ * event_type 絞り込みと除外条件から SELECT 文を組み立てる。
+ */
+private fun buildSelectEventsSql(
+    filterByEventType: Boolean,
+    excludeEventTypeCount: Int,
+): String {
+    val conditions = buildList {
+        if (filterByEventType) {
+            add("event_type = ?")
+        }
+
+        if (excludeEventTypeCount > 0) {
+            add("event_type NOT IN (" + placeholders(excludeEventTypeCount) + ")")
+        }
+    }
+
+    val whereClause = if (conditions.isEmpty()) {
+        ""
+    } else {
+        "\n    WHERE " + conditions.joinToString(" AND ")
+    }
+
+    return SELECT_COMMAND_EVENTS_SQL_PREFIX + whereClause + SELECT_COMMAND_EVENTS_SQL_SUFFIX
+}
+
+/**
+ * event_type 絞り込みと除外条件の placeholder を束縛し、次に束縛すべき limit の parameter index を返す。
+ */
+private fun bindEventFilterParameters(
+    statement: PreparedStatement,
+    eventType: CommandEventType?,
+    excludeEventTypes: Set<CommandEventType>,
+): Int {
+    var parameterIndex = 1
+
+    if (eventType != null) {
+        statement.setString(parameterIndex, eventType.name)
+        parameterIndex += 1
+    }
+
+    excludeEventTypes.forEach { excludedEventType ->
+        statement.setString(parameterIndex, excludedEventType.name)
+        parameterIndex += 1
+    }
+
+    return parameterIndex
 }
 
 private fun ResultSet.toCommandEvent(): CommandEvent {

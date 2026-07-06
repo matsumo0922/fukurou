@@ -955,11 +955,18 @@ export interface paths {
         };
         /**
          * command_event_log の raw feed を取得する
-         * @description 監査イベントを新しい順で返します。limit は既定 50、最大 200、eventType で任意に絞り込めます。
+         * @description 監査イベントを新しい順で返します。limit は既定 50、最大 200、eventType で任意に絞り込めます。excludeEventType（複数指定可）で高頻度な heartbeat などを除外できます。
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description 取得件数です。既定 50、最大 200 です。 */
+                    limit?: number;
+                    /** @description 指定した event_type だけに絞り込みます。値は CommandEventType の名前です。 */
+                    eventType?: string;
+                    /** @description 除外する event_type です。複数指定可（例: excludeEventType=RECONCILER_PASS_COMPLETED）。値は CommandEventType の名前です。 */
+                    excludeEventType?: string[];
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;

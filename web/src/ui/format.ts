@@ -1,3 +1,6 @@
+const TIME_ZONE = "Asia/Tokyo";
+const TIME_ZONE_LABEL = "JST";
+
 export function formatDateTime(value: string | null | undefined): string {
   if (!value) {
     return "not reported";
@@ -9,7 +12,7 @@ export function formatDateTime(value: string | null | undefined): string {
     return value;
   }
 
-  return date.toLocaleString("en-US", {
+  const formatted = date.toLocaleString("en-US", {
     year: "numeric",
     month: "short",
     day: "2-digit",
@@ -17,9 +20,10 @@ export function formatDateTime(value: string | null | undefined): string {
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
-    timeZoneName: "short",
-    timeZone: "UTC",
+    timeZone: TIME_ZONE,
   });
+
+  return `${formatted} ${TIME_ZONE_LABEL}`;
 }
 
 export function formatTime(value: string | null | undefined): string {
@@ -33,11 +37,11 @@ export function formatTime(value: string | null | undefined): string {
     return value;
   }
 
-  return formatUtcTime(date);
+  return formatJstTime(date);
 }
 
-export function formatUtcClock(date: Date): string {
-  return formatUtcTime(date);
+export function formatJstClock(date: Date): string {
+  return formatJstTime(date);
 }
 
 export function describeError(error: unknown): string {
@@ -48,13 +52,14 @@ export function describeError(error: unknown): string {
   return "Unknown API error";
 }
 
-function formatUtcTime(date: Date): string {
-  return date.toLocaleTimeString("en-US", {
+function formatJstTime(date: Date): string {
+  const formatted = date.toLocaleTimeString("en-US", {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
-    timeZone: "UTC",
-    timeZoneName: "short",
+    timeZone: TIME_ZONE,
   });
+
+  return `${formatted} ${TIME_ZONE_LABEL}`;
 }

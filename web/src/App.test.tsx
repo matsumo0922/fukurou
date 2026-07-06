@@ -84,7 +84,7 @@ describe("App", () => {
     expect(screen.getByText("status=ok")).toBeInTheDocument();
     expect(screen.getByText("status=ready")).toBeInTheDocument();
     expect(screen.getAllByText("local-sha").length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/UTC/).length).toBeGreaterThan(1);
+    expect(screen.getAllByText(/JST/).length).toBeGreaterThan(1);
   });
 
   it("shows overview operations data from read APIs", async () => {
@@ -166,7 +166,7 @@ describe("App", () => {
       expect.objectContaining({ method: "GET" }),
     );
     expect(fetchMock).toHaveBeenCalledWith(
-      "/ops/audit?limit=50",
+      "/ops/audit?limit=50&excludeEventType=RECONCILER_PASS_COMPLETED",
       expect.objectContaining({ method: "GET" }),
     );
     expect(fetchMock).toHaveBeenCalledWith(

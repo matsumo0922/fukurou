@@ -114,6 +114,24 @@ class ApiDocumentationRouteTest {
             summary = "command_event_log の raw feed を取得する",
             tag = "ops",
         )
+        assertGetQueryParameter(
+            paths = paths,
+            path = "/ops/audit",
+            name = "limit",
+            type = "integer",
+        )
+        assertGetQueryParameter(
+            paths = paths,
+            path = "/ops/audit",
+            name = "eventType",
+            type = "string",
+        )
+        assertGetArrayQueryParameter(
+            paths = paths,
+            path = "/ops/audit",
+            name = "excludeEventType",
+            itemType = "string",
+        )
     }
 
     private fun assertOperation(
@@ -180,5 +198,34 @@ class ApiDocumentationRouteTest {
 
         assertEquals("query", parameter.getValue("in").jsonPrimitive.content)
         assertEquals(type, schema.getValue("type").jsonPrimitive.content)
+    }
+
+    private fun assertGetArrayQueryParameter(
+        paths: JsonObject,
+        path: String,
+        name: String,
+        itemType: String,
+    ) {
+        val parameters = paths
+            .getValue(path)
+            .jsonObject
+            .getValue("get")
+            .jsonObject
+            .getValue("parameters")
+            .jsonArray
+        val parameter = parameters
+            .map { parameterElement -> parameterElement.jsonObject }
+            .single { parameterObject -> parameterObject.getValue("name").jsonPrimitive.content == name }
+        val schema = parameter
+            .getValue("schema")
+            .jsonObject
+        val items = schema
+            .getValue("items")
+            .jsonObject
+
+        assertEquals("query", parameter.getValue("in").jsonPrimitive.content)
+        assertEquals(true, parameter.getValue("explode").jsonPrimitive.content.toBoolean())
+        assertEquals("array", schema.getValue("type").jsonPrimitive.content)
+        assertEquals(itemType, items.getValue("type").jsonPrimitive.content)
     }
 }
