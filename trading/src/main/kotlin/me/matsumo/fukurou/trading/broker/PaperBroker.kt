@@ -203,6 +203,49 @@ class PaperBroker(
         }
     }
 
+    override suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult> {
+        return runCatching {
+            validatePlaceOrderCommand(command)
+
+            val ticker = tickerFor(command.symbol).getOrThrow()
+            val symbolRules = symbolRulesFor(command.symbol).getOrThrow()
+            val context = safetyContext(
+                ticker = ticker,
+                symbolRules = symbolRules,
+                intentId = command.intentId,
+            )
+            val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
+            val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
+            val riskDetails = safetyFloor.placeOrderRiskDetails(resolvedCommand, context)
+            val normalizedOrderContent = command.toPreviewOrderNormalizedContent()
+            val previewHash = normalizedOrderContent.calculatePreviewHash()
+            val verdict = safetyFloor.evaluatePlaceOrder(resolvedCommand, context)
+
+            if (verdict is SafetyFloorVerdict.Rejected) {
+                return@runCatching PreviewOrderResult(
+                    accepted = false,
+                    previewHash = previewHash,
+                    normalizedOrderContent = normalizedOrderContent,
+                    riskDetails = riskDetails,
+                    messageJa = verdict.violation.messageJa,
+                    safetyViolation = verdict.violation,
+                )
+            }
+
+            validateSymbolRules(resolvedCommand, symbolRules)
+            validateEntryPriceContract(resolvedCommand, ticker)
+            validateCashAvailability(resolvedCommand, ticker, symbolRules)
+
+            PreviewOrderResult(
+                accepted = true,
+                previewHash = previewHash,
+                normalizedOrderContent = normalizedOrderContent,
+                riskDetails = riskDetails,
+                messageJa = "paper entry 注文 preview は SafetyFloor と broker 事前検証を通過しました。",
+            )
+        }
+    }
+
     override suspend fun closePosition(command: ClosePositionCommand): Result<PaperTradeResult> {
         return runCatching {
             validateReason(command.reasonJa)

@@ -481,15 +481,26 @@ class OneShotLlmRunnerTest {
 
         fixture.runner.runOneShot(defaultRequest()).getOrThrow()
 
+        val toolCompletionOrder = fixture.eventLog.events()
+            .filter { event -> event.eventType == CommandEventType.TOOL_CALL_COMPLETED }
+            .map { event -> event.toolName }
+            .filter { toolName -> toolName == "preview_order" || toolName == "place_order" }
         val latencyEvent = fixture.eventLog.events().single { event ->
             val runnerPhaseCompleted = event.eventType == CommandEventType.RUNNER_PHASE_COMPLETED
             val decisionToPlaceOrderPhase = event.payload.contains("decision_to_place_order")
 
             runnerPhaseCompleted && decisionToPlaceOrderPhase
         }
+        val latencyDetails = fixture.eventLog.events().singleRunnerPhaseDetails("decision_to_place_order")
 
+        assertEquals(listOf("preview_order", "place_order"), toolCompletionOrder)
         assertTrue(latencyEvent.payload.contains("durationMillis"))
+        assertTrue(latencyEvent.payload.contains("previewExecutionMillis"))
         assertTrue(latencyEvent.payload.contains("placeOrderExecutionMillis"))
+        assertEquals("true", latencyDetails.stringValue("previewAccepted"))
+        assertEquals(64, latencyDetails.stringValue("previewHash").length)
+        assertEquals(64, latencyDetails.stringValue("placeOrderHash").length)
+        assertFalse(latencyDetails.containsKey("previewHashMismatchWarning"))
     }
 
     @Test
@@ -505,6 +516,7 @@ class OneShotLlmRunnerTest {
 
         assertTrue(allowedToolsConfig.contains("submit_falsification"))
         assertTrue(allowedToolsConfig.contains("get_trade_intent"))
+        assertTrue(allowedToolsConfig.contains("preview_order"))
         assertFalse(allowedToolsConfig.contains("place_order"))
         assertFalse(allowedToolsConfig.contains("submit_decision"))
     }

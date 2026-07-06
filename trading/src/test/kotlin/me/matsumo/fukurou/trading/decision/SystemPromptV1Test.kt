@@ -20,6 +20,7 @@ class SystemPromptV1Test {
         assertEquals("system-prompt-v1", SystemPromptV1.VERSION)
         assertTrue(content.contains("submit_decision"))
         assertTrue(content.contains("submit_falsification"))
+        assertTrue(content.contains("preview_order"))
         assertTrue(content.contains("revision_count <= 2"))
         assertEquals(64, contentHash.length)
         assertTrue(contentHash.matches(Regex("[0-9a-f]{64}")))
