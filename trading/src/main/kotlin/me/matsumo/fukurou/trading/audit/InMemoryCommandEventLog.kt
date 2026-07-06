@@ -50,7 +50,11 @@ class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
         }
     }
 
-    override suspend fun findEvents(limit: Int, eventType: CommandEventType?): Result<List<CommandEvent>> {
+    override suspend fun findEvents(
+        limit: Int,
+        eventType: CommandEventType?,
+        excludeEventTypes: Set<CommandEventType>,
+    ): Result<List<CommandEvent>> {
         return runCatching {
             require(limit > 0) {
                 "limit must be greater than 0."
@@ -58,7 +62,7 @@ class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
 
             mutex.withLock {
                 storedEvents
-                    .filter { event -> event.matchesEventType(eventType) }
+                    .filter { event -> event.matchesEventTypeFilter(eventType, excludeEventTypes) }
                     .sortedByDescending { event -> event.occurredAt }
                     .take(limit)
             }
@@ -73,8 +77,14 @@ class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
     }
 }
 
-private fun CommandEvent.matchesEventType(eventType: CommandEventType?): Boolean {
-    return eventType == null || this.eventType == eventType
+private fun CommandEvent.matchesEventTypeFilter(
+    eventType: CommandEventType?,
+    excludeEventTypes: Set<CommandEventType>,
+): Boolean {
+    val includedByType = eventType == null || this.eventType == eventType
+    val notExcluded = this.eventType !in excludeEventTypes
+
+    return includedByType && notExcluded
 }
 
 /**

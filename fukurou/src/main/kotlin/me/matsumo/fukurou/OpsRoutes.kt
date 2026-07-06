@@ -548,8 +548,9 @@ internal fun Route.opsRoutes(
         } else {
             call.requireCommandEventType(eventTypeParameter) ?: return@get
         }
+        val excludeEventTypes = call.requireExcludeEventTypes() ?: return@get
         val reader = call.requireCommandEventFeedReader(commandEventFeedReader) ?: return@get
-        val events = reader.findEvents(limit, eventType).getOrThrow()
+        val events = reader.findEvents(limit, eventType, excludeEventTypes).getOrThrow()
 
         call.respond(
             OpsAuditResponse(
@@ -558,7 +559,7 @@ internal fun Route.opsRoutes(
         )
     }.describe {
         summary = "command_event_log の raw feed を取得する"
-        description = "監査イベントを新しい順で返します。limit は既定 50、最大 200、eventType で任意に絞り込めます。"
+        description = "監査イベントを新しい順で返します。limit は既定 50、最大 200、eventType で任意に絞り込めます。excludeEventType（複数指定可）で高頻度な heartbeat などを除外できます。"
         tag(OPS_TAG)
         responses {
             HttpStatusCode.OK {
@@ -694,6 +695,19 @@ private suspend fun ApplicationCall.requireCommandEventType(rawEventType: String
     respond(HttpStatusCode.BadRequest, ErrorResponse("eventType is invalid"))
 
     return null
+}
+
+private suspend fun ApplicationCall.requireExcludeEventTypes(): Set<CommandEventType>? {
+    val rawExcludeEventTypes = request.queryParameters.getAll("excludeEventType") ?: return emptySet()
+
+    val excludeEventTypes = mutableSetOf<CommandEventType>()
+
+    for (rawExcludeEventType in rawExcludeEventTypes) {
+        val excludeEventType = requireCommandEventType(rawExcludeEventType) ?: return null
+        excludeEventTypes.add(excludeEventType)
+    }
+
+    return excludeEventTypes
 }
 
 private suspend fun ApplicationCall.respondConflictOrThrow(result: Result<RiskState>): RiskState? {

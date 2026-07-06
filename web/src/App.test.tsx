@@ -105,7 +105,7 @@ describe("App", () => {
       expect.objectContaining({ method: "GET" }),
     );
     expect(fetchMock).toHaveBeenCalledWith(
-      "/ops/audit?limit=50",
+      "/ops/audit?limit=50&excludeEventType=RECONCILER_PASS_COMPLETED",
       expect.objectContaining({ method: "GET" }),
     );
     expect(fetchMock).toHaveBeenCalledWith(
