@@ -561,6 +561,22 @@ internal fun Route.opsRoutes(
         summary = "command_event_log の raw feed を取得する"
         description = "監査イベントを新しい順で返します。limit は既定 50、最大 200、eventType で任意に絞り込めます。excludeEventType（複数指定可）で高頻度な heartbeat などを除外できます。"
         tag(OPS_TAG)
+        parameters {
+            query("limit") {
+                description = "取得件数です。既定 50、最大 200 です。"
+                schema = jsonSchema<Int>()
+            }
+            query("eventType") {
+                description = "指定した event_type だけに絞り込みます。値は CommandEventType の名前です。"
+                schema = jsonSchema<String>()
+            }
+            query("excludeEventType") {
+                description = "除外する event_type です。複数指定可（例: excludeEventType=RECONCILER_PASS_COMPLETED）。値は CommandEventType の名前です。"
+                schema = jsonSchema<List<String>>()
+                style = "form"
+                explode = true
+            }
+        }
         responses {
             HttpStatusCode.OK {
                 description = "audit raw feed です。"
