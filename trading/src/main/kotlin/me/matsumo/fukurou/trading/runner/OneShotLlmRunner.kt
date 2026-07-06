@@ -623,6 +623,7 @@ class OneShotLlmRunner(
                 placeOrderHash = null,
                 hashMismatchWarning = null,
                 hardHaltSideEffectAttempted = false,
+                hardHaltSideEffectUnexpectedAccepted = false,
                 accepted = false,
             ).getOrThrow()
 
@@ -631,13 +632,22 @@ class OneShotLlmRunner(
 
         if (!preview.accepted) {
             val hardHaltSideEffectResult = if (preview.requiresHardHaltSideEffect()) {
-                placeRejectedPreviewForHardHaltSideEffect(context, intent)
+                recoverRejectedPreviewHardHaltSideEffect(
+                    context = context,
+                    intent = intent,
+                    preview = preview,
+                )
             } else {
                 null
             }
             val hardHaltSideEffectFailure = hardHaltSideEffectResult?.result?.exceptionOrNull()
-            val rejectedTradeResult = hardHaltSideEffectResult?.result?.getOrNull()
-                ?: preview.toRejectedPaperTradeResult()
+            val hardHaltSideEffectUnexpectedAccepted = hardHaltSideEffectResult.isUnexpectedAccepted()
+            val rejectedTradeResult = if (hardHaltSideEffectUnexpectedAccepted) {
+                preview.toRejectedPaperTradeResult()
+            } else {
+                hardHaltSideEffectResult?.result?.getOrNull()
+                    ?: preview.toRejectedPaperTradeResult()
+            }
             val hashMismatchWarning = hardHaltSideEffectResult?.let { result ->
                 if (preview.previewHash == result.placeOrderHash) {
                     null
@@ -656,14 +666,20 @@ class OneShotLlmRunner(
                 placeOrderHash = hardHaltSideEffectResult?.placeOrderHash,
                 hashMismatchWarning = hashMismatchWarning,
                 hardHaltSideEffectAttempted = hardHaltSideEffectResult != null,
-                accepted = rejectedTradeResult.accepted,
+                hardHaltSideEffectUnexpectedAccepted = hardHaltSideEffectUnexpectedAccepted,
+                accepted = false,
             ).getOrThrow()
 
             if (hardHaltSideEffectFailure != null) {
                 return Result.failure(hardHaltSideEffectFailure)
             }
 
-            recordNoTrade(context, "preview_order_rejected", null).getOrThrow()
+            val noTradeReason = if (hardHaltSideEffectUnexpectedAccepted) {
+                "preview_order_hard_halt_recovery_unexpected_accepted"
+            } else {
+                "preview_order_rejected"
+            }
+            recordNoTrade(context, noTradeReason, null).getOrThrow()
 
             return Result.success(rejectedTradeResult)
         }
@@ -701,6 +717,7 @@ class OneShotLlmRunner(
             placeOrderHash = placeOrderHash,
             hashMismatchWarning = hashMismatchWarning,
             hardHaltSideEffectAttempted = false,
+            hardHaltSideEffectUnexpectedAccepted = false,
             accepted = result.getOrNull()?.accepted ?: false,
         ).getOrThrow()
         if (result.getOrNull()?.accepted == false) {
@@ -720,6 +737,7 @@ class OneShotLlmRunner(
         placeOrderHash: String?,
         hashMismatchWarning: String?,
         hardHaltSideEffectAttempted: Boolean,
+        hardHaltSideEffectUnexpectedAccepted: Boolean,
         accepted: Boolean,
     ): Result<Unit> {
         return appendRunnerPhase(
@@ -746,15 +764,17 @@ class OneShotLlmRunner(
                     put("previewHashMismatchWarning", hashMismatchWarning)
                 }
                 put("hardHaltSideEffectAttempted", hardHaltSideEffectAttempted)
+                put("hardHaltSideEffectUnexpectedAccepted", hardHaltSideEffectUnexpectedAccepted)
                 put("accepted", accepted)
             },
         )
     }
 
-    private suspend fun placeRejectedPreviewForHardHaltSideEffect(
+    private suspend fun recoverRejectedPreviewHardHaltSideEffect(
         context: DecisionRunContext,
         intent: TradeIntentRecord,
-    ): PreviewRejectedPlaceOrderResult {
+        preview: PreviewOrderResult,
+    ): PreviewRejectedHardHaltRecoveryResult {
         val executionStartedAt = System.nanoTime()
         val call = GuardedToolCall(
             toolName = "place_order",
@@ -768,13 +788,16 @@ class OneShotLlmRunner(
             }.toString(),
         )
         val command = intent.toPlaceOrderCommand(call)
+        val violation = requireNotNull(preview.safetyViolation) {
+            "preview rejected hard halt recovery requires SafetyViolation."
+        }
         val placeOrderHash = command.toPreviewOrderNormalizedContent().calculatePreviewHash()
         val result = tradingRuntime.toolCallGuard.runSafetyRecoveryTool(call) {
-            tradingRuntime.broker.placeOrder(command).getOrThrow()
+            tradingRuntime.broker.recoverRejectedPreviewHardHalt(command, violation).getOrThrow()
         }
         val executionDuration = Duration.ofNanos(System.nanoTime() - executionStartedAt)
 
-        return PreviewRejectedPlaceOrderResult(
+        return PreviewRejectedHardHaltRecoveryResult(
             result = result,
             executionDuration = executionDuration,
             placeOrderHash = placeOrderHash,
@@ -813,6 +836,10 @@ class OneShotLlmRunner(
 
     private fun PreviewOrderResult.requiresHardHaltSideEffect(): Boolean {
         return safetyViolation?.hardHaltRequired == true
+    }
+
+    private fun PreviewRejectedHardHaltRecoveryResult?.isUnexpectedAccepted(): Boolean {
+        return this?.result?.getOrNull()?.accepted == true
     }
 
     private suspend fun recordFalsificationNoTrade(
@@ -1149,13 +1176,13 @@ private data class RunnerLaunchEligibility(
 )
 
 /**
- * preview rejected 後に place_order rejection 経路へ通した結果。
+ * preview rejected 後に HARD_HALT 副作用だけを復旧した結果。
  *
- * @param result broker が返した authoritative rejection result
- * @param executionDuration place_order fallback 実行時間
+ * @param result broker が返した side effect recovery result
+ * @param executionDuration recovery 実行時間
  * @param placeOrderHash place_order 入力の normalized order hash
  */
-private data class PreviewRejectedPlaceOrderResult(
+private data class PreviewRejectedHardHaltRecoveryResult(
     val result: Result<PaperTradeResult>,
     val executionDuration: Duration,
     val placeOrderHash: String,

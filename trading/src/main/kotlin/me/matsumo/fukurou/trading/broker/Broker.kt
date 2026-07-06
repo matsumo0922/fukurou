@@ -5,6 +5,7 @@ import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.safety.SafetyViolation
 import java.time.Instant
 
 /**
@@ -104,6 +105,16 @@ interface Broker {
      * paper entry 注文を副作用なしで事前検証する。
      */
     suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult>
+
+    /**
+     * preview rejected 後に HARD_HALT 副作用だけを復旧する。
+     */
+    suspend fun recoverRejectedPreviewHardHalt(
+        command: PlaceOrderCommand,
+        violation: SafetyViolation,
+    ): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("Rejected preview recovery is not supported."))
+    }
 
     /**
      * paper position を close する。
