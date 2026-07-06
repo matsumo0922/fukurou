@@ -518,7 +518,7 @@ private fun Server.registerSubmitDecisionTool(
                 }
                 putStringArraySchema("setup_tags", "Setup taxonomy tags.")
                 putDecimalStringSchema("estimated_win_probability", "Estimated win probability from 0 to 1.")
-                putDecimalStringSchema("expected_r_multiple", "Expected reward multiple in R.")
+                putDecimalStringSchema("expected_r_multiple", "Required expected R for every action. Submit 0 when no setup or managed-plan residual R is unavailable; negative values are valid.")
                 putDecimalStringSchema("round_trip_cost_r", "Round-trip cost expressed in R.")
                 putStringArraySchema("tool_evidence_ids", "Tool call IDs used as decision evidence.")
                 putJsonObject("fact_check") {
@@ -542,6 +542,7 @@ private fun Server.registerSubmitDecisionTool(
             required = listOf(
                 "action",
                 "estimated_win_probability",
+                "expected_r_multiple",
                 "fact_check",
                 "self_review",
                 "reason_ja",
@@ -1321,7 +1322,7 @@ private fun parseDecisionSubmission(
             action = action,
             setupTags = request.stringListArgument("setup_tags"),
             estimatedWinProbability = parseBigDecimalArgument(request, "estimated_win_probability").getOrThrow(),
-            expectedRMultiple = parseOptionalBigDecimalArgument(request, "expected_r_multiple").getOrThrow(),
+            expectedRMultiple = parseBigDecimalArgument(request, "expected_r_multiple").getOrThrow(),
             roundTripCostR = parseOptionalBigDecimalArgument(request, "round_trip_cost_r").getOrThrow(),
             toolEvidenceIds = request.stringListArgument("tool_evidence_ids"),
             factCheckJson = requiredStringArgument(request, "fact_check"),
