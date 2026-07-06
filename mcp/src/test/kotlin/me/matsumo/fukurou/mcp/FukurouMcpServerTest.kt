@@ -46,6 +46,7 @@ import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.PreviewOrderResult
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -118,6 +119,7 @@ class FukurouMcpServerTest {
                 "get_trade_intent",
                 "submit_decision",
                 "submit_falsification",
+                "preview_order",
                 "place_order",
                 "close_position",
                 "update_protection",
@@ -565,6 +567,70 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun previewOrderTool_acceptsApprovedIntentWithoutPaperExecutionSideEffects() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = PreviewMarketDataSource,
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = PreviewMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+        val intentId = submitApprovedEnterIntent(server)
+
+        val result = callTool(server, "preview_order", placeOrderArguments(intentId))
+        val structuredContent = assertNotNull(result.structuredContent)
+        val normalizedOrderContent = structuredContent.getValue("normalized_order_content").jsonObject
+        val riskDetails = structuredContent.getValue("risk_details").jsonObject
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(result.isError != true)
+        assertEquals(true, structuredContent.getValue("accepted").jsonPrimitive.booleanOrNull)
+        assertEquals(64, structuredContent.getValue("preview_hash").jsonPrimitive.contentOrNull?.length)
+        assertEquals(intentId, normalizedOrderContent.getValue("intent_id").jsonPrimitive.contentOrNull)
+        assertEquals("0.0050", normalizedOrderContent.getValue("size_btc").jsonPrimitive.contentOrNull)
+        assertNotNull(riskDetails.getValue("estimated_entry_price_jpy").jsonPrimitive.contentOrNull)
+        assertEquals(0, runtime.broker.getPositions().getOrThrow().size)
+        assertEquals(0, runtime.broker.getOpenOrders().getOrThrow().size)
+        assertEquals(0, repository.intentConsumptions().size)
+    }
+
+    @Test
+    fun previewOrderTool_rejectedPathMatchesPlaceOrderFirstSafetyViolation() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = PreviewMarketDataSource,
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = PreviewMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+        val intentId = submitApprovedEnterIntent(server)
+        val mismatchedArguments = placeOrderArguments(
+            intentId = intentId,
+            sizeBtc = "0.0100",
+        )
+
+        val previewResult = callTool(server, "preview_order", mismatchedArguments)
+        val placeOrderResult = callTool(server, "place_order", mismatchedArguments)
+        val previewContent = assertNotNull(previewResult.structuredContent)
+        val placeOrderContent = assertNotNull(placeOrderResult.structuredContent)
+        val previewViolation = previewContent.getValue("safety_violation").jsonObject
+        val placeOrderViolation = placeOrderContent.getValue("safety_violation").jsonObject
+
+        assertTrue(previewResult.isError != true)
+        assertTrue(placeOrderResult.isError != true)
+        assertEquals(false, previewContent.getValue("accepted").jsonPrimitive.booleanOrNull)
+        assertEquals(false, placeOrderContent.getValue("accepted").jsonPrimitive.booleanOrNull)
+        assertEquals(
+            placeOrderViolation.getValue("rule").jsonPrimitive.contentOrNull,
+            previewViolation.getValue("rule").jsonPrimitive.contentOrNull,
+        )
+    }
+
+    @Test
     fun submitFalsificationTool_rejectsMissingIntentId() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
@@ -948,6 +1014,39 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun previewOrderTool_doesNotConsumeActToolBudget() = runBlocking {
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(
+                maxToolCallsPerRun = 5,
+                maxActToolCallsPerRun = 1,
+            ),
+        )
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = PreviewMarketDataSource,
+            tradingConfig = config,
+        )
+        val server = FukurouMcpServer(
+            tradingConfig = config,
+            marketDataSource = PreviewMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+        val intentId = submitApprovedEnterIntent(server)
+        val tradeRequest = buildJsonObject {
+            put("reason", "act limit test")
+        }
+
+        val tradeResult = callTool(server, "reject_dummy_trade", tradeRequest)
+        val previewResult = callTool(server, "preview_order", placeOrderArguments(intentId))
+        val previewContent = assertNotNull(previewResult.structuredContent)
+
+        assertTrue(tradeResult.isError == true)
+        assertTrue(previewResult.isError != true)
+        assertEquals(true, previewContent.getValue("accepted").jsonPrimitive.booleanOrNull)
+    }
+
+    @Test
     fun toolAllowlistDenied_returnsToolErrorAndNoTradeAudit() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
@@ -1034,6 +1133,44 @@ private fun enterDecisionArguments() = buildJsonObject {
     put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ", "出来高急減"))
     put("trade_plan_target_price_jpy", "10500000")
     put("trade_plan_time_stop_at", "2026-07-02T01:00:00Z")
+}
+
+private suspend fun submitApprovedEnterIntent(server: io.modelcontextprotocol.kotlin.sdk.server.Server): String {
+    val decisionResult = callTool(server, "submit_decision", enterDecisionArguments())
+    val intentId = assertNotNull(decisionResult.structuredContent)
+        .getValue("intent_id")
+        .jsonPrimitive
+        .contentOrNull
+        .let { value -> assertNotNull(value) }
+    val falsificationResult = callTool(
+        server = server,
+        toolName = "submit_falsification",
+        arguments = buildJsonObject {
+            put("intent_id", intentId)
+            put("verdict", FalsificationVerdict.APPROVED.name)
+            put("llm_provider", "codex")
+            put("reason_ja", "preview test approved")
+        },
+    )
+
+    assertTrue(falsificationResult.isError != true)
+
+    return intentId
+}
+
+private fun placeOrderArguments(
+    intentId: String,
+    sizeBtc: String = "0.0050",
+) = buildJsonObject {
+    put("intent_id", intentId)
+    put("symbol", TradingSymbol.BTC.apiSymbol)
+    put("side", "BUY")
+    put("type", "MARKET")
+    put("size_btc", sizeBtc)
+    put("protective_stop_price_jpy", "9700000")
+    put("take_profit_price_jpy", "10500000")
+    put("estimated_win_probability", "0.73")
+    put("reason", "preview test order")
 }
 
 /**
@@ -1205,6 +1342,10 @@ private class SnapshotOnlyBroker(
     }
 
     override suspend fun placeOrder(command: PlaceOrderCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 
@@ -1396,6 +1537,61 @@ private object FakeMarketDataSource : MarketDataSource {
                 ),
             ),
         )
+    }
+
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
+        return Result.success(
+            SymbolRules(
+                symbol = symbol.apiSymbol,
+                minOrderSize = "0.0001",
+                sizeStep = "0.0001",
+                tickSize = "1",
+                takerFee = "0.0005",
+                makerFee = "-0.0001",
+            ),
+        )
+    }
+}
+
+/**
+ * preview_order test 用の高価格帯 fake market data source。
+ */
+private object PreviewMarketDataSource : MarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return Result.success(
+            Ticker(
+                symbol = symbol.apiSymbol,
+                last = "10000000",
+                bid = "9990000",
+                ask = "10000000",
+                high = "10100000",
+                low = "9900000",
+                volume = "1.0",
+                timestamp = fixedInstant().toString(),
+            ),
+        )
+    }
+
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.success(
+            Orderbook(
+                symbol = symbol.apiSymbol,
+                bids = listOf(OrderbookLevel("9990000", "0.1")),
+                asks = listOf(OrderbookLevel("10000000", "0.1")),
+            ),
+        )
+    }
+
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> {
+        return Result.success(emptyList())
     }
 
     override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {

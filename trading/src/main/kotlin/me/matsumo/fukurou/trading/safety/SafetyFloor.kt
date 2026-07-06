@@ -335,6 +335,56 @@ data class SafetyViolation(
 )
 
 /**
+ * place_order / preview_order の SafetyFloor 計算詳細。
+ *
+ * @param estimatedEntryPriceJpy SafetyFloor が見積もった entry 価格
+ * @param orderRiskJpy 今回注文単体の最大損失見積もり
+ * @param groupRiskBeforeOrderJpy 注文前 trade group risk
+ * @param groupRiskAfterOrderJpy 注文後 trade group risk
+ * @param maxRiskPerTradeJpy 1 trade group の risk 上限
+ * @param currentExposureJpy 注文前 exposure
+ * @param orderExposureJpy 今回注文単体の exposure
+ * @param totalExposureAfterOrderJpy 注文後 exposure
+ * @param maxTotalExposureJpy total exposure 上限
+ * @param availableCashJpy 未約定買い予約を差し引いた利用可能 cash
+ * @param requiredCashJpy 今回注文に必要な cash 見積もり
+ * @param expectedValueR EV の R 倍
+ * @param expectedMoveToCostRatio 期待値幅 / 往復 cost 比
+ * @param probabilityUsedForExpectedValue EV 計算に使った勝率
+ * @param probabilityCapApplied データ鮮度 cap が適用されたか
+ */
+data class SafetyFloorPlaceOrderRiskDetails(
+    val estimatedEntryPriceJpy: String,
+    val orderRiskJpy: String,
+    val groupRiskBeforeOrderJpy: String,
+    val groupRiskAfterOrderJpy: String,
+    val maxRiskPerTradeJpy: String,
+    val currentExposureJpy: String,
+    val orderExposureJpy: String,
+    val totalExposureAfterOrderJpy: String,
+    val maxTotalExposureJpy: String,
+    val availableCashJpy: String,
+    val requiredCashJpy: String,
+    val expectedValueR: String?,
+    val expectedMoveToCostRatio: String?,
+    val probabilityUsedForExpectedValue: String,
+    val probabilityCapApplied: Boolean,
+)
+
+/**
+ * EV 計算の途中結果。
+ *
+ * @param expectedValueR EV の R 倍
+ * @param probabilityUsed EV 計算に使った勝率
+ * @param probabilityCapApplied データ鮮度 cap が適用されたか
+ */
+private data class ExpectedValueDetails(
+    val expectedValueR: BigDecimal,
+    val probabilityUsed: BigDecimal,
+    val probabilityCapApplied: Boolean,
+)
+
+/**
  * Broker 副作用の手前で強制する安全床。
  *
  * @param config 安全床しきい値
@@ -362,6 +412,51 @@ class SafetyFloor(
         validateExpectedMoveToCost(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
 
         return SafetyFloorVerdict.Accepted
+    }
+
+    /**
+     * place_order / preview_order の主要な risk 計算詳細を返す。
+     */
+    fun placeOrderRiskDetails(
+        command: PlaceOrderCommand,
+        context: SafetyFloorContext,
+    ): SafetyFloorPlaceOrderRiskDetails {
+        val targetTradeGroupId = command.tradeGroupId?.toString()
+        val estimatedEntryPrice = estimatedEntryPrice(command, context)
+        val groupRiskBeforeOrder = groupRiskBeforeOrder(context, targetTradeGroupId)
+        val orderRisk = orderRisk(command, context)
+        val groupRiskAfterOrder = groupRiskBeforeOrder.add(orderRisk).safetyScale()
+        val maxRiskPerTrade = context.account.totalEquityJpy.toBigDecimal()
+            .multiply(config.maxRiskPerTradeRatio)
+            .safetyScale()
+        val currentExposure = currentExposure(context)
+        val orderExposure = orderExposure(command, context)
+        val totalExposureAfterOrder = currentExposure.add(orderExposure).safetyScale()
+        val maxTotalExposure = context.account.totalEquityJpy.toBigDecimal()
+            .multiply(config.maxTotalExposureRatio)
+            .safetyScale()
+        val expectedValueDetails = expectedValueDetailsOrNull(command, context)
+
+        return SafetyFloorPlaceOrderRiskDetails(
+            estimatedEntryPriceJpy = estimatedEntryPrice.toPlainString(),
+            orderRiskJpy = orderRisk.toPlainString(),
+            groupRiskBeforeOrderJpy = groupRiskBeforeOrder.toPlainString(),
+            groupRiskAfterOrderJpy = groupRiskAfterOrder.toPlainString(),
+            maxRiskPerTradeJpy = maxRiskPerTrade.toPlainString(),
+            currentExposureJpy = currentExposure.toPlainString(),
+            orderExposureJpy = orderExposure.toPlainString(),
+            totalExposureAfterOrderJpy = totalExposureAfterOrder.toPlainString(),
+            maxTotalExposureJpy = maxTotalExposure.toPlainString(),
+            availableCashJpy = availableCash(context).toPlainString(),
+            requiredCashJpy = orderRequiredCash(command, context).toPlainString(),
+            expectedValueR = expectedValueDetails?.expectedValueR?.toPlainString(),
+            expectedMoveToCostRatio = expectedMoveToCostRatioOrNull(command, context)?.toPlainString(),
+            probabilityUsedForExpectedValue = expectedValueDetails
+                ?.probabilityUsed
+                ?.toPlainString()
+                ?: command.estimatedWinProbability.toPlainString(),
+            probabilityCapApplied = expectedValueDetails?.probabilityCapApplied ?: false,
+        )
     }
 
     /**
@@ -676,23 +771,13 @@ class SafetyFloor(
                 measuredValue = "null",
                 limitValue = "required",
             )
-        val cappedProbability = cappedProbabilityOrNull(probability, context)
-        val probabilityForExpectedValue = cappedProbability ?: probability
-        val probabilityCapSuffix = probabilityCapSuffix(cappedProbability)
-        val entryPrice = estimatedEntryPrice(command, context)
-        val riskAmount = entryRiskAmount(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy)
-        val expectedRMultiple = expectedRMultiple(command.sizeBtc, entryPrice, takeProfitPrice, riskAmount)
-        val roundTripCostR = roundTripCost(
-            sizeBtc = command.sizeBtc,
-            entryPrice = entryPrice,
-            stopPrice = command.protectiveStopPriceJpy,
-            context = context,
-        ).divideOrZero(riskAmount)
-        val expectedValueR = probabilityForExpectedValue
-            .multiply(expectedRMultiple)
-            .subtract(BigDecimal.ONE.subtract(probabilityForExpectedValue))
-            .subtract(roundTripCostR)
-            .safetyScale()
+        val expectedValueDetails = expectedValueDetails(command, context, takeProfitPrice)
+        val expectedValueR = expectedValueDetails.expectedValueR
+        val probabilityCapSuffix = if (expectedValueDetails.probabilityCapApplied) {
+            probabilityCapSuffix(expectedValueDetails.probabilityUsed)
+        } else {
+            ""
+        }
 
         if (expectedValueR <= BigDecimal.ZERO) {
             return violation(
@@ -720,11 +805,7 @@ class SafetyFloor(
     }
 
     private fun validateExpectedMoveToCost(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
-        val takeProfitPrice = command.takeProfitPriceJpy ?: return null
-        val entryPrice = estimatedEntryPrice(command, context)
-        val expectedMove = takeProfitPrice.subtract(entryPrice).maxZero().multiply(command.sizeBtc)
-        val roundTripCost = roundTripCost(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy, context)
-        val impliedRatio = expectedMove.divideOrZero(roundTripCost)
+        val impliedRatio = expectedMoveToCostRatioOrNull(command, context) ?: return null
 
         if (impliedRatio >= config.minExpectedMoveToCostRatio) {
             return null
@@ -1028,11 +1109,61 @@ class SafetyFloor(
         return config.dataQualityCap.cappedProbability
     }
 
-    private fun probabilityCapSuffix(cappedProbability: BigDecimal?): String {
-        if (cappedProbability == null) {
-            return ""
+    private fun expectedValueDetailsOrNull(
+        command: PlaceOrderCommand,
+        context: SafetyFloorContext,
+    ): ExpectedValueDetails? {
+        val takeProfitPrice = command.takeProfitPriceJpy ?: return null
+        val probability = command.estimatedWinProbability
+        val probabilityInRange = probability >= BigDecimal.ZERO && probability <= BigDecimal.ONE
+
+        if (!probabilityInRange) {
+            return null
         }
 
+        return expectedValueDetails(command, context, takeProfitPrice)
+    }
+
+    private fun expectedValueDetails(
+        command: PlaceOrderCommand,
+        context: SafetyFloorContext,
+        takeProfitPrice: BigDecimal,
+    ): ExpectedValueDetails {
+        val probability = command.estimatedWinProbability
+        val cappedProbability = cappedProbabilityOrNull(probability, context)
+        val probabilityForExpectedValue = cappedProbability ?: probability
+        val entryPrice = estimatedEntryPrice(command, context)
+        val riskAmount = entryRiskAmount(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy)
+        val expectedRMultiple = expectedRMultiple(command.sizeBtc, entryPrice, takeProfitPrice, riskAmount)
+        val roundTripCostR = roundTripCost(
+            sizeBtc = command.sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = command.protectiveStopPriceJpy,
+            context = context,
+        ).divideOrZero(riskAmount)
+        val expectedValueR = probabilityForExpectedValue
+            .multiply(expectedRMultiple)
+            .subtract(BigDecimal.ONE.subtract(probabilityForExpectedValue))
+            .subtract(roundTripCostR)
+            .safetyScale()
+
+        return ExpectedValueDetails(
+            expectedValueR = expectedValueR,
+            probabilityUsed = probabilityForExpectedValue,
+            probabilityCapApplied = cappedProbability != null,
+        )
+    }
+
+    private fun expectedMoveToCostRatioOrNull(command: PlaceOrderCommand, context: SafetyFloorContext): BigDecimal? {
+        val takeProfitPrice = command.takeProfitPriceJpy ?: return null
+        val entryPrice = estimatedEntryPrice(command, context)
+        val expectedMove = takeProfitPrice.subtract(entryPrice).maxZero().multiply(command.sizeBtc)
+        val roundTripCost = roundTripCost(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy, context)
+
+        return expectedMove.divideOrZero(roundTripCost)
+    }
+
+    private fun probabilityCapSuffix(cappedProbability: BigDecimal): String {
         return "データ鮮度劣化により p を ${cappedProbability.toPlainString()} に cap しました。"
     }
 }

@@ -101,6 +101,11 @@ interface Broker {
     suspend fun placeOrder(command: PlaceOrderCommand): Result<PaperTradeResult>
 
     /**
+     * paper entry 注文を副作用なしで事前検証する。
+     */
+    suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult>
+
+    /**
      * paper position を close する。
      */
     suspend fun closePosition(command: ClosePositionCommand): Result<PaperTradeResult>

@@ -49,6 +49,7 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.PreviewOrderResult
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -126,6 +127,11 @@ private const val GET_ACCOUNT_STATUS_TOOL = "get_account_status"
 private const val GET_TRADE_INTENT_TOOL = "get_trade_intent"
 
 /**
+ * paper entry 発注 preview tool 名。
+ */
+private const val PREVIEW_ORDER_TOOL = "preview_order"
+
+/**
  * paper entry 発注 tool 名。
  */
 private const val PLACE_ORDER_TOOL = "place_order"
@@ -182,6 +188,7 @@ private val MCP_TOOL_NAMES = setOf(
     GET_TRADE_INTENT_TOOL,
     SUBMIT_DECISION_TOOL,
     SUBMIT_FALSIFICATION_TOOL,
+    PREVIEW_ORDER_TOOL,
     PLACE_ORDER_TOOL,
     CLOSE_POSITION_TOOL,
     UPDATE_PROTECTION_TOOL,
@@ -215,6 +222,20 @@ private const val FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME_PROPERTY = "fukurou.mcp.tes
  * MCP server instance 内で許可する tool 名 allowlist の環境変数名。
  */
 private const val FUKUROU_MCP_ALLOWED_TOOLS_ENV = "FUKUROU_MCP_ALLOWED_TOOLS"
+
+/**
+ * place_order / preview_order の必須引数。
+ */
+private val PLACE_ORDER_REQUIRED_ARGUMENTS = listOf(
+    "intent_id",
+    "side",
+    "type",
+    "size_btc",
+    "protective_stop_price_jpy",
+    "take_profit_price_jpy",
+    "estimated_win_probability",
+    "reason",
+)
 
 /**
  * JSON schema の string 型。
@@ -369,6 +390,7 @@ class FukurouMcpServer(
         server.registerTradeIntentTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerSubmitDecisionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerSubmitFalsificationTool(tradingRuntime, decisionRunContext, toolCallLimiter)
+        server.registerPreviewOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerPlaceOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerClosePositionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerUpdateProtectionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
@@ -597,6 +619,27 @@ private fun Server.registerSubmitFalsificationTool(
     }
 }
 
+private fun Server.registerPreviewOrderTool(
+    tradingRuntime: TradingRuntime,
+    decisionRunContext: DecisionRunContext,
+    toolCallLimiter: McpToolCallLimiter,
+) {
+    addLimitedTool(
+        name = PREVIEW_ORDER_TOOL,
+        description = "Dry-run a paper BTC entry order before place_order. Uses the same input shape and SafetyFloor path, but creates no orders or executions.",
+        inputSchema = ToolSchema(
+            properties = buildPlaceOrderToolProperties(),
+            required = PLACE_ORDER_REQUIRED_ARGUMENTS,
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+        kind = McpToolCallKind.READ_ONLY,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handlePreviewOrder(request, tradingRuntime, call)
+    }
+}
+
 private fun Server.registerPlaceOrderTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
@@ -606,44 +649,8 @@ private fun Server.registerPlaceOrderTool(
         name = PLACE_ORDER_TOOL,
         description = "Place a paper BTC entry order with a fresh approved intent. intent_id, protective_stop_price_jpy, and reason are required.",
         inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("intent_id") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Trade intent UUID approved by submit_falsification.")
-                }
-                putSymbolSchema()
-                putJsonObject("side") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "BUY entry only for BTC spot.")
-                    put("enum", ToolJson.encodeToJsonElement(listOf(OrderSide.BUY.name)))
-                }
-                putJsonObject("type") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "MARKET, LIMIT, or STOP.")
-                    put("enum", ToolJson.encodeToJsonElement(OrderType.entries.map { type -> type.name }))
-                }
-                putDecimalStringSchema("size_btc", "BTC order size.")
-                putDecimalStringSchema("price_jpy", "LIMIT or STOP price. Omit for MARKET.")
-                putJsonObject("trade_group_id") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Optional trade group UUID when adding to an existing group.")
-                }
-                putDecimalStringSchema("protective_stop_price_jpy", "Required protective STOP price after entry fill.")
-                putDecimalStringSchema("take_profit_price_jpy", "Required virtual take-profit trigger price for SafetyFloor EV calculation.")
-                putDecimalStringSchema("estimated_win_probability", "Estimated win probability from 0 to 1. SafetyFloor calculates EV from this value.")
-                putReasonSchema()
-                putClientRequestIdSchema()
-            },
-            required = listOf(
-                "intent_id",
-                "side",
-                "type",
-                "size_btc",
-                "protective_stop_price_jpy",
-                "take_profit_price_jpy",
-                "estimated_win_probability",
-                "reason",
-            ),
+            properties = buildPlaceOrderToolProperties(),
+            required = PLACE_ORDER_REQUIRED_ARGUMENTS,
         ),
         toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
         kind = McpToolCallKind.TRADE,
@@ -651,6 +658,37 @@ private fun Server.registerPlaceOrderTool(
         toolCallLimiter = toolCallLimiter,
     ) { request, call ->
         handlePlaceOrder(request, tradingRuntime, call)
+    }
+}
+
+private fun buildPlaceOrderToolProperties(): JsonObject {
+    return buildJsonObject {
+        putJsonObject("intent_id") {
+            put("type", JSON_TYPE_STRING)
+            put("description", "Trade intent UUID approved by submit_falsification.")
+        }
+        putSymbolSchema()
+        putJsonObject("side") {
+            put("type", JSON_TYPE_STRING)
+            put("description", "BUY entry only for BTC spot.")
+            put("enum", ToolJson.encodeToJsonElement(listOf(OrderSide.BUY.name)))
+        }
+        putJsonObject("type") {
+            put("type", JSON_TYPE_STRING)
+            put("description", "MARKET, LIMIT, or STOP.")
+            put("enum", ToolJson.encodeToJsonElement(OrderType.entries.map { type -> type.name }))
+        }
+        putDecimalStringSchema("size_btc", "BTC order size.")
+        putDecimalStringSchema("price_jpy", "LIMIT or STOP price. Omit for MARKET.")
+        putJsonObject("trade_group_id") {
+            put("type", JSON_TYPE_STRING)
+            put("description", "Optional trade group UUID when adding to an existing group.")
+        }
+        putDecimalStringSchema("protective_stop_price_jpy", "Required protective STOP price after entry fill.")
+        putDecimalStringSchema("take_profit_price_jpy", "Required virtual take-profit trigger price for SafetyFloor EV calculation.")
+        putDecimalStringSchema("estimated_win_probability", "Estimated win probability from 0 to 1. SafetyFloor calculates EV from this value.")
+        putReasonSchema()
+        putClientRequestIdSchema()
     }
 }
 
@@ -1048,6 +1086,23 @@ private suspend fun handleSubmitFalsification(
 
     return result.fold(
         onSuccess = { value -> falsificationResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
+private suspend fun handlePreviewOrder(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    call: GuardedToolCall,
+): CallToolResult {
+    val result = tradingRuntime.toolCallGuard.runReadOnlyTool(call) {
+        val command = parsePlaceOrderCommand(request, call).getOrThrow()
+
+        tradingRuntime.broker.previewOrder(command).getOrThrow()
+    }
+
+    return result.fold(
+        onSuccess = { value -> previewOrderResult(value) },
         onFailure = { throwable -> throwableResult(throwable) },
     )
 }
@@ -1717,6 +1772,55 @@ private fun tradeResult(result: PaperTradeResult): CallToolResult {
             put("position_ids", ToolJson.encodeToJsonElement(result.positionIds))
             put("execution_ids", ToolJson.encodeToJsonElement(result.executionIds))
             put("message", result.messageJa)
+            result.safetyViolation?.let { violation ->
+                putJsonObject("safety_violation") {
+                    put("id", violation.id.toString())
+                    put("rule", violation.rule.name)
+                    put("message", violation.messageJa)
+                    put("measured_value", violation.measuredValue)
+                    put("limit_value", violation.limitValue)
+                    put("hard_halt_required", violation.hardHaltRequired)
+                }
+            }
+        },
+    )
+}
+
+private fun previewOrderResult(result: PreviewOrderResult): CallToolResult {
+    return jsonObjectResult(
+        buildJsonObject {
+            put("accepted", result.accepted)
+            put("preview_hash", result.previewHash)
+            put("message", result.messageJa)
+            putJsonObject("normalized_order_content") {
+                putNullableString("intent_id", result.normalizedOrderContent.intentId)
+                put("symbol", result.normalizedOrderContent.symbol)
+                put("side", result.normalizedOrderContent.side)
+                put("type", result.normalizedOrderContent.orderType)
+                put("size_btc", result.normalizedOrderContent.sizeBtc)
+                putNullableString("price_jpy", result.normalizedOrderContent.priceJpy)
+                putNullableString("trade_group_id", result.normalizedOrderContent.tradeGroupId)
+                put("protective_stop_price_jpy", result.normalizedOrderContent.protectiveStopPriceJpy)
+                putNullableString("take_profit_price_jpy", result.normalizedOrderContent.takeProfitPriceJpy)
+                put("estimated_win_probability", result.normalizedOrderContent.estimatedWinProbability)
+            }
+            putJsonObject("risk_details") {
+                put("estimated_entry_price_jpy", result.riskDetails.estimatedEntryPriceJpy)
+                put("order_risk_jpy", result.riskDetails.orderRiskJpy)
+                put("group_risk_before_order_jpy", result.riskDetails.groupRiskBeforeOrderJpy)
+                put("group_risk_after_order_jpy", result.riskDetails.groupRiskAfterOrderJpy)
+                put("max_risk_per_trade_jpy", result.riskDetails.maxRiskPerTradeJpy)
+                put("current_exposure_jpy", result.riskDetails.currentExposureJpy)
+                put("order_exposure_jpy", result.riskDetails.orderExposureJpy)
+                put("total_exposure_after_order_jpy", result.riskDetails.totalExposureAfterOrderJpy)
+                put("max_total_exposure_jpy", result.riskDetails.maxTotalExposureJpy)
+                put("available_cash_jpy", result.riskDetails.availableCashJpy)
+                put("required_cash_jpy", result.riskDetails.requiredCashJpy)
+                putNullableString("expected_value_r", result.riskDetails.expectedValueR)
+                putNullableString("expected_move_to_cost_ratio", result.riskDetails.expectedMoveToCostRatio)
+                put("probability_used_for_expected_value", result.riskDetails.probabilityUsedForExpectedValue)
+                put("probability_cap_applied", result.riskDetails.probabilityCapApplied)
+            }
             result.safetyViolation?.let { violation ->
                 putJsonObject("safety_violation") {
                     put("id", violation.id.toString())
