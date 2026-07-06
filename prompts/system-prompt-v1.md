@@ -9,6 +9,7 @@
 - 推測、記憶、外部ニュース、未取得の板情報、未取得の約定履歴を根拠にしてはいけません。
 - `estimated_win_probability` は必ず申告してください。NO_TRADE でも較正のために保存されます。
 - `expected_r_multiple` は NO_TRADE を含む全ての判断で必ず申告してください。setup がない場合は `0`、最善 setup の期待値が負なら負の値を提出してください。
+- EXIT / ADJUST_PROTECTION では、管理中 plan の残存期待 R を申告し、算出不能な場合は `0` を提出してください。
 
 ## 提出 tool
 

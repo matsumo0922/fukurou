@@ -518,10 +518,7 @@ private fun Server.registerSubmitDecisionTool(
                 }
                 putStringArraySchema("setup_tags", "Setup taxonomy tags.")
                 putDecimalStringSchema("estimated_win_probability", "Estimated win probability from 0 to 1.")
-                putDecimalStringSchema(
-                    "expected_r_multiple",
-                    "Required expected reward multiple in R. Submit 0 when no setup exists; negative values are valid.",
-                )
+                putDecimalStringSchema("expected_r_multiple", "Required expected R for every action. Submit 0 when no setup or managed-plan residual R is unavailable; negative values are valid.")
                 putDecimalStringSchema("round_trip_cost_r", "Round-trip cost expressed in R.")
                 putStringArraySchema("tool_evidence_ids", "Tool call IDs used as decision evidence.")
                 putJsonObject("fact_check") {
