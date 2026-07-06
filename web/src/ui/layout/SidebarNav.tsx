@@ -11,26 +11,46 @@ type NavigationItem = {
   icon: LucideIcon;
 };
 
-const navigationItems: NavigationItem[] = [
+type NavigationSection = {
+  label: string;
+  items: NavigationItem[];
+};
+
+const navigationSections: NavigationSection[] = [
   {
-    label: "Overview",
-    path: "/app/overview",
-    icon: LayoutDashboard,
+    label: "Read",
+    items: [
+      {
+        label: "Overview",
+        path: "/app/overview",
+        icon: LayoutDashboard,
+      },
+      {
+        label: "Activity",
+        path: "/app/activity",
+        icon: Activity,
+      },
+      {
+        label: "Evaluation",
+        path: "/app/evaluation",
+        icon: ShieldAlert,
+      },
+      {
+        label: "System",
+        path: "/app/system",
+        icon: ServerCog,
+      },
+    ],
   },
   {
-    label: "Activity",
-    path: "/app/activity",
-    icon: Activity,
-  },
-  {
-    label: "Evaluation",
-    path: "/app/evaluation",
-    icon: ShieldAlert,
-  },
-  {
-    label: "System",
-    path: "/app/system",
-    icon: ServerCog,
+    label: "Operate",
+    items: [
+      {
+        label: "Controls",
+        path: "/app/controls",
+        icon: ShieldAlert,
+      },
+    ],
   },
 ];
 
@@ -45,12 +65,19 @@ export function SidebarNav() {
         </div>
       </div>
 
-      <nav className="sidebar__nav">
-        {navigationItems.map((item) => (
-          <NavLink className={navLinkClassName} key={item.path} to={item.path}>
-            <item.icon size={17} aria-hidden="true" />
-            <span>{item.label}</span>
-          </NavLink>
+      <nav className="sidebar__nav" aria-label="App sections">
+        {navigationSections.map((section) => (
+          <div className="sidebar__section" key={section.label}>
+            <p className="sidebar__section-label">{section.label}</p>
+            <div className="sidebar__section-links">
+              {section.items.map((item) => (
+                <NavLink className={navLinkClassName} key={item.path} to={item.path}>
+                  <item.icon size={17} aria-hidden="true" />
+                  <span>{item.label}</span>
+                </NavLink>
+              ))}
+            </div>
+          </div>
         ))}
       </nav>
     </aside>
