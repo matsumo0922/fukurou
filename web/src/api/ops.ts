@@ -1,5 +1,5 @@
 import { queryOptions } from "@tanstack/react-query";
-import { getJson } from "./client";
+import { getJson, postJsonResponse } from "./client";
 import type { components } from "./openapi-types";
 
 export type EvaluationSummaryResponse = components["schemas"]["EvaluationSummaryResponse"];
@@ -11,8 +11,10 @@ export type OpsAccountResponse = components["schemas"]["OpsAccountResponse"];
 export type OpsAuditEventResponse = components["schemas"]["OpsAuditEventResponse"];
 export type OpsDecisionResponse = components["schemas"]["OpsDecisionResponse"];
 export type OpsExecutionResponse = components["schemas"]["OpsExecutionResponse"];
+export type OpsHaltLevel = components["schemas"]["OpsHaltRequest"]["level"];
 export type OpsPositionsResponse = components["schemas"]["OpsPositionsResponse"];
 export type OpsRiskStateResponse = components["schemas"]["OpsRiskStateResponse"];
+export type OpsTriggerResponse = components["schemas"]["OpsTriggerResponse"];
 
 export type ActivityTimelineSource = "audit" | "decision" | "execution";
 
@@ -117,6 +119,24 @@ export const activityTimelineQuery = queryOptions({
   staleTime: 15_000,
   refetchInterval: 30_000,
 });
+
+export async function requestOpsHalt(level: OpsHaltLevel, reason: string): Promise<OpsRiskStateResponse> {
+  const response = await postJsonResponse("/ops/halt", { level, reason }, [200] as const);
+
+  return response.data;
+}
+
+export async function requestOpsResume(reason: string): Promise<OpsRiskStateResponse> {
+  const response = await postJsonResponse("/ops/resume", { reason }, [200] as const);
+
+  return response.data;
+}
+
+export async function requestOpsTrigger(reason: string): Promise<OpsTriggerResponse> {
+  const response = await postJsonResponse("/ops/trigger", { reason }, [202] as const);
+
+  return response.data;
+}
 
 async function fetchActivityTimeline(): Promise<ActivityTimelineSnapshot> {
   const [decisionsResponse, auditResponse, executionsResponse] = await Promise.all([

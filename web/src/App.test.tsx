@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
 
 describe("App", () => {
@@ -22,15 +22,15 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Overview/ })).toHaveAttribute("href", "/app/overview");
     expect(screen.getByRole("link", { name: /Activity/ })).toHaveAttribute("href", "/app/activity");
+    expect(screen.getByRole("link", { name: /Controls/ })).toHaveAttribute("href", "/app/controls");
     expect(screen.getByRole("link", { name: /Evaluation/ })).toHaveAttribute("href", "/app/evaluation");
     expect(screen.getByRole("link", { name: /System/ })).toHaveAttribute("href", "/app/system");
-    expect(screen.queryByText("Controls")).not.toBeInTheDocument();
     expect(screen.queryByText("Notes")).not.toBeInTheDocument();
   });
 
   it("redirects unimplemented app deep links to overview", async () => {
     stubSystemFetch();
-    window.history.pushState({}, "", "/app/controls");
+    window.history.pushState({}, "", "/app/notes");
 
     render(<App />);
 
@@ -38,6 +38,27 @@ describe("App", () => {
       expect(window.location.pathname).toBe("/app/overview");
     });
     expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
+  });
+
+  it("routes to controls and keeps operations out of read-only overview", async () => {
+    stubSystemFetch();
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Controls" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Controls/ })).toHaveAttribute("href", "/app/controls");
+    expect(screen.getByRole("heading", { name: "Halt controls" })).toBeInTheDocument();
+    expect(screen.getByText(/New entry decisions are rejected/)).toBeInTheDocument();
+
+    window.history.pushState({}, "", "/app/overview");
+    cleanup();
+    stubSystemFetch();
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Review SOFT_HALT" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Review manual trigger" })).not.toBeInTheDocument();
   });
 
   it("shows system endpoint data from the real health and revision routes", async () => {
@@ -154,6 +175,154 @@ describe("App", () => {
     );
   });
 
+  it("rejects blank control reasons before calling the API", async () => {
+    const fetchMock = stubSystemFetch();
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Review SOFT_HALT" }));
+
+    expect(screen.getByText("Reason is required before this operation can be reviewed.")).toBeInTheDocument();
+    expect(hasPostCall(fetchMock, "/ops/halt")).toBe(false);
+  });
+
+  it("requires confirmation before submitting a resume request", async () => {
+    const fetchMock = stubSystemFetch();
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("Resume reason"), {
+      target: {
+        value: "operator checked safety state",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review resume request" }));
+
+    expect(screen.getByText("Confirm before sending")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("group", { name: "Confirm resume request confirmation" })).getByText(
+        "operator checked safety state",
+      ),
+    ).toBeInTheDocument();
+    expect(hasPostCall(fetchMock, "/ops/resume")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm resume request" }));
+
+    expect(await screen.findByText("Resume requested")).toBeInTheDocument();
+    expect(postBody(fetchMock, "/ops/resume")).toEqual({
+      reason: "operator checked safety state",
+    });
+  });
+
+  it("locks every mutating control while one operation is in flight", async () => {
+    const fetchMock = stubSystemFetch({
+      resumeResponse: new Promise<Response>(() => undefined),
+    });
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("Resume reason"), {
+      target: {
+        value: "operator checked safety state",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review resume request" }));
+    fireEvent.change(screen.getByLabelText("HARD_HALT reason"), {
+      target: {
+        value: "emergency safety stop",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review HARD_HALT" }));
+
+    const hardHaltConfirmButton = screen.getByRole("button", { name: "Confirm HARD_HALT" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm resume request" }));
+
+    await waitFor(() => {
+      expect(hardHaltConfirmButton).toBeDisabled();
+    });
+    fireEvent.click(hardHaltConfirmButton);
+
+    expect(postBody(fetchMock, "/ops/resume")).toEqual({
+      reason: "operator checked safety state",
+    });
+    expect(hasPostCall(fetchMock, "/ops/halt")).toBe(false);
+  });
+
+  it("submits confirmed halt actions with the selected level", async () => {
+    const fetchMock = stubSystemFetch();
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("HARD_HALT reason"), {
+      target: {
+        value: "emergency safety stop",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review HARD_HALT" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm HARD_HALT" }));
+
+    expect(await screen.findByText("HARD_HALT set")).toBeInTheDocument();
+    expect(postBody(fetchMock, "/ops/halt")).toEqual({
+      level: "HARD",
+      reason: "emergency safety stop",
+    });
+  });
+
+  it("shows manual trigger 409 refusal reasons in user-facing language", async () => {
+    stubSystemFetch({
+      triggerResponse: {
+        status: 409,
+        body: {
+          message: "max_invocations_per_hour_exceeded",
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("Manual trigger reason"), {
+      target: {
+        value: "operator requested a smoke check",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review manual trigger" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm manual trigger" }));
+
+    expect(await screen.findByText("Manual trigger failed")).toBeInTheDocument();
+    expect(screen.getByText(/hourly LLM invocation cap has already been reached/)).toBeInTheDocument();
+  });
+
+  it("shows halt 409 refusal reasons in user-facing language", async () => {
+    stubSystemFetch({
+      haltResponse: {
+        status: 409,
+        body: {
+          message: "SOFT_HALT cannot downgrade HARD_HALT.",
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("SOFT_HALT reason"), {
+      target: {
+        value: "pause new entries after hard halt review",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review SOFT_HALT" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm SOFT_HALT" }));
+
+    expect(await screen.findByText("SOFT_HALT failed")).toBeInTheDocument();
+    expect(screen.getByText(/HARD_HALT is already active/)).toBeInTheDocument();
+  });
+
   it("shows a loading state while system endpoints are pending", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)));
     window.history.pushState({}, "", "/app/system");
@@ -189,6 +358,15 @@ type SystemFetchFixture = {
   };
   revision?: string;
   readinessStatus?: number;
+  haltResponse?: {
+    status: number;
+    body: unknown;
+  };
+  resumeResponse?: Promise<Response>;
+  triggerResponse?: {
+    status: number;
+    body: unknown;
+  };
 };
 
 function stubSystemFetch(fixture: SystemFetchFixture = {}) {
@@ -204,8 +382,9 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
   const revision = fixture.revision ?? "test-sha";
   const readinessStatus = fixture.readinessStatus ?? 200;
 
-  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = requestPath(input);
+    const method = requestMethod(input, init);
 
     switch (path) {
       case "/health":
@@ -228,6 +407,64 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
           resumedReason: null,
           drawdownRatio: "0.01",
         });
+      case "/ops/halt": {
+        if (method !== "POST") {
+          return jsonResponse({ message: "method not allowed" }, { status: 405 });
+        }
+
+        const body = requestJson(init) as { level: "SOFT" | "HARD"; reason: string };
+        const state = body.level === "HARD" ? "HARD_HALT" : "SOFT_HALT";
+
+        if (fixture.haltResponse) {
+          return jsonResponse(fixture.haltResponse.body, { status: fixture.haltResponse.status });
+        }
+
+        return jsonResponse({
+          state,
+          haltReason: body.reason,
+          haltAt: "2026-07-05T12:05:00.000Z",
+          resumedAt: null,
+          resumedReason: null,
+          drawdownRatio: "0.01",
+        });
+      }
+      case "/ops/resume": {
+        if (method !== "POST") {
+          return jsonResponse({ message: "method not allowed" }, { status: 405 });
+        }
+
+        const body = requestJson(init) as { reason: string };
+
+        if (fixture.resumeResponse) {
+          return fixture.resumeResponse;
+        }
+
+        return jsonResponse({
+          state: "RUNNING",
+          haltReason: null,
+          haltAt: null,
+          resumedAt: "2026-07-05T12:06:00.000Z",
+          resumedReason: body.reason,
+          drawdownRatio: "0.01",
+        });
+      }
+      case "/ops/trigger": {
+        if (method !== "POST") {
+          return jsonResponse({ message: "method not allowed" }, { status: 405 });
+        }
+
+        if (fixture.triggerResponse) {
+          return jsonResponse(fixture.triggerResponse.body, { status: fixture.triggerResponse.status });
+        }
+
+        return jsonResponse(
+          {
+            invocationId: "manual-invocation-1",
+            triggerKind: "MANUAL",
+          },
+          { status: 202 },
+        );
+      }
       case "/ops/account":
         return jsonResponse({
           mode: "PAPER",
@@ -546,6 +783,41 @@ function requestPath(input: RequestInfo | URL): string {
   }
 
   return new URL(input, "http://localhost").pathname;
+}
+
+function requestMethod(input: RequestInfo | URL, init?: RequestInit): string {
+  if (init?.method) {
+    return init.method;
+  }
+
+  return input instanceof Request ? input.method : "GET";
+}
+
+function requestJson(init?: RequestInit): unknown {
+  return typeof init?.body === "string" ? JSON.parse(init.body) : null;
+}
+
+type FetchMock = ReturnType<typeof vi.fn>;
+type FetchCall = [RequestInfo | URL, RequestInit?];
+
+function hasPostCall(fetchMock: FetchMock, path: string): boolean {
+  return fetchMock.mock.calls.some((call) => isPostCall(call, path));
+}
+
+function postBody(fetchMock: FetchMock, path: string): unknown {
+  const call = fetchMock.mock.calls.find((mockCall) => isPostCall(mockCall, path));
+
+  return requestJson(toFetchCall(call ?? [])[1]);
+}
+
+function isPostCall(call: unknown[], path: string): boolean {
+  const [input, init] = toFetchCall(call);
+
+  return requestPath(input) === path && requestMethod(input, init) === "POST";
+}
+
+function toFetchCall(call: unknown[]): FetchCall {
+  return [call[0] as RequestInfo | URL, call[1] as RequestInit | undefined];
 }
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {

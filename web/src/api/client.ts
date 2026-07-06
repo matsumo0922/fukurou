@@ -5,6 +5,16 @@ type OperationFor<
   Method extends keyof paths[Path],
 > = paths[Path][Method];
 
+type OperationResponses<Operation> = Operation extends {
+  responses: infer Responses;
+}
+  ? Responses
+  : never;
+
+type ResponseForStatus<Operation, Status extends number> = Status extends keyof OperationResponses<Operation>
+  ? OperationResponses<Operation>[Status]
+  : never;
+
 type SuccessResponse<Operation> = Operation extends {
   responses: {
     200: infer Response;
@@ -31,6 +41,22 @@ type JsonPayload<Content> = Content extends {
   ? Payload
   : never;
 
+type RequestBodyContent<Operation> = Operation extends {
+  requestBody: {
+    content: infer Content;
+  };
+}
+  ? Content
+  : never;
+
+type JsonRequestBody<Content> = Content extends {
+  "application/json": infer Payload;
+}
+  ? Payload
+  : never;
+
+type JsonPostRequestBody<Operation> = JsonRequestBody<RequestBodyContent<Operation>>;
+
 type TextGetPath = {
   [Path in keyof paths]: "get" extends keyof paths[Path]
     ? TextPayload<ResponseContent<SuccessResponse<OperationFor<Path, "get">>>> extends never
@@ -47,6 +73,14 @@ type JsonGetPath = {
     : never;
 }[keyof paths];
 
+type JsonPostPath = {
+  [Path in keyof paths]: "post" extends keyof paths[Path]
+    ? JsonPostRequestBody<OperationFor<Path, "post">> extends never
+      ? never
+      : Path
+    : never;
+}[keyof paths];
+
 type TextResponse<Path extends TextGetPath> = TextPayload<
   ResponseContent<SuccessResponse<OperationFor<Path, "get">>>
 >;
@@ -54,6 +88,13 @@ type TextResponse<Path extends TextGetPath> = TextPayload<
 type JsonResponse<Path extends JsonGetPath> = JsonPayload<
   ResponseContent<SuccessResponse<OperationFor<Path, "get">>>
 >;
+
+type JsonPostBody<Path extends JsonPostPath> = JsonPostRequestBody<OperationFor<Path, "post">>;
+
+type JsonPostResponse<
+  Path extends JsonPostPath,
+  Status extends number,
+> = JsonPayload<ResponseContent<ResponseForStatus<OperationFor<Path, "post">, Status>>>;
 
 type ApiRequestInit = Omit<RequestInit, "body" | "method">;
 type ApiPathWithSearch<Path extends string> = Path | `${Path}?${string}`;
@@ -65,11 +106,12 @@ export type ApiResponse<Payload> = {
 
 export class ApiClientError extends Error {
   constructor(
+    readonly method: string,
     readonly path: string,
     readonly status: number,
     readonly responseText: string,
   ) {
-    super(`GET ${path} failed with status ${status}`);
+    super(`${method} ${path} failed with status ${status}`);
   }
 }
 
@@ -117,11 +159,49 @@ export async function getJsonResponse<Path extends JsonGetPath & string>(
   };
 }
 
+export async function postJsonResponse<
+  Path extends JsonPostPath & string,
+  Status extends number,
+>(
+  path: Path,
+  body: JsonPostBody<Path>,
+  allowedStatuses: readonly Status[],
+  init: ApiRequestInit = {},
+): Promise<ApiResponse<JsonPostResponse<Path, Status>>> {
+  const response = await post(path, body, "application/json", allowedStatuses, init);
+
+  return {
+    status: response.status,
+    data: (await response.json()) as JsonPostResponse<Path, Status>,
+  };
+}
+
 async function get(
   path: string,
   accept: string,
   allowedStatuses: readonly number[],
   init: ApiRequestInit,
+): Promise<Response> {
+  return request("GET", path, accept, allowedStatuses, init);
+}
+
+async function post(
+  path: string,
+  body: unknown,
+  accept: string,
+  allowedStatuses: readonly number[],
+  init: ApiRequestInit,
+): Promise<Response> {
+  return request("POST", path, accept, allowedStatuses, init, body);
+}
+
+async function request(
+  method: "GET" | "POST",
+  path: string,
+  accept: string,
+  allowedStatuses: readonly number[],
+  init: ApiRequestInit,
+  body?: unknown,
 ): Promise<Response> {
   const headers = new Headers(init.headers);
 
@@ -129,14 +209,19 @@ async function get(
     headers.set("Accept", accept);
   }
 
+  if (body !== undefined && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+
   const response = await fetch(path, {
     ...init,
-    method: "GET",
+    body: body === undefined ? undefined : JSON.stringify(body),
+    method,
     headers,
   });
 
   if (!allowedStatuses.includes(response.status)) {
-    throw new ApiClientError(path, response.status, await response.text());
+    throw new ApiClientError(method, path, response.status, await response.text());
   }
 
   return response;
