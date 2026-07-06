@@ -571,7 +571,8 @@ class FukurouMcpServerTest {
     @Test
     fun knowledgeRecentLessonsTool_returnsBoundedReadOnlySummaries() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
-        runtime.llmRunRepository.finish(failedLlmRun("recent-run")).getOrThrow()
+        val longInvocationId = "recent-run-" + "x".repeat(140)
+        runtime.llmRunRepository.finish(failedLlmRun(longInvocationId)).getOrThrow()
         val server = FukurouMcpServer(
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
@@ -581,20 +582,31 @@ class FukurouMcpServerTest {
         callTool(
             server = server,
             toolName = "submit_decision",
-            arguments = noTradeDecisionArguments(invocationId = "recent-run"),
+            arguments = noTradeDecisionArguments(invocationId = longInvocationId),
         )
 
         val result = callTool(
             server = server,
             toolName = "knowledge.get_recent_lessons",
             arguments = buildJsonObject {
-                put("limit", 1)
+                put("limit", 2)
             },
         )
         val structuredContent = assertNotNull(result.structuredContent)
         val lessons = structuredContent.getValue("lessons").jsonArray
         val lesson = lessons.single().jsonObject
         val runSummary = structuredContent.getValue("run_summaries").jsonArray.single().jsonObject
+        val failurePatterns = structuredContent.getValue("failure_patterns").jsonArray
+        val failureSources = failurePatterns.map { pattern ->
+            pattern.jsonObject.getValue("source").jsonPrimitive.contentOrNull
+        }
+        val runFailurePattern = failurePatterns
+            .first()
+            .jsonObject
+        val runFailureSourceId = runFailurePattern
+            .getValue("source_id")
+            .jsonPrimitive
+            .contentOrNull
         val repository = runtime.decisionRepository as InMemoryDecisionRepository
 
         assertTrue(result.isError != true)
@@ -602,8 +614,15 @@ class FukurouMcpServerTest {
         assertEquals(1L, structuredContent.getValue("item_count").jsonPrimitive.longOrNull)
         assertEquals("NO_TRADE", lesson.getValue("action").jsonPrimitive.contentOrNull)
         assertEquals("材料不足のため見送ります。", lesson.getValue("reason_ja").jsonPrimitive.contentOrNull)
+        assertTrue(
+            lesson.getValue("invocation_id").jsonPrimitive.contentOrNull?.contains("[TRUNCATED]") == true,
+        )
         assertEquals(LLM_RUN_STATUS_FAILED, runSummary.getValue("status").jsonPrimitive.contentOrNull)
-        assertTrue(structuredContent.getValue("failure_patterns").jsonArray.isNotEmpty())
+        assertTrue(
+            runSummary.getValue("invocation_id").jsonPrimitive.contentOrNull?.contains("[TRUNCATED]") == true,
+        )
+        assertEquals(listOf("llm_run", "decision"), failureSources)
+        assertTrue(runFailureSourceId?.contains("[TRUNCATED]") == true)
         assertEquals(1, repository.decisions().size)
         assertTrue(!structuredContent.toString().contains("fact_check"))
         assertTrue(!structuredContent.toString().contains("tool_evidence_ids"))
@@ -660,6 +679,35 @@ class FukurouMcpServerTest {
         assertEquals(LLM_RUN_STATUS_FAILED, outcome.getValue("run_status").jsonPrimitive.contentOrNull)
         assertTrue(hit.getValue("score").jsonPrimitive.longOrNull?.let { score -> score > 0L } == true)
         assertTrue(hit.getValue("matched_terms").jsonArray.isNotEmpty())
+    }
+
+    @Test
+    fun knowledgeSimilarSetupsTool_doesNotSubstringMatchShortSearchTokens() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = noTradeDecisionArguments(),
+        )
+
+        val result = callTool(
+            server = server,
+            toolName = "knowledge.search_similar_setups",
+            arguments = buildJsonObject {
+                put("signal_summary", "料不")
+                put("limit", 3)
+            },
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertTrue(result.isError != true)
+        assertTrue(structuredContent.getValue("hits").jsonArray.isEmpty())
     }
 
     @Test

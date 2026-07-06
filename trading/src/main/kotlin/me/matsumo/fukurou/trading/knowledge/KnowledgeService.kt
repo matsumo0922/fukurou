@@ -50,6 +50,11 @@ private const val KNOWLEDGE_TEXT_MAX_LENGTH = 240
 private const val KNOWLEDGE_SHORT_TEXT_MAX_LENGTH = 160
 
 /**
+ * Knowledge response の識別子最大文字数。
+ */
+private const val KNOWLEDGE_IDENTIFIER_MAX_LENGTH = 96
+
+/**
  * Knowledge response の配列要素最大件数。
  */
 private const val KNOWLEDGE_LIST_MAX_ITEMS = 5
@@ -243,19 +248,45 @@ class KnowledgeService(
         setupPerformance: List<KnowledgeSetupPerformanceSummary>,
         limit: Int,
     ): List<KnowledgeFailurePattern> {
+        val runPatterns = runRecords.mapNotNull { record -> record.toRunFailurePatternOrNull() }
+        val performancePatterns = setupPerformance.mapNotNull { performance ->
+            performance.toPerformanceFailurePatternOrNull()
+        }
+        val decisionPatterns = decisionRecords.flatMap { record -> record.toDecisionFailurePatterns() }
+
+        return interleavedFailurePatterns(
+            sourcePatternBuckets = listOf(runPatterns, performancePatterns, decisionPatterns),
+            limit = limit,
+        )
+    }
+
+    private fun interleavedFailurePatterns(
+        sourcePatternBuckets: List<List<KnowledgeFailurePattern>>,
+        limit: Int,
+    ): List<KnowledgeFailurePattern> {
         val patterns = mutableListOf<KnowledgeFailurePattern>()
+        var patternIndex = 0
 
-        decisionRecords.forEach { record ->
-            patterns.addAll(record.toDecisionFailurePatterns())
-        }
-        runRecords.forEach { record ->
-            record.toRunFailurePatternOrNull()?.let { pattern -> patterns.add(pattern) }
-        }
-        setupPerformance.forEach { performance ->
-            performance.toPerformanceFailurePatternOrNull()?.let { pattern -> patterns.add(pattern) }
+        while (patterns.size < limit) {
+            var addedPattern = false
+
+            for (bucket in sourcePatternBuckets) {
+                val canAddPattern = patternIndex < bucket.size && patterns.size < limit
+
+                if (canAddPattern) {
+                    patterns += bucket[patternIndex]
+                    addedPattern = true
+                }
+            }
+
+            if (!addedPattern) {
+                return patterns
+            }
+
+            patternIndex += 1
         }
 
-        return patterns.take(limit)
+        return patterns
     }
 
     private fun DecisionJournalRecord.toKnowledgeLesson(): KnowledgeLesson {
@@ -264,7 +295,7 @@ class KnowledgeService(
         return KnowledgeLesson(
             decisionId = decision.decisionId.toString(),
             createdAt = decision.createdAt,
-            invocationId = submission.invocationId,
+            invocationId = submission.invocationId?.sanitizeIdentifier(),
             action = submission.action.name,
             setupTags = sanitizeList(recordSetupTags(), KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
             estimatedWinProbability = submission.estimatedWinProbability.toPlainString(),
@@ -316,7 +347,7 @@ class KnowledgeService(
 
         return KnowledgeFailurePattern(
             source = "decision",
-            sourceId = decision.decisionId.toString(),
+            sourceId = decision.decisionId.toString().sanitizeIdentifier(),
             occurredAt = decision.createdAt,
             summary = "missing_data",
             evidence = sanitizeList(missingData, KNOWLEDGE_SHORT_TEXT_MAX_LENGTH).joinToString("; "),
@@ -332,7 +363,7 @@ class KnowledgeService(
 
         return KnowledgeFailurePattern(
             source = "decision",
-            sourceId = decision.decisionId.toString(),
+            sourceId = decision.decisionId.toString().sanitizeIdentifier(),
             occurredAt = decision.createdAt,
             summary = "no_trade_conditions",
             evidence = sanitizeList(noTradeConditions, KNOWLEDGE_SHORT_TEXT_MAX_LENGTH).joinToString("; "),
@@ -348,7 +379,7 @@ class KnowledgeService(
 
         return KnowledgeFailurePattern(
             source = "falsification",
-            sourceId = record.falsificationId.toString(),
+            sourceId = record.falsificationId.toString().sanitizeIdentifier(),
             occurredAt = record.createdAt,
             summary = "falsifier_rejected",
             evidence = record.reasonJa.sanitize(KNOWLEDGE_TEXT_MAX_LENGTH),
@@ -364,7 +395,7 @@ class KnowledgeService(
 
         return KnowledgeFailurePattern(
             source = "decision",
-            sourceId = decision.decisionId.toString(),
+            sourceId = decision.decisionId.toString().sanitizeIdentifier(),
             occurredAt = decision.createdAt,
             summary = "non_positive_expected_r",
             evidence = expectedRMultiple.toPlainString(),
@@ -381,7 +412,7 @@ class KnowledgeService(
 
         return KnowledgeFailurePattern(
             source = "llm_run",
-            sourceId = invocationId,
+            sourceId = invocationId.sanitizeIdentifier(),
             occurredAt = finishedAt ?: startedAt,
             summary = status.lowercase(),
             evidence = errorMessage.sanitizeOptional(KNOWLEDGE_TEXT_MAX_LENGTH) ?: "",
@@ -400,7 +431,7 @@ class KnowledgeService(
 
         return KnowledgeFailurePattern(
             source = "evaluation",
-            sourceId = setupTag,
+            sourceId = setupTag.sanitizeIdentifier(),
             occurredAt = null,
             summary = "weak_setup_performance",
             evidence = "trade_count=$tradeCount total_pnl_jpy=$totalPnlJpy expected_r=${expectedR ?: "null"}",
@@ -409,7 +440,7 @@ class KnowledgeService(
 
     private fun LlmRunRecord.toRunSummary(): KnowledgeRunSummary {
         return KnowledgeRunSummary(
-            invocationId = invocationId,
+            invocationId = invocationId.sanitizeIdentifier(),
             mode = mode.name,
             symbol = symbol.apiSymbol,
             status = status,
@@ -428,7 +459,10 @@ class KnowledgeService(
         val recordTags = recordSetupTags().map { tag -> tag.normalizeTerm() }
         val matchedTags = queryTags.filter { tag -> tag.normalizeTerm() in recordTags }
         val searchText = searchableText().normalizeTerm()
-        val matchedTerms = searchTerms.filter { term -> searchText.contains(term.normalizeTerm()) }
+        val searchTokens = searchableTokens()
+        val matchedTerms = searchTerms.filter { term ->
+            term.matchesSearchText(searchText, searchTokens)
+        }
         val falsifierRejectedScore = if (falsification?.verdict == FalsificationVerdict.REJECTED) 1 else 0
         val baseScore = matchedTags.size * 3 + matchedTerms.size
 
@@ -533,14 +567,19 @@ class KnowledgeService(
         ).joinToString(" ")
     }
 
+    private fun DecisionJournalRecord.searchableTokens(): Set<String> {
+        return searchableText().searchTokens().toSet()
+    }
+
     private fun KnowledgeRecentLessonsQuery.toEvaluationPeriod(now: Instant): EvaluationPeriod {
-        return EvaluationPeriod(
-            from = now.minus(Duration.ofDays(lookbackDays.toLong())),
-            toExclusive = now.plusMillis(1),
-        )
+        return evaluationPeriod(now, lookbackDays)
     }
 
     private fun KnowledgeSimilarSetupsQuery.toEvaluationPeriod(now: Instant): EvaluationPeriod {
+        return evaluationPeriod(now, lookbackDays)
+    }
+
+    private fun evaluationPeriod(now: Instant, lookbackDays: Int): EvaluationPeriod {
         return EvaluationPeriod(
             from = now.minus(Duration.ofDays(lookbackDays.toLong())),
             toExclusive = now.plusMillis(1),
@@ -556,14 +595,28 @@ class KnowledgeService(
 
     private fun String.queryTerms(): List<String> {
         val sanitizedValue = sanitize(KNOWLEDGE_TEXT_MAX_LENGTH)
-        val splitTerms = sanitizedValue
-            .split(KnowledgeTokenSplitRegex)
-            .map { value -> value.normalizeTerm() }
-            .filter { value -> value.length >= KNOWLEDGE_MIN_SEARCH_TOKEN_LENGTH }
+        val splitTerms = sanitizedValue.searchTokens()
         val wholeTerm = sanitizedValue.normalizeTerm()
             .takeIf { value -> value.length >= KNOWLEDGE_MIN_SEARCH_TOKEN_LENGTH }
 
         return (splitTerms + listOfNotNull(wholeTerm)).distinct()
+    }
+
+    private fun String.searchTokens(): List<String> {
+        return split(KnowledgeTokenSplitRegex)
+            .map { value -> value.normalizeTerm() }
+            .filter { value -> value.length >= KNOWLEDGE_MIN_SEARCH_TOKEN_LENGTH }
+    }
+
+    private fun String.matchesSearchText(searchText: String, searchTokens: Set<String>): Boolean {
+        val normalizedTerm = normalizeTerm()
+        val shortSearchToken = normalizedTerm.length <= KNOWLEDGE_MIN_SEARCH_TOKEN_LENGTH
+
+        if (shortSearchToken) {
+            return normalizedTerm in searchTokens
+        }
+
+        return normalizedTerm in searchTokens || searchText.contains(normalizedTerm)
     }
 
     private fun normalizeTags(tags: List<String>): List<String> {
@@ -597,6 +650,10 @@ class KnowledgeService(
         }
 
         return redacted.take(maxLength) + KNOWLEDGE_TRUNCATED_SUFFIX
+    }
+
+    private fun String.sanitizeIdentifier(): String {
+        return sanitize(KNOWLEDGE_IDENTIFIER_MAX_LENGTH)
     }
 
     private fun String.normalizeTerm(): String {
