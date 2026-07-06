@@ -17,6 +17,9 @@ import me.matsumo.fukurou.trading.audit.FUKUROU_SYSTEM_PROMPT_VERSION_ENV
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.PreviewOrderResult
+import me.matsumo.fukurou.trading.broker.calculatePreviewHash
+import me.matsumo.fukurou.trading.broker.toPreviewOrderNormalizedContent
 import me.matsumo.fukurou.trading.config.FUKUROU_MCP_ACT_TOOL_CALL_LIMIT_ENV
 import me.matsumo.fukurou.trading.config.FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT_ENV
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -590,6 +593,40 @@ class OneShotLlmRunner(
     ): Result<PaperTradeResult> {
         val arrivedAtPlaceOrder = clock.instant()
         val decisionToPlaceOrderDuration = Duration.between(intent.createdAt, arrivedAtPlaceOrder)
+        val previewStartedAt = System.nanoTime()
+        val previewCall = GuardedToolCall(
+            toolName = "preview_order",
+            toolCallId = idGenerator().toString(),
+            clientRequestId = "runner-preview-order-${intent.intentId}",
+            decisionRunContext = context,
+            payload = buildJsonObject {
+                put("intentId", intent.intentId.toString())
+                put("source", "one_shot_runner")
+            }.toString(),
+        )
+        val previewCommand = intent.toPlaceOrderCommand(previewCall)
+        val previewResult = tradingRuntime.toolCallGuard.runReadOnlyTool(previewCall) {
+            tradingRuntime.broker.previewOrder(previewCommand).getOrThrow()
+        }
+        val previewExecutionDuration = Duration.ofNanos(System.nanoTime() - previewStartedAt)
+        val preview = previewResult.getOrNull()
+
+        if (preview == null) {
+            appendDecisionToPlaceOrderPhase(
+                context = context,
+                intent = intent,
+                decisionToPlaceOrderDuration = decisionToPlaceOrderDuration,
+                previewExecutionDuration = previewExecutionDuration,
+                preview = null,
+                placeOrderExecutionDuration = null,
+                placeOrderHash = null,
+                hashMismatchWarning = null,
+                accepted = false,
+            ).getOrThrow()
+
+            return Result.failure(requireNotNull(previewResult.exceptionOrNull()))
+        }
+
         val executionStartedAt = System.nanoTime()
         val call = GuardedToolCall(
             toolName = "place_order",
@@ -602,26 +639,77 @@ class OneShotLlmRunner(
             }.toString(),
         )
         val command = intent.toPlaceOrderCommand(call)
+        val placeOrderHash = command.toPreviewOrderNormalizedContent().calculatePreviewHash()
+        val hashMismatchWarning = if (preview.previewHash == placeOrderHash) {
+            null
+        } else {
+            "preview_hash_mismatch"
+        }
         val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
             tradingRuntime.broker.placeOrder(command).getOrThrow()
         }
         val placeOrderExecutionDuration = Duration.ofNanos(System.nanoTime() - executionStartedAt)
 
-        appendRunnerPhase(
+        appendDecisionToPlaceOrderPhase(
+            context = context,
+            intent = intent,
+            decisionToPlaceOrderDuration = decisionToPlaceOrderDuration,
+            previewExecutionDuration = previewExecutionDuration,
+            preview = preview,
+            placeOrderExecutionDuration = placeOrderExecutionDuration,
+            placeOrderHash = placeOrderHash,
+            hashMismatchWarning = hashMismatchWarning,
+            accepted = result.getOrNull()?.accepted ?: false,
+        ).getOrThrow()
+        if (result.getOrNull()?.accepted == false) {
+            val noTradeReason = if (preview.accepted) {
+                "place_order_rejected"
+            } else {
+                "preview_order_rejected"
+            }
+            recordNoTrade(context, noTradeReason, null).getOrThrow()
+        }
+
+        return result
+    }
+
+    private suspend fun appendDecisionToPlaceOrderPhase(
+        context: DecisionRunContext,
+        intent: TradeIntentRecord,
+        decisionToPlaceOrderDuration: Duration,
+        previewExecutionDuration: Duration,
+        preview: PreviewOrderResult?,
+        placeOrderExecutionDuration: Duration?,
+        placeOrderHash: String?,
+        hashMismatchWarning: String?,
+        accepted: Boolean,
+    ): Result<Unit> {
+        return appendRunnerPhase(
             context = context,
             phase = "decision_to_place_order",
             duration = decisionToPlaceOrderDuration,
             details = buildJsonObject {
                 put("intentId", intent.intentId.toString())
-                put("placeOrderExecutionMillis", placeOrderExecutionDuration.toMillis())
-                put("accepted", result.getOrNull()?.accepted ?: false)
+                put("previewExecutionMillis", previewExecutionDuration.toMillis())
+                put("previewAccepted", preview?.accepted ?: false)
+                preview?.let { previewResult ->
+                    put("previewHash", previewResult.previewHash)
+                    previewResult.safetyViolation?.let { violation ->
+                        put("previewSafetyViolationRule", violation.rule.name)
+                    }
+                }
+                if (placeOrderExecutionDuration != null) {
+                    put("placeOrderExecutionMillis", placeOrderExecutionDuration.toMillis())
+                }
+                if (placeOrderHash != null) {
+                    put("placeOrderHash", placeOrderHash)
+                }
+                if (hashMismatchWarning != null) {
+                    put("previewHashMismatchWarning", hashMismatchWarning)
+                }
+                put("accepted", accepted)
             },
-        ).getOrThrow()
-        if (result.getOrNull()?.accepted == false) {
-            recordNoTrade(context, "place_order_rejected", null).getOrThrow()
-        }
-
-        return result
+        )
     }
 
     private fun TradeIntentRecord.toPlaceOrderCommand(call: GuardedToolCall): PlaceOrderCommand {
@@ -860,7 +948,7 @@ class OneShotLlmRunner(
             |$systemPrompt
             |
             |Run one Falsifier session for intent_id=$intentId.
-            |Use only the intent_id and fukurou MCP read tools, then call submit_falsification.
+            |Use only the intent_id and fukurou MCP read/preview tools, then call submit_falsification.
             |Do not call place_order and do not request proposer narrative from the caller.
         """.trimMargin()
     }
@@ -1096,6 +1184,7 @@ private val DEFAULT_PROPOSER_TOOL_NAMES = listOf(
  */
 private val DEFAULT_FALSIFIER_TOOL_NAMES = listOf(
     "get_trade_intent",
+    "preview_order",
     "get_ticker",
     "get_candles",
     "get_orderbook",

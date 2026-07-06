@@ -13,6 +13,7 @@ import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.PreviewOrderResult
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.KillCriterionConfig
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
@@ -288,6 +289,10 @@ private class FakeBroker : Broker {
     }
 
     override suspend fun placeOrder(command: PlaceOrderCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
+    override suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 
