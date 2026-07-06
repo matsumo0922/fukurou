@@ -66,6 +66,8 @@ import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
+import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
@@ -116,6 +118,8 @@ class FukurouMcpServerTest {
                 "get_open_orders",
                 "get_account_status",
                 "get_trade_intent",
+                "knowledge.get_recent_lessons",
+                "knowledge.search_similar_setups",
                 "submit_decision",
                 "submit_falsification",
                 "place_order",
@@ -565,6 +569,100 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun knowledgeRecentLessonsTool_returnsBoundedReadOnlySummaries() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        runtime.llmRunRepository.finish(failedLlmRun("recent-run")).getOrThrow()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = noTradeDecisionArguments(invocationId = "recent-run"),
+        )
+
+        val result = callTool(
+            server = server,
+            toolName = "knowledge.get_recent_lessons",
+            arguments = buildJsonObject {
+                put("limit", 1)
+            },
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+        val lessons = structuredContent.getValue("lessons").jsonArray
+        val lesson = lessons.single().jsonObject
+        val runSummary = structuredContent.getValue("run_summaries").jsonArray.single().jsonObject
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(result.isError != true)
+        assertEquals("postgres", structuredContent.getValue("source").jsonPrimitive.contentOrNull)
+        assertEquals(1L, structuredContent.getValue("item_count").jsonPrimitive.longOrNull)
+        assertEquals("NO_TRADE", lesson.getValue("action").jsonPrimitive.contentOrNull)
+        assertEquals("材料不足のため見送ります。", lesson.getValue("reason_ja").jsonPrimitive.contentOrNull)
+        assertEquals(LLM_RUN_STATUS_FAILED, runSummary.getValue("status").jsonPrimitive.contentOrNull)
+        assertTrue(structuredContent.getValue("failure_patterns").jsonArray.isNotEmpty())
+        assertEquals(1, repository.decisions().size)
+        assertTrue(!structuredContent.toString().contains("fact_check"))
+        assertTrue(!structuredContent.toString().contains("tool_evidence_ids"))
+    }
+
+    @Test
+    fun knowledgeSimilarSetupsTool_returnsMatchedDecisionOutcome() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        runtime.llmRunRepository.finish(failedLlmRun("similar-run")).getOrThrow()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val decisionResult = callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = enterDecisionArguments(invocationId = "similar-run"),
+        )
+        val intentId = assertNotNull(decisionResult.structuredContent)
+            .getValue("intent_id")
+            .jsonPrimitive
+            .contentOrNull
+        callTool(
+            server = server,
+            toolName = "submit_falsification",
+            arguments = buildJsonObject {
+                put("intent_id", intentId)
+                put("verdict", FalsificationVerdict.REJECTED.name)
+                put("llm_provider", "codex")
+                put("reason_ja", "過去の同種 setup はブレイク失敗が多いため拒否します。")
+            },
+        )
+
+        val result = callTool(
+            server = server,
+            toolName = "knowledge.search_similar_setups",
+            arguments = buildJsonObject {
+                put("setup_tags", stringArray("breakout"))
+                put("signal_summary", "1時間足の上昇継続")
+                put("limit", 3)
+            },
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+        val hit = structuredContent.getValue("hits").jsonArray.single().jsonObject
+        val lesson = hit.getValue("lesson").jsonObject
+        val outcome = hit.getValue("outcome").jsonObject
+
+        assertTrue(result.isError != true)
+        assertEquals("ENTER", lesson.getValue("action").jsonPrimitive.contentOrNull)
+        assertEquals(true, outcome.getValue("has_trade_intent").jsonPrimitive.booleanOrNull)
+        assertEquals(FalsificationVerdict.REJECTED.name, outcome.getValue("falsification_verdict").jsonPrimitive.contentOrNull)
+        assertEquals(LLM_RUN_STATUS_FAILED, outcome.getValue("run_status").jsonPrimitive.contentOrNull)
+        assertTrue(hit.getValue("score").jsonPrimitive.longOrNull?.let { score -> score > 0L } == true)
+        assertTrue(hit.getValue("matched_terms").jsonArray.isNotEmpty())
+    }
+
+    @Test
     fun submitFalsificationTool_rejectsMissingIntentId() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
@@ -996,7 +1094,9 @@ private const val MEASURED_FALSIFIER_TOOL_CALLS = 17
  */
 private fun noTradeDecisionArguments(
     expectedRMultiple: String? = "0",
+    invocationId: String? = null,
 ) = buildJsonObject {
+    invocationId?.let { value -> put("invocation_id", value) }
     put("action", "NO_TRADE")
     put("estimated_win_probability", "0.12")
     if (expectedRMultiple != null) {
@@ -1013,7 +1113,10 @@ private fun noTradeDecisionArguments(
 /**
  * ENTER decision tool request の引数を作る。
  */
-private fun enterDecisionArguments() = buildJsonObject {
+private fun enterDecisionArguments(
+    invocationId: String? = null,
+) = buildJsonObject {
+    invocationId?.let { value -> put("invocation_id", value) }
     put("action", "ENTER")
     put("setup_tags", stringArray("breakout", "trend-follow"))
     put("estimated_win_probability", "0.73")
@@ -1056,6 +1159,22 @@ private fun tradePlanRevisionDecisionArguments(parentTradePlanId: String, revisi
     put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ"))
     put("trade_plan_target_price_jpy", "10400000")
     put("trade_plan_time_stop_at", "2026-07-02T02:00:00Z")
+}
+
+/**
+ * failed llm_run fixture を作る。
+ */
+private fun failedLlmRun(invocationId: String): LlmRunFinish {
+    return LlmRunFinish(
+        invocationId = invocationId,
+        mode = TradingMode.PAPER,
+        symbol = TradingSymbol.BTC,
+        triggerKind = null,
+        status = LLM_RUN_STATUS_FAILED,
+        startedAt = fixedInstant().minusSeconds(5),
+        finishedAt = fixedInstant(),
+        errorMessage = "redacted failure",
+    )
 }
 
 private suspend fun callTool(

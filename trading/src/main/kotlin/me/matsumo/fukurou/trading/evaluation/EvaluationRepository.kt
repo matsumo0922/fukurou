@@ -53,3 +53,69 @@ interface EvaluationRepository {
      */
     suspend fun fetchKillCriterionStats(): Result<KillCriterionStats>
 }
+
+/**
+ * unit test と in-memory runtime 用の空の評価 repository。
+ */
+class InMemoryEvaluationRepository : EvaluationRepository {
+    override suspend fun fetchClosedTrades(
+        period: EvaluationPeriod,
+        limit: Int,
+    ): Result<EvaluationTradeQueryResult> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            EvaluationTradeQueryResult(
+                trades = emptyList(),
+                truncated = false,
+            )
+        }
+    }
+
+    override suspend fun countDecisionRuns(period: EvaluationPeriod): Result<Int> {
+        return Result.success(0)
+    }
+
+    override suspend fun countDecisionsByAction(period: EvaluationPeriod): Result<List<DecisionActionCount>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun fetchDailyTradePnl(period: EvaluationPeriod): Result<List<DailyTradePnlFact>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun sumTradePnlBefore(instant: Instant): Result<BigDecimal> {
+        return Result.success(BigDecimal.ZERO)
+    }
+
+    override suspend fun fetchInitialCashJpy(): Result<BigDecimal> {
+        return Result.success(BigDecimal.ZERO)
+    }
+
+    override suspend fun fetchLlmPhaseUsages(
+        period: EvaluationPeriod,
+        limit: Int,
+    ): Result<EvaluationLlmUsageQueryResult> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            EvaluationLlmUsageQueryResult(
+                facts = emptyList(),
+                truncated = false,
+            )
+        }
+    }
+
+    override suspend fun fetchKillCriterionStats(): Result<KillCriterionStats> {
+        return Result.success(
+            KillCriterionStats(
+                closedTrades = 0,
+                profitFactor = null,
+            ),
+        )
+    }
+}
