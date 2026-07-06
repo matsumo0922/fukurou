@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.audit.FUKUROU_MARKET_SNAPSHOT_ID_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_PROMPT_HASH_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_SYSTEM_PROMPT_VERSION_ENV
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -42,6 +43,7 @@ import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.RecentTrade
@@ -69,8 +71,15 @@ import me.matsumo.fukurou.trading.invoker.ProcessRunner
 import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
+import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import me.matsumo.fukurou.trading.risk.RiskHaltState
+import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import me.matsumo.fukurou.trading.safety.SafetyFloor
+import me.matsumo.fukurou.trading.safety.SafetyFloorRule
+import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import java.io.IOException
 import java.math.BigDecimal
 import java.nio.file.Files
@@ -501,6 +510,42 @@ class OneShotLlmRunnerTest {
         assertEquals(64, latencyDetails.stringValue("previewHash").length)
         assertEquals(64, latencyDetails.stringValue("placeOrderHash").length)
         assertFalse(latencyDetails.containsKey("previewHashMismatchWarning"))
+    }
+
+    @Test
+    fun previewRejectedHardHaltTriggersAuthoritativePlaceOrderSideEffectWithoutEntry() = runBlocking {
+        val config = TradingBotConfig()
+        val fixture = runnerFixture(
+            config = config,
+            runtimeTransform = { runtime -> runtime.withHardHaltDrawdown(config) },
+        ) { command ->
+            handleEnterAndApprovedFalsifier(fixtureRepository, command)
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val tradeResult = assertNotNull(result.tradeResult)
+        val positions = fixture.runtime.broker.getPositions().getOrThrow()
+        val riskState = fixture.runtime.riskStateRepository.current().getOrThrow()
+        val toolCompletionOrder = fixture.eventLog.events()
+            .filter { event -> event.eventType == CommandEventType.TOOL_CALL_COMPLETED }
+            .map { event -> event.toolName }
+            .filter { toolName -> toolName == "preview_order" || toolName == "place_order" }
+        val latencyDetails = fixture.eventLog.events().singleRunnerPhaseDetails("decision_to_place_order")
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertFalse(tradeResult.accepted)
+        assertEquals(OrderStatus.REJECTED, tradeResult.status)
+        assertEquals(SafetyFloorRule.MAX_DRAWDOWN_HALT, tradeResult.safetyViolation?.rule)
+        assertEquals(RiskHaltState.HARD_HALT, riskState.state)
+        assertTrue(requireNotNull(riskState.haltReason).contains("MAX_DRAWDOWN_HALT"))
+        assertEquals(0, positions.size)
+        assertEquals(listOf("preview_order", "place_order"), toolCompletionOrder)
+        assertEquals("false", latencyDetails.stringValue("previewAccepted"))
+        assertEquals("MAX_DRAWDOWN_HALT", latencyDetails.stringValue("previewSafetyViolationRule"))
+        assertEquals("true", latencyDetails.stringValue("hardHaltSideEffectAttempted"))
+        assertEquals("false", latencyDetails.stringValue("accepted"))
+        assertEquals(64, latencyDetails.stringValue("placeOrderHash").length)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("preview_order_rejected"))
     }
 
     @Test
@@ -954,6 +999,49 @@ private fun runnerFixture(
         eventLog = eventLog,
         processRunner = processRunner,
         runner = runner,
+    )
+}
+
+private fun TradingRuntime.withHardHaltDrawdown(config: TradingBotConfig): TradingRuntime {
+    val baseBroker = broker as PaperBroker
+    val drawdownRiskStateRepository = InMemoryRiskStateRepository(
+        clock = fixedClock(),
+        initialState = RiskState(
+            state = RiskHaltState.RUNNING,
+            drawdownRatio = BigDecimal("-0.1500000000"),
+            equityPeak = BigDecimal("100000.0000"),
+            updatedAt = fixedInstant(),
+        ),
+    )
+    val drawdownRiskStateCommandService = InMemoryRiskStateCommandService(
+        riskStateRepository = drawdownRiskStateRepository,
+        commandEventLog = commandEventLog,
+        clock = fixedClock(),
+    )
+    val drawdownBroker = PaperBroker(
+        ledgerRepository = baseBroker.ledgerRepository,
+        riskStateRepository = drawdownRiskStateRepository,
+        riskStateCommandService = drawdownRiskStateCommandService,
+        decisionRepository = decisionRepository,
+        falsificationFreshnessWindow = config.decisionProtocol.falsificationFreshnessWindow,
+        safetyViolationRepository = safetyViolationRepository,
+        safetyFloor = SafetyFloor(config.safetyFloor, fixedClock()),
+        marketDataSource = baseBroker.marketDataSource,
+        fillSimulator = baseBroker.fillSimulator,
+        clock = fixedClock(),
+    )
+    val drawdownToolCallGuard = ToolCallGuard(
+        riskStateRepository = drawdownRiskStateRepository,
+        commandEventLog = commandEventLog,
+        tradingLock = tradingLock,
+        clock = fixedClock(),
+    )
+
+    return copy(
+        riskStateRepository = drawdownRiskStateRepository,
+        riskStateCommandService = drawdownRiskStateCommandService,
+        broker = drawdownBroker,
+        toolCallGuard = drawdownToolCallGuard,
     )
 }
 
