@@ -18,10 +18,8 @@ import me.matsumo.fukurou.trading.audit.FUKUROU_MARKET_SNAPSHOT_ID_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_PROMPT_HASH_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_SYSTEM_PROMPT_VERSION_ENV
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
-import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
-import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
@@ -79,9 +77,9 @@ import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
-import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import java.io.IOException
 import java.math.BigDecimal
@@ -545,8 +543,6 @@ class OneShotLlmRunnerTest {
         assertEquals(listOf("preview_order", "place_order"), toolCompletionOrder)
         assertEquals("false", latencyDetails.stringValue("previewAccepted"))
         assertEquals("MAX_DRAWDOWN_HALT", latencyDetails.stringValue("previewSafetyViolationRule"))
-        assertEquals("true", latencyDetails.stringValue("hardHaltSideEffectAttempted"))
-        assertEquals("false", latencyDetails.stringValue("hardHaltSideEffectUnexpectedAccepted"))
         assertEquals("false", latencyDetails.stringValue("accepted"))
         assertTrue(tradeResult.executionIds.isEmpty())
         assertEquals(64, latencyDetails.stringValue("placeOrderHash").length)
@@ -554,33 +550,37 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun previewRejectedHardHaltRecoveryUnexpectedAcceptedFailsClosed() = runBlocking {
-        val config = TradingBotConfig()
-        val fixture = runnerFixture(
-            config = config,
-            runtimeTransform = { runtime -> runtime.withUnexpectedAcceptedHardHaltRecovery(config) },
-        ) { command ->
-            handleEnterAndApprovedFalsifier(fixtureRepository, command)
+    fun previewRejectedSoftSafetyViolationIsPersistedByAuthoritativePlaceOrder() = runBlocking {
+        val fixture = runnerFixture { command ->
+            handleEnterAndApprovedFalsifier(
+                repository = fixtureRepository,
+                command = command,
+                estimatedWinProbability = BigDecimal("0.20"),
+            )
         }
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
         val tradeResult = assertNotNull(result.tradeResult)
         val positions = fixture.runtime.broker.getPositions().getOrThrow()
+        val violationRepository = fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository
+        val violations = violationRepository.violations()
+        val toolCompletionOrder = fixture.eventLog.events()
+            .filter { event -> event.eventType == CommandEventType.TOOL_CALL_COMPLETED }
+            .map { event -> event.toolName }
+            .filter { toolName -> toolName == "preview_order" || toolName == "place_order" }
         val latencyDetails = fixture.eventLog.events().singleRunnerPhaseDetails("decision_to_place_order")
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertFalse(tradeResult.accepted)
         assertEquals(OrderStatus.REJECTED, tradeResult.status)
-        assertEquals(SafetyFloorRule.MAX_DRAWDOWN_HALT, tradeResult.safetyViolation?.rule)
+        assertEquals(SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE, tradeResult.safetyViolation?.rule)
         assertEquals(0, positions.size)
-        assertEquals("true", latencyDetails.stringValue("hardHaltSideEffectAttempted"))
-        assertEquals("true", latencyDetails.stringValue("hardHaltSideEffectUnexpectedAccepted"))
+        assertEquals(listOf("preview_order", "place_order"), toolCompletionOrder)
+        assertEquals(listOf(SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE), violations.map { violation -> violation.rule })
+        assertEquals("false", latencyDetails.stringValue("previewAccepted"))
+        assertEquals("NON_POSITIVE_EXPECTED_VALUE", latencyDetails.stringValue("previewSafetyViolationRule"))
         assertEquals("false", latencyDetails.stringValue("accepted"))
-        assertTrue(
-            fixture.eventLog.events().containsNoTradeReason(
-                "preview_order_hard_halt_recovery_unexpected_accepted",
-            ),
-        )
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("preview_order_rejected"))
     }
 
     @Test
@@ -1080,40 +1080,6 @@ private fun TradingRuntime.withHardHaltDrawdown(config: TradingBotConfig): Tradi
     )
 }
 
-private fun TradingRuntime.withUnexpectedAcceptedHardHaltRecovery(config: TradingBotConfig): TradingRuntime {
-    return withHardHaltDrawdown(config).withUnexpectedAcceptedHardHaltRecoveryBroker()
-}
-
-private fun TradingRuntime.withUnexpectedAcceptedHardHaltRecoveryBroker(): TradingRuntime {
-    return copy(broker = UnexpectedAcceptedHardHaltRecoveryBroker(broker))
-}
-
-/**
- * HARD_HALT recovery が誤って accepted を返す test broker。
- *
- * @param delegate recovery 以外を委譲する broker
- */
-private class UnexpectedAcceptedHardHaltRecoveryBroker(
-    private val delegate: Broker,
-) : Broker by delegate {
-    override suspend fun recoverRejectedPreviewHardHalt(
-        command: PlaceOrderCommand,
-        violation: SafetyViolation,
-    ): Result<PaperTradeResult> {
-        return Result.success(
-            PaperTradeResult(
-                accepted = true,
-                status = OrderStatus.FILLED,
-                orderIds = listOf(command.commandId.toString()),
-                positionIds = listOf("unexpected-position"),
-                executionIds = listOf("unexpected-execution"),
-                messageJa = "unexpected accepted recovery",
-                safetyViolation = violation,
-            ),
-        )
-    }
-}
-
 private fun requestCapturingRunnerFixture(
     proposerAction: DecisionAction = DecisionAction.ENTER,
     parentEnvironment: Map<String, String> = defaultParentEnvironment(),
@@ -1252,9 +1218,15 @@ private class FakeProcessRunner(
 private suspend fun handleEnterAndApprovedFalsifier(
     repository: DecisionRepository,
     command: RenderedLlmCommand,
+    estimatedWinProbability: BigDecimal = BigDecimal("0.60"),
 ): ProcessRunResult {
     if (command.isProposerLaunch()) {
-        submitDecision(repository, command, DecisionAction.ENTER).getOrThrow()
+        submitDecision(
+            repository = repository,
+            command = command,
+            action = DecisionAction.ENTER,
+            estimatedWinProbability = estimatedWinProbability,
+        ).getOrThrow()
 
         return cleanExit()
     }
@@ -1283,8 +1255,15 @@ private suspend fun submitDecision(
     repository: DecisionRepository,
     command: RenderedLlmCommand,
     action: DecisionAction,
+    estimatedWinProbability: BigDecimal = BigDecimal("0.60"),
 ): Result<Unit> {
-    return repository.submitDecision(decisionSubmission(command, action)).fold(
+    return repository.submitDecision(
+        decisionSubmission(
+            command = command,
+            action = action,
+            estimatedWinProbability = estimatedWinProbability,
+        ),
+    ).fold(
         onSuccess = { Result.success(Unit) },
         onFailure = { throwable -> Result.failure(throwable) },
     )
@@ -1337,7 +1316,11 @@ private suspend fun submitFalsificationFromRequest(
     )
 }
 
-private fun decisionSubmission(command: RenderedLlmCommand, action: DecisionAction): DecisionSubmission {
+private fun decisionSubmission(
+    command: RenderedLlmCommand,
+    action: DecisionAction,
+    estimatedWinProbability: BigDecimal = BigDecimal("0.60"),
+): DecisionSubmission {
     return DecisionSubmission(
         invocationId = command.environment[FUKUROU_INVOCATION_ID_ENV],
         llmProvider = command.environment[FUKUROU_LLM_PROVIDER_ENV],
@@ -1346,7 +1329,7 @@ private fun decisionSubmission(command: RenderedLlmCommand, action: DecisionActi
         marketSnapshotId = command.environment[FUKUROU_MARKET_SNAPSHOT_ID_ENV],
         action = action,
         setupTags = if (action == DecisionAction.ENTER) listOf("runner-test") else emptyList(),
-        estimatedWinProbability = BigDecimal("0.60"),
+        estimatedWinProbability = estimatedWinProbability,
         expectedRMultiple = if (action == DecisionAction.ENTER) BigDecimal("2.0") else null,
         roundTripCostR = if (action == DecisionAction.ENTER) BigDecimal("0.1") else null,
         toolEvidenceIds = listOf("tool-1"),

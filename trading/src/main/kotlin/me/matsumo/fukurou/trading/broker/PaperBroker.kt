@@ -246,26 +246,6 @@ class PaperBroker(
         }
     }
 
-    override suspend fun recoverRejectedPreviewHardHalt(
-        command: PlaceOrderCommand,
-        violation: SafetyViolation,
-    ): Result<PaperTradeResult> {
-        return runCatching {
-            validatePlaceOrderCommand(command)
-            require(violation.hardHaltRequired) {
-                "SafetyViolation must require HARD_HALT side effects."
-            }
-
-            val ticker = tickerFor(command.symbol).getOrThrow()
-            val symbolRules = symbolRulesFor(command.symbol).getOrThrow()
-
-            safetyViolationRepository.append(violation).getOrThrow()
-            val sweepResult = activateHardHaltAndSweep(violation, command, ticker, symbolRules)
-
-            rejectedTradeResult(violation, sweepResult)
-        }
-    }
-
     override suspend fun closePosition(command: ClosePositionCommand): Result<PaperTradeResult> {
         return runCatching {
             validateReason(command.reasonJa)

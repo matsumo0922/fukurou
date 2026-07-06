@@ -77,19 +77,6 @@ class ToolCallGuard(
     }
 
     /**
-     * runner 内部の SafetyFloor 副作用復旧 tool を global lock と audit の内側で実行する。
-     *
-     * HARD_HALT pre-gate は broker の authoritative rejection path に到達させるため適用しない。
-     */
-    internal suspend fun <T> runSafetyRecoveryTool(call: GuardedToolCall, block: suspend () -> T): Result<T> {
-        return runLockedTool(
-            call = call,
-            enforceHardHalt = false,
-            block = block,
-        )
-    }
-
-    /**
      * 失敗時に no-trade 終了を audit へ記録する。
      */
     suspend fun recordNoTradeExit(
