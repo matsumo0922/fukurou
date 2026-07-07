@@ -16,6 +16,8 @@ internal fun stableFeedCursorCondition(
         return "($timestampColumn < ? OR $timestampColumn = ?)"
     }
 
+    // DB collation に依存するが、現在の stable feed ID は UUID など lower-case ASCII 文字列なので、
+    // Kotlin 側の String 比較と DB の TEXT 比較で同じ順序になる前提で扱う。
     return "($timestampColumn < ? OR ($timestampColumn = ? AND CAST($idColumn AS TEXT) > ?))"
 }
 

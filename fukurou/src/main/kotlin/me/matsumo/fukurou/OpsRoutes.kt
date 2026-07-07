@@ -284,9 +284,12 @@ private enum class OpsActivitySource(
  * Activity timeline の cursor。
  *
  * @param occurredAt cursor 境界の発生時刻
- * @param source 同一時刻 tie-break 用 source。null の場合は timestamp-only cursor として扱う
- * @param eventId 同一時刻 tie-break 用 event ID。null の場合は timestamp-only cursor として扱う
- * @param sourceEventId source reader に渡す prefix なしの event ID。null の場合は timestamp-only cursor として扱う
+ * @param source 同一時刻 tie-break 用 source。null の場合は同一 timestamp を含めない
+ * timestamp-only cursor として扱う
+ * @param eventId 同一時刻 tie-break 用 event ID。null の場合は同一 timestamp を含めない
+ * timestamp-only cursor として扱う
+ * @param sourceEventId source reader に渡す prefix なしの event ID。null の場合は同一 timestamp を含めない
+ * timestamp-only cursor として扱う
  */
 private data class OpsActivityCursor(
     val occurredAt: Instant,
@@ -337,6 +340,17 @@ private data class OpsActivityCursor(
         )
     }
 }
+
+/**
+ * Activity timeline event と parse 済み timestamp をまとめた sort key。
+ *
+ * @param event Activity timeline に返す event
+ * @param occurredAt sort に使う発生時刻
+ */
+private data class OpsActivitySortableEvent(
+    val event: OpsActivityEventResponse,
+    val occurredAt: Instant,
+)
 
 /**
  * Activity timeline API の response body。
@@ -1095,11 +1109,19 @@ private fun OpsActivitySource?.matchesActivitySource(source: OpsActivitySource):
 private fun newestFirstOpsActivityEvents(
     events: List<OpsActivityEventResponse>,
 ): List<OpsActivityEventResponse> {
-    return events.sortedWith(
-        compareByDescending<OpsActivityEventResponse> { event -> Instant.parse(event.occurredAt) }
-            .thenBy { event -> event.source }
-            .thenBy { event -> event.id },
-    )
+    return events
+        .map { event ->
+            OpsActivitySortableEvent(
+                event = event,
+                occurredAt = Instant.parse(event.occurredAt),
+            )
+        }
+        .sortedWith(
+            compareByDescending<OpsActivitySortableEvent> { sortableEvent -> sortableEvent.occurredAt }
+                .thenBy { sortableEvent -> sortableEvent.event.source }
+                .thenBy { sortableEvent -> sortableEvent.event.id },
+        )
+        .map { sortableEvent -> sortableEvent.event }
 }
 
 private fun OpsActivityEventResponse.isOlderThan(cursor: OpsActivityCursor): Boolean {

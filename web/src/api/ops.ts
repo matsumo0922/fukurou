@@ -226,7 +226,19 @@ function normalizeActivityTimelineEvent(event: OpsActivityEventResponse): Activi
 }
 
 function compareTimelineEvents(firstEvent: ActivityTimelineEvent, secondEvent: ActivityTimelineEvent): number {
-  return timestampMillis(secondEvent.occurredAt) - timestampMillis(firstEvent.occurredAt);
+  const timestampComparison = timestampMillis(secondEvent.occurredAt) - timestampMillis(firstEvent.occurredAt);
+
+  if (timestampComparison !== 0) {
+    return timestampComparison;
+  }
+
+  const sourceComparison = firstEvent.source.localeCompare(secondEvent.source);
+
+  if (sourceComparison !== 0) {
+    return sourceComparison;
+  }
+
+  return firstEvent.id.localeCompare(secondEvent.id);
 }
 
 function timestampMillis(value: string): number {
