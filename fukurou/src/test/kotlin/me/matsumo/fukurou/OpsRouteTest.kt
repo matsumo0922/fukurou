@@ -1,6 +1,7 @@
 package me.matsumo.fukurou
 
 import io.ktor.client.request.get
+import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
@@ -43,6 +44,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
+import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -404,7 +406,10 @@ class OpsRouteTest {
         val latestEvents = latestBody.getValue("events").jsonArray.map { element -> element.jsonObject }
         val latestTitles = latestEvents.map { event -> event.getValue("title").jsonPrimitive.content }
         val nextBefore = latestBody.getValue("nextBefore").jsonPrimitive.content
-        val olderResponse = client.get("/ops/activity?limit=10&before=$nextBefore")
+        val olderResponse = client.get("/ops/activity") {
+            parameter("limit", "10")
+            parameter("before", nextBefore)
+        }
         val olderBody = Json.parseToJsonElement(olderResponse.bodyAsText()).jsonObject
         val olderEvents = olderBody.getValue("events").jsonArray.map { element -> element.jsonObject }
         val olderDetails = olderEvents.map { event -> event.getValue("detail").jsonPrimitive.content }
@@ -423,12 +428,69 @@ class OpsRouteTest {
             ),
             latestTitles,
         )
-        assertEquals("2026-07-02T01:00:02Z", nextBefore)
+        assertTrue(nextBefore.startsWith("2026-07-02T01:00:02Z|audit|audit:"))
         assertEquals(HttpStatusCode.OK, olderResponse.status)
         assertEquals(listOf("new reason", "old reason"), olderDetails)
         assertEquals(HttpStatusCode.OK, auditFilterResponse.status)
         assertEquals(1, auditFilterEvents.size)
         assertEquals("HARD_HALT_SET", auditFilterEvents.single().getValue("kind").jsonPrimitive.content)
+    }
+
+    @Test
+    fun opsRoutes_activityCursorKeepsUnshownEventsWithSameTimestamp() = testApplication {
+        val eventLog = InMemoryCommandEventLog()
+        val occurredAt = fixedInstant().plusSeconds(7)
+        eventLog.append(
+            auditEvent(
+                id = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                eventType = CommandEventType.HARD_HALT_SET,
+                occurredAt = occurredAt,
+                toolName = "first",
+            ),
+        ).getOrThrow()
+        eventLog.append(
+            auditEvent(
+                id = UUID.fromString("00000000-0000-0000-0000-000000000002"),
+                eventType = CommandEventType.HARD_HALT_SET,
+                occurredAt = occurredAt,
+                toolName = "second",
+            ),
+        ).getOrThrow()
+        eventLog.append(
+            auditEvent(
+                id = UUID.fromString("00000000-0000-0000-0000-000000000003"),
+                eventType = CommandEventType.HARD_HALT_SET,
+                occurredAt = occurredAt,
+                toolName = "third",
+            ),
+        ).getOrThrow()
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsCommandEventFeedReader = eventLog,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val firstPageResponse = client.get("/ops/activity?source=audit&auditEventType=HARD_HALT_SET&limit=2")
+        val firstPageBody = Json.parseToJsonElement(firstPageResponse.bodyAsText()).jsonObject
+        val firstPageEvents = firstPageBody.getValue("events").jsonArray.map { element -> element.jsonObject }
+        val nextBefore = firstPageBody.getValue("nextBefore").jsonPrimitive.content
+        val secondPageResponse = client.get("/ops/activity") {
+            parameter("source", "audit")
+            parameter("auditEventType", "HARD_HALT_SET")
+            parameter("limit", "2")
+            parameter("before", nextBefore)
+        }
+        val secondPageBody = Json.parseToJsonElement(secondPageResponse.bodyAsText()).jsonObject
+        val secondPageEvents = secondPageBody.getValue("events").jsonArray.map { element -> element.jsonObject }
+
+        assertEquals(HttpStatusCode.OK, firstPageResponse.status)
+        assertEquals(listOf("first", "second"), firstPageEvents.map { event -> event.getValue("detail").jsonPrimitive.content })
+        assertEquals("2026-07-02T01:00:07Z|audit|audit:00000000-0000-0000-0000-000000000002", nextBefore)
+        assertEquals(HttpStatusCode.OK, secondPageResponse.status)
+        assertEquals(listOf("third"), secondPageEvents.map { event -> event.getValue("detail").jsonPrimitive.content })
     }
 
     @Test
@@ -654,8 +716,10 @@ private fun auditEvent(
     occurredAt: Instant,
     toolName: String,
     payload: String = """{"toolName":"$toolName"}""",
+    id: UUID = UUID.randomUUID(),
 ): CommandEvent {
     return CommandEvent(
+        id = id,
         decisionRunContext = DecisionRunContext.EMPTY,
         toolName = toolName,
         toolCallId = null,

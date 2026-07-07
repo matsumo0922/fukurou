@@ -914,7 +914,7 @@ export interface paths {
                 query?: {
                     /** @description 取得件数です。既定 50、最大 100 です。 */
                     limit?: number;
-                    /** @description この ISO-8601 時刻より古い event を取得する排他的 cursor です。未指定の場合は現在時刻を使います。 */
+                    /** @description 前回応答の nextBefore をそのまま指定する opaque cursor です。ISO-8601 時刻だけの旧形式も受け付けます。未指定の場合は現在時刻を使います。 */
                     before?: string;
                     /** @description decision / audit / execution のいずれかに絞り込みます。未指定の場合は全 source を返します。 */
                     source?: string;

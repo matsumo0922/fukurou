@@ -280,10 +280,35 @@ private enum class OpsActivitySource(
 }
 
 /**
+ * Activity timeline の cursor。
+ *
+ * @param occurredAt cursor 境界の発生時刻
+ * @param source 同一時刻 tie-break 用 source。null の場合は timestamp-only cursor として扱う
+ * @param eventId 同一時刻 tie-break 用 event ID。null の場合は timestamp-only cursor として扱う
+ */
+private data class OpsActivityCursor(
+    val occurredAt: Instant,
+    val source: String?,
+    val eventId: String?,
+) {
+    fun hasTieBreaker(): Boolean {
+        return source != null && eventId != null
+    }
+
+    fun fetchBeforeExclusive(): Instant {
+        if (!hasTieBreaker()) {
+            return occurredAt
+        }
+
+        return occurredAt.plusMillis(ACTIVITY_CURSOR_EQUAL_TIMESTAMP_FETCH_MILLIS)
+    }
+}
+
+/**
  * Activity timeline API の response body。
  *
  * @param events 新しい順の timeline event 一覧
- * @param nextBefore 次の古いページ取得に使う cursor。これ以上古い event がない場合は null
+ * @param nextBefore 次の古いページ取得に使う opaque cursor。これ以上古い event がない場合は null
  * @param limit API が適用したページ上限
  */
 @Serializable
@@ -585,7 +610,8 @@ internal fun Route.opsRoutes(
             defaultLimit = DEFAULT_ACTIVITY_LIMIT,
             maxLimit = MAX_ACTIVITY_LIMIT,
         ) ?: return@get
-        val before = call.requireBeforeCursor(clock) ?: return@get
+        val cursor = call.requireBeforeCursor(clock) ?: return@get
+        val fetchBeforeExclusive = cursor.fetchBeforeExclusive()
         val sourceParameter = call.request.queryParameters["source"]?.trim()
         val source = if (sourceParameter.isNullOrEmpty()) {
             null
@@ -600,7 +626,7 @@ internal fun Route.opsRoutes(
             val repository = call.requireDecisionRepository(decisionRepository) ?: return@get
             val decisions = repository.findDecisionsCreatedBetween(
                 from = Instant.EPOCH,
-                toExclusive = before,
+                toExclusive = fetchBeforeExclusive,
                 limit = fetchLimit,
             ).getOrThrow()
 
@@ -617,7 +643,7 @@ internal fun Route.opsRoutes(
             val auditEventTypesFilter = auditEventTypes.takeIf { eventTypes -> eventTypes.isNotEmpty() }
             val auditEvents = reader.findEventsBefore(
                 limit = fetchLimit,
-                before = before,
+                before = fetchBeforeExclusive,
                 eventTypes = auditEventTypesFilter,
                 excludeEventTypes = excludeEventTypes,
             ).getOrThrow()
@@ -627,15 +653,15 @@ internal fun Route.opsRoutes(
 
         if (source.matchesActivitySource(OpsActivitySource.EXECUTION)) {
             val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
-            val executions = repository.findExecutionsBefore(before, fetchLimit).getOrThrow()
+            val executions = repository.findExecutionsBefore(fetchBeforeExclusive, fetchLimit).getOrThrow()
 
             events += executions.map { execution -> execution.toOpsActivityEventResponse() }
         }
 
-        val sortedEvents = newestFirstOpsActivityEvents(events)
+        val sortedEvents = newestFirstOpsActivityEvents(events).filter { event -> event.isOlderThan(cursor) }
         val pageEvents = sortedEvents.take(limit)
         val nextBefore = if (sortedEvents.size > limit) {
-            pageEvents.lastOrNull()?.occurredAt
+            pageEvents.lastOrNull()?.toActivityCursorValue()
         } else {
             null
         }
@@ -658,7 +684,7 @@ internal fun Route.opsRoutes(
                 schema = jsonSchema<Int>()
             }
             query("before") {
-                description = "この ISO-8601 時刻より古い event を取得する排他的 cursor です。未指定の場合は現在時刻を使います。"
+                description = "前回応答の nextBefore をそのまま指定する opaque cursor です。ISO-8601 時刻だけの旧形式も受け付けます。未指定の場合は現在時刻を使います。"
                 schema = jsonSchema<String>()
             }
             query("source") {
@@ -878,24 +904,60 @@ private suspend fun ApplicationCall.requireLimit(defaultLimit: Int, maxLimit: In
     return null
 }
 
-private suspend fun ApplicationCall.requireBeforeCursor(clock: Clock): Instant? {
-    val rawBefore = request.queryParameters["before"]?.trim() ?: return Instant.now(clock)
+private suspend fun ApplicationCall.requireBeforeCursor(clock: Clock): OpsActivityCursor? {
+    val rawBefore = request.queryParameters["before"]?.trim()
+        ?: return OpsActivityCursor(
+            occurredAt = Instant.now(clock),
+            source = null,
+            eventId = null,
+        )
 
     if (rawBefore.isEmpty()) {
-        respond(HttpStatusCode.BadRequest, ErrorResponse("before must be an ISO-8601 instant"))
+        respondInvalidBeforeCursor()
 
         return null
     }
 
-    val before = runCatching { Instant.parse(rawBefore) }.getOrNull()
+    val timestampOnlyCursor = runCatching { Instant.parse(rawBefore) }.getOrNull()
 
-    if (before != null) {
-        return before
+    if (timestampOnlyCursor != null) {
+        return OpsActivityCursor(
+            occurredAt = timestampOnlyCursor,
+            source = null,
+            eventId = null,
+        )
     }
 
-    respond(HttpStatusCode.BadRequest, ErrorResponse("before must be an ISO-8601 instant"))
+    val cursorParts = rawBefore.split(ACTIVITY_CURSOR_SEPARATOR, limit = ACTIVITY_CURSOR_PART_COUNT)
+    val cursorHasThreeParts = cursorParts.size == ACTIVITY_CURSOR_PART_COUNT
+
+    if (!cursorHasThreeParts) {
+        respondInvalidBeforeCursor()
+
+        return null
+    }
+
+    val occurredAt = runCatching { Instant.parse(cursorParts[0]) }.getOrNull()
+    val source = cursorParts[1].takeIf { value -> value.isNotBlank() }
+    val eventId = cursorParts[2].takeIf { value -> value.isNotBlank() }
+    val sourceIsValid = source != null && OpsActivitySource.entries.any { candidate -> candidate.wireName == source }
+    val cursorIsValid = occurredAt != null && sourceIsValid && eventId != null
+
+    if (cursorIsValid) {
+        return OpsActivityCursor(
+            occurredAt = requireNotNull(occurredAt),
+            source = source,
+            eventId = eventId,
+        )
+    }
+
+    respondInvalidBeforeCursor()
 
     return null
+}
+
+private suspend fun ApplicationCall.respondInvalidBeforeCursor() {
+    respond(HttpStatusCode.BadRequest, ErrorResponse("before cursor is invalid"))
 }
 
 private suspend fun ApplicationCall.requireActivitySource(rawSource: String): OpsActivitySource? {
@@ -980,6 +1042,39 @@ private fun newestFirstOpsActivityEvents(
             .thenBy { event -> event.source }
             .thenBy { event -> event.id },
     )
+}
+
+private fun OpsActivityEventResponse.isOlderThan(cursor: OpsActivityCursor): Boolean {
+    val eventOccurredAt = Instant.parse(occurredAt)
+
+    if (eventOccurredAt.isBefore(cursor.occurredAt)) {
+        return true
+    }
+
+    val eventHasCursorTimestamp = eventOccurredAt == cursor.occurredAt
+
+    if (!eventHasCursorTimestamp) {
+        return false
+    }
+
+    if (!cursor.hasTieBreaker()) {
+        return false
+    }
+
+    val cursorSource = requireNotNull(cursor.source)
+    val sourceComparison = source.compareTo(cursorSource)
+
+    if (sourceComparison != 0) {
+        return sourceComparison > 0
+    }
+
+    val cursorEventId = requireNotNull(cursor.eventId)
+
+    return id > cursorEventId
+}
+
+private fun OpsActivityEventResponse.toActivityCursorValue(): String {
+    return listOf(occurredAt, source, id).joinToString(ACTIVITY_CURSOR_SEPARATOR)
 }
 
 private fun RiskState.toOpsRiskStateResponse(): OpsRiskStateResponse {
@@ -1164,6 +1259,21 @@ private const val DEFAULT_ACTIVITY_LIMIT = 50
  * activity timeline feed の最大 limit。
  */
 private const val MAX_ACTIVITY_LIMIT = 100
+
+/**
+ * Activity cursor 内の区切り文字。
+ */
+private const val ACTIVITY_CURSOR_SEPARATOR = "|"
+
+/**
+ * Activity cursor の要素数。
+ */
+private const val ACTIVITY_CURSOR_PART_COUNT = 3
+
+/**
+ * 同一 timestamp の event を route 側 tie-break filter に通すための fetch 幅。
+ */
+private const val ACTIVITY_CURSOR_EQUAL_TIMESTAMP_FETCH_MILLIS = 1L
 
 /**
  * audit eventType 未指定時に activity timeline から除外する event_type。

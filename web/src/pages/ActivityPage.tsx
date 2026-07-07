@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import Activity from "lucide-react/dist/esm/icons/activity.mjs";
 import ChevronDown from "lucide-react/dist/esm/icons/chevron-down.mjs";
@@ -33,6 +33,7 @@ export function ActivityPage() {
   const [olderPages, setOlderPages] = useState<ActivityTimelineSnapshot[]>([]);
   const [olderError, setOlderError] = useState<unknown>(null);
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+  const timelineVersionRef = useRef(0);
   const hasLoadedOlderPages = olderPages.length > 0;
   const timelineQuery = useQuery(activityTimelineQuery(filters, undefined, !hasLoadedOlderPages));
   const visibleTimeline = useMemo(
@@ -46,16 +47,22 @@ export function ActivityPage() {
   }, [filters]);
 
   const refreshed = () => {
+    timelineVersionRef.current += 1;
     setOlderPages([]);
     setOlderError(null);
+    setIsLoadingOlder(false);
     void timelineQuery.refetch();
   };
   const filtersChanged = (changedFilters: ActivityTimelineFilters) => {
+    timelineVersionRef.current += 1;
     setFilters(changedFilters);
     setOlderPages([]);
     setOlderError(null);
+    setIsLoadingOlder(false);
   };
   const olderLoaded = () => {
+    const requestVersion = timelineVersionRef.current;
+
     void loadOlderActivityPage({
       filters,
       latestPage: timelineQuery.data ?? null,
@@ -63,6 +70,7 @@ export function ActivityPage() {
       setOlderPages,
       setOlderError,
       setIsLoadingOlder,
+      requestIsCurrent: () => timelineVersionRef.current === requestVersion,
     });
   };
 
@@ -396,6 +404,7 @@ async function loadOlderActivityPage({
   setOlderPages,
   setOlderError,
   setIsLoadingOlder,
+  requestIsCurrent,
 }: {
   filters: ActivityTimelineFilters;
   latestPage: ActivityTimelineSnapshot | null;
@@ -403,6 +412,7 @@ async function loadOlderActivityPage({
   setOlderPages: (pages: ActivityTimelineSnapshot[]) => void;
   setOlderError: (error: unknown) => void;
   setIsLoadingOlder: (isLoading: boolean) => void;
+  requestIsCurrent: () => boolean;
 }) {
   const lastOlderPage = olderPages[olderPages.length - 1];
   const lastPage = lastOlderPage ?? latestPage;
@@ -417,11 +427,22 @@ async function loadOlderActivityPage({
 
   try {
     const olderPage = await fetchActivityTimeline({ filters, before });
+
+    if (!requestIsCurrent()) {
+      return;
+    }
+
     setOlderPages([...olderPages, olderPage]);
   } catch (error) {
+    if (!requestIsCurrent()) {
+      return;
+    }
+
     setOlderError(error);
   } finally {
-    setIsLoadingOlder(false);
+    if (requestIsCurrent()) {
+      setIsLoadingOlder(false);
+    }
   }
 }
 

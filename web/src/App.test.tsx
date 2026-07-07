@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
 import { ACTIVITY_TIMELINE_FILTER_STORAGE_KEY } from "./api/ops";
 import { LOCALE_STORAGE_KEY } from "./i18n/messages";
@@ -265,7 +265,7 @@ describe("App", () => {
       hasGetCall(
         fetchMock,
         "/ops/activity",
-        (params) => params.get("before") === "2026-07-05T12:02:00.000Z",
+        (params) => params.get("before") === "2026-07-05T12:02:00.000Z|decision|decision:decision-1",
       ),
     ).toBe(true);
 
@@ -314,6 +314,39 @@ describe("App", () => {
         ),
       ).toBe(true);
     });
+  });
+
+  it("ignores an older activity page response after filters change", async () => {
+    let resolveOlderResponse: (response: Response) => void = () => undefined;
+    const activityOlderResponse = new Promise<Response>((resolve) => {
+      resolveOlderResponse = resolve;
+    });
+    const fetchMock = stubSystemFetch({
+      activityOlderResponse,
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    expect(await screen.findByText("BUY BTC execution")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+    fireEvent.click(screen.getByRole("button", { name: "audit" }));
+
+    await waitFor(() => {
+      expect(hasGetCall(fetchMock, "/ops/activity", (params) => params.get("source") === "audit")).toBe(true);
+    });
+
+    await act(async () => {
+      resolveOlderResponse(jsonResponse(activityTimelineOlderPage()));
+      await activityOlderResponse;
+      await Promise.resolve();
+    });
+
+    const timeline = screen.getByRole("list", { name: "Activity timeline" });
+
+    expect(within(timeline).queryByText("HARD_HALT_SET")).not.toBeInTheDocument();
+    expect(within(timeline).getAllByText("MANUAL_RESUME_REQUESTED").length).toBeGreaterThan(0);
   });
 
   it("rejects blank control reasons before calling the API", async () => {
@@ -508,6 +541,7 @@ type SystemFetchFixture = {
     status: number;
     body: unknown;
   };
+  activityOlderResponse?: Promise<Response>;
 };
 
 function stubSystemFetch(fixture: SystemFetchFixture = {}) {
@@ -619,6 +653,10 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
           updatedAt: "2026-07-05T12:01:00.000Z",
         });
       case "/ops/activity":
+        if (requestSearchParams(input).has("before") && fixture.activityOlderResponse) {
+          return fixture.activityOlderResponse;
+        }
+
         return jsonResponse(activityTimelineResponse(requestSearchParams(input)));
       case "/ops/decisions":
         return jsonResponse({
@@ -933,7 +971,15 @@ function activityTimelineResponse(searchParams: URLSearchParams) {
 
   return {
     events,
-    nextBefore: before ? null : "2026-07-05T12:02:00.000Z",
+    nextBefore: before ? null : "2026-07-05T12:02:00.000Z|decision|decision:decision-1",
+    limit: 50,
+  };
+}
+
+function activityTimelineOlderPage() {
+  return {
+    events: olderActivityEvents(),
+    nextBefore: null,
     limit: 50,
   };
 }
