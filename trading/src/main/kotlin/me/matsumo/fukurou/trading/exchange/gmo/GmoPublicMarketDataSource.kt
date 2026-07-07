@@ -80,6 +80,11 @@ private const val DEFAULT_TRADES_PAGE = 1
 private const val HTTP_OK = 200
 
 /**
+ * GMO klines openTime の epoch millisecond wire value を判定する pattern。
+ */
+private val GmoEpochMillisOpenTimeRegex = Regex("^\\d+$")
+
+/**
  * HTTP rate limit status code。
  */
 private const val HTTP_TOO_MANY_REQUESTS = 429
@@ -599,10 +604,12 @@ fun parseKlinesResponse(
     validateGmoStatus(response.status, response.messages, "klines")
 
     return response.data.map { candle ->
+        val normalizedOpenTime = normalizeGmoKlineOpenTime(candle.openTime)
+
         Candle(
             symbol = symbol.apiSymbol,
             interval = interval,
-            openTime = candle.openTime,
+            openTime = normalizedOpenTime,
             open = candle.open,
             high = candle.high,
             low = candle.low,
@@ -723,6 +730,36 @@ private fun GmoKlinesResponse.isKlinesNotFound(): Boolean {
     val isNotFound = messages.hasMessageCode(GMO_KLINES_NOT_FOUND_MESSAGE_CODE)
 
     return isStatusError && isNotFound
+}
+
+/**
+ * GMO kline wire の openTime を domain 前提の ISO-8601 instant 文字列へ正規化する。
+ *
+ * @param openTime GMO Public API が返した openTime
+ */
+private fun normalizeGmoKlineOpenTime(openTime: String): String {
+    val isEpochMillis = GmoEpochMillisOpenTimeRegex.matches(openTime)
+
+    if (isEpochMillis) {
+        return runCatching {
+            Instant.ofEpochMilli(openTime.toLong()).toString()
+        }.getOrElse { throwable ->
+            throw MarketDataParseException(
+                message = "GMO kline openTime must be epoch milliseconds or ISO-8601 instant: $openTime",
+                cause = throwable,
+            )
+        }
+    }
+
+    return runCatching {
+        Instant.parse(openTime)
+        openTime
+    }.getOrElse { throwable ->
+        throw MarketDataParseException(
+            message = "GMO kline openTime must be epoch milliseconds or ISO-8601 instant: $openTime",
+            cause = throwable,
+        )
+    }
 }
 
 private fun validateLimit(limit: Int, maxLimit: Int, name: String) {
