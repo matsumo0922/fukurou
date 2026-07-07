@@ -1760,7 +1760,7 @@ LLMには `market.build_context_bundle` で要約を取得させ、必要な場�
 
 | action | 必須tool |
 |---|---|
-| `ENTER_LONG` | ticker, candles(5m/1h/1d), orderbook, recent_trades, trade_rules, balances, positions, risk.preview_order, knowledge_recent_lessons, fresh_falsifier_approval |
+| `ENTER_LONG` | ticker, candles(5m/1h/1d), orderbook, recent_trades, trade_rules, balances, positions, risk.preview_order, knowledge_get_recent_lessons, fresh_falsifier_approval |
 | `ADD_LONG` | 上記 + current_position + pyramid_status |
 | `UPDATE_PROTECTION` | positions, indicator ATR, risk.preview_protection_update |
 | `CLOSE` / `REDUCE` | ticker, orderbook, positions, risk.preview_close |
