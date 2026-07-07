@@ -28,6 +28,7 @@ import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
@@ -518,6 +519,40 @@ private const val SELECT_EXECUTIONS_BEFORE_SQL = """
 """
 
 /**
+ * Activity timeline 用 execution stable feed SELECT の列部分。
+ */
+private const val SELECT_EXECUTIONS_FOR_STABLE_FEED_SQL_PREFIX = """
+    SELECT
+        id,
+        order_id,
+        position_id,
+        mode,
+        symbol,
+        side,
+        price_jpy,
+        size_btc,
+        fee_jpy,
+        realized_pnl_jpy,
+        liquidity,
+        executed_at
+    FROM executions
+    WHERE mode = (
+        SELECT mode
+        FROM paper_account
+        WHERE id = ?
+    )
+        AND 
+"""
+
+/**
+ * Activity timeline 用 execution stable feed SELECT の並び順と件数制限。
+ */
+private const val SELECT_EXECUTIONS_FOR_STABLE_FEED_SQL_SUFFIX = """
+    ORDER BY executed_at DESC, CAST(id AS TEXT) ASC
+    LIMIT ?
+"""
+
+/**
  * 指定日実現損益を集計する SQL。
  */
 private const val SELECT_REALIZED_PNL_FOR_RANGE_SQL = """
@@ -661,6 +696,23 @@ class ExposedPaperLedgerRepository(
 
                 exposedTransaction(database) {
                     selectExecutionsBefore(before, limit)
+                }
+            }
+        }
+    }
+
+    override suspend fun findExecutionsForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+    ): Result<List<Execution>> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+
+                exposedTransaction(database) {
+                    selectExecutionsForStableFeed(cursor, limit)
                 }
             }
         }
@@ -1020,6 +1072,25 @@ private fun JdbcTransaction.selectExecutionsBefore(before: Instant, limit: Int):
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.setLong(2, before.toEpochMilli())
         statement.setInt(3, limit)
+        statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
+    }
+}
+
+private fun JdbcTransaction.selectExecutionsForStableFeed(
+    cursor: StableFeedCursor,
+    limit: Int,
+): List<Execution> {
+    val sql = SELECT_EXECUTIONS_FOR_STABLE_FEED_SQL_PREFIX +
+        stableFeedCursorCondition("executed_at", "id", cursor) +
+        SELECT_EXECUTIONS_FOR_STABLE_FEED_SQL_SUFFIX
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        val limitParameterIndex = statement.bindStableFeedCursor(
+            startIndex = 2,
+            cursor = cursor,
+        )
+        statement.setInt(limitParameterIndex, limit)
         statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
     }
 }

@@ -440,30 +440,24 @@ class OpsRouteTest {
     fun opsRoutes_activityCursorKeepsUnshownEventsWithSameTimestamp() = testApplication {
         val eventLog = InMemoryCommandEventLog()
         val occurredAt = fixedInstant().plusSeconds(7)
-        eventLog.append(
-            auditEvent(
-                id = UUID.fromString("00000000-0000-0000-0000-000000000001"),
-                eventType = CommandEventType.HARD_HALT_SET,
-                occurredAt = occurredAt,
-                toolName = "first",
-            ),
-        ).getOrThrow()
-        eventLog.append(
-            auditEvent(
-                id = UUID.fromString("00000000-0000-0000-0000-000000000002"),
-                eventType = CommandEventType.HARD_HALT_SET,
-                occurredAt = occurredAt,
-                toolName = "second",
-            ),
-        ).getOrThrow()
-        eventLog.append(
-            auditEvent(
-                id = UUID.fromString("00000000-0000-0000-0000-000000000003"),
-                eventType = CommandEventType.HARD_HALT_SET,
-                occurredAt = occurredAt,
-                toolName = "third",
-            ),
-        ).getOrThrow()
+        val auditEvents = listOf(
+            "00000000-0000-0000-0000-000000000001" to "first",
+            "00000000-0000-0000-0000-000000000002" to "second",
+            "00000000-0000-0000-0000-000000000003" to "third",
+            "00000000-0000-0000-0000-000000000004" to "fourth",
+            "00000000-0000-0000-0000-000000000005" to "fifth",
+        )
+
+        for ((rawEventId, toolName) in auditEvents) {
+            eventLog.append(
+                auditEvent(
+                    id = UUID.fromString(rawEventId),
+                    eventType = CommandEventType.HARD_HALT_SET,
+                    occurredAt = occurredAt,
+                    toolName = toolName,
+                ),
+            ).getOrThrow()
+        }
 
         application {
             module(
@@ -485,12 +479,24 @@ class OpsRouteTest {
         }
         val secondPageBody = Json.parseToJsonElement(secondPageResponse.bodyAsText()).jsonObject
         val secondPageEvents = secondPageBody.getValue("events").jsonArray.map { element -> element.jsonObject }
+        val secondNextBefore = secondPageBody.getValue("nextBefore").jsonPrimitive.content
+        val thirdPageResponse = client.get("/ops/activity") {
+            parameter("source", "audit")
+            parameter("auditEventType", "HARD_HALT_SET")
+            parameter("limit", "2")
+            parameter("before", secondNextBefore)
+        }
+        val thirdPageBody = Json.parseToJsonElement(thirdPageResponse.bodyAsText()).jsonObject
+        val thirdPageEvents = thirdPageBody.getValue("events").jsonArray.map { element -> element.jsonObject }
 
         assertEquals(HttpStatusCode.OK, firstPageResponse.status)
         assertEquals(listOf("first", "second"), firstPageEvents.map { event -> event.getValue("detail").jsonPrimitive.content })
         assertEquals("2026-07-02T01:00:07Z|audit|audit:00000000-0000-0000-0000-000000000002", nextBefore)
         assertEquals(HttpStatusCode.OK, secondPageResponse.status)
-        assertEquals(listOf("third"), secondPageEvents.map { event -> event.getValue("detail").jsonPrimitive.content })
+        assertEquals(listOf("third", "fourth"), secondPageEvents.map { event -> event.getValue("detail").jsonPrimitive.content })
+        assertEquals("2026-07-02T01:00:07Z|audit|audit:00000000-0000-0000-0000-000000000004", secondNextBefore)
+        assertEquals(HttpStatusCode.OK, thirdPageResponse.status)
+        assertEquals(listOf("fifth"), thirdPageEvents.map { event -> event.getValue("detail").jsonPrimitive.content })
     }
 
     @Test

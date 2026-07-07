@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.audit
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import java.time.Instant
 
 /**
@@ -81,6 +82,30 @@ class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
                     .filter { event -> event.occurredAt < before }
                     .filter { event -> event.matchesEventTypeFilter(eventTypes, excludeEventTypes) }
                     .sortedByDescending { event -> event.occurredAt }
+                    .take(limit)
+            }
+        }
+    }
+
+    override suspend fun findEventsForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+        eventTypes: Set<CommandEventType>?,
+        excludeEventTypes: Set<CommandEventType>,
+    ): Result<List<CommandEvent>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            mutex.withLock {
+                storedEvents
+                    .filter { event -> cursor.accepts(event.occurredAt, event.id.toString()) }
+                    .filter { event -> event.matchesEventTypeFilter(eventTypes, excludeEventTypes) }
+                    .sortedWith(
+                        compareByDescending<CommandEvent> { event -> event.occurredAt }
+                            .thenBy { event -> event.id.toString() },
+                    )
                     .take(limit)
             }
         }

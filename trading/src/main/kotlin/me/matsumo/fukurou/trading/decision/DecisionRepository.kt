@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.decision
 
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import java.time.Duration
 import java.time.Instant
@@ -30,6 +31,14 @@ interface DecisionRepository {
     suspend fun findDecisionsCreatedBetween(
         from: Instant,
         toExclusive: Instant,
+        limit: Int,
+    ): Result<List<DecisionJournalRecord>>
+
+    /**
+     * 安定 cursor 条件に一致する decision を Activity timeline 用に新しい順で取得する。
+     */
+    suspend fun findDecisionsForStableFeed(
+        cursor: StableFeedCursor,
         limit: Int,
     ): Result<List<DecisionJournalRecord>>
 

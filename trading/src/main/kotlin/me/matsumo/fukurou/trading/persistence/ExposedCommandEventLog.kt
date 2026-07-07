@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.PreparedStatement
 import java.sql.ResultSet
@@ -90,6 +91,14 @@ private const val SELECT_COMMAND_EVENTS_SQL_PREFIX = """
  */
 private const val SELECT_COMMAND_EVENTS_SQL_SUFFIX = """
     ORDER BY ts DESC
+    LIMIT ?
+"""
+
+/**
+ * Activity timeline 用 command_event_log stable feed SELECT の並び順と件数制限。
+ */
+private const val SELECT_COMMAND_EVENTS_STABLE_FEED_SQL_SUFFIX = """
+    ORDER BY ts DESC, CAST(id AS TEXT) ASC
     LIMIT ?
 """
 
@@ -215,6 +224,33 @@ class ExposedCommandEventLog(
             }
         }
     }
+
+    override suspend fun findEventsForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+        eventTypes: Set<CommandEventType>?,
+        excludeEventTypes: Set<CommandEventType>,
+    ): Result<List<CommandEvent>> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+                require(eventTypes == null || eventTypes.isNotEmpty()) {
+                    "eventTypes must be null or not empty."
+                }
+
+                exposedTransaction(database) {
+                    selectEventsForStableFeed(
+                        cursor = cursor,
+                        limit = limit,
+                        eventTypes = eventTypes,
+                        excludeEventTypes = excludeEventTypes,
+                    )
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -286,6 +322,39 @@ private fun JdbcTransaction.selectEventsBefore(
     }
 }
 
+private fun JdbcTransaction.selectEventsForStableFeed(
+    cursor: StableFeedCursor,
+    limit: Int,
+    eventTypes: Set<CommandEventType>?,
+    excludeEventTypes: Set<CommandEventType>,
+): List<CommandEvent> {
+    val sortedEventTypes = eventTypes?.sortedBy { eventType -> eventType.name }
+    val sortedExcludeEventTypes = excludeEventTypes.sortedBy { eventType -> eventType.name }
+    val sql = buildSelectEventsForStableFeedSql(
+        cursor = cursor,
+        eventTypeCount = sortedEventTypes?.size ?: 0,
+        excludeEventTypeCount = sortedExcludeEventTypes.size,
+    )
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        val cursorParameterIndex = bindEventFilterParameters(
+            statement = statement,
+            eventTypes = sortedEventTypes,
+            excludeEventTypes = sortedExcludeEventTypes,
+        )
+        val limitParameterIndex = statement.bindStableFeedCursor(cursorParameterIndex, cursor)
+        statement.setInt(limitParameterIndex, limit)
+
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(resultSet.toCommandEvent())
+                }
+            }
+        }
+    }
+}
+
 /**
  * event_type 絞り込みと除外条件から SELECT 文を組み立てる。
  */
@@ -312,6 +381,30 @@ private fun buildSelectEventsSql(
     }
 
     return SELECT_COMMAND_EVENTS_SQL_PREFIX + whereClause + SELECT_COMMAND_EVENTS_SQL_SUFFIX
+}
+
+/**
+ * event_type 絞り込み、除外条件、安定 cursor 条件から SELECT 文を組み立てる。
+ */
+private fun buildSelectEventsForStableFeedSql(
+    cursor: StableFeedCursor,
+    eventTypeCount: Int,
+    excludeEventTypeCount: Int,
+): String {
+    val conditions = buildList {
+        if (eventTypeCount > 0) {
+            add("event_type IN (" + placeholders(eventTypeCount) + ")")
+        }
+
+        if (excludeEventTypeCount > 0) {
+            add("event_type NOT IN (" + placeholders(excludeEventTypeCount) + ")")
+        }
+
+        add(stableFeedCursorCondition("ts", "id", cursor))
+    }
+    val whereClause = "\n    WHERE " + conditions.joinToString(" AND ")
+
+    return SELECT_COMMAND_EVENTS_SQL_PREFIX + whereClause + SELECT_COMMAND_EVENTS_STABLE_FEED_SQL_SUFFIX
 }
 
 /**

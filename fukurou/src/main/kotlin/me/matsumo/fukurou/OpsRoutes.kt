@@ -24,6 +24,7 @@ import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
@@ -285,22 +286,55 @@ private enum class OpsActivitySource(
  * @param occurredAt cursor 境界の発生時刻
  * @param source 同一時刻 tie-break 用 source。null の場合は timestamp-only cursor として扱う
  * @param eventId 同一時刻 tie-break 用 event ID。null の場合は timestamp-only cursor として扱う
+ * @param sourceEventId source reader に渡す prefix なしの event ID。null の場合は timestamp-only cursor として扱う
  */
 private data class OpsActivityCursor(
     val occurredAt: Instant,
-    val source: String?,
+    val source: OpsActivitySource?,
     val eventId: String?,
+    val sourceEventId: String?,
 ) {
     fun hasTieBreaker(): Boolean {
-        return source != null && eventId != null
+        val hasSource = source != null
+        val hasEventId = eventId != null
+        val hasSourceEventId = sourceEventId != null
+
+        return hasSource && hasEventId && hasSourceEventId
     }
 
-    fun fetchBeforeExclusive(): Instant {
+    fun toStableFeedCursor(targetSource: OpsActivitySource): StableFeedCursor {
         if (!hasTieBreaker()) {
-            return occurredAt
+            return StableFeedCursor(
+                occurredAt = occurredAt,
+                includesSameTimestamp = false,
+                afterId = null,
+            )
         }
 
-        return occurredAt.plusMillis(ACTIVITY_CURSOR_EQUAL_TIMESTAMP_FETCH_MILLIS)
+        val cursorSource = requireNotNull(this.source)
+        val sourceComparison = targetSource.wireName.compareTo(cursorSource.wireName)
+
+        if (sourceComparison < 0) {
+            return StableFeedCursor(
+                occurredAt = occurredAt,
+                includesSameTimestamp = false,
+                afterId = null,
+            )
+        }
+
+        if (sourceComparison > 0) {
+            return StableFeedCursor(
+                occurredAt = occurredAt,
+                includesSameTimestamp = true,
+                afterId = null,
+            )
+        }
+
+        return StableFeedCursor(
+            occurredAt = occurredAt,
+            includesSameTimestamp = true,
+            afterId = requireNotNull(sourceEventId),
+        )
     }
 }
 
@@ -611,7 +645,6 @@ internal fun Route.opsRoutes(
             maxLimit = MAX_ACTIVITY_LIMIT,
         ) ?: return@get
         val cursor = call.requireBeforeCursor(clock) ?: return@get
-        val fetchBeforeExclusive = cursor.fetchBeforeExclusive()
         val sourceParameter = call.request.queryParameters["source"]?.trim()
         val source = if (sourceParameter.isNullOrEmpty()) {
             null
@@ -624,9 +657,8 @@ internal fun Route.opsRoutes(
 
         if (source.matchesActivitySource(OpsActivitySource.DECISION)) {
             val repository = call.requireDecisionRepository(decisionRepository) ?: return@get
-            val decisions = repository.findDecisionsCreatedBetween(
-                from = Instant.EPOCH,
-                toExclusive = fetchBeforeExclusive,
+            val decisions = repository.findDecisionsForStableFeed(
+                cursor = cursor.toStableFeedCursor(OpsActivitySource.DECISION),
                 limit = fetchLimit,
             ).getOrThrow()
 
@@ -641,9 +673,9 @@ internal fun Route.opsRoutes(
                 emptySet()
             }
             val auditEventTypesFilter = auditEventTypes.takeIf { eventTypes -> eventTypes.isNotEmpty() }
-            val auditEvents = reader.findEventsBefore(
+            val auditEvents = reader.findEventsForStableFeed(
+                cursor = cursor.toStableFeedCursor(OpsActivitySource.AUDIT),
                 limit = fetchLimit,
-                before = fetchBeforeExclusive,
                 eventTypes = auditEventTypesFilter,
                 excludeEventTypes = excludeEventTypes,
             ).getOrThrow()
@@ -653,7 +685,10 @@ internal fun Route.opsRoutes(
 
         if (source.matchesActivitySource(OpsActivitySource.EXECUTION)) {
             val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
-            val executions = repository.findExecutionsBefore(fetchBeforeExclusive, fetchLimit).getOrThrow()
+            val executions = repository.findExecutionsForStableFeed(
+                cursor = cursor.toStableFeedCursor(OpsActivitySource.EXECUTION),
+                limit = fetchLimit,
+            ).getOrThrow()
 
             events += executions.map { execution -> execution.toOpsActivityEventResponse() }
         }
@@ -910,6 +945,7 @@ private suspend fun ApplicationCall.requireBeforeCursor(clock: Clock): OpsActivi
             occurredAt = Instant.now(clock),
             source = null,
             eventId = null,
+            sourceEventId = null,
         )
 
     if (rawBefore.isEmpty()) {
@@ -925,6 +961,7 @@ private suspend fun ApplicationCall.requireBeforeCursor(clock: Clock): OpsActivi
             occurredAt = timestampOnlyCursor,
             source = null,
             eventId = null,
+            sourceEventId = null,
         )
     }
 
@@ -938,16 +975,25 @@ private suspend fun ApplicationCall.requireBeforeCursor(clock: Clock): OpsActivi
     }
 
     val occurredAt = runCatching { Instant.parse(cursorParts[0]) }.getOrNull()
-    val source = cursorParts[1].takeIf { value -> value.isNotBlank() }
+    val source = OpsActivitySource.entries.firstOrNull { candidate -> candidate.wireName == cursorParts[1] }
     val eventId = cursorParts[2].takeIf { value -> value.isNotBlank() }
-    val sourceIsValid = source != null && OpsActivitySource.entries.any { candidate -> candidate.wireName == source }
-    val cursorIsValid = occurredAt != null && sourceIsValid && eventId != null
+    val sourceEventId = if (source != null && eventId != null) {
+        parseActivityCursorSourceEventId(source, eventId)
+    } else {
+        null
+    }
+    val cursorHasOccurredAt = occurredAt != null
+    val cursorHasSource = source != null
+    val cursorHasEventId = eventId != null
+    val cursorHasSourceEventId = sourceEventId != null
+    val cursorIsValid = cursorHasOccurredAt && cursorHasSource && cursorHasEventId && cursorHasSourceEventId
 
     if (cursorIsValid) {
         return OpsActivityCursor(
             occurredAt = requireNotNull(occurredAt),
             source = source,
             eventId = eventId,
+            sourceEventId = sourceEventId,
         )
     }
 
@@ -958,6 +1004,18 @@ private suspend fun ApplicationCall.requireBeforeCursor(clock: Clock): OpsActivi
 
 private suspend fun ApplicationCall.respondInvalidBeforeCursor() {
     respond(HttpStatusCode.BadRequest, ErrorResponse("before cursor is invalid"))
+}
+
+private fun parseActivityCursorSourceEventId(source: OpsActivitySource, eventId: String): String? {
+    val expectedPrefix = "${source.wireName}:"
+
+    if (!eventId.startsWith(expectedPrefix)) {
+        return null
+    }
+
+    return eventId
+        .removePrefix(expectedPrefix)
+        .takeIf { rawEventId -> rawEventId.isNotBlank() }
 }
 
 private suspend fun ApplicationCall.requireActivitySource(rawSource: String): OpsActivitySource? {
@@ -1062,7 +1120,7 @@ private fun OpsActivityEventResponse.isOlderThan(cursor: OpsActivityCursor): Boo
     }
 
     val cursorSource = requireNotNull(cursor.source)
-    val sourceComparison = source.compareTo(cursorSource)
+    val sourceComparison = source.compareTo(cursorSource.wireName)
 
     if (sourceComparison != 0) {
         return sourceComparison > 0
@@ -1269,11 +1327,6 @@ private const val ACTIVITY_CURSOR_SEPARATOR = "|"
  * Activity cursor の要素数。
  */
 private const val ACTIVITY_CURSOR_PART_COUNT = 3
-
-/**
- * 同一 timestamp の event を route 側 tie-break filter に通すための fetch 幅。
- */
-private const val ACTIVITY_CURSOR_EQUAL_TIMESTAMP_FETCH_MILLIS = 1L
 
 /**
  * audit eventType 未指定時に activity timeline から除外する event_type。
