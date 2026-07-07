@@ -17,6 +17,7 @@ import me.matsumo.fukurou.trading.domain.ProtectionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.domain.requiredCashFor
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
@@ -775,7 +776,7 @@ private suspend fun PaperBroker.validateCashAvailability(
     val cashJpy = balance.cashJpy.toBigDecimal()
     val reservedCashJpy = openOrders
         .filter { order -> order.side == OrderSide.BUY && order.status == OrderStatus.OPEN }
-        .sumOf { order -> order.estimatedBuyReservationJpy(rules) }
+        .sumOf { order -> order.estimatedBuyReservationJpy(ticker, rules, fillSimulator) }
     val requiredCash = command.estimatedRequiredCash(ticker, rules, fillSimulator)
     val availableCash = cashJpy.subtract(reservedCashJpy).moneyScale()
 
@@ -791,27 +792,56 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
 ): BigDecimal {
     if (orderType == OrderType.MARKET) {
         val fill = fillSimulator.marketFill(side, sizeBtc, ticker, rules)
+        val notional = fill.priceJpy.multiply(sizeBtc)
 
-        return fill.priceJpy.multiply(sizeBtc).add(fill.feeJpy).moneyScale()
+        return requiredCashFor(
+            notional = notional,
+            orderType = orderType,
+            symbolRules = rules,
+        ).moneyScale()
     }
 
     val estimatedPrice = requireNotNull(priceJpy) {
         "$orderType order requires priceJpy."
     }
     val estimatedNotional = estimatedPrice.multiply(sizeBtc)
-    val estimatedFee = estimatedNotional.multiply(rules.takerFee.toBigDecimal())
+    val requiredCash = requiredCashFor(
+        notional = estimatedNotional,
+        orderType = orderType,
+        symbolRules = rules,
+    )
 
-    return estimatedNotional.add(estimatedFee).moneyScale()
+    return requiredCash.moneyScale()
 }
 
-private fun Order.estimatedBuyReservationJpy(rules: SymbolRules): BigDecimal {
-    val price = limitPriceJpy?.toBigDecimal()
-        ?: triggerPriceJpy?.toBigDecimal()
-        ?: BigDecimal.ZERO
+internal fun Order.estimatedBuyReservationJpy(
+    ticker: Ticker,
+    rules: SymbolRules,
+    fillSimulator: FillSimulator,
+): BigDecimal {
+    val price = when (orderType) {
+        OrderType.MARKET -> fillSimulator.marketFill(side, sizeBtc.toBigDecimal(), ticker, rules).priceJpy
+        OrderType.LIMIT -> requireNotNull(limitPriceJpy) {
+            "LIMIT buy reservation requires limitPriceJpy."
+        }.toBigDecimal()
+        OrderType.STOP -> fillSimulator.stopFill(
+            side = side,
+            sizeBtc = sizeBtc.toBigDecimal(),
+            triggerPriceJpy = requireNotNull(triggerPriceJpy) {
+                "STOP buy reservation requires triggerPriceJpy."
+            }.toBigDecimal(),
+            ticker = ticker,
+            rules = rules,
+        ).priceJpy
+    }
     val notional = price.multiply(sizeBtc.toBigDecimal())
-    val fee = notional.multiply(rules.takerFee.toBigDecimal())
+    val requiredCash = requiredCashFor(
+        notional = notional,
+        orderType = orderType,
+        symbolRules = rules,
+    )
 
-    return notional.add(fee).moneyScale()
+    return requiredCash.moneyScale()
 }
 
 private fun validateProtectionUpdateHasChange(command: UpdateProtectionCommand) {

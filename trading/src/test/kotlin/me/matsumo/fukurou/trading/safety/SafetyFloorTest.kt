@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
@@ -215,10 +216,145 @@ class SafetyFloorTest {
 
         assertIs<SafetyFloorVerdict.Accepted>(verdict)
     }
+
+    @Test
+    fun placeOrderRiskDetails_usesOrderTypeAwareFeesForRequiredCashAndRoundTripCost() {
+        val floor = SafetyFloor(clock = fixedClock())
+        val context = safetyContext(
+            positions = emptyList(),
+            atr14Jpy = null,
+        )
+
+        val limitDetails = floor.placeOrderRiskDetails(
+            command = entryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("10000000"),
+            ),
+            context = context,
+        )
+        val marketDetails = floor.placeOrderRiskDetails(
+            command = entryCommand(),
+            context = context,
+        )
+        val stopDetails = floor.placeOrderRiskDetails(
+            command = entryCommand(
+                orderType = OrderType.STOP,
+                priceJpy = BigDecimal("10000000"),
+            ),
+            context = context,
+        )
+
+        assertEquals("50000.00000000", limitDetails.requiredCashJpy)
+        assertEquals("1568.50000000", limitDetails.orderRiskJpy)
+        assertEquals("50600.56263750", marketDetails.requiredCashJpy)
+        assertEquals("2174.35027500", marketDetails.orderRiskJpy)
+        assertEquals("50050.01250000", stopDetails.requiredCashJpy)
+        assertEquals("1623.52500000", stopDetails.orderRiskJpy)
+    }
+
+    @Test
+    fun placeOrderRiskDetails_reservesOpenBuyOrdersWithOrderTypeAwareFees() {
+        val details = SafetyFloor(clock = fixedClock()).placeOrderRiskDetails(
+            command = entryCommand(
+                orderType = OrderType.LIMIT,
+                sizeBtc = BigDecimal("0.0010"),
+                priceJpy = BigDecimal("9900000"),
+            ),
+            context = safetyContext(
+                positions = emptyList(),
+                openOrders = listOf(
+                    openBuyOrder(
+                        orderType = OrderType.LIMIT,
+                        sizeBtc = "0.001000000000",
+                        limitPriceJpy = "10000000.00000000",
+                    ),
+                    openBuyOrder(
+                        orderType = OrderType.MARKET,
+                        sizeBtc = "0.001000000000",
+                    ),
+                    openBuyOrder(
+                        orderType = OrderType.STOP,
+                        sizeBtc = "0.001000000000",
+                        triggerPriceJpy = "10000000.00000000",
+                    ),
+                ),
+                atr14Jpy = null,
+            ),
+        )
+
+        // reserved cash:
+        // LIMIT = 10,000,000 * 0.001 + maker rebate clamped to 0 = 10,000
+        // MARKET = 10,110,000 ask * 1.0005 slippage * 0.001 * (1 + 0.0005 taker) = 10,120.11252750
+        // STOP = 10,000,000 trigger * 1.0005 slippage * 0.001 * (1 + 0.0005 taker) = 10,010.00250000
+        assertEquals("69869.88497250", details.availableCashJpy)
+    }
+
+    @Test
+    fun place_order_acceptsLimitBoundaryThatTakerOnlyCostWouldReject() {
+        val command = entryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("10000000"),
+            takeProfitPriceJpy = BigDecimal("10050000"),
+            estimatedWinProbability = BigDecimal.ONE,
+        )
+        val floor = SafetyFloor(clock = fixedClock())
+        val context = safetyContext(
+            account = accountSnapshot(
+                cashJpy = "50000.00000000",
+                totalEquityJpy = "200000.00000000",
+            ),
+            positions = emptyList(),
+            atr14Jpy = null,
+            entryIntent = approvedIntentSnapshot(command),
+            marketDataObservedAt = fixedInstant(),
+        )
+
+        val verdict = floor.evaluatePlaceOrder(
+            command = command,
+            context = context,
+        )
+        val details = floor.placeOrderRiskDetails(
+            command = command,
+            context = context,
+        )
+
+        assertIs<SafetyFloorVerdict.Accepted>(verdict)
+        assertEquals("50000.00000000", details.requiredCashJpy)
+        // maker LIMIT cost:
+        // (-5.00000000 entry rebate + 24.25000000 exit taker) + 49.25000000 slippage = 68.50000000
+        assertEquals("3.64963504", details.expectedMoveToCostRatio)
+    }
+
+    @Test
+    fun place_order_rejectsUnsafeNegativeTakerFeeBeforeCostGates() {
+        val command = entryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("10000000"),
+        )
+        val verdict = SafetyFloor(clock = fixedClock()).evaluatePlaceOrder(
+            command = command,
+            context = safetyContext(
+                positions = emptyList(),
+                atr14Jpy = null,
+                entryIntent = approvedIntentSnapshot(command),
+                marketDataObservedAt = fixedInstant(),
+                symbolRules = symbolRules(takerFee = "-0.0010"),
+            ),
+        )
+        val rejected = assertIs<SafetyFloorVerdict.Rejected>(verdict)
+
+        assertEquals(SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT, rejected.violation.rule)
+        val measuredValue = requireNotNull(rejected.violation.measuredValue)
+
+        assertTrue(measuredValue.contains("takerFee must be greater than 0."))
+    }
 }
 
 private fun entryCommand(
+    orderType: OrderType = OrderType.MARKET,
     sizeBtc: BigDecimal = BigDecimal("0.0050"),
+    priceJpy: BigDecimal? = null,
+    protectiveStopPriceJpy: BigDecimal = BigDecimal("9700000"),
     takeProfitPriceJpy: BigDecimal = BigDecimal("10500000"),
     estimatedWinProbability: BigDecimal = BigDecimal("0.60"),
 ): PlaceOrderCommand {
@@ -227,11 +363,11 @@ private fun entryCommand(
         intentId = UUID.randomUUID(),
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
-        orderType = OrderType.MARKET,
+        orderType = orderType,
         sizeBtc = sizeBtc,
-        priceJpy = null,
+        priceJpy = priceJpy,
         tradeGroupId = null,
-        protectiveStopPriceJpy = BigDecimal("9700000"),
+        protectiveStopPriceJpy = protectiveStopPriceJpy,
         takeProfitPriceJpy = takeProfitPriceJpy,
         estimatedWinProbability = estimatedWinProbability,
         reasonJa = "test entry during blackout",
@@ -240,25 +376,19 @@ private fun entryCommand(
 }
 
 private fun safetyContext(
+    account: AccountSnapshot = accountSnapshot(),
     positions: List<Position>,
+    openOrders: List<Order> = emptyList(),
     atr14Jpy: BigDecimal?,
     entryIntent: EntryIntentSafetySnapshot? = null,
     marketDataObservedAt: Instant? = null,
+    symbolRules: SymbolRules = symbolRules(),
 ): SafetyFloorContext {
     return SafetyFloorContext(
-        account = AccountSnapshot(
-            mode = TradingMode.PAPER,
-            cashJpy = "100000.00000000",
-            initialCashJpy = "100000.00000000",
-            btcQuantity = "0.000000000000",
-            btcMarkPriceJpy = "10000000.00000000",
-            totalEquityJpy = "100000.00000000",
-            equityPeakJpy = "100000.00000000",
-            drawdownRatio = "0",
-        ),
+        account = account,
         riskState = RiskState(updatedAt = fixedInstant()),
         positions = positions,
-        openOrders = emptyList<Order>(),
+        openOrders = openOrders,
         ticker = Ticker(
             symbol = "BTC",
             last = "10100000",
@@ -269,17 +399,69 @@ private fun safetyContext(
             volume = "1.0",
             timestamp = fixedInstant().toString(),
         ),
-        symbolRules = SymbolRules(
-            symbol = "BTC",
-            minOrderSize = "0.0001",
-            sizeStep = "0.0001",
-            tickSize = "1",
-            takerFee = "0.0005",
-            makerFee = "-0.0001",
-        ),
+        symbolRules = symbolRules,
         entryIntent = entryIntent,
         atr14Jpy = atr14Jpy,
         marketDataObservedAt = marketDataObservedAt,
+    )
+}
+
+private fun symbolRules(
+    takerFee: String = "0.0005",
+    makerFee: String = "-0.0001",
+): SymbolRules {
+    return SymbolRules(
+        symbol = "BTC",
+        minOrderSize = "0.0001",
+        sizeStep = "0.0001",
+        tickSize = "1",
+        takerFee = takerFee,
+        makerFee = makerFee,
+    )
+}
+
+private fun accountSnapshot(
+    cashJpy: String = "100000.00000000",
+    totalEquityJpy: String = "100000.00000000",
+): AccountSnapshot {
+    return AccountSnapshot(
+        mode = TradingMode.PAPER,
+        cashJpy = cashJpy,
+        initialCashJpy = "100000.00000000",
+        btcQuantity = "0.000000000000",
+        btcMarkPriceJpy = "10000000.00000000",
+        totalEquityJpy = totalEquityJpy,
+        equityPeakJpy = totalEquityJpy,
+        drawdownRatio = "0",
+    )
+}
+
+private fun openBuyOrder(
+    orderType: OrderType,
+    sizeBtc: String,
+    limitPriceJpy: String? = null,
+    triggerPriceJpy: String? = null,
+): Order {
+    return Order(
+        orderId = UUID.randomUUID().toString(),
+        intentId = null,
+        positionId = null,
+        tradeGroupId = null,
+        symbol = TradingSymbol.BTC.apiSymbol,
+        mode = TradingMode.PAPER,
+        side = OrderSide.BUY,
+        orderType = orderType,
+        status = OrderStatus.OPEN,
+        sizeBtc = sizeBtc,
+        limitPriceJpy = limitPriceJpy,
+        triggerPriceJpy = triggerPriceJpy,
+        protectiveStopPriceJpy = "9700000.00000000",
+        takeProfitPriceJpy = "10500000.00000000",
+        estimatedWinProbability = "0.60",
+        reasonJa = "test open buy order",
+        clientRequestId = null,
+        createdAt = fixedInstant().toString(),
+        updatedAt = fixedInstant().toString(),
     )
 }
 

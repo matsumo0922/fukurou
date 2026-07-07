@@ -1012,11 +1012,15 @@ private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
 }
 
 private fun Order.createEntryFill(ticker: Ticker, rules: SymbolRules, simulator: FillSimulator): SimulatedFill {
-    return when (orderType) {
-        OrderType.LIMIT -> simulator.restingLimitFill(sizeBtc.toBigDecimal(), requireNotNull(limitPriceJpy).toBigDecimal(), rules)
-        OrderType.STOP -> simulator.stopFill(side, sizeBtc.toBigDecimal(), requireNotNull(triggerPriceJpy).toBigDecimal(), ticker, rules)
-        OrderType.MARKET -> error("MARKET entry is not a resting order.")
-    }
+    return simulator.restingEntryFill(
+        side = side,
+        orderType = orderType,
+        sizeBtc = sizeBtc.toBigDecimal(),
+        limitPriceJpy = limitPriceJpy?.toBigDecimal(),
+        triggerPriceJpy = triggerPriceJpy?.toBigDecimal(),
+        ticker = ticker,
+        rules = rules,
+    )
 }
 
 private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {

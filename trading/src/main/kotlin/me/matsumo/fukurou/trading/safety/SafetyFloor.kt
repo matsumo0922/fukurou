@@ -15,6 +15,9 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.domain.requiredCashFor
+import me.matsumo.fukurou.trading.domain.roundTripCostReserveFor
+import me.matsumo.fukurou.trading.domain.unsafeOrderFeeRateReasonOrNull
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import java.math.BigDecimal
@@ -177,7 +180,7 @@ data class EconomicEventBlackout(
  * @param minExpectedValueR コード計算した entry plan に求める最小 EV
  * @param minExpectedMoveToCostRatio 想定値幅と往復 cost の最小比率
  * @param dataQualityCap 市場データ鮮度劣化時の p cap 設定
- * @param maxTakerFeeRatio paper で許容する taker fee 上限
+ * @param maxTakerFeeRatio 環境変数互換の名称。実際には order fee / maker rebate の絶対値上限
  * @param economicEventBlackouts 高影響経済イベントの新規 entry blackout 一覧
  * @param marketSlippageReserveBps MARKET / STOP の片道 slippage reserve
  */
@@ -202,9 +205,9 @@ data class SafetyFloorConfig(
         val maxTotalExposureIsPositive = maxTotalExposureRatio > BigDecimal.ZERO
         val maxTotalExposureIsAtOrBelowDefault = maxTotalExposureRatio <= DEFAULT_MAX_TOTAL_EXPOSURE_RATIO
         val maxTotalExposureIsConservative = maxTotalExposureIsPositive && maxTotalExposureIsAtOrBelowDefault
-        val maxTakerFeeIsNonNegative = maxTakerFeeRatio >= BigDecimal.ZERO
-        val maxTakerFeeIsAtOrBelowDefault = maxTakerFeeRatio <= DEFAULT_MAX_TAKER_FEE_RATIO
-        val maxTakerFeeIsConservative = maxTakerFeeIsNonNegative && maxTakerFeeIsAtOrBelowDefault
+        val maxOrderFeeIsNonNegative = maxTakerFeeRatio >= BigDecimal.ZERO
+        val maxOrderFeeIsAtOrBelowDefault = maxTakerFeeRatio <= DEFAULT_MAX_TAKER_FEE_RATIO
+        val maxOrderFeeIsConservative = maxOrderFeeIsNonNegative && maxOrderFeeIsAtOrBelowDefault
 
         require(maxRiskPerTradeIsConservative) {
             "maxRiskPerTradeRatio must be greater than 0 and less than or equal to 0.02."
@@ -221,8 +224,8 @@ data class SafetyFloorConfig(
         require(minExpectedMoveToCostRatio >= DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO) {
             "minExpectedMoveToCostRatio must be greater than or equal to 3.0."
         }
-        require(maxTakerFeeIsConservative) {
-            "maxTakerFeeRatio must be greater than or equal to 0 and less than or equal to 0.0010."
+        require(maxOrderFeeIsConservative) {
+            "maxTakerFeeRatio must stay between 0 and 0.0010 as the order fee / maker rebate cap."
         }
         require(marketSlippageReserveBps >= DEFAULT_MARKET_SLIPPAGE_RESERVE_BPS) {
             "marketSlippageReserveBps must be greater than or equal to 5."
@@ -405,6 +408,7 @@ class SafetyFloor(
         validateFalsifierGate(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateStopLoss(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateNoAveragingDown(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateSymbolFeeRates(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateGroupRisk(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateTotalExposure(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateBalanceAndCost(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
@@ -718,19 +722,29 @@ class SafetyFloor(
         )
     }
 
-    private fun validateBalanceAndCost(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
-        val takerFee = context.symbolRules.takerFee.toBigDecimal().abs()
-        if (takerFee > config.maxTakerFeeRatio) {
+    private fun validateSymbolFeeRates(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
+        val unsafeReason = unsafeOrderFeeRateReasonOrNull(
+            symbolRules = context.symbolRules,
+            maxFeeRate = config.maxTakerFeeRatio,
+        )
+
+        if (unsafeReason != null) {
+            val measuredFeeRates = "takerFee=${context.symbolRules.takerFee}, makerFee=${context.symbolRules.makerFee}; $unsafeReason"
+
             return violation(
                 commandName = "place_order",
                 command = command,
                 rule = SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT,
-                messageJa = "taker fee が SafetyFloor の cost 上限を超えています。",
-                measuredValue = takerFee.toPlainString(),
+                messageJa = "取引所 fee rate が SafetyFloor の許容範囲外です。",
+                measuredValue = measuredFeeRates,
                 limitValue = config.maxTakerFeeRatio.toPlainString(),
             )
         }
 
+        return null
+    }
+
+    private fun validateBalanceAndCost(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
         val availableCash = availableCash(context)
         val requiredCash = orderRequiredCash(command, context)
         if (requiredCash <= availableCash) {
@@ -941,6 +955,20 @@ class SafetyFloor(
         }.safetyScale()
     }
 
+    private fun estimatedEntryPrice(order: Order, context: SafetyFloorContext): BigDecimal {
+        val askPrice = context.ticker.ask.toBigDecimal()
+
+        return when (order.orderType) {
+            OrderType.MARKET -> applyPositiveSlippage(askPrice)
+            OrderType.LIMIT -> order.limitPriceJpy?.toBigDecimal() ?: askPrice
+            OrderType.STOP -> {
+                val triggerPrice = order.triggerPriceJpy?.toBigDecimal() ?: askPrice
+
+                applyPositiveSlippage(triggerPrice)
+            }
+        }.safetyScale()
+    }
+
     private fun groupRiskBeforeOrder(context: SafetyFloorContext, tradeGroupId: String?): BigDecimal {
         val positionRisk = context.positions
             .filterTargetPositions(tradeGroupId)
@@ -958,7 +986,14 @@ class SafetyFloor(
         val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
         val stopPrice = position.currentStopLossJpy?.toBigDecimal() ?: BigDecimal.ZERO
         val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(sizeBtc)
-        val costReserve = roundTripCost(sizeBtc, entryPrice, stopPrice, context)
+        // Position は entry order type を保持しないため、既存 position の entry leg は taker 近似で保守的に評価する。
+        val costReserve = roundTripCost(
+            sizeBtc = sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = stopPrice,
+            entryOrderType = OrderType.MARKET,
+            context = context,
+        )
 
         return priceRisk.add(costReserve).safetyScale()
     }
@@ -967,20 +1002,29 @@ class SafetyFloor(
         val entryPrice = estimatedEntryPrice(command, context)
         val stopPrice = command.protectiveStopPriceJpy
         val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(command.sizeBtc)
-        val costReserve = roundTripCost(command.sizeBtc, entryPrice, stopPrice, context)
+        val costReserve = roundTripCost(
+            sizeBtc = command.sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = stopPrice,
+            entryOrderType = command.orderType,
+            context = context,
+        )
 
         return priceRisk.add(costReserve).safetyScale()
     }
 
     private fun orderRisk(order: Order, context: SafetyFloorContext): BigDecimal {
-        val entryPrice = order.limitPriceJpy
-            ?.toBigDecimal()
-            ?: order.triggerPriceJpy?.toBigDecimal()
-            ?: context.ticker.ask.toBigDecimal()
+        val entryPrice = estimatedEntryPrice(order, context)
         val stopPrice = order.protectiveStopPriceJpy?.toBigDecimal() ?: BigDecimal.ZERO
         val sizeBtc = order.sizeBtc.toBigDecimal()
         val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(sizeBtc)
-        val costReserve = roundTripCost(sizeBtc, entryPrice, stopPrice, context)
+        val costReserve = roundTripCost(
+            sizeBtc = sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = stopPrice,
+            entryOrderType = order.orderType,
+            context = context,
+        )
 
         return priceRisk.add(costReserve).safetyScale()
     }
@@ -1003,10 +1047,7 @@ class SafetyFloor(
     }
 
     private fun orderExposure(order: Order, context: SafetyFloorContext): BigDecimal {
-        val price = order.limitPriceJpy
-            ?.toBigDecimal()
-            ?: order.triggerPriceJpy?.toBigDecimal()
-            ?: context.ticker.ask.toBigDecimal()
+        val price = estimatedEntryPrice(order, context)
 
         return price.multiply(order.sizeBtc.toBigDecimal()).safetyScale()
     }
@@ -1024,20 +1065,25 @@ class SafetyFloor(
     private fun orderRequiredCash(command: PlaceOrderCommand, context: SafetyFloorContext): BigDecimal {
         val entryPrice = estimatedEntryPrice(command, context)
         val notional = entryPrice.multiply(command.sizeBtc)
-        val fee = notional.multiply(context.symbolRules.takerFee.toBigDecimal().abs())
+        val requiredCash = requiredCashFor(
+            notional = notional,
+            orderType = command.orderType,
+            symbolRules = context.symbolRules,
+        )
 
-        return notional.add(fee).safetyScale()
+        return requiredCash.safetyScale()
     }
 
     private fun orderRequiredCash(order: Order, context: SafetyFloorContext): BigDecimal {
-        val price = order.limitPriceJpy
-            ?.toBigDecimal()
-            ?: order.triggerPriceJpy?.toBigDecimal()
-            ?: context.ticker.ask.toBigDecimal()
+        val price = estimatedEntryPrice(order, context)
         val notional = price.multiply(order.sizeBtc.toBigDecimal())
-        val fee = notional.multiply(context.symbolRules.takerFee.toBigDecimal().abs())
+        val requiredCash = requiredCashFor(
+            notional = notional,
+            orderType = order.orderType,
+            symbolRules = context.symbolRules,
+        )
 
-        return notional.add(fee).safetyScale()
+        return requiredCash.safetyScale()
     }
 
     private fun entryRiskAmount(
@@ -1069,15 +1115,20 @@ class SafetyFloor(
         sizeBtc: BigDecimal,
         entryPrice: BigDecimal,
         stopPrice: BigDecimal,
+        entryOrderType: OrderType,
         context: SafetyFloorContext,
     ): BigDecimal {
         val entryNotional = entryPrice.multiply(sizeBtc)
         val exitNotional = stopPrice.multiply(sizeBtc)
-        val takerFee = context.symbolRules.takerFee.toBigDecimal().abs()
-        val feeReserve = entryNotional.add(exitNotional).multiply(takerFee)
-        val slippageReserve = entryNotional.add(exitNotional).multiply(slippageRatio())
+        val costReserve = roundTripCostReserveFor(
+            entryNotional = entryNotional,
+            exitNotional = exitNotional,
+            entryOrderType = entryOrderType,
+            symbolRules = context.symbolRules,
+            slippageRatio = slippageRatio(),
+        )
 
-        return feeReserve.add(slippageReserve).safetyScale()
+        return costReserve.safetyScale()
     }
 
     private fun applyPositiveSlippage(price: BigDecimal): BigDecimal {
@@ -1139,6 +1190,7 @@ class SafetyFloor(
             sizeBtc = command.sizeBtc,
             entryPrice = entryPrice,
             stopPrice = command.protectiveStopPriceJpy,
+            entryOrderType = command.orderType,
             context = context,
         ).divideOrZero(riskAmount)
         val expectedValueR = probabilityForExpectedValue
@@ -1158,7 +1210,13 @@ class SafetyFloor(
         val takeProfitPrice = command.takeProfitPriceJpy ?: return null
         val entryPrice = estimatedEntryPrice(command, context)
         val expectedMove = takeProfitPrice.subtract(entryPrice).maxZero().multiply(command.sizeBtc)
-        val roundTripCost = roundTripCost(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy, context)
+        val roundTripCost = roundTripCost(
+            sizeBtc = command.sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = command.protectiveStopPriceJpy,
+            entryOrderType = command.orderType,
+            context = context,
+        )
 
         return expectedMove.divideOrZero(roundTripCost)
     }
@@ -1331,7 +1389,7 @@ private val DEFAULT_MIN_EXPECTED_VALUE_R = BigDecimal("0.10")
 private val DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO = BigDecimal("3.0")
 
 /**
- * 既定 taker fee 上限。
+ * 既定 order fee / maker rebate 絶対値上限。
  */
 private val DEFAULT_MAX_TAKER_FEE_RATIO = BigDecimal("0.0010")
 
