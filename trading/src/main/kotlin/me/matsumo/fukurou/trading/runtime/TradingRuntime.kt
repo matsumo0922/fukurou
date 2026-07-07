@@ -198,6 +198,7 @@ object TradingRuntimeFactory {
             accountSnapshot = tradingConfig.paperAccount.toInitialAccountSnapshot(),
             accountUpdatedAt = Instant.now(clock),
             fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
+            clock = clock,
         )
         val broker = PaperBroker(
             ledgerRepository = ledgerRepository,

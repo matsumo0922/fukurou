@@ -58,14 +58,34 @@ internal class DecisionExecutionLifecycle(
                     ttl = tradingConfig.decisionProtocol.restingEntryOrderTtl,
                 )
             }
-            val results = expiredOrders.map { order ->
-                cancelOrder(
-                    context = context,
-                    order = order,
-                    clientRequestId = "runner-ttl-cancel-${order.orderId}",
-                    reason = "resting_entry_order_ttl_exceeded",
-                )
+            val successfulResults = mutableListOf<PaperTradeResult>()
+            val failedOrderIds = mutableListOf<String>()
+            val failureSummaries = mutableListOf<String>()
+
+            expiredOrders.forEach { order ->
+                runCatching {
+                    cancelOrder(
+                        context = context,
+                        order = order,
+                        clientRequestId = "runner-ttl-cancel-${order.orderId}",
+                        reason = "resting_entry_order_ttl_exceeded",
+                    )
+                }.onSuccess { result ->
+                    successfulResults += result
+                }.onFailure { throwable ->
+                    val failureSummary = listOf(
+                        order.orderId,
+                        throwable.javaClass.simpleName,
+                        throwable.message.orEmpty(),
+                    ).joinToString(":")
+
+                    failedOrderIds += order.orderId
+                    failureSummaries += failureSummary
+                }
             }
+            val canceledOrderIds = successfulResults
+                .flatMap { result -> result.orderIds }
+                .joinToString(",")
 
             appendLifecyclePhase(
                 context = context,
@@ -73,11 +93,15 @@ internal class DecisionExecutionLifecycle(
                 details = buildJsonObject {
                     put("ttlSeconds", tradingConfig.decisionProtocol.restingEntryOrderTtl.seconds)
                     put("expiredOrderCount", expiredOrders.size)
-                    put("canceledOrderIds", results.flatMap { result -> result.orderIds }.joinToString(","))
+                    put("canceledOrderIds", canceledOrderIds)
+                    put("failedOrderIds", failedOrderIds.joinToString(","))
+                    put("cancelSuccessCount", successfulResults.size)
+                    put("cancelFailureCount", failedOrderIds.size)
+                    put("failureSummaries", failureSummaries.joinToString(" | "))
                 },
             ).getOrThrow()
 
-            results
+            successfulResults
         }
     }
 
@@ -93,8 +117,12 @@ internal class DecisionExecutionLifecycle(
         val target = resolveExitTarget(openPositions, openEntryOrders)
 
         if (target is ExitExecutionTarget.FailClosed) {
-            appendFailClosedPhase(context, "exit_execution", target.reason).getOrThrow()
-            recordNoTrade(context, target.reason, null).getOrThrow()
+            appendFailClosedPhase(
+                context = context,
+                phase = "exit_execution",
+                failure = target.failure,
+            ).getOrThrow()
+            recordNoTrade(context, target.failure.reason, null).getOrThrow()
 
             return DecisionLifecycleExecutionResult(
                 status = OneShotRunnerStatus.NO_TRADE_AUDITED,
@@ -114,7 +142,11 @@ internal class DecisionExecutionLifecycle(
                 is ExitExecutionTarget.FailClosed -> error("fail closed target must be handled before execution.")
             }
         }.getOrElse { throwable ->
-            appendFailClosedPhase(context, "exit_execution", "exit_execution_failed").getOrThrow()
+            appendFailClosedPhase(
+                context = context,
+                phase = "exit_execution",
+                failure = DecisionLifecycleFailure("exit_execution_failed"),
+            ).getOrThrow()
             recordNoTrade(context, "exit_execution_failed", throwable).getOrThrow()
 
             return DecisionLifecycleExecutionResult(
@@ -145,11 +177,15 @@ internal class DecisionExecutionLifecycle(
     ): DecisionLifecycleExecutionResult {
         val openPositions = tradingRuntime.broker.getPositions().getOrThrow()
         val targetPosition = openPositions.singleOrNull()
-        val failClosedReason = adjustProtectionFailClosedReason(decision, openPositions, targetPosition)
+        val failClosedFailure = adjustProtectionFailClosedFailure(decision, openPositions, targetPosition)
 
-        if (failClosedReason != null) {
-            appendFailClosedPhase(context, "adjust_protection_execution", failClosedReason).getOrThrow()
-            recordNoTrade(context, failClosedReason, null).getOrThrow()
+        if (failClosedFailure != null) {
+            appendFailClosedPhase(
+                context = context,
+                phase = "adjust_protection_execution",
+                failure = failClosedFailure,
+            ).getOrThrow()
+            recordNoTrade(context, failClosedFailure.reason, null).getOrThrow()
 
             return DecisionLifecycleExecutionResult(
                 status = OneShotRunnerStatus.NO_TRADE_AUDITED,
@@ -169,7 +205,7 @@ internal class DecisionExecutionLifecycle(
             appendFailClosedPhase(
                 context = context,
                 phase = "adjust_protection_execution",
-                reason = "adjust_protection_execution_failed",
+                failure = DecisionLifecycleFailure("adjust_protection_execution_failed"),
             ).getOrThrow()
             recordNoTrade(context, "adjust_protection_execution_failed", throwable).getOrThrow()
 
@@ -202,35 +238,127 @@ internal class DecisionExecutionLifecycle(
         openPositions: List<Position>,
         openEntryOrders: List<Order>,
     ): ExitExecutionTarget {
-        if (openPositions.size == 1 && openEntryOrders.isEmpty()) {
+        if (openPositions.size == 1) {
             return ExitExecutionTarget.ClosePosition(openPositions.single())
+        }
+        if (openPositions.size > 1) {
+            return ExitExecutionTarget.FailClosed(
+                exitFailure(
+                    reason = "exit_target_ambiguous",
+                    openPositions = openPositions,
+                    openEntryOrders = openEntryOrders,
+                ),
+            )
         }
         if (openPositions.isEmpty() && openEntryOrders.size == 1) {
             return ExitExecutionTarget.CancelEntryOrder(openEntryOrders.single())
         }
         if (openPositions.isEmpty() && openEntryOrders.isEmpty()) {
-            return ExitExecutionTarget.FailClosed("exit_target_not_found")
+            return ExitExecutionTarget.FailClosed(
+                exitFailure(
+                    reason = "exit_target_not_found",
+                    openPositions = openPositions,
+                    openEntryOrders = openEntryOrders,
+                ),
+            )
         }
 
-        return ExitExecutionTarget.FailClosed("exit_target_ambiguous")
+        return ExitExecutionTarget.FailClosed(
+            exitFailure(
+                reason = "exit_target_ambiguous",
+                openPositions = openPositions,
+                openEntryOrders = openEntryOrders,
+            ),
+        )
     }
 
-    private fun adjustProtectionFailClosedReason(
+    private fun adjustProtectionFailClosedFailure(
         decision: DecisionSubmissionResult,
         openPositions: List<Position>,
         targetPosition: Position?,
-    ): String? {
+    ): DecisionLifecycleFailure? {
         if (openPositions.size != 1) {
-            return "adjust_protection_target_ambiguous"
+            return DecisionLifecycleFailure(
+                reason = "adjust_protection_target_ambiguous",
+                details = buildJsonObject {
+                    put("positionCount", openPositions.size)
+                },
+            )
         }
-        if (targetPosition?.currentStopLossJpy == null) {
-            return "adjust_protection_unprotected_position"
+
+        val position = requireNotNull(targetPosition)
+        val stopPriceText = position.currentStopLossJpy
+
+        if (stopPriceText == null) {
+            return DecisionLifecycleFailure(
+                reason = "adjust_protection_unprotected_position",
+                details = buildJsonObject {
+                    put("positionId", position.positionId)
+                },
+            )
         }
-        if (decision.tradePlan?.draft?.targetPriceJpy == null) {
-            return "adjust_protection_missing_target_price"
+
+        val targetPrice = decision.tradePlan?.draft?.targetPriceJpy
+
+        if (targetPrice == null) {
+            return DecisionLifecycleFailure(
+                reason = "adjust_protection_missing_target_price",
+                details = buildJsonObject {
+                    put("positionId", position.positionId)
+                    put("currentPriceJpy", position.currentPriceJpy)
+                    put("currentStopLossJpy", stopPriceText)
+                },
+            )
+        }
+
+        val currentPrice = position.currentPriceJpy.toBigDecimalOrNull()
+            ?: return DecisionLifecycleFailure(
+                reason = "adjust_protection_invalid_position_price",
+                details = adjustProtectionPriceDetails(position, stopPriceText, targetPrice),
+            )
+        val stopPrice = stopPriceText.toBigDecimalOrNull()
+            ?: return DecisionLifecycleFailure(
+                reason = "adjust_protection_invalid_stop_price",
+                details = adjustProtectionPriceDetails(position, stopPriceText, targetPrice),
+            )
+        val targetIsNotAboveCurrent = targetPrice <= currentPrice
+        val targetIsNotAboveStop = targetPrice <= stopPrice
+
+        if (targetIsNotAboveCurrent || targetIsNotAboveStop) {
+            return DecisionLifecycleFailure(
+                reason = "adjust_protection_invalid_take_profit_price",
+                details = adjustProtectionPriceDetails(position, stopPriceText, targetPrice),
+            )
         }
 
         return null
+    }
+
+    private fun exitFailure(
+        reason: String,
+        openPositions: List<Position>,
+        openEntryOrders: List<Order>,
+    ): DecisionLifecycleFailure {
+        return DecisionLifecycleFailure(
+            reason = reason,
+            details = buildJsonObject {
+                put("positionCount", openPositions.size)
+                put("restingEntryOrderCount", openEntryOrders.size)
+            },
+        )
+    }
+
+    private fun adjustProtectionPriceDetails(
+        position: Position,
+        stopPriceText: String,
+        targetPrice: BigDecimal,
+    ): JsonObject {
+        return buildJsonObject {
+            put("positionId", position.positionId)
+            put("currentPriceJpy", position.currentPriceJpy)
+            put("currentStopLossJpy", stopPriceText)
+            put("targetPriceJpy", targetPrice.toPlainString())
+        }
     }
 
     private suspend fun closePosition(
@@ -359,14 +487,15 @@ internal class DecisionExecutionLifecycle(
     private suspend fun appendFailClosedPhase(
         context: DecisionRunContext,
         phase: String,
-        reason: String,
+        failure: DecisionLifecycleFailure,
     ): Result<Unit> {
         return appendLifecyclePhase(
             context = context,
             phase = phase,
             details = buildJsonObject {
                 put("accepted", false)
-                put("reason", reason)
+                put("reason", failure.reason)
+                put("evidence", failure.details)
             },
         )
     }
@@ -424,6 +553,17 @@ internal data class DecisionLifecycleExecutionResult(
 )
 
 /**
+ * lifecycle fail-closed の監査理由と補足 evidence。
+ *
+ * @param reason no-trade audit に残す理由
+ * @param details runner lifecycle event に残す補足 evidence
+ */
+private data class DecisionLifecycleFailure(
+    val reason: String,
+    val details: JsonObject = buildJsonObject {},
+)
+
+/**
  * EXIT decision の決定論的な実行対象。
  */
 private sealed interface ExitExecutionTarget {
@@ -457,10 +597,10 @@ private sealed interface ExitExecutionTarget {
     /**
      * 対象が一意に決められないため fail closed する。
      *
-     * @param reason no-trade audit に残す理由
+     * @param failure fail-closed の理由と evidence
      */
     data class FailClosed(
-        val reason: String,
+        val failure: DecisionLifecycleFailure,
     ) : ExitExecutionTarget {
         override val operationName: String = "fail_closed"
     }

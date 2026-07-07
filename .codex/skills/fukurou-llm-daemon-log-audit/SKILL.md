@@ -39,15 +39,18 @@ scripts/prod-curl "/evaluation/costs?from=<JST-date>&to=<JST-date>" -fsS
 
 `FUKUROU_PROD_SSH_HOST` と `FUKUROU_POSTGRES_CONTAINER` で接続先を上書きできる。既定は `dxp4800plus` / `fukurou-postgres`。
 
-4. `RUN|...` を時系列表へ変換する。`SKIP|...` は daemon が起動しなかった判断として別にまとめる。
+4. `RUN|...` を時系列表へ変換する。`LIFECYCLE|...` は TTL cancel / EXIT / ADJUST_PROTECTION の runner 決定論的副作用として該当 run に紐づける。`SKIP|...` は daemon が起動しなかった判断として別にまとめる。
 5. `PAPER|...`、`RISK|...`、`LEDGER|...` から paper trading の実取引有無を結論づける。
 
 ## Interpreting Rows
 
 - `NO_TRADE_DECISION`: Proposer が正常終了し、`decisions` に `NO_TRADE` を保存した。理由・p・expectedR を説明する。
-- `NO_TRADE_AUDITED`: 判断保存まで到達せず、fail-closed として `NO_TRADE_EXIT` 監査だけを残した。`proposer_missing_decision`、`exit=1`、`FAILED_TO_START`、`authFailureSuspected=true` などを原因として説明する。
+- `NO_TRADE_AUDITED`: 判断保存まで到達しない、または EXIT / ADJUST_PROTECTION の対象が曖昧・不正で fail-closed し、`NO_TRADE_EXIT` 監査を残した。`proposer_missing_decision`、`exit=1`、`FAILED_TO_START`、`authFailureSuspected=true`、`exit_target_ambiguous`、`adjust_protection_invalid_take_profit_price` などを原因として説明する。
 - `PAPER_ENTRY_PLACED`: paper order / position / execution を追加確認し、発注・約定・STOP/TP 保護の状態を分けて報告する。
+- `PAPER_EXIT_EXECUTED`: runner が EXIT decision を `close_position` または `cancel_order` に写像した。`LIFECYCLE|...|exit_execution|...` と paper ledger の positions / orders / executions を確認し、position close と resting entry cancel を分けて説明する。
+- `PAPER_PROTECTION_UPDATED`: runner が ADJUST_PROTECTION decision を `update_protection` に写像した。`LIFECYCLE|...|adjust_protection_execution|...` と position の STOP / virtual TP を確認し、STOP が維持され TP だけ更新されたことを説明する。
 - `RUNNING`: run がまだ終わっていない。少し待って再確認してから断定する。
+- `LIFECYCLE|...`: `DECISION_LIFECYCLE_COMPLETED` の監査行。`phase` が `stale_resting_entry_ttl_sweep` なら stale resting entry cancel の件数、`exit_execution` なら close / cancel / fail-closed、`adjust_protection_execution` なら protection update / fail-closed を読む。fail-closed は `reason` と `evidence` を根拠にする。
 - `max_invocations_per_hour_exceeded`: scheduler が起動上限で skip した。障害ではなく cap による抑制として扱う。
 - `RISK|...` の `state`: `RUNNING` 以外（soft halt / hard halt）なら停止中。`hard_halt=true` は全取引停止、soft halt は縮小運用。`halt_reason` を添えて説明する。
 - `LEDGER|...` の各 count は累計値（対象期間フィルタなし）。「この期間に取引があったか」は RUN 行の `PAPER_ENTRY_PLACED` と executions 累計の増減で判断する。
