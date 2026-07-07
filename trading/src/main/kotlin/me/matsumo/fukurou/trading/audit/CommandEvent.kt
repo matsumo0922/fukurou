@@ -69,6 +69,11 @@ enum class CommandEventType {
     RUNNER_PHASE_COMPLETED,
 
     /**
+     * one-shot runner の deterministic lifecycle action が完了した。
+     */
+    DECISION_LIFECYCLE_COMPLETED,
+
+    /**
      * LLM daemon scheduler worker が起動した。
      */
     DAEMON_STARTED,
