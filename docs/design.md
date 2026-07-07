@@ -1422,7 +1422,7 @@ suspend fun handleTrigger(
 
 | 区分 | 許可 | 禁止 |
 |---|---|---|
-| データ取得 | MCPでticker/candles/orderbook/trades/account/knowledge取得 | 外部サイトを勝手にブラウズして根拠不明データで売買 |
+| データ取得 | MCPでget_trade_intent/ticker/candles/orderbook/trades/account/knowledge取得 | 外部サイトを勝手にブラウズして根拠不明データで売買 |
 | 数秒待機 | 1起動内で最大2回、各3〜5秒程度の再取得 | 分単位sleep、自己再スケジュール |
 | ツール呼び出し | 既定最大48回/起動 | 無制限ループ |
 | 判断提出 | `submit_decision` を1回だけ | 複数の矛盾する最終判断 |
@@ -1543,7 +1543,7 @@ llm:
 - エントリーは推定勝率p・目標価格・STOP・往復コストからコードが計算するEVゲートを通る必要があります。confidenceは発注ゲートではなく、較正とデータ品質防衛の材料です。
 
 必須手順:
-1. market/account/risk/knowledge の必要なread toolを使ってファクトを確認する。
+1. market/account/risk/knowledge の必要なread toolを使ってファクトを確認する。未約定のentry intentがある場合は、get_trade_intentも確認する。
 2. エントリーまたは買い増し前に preview_order を呼ぶ。
 3. 反証として「取引しない理由」を最低3つ検討する。
 4. submit_decision を正確に1回呼ぶ。

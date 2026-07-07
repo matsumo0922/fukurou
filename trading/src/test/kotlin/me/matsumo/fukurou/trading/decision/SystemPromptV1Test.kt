@@ -18,10 +18,11 @@ class SystemPromptV1Test {
         val content = Files.readString(promptPath)
         val contentHash = SystemPromptV1.calculateContentHash(content)
 
-        assertEquals("system-prompt-v1.5", SystemPromptV1.VERSION)
+        assertEquals("system-prompt-v1.6", SystemPromptV1.VERSION)
         assertTrue(content.contains("submit_decision"))
         assertTrue(content.contains("submit_falsification"))
         assertTrue(content.contains("preview_order"))
+        assertTrue(content.contains("get_trade_intent"))
         assertTrue(content.contains("knowledge_get_recent_lessons"))
         assertTrue(content.contains("no_trade_conditions_ja"))
         assertTrue(content.contains("revision_count <= 2"))
