@@ -1203,12 +1203,12 @@ private val DEFAULT_FALSIFIER_TOOL_NAMES = listOf(
 /**
  * recent lessons を読む read-only Knowledge tool 名。
  */
-private const val KNOWLEDGE_GET_RECENT_LESSONS_TOOL_NAME = "knowledge.get_recent_lessons"
+private const val KNOWLEDGE_GET_RECENT_LESSONS_TOOL_NAME = "knowledge_get_recent_lessons"
 
 /**
  * similar setups を読む read-only Knowledge tool 名。
  */
-private const val KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL_NAME = "knowledge.search_similar_setups"
+private const val KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL_NAME = "knowledge_search_similar_setups"
 
 /**
  * Proposer の最終判断を保存する write tool 名。

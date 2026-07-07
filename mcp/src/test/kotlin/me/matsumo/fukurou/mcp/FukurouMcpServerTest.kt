@@ -71,6 +71,9 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.runner.DEFAULT_RUNNER_MCP_SERVER_NAME
+import me.matsumo.fukurou.trading.runner.defaultFalsifierAllowedTools
+import me.matsumo.fukurou.trading.runner.defaultProposerAllowedTools
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
@@ -119,8 +122,8 @@ class FukurouMcpServerTest {
                 "get_open_orders",
                 "get_account_status",
                 "get_trade_intent",
-                "knowledge.get_recent_lessons",
-                "knowledge.search_similar_setups",
+                "knowledge_get_recent_lessons",
+                "knowledge_search_similar_setups",
                 "submit_decision",
                 "submit_falsification",
                 "preview_order",
@@ -132,6 +135,44 @@ class FukurouMcpServerTest {
                 "simulate_tool_timeout",
             ),
             server.tools.keys,
+        )
+    }
+
+    @Test
+    fun createServer_registeredToolNamesMatchClaudeAllowedToolPattern() {
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        ).createServer()
+        val claudeAllowedToolNamePattern = Regex("^[a-zA-Z0-9_-]{1,64}$")
+
+        val invalidToolNames = server.tools.keys
+            .filterNot { toolName -> toolName.matches(claudeAllowedToolNamePattern) }
+
+        assertTrue(
+            invalidToolNames.isEmpty(),
+            "MCP tool names must match Claude CLI allowedTools pattern: $invalidToolNames",
+        )
+    }
+
+    @Test
+    fun createServer_containsDefaultRunnerAllowlistTools() {
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        ).createServer()
+        val defaultAllowedToolNames = (
+            defaultProposerAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME) +
+                defaultFalsifierAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME)
+            )
+            .map { toolName -> toolName.substringAfterLast("__") }
+            .toSet()
+
+        val missingToolNames = defaultAllowedToolNames - server.tools.keys
+
+        assertTrue(
+            missingToolNames.isEmpty(),
+            "Default runner allowlists must reference registered MCP tools: $missingToolNames",
         )
     }
 
@@ -589,7 +630,7 @@ class FukurouMcpServerTest {
 
         val result = callTool(
             server = server,
-            toolName = "knowledge.get_recent_lessons",
+            toolName = "knowledge_get_recent_lessons",
             arguments = buildJsonObject {
                 put("limit", 2)
             },
@@ -662,7 +703,7 @@ class FukurouMcpServerTest {
 
         val result = callTool(
             server = server,
-            toolName = "knowledge.search_similar_setups",
+            toolName = "knowledge_search_similar_setups",
             arguments = buildJsonObject {
                 put("setup_tags", stringArray("breakout"))
                 put("signal_summary", "1時間足の上昇継続")
@@ -700,7 +741,7 @@ class FukurouMcpServerTest {
 
         val result = callTool(
             server = server,
-            toolName = "knowledge.search_similar_setups",
+            toolName = "knowledge_search_similar_setups",
             arguments = buildJsonObject {
                 put("signal_summary", "料不")
                 put("limit", 3)
