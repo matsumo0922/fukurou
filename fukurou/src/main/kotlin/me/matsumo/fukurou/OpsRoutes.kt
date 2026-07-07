@@ -24,6 +24,7 @@ import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
@@ -255,6 +256,148 @@ data class OpsExecutionResponse(
     val realizedPnlJpy: String,
     val liquidity: String,
     val executedAt: String,
+)
+
+/**
+ * Activity timeline API の source。
+ */
+private enum class OpsActivitySource(
+    val wireName: String,
+) {
+    /**
+     * LLM decision。
+     */
+    DECISION("decision"),
+
+    /**
+     * command_event_log audit event。
+     */
+    AUDIT("audit"),
+
+    /**
+     * paper ledger execution。
+     */
+    EXECUTION("execution"),
+}
+
+/**
+ * Activity timeline の cursor。
+ *
+ * @param occurredAt cursor 境界の発生時刻
+ * @param source 同一時刻 tie-break 用 source。null の場合は同一 timestamp を含めない
+ * timestamp-only cursor として扱う
+ * @param eventId 同一時刻 tie-break 用 event ID。null の場合は同一 timestamp を含めない
+ * timestamp-only cursor として扱う
+ * @param sourceEventId source reader に渡す prefix なしの event ID。null の場合は同一 timestamp を含めない
+ * timestamp-only cursor として扱う
+ */
+private data class OpsActivityCursor(
+    val occurredAt: Instant,
+    val source: OpsActivitySource?,
+    val eventId: String?,
+    val sourceEventId: String?,
+) {
+    fun hasTieBreaker(): Boolean {
+        val hasSource = source != null
+        val hasEventId = eventId != null
+        val hasSourceEventId = sourceEventId != null
+
+        return hasSource && hasEventId && hasSourceEventId
+    }
+
+    fun toStableFeedCursor(targetSource: OpsActivitySource): StableFeedCursor {
+        if (!hasTieBreaker()) {
+            return StableFeedCursor(
+                occurredAt = occurredAt,
+                includesSameTimestamp = false,
+                afterId = null,
+            )
+        }
+
+        val cursorSource = requireNotNull(this.source)
+        val sourceComparison = targetSource.wireName.compareTo(cursorSource.wireName)
+
+        if (sourceComparison < 0) {
+            return StableFeedCursor(
+                occurredAt = occurredAt,
+                includesSameTimestamp = false,
+                afterId = null,
+            )
+        }
+
+        if (sourceComparison > 0) {
+            return StableFeedCursor(
+                occurredAt = occurredAt,
+                includesSameTimestamp = true,
+                afterId = null,
+            )
+        }
+
+        return StableFeedCursor(
+            occurredAt = occurredAt,
+            includesSameTimestamp = true,
+            afterId = requireNotNull(sourceEventId),
+        )
+    }
+}
+
+/**
+ * Activity timeline event と parse 済み timestamp をまとめた sort key。
+ *
+ * @param event Activity timeline に返す event
+ * @param occurredAt sort に使う発生時刻
+ */
+private data class OpsActivitySortableEvent(
+    val event: OpsActivityEventResponse,
+    val occurredAt: Instant,
+)
+
+/**
+ * Activity timeline API の response body。
+ *
+ * @param events 新しい順の timeline event 一覧
+ * @param nextBefore 次の古いページ取得に使う opaque cursor。これ以上古い event がない場合は null
+ * @param limit API が適用したページ上限
+ */
+@Serializable
+data class OpsActivityResponse(
+    val events: List<OpsActivityEventResponse>,
+    val nextBefore: String?,
+    val limit: Int,
+)
+
+/**
+ * Activity timeline API の event 要素。
+ *
+ * @param id source prefix 付きの timeline event ID
+ * @param source decision / audit / execution の source
+ * @param kind source ごとの event 種別
+ * @param title UI 表示用 title
+ * @param detail UI 表示用 detail
+ * @param occurredAt 発生時刻
+ * @param metadata 補助表示用 metadata
+ */
+@Serializable
+data class OpsActivityEventResponse(
+    val id: String,
+    val source: String,
+    val kind: String,
+    val title: String,
+    val detail: String,
+    val occurredAt: String,
+    val metadata: List<OpsActivityMetadataResponse>,
+)
+
+/**
+ * Activity timeline API の metadata 要素。
+ *
+ * @param label metadata label
+ * @param value metadata value
+ */
+@Serializable
+data class OpsActivityMetadataResponse(
+    val label: String,
+    val value: String,
 )
 
 /**
@@ -510,6 +653,116 @@ internal fun Route.opsRoutes(
         }
     }
 
+    get("/ops/activity") {
+        val limit = call.requireLimit(
+            defaultLimit = DEFAULT_ACTIVITY_LIMIT,
+            maxLimit = MAX_ACTIVITY_LIMIT,
+        ) ?: return@get
+        val cursor = call.requireBeforeCursor(clock) ?: return@get
+        val sourceParameter = call.request.queryParameters["source"]?.trim()
+        val source = if (sourceParameter.isNullOrEmpty()) {
+            null
+        } else {
+            call.requireActivitySource(sourceParameter) ?: return@get
+        }
+        val auditEventTypes = call.requireAuditEventTypes() ?: return@get
+        val fetchLimit = limit + 1
+        val events = mutableListOf<OpsActivityEventResponse>()
+
+        if (source.matchesActivitySource(OpsActivitySource.DECISION)) {
+            val repository = call.requireDecisionRepository(decisionRepository) ?: return@get
+            val decisions = repository.findDecisionsForStableFeed(
+                cursor = cursor.toStableFeedCursor(OpsActivitySource.DECISION),
+                limit = fetchLimit,
+            ).getOrThrow()
+
+            events += decisions.map { record -> record.toOpsActivityEventResponse() }
+        }
+
+        if (source.matchesActivitySource(OpsActivitySource.AUDIT)) {
+            val reader = call.requireCommandEventFeedReader(commandEventFeedReader) ?: return@get
+            val excludeEventTypes = if (auditEventTypes.isEmpty()) {
+                DEFAULT_ACTIVITY_EXCLUDED_AUDIT_EVENT_TYPES
+            } else {
+                emptySet()
+            }
+            val auditEventTypesFilter = auditEventTypes.takeIf { eventTypes -> eventTypes.isNotEmpty() }
+            val auditEvents = reader.findEventsForStableFeed(
+                cursor = cursor.toStableFeedCursor(OpsActivitySource.AUDIT),
+                limit = fetchLimit,
+                eventTypes = auditEventTypesFilter,
+                excludeEventTypes = excludeEventTypes,
+            ).getOrThrow()
+
+            events += auditEvents.map { event -> event.toOpsActivityEventResponse() }
+        }
+
+        if (source.matchesActivitySource(OpsActivitySource.EXECUTION)) {
+            val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
+            val executions = repository.findExecutionsForStableFeed(
+                cursor = cursor.toStableFeedCursor(OpsActivitySource.EXECUTION),
+                limit = fetchLimit,
+            ).getOrThrow()
+
+            events += executions.map { execution -> execution.toOpsActivityEventResponse() }
+        }
+
+        val sortedEvents = newestFirstOpsActivityEvents(events).filter { event -> event.isOlderThan(cursor) }
+        val pageEvents = sortedEvents.take(limit)
+        val nextBefore = if (sortedEvents.size > limit) {
+            pageEvents.lastOrNull()?.toActivityCursorValue()
+        } else {
+            null
+        }
+
+        call.respond(
+            OpsActivityResponse(
+                events = pageEvents,
+                nextBefore = nextBefore,
+                limit = limit,
+            ),
+        )
+    }.describe {
+        summary = "Activity timeline を取得する"
+        description = "decision、audit、paper execution を backend で統合し、cursor paging と source / audit eventType filter を適用して新しい順で返します。" +
+            "audit payload は返しません。"
+        tag(OPS_TAG)
+        parameters {
+            query("limit") {
+                description = "取得件数です。既定 50、最大 100 です。"
+                schema = jsonSchema<Int>()
+            }
+            query("before") {
+                description = "前回応答の nextBefore をそのまま指定する opaque cursor です。ISO-8601 時刻だけの旧形式も受け付けます。未指定の場合は現在時刻を使います。"
+                schema = jsonSchema<String>()
+            }
+            query("source") {
+                description = "decision / audit / execution のいずれかに絞り込みます。未指定の場合は全 source を返します。"
+                schema = jsonSchema<String>()
+            }
+            query("auditEventType") {
+                description = "audit event_type の許可リストです。複数指定可。未指定の場合は RECONCILER_PASS_COMPLETED を既定除外します。"
+                schema = jsonSchema<List<String>>()
+                style = "form"
+                explode = true
+            }
+        }
+        responses {
+            HttpStatusCode.OK {
+                description = "Activity timeline です。"
+                schema = jsonSchema<OpsActivityResponse>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "limit、before、source、または auditEventType が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "Activity timeline に必要な repository が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
     get("/ops/positions") {
         val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
         val positions = repository.getOpenPositions().getOrThrow()
@@ -700,6 +953,109 @@ private suspend fun ApplicationCall.requireLimit(defaultLimit: Int, maxLimit: In
     return null
 }
 
+private suspend fun ApplicationCall.requireBeforeCursor(clock: Clock): OpsActivityCursor? {
+    val rawBefore = request.queryParameters["before"]?.trim()
+        ?: return OpsActivityCursor(
+            occurredAt = Instant.now(clock),
+            source = null,
+            eventId = null,
+            sourceEventId = null,
+        )
+
+    if (rawBefore.isEmpty()) {
+        respondInvalidBeforeCursor()
+
+        return null
+    }
+
+    val timestampOnlyCursor = runCatching { Instant.parse(rawBefore) }.getOrNull()
+
+    if (timestampOnlyCursor != null) {
+        return OpsActivityCursor(
+            occurredAt = timestampOnlyCursor,
+            source = null,
+            eventId = null,
+            sourceEventId = null,
+        )
+    }
+
+    val cursorParts = rawBefore.split(ACTIVITY_CURSOR_SEPARATOR, limit = ACTIVITY_CURSOR_PART_COUNT)
+    val cursorHasThreeParts = cursorParts.size == ACTIVITY_CURSOR_PART_COUNT
+
+    if (!cursorHasThreeParts) {
+        respondInvalidBeforeCursor()
+
+        return null
+    }
+
+    val occurredAt = runCatching { Instant.parse(cursorParts[0]) }.getOrNull()
+    val source = OpsActivitySource.entries.firstOrNull { candidate -> candidate.wireName == cursorParts[1] }
+    val eventId = cursorParts[2].takeIf { value -> value.isNotBlank() }
+    val sourceEventId = if (source != null && eventId != null) {
+        parseActivityCursorSourceEventId(source, eventId)
+    } else {
+        null
+    }
+    val cursorHasOccurredAt = occurredAt != null
+    val cursorHasSource = source != null
+    val cursorHasEventId = eventId != null
+    val cursorHasSourceEventId = sourceEventId != null
+    val cursorIsValid = cursorHasOccurredAt && cursorHasSource && cursorHasEventId && cursorHasSourceEventId
+
+    if (cursorIsValid) {
+        return OpsActivityCursor(
+            occurredAt = requireNotNull(occurredAt),
+            source = source,
+            eventId = eventId,
+            sourceEventId = sourceEventId,
+        )
+    }
+
+    respondInvalidBeforeCursor()
+
+    return null
+}
+
+private suspend fun ApplicationCall.respondInvalidBeforeCursor() {
+    respond(HttpStatusCode.BadRequest, ErrorResponse("before cursor is invalid"))
+}
+
+private fun parseActivityCursorSourceEventId(source: OpsActivitySource, eventId: String): String? {
+    val expectedPrefix = "${source.wireName}:"
+
+    if (!eventId.startsWith(expectedPrefix)) {
+        return null
+    }
+
+    return eventId
+        .removePrefix(expectedPrefix)
+        .takeIf { rawEventId -> rawEventId.isNotBlank() }
+}
+
+private suspend fun ApplicationCall.requireActivitySource(rawSource: String): OpsActivitySource? {
+    val source = OpsActivitySource.entries.firstOrNull { candidate -> candidate.wireName == rawSource }
+
+    if (source != null) {
+        return source
+    }
+
+    respond(HttpStatusCode.BadRequest, ErrorResponse("source is invalid"))
+
+    return null
+}
+
+private suspend fun ApplicationCall.requireAuditEventTypes(): Set<CommandEventType>? {
+    val rawAuditEventTypes = request.queryParameters.getAll("auditEventType") ?: return emptySet()
+    val auditEventTypes = mutableSetOf<CommandEventType>()
+
+    for (rawAuditEventType in rawAuditEventTypes) {
+        val auditEventType = requireCommandEventType(rawAuditEventType) ?: return null
+        auditEventTypes.add(auditEventType)
+    }
+
+    return auditEventTypes
+}
+
 private suspend fun ApplicationCall.requireCommandEventType(rawEventType: String): CommandEventType? {
     val eventTypeName = rawEventType.trim()
     val eventType = CommandEventType.entries.firstOrNull { candidate -> candidate.name == eventTypeName }
@@ -746,6 +1102,61 @@ private suspend fun ApplicationCall.respondConflictOrThrow(result: Result<RiskSt
     throw throwable
 }
 
+private fun OpsActivitySource?.matchesActivitySource(source: OpsActivitySource): Boolean {
+    return this == null || this == source
+}
+
+private fun newestFirstOpsActivityEvents(
+    events: List<OpsActivityEventResponse>,
+): List<OpsActivityEventResponse> {
+    return events
+        .map { event ->
+            OpsActivitySortableEvent(
+                event = event,
+                occurredAt = Instant.parse(event.occurredAt),
+            )
+        }
+        .sortedWith(
+            compareByDescending<OpsActivitySortableEvent> { sortableEvent -> sortableEvent.occurredAt }
+                .thenBy { sortableEvent -> sortableEvent.event.source }
+                .thenBy { sortableEvent -> sortableEvent.event.id },
+        )
+        .map { sortableEvent -> sortableEvent.event }
+}
+
+private fun OpsActivityEventResponse.isOlderThan(cursor: OpsActivityCursor): Boolean {
+    val eventOccurredAt = Instant.parse(occurredAt)
+
+    if (eventOccurredAt.isBefore(cursor.occurredAt)) {
+        return true
+    }
+
+    val eventHasCursorTimestamp = eventOccurredAt == cursor.occurredAt
+
+    if (!eventHasCursorTimestamp) {
+        return false
+    }
+
+    if (!cursor.hasTieBreaker()) {
+        return false
+    }
+
+    val cursorSource = requireNotNull(cursor.source)
+    val sourceComparison = source.compareTo(cursorSource.wireName)
+
+    if (sourceComparison != 0) {
+        return sourceComparison > 0
+    }
+
+    val cursorEventId = requireNotNull(cursor.eventId)
+
+    return id > cursorEventId
+}
+
+private fun OpsActivityEventResponse.toActivityCursorValue(): String {
+    return listOf(occurredAt, source, id).joinToString(ACTIVITY_CURSOR_SEPARATOR)
+}
+
 private fun RiskState.toOpsRiskStateResponse(): OpsRiskStateResponse {
     return OpsRiskStateResponse(
         state = state.name,
@@ -771,6 +1182,33 @@ private fun DecisionJournalRecord.toOpsDecisionResponse(): OpsDecisionResponse {
     )
 }
 
+private fun DecisionJournalRecord.toOpsActivityEventResponse(): OpsActivityEventResponse {
+    val response = toOpsDecisionResponse()
+
+    return OpsActivityEventResponse(
+        id = "decision:${response.id}",
+        source = OpsActivitySource.DECISION.wireName,
+        kind = response.action,
+        title = "${response.action} decision",
+        detail = response.reasonJa,
+        occurredAt = response.createdAt,
+        metadata = listOf(
+            OpsActivityMetadataResponse(
+                label = "estimated p",
+                value = response.estimatedWinProbability,
+            ),
+            OpsActivityMetadataResponse(
+                label = "setup tags",
+                value = response.setupTags.takeIf { tags -> tags.isNotEmpty() }?.joinToString(", ") ?: "none",
+            ),
+            OpsActivityMetadataResponse(
+                label = "no-trade conditions",
+                value = response.noTradeConditionsJa.takeIf { conditions -> conditions.isNotEmpty() }?.joinToString(" / ") ?: "none",
+            ),
+        ),
+    )
+}
+
 private fun CommandEvent.toOpsAuditEventResponse(): OpsAuditEventResponse {
     return OpsAuditEventResponse(
         id = id.toString(),
@@ -778,6 +1216,23 @@ private fun CommandEvent.toOpsAuditEventResponse(): OpsAuditEventResponse {
         toolName = toolName,
         payload = payload,
         occurredAt = occurredAt.toString(),
+    )
+}
+
+private fun CommandEvent.toOpsActivityEventResponse(): OpsActivityEventResponse {
+    return OpsActivityEventResponse(
+        id = "audit:$id",
+        source = OpsActivitySource.AUDIT.wireName,
+        kind = eventType.name,
+        title = eventType.name,
+        detail = toolName,
+        occurredAt = occurredAt.toString(),
+        metadata = listOf(
+            OpsActivityMetadataResponse(
+                label = "tool",
+                value = toolName,
+            ),
+        ),
     )
 }
 
@@ -794,6 +1249,37 @@ private fun AccountSnapshotWithUpdatedAt.toOpsAccountResponse(): OpsAccountRespo
         equityPeakJpy = snapshot.equityPeakJpy,
         drawdownRatio = snapshot.drawdownRatio,
         updatedAt = updatedAt.toString(),
+    )
+}
+
+private fun Execution.toOpsActivityEventResponse(): OpsActivityEventResponse {
+    val response = toOpsExecutionResponse()
+
+    return OpsActivityEventResponse(
+        id = "execution:${response.executionId}",
+        source = OpsActivitySource.EXECUTION.wireName,
+        kind = response.side,
+        title = "${response.side} ${response.symbol} execution",
+        detail = "${response.sizeBtc} BTC at ${response.priceJpy} JPY",
+        occurredAt = response.executedAt,
+        metadata = listOf(
+            OpsActivityMetadataResponse(
+                label = "realized pnl",
+                value = response.realizedPnlJpy,
+            ),
+            OpsActivityMetadataResponse(
+                label = "fee",
+                value = response.feeJpy,
+            ),
+            OpsActivityMetadataResponse(
+                label = "liquidity",
+                value = response.liquidity,
+            ),
+            OpsActivityMetadataResponse(
+                label = "order",
+                value = response.orderId ?: "not linked",
+            ),
+        ),
     )
 }
 
@@ -843,3 +1329,30 @@ private const val DEFAULT_EXECUTIONS_LIMIT = 20
  * executions feed の最大 limit。
  */
 private const val MAX_EXECUTIONS_LIMIT = 100
+
+/**
+ * activity timeline feed の既定 limit。
+ */
+private const val DEFAULT_ACTIVITY_LIMIT = 50
+
+/**
+ * activity timeline feed の最大 limit。
+ */
+private const val MAX_ACTIVITY_LIMIT = 100
+
+/**
+ * Activity cursor 内の区切り文字。
+ */
+private const val ACTIVITY_CURSOR_SEPARATOR = "|"
+
+/**
+ * Activity cursor の要素数。
+ */
+private const val ACTIVITY_CURSOR_PART_COUNT = 3
+
+/**
+ * audit eventType 未指定時に activity timeline から除外する event_type。
+ */
+private val DEFAULT_ACTIVITY_EXCLUDED_AUDIT_EVENT_TYPES = setOf(
+    CommandEventType.RECONCILER_PASS_COMPLETED,
+)

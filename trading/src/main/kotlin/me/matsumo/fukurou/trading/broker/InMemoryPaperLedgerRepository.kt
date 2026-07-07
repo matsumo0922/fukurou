@@ -16,6 +16,7 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.InMemoryEquitySnapshotRepository
 import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.requireTicker
@@ -129,6 +130,16 @@ class InMemoryPaperLedgerRepository(
     }
 
     override suspend fun getRecentExecutions(limit: Int): Result<List<Execution>> {
+        return findExecutionsBefore(
+            before = Instant.MAX,
+            limit = limit,
+        )
+    }
+
+    override suspend fun findExecutionsBefore(
+        before: Instant,
+        limit: Int,
+    ): Result<List<Execution>> {
         return runCatching {
             require(limit > 0) {
                 "limit must be greater than 0."
@@ -136,7 +147,29 @@ class InMemoryPaperLedgerRepository(
 
             synchronized(lock) {
                 executions
+                    .filter { execution -> Instant.parse(execution.executedAt) < before }
                     .sortedByDescending { execution -> Instant.parse(execution.executedAt) }
+                    .take(limit)
+            }
+        }
+    }
+
+    override suspend fun findExecutionsForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+    ): Result<List<Execution>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            synchronized(lock) {
+                executions
+                    .filter { execution -> cursor.accepts(Instant.parse(execution.executedAt), execution.executionId) }
+                    .sortedWith(
+                        compareByDescending<Execution> { execution -> Instant.parse(execution.executedAt) }
+                            .thenBy { execution -> execution.executionId },
+                    )
                     .take(limit)
             }
         }

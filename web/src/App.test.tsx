@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
+import { ACTIVITY_TIMELINE_FILTER_STORAGE_KEY } from "./api/ops";
 import { LOCALE_STORAGE_KEY } from "./i18n/messages";
 import { formatDateTime } from "./ui/format";
 
@@ -234,7 +235,7 @@ describe("App", () => {
     );
   });
 
-  it("shows merged activity timeline records newest first from bounded feeds", async () => {
+  it("shows activity timeline filters and loads older cursor pages", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/activity");
 
@@ -245,7 +246,7 @@ describe("App", () => {
     expect(screen.getAllByText("MANUAL_RESUME_REQUESTED").length).toBeGreaterThan(0);
     expect(screen.getAllByText("operator").length).toBeGreaterThan(0);
     expect(screen.getByText(/newest first/)).toBeInTheDocument();
-    expect(screen.getByText(/3\/90 records/)).toBeInTheDocument();
+    expect(screen.getByText(/3\/50 records/)).toBeInTheDocument();
 
     const timeline = screen.getByRole("list", { name: "Activity timeline" });
     const timelineItems = within(timeline).getAllByRole("listitem");
@@ -255,18 +256,97 @@ describe("App", () => {
       "MANUAL_RESUME_REQUESTED",
       "NO_TRADE decision",
     ]);
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/ops/decisions?limit=20",
-      expect.objectContaining({ method: "GET" }),
+    expect(hasGetCall(fetchMock, "/ops/activity", (params) => params.get("limit") === "50")).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+
+    expect(await screen.findByText("HARD_HALT_SET")).toBeInTheDocument();
+    expect(
+      hasGetCall(
+        fetchMock,
+        "/ops/activity",
+        (params) => params.get("before") === "2026-07-05T12:02:00.000Z|decision|decision:decision-1",
+      ),
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "audit" }));
+    fireEvent.click(screen.getByLabelText("MANUAL_RESUME_REQUESTED"));
+
+    await waitFor(() => {
+      expect(
+        hasGetCall(
+          fetchMock,
+          "/ops/activity",
+          (params) => params.get("source") === "audit" && params.get("auditEventType") === "MANUAL_RESUME_REQUESTED",
+        ),
+      ).toBe(true);
+    });
+    expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
+      source: "audit",
+      auditEventTypes: ["MANUAL_RESUME_REQUESTED"],
+    });
+  });
+
+  it("restores valid activity filters and drops stale saved values", async () => {
+    window.localStorage.setItem(
+      ACTIVITY_TIMELINE_FILTER_STORAGE_KEY,
+      JSON.stringify({
+        source: "audit",
+        auditEventTypes: ["HARD_HALT_SET", "STALE_EVENT"],
+      }),
     );
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/ops/audit?limit=50&excludeEventType=RECONCILER_PASS_COMPLETED",
-      expect.objectContaining({ method: "GET" }),
-    );
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/ops/executions?limit=20",
-      expect.objectContaining({ method: "GET" }),
-    );
+    const fetchMock = stubSystemFetch();
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Activity" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "audit" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByLabelText("HARD_HALT_SET")).toBeChecked();
+    expect(screen.queryByText("STALE_EVENT")).not.toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(
+        hasGetCall(
+          fetchMock,
+          "/ops/activity",
+          (params) => params.get("source") === "audit" && params.get("auditEventType") === "HARD_HALT_SET",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("ignores an older activity page response after filters change", async () => {
+    let resolveOlderResponse: (response: Response) => void = () => undefined;
+    const activityOlderResponse = new Promise<Response>((resolve) => {
+      resolveOlderResponse = resolve;
+    });
+    const fetchMock = stubSystemFetch({
+      activityOlderResponse,
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    expect(await screen.findByText("BUY BTC execution")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+    fireEvent.click(screen.getByRole("button", { name: "audit" }));
+
+    await waitFor(() => {
+      expect(hasGetCall(fetchMock, "/ops/activity", (params) => params.get("source") === "audit")).toBe(true);
+    });
+
+    await act(async () => {
+      resolveOlderResponse(jsonResponse(activityTimelineOlderPage()));
+      await activityOlderResponse;
+      await Promise.resolve();
+    });
+
+    const timeline = screen.getByRole("list", { name: "Activity timeline" });
+
+    expect(within(timeline).queryByText("HARD_HALT_SET")).not.toBeInTheDocument();
+    expect(within(timeline).getAllByText("MANUAL_RESUME_REQUESTED").length).toBeGreaterThan(0);
   });
 
   it("rejects blank control reasons before calling the API", async () => {
@@ -461,6 +541,7 @@ type SystemFetchFixture = {
     status: number;
     body: unknown;
   };
+  activityOlderResponse?: Promise<Response>;
 };
 
 function stubSystemFetch(fixture: SystemFetchFixture = {}) {
@@ -571,6 +652,12 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
           drawdownRatio: "0.025",
           updatedAt: "2026-07-05T12:01:00.000Z",
         });
+      case "/ops/activity":
+        if (requestSearchParams(input).has("before") && fixture.activityOlderResponse) {
+          return fixture.activityOlderResponse;
+        }
+
+        return jsonResponse(activityTimelineResponse(requestSearchParams(input)));
       case "/ops/decisions":
         return jsonResponse({
           decisions: [
@@ -867,6 +954,132 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
   return fetchMock;
 }
 
+function activityTimelineResponse(searchParams: URLSearchParams) {
+  const source = searchParams.get("source");
+  const auditEventTypes = searchParams.getAll("auditEventType");
+  const before = searchParams.get("before");
+  const baseEvents = before ? olderActivityEvents() : latestActivityEvents(source, auditEventTypes);
+  const events = baseEvents
+    .filter((event) => {
+      const sourceMatched = source === null || event.source === source;
+      const auditEventTypeMatched =
+        auditEventTypes.length === 0 || event.source !== "audit" || auditEventTypes.includes(event.kind);
+
+      return sourceMatched && auditEventTypeMatched;
+    })
+    .sort((firstEvent, secondEvent) => Date.parse(secondEvent.occurredAt) - Date.parse(firstEvent.occurredAt));
+
+  return {
+    events,
+    nextBefore: before ? null : "2026-07-05T12:02:00.000Z|decision|decision:decision-1",
+    limit: 50,
+  };
+}
+
+function activityTimelineOlderPage() {
+  return {
+    events: olderActivityEvents(),
+    nextBefore: null,
+    limit: 50,
+  };
+}
+
+function latestActivityEvents(source: string | null, auditEventTypes: string[]) {
+  const filteredAuditRequested = source === "audit" && auditEventTypes.length > 0;
+
+  if (filteredAuditRequested) {
+    return [...defaultLatestActivityEvents(), ...olderActivityEvents()];
+  }
+
+  return defaultLatestActivityEvents();
+}
+
+function defaultLatestActivityEvents() {
+  return [
+    {
+      id: "execution:execution-1",
+      source: "execution",
+      kind: "BUY",
+      title: "BUY BTC execution",
+      detail: "0.01000000 BTC at 10000000 JPY",
+      occurredAt: "2026-07-05T12:04:00.000Z",
+      metadata: [
+        {
+          label: "realized pnl",
+          value: "0",
+        },
+        {
+          label: "fee",
+          value: "10",
+        },
+        {
+          label: "liquidity",
+          value: "TAKER",
+        },
+        {
+          label: "order",
+          value: "order-1",
+        },
+      ],
+    },
+    {
+      id: "audit:event-1",
+      source: "audit",
+      kind: "MANUAL_RESUME_REQUESTED",
+      title: "MANUAL_RESUME_REQUESTED",
+      detail: "operator",
+      occurredAt: "2026-07-05T12:03:00.000Z",
+      metadata: [
+        {
+          label: "tool",
+          value: "operator",
+        },
+      ],
+    },
+    {
+      id: "decision:decision-1",
+      source: "decision",
+      kind: "NO_TRADE",
+      title: "NO_TRADE decision",
+      detail: "条件が揃うまで待機します。",
+      occurredAt: "2026-07-05T12:02:00.000Z",
+      metadata: [
+        {
+          label: "estimated p",
+          value: "0.42",
+        },
+        {
+          label: "setup tags",
+          value: "range",
+        },
+        {
+          label: "no-trade conditions",
+          value: "ボラティリティ不足",
+        },
+      ],
+    },
+  ];
+}
+
+function olderActivityEvents() {
+  return [
+    {
+      id: "audit:event-older",
+      source: "audit",
+      kind: "HARD_HALT_SET",
+      title: "HARD_HALT_SET",
+      detail: "risk",
+      occurredAt: "2026-07-05T12:01:00.000Z",
+      metadata: [
+        {
+          label: "tool",
+          value: "risk",
+        },
+      ],
+    },
+  ];
+}
+
 function requestPath(input: RequestInfo | URL): string {
   if (input instanceof Request) {
     return new URL(input.url).pathname;
@@ -877,6 +1090,18 @@ function requestPath(input: RequestInfo | URL): string {
   }
 
   return new URL(input, "http://localhost").pathname;
+}
+
+function requestSearchParams(input: RequestInfo | URL): URLSearchParams {
+  if (input instanceof Request) {
+    return new URL(input.url).searchParams;
+  }
+
+  if (input instanceof URL) {
+    return input.searchParams;
+  }
+
+  return new URL(input, "http://localhost").searchParams;
 }
 
 function requestMethod(input: RequestInfo | URL, init?: RequestInit): string {
@@ -896,6 +1121,20 @@ type FetchCall = [RequestInfo | URL, RequestInit?];
 
 function hasPostCall(fetchMock: FetchMock, path: string): boolean {
   return fetchMock.mock.calls.some((call) => isPostCall(call, path));
+}
+
+function hasGetCall(
+  fetchMock: FetchMock,
+  path: string,
+  matched: (searchParams: URLSearchParams) => boolean,
+): boolean {
+  return fetchMock.mock.calls.some((call) => {
+    const [input, init] = toFetchCall(call);
+    const pathMatched = requestPath(input) === path;
+    const methodMatched = requestMethod(input, init) === "GET";
+
+    return pathMatched && methodMatched && matched(requestSearchParams(input));
+  });
 }
 
 function postBody(fetchMock: FetchMock, path: string): unknown {

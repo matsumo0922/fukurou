@@ -26,6 +26,7 @@ import me.matsumo.fukurou.trading.decision.validateTradePlanLineage
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.ResultSet
@@ -300,6 +301,41 @@ private const val SELECT_DECISIONS_CREATED_BETWEEN_SQL = """
 """
 
 /**
+ * Activity timeline 用 decision stable feed SELECT の列部分。
+ */
+private const val SELECT_DECISIONS_FOR_STABLE_FEED_SQL_PREFIX = """
+    SELECT
+        id,
+        invocation_id,
+        llm_provider,
+        prompt_hash,
+        system_prompt_version,
+        market_snapshot_id,
+        action,
+        setup_tags,
+        estimated_win_probability,
+        expected_r_multiple,
+        round_trip_cost_r,
+        tool_evidence_ids,
+        fact_check,
+        self_review,
+        reason_ja,
+        missing_data_ja,
+        no_trade_conditions_ja,
+        created_at
+    FROM decisions
+    WHERE 
+"""
+
+/**
+ * Activity timeline 用 decision stable feed SELECT の並び順と件数制限。
+ */
+private const val SELECT_DECISIONS_FOR_STABLE_FEED_SQL_SUFFIX = """
+    ORDER BY created_at DESC, CAST(id AS TEXT) ASC
+    LIMIT ?
+"""
+
+/**
  * intent ID で falsifications を読む SQL。
  */
 private const val SELECT_FALSIFICATION_BY_INTENT_ID_SQL = """
@@ -402,18 +438,25 @@ class ExposedDecisionRepository(
 
                 exposedTransaction(database) {
                     selectDecisionsCreatedBetween(from, toExclusive, limit)
-                        .map { decision ->
-                            val tradeIntent = selectTradeIntentByDecisionId(decision.decisionId)
-                            val tradePlan = selectTradePlanByDecisionId(decision.decisionId)
-                            val falsification = tradeIntent?.let { intent -> selectFalsification(intent.intentId) }
+                        .map { decision -> toDecisionJournalRecord(decision) }
+                }
+            }
+        }
+    }
 
-                            DecisionJournalRecord(
-                                decision = decision,
-                                tradeIntent = tradeIntent,
-                                tradePlan = tradePlan,
-                                falsification = falsification,
-                            )
-                        }
+    override suspend fun findDecisionsForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+    ): Result<List<DecisionJournalRecord>> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+
+                exposedTransaction(database) {
+                    selectDecisionsForStableFeed(cursor, limit)
+                        .map { decision -> toDecisionJournalRecord(decision) }
                 }
             }
         }
@@ -724,6 +767,43 @@ private fun JdbcTransaction.selectDecisionsCreatedBetween(
             }
         }
     }
+}
+
+private fun JdbcTransaction.selectDecisionsForStableFeed(
+    cursor: StableFeedCursor,
+    limit: Int,
+): List<DecisionRecord> {
+    val sql = SELECT_DECISIONS_FOR_STABLE_FEED_SQL_PREFIX +
+        stableFeedCursorCondition("created_at", "id", cursor) +
+        SELECT_DECISIONS_FOR_STABLE_FEED_SQL_SUFFIX
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        val limitParameterIndex = statement.bindStableFeedCursor(
+            startIndex = 1,
+            cursor = cursor,
+        )
+        statement.setInt(limitParameterIndex, limit)
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(resultSet.toDecisionRecord())
+                }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.toDecisionJournalRecord(decision: DecisionRecord): DecisionJournalRecord {
+    val tradeIntent = selectTradeIntentByDecisionId(decision.decisionId)
+    val tradePlan = selectTradePlanByDecisionId(decision.decisionId)
+    val falsification = tradeIntent?.let { intent -> selectFalsification(intent.intentId) }
+
+    return DecisionJournalRecord(
+        decision = decision,
+        tradeIntent = tradeIntent,
+        tradePlan = tradePlan,
+        falsification = falsification,
+    )
 }
 
 private fun JdbcTransaction.selectTradePlan(tradePlanId: UUID): TradePlanRecord? {

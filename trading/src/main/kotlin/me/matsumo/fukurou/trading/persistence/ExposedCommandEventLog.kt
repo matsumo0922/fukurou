@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.PreparedStatement
 import java.sql.ResultSet
@@ -94,6 +95,19 @@ private const val SELECT_COMMAND_EVENTS_SQL_SUFFIX = """
 """
 
 /**
+ * Activity timeline 用 command_event_log stable feed SELECT の並び順と件数制限。
+ */
+private const val SELECT_COMMAND_EVENTS_STABLE_FEED_SQL_SUFFIX = """
+    ORDER BY ts DESC, CAST(id AS TEXT) ASC
+    LIMIT ?
+"""
+
+/**
+ * cursor 未指定時に全件を対象にするための DB 保存可能な終端時刻。
+ */
+private val COMMAND_EVENT_FEED_END_CURSOR: Instant = Instant.ofEpochMilli(Long.MAX_VALUE)
+
+/**
  * Exposed/JDBC で command_event_log を扱う repository。
  *
  * @param database Exposed database
@@ -174,14 +188,65 @@ class ExposedCommandEventLog(
         eventType: CommandEventType?,
         excludeEventTypes: Set<CommandEventType>,
     ): Result<List<CommandEvent>> {
+        val eventTypes = eventType?.let { setOf(it) }
+
+        return findEventsBefore(
+            limit = limit,
+            before = COMMAND_EVENT_FEED_END_CURSOR,
+            eventTypes = eventTypes,
+            excludeEventTypes = excludeEventTypes,
+        )
+    }
+
+    override suspend fun findEventsBefore(
+        limit: Int,
+        before: Instant,
+        eventTypes: Set<CommandEventType>?,
+        excludeEventTypes: Set<CommandEventType>,
+    ): Result<List<CommandEvent>> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 require(limit > 0) {
                     "limit must be greater than 0."
                 }
+                require(eventTypes == null || eventTypes.isNotEmpty()) {
+                    "eventTypes must be null or not empty."
+                }
 
                 exposedTransaction(database) {
-                    selectEvents(limit, eventType, excludeEventTypes)
+                    selectEventsBefore(
+                        limit = limit,
+                        before = before,
+                        eventTypes = eventTypes,
+                        excludeEventTypes = excludeEventTypes,
+                    )
+                }
+            }
+        }
+    }
+
+    override suspend fun findEventsForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+        eventTypes: Set<CommandEventType>?,
+        excludeEventTypes: Set<CommandEventType>,
+    ): Result<List<CommandEvent>> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+                require(eventTypes == null || eventTypes.isNotEmpty()) {
+                    "eventTypes must be null or not empty."
+                }
+
+                exposedTransaction(database) {
+                    selectEventsForStableFeed(
+                        cursor = cursor,
+                        limit = limit,
+                        eventTypes = eventTypes,
+                        excludeEventTypes = excludeEventTypes,
+                    )
                 }
             }
         }
@@ -224,18 +289,60 @@ private fun placeholders(count: Int): String {
     return List(count) { "?" }.joinToString(", ")
 }
 
-private fun JdbcTransaction.selectEvents(
+private fun JdbcTransaction.selectEventsBefore(
     limit: Int,
-    eventType: CommandEventType?,
+    before: Instant,
+    eventTypes: Set<CommandEventType>?,
     excludeEventTypes: Set<CommandEventType>,
 ): List<CommandEvent> {
+    val sortedEventTypes = eventTypes?.sortedBy { eventType -> eventType.name }
+    val sortedExcludeEventTypes = excludeEventTypes.sortedBy { eventType -> eventType.name }
     val sql = buildSelectEventsSql(
-        filterByEventType = eventType != null,
-        excludeEventTypeCount = excludeEventTypes.size,
+        eventTypeCount = sortedEventTypes?.size ?: 0,
+        excludeEventTypeCount = sortedExcludeEventTypes.size,
     )
 
     return jdbcConnection().prepareStatement(sql).use { statement ->
-        val limitParameterIndex = bindEventFilterParameters(statement, eventType, excludeEventTypes)
+        val beforeParameterIndex = bindEventFilterParameters(
+            statement = statement,
+            eventTypes = sortedEventTypes,
+            excludeEventTypes = sortedExcludeEventTypes,
+        )
+        val limitParameterIndex = beforeParameterIndex + 1
+        statement.setLong(beforeParameterIndex, before.toEpochMilli())
+        statement.setInt(limitParameterIndex, limit)
+
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(resultSet.toCommandEvent())
+                }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectEventsForStableFeed(
+    cursor: StableFeedCursor,
+    limit: Int,
+    eventTypes: Set<CommandEventType>?,
+    excludeEventTypes: Set<CommandEventType>,
+): List<CommandEvent> {
+    val sortedEventTypes = eventTypes?.sortedBy { eventType -> eventType.name }
+    val sortedExcludeEventTypes = excludeEventTypes.sortedBy { eventType -> eventType.name }
+    val sql = buildSelectEventsForStableFeedSql(
+        cursor = cursor,
+        eventTypeCount = sortedEventTypes?.size ?: 0,
+        excludeEventTypeCount = sortedExcludeEventTypes.size,
+    )
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        val cursorParameterIndex = bindEventFilterParameters(
+            statement = statement,
+            eventTypes = sortedEventTypes,
+            excludeEventTypes = sortedExcludeEventTypes,
+        )
+        val limitParameterIndex = statement.bindStableFeedCursor(cursorParameterIndex, cursor)
         statement.setInt(limitParameterIndex, limit)
 
         statement.executeQuery().use { resultSet ->
@@ -252,17 +359,19 @@ private fun JdbcTransaction.selectEvents(
  * event_type 絞り込みと除外条件から SELECT 文を組み立てる。
  */
 private fun buildSelectEventsSql(
-    filterByEventType: Boolean,
+    eventTypeCount: Int,
     excludeEventTypeCount: Int,
 ): String {
     val conditions = buildList {
-        if (filterByEventType) {
-            add("event_type = ?")
+        if (eventTypeCount > 0) {
+            add("event_type IN (" + placeholders(eventTypeCount) + ")")
         }
 
         if (excludeEventTypeCount > 0) {
             add("event_type NOT IN (" + placeholders(excludeEventTypeCount) + ")")
         }
+
+        add("ts < ?")
     }
 
     val whereClause = if (conditions.isEmpty()) {
@@ -275,16 +384,40 @@ private fun buildSelectEventsSql(
 }
 
 /**
+ * event_type 絞り込み、除外条件、安定 cursor 条件から SELECT 文を組み立てる。
+ */
+private fun buildSelectEventsForStableFeedSql(
+    cursor: StableFeedCursor,
+    eventTypeCount: Int,
+    excludeEventTypeCount: Int,
+): String {
+    val conditions = buildList {
+        if (eventTypeCount > 0) {
+            add("event_type IN (" + placeholders(eventTypeCount) + ")")
+        }
+
+        if (excludeEventTypeCount > 0) {
+            add("event_type NOT IN (" + placeholders(excludeEventTypeCount) + ")")
+        }
+
+        add(stableFeedCursorCondition("ts", "id", cursor))
+    }
+    val whereClause = "\n    WHERE " + conditions.joinToString(" AND ")
+
+    return SELECT_COMMAND_EVENTS_SQL_PREFIX + whereClause + SELECT_COMMAND_EVENTS_STABLE_FEED_SQL_SUFFIX
+}
+
+/**
  * event_type 絞り込みと除外条件の placeholder を束縛し、次に束縛すべき limit の parameter index を返す。
  */
 private fun bindEventFilterParameters(
     statement: PreparedStatement,
-    eventType: CommandEventType?,
-    excludeEventTypes: Set<CommandEventType>,
+    eventTypes: List<CommandEventType>?,
+    excludeEventTypes: List<CommandEventType>,
 ): Int {
     var parameterIndex = 1
 
-    if (eventType != null) {
+    eventTypes?.forEach { eventType ->
         statement.setString(parameterIndex, eventType.name)
         parameterIndex += 1
     }

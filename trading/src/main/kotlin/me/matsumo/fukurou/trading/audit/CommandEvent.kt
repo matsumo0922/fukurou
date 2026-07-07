@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.audit
 
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import java.time.Instant
 import java.util.UUID
 
@@ -146,6 +147,33 @@ interface CommandEventFeedReader {
     suspend fun findEvents(
         limit: Int,
         eventType: CommandEventType?,
+        excludeEventTypes: Set<CommandEventType> = emptySet(),
+    ): Result<List<CommandEvent>>
+
+    /**
+     * 指定時刻より古い command_event_log の event を新しい順で読む。
+     *
+     * @param before この時刻より古い event だけを返す排他的 cursor
+     * @param eventTypes 許可する event_type。null なら全 event_type を対象にする
+     * @param excludeEventTypes 除外する event_type。高頻度な heartbeat（例: RECONCILER_PASS_COMPLETED）を feed から外す用途に使う。
+     */
+    suspend fun findEventsBefore(
+        limit: Int,
+        before: Instant,
+        eventTypes: Set<CommandEventType>?,
+        excludeEventTypes: Set<CommandEventType> = emptySet(),
+    ): Result<List<CommandEvent>>
+
+    /**
+     * 安定 cursor 条件に一致する command_event_log の event を Activity timeline 用に新しい順で読む。
+     *
+     * @param eventTypes 許可する event_type。null なら全 event_type を対象にする
+     * @param excludeEventTypes 除外する event_type。高頻度な heartbeat（例: RECONCILER_PASS_COMPLETED）を feed から外す用途に使う。
+     */
+    suspend fun findEventsForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+        eventTypes: Set<CommandEventType>?,
         excludeEventTypes: Set<CommandEventType> = emptySet(),
     ): Result<List<CommandEvent>>
 }

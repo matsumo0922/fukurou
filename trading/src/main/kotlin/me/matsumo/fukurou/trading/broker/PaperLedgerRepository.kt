@@ -4,6 +4,7 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import java.math.BigDecimal
@@ -59,6 +60,22 @@ interface PaperLedgerRepository {
      * execution ledger の最新行を指定上限で返す。
      */
     suspend fun getRecentExecutions(limit: Int): Result<List<Execution>>
+
+    /**
+     * 指定時刻より古い execution ledger の行を新しい順で返す。
+     */
+    suspend fun findExecutionsBefore(
+        before: Instant,
+        limit: Int,
+    ): Result<List<Execution>>
+
+    /**
+     * 安定 cursor 条件に一致する execution ledger の行を Activity timeline 用に新しい順で取得する。
+     */
+    suspend fun findExecutionsForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+    ): Result<List<Execution>>
 
     /**
      * 指定範囲に close された position と関連 executions を返す。

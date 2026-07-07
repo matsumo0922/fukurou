@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.decision
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import java.math.BigDecimal
 import java.time.Clock
@@ -139,6 +140,28 @@ class InMemoryDecisionRepository(
                     .sortedByDescending { decision -> decision.createdAt }
                     .take(limit)
                     .sortedBy { decision -> decision.createdAt }
+                    .map { decision -> decision.toJournalRecordLocked() }
+            }
+        }
+    }
+
+    override suspend fun findDecisionsForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+    ): Result<List<DecisionJournalRecord>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            mutex.withLock {
+                decisions
+                    .filter { decision -> cursor.accepts(decision.createdAt, decision.decisionId.toString()) }
+                    .sortedWith(
+                        compareByDescending<DecisionRecord> { decision -> decision.createdAt }
+                            .thenBy { decision -> decision.decisionId.toString() },
+                    )
+                    .take(limit)
                     .map { decision -> decision.toJournalRecordLocked() }
             }
         }
