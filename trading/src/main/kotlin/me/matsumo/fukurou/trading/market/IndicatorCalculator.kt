@@ -129,6 +129,71 @@ data class IndicatorValue(
 object IndicatorCalculator {
 
     /**
+     * indicator が少なくとも 1 つの非 null 値を返すために必要な最小 candle 本数を返す。
+     */
+    fun requiredCandleCount(
+        indicator: IndicatorType,
+        params: IndicatorParams = IndicatorParams(),
+    ): Result<Int> {
+        return runCatching {
+            when (indicator) {
+                IndicatorType.ATR -> {
+                    val period = validatePeriod(params.period ?: DEFAULT_ATR_PERIOD, "period")
+
+                    validateRequiredCandleCount(period.toLong())
+                }
+                IndicatorType.EMA -> {
+                    val period = validatePeriod(params.period ?: DEFAULT_EMA_PERIOD, "period")
+
+                    validateRequiredCandleCount(period.toLong())
+                }
+                IndicatorType.RSI -> {
+                    val period = validatePeriod(params.period ?: DEFAULT_RSI_PERIOD, "period")
+
+                    validateRequiredCandleCount(period.toLong() + 1L)
+                }
+                IndicatorType.SMA -> {
+                    val period = validatePeriod(params.period ?: DEFAULT_SMA_PERIOD, "period")
+
+                    validateRequiredCandleCount(period.toLong())
+                }
+                IndicatorType.MACD -> {
+                    val fastPeriod = validatePeriod(
+                        period = params.fastPeriod ?: DEFAULT_MACD_FAST_PERIOD,
+                        name = "fast_period",
+                    )
+                    val slowPeriod = validatePeriod(
+                        period = params.slowPeriod ?: DEFAULT_MACD_SLOW_PERIOD,
+                        name = "slow_period",
+                    )
+                    val signalPeriod = validatePeriod(
+                        period = params.signalPeriod ?: DEFAULT_MACD_SIGNAL_PERIOD,
+                        name = "signal_period",
+                    )
+
+                    require(fastPeriod < slowPeriod) {
+                        "fast_period must be smaller than slow_period."
+                    }
+
+                    validateRequiredCandleCount(slowPeriod.toLong() + signalPeriod.toLong() - 1L)
+                }
+                IndicatorType.ATR_PERCENTILE -> {
+                    val period = validatePeriod(params.period ?: DEFAULT_ATR_PERCENTILE_PERIOD, "period")
+                    val lookback = validateLookback(params.lookback ?: DEFAULT_ATR_PERCENTILE_LOOKBACK)
+
+                    validateRequiredCandleCount(period.toLong() + lookback.toLong() - 1L)
+                }
+                IndicatorType.VWAP_SESSION -> validateRequiredCandleCount(1L)
+                IndicatorType.VOLUME_Z_SCORE -> {
+                    val period = validatePeriod(params.period ?: DEFAULT_VOLUME_Z_SCORE_PERIOD, "period")
+
+                    validateRequiredCandleCount(period.toLong())
+                }
+            }
+        }.mapError()
+    }
+
+    /**
      * 指定 indicator を計算する。
      */
     fun calculate(
@@ -266,12 +331,7 @@ object IndicatorCalculator {
     private fun calculateAtrPercentile(candles: List<Candle>, params: IndicatorParams): IndicatorResult {
         val period = validatePeriod(params.period ?: DEFAULT_ATR_PERCENTILE_PERIOD, "period")
         val lookback = validateLookback(params.lookback ?: DEFAULT_ATR_PERCENTILE_LOOKBACK)
-        val requiredCandleLimit = period.toLong() + lookback.toLong()
-        val isWithinCandleLimit = requiredCandleLimit <= MAX_INDICATOR_CANDLE_LIMIT.toLong()
-
-        require(isWithinCandleLimit) {
-            "period + lookback must be less than or equal to $MAX_INDICATOR_CANDLE_LIMIT."
-        }
+        validateRequiredCandleCount(period.toLong() + lookback.toLong() - 1L)
 
         val trueRanges = candles.mapIndexed { candleIndex, candle -> trueRange(candles, candleIndex, candle) }
         val atrValues = wilderAverage(trueRanges, period)
@@ -411,7 +471,7 @@ private const val GMO_KLINE_SESSION_BOUNDARY_HOUR = 6
  */
 private val GmoKlineSessionZone = ZoneId.of("Asia/Tokyo")
 
-private fun Result<IndicatorResult>.mapError(): Result<IndicatorResult> {
+private fun <Value> Result<Value>.mapError(): Result<Value> {
     return recoverCatching { throwable ->
         if (throwable is MarketDataParseException) {
             throw throwable
@@ -435,6 +495,16 @@ private fun validateLookback(lookback: Int): Int {
     }
 
     return lookback
+}
+
+private fun validateRequiredCandleCount(requiredCandleCount: Long): Int {
+    val isInRange = requiredCandleCount in 1L..MAX_INDICATOR_CANDLE_LIMIT.toLong()
+
+    require(isInRange) {
+        "required candle count must be between 1 and $MAX_INDICATOR_CANDLE_LIMIT: $requiredCandleCount"
+    }
+
+    return requiredCandleCount.toInt()
 }
 
 private fun trueRange(

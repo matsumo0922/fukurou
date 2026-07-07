@@ -191,6 +191,14 @@ object DirectGmoCoinMarketToolExecutor : GmoCoinMarketToolExecutor {
  */
 interface GmoCoinIndicatorCalculator {
     /**
+     * indicator が少なくとも 1 つの非 null 値を返すために必要な最小 candle 本数を返す。
+     */
+    fun requiredCandleCount(
+        indicatorType: IndicatorType,
+        params: IndicatorParams,
+    ): Result<Int>
+
+    /**
      * indicator を計算する。
      */
     fun calculate(
@@ -204,6 +212,13 @@ interface GmoCoinIndicatorCalculator {
  * `:trading` の標準 calculator に委譲する calculator。
  */
 object DefaultGmoCoinIndicatorCalculator : GmoCoinIndicatorCalculator {
+    override fun requiredCandleCount(
+        indicatorType: IndicatorType,
+        params: IndicatorParams,
+    ): Result<Int> {
+        return IndicatorCalculator.requiredCandleCount(indicatorType, params)
+    }
+
     override fun calculate(
         candles: List<Candle>,
         indicatorType: IndicatorType,
@@ -624,7 +639,9 @@ private suspend fun handleCalcIndicator(
         val interval = parseCandleInterval(request.arguments?.get("interval")?.jsonPrimitive?.contentOrNull).getOrThrow()
         val indicatorType = parseIndicatorType(request.arguments?.get("indicator")?.jsonPrimitive?.contentOrNull).getOrThrow()
         val params = parseIndicatorParams(request).getOrThrow()
-        val limit = parseIndicatorCandleLimit(request).getOrThrow()
+        val requestedLimit = parseIndicatorCandleLimit(request).getOrThrow()
+        val requiredCandleCount = indicatorCalculator.requiredCandleCount(indicatorType, params).getOrThrow()
+        val limit = resolveIndicatorCandleLimit(requestedLimit, requiredCandleCount).getOrThrow()
         val klineRequest = GmoCoinKlineRequest(
             toolName = CALC_INDICATOR_TOOL,
             interval = interval,
@@ -640,6 +657,11 @@ private suspend fun handleCalcIndicator(
             symbol = symbol.apiSymbol,
             interval = interval,
             candleCount = candles.size,
+            candleRequirement = IndicatorCandleRequirementMetadata(
+                requiredCandleCount = requiredCandleCount,
+                requestedCandleLimit = limit,
+                sourceCandlesSufficient = candles.size >= requiredCandleCount,
+            ),
             result = result,
             freshness = marketFreshness(
                 clock = clock,
@@ -797,6 +819,21 @@ private fun parseIndicatorCandleLimit(request: CallToolRequest): Result<Int> {
     }
 }
 
+private fun resolveIndicatorCandleLimit(
+    requestedLimit: Int,
+    requiredCandleCount: Int,
+): Result<Int> {
+    return runCatching {
+        val isRequiredCountInRange = requiredCandleCount in 1..MAX_INDICATOR_CANDLE_LIMIT
+
+        require(isRequiredCountInRange) {
+            "required candle count must be between 1 and $MAX_INDICATOR_CANDLE_LIMIT: $requiredCandleCount"
+        }
+
+        maxOf(requestedLimit, requiredCandleCount).coerceAtMost(MAX_INDICATOR_CANDLE_LIMIT)
+    }
+}
+
 private fun JsonObject?.readOptionalInt(
     primaryName: String,
     secondaryName: String? = null,
@@ -904,6 +941,11 @@ private fun indicatorResult(output: IndicatorToolOutput): CallToolResult {
             put("symbol", output.symbol)
             put("interval", output.interval.apiValue)
             put("candle_count", output.candleCount)
+            putJsonObject("candle_requirement") {
+                put("required_candle_count", output.candleRequirement.requiredCandleCount)
+                put("requested_candle_limit", output.candleRequirement.requestedCandleLimit)
+                put("source_candles_sufficient", output.candleRequirement.sourceCandlesSufficient)
+            }
             put("indicator", ToolJson.encodeToJsonElement(output.result.indicator))
             put("params", ToolJson.encodeToJsonElement(output.result.params))
             put("values", ToolJson.encodeToJsonElement(output.result.values))
@@ -1011,9 +1053,9 @@ private fun candlesDescription(dailyKlineRequestLimit: Int?): String {
 
 private fun indicatorDescription(dailyKlineRequestLimit: Int?): String {
     return if (dailyKlineRequestLimit == null) {
-        "Calculate one technical indicator from GMO Coin public candles. DAY-based intervals use GMO business dates that switch at 06:00 JST before calculating. Response includes freshness metadata."
+        "Calculate one technical indicator from GMO Coin public candles. The handler expands the candle limit to each indicator's minimum required count before calculating. DAY-based intervals use GMO business dates that switch at 06:00 JST. Response includes candle requirement and freshness metadata."
     } else {
-        "Calculate one technical indicator from GMO Coin public candles. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $dailyKlineRequestLimit dates before calculating. Response includes freshness metadata."
+        "Calculate one technical indicator from GMO Coin public candles. The handler expands the candle limit to each indicator's minimum required count before calculating. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $dailyKlineRequestLimit dates, so long 1hour windows may still return fewer candles than required. Response includes candle requirement and freshness metadata."
     }
 }
 
@@ -1031,6 +1073,7 @@ private fun indicatorParamsDescription(dailyKlineRequestLimit: Int?): String {
  * @param symbol 取引対象 symbol
  * @param interval ローソク足 interval
  * @param candleCount 計算に使った candle 数
+ * @param candleRequirement indicator 計算に必要な candle 本数 metadata
  * @param result indicator 計算結果
  * @param freshness 計算に使った candle data の鮮度
  */
@@ -1039,6 +1082,21 @@ private data class IndicatorToolOutput(
     val symbol: String,
     val interval: CandleInterval,
     val candleCount: Int,
+    val candleRequirement: IndicatorCandleRequirementMetadata,
     val result: IndicatorResult,
     val freshness: FreshnessMetadata,
+)
+
+/**
+ * calc_indicator の candle 必要本数 metadata。
+ *
+ * @param requiredCandleCount indicator が非 null 値を返すために必要な最小 candle 本数
+ * @param requestedCandleLimit market data source に要求した candle 上限
+ * @param sourceCandlesSufficient 供給側が必要本数以上の candle を返したかどうか
+ */
+@Serializable
+private data class IndicatorCandleRequirementMetadata(
+    val requiredCandleCount: Int,
+    val requestedCandleLimit: Int,
+    val sourceCandlesSufficient: Boolean,
 )

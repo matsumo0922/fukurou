@@ -6,6 +6,7 @@ import kotlin.math.abs
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -114,6 +115,25 @@ class IndicatorCalculatorTest {
         assertClose(2.0 / 3.0, values[3])
         assertClose(1.0, values[4])
         assertClose(1.0 / 3.0, values[5])
+    }
+
+    @Test
+    fun calculate_returnsAtrPercentileOnlyAfterDefaultRequiredCandleCount() {
+        val insufficientResult = IndicatorCalculator.calculate(
+            candles = sequentialTrueRangeCandles(count = 112),
+            indicator = IndicatorType.ATR_PERCENTILE,
+        ).getOrThrow()
+        val sufficientResult = IndicatorCalculator.calculate(
+            candles = sequentialTrueRangeCandles(count = 113),
+            indicator = IndicatorType.ATR_PERCENTILE,
+        ).getOrThrow()
+
+        val insufficientValues = insufficientResult.values.map { value -> value.value }
+        val sufficientValues = sufficientResult.values.map { value -> value.value }
+
+        assertTrue(insufficientValues.all { value -> value == null })
+        assertTrue(sufficientValues.take(112).all { value -> value == null })
+        assertNotNull(sufficientValues[112])
     }
 
     @Test
@@ -262,6 +282,28 @@ class IndicatorCalculatorTest {
     }
 
     @Test
+    fun requiredCandleCount_resolvesAtrPercentileDefaultWindow() {
+        val requiredCandleCount = IndicatorCalculator.requiredCandleCount(
+            indicator = IndicatorType.ATR_PERCENTILE,
+        ).getOrThrow()
+
+        assertEquals(113, requiredCandleCount)
+    }
+
+    @Test
+    fun requiredCandleCount_allowsAtrPercentileAtMcpCandleLimitBoundary() {
+        val requiredCandleCount = IndicatorCalculator.requiredCandleCount(
+            indicator = IndicatorType.ATR_PERCENTILE,
+            params = IndicatorParams(
+                period = 400,
+                lookback = 101,
+            ),
+        ).getOrThrow()
+
+        assertEquals(500, requiredCandleCount)
+    }
+
+    @Test
     fun calculate_rejectsInvalidPeriod() {
         val result = IndicatorCalculator.calculate(
             candles = closeCandles(1.0, 2.0, 3.0),
@@ -297,7 +339,7 @@ class IndicatorCalculatorTest {
             indicator = IndicatorType.ATR_PERCENTILE,
             params = IndicatorParams(
                 period = 400,
-                lookback = 101,
+                lookback = 102,
             ),
         )
 
@@ -372,6 +414,14 @@ private fun trueRangeCandles(vararg trueRangeValues: Double): List<Candle> {
             close = 100.0,
         )
     }
+}
+
+private fun sequentialTrueRangeCandles(count: Int): List<Candle> {
+    val trueRangeValues = DoubleArray(count) { trueRangeIndex ->
+        trueRangeIndex.toDouble() + 1.0
+    }
+
+    return trueRangeCandles(*trueRangeValues)
 }
 
 private fun closeCandles(vararg closes: Double): List<Candle> {
