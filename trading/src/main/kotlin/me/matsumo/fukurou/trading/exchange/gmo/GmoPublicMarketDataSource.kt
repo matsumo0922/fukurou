@@ -16,6 +16,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.domain.unsafeOrderFeeRateReasonOrNull
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoHttpException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
@@ -669,7 +670,7 @@ fun parseSymbolsResponse(
     val rules = response.data.firstOrNull { data -> data.symbol == symbol.apiSymbol }
         ?: throw MarketDataParseException("GMO symbols response did not include ${symbol.apiSymbol}.")
 
-    return SymbolRules(
+    val symbolRules = SymbolRules(
         symbol = rules.symbol,
         minOrderSize = rules.minOrderSize,
         sizeStep = rules.sizeStep,
@@ -677,6 +678,13 @@ fun parseSymbolsResponse(
         takerFee = rules.takerFee,
         makerFee = rules.makerFee,
     )
+    val unsafeFeeReason = unsafeOrderFeeRateReasonOrNull(symbolRules)
+
+    if (unsafeFeeReason != null) {
+        throw MarketDataParseException("GMO symbols response included unsafe fee rates: $unsafeFeeReason")
+    }
+
+    return symbolRules
 }
 
 private inline fun <reified T> decodeResponse(

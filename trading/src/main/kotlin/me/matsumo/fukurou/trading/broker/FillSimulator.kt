@@ -2,8 +2,10 @@ package me.matsumo.fukurou.trading.broker
 
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.domain.entryFeeRateFor
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Clock
@@ -47,7 +49,7 @@ class FillSimulator(
         return fill(
             sizeBtc = sizeBtc,
             priceJpy = price,
-            feeRate = rules.takerFee.toBigDecimal(),
+            feeRate = entryFeeRateFor(OrderType.MARKET, rules),
             liquidity = ExecutionLiquidity.TAKER,
         )
     }
@@ -74,7 +76,7 @@ class FillSimulator(
         return fill(
             sizeBtc = sizeBtc,
             priceJpy = price,
-            feeRate = rules.takerFee.toBigDecimal(),
+            feeRate = entryFeeRateFor(OrderType.STOP, rules),
             liquidity = ExecutionLiquidity.TAKER,
         )
     }
@@ -90,9 +92,42 @@ class FillSimulator(
         return fill(
             sizeBtc = sizeBtc,
             priceJpy = limitPriceJpy,
-            feeRate = rules.makerFee.toBigDecimal(),
+            feeRate = entryFeeRateFor(OrderType.LIMIT, rules),
             liquidity = ExecutionLiquidity.MAKER,
         )
+    }
+
+    /**
+     * resting entry order の約定を注文種別に応じて計算する。
+     */
+    fun restingEntryFill(
+        side: OrderSide,
+        orderType: OrderType,
+        sizeBtc: BigDecimal,
+        limitPriceJpy: BigDecimal?,
+        triggerPriceJpy: BigDecimal?,
+        ticker: Ticker,
+        rules: SymbolRules,
+    ): SimulatedFill {
+        return when (orderType) {
+            OrderType.LIMIT -> restingLimitFill(
+                sizeBtc = sizeBtc,
+                limitPriceJpy = requireNotNull(limitPriceJpy) {
+                    "LIMIT entry order requires limitPriceJpy."
+                },
+                rules = rules,
+            )
+            OrderType.STOP -> stopFill(
+                side = side,
+                sizeBtc = sizeBtc,
+                triggerPriceJpy = requireNotNull(triggerPriceJpy) {
+                    "STOP entry order requires triggerPriceJpy."
+                },
+                ticker = ticker,
+                rules = rules,
+            )
+            OrderType.MARKET -> error("MARKET entry is not a resting order.")
+        }
     }
 
     private fun fill(

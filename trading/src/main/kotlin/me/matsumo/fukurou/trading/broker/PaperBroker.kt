@@ -17,7 +17,7 @@ import me.matsumo.fukurou.trading.domain.ProtectionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
-import me.matsumo.fukurou.trading.domain.cashFeeReserveFor
+import me.matsumo.fukurou.trading.domain.requiredCashFor
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
@@ -792,21 +792,26 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
 ): BigDecimal {
     if (orderType == OrderType.MARKET) {
         val fill = fillSimulator.marketFill(side, sizeBtc, ticker, rules)
+        val notional = fill.priceJpy.multiply(sizeBtc)
 
-        return fill.priceJpy.multiply(sizeBtc).add(fill.feeJpy).moneyScale()
+        return requiredCashFor(
+            notional = notional,
+            orderType = orderType,
+            symbolRules = rules,
+        ).moneyScale()
     }
 
     val estimatedPrice = requireNotNull(priceJpy) {
         "$orderType order requires priceJpy."
     }
     val estimatedNotional = estimatedPrice.multiply(sizeBtc)
-    val estimatedFee = cashFeeReserveFor(
+    val requiredCash = requiredCashFor(
         notional = estimatedNotional,
         orderType = orderType,
         symbolRules = rules,
     )
 
-    return estimatedNotional.add(estimatedFee).moneyScale()
+    return requiredCash.moneyScale()
 }
 
 private fun Order.estimatedBuyReservationJpy(rules: SymbolRules): BigDecimal {
@@ -814,13 +819,13 @@ private fun Order.estimatedBuyReservationJpy(rules: SymbolRules): BigDecimal {
         ?: triggerPriceJpy?.toBigDecimal()
         ?: BigDecimal.ZERO
     val notional = price.multiply(sizeBtc.toBigDecimal())
-    val fee = cashFeeReserveFor(
+    val requiredCash = requiredCashFor(
         notional = notional,
         orderType = orderType,
         symbolRules = rules,
     )
 
-    return notional.add(fee).moneyScale()
+    return requiredCash.moneyScale()
 }
 
 private fun validateProtectionUpdateHasChange(command: UpdateProtectionCommand) {

@@ -282,7 +282,11 @@ class SafetyFloorTest {
             ),
         )
 
-        assertEquals("69879.94500000", details.availableCashJpy)
+        // reserved cash:
+        // LIMIT = 10,000,000 * 0.001 + maker rebate clamped to 0 = 10,000
+        // MARKET = 10,110,000 ask * 1.0005 slippage * 0.001 * (1 + 0.0005 taker) = 10,120.11252750
+        // STOP = 10,000,000 trigger * 1.0005 slippage * 0.001 * (1 + 0.0005 taker) = 10,010.00250000
+        assertEquals("69869.88497250", details.availableCashJpy)
     }
 
     @Test
@@ -316,7 +320,33 @@ class SafetyFloorTest {
 
         assertIs<SafetyFloorVerdict.Accepted>(verdict)
         assertEquals("50000.00000000", details.requiredCashJpy)
+        // maker LIMIT cost:
+        // (-5.00000000 entry rebate + 24.25000000 exit taker) + 49.25000000 slippage = 68.50000000
         assertEquals("3.64963504", details.expectedMoveToCostRatio)
+    }
+
+    @Test
+    fun place_order_rejectsUnsafeNegativeTakerFeeBeforeCostGates() {
+        val command = entryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("10000000"),
+        )
+        val verdict = SafetyFloor(clock = fixedClock()).evaluatePlaceOrder(
+            command = command,
+            context = safetyContext(
+                positions = emptyList(),
+                atr14Jpy = null,
+                entryIntent = approvedIntentSnapshot(command),
+                marketDataObservedAt = fixedInstant(),
+                symbolRules = symbolRules(takerFee = "-0.0010"),
+            ),
+        )
+        val rejected = assertIs<SafetyFloorVerdict.Rejected>(verdict)
+
+        assertEquals(SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT, rejected.violation.rule)
+        val measuredValue = requireNotNull(rejected.violation.measuredValue)
+
+        assertTrue(measuredValue.contains("takerFee must be greater than 0."))
     }
 }
 
@@ -352,6 +382,7 @@ private fun safetyContext(
     atr14Jpy: BigDecimal?,
     entryIntent: EntryIntentSafetySnapshot? = null,
     marketDataObservedAt: Instant? = null,
+    symbolRules: SymbolRules = symbolRules(),
 ): SafetyFloorContext {
     return SafetyFloorContext(
         account = account,
@@ -368,17 +399,24 @@ private fun safetyContext(
             volume = "1.0",
             timestamp = fixedInstant().toString(),
         ),
-        symbolRules = SymbolRules(
-            symbol = "BTC",
-            minOrderSize = "0.0001",
-            sizeStep = "0.0001",
-            tickSize = "1",
-            takerFee = "0.0005",
-            makerFee = "-0.0001",
-        ),
+        symbolRules = symbolRules,
         entryIntent = entryIntent,
         atr14Jpy = atr14Jpy,
         marketDataObservedAt = marketDataObservedAt,
+    )
+}
+
+private fun symbolRules(
+    takerFee: String = "0.0005",
+    makerFee: String = "-0.0001",
+): SymbolRules {
+    return SymbolRules(
+        symbol = "BTC",
+        minOrderSize = "0.0001",
+        sizeStep = "0.0001",
+        tickSize = "1",
+        takerFee = takerFee,
+        makerFee = makerFee,
     )
 }
 

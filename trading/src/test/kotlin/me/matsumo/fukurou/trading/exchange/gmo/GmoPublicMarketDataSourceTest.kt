@@ -137,6 +137,18 @@ class GmoPublicMarketDataSourceTest {
     }
 
     @Test
+    fun parseSymbolsResponse_rejectsUnsafeNegativeTakerFee() {
+        val response = SYMBOLS_SUCCESS_RESPONSE.replace(
+            oldValue = "\"takerFee\": \"0.0005\"",
+            newValue = "\"takerFee\": \"-0.0010\"",
+        )
+
+        assertFailsWith<MarketDataParseException> {
+            parseSymbolsResponse(response, TradingSymbol.BTC)
+        }
+    }
+
+    @Test
     fun getCandles_fetchesPreviousDayOnlyWhenTodayIsShort() = runBlocking {
         val httpClient = FakeHttpClient(
             responses = mapOf(
