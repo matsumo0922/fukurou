@@ -776,7 +776,7 @@ private suspend fun PaperBroker.validateCashAvailability(
     val cashJpy = balance.cashJpy.toBigDecimal()
     val reservedCashJpy = openOrders
         .filter { order -> order.side == OrderSide.BUY && order.status == OrderStatus.OPEN }
-        .sumOf { order -> order.estimatedBuyReservationJpy(rules) }
+        .sumOf { order -> order.estimatedBuyReservationJpy(ticker, rules, fillSimulator) }
     val requiredCash = command.estimatedRequiredCash(ticker, rules, fillSimulator)
     val availableCash = cashJpy.subtract(reservedCashJpy).moneyScale()
 
@@ -814,10 +814,26 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
     return requiredCash.moneyScale()
 }
 
-private fun Order.estimatedBuyReservationJpy(rules: SymbolRules): BigDecimal {
-    val price = limitPriceJpy?.toBigDecimal()
-        ?: triggerPriceJpy?.toBigDecimal()
-        ?: BigDecimal.ZERO
+internal fun Order.estimatedBuyReservationJpy(
+    ticker: Ticker,
+    rules: SymbolRules,
+    fillSimulator: FillSimulator,
+): BigDecimal {
+    val price = when (orderType) {
+        OrderType.MARKET -> fillSimulator.marketFill(side, sizeBtc.toBigDecimal(), ticker, rules).priceJpy
+        OrderType.LIMIT -> requireNotNull(limitPriceJpy) {
+            "LIMIT buy reservation requires limitPriceJpy."
+        }.toBigDecimal()
+        OrderType.STOP -> fillSimulator.stopFill(
+            side = side,
+            sizeBtc = sizeBtc.toBigDecimal(),
+            triggerPriceJpy = requireNotNull(triggerPriceJpy) {
+                "STOP buy reservation requires triggerPriceJpy."
+            }.toBigDecimal(),
+            ticker = ticker,
+            rules = rules,
+        ).priceJpy
+    }
     val notional = price.multiply(sizeBtc.toBigDecimal())
     val requiredCash = requiredCashFor(
         notional = notional,

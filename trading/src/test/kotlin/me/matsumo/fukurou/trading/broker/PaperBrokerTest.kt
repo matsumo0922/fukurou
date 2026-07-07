@@ -506,6 +506,29 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun estimatedBuyReservationJpy_usesSlippageForOpenStopOrder() = runBlocking {
+        val ticker = FakeMarketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        val order = order(
+            orderId = "20000000-0000-0000-0000-000000000006",
+            positionId = null,
+            orderType = OrderType.STOP,
+            side = OrderSide.BUY,
+            status = OrderStatus.OPEN,
+        ).copy(
+            limitPriceJpy = null,
+            triggerPriceJpy = "10000000.00000000",
+        )
+
+        val reservation = order.estimatedBuyReservationJpy(
+            ticker = ticker,
+            rules = defaultSymbolRules(),
+            fillSimulator = FillSimulator(clock = fixedClock()),
+        )
+
+        assertEquals("100100.02500000", reservation.toPlainString())
+    }
+
+    @Test
     fun safety_floor_rejects_group_risk_over_two_percent_before_side_effect() = runBlocking {
         val violationRepository = InMemorySafetyViolationRepository()
         val repository = InMemoryPaperLedgerRepository()
