@@ -596,8 +596,8 @@ class OneShotLlmRunnerTest {
 
         assertTrue(allowedToolsConfig.contains("submit_falsification"))
         assertTrue(allowedToolsConfig.contains("get_trade_intent"))
-        assertTrue(allowedToolsConfig.contains("knowledge.get_recent_lessons"))
-        assertTrue(allowedToolsConfig.contains("knowledge.search_similar_setups"))
+        assertTrue(allowedToolsConfig.contains("knowledge_get_recent_lessons"))
+        assertTrue(allowedToolsConfig.contains("knowledge_search_similar_setups"))
         assertTrue(allowedToolsConfig.contains("preview_order"))
         assertFalse(allowedToolsConfig.contains("place_order"))
         assertFalse(allowedToolsConfig.contains("submit_decision"))
@@ -618,10 +618,10 @@ class OneShotLlmRunnerTest {
 
         assertEquals(emptyList(), proposerRequest.mcpServer.autoApprovedTools)
         assertEquals(listOf("submit_falsification"), falsifierRequest.mcpServer.autoApprovedTools)
-        assertTrue(proposerRequest.allowedTools.contains("mcp__fukurou-mcp__knowledge.get_recent_lessons"))
-        assertTrue(proposerRequest.allowedTools.contains("mcp__fukurou-mcp__knowledge.search_similar_setups"))
-        assertTrue(falsifierRequest.allowedTools.contains("mcp__fukurou-mcp__knowledge.get_recent_lessons"))
-        assertTrue(falsifierRequest.allowedTools.contains("mcp__fukurou-mcp__knowledge.search_similar_setups"))
+        assertTrue(proposerRequest.allowedTools.contains("mcp__fukurou-mcp__knowledge_get_recent_lessons"))
+        assertTrue(proposerRequest.allowedTools.contains("mcp__fukurou-mcp__knowledge_search_similar_setups"))
+        assertTrue(falsifierRequest.allowedTools.contains("mcp__fukurou-mcp__knowledge_get_recent_lessons"))
+        assertTrue(falsifierRequest.allowedTools.contains("mcp__fukurou-mcp__knowledge_search_similar_setups"))
     }
 
     @Test

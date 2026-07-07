@@ -151,12 +151,12 @@ private const val GET_TRADE_INTENT_TOOL = "get_trade_intent"
 /**
  * recent lessons 取得 tool 名。
  */
-private const val KNOWLEDGE_GET_RECENT_LESSONS_TOOL = "knowledge.get_recent_lessons"
+private const val KNOWLEDGE_GET_RECENT_LESSONS_TOOL = "knowledge_get_recent_lessons"
 
 /**
  * similar setup search tool 名。
  */
-private const val KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL = "knowledge.search_similar_setups"
+private const val KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL = "knowledge_search_similar_setups"
 
 /**
  * paper entry 発注 preview tool 名。
