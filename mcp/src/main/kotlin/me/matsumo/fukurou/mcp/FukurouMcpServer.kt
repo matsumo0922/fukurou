@@ -25,6 +25,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.encodeToJsonElement
@@ -34,6 +35,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import me.matsumo.fukurou.mcp.gmo.DescribedGmoCoinKlineRequestBudgetHook
 import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolErrorResponse
@@ -66,6 +68,26 @@ import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GMO_MAX_DAILY_KLINE_REQUESTS
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
+import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_RECENT_LESSONS_LIMIT
+import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_RECENT_LESSONS_LOOKBACK_DAYS
+import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LIMIT
+import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LOOKBACK_DAYS
+import me.matsumo.fukurou.trading.knowledge.KnowledgeDecisionOutcome
+import me.matsumo.fukurou.trading.knowledge.KnowledgeFailurePattern
+import me.matsumo.fukurou.trading.knowledge.KnowledgeFalsificationSummary
+import me.matsumo.fukurou.trading.knowledge.KnowledgeLesson
+import me.matsumo.fukurou.trading.knowledge.KnowledgeRecentLessonsQuery
+import me.matsumo.fukurou.trading.knowledge.KnowledgeRecentLessonsResult
+import me.matsumo.fukurou.trading.knowledge.KnowledgeRunSummary
+import me.matsumo.fukurou.trading.knowledge.KnowledgeService
+import me.matsumo.fukurou.trading.knowledge.KnowledgeSetupPerformanceSummary
+import me.matsumo.fukurou.trading.knowledge.KnowledgeSimilarSetupHit
+import me.matsumo.fukurou.trading.knowledge.KnowledgeSimilarSetupsQuery
+import me.matsumo.fukurou.trading.knowledge.KnowledgeSimilarSetupsResult
+import me.matsumo.fukurou.trading.knowledge.KnowledgeTradePlanSummary
+import me.matsumo.fukurou.trading.knowledge.MAX_KNOWLEDGE_LOOKBACK_DAYS
+import me.matsumo.fukurou.trading.knowledge.MAX_KNOWLEDGE_RECENT_LESSONS_LIMIT
+import me.matsumo.fukurou.trading.knowledge.MAX_KNOWLEDGE_SIMILAR_SETUPS_LIMIT
 import me.matsumo.fukurou.trading.market.FreshnessDefaults
 import me.matsumo.fukurou.trading.market.FreshnessMetadata
 import me.matsumo.fukurou.trading.market.FreshnessSource
@@ -127,6 +149,16 @@ private const val GET_ACCOUNT_STATUS_TOOL = "get_account_status"
 private const val GET_TRADE_INTENT_TOOL = "get_trade_intent"
 
 /**
+ * recent lessons 取得 tool 名。
+ */
+private const val KNOWLEDGE_GET_RECENT_LESSONS_TOOL = "knowledge.get_recent_lessons"
+
+/**
+ * similar setup search tool 名。
+ */
+private const val KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL = "knowledge.search_similar_setups"
+
+/**
  * paper entry 発注 preview tool 名。
  */
 private const val PREVIEW_ORDER_TOOL = "preview_order"
@@ -186,6 +218,8 @@ private val MCP_TOOL_NAMES = setOf(
     GET_OPEN_ORDERS_TOOL,
     GET_ACCOUNT_STATUS_TOOL,
     GET_TRADE_INTENT_TOOL,
+    KNOWLEDGE_GET_RECENT_LESSONS_TOOL,
+    KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL,
     SUBMIT_DECISION_TOOL,
     SUBMIT_FALSIFICATION_TOOL,
     PREVIEW_ORDER_TOOL,
@@ -289,6 +323,7 @@ fun main() {
  * @param marketDataSource 市場データ取得元
  * @param clock response 鮮度 metadata と default runtime を作る clock
  * @param tradingRuntime 取引 runtime
+ * @param knowledgeService Knowledge read-only tool 用 service
  * @param decisionRunContext 呼び出し元の decision run context
  */
 class FukurouMcpServer(
@@ -298,6 +333,12 @@ class FukurouMcpServer(
     private val tradingRuntime: TradingRuntime = defaultTradingRuntime(
         tradingConfig = tradingConfig,
         marketDataSource = marketDataSource,
+        clock = clock,
+    ),
+    private val knowledgeService: KnowledgeService = KnowledgeService(
+        decisionRepository = tradingRuntime.decisionRepository,
+        llmRunRepository = tradingRuntime.llmRunRepository,
+        evaluationRepository = tradingRuntime.evaluationRepository,
         clock = clock,
     ),
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
@@ -386,6 +427,18 @@ class FukurouMcpServer(
             decisionRunContext = decisionRunContext,
             toolCallLimiter = toolCallLimiter,
             clock = clock,
+        )
+        server.registerKnowledgeRecentLessonsTool(
+            tradingRuntime = tradingRuntime,
+            knowledgeService = knowledgeService,
+            decisionRunContext = decisionRunContext,
+            toolCallLimiter = toolCallLimiter,
+        )
+        server.registerKnowledgeSimilarSetupsTool(
+            tradingRuntime = tradingRuntime,
+            knowledgeService = knowledgeService,
+            decisionRunContext = decisionRunContext,
+            toolCallLimiter = toolCallLimiter,
         )
         server.registerTradeIntentTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerSubmitDecisionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
@@ -875,6 +928,89 @@ private fun Server.registerAccountStatusTool(
     }
 }
 
+private fun Server.registerKnowledgeRecentLessonsTool(
+    tradingRuntime: TradingRuntime,
+    knowledgeService: KnowledgeService,
+    decisionRunContext: DecisionRunContext,
+    toolCallLimiter: McpToolCallLimiter,
+) {
+    addLimitedTool(
+        name = KNOWLEDGE_GET_RECENT_LESSONS_TOOL,
+        description = "Return bounded DB-backed recent lessons, failure patterns, and reflection summaries.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putSymbolSchema()
+                putJsonObject("limit") {
+                    put("type", JSON_TYPE_INTEGER)
+                    put("description", "Maximum number of lessons to return.")
+                    put("default", DEFAULT_KNOWLEDGE_RECENT_LESSONS_LIMIT)
+                    put("minimum", 1)
+                    put("maximum", MAX_KNOWLEDGE_RECENT_LESSONS_LIMIT)
+                }
+                putJsonObject("lookback_days") {
+                    put("type", JSON_TYPE_INTEGER)
+                    put("description", "Number of past days to inspect.")
+                    put("default", DEFAULT_KNOWLEDGE_RECENT_LESSONS_LOOKBACK_DAYS)
+                    put("minimum", 1)
+                    put("maximum", MAX_KNOWLEDGE_LOOKBACK_DAYS)
+                }
+            },
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+        kind = McpToolCallKind.READ_ONLY,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handleKnowledgeRecentLessons(request, tradingRuntime, knowledgeService, call)
+    }
+}
+
+private fun Server.registerKnowledgeSimilarSetupsTool(
+    tradingRuntime: TradingRuntime,
+    knowledgeService: KnowledgeService,
+    decisionRunContext: DecisionRunContext,
+    toolCallLimiter: McpToolCallLimiter,
+) {
+    addLimitedTool(
+        name = KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL,
+        description = "Search bounded DB-backed past decisions and outcomes by setup tags or signal context.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putSymbolSchema()
+                putStringArraySchema("setup_tags", "Setup taxonomy tags to match.")
+                putJsonObject("regime") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Short market regime label or description.")
+                }
+                putJsonObject("signal_summary") {
+                    put("type", JSON_TYPE_STRING)
+                    put("description", "Short signal summary for text matching.")
+                }
+                putJsonObject("limit") {
+                    put("type", JSON_TYPE_INTEGER)
+                    put("description", "Maximum number of similar decisions to return.")
+                    put("default", DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LIMIT)
+                    put("minimum", 1)
+                    put("maximum", MAX_KNOWLEDGE_SIMILAR_SETUPS_LIMIT)
+                }
+                putJsonObject("lookback_days") {
+                    put("type", JSON_TYPE_INTEGER)
+                    put("description", "Number of past days to inspect.")
+                    put("default", DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LOOKBACK_DAYS)
+                    put("minimum", 1)
+                    put("maximum", MAX_KNOWLEDGE_LOOKBACK_DAYS)
+                }
+            },
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+        kind = McpToolCallKind.READ_ONLY,
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    ) { request, call ->
+        handleKnowledgeSimilarSetups(request, tradingRuntime, knowledgeService, call)
+    }
+}
+
 private fun Server.registerTradeIntentTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
@@ -1031,6 +1167,42 @@ private suspend fun handleGetAccountStatus(
                 clock = clock,
             )
         },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
+private suspend fun handleKnowledgeRecentLessons(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    knowledgeService: KnowledgeService,
+    call: GuardedToolCall,
+): CallToolResult {
+    val result = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
+        val query = parseKnowledgeRecentLessonsQuery(request).getOrThrow()
+
+        knowledgeService.getRecentLessons(query).getOrThrow()
+    }
+
+    return result.fold(
+        onSuccess = { value -> knowledgeRecentLessonsResult(value) },
+        onFailure = { throwable -> throwableResult(throwable) },
+    )
+}
+
+private suspend fun handleKnowledgeSimilarSetups(
+    request: CallToolRequest,
+    tradingRuntime: TradingRuntime,
+    knowledgeService: KnowledgeService,
+    call: GuardedToolCall,
+): CallToolResult {
+    val result = toolCallGuard(tradingRuntime).runReadOnlyTool(call) {
+        val query = parseKnowledgeSimilarSetupsQuery(request).getOrThrow()
+
+        knowledgeService.searchSimilarSetups(query).getOrThrow()
+    }
+
+    return result.fold(
+        onSuccess = { value -> knowledgeSimilarSetupsResult(value) },
         onFailure = { throwable -> throwableResult(throwable) },
     )
 }
@@ -1452,6 +1624,41 @@ private fun parseTradePlanDraft(request: CallToolRequest, action: DecisionAction
     }
 }
 
+private fun parseKnowledgeRecentLessonsQuery(request: CallToolRequest): Result<KnowledgeRecentLessonsQuery> {
+    return runCatching {
+        KnowledgeRecentLessonsQuery(
+            symbol = parseTradingSymbol(request.stringArgument("symbol")).getOrThrow(),
+            limit = request.intArgument(
+                name = "limit",
+                defaultValue = DEFAULT_KNOWLEDGE_RECENT_LESSONS_LIMIT,
+            ),
+            lookbackDays = request.intArgument(
+                name = "lookback_days",
+                defaultValue = DEFAULT_KNOWLEDGE_RECENT_LESSONS_LOOKBACK_DAYS,
+            ),
+        )
+    }
+}
+
+private fun parseKnowledgeSimilarSetupsQuery(request: CallToolRequest): Result<KnowledgeSimilarSetupsQuery> {
+    return runCatching {
+        KnowledgeSimilarSetupsQuery(
+            symbol = parseTradingSymbol(request.stringArgument("symbol")).getOrThrow(),
+            setupTags = request.stringListArgument("setup_tags"),
+            regime = request.stringArgument("regime"),
+            signalSummary = request.stringArgument("signal_summary"),
+            limit = request.intArgument(
+                name = "limit",
+                defaultValue = DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LIMIT,
+            ),
+            lookbackDays = request.intArgument(
+                name = "lookback_days",
+                defaultValue = DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LOOKBACK_DAYS,
+            ),
+        )
+    }
+}
+
 private fun parsePlaceOrderCommand(request: CallToolRequest, call: GuardedToolCall): Result<PlaceOrderCommand> {
     return runCatching {
         PlaceOrderCommand(
@@ -1761,6 +1968,155 @@ private fun tradeIntentResult(snapshot: TradeIntentReviewSnapshot): CallToolResu
             }
         },
     )
+}
+
+private fun knowledgeRecentLessonsResult(result: KnowledgeRecentLessonsResult): CallToolResult {
+    return jsonObjectResult(
+        buildJsonObject {
+            put("schema_version", "knowledge.recent_lessons.v1")
+            put("source", "postgres")
+            put("symbol", result.symbol.apiSymbol)
+            put("lookback_days", result.lookbackDays)
+            put("limit", result.limit)
+            put("item_count", result.lessons.size)
+            put("evaluation_truncated", result.evaluationTruncated)
+            putJsonArray("lessons") {
+                result.lessons.forEach { lesson -> add(lesson.toJsonObject()) }
+            }
+            putJsonArray("failure_patterns") {
+                result.failurePatterns.forEach { pattern -> add(pattern.toJsonObject()) }
+            }
+            putJsonArray("run_summaries") {
+                result.runSummaries.forEach { summary -> add(summary.toJsonObject()) }
+            }
+            putJsonArray("setup_performance") {
+                result.setupPerformance.forEach { performance -> add(performance.toJsonObject()) }
+            }
+        },
+    )
+}
+
+private fun knowledgeSimilarSetupsResult(result: KnowledgeSimilarSetupsResult): CallToolResult {
+    return jsonObjectResult(
+        buildJsonObject {
+            put("schema_version", "knowledge.similar_setups.v1")
+            put("source", "postgres")
+            put("symbol", result.symbol.apiSymbol)
+            put("setup_tags", ToolJson.encodeToJsonElement(result.setupTags))
+            putNullableString("regime", result.regime)
+            putNullableString("signal_summary", result.signalSummary)
+            put("lookback_days", result.lookbackDays)
+            put("limit", result.limit)
+            put("item_count", result.hits.size)
+            put("evaluation_truncated", result.evaluationTruncated)
+            putJsonArray("hits") {
+                result.hits.forEach { hit -> add(hit.toJsonObject()) }
+            }
+            putJsonArray("setup_performance") {
+                result.setupPerformance.forEach { performance -> add(performance.toJsonObject()) }
+            }
+        },
+    )
+}
+
+private fun KnowledgeSimilarSetupHit.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        put("score", score)
+        put("matched_terms", ToolJson.encodeToJsonElement(matchedTerms))
+        put("lesson", lesson.toJsonObject())
+        put("outcome", outcome.toJsonObject())
+    }
+}
+
+private fun KnowledgeLesson.toJsonObject(): JsonObject {
+    val tradePlan = tradePlanSummary
+    val falsification = falsificationSummary
+
+    return buildJsonObject {
+        put("decision_id", decisionId)
+        put("created_at", createdAt.toString())
+        putNullableString("invocation_id", invocationId)
+        put("action", action)
+        put("setup_tags", ToolJson.encodeToJsonElement(setupTags))
+        putNullableString("estimated_win_probability", estimatedWinProbability)
+        putNullableString("expected_r_multiple", expectedRMultiple)
+        put("reason_ja", reasonJa)
+        put("self_review_summary", selfReviewSummary)
+        put("missing_data_ja", ToolJson.encodeToJsonElement(missingDataJa))
+        put("no_trade_conditions_ja", ToolJson.encodeToJsonElement(noTradeConditionsJa))
+        if (tradePlan == null) {
+            put("trade_plan", JsonNull)
+        } else {
+            put("trade_plan", tradePlan.toJsonObject())
+        }
+        if (falsification == null) {
+            put("falsification", JsonNull)
+        } else {
+            put("falsification", falsification.toJsonObject())
+        }
+    }
+}
+
+private fun KnowledgeTradePlanSummary.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        put("trade_plan_id", tradePlanId)
+        put("thesis_ja", thesisJa)
+        put("invalidation_conditions_ja", ToolJson.encodeToJsonElement(invalidationConditionsJa))
+        put("revision_count", revisionCount)
+    }
+}
+
+private fun KnowledgeFalsificationSummary.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        put("verdict", verdict)
+        put("reason_ja", reasonJa)
+        put("created_at", createdAt.toString())
+    }
+}
+
+private fun KnowledgeFailurePattern.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        put("source", source)
+        put("source_id", sourceId)
+        putNullableString("occurred_at", occurredAt?.toString())
+        put("summary", summary)
+        put("evidence", evidence)
+    }
+}
+
+private fun KnowledgeRunSummary.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        put("invocation_id", invocationId)
+        put("mode", mode)
+        put("symbol", symbol)
+        put("status", status)
+        putNullableString("trigger_kind", triggerKind)
+        put("started_at", startedAt.toString())
+        putNullableString("finished_at", finishedAt?.toString())
+        putNullableString("error_message", errorMessage)
+    }
+}
+
+private fun KnowledgeSetupPerformanceSummary.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        put("setup_tag", setupTag)
+        put("trade_count", tradeCount)
+        put("total_pnl_jpy", totalPnlJpy)
+        putNullableString("profit_factor", profitFactor)
+        putNullableString("win_rate", winRate)
+        putNullableString("expected_r", expectedR)
+        putNullableString("average_mae_r", averageMaeR)
+        putNullableString("average_mfe_r", averageMfeR)
+    }
+}
+
+private fun KnowledgeDecisionOutcome.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        putNullableString("run_status", runStatus)
+        putNullableString("falsification_verdict", falsificationVerdict)
+        put("has_trade_intent", hasTradeIntent)
+        putNullableString("expected_r_multiple", expectedRMultiple)
+    }
 }
 
 private fun tradeResult(result: PaperTradeResult): CallToolResult {
