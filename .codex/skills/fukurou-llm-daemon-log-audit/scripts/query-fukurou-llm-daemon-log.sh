@@ -175,6 +175,13 @@ SELECT
     || '|' || COALESCE(payload::jsonb #>> '{details,operation}', '<none>')
     || '|' || COALESCE(payload::jsonb #>> '{details,reason}', '<none>')
     || '|accepted=' || COALESCE(payload::jsonb #>> '{details,accepted}', '<none>')
+    || '|ttlSeconds=' || COALESCE(payload::jsonb #>> '{details,ttlSeconds}', '<none>')
+    || '|expiredOrderCount=' || COALESCE(payload::jsonb #>> '{details,expiredOrderCount}', '<none>')
+    || '|cancelSuccessCount=' || COALESCE(payload::jsonb #>> '{details,cancelSuccessCount}', '<none>')
+    || '|cancelFailureCount=' || COALESCE(payload::jsonb #>> '{details,cancelFailureCount}', '<none>')
+    || '|canceledOrderIds=' || COALESCE(replace(payload::jsonb #>> '{details,canceledOrderIds}', '|', '/'), '<none>')
+    || '|failedOrderIds=' || COALESCE(replace(payload::jsonb #>> '{details,failedOrderIds}', '|', '/'), '<none>')
+    || '|failureSummaries=' || COALESCE(replace(regexp_replace(payload::jsonb #>> '{details,failureSummaries}', '\\s+', ' ', 'g'), '|', '/'), '<none>')
     || '|evidence=' || COALESCE(replace(regexp_replace((payload::jsonb #> '{details,evidence}')::text, '\\s+', ' ', 'g'), '|', '/'), '<none>')
 FROM command_event_log
 CROSS JOIN query_window

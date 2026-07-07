@@ -50,7 +50,7 @@ scripts/prod-curl "/evaluation/costs?from=<JST-date>&to=<JST-date>" -fsS
 - `PAPER_EXIT_EXECUTED`: runner が EXIT decision を `close_position` または `cancel_order` に写像した。`LIFECYCLE|...|exit_execution|...` と paper ledger の positions / orders / executions を確認し、position close と resting entry cancel を分けて説明する。
 - `PAPER_PROTECTION_UPDATED`: runner が ADJUST_PROTECTION decision を `update_protection` に写像した。`LIFECYCLE|...|adjust_protection_execution|...` と position の STOP / virtual TP を確認し、STOP が維持され TP だけ更新されたことを説明する。
 - `RUNNING`: run がまだ終わっていない。少し待って再確認してから断定する。
-- `LIFECYCLE|...`: `DECISION_LIFECYCLE_COMPLETED` の監査行。`phase` が `stale_resting_entry_ttl_sweep` なら stale resting entry cancel の件数、`exit_execution` なら close / cancel / fail-closed、`adjust_protection_execution` なら protection update / fail-closed を読む。fail-closed は `reason` と `evidence` を根拠にする。
+- `LIFECYCLE|...`: `DECISION_LIFECYCLE_COMPLETED` の監査行。`phase` が `stale_resting_entry_ttl_sweep` なら `expiredOrderCount`、`cancelSuccessCount`、`cancelFailureCount`、`canceledOrderIds`、`failedOrderIds`、`failureSummaries` で TTL cancel の部分成功・失敗を確認する。`exit_execution` なら close / cancel / fail-closed、`adjust_protection_execution` なら protection update / fail-closed を読む。fail-closed は `reason` と `evidence` を根拠にする。
 - `max_invocations_per_hour_exceeded`: scheduler が起動上限で skip した。障害ではなく cap による抑制として扱う。
 - `RISK|...` の `state`: `RUNNING` 以外（soft halt / hard halt）なら停止中。`hard_halt=true` は全取引停止、soft halt は縮小運用。`halt_reason` を添えて説明する。
 - `LEDGER|...` の各 count は累計値（対象期間フィルタなし）。「この期間に取引があったか」は RUN 行の `PAPER_ENTRY_PLACED` と executions 累計の増減で判断する。
