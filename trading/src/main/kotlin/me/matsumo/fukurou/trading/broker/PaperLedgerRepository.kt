@@ -61,6 +61,14 @@ interface PaperLedgerRepository {
     suspend fun getRecentExecutions(limit: Int): Result<List<Execution>>
 
     /**
+     * 指定時刻より古い execution ledger の行を新しい順で返す。
+     */
+    suspend fun findExecutionsBefore(
+        before: Instant,
+        limit: Int,
+    ): Result<List<Execution>>
+
+    /**
      * 指定範囲に close された position と関連 executions を返す。
      */
     suspend fun findClosedPositionsClosedBetween(

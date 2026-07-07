@@ -148,4 +148,18 @@ interface CommandEventFeedReader {
         eventType: CommandEventType?,
         excludeEventTypes: Set<CommandEventType> = emptySet(),
     ): Result<List<CommandEvent>>
+
+    /**
+     * 指定時刻より古い command_event_log の event を新しい順で読む。
+     *
+     * @param before この時刻より古い event だけを返す排他的 cursor
+     * @param eventTypes 許可する event_type。null なら全 event_type を対象にする
+     * @param excludeEventTypes 除外する event_type。高頻度な heartbeat（例: RECONCILER_PASS_COMPLETED）を feed から外す用途に使う。
+     */
+    suspend fun findEventsBefore(
+        limit: Int,
+        before: Instant,
+        eventTypes: Set<CommandEventType>?,
+        excludeEventTypes: Set<CommandEventType> = emptySet(),
+    ): Result<List<CommandEvent>>
 }

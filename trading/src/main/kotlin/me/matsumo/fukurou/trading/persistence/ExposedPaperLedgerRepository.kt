@@ -490,6 +490,34 @@ private const val SELECT_RECENT_EXECUTIONS_SQL = """
 """
 
 /**
+ * execution ledger の指定時刻より古い行を指定上限で読む SQL。
+ */
+private const val SELECT_EXECUTIONS_BEFORE_SQL = """
+    SELECT
+        id,
+        order_id,
+        position_id,
+        mode,
+        symbol,
+        side,
+        price_jpy,
+        size_btc,
+        fee_jpy,
+        realized_pnl_jpy,
+        liquidity,
+        executed_at
+    FROM executions
+    WHERE mode = (
+        SELECT mode
+        FROM paper_account
+        WHERE id = ?
+    )
+        AND executed_at < ?
+    ORDER BY executed_at DESC
+    LIMIT ?
+"""
+
+/**
  * 指定日実現損益を集計する SQL。
  */
 private const val SELECT_REALIZED_PNL_FOR_RANGE_SQL = """
@@ -616,6 +644,23 @@ class ExposedPaperLedgerRepository(
 
                 exposedTransaction(database) {
                     selectRecentExecutions(limit)
+                }
+            }
+        }
+    }
+
+    override suspend fun findExecutionsBefore(
+        before: Instant,
+        limit: Int,
+    ): Result<List<Execution>> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+
+                exposedTransaction(database) {
+                    selectExecutionsBefore(before, limit)
                 }
             }
         }
@@ -966,6 +1011,15 @@ private fun JdbcTransaction.selectRecentExecutions(limit: Int): List<Execution> 
     return jdbcConnection().prepareStatement(SELECT_RECENT_EXECUTIONS_SQL).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.setInt(2, limit)
+        statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
+    }
+}
+
+private fun JdbcTransaction.selectExecutionsBefore(before: Instant, limit: Int): List<Execution> {
+    return jdbcConnection().prepareStatement(SELECT_EXECUTIONS_BEFORE_SQL).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.setLong(2, before.toEpochMilli())
+        statement.setInt(3, limit)
         statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
     }
 }

@@ -352,6 +352,104 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_activityReturnsFilteredCursorPagedTimelineWithoutAuditPayload() = testApplication {
+        val clock = MutableClock(fixedInstant())
+        val decisionRepository = InMemoryDecisionRepository(clock)
+        decisionRepository.submitDecision(noTradeSubmission("decision-old", "old reason")).getOrThrow()
+        clock.advance(Duration.ofSeconds(1))
+        decisionRepository.submitDecision(noTradeSubmission("decision-new", "new reason")).getOrThrow()
+        clock.advance(Duration.ofSeconds(9))
+
+        val eventLog = InMemoryCommandEventLog()
+        eventLog.append(
+            auditEvent(
+                eventType = CommandEventType.MANUAL_RESUME_REQUESTED,
+                occurredAt = fixedInstant().plusSeconds(2),
+                toolName = "operator",
+                payload = """{"token":"anthropic-secret-token"}""",
+            ),
+        ).getOrThrow()
+        eventLog.append(auditEvent(CommandEventType.HARD_HALT_SET, fixedInstant().plusSeconds(4), "risk")).getOrThrow()
+        eventLog.append(
+            auditEvent(
+                eventType = CommandEventType.RECONCILER_PASS_COMPLETED,
+                occurredAt = fixedInstant().plusSeconds(6),
+                toolName = "reconciler",
+            ),
+        ).getOrThrow()
+        val ledgerRepository = InMemoryPaperLedgerRepository(
+            executions = listOf(
+                execution(
+                    executionId = "execution-1",
+                    executedAt = fixedInstant().plusSeconds(3),
+                    realizedPnlJpy = "1200",
+                ),
+            ),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                clock = clock,
+                opsDecisionRepository = decisionRepository,
+                opsPaperLedgerRepository = ledgerRepository,
+                opsCommandEventFeedReader = eventLog,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val latestResponse = client.get("/ops/activity?limit=3")
+        val latestResponseText = latestResponse.bodyAsText()
+        val latestBody = Json.parseToJsonElement(latestResponseText).jsonObject
+        val latestEvents = latestBody.getValue("events").jsonArray.map { element -> element.jsonObject }
+        val latestTitles = latestEvents.map { event -> event.getValue("title").jsonPrimitive.content }
+        val nextBefore = latestBody.getValue("nextBefore").jsonPrimitive.content
+        val olderResponse = client.get("/ops/activity?limit=10&before=$nextBefore")
+        val olderBody = Json.parseToJsonElement(olderResponse.bodyAsText()).jsonObject
+        val olderEvents = olderBody.getValue("events").jsonArray.map { element -> element.jsonObject }
+        val olderDetails = olderEvents.map { event -> event.getValue("detail").jsonPrimitive.content }
+        val auditFilterResponse = client.get("/ops/activity?source=audit&auditEventType=HARD_HALT_SET&limit=10")
+        val auditFilterBody = Json.parseToJsonElement(auditFilterResponse.bodyAsText()).jsonObject
+        val auditFilterEvents = auditFilterBody.getValue("events").jsonArray.map { element -> element.jsonObject }
+
+        assertEquals(HttpStatusCode.OK, latestResponse.status)
+        assertNoSecretLikeText(latestResponseText)
+        assertFalse(latestResponseText.contains("token"))
+        assertEquals(
+            listOf(
+                "HARD_HALT_SET",
+                "BUY BTC execution",
+                "MANUAL_RESUME_REQUESTED",
+            ),
+            latestTitles,
+        )
+        assertEquals("2026-07-02T01:00:02Z", nextBefore)
+        assertEquals(HttpStatusCode.OK, olderResponse.status)
+        assertEquals(listOf("new reason", "old reason"), olderDetails)
+        assertEquals(HttpStatusCode.OK, auditFilterResponse.status)
+        assertEquals(1, auditFilterEvents.size)
+        assertEquals("HARD_HALT_SET", auditFilterEvents.single().getValue("kind").jsonPrimitive.content)
+    }
+
+    @Test
+    fun opsRoutes_activityRejectsInvalidFilters() = testApplication {
+        application {
+            module(
+                readinessProbe = { true },
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val invalidSourceResponse = client.get("/ops/activity?source=unknown")
+        val invalidBeforeResponse = client.get("/ops/activity?before=not-an-instant")
+        val invalidAuditEventTypeResponse = client.get("/ops/activity?source=audit&auditEventType=UNKNOWN")
+
+        assertEquals(HttpStatusCode.BadRequest, invalidSourceResponse.status)
+        assertEquals(HttpStatusCode.BadRequest, invalidBeforeResponse.status)
+        assertEquals(HttpStatusCode.BadRequest, invalidAuditEventTypeResponse.status)
+    }
+
+    @Test
     fun opsRoutes_auditReturnsLimitedFilteredDescendingRawFeedAndRejectsInvalidEventType() = testApplication {
         val eventLog = InMemoryCommandEventLog()
         eventLog.append(auditEvent(CommandEventType.TOOL_CALL_COMPLETED, fixedInstant(), "tool-old")).getOrThrow()
@@ -418,6 +516,7 @@ class OpsRouteTest {
         val positionsResponse = client.get("/ops/positions")
         val executionsResponse = client.get("/ops/executions")
         val auditResponse = client.get("/ops/audit")
+        val activityResponse = client.get("/ops/activity")
 
         assertEquals(HttpStatusCode.ServiceUnavailable, getResponse.status)
         assertEquals(HttpStatusCode.ServiceUnavailable, haltResponse.status)
@@ -428,6 +527,7 @@ class OpsRouteTest {
         assertEquals(HttpStatusCode.ServiceUnavailable, positionsResponse.status)
         assertEquals(HttpStatusCode.ServiceUnavailable, executionsResponse.status)
         assertEquals(HttpStatusCode.ServiceUnavailable, auditResponse.status)
+        assertEquals(HttpStatusCode.ServiceUnavailable, activityResponse.status)
     }
 }
 
@@ -553,6 +653,7 @@ private fun auditEvent(
     eventType: CommandEventType,
     occurredAt: Instant,
     toolName: String,
+    payload: String = """{"toolName":"$toolName"}""",
 ): CommandEvent {
     return CommandEvent(
         decisionRunContext = DecisionRunContext.EMPTY,
@@ -560,7 +661,7 @@ private fun auditEvent(
         toolCallId = null,
         clientRequestId = null,
         eventType = eventType,
-        payload = """{"toolName":"$toolName"}""",
+        payload = payload,
         occurredAt = occurredAt,
     )
 }

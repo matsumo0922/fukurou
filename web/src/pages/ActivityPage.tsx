@@ -1,12 +1,23 @@
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import Activity from "lucide-react/dist/esm/icons/activity.mjs";
+import ChevronDown from "lucide-react/dist/esm/icons/chevron-down.mjs";
+import Filter from "lucide-react/dist/esm/icons/filter.mjs";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import {
+  ACTIVITY_AUDIT_EVENT_TYPES,
+  ACTIVITY_TIMELINE_FILTER_STORAGE_KEY,
+  ACTIVITY_TIMELINE_SOURCE_FILTERS,
+  DEFAULT_ACTIVITY_TIMELINE_FILTERS,
   activityTimelineQuery,
+  fetchActivityTimeline,
   newestFirstActivityTimelineEvents,
+  normalizeActivityTimelineFilters,
   type ActivityTimelineEvent,
+  type ActivityTimelineFilters,
   type ActivityTimelineSnapshot,
   type ActivityTimelineSource,
+  type ActivityTimelineSourceFilter,
 } from "../api/ops";
 import type { MessageKey } from "../i18n/messages";
 import { useI18n } from "../i18n/useI18n";
@@ -18,8 +29,42 @@ import { describeError, formatDateTime } from "../ui/format";
 import { formatJpy, formatRatioAsPercent, formatSignedJpy } from "../ui/numberFormat";
 
 export function ActivityPage() {
-  const timelineQuery = useQuery(activityTimelineQuery);
+  const [filters, setFilters] = useState(loadStoredActivityTimelineFilters);
+  const [olderPages, setOlderPages] = useState<ActivityTimelineSnapshot[]>([]);
+  const [olderError, setOlderError] = useState<unknown>(null);
+  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+  const hasLoadedOlderPages = olderPages.length > 0;
+  const timelineQuery = useQuery(activityTimelineQuery(filters, undefined, !hasLoadedOlderPages));
+  const visibleTimeline = useMemo(
+    () => mergeActivityTimelinePages(timelineQuery.data ?? null, olderPages),
+    [olderPages, timelineQuery.data],
+  );
   const { t } = useI18n();
+
+  useEffect(() => {
+    persistActivityTimelineFilters(filters);
+  }, [filters]);
+
+  const refreshed = () => {
+    setOlderPages([]);
+    setOlderError(null);
+    void timelineQuery.refetch();
+  };
+  const filtersChanged = (changedFilters: ActivityTimelineFilters) => {
+    setFilters(changedFilters);
+    setOlderPages([]);
+    setOlderError(null);
+  };
+  const olderLoaded = () => {
+    void loadOlderActivityPage({
+      filters,
+      latestPage: timelineQuery.data ?? null,
+      olderPages,
+      setOlderPages,
+      setOlderError,
+      setIsLoadingOlder,
+    });
+  };
 
   return (
     <div className="page-stack">
@@ -31,7 +76,7 @@ export function ActivityPage() {
           <button
             className="icon-text-button icon-text-button--prominent"
             type="button"
-            onClick={() => void timelineQuery.refetch()}
+            onClick={refreshed}
             disabled={timelineQuery.isFetching}
           >
             <RefreshCw size={16} aria-hidden="true" />
@@ -41,17 +86,88 @@ export function ActivityPage() {
       />
 
       <Panel>
+        <ActivityFilters filters={filters} filtersChanged={filtersChanged} />
+      </Panel>
+
+      <Panel>
         <div className="panel-heading">
           <Activity size={18} aria-hidden="true" />
           <h2>{t("activity.panel.timeline")}</h2>
-          {timelineQuery.data ? (
-            <StatusPill label={timelineQuery.isStale ? t("common.stale") : t("common.fresh")} tone={timelineQuery.isStale ? "warning" : "positive"} />
+          {visibleTimeline ? (
+            <StatusPill
+              label={timelineQuery.isStale ? t("common.stale") : t("common.fresh")}
+              tone={timelineQuery.isStale ? "warning" : "positive"}
+            />
           ) : null}
         </div>
-        {timelineQuery.isPending ? <ActivityLoading /> : null}
-        {timelineQuery.isError ? <ActivityError error={timelineQuery.error} retried={() => void timelineQuery.refetch()} /> : null}
-        {timelineQuery.data ? <ActivityTimeline timeline={timelineQuery.data} /> : null}
+        {timelineQuery.isPending && !visibleTimeline ? <ActivityLoading /> : null}
+        {timelineQuery.isError && !visibleTimeline ? (
+          <ActivityError error={timelineQuery.error} retried={() => void timelineQuery.refetch()} />
+        ) : null}
+        {visibleTimeline ? (
+          <ActivityTimeline
+            timeline={visibleTimeline}
+            loadedPageCount={1 + olderPages.length}
+            olderError={olderError}
+            isLoadingOlder={isLoadingOlder}
+            olderLoaded={olderLoaded}
+          />
+        ) : null}
       </Panel>
+    </div>
+  );
+}
+
+function ActivityFilters({
+  filters,
+  filtersChanged,
+}: {
+  filters: ActivityTimelineFilters;
+  filtersChanged: (filters: ActivityTimelineFilters) => void;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <div className="activity-filters" aria-label={t("activity.filters.aria")}>
+      <div className="activity-filters__heading">
+        <Filter size={18} aria-hidden="true" />
+        <h2>{t("activity.filters.title")}</h2>
+      </div>
+      <div className="activity-filters__section">
+        <span className="activity-filters__label">{t("activity.filters.source")}</span>
+        <div className="segmented-control" role="group" aria-label={t("activity.filters.source")}>
+          {ACTIVITY_TIMELINE_SOURCE_FILTERS.map((source) => (
+            <button
+              className={
+                source === filters.source
+                  ? "segmented-control__button segmented-control__button--active"
+                  : "segmented-control__button"
+              }
+              type="button"
+              aria-pressed={source === filters.source}
+              key={source}
+              onClick={() => filtersChanged({ ...filters, source })}
+            >
+              {sourceFilterLabel(source, t)}
+            </button>
+          ))}
+        </div>
+      </div>
+      <fieldset className="activity-event-filter">
+        <legend>{t("activity.filters.auditEventTypes")}</legend>
+        <div className="activity-event-filter__options">
+          {ACTIVITY_AUDIT_EVENT_TYPES.map((eventType) => (
+            <label className="checkbox-chip" key={eventType}>
+              <input
+                type="checkbox"
+                checked={filters.auditEventTypes.includes(eventType)}
+                onChange={() => filtersChanged(toggleAuditEventType(filters, eventType))}
+              />
+              <span>{eventType}</span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
     </div>
   );
 }
@@ -84,10 +200,22 @@ function ActivityError({ error, retried }: { error: unknown; retried: () => void
   );
 }
 
-function ActivityTimeline({ timeline }: { timeline: ActivityTimelineSnapshot }) {
+function ActivityTimeline({
+  timeline,
+  loadedPageCount,
+  olderError,
+  isLoadingOlder,
+  olderLoaded,
+}: {
+  timeline: ActivityTimelineSnapshot;
+  loadedPageCount: number;
+  olderError: unknown;
+  isLoadingOlder: boolean;
+  olderLoaded: () => void;
+}) {
   const { locale, t } = useI18n();
-  const { fetchedAt, limits } = timeline;
   const events = newestFirstActivityTimelineEvents(timeline.events);
+  const canLoadOlder = timeline.nextBefore !== null;
 
   if (events.length === 0) {
     return <EmptyState title={t("activity.empty.title")} description={t("activity.empty.description")} />;
@@ -96,9 +224,8 @@ function ActivityTimeline({ timeline }: { timeline: ActivityTimelineSnapshot }) 
   return (
     <>
       <p className="timeline__freshness">
-        {t("activity.updated")} {formatDateTime(fetchedAt, locale)} · {t("activity.newestFirst")} · {events.length}/{limits.total}{" "}
-        {t("activity.records")} · {t("activity.decisions")} {limits.decisions} / {t("activity.audit")} {limits.audit} /{" "}
-        {t("activity.executions")} {limits.executions}
+        {t("activity.updated")} {formatDateTime(timeline.fetchedAt, locale)} · {t("activity.newestFirst")} · {events.length}/
+        {timeline.limit} {t("activity.records")} · {t("activity.loadedPages")} {loadedPageCount}
       </p>
       <ol className="timeline" aria-label={t("activity.timelineAria")}>
         {events.map((event) => (
@@ -124,8 +251,29 @@ function ActivityTimeline({ timeline }: { timeline: ActivityTimelineSnapshot }) 
           </li>
         ))}
       </ol>
+      <div className="timeline__paging">
+        <button className="icon-text-button" type="button" onClick={olderLoaded} disabled={!canLoadOlder || isLoadingOlder}>
+          <ChevronDown size={16} aria-hidden="true" />
+          {isLoadingOlder ? t("activity.loadingOlder") : t("activity.loadOlder")}
+        </button>
+        {!canLoadOlder ? <span>{t("activity.noOlderRecords")}</span> : null}
+      </div>
+      {olderError ? <p className="timeline__paging-error">{describeError(olderError, locale)}</p> : null}
     </>
   );
+}
+
+function sourceFilterLabel(source: ActivityTimelineSourceFilter, t: (key: MessageKey) => string): string {
+  switch (source) {
+    case "all":
+      return t("activity.filter.all");
+    case "audit":
+      return t("activity.source.audit");
+    case "decision":
+      return t("activity.source.decision");
+    case "execution":
+      return t("activity.source.execution");
+  }
 }
 
 function sourceLabel(source: ActivityTimelineSource, t: (key: MessageKey) => string): string {
@@ -221,4 +369,92 @@ function formatMetadataValue(label: string, value: string, t: (key: MessageKey) 
   }
 
   return value;
+}
+
+function mergeActivityTimelinePages(
+  latestPage: ActivityTimelineSnapshot | null,
+  olderPages: ActivityTimelineSnapshot[],
+): ActivityTimelineSnapshot | null {
+  const lastOlderPage = olderPages[olderPages.length - 1];
+  const lastPage = lastOlderPage ?? latestPage;
+
+  if (!latestPage || !lastPage) {
+    return null;
+  }
+
+  return {
+    ...latestPage,
+    events: newestFirstActivityTimelineEvents([latestPage, ...olderPages].flatMap((page) => page.events)),
+    nextBefore: lastPage.nextBefore,
+  };
+}
+
+async function loadOlderActivityPage({
+  filters,
+  latestPage,
+  olderPages,
+  setOlderPages,
+  setOlderError,
+  setIsLoadingOlder,
+}: {
+  filters: ActivityTimelineFilters;
+  latestPage: ActivityTimelineSnapshot | null;
+  olderPages: ActivityTimelineSnapshot[];
+  setOlderPages: (pages: ActivityTimelineSnapshot[]) => void;
+  setOlderError: (error: unknown) => void;
+  setIsLoadingOlder: (isLoading: boolean) => void;
+}) {
+  const lastOlderPage = olderPages[olderPages.length - 1];
+  const lastPage = lastOlderPage ?? latestPage;
+  const before = lastPage?.nextBefore;
+
+  if (!before) {
+    return;
+  }
+
+  setOlderError(null);
+  setIsLoadingOlder(true);
+
+  try {
+    const olderPage = await fetchActivityTimeline({ filters, before });
+    setOlderPages([...olderPages, olderPage]);
+  } catch (error) {
+    setOlderError(error);
+  } finally {
+    setIsLoadingOlder(false);
+  }
+}
+
+function toggleAuditEventType(filters: ActivityTimelineFilters, eventType: string): ActivityTimelineFilters {
+  const selectedEventTypes = new Set(filters.auditEventTypes);
+
+  if (selectedEventTypes.has(eventType)) {
+    selectedEventTypes.delete(eventType);
+  } else {
+    selectedEventTypes.add(eventType);
+  }
+
+  return {
+    ...filters,
+    auditEventTypes: ACTIVITY_AUDIT_EVENT_TYPES.filter((candidate) => selectedEventTypes.has(candidate)),
+  };
+}
+
+function loadStoredActivityTimelineFilters(): ActivityTimelineFilters {
+  try {
+    const storedValue = window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY);
+    const parsedValue = storedValue ? JSON.parse(storedValue) : null;
+
+    return normalizeActivityTimelineFilters(parsedValue);
+  } catch {
+    return DEFAULT_ACTIVITY_TIMELINE_FILTERS;
+  }
+}
+
+function persistActivityTimelineFilters(filters: ActivityTimelineFilters) {
+  try {
+    window.localStorage.setItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY, JSON.stringify(filters));
+  } catch {
+    return;
+  }
 }

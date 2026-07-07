@@ -8,6 +8,9 @@ export type EvaluationCalibrationResponse = components["schemas"]["EvaluationCal
 export type EvaluationBenchmarkResponse = components["schemas"]["EvaluationBenchmarkResponse"];
 export type EvaluationCostsResponse = components["schemas"]["EvaluationCostsResponse"];
 export type OpsAccountResponse = components["schemas"]["OpsAccountResponse"];
+export type OpsActivityEventResponse = components["schemas"]["OpsActivityEventResponse"];
+export type OpsActivityMetadataResponse = components["schemas"]["OpsActivityMetadataResponse"];
+export type OpsActivityResponse = components["schemas"]["OpsActivityResponse"];
 export type OpsAuditEventResponse = components["schemas"]["OpsAuditEventResponse"];
 export type OpsDecisionResponse = components["schemas"]["OpsDecisionResponse"];
 export type OpsExecutionResponse = components["schemas"]["OpsExecutionResponse"];
@@ -17,40 +20,55 @@ export type OpsRiskStateResponse = components["schemas"]["OpsRiskStateResponse"]
 export type OpsTriggerResponse = components["schemas"]["OpsTriggerResponse"];
 
 export type ActivityTimelineSource = "audit" | "decision" | "execution";
+export type ActivityTimelineSourceFilter = ActivityTimelineSource | "all";
 
-export type ActivityTimelineEvent = {
-  id: string;
+export type ActivityTimelineEvent = Omit<OpsActivityEventResponse, "metadata" | "source"> & {
   source: ActivityTimelineSource;
-  kind: string;
-  title: string;
-  detail: string;
-  occurredAt: string;
-  metadata: {
-    label: string;
-    value: string;
-  }[];
+  metadata: OpsActivityMetadataResponse[];
 };
 
 export type ActivityTimelineSnapshot = {
   events: ActivityTimelineEvent[];
   fetchedAt: string;
-  limits: ActivityTimelineLimits;
+  limit: number;
+  nextBefore: string | null;
+  filters: ActivityTimelineFilters;
 };
 
-export type ActivityTimelineLimits = {
-  decisions: number;
-  audit: number;
-  executions: number;
-  total: number;
+export type ActivityTimelineFilters = {
+  source: ActivityTimelineSourceFilter;
+  auditEventTypes: string[];
 };
 
-const ACTIVITY_TIMELINE_DECISIONS_LIMIT = 20;
-const ACTIVITY_TIMELINE_AUDIT_LIMIT = 50;
-const ACTIVITY_TIMELINE_EXECUTIONS_LIMIT = 20;
-// 5秒毎に記録される reconciler heartbeat は activity timeline を埋め尽くすため除外する。
-const ACTIVITY_TIMELINE_AUDIT_EXCLUDED_EVENT_TYPES = ["RECONCILER_PASS_COMPLETED"];
-const ACTIVITY_TIMELINE_TOTAL_LIMIT =
-  ACTIVITY_TIMELINE_DECISIONS_LIMIT + ACTIVITY_TIMELINE_AUDIT_LIMIT + ACTIVITY_TIMELINE_EXECUTIONS_LIMIT;
+export const ACTIVITY_TIMELINE_FILTER_STORAGE_KEY = "fukurou.web.activity.filters.v1";
+
+export const ACTIVITY_TIMELINE_SOURCE_FILTERS = ["all", "decision", "audit", "execution"] as const;
+
+export const ACTIVITY_AUDIT_EVENT_TYPES = [
+  "TOOL_CALL_COMPLETED",
+  "TOOL_CALL_REJECTED_BY_HARD_HALT",
+  "NO_TRADE_EXIT",
+  "RECONCILER_STARTED",
+  "RECONCILER_PASS_COMPLETED",
+  "RECONCILER_PASS_FAILED",
+  "RECONCILER_PASS_RECOVERED",
+  "HARD_HALT_SET",
+  "SOFT_HALT_SET",
+  "KILL_CRITERION_BREACHED",
+  "MANUAL_RESUME_REQUESTED",
+  "RUNNER_PHASE_COMPLETED",
+  "DAEMON_STARTED",
+  "DAEMON_TRIGGER_SKIPPED",
+  "DAEMON_TRIGGER_LAUNCHED",
+  "DAEMON_INVOCATION_COMPLETED",
+] as const;
+
+export const DEFAULT_ACTIVITY_TIMELINE_FILTERS: ActivityTimelineFilters = {
+  source: "all",
+  auditEventTypes: [],
+};
+
+const ACTIVITY_TIMELINE_LIMIT = 50;
 
 export const opsRiskStateQuery = queryOptions({
   queryKey: ["ops", "risk-state"],
@@ -115,12 +133,14 @@ export const evaluationCostsQuery = queryOptions({
   refetchInterval: 60_000,
 });
 
-export const activityTimelineQuery = queryOptions({
-  queryKey: ["ops", "activity-timeline"],
-  queryFn: fetchActivityTimeline,
-  staleTime: 15_000,
-  refetchInterval: 30_000,
-});
+export function activityTimelineQuery(filters: ActivityTimelineFilters, before?: string, autoRefresh = true) {
+  return queryOptions({
+    queryKey: ["ops", "activity-timeline", filters.source, filters.auditEventTypes, before ?? null],
+    queryFn: () => fetchActivityTimeline({ filters, before }),
+    staleTime: 15_000,
+    refetchInterval: autoRefresh ? 30_000 : false,
+  });
+}
 
 export async function requestOpsHalt(level: OpsHaltLevel, reason: string): Promise<OpsRiskStateResponse> {
   const response = await postJsonResponse("/ops/halt", { level, reason }, [200] as const);
@@ -140,30 +160,53 @@ export async function requestOpsTrigger(reason: string): Promise<OpsTriggerRespo
   return response.data;
 }
 
-async function fetchActivityTimeline(): Promise<ActivityTimelineSnapshot> {
-  const auditExcludeParams = ACTIVITY_TIMELINE_AUDIT_EXCLUDED_EVENT_TYPES.map(
-    (eventType) => `&excludeEventType=${eventType}`,
-  ).join("");
-  const [decisionsResponse, auditResponse, executionsResponse] = await Promise.all([
-    getJson(`/ops/decisions?limit=${ACTIVITY_TIMELINE_DECISIONS_LIMIT}`),
-    getJson(`/ops/audit?limit=${ACTIVITY_TIMELINE_AUDIT_LIMIT}${auditExcludeParams}`),
-    getJson(`/ops/executions?limit=${ACTIVITY_TIMELINE_EXECUTIONS_LIMIT}`),
-  ]);
-  const events = [
-    ...decisionsResponse.decisions.map(decisionToTimelineEvent),
-    ...auditResponse.events.map(auditEventToTimelineEvent),
-    ...executionsResponse.executions.map(executionToTimelineEvent),
-  ];
+export async function fetchActivityTimeline({
+  filters,
+  before,
+}: {
+  filters: ActivityTimelineFilters;
+  before?: string;
+}): Promise<ActivityTimelineSnapshot> {
+  const searchParams = new URLSearchParams({
+    limit: String(ACTIVITY_TIMELINE_LIMIT),
+  });
+
+  if (before) {
+    searchParams.set("before", before);
+  }
+
+  if (filters.source !== "all") {
+    searchParams.set("source", filters.source);
+  }
+
+  filters.auditEventTypes.forEach((eventType) => {
+    searchParams.append("auditEventType", eventType);
+  });
+
+  const response = await getJson(`/ops/activity?${searchParams.toString()}`);
 
   return {
-    events: newestFirstActivityTimelineEvents(events),
+    events: newestFirstActivityTimelineEvents(response.events.map(normalizeActivityTimelineEvent)),
     fetchedAt: new Date().toISOString(),
-    limits: {
-      decisions: ACTIVITY_TIMELINE_DECISIONS_LIMIT,
-      audit: ACTIVITY_TIMELINE_AUDIT_LIMIT,
-      executions: ACTIVITY_TIMELINE_EXECUTIONS_LIMIT,
-      total: ACTIVITY_TIMELINE_TOTAL_LIMIT,
-    },
+    limit: response.limit,
+    nextBefore: response.nextBefore ?? null,
+    filters,
+  };
+}
+
+export function normalizeActivityTimelineFilters(value: unknown): ActivityTimelineFilters {
+  if (!isRecord(value)) {
+    return DEFAULT_ACTIVITY_TIMELINE_FILTERS;
+  }
+
+  const source = isActivityTimelineSourceFilter(value.source) ? value.source : "all";
+  const auditEventTypes = Array.isArray(value.auditEventTypes)
+    ? value.auditEventTypes.filter(isKnownActivityAuditEventType)
+    : [];
+
+  return {
+    source,
+    auditEventTypes,
   };
 }
 
@@ -171,74 +214,14 @@ export function newestFirstActivityTimelineEvents(events: ActivityTimelineEvent[
   return [...events].sort(compareTimelineEvents);
 }
 
-function decisionToTimelineEvent(decision: OpsDecisionResponse): ActivityTimelineEvent {
-  return {
-    id: `decision:${decision.id}`,
-    source: "decision",
-    kind: decision.action,
-    title: `${decision.action} decision`,
-    detail: decision.reasonJa,
-    occurredAt: decision.createdAt,
-    metadata: [
-      {
-        label: "estimated p",
-        value: decision.estimatedWinProbability,
-      },
-      {
-        label: "setup tags",
-        value: decision.setupTags.length > 0 ? decision.setupTags.join(", ") : "none",
-      },
-      {
-        label: "no-trade conditions",
-        value: decision.noTradeConditionsJa.length > 0 ? decision.noTradeConditionsJa.join(" / ") : "none",
-      },
-    ],
-  };
-}
+function normalizeActivityTimelineEvent(event: OpsActivityEventResponse): ActivityTimelineEvent {
+  if (!isActivityTimelineSource(event.source)) {
+    throw new Error(`Unknown activity timeline source: ${event.source}`);
+  }
 
-function auditEventToTimelineEvent(event: OpsAuditEventResponse): ActivityTimelineEvent {
   return {
-    id: `audit:${event.id}`,
-    source: "audit",
-    kind: event.eventType,
-    title: event.eventType,
-    detail: event.toolName,
-    occurredAt: event.occurredAt,
-    metadata: [
-      {
-        label: "tool",
-        value: event.toolName,
-      },
-    ],
-  };
-}
-
-function executionToTimelineEvent(execution: OpsExecutionResponse): ActivityTimelineEvent {
-  return {
-    id: `execution:${execution.executionId}`,
-    source: "execution",
-    kind: execution.side,
-    title: `${execution.side} ${execution.symbol} execution`,
-    detail: `${execution.sizeBtc} BTC at ${execution.priceJpy} JPY`,
-    occurredAt: execution.executedAt,
-    metadata: [
-      {
-        label: "realized pnl",
-        value: execution.realizedPnlJpy,
-      },
-      {
-        label: "fee",
-        value: execution.feeJpy,
-      },
-      {
-        label: "liquidity",
-        value: execution.liquidity,
-      },
-      {
-        label: "order",
-        value: execution.orderId ?? "not linked",
-      },
-    ],
+    ...event,
+    source: event.source,
   };
 }
 
@@ -250,4 +233,20 @@ function timestampMillis(value: string): number {
   const timestamp = new Date(value).getTime();
 
   return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function isActivityTimelineSource(value: string): value is ActivityTimelineSource {
+  return value === "audit" || value === "decision" || value === "execution";
+}
+
+function isActivityTimelineSourceFilter(value: unknown): value is ActivityTimelineSourceFilter {
+  return typeof value === "string" && ACTIVITY_TIMELINE_SOURCE_FILTERS.includes(value as ActivityTimelineSourceFilter);
+}
+
+function isKnownActivityAuditEventType(value: unknown): value is string {
+  return typeof value === "string" && ACTIVITY_AUDIT_EVENT_TYPES.includes(value as (typeof ACTIVITY_AUDIT_EVENT_TYPES)[number]);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

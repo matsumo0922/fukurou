@@ -129,6 +129,16 @@ class InMemoryPaperLedgerRepository(
     }
 
     override suspend fun getRecentExecutions(limit: Int): Result<List<Execution>> {
+        return findExecutionsBefore(
+            before = Instant.MAX,
+            limit = limit,
+        )
+    }
+
+    override suspend fun findExecutionsBefore(
+        before: Instant,
+        limit: Int,
+    ): Result<List<Execution>> {
         return runCatching {
             require(limit > 0) {
                 "limit must be greater than 0."
@@ -136,6 +146,7 @@ class InMemoryPaperLedgerRepository(
 
             synchronized(lock) {
                 executions
+                    .filter { execution -> Instant.parse(execution.executedAt) < before }
                     .sortedByDescending { execution -> Instant.parse(execution.executedAt) }
                     .take(limit)
             }

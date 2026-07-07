@@ -55,6 +55,22 @@ class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
         eventType: CommandEventType?,
         excludeEventTypes: Set<CommandEventType>,
     ): Result<List<CommandEvent>> {
+        val eventTypes = eventType?.let { setOf(it) }
+
+        return findEventsBefore(
+            limit = limit,
+            before = COMMAND_EVENT_FEED_END_CURSOR,
+            eventTypes = eventTypes,
+            excludeEventTypes = excludeEventTypes,
+        )
+    }
+
+    override suspend fun findEventsBefore(
+        limit: Int,
+        before: Instant,
+        eventTypes: Set<CommandEventType>?,
+        excludeEventTypes: Set<CommandEventType>,
+    ): Result<List<CommandEvent>> {
         return runCatching {
             require(limit > 0) {
                 "limit must be greater than 0."
@@ -62,7 +78,8 @@ class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
 
             mutex.withLock {
                 storedEvents
-                    .filter { event -> event.matchesEventTypeFilter(eventType, excludeEventTypes) }
+                    .filter { event -> event.occurredAt < before }
+                    .filter { event -> event.matchesEventTypeFilter(eventTypes, excludeEventTypes) }
                     .sortedByDescending { event -> event.occurredAt }
                     .take(limit)
             }
@@ -78,10 +95,10 @@ class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
 }
 
 private fun CommandEvent.matchesEventTypeFilter(
-    eventType: CommandEventType?,
+    eventTypes: Set<CommandEventType>?,
     excludeEventTypes: Set<CommandEventType>,
 ): Boolean {
-    val includedByType = eventType == null || this.eventType == eventType
+    val includedByType = eventTypes == null || this.eventType in eventTypes
     val notExcluded = this.eventType !in excludeEventTypes
 
     return includedByType && notExcluded
@@ -103,3 +120,8 @@ private val DECISION_RUN_COUNTED_EVENT_TYPES = setOf(
     CommandEventType.RUNNER_PHASE_COMPLETED,
     CommandEventType.NO_TRADE_EXIT,
 )
+
+/**
+ * cursor 未指定時に全件を対象にするための終端時刻。
+ */
+private val COMMAND_EVENT_FEED_END_CURSOR: Instant = Instant.ofEpochMilli(Long.MAX_VALUE)

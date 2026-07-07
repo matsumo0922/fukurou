@@ -898,6 +898,72 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ops/activity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Activity timeline を取得する
+         * @description decision、audit、paper execution を backend で統合し、cursor paging と source / audit eventType filter を適用して新しい順で返します。audit payload は返しません。
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description 取得件数です。既定 50、最大 100 です。 */
+                    limit?: number;
+                    /** @description この ISO-8601 時刻より古い event を取得する排他的 cursor です。未指定の場合は現在時刻を使います。 */
+                    before?: string;
+                    /** @description decision / audit / execution のいずれかに絞り込みます。未指定の場合は全 source を返します。 */
+                    source?: string;
+                    /** @description audit event_type の許可リストです。複数指定可。未指定の場合は RECONCILER_PASS_COMPLETED を既定除外します。 */
+                    auditEventType?: string[];
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Activity timeline です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsActivityResponse"];
+                    };
+                };
+                /** @description limit、before、source、または auditEventType が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Activity timeline に必要な repository が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ops/positions": {
         parameters: {
             query?: never;
@@ -1236,6 +1302,27 @@ export interface components {
         /** OpsExecutionsResponse */
         OpsExecutionsResponse: {
             executions: components["schemas"]["OpsExecutionResponse"][];
+        };
+        /** OpsActivityMetadataResponse */
+        OpsActivityMetadataResponse: {
+            label: string;
+            value: string;
+        };
+        /** OpsActivityEventResponse */
+        OpsActivityEventResponse: {
+            id: string;
+            source: string;
+            kind: string;
+            title: string;
+            detail: string;
+            occurredAt: string;
+            metadata: components["schemas"]["OpsActivityMetadataResponse"][];
+        };
+        /** OpsActivityResponse */
+        OpsActivityResponse: {
+            events: components["schemas"]["OpsActivityEventResponse"][];
+            nextBefore?: string | null;
+            limit: number;
         };
         /** Position */
         Position: {
