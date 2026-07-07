@@ -71,6 +71,9 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.runner.DEFAULT_RUNNER_MCP_SERVER_NAME
+import me.matsumo.fukurou.trading.runner.defaultFalsifierAllowedTools
+import me.matsumo.fukurou.trading.runner.defaultProposerAllowedTools
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
@@ -149,6 +152,27 @@ class FukurouMcpServerTest {
         assertTrue(
             invalidToolNames.isEmpty(),
             "MCP tool names must match Claude CLI allowedTools pattern: $invalidToolNames",
+        )
+    }
+
+    @Test
+    fun createServer_containsDefaultRunnerAllowlistTools() {
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        ).createServer()
+        val defaultAllowedToolNames = (
+            defaultProposerAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME) +
+                defaultFalsifierAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME)
+            )
+            .map { toolName -> toolName.substringAfterLast("__") }
+            .toSet()
+
+        val missingToolNames = defaultAllowedToolNames - server.tools.keys
+
+        assertTrue(
+            missingToolNames.isEmpty(),
+            "Default runner allowlists must reference registered MCP tools: $missingToolNames",
         )
     }
 
