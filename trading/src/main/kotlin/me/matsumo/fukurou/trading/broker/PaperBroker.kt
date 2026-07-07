@@ -17,6 +17,7 @@ import me.matsumo.fukurou.trading.domain.ProtectionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.domain.cashFeeReserveFor
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
@@ -799,7 +800,11 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
         "$orderType order requires priceJpy."
     }
     val estimatedNotional = estimatedPrice.multiply(sizeBtc)
-    val estimatedFee = estimatedNotional.multiply(rules.takerFee.toBigDecimal())
+    val estimatedFee = cashFeeReserveFor(
+        notional = estimatedNotional,
+        orderType = orderType,
+        symbolRules = rules,
+    )
 
     return estimatedNotional.add(estimatedFee).moneyScale()
 }
@@ -809,7 +814,11 @@ private fun Order.estimatedBuyReservationJpy(rules: SymbolRules): BigDecimal {
         ?: triggerPriceJpy?.toBigDecimal()
         ?: BigDecimal.ZERO
     val notional = price.multiply(sizeBtc.toBigDecimal())
-    val fee = notional.multiply(rules.takerFee.toBigDecimal())
+    val fee = cashFeeReserveFor(
+        notional = notional,
+        orderType = orderType,
+        symbolRules = rules,
+    )
 
     return notional.add(fee).moneyScale()
 }

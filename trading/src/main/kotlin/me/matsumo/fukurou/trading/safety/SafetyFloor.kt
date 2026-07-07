@@ -15,6 +15,9 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.domain.cashFeeReserveFor
+import me.matsumo.fukurou.trading.domain.entryFeeRateFor
+import me.matsumo.fukurou.trading.domain.protectiveExitFeeRateFor
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import java.math.BigDecimal
@@ -719,14 +722,14 @@ class SafetyFloor(
     }
 
     private fun validateBalanceAndCost(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
-        val takerFee = context.symbolRules.takerFee.toBigDecimal().abs()
-        if (takerFee > config.maxTakerFeeRatio) {
+        val feeRate = maxBalanceAndCostFeeRate(command.orderType, context.symbolRules)
+        if (feeRate > config.maxTakerFeeRatio) {
             return violation(
                 commandName = "place_order",
                 command = command,
                 rule = SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT,
-                messageJa = "taker fee が SafetyFloor の cost 上限を超えています。",
-                measuredValue = takerFee.toPlainString(),
+                messageJa = "entry / exit fee が SafetyFloor の cost 上限を超えています。",
+                measuredValue = feeRate.toPlainString(),
                 limitValue = config.maxTakerFeeRatio.toPlainString(),
             )
         }
@@ -958,7 +961,13 @@ class SafetyFloor(
         val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
         val stopPrice = position.currentStopLossJpy?.toBigDecimal() ?: BigDecimal.ZERO
         val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(sizeBtc)
-        val costReserve = roundTripCost(sizeBtc, entryPrice, stopPrice, context)
+        val costReserve = roundTripCost(
+            sizeBtc = sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = stopPrice,
+            entryOrderType = OrderType.MARKET,
+            context = context,
+        )
 
         return priceRisk.add(costReserve).safetyScale()
     }
@@ -967,7 +976,13 @@ class SafetyFloor(
         val entryPrice = estimatedEntryPrice(command, context)
         val stopPrice = command.protectiveStopPriceJpy
         val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(command.sizeBtc)
-        val costReserve = roundTripCost(command.sizeBtc, entryPrice, stopPrice, context)
+        val costReserve = roundTripCost(
+            sizeBtc = command.sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = stopPrice,
+            entryOrderType = command.orderType,
+            context = context,
+        )
 
         return priceRisk.add(costReserve).safetyScale()
     }
@@ -980,7 +995,13 @@ class SafetyFloor(
         val stopPrice = order.protectiveStopPriceJpy?.toBigDecimal() ?: BigDecimal.ZERO
         val sizeBtc = order.sizeBtc.toBigDecimal()
         val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(sizeBtc)
-        val costReserve = roundTripCost(sizeBtc, entryPrice, stopPrice, context)
+        val costReserve = roundTripCost(
+            sizeBtc = sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = stopPrice,
+            entryOrderType = order.orderType,
+            context = context,
+        )
 
         return priceRisk.add(costReserve).safetyScale()
     }
@@ -1024,7 +1045,11 @@ class SafetyFloor(
     private fun orderRequiredCash(command: PlaceOrderCommand, context: SafetyFloorContext): BigDecimal {
         val entryPrice = estimatedEntryPrice(command, context)
         val notional = entryPrice.multiply(command.sizeBtc)
-        val fee = notional.multiply(context.symbolRules.takerFee.toBigDecimal().abs())
+        val fee = cashFeeReserveFor(
+            notional = notional,
+            orderType = command.orderType,
+            symbolRules = context.symbolRules,
+        )
 
         return notional.add(fee).safetyScale()
     }
@@ -1035,7 +1060,11 @@ class SafetyFloor(
             ?: order.triggerPriceJpy?.toBigDecimal()
             ?: context.ticker.ask.toBigDecimal()
         val notional = price.multiply(order.sizeBtc.toBigDecimal())
-        val fee = notional.multiply(context.symbolRules.takerFee.toBigDecimal().abs())
+        val fee = cashFeeReserveFor(
+            notional = notional,
+            orderType = order.orderType,
+            symbolRules = context.symbolRules,
+        )
 
         return notional.add(fee).safetyScale()
     }
@@ -1069,15 +1098,24 @@ class SafetyFloor(
         sizeBtc: BigDecimal,
         entryPrice: BigDecimal,
         stopPrice: BigDecimal,
+        entryOrderType: OrderType,
         context: SafetyFloorContext,
     ): BigDecimal {
         val entryNotional = entryPrice.multiply(sizeBtc)
         val exitNotional = stopPrice.multiply(sizeBtc)
-        val takerFee = context.symbolRules.takerFee.toBigDecimal().abs()
-        val feeReserve = entryNotional.add(exitNotional).multiply(takerFee)
+        val entryFee = entryNotional.multiply(entryFeeRateFor(entryOrderType, context.symbolRules))
+        val exitFee = exitNotional.multiply(protectiveExitFeeRateFor(context.symbolRules))
+        val feeReserve = entryFee.add(exitFee)
         val slippageReserve = entryNotional.add(exitNotional).multiply(slippageRatio())
 
-        return feeReserve.add(slippageReserve).safetyScale()
+        return feeReserve.add(slippageReserve).maxZero().safetyScale()
+    }
+
+    private fun maxBalanceAndCostFeeRate(orderType: OrderType, symbolRules: SymbolRules): BigDecimal {
+        val entryRate = entryFeeRateFor(orderType, symbolRules).abs()
+        val exitRate = protectiveExitFeeRateFor(symbolRules).abs()
+
+        return maxOf(entryRate, exitRate)
     }
 
     private fun applyPositiveSlippage(price: BigDecimal): BigDecimal {
@@ -1139,6 +1177,7 @@ class SafetyFloor(
             sizeBtc = command.sizeBtc,
             entryPrice = entryPrice,
             stopPrice = command.protectiveStopPriceJpy,
+            entryOrderType = command.orderType,
             context = context,
         ).divideOrZero(riskAmount)
         val expectedValueR = probabilityForExpectedValue
@@ -1158,7 +1197,13 @@ class SafetyFloor(
         val takeProfitPrice = command.takeProfitPriceJpy ?: return null
         val entryPrice = estimatedEntryPrice(command, context)
         val expectedMove = takeProfitPrice.subtract(entryPrice).maxZero().multiply(command.sizeBtc)
-        val roundTripCost = roundTripCost(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy, context)
+        val roundTripCost = roundTripCost(
+            sizeBtc = command.sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = command.protectiveStopPriceJpy,
+            entryOrderType = command.orderType,
+            context = context,
+        )
 
         return expectedMove.divideOrZero(roundTripCost)
     }

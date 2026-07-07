@@ -2609,8 +2609,10 @@ riskBudgetJpy = currentEquityJpy * 0.02
 perBtcRiskJpy = abs(entryPriceJpy - stopLossJpy)
 rawSizeBtc = riskBudgetJpy / perBtcRiskJpy
 roundedSizeBtc = floorToStep(rawSizeBtc, tradeRule.sizeStep)
-estimatedMaxLossJpy = roundedSizeBtc * perBtcRiskJpy + takerFeeEstimate + slippageBuffer
+estimatedMaxLossJpy = roundedSizeBtc * perBtcRiskJpy + orderTypeAwareFeeEstimate + slippageBuffer
 ```
+
+`orderTypeAwareFeeEstimate` は、MARKET/STOP entry と protective exit を taker、resting LIMIT entry を maker fee / rebate として見積もる。
 
 `estimatedMaxLossJpy <= riskBudgetJpy` でなければ拒否する。
 

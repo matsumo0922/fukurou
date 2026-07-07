@@ -995,7 +995,7 @@ private fun nearAllCashRestingLimitCommand(): PlaceOrderCommand {
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
         orderType = OrderType.LIMIT,
-        sizeBtc = BigDecimal("0.009995"),
+        sizeBtc = BigDecimal("0.009999"),
         priceJpy = BigDecimal("10000000"),
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
