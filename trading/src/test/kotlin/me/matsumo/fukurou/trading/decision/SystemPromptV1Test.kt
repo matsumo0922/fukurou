@@ -4,6 +4,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -17,13 +18,18 @@ class SystemPromptV1Test {
         val content = Files.readString(promptPath)
         val contentHash = SystemPromptV1.calculateContentHash(content)
 
-        assertEquals("system-prompt-v1.2", SystemPromptV1.VERSION)
+        assertEquals("system-prompt-v1.3", SystemPromptV1.VERSION)
         assertTrue(content.contains("submit_decision"))
         assertTrue(content.contains("submit_falsification"))
         assertTrue(content.contains("preview_order"))
         assertTrue(content.contains("knowledge.get_recent_lessons"))
         assertTrue(content.contains("no_trade_conditions_ja"))
         assertTrue(content.contains("revision_count <= 2"))
+        assertTrue(content.contains("LIMIT / STOP entry intent"))
+        assertTrue(content.contains("maker fee(rebate)"))
+        assertTrue(content.contains("p < 0.5 でも ENTER"))
+        assertTrue(content.contains("runner が intent 内容どおり自動で preview・発注します"))
+        assertFalse(content.contains("`place_order` の前に必ず `preview_order` を呼び"))
         assertEquals(64, contentHash.length)
         assertTrue(contentHash.matches(Regex("[0-9a-f]{64}")))
     }
