@@ -19,9 +19,13 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
+import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
+import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshotWarning
 import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedException
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
@@ -192,6 +196,11 @@ private class ApplicationRuntimeConfigState(
     private val databaseResources: ApplicationDatabaseResources,
     private val inputs: ApplicationRuntimeInputs,
 ) {
+    private val lock = Any()
+
+    @Volatile
+    private var cachedSnapshot: ApplicationRuntimeConfigSnapshot? = null
+
     private val runtimeConfigRepository = databaseResources.database?.let { database ->
         ExposedRuntimeConfigRepository(
             database = database,
@@ -201,6 +210,22 @@ private class ApplicationRuntimeConfigState(
     }
 
     fun snapshot(): ApplicationRuntimeConfigSnapshot {
+        cachedSnapshot?.let { snapshot -> return snapshot }
+
+        return synchronized(lock) {
+            cachedSnapshot ?: resolveSnapshot().also { snapshot ->
+                cachedSnapshot = snapshot
+            }
+        }
+    }
+
+    fun invalidate() {
+        synchronized(lock) {
+            cachedSnapshot = null
+        }
+    }
+
+    private fun resolveSnapshot(): ApplicationRuntimeConfigSnapshot {
         return runCatching {
             snapshotUnsafe()
         }.getOrElse { error ->
@@ -374,6 +399,12 @@ private fun createOpsRouteResources(
     )
     val runtimeConfigAdminService = opsOverrides.runtimeConfigAdminService
         ?: createRuntimeConfigAdminService(databaseResources, runtime)
+    val invalidatingRuntimeConfigAdminService = runtimeConfigAdminService?.let { service ->
+        InvalidatingRuntimeConfigAdminService(
+            delegate = service,
+            onActiveChanged = runtime.runtimeConfigState::invalidate,
+        )
+    }
 
     return ApplicationOpsRouteResources(
         dependencies = OpsRouteDependencies(
@@ -381,7 +412,7 @@ private fun createOpsRouteResources(
                 snapshotProvider = OpsRuntimeConfigSnapshotProvider {
                     runtime.runtimeConfigState.snapshot().toOpsRuntimeConfigRouteSnapshot()
                 },
-                adminService = runtimeConfigAdminService,
+                adminService = invalidatingRuntimeConfigAdminService,
             ),
             risk = createOpsRiskRouteDependencies(
                 database = database,
@@ -404,6 +435,46 @@ private fun createOpsRouteResources(
         createdManualLlmLaunchService = createdManualLlmLaunchService,
         createdLlmAuthService = createdLlmAuthService,
     )
+}
+
+/**
+ * active runtime config の変更成功時に snapshot cache を破棄する admin service。
+ *
+ * @param delegate runtime config 操作の実体
+ * @param onActiveChanged active version が変わった後の通知
+ */
+private class InvalidatingRuntimeConfigAdminService(
+    private val delegate: RuntimeConfigAdminService,
+    private val onActiveChanged: () -> Unit,
+) : RuntimeConfigAdminService {
+
+    override fun listVersions(limit: Int): Result<List<RuntimeConfigVersionSummary>> {
+        return delegate.listVersions(limit)
+    }
+
+    override fun createDraft(request: RuntimeConfigDraftCreation): Result<RuntimeConfigVersionDetail> {
+        return delegate.createDraft(request)
+    }
+
+    override fun validateVersion(versionId: String): Result<RuntimeConfigVersionDetail> {
+        return delegate.validateVersion(versionId)
+    }
+
+    override fun activateDraft(versionId: String): Result<RuntimeConfigActivationResult> {
+        return delegate.activateDraft(versionId).also { result ->
+            if (result.isSuccess) {
+                onActiveChanged()
+            }
+        }
+    }
+
+    override fun rollbackToVersion(versionId: String): Result<RuntimeConfigActivationResult> {
+        return delegate.rollbackToVersion(versionId).also { result ->
+            if (result.isSuccess) {
+                onActiveChanged()
+            }
+        }
+    }
 }
 
 private fun createOpsRiskRouteDependencies(

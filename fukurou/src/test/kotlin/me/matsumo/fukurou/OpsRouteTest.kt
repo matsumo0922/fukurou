@@ -630,7 +630,7 @@ class OpsRouteTest {
                 password = databaseConfig.password,
             )
             RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
-            deleteRuntimeConfigValue(database, "runner.maxToolCallsPerRun")
+            updateRuntimeConfigValue(database = database, key = "runner.maxToolCallsPerRun", value = "49")
 
             val manualService = CapturingManualLlmLaunchService(
                 ManualLlmLaunchResult.Accepted(
@@ -672,14 +672,14 @@ class OpsRouteTest {
 
             assertEquals(HttpStatusCode.OK, configResponse.status)
             assertEquals("runtimeConfig.warning.activeValidationFailed", warning.getValue("code").jsonPrimitive.content)
-            assertEquals("runtimeConfig.validation.missingKeys", validationError.getValue("code").jsonPrimitive.content)
+            assertEquals("runtimeConfig.validation.typedBetweenInclusive", validationError.getValue("code").jsonPrimitive.content)
             assertEquals(HttpStatusCode.ServiceUnavailable, triggerResponse.status)
             assertEquals(HttpStatusCode.ServiceUnavailable, readyResponse.status)
             assertEquals(emptyList(), manualService.reasons)
 
             val draftResponse = client.post("/ops/runtime-config/drafts") {
                 contentType(ContentType.Application.Json)
-                setBody("""{"values":{"runner.maxToolCallsPerRun":"12"},"note":"restore missing runtime key"}""")
+                setBody("""{"values":{"runner.maxToolCallsPerRun":"12"},"note":"restore runtime key"}""")
             }
             val draftBody = Json.parseToJsonElement(draftResponse.bodyAsText()).jsonObject
             val versionId = draftBody.getValue("version").jsonObject.getValue("id").jsonPrimitive.content
@@ -1692,15 +1692,21 @@ private fun isDockerAvailable(): Boolean {
     }.getOrDefault(false)
 }
 
-private fun deleteRuntimeConfigValue(database: ExposedDatabase, key: String) {
+private fun updateRuntimeConfigValue(
+    database: ExposedDatabase,
+    key: String,
+    value: String,
+) {
     exposedTransaction(database) {
         jdbcConnection().prepareStatement(
             """
-                DELETE FROM runtime_config_values
+                UPDATE runtime_config_values
+                SET config_value = ?
                 WHERE config_key = ?
             """.trimIndent(),
         ).use { statement ->
-            statement.setString(1, key)
+            statement.setString(1, value)
+            statement.setString(2, key)
             statement.executeUpdate()
         }
     }
