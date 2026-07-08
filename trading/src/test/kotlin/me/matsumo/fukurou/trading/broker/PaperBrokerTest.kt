@@ -1445,7 +1445,7 @@ private class FailingPlaceOrderLedgerRepository(
     }
 }
 
-private suspend fun approvedCommand(repository: DecisionRepository, command: PlaceOrderCommand,): PlaceOrderCommand {
+private suspend fun approvedCommand(repository: DecisionRepository, command: PlaceOrderCommand): PlaceOrderCommand {
     val intentId = submitIntent(repository, command)
 
     repository.submitFalsification(
@@ -1460,7 +1460,7 @@ private suspend fun approvedCommand(repository: DecisionRepository, command: Pla
     return command.copy(intentId = intentId)
 }
 
-private suspend fun intentCommand(repository: DecisionRepository, command: PlaceOrderCommand,): PlaceOrderCommand {
+private suspend fun intentCommand(repository: DecisionRepository, command: PlaceOrderCommand): PlaceOrderCommand {
     val intentId = submitIntent(repository, command)
 
     return command.copy(intentId = intentId)

@@ -1280,8 +1280,7 @@ private const val MEASURED_FALSIFIER_TOOL_CALLS = 17
  *
  * @param expectedRMultiple expected_r_multiple。null の場合は欠落ケースを作る。
  */
-private fun noTradeDecisionArguments(expectedRMultiple: String? = "0", invocationId: String? = null,) =
-    buildJsonObject {
+private fun noTradeDecisionArguments(expectedRMultiple: String? = "0", invocationId: String? = null) = buildJsonObject {
     invocationId?.let { value -> put("invocation_id", value) }
     put("action", "NO_TRADE")
     put("estimated_win_probability", "0.12")
@@ -1299,7 +1298,7 @@ private fun noTradeDecisionArguments(expectedRMultiple: String? = "0", invocatio
 /**
  * ENTER decision tool request の引数を作る。
  */
-private fun enterDecisionArguments(invocationId: String? = null,) = buildJsonObject {
+private fun enterDecisionArguments(invocationId: String? = null) = buildJsonObject {
     invocationId?.let { value -> put("invocation_id", value) }
     put("action", "ENTER")
     put("setup_tags", stringArray("breakout", "trend-follow"))
@@ -1346,7 +1345,7 @@ private suspend fun submitApprovedEnterIntent(server: io.modelcontextprotocol.ko
     return intentId
 }
 
-private fun placeOrderArguments(intentId: String, sizeBtc: String = "0.0050",) = buildJsonObject {
+private fun placeOrderArguments(intentId: String, sizeBtc: String = "0.0050") = buildJsonObject {
     put("intent_id", intentId)
     put("symbol", TradingSymbol.BTC.apiSymbol)
     put("side", "BUY")
@@ -1453,7 +1452,7 @@ private object FailingCommandEventLog : CommandEventLog {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 
-    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>,): Result<Int> {
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 }
@@ -1474,7 +1473,7 @@ private class CountFailingCommandEventLog(
         return delegate.countDistinctDecisionRunsSince(since)
     }
 
-    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>,): Result<Int> {
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 
@@ -1565,7 +1564,7 @@ private class SnapshotOnlyBroker(
     }
 }
 
-private fun accountSnapshot(totalEquityJpy: String = "100000.00000000",): AccountSnapshot {
+private fun accountSnapshot(totalEquityJpy: String = "100000.00000000"): AccountSnapshot {
     return AccountSnapshot(
         mode = TradingMode.PAPER,
         cashJpy = totalEquityJpy,
@@ -1578,7 +1577,7 @@ private fun accountSnapshot(totalEquityJpy: String = "100000.00000000",): Accoun
     )
 }
 
-private fun accountStatus(currentEquityJpy: String = "100000.00000000",): AccountStatus {
+private fun accountStatus(currentEquityJpy: String = "100000.00000000"): AccountStatus {
     return AccountStatus(
         mode = TradingMode.PAPER,
         riskState = "RUNNING",
@@ -1611,7 +1610,7 @@ private object TestClientConnection : ClientConnection {
         return unsupported()
     }
 
-    override suspend fun createMessage(request: CreateMessageRequest, options: RequestOptions?,): CreateMessageResult {
+    override suspend fun createMessage(request: CreateMessageRequest, options: RequestOptions?): CreateMessageResult {
         return unsupported()
     }
 
@@ -1697,7 +1696,7 @@ private object FakeMarketDataSource : MarketDataSource {
         )
     }
 
-    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int,): Result<Orderbook> {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
         return Result.success(
             Orderbook(
                 symbol = symbol.apiSymbol,
@@ -1707,7 +1706,7 @@ private object FakeMarketDataSource : MarketDataSource {
         )
     }
 
-    override suspend fun getTrades(symbol: TradingSymbol, limit: Int,): Result<List<RecentTrade>> {
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> {
         return Result.success(
             listOf(
                 RecentTrade(

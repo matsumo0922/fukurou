@@ -2425,7 +2425,7 @@ private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresCont
 /**
  * Docker が利用できる場合だけ Postgres integration test を実行する。
  */
-private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit,) = runBlocking {
+private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = runBlocking {
     if (!isDockerAvailable()) {
         println("Skipping Postgres integration test because Docker is unavailable.")
         return@runBlocking
@@ -2718,7 +2718,7 @@ private fun assertEquitySnapshotMatchesAccount(snapshot: EquitySnapshotRecord, a
 private fun assertDecimalStringEquals(
     fieldName: String,
     expected: String,
-    actual: BigDecimal
+    actual: BigDecimal,
 ) {
     assertEquals(0, actual.compareTo(expected.toBigDecimal()), "$fieldName mismatch")
 }
@@ -2726,7 +2726,7 @@ private fun assertDecimalStringEquals(
 /**
  * reason 別 equity_snapshots 件数を読む。
  */
-private fun selectEquitySnapshotCountByReason(database: ExposedDatabase, reason: EquitySnapshotReason,): Int {
+private fun selectEquitySnapshotCountByReason(database: ExposedDatabase, reason: EquitySnapshotReason): Int {
     return exposedTransaction(database) {
         jdbcConnection().prepareStatement(SELECT_EQUITY_SNAPSHOT_COUNT_BY_REASON_SQL).use { statement ->
             statement.setString(1, reason.name)
@@ -2821,7 +2821,7 @@ private fun JdbcTransaction.insertBackfillPosition(
 /**
  * backfill 済み lowest watermark を実測値相当に更新する。
  */
-private fun JdbcTransaction.updateLowestWatermark(positionId: UUID, lowestPriceJpy: BigDecimal,) {
+private fun JdbcTransaction.updateLowestWatermark(positionId: UUID, lowestPriceJpy: BigDecimal) {
     jdbcConnection().prepareStatement(UPDATE_LOWEST_WATERMARK_SQL).use { statement ->
         statement.setBigDecimal(1, lowestPriceJpy)
         statement.setObject(2, positionId)

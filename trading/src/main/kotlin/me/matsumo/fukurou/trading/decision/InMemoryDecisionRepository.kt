@@ -334,7 +334,7 @@ class InMemoryDecisionRepository(
 /**
  * decision submission の最小 contract を検証する。
  */
-fun validateDecisionSubmission(submission: DecisionSubmission, maxTradePlanRevisions: Int = MAX_TRADE_PLAN_REVISIONS,) {
+fun validateDecisionSubmission(submission: DecisionSubmission, maxTradePlanRevisions: Int = MAX_TRADE_PLAN_REVISIONS) {
     val estimatedProbabilityIsInRange = submission.estimatedWinProbability >= BigDecimal.ZERO &&
         submission.estimatedWinProbability <= BigDecimal.ONE
 

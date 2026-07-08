@@ -180,7 +180,7 @@ private object FailingCommandEventLog : CommandEventLog {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 
-    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>,): Result<Int> {
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 }

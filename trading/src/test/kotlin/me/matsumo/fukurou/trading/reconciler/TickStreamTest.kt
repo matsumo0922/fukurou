@@ -84,7 +84,7 @@ private class RecordingMarketDataSource : MarketDataSource {
         return Result.success(emptyList())
     }
 
-    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int,): Result<Orderbook> {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
         return Result.success(
             Orderbook(
                 symbol = symbol.apiSymbol,
@@ -94,7 +94,7 @@ private class RecordingMarketDataSource : MarketDataSource {
         )
     }
 
-    override suspend fun getTrades(symbol: TradingSymbol, limit: Int,): Result<List<RecentTrade>> {
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> {
         tradesCallCount += 1
 
         return Result.success(

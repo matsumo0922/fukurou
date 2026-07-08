@@ -447,7 +447,7 @@ internal class ExposedPaperLedgerWriter(
     private fun JdbcTransaction.updateMarks(
         lastPrice: BigDecimal,
         atr14Jpy: BigDecimal?,
-        rules: SymbolRules
+        rules: SymbolRules,
     ) {
         selectOpenPositions().forEach { position ->
             val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
@@ -767,7 +767,7 @@ internal class ExposedPaperLedgerWriter(
     private fun JdbcTransaction.updateLinkedStopOrder(
         positionId: String,
         stopPrice: BigDecimal,
-        reasonJa: String
+        reasonJa: String,
     ) {
         prepare(
             """
@@ -798,7 +798,7 @@ internal class ExposedPaperLedgerWriter(
     private fun JdbcTransaction.updateOrderStatus(
         orderId: String,
         status: OrderStatus,
-        reasonJa: String
+        reasonJa: String,
     ) {
         prepare(
             """
@@ -1040,7 +1040,7 @@ internal class ExposedPaperLedgerWriter(
 private fun PreparedStatement.bindOrderId(
     orderId: UUID,
     positionId: UUID?,
-    tradeGroupId: UUID?
+    tradeGroupId: UUID?,
 ) {
     setObject(1, orderId)
     setObject(2, positionId)
@@ -1068,7 +1068,7 @@ private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
 private fun Order.createEntryFill(
     ticker: Ticker,
     rules: SymbolRules,
-    simulator: FillSimulator
+    simulator: FillSimulator,
 ): SimulatedFill {
     return simulator.restingEntryFill(
         side = side,

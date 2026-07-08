@@ -237,7 +237,7 @@ class GmoPublicMarketDataSource(
         }
     }
 
-    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int,): Result<Orderbook> = runMarketRequest {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> = runMarketRequest {
         validateLimit(depth, MAX_ORDERBOOK_DEPTH, "depth")
 
         val request = buildOrderbookRequest(symbol)
@@ -246,7 +246,7 @@ class GmoPublicMarketDataSource(
         parseOrderbookResponse(responseBody, symbol, depth, json)
     }
 
-    override suspend fun getTrades(symbol: TradingSymbol, limit: Int,): Result<List<RecentTrade>> = runMarketRequest {
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> = runMarketRequest {
         validateLimit(limit, MAX_TRADES_LIMIT, "limit")
 
         val request = buildTradesRequest(symbol, limit)
@@ -759,7 +759,7 @@ private fun normalizeGmoKlineOpenTime(openTime: String): String {
 private fun validateLimit(
     limit: Int,
     maxLimit: Int,
-    name: String
+    name: String,
 ) {
     val isInRange = limit in 1..maxLimit
 
