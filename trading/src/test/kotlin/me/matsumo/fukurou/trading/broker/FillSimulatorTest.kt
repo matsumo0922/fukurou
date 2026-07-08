@@ -54,11 +54,15 @@ class FillSimulatorTest {
     fun resting_limit_uses_limit_price_and_maker_rebate() {
         val simulator = FillSimulator(clock = fixedClock())
 
-        val fill = simulator.restingLimitFill(
-            sizeBtc = BigDecimal("0.0100"),
-            limitPriceJpy = BigDecimal("9900000"),
-            rules = symbolRules(),
+        val update = simulator.simulatePendingLimit(
+            request = PendingLimitExecutionRequest(
+                side = OrderSide.BUY,
+                sizeBtc = BigDecimal("0.0100"),
+                limitPriceJpy = BigDecimal("9900000"),
+            ),
+            context = paperSimulationContext(),
         )
+        val fill = requireNotNull(update.fill)
 
         assertEquals("9900000.00000000", fill.priceJpy.toPlainString())
         assertEquals("-9.90000000", fill.feeJpy.toPlainString())
@@ -140,6 +144,22 @@ class FillSimulatorTest {
         )
 
         assertEquals("10006000.00000000", fill.priceJpy.toPlainString())
+    }
+
+    @Test
+    fun market_sell_clamps_adverse_slippage_to_zero() {
+        val simulator = FillSimulator(clock = fixedClock())
+
+        val fill = simulator.marketFill(
+            side = OrderSide.SELL,
+            sizeBtc = BigDecimal("0.0100"),
+            context = paperSimulationContext(
+                volatilitySlippageJpy = BigDecimal("20000000"),
+            ),
+        )
+
+        assertEquals("0.00000000", fill.priceJpy.toPlainString())
+        assertEquals("0.00000000", fill.feeJpy.toPlainString())
     }
 }
 

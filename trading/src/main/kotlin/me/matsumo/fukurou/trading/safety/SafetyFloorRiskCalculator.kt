@@ -19,6 +19,9 @@ import java.time.Instant
 
 /**
  * SafetyFloor の金額、exposure、EV 計算を担当する。
+ * pre-trade 見積もりは板深さを取得せず、ticker ask / bid と slippage reserve で保守的に近似する。
+ * volatility slippage は entry 価格の price risk と往復 cost reserve の両方に含め、
+ * 急変時の価格不利と約定 cost を別々に安全方向へ見積もる。
  *
  * @param config 安全床しきい値
  * @param clock 市場データ鮮度判定に使う clock

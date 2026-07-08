@@ -85,31 +85,6 @@ internal fun PaperExecutionSimulator.stopFill(
 }
 
 /**
- * resting LIMIT 約定を計算する。
- */
-internal fun PaperExecutionSimulator.restingLimitFill(
-    sizeBtc: BigDecimal,
-    limitPriceJpy: BigDecimal,
-    rules: SymbolRules,
-): SimulatedFill {
-    return requireNotNull(
-        simulatePendingLimit(
-            request = PendingLimitExecutionRequest(
-                side = OrderSide.BUY,
-                sizeBtc = sizeBtc,
-                limitPriceJpy = limitPriceJpy,
-            ),
-            context = PaperSimulationContext(
-                ticker = limitOnlyTicker(limitPriceJpy),
-                rules = rules,
-            ),
-        ).fill,
-    ) {
-        "Triggered LIMIT order must create a fill."
-    }
-}
-
-/**
  * resting entry order の約定を注文種別に応じて計算する。
  */
 internal fun PaperExecutionSimulator.restingEntryFill(request: RestingEntryFillRequest): SimulatedFill {
@@ -176,18 +151,3 @@ data class RestingEntryFillRequest(
     val ticker: Ticker,
     val rules: SymbolRules,
 )
-
-private fun limitOnlyTicker(priceJpy: BigDecimal): Ticker {
-    val priceText = priceJpy.toPlainString()
-
-    return Ticker(
-        symbol = "",
-        last = priceText,
-        bid = priceText,
-        ask = priceText,
-        high = priceText,
-        low = priceText,
-        volume = BigDecimal.ZERO.toPlainString(),
-        timestamp = "",
-    )
-}

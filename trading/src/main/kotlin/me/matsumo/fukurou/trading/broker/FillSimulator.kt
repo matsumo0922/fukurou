@@ -228,6 +228,7 @@ class DefaultPaperExecutionSimulator(
     private fun applyNegativeSlippage(price: BigDecimal): BigDecimal {
         return price
             .multiply(BigDecimal.ONE.subtract(slippageRatio()))
+            .max(BigDecimal.ZERO)
             .moneyScale()
     }
 
@@ -238,7 +239,7 @@ class DefaultPaperExecutionSimulator(
     ): BigDecimal {
         return when (side) {
             OrderSide.BUY -> applyPositiveSlippage(price).add(volatilitySlippageJpy).moneyScale()
-            OrderSide.SELL -> applyNegativeSlippage(price).subtract(volatilitySlippageJpy).moneyScale()
+            OrderSide.SELL -> applyNegativeSlippage(price).subtract(volatilitySlippageJpy).max(BigDecimal.ZERO).moneyScale()
         }
     }
 

@@ -994,7 +994,7 @@ private suspend fun PaperBrokerRuntime.volatilitySlippageJpyFor(
     symbol: TradingSymbol,
     atr14Jpy: BigDecimal?,
 ): BigDecimal {
-    if (market.paperExecutionConfig.volatilitySlippageMultiplier == BigDecimal.ZERO) {
+    if (market.paperExecutionConfig.volatilitySlippageMultiplier.signum() == 0) {
         return BigDecimal.ZERO
     }
 
