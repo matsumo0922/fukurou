@@ -452,7 +452,7 @@ class FukurouMcpServerTest {
         ).createServer()
         val tool = requireNotNull(server.tools["submit_decision"]?.tool)
 
-        assertTrue(tool.inputSchema.required?.contains("expected_r_multiple") == true)
+        assertEquals(true, tool.inputSchema.required?.contains("expected_r_multiple"))
     }
 
     @Test
@@ -516,7 +516,7 @@ class FukurouMcpServerTest {
         val structuredContent = assertNotNull(result.structuredContent)
         val repository = runtime.decisionRepository as InMemoryDecisionRepository
 
-        assertTrue(result.isError == true)
+        assertEquals(true, result.isError)
         assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertEquals(
             "expected_r_multiple is required.",
@@ -663,7 +663,7 @@ class FukurouMcpServerTest {
         assertEquals(FalsificationVerdict.APPROVED.name, structuredContent.getValue("verdict").jsonPrimitive.contentOrNull)
         assertEquals(1, repository.snapshots.tradeIntents().size)
         assertEquals(1, repository.snapshots.falsifications().size)
-        assertTrue(duplicateResult.isError == true)
+        assertEquals(true, duplicateResult.isError)
         assertEquals("invalid_request", duplicateContent.getValue("type").jsonPrimitive.contentOrNull)
     }
 
@@ -815,15 +815,17 @@ class FukurouMcpServerTest {
         assertEquals(1L, structuredContent.getValue("item_count").jsonPrimitive.longOrNull)
         assertEquals("NO_TRADE", lesson.getValue("action").jsonPrimitive.contentOrNull)
         assertEquals("材料不足のため見送ります。", lesson.getValue("reason_ja").jsonPrimitive.contentOrNull)
-        assertTrue(
-            lesson.getValue("invocation_id").jsonPrimitive.contentOrNull?.contains("[TRUNCATED]") == true,
+        assertEquals(
+            true,
+            lesson.getValue("invocation_id").jsonPrimitive.contentOrNull?.contains("[TRUNCATED]"),
         )
         assertEquals(LLM_RUN_STATUS_FAILED, runSummary.getValue("status").jsonPrimitive.contentOrNull)
-        assertTrue(
-            runSummary.getValue("invocation_id").jsonPrimitive.contentOrNull?.contains("[TRUNCATED]") == true,
+        assertEquals(
+            true,
+            runSummary.getValue("invocation_id").jsonPrimitive.contentOrNull?.contains("[TRUNCATED]"),
         )
         assertEquals(listOf("llm_run", "decision"), failureSources)
-        assertTrue(runFailureSourceId?.contains("[TRUNCATED]") == true)
+        assertEquals(true, runFailureSourceId?.contains("[TRUNCATED]"))
         assertEquals(1, repository.snapshots.decisions().size)
         assertTrue(!structuredContent.toString().contains("fact_check"))
         assertTrue(!structuredContent.toString().contains("tool_evidence_ids"))
@@ -878,7 +880,7 @@ class FukurouMcpServerTest {
         assertEquals(true, outcome.getValue("has_trade_intent").jsonPrimitive.booleanOrNull)
         assertEquals(FalsificationVerdict.REJECTED.name, outcome.getValue("falsification_verdict").jsonPrimitive.contentOrNull)
         assertEquals(LLM_RUN_STATUS_FAILED, outcome.getValue("run_status").jsonPrimitive.contentOrNull)
-        assertTrue(hit.getValue("score").jsonPrimitive.longOrNull?.let { score -> score > 0L } == true)
+        assertEquals(true, hit.getValue("score").jsonPrimitive.longOrNull?.let { score -> score > 0L })
         assertTrue(hit.getValue("matched_terms").jsonArray.isNotEmpty())
     }
 
@@ -1034,7 +1036,7 @@ class FukurouMcpServerTest {
         val result = server.tools.getValue("submit_falsification").handler.invoke(TestClientConnection, request)
         val structuredContent = assertNotNull(result.structuredContent)
 
-        assertTrue(result.isError == true)
+        assertEquals(true, result.isError)
         assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
     }
 
@@ -1145,7 +1147,7 @@ class FukurouMcpServerTest {
         val structuredContent = assertNotNull(resetRevisionResult.structuredContent)
         val repository = runtime.decisionRepository as InMemoryDecisionRepository
 
-        assertTrue(resetRevisionResult.isError == true)
+        assertEquals(true, resetRevisionResult.isError)
         assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertEquals(3, repository.snapshots.tradePlans().size)
     }
@@ -1177,7 +1179,7 @@ class FukurouMcpServerTest {
         val result = server.tools.getValue("get_ticker").handler.invoke(TestClientConnection, request)
         val structuredContent = assertNotNull(result.structuredContent)
 
-        assertTrue(result.isError == true)
+        assertEquals(true, result.isError)
         assertEquals("audit_failed_after_execution", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertEquals("true", structuredContent.getValue("executed").jsonPrimitive.contentOrNull)
     }
@@ -1211,7 +1213,7 @@ class FukurouMcpServerTest {
             event.eventType == CommandEventType.NO_TRADE_EXIT
         }
 
-        assertTrue(limitedResult.isError == true)
+        assertEquals(true, limitedResult.isError)
         assertEquals("tool_call_limit_exceeded", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertTrue(noTradeEvent.payload.contains("mcp_total_tool_call_limit_exceeded"))
     }
@@ -1265,7 +1267,7 @@ class FukurouMcpServerTest {
             event.eventType == CommandEventType.NO_TRADE_EXIT
         }
 
-        assertTrue(limitedResult.isError == true)
+        assertEquals(true, limitedResult.isError)
         assertEquals("tool_call_limit_exceeded", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertTrue(noTradeEvent.payload.contains("mcp_total_tool_call_limit_exceeded"))
     }
@@ -1352,7 +1354,7 @@ class FukurouMcpServerTest {
             event.eventType == CommandEventType.NO_TRADE_EXIT
         }
 
-        assertTrue(result.isError == true)
+        assertEquals(true, result.isError)
         assertEquals("tool_call_limit_unavailable", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertTrue(noTradeEvent.payload.contains("mcp_tool_call_count_unavailable"))
     }
@@ -1391,7 +1393,7 @@ class FukurouMcpServerTest {
         val readResult = server.tools.getValue("get_balance").handler.invoke(TestClientConnection, readRequest)
         val tradeLimitedContent = assertNotNull(tradeLimitedResult.structuredContent)
 
-        assertTrue(tradeLimitedResult.isError == true)
+        assertEquals(true, tradeLimitedResult.isError)
         assertEquals("tool_call_limit_exceeded", tradeLimitedContent.getValue("type").jsonPrimitive.contentOrNull)
         assertTrue(readResult.isError != true)
     }
@@ -1424,7 +1426,7 @@ class FukurouMcpServerTest {
         val previewResult = callTool(server, "preview_order", placeOrderArguments(intentId))
         val previewContent = assertNotNull(previewResult.structuredContent)
 
-        assertTrue(tradeResult.isError == true)
+        assertEquals(true, tradeResult.isError)
         assertTrue(previewResult.isError != true)
         assertEquals(true, previewContent.getValue("accepted").jsonPrimitive.booleanOrNull)
     }
@@ -1455,7 +1457,7 @@ class FukurouMcpServerTest {
             event.eventType == CommandEventType.NO_TRADE_EXIT
         }
 
-        assertTrue(deniedResult.isError == true)
+        assertEquals(true, deniedResult.isError)
         assertEquals("tool_call_not_allowed", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertTrue(noTradeEvent.payload.contains("mcp_tool_not_allowed"))
     }

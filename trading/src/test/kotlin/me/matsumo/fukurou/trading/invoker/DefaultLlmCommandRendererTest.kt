@@ -8,6 +8,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -404,7 +405,7 @@ class DefaultLlmCommandRendererTest {
         val privateConfigFile = privateCodexHome.resolve(CODEX_CONFIG_FILE_NAME)
         val copiedAuthContent = Files.readString(copiedAuthFile)
 
-        assertFalse(privateCodexHome == parentCodexHome)
+        assertNotEquals(parentCodexHome, privateCodexHome)
         assertFalse(joinedArgs.contains("test-auth-token"))
         assertEquals("""{"token":"test-auth-token"}""", copiedAuthContent)
         assertTrue(Files.exists(privateConfigFile))
