@@ -40,6 +40,7 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `/evaluation/*`
 - `/ops/*`
 - `GET /ops/runtime-config`
+- `GET /ops/activity/catalog`
 - `GET /swagger`
 - `GET /openapi.json`
 
@@ -94,6 +95,8 @@ make dev-web
 Vite dev server は既定で `http://localhost:8080` の Ktor API へ proxy します。接続先は `VITE_FUKUROU_API_TARGET` で上書きできます。
 
 WebUI の `Config` 画面（`/app/config`）は `/ops/runtime-config` を表示します。Runtime / Deployment / Secrets の各 group は読み取り専用で、secret 値は画面に表示しません。
+
+WebUI の `Activity` 画面（`/app/activity`）は `/ops/activity` の decision / audit / paper execution timeline を表示します。監査イベントと判断アクションの表示名・説明は `/ops/activity/catalog` の i18n key catalog から解決し、audit event type filter も同じ catalog を使います。audit event type を選択していない場合、`RECONCILER_PASS_COMPLETED` は高頻度 heartbeat として既定で除外されます。paper execution の `BUY` / `SELL` side は catalog 対象外の raw execution 値として表示します。
 
 Web 側の検証は次を使います。
 

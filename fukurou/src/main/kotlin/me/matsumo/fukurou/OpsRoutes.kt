@@ -23,6 +23,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
+import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
@@ -503,6 +504,36 @@ data class OpsActivityEventResponse(
 data class OpsActivityMetadataResponse(
     val label: String,
     val value: String,
+)
+
+/**
+ * Activity 表示用 catalog API の response body。
+ *
+ * @param sourceFilters Activity source filter の表示定義
+ * @param auditEventTypes audit event_type の表示定義
+ * @param decisionActions decision action の表示定義
+ * @param defaultExcludedAuditEventTypes auditEventType 未指定時に activity timeline から既定除外する event_type
+ */
+@Serializable
+data class OpsActivityCatalogResponse(
+    val sourceFilters: List<OpsActivityCatalogItemResponse>,
+    val auditEventTypes: List<OpsActivityCatalogItemResponse>,
+    val decisionActions: List<OpsActivityCatalogItemResponse>,
+    val defaultExcludedAuditEventTypes: List<String>,
+)
+
+/**
+ * Activity 表示用 catalog の項目。
+ *
+ * @param value API filter / kind / localStorage で使う raw wire value
+ * @param labelKey WebUI i18n label key
+ * @param descriptionKey WebUI i18n description key
+ */
+@Serializable
+data class OpsActivityCatalogItemResponse(
+    val value: String,
+    val labelKey: String,
+    val descriptionKey: String,
 )
 
 /**
@@ -1094,6 +1125,21 @@ private fun Route.registerOpsExecutionsRoute(dependencies: OpsRouteDependencies)
 
 @OptIn(ExperimentalKtorApi::class)
 private fun Route.registerOpsActivityRoute(dependencies: OpsRouteDependencies) {
+    get("/ops/activity/catalog") {
+        call.respond(opsActivityCatalogResponse())
+    }.describe {
+        summary = "Activity 表示用 catalog を取得する"
+        description = "Activity 画面で source、audit event_type、decision action を人間向け文言へ解決するための code-owned catalog です。" +
+            "値は filter / kind / localStorage と同じ raw wire value のまま返し、人間向け文言は WebUI i18n key で返します。"
+        tag(OPS_TAG)
+        responses {
+            HttpStatusCode.OK {
+                description = "Activity 表示用 catalog です。"
+                schema = jsonSchema<OpsActivityCatalogResponse>()
+            }
+        }
+    }
+
     get("/ops/activity") {
         call.respondOpsActivity(dependencies)
     }.describe {
@@ -1744,6 +1790,75 @@ private fun OpsActivityEventResponse.toActivityCursorValue(): String {
     return listOf(occurredAt, source, id).joinToString(ACTIVITY_CURSOR_SEPARATOR)
 }
 
+private fun opsActivityCatalogResponse(): OpsActivityCatalogResponse {
+    return OpsActivityCatalogResponse(
+        sourceFilters = listOf(activityCatalogItem(ACTIVITY_SOURCE_ALL, "activity.catalog.source.all")) +
+            OpsActivitySource.entries.map { source -> source.toActivitySourceDefinition() },
+        auditEventTypes = CommandEventType.entries.map { eventType -> eventType.toActivityAuditEventDefinition() },
+        decisionActions = DecisionAction.entries.map { action -> action.toActivityDecisionActionDefinition() },
+        defaultExcludedAuditEventTypes = DEFAULT_ACTIVITY_EXCLUDED_AUDIT_EVENT_TYPES.map { eventType -> eventType.name },
+    )
+}
+
+private fun OpsActivitySource.toActivitySourceDefinition(): OpsActivityCatalogItemResponse {
+    val keySuffix = when (this) {
+        OpsActivitySource.DECISION -> "decision"
+        OpsActivitySource.AUDIT -> "audit"
+        OpsActivitySource.EXECUTION -> "execution"
+    }
+
+    return activityCatalogItem(wireName, "activity.catalog.source.$keySuffix")
+}
+
+@Suppress("CyclomaticComplexMethod")
+private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalogItemResponse {
+    val keySuffix = when (this) {
+        CommandEventType.TOOL_CALL_COMPLETED -> "toolCallCompleted"
+        CommandEventType.TOOL_CALL_REJECTED_BY_HARD_HALT -> "toolCallRejectedByHardHalt"
+        CommandEventType.NO_TRADE_EXIT -> "noTradeExit"
+        CommandEventType.RECONCILER_STARTED -> "reconcilerStarted"
+        CommandEventType.RECONCILER_PASS_COMPLETED -> "reconcilerPassCompleted"
+        CommandEventType.RECONCILER_PASS_FAILED -> "reconcilerPassFailed"
+        CommandEventType.RECONCILER_PASS_RECOVERED -> "reconcilerPassRecovered"
+        CommandEventType.HARD_HALT_SET -> "hardHaltSet"
+        CommandEventType.SOFT_HALT_SET -> "softHaltSet"
+        CommandEventType.KILL_CRITERION_BREACHED -> "killCriterionBreached"
+        CommandEventType.MANUAL_RESUME_REQUESTED -> "manualResumeRequested"
+        CommandEventType.RUNNER_PHASE_COMPLETED -> "runnerPhaseCompleted"
+        CommandEventType.DECISION_LIFECYCLE_COMPLETED -> "decisionLifecycleCompleted"
+        CommandEventType.DAEMON_STARTED -> "daemonStarted"
+        CommandEventType.DAEMON_TRIGGER_SKIPPED -> "daemonTriggerSkipped"
+        CommandEventType.DAEMON_TRIGGER_LAUNCHED -> "daemonTriggerLaunched"
+        CommandEventType.DAEMON_INVOCATION_COMPLETED -> "daemonInvocationCompleted"
+        CommandEventType.CLI_AUTH_LOGIN_STARTED -> "cliAuthLoginStarted"
+        CommandEventType.CLI_AUTH_LOGIN_TOKEN_SUBMITTED -> "cliAuthLoginTokenSubmitted"
+        CommandEventType.CLI_AUTH_LOGIN_COMPLETED -> "cliAuthLoginCompleted"
+        CommandEventType.CLI_AUTH_LOGIN_FAILED -> "cliAuthLoginFailed"
+        CommandEventType.CLI_AUTH_LOGIN_TIMED_OUT -> "cliAuthLoginTimedOut"
+    }
+
+    return activityCatalogItem(name, "activity.catalog.audit.$keySuffix")
+}
+
+private fun DecisionAction.toActivityDecisionActionDefinition(): OpsActivityCatalogItemResponse {
+    val keySuffix = when (this) {
+        DecisionAction.ENTER -> "enter"
+        DecisionAction.EXIT -> "exit"
+        DecisionAction.ADJUST_PROTECTION -> "adjustProtection"
+        DecisionAction.NO_TRADE -> "noTrade"
+    }
+
+    return activityCatalogItem(name, "activity.catalog.decision.$keySuffix")
+}
+
+private fun activityCatalogItem(value: String, keyPrefix: String): OpsActivityCatalogItemResponse {
+    return OpsActivityCatalogItemResponse(
+        value = value,
+        labelKey = "$keyPrefix.label",
+        descriptionKey = "$keyPrefix.description",
+    )
+}
+
 private fun RiskState.toOpsRiskStateResponse(): OpsRiskStateResponse {
     return OpsRiskStateResponse(
         state = state.name,
@@ -1975,6 +2090,11 @@ private const val MAX_ACTIVITY_LIMIT = 100
  * Activity cursor 内の区切り文字。
  */
 private const val ACTIVITY_CURSOR_SEPARATOR = "|"
+
+/**
+ * Activity source filter の all pseudo source。
+ */
+private const val ACTIVITY_SOURCE_ALL = "all"
 
 /**
  * Activity cursor の要素数。

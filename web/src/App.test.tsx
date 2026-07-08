@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import App from "./App";
 import { ACTIVITY_TIMELINE_FILTER_STORAGE_KEY } from "./api/ops";
 import { LOCALE_STORAGE_KEY } from "./i18n/messages";
 import { formatDateTime } from "./ui/format";
+
+const activityCatalogGolden = JSON.parse(
+  readFileSync(resolve(process.cwd(), "../testdata/ops-activity-catalog.golden.json"), "utf8"),
+) as unknown;
 
 describe("App", () => {
   afterEach(() => {
@@ -267,8 +273,8 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByText("BUY BTC execution")).toBeInTheDocument();
-    expect(screen.getByText("NO_TRADE decision")).toBeInTheDocument();
-    expect(screen.getAllByText("MANUAL_RESUME_REQUESTED").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("No trade").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Manual resume requested").length).toBeGreaterThan(0);
     expect(screen.getAllByText("operator").length).toBeGreaterThan(0);
     expect(screen.getByText(/newest first/)).toBeInTheDocument();
     expect(screen.getByText(/3\/50 records/)).toBeInTheDocument();
@@ -278,14 +284,14 @@ describe("App", () => {
 
     expect(timelineItems.map((item) => within(item).getByRole("heading", { level: 2 }).textContent)).toEqual([
       "BUY BTC execution",
-      "MANUAL_RESUME_REQUESTED",
-      "NO_TRADE decision",
+      "Manual resume requested",
+      "No trade",
     ]);
     expect(hasGetCall(fetchMock, "/ops/activity", (params) => params.get("limit") === "50")).toBe(true);
 
     fireEvent.click(screen.getByRole("button", { name: "Load older" }));
 
-    expect(await screen.findByText("HARD_HALT_SET")).toBeInTheDocument();
+    expect(await screen.findByText("HARD_HALT set")).toBeInTheDocument();
     expect(
       hasGetCall(
         fetchMock,
@@ -294,8 +300,8 @@ describe("App", () => {
       ),
     ).toBe(true);
 
-    fireEvent.click(screen.getByRole("button", { name: "audit" }));
-    fireEvent.click(screen.getByLabelText("MANUAL_RESUME_REQUESTED"));
+    fireEvent.click(screen.getByRole("button", { name: "Audit" }));
+    fireEvent.click(screen.getByLabelText("Manual resume requested"));
 
     await waitFor(() => {
       expect(
@@ -326,8 +332,8 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Activity" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "audit" })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByLabelText("HARD_HALT_SET")).toBeChecked();
+    expect(screen.getByRole("button", { name: "Audit" })).toHaveAttribute("aria-pressed", "true");
+    expect(await screen.findByLabelText("HARD_HALT set")).toBeChecked();
     expect(screen.queryByText("STALE_EVENT")).not.toBeInTheDocument();
 
     await waitFor(() => {
@@ -338,6 +344,61 @@ describe("App", () => {
           (params) => params.get("source") === "audit" && params.get("auditEventType") === "HARD_HALT_SET",
         ),
       ).toBe(true);
+    });
+    await waitFor(() => {
+      expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
+        source: "audit",
+        auditEventTypes: ["HARD_HALT_SET"],
+      });
+    });
+  });
+
+  it("opens the activity glossary and explains default audit exclusions", async () => {
+    stubSystemFetch();
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open activity glossary" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Activity glossary" });
+
+    expect(within(dialog).getByText("Sources")).toBeInTheDocument();
+    expect(within(dialog).getByText("Audit event types")).toBeInTheDocument();
+    expect(within(dialog).getByText("Decision actions")).toBeInTheDocument();
+    expect(within(dialog).getByText("Decision lifecycle completed")).toBeInTheDocument();
+    expect(within(dialog).getByText(/RECONCILER_PASS_COMPLETED.*excluded by default/)).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Activity glossary" })).not.toBeInTheDocument();
+    });
+  });
+
+  it("keeps saved filters and falls back to raw labels when the activity catalog fails", async () => {
+    window.localStorage.setItem(
+      ACTIVITY_TIMELINE_FILTER_STORAGE_KEY,
+      JSON.stringify({
+        source: "all",
+        auditEventTypes: ["STALE_EVENT"],
+      }),
+    );
+    stubSystemFetch({
+      activityCatalogResponse: {
+        status: 500,
+        body: { message: "catalog unavailable" },
+      },
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    expect(await screen.findByText("NO_TRADE decision")).toBeInTheDocument();
+    expect(screen.getByLabelText("STALE_EVENT")).toBeChecked();
+    expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
+      source: "all",
+      auditEventTypes: ["STALE_EVENT"],
     });
   });
 
@@ -356,7 +417,7 @@ describe("App", () => {
     expect(await screen.findByText("BUY BTC execution")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Load older" }));
-    fireEvent.click(screen.getByRole("button", { name: "audit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Audit" }));
 
     await waitFor(() => {
       expect(hasGetCall(fetchMock, "/ops/activity", (params) => params.get("source") === "audit")).toBe(true);
@@ -370,8 +431,8 @@ describe("App", () => {
 
     const timeline = await screen.findByRole("list", { name: "Activity timeline" });
 
-    expect(within(timeline).queryByText("HARD_HALT_SET")).not.toBeInTheDocument();
-    expect(within(timeline).getAllByText("MANUAL_RESUME_REQUESTED").length).toBeGreaterThan(0);
+    expect(within(timeline).queryByText("HARD_HALT set")).not.toBeInTheDocument();
+    expect(within(timeline).getAllByText("Manual resume requested").length).toBeGreaterThan(0);
   });
 
   it("rejects blank control reasons before calling the API", async () => {
@@ -648,6 +709,10 @@ type SystemFetchFixture = {
     body: unknown;
   };
   runtimeConfigResponse?: unknown;
+  activityCatalogResponse?: {
+    status: number;
+    body: unknown;
+  };
   activityOlderResponse?: Promise<Response>;
 };
 
@@ -795,6 +860,15 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         });
       case "/ops/runtime-config":
         return jsonResponse(fixture.runtimeConfigResponse ?? runtimeConfigResponse());
+      case "/ops/activity/catalog":
+        if (fixture.activityCatalogResponse) {
+          return jsonResponse(
+            fixture.activityCatalogResponse.body,
+            { status: fixture.activityCatalogResponse.status },
+          );
+        }
+
+        return jsonResponse(activityCatalogGolden);
       case "/ops/activity":
         if (requestSearchParams(input).has("before") && fixture.activityOlderResponse) {
           return fixture.activityOlderResponse;

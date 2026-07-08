@@ -8,6 +8,8 @@ export type EvaluationCalibrationResponse = components["schemas"]["EvaluationCal
 export type EvaluationBenchmarkResponse = components["schemas"]["EvaluationBenchmarkResponse"];
 export type EvaluationCostsResponse = components["schemas"]["EvaluationCostsResponse"];
 export type OpsAccountResponse = components["schemas"]["OpsAccountResponse"];
+export type OpsActivityCatalogItemResponse = components["schemas"]["OpsActivityCatalogItemResponse"];
+export type OpsActivityCatalogResponse = components["schemas"]["OpsActivityCatalogResponse"];
 export type OpsActivityEventResponse = components["schemas"]["OpsActivityEventResponse"];
 export type OpsActivityMetadataResponse = components["schemas"]["OpsActivityMetadataResponse"];
 export type OpsActivityResponse = components["schemas"]["OpsActivityResponse"];
@@ -53,30 +55,6 @@ export const ACTIVITY_TIMELINE_FILTER_STORAGE_KEY = "fukurou.web.activity.filter
 export const ACTIVITY_TIMELINE_SOURCE_FILTERS = ["all", "decision", "audit", "execution"] as const;
 
 export const LLM_AUTH_PROVIDERS = ["claude", "codex"] as const;
-
-export const ACTIVITY_AUDIT_EVENT_TYPES = [
-  "TOOL_CALL_COMPLETED",
-  "TOOL_CALL_REJECTED_BY_HARD_HALT",
-  "NO_TRADE_EXIT",
-  "RECONCILER_STARTED",
-  "RECONCILER_PASS_COMPLETED",
-  "RECONCILER_PASS_FAILED",
-  "RECONCILER_PASS_RECOVERED",
-  "HARD_HALT_SET",
-  "SOFT_HALT_SET",
-  "KILL_CRITERION_BREACHED",
-  "MANUAL_RESUME_REQUESTED",
-  "RUNNER_PHASE_COMPLETED",
-  "DAEMON_STARTED",
-  "DAEMON_TRIGGER_SKIPPED",
-  "DAEMON_TRIGGER_LAUNCHED",
-  "DAEMON_INVOCATION_COMPLETED",
-  "CLI_AUTH_LOGIN_STARTED",
-  "CLI_AUTH_LOGIN_TOKEN_SUBMITTED",
-  "CLI_AUTH_LOGIN_COMPLETED",
-  "CLI_AUTH_LOGIN_FAILED",
-  "CLI_AUTH_LOGIN_TIMED_OUT",
-] as const;
 
 export const DEFAULT_ACTIVITY_TIMELINE_FILTERS: ActivityTimelineFilters = {
   source: "all",
@@ -125,6 +103,12 @@ export const opsRuntimeConfigQuery = queryOptions({
   queryFn: () => getJson("/ops/runtime-config"),
   staleTime: 60_000,
   refetchInterval: 60_000,
+});
+
+export const opsActivityCatalogQuery = queryOptions({
+  queryKey: ["ops", "activity-catalog"],
+  queryFn: () => getJson("/ops/activity/catalog"),
+  staleTime: 300_000,
 });
 
 export const evaluationSummaryQuery = queryOptions({
@@ -277,12 +261,24 @@ export function normalizeActivityTimelineFilters(value: unknown): ActivityTimeli
 
   const source = isActivityTimelineSourceFilter(value.source) ? value.source : "all";
   const auditEventTypes = Array.isArray(value.auditEventTypes)
-    ? value.auditEventTypes.filter(isKnownActivityAuditEventType)
+    ? value.auditEventTypes.filter(isNonEmptyString)
     : [];
 
   return {
     source,
     auditEventTypes,
+  };
+}
+
+export function pruneActivityTimelineFilters(
+  filters: ActivityTimelineFilters,
+  catalog: OpsActivityCatalogResponse,
+): ActivityTimelineFilters {
+  const knownAuditEventTypes = new Set(catalog.auditEventTypes.map((item) => item.value));
+
+  return {
+    ...filters,
+    auditEventTypes: filters.auditEventTypes.filter((eventType) => knownAuditEventTypes.has(eventType)),
   };
 }
 
@@ -331,8 +327,8 @@ function isActivityTimelineSourceFilter(value: unknown): value is ActivityTimeli
   return typeof value === "string" && ACTIVITY_TIMELINE_SOURCE_FILTERS.includes(value as ActivityTimelineSourceFilter);
 }
 
-function isKnownActivityAuditEventType(value: unknown): value is string {
-  return typeof value === "string" && ACTIVITY_AUDIT_EVENT_TYPES.includes(value as (typeof ACTIVITY_AUDIT_EVENT_TYPES)[number]);
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

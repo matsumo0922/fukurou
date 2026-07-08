@@ -279,6 +279,10 @@ a:focus-visible {
   line-height: 1.25;
 }
 
+.panel-heading__spacer {
+  flex: 1 1 auto;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -425,6 +429,25 @@ a:focus-visible {
 .icon-text-button--critical:hover:not(:disabled) {
   background: #843027;
   color: #ffffff;
+}
+
+.icon-only-button {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  cursor: pointer;
+  padding: 0;
+}
+
+.icon-only-button:hover {
+  border-color: var(--blue);
+  color: var(--blue);
 }
 
 .language-toggle {
@@ -658,6 +681,13 @@ a:focus-visible {
   font-family: var(--mono);
   font-size: 0.72rem;
   overflow-wrap: anywhere;
+}
+
+.activity-filters__hint {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
 }
 
 .data-strip {
@@ -1540,6 +1570,114 @@ a:focus-visible {
   line-height: 1.4;
 }
 
+.activity-catalog-dialog__backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(15 23 18 / 46%);
+  padding: 18px;
+}
+
+.activity-catalog-dialog {
+  display: grid;
+  gap: 14px;
+  width: min(760px, 100%);
+  max-height: min(760px, 90vh);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+  padding: 16px;
+  overflow: auto;
+}
+
+.activity-catalog-dialog__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.activity-catalog-dialog__heading h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 1rem;
+  line-height: 1.3;
+}
+
+.activity-catalog-dialog__note,
+.activity-catalog-dialog__empty {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.activity-catalog-dialog__groups {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.activity-catalog-dialog__group {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.activity-catalog-dialog__group h3 {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 0.72rem;
+  font-weight: 760;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.activity-catalog-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--line);
+}
+
+.activity-catalog-list__item {
+  min-width: 0;
+  background: var(--surface-muted);
+  padding: 10px;
+}
+
+.activity-catalog-list__item dt {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--ink);
+  font-weight: 760;
+}
+
+.activity-catalog-list__item code {
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.activity-catalog-list__item dd {
+  margin: 7px 0 0;
+  color: var(--ink-muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 920px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -1579,6 +1717,10 @@ a:focus-visible {
 
   .control-action-grid--two,
   .halt-semantics {
+    grid-template-columns: 1fr;
+  }
+
+  .activity-catalog-list {
     grid-template-columns: 1fr;
   }
 }

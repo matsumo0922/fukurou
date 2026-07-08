@@ -3,9 +3,10 @@ import { useQuery } from "@tanstack/react-query";
 import Activity from "lucide-react/dist/esm/icons/activity.mjs";
 import ChevronDown from "lucide-react/dist/esm/icons/chevron-down.mjs";
 import Filter from "lucide-react/dist/esm/icons/filter.mjs";
+import Info from "lucide-react/dist/esm/icons/info.mjs";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
+import X from "lucide-react/dist/esm/icons/x.mjs";
 import {
-  ACTIVITY_AUDIT_EVENT_TYPES,
   ACTIVITY_TIMELINE_FILTER_STORAGE_KEY,
   ACTIVITY_TIMELINE_SOURCE_FILTERS,
   DEFAULT_ACTIVITY_TIMELINE_FILTERS,
@@ -13,11 +14,15 @@ import {
   fetchActivityTimeline,
   newestFirstActivityTimelineEvents,
   normalizeActivityTimelineFilters,
+  opsActivityCatalogQuery,
+  pruneActivityTimelineFilters,
   type ActivityTimelineEvent,
   type ActivityTimelineFilters,
   type ActivityTimelineSnapshot,
   type ActivityTimelineSource,
   type ActivityTimelineSourceFilter,
+  type OpsActivityCatalogItemResponse,
+  type OpsActivityCatalogResponse,
 } from "../api/ops";
 import type { MessageKey } from "../i18n/messages";
 import { useI18n } from "../i18n/useI18n";
@@ -33,9 +38,12 @@ export function ActivityPage() {
   const [olderPages, setOlderPages] = useState<ActivityTimelineSnapshot[]>([]);
   const [olderError, setOlderError] = useState<unknown>(null);
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+  const [isCatalogDialogOpen, setIsCatalogDialogOpen] = useState(false);
   const timelineVersionRef = useRef(0);
   const hasLoadedOlderPages = olderPages.length > 0;
+  const catalogQuery = useQuery(opsActivityCatalogQuery);
   const timelineQuery = useQuery(activityTimelineQuery(filters, undefined, !hasLoadedOlderPages));
+  const catalog = catalogQuery.data ?? null;
   const visibleTimeline = useMemo(
     () => mergeActivityTimelinePages(timelineQuery.data ?? null, olderPages),
     [olderPages, timelineQuery.data],
@@ -45,6 +53,22 @@ export function ActivityPage() {
   useEffect(() => {
     persistActivityTimelineFilters(filters);
   }, [filters]);
+
+  useEffect(() => {
+    if (!catalogQuery.isSuccess) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setFilters((currentFilters) => {
+        const prunedFilters = pruneActivityTimelineFilters(currentFilters, catalogQuery.data);
+
+        return activityTimelineFiltersEqual(currentFilters, prunedFilters) ? currentFilters : prunedFilters;
+      });
+    }, 0);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [catalogQuery.data, catalogQuery.isSuccess]);
 
   const refreshed = () => {
     timelineVersionRef.current += 1;
@@ -94,7 +118,12 @@ export function ActivityPage() {
       />
 
       <Panel>
-        <ActivityFilters filters={filters} filtersChanged={filtersChanged} />
+        <ActivityFilters
+          catalog={catalog}
+          catalogFailed={catalogQuery.isError}
+          filters={filters}
+          filtersChanged={filtersChanged}
+        />
       </Panel>
 
       <Panel>
@@ -107,6 +136,16 @@ export function ActivityPage() {
               tone={timelineQuery.isStale ? "warning" : "positive"}
             />
           ) : null}
+          <span className="panel-heading__spacer" />
+          <button
+            className="icon-only-button"
+            type="button"
+            aria-label={t("activity.catalog.open")}
+            title={t("activity.catalog.open")}
+            onClick={() => setIsCatalogDialogOpen(true)}
+          >
+            <Info size={17} aria-hidden="true" />
+          </button>
         </div>
         {timelineQuery.isPending && !visibleTimeline ? <ActivityLoading /> : null}
         {timelineQuery.isError && !visibleTimeline ? (
@@ -119,6 +158,14 @@ export function ActivityPage() {
             olderError={olderError}
             isLoadingOlder={isLoadingOlder}
             olderLoaded={olderLoaded}
+            catalog={catalog}
+          />
+        ) : null}
+        {isCatalogDialogOpen ? (
+          <ActivityCatalogDialog
+            catalog={catalog}
+            catalogFailed={catalogQuery.isError}
+            closed={() => setIsCatalogDialogOpen(false)}
           />
         ) : null}
       </Panel>
@@ -127,13 +174,19 @@ export function ActivityPage() {
 }
 
 function ActivityFilters({
+  catalog,
+  catalogFailed,
   filters,
   filtersChanged,
 }: {
+  catalog: OpsActivityCatalogResponse | null;
+  catalogFailed: boolean;
   filters: ActivityTimelineFilters;
   filtersChanged: (filters: ActivityTimelineFilters) => void;
 }) {
   const { t } = useI18n();
+  const sourceFilters = catalog?.sourceFilters ?? fallbackSourceFilters();
+  const auditEventTypes = catalog?.auditEventTypes ?? fallbackSelectedAuditEventTypes(filters);
 
   return (
     <div className="activity-filters" aria-label={t("activity.filters.aria")}>
@@ -144,19 +197,19 @@ function ActivityFilters({
       <div className="activity-filters__section">
         <span className="activity-filters__label">{t("activity.filters.source")}</span>
         <div className="segmented-control" role="group" aria-label={t("activity.filters.source")}>
-          {ACTIVITY_TIMELINE_SOURCE_FILTERS.map((source) => (
+          {sourceFilters.map((source) => (
             <button
               className={
-                source === filters.source
+                source.value === filters.source
                   ? "segmented-control__button segmented-control__button--active"
                   : "segmented-control__button"
               }
               type="button"
-              aria-pressed={source === filters.source}
-              key={source}
-              onClick={() => filtersChanged({ ...filters, source })}
+              aria-pressed={source.value === filters.source}
+              key={source.value}
+              onClick={() => filtersChanged({ ...filters, source: source.value as ActivityTimelineSourceFilter })}
             >
-              {sourceFilterLabel(source, t)}
+              {catalogMessage(source.labelKey, source.value, t)}
             </button>
           ))}
         </div>
@@ -164,17 +217,22 @@ function ActivityFilters({
       <fieldset className="activity-event-filter">
         <legend>{t("activity.filters.auditEventTypes")}</legend>
         <div className="activity-event-filter__options">
-          {ACTIVITY_AUDIT_EVENT_TYPES.map((eventType) => (
-            <label className="checkbox-chip" key={eventType}>
+          {auditEventTypes.map((eventType) => (
+            <label className="checkbox-chip" key={eventType.value}>
               <input
                 type="checkbox"
-                checked={filters.auditEventTypes.includes(eventType)}
-                onChange={() => filtersChanged(toggleAuditEventType(filters, eventType))}
+                checked={filters.auditEventTypes.includes(eventType.value)}
+                onChange={() => filtersChanged(toggleAuditEventType(filters, eventType.value, auditEventTypes))}
               />
-              <span>{eventType}</span>
+              <span>{catalogMessage(eventType.labelKey, eventType.value, t)}</span>
             </label>
           ))}
         </div>
+        {auditEventTypes.length === 0 ? (
+          <p className="activity-filters__hint">
+            {catalogFailed ? t("activity.filters.catalogUnavailable") : t("activity.filters.catalogLoading")}
+          </p>
+        ) : null}
       </fieldset>
     </div>
   );
@@ -214,12 +272,14 @@ function ActivityTimeline({
   olderError,
   isLoadingOlder,
   olderLoaded,
+  catalog,
 }: {
   timeline: ActivityTimelineSnapshot;
   loadedPageCount: number;
   olderError: unknown;
   isLoadingOlder: boolean;
   olderLoaded: () => void;
+  catalog: OpsActivityCatalogResponse | null;
 }) {
   const { locale, t } = useI18n();
   const events = newestFirstActivityTimelineEvents(timeline.events);
@@ -242,10 +302,10 @@ function ActivityTimeline({
             <div className="timeline__body">
               <div className="timeline__header">
                 <StatusPill label={sourceLabel(event.source, t)} tone={sourceTone(event.source)} />
-                <StatusPill label={event.kind} tone={eventTone(event)} />
+                <StatusPill label={activityEventKindLabel(event, catalog, t)} tone={eventTone(event)} />
                 <time dateTime={event.occurredAt}>{formatDateTime(event.occurredAt, locale)}</time>
               </div>
-              <h2>{event.title}</h2>
+              <h2>{activityEventTitle(event, catalog, t)}</h2>
               <p>{formatTimelineDetail(event, t)}</p>
               <dl className="timeline__metadata">
                 {event.metadata.map((item) => (
@@ -271,17 +331,186 @@ function ActivityTimeline({
   );
 }
 
-function sourceFilterLabel(source: ActivityTimelineSourceFilter, t: (key: MessageKey) => string): string {
-  switch (source) {
-    case "all":
-      return t("activity.filter.all");
-    case "audit":
-      return t("activity.source.audit");
-    case "decision":
-      return t("activity.source.decision");
-    case "execution":
-      return t("activity.source.execution");
+function ActivityCatalogDialog({
+  catalog,
+  catalogFailed,
+  closed,
+}: {
+  catalog: OpsActivityCatalogResponse | null;
+  catalogFailed: boolean;
+  closed: () => void;
+}) {
+  const { t } = useI18n();
+  const defaultExcludedAuditEventTypes = catalog
+    ? defaultExcludedAuditEventSummary(catalog, t)
+    : "RECONCILER_PASS_COMPLETED";
+
+  useEffect(() => {
+    const keyDownHandled = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closed();
+      }
+    };
+
+    window.addEventListener("keydown", keyDownHandled);
+
+    return () => window.removeEventListener("keydown", keyDownHandled);
+  }, [closed]);
+
+  return (
+    <div
+      className="activity-catalog-dialog__backdrop"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) {
+          closed();
+        }
+      }}
+    >
+      <div
+        className="activity-catalog-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="activity-catalog-dialog-title"
+      >
+        <div className="activity-catalog-dialog__heading">
+          <h2 id="activity-catalog-dialog-title">{t("activity.catalog.title")}</h2>
+          <button
+            className="icon-only-button"
+            type="button"
+            aria-label={t("activity.catalog.close")}
+            title={t("activity.catalog.close")}
+            onClick={closed}
+          >
+            <X size={17} aria-hidden="true" />
+          </button>
+        </div>
+        <p className="activity-catalog-dialog__note">
+          {formatMessage(t("activity.catalog.defaultExcluded"), {
+            eventTypes: defaultExcludedAuditEventTypes,
+          })}
+        </p>
+        {catalog ? (
+          <div className="activity-catalog-dialog__groups">
+            <ActivityCatalogGroup title={t("activity.catalog.group.sources")} items={catalog.sourceFilters} />
+            <ActivityCatalogGroup title={t("activity.catalog.group.audit")} items={catalog.auditEventTypes} />
+            <ActivityCatalogGroup title={t("activity.catalog.group.decisions")} items={catalog.decisionActions} />
+          </div>
+        ) : (
+          <p className="activity-catalog-dialog__empty">
+            {catalogFailed ? t("activity.catalog.unavailable") : t("activity.catalog.loading")}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ActivityCatalogGroup({
+  title,
+  items,
+}: {
+  title: string;
+  items: OpsActivityCatalogItemResponse[];
+}) {
+  const { t } = useI18n();
+
+  return (
+    <section className="activity-catalog-dialog__group">
+      <h3>{title}</h3>
+      <dl className="activity-catalog-list">
+        {items.map((item) => (
+          <div className="activity-catalog-list__item" key={item.value}>
+            <dt>
+              <span>{catalogMessage(item.labelKey, item.value, t)}</span>
+              <code>{item.value}</code>
+            </dt>
+            <dd>{catalogMessage(item.descriptionKey, item.value, t)}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
+}
+
+function activityEventTitle(
+  event: ActivityTimelineEvent,
+  catalog: OpsActivityCatalogResponse | null,
+  t: (key: MessageKey) => string,
+): string {
+  const definition = activityEventDefinition(event, catalog);
+
+  return definition ? catalogMessage(definition.labelKey, event.title, t) : event.title;
+}
+
+function activityEventKindLabel(
+  event: ActivityTimelineEvent,
+  catalog: OpsActivityCatalogResponse | null,
+  t: (key: MessageKey) => string,
+): string {
+  const definition = activityEventDefinition(event, catalog);
+
+  return definition ? catalogMessage(definition.labelKey, event.kind, t) : event.kind;
+}
+
+function activityEventDefinition(
+  event: ActivityTimelineEvent,
+  catalog: OpsActivityCatalogResponse | null,
+): OpsActivityCatalogItemResponse | null {
+  if (!catalog) {
+    return null;
   }
+
+  switch (event.source) {
+    case "audit":
+      return catalog.auditEventTypes.find((item) => item.value === event.kind) ?? null;
+    case "decision":
+      return catalog.decisionActions.find((item) => item.value === event.kind) ?? null;
+    case "execution":
+      return null;
+  }
+}
+
+function defaultExcludedAuditEventSummary(
+  catalog: OpsActivityCatalogResponse,
+  t: (key: MessageKey) => string,
+): string {
+  const defaultExcludedAuditEventTypes = catalog.defaultExcludedAuditEventTypes.map((eventType) => {
+    const definition = catalog.auditEventTypes.find((item) => item.value === eventType);
+    const label = definition ? catalogMessage(definition.labelKey, eventType, t) : eventType;
+
+    return `${label} (${eventType})`;
+  });
+
+  return defaultExcludedAuditEventTypes.length > 0 ? defaultExcludedAuditEventTypes.join(", ") : t("common.none");
+}
+
+function fallbackSourceFilters(): OpsActivityCatalogItemResponse[] {
+  return ACTIVITY_TIMELINE_SOURCE_FILTERS.map((source) => ({
+    value: source,
+    labelKey: `activity.catalog.source.${source}.label`,
+    descriptionKey: `activity.catalog.source.${source}.description`,
+  }));
+}
+
+function fallbackSelectedAuditEventTypes(filters: ActivityTimelineFilters): OpsActivityCatalogItemResponse[] {
+  return filters.auditEventTypes.map((eventType) => ({
+    value: eventType,
+    labelKey: eventType,
+    descriptionKey: eventType,
+  }));
+}
+
+function catalogMessage(key: string, fallback: string, t: (key: MessageKey) => string): string {
+  const message = t(key as MessageKey);
+
+  return message === key ? fallback : message;
+}
+
+function formatMessage(template: string, replacements: Record<string, string>): string {
+  return Object.entries(replacements).reduce(
+    (message, [key, value]) => message.replace(`{${key}}`, value),
+    template,
+  );
 }
 
 function sourceLabel(source: ActivityTimelineSource, t: (key: MessageKey) => string): string {
@@ -446,7 +675,11 @@ async function loadOlderActivityPage({
   }
 }
 
-function toggleAuditEventType(filters: ActivityTimelineFilters, eventType: string): ActivityTimelineFilters {
+function toggleAuditEventType(
+  filters: ActivityTimelineFilters,
+  eventType: string,
+  candidates: OpsActivityCatalogItemResponse[],
+): ActivityTimelineFilters {
   const selectedEventTypes = new Set(filters.auditEventTypes);
 
   if (selectedEventTypes.has(eventType)) {
@@ -457,8 +690,24 @@ function toggleAuditEventType(filters: ActivityTimelineFilters, eventType: strin
 
   return {
     ...filters,
-    auditEventTypes: ACTIVITY_AUDIT_EVENT_TYPES.filter((candidate) => selectedEventTypes.has(candidate)),
+    auditEventTypes: candidates
+      .map((candidate) => candidate.value)
+      .filter((candidate) => selectedEventTypes.has(candidate)),
   };
+}
+
+function activityTimelineFiltersEqual(firstFilters: ActivityTimelineFilters, secondFilters: ActivityTimelineFilters): boolean {
+  if (firstFilters.source !== secondFilters.source) {
+    return false;
+  }
+
+  if (firstFilters.auditEventTypes.length !== secondFilters.auditEventTypes.length) {
+    return false;
+  }
+
+  return firstFilters.auditEventTypes.every(
+    (eventType, index) => eventType === secondFilters.auditEventTypes[index],
+  );
 }
 
 function loadStoredActivityTimelineFilters(): ActivityTimelineFilters {
