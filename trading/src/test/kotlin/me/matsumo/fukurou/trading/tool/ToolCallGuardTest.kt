@@ -217,10 +217,7 @@ class ToolCallGuardTest {
 /**
  * 並行区間に入り、最大同時実行数を記録する。
  */
-private suspend fun recordConcurrentSection(
-    activeCount: AtomicInteger,
-    maxActiveCount: AtomicInteger,
-) {
+private suspend fun recordConcurrentSection(activeCount: AtomicInteger, maxActiveCount: AtomicInteger,) {
     val currentActiveCount = activeCount.incrementAndGet()
     maxActiveCount.updateAndGet { previousMaxCount -> maxOf(previousMaxCount, currentActiveCount) }
 
@@ -295,10 +292,7 @@ private class ToolContextSwitchingCommandEventLog : CommandEventLog {
         return Result.success(0)
     }
 
-    override suspend fun countToolCallEvents(
-        decisionRunId: String,
-        toolNames: Set<String>,
-    ): Result<Int> {
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>,): Result<Int> {
         return Result.success(0)
     }
 
@@ -322,10 +316,7 @@ private object FailingCommandEventLog : CommandEventLog {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 
-    override suspend fun countToolCallEvents(
-        decisionRunId: String,
-        toolNames: Set<String>,
-    ): Result<Int> {
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>,): Result<Int> {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 }

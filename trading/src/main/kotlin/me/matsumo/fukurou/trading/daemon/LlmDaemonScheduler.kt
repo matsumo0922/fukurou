@@ -233,10 +233,7 @@ class LlmDaemonScheduler(
         return launchReservationRepository.hasFreshRunningReservation(activeSince).getOrThrow()
     }
 
-    private suspend fun reserveAndLaunch(
-        trigger: LlmDaemonTrigger,
-        observedAt: Instant,
-    ): LlmDaemonTickResult {
+    private suspend fun reserveAndLaunch(trigger: LlmDaemonTrigger, observedAt: Instant): LlmDaemonTickResult {
         val invocationId = idGenerator().toString()
         val reservationRequest = LlmLaunchReservationRequest(
             invocationId = invocationId,
@@ -267,10 +264,7 @@ class LlmDaemonScheduler(
         return runReservedInvocation(trigger, invocationId)
     }
 
-    private suspend fun runReservedInvocation(
-        trigger: LlmDaemonTrigger,
-        invocationId: String,
-    ): LlmDaemonTickResult {
+    private suspend fun runReservedInvocation(trigger: LlmDaemonTrigger, invocationId: String): LlmDaemonTickResult {
         val request = requestBase.copy(
             invocationId = invocationId,
             marketSnapshotId = "daemon-${trigger.key}-$invocationId",
@@ -512,10 +506,7 @@ class LlmDaemonScheduler(
         }
     }
 
-    private fun stopProximityFor(
-        position: Position,
-        currentPriceJpy: BigDecimal,
-    ): LlmDaemonStopProximity? {
+    private fun stopProximityFor(position: Position, currentPriceJpy: BigDecimal): LlmDaemonStopProximity? {
         val stopLossJpy = position.currentStopLossJpy?.toBigDecimal() ?: return null
         val entryPriceJpy = position.averageEntryPriceJpy.toBigDecimal()
         val oneR = entryPriceJpy.subtract(stopLossJpy).abs()
@@ -618,7 +609,11 @@ class LlmDaemonScheduler(
         return if (triggerDue(trigger.key, daemonConfig.flatHeartbeatInterval, observedAt)) trigger else null
     }
 
-    private suspend fun triggerDue(triggerKey: String, interval: Duration, observedAt: Instant): Boolean {
+    private suspend fun triggerDue(
+        triggerKey: String,
+        interval: Duration,
+        observedAt: Instant,
+    ): Boolean {
         val latestReservedAt = launchReservationRepository.latestReservedAt(triggerKey).getOrThrow()
             ?: return true
         val nextDueAt = latestReservedAt.plus(interval)

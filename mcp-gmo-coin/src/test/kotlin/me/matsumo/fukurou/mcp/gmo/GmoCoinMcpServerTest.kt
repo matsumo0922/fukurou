@@ -715,10 +715,7 @@ private object TestClientConnection : ClientConnection {
         return unsupported()
     }
 
-    override suspend fun createMessage(
-        request: CreateMessageRequest,
-        options: RequestOptions?,
-    ): CreateMessageResult {
+    override suspend fun createMessage(request: CreateMessageRequest, options: RequestOptions?,): CreateMessageResult {
         return unsupported()
     }
 
@@ -813,10 +810,7 @@ private class FreshnessMarketDataSource(
         )
     }
 
-    override suspend fun getOrderbook(
-        symbol: TradingSymbol,
-        depth: Int,
-    ): Result<Orderbook> {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int,): Result<Orderbook> {
         return Result.success(
             Orderbook(
                 symbol = symbol.apiSymbol,
@@ -826,10 +820,7 @@ private class FreshnessMarketDataSource(
         )
     }
 
-    override suspend fun getTrades(
-        symbol: TradingSymbol,
-        limit: Int,
-    ): Result<List<RecentTrade>> {
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int,): Result<List<RecentTrade>> {
         val trades = tradeTimestamps.map { tradeTimestamp ->
             RecentTrade(
                 symbol = symbol.apiSymbol,
@@ -873,17 +864,11 @@ private class IndicatorMarketDataSource(
         return Result.success(candles.take(limit))
     }
 
-    override suspend fun getOrderbook(
-        symbol: TradingSymbol,
-        depth: Int,
-    ): Result<Orderbook> {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int,): Result<Orderbook> {
         return FakeMarketDataSource.getOrderbook(symbol, depth)
     }
 
-    override suspend fun getTrades(
-        symbol: TradingSymbol,
-        limit: Int,
-    ): Result<List<RecentTrade>> {
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int,): Result<List<RecentTrade>> {
         return FakeMarketDataSource.getTrades(symbol, limit)
     }
 
@@ -921,17 +906,11 @@ private class ParsedKlineMarketDataSource(
         }
     }
 
-    override suspend fun getOrderbook(
-        symbol: TradingSymbol,
-        depth: Int,
-    ): Result<Orderbook> {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int,): Result<Orderbook> {
         return FakeMarketDataSource.getOrderbook(symbol, depth)
     }
 
-    override suspend fun getTrades(
-        symbol: TradingSymbol,
-        limit: Int,
-    ): Result<List<RecentTrade>> {
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int,): Result<List<RecentTrade>> {
         return FakeMarketDataSource.getTrades(symbol, limit)
     }
 
@@ -980,10 +959,7 @@ private object FakeMarketDataSource : MarketDataSource {
         )
     }
 
-    override suspend fun getOrderbook(
-        symbol: TradingSymbol,
-        depth: Int,
-    ): Result<Orderbook> {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int,): Result<Orderbook> {
         return Result.success(
             Orderbook(
                 symbol = symbol.apiSymbol,
@@ -993,10 +969,7 @@ private object FakeMarketDataSource : MarketDataSource {
         )
     }
 
-    override suspend fun getTrades(
-        symbol: TradingSymbol,
-        limit: Int,
-    ): Result<List<RecentTrade>> {
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int,): Result<List<RecentTrade>> {
         return Result.success(
             listOf(
                 RecentTrade(
@@ -1100,10 +1073,7 @@ private fun expandedIndicatorCandles(): List<Candle> {
     }
 }
 
-private fun atrPercentileCandles(
-    count: Int,
-    interval: CandleInterval = CandleInterval.FIVE_MINUTES,
-): List<Candle> {
+private fun atrPercentileCandles(count: Int, interval: CandleInterval = CandleInterval.FIVE_MINUTES,): List<Candle> {
     return (0 until count).map { candleIndex ->
         atrPercentileCandle(candleIndex, interval)
     }

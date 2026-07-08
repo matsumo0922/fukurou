@@ -37,10 +37,7 @@ interface DecisionRepository {
     /**
      * 安定 cursor 条件に一致する decision を Activity timeline 用に新しい順で取得する。
      */
-    suspend fun findDecisionsForStableFeed(
-        cursor: StableFeedCursor,
-        limit: Int,
-    ): Result<List<DecisionJournalRecord>>
+    suspend fun findDecisionsForStableFeed(cursor: StableFeedCursor, limit: Int): Result<List<DecisionJournalRecord>>
 
     /**
      * intent ID に紐づく最新 falsification を取得する。

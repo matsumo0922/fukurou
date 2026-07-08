@@ -524,7 +524,11 @@ class SafetyFloor(
         return detectHardHalt(commandName = "cancel_order", command = command, context = context)
     }
 
-    private fun detectHardHalt(commandName: String, command: Any, context: SafetyFloorContext): SafetyViolation? {
+    private fun detectHardHalt(
+        commandName: String,
+        command: Any,
+        context: SafetyFloorContext,
+    ): SafetyViolation? {
         val accountDrawdown = context.account.drawdownRatio.toBigDecimal()
         val riskStateDrawdown = context.riskState.drawdownRatio
         val measuredDrawdown = minOf(accountDrawdown, riskStateDrawdown)
@@ -1139,10 +1143,7 @@ class SafetyFloor(
         return config.marketSlippageReserveBps.divide(BPS_DIVISOR, SAFETY_SCALE, RoundingMode.HALF_UP)
     }
 
-    private fun cappedProbabilityOrNull(
-        probability: BigDecimal,
-        context: SafetyFloorContext,
-    ): BigDecimal? {
+    private fun cappedProbabilityOrNull(probability: BigDecimal, context: SafetyFloorContext): BigDecimal? {
         val marketDataObservedAt = context.marketDataObservedAt
         val stale = if (marketDataObservedAt == null) {
             true

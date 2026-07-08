@@ -146,10 +146,7 @@ class EvaluationRouteTest {
  */
 private object FakeEvaluationRepository : EvaluationRepository {
 
-    override suspend fun fetchClosedTrades(
-        period: EvaluationPeriod,
-        limit: Int,
-    ): Result<EvaluationTradeQueryResult> {
+    override suspend fun fetchClosedTrades(period: EvaluationPeriod, limit: Int): Result<EvaluationTradeQueryResult> {
         return Result.success(
             EvaluationTradeQueryResult(
                 trades = listOf(testTrade()),
@@ -246,17 +243,11 @@ private object FakeEvaluationMarketDataSource : MarketDataSource {
         )
     }
 
-    override suspend fun getOrderbook(
-        symbol: TradingSymbol,
-        depth: Int,
-    ): Result<Orderbook> {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 
-    override suspend fun getTrades(
-        symbol: TradingSymbol,
-        limit: Int,
-    ): Result<List<RecentTrade>> {
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 
@@ -309,17 +300,11 @@ private class RecordingEvaluationMarketDataSource : MarketDataSource {
         )
     }
 
-    override suspend fun getOrderbook(
-        symbol: TradingSymbol,
-        depth: Int,
-    ): Result<Orderbook> {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 
-    override suspend fun getTrades(
-        symbol: TradingSymbol,
-        limit: Int,
-    ): Result<List<RecentTrade>> {
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 

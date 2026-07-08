@@ -193,10 +193,7 @@ interface GmoCoinIndicatorCalculator {
     /**
      * indicator が少なくとも 1 つの非 null 値を返すために必要な最小 candle 本数を返す。
      */
-    fun requiredCandleCount(
-        indicatorType: IndicatorType,
-        params: IndicatorParams,
-    ): Result<Int>
+    fun requiredCandleCount(indicatorType: IndicatorType, params: IndicatorParams): Result<Int>
 
     /**
      * indicator を計算する。
@@ -212,10 +209,7 @@ interface GmoCoinIndicatorCalculator {
  * `:trading` の標準 calculator に委譲する calculator。
  */
 object DefaultGmoCoinIndicatorCalculator : GmoCoinIndicatorCalculator {
-    override fun requiredCandleCount(
-        indicatorType: IndicatorType,
-        params: IndicatorParams,
-    ): Result<Int> {
+    override fun requiredCandleCount(indicatorType: IndicatorType, params: IndicatorParams): Result<Int> {
         return IndicatorCalculator.requiredCandleCount(indicatorType, params)
     }
 
@@ -819,10 +813,7 @@ private fun parseIndicatorCandleLimit(request: CallToolRequest): Result<Int> {
     }
 }
 
-private fun resolveIndicatorCandleLimit(
-    requestedLimit: Int,
-    requiredCandleCount: Int,
-): Result<Int> {
+private fun resolveIndicatorCandleLimit(requestedLimit: Int, requiredCandleCount: Int): Result<Int> {
     return runCatching {
         val isRequiredCountInRange = requiredCandleCount in 1..MAX_INDICATOR_CANDLE_LIMIT
 
@@ -834,10 +825,7 @@ private fun resolveIndicatorCandleLimit(
     }
 }
 
-private fun JsonObject?.readOptionalInt(
-    primaryName: String,
-    secondaryName: String? = null,
-): Int? {
+private fun JsonObject?.readOptionalInt(primaryName: String, secondaryName: String? = null): Int? {
     if (this == null) {
         return null
     }
@@ -996,10 +984,7 @@ private fun jsonObjectResult(structuredContent: JsonObject): CallToolResult {
     )
 }
 
-private fun throwableResult(
-    throwable: Throwable,
-    toolExecutor: GmoCoinMarketToolExecutor,
-): CallToolResult {
+private fun throwableResult(throwable: Throwable, toolExecutor: GmoCoinMarketToolExecutor): CallToolResult {
     val mappedError = toolExecutor.errorResponse(throwable)
     val type = mappedError?.type ?: when (throwable) {
         is MarketInvalidRequestException -> "invalid_request"

@@ -244,10 +244,7 @@ internal class DecisionExecutionLifecycle(
             .filter { order -> order.isRestingEntryOrder() }
     }
 
-    private fun resolveExitTarget(
-        openPositions: List<Position>,
-        openEntryOrders: List<Order>,
-    ): ExitExecutionTarget {
+    private fun resolveExitTarget(openPositions: List<Position>, openEntryOrders: List<Order>): ExitExecutionTarget {
         if (openPositions.size == 1) {
             return ExitExecutionTarget.ClosePosition(openPositions.single())
         }

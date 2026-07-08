@@ -444,7 +444,11 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 
-    private fun JdbcTransaction.updateMarks(lastPrice: BigDecimal, atr14Jpy: BigDecimal?, rules: SymbolRules) {
+    private fun JdbcTransaction.updateMarks(
+        lastPrice: BigDecimal,
+        atr14Jpy: BigDecimal?,
+        rules: SymbolRules
+    ) {
         selectOpenPositions().forEach { position ->
             val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
             val sizeBtc = position.sizeBtc.toBigDecimal()
@@ -760,7 +764,11 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 
-    private fun JdbcTransaction.updateLinkedStopOrder(positionId: String, stopPrice: BigDecimal, reasonJa: String) {
+    private fun JdbcTransaction.updateLinkedStopOrder(
+        positionId: String,
+        stopPrice: BigDecimal,
+        reasonJa: String
+    ) {
         prepare(
             """
                 UPDATE orders
@@ -787,7 +795,11 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 
-    private fun JdbcTransaction.updateOrderStatus(orderId: String, status: OrderStatus, reasonJa: String) {
+    private fun JdbcTransaction.updateOrderStatus(
+        orderId: String,
+        status: OrderStatus,
+        reasonJa: String
+    ) {
         prepare(
             """
                 UPDATE orders
@@ -1025,7 +1037,11 @@ internal class ExposedPaperLedgerWriter(
     }
 }
 
-private fun PreparedStatement.bindOrderId(orderId: UUID, positionId: UUID?, tradeGroupId: UUID?) {
+private fun PreparedStatement.bindOrderId(
+    orderId: UUID,
+    positionId: UUID?,
+    tradeGroupId: UUID?
+) {
     setObject(1, orderId)
     setObject(2, positionId)
     setObject(3, tradeGroupId)
@@ -1049,7 +1065,11 @@ private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
     }
 }
 
-private fun Order.createEntryFill(ticker: Ticker, rules: SymbolRules, simulator: FillSimulator): SimulatedFill {
+private fun Order.createEntryFill(
+    ticker: Ticker,
+    rules: SymbolRules,
+    simulator: FillSimulator
+): SimulatedFill {
     return simulator.restingEntryFill(
         side = side,
         orderType = orderType,

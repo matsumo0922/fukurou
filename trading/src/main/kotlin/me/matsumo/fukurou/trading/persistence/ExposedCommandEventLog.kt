@@ -141,10 +141,7 @@ class ExposedCommandEventLog(
         }
     }
 
-    override suspend fun countToolCallEvents(
-        decisionRunId: String,
-        toolNames: Set<String>,
-    ): Result<Int> {
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {
         if (toolNames.isEmpty()) {
             return Result.success(0)
         }
@@ -358,10 +355,7 @@ private fun JdbcTransaction.selectEventsForStableFeed(
 /**
  * event_type 絞り込みと除外条件から SELECT 文を組み立てる。
  */
-private fun buildSelectEventsSql(
-    eventTypeCount: Int,
-    excludeEventTypeCount: Int,
-): String {
+private fun buildSelectEventsSql(eventTypeCount: Int, excludeEventTypeCount: Int): String {
     val conditions = buildList {
         if (eventTypeCount > 0) {
             add("event_type IN (" + placeholders(eventTypeCount) + ")")

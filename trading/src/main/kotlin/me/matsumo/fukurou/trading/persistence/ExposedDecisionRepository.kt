@@ -769,10 +769,7 @@ private fun JdbcTransaction.selectDecisionsCreatedBetween(
     }
 }
 
-private fun JdbcTransaction.selectDecisionsForStableFeed(
-    cursor: StableFeedCursor,
-    limit: Int,
-): List<DecisionRecord> {
+private fun JdbcTransaction.selectDecisionsForStableFeed(cursor: StableFeedCursor, limit: Int): List<DecisionRecord> {
     val sql = SELECT_DECISIONS_FOR_STABLE_FEED_SQL_PREFIX +
         stableFeedCursorCondition("created_at", "id", cursor) +
         SELECT_DECISIONS_FOR_STABLE_FEED_SQL_SUFFIX

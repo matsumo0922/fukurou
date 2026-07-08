@@ -139,10 +139,7 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
-    override suspend fun findExecutionsBefore(
-        before: Instant,
-        limit: Int,
-    ): Result<List<Execution>> {
+    override suspend fun findExecutionsBefore(before: Instant, limit: Int): Result<List<Execution>> {
         return runCatching {
             require(limit > 0) {
                 "limit must be greater than 0."
@@ -157,10 +154,7 @@ class InMemoryPaperLedgerRepository(
         }
     }
 
-    override suspend fun findExecutionsForStableFeed(
-        cursor: StableFeedCursor,
-        limit: Int,
-    ): Result<List<Execution>> {
+    override suspend fun findExecutionsForStableFeed(cursor: StableFeedCursor, limit: Int): Result<List<Execution>> {
         return runCatching {
             require(limit > 0) {
                 "limit must be greater than 0."
@@ -673,7 +667,11 @@ class InMemoryPaperLedgerRepository(
         accountUpdatedAt = updatedAt
     }
 
-    private fun updateLinkedStopOrderLocked(positionId: String, stopPrice: BigDecimal, reasonJa: String) {
+    private fun updateLinkedStopOrderLocked(
+        positionId: String,
+        stopPrice: BigDecimal,
+        reasonJa: String,
+    ) {
         val stopOrderIndex = orders.indexOfFirst { order ->
             order.positionId == positionId && order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.status == OrderStatus.OPEN
         }
@@ -706,7 +704,11 @@ class InMemoryPaperLedgerRepository(
         }
     }
 
-    private fun markOrderStatusLocked(orderId: String, status: OrderStatus, reasonJa: String? = null) {
+    private fun markOrderStatusLocked(
+        orderId: String,
+        status: OrderStatus,
+        reasonJa: String? = null,
+    ) {
         val orderIndex = orders.indexOfFirst { order -> order.orderId == orderId }
 
         if (orderIndex >= 0) {
@@ -802,7 +804,11 @@ private fun PlaceOrderCommand.toProtectiveStopOrder(
     )
 }
 
-private fun PlaceOrderCommand.toOpenPosition(positionId: UUID, tradeGroupId: UUID, fill: SimulatedFill): Position {
+private fun PlaceOrderCommand.toOpenPosition(
+    positionId: UUID,
+    tradeGroupId: UUID,
+    fill: SimulatedFill,
+): Position {
     return Position(
         positionId = positionId.toString(),
         tradeGroupId = tradeGroupId.toString(),
@@ -846,7 +852,11 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
     )
 }
 
-private fun SimulatedFill.toExecution(orderId: String, positionId: String, command: PlaceOrderCommand): Execution {
+private fun SimulatedFill.toExecution(
+    orderId: String,
+    positionId: String,
+    command: PlaceOrderCommand,
+): Execution {
     return toExecution(
         orderId = orderId,
         positionId = positionId,
@@ -984,7 +994,11 @@ private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
     }
 }
 
-private fun Order.createEntryFill(ticker: Ticker, rules: SymbolRules, simulator: FillSimulator): SimulatedFill {
+private fun Order.createEntryFill(
+    ticker: Ticker,
+    rules: SymbolRules,
+    simulator: FillSimulator,
+): SimulatedFill {
     return simulator.restingEntryFill(
         side = side,
         orderType = orderType,

@@ -134,10 +134,7 @@ interface CommandEventLog {
     /**
      * 指定 decision run ID に紐づく tool call 監査イベント数を返す。
      */
-    suspend fun countToolCallEvents(
-        decisionRunId: String,
-        toolNames: Set<String>,
-    ): Result<Int>
+    suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>,): Result<Int>
 }
 
 /**

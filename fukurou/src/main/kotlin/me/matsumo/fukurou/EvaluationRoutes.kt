@@ -298,7 +298,9 @@ internal fun Route.evaluationRoutes(
     }
 }
 
-private suspend fun ApplicationCall.requireEvaluationRepository(repository: EvaluationRepository?): EvaluationRepository? {
+private suspend fun ApplicationCall.requireEvaluationRepository(
+    repository: EvaluationRepository?,
+): EvaluationRepository? {
     if (repository != null) {
         return repository
     }

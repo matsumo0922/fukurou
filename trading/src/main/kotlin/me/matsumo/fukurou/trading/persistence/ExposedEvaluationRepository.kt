@@ -243,10 +243,7 @@ class ExposedEvaluationRepository(
     private val database: ExposedDatabase,
 ) : EvaluationRepository {
 
-    override suspend fun fetchClosedTrades(
-        period: EvaluationPeriod,
-        limit: Int,
-    ): Result<EvaluationTradeQueryResult> {
+    override suspend fun fetchClosedTrades(period: EvaluationPeriod, limit: Int): Result<EvaluationTradeQueryResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
@@ -330,10 +327,7 @@ class ExposedEvaluationRepository(
     }
 }
 
-private fun JdbcTransaction.selectClosedTrades(
-    period: EvaluationPeriod,
-    limit: Int,
-): EvaluationTradeQueryResult {
+private fun JdbcTransaction.selectClosedTrades(period: EvaluationPeriod, limit: Int): EvaluationTradeQueryResult {
     val fetchLimit = limit + 1
 
     return jdbcConnection().prepareStatement(SELECT_CLOSED_TRADE_FACTS_SQL).use { statement ->
@@ -427,10 +421,7 @@ private fun JdbcTransaction.selectInitialCashJpy(): BigDecimal {
     }
 }
 
-private fun JdbcTransaction.selectLlmPhaseUsages(
-    period: EvaluationPeriod,
-    limit: Int,
-): EvaluationLlmUsageQueryResult {
+private fun JdbcTransaction.selectLlmPhaseUsages(period: EvaluationPeriod, limit: Int): EvaluationLlmUsageQueryResult {
     val fetchLimit = limit + 1
 
     return jdbcConnection().prepareStatement(SELECT_LLM_PHASE_USAGE_SQL).use { statement ->

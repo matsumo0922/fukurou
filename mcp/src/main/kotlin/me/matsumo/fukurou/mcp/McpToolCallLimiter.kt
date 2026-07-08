@@ -130,10 +130,7 @@ class McpToolCallLimiter(
         }
     }
 
-    private suspend fun recordCountUnavailable(
-        call: GuardedToolCall,
-        cause: Throwable,
-    ): Result<Unit> {
+    private suspend fun recordCountUnavailable(call: GuardedToolCall, cause: Throwable,): Result<Unit> {
         val exception = ToolCallLimitUnavailableException(
             message = "mcp_tool_call_count_unavailable",
             cause = cause,

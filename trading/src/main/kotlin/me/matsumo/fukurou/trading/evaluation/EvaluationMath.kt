@@ -94,10 +94,7 @@ object EvaluationMath {
     /**
      * decision 起動数に対する action rate を計算する。
      */
-    fun decisionRunRates(
-        decisionRunCount: Int,
-        actionCounts: List<DecisionActionCount>,
-    ): DecisionRunRateStats {
+    fun decisionRunRates(decisionRunCount: Int, actionCounts: List<DecisionActionCount>): DecisionRunRateStats {
         val entryCount = actionCounts.firstCount("ENTER")
         val noTradeCount = actionCounts.firstCount("NO_TRADE")
 
@@ -162,10 +159,7 @@ object EvaluationMath {
     /**
      * 日足から相場局面 label を計算する。
      */
-    fun classifyMarketRegimes(
-        candles: List<Candle>,
-        zoneId: ZoneId,
-    ): List<MarketRegimeLabel> {
+    fun classifyMarketRegimes(candles: List<Candle>, zoneId: ZoneId): List<MarketRegimeLabel> {
         val points = candles
             .mapNotNull { candle -> candle.toDailyOhlcOrNull(zoneId) }
             .sortedBy { point -> point.date }
@@ -432,10 +426,7 @@ private fun trendRegime(points: List<DailyOhlcPoint>, currentIndex: Int): TrendR
     }
 }
 
-private fun volatilityRegime(
-    rollingRangeAverage: BigDecimal?,
-    medianRange: BigDecimal?,
-): VolatilityRegime {
+private fun volatilityRegime(rollingRangeAverage: BigDecimal?, medianRange: BigDecimal?): VolatilityRegime {
     val currentAverage = rollingRangeAverage ?: return VolatilityRegime.UNKNOWN
     val median = medianRange ?: return VolatilityRegime.UNKNOWN
 
