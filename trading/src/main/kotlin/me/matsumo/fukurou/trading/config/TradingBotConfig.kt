@@ -193,7 +193,7 @@ data class LlmRunnerConfig(
         val toolLimitIsConservative = maxToolCallsPerRun in 1..DEFAULT_MAX_TOOL_CALLS_PER_RUN
         val actLimitIsConservative = maxActToolCallsPerRun in 1..DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN
         val timeoutIsPositive = !perRunTimeout.isNegative && !perRunTimeout.isZero
-        val timeoutIsConservative = timeoutIsPositive && perRunTimeout <= DEFAULT_LLM_PER_RUN_TIMEOUT
+        val timeoutIsWithinCap = timeoutIsPositive && perRunTimeout <= MAX_LLM_PER_RUN_TIMEOUT
         val hourlyLimitIsConservative = maxInvocationsPerHour in 1..DEFAULT_MAX_INVOCATIONS_PER_HOUR
         val dailyLimitIsConservative = maxInvocationsPerDay in 1..DEFAULT_MAX_INVOCATIONS_PER_DAY
         val actLimitFitsTotal = maxActToolCallsPerRun <= maxToolCallsPerRun
@@ -204,8 +204,8 @@ data class LlmRunnerConfig(
         require(actLimitIsConservative) {
             "maxActToolCallsPerRun must be between 1 and $DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN."
         }
-        require(timeoutIsConservative) {
-            "perRunTimeout must be greater than 0 and less than or equal to ${DEFAULT_LLM_PER_RUN_TIMEOUT.seconds} seconds."
+        require(timeoutIsWithinCap) {
+            "perRunTimeout must be greater than 0 and less than or equal to ${MAX_LLM_PER_RUN_TIMEOUT.seconds} seconds."
         }
         require(hourlyLimitIsConservative) {
             "maxInvocationsPerHour must be between 1 and $DEFAULT_MAX_INVOCATIONS_PER_HOUR."
@@ -561,6 +561,13 @@ const val DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN = 3
  * LLM CLI 1 起動の既定 timeout。
  */
 val DEFAULT_LLM_PER_RUN_TIMEOUT: Duration = Duration.ofSeconds(180)
+
+/**
+ * LLM CLI 1 起動 timeout の許容上限。
+ *
+ * ENTER 経路の実測 4〜5 分 + 余裕として、暴走防止を残したまま 600 秒まで許可する。
+ */
+val MAX_LLM_PER_RUN_TIMEOUT: Duration = Duration.ofSeconds(600)
 
 /**
  * 直近 1 時間の既定 runner 起動上限。

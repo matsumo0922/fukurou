@@ -154,6 +154,23 @@ class TradingBotConfigTest {
     }
 
     @Test
+    fun fromEnvironment_acceptsLlmRunTimeoutBoundaryOverrides() {
+        val defaultTimeoutConfig = TradingBotConfig.fromEnvironment(
+            mapOf(
+                "FUKUROU_LLM_RUN_TIMEOUT_SECONDS" to "180",
+            ),
+        )
+        val maxTimeoutConfig = TradingBotConfig.fromEnvironment(
+            mapOf(
+                "FUKUROU_LLM_RUN_TIMEOUT_SECONDS" to "600",
+            ),
+        )
+
+        assertEquals(Duration.ofSeconds(180), defaultTimeoutConfig.runner.perRunTimeout)
+        assertEquals(Duration.ofSeconds(600), maxTimeoutConfig.runner.perRunTimeout)
+    }
+
+    @Test
     fun fromEnvironment_rejectsUnsafeTradingOverrides() {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
@@ -247,7 +264,7 @@ class TradingBotConfigTest {
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_LLM_RUN_TIMEOUT_SECONDS" to "181"),
+                mapOf("FUKUROU_LLM_RUN_TIMEOUT_SECONDS" to "601"),
             )
         }
         assertFailsWith<IllegalArgumentException> {
