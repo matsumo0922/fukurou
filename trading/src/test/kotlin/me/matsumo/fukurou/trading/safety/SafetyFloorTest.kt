@@ -253,6 +253,21 @@ class SafetyFloorTest {
     }
 
     @Test
+    fun placeOrderRiskDetails_addsAtrVolatilitySlippageForMarketRisk() {
+        val details = SafetyFloor(clock = fixedClock()).placeOrderRiskDetails(
+            command = entryCommand(),
+            context = safetyContext(
+                positions = emptyList(),
+                atr14Jpy = BigDecimal("4000"),
+            ),
+        )
+
+        assertEquals("10115455.00000000", details.estimatedEntryPriceJpy)
+        assertEquals("50602.56363750", details.requiredCashJpy)
+        assertEquals("2180.35227500", details.orderRiskJpy)
+    }
+
+    @Test
     fun placeOrderRiskDetails_reservesOpenBuyOrdersWithOrderTypeAwareFees() {
         val details = SafetyFloor(clock = fixedClock()).placeOrderRiskDetails(
             command = entryCommand(

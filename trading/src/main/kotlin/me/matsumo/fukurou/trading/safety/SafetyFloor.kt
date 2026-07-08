@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.safety
 
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
@@ -391,12 +392,14 @@ data class SafetyFloorPlaceOrderRiskDetails(
  *
  * @param config 安全床しきい値
  * @param clock violation timestamp に使う clock
+ * @param paperExecutionConfig paper 約定近似設定
  */
 class SafetyFloor(
     private val config: SafetyFloorConfig = SafetyFloorConfig(),
     private val clock: Clock = Clock.systemUTC(),
+    private val paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
 ) {
-    private val riskCalculator = SafetyFloorRiskCalculator(config, clock)
+    private val riskCalculator = SafetyFloorRiskCalculator(config, clock, paperExecutionConfig)
 
     /**
      * place_order の entry intent を検証する。

@@ -3,25 +3,34 @@ package me.matsumo.fukurou.trading.broker
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.entryFeeRateFor
+import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Clock
 import java.util.UUID
+import java.util.logging.Logger
 
 /**
  * paper 約定の既定設定。
  *
  * @param marketSlippageBps MARKET / STOP の悲観 slippage。5bps は paper 初期の保守的な近似値
+ * @param volatilitySlippageMultiplier ATR(5m, 14) に掛けるボラティリティ slippage 係数
  */
 data class PaperExecutionConfig(
     val marketSlippageBps: BigDecimal = DEFAULT_MARKET_SLIPPAGE_BPS,
+    val volatilitySlippageMultiplier: BigDecimal = DEFAULT_VOLATILITY_SLIPPAGE_MULTIPLIER,
 ) {
     init {
         require(marketSlippageBps >= BigDecimal.ZERO) {
             "marketSlippageBps must be greater than or equal to 0."
+        }
+        require(volatilitySlippageMultiplier >= BigDecimal.ZERO) {
+            "volatilitySlippageMultiplier must be greater than or equal to 0."
         }
     }
 }
@@ -33,18 +42,12 @@ interface PaperExecutionSimulator {
     /**
      * 即時 taker 約定を計算する。
      */
-    fun simulateImmediate(
-        request: ImmediateExecutionRequest,
-        context: PaperSimulationContext,
-    ): SimulatedFill
+    fun simulateImmediate(request: ImmediateExecutionRequest, context: PaperSimulationContext): SimulatedFill
 
     /**
      * 未約定 LIMIT 注文の更新を計算する。
      */
-    fun simulatePendingLimit(
-        request: PendingLimitExecutionRequest,
-        context: PaperSimulationContext,
-    ): PaperOrderUpdate
+    fun simulatePendingLimit(request: PendingLimitExecutionRequest, context: PaperSimulationContext): PaperOrderUpdate
 }
 
 /**
@@ -80,12 +83,16 @@ data class PendingLimitExecutionRequest(
  *
  * @param ticker 最新 ticker
  * @param rules symbol rule
+ * @param orderbook 約定時点の板情報
+ * @param orderbookLookupAttempted 板取得を試みたなら true
  * @param volatilitySlippageJpy ボラティリティ由来の追加 slippage
  * @param queueFillRatio maker queue の約定率。現行実装では all-or-none のため将来拡張用
  */
 data class PaperSimulationContext(
     val ticker: Ticker,
     val rules: SymbolRules,
+    val orderbook: Orderbook? = null,
+    val orderbookLookupAttempted: Boolean = false,
     val volatilitySlippageJpy: BigDecimal = BigDecimal.ZERO,
     val queueFillRatio: BigDecimal = BigDecimal.ONE,
 )
@@ -108,10 +115,15 @@ data class PaperOrderUpdate(
  *
  * @param config paper execution 設定
  * @param clock 約定時刻に使う clock
+ * @param warnLogger fallback を記録する WARN logger
  */
 class DefaultPaperExecutionSimulator(
     private val config: PaperExecutionConfig = PaperExecutionConfig(),
     private val clock: Clock = Clock.systemUTC(),
+    private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
+        logger = paperExecutionLogger,
+        clock = clock,
+    ),
 ) : PaperExecutionSimulator {
 
     override fun simulateImmediate(
@@ -119,8 +131,8 @@ class DefaultPaperExecutionSimulator(
         context: PaperSimulationContext,
     ): SimulatedFill {
         val price = when (request.orderType) {
-            OrderType.MARKET -> marketPrice(request.side, context.ticker)
-            OrderType.STOP -> stopPrice(request, context.ticker)
+            OrderType.MARKET -> marketPrice(request.side, request.sizeBtc, context)
+            OrderType.STOP -> stopPrice(request, context)
             OrderType.LIMIT -> error("LIMIT order is not an immediate taker order.")
         }
 
@@ -150,18 +162,36 @@ class DefaultPaperExecutionSimulator(
         )
     }
 
-    private fun marketPrice(side: OrderSide, ticker: Ticker): BigDecimal {
+    private fun marketPrice(
+        side: OrderSide,
+        sizeBtc: BigDecimal,
+        context: PaperSimulationContext,
+    ): BigDecimal {
+        val basePrice = walkedOrderbookPrice(side, sizeBtc, context)
+            ?: fallbackTickerPrice(side, context)
+
+        return applyAdverseSlippage(side, basePrice, context.volatilitySlippageJpy)
+    }
+
+    private fun fallbackTickerPrice(side: OrderSide, context: PaperSimulationContext): BigDecimal {
+        if (context.orderbookLookupAttempted && context.orderbook == null) {
+            warnLogger.warn(
+                key = ORDERBOOK_FALLBACK_LOG_KEY,
+                message = "Paper execution orderbook is unavailable; falling back to ticker price.",
+            )
+        }
+
         return when (side) {
-            OrderSide.BUY -> applyPositiveSlippage(ticker.ask.toBigDecimal())
-            OrderSide.SELL -> applyNegativeSlippage(ticker.bid.toBigDecimal())
+            OrderSide.BUY -> context.ticker.ask.toBigDecimal()
+            OrderSide.SELL -> context.ticker.bid.toBigDecimal()
         }
     }
 
-    private fun stopPrice(request: ImmediateExecutionRequest, ticker: Ticker): BigDecimal {
+    private fun stopPrice(request: ImmediateExecutionRequest, context: PaperSimulationContext): BigDecimal {
         val triggerPriceJpy = requireNotNull(request.triggerPriceJpy) {
             "STOP order requires triggerPriceJpy."
         }
-        val slippagePrice = marketPrice(request.side, ticker)
+        val slippagePrice = marketPrice(request.side, request.sizeBtc, context)
 
         return when (request.side) {
             OrderSide.BUY -> maxOf(triggerPriceJpy, slippagePrice)
@@ -201,174 +231,191 @@ class DefaultPaperExecutionSimulator(
             .moneyScale()
     }
 
+    private fun applyAdverseSlippage(
+        side: OrderSide,
+        price: BigDecimal,
+        volatilitySlippageJpy: BigDecimal,
+    ): BigDecimal {
+        return when (side) {
+            OrderSide.BUY -> applyPositiveSlippage(price).add(volatilitySlippageJpy).moneyScale()
+            OrderSide.SELL -> applyNegativeSlippage(price).subtract(volatilitySlippageJpy).moneyScale()
+        }
+    }
+
+    private fun walkedOrderbookPrice(
+        side: OrderSide,
+        requestedSizeBtc: BigDecimal,
+        context: PaperSimulationContext,
+    ): BigDecimal? {
+        val orderbook = context.orderbook ?: return null
+        val levels = when (side) {
+            OrderSide.BUY -> orderbook.asks.toAdverseAskLevels()
+            OrderSide.SELL -> orderbook.bids.toAdverseBidLevels()
+        }
+
+        if (levels.invalidLevelFound) {
+            warnLogger.warn(
+                key = ORDERBOOK_INVALID_LEVEL_LOG_KEY,
+                message = "Paper execution ignored invalid orderbook levels.",
+            )
+        }
+        if (levels.usableLevels.isEmpty()) {
+            warnLogger.warn(
+                key = ORDERBOOK_FALLBACK_LOG_KEY,
+                message = "Paper execution orderbook has no usable levels; falling back to ticker price.",
+            )
+
+            return null
+        }
+
+        val walkResult = walkLevels(
+            side = side,
+            levels = levels.usableLevels,
+            requestedSizeBtc = requestedSizeBtc,
+        )
+
+        if (walkResult.depthExhausted) {
+            warnLogger.warn(
+                key = ORDERBOOK_DEPTH_EXHAUSTED_LOG_KEY,
+                message = "Paper execution orderbook depth is insufficient; applying conservative residual price.",
+            )
+        }
+
+        return walkResult.priceJpy
+    }
+
     private fun slippageRatio(): BigDecimal {
         return config.marketSlippageBps.divide(BPS_DIVISOR, PRICE_CALCULATION_SCALE, RoundingMode.HALF_UP)
     }
+
+    private fun walkLevels(
+        side: OrderSide,
+        levels: List<ParsedOrderbookLevel>,
+        requestedSizeBtc: BigDecimal,
+    ): OrderbookWalkResult {
+        require(requestedSizeBtc > BigDecimal.ZERO) {
+            "requestedSizeBtc must be greater than zero."
+        }
+
+        var remainingSizeBtc = requestedSizeBtc
+        var notionalJpy = BigDecimal.ZERO
+        var lastLevelPrice = levels.first().priceJpy
+
+        levels.forEach { level ->
+            if (remainingSizeBtc <= BigDecimal.ZERO) {
+                return@forEach
+            }
+
+            val fillSizeBtc = minOf(level.sizeBtc, remainingSizeBtc)
+
+            notionalJpy = notionalJpy.add(level.priceJpy.multiply(fillSizeBtc))
+            remainingSizeBtc = remainingSizeBtc.subtract(fillSizeBtc)
+            lastLevelPrice = level.priceJpy
+        }
+
+        val depthExhausted = remainingSizeBtc > BigDecimal.ZERO
+
+        if (depthExhausted) {
+            notionalJpy = notionalJpy.add(residualDepthPrice(side, lastLevelPrice).multiply(remainingSizeBtc))
+        }
+
+        return OrderbookWalkResult(
+            priceJpy = notionalJpy.divide(requestedSizeBtc, PRICE_CALCULATION_SCALE, RoundingMode.HALF_UP),
+            depthExhausted = depthExhausted,
+        )
+    }
+
+    private fun residualDepthPrice(side: OrderSide, lastLevelPrice: BigDecimal): BigDecimal {
+        val penaltyRatio = maxOf(slippageRatio(), MIN_DEPTH_EXHAUSTION_PENALTY_RATIO)
+
+        return when (side) {
+            OrderSide.BUY -> lastLevelPrice.multiply(BigDecimal.ONE.add(penaltyRatio))
+            OrderSide.SELL -> lastLevelPrice.multiply(BigDecimal.ONE.subtract(penaltyRatio)).max(BigDecimal.ZERO)
+        }
+    }
+}
+
+/**
+ * 約定計算に使える板 level。
+ *
+ * @param priceJpy 価格
+ * @param sizeBtc 数量
+ */
+private data class ParsedOrderbookLevel(
+    val priceJpy: BigDecimal,
+    val sizeBtc: BigDecimal,
+)
+
+/**
+ * parse 済み板 level と invalid level の有無。
+ *
+ * @param usableLevels 約定計算に使える level
+ * @param invalidLevelFound invalid level が含まれていたか
+ */
+private data class ParsedOrderbookLevels(
+    val usableLevels: List<ParsedOrderbookLevel>,
+    val invalidLevelFound: Boolean,
+)
+
+/**
+ * 板歩きの価格結果。
+ *
+ * @param priceJpy 数量加重平均価格
+ * @param depthExhausted 板深さが不足したか
+ */
+private data class OrderbookWalkResult(
+    val priceJpy: BigDecimal,
+    val depthExhausted: Boolean,
+)
+
+private fun List<OrderbookLevel>.toAdverseAskLevels(): ParsedOrderbookLevels {
+    return toParsedOrderbookLevels().let { levels ->
+        levels.copy(usableLevels = levels.usableLevels.sortedBy { level -> level.priceJpy })
+    }
+}
+
+private fun List<OrderbookLevel>.toAdverseBidLevels(): ParsedOrderbookLevels {
+    return toParsedOrderbookLevels().let { levels ->
+        levels.copy(usableLevels = levels.usableLevels.sortedByDescending { level -> level.priceJpy })
+    }
+}
+
+private fun List<OrderbookLevel>.toParsedOrderbookLevels(): ParsedOrderbookLevels {
+    var invalidLevelFound = false
+    val usableLevels = mapNotNull { level ->
+        val parsedLevel = level.toParsedOrderbookLevel()
+
+        if (parsedLevel == null) {
+            invalidLevelFound = true
+        }
+
+        parsedLevel
+    }
+
+    return ParsedOrderbookLevels(
+        usableLevels = usableLevels,
+        invalidLevelFound = invalidLevelFound,
+    )
+}
+
+private fun OrderbookLevel.toParsedOrderbookLevel(): ParsedOrderbookLevel? {
+    val priceJpy = price.toBigDecimalOrNull() ?: return null
+    val sizeBtc = size.toBigDecimalOrNull() ?: return null
+
+    if (priceJpy <= BigDecimal.ZERO || sizeBtc <= BigDecimal.ZERO) {
+        return null
+    }
+
+    return ParsedOrderbookLevel(
+        priceJpy = priceJpy,
+        sizeBtc = sizeBtc,
+    )
 }
 
 /**
  * 従来名との互換 alias。
  */
 typealias FillSimulator = DefaultPaperExecutionSimulator
-
-/**
- * MARKET 約定を計算する。
- */
-internal fun PaperExecutionSimulator.marketFill(
-    side: OrderSide,
-    sizeBtc: BigDecimal,
-    ticker: Ticker,
-    rules: SymbolRules,
-): SimulatedFill {
-    return marketFill(
-        side = side,
-        sizeBtc = sizeBtc,
-        context = PaperSimulationContext(
-            ticker = ticker,
-            rules = rules,
-        ),
-    )
-}
-
-/**
- * MARKET 約定を計算する。
- */
-internal fun PaperExecutionSimulator.marketFill(
-    side: OrderSide,
-    sizeBtc: BigDecimal,
-    context: PaperSimulationContext,
-): SimulatedFill {
-    return simulateImmediate(
-        request = ImmediateExecutionRequest(
-            side = side,
-            orderType = OrderType.MARKET,
-            sizeBtc = sizeBtc,
-        ),
-        context = context,
-    )
-}
-
-/**
- * STOP 約定を計算する。
- */
-internal fun PaperExecutionSimulator.stopFill(
-    side: OrderSide,
-    sizeBtc: BigDecimal,
-    triggerPriceJpy: BigDecimal,
-    ticker: Ticker,
-    rules: SymbolRules,
-): SimulatedFill {
-    return stopFill(
-        side = side,
-        sizeBtc = sizeBtc,
-        triggerPriceJpy = triggerPriceJpy,
-        context = PaperSimulationContext(
-            ticker = ticker,
-            rules = rules,
-        ),
-    )
-}
-
-/**
- * STOP 約定を計算する。
- */
-internal fun PaperExecutionSimulator.stopFill(
-    side: OrderSide,
-    sizeBtc: BigDecimal,
-    triggerPriceJpy: BigDecimal,
-    context: PaperSimulationContext,
-): SimulatedFill {
-    return simulateImmediate(
-        request = ImmediateExecutionRequest(
-            side = side,
-            orderType = OrderType.STOP,
-            sizeBtc = sizeBtc,
-            triggerPriceJpy = triggerPriceJpy,
-        ),
-        context = context,
-    )
-}
-
-/**
- * resting LIMIT 約定を計算する。
- */
-internal fun PaperExecutionSimulator.restingLimitFill(
-    sizeBtc: BigDecimal,
-    limitPriceJpy: BigDecimal,
-    rules: SymbolRules,
-): SimulatedFill {
-    return requireNotNull(
-        simulatePendingLimit(
-            request = PendingLimitExecutionRequest(
-                side = OrderSide.BUY,
-                sizeBtc = sizeBtc,
-                limitPriceJpy = limitPriceJpy,
-            ),
-            context = PaperSimulationContext(
-                ticker = limitOnlyTicker(limitPriceJpy),
-                rules = rules,
-            ),
-        ).fill,
-    ) {
-        "Triggered LIMIT order must create a fill."
-    }
-}
-
-/**
- * resting entry order の約定を注文種別に応じて計算する。
- */
-internal fun PaperExecutionSimulator.restingEntryFill(request: RestingEntryFillRequest): SimulatedFill {
-    return when (request.orderType) {
-        OrderType.LIMIT -> requireNotNull(
-            simulatePendingLimit(
-                request = PendingLimitExecutionRequest(
-                    side = request.side,
-                    sizeBtc = request.sizeBtc,
-                    limitPriceJpy = requireNotNull(request.limitPriceJpy) {
-                        "LIMIT entry order requires limitPriceJpy."
-                    },
-                ),
-                context = PaperSimulationContext(
-                    ticker = request.ticker,
-                    rules = request.rules,
-                ),
-            ).fill,
-        ) {
-            "Triggered LIMIT order must create a fill."
-        }
-        OrderType.STOP -> stopFill(
-            side = request.side,
-            sizeBtc = request.sizeBtc,
-            triggerPriceJpy = requireNotNull(request.triggerPriceJpy) {
-                "STOP entry order requires triggerPriceJpy."
-            },
-            ticker = request.ticker,
-            rules = request.rules,
-        )
-        OrderType.MARKET -> error("MARKET entry is not a resting order.")
-    }
-}
-
-/**
- * resting entry order の約定計算入力。
- *
- * @param side 注文 side
- * @param orderType 注文種別
- * @param sizeBtc 注文数量
- * @param limitPriceJpy LIMIT 価格
- * @param triggerPriceJpy STOP trigger 価格
- * @param ticker 現在 ticker
- * @param rules symbol rule
- */
-data class RestingEntryFillRequest(
-    val side: OrderSide,
-    val orderType: OrderType,
-    val sizeBtc: BigDecimal,
-    val limitPriceJpy: BigDecimal?,
-    val triggerPriceJpy: BigDecimal?,
-    val ticker: Ticker,
-    val rules: SymbolRules,
-)
 
 /**
  * JPY 金額を DB scale に丸める。
@@ -404,21 +451,6 @@ internal fun BigDecimal.floorToStep(step: BigDecimal): BigDecimal {
     return stepCount.multiply(step)
 }
 
-private fun limitOnlyTicker(priceJpy: BigDecimal): Ticker {
-    val priceText = priceJpy.toPlainString()
-
-    return Ticker(
-        symbol = "",
-        last = priceText,
-        bid = priceText,
-        ask = priceText,
-        high = priceText,
-        low = priceText,
-        volume = BigDecimal.ZERO.toPlainString(),
-        timestamp = "",
-    )
-}
-
 /**
  * JPY 金額 scale。
  */
@@ -448,3 +480,30 @@ private val BPS_DIVISOR = BigDecimal("10000")
  * MARKET / STOP の既定 slippage。
  */
 private val DEFAULT_MARKET_SLIPPAGE_BPS = BigDecimal("5")
+
+/**
+ * ATR 由来 slippage の既定係数。
+ */
+private val DEFAULT_VOLATILITY_SLIPPAGE_MULTIPLIER = BigDecimal("0.1")
+
+/**
+ * 板深さ不足時に最後の level へ最低限乗せる不利方向 penalty。
+ */
+private val MIN_DEPTH_EXHAUSTION_PENALTY_RATIO = BigDecimal("0.0001")
+
+/**
+ * orderbook fallback log の key。
+ */
+private const val ORDERBOOK_FALLBACK_LOG_KEY = "paper-execution-orderbook-fallback"
+
+/**
+ * invalid orderbook level log の key。
+ */
+private const val ORDERBOOK_INVALID_LEVEL_LOG_KEY = "paper-execution-orderbook-invalid-level"
+
+/**
+ * orderbook depth exhaustion log の key。
+ */
+private const val ORDERBOOK_DEPTH_EXHAUSTED_LOG_KEY = "paper-execution-orderbook-depth-exhausted"
+
+private val paperExecutionLogger: Logger = Logger.getLogger(DefaultPaperExecutionSimulator::class.java.name)
