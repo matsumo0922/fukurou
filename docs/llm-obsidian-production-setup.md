@@ -116,6 +116,11 @@ Obsidian Writer / deterministic Reflection Runner は LLM daemon と独立して
 
 ```dotenv
 FUKUROU_OBSIDIAN_ENABLED=true
+FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS=3600
+FUKUROU_REFLECTION_QUERY_LIMIT=1000
+FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS=180
+FUKUROU_REFLECTION_RECENT_DECISION_LIMIT=50
+FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT=30
 FUKUROU_LLM_DAEMON_ENABLED=false
 ```
 
@@ -129,7 +134,9 @@ find /srv/fukurou/obsidian-vault -maxdepth 4 -type f | sort | head -50
 
 Writer は DB を正本として、frontmatter、機械導出できる数値、空見出し骨組みだけを書く。解釈的本文や `Knowledge/` の中身は reflection runner の責務であり、ここでは生成しない。
 
-Reflection Runner は DB を正本として、日次・週次・confidence calibration・setup tag taxonomy の Markdown を deterministic に生成する。LLM CLI は呼び出さず、PromptCandidates は生成せず、system prompt や config は変更しない。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。
+Reflection Runner は DB を正本として、日次・週次・confidence calibration・setup tag taxonomy の Markdown を deterministic に生成する。LLM CLI は呼び出さず、PromptCandidates は生成せず、system prompt や trading config を自動変更しない。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。
+
+Reflection Runner の loop は `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` と `FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS` の大きい方を使う。Markdown 本文には生成時刻だけで変わる field を書かず、対象 period の DB データが変わらない tick は unchanged として扱う。日付または週の境界直前に保存された decision / trade を確定ノートへ反映するため、current period と previous period の Daily / Weekly / TagTaxonomy report を同じ tick で再生成する。
 
 ## Enable LLM daemon
 

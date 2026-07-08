@@ -3020,7 +3020,7 @@ Instruments/BTC.md
 
 [実装済み: 2026-07-04] 実装 package は新 module `:trading.knowledge` ではなく、既存 `:trading` module の `me.matsumo.fukurou.trading.knowledge` とする。A-2 は既存 repository と typed config に薄く乗るだけで、module 分割による依存境界を増やす段階ではないため。
 
-A-3 の deterministic Reflection Runner は、同じ vault に `Knowledge/DailyReflections/YYYY-MM-DD.md`、`Knowledge/WeeklyReviews/YYYY-Www.md`、`Knowledge/Calibration/ConfidenceCalibration.md`、`Knowledge/Setups/TagTaxonomy-YYYY-Www.md` を生成する。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。
+A-3 の deterministic Reflection Runner は、同じ vault に `Knowledge/DailyReflections/YYYY-MM-DD.md`、`Knowledge/WeeklyReviews/YYYY-Www.md`、`Knowledge/Calibration/ConfidenceCalibration.md`、`Knowledge/Setups/TagTaxonomy-YYYY-Www.md` を生成する。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。Reflection Runner は current period と previous period の Daily / Weekly / TagTaxonomy report を再生成し、境界直前に保存された decision / trade を確定ノートへ反映する。
 
 ### 11.4 Trade note frontmatter例
 
@@ -3261,6 +3261,8 @@ SORT created DESC
 
 Reflection Runner は LLM CLI を呼び出さず、売買 act 系ツールも持たない。read-only DB と vault write だけで report を再生成し、失敗しても trading / scheduler / DB record には影響させない。
 
+Reflection Runner の loop は `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` と `FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS` の大きい方を使う。Markdown 本文には生成時刻だけで変わる field を書かず、対象 period の DB データが変わらない tick は unchanged として扱う。Recent Decisions は `FUKUROU_REFLECTION_RECENT_DECISION_LIMIT` 件まで表示し、confidence calibration は `FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS` 日の安定した取引日境界 window を読む。
+
 [確定事項の改訂: 2026-07-02] 全エントリーは setup tags を必須とする。LLMは新タグを作成できるが、振り返りエージェントが taxonomy を統合・改廃し、似たタグの統合、廃止タグの提案、setup別の勝率/PF/期待Rを一次出力として記録する。
 
 ### 12.2 日次振り返り
@@ -3280,6 +3282,7 @@ Reflection Runner は LLM CLI を呼び出さず、売買 act 系ツールも持
 出力:
 
 - `Knowledge/DailyReflections/YYYY-MM-DD.md`
+- `Knowledge/DailyReflections/<previous YYYY-MM-DD>.md`
 - `Knowledge/Calibration/ConfidenceCalibration.md`
 - `Knowledge/Setups/TagTaxonomy-YYYY-Www.md`
 - `Daily/` 配下の note は更新しない
@@ -3309,8 +3312,10 @@ Reflection Runner は LLM CLI を呼び出さず、売買 act 系ツールも持
 出力:
 
 - `Knowledge/WeeklyReviews/YYYY-Www.md`
+- `Knowledge/WeeklyReviews/<previous YYYY-Www>.md`
 - `Knowledge/Calibration/ConfidenceCalibration.md`
 - `Knowledge/Setups/TagTaxonomy-YYYY-Www.md`
+- `Knowledge/Setups/TagTaxonomy-<previous YYYY-Www>.md`
 - `Knowledge/PromptCandidates/` は deterministic runner では生成しない
 
 週次の分析:
@@ -3326,7 +3331,7 @@ Reflection Runner は LLM CLI を呼び出さず、売買 act 系ツールも持
 
 ### 12.4 Knowledge更新の安全策
 
-Reflection Runner は Knowledge report を直接更新するが、system prompt や config は変更しない。PromptCandidates も deterministic runner では生成しない。
+Reflection Runner は Knowledge report を直接更新するが、system prompt や trading config は自動変更しない。PromptCandidates も deterministic runner では生成しない。
 
 ```text
 Knowledge update: 自動可

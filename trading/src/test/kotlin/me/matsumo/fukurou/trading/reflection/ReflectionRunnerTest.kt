@@ -62,13 +62,18 @@ class ReflectionRunnerTest {
             val calibration = Files.readString(vaultPath.resolve("Knowledge/Calibration/ConfidenceCalibration.md"))
             val taxonomy = Files.readString(vaultPath.resolve("Knowledge/Setups/TagTaxonomy-2026-W27.md"))
 
-            assertEquals(4, summary.writtenFiles)
+            assertEquals(7, summary.writtenFiles)
             assertEquals(dailyContent, Files.readString(dailyPath))
             assertTrue(Files.isDirectory(vaultPath.resolve("Knowledge/DailyReflections")))
+            assertTrue(Files.exists(vaultPath.resolve("Knowledge/DailyReflections/2026-07-01.md")))
+            assertTrue(Files.exists(vaultPath.resolve("Knowledge/WeeklyReviews/2026-W26.md")))
+            assertTrue(Files.exists(vaultPath.resolve("Knowledge/Setups/TagTaxonomy-2026-W26.md")))
             assertTrue(dailyReflection.contains("type: \"daily_reflection\""))
             assertTrue(dailyReflection.contains("sample_size_warning: true"))
             assertTrue(dailyReflection.contains("truncated: false"))
-            assertTrue(dailyReflection.contains("sample_size_warning:: true"))
+            assertFalse(dailyReflection.contains("generated_at:"))
+            assertFalse(dailyReflection.contains("sample_size_warning::"))
+            assertFalse(dailyReflection.contains("truncated::"))
             assertTrue(weeklyReview.contains("type: \"weekly_reflection\""))
             assertTrue(calibration.contains("type: \"confidence_calibration\""))
             assertTrue(taxonomy.contains("type: \"setup_tag_taxonomy\""))
@@ -101,9 +106,84 @@ class ReflectionRunnerTest {
             assertTrue(dailyReflection.contains("llm_run_truncated: true"))
             assertTrue(dailyReflection.contains("closed_trade_truncated: true"))
             assertTrue(dailyReflection.contains("llm_usage_truncated: true"))
-            assertTrue(dailyReflection.contains("truncated:: true"))
         } finally {
             deleteRecursively(vaultPath)
+        }
+    }
+
+    @Test
+    fun runOnce_doesNotRewriteReportsWhenOnlyClockAdvancesInsideSameTradingDate() = runBlocking {
+        val vaultPath = Files.createTempDirectory("fukurou-reflection-unchanged")
+        val firstRunner = reflectionRunner(vaultPath)
+        val secondRunner = reflectionRunner(
+            vaultPath = vaultPath,
+            writerClock = Clock.fixed(Instant.parse("2026-07-02T12:05:00Z"), ZoneOffset.UTC),
+        )
+
+        try {
+            val firstSummary = firstRunner.runOnce().getOrThrow()
+            val secondSummary = secondRunner.runOnce().getOrThrow()
+
+            assertEquals(7, firstSummary.writtenFiles)
+            assertEquals(0, firstSummary.unchangedFiles)
+            assertEquals(0, secondSummary.writtenFiles)
+            assertEquals(7, secondSummary.unchangedFiles)
+        } finally {
+            deleteRecursively(vaultPath)
+        }
+    }
+
+    @Test
+    fun runOnce_limitsRecentDecisionRows() = runBlocking {
+        val vaultPath = Files.createTempDirectory("fukurou-reflection-recent-decisions")
+        val runner = reflectionRunner(
+            vaultPath = vaultPath,
+            secondDecision = true,
+            recentDecisionLimit = 1,
+        )
+
+        try {
+            runner.runOnce().getOrThrow()
+
+            val dailyReflection = Files.readString(vaultPath.resolve("Knowledge/DailyReflections/2026-07-02.md"))
+
+            assertTrue(dailyReflection.contains("recent_decisions_rendered: 1"))
+            assertTrue(dailyReflection.contains("recent_decisions_omitted: 1"))
+            assertTrue(dailyReflection.contains("decision_input_truncated: false"))
+        } finally {
+            deleteRecursively(vaultPath)
+        }
+    }
+
+    @Test
+    fun runOnce_marksSampleWarningForEmptyTradesAndClearsItAtThreshold() = runBlocking {
+        val emptyVaultPath = Files.createTempDirectory("fukurou-reflection-empty-trades")
+        val thresholdVaultPath = Files.createTempDirectory("fukurou-reflection-threshold-trades")
+        val emptyRunner = reflectionRunner(
+            vaultPath = emptyVaultPath,
+            trades = emptyList(),
+        )
+        val thresholdRunner = reflectionRunner(
+            vaultPath = thresholdVaultPath,
+            trades = closedTrades(DEFAULT_REFLECTION_SAMPLE_WARNING_TRADE_COUNT),
+        )
+
+        try {
+            emptyRunner.runOnce().getOrThrow()
+            thresholdRunner.runOnce().getOrThrow()
+
+            val emptyDailyReflection =
+                Files.readString(emptyVaultPath.resolve("Knowledge/DailyReflections/2026-07-02.md"))
+            val thresholdDailyReflection =
+                Files.readString(thresholdVaultPath.resolve("Knowledge/DailyReflections/2026-07-02.md"))
+
+            assertTrue(emptyDailyReflection.contains("closed_trades: 0"))
+            assertTrue(emptyDailyReflection.contains("sample_size_warning: true"))
+            assertTrue(thresholdDailyReflection.contains("closed_trades: 30"))
+            assertTrue(thresholdDailyReflection.contains("sample_size_warning: false"))
+        } finally {
+            deleteRecursively(emptyVaultPath)
+            deleteRecursively(thresholdVaultPath)
         }
     }
 
@@ -164,6 +244,8 @@ private suspend fun reflectionRunner(
     llmUsagesTruncated: Boolean = false,
     trades: List<ClosedTradeFact> = listOf(closedTrade()),
     linkedDecisionSetupTags: List<String> = listOf("breakout", "trend-follow"),
+    recentDecisionLimit: Int = DEFAULT_REFLECTION_RECENT_DECISION_LIMIT,
+    writerClock: Clock = WRITER_CLOCK,
 ): ReflectionRunner {
     val decisionRepository = InMemoryDecisionRepository(FIXED_CLOCK)
     val llmRunRepository = InMemoryLlmRunRepository()
@@ -196,10 +278,16 @@ private suspend fun reflectionRunner(
             decisionRepository = decisionRepository,
             llmRunRepository = llmRunRepository,
             evaluationRepository = evaluationRepository,
-            clock = WRITER_CLOCK,
+            clock = writerClock,
             queryLimit = queryLimit,
         ),
-        reportBuilder = ReflectionReportBuilder(TradingBotConfig()),
+        reportBuilder = ReflectionReportBuilder(
+            tradingConfig = TradingBotConfig(
+                reflection = ReflectionConfig(
+                    recentDecisionLimit = recentDecisionLimit,
+                ),
+            ),
+        ),
         vaultWriter = ReflectionVaultWriter(
             vaultPath = vaultPath,
             redactor = SecretRedactor(setOf("reflection-secret-token")),
@@ -302,6 +390,12 @@ private fun closedTrade(
         setupTags = setupTags,
         llmProvider = "claude",
     )
+}
+
+private fun closedTrades(count: Int): List<ClosedTradeFact> {
+    return (1..count).map { index ->
+        closedTrade(positionId = UUID(0L, index.toLong()).toString())
+    }
 }
 
 private fun failedLlmRun(invocationId: String = "failed-run", startedAt: Instant = FIXED_INSTANT): LlmRunFinish {

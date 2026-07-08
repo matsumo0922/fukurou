@@ -14,25 +14,32 @@ import me.matsumo.fukurou.trading.evaluation.SetupPerformance
 import me.matsumo.fukurou.trading.evaluation.TradePerformanceStats
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import java.math.BigDecimal
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.time.temporal.WeekFields
 
 /**
  * reflection 用 Markdown report を決定論的に組み立てる builder。
  *
  * @param tradingConfig frontmatter に使う trading config
  * @param sampleWarningTradeCount sample size warning を出す closed trade 件数
+ * @param recentDecisionLimit Recent Decisions に表示する最大行数
  * @param tradingZone frontmatter の時刻表現に使う timezone
  */
 class ReflectionReportBuilder(
     private val tradingConfig: TradingBotConfig,
-    private val sampleWarningTradeCount: Int = DEFAULT_REFLECTION_SAMPLE_WARNING_TRADE_COUNT,
+    private val sampleWarningTradeCount: Int = tradingConfig.reflection.sampleWarningTradeCount,
+    private val recentDecisionLimit: Int = tradingConfig.reflection.recentDecisionLimit,
     private val tradingZone: ZoneId = EQUITY_SNAPSHOT_TRADING_DATE_ZONE,
 ) {
 
     init {
         require(sampleWarningTradeCount > 0) {
             "sampleWarningTradeCount must be greater than 0."
+        }
+        require(recentDecisionLimit > 0) {
+            "recentDecisionLimit must be greater than 0."
         }
     }
 
@@ -43,26 +50,46 @@ class ReflectionReportBuilder(
         return runCatching {
             ReflectionReports(
                 files = listOf(
-                    dailyReport(dataset),
-                    weeklyReport(dataset),
+                    dailyReport(
+                        tradingDate = dataset.tradingDate,
+                        data = dataset.daily,
+                    ),
+                    dailyReport(
+                        tradingDate = dataset.previousTradingDate,
+                        data = dataset.previousDaily,
+                    ),
+                    weeklyReport(
+                        weekId = dataset.weekId,
+                        data = dataset.weekly,
+                    ),
+                    weeklyReport(
+                        weekId = dataset.previousWeekId,
+                        data = dataset.previousWeekly,
+                    ),
                     calibrationReport(dataset),
-                    tagTaxonomyReport(dataset),
+                    tagTaxonomyReport(
+                        weekId = dataset.weekId,
+                        data = dataset.weekly,
+                    ),
+                    tagTaxonomyReport(
+                        weekId = dataset.previousWeekId,
+                        data = dataset.previousWeekly,
+                    ),
                 ),
             )
         }
     }
 
-    private fun dailyReport(dataset: ReflectionDataset): ReflectionMarkdownFile {
-        val data = dataset.daily
-
+    private fun dailyReport(tradingDate: LocalDate, data: ReflectionWindowData): ReflectionMarkdownFile {
         return ReflectionMarkdownFile(
-            relativePath = "Knowledge/DailyReflections/${dataset.tradingDate}.md",
+            relativePath = "Knowledge/DailyReflections/$tradingDate.md",
             content = buildWindowReport(
                 WindowReportContext(
-                    title = "Daily Reflection ${dataset.tradingDate}",
+                    title = "Daily Reflection $tradingDate",
                     reflectionType = "daily_reflection",
-                    periodLabel = dataset.tradingDate.toString(),
-                    dataset = dataset,
+                    periodLabel = tradingDate.toString(),
+                    tradingDate = tradingDate,
+                    weekId = tradingDate.isoWeekId(),
                     data = data,
                     reportTags = listOf("reflection", "daily-reflection", tradingConfig.symbol.apiSymbol.lowercase()),
                 ),
@@ -70,17 +97,16 @@ class ReflectionReportBuilder(
         )
     }
 
-    private fun weeklyReport(dataset: ReflectionDataset): ReflectionMarkdownFile {
-        val data = dataset.weekly
-
+    private fun weeklyReport(weekId: String, data: ReflectionWindowData): ReflectionMarkdownFile {
         return ReflectionMarkdownFile(
-            relativePath = "Knowledge/WeeklyReviews/${dataset.weekId}.md",
+            relativePath = "Knowledge/WeeklyReviews/$weekId.md",
             content = buildWindowReport(
                 WindowReportContext(
-                    title = "Weekly Review ${dataset.weekId}",
+                    title = "Weekly Review $weekId",
                     reflectionType = "weekly_reflection",
-                    periodLabel = dataset.weekId,
-                    dataset = dataset,
+                    periodLabel = weekId,
+                    tradingDate = data.period.from.atZone(tradingZone).toLocalDate(),
+                    weekId = weekId,
                     data = data,
                     reportTags = listOf("reflection", "weekly-review", tradingConfig.symbol.apiSymbol.lowercase()),
                 ),
@@ -102,12 +128,7 @@ class ReflectionReportBuilder(
                 context = context,
                 stats = stats,
             )
-            appendInlineFields(
-                context.reflectionType,
-                context.periodLabel,
-                data,
-                stats.sampleSizeWarning,
-            )
+            appendInlineFields(context.reflectionType, context.periodLabel)
             appendLine("# ${context.title}")
             appendLine()
             appendSummarySection(data, stats.tradeStats, stats.costStats)
@@ -119,17 +140,15 @@ class ReflectionReportBuilder(
     }
 
     private fun StringBuilder.appendWindowFrontmatter(context: WindowReportContext, stats: WindowReportStats) {
-        val dataset = context.dataset
         val data = context.data
 
         appendLine("---")
         appendLine("type: ${context.reflectionType.yamlQuoted()}")
         appendLine("period: ${context.periodLabel.yamlQuoted()}")
-        appendLine("date: ${dataset.tradingDate.toString().yamlQuoted()}")
-        appendLine("week: ${dataset.weekId.yamlQuoted()}")
+        appendLine("date: ${context.tradingDate.toString().yamlQuoted()}")
+        appendLine("week: ${context.weekId.yamlQuoted()}")
         appendLine("symbol: ${tradingConfig.symbol.apiSymbol.yamlQuoted()}")
         appendLine("mode: ${tradingConfig.mode.name.yamlQuoted()}")
-        appendLine("generated_at: ${dataset.generatedAt.toOffsetText().yamlQuoted()}")
         appendLine("period_start: ${data.period.from.toOffsetText().yamlQuoted()}")
         appendLine("period_end: ${data.period.toExclusive.toOffsetText().yamlQuoted()}")
         appendLine("decision_runs: ${data.decisionRunCount}")
@@ -154,16 +173,9 @@ class ReflectionReportBuilder(
         appendLine()
     }
 
-    private fun StringBuilder.appendInlineFields(
-        reflectionType: String,
-        periodLabel: String,
-        data: ReflectionWindowData,
-        sampleSizeWarning: Boolean,
-    ) {
+    private fun StringBuilder.appendInlineFields(reflectionType: String, periodLabel: String) {
         appendLine("reflection_type:: $reflectionType")
         appendLine("reflection_period:: $periodLabel")
-        appendLine("sample_size_warning:: $sampleSizeWarning")
-        appendLine("truncated:: ${data.truncation.any}")
         appendLine()
     }
 
@@ -198,17 +210,37 @@ class ReflectionReportBuilder(
         appendLine()
         appendLine("### Recent Decisions")
         appendLine()
+        appendRecentDecisionSummary(data)
         appendLine("| Created | Action | Setups | Reason |")
         appendLine("|---|---|---|---|")
-        data.decisions.forEach { record ->
+        val recentDecisions = recentDecisions(data)
+        recentDecisions.forEach { record ->
             appendLine(
                 "| ${record.decision.createdAt.toOffsetText()} | ${record.decision.submission.action.name} | " +
                     "${record.recordSetupTags().joinToString(", ").markdownCell()} | " +
                     "${record.decision.submission.reasonJa.markdownCell()} |",
             )
         }
-        appendEmptyDecisionRowIfNeeded(data.decisions)
+        appendEmptyDecisionRowIfNeeded(recentDecisions)
         appendLine()
+    }
+
+    private fun StringBuilder.appendRecentDecisionSummary(data: ReflectionWindowData) {
+        if (data.decisions.isEmpty()) {
+            return
+        }
+
+        val recentDecisionCount = recentDecisions(data).size
+        val omittedFetchedDecisionCount = data.decisions.size - recentDecisionCount
+
+        appendLine("- recent_decisions_rendered: $recentDecisionCount")
+        appendLine("- recent_decisions_omitted: $omittedFetchedDecisionCount")
+        appendLine("- decision_input_truncated: ${data.truncation.decisions}")
+        appendLine()
+    }
+
+    private fun recentDecisions(data: ReflectionWindowData): List<DecisionJournalRecord> {
+        return data.decisions.takeLast(recentDecisionLimit)
     }
 
     private fun decisionActions(data: ReflectionWindowData): List<ActionCountView> {
@@ -298,12 +330,10 @@ class ReflectionReportBuilder(
         return ReflectionMarkdownFile(
             relativePath = "Knowledge/Calibration/ConfidenceCalibration.md",
             content = buildString {
-                appendCalibrationFrontmatter(dataset, data, sampleSizeWarning)
+                appendCalibrationFrontmatter(data, sampleSizeWarning)
                 appendInlineFields(
                     reflectionType = "confidence_calibration",
                     periodLabel = data.period.id,
-                    data = data,
-                    sampleSizeWarning = sampleSizeWarning,
                 )
                 appendLine("# Confidence Calibration")
                 appendLine()
@@ -314,17 +344,12 @@ class ReflectionReportBuilder(
         )
     }
 
-    private fun StringBuilder.appendCalibrationFrontmatter(
-        dataset: ReflectionDataset,
-        data: ReflectionWindowData,
-        sampleSizeWarning: Boolean,
-    ) {
+    private fun StringBuilder.appendCalibrationFrontmatter(data: ReflectionWindowData, sampleSizeWarning: Boolean) {
         appendLine("---")
         appendLine("type: ${"confidence_calibration".yamlQuoted()}")
         appendLine("period: ${data.period.id.yamlQuoted()}")
         appendLine("symbol: ${tradingConfig.symbol.apiSymbol.yamlQuoted()}")
         appendLine("mode: ${tradingConfig.mode.name.yamlQuoted()}")
-        appendLine("generated_at: ${dataset.generatedAt.toOffsetText().yamlQuoted()}")
         appendLine("period_start: ${data.period.from.toOffsetText().yamlQuoted()}")
         appendLine("period_end: ${data.period.toExclusive.toOffsetText().yamlQuoted()}")
         appendLine("closed_trades: ${data.closedTrades.size}")
@@ -362,24 +387,21 @@ class ReflectionReportBuilder(
         appendEmptyMessageIfNeeded(groups)
     }
 
-    private fun tagTaxonomyReport(dataset: ReflectionDataset): ReflectionMarkdownFile {
-        val data = dataset.weekly
+    private fun tagTaxonomyReport(weekId: String, data: ReflectionWindowData): ReflectionMarkdownFile {
         val tagSummaries = tagSummaries(data)
         val aliasGroups = tagSummaries
             .filter { summary -> summary.rawTags.size > 1 }
         val sampleSizeWarning = data.closedTrades.size < sampleWarningTradeCount
 
         return ReflectionMarkdownFile(
-            relativePath = "Knowledge/Setups/TagTaxonomy-${dataset.weekId}.md",
+            relativePath = "Knowledge/Setups/TagTaxonomy-$weekId.md",
             content = buildString {
-                appendTagTaxonomyFrontmatter(dataset, data, tagSummaries, aliasGroups, sampleSizeWarning)
+                appendTagTaxonomyFrontmatter(weekId, data, tagSummaries, aliasGroups, sampleSizeWarning)
                 appendInlineFields(
                     reflectionType = "setup_tag_taxonomy",
-                    periodLabel = dataset.weekId,
-                    data = data,
-                    sampleSizeWarning = sampleSizeWarning,
+                    periodLabel = weekId,
                 )
-                appendLine("# Setup Tag Taxonomy ${dataset.weekId}")
+                appendLine("# Setup Tag Taxonomy $weekId")
                 appendLine()
                 appendTagSummarySection(tagSummaries)
                 appendAliasSection(aliasGroups)
@@ -389,7 +411,7 @@ class ReflectionReportBuilder(
     }
 
     private fun StringBuilder.appendTagTaxonomyFrontmatter(
-        dataset: ReflectionDataset,
+        weekId: String,
         data: ReflectionWindowData,
         tagSummaries: List<TagSummaryView>,
         aliasGroups: List<TagSummaryView>,
@@ -397,10 +419,9 @@ class ReflectionReportBuilder(
     ) {
         appendLine("---")
         appendLine("type: ${"setup_tag_taxonomy".yamlQuoted()}")
-        appendLine("week: ${dataset.weekId.yamlQuoted()}")
+        appendLine("week: ${weekId.yamlQuoted()}")
         appendLine("symbol: ${tradingConfig.symbol.apiSymbol.yamlQuoted()}")
         appendLine("mode: ${tradingConfig.mode.name.yamlQuoted()}")
-        appendLine("generated_at: ${dataset.generatedAt.toOffsetText().yamlQuoted()}")
         appendLine("period_start: ${data.period.from.toOffsetText().yamlQuoted()}")
         appendLine("period_end: ${data.period.toExclusive.toOffsetText().yamlQuoted()}")
         appendLine("tag_count: ${tagSummaries.size}")
@@ -611,6 +632,14 @@ class ReflectionReportBuilder(
     private fun java.time.Instant.toOffsetText(): String {
         return atZone(tradingZone).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
     }
+
+    private fun LocalDate.isoWeekId(): String {
+        val weekFields = WeekFields.ISO
+        val weekBasedYear = get(weekFields.weekBasedYear())
+        val week = get(weekFields.weekOfWeekBasedYear())
+
+        return "$weekBasedYear-W${week.toString().padStart(length = 2, padChar = '0')}"
+    }
 }
 
 /**
@@ -619,7 +648,8 @@ class ReflectionReportBuilder(
  * @param title Markdown title
  * @param reflectionType frontmatter の type
  * @param periodLabel 表示用 period label
- * @param dataset report 生成入力全体
+ * @param tradingDate frontmatter の date
+ * @param weekId frontmatter の week
  * @param data 対象期間の入力データ
  * @param reportTags frontmatter tags
  */
@@ -627,7 +657,8 @@ private data class WindowReportContext(
     val title: String,
     val reflectionType: String,
     val periodLabel: String,
-    val dataset: ReflectionDataset,
+    val tradingDate: LocalDate,
+    val weekId: String,
     val data: ReflectionWindowData,
     val reportTags: List<String>,
 )

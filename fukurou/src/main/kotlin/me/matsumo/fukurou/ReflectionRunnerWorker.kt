@@ -124,7 +124,6 @@ internal fun startReflectionRunnerWorker(
     database: ExposedDatabase,
     environment: Map<String, String> = System.getenv(),
     clock: Clock = Clock.systemUTC(),
-    runnerFactory: ((TradingBotConfig) -> Result<ReflectionRunner>)? = null,
     bootstrap: (() -> Result<Unit>)? = null,
 ): ReflectionRunnerWorker? {
     val tradingConfig = TradingBotConfig.fromEnvironment(environment)
@@ -135,17 +134,19 @@ internal fun startReflectionRunnerWorker(
 
     return ReflectionRunnerWorker(
         runnerFactory = {
-            runnerFactory?.invoke(tradingConfig)
-                ?: runCatching {
-                    createReflectionRunner(
-                        database = database,
-                        environment = environment,
-                        tradingConfig = tradingConfig,
-                        clock = clock,
-                    )
-                }
+            runCatching {
+                createReflectionRunner(
+                    database = database,
+                    environment = environment,
+                    tradingConfig = tradingConfig,
+                    clock = clock,
+                )
+            }
         },
-        interval = tradingConfig.obsidian.writeInterval,
+        interval = maxDuration(
+            tradingConfig.obsidian.writeInterval,
+            tradingConfig.reflection.minInterval,
+        ),
         bootstrap = bootstrap ?: {
             TradingPersistenceBootstrap(
                 database = database,
@@ -173,11 +174,21 @@ private fun createReflectionRunner(
             llmRunRepository = ExposedLlmRunRepository(database),
             evaluationRepository = ExposedEvaluationRepository(database),
             clock = clock,
+            queryLimit = tradingConfig.reflection.queryLimit,
+            calibrationLookbackDays = tradingConfig.reflection.calibrationLookbackDays,
         ),
-        reportBuilder = ReflectionReportBuilder(tradingConfig),
+        reportBuilder = ReflectionReportBuilder(
+            tradingConfig = tradingConfig,
+            sampleWarningTradeCount = tradingConfig.reflection.sampleWarningTradeCount,
+            recentDecisionLimit = tradingConfig.reflection.recentDecisionLimit,
+        ),
         vaultWriter = ReflectionVaultWriter(
             vaultPath = vaultPath,
             redactor = SecretRedactor.fromEnvironment(environment),
         ),
     )
+}
+
+private fun maxDuration(first: Duration, second: Duration): Duration {
+    return if (first >= second) first else second
 }

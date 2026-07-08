@@ -7,7 +7,6 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import java.time.Clock
 import java.time.DayOfWeek
 import java.time.Duration
-import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.temporal.TemporalAdjusters
@@ -48,18 +47,27 @@ class ReflectionDataCollector(
      */
     suspend fun collect(): Result<ReflectionDataset> {
         return runCatching {
-            val generatedAt = clock.instant()
-            val tradingDate = generatedAt.atZone(tradingZone).toLocalDate()
+            val collectedAt = clock.instant()
+            val tradingDate = collectedAt.atZone(tradingZone).toLocalDate()
+            val previousTradingDate = tradingDate.minusDays(1)
+            val previousWeekDate = tradingDate
+                .with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY))
+                .minusDays(1)
             val dailyPeriod = dailyPeriod(tradingDate)
+            val previousDailyPeriod = dailyPeriod(previousTradingDate)
             val weeklyPeriod = weeklyPeriod(tradingDate)
-            val calibrationPeriod = calibrationPeriod(generatedAt)
+            val previousWeeklyPeriod = weeklyPeriod(previousWeekDate)
+            val calibrationPeriod = calibrationPeriod(tradingDate)
 
             ReflectionDataset(
-                generatedAt = generatedAt,
                 tradingDate = tradingDate,
                 weekId = weekId(tradingDate),
                 daily = collectWindow(dailyPeriod),
+                previousTradingDate = previousTradingDate,
+                previousDaily = collectWindow(previousDailyPeriod),
                 weekly = collectWindow(weeklyPeriod),
+                previousWeekId = weekId(previousWeekDate),
+                previousWeekly = collectWindow(previousWeeklyPeriod),
                 calibration = collectWindow(calibrationPeriod),
             )
         }
@@ -138,11 +146,13 @@ class ReflectionDataCollector(
         )
     }
 
-    private fun calibrationPeriod(generatedAt: Instant): ReflectionPeriod {
+    private fun calibrationPeriod(tradingDate: LocalDate): ReflectionPeriod {
+        val toExclusive = tradingDate.plusDays(1).atStartOfDay(tradingZone).toInstant()
+
         return ReflectionPeriod(
             id = "last-${calibrationLookbackDays}d",
-            from = generatedAt.minus(Duration.ofDays(calibrationLookbackDays.toLong())),
-            toExclusive = generatedAt.plusSeconds(READ_RANGE_FUTURE_TOLERANCE_SECONDS),
+            from = toExclusive.minus(Duration.ofDays(calibrationLookbackDays.toLong())),
+            toExclusive = toExclusive,
         )
     }
 
@@ -174,8 +184,3 @@ private fun Int.twoDigits(): String {
  * 1 週間の日数。
  */
 private const val DAYS_PER_WEEK = 7L
-
-/**
- * note 読み取り範囲の将来許容秒数。
- */
-private const val READ_RANGE_FUTURE_TOLERANCE_SECONDS = 1L

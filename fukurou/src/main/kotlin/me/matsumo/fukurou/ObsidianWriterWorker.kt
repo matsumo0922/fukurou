@@ -122,6 +122,7 @@ internal fun startObsidianWriterWorker(
     database: ExposedDatabase,
     environment: Map<String, String> = System.getenv(),
     clock: Clock = Clock.systemUTC(),
+    bootstrap: (() -> Result<Unit>)? = null,
 ): ObsidianWriterWorker? {
     val tradingConfig = TradingBotConfig.fromEnvironment(environment)
 
@@ -141,7 +142,7 @@ internal fun startObsidianWriterWorker(
             }
         },
         interval = tradingConfig.obsidian.writeInterval,
-        bootstrap = {
+        bootstrap = bootstrap ?: {
             TradingPersistenceBootstrap(
                 database = database,
                 clock = clock,
