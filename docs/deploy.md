@@ -30,16 +30,16 @@ docker compose pull && docker compose up -d
 
 ## 本番環境の想定値
 
-| 項目 | 値 |
-| --- | --- |
-| 公開ドメイン | `fukurou.matsumo.me` |
-| deploy root | `/srv/fukurou` |
-| root checkout | `/srv/fukurou/repo` |
-| NAS `.env` | `/srv/fukurou/.env` |
-| deploy script | `/usr/local/sbin/deploy-fukurou` |
-| self-hosted runner name | `dxp4800plus-fukurou-prod` |
-| self-hosted runner label | `fukurou-prod` |
-| production image | `ghcr.io/matsumo0922/fukurou:<commit-sha>` |
+| 項目                       | 値                                          |
+| ------------------------ | ------------------------------------------ |
+| 公開ドメイン                   | `fukurou.matsumo.me`                       |
+| deploy root              | `/srv/fukurou`                             |
+| root checkout            | `/srv/fukurou/repo`                        |
+| NAS `.env`               | `/srv/fukurou/.env`                        |
+| deploy script            | `/usr/local/sbin/deploy-fukurou`           |
+| self-hosted runner name  | `dxp4800plus-fukurou-prod`                 |
+| self-hosted runner label | `fukurou-prod`                             |
+| production image         | `ghcr.io/matsumo0922/fukurou:<commit-sha>` |
 
 ## NAS 側の初期セットアップ
 
