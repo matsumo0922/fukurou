@@ -7,7 +7,7 @@
 - コードは最低限の「安全床」だけを強制し、判断は LLM に広い裁量を与える
 - 売買能力は自作 MCP サーバー（`fukurou-mcp`）としてツール提供し、LLM がツール呼び出しで取引する
 - LLM は CLI（`claude` / `codex`）シェルアウトで実行（サブスク利用）
-- 取引・監査ログは PostgreSQL を正本にし、Obsidian Writer が人間向けノートを生成する
+- 取引・監査ログは PostgreSQL を正本にし、Obsidian Writer / Reflection Runner が人間向けノートを生成する
 
 ## 安全床
 
@@ -26,7 +26,7 @@ Kotlin/JVM ・ Ktor ・ Exposed ・ PostgreSQL ・ Docker Compose ・ MCP 公式
 
 詳細設計は [`docs/design.md`](docs/design.md)、MCP runtime と Docker 手順は [`docs/mcp-runtime.md`](docs/mcp-runtime.md) を参照。
 
-現時点では、`:trading` の paper account / broker / safety / reconciler / decision protocol / evaluation / knowledge writer / GMO Public market data、`:mcp-gmo-coin` の GMO Public market tools、`:mcp` の fukurou stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 worker、`web/` の Vite + React + TypeScript foundation が実装済みです。
+現時点では、`:trading` の paper account / broker / safety / reconciler / decision protocol / evaluation / knowledge writer / reflection runner / GMO Public market data、`:mcp-gmo-coin` の GMO Public market tools、`:mcp` の fukurou stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 worker、`web/` の Vite + React + TypeScript foundation が実装済みです。
 
 ## Backend / API
 

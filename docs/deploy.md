@@ -95,6 +95,7 @@ FUKUROU_OBSIDIAN_ENABLED=false
 FUKUROU_OBSIDIAN_VAULT_PATH=/vault
 FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS=300
 # FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
+# Obsidian writer と deterministic Reflection Runner は FUKUROU_OBSIDIAN_ENABLED を共有する。
 
 # production container では image 内の MCP fat jar を使う。
 FUKUROU_MCP_JAR_PATH=/app/fukurou-mcp-all.jar

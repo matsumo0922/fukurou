@@ -754,6 +754,7 @@ private val REQUIRED_DIRECTORIES = listOf(
     "Trades",
     "Daily",
     "Knowledge",
+    "Knowledge/DailyReflections",
     "Knowledge/Setups",
     "Knowledge/FailureModes",
     "Knowledge/Calibration",

@@ -3004,6 +3004,7 @@ Daily/2026/07/
 Knowledge/Setups/
 Knowledge/FailureModes/
 Knowledge/Calibration/
+Knowledge/DailyReflections/
 Knowledge/WeeklyReviews/
 Knowledge/PromptCandidates/
 Instruments/BTC.md
@@ -3018,6 +3019,8 @@ Instruments/BTC.md
 [実装済み: 2026-07-04] outbox table と `knowledge_notes` table は A-2 では追加しない。note は DB 状態の純粋な派生物として扱い、writer tick ごとに同じ入力から同じ Markdown を組み立てる。既存 file と内容が同じ場合は書き換えず、差分がある場合だけ同一 directory 内の一時 file へ書いてから atomic replace を試みる。vault 書き込みに失敗しても trading / DB record には影響させず、次 tick で自然復旧させる。vault を削除した場合も、DB から復元できる。
 
 [実装済み: 2026-07-04] 実装 package は新 module `:trading.knowledge` ではなく、既存 `:trading` module の `me.matsumo.fukurou.trading.knowledge` とする。A-2 は既存 repository と typed config に薄く乗るだけで、module 分割による依存境界を増やす段階ではないため。
+
+A-3 の deterministic Reflection Runner は、同じ vault に `Knowledge/DailyReflections/YYYY-MM-DD.md`、`Knowledge/WeeklyReviews/YYYY-Www.md`、`Knowledge/Calibration/ConfidenceCalibration.md`、`Knowledge/Setups/TagTaxonomy-YYYY-Www.md` を生成する。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。
 
 ### 11.4 Trade note frontmatter例
 
@@ -3254,9 +3257,9 @@ SORT created DESC
 
 ### 12.1 役割
 
-[確定] AI振り返りは日次＋週次で `Knowledge/` を書く・更新・リンクする。
+[確定] Reflection Runner は日次＋週次で `Knowledge/` に deterministic report を書く。
 
-[設計提案] 振り返りエージェントは売買act系ツールを持たない。read-only DB + Knowledge writeだけを許可する。これにより、分析エージェントが誤って発注する経路を断つ。
+Reflection Runner は LLM CLI を呼び出さず、売買 act 系ツールも持たない。read-only DB と vault write だけで report を再生成し、失敗しても trading / scheduler / DB record には影響させない。
 
 [確定事項の改訂: 2026-07-02] 全エントリーは setup tags を必須とする。LLMは新タグを作成できるが、振り返りエージェントが taxonomy を統合・改廃し、似たタグの統合、廃止タグの提案、setup別の勝率/PF/期待Rを一次出力として記録する。
 
@@ -3276,10 +3279,10 @@ SORT created DESC
 
 出力:
 
-- `Daily/YYYY/MM/YYYY-MM-DD.md`
-- 当日trade noteへの追記
-- `Knowledge/FailureModes/*.md` の追記候補
-- `Knowledge/Setups/*.md` の統計更新候補
+- `Knowledge/DailyReflections/YYYY-MM-DD.md`
+- `Knowledge/Calibration/ConfidenceCalibration.md`
+- `Knowledge/Setups/TagTaxonomy-YYYY-Www.md`
+- `Daily/` 配下の note は更新しない
 
 日次で見る指標:
 
@@ -3307,9 +3310,8 @@ SORT created DESC
 
 - `Knowledge/WeeklyReviews/YYYY-Www.md`
 - `Knowledge/Calibration/ConfidenceCalibration.md`
-- `Knowledge/Setups/*.md` の統計更新
-- `Knowledge/FailureModes/*.md` の統合・リンク
-- `Knowledge/PromptCandidates/YYYY-Www.md` にsystem prompt改善候補
+- `Knowledge/Setups/TagTaxonomy-YYYY-Www.md`
+- `Knowledge/PromptCandidates/` は deterministic runner では生成しない
 
 週次の分析:
 
@@ -3324,24 +3326,18 @@ SORT created DESC
 
 ### 12.4 Knowledge更新の安全策
 
-[設計提案] reflection agentはKnowledgeを直接更新してよいが、system promptやconfigは直接変更しない。変更候補だけを書き、人間または別の明示的な適用プロセスで採用する。
+Reflection Runner は Knowledge report を直接更新するが、system prompt や config は変更しない。PromptCandidates も deterministic runner では生成しない。
 
 ```text
 Knowledge update: 自動可
-PromptCandidates: 自動可
+PromptCandidates: 自動不可
 Config change: 自動不可
 Safety Floor change: 不可
 ```
 
-### 12.5 振り返り用プロンプト要約
+### 12.5 振り返り用プロンプト境界
 
-```markdown
-あなたは取引実行を行わない振り返りエージェントです。
-目的は、今日/今週の判断を検証し、Knowledgeを更新することです。
-売買ツールは使えません。結果論だけで判断を責めず、判断時点の情報で妥当だったかを評価してください。
-confidenceの較正、安全床拒否、override、NO_TRADEの質を重視してください。
-出力はObsidian Markdownとして保存されます。
-```
+Reflection Runner は deterministic report のみを生成し、LLM prompt は実行しない。confidence の較正、sample size warning、truncation flag、setup tag taxonomy は DB から機械的に算出し、Obsidian Markdown として保存する。
 
 ---
 
@@ -3938,7 +3934,7 @@ maxDD = min((equity - equityPeak) / equityPeak)
    - confidence bucketごとの実現勝率、期待R、Brier風スコアを週次で計算する。
 
 7. プロンプト改善パイプライン
-   - Reflectionが `PromptCandidates/` に改善案を書き、人間承認後にsystem prompt versionを更新する。
+   - PromptCandidates パイプラインは未実装。deterministic Reflection Runner は `PromptCandidates/` を生成しない。
 
 ### 16.4 確定事項からの逸脱提案
 

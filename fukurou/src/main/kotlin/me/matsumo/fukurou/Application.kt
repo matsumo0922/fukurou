@@ -219,7 +219,18 @@ fun Application.module(
     } else {
         null
     }
-    val hasBackgroundWorker = reconcilerWorker != null || llmDaemonWorker != null || obsidianWriterWorker != null
+    val reflectionRunnerWorker = if (databaseDataSource != null && database != null) {
+        startReflectionRunnerWorker(
+            database = database,
+            clock = clock,
+        )
+    } else {
+        null
+    }
+    val hasBackgroundWorker = reconcilerWorker != null ||
+        llmDaemonWorker != null ||
+        obsidianWriterWorker != null ||
+        reflectionRunnerWorker != null
     val hasClosableResource = databaseDataSource != null ||
         hasBackgroundWorker ||
         createdManualLlmLaunchService != null ||
@@ -227,6 +238,7 @@ fun Application.module(
 
     if (hasClosableResource) {
         monitor.subscribe(ApplicationStopped) {
+            reflectionRunnerWorker?.close()
             obsidianWriterWorker?.close()
             llmDaemonWorker?.close()
             createdLlmAuthService?.close()

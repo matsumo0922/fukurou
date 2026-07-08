@@ -1,0 +1,183 @@
+package me.matsumo.fukurou
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
+import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
+import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
+import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import me.matsumo.fukurou.trading.reflection.ReflectionDataCollector
+import me.matsumo.fukurou.trading.reflection.ReflectionReportBuilder
+import me.matsumo.fukurou.trading.reflection.ReflectionRunner
+import me.matsumo.fukurou.trading.reflection.ReflectionVaultWriter
+import me.matsumo.fukurou.trading.runner.SecretRedactor
+import java.nio.file.Path
+import java.time.Clock
+import java.time.Duration
+import java.util.logging.Logger
+import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
+
+/**
+ * Reflection runner failure log の rate limit key。
+ */
+private const val REFLECTION_RUNNER_FAILURE_LOG_KEY = "reflection-runner-worker-failure"
+
+/**
+ * ReflectionRunnerWorker 用 logger。
+ */
+private val REFLECTION_WORKER_LOGGER = Logger.getLogger(ReflectionRunnerWorker::class.java.name)
+
+/**
+ * Ktor backend 上で deterministic reflection runner を常駐起動する worker。
+ *
+ * @param runnerFactory runner 構築処理
+ * @param interval loop 間隔
+ * @param bootstrap runner loop 開始前に必要な DB schema 初期化
+ * @param clock warning log の rate limit 判定に使う clock
+ * @param warnLogger rate-limited warning logger
+ * @param scope worker coroutine scope
+ */
+class ReflectionRunnerWorker(
+    private val runnerFactory: () -> Result<ReflectionRunner>,
+    private val interval: Duration,
+    private val bootstrap: () -> Result<Unit> = { Result.success(Unit) },
+    clock: Clock = Clock.systemUTC(),
+    private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
+        logger = REFLECTION_WORKER_LOGGER,
+        clock = clock,
+    ),
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+) : AutoCloseable {
+
+    private var job: Job? = null
+
+    /**
+     * worker loop を開始する。
+     */
+    fun start(): ReflectionRunnerWorker {
+        require(job == null) { "ReflectionRunnerWorker is already started." }
+
+        job = scope.launch {
+            awaitBootstrap()
+
+            while (currentCoroutineContext().isActive) {
+                val loopResult = runnerFactory().mapCatching { runner ->
+                    runner.runOnce().getOrThrow()
+                }
+
+                if (loopResult.isFailure) {
+                    warnLoopFailure(requireNotNull(loopResult.exceptionOrNull()))
+                }
+
+                delay(interval.toMillis())
+            }
+        }
+
+        return this
+    }
+
+    private suspend fun awaitBootstrap() {
+        while (currentCoroutineContext().isActive) {
+            val bootstrapResult = bootstrap()
+
+            if (bootstrapResult.isSuccess) {
+                return
+            }
+
+            warnLoopFailure(requireNotNull(bootstrapResult.exceptionOrNull()))
+            delay(interval.toMillis())
+        }
+    }
+
+    private fun warnLoopFailure(throwable: Throwable) {
+        if (throwable is CancellationException) {
+            throw throwable
+        }
+
+        warnLogger.warn(
+            key = REFLECTION_RUNNER_FAILURE_LOG_KEY,
+            message = "ReflectionRunnerWorker loop failed.",
+            throwable = throwable,
+        )
+    }
+
+    override fun close() {
+        job?.cancel()
+        scope.cancel()
+    }
+}
+
+/**
+ * DB runtime から ReflectionRunnerWorker を構築して起動する。
+ */
+internal fun startReflectionRunnerWorker(
+    database: ExposedDatabase,
+    environment: Map<String, String> = System.getenv(),
+    clock: Clock = Clock.systemUTC(),
+    runnerFactory: ((TradingBotConfig) -> Result<ReflectionRunner>)? = null,
+    bootstrap: (() -> Result<Unit>)? = null,
+): ReflectionRunnerWorker? {
+    val tradingConfig = TradingBotConfig.fromEnvironment(environment)
+
+    if (!tradingConfig.obsidian.enabled) {
+        return null
+    }
+
+    return ReflectionRunnerWorker(
+        runnerFactory = {
+            runnerFactory?.invoke(tradingConfig)
+                ?: runCatching {
+                    createReflectionRunner(
+                        database = database,
+                        environment = environment,
+                        tradingConfig = tradingConfig,
+                        clock = clock,
+                    )
+                }
+        },
+        interval = tradingConfig.obsidian.writeInterval,
+        bootstrap = bootstrap ?: {
+            TradingPersistenceBootstrap(
+                database = database,
+                clock = clock,
+                paperAccountConfig = tradingConfig.paperAccount,
+            ).ensureSchema()
+        },
+        clock = clock,
+    ).start()
+}
+
+private fun createReflectionRunner(
+    database: ExposedDatabase,
+    environment: Map<String, String>,
+    tradingConfig: TradingBotConfig,
+    clock: Clock,
+): ReflectionRunner {
+    val vaultPath = Path.of(tradingConfig.obsidian.vaultPath)
+        .toAbsolutePath()
+        .normalize()
+
+    return ReflectionRunner(
+        dataCollector = ReflectionDataCollector(
+            decisionRepository = ExposedDecisionRepository(database, clock),
+            llmRunRepository = ExposedLlmRunRepository(database),
+            evaluationRepository = ExposedEvaluationRepository(database),
+            clock = clock,
+        ),
+        reportBuilder = ReflectionReportBuilder(tradingConfig),
+        vaultWriter = ReflectionVaultWriter(
+            vaultPath = vaultPath,
+            redactor = SecretRedactor.fromEnvironment(environment),
+        ),
+    )
+}
