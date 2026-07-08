@@ -2,11 +2,10 @@ package me.matsumo.fukurou
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
@@ -464,14 +463,7 @@ class DefaultLlmAuthService(
 
     override fun close() {
         sessions.values.forEach { session -> session.destroyProcess() }
-
-        val scopeJob = scope.coroutineContext[Job] ?: return
-
-        scopeJob.cancel()
-
-        runBlocking {
-            scopeJob.join()
-        }
+        scope.cancel()
     }
 
     private fun providerStatus(provider: LlmAuthProvider, checkedAt: Instant): LlmAuthProviderStatus {
