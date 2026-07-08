@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import AlertTriangle from "lucide-react/dist/esm/icons/alert-triangle.mjs";
+import KeyRound from "lucide-react/dist/esm/icons/key-round.mjs";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import ServerCog from "lucide-react/dist/esm/icons/server-cog.mjs";
 import { systemStatusQuery, type SystemStatusSnapshot } from "../api/system";
@@ -45,6 +46,7 @@ export function SystemPage() {
 function SystemStatus({ data, isStale }: { data: SystemStatusSnapshot; isStale: boolean }) {
   const { locale, t } = useI18n();
   const readinessTone = readinessStatusTone(data.readiness.status);
+  const authSummary = llmAuthSummary(data);
 
   return (
     <>
@@ -56,6 +58,7 @@ function SystemStatus({ data, isStale }: { data: SystemStatusSnapshot; isStale: 
         />
         <Metric label={t("system.metric.readiness")} value={data.readiness.status} detail={`HTTP ${data.readinessHttpStatus}`} />
         <Metric label={t("system.metric.revision")} value={data.revision} detail={`HTTP ${data.revisionHttpStatus}`} />
+        <Metric label={t("system.metric.llmAuth")} value={authSummary.value} detail={authSummary.detail} />
         <div className="metric">
           <div className="metric__label-row">
             <p className="metric__label">{t("system.metric.freshness")}</p>
@@ -110,6 +113,20 @@ function SystemStatus({ data, isStale }: { data: SystemStatusSnapshot; isStale: 
           ]}
         />
       </Panel>
+
+      <Panel>
+        <div className="panel-heading">
+          <KeyRound size={18} aria-hidden="true" />
+          <h2>{t("system.panel.cliAuth")}</h2>
+        </div>
+        <DataStrip
+          items={data.llmAuth.providers.map((provider) => ({
+            label: provider.displayName,
+            value: provider.status,
+            detail: `${provider.detail ?? t("common.notReported")} / ${t("system.label.authHome")}: ${provider.homePath}`,
+          }))}
+        />
+      </Panel>
     </>
   );
 }
@@ -154,6 +171,10 @@ function endpointPayload(path: SystemStatusSnapshot["endpoints"][number]["path"]
       return `status=${data.readiness.status}`;
     case "/revision":
       return data.revision;
+    case "/ops/llm-auth":
+      return data.llmAuth.providers
+        .map((provider) => `${provider.provider}=${provider.status}`)
+        .join(", ");
   }
 }
 
@@ -171,4 +192,14 @@ function httpStatusTone(status: number): StatusTone {
 
 function readinessStatusTone(status: string): StatusTone {
   return status.toLowerCase() === "ready" ? "positive" : "warning";
+}
+
+function llmAuthSummary(data: SystemStatusSnapshot): { value: string; detail: string } {
+  const loggedInCount = data.llmAuth.providers.filter((provider) => provider.status === "logged_in").length;
+  const providerCount = data.llmAuth.providers.length;
+
+  return {
+    value: `${loggedInCount}/${providerCount} logged in`,
+    detail: `HTTP ${data.llmAuthHttpStatus}`,
+  };
 }

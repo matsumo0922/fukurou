@@ -99,6 +99,74 @@ data class OpsTriggerResponse(
 )
 
 /**
+ * CLI auth status API の response body。
+ *
+ * @param providers provider 別 login 状態
+ * @param checkedAt 状態を確認した時刻
+ */
+@Serializable
+data class OpsLlmAuthResponse(
+    val providers: List<OpsLlmAuthProviderResponse>,
+    val checkedAt: String,
+)
+
+/**
+ * CLI auth status API の provider 要素。
+ *
+ * @param provider provider wire name
+ * @param displayName UI 表示名
+ * @param status login 状態
+ * @param detail secret を含まない補足
+ * @param homePath login state の home path
+ * @param checkedAt 状態を確認した時刻
+ */
+@Serializable
+data class OpsLlmAuthProviderResponse(
+    val provider: String,
+    val displayName: String,
+    val status: String,
+    val detail: String?,
+    val homePath: String,
+    val checkedAt: String,
+)
+
+/**
+ * CLI auth login API の request body。
+ *
+ * @param reason login flow を開始する理由
+ */
+@Serializable
+data class OpsLlmAuthLoginRequest(
+    val reason: String,
+)
+
+/**
+ * CLI auth login API の response body。
+ *
+ * @param provider provider wire name
+ * @param sessionId login session ID
+ * @param status login process 状態
+ * @param authorizationUrl browser 承認用 URL
+ * @param userCode device auth code
+ * @param detail secret を含まない補足
+ * @param startedAt 開始時刻
+ * @param expiresAt timeout 時刻
+ * @param completedAt 完了時刻
+ */
+@Serializable
+data class OpsLlmAuthLoginResponse(
+    val provider: String,
+    val sessionId: String,
+    val status: String,
+    val authorizationUrl: String?,
+    val userCode: String?,
+    val detail: String?,
+    val startedAt: String,
+    val expiresAt: String,
+    val completedAt: String?,
+)
+
+/**
  * risk_state API の response body。
  *
  * @param state 現在の halt state
@@ -403,11 +471,13 @@ data class OpsActivityMetadataResponse(
 /**
  * 運用系 route を定義する。
  */
+@Suppress("LongMethod", "CyclomaticComplexMethod", "LongParameterList")
 @OptIn(ExperimentalKtorApi::class)
 internal fun Route.opsRoutes(
     riskStateRepository: RiskStateRepository?,
     riskStateCommandService: RiskStateCommandService?,
     manualLlmLaunchService: ManualLlmLaunchService?,
+    llmAuthService: LlmAuthService?,
     decisionRepository: DecisionRepository?,
     paperLedgerRepository: PaperLedgerRepository?,
     commandEventFeedReader: CommandEventFeedReader?,
@@ -549,6 +619,126 @@ internal fun Route.opsRoutes(
             }
             HttpStatusCode.ServiceUnavailable {
                 description = "manual LLM launch service が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    get("/ops/llm-auth") {
+        val service = call.requireLlmAuthService(llmAuthService) ?: return@get
+        val snapshot = service.snapshot().getOrThrow()
+
+        call.respond(snapshot.toOpsLlmAuthResponse())
+    }.describe {
+        summary = "CLI auth 状態を取得する"
+        description = "Claude Code / Codex CLI の login state を専用 endpoint で返します。token や credential file の内容は返しません。"
+        tag(OPS_TAG)
+        responses {
+            HttpStatusCode.OK {
+                description = "CLI auth provider 別状態です。"
+                schema = jsonSchema<OpsLlmAuthResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "CLI auth service が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    post("/ops/llm-auth/{provider}/login") {
+        val provider = call.requireLlmAuthProvider(call.parameters["provider"]) ?: return@post
+        val request = call.receiveBodyOrBadRequest<OpsLlmAuthLoginRequest>() ?: return@post
+        val reason = call.requireReason(request.reason) ?: return@post
+        val service = call.requireLlmAuthService(llmAuthService) ?: return@post
+        val result = service.startLogin(provider, reason).getOrThrow()
+
+        when (result) {
+            is LlmAuthLoginStartResult.Accepted -> call.respond(
+                HttpStatusCode.Accepted,
+                result.session.toOpsLlmAuthLoginResponse(),
+            )
+            is LlmAuthLoginStartResult.Rejected -> call.respond(
+                HttpStatusCode.Conflict,
+                ErrorResponse(result.reason),
+            )
+        }
+    }.describe {
+        summary = "CLI auth login flow を開始する"
+        description = "Claude Code / Codex CLI の login flow を reason 付きで開始します。応答には token や credential file の内容を含めません。"
+        tag(OPS_TAG)
+        parameters {
+            path("provider") {
+                description = "claude または codex です。"
+                schema = jsonSchema<String>()
+            }
+        }
+        requestBody {
+            description = "login flow を開始する理由です。"
+            required = true
+            schema = jsonSchema<OpsLlmAuthLoginRequest>()
+        }
+        responses {
+            HttpStatusCode.Accepted {
+                description = "login process を開始しました。"
+                schema = jsonSchema<OpsLlmAuthLoginResponse>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "provider、request body、または reason が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.Conflict {
+                description = "同じ provider の login process がすでに実行中です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "CLI auth service が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    get("/ops/llm-auth/{provider}/login/{sessionId}") {
+        val provider = call.requireLlmAuthProvider(call.parameters["provider"]) ?: return@get
+        val sessionId = call.requirePathValue(call.parameters["sessionId"], "sessionId is required") ?: return@get
+        val service = call.requireLlmAuthService(llmAuthService) ?: return@get
+        val session = service.loginSession(provider, sessionId).getOrThrow()
+
+        if (session == null) {
+            call.respond(HttpStatusCode.NotFound, ErrorResponse("login session not found"))
+
+            return@get
+        }
+
+        call.respond(session.toOpsLlmAuthLoginResponse())
+    }.describe {
+        summary = "CLI auth login session を取得する"
+        description = "開始済み login flow の現在状態と、CLI が出した authorization URL / user code を返します。token や credential file の内容は返しません。"
+        tag(OPS_TAG)
+        parameters {
+            path("provider") {
+                description = "claude または codex です。"
+                schema = jsonSchema<String>()
+            }
+            path("sessionId") {
+                description = "login start 応答の sessionId です。"
+                schema = jsonSchema<String>()
+            }
+        }
+        responses {
+            HttpStatusCode.OK {
+                description = "login session の現在状態です。"
+                schema = jsonSchema<OpsLlmAuthLoginResponse>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "provider または sessionId が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.NotFound {
+                description = "login session が見つかりません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "CLI auth service が利用できません。"
                 schema = jsonSchema<ErrorResponse>()
             }
         }
@@ -905,6 +1095,42 @@ private suspend fun ApplicationCall.requireManualLlmLaunchService(
     return null
 }
 
+private suspend fun ApplicationCall.requireLlmAuthService(service: LlmAuthService?): LlmAuthService? {
+    if (service != null) {
+        return service
+    }
+
+    respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("CLI auth service is not configured"))
+
+    return null
+}
+
+private suspend fun ApplicationCall.requireLlmAuthProvider(rawProvider: String?): LlmAuthProvider? {
+    val provider = rawProvider
+        ?.trim()
+        ?.let { value -> LlmAuthProvider.entries.firstOrNull { candidate -> candidate.wireName == value } }
+
+    if (provider != null) {
+        return provider
+    }
+
+    respond(HttpStatusCode.BadRequest, ErrorResponse("provider is invalid"))
+
+    return null
+}
+
+private suspend fun ApplicationCall.requirePathValue(rawValue: String?, errorMessage: String): String? {
+    val value = rawValue?.trim()
+
+    if (!value.isNullOrEmpty()) {
+        return value
+    }
+
+    respond(HttpStatusCode.BadRequest, ErrorResponse(errorMessage))
+
+    return null
+}
+
 private suspend fun ApplicationCall.requireDecisionRepository(repository: DecisionRepository?): DecisionRepository? {
     if (repository != null) {
         return repository
@@ -1163,6 +1389,38 @@ private fun RiskState.toOpsRiskStateResponse(): OpsRiskStateResponse {
         resumedAt = resumedAt?.toString(),
         resumedReason = resumedReason,
         drawdownRatio = drawdownRatio.toPlainString(),
+    )
+}
+
+private fun LlmAuthSnapshot.toOpsLlmAuthResponse(): OpsLlmAuthResponse {
+    return OpsLlmAuthResponse(
+        providers = providers.map { provider -> provider.toOpsLlmAuthProviderResponse() },
+        checkedAt = checkedAt.toString(),
+    )
+}
+
+private fun LlmAuthProviderStatus.toOpsLlmAuthProviderResponse(): OpsLlmAuthProviderResponse {
+    return OpsLlmAuthProviderResponse(
+        provider = provider.wireName,
+        displayName = provider.displayName,
+        status = status.wireName,
+        detail = detail,
+        homePath = homePath,
+        checkedAt = checkedAt.toString(),
+    )
+}
+
+private fun LlmAuthLoginSessionSnapshot.toOpsLlmAuthLoginResponse(): OpsLlmAuthLoginResponse {
+    return OpsLlmAuthLoginResponse(
+        provider = provider.wireName,
+        sessionId = sessionId,
+        status = status.wireName,
+        authorizationUrl = authorizationUrl,
+        userCode = userCode,
+        detail = detail,
+        startedAt = startedAt.toString(),
+        expiresAt = expiresAt.toString(),
+        completedAt = completedAt?.toString(),
     )
 }
 

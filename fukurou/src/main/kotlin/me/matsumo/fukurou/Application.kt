@@ -13,6 +13,7 @@ import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -52,12 +53,15 @@ fun interface ReadinessProbe {
  * @param evaluationMarketDataSource 評価 API 用 market data source。null なら DB 設定時だけ GMO source を構築する
  * @param opsRiskStateCommandService ops API 用 risk_state command service。null なら DB 設定から構築する
  * @param opsManualLlmLaunchService ops API 用 manual LLM launch service。null なら DB と runner env から構築する
+ * @param opsLlmAuthService ops API 用 CLI auth service。null なら環境変数から構築する
  * @param opsDecisionRepository ops API 用 decision repository。null なら DB 設定から構築する
  * @param opsPaperLedgerRepository ops API 用 paper ledger repository。null なら DB 設定から構築する
+ * @param opsCommandEventLog ops API 用 command_event_log writer。null なら DB 設定から構築する
  * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
  * @param tradingConfig trading runtime config
  * @param webRoot WebUI の build output を配信する filesystem root。null なら Web 配信を無効にする
  */
+@Suppress("LongMethod", "CyclomaticComplexMethod")
 fun Application.module(
     readinessProbe: ReadinessProbe? = null,
     revision: String = currentRevisionFromEnv(),
@@ -68,8 +72,10 @@ fun Application.module(
     evaluationMarketDataSource: MarketDataSource? = null,
     opsRiskStateCommandService: RiskStateCommandService? = null,
     opsManualLlmLaunchService: ManualLlmLaunchService? = null,
+    opsLlmAuthService: LlmAuthService? = null,
     opsDecisionRepository: DecisionRepository? = null,
     opsPaperLedgerRepository: PaperLedgerRepository? = null,
+    opsCommandEventLog: CommandEventLog? = null,
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     webRoot: File? = webRootFromEnv(),
@@ -98,9 +104,11 @@ fun Application.module(
     val resolvedOpsPaperLedgerRepository = opsPaperLedgerRepository ?: database?.let { connectedDatabase ->
         ExposedPaperLedgerRepository(connectedDatabase)
     }
-    val resolvedOpsCommandEventFeedReader = opsCommandEventFeedReader ?: database?.let { connectedDatabase ->
+    val createdOpsCommandEventLog = database?.let { connectedDatabase ->
         ExposedCommandEventLog(connectedDatabase)
     }
+    val resolvedOpsCommandEventLog: CommandEventLog? = opsCommandEventLog ?: createdOpsCommandEventLog
+    val resolvedOpsCommandEventFeedReader: CommandEventFeedReader? = opsCommandEventFeedReader ?: createdOpsCommandEventLog
     val shouldCreateManualLlmLaunchService = opsManualLlmLaunchService == null && databaseDataSource != null && database != null
     val createdManualLlmLaunchService = if (shouldCreateManualLlmLaunchService) {
         createManualLlmLaunchService(
@@ -114,6 +122,16 @@ fun Application.module(
         null
     }
     val resolvedOpsManualLlmLaunchService = opsManualLlmLaunchService ?: createdManualLlmLaunchService
+    val createdLlmAuthService = if (opsLlmAuthService == null) {
+        DefaultLlmAuthService(
+            config = LlmAuthServiceConfig.fromEnvironment(environment),
+            commandEventLog = resolvedOpsCommandEventLog,
+            clock = clock,
+        )
+    } else {
+        null
+    }
+    val resolvedOpsLlmAuthService = opsLlmAuthService ?: createdLlmAuthService
     val resolvedEvaluationMarketDataSource = evaluationMarketDataSource ?: database?.let {
         GmoPublicMarketDataSource.fromConfig(
             config = tradingConfig.gmoPublicClient,
@@ -165,6 +183,7 @@ fun Application.module(
             riskStateRepository = resolvedEvaluationRiskStateRepository,
             riskStateCommandService = resolvedOpsRiskStateCommandService,
             manualLlmLaunchService = resolvedOpsManualLlmLaunchService,
+            llmAuthService = resolvedOpsLlmAuthService,
             decisionRepository = resolvedOpsDecisionRepository,
             paperLedgerRepository = resolvedOpsPaperLedgerRepository,
             commandEventFeedReader = resolvedOpsCommandEventFeedReader,
@@ -201,12 +220,16 @@ fun Application.module(
         null
     }
     val hasBackgroundWorker = reconcilerWorker != null || llmDaemonWorker != null || obsidianWriterWorker != null
-    val hasClosableResource = databaseDataSource != null || hasBackgroundWorker || createdManualLlmLaunchService != null
+    val hasClosableResource = databaseDataSource != null ||
+        hasBackgroundWorker ||
+        createdManualLlmLaunchService != null ||
+        createdLlmAuthService != null
 
     if (hasClosableResource) {
         monitor.subscribe(ApplicationStopped) {
             obsidianWriterWorker?.close()
             llmDaemonWorker?.close()
+            createdLlmAuthService?.close()
             createdManualLlmLaunchService?.close()
             reconcilerWorker?.close()
             databaseDataSource?.close()

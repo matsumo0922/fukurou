@@ -6,9 +6,11 @@ export type HealthResponse = components["schemas"]["HealthResponse"];
 
 export type ReadinessResponse = components["schemas"]["ReadinessResponse"];
 
+export type OpsLlmAuthResponse = components["schemas"]["OpsLlmAuthResponse"];
+
 export type SystemEndpointSnapshot = {
   label: string;
-  path: "/health" | "/health/ready" | "/revision";
+  path: "/health" | "/health/ready" | "/revision" | "/ops/llm-auth";
   httpStatus: number;
 };
 
@@ -19,6 +21,8 @@ export type SystemStatusSnapshot = {
   readinessHttpStatus: number;
   revision: string;
   revisionHttpStatus: number;
+  llmAuth: OpsLlmAuthResponse;
+  llmAuthHttpStatus: number;
   fetchedAt: string;
   endpoints: SystemEndpointSnapshot[];
 };
@@ -31,10 +35,11 @@ export const systemStatusQuery = queryOptions({
 });
 
 export async function fetchSystemStatus(): Promise<SystemStatusSnapshot> {
-  const [healthResponse, readinessResponse, revisionResponse] = await Promise.all([
+  const [healthResponse, readinessResponse, revisionResponse, llmAuthResponse] = await Promise.all([
     getJsonResponse("/health"),
     getJsonResponse("/health/ready", [200, 503]),
     getTextResponse("/revision"),
+    getJsonResponse("/ops/llm-auth"),
   ]);
 
   return {
@@ -44,6 +49,8 @@ export async function fetchSystemStatus(): Promise<SystemStatusSnapshot> {
     readinessHttpStatus: readinessResponse.status,
     revision: normalizeRevision(revisionResponse.data),
     revisionHttpStatus: revisionResponse.status,
+    llmAuth: llmAuthResponse.data,
+    llmAuthHttpStatus: llmAuthResponse.status,
     fetchedAt: new Date().toISOString(),
     endpoints: [
       {
@@ -60,6 +67,11 @@ export async function fetchSystemStatus(): Promise<SystemStatusSnapshot> {
         label: "Revision",
         path: "/revision",
         httpStatus: revisionResponse.status,
+      },
+      {
+        label: "CLI Auth",
+        path: "/ops/llm-auth",
+        httpStatus: llmAuthResponse.status,
       },
     ],
   };

@@ -2,15 +2,21 @@ import { useMutation, useQuery, useQueryClient, type QueryClient, type UseQueryR
 import { useState, type ChangeEvent, type FormEvent } from "react";
 import Activity from "lucide-react/dist/esm/icons/activity.mjs";
 import AlertTriangle from "lucide-react/dist/esm/icons/alert-triangle.mjs";
+import KeyRound from "lucide-react/dist/esm/icons/key-round.mjs";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import ShieldAlert from "lucide-react/dist/esm/icons/shield-alert.mjs";
 import { ApiClientError } from "../api/client";
 import {
+  LLM_AUTH_PROVIDERS,
+  opsLlmAuthLoginSessionQuery,
   opsPositionsQuery,
   opsRiskStateQuery,
+  requestOpsLlmAuthLogin,
   requestOpsHalt,
   requestOpsResume,
   requestOpsTrigger,
+  type LlmAuthProvider,
+  type OpsLlmAuthLoginResponse,
   type OpsPositionsResponse,
   type OpsRiskStateResponse,
 } from "../api/ops";
@@ -28,6 +34,11 @@ type ControlNotice = {
   tone: StatusTone;
   title: string;
   detail: string;
+};
+
+type ActiveLlmAuthLogin = {
+  provider: LlmAuthProvider;
+  session: OpsLlmAuthLoginResponse;
 };
 
 type ActionButtonTone = "neutral" | "warning" | "critical";
@@ -56,6 +67,14 @@ export function ControlsPage() {
   const riskStateQuery = useQuery(opsRiskStateQuery);
   const positionsQuery = useQuery(opsPositionsQuery);
   const [notice, setNotice] = useState<ControlNotice | null>(null);
+  const [activeLlmAuthLogin, setActiveLlmAuthLogin] = useState<ActiveLlmAuthLogin | null>(null);
+  const llmAuthLoginSessionQuery = useQuery({
+    ...opsLlmAuthLoginSessionQuery(
+      activeLlmAuthLogin?.provider ?? "claude",
+      activeLlmAuthLogin?.session.sessionId ?? "",
+    ),
+    enabled: activeLlmAuthLogin !== null,
+  });
 
   const refreshAfterSuccess = () => {
     void refreshControlsData(queryClient);
@@ -141,9 +160,38 @@ export function ControlsPage() {
       });
     },
   });
-  const isRefreshing = riskStateQuery.isFetching || positionsQuery.isFetching;
+  const llmAuthLoginMutation = useMutation({
+    mutationFn: requestOpsLlmAuthLogin,
+    onSuccess: (session, variables) => {
+      setActiveLlmAuthLogin({
+        provider: variables.provider,
+        session,
+      });
+      setNotice({
+        tone: "positive",
+        title: t("controls.notice.llmAuthLoginStartedTitle"),
+        detail: formatMessage(t("controls.notice.llmAuthLoginStarted"), {
+          provider: providerDisplayName(variables.provider),
+          sessionId: session.sessionId,
+        }),
+      });
+      refreshAfterSuccess();
+    },
+    onError: (error) => {
+      setNotice({
+        tone: "critical",
+        title: t("controls.notice.llmAuthLoginFailed"),
+        detail: describeControlError(error, t),
+      });
+    },
+  });
+  const isRefreshing = riskStateQuery.isFetching || positionsQuery.isFetching || llmAuthLoginSessionQuery.isFetching;
   const isOperationInFlight =
-    softHaltMutation.isPending || hardHaltMutation.isPending || resumeMutation.isPending || triggerMutation.isPending;
+    softHaltMutation.isPending ||
+    hardHaltMutation.isPending ||
+    resumeMutation.isPending ||
+    triggerMutation.isPending ||
+    llmAuthLoginMutation.isPending;
   const refreshed = () => {
     void riskStateQuery.refetch();
     void positionsQuery.refetch();
@@ -264,6 +312,50 @@ export function ControlsPage() {
           />
         </Panel>
       </div>
+
+      <Panel className="panel--wide">
+        <div className="panel-heading">
+          <KeyRound size={18} aria-hidden="true" />
+          <h2>{t("controls.panel.llmAuth")}</h2>
+        </div>
+        <div className="control-action-grid control-action-grid--two">
+          {LLM_AUTH_PROVIDERS.map((provider) => {
+            const displayName = providerDisplayName(provider);
+            const providerIsPending = llmAuthLoginMutation.isPending && llmAuthLoginMutation.variables?.provider === provider;
+
+            return (
+              <SafetyActionForm
+                id={`${provider}-llm-auth`}
+                key={provider}
+                title={formatMessage(t("controls.action.llmAuth.title"), {
+                  provider: displayName,
+                })}
+                description={t("controls.action.llmAuth.description")}
+                badgeLabel={provider.toUpperCase()}
+                badgeTone="neutral"
+                reasonLabel={formatMessage(t("controls.action.llmAuth.reason"), {
+                  provider: displayName,
+                })}
+                reasonPlaceholder={t("controls.action.llmAuth.placeholder")}
+                reviewLabel={formatMessage(t("controls.action.llmAuth.review"), {
+                  provider: displayName,
+                })}
+                confirmLabel={formatMessage(t("controls.action.llmAuth.confirm"), {
+                  provider: displayName,
+                })}
+                pendingLabel={t("controls.action.llmAuth.pending")}
+                buttonTone="neutral"
+                isPending={providerIsPending}
+                isDisabled={isOperationInFlight}
+                submitted={(reason) => llmAuthLoginMutation.mutate({ provider, reason })}
+              />
+            );
+          })}
+        </div>
+        <LlmAuthLoginSessionPanel
+          session={llmAuthLoginSessionQuery.data ?? activeLlmAuthLogin?.session ?? null}
+        />
+      </Panel>
     </div>
   );
 }
@@ -391,6 +483,59 @@ function HaltSemantics() {
       <div className="halt-semantics__item halt-semantics__item--hard">
         <StatusPill label="HARD_HALT" tone="critical" />
         <p>{t("controls.haltSemantics.hard")}</p>
+      </div>
+    </div>
+  );
+}
+
+function LlmAuthLoginSessionPanel({ session }: { session: OpsLlmAuthLoginResponse | null }) {
+  const { locale, t } = useI18n();
+
+  if (!session) {
+    return null;
+  }
+
+  return (
+    <div className="llm-auth-session">
+      <div className="llm-auth-session__heading">
+        <h3>{t("controls.panel.llmAuthSession")}</h3>
+        <StatusPill label={session.status} tone={llmAuthLoginStatusTone(session.status)} />
+      </div>
+      <DataStrip
+        items={[
+          {
+            label: t("controls.label.provider"),
+            value: providerDisplayName(session.provider),
+          },
+          {
+            label: t("controls.label.status"),
+            value: session.status,
+            detail: session.detail ?? t("common.notReported"),
+          },
+          {
+            label: t("controls.label.userCode"),
+            value: session.userCode ?? t("controls.detail.authorizationPending"),
+          },
+          {
+            label: t("controls.label.expiresAt"),
+            value: formatDateTime(session.expiresAt, locale),
+          },
+          {
+            label: t("controls.label.completedAt"),
+            value: formatDateTime(session.completedAt, locale),
+            detail: session.completedAt ? undefined : t("controls.detail.notCompleted"),
+          },
+        ]}
+      />
+      <div className="llm-auth-session__url">
+        <span>{t("controls.label.authorizationUrl")}</span>
+        {session.authorizationUrl ? (
+          <a href={session.authorizationUrl} target="_blank" rel="noreferrer">
+            {session.authorizationUrl}
+          </a>
+        ) : (
+          <p>{t("controls.detail.authorizationPending")}</p>
+        )}
       </div>
     </div>
   );
@@ -564,6 +709,31 @@ function riskStateTone(state: string): StatusTone {
   return "neutral";
 }
 
+function llmAuthLoginStatusTone(status: string): StatusTone {
+  switch (status) {
+    case "succeeded":
+      return "positive";
+    case "failed":
+    case "timed_out":
+      return "critical";
+    case "running":
+      return "warning";
+    default:
+      return "neutral";
+  }
+}
+
+function providerDisplayName(provider: string): string {
+  switch (provider) {
+    case "claude":
+      return "Claude Code";
+    case "codex":
+      return "Codex";
+    default:
+      return provider;
+  }
+}
+
 function sumNumbers(values: string[]): string | null {
   let total = 0;
 
@@ -591,6 +761,12 @@ function describeControlError(error: unknown, t: Translate): string {
     return formatMessage(t("controls.error.manualTriggerRefused"), {
       reason: triggerRefusalDescription(apiMessage, t),
     });
+  }
+
+  if (error.path.includes("/ops/llm-auth/") && error.status === 409) {
+    return apiMessage === "login already in progress"
+      ? t("controls.error.llmAuthInProgress")
+      : `${apiMessage} (HTTP ${error.status})`;
   }
 
   if (error.path === "/ops/halt" && error.status === 409) {
