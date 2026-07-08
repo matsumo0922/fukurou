@@ -108,6 +108,7 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "Runtime" }, { timeout: 5_000 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Deployment" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Secrets" })).toBeInTheDocument();
+    expect(screen.getByText("GMO public base URL")).toBeInTheDocument();
     expect(screen.getAllByText("FUKUROU_GMO_PUBLIC_BASE_URL").length).toBeGreaterThan(0);
     expect(screen.getAllByText("https://api.coin.z.com/public").length).toBeGreaterThan(0);
     expect(screen.getAllByText("configured").length).toBeGreaterThan(0);
