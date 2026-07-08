@@ -46,6 +46,7 @@ export function ConfigPage() {
   const { t } = useI18n();
   const [draftValues, setDraftValues] = useState<DraftValues>({});
   const [draftDetail, setDraftDetail] = useState<RuntimeConfigVersionDetail | null>(null);
+  const [operationValidation, setOperationValidation] = useState<RuntimeConfigValidationResult | null>(null);
   const [operationState, setOperationState] = useState<OperationState | null>(null);
   const draftChanges = useMemo(
     () => collectDraftChanges(configQuery.data?.groups ?? [], draftValues),
@@ -64,6 +65,7 @@ export function ConfigPage() {
     mutationFn: () => createRuntimeConfigDraft({ values: draftPatch }),
     onSuccess: (detail) => {
       setDraftDetail(detail);
+      setOperationValidation(null);
       setOperationState({
         tone: detail.validation.valid ? "positive" : "warning",
         messageKey: detail.validation.valid ? "config.operation.draftSaved" : "config.operation.draftSavedInvalid",
@@ -75,6 +77,7 @@ export function ConfigPage() {
     mutationFn: (versionId: string) => validateRuntimeConfigDraft(versionId),
     onSuccess: (detail) => {
       setDraftDetail(detail);
+      setOperationValidation(null);
       setOperationState({
         tone: detail.validation.valid ? "positive" : "warning",
         messageKey: detail.validation.valid ? "config.operation.validationPassed" : "config.operation.validationFailed",
@@ -85,13 +88,17 @@ export function ConfigPage() {
     mutationFn: (versionId: string) => activateRuntimeConfigDraft(versionId),
     onSuccess: (response) => {
       if (response.status === 409) {
-        setDraftDetail((detail) => (detail ? { ...detail, validation: response.data as RuntimeConfigValidationResult } : detail));
+        const validation = response.data as RuntimeConfigValidationResult;
+
+        setDraftDetail((detail) => (detail ? { ...detail, validation } : detail));
+        setOperationValidation(validation);
         setOperationState({ tone: "critical", messageKey: "config.operation.activationRejected" });
 
         return;
       }
 
       setDraftDetail(null);
+      setOperationValidation(null);
       setDraftValues({});
       setOperationState({ tone: "positive", messageKey: "config.operation.activated" });
       void queryClient.invalidateQueries({ queryKey: opsRuntimeConfigQuery.queryKey });
@@ -101,12 +108,14 @@ export function ConfigPage() {
     mutationFn: (versionId: string) => rollbackRuntimeConfigVersion(versionId),
     onSuccess: (response) => {
       if (response.status === 409) {
+        setOperationValidation(response.data as RuntimeConfigValidationResult);
         setOperationState({ tone: "critical", messageKey: "config.operation.rollbackRejected" });
 
         return;
       }
 
       setDraftDetail(null);
+      setOperationValidation(null);
       setDraftValues({});
       setOperationState({ tone: "positive", messageKey: "config.operation.rolledBack" });
       void queryClient.invalidateQueries({ queryKey: opsRuntimeConfigQuery.queryKey });
@@ -184,6 +193,7 @@ export function ConfigPage() {
           <ConfigDraftPanel
             changes={draftChanges}
             draftDetail={draftDetail}
+            operationValidation={operationValidation}
             operationState={operationState}
           />
           <ConfigCatalog
@@ -195,6 +205,7 @@ export function ConfigPage() {
                 [key]: value,
               }));
               setDraftDetail(null);
+              setOperationValidation(null);
               setOperationState(null);
             }}
           />
@@ -258,14 +269,16 @@ function ConfigVersionPanel({
 function ConfigDraftPanel({
   changes,
   draftDetail,
+  operationValidation,
   operationState,
 }: {
   changes: DraftChange[];
   draftDetail: RuntimeConfigVersionDetail | null;
+  operationValidation: RuntimeConfigValidationResult | null;
   operationState: OperationState | null;
 }) {
   const { t } = useI18n();
-  const validation = draftDetail?.validation ?? null;
+  const validation = operationValidation ?? draftDetail?.validation ?? null;
   const validationErrors = validation?.errors ?? [];
 
   if (changes.length === 0 && !draftDetail && !operationState) {

@@ -270,6 +270,20 @@ object RuntimeConfigCandidateValidator {
             .filterKeys { key -> key !in RuntimeConfigCatalog.runtimeLegacyEnvNames() }
         val typedEnvironment = deploymentEnvironment + runtimeTypedEnvironment
         val catalogEnvironment = deploymentEnvironment + runtimeCatalogEnvironment
+        val typedConstraintErrors = validateTypedConfigConstraints(
+            values = canonicalValues,
+            runtimeItemsByKey = runtimeItemsByKey,
+        )
+
+        if (typedConstraintErrors.isNotEmpty()) {
+            return RuntimeConfigValidatedCandidate(
+                validation = RuntimeConfigValidationResult(valid = false, errors = typedConstraintErrors),
+                tradingConfig = null,
+                typedEnvironment = typedEnvironment,
+                catalogEnvironment = catalogEnvironment,
+            )
+        }
+
         val tradingConfigResult = runCatching {
             TradingBotConfig.fromEnvironment(typedEnvironment)
         }
@@ -290,7 +304,7 @@ object RuntimeConfigCandidateValidator {
                         errors = listOf(
                             RuntimeConfigValidationError(
                                 code = "runtimeConfig.validation.typedConfig",
-                                params = mapOf("message" to (error.message ?: error::class.simpleName.orEmpty())),
+                                params = mapOf("reason" to error::class.simpleName.orEmpty()),
                             ),
                         ),
                     ),
@@ -300,6 +314,302 @@ object RuntimeConfigCandidateValidator {
                 )
             },
         )
+    }
+}
+
+private fun validateTypedConfigConstraints(
+    values: Map<String, String>,
+    runtimeItemsByKey: Map<String, RuntimeConfigItem>,
+): List<RuntimeConfigValidationError> {
+    return buildList {
+        requireDecimalGreaterThan(values, "paper.initialCashJpy", BigDecimal.ZERO)
+        requireDecimalGreaterThanOrEqual(values, "paper.marketSlippageBps", BigDecimal.ZERO)
+        requireDecimalGreaterThanOrEqualDefault(values, runtimeItemsByKey, "paper.fallbackMakerFeeRate")
+        requireDecimalGreaterThanOrEqualDefault(values, runtimeItemsByKey, "paper.fallbackTakerFeeRate")
+        requireDecimalGreaterThanOrEqualDefault(values, runtimeItemsByKey, "paper.fallbackSpreadBps")
+        requireDecimalGreaterThanAndLessThanOrEqualDefault(values, runtimeItemsByKey, "safety.maxRiskPerTradeRatio")
+        requireDecimalGreaterThanOrEqualDefaultAndLessThan(values, runtimeItemsByKey, "safety.maxDrawdownRatio", BigDecimal.ZERO)
+        requireDecimalGreaterThanAndLessThanOrEqualDefault(values, runtimeItemsByKey, "safety.maxTotalExposureRatio")
+        requireDecimalGreaterThanOrEqualDefault(values, runtimeItemsByKey, "safety.minExpectedValueR")
+        requireDecimalGreaterThanOrEqualDefault(values, runtimeItemsByKey, "safety.minExpectedMoveToCostRatio")
+        requireDecimalBetweenInclusive(
+            values = values,
+            key = "safety.maxTakerFeeRatio",
+            min = BigDecimal.ZERO,
+            max = defaultDecimal(runtimeItemsByKey, "safety.maxTakerFeeRatio"),
+        )
+        requireDecimalGreaterThanOrEqualDefault(values, runtimeItemsByKey, "safety.marketSlippageReserveBps")
+        requireLongBetweenInclusive(
+            values = values,
+            key = "safety.dataQualityStaleAfter",
+            min = 1,
+            max = defaultLong(runtimeItemsByKey, "safety.dataQualityStaleAfter"),
+        )
+        requireDecimalBetweenInclusive(
+            values = values,
+            key = "safety.dataQualityCappedProbability",
+            min = BigDecimal.ZERO,
+            max = defaultDecimal(runtimeItemsByKey, "safety.dataQualityCappedProbability"),
+        )
+        requireLongBetweenInclusive(
+            values = values,
+            key = "decision.falsificationFreshnessWindow",
+            min = 1,
+            max = defaultLong(runtimeItemsByKey, "decision.falsificationFreshnessWindow"),
+        )
+        requireLongBetweenInclusive(
+            values = values,
+            key = "decision.restingEntryOrderTtl",
+            min = 1,
+            max = defaultLong(runtimeItemsByKey, "decision.restingEntryOrderTtl"),
+        )
+        requireIntBetweenInclusive(values, "runner.maxToolCallsPerRun", 1, defaultInt(runtimeItemsByKey, "runner.maxToolCallsPerRun"))
+        requireIntBetweenInclusive(values, "runner.maxActToolCallsPerRun", 1, defaultInt(runtimeItemsByKey, "runner.maxActToolCallsPerRun"))
+        requireLongBetweenInclusive(values, "runner.perRunTimeout", 1, defaultLong(runtimeItemsByKey, "runner.perRunTimeout"))
+        requireIntBetweenInclusive(values, "runner.maxInvocationsPerHour", 1, defaultInt(runtimeItemsByKey, "runner.maxInvocationsPerHour"))
+        requireIntBetweenInclusive(values, "runner.maxInvocationsPerDay", 1, defaultInt(runtimeItemsByKey, "runner.maxInvocationsPerDay"))
+        requireIntLessThanOrEqualKey(values, "runner.maxActToolCallsPerRun", "runner.maxToolCallsPerRun")
+        requireLongGreaterThanOrEqualDefault(values, runtimeItemsByKey, "daemon.pollInterval")
+        requireLongGreaterThanOrEqualDefault(values, runtimeItemsByKey, "daemon.flatHeartbeatInterval")
+        requireLongGreaterThanOrEqualDefault(values, runtimeItemsByKey, "daemon.holdingCheckInterval")
+        requireDecimalGreaterThan(values, "daemon.priceMoveThresholdRatio", BigDecimal.ZERO)
+        requireLongGreaterThanOrEqualKey(values, "daemon.priceMoveWindow", "daemon.pollInterval")
+        requireLongGreaterThanOrEqualKey(values, "daemon.priceMoveCooldown", "daemon.pollInterval")
+        requireDecimalGreaterThan(values, "daemon.stopProximityRemainingRThreshold", BigDecimal.ZERO)
+        requireLongGreaterThanOrEqualKey(values, "daemon.stopProximityCooldown", "daemon.pollInterval")
+        requireLongGreaterThanOrEqualDefault(values, runtimeItemsByKey, "obsidian.writeInterval")
+        requireIntBetweenInclusive(
+            values = values,
+            key = "killCriterion.minClosedTrades",
+            min = 1,
+            max = defaultInt(runtimeItemsByKey, "killCriterion.minClosedTrades"),
+        )
+        requireDecimalGreaterThanOrEqualDefault(values, runtimeItemsByKey, "killCriterion.minProfitFactor")
+        requireIntBetweenInclusive(values, "gmoPublic.restPerSecond", 1, defaultInt(runtimeItemsByKey, "gmoPublic.restPerSecond"))
+        requireIntBetweenInclusive(values, "gmoPublic.restBurst", 1, defaultInt(runtimeItemsByKey, "gmoPublic.restBurst"))
+        requireIntGreaterThan(values, "gmoPublic.retryMaxAttempts", 0)
+        requireLongGreaterThan(values, "gmoPublic.retryInitialBackoff", 0)
+        requireLongGreaterThan(values, "gmoPublic.retryMaxBackoff", 0)
+        requireLongGreaterThan(values, "gmoPublic.retryBackoffMultiplier", 1)
+        requireLongGreaterThan(values, "gmoPublic.connectTimeout", 0)
+        requireLongGreaterThan(values, "gmoPublic.requestTimeout", 0)
+        requireLongGreaterThan(values, "gmoPublic.symbolRulesCacheTtl", 0)
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireDecimalGreaterThan(
+    values: Map<String, String>,
+    key: String,
+    min: BigDecimal,
+) {
+    val value = values.getValue(key).toBigDecimal()
+
+    if (value <= min) {
+        addTypedConfigError(key, "runtimeConfig.validation.typedGreaterThan", mapOf("min" to min.toPlainString()))
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireDecimalGreaterThanOrEqual(
+    values: Map<String, String>,
+    key: String,
+    min: BigDecimal,
+) {
+    val value = values.getValue(key).toBigDecimal()
+
+    if (value < min) {
+        addTypedConfigError(key, "runtimeConfig.validation.typedGreaterThanOrEqual", mapOf("min" to min.toPlainString()))
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireDecimalGreaterThanOrEqualDefault(
+    values: Map<String, String>,
+    runtimeItemsByKey: Map<String, RuntimeConfigItem>,
+    key: String,
+) {
+    requireDecimalGreaterThanOrEqual(values, key, defaultDecimal(runtimeItemsByKey, key))
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireDecimalGreaterThanAndLessThanOrEqualDefault(
+    values: Map<String, String>,
+    runtimeItemsByKey: Map<String, RuntimeConfigItem>,
+    key: String,
+) {
+    val min = BigDecimal.ZERO
+    val max = defaultDecimal(runtimeItemsByKey, key)
+    val value = values.getValue(key).toBigDecimal()
+
+    if (value <= min || value > max) {
+        addTypedConfigError(
+            key = key,
+            code = "runtimeConfig.validation.typedBetweenExclusiveMinInclusiveMax",
+            params = mapOf("min" to min.toPlainString(), "max" to max.toPlainString()),
+        )
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireDecimalGreaterThanOrEqualDefaultAndLessThan(
+    values: Map<String, String>,
+    runtimeItemsByKey: Map<String, RuntimeConfigItem>,
+    key: String,
+    max: BigDecimal,
+) {
+    val min = defaultDecimal(runtimeItemsByKey, key)
+    val value = values.getValue(key).toBigDecimal()
+
+    if (value < min || value >= max) {
+        addTypedConfigError(
+            key = key,
+            code = "runtimeConfig.validation.typedBetweenInclusiveMinExclusiveMax",
+            params = mapOf("min" to min.toPlainString(), "max" to max.toPlainString()),
+        )
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireDecimalBetweenInclusive(
+    values: Map<String, String>,
+    key: String,
+    min: BigDecimal,
+    max: BigDecimal,
+) {
+    val value = values.getValue(key).toBigDecimal()
+
+    if (value < min || value > max) {
+        addTypedConfigError(
+            key = key,
+            code = "runtimeConfig.validation.typedBetweenInclusive",
+            params = mapOf("min" to min.toPlainString(), "max" to max.toPlainString()),
+        )
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireIntBetweenInclusive(
+    values: Map<String, String>,
+    key: String,
+    min: Int,
+    max: Int,
+) {
+    val value = values.getValue(key).toInt()
+
+    if (value < min || value > max) {
+        addTypedConfigError(
+            key = key,
+            code = "runtimeConfig.validation.typedBetweenInclusive",
+            params = mapOf("min" to min.toString(), "max" to max.toString()),
+        )
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireLongBetweenInclusive(
+    values: Map<String, String>,
+    key: String,
+    min: Long,
+    max: Long,
+) {
+    val value = values.getValue(key).toLong()
+
+    if (value < min || value > max) {
+        addTypedConfigError(
+            key = key,
+            code = "runtimeConfig.validation.typedBetweenInclusive",
+            params = mapOf("min" to min.toString(), "max" to max.toString()),
+        )
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireIntGreaterThan(
+    values: Map<String, String>,
+    key: String,
+    min: Int,
+) {
+    val value = values.getValue(key).toInt()
+
+    if (value <= min) {
+        addTypedConfigError(key, "runtimeConfig.validation.typedGreaterThan", mapOf("min" to min.toString()))
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireLongGreaterThan(
+    values: Map<String, String>,
+    key: String,
+    min: Long,
+) {
+    val value = values.getValue(key).toLong()
+
+    if (value <= min) {
+        addTypedConfigError(key, "runtimeConfig.validation.typedGreaterThan", mapOf("min" to min.toString()))
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireLongGreaterThanOrEqualDefault(
+    values: Map<String, String>,
+    runtimeItemsByKey: Map<String, RuntimeConfigItem>,
+    key: String,
+) {
+    val min = defaultLong(runtimeItemsByKey, key)
+    val value = values.getValue(key).toLong()
+
+    if (value < min) {
+        addTypedConfigError(key, "runtimeConfig.validation.typedGreaterThanOrEqual", mapOf("min" to min.toString()))
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireIntLessThanOrEqualKey(
+    values: Map<String, String>,
+    key: String,
+    maxKey: String,
+) {
+    val value = values.getValue(key).toInt()
+    val max = values.getValue(maxKey).toInt()
+
+    if (value > max) {
+        addTypedConfigError(
+            key = key,
+            code = "runtimeConfig.validation.typedLessThanOrEqualKey",
+            params = mapOf("maxKey" to maxKey, "max" to max.toString()),
+        )
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireLongGreaterThanOrEqualKey(
+    values: Map<String, String>,
+    key: String,
+    minKey: String,
+) {
+    val value = values.getValue(key).toLong()
+    val min = values.getValue(minKey).toLong()
+
+    if (value < min) {
+        addTypedConfigError(
+            key = key,
+            code = "runtimeConfig.validation.typedGreaterThanOrEqualKey",
+            params = mapOf("minKey" to minKey, "min" to min.toString()),
+        )
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.addTypedConfigError(
+    key: String,
+    code: String,
+    params: Map<String, String>,
+) {
+    add(RuntimeConfigValidationError(code = code, key = key, params = params))
+}
+
+private fun defaultDecimal(runtimeItemsByKey: Map<String, RuntimeConfigItem>, key: String): BigDecimal {
+    return defaultValue(runtimeItemsByKey, key).toBigDecimal()
+}
+
+private fun defaultInt(runtimeItemsByKey: Map<String, RuntimeConfigItem>, key: String): Int {
+    return defaultValue(runtimeItemsByKey, key).toInt()
+}
+
+private fun defaultLong(runtimeItemsByKey: Map<String, RuntimeConfigItem>, key: String): Long {
+    return defaultValue(runtimeItemsByKey, key).toLong()
+}
+
+private fun defaultValue(runtimeItemsByKey: Map<String, RuntimeConfigItem>, key: String): String {
+    return requireNotNull(runtimeItemsByKey.getValue(key).defaultValue) {
+        "Runtime config default value must not be null: $key"
     }
 }
 

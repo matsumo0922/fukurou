@@ -68,8 +68,15 @@ class RuntimeConfigResolverTest {
             "runner.maxToolCallsPerRun" to "49",
         )
         val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
+        val result = resolver.resolve(emptyMap())
+        val exception = result.exceptionOrNull() as RuntimeConfigValidationRejectedException
+        val validationError = exception.validation.errors.single()
 
-        assertTrue(resolver.resolve(emptyMap()).isFailure)
+        assertTrue(result.isFailure)
+        assertEquals("runtimeConfig.validation.typedBetweenInclusive", validationError.code)
+        assertEquals("runner.maxToolCallsPerRun", validationError.key)
+        assertEquals("1", validationError.params.getValue("min"))
+        assertEquals("48", validationError.params.getValue("max"))
     }
 }
 

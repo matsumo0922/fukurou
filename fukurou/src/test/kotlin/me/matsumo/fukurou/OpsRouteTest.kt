@@ -567,7 +567,9 @@ class OpsRouteTest {
         assertEquals("false", draftBody.getValue("validation").jsonObject.getValue("valid").jsonPrimitive.content)
         assertEquals(HttpStatusCode.Conflict, activateResponse.status)
         assertEquals("false", activateBody.getValue("valid").jsonPrimitive.content)
-        assertEquals("runtimeConfig.validation.typedConfig", validationError.getValue("code").jsonPrimitive.content)
+        assertEquals("runtimeConfig.validation.typedBetweenInclusive", validationError.getValue("code").jsonPrimitive.content)
+        assertEquals("runner.maxToolCallsPerRun", validationError.getValue("key").jsonPrimitive.content)
+        assertEquals("48", validationError.getValue("params").jsonObject.getValue("max").jsonPrimitive.content)
     }
 
     @Test
