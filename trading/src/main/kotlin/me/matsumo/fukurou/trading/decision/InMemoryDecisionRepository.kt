@@ -148,7 +148,7 @@ class InMemoryDecisionRepository(
 
             mutex.withLock {
                 decisions
-                    .filter { decision -> decision.createdAt >= from && decision.createdAt < toExclusive }
+                    .filter { decision -> decision.createdAt in from..<toExclusive }
                     .sortedByDescending { decision -> decision.createdAt }
                     .take(limit)
                     .sortedBy { decision -> decision.createdAt }

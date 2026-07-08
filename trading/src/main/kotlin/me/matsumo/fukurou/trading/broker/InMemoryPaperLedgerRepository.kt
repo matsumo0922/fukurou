@@ -397,7 +397,7 @@ private class InMemoryPaperLedgerHistoryReader(
                     .filter { closedPosition ->
                         val closedAt = closedPosition.closedAt
 
-                        closedAt >= from && closedAt < toExclusive
+                        closedAt in from..<toExclusive
                     }
                     .sortedByDescending { closedPosition -> closedPosition.closedAt }
                     .take(limit)
