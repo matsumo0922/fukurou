@@ -10,6 +10,7 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -471,6 +472,54 @@ class OpsRouteTest {
         assertNoSecretLikeText(missingSessionResponse.bodyAsText())
         assertNoSecretLikeText(terminalSessionResponse.bodyAsText())
         assertNoSecretLikeText(duplicateSubmitResponse.bodyAsText())
+    }
+
+    @Test
+    fun opsRoutes_runtimeConfigReturnsReadOnlyCatalogWithoutSecretValues() = testApplication {
+        val runtimeConfigEnvironment = mapOf(
+            "FUKUROU_TRADING_SYMBOL" to "BTC",
+            "FUKUROU_GMO_PUBLIC_BASE_URL" to "https://example.test/public",
+            "FUKUROU_CLAUDE_COMMAND_TEMPLATE" to "docker run claude",
+            "DB_PASSWORD" to "super-secret-password",
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                tradingConfig = TradingBotConfig.fromEnvironment(runtimeConfigEnvironment),
+                runtimeConfigEnvironment = runtimeConfigEnvironment,
+            )
+        }
+
+        val response = client.get("/ops/runtime-config")
+        val responseText = response.bodyAsText()
+        val responseBody = Json.parseToJsonElement(responseText).jsonObject
+        val groups = responseBody.getValue("groups").jsonArray
+        val deploymentGroup = groups
+            .map { group -> group.jsonObject }
+            .single { group -> group.getValue("id").jsonPrimitive.content == "deployment" }
+        val secretsGroup = groups
+            .map { group -> group.jsonObject }
+            .single { group -> group.getValue("id").jsonPrimitive.content == "secrets" }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertFalse(responseText.contains("super-secret-password"))
+        assertConfigItem(
+            group = deploymentGroup,
+            key = "gmoPublic.baseUrl",
+            sourceKind = "DEPLOYMENT",
+            effectiveValue = "https://example.test/public",
+        )
+        assertConfigItem(
+            group = deploymentGroup,
+            key = "llm.claudeCommandTemplate",
+            sourceKind = "DEPLOYMENT",
+            effectiveValue = "docker run claude",
+        )
+        assertSecretItemConfigured(
+            group = secretsGroup,
+            key = "database.password",
+        )
     }
 
     @Test
@@ -1000,6 +1049,36 @@ private fun assertNoSecretLikeText(responseText: String) {
     SECRET_FIXTURE_TEXTS.forEach { secretText ->
         assertFalse(responseText.contains(secretText), secretText)
     }
+}
+
+private fun assertConfigItem(
+    group: JsonObject,
+    key: String,
+    sourceKind: String,
+    effectiveValue: String,
+) {
+    val item = configItem(group, key)
+
+    assertEquals(sourceKind, item.getValue("sourceKind").jsonPrimitive.content)
+    assertEquals(effectiveValue, item.getValue("effectiveValue").jsonPrimitive.content)
+    assertEquals("false", item.getValue("editable").jsonPrimitive.content)
+}
+
+private fun assertSecretItemConfigured(group: JsonObject, key: String) {
+    val item = configItem(group, key)
+
+    assertEquals("SECRET", item.getValue("sourceKind").jsonPrimitive.content)
+    assertEquals("true", item.getValue("valueConfigured").jsonPrimitive.content)
+    assertEquals("null", item.getValue("currentValue").toString())
+    assertEquals("null", item.getValue("effectiveValue").toString())
+}
+
+private fun configItem(group: JsonObject, key: String): JsonObject {
+    return group
+        .getValue("items")
+        .jsonArray
+        .map { item -> item.jsonObject }
+        .single { item -> item.getValue("key").jsonPrimitive.content == key }
 }
 
 /**

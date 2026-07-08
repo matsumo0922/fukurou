@@ -108,6 +108,12 @@ class ApiDocumentationRouteTest {
         )
         assertOperation(
             paths = paths,
+            path = "/ops/runtime-config",
+            summary = "runtime config catalog を取得する",
+            tag = "ops",
+        )
+        assertOperation(
+            paths = paths,
             path = "/ops/decisions",
             summary = "LLM decision の raw feed を取得する",
             tag = "ops",

@@ -481,6 +481,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ops/runtime-config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * runtime config catalog を取得する
+         * @description code-owned catalog から read-only の実効 runtime config を返します。secret は設定有無だけを返し、値は返しません。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description runtime config catalog です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RuntimeConfigSnapshot"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ops/halt": {
         parameters: {
             query?: never;
@@ -1507,6 +1546,38 @@ export interface components {
             totalCostUsd: string;
             byProvider: components["schemas"]["EvaluationProviderCostResponse"][];
             byModel: components["schemas"]["EvaluationModelTokenResponse"][];
+        };
+        /** RuntimeConfigItem */
+        RuntimeConfigItem: {
+            key: string;
+            /** @enum {string} */
+            sourceKind: "RUNTIME" | "DEPLOYMENT" | "SECRET";
+            /** @enum {string} */
+            valueType: "BOOLEAN" | "ENUM" | "STRING" | "URL" | "INT" | "DURATION_SECONDS" | "DECIMAL_STRING" | "STRING_LIST" | "STRUCTURED_JSON_LIST" | "SECRET_STATUS";
+            defaultValue?: string | null;
+            currentValue?: string | null;
+            effectiveValue?: string | null;
+            unit?: string | null;
+            valueConfigured: boolean;
+            legacyEnvName: string;
+            editable: boolean;
+            /** @enum {string} */
+            applyMode: "PROCESS_RESTART";
+            /** @enum {string} */
+            safetyTier: "STANDARD" | "GUARDED" | "SAFETY_CRITICAL" | "DEPLOYMENT_BOUNDARY" | "SECRET";
+            labelKey: string;
+            descriptionKey: string;
+        };
+        /** RuntimeConfigGroup */
+        RuntimeConfigGroup: {
+            id: string;
+            labelKey: string;
+            descriptionKey: string;
+            items: components["schemas"]["RuntimeConfigItem"][];
+        };
+        /** RuntimeConfigSnapshot */
+        RuntimeConfigSnapshot: {
+            groups: components["schemas"]["RuntimeConfigGroup"][];
         };
         /** OpsHaltRequest */
         OpsHaltRequest: {

@@ -462,6 +462,86 @@ a:focus-visible {
   color: #ffffff;
 }
 
+.config-group-description {
+  margin: -6px 0 14px;
+  color: var(--ink-muted);
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.config-table {
+  display: grid;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.config-table__row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.35fr) repeat(3, minmax(130px, 0.8fr)) minmax(280px, 1.4fr);
+  gap: 10px;
+  align-items: start;
+  min-width: 980px;
+  border-top: 1px solid var(--line);
+  padding: 11px 0;
+}
+
+.config-table__row--head {
+  border-top: 0;
+  color: var(--ink-faint);
+  font-size: 0.72rem;
+  font-weight: 760;
+  letter-spacing: 0;
+  padding-top: 0;
+  text-transform: uppercase;
+}
+
+.config-table__item,
+.config-table__metadata {
+  min-width: 0;
+}
+
+.config-table__item {
+  display: grid;
+  gap: 4px;
+}
+
+.config-table__label {
+  color: var(--ink);
+  font-weight: 760;
+  overflow-wrap: anywhere;
+}
+
+.config-table__description {
+  color: var(--ink-muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.config-table__env,
+.config-table__value {
+  color: var(--ink-muted);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.config-table__value {
+  color: var(--ink);
+  line-height: 1.45;
+}
+
+.config-table__unit {
+  color: var(--ink-faint);
+  margin-left: 5px;
+}
+
+.config-table__metadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .activity-filters {
   display: grid;
   gap: 14px;

@@ -4,6 +4,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 import { AppShell } from "./ui/layout/AppShell";
 import { ActivityPage } from "./pages/ActivityPage";
 import { I18nProvider } from "./i18n/I18nProvider";
+import { ConfigPage } from "./pages/ConfigPage";
 import { ControlsPage } from "./pages/ControlsPage";
 import { EvaluationPage } from "./pages/EvaluationPage";
 import { OverviewPage } from "./pages/OverviewPage";
@@ -32,6 +33,7 @@ export default function App() {
               <Route index element={<Navigate to="overview" replace />} />
               <Route path="overview" element={<OverviewPage />} />
               <Route path="activity" element={<ActivityPage />} />
+              <Route path="config" element={<ConfigPage />} />
               <Route path="controls" element={<ControlsPage />} />
               <Route path="evaluation" element={<EvaluationPage />} />
               <Route path="system" element={<SystemPage />} />

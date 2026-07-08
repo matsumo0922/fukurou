@@ -4,6 +4,7 @@ import LayoutDashboard from "lucide-react/dist/esm/icons/layout-dashboard.mjs";
 import Power from "lucide-react/dist/esm/icons/power.mjs";
 import ServerCog from "lucide-react/dist/esm/icons/server-cog.mjs";
 import ShieldAlert from "lucide-react/dist/esm/icons/shield-alert.mjs";
+import SlidersHorizontal from "lucide-react/dist/esm/icons/sliders-horizontal.mjs";
 import { NavLink } from "react-router";
 import type { MessageKey } from "../../i18n/messages";
 import { useI18n } from "../../i18n/useI18n";
@@ -32,6 +33,11 @@ const navigationSections: NavigationSection[] = [
         label: "Activity",
         path: "/app/activity",
         icon: Activity,
+      },
+      {
+        label: "Config",
+        path: "/app/config",
+        icon: SlidersHorizontal,
       },
       {
         label: "Evaluation",

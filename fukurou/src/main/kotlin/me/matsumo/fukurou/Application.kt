@@ -60,6 +60,7 @@ fun interface ReadinessProbe {
  * @param opsCommandEventLog ops API 用 command_event_log writer。null なら DB 設定から構築する
  * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
  * @param tradingConfig trading runtime config
+ * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  * @param webRoot WebUI の build output を配信する filesystem root。null なら Web 配信を無効にする
  */
 @Suppress("LongMethod", "CyclomaticComplexMethod")
@@ -79,6 +80,7 @@ fun Application.module(
     opsCommandEventLog: CommandEventLog? = null,
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
+    runtimeConfigEnvironment: Map<String, String> = System.getenv(),
     webRoot: File? = webRootFromEnv(),
 ) {
     val environment = System.getenv()
@@ -188,6 +190,8 @@ fun Application.module(
             decisionRepository = resolvedOpsDecisionRepository,
             paperLedgerRepository = resolvedOpsPaperLedgerRepository,
             commandEventFeedReader = resolvedOpsCommandEventFeedReader,
+            tradingConfig = tradingConfig,
+            runtimeConfigEnvironment = runtimeConfigEnvironment,
             clock = clock,
         )
         apiDocumentationRoutes()

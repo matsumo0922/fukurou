@@ -18,6 +18,9 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
+import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshot
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
 import me.matsumo.fukurou.trading.decision.DecisionRepository
@@ -515,8 +518,24 @@ internal fun Route.opsRoutes(
     decisionRepository: DecisionRepository?,
     paperLedgerRepository: PaperLedgerRepository?,
     commandEventFeedReader: CommandEventFeedReader?,
+    tradingConfig: TradingBotConfig,
+    runtimeConfigEnvironment: Map<String, String>,
     clock: Clock = Clock.systemUTC(),
 ) {
+    get("/ops/runtime-config") {
+        call.respond(RuntimeConfigCatalog.snapshot(tradingConfig, runtimeConfigEnvironment))
+    }.describe {
+        summary = "runtime config catalog を取得する"
+        description = "code-owned catalog から read-only の実効 runtime config を返します。secret は設定有無だけを返し、値は返しません。"
+        tag(OPS_TAG)
+        responses {
+            HttpStatusCode.OK {
+                description = "runtime config catalog です。"
+                schema = jsonSchema<RuntimeConfigSnapshot>()
+            }
+        }
+    }
+
     post("/ops/halt") {
         val request = call.receiveBodyOrBadRequest<OpsHaltRequest>() ?: return@post
         val reason = call.requireReason(request.reason) ?: return@post
