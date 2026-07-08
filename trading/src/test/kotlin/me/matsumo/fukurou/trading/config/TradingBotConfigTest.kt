@@ -42,6 +42,11 @@ class TradingBotConfigTest {
         assertEquals(false, config.obsidian.enabled)
         assertEquals("/vault", config.obsidian.vaultPath)
         assertEquals(Duration.ofMinutes(5), config.obsidian.writeInterval)
+        assertEquals(Duration.ofHours(1), config.reflection.minInterval)
+        assertEquals(1_000, config.reflection.queryLimit)
+        assertEquals(180, config.reflection.calibrationLookbackDays)
+        assertEquals(50, config.reflection.recentDecisionLimit)
+        assertEquals(30, config.reflection.sampleWarningTradeCount)
         assertEquals(100, config.killCriterion.minClosedTrades)
         assertEquals(BigDecimal("0.8"), config.killCriterion.minProfitFactor)
         assertEquals(10, config.gmoPublicClient.rateLimit.permitsPerSecond)
@@ -97,6 +102,11 @@ class TradingBotConfigTest {
                 "FUKUROU_OBSIDIAN_ENABLED" to "true",
                 "FUKUROU_OBSIDIAN_VAULT_PATH" to "/srv/fukurou/obsidian-vault",
                 "FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS" to "600",
+                "FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS" to "7200",
+                "FUKUROU_REFLECTION_QUERY_LIMIT" to "500",
+                "FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS" to "90",
+                "FUKUROU_REFLECTION_RECENT_DECISION_LIMIT" to "25",
+                "FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT" to "20",
                 "FUKUROU_KILL_MIN_CLOSED_TRADES" to "50",
                 "FUKUROU_KILL_MIN_PROFIT_FACTOR" to "0.9",
                 "FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC" to
@@ -150,6 +160,11 @@ class TradingBotConfigTest {
         assertEquals(true, config.obsidian.enabled)
         assertEquals("/srv/fukurou/obsidian-vault", config.obsidian.vaultPath)
         assertEquals(Duration.ofMinutes(10), config.obsidian.writeInterval)
+        assertEquals(Duration.ofHours(2), config.reflection.minInterval)
+        assertEquals(500, config.reflection.queryLimit)
+        assertEquals(90, config.reflection.calibrationLookbackDays)
+        assertEquals(25, config.reflection.recentDecisionLimit)
+        assertEquals(20, config.reflection.sampleWarningTradeCount)
         assertEquals(50, config.killCriterion.minClosedTrades)
         assertEquals(BigDecimal("0.9"), config.killCriterion.minProfitFactor)
         assertEquals(1, config.safetyFloor.economicEventBlackouts.size)
@@ -333,6 +348,31 @@ class TradingBotConfigTest {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS" to "30"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS" to "30"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_REFLECTION_QUERY_LIMIT" to "0"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS" to "0"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_REFLECTION_RECENT_DECISION_LIMIT" to "0"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT" to "0"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

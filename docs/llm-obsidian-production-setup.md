@@ -1,15 +1,15 @@
-# LLM daemon / Obsidian Writer production setup
+# LLM daemon / Obsidian Writer / Reflection Runner production setup
 
 Fukurou production で Claude Code / Codex CLI auth と Obsidian vault を準備し、`FUKUROU_OBSIDIAN_ENABLED` / `FUKUROU_LLM_DAEMON_ENABLED` を有効化する前に確認する手順。
 
-Obsidian Writer と LLM daemon は独立した worker であり、同時に有効化する必要はない。Obsidian Writer は DB の内容を Markdown へ機械的に書き出すだけなので、LLM auth が無くても単独で有効化できる。LLM daemon は Claude / Codex CLI auth と MCP runtime の疎通確認後に有効化する。
+Obsidian Writer / deterministic Reflection Runner と LLM daemon は独立した worker であり、同時に有効化する必要はない。Obsidian Writer / Reflection Runner は DB の内容を Markdown へ機械的に書き出すだけなので、LLM auth が無くても単独で有効化できる。LLM daemon は Claude / Codex CLI auth と MCP runtime の疎通確認後に有効化する。
 
 ## 現在の推奨順序
 
 1. Obsidian vault directory を作る。
 2. deploy 後の WebUI で Claude / Codex CLI login flow を開始する。
 3. CLI login state と MCP path の smoke test を確認する。
-4. Obsidian Writer だけを有効化し、vault に Markdown が生成されることを確認する。
+4. Obsidian Writer / Reflection Runner だけを有効化し、vault に Markdown が生成されることを確認する。
 5. LLM daemon を有効化する。最初は paper mode / 低頻度 / 低コスト model で監視する。
 
 ## NAS directory
@@ -110,12 +110,17 @@ ssh dxp4800plus \
 
 2026-07-04 時点の確認では、ChatGPT account の Codex CLI で `gpt-5-mini` は受け付けられず、未指定時は `gpt-5.5` が使われた。短い smoke test でも CLI の system prompt / session overhead により token 表示は小さくならないため、daemon 有効化前に model / cost 方針を決める。
 
-## Enable Obsidian Writer
+## Enable Obsidian Writer / Reflection Runner
 
-Obsidian Writer は LLM daemon と独立している。先にこれだけ有効化してよい。
+Obsidian Writer / deterministic Reflection Runner は LLM daemon と独立している。先にこれだけ有効化してよい。`FUKUROU_OBSIDIAN_ENABLED=true` では、Trade / Daily note の機械再生成と、`Knowledge/DailyReflections/`、`Knowledge/WeeklyReviews/`、`Knowledge/Calibration/`、`Knowledge/Setups/` への deterministic reflection report 生成が同じ Ktor process 内で動く。
 
 ```dotenv
 FUKUROU_OBSIDIAN_ENABLED=true
+FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS=3600
+FUKUROU_REFLECTION_QUERY_LIMIT=1000
+FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS=180
+FUKUROU_REFLECTION_RECENT_DECISION_LIMIT=50
+FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT=30
 FUKUROU_LLM_DAEMON_ENABLED=false
 ```
 
@@ -128,6 +133,10 @@ find /srv/fukurou/obsidian-vault -maxdepth 4 -type f | sort | head -50
 ```
 
 Writer は DB を正本として、frontmatter、機械導出できる数値、空見出し骨組みだけを書く。解釈的本文や `Knowledge/` の中身は reflection runner の責務であり、ここでは生成しない。
+
+Reflection Runner は DB を正本として、日次・週次・confidence calibration・setup tag taxonomy の Markdown を deterministic に生成する。LLM CLI は呼び出さず、PromptCandidates は生成せず、system prompt や trading config を自動変更しない。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。
+
+Reflection Runner の loop は `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` と `FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS` の大きい方を使う。Markdown 本文には生成時刻だけで変わる field を書かず、対象 period の DB データが変わらない tick は unchanged として扱う。日付または週の境界直前に保存された decision / trade を確定ノートへ反映するため、current period と previous period の Daily / Weekly / TagTaxonomy report を同じ tick で再生成する。
 
 ## Enable LLM daemon
 

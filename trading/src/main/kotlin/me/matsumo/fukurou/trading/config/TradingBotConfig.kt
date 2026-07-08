@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
+import me.matsumo.fukurou.trading.reflection.ReflectionConfig
 import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
@@ -26,6 +27,7 @@ import java.time.Instant
  * @param runner LLM one-shot runner の保守的な上限設定
  * @param daemon Ktor 常駐 daemon scheduler 設定
  * @param obsidian Obsidian vault への機械生成 note writer 設定
+ * @param reflection deterministic reflection runner 設定
  * @param killCriterion 評価成績による HARD_HALT 基準
  * @param gmoPublicClient GMO Public API client 設定
  */
@@ -40,6 +42,7 @@ data class TradingBotConfig(
     val runner: LlmRunnerConfig = LlmRunnerConfig(),
     val daemon: LlmDaemonConfig = LlmDaemonConfig(),
     val obsidian: ObsidianConfig = ObsidianConfig(),
+    val reflection: ReflectionConfig = ReflectionConfig(),
     val killCriterion: KillCriterionConfig = KillCriterionConfig(),
     val gmoPublicClient: GmoPublicClientConfig = GmoPublicClientConfig(),
 ) {
@@ -89,6 +92,7 @@ data class TradingBotConfig(
                 runner = environment.readLlmRunnerConfig(),
                 daemon = environment.readLlmDaemonConfig(),
                 obsidian = environment.readObsidianConfig(),
+                reflection = environment.readReflectionConfig(),
                 killCriterion = environment.readKillCriterionConfig(),
                 gmoPublicClient = environment.readGmoPublicClientConfig(),
             )
@@ -535,6 +539,34 @@ private const val FUKUROU_OBSIDIAN_VAULT_PATH_ENV = "FUKUROU_OBSIDIAN_VAULT_PATH
 private const val FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS_ENV = "FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS"
 
 /**
+ * deterministic Reflection Runner 最小間隔秒数の環境変数名。
+ */
+private const val FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS_ENV = "FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS"
+
+/**
+ * deterministic Reflection Runner の 1 tick 読み取り上限の環境変数名。
+ */
+private const val FUKUROU_REFLECTION_QUERY_LIMIT_ENV = "FUKUROU_REFLECTION_QUERY_LIMIT"
+
+/**
+ * confidence calibration lookback 日数の環境変数名。
+ */
+private const val FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS_ENV =
+    "FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS"
+
+/**
+ * Recent Decisions 表示上限の環境変数名。
+ */
+private const val FUKUROU_REFLECTION_RECENT_DECISION_LIMIT_ENV =
+    "FUKUROU_REFLECTION_RECENT_DECISION_LIMIT"
+
+/**
+ * sample size warning の closed trade 件数しきい値の環境変数名。
+ */
+private const val FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT_ENV =
+    "FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT"
+
+/**
  * kill 基準の最小 closed trade 数の環境変数名。
  */
 private const val FUKUROU_KILL_MIN_CLOSED_TRADES_ENV = "FUKUROU_KILL_MIN_CLOSED_TRADES"
@@ -903,6 +935,30 @@ private fun Map<String, String>.readObsidianConfig(): ObsidianConfig {
                 ?.toLong()
                 ?: DEFAULT_OBSIDIAN_WRITE_INTERVAL.seconds,
         ),
+    )
+}
+
+private fun Map<String, String>.readReflectionConfig(): ReflectionConfig {
+    val defaults = ReflectionConfig()
+
+    return ReflectionConfig(
+        minInterval = Duration.ofSeconds(
+            readOptional(FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS_ENV)
+                ?.toLong()
+                ?: defaults.minInterval.seconds,
+        ),
+        queryLimit = readOptional(FUKUROU_REFLECTION_QUERY_LIMIT_ENV)
+            ?.toInt()
+            ?: defaults.queryLimit,
+        calibrationLookbackDays = readOptional(FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS_ENV)
+            ?.toInt()
+            ?: defaults.calibrationLookbackDays,
+        recentDecisionLimit = readOptional(FUKUROU_REFLECTION_RECENT_DECISION_LIMIT_ENV)
+            ?.toInt()
+            ?: defaults.recentDecisionLimit,
+        sampleWarningTradeCount = readOptional(FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT_ENV)
+            ?.toInt()
+            ?: defaults.sampleWarningTradeCount,
     )
 }
 

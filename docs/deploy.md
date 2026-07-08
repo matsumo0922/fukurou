@@ -2,7 +2,7 @@
 
 Fukurou の最小 Ktor backend を NAS 上で常時稼働させ、Cloudflare Tunnel + Access で公開・保護するための運用手順。
 
-この scaffold では `ktor` + `postgres` + `cloudflared` の 3 サービスを扱う。Step6 時点では Ktor backend、paper trading runtime、常駐 `ProtectionReconciler`、MCP stdio fat jar の image 同梱、LlmInvoker、daemon scheduler、Obsidian Writer まで実装済み。Obsidian reflection runner、Knowledge note 育成、live 実発注はまだ実装しない。
+この scaffold では `ktor` + `postgres` + `cloudflared` の 3 サービスを扱う。Step6 時点では Ktor backend、paper trading runtime、常駐 `ProtectionReconciler`、MCP stdio fat jar の image 同梱、LlmInvoker、daemon scheduler、Obsidian Writer、deterministic Reflection Runner まで実装済み。LLM PromptCandidates 生成、Knowledge note の LLM 育成、live 実発注は未実装。
 
 ## 全体像
 
@@ -94,7 +94,13 @@ POSTGRES_PASSWORD=
 FUKUROU_OBSIDIAN_ENABLED=false
 FUKUROU_OBSIDIAN_VAULT_PATH=/vault
 FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS=300
+FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS=3600
+FUKUROU_REFLECTION_QUERY_LIMIT=1000
+FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS=180
+FUKUROU_REFLECTION_RECENT_DECISION_LIMIT=50
+FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT=30
 # FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
+# Obsidian writer と deterministic Reflection Runner は FUKUROU_OBSIDIAN_ENABLED を共有する。
 
 # production container では image 内の MCP fat jar を使う。
 FUKUROU_MCP_JAR_PATH=/app/fukurou-mcp-all.jar

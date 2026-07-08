@@ -27,6 +27,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
+import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -211,15 +212,37 @@ fun Application.module(
     } else {
         null
     }
-    val obsidianWriterWorker = if (databaseDataSource != null && database != null) {
-        startObsidianWriterWorker(
+    val sharedPersistenceBootstrap = if (database != null) {
+        sharedTradingPersistenceBootstrap(
             database = database,
+            tradingConfig = tradingConfig,
             clock = clock,
         )
     } else {
         null
     }
-    val hasBackgroundWorker = reconcilerWorker != null || llmDaemonWorker != null || obsidianWriterWorker != null
+    val obsidianWriterWorker = if (databaseDataSource != null && database != null) {
+        startObsidianWriterWorker(
+            database = database,
+            clock = clock,
+            bootstrap = sharedPersistenceBootstrap,
+        )
+    } else {
+        null
+    }
+    val reflectionRunnerWorker = if (databaseDataSource != null && database != null) {
+        startReflectionRunnerWorker(
+            database = database,
+            clock = clock,
+            bootstrap = sharedPersistenceBootstrap,
+        )
+    } else {
+        null
+    }
+    val hasBackgroundWorker = reconcilerWorker != null ||
+        llmDaemonWorker != null ||
+        obsidianWriterWorker != null ||
+        reflectionRunnerWorker != null
     val hasClosableResource = databaseDataSource != null ||
         hasBackgroundWorker ||
         createdManualLlmLaunchService != null ||
@@ -227,12 +250,40 @@ fun Application.module(
 
     if (hasClosableResource) {
         monitor.subscribe(ApplicationStopped) {
+            reflectionRunnerWorker?.close()
             obsidianWriterWorker?.close()
             llmDaemonWorker?.close()
             createdLlmAuthService?.close()
             createdManualLlmLaunchService?.close()
             reconcilerWorker?.close()
             databaseDataSource?.close()
+        }
+    }
+}
+
+private fun sharedTradingPersistenceBootstrap(
+    database: ExposedDatabase,
+    tradingConfig: TradingBotConfig,
+    clock: Clock,
+): () -> Result<Unit> {
+    val lock = Any()
+    var completed = false
+
+    return {
+        synchronized(lock) {
+            if (completed) {
+                Result.success(Unit)
+            } else {
+                TradingPersistenceBootstrap(
+                    database = database,
+                    clock = clock,
+                    paperAccountConfig = tradingConfig.paperAccount,
+                ).ensureSchema().also { result ->
+                    if (result.isSuccess) {
+                        completed = true
+                    }
+                }
+            }
         }
     }
 }
