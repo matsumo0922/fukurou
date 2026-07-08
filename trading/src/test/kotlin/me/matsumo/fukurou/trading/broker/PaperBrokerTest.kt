@@ -1071,6 +1071,27 @@ class PaperBrokerTest {
         assertEquals("9685155.00000000", closedPosition.lowestPriceSinceEntryJpy)
         assertEquals("9685155.00000000", closedPosition.currentPriceJpy)
     }
+
+    @Test
+    fun reconcile_stop_fill_uses_bid_orderbook_walk_and_tick_atr_slippage() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc().copy(btcQuantity = "0.010000000000"),
+            positions = listOf(protectedPosition()),
+            openOrders = listOf(linkedStopOrder()),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = StopOrderbookMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val result = broker.reconcile(stopGapTickSnapshotWithAtr()).getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertEquals(1, result.closedPositionIds.size)
+        assertEquals("9672761.00000000", executions.single().priceJpy)
+    }
 }
 
 private fun marketEntryCommand(
@@ -1186,6 +1207,13 @@ private fun stopGapTickSnapshot(): TickSnapshot {
 }
 
 /**
+ * STOP gap fill で tick ATR を含む bid 板歩きを検証するための tick。
+ */
+private fun stopGapTickSnapshotWithAtr(): TickSnapshot {
+    return stopGapTickSnapshot().copy(atr14Jpy = "4000")
+}
+
+/**
  * watermark の単調更新検証に使う tick。
  */
 private fun watermarkTickSnapshot(
@@ -1297,6 +1325,24 @@ private object OrderbookAtrMarketDataSource : MarketDataSource by FakeMarketData
                     OrderbookLevel(price = "10000000", size = "0.0020"),
                     OrderbookLevel(price = "10020000", size = "0.0030"),
                 ),
+            ),
+        )
+    }
+}
+
+/**
+ * STOP reconcile の bid 板歩き検証用 fake market data。
+ */
+private object StopOrderbookMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.success(
+            Orderbook(
+                symbol = symbol.apiSymbol,
+                bids = listOf(
+                    OrderbookLevel(price = "9690000", size = "0.0040"),
+                    OrderbookLevel(price = "9670000", size = "0.0060"),
+                ),
+                asks = emptyList(),
             ),
         )
     }
