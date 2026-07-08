@@ -54,11 +54,10 @@ internal class DecisionExecutionLifecycle(
     suspend fun cancelExpiredRestingEntryOrders(context: DecisionRunContext): Result<List<PaperTradeResult>> {
         return runCatching {
             val startedAt = Instant.now(clock)
-            val observedAt = startedAt
             val openOrders = tradingRuntime.broker.getOpenOrders().getOrThrow()
             val expiredOrders = openOrders.filter { order ->
                 order.isExpiredRestingEntryOrder(
-                    observedAt = observedAt,
+                    observedAt = startedAt,
                     ttl = tradingConfig.decisionProtocol.restingEntryOrderTtl,
                 )
             }
