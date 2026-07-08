@@ -51,10 +51,7 @@ class InMemoryRiskStateCommandService(
     private val clock: Clock = Clock.systemUTC(),
 ) : RiskStateCommandService {
 
-    override suspend fun setHardHalt(
-        reason: String,
-        decisionRunContext: DecisionRunContext,
-    ): Result<RiskState> {
+    override suspend fun setHardHalt(reason: String, decisionRunContext: DecisionRunContext): Result<RiskState> {
         return mutateAndAudit(
             reason = reason,
             decisionRunContext = decisionRunContext,
@@ -64,10 +61,7 @@ class InMemoryRiskStateCommandService(
         }
     }
 
-    override suspend fun setSoftHalt(
-        reason: String,
-        decisionRunContext: DecisionRunContext,
-    ): Result<RiskState> {
+    override suspend fun setSoftHalt(reason: String, decisionRunContext: DecisionRunContext): Result<RiskState> {
         return mutateAndAudit(
             reason = reason,
             decisionRunContext = decisionRunContext,
@@ -77,10 +71,7 @@ class InMemoryRiskStateCommandService(
         }
     }
 
-    override suspend fun resume(
-        reason: String,
-        decisionRunContext: DecisionRunContext,
-    ): Result<RiskState> {
+    override suspend fun resume(reason: String, decisionRunContext: DecisionRunContext): Result<RiskState> {
         return mutateAndAudit(
             reason = reason,
             decisionRunContext = decisionRunContext,

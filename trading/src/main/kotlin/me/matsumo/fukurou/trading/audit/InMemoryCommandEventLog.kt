@@ -34,10 +34,7 @@ class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
         }
     }
 
-    override suspend fun countToolCallEvents(
-        decisionRunId: String,
-        toolNames: Set<String>,
-    ): Result<Int> {
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {
         return runCatching {
             mutex.withLock {
                 storedEvents.count { event ->

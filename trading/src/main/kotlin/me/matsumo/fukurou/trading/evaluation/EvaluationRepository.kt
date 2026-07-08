@@ -58,10 +58,7 @@ interface EvaluationRepository {
  * unit test と in-memory runtime 用の空の評価 repository。
  */
 class InMemoryEvaluationRepository : EvaluationRepository {
-    override suspend fun fetchClosedTrades(
-        period: EvaluationPeriod,
-        limit: Int,
-    ): Result<EvaluationTradeQueryResult> {
+    override suspend fun fetchClosedTrades(period: EvaluationPeriod, limit: Int): Result<EvaluationTradeQueryResult> {
         return runCatching {
             require(limit > 0) {
                 "limit must be greater than 0."

@@ -66,10 +66,7 @@ class OrderFeeRatesTest {
     }
 }
 
-private fun symbolRules(
-    takerFee: String = "0.0005",
-    makerFee: String = "-0.0001",
-): SymbolRules {
+private fun symbolRules(takerFee: String = "0.0005", makerFee: String = "-0.0001"): SymbolRules {
     return SymbolRules(
         symbol = "BTC",
         minOrderSize = "0.0001",

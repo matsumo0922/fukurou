@@ -1691,7 +1691,10 @@ private fun parseClosePositionCommand(request: CallToolRequest, call: GuardedToo
     }
 }
 
-private fun parseUpdateProtectionCommand(request: CallToolRequest, call: GuardedToolCall): Result<UpdateProtectionCommand> {
+private fun parseUpdateProtectionCommand(
+    request: CallToolRequest,
+    call: GuardedToolCall,
+): Result<UpdateProtectionCommand> {
     return runCatching {
         val takeProfitPriceSpecified = request.arguments?.containsKey("new_take_profit_price_jpy") == true
 
@@ -1796,7 +1799,11 @@ private fun parseOptionalBigDecimalArgument(request: CallToolRequest, name: Stri
     }
 }
 
-private fun parseBooleanArgument(request: CallToolRequest, name: String, defaultValue: Boolean): Boolean {
+private fun parseBooleanArgument(
+    request: CallToolRequest,
+    name: String,
+    defaultValue: Boolean,
+): Boolean {
     val rawValue = request.arguments
         ?.get(name)
         ?.jsonPrimitive

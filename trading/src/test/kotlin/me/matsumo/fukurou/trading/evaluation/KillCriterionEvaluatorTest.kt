@@ -345,10 +345,7 @@ private class FailingOnceRiskStateCommandService(
     private val delegate = InMemoryRiskStateCommandService(riskStateRepository, commandEventLog, clock)
     private var shouldFail = true
 
-    override suspend fun setHardHalt(
-        reason: String,
-        decisionRunContext: DecisionRunContext,
-    ): Result<RiskState> {
+    override suspend fun setHardHalt(reason: String, decisionRunContext: DecisionRunContext): Result<RiskState> {
         if (shouldFail) {
             shouldFail = false
 
@@ -358,17 +355,11 @@ private class FailingOnceRiskStateCommandService(
         return delegate.setHardHalt(reason, decisionRunContext)
     }
 
-    override suspend fun setSoftHalt(
-        reason: String,
-        decisionRunContext: DecisionRunContext,
-    ): Result<RiskState> {
+    override suspend fun setSoftHalt(reason: String, decisionRunContext: DecisionRunContext): Result<RiskState> {
         return delegate.setSoftHalt(reason, decisionRunContext)
     }
 
-    override suspend fun resume(
-        reason: String,
-        decisionRunContext: DecisionRunContext,
-    ): Result<RiskState> {
+    override suspend fun resume(reason: String, decisionRunContext: DecisionRunContext): Result<RiskState> {
         return delegate.resume(reason, decisionRunContext)
     }
 }

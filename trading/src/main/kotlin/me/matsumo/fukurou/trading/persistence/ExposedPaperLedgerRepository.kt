@@ -684,10 +684,7 @@ class ExposedPaperLedgerRepository(
         }
     }
 
-    override suspend fun findExecutionsBefore(
-        before: Instant,
-        limit: Int,
-    ): Result<List<Execution>> {
+    override suspend fun findExecutionsBefore(before: Instant, limit: Int): Result<List<Execution>> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 require(limit > 0) {
@@ -701,10 +698,7 @@ class ExposedPaperLedgerRepository(
         }
     }
 
-    override suspend fun findExecutionsForStableFeed(
-        cursor: StableFeedCursor,
-        limit: Int,
-    ): Result<List<Execution>> {
+    override suspend fun findExecutionsForStableFeed(cursor: StableFeedCursor, limit: Int): Result<List<Execution>> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 require(limit > 0) {
@@ -1076,10 +1070,7 @@ private fun JdbcTransaction.selectExecutionsBefore(before: Instant, limit: Int):
     }
 }
 
-private fun JdbcTransaction.selectExecutionsForStableFeed(
-    cursor: StableFeedCursor,
-    limit: Int,
-): List<Execution> {
+private fun JdbcTransaction.selectExecutionsForStableFeed(cursor: StableFeedCursor, limit: Int): List<Execution> {
     val sql = SELECT_EXECUTIONS_FOR_STABLE_FEED_SQL_PREFIX +
         stableFeedCursorCondition("executed_at", "id", cursor) +
         SELECT_EXECUTIONS_FOR_STABLE_FEED_SQL_SUFFIX

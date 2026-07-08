@@ -1106,9 +1106,7 @@ private fun OpsActivitySource?.matchesActivitySource(source: OpsActivitySource):
     return this == null || this == source
 }
 
-private fun newestFirstOpsActivityEvents(
-    events: List<OpsActivityEventResponse>,
-): List<OpsActivityEventResponse> {
+private fun newestFirstOpsActivityEvents(events: List<OpsActivityEventResponse>): List<OpsActivityEventResponse> {
     return events
         .map { event ->
             OpsActivitySortableEvent(

@@ -12,10 +12,7 @@ internal fun Map<String, String>.readOptionalEnv(name: String): String? {
 /**
  * env value の command template を shell 風 quote 対応で分割する。
  */
-internal fun Map<String, String>.readCommandTemplateEnv(
-    name: String,
-    defaultValue: List<String>,
-): List<String> {
+internal fun Map<String, String>.readCommandTemplateEnv(name: String, defaultValue: List<String>): List<String> {
     return readOptionalEnv(name)?.splitCommandTemplate() ?: defaultValue
 }
 

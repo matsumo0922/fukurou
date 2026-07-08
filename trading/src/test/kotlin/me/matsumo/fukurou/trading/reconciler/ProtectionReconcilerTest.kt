@@ -568,7 +568,11 @@ private fun assertEquitySnapshotMatchesAccount(snapshot: EquitySnapshotRecord, a
     assertDecimalStringEquals("drawdown_ratio", account.drawdownRatio, snapshot.drawdownRatio)
 }
 
-private fun assertDecimalStringEquals(fieldName: String, expected: String, actual: BigDecimal) {
+private fun assertDecimalStringEquals(
+    fieldName: String,
+    expected: String,
+    actual: BigDecimal,
+) {
     assertEquals(0, actual.compareTo(expected.toBigDecimal()), "$fieldName mismatch")
 }
 
@@ -723,10 +727,7 @@ private object FailingCommandEventLog : CommandEventLog {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 
-    override suspend fun countToolCallEvents(
-        decisionRunId: String,
-        toolNames: Set<String>,
-    ): Result<Int> {
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 }
@@ -754,9 +755,7 @@ private class SwitchableTickStream(
 /**
  * 固定時刻の tick snapshot を返す。
  */
-private fun fixedTickSnapshot(
-    observedAt: Instant = fixedInstant(),
-): TickSnapshot {
+private fun fixedTickSnapshot(observedAt: Instant = fixedInstant()): TickSnapshot {
     return TickSnapshot(
         symbol = "BTC",
         observedAt = observedAt,

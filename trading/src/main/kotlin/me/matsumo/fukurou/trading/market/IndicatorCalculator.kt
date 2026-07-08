@@ -131,10 +131,7 @@ object IndicatorCalculator {
     /**
      * indicator が少なくとも 1 つの非 null 値を返すために必要な最小 candle 本数を返す。
      */
-    fun requiredCandleCount(
-        indicator: IndicatorType,
-        params: IndicatorParams = IndicatorParams(),
-    ): Result<Int> {
+    fun requiredCandleCount(indicator: IndicatorType, params: IndicatorParams = IndicatorParams()): Result<Int> {
         return runCatching {
             when (indicator) {
                 IndicatorType.ATR -> {
@@ -698,10 +695,7 @@ private fun rsiValue(averageGain: Double, averageLoss: Double): Double {
     return 100.0 - (100.0 / (1.0 + relativeStrength))
 }
 
-private fun calculateMacdLine(
-    fastEmaValues: List<Double?>,
-    slowEmaValues: List<Double?>,
-): List<Double?> {
+private fun calculateMacdLine(fastEmaValues: List<Double?>, slowEmaValues: List<Double?>): List<Double?> {
     return fastEmaValues.mapIndexed { valueIndex, fastEma ->
         val slowEma = slowEmaValues[valueIndex]
 

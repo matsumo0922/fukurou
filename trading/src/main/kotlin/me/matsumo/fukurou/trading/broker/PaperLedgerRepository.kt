@@ -64,18 +64,12 @@ interface PaperLedgerRepository {
     /**
      * 指定時刻より古い execution ledger の行を新しい順で返す。
      */
-    suspend fun findExecutionsBefore(
-        before: Instant,
-        limit: Int,
-    ): Result<List<Execution>>
+    suspend fun findExecutionsBefore(before: Instant, limit: Int): Result<List<Execution>>
 
     /**
      * 安定 cursor 条件に一致する execution ledger の行を Activity timeline 用に新しい順で取得する。
      */
-    suspend fun findExecutionsForStableFeed(
-        cursor: StableFeedCursor,
-        limit: Int,
-    ): Result<List<Execution>>
+    suspend fun findExecutionsForStableFeed(cursor: StableFeedCursor, limit: Int): Result<List<Execution>>
 
     /**
      * 指定範囲に close された position と関連 executions を返す。

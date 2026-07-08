@@ -1,0 +1,9 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<SmellBaseline>
+  <ManuallySuppressedIssues/>
+  <CurrentIssues>
+    <ID>LongParameterList:GmoCoinMarketTools.kt$( marketDataSource: MarketDataSource, toolExecutor: GmoCoinMarketToolExecutor, indicatorCalculator: GmoCoinIndicatorCalculator, klineRequestBudgetHook: GmoCoinKlineRequestBudgetHook, dailyKlineRequestLimit: Int?, clock: Clock, )</ID>
+    <ID>LongParameterList:GmoCoinMarketTools.kt$( request: CallToolRequest, marketDataSource: MarketDataSource, toolExecutor: GmoCoinMarketToolExecutor, indicatorCalculator: GmoCoinIndicatorCalculator, klineRequestBudgetHook: GmoCoinKlineRequestBudgetHook, clock: Clock, )</ID>
+    <ID>LongParameterList:GmoCoinMcpServerTest.kt$( structuredContent: JsonObject, fetchedAt: String, sourceTimestamp: String?, stalenessMs: Long, staleAfterMs: Long, stale: Boolean, source: String, )</ID>
+  </CurrentIssues>
+</SmellBaseline>

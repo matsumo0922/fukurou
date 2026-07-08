@@ -1900,10 +1900,7 @@ private fun RenderedLlmCommand.codexConfigContent(): String {
     return Files.readString(codexHome.resolve("config.toml"))
 }
 
-private fun cleanExit(
-    stdout: String = "",
-    stderr: String = "",
-): ProcessRunResult {
+private fun cleanExit(stdout: String = "", stderr: String = ""): ProcessRunResult {
     return ProcessRunResult(
         status = ProcessRunStatus.EXITED,
         exitCode = 0,
@@ -1912,10 +1909,7 @@ private fun cleanExit(
     )
 }
 
-private fun nonZeroExit(
-    stdout: String = "",
-    stderr: String = "failed",
-): ProcessRunResult {
+private fun nonZeroExit(stdout: String = "", stderr: String = "failed"): ProcessRunResult {
     return ProcessRunResult(
         status = ProcessRunStatus.EXITED,
         exitCode = 1,

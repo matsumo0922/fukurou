@@ -40,7 +40,12 @@ class FillSimulator(
     /**
      * MARKET 約定を計算する。
      */
-    fun marketFill(side: OrderSide, sizeBtc: BigDecimal, ticker: Ticker, rules: SymbolRules): SimulatedFill {
+    fun marketFill(
+        side: OrderSide,
+        sizeBtc: BigDecimal,
+        ticker: Ticker,
+        rules: SymbolRules,
+    ): SimulatedFill {
         val price = when (side) {
             OrderSide.BUY -> applyPositiveSlippage(ticker.ask.toBigDecimal())
             OrderSide.SELL -> applyNegativeSlippage(ticker.bid.toBigDecimal())

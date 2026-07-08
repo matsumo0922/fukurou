@@ -140,10 +140,7 @@ private class CallerContextSwitchingCommandEventLog : CommandEventLog {
         return Result.success(0)
     }
 
-    override suspend fun countToolCallEvents(
-        decisionRunId: String,
-        toolNames: Set<String>,
-    ): Result<Int> {
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {
         return Result.success(0)
     }
 

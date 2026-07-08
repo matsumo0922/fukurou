@@ -29,18 +29,12 @@ interface MarketDataSource {
     /**
      * 指定 symbol の板情報を取得する。
      */
-    suspend fun getOrderbook(
-        symbol: TradingSymbol,
-        depth: Int,
-    ): Result<Orderbook>
+    suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook>
 
     /**
      * 指定 symbol の直近約定を取得する。
      */
-    suspend fun getTrades(
-        symbol: TradingSymbol,
-        limit: Int,
-    ): Result<List<RecentTrade>>
+    suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>>
 
     /**
      * 指定 symbol の最小発注数量や刻み幅を取得する。

@@ -320,7 +320,10 @@ private fun writePersistentCodexHome(mcpServer: LlmMcpServerConfig, directory: P
     )
 }
 
-private fun writeTemporaryCodexHome(mcpServer: LlmMcpServerConfig, environment: Map<String, String>): PrivateConfigPath {
+private fun writeTemporaryCodexHome(
+    mcpServer: LlmMcpServerConfig,
+    environment: Map<String, String>,
+): PrivateConfigPath {
     val directory = Files.createTempDirectory("fukurou-codex-home-")
     directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
 
@@ -346,10 +349,7 @@ private fun writeTemporaryCodexHome(mcpServer: LlmMcpServerConfig, environment: 
     }
 }
 
-private fun copyCodexAuthFile(
-    environment: Map<String, String>,
-    targetDirectory: Path,
-): Path? {
+private fun copyCodexAuthFile(environment: Map<String, String>, targetDirectory: Path): Path? {
     val sourcePath = environment.codexAuthFilePath() ?: return null
 
     if (!Files.isRegularFile(sourcePath)) {

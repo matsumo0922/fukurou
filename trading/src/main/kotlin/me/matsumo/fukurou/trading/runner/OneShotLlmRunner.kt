@@ -921,10 +921,7 @@ class OneShotLlmRunner(
         }
     }
 
-    private fun mcpEnvironment(
-        context: DecisionRunContext,
-        allowedTools: List<String>,
-    ): Map<String, String> {
+    private fun mcpEnvironment(context: DecisionRunContext, allowedTools: List<String>): Map<String, String> {
         val runEnvironment = runEnvironment(context)
         val databaseEnvironment = DB_ENV_KEYS.mapNotNull { key ->
             parentEnvironment[key]?.let { value -> key to value }
@@ -944,10 +941,7 @@ class OneShotLlmRunner(
             )
     }
 
-    private fun childEnvironment(
-        context: DecisionRunContext,
-        intentId: UUID?,
-    ): Map<String, String> {
+    private fun childEnvironment(context: DecisionRunContext, intentId: UUID?): Map<String, String> {
         val baseEnvironment = parentEnvironment
             .filterKeys { key -> key in CHILD_ENV_ALLOWLIST }
             .filterKeys { key -> !isForbiddenSecretEnvKey(key) }
@@ -1008,10 +1002,7 @@ class OneShotLlmRunner(
         """.trimMargin()
     }
 
-    private fun allowedToolsForPhase(
-        phase: LlmInvocationPhase,
-        cliConfig: OneShotRunnerCliConfig,
-    ): List<String> {
+    private fun allowedToolsForPhase(phase: LlmInvocationPhase, cliConfig: OneShotRunnerCliConfig): List<String> {
         return when (phase) {
             LlmInvocationPhase.PROPOSER -> cliConfig.proposerAllowedTools
             LlmInvocationPhase.FALSIFIER -> cliConfig.falsifierAllowedTools
