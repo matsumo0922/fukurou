@@ -580,17 +580,33 @@ data class OpsActivityCatalogItemResponse(
 /**
  * runtime config catalog route の依存関係。
  *
- * @param tradingConfig 取引 bot 全体の typed config
- * @param environment runtime config catalog API で参照する環境変数 map
+ * @param snapshotProvider active runtime config の現在状態 provider
  * @param adminService runtime config の draft / validate / activate 操作用 service
- * @param warnings startup 時に検出した runtime config warning
  */
 internal data class OpsRuntimeConfigRouteDependencies(
+    val snapshotProvider: OpsRuntimeConfigSnapshotProvider,
+    val adminService: RuntimeConfigAdminService? = null,
+)
+
+/**
+ * runtime config catalog route が参照する現在状態。
+ *
+ * @param tradingConfig 取引 bot 全体の typed config
+ * @param environment runtime config catalog API で参照する環境変数 map
+ * @param warnings active runtime config の warning
+ */
+internal data class OpsRuntimeConfigRouteSnapshot(
     val tradingConfig: TradingBotConfig,
     val environment: Map<String, String>,
-    val adminService: RuntimeConfigAdminService? = null,
     val warnings: List<RuntimeConfigSnapshotWarning> = emptyList(),
 )
+
+/**
+ * runtime config catalog route が現在状態を読む境界。
+ */
+internal fun interface OpsRuntimeConfigSnapshotProvider {
+    fun snapshot(): OpsRuntimeConfigRouteSnapshot
+}
 
 /**
  * runtime config draft 作成 API の request body。
@@ -622,12 +638,21 @@ data class OpsRuntimeConfigVersionActionRequest(
  * @param riskStateRepository risk_state repository
  * @param riskStateCommandService risk_state command service
  * @param manualLlmLaunchService manual LLM launch service
+ * @param runtimeAvailabilityProvider 取引 runtime が利用可能かを読む境界
  */
 internal data class OpsRiskRouteDependencies(
     val riskStateRepository: RiskStateRepository?,
     val riskStateCommandService: RiskStateCommandService?,
     val manualLlmLaunchService: ManualLlmLaunchService?,
+    val runtimeAvailabilityProvider: OpsRuntimeAvailabilityProvider = OpsRuntimeAvailabilityProvider { true },
 )
+
+/**
+ * 取引 runtime が利用可能かを読む境界。
+ */
+internal fun interface OpsRuntimeAvailabilityProvider {
+    fun isAvailable(): Boolean
+}
 
 /**
  * ops CLI auth route の依存関係。
@@ -694,14 +719,15 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
     val adminService = runtimeConfig.adminService
 
     get("/ops/runtime-config") {
+        val runtimeConfigSnapshot = runtimeConfig.snapshotProvider.snapshot()
         val versionsResult = adminService?.listVersions()
         val versions = versionsResult?.getOrNull().orEmpty()
-        val warnings = runtimeConfig.warnings + versionHistoryWarning(versionsResult)
+        val warnings = runtimeConfigSnapshot.warnings + versionHistoryWarning(versionsResult)
 
         call.respond(
             RuntimeConfigCatalog.snapshot(
-                tradingConfig = runtimeConfig.tradingConfig,
-                environment = runtimeConfig.environment,
+                tradingConfig = runtimeConfigSnapshot.tradingConfig,
+                environment = runtimeConfigSnapshot.environment,
             ).copy(
                 activeVersion = versions.firstOrNull { version -> version.status == "ACTIVE" },
                 versions = versions,
@@ -1005,10 +1031,18 @@ private fun Route.registerOpsRiskStateRoute(dependencies: OpsRouteDependencies) 
 @OptIn(ExperimentalKtorApi::class)
 private fun Route.registerOpsTriggerRoute(dependencies: OpsRouteDependencies) {
     val manualLlmLaunchService = dependencies.risk.manualLlmLaunchService
+    val runtimeAvailabilityProvider = dependencies.risk.runtimeAvailabilityProvider
 
     post("/ops/trigger") {
         val request = call.receiveBodyOrBadRequest<OpsTriggerRequest>() ?: return@post
         val reason = call.requireReason(request.reason) ?: return@post
+
+        if (!runtimeAvailabilityProvider.isAvailable()) {
+            call.respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("runtime config is unavailable"))
+
+            return@post
+        }
+
         val service = call.requireManualLlmLaunchService(manualLlmLaunchService) ?: return@post
         val result = service.launch(reason).getOrThrow()
 

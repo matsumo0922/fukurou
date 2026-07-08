@@ -24,6 +24,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshotWarning
 import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedException
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
+import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
@@ -164,58 +165,107 @@ private fun createApplicationRuntimeResources(
     databaseResources: ApplicationDatabaseResources,
     inputs: ApplicationRuntimeInputs,
 ): ApplicationRuntimeResources {
-    val runtimeConfigWarnings = mutableListOf<RuntimeConfigSnapshotWarning>()
-    val runtimeConfigRepository = databaseResources.database?.let { database ->
+    val runtimeConfigState = ApplicationRuntimeConfigState(
+        databaseResources = databaseResources,
+        inputs = inputs,
+    )
+    val runtimeConfigSnapshot = runtimeConfigState.snapshot()
+
+    return ApplicationRuntimeResources(
+        readinessProbe = inputs.readinessProbe,
+        reconcilerStatus = inputs.reconcilerStatus,
+        clock = inputs.clock,
+        tradingConfig = runtimeConfigSnapshot.tradingConfig,
+        tradingRuntimeAvailable = runtimeConfigSnapshot.tradingRuntimeAvailable,
+        runtimeConfigSnapshot = runtimeConfigSnapshot.runtimeConfigSnapshot,
+        runtimeConfigState = runtimeConfigState,
+    )
+}
+
+/**
+ * active runtime config の現在状態を解決する holder。
+ *
+ * @param databaseResources DB と process environment
+ * @param inputs module の runtime 入力
+ */
+private class ApplicationRuntimeConfigState(
+    private val databaseResources: ApplicationDatabaseResources,
+    private val inputs: ApplicationRuntimeInputs,
+) {
+    private val runtimeConfigRepository = databaseResources.database?.let { database ->
         ExposedRuntimeConfigRepository(
             database = database,
             clock = inputs.clock,
             environment = databaseResources.environment,
         )
     }
-    val runtimeConfigBootstrapResult = databaseResources.database?.let { database ->
-        RuntimeConfigPersistenceBootstrap(
-            database = database,
-            clock = inputs.clock,
-        ).ensureSchema()
-    }
-    val runtimeConfigResolutionResult = runtimeConfigRepository
-        ?.let { repository -> RuntimeConfigResolver(repository).resolve(databaseResources.environment) }
-    val runtimeConfigResolution = runtimeConfigResolutionResult?.getOrNull()
 
-    runtimeConfigResolutionResult?.exceptionOrNull()
-        ?.let { error -> runtimeConfigWarnings += runtimeConfigResolveWarning(error) }
-    if (runtimeConfigBootstrapResult?.isFailure == true && runtimeConfigResolutionResult?.isFailure != true) {
-        runtimeConfigWarnings += RuntimeConfigSnapshotWarning(code = "runtimeConfig.warning.bootstrapUnavailable")
-    }
-
-    val resolvedTradingConfig = runtimeConfigResolution?.tradingConfig ?: inputs.tradingConfig
-    val hasNoDatabase = databaseResources.database == null
-    val hasResolvedDatabaseRuntimeConfig = runtimeConfigBootstrapResult?.isSuccess == true && runtimeConfigResolution != null
-    var tradingRuntimeAvailable = hasNoDatabase || hasResolvedDatabaseRuntimeConfig
-
-    if (databaseResources.database != null && tradingRuntimeAvailable) {
-        val tradingBootstrapResult = TradingPersistenceBootstrap(
-            database = databaseResources.database,
-            clock = inputs.clock,
-            paperAccountConfig = resolvedTradingConfig.paperAccount,
-        ).ensureSchema()
-
-        if (tradingBootstrapResult.isFailure) {
-            tradingRuntimeAvailable = false
-            runtimeConfigWarnings += RuntimeConfigSnapshotWarning(code = "runtimeConfig.warning.tradingSchemaUnavailable")
+    fun snapshot(): ApplicationRuntimeConfigSnapshot {
+        return runCatching {
+            snapshotUnsafe()
+        }.getOrElse { error ->
+            ApplicationRuntimeConfigSnapshot(
+                tradingConfig = inputs.tradingConfig,
+                tradingRuntimeAvailable = false,
+                runtimeConfigEnvironment = inputs.runtimeConfigEnvironment,
+                runtimeConfigSnapshot = null,
+                runtimeConfigWarnings = listOf(runtimeConfigResolveWarning(error)),
+            )
         }
     }
 
-    return ApplicationRuntimeResources(
-        readinessProbe = inputs.readinessProbe,
-        reconcilerStatus = inputs.reconcilerStatus,
-        clock = inputs.clock,
-        tradingConfig = resolvedTradingConfig,
-        tradingRuntimeAvailable = tradingRuntimeAvailable,
-        runtimeConfigEnvironment = runtimeConfigResolution?.catalogEnvironment ?: inputs.runtimeConfigEnvironment,
-        runtimeConfigSnapshot = runtimeConfigResolution?.auditSnapshot,
-        runtimeConfigWarnings = runtimeConfigWarnings,
-    )
+    private fun snapshotUnsafe(): ApplicationRuntimeConfigSnapshot {
+        val database = databaseResources.database
+
+        if (database == null) {
+            return ApplicationRuntimeConfigSnapshot(
+                tradingConfig = inputs.tradingConfig,
+                tradingRuntimeAvailable = true,
+                runtimeConfigEnvironment = inputs.runtimeConfigEnvironment,
+                runtimeConfigSnapshot = null,
+                runtimeConfigWarnings = emptyList(),
+            )
+        }
+
+        val runtimeConfigWarnings = mutableListOf<RuntimeConfigSnapshotWarning>()
+        val runtimeConfigBootstrapResult = RuntimeConfigPersistenceBootstrap(
+            database = database,
+            clock = inputs.clock,
+        ).ensureSchema()
+        val runtimeConfigResolutionResult = runtimeConfigRepository
+            ?.let { repository -> RuntimeConfigResolver(repository).resolve(databaseResources.environment) }
+        val runtimeConfigResolution = runtimeConfigResolutionResult?.getOrNull()
+
+        runtimeConfigResolutionResult?.exceptionOrNull()
+            ?.let { error -> runtimeConfigWarnings += runtimeConfigResolveWarning(error) }
+        if (runtimeConfigBootstrapResult.isFailure && runtimeConfigResolutionResult?.isFailure != true) {
+            runtimeConfigWarnings += RuntimeConfigSnapshotWarning(code = "runtimeConfig.warning.bootstrapUnavailable")
+        }
+
+        val resolvedTradingConfig = runtimeConfigResolution?.tradingConfig ?: inputs.tradingConfig
+        var tradingRuntimeAvailable = runtimeConfigBootstrapResult.isSuccess && runtimeConfigResolution != null
+
+        if (tradingRuntimeAvailable) {
+            val tradingBootstrapResult = TradingPersistenceBootstrap(
+                database = database,
+                clock = inputs.clock,
+                paperAccountConfig = resolvedTradingConfig.paperAccount,
+            ).ensureSchema()
+
+            if (tradingBootstrapResult.isFailure) {
+                tradingRuntimeAvailable = false
+                runtimeConfigWarnings += RuntimeConfigSnapshotWarning(code = "runtimeConfig.warning.tradingSchemaUnavailable")
+            }
+        }
+
+        return ApplicationRuntimeConfigSnapshot(
+            tradingConfig = resolvedTradingConfig,
+            tradingRuntimeAvailable = tradingRuntimeAvailable,
+            runtimeConfigEnvironment = runtimeConfigResolution?.catalogEnvironment ?: inputs.runtimeConfigEnvironment,
+            runtimeConfigSnapshot = runtimeConfigResolution?.auditSnapshot,
+            runtimeConfigWarnings = runtimeConfigWarnings,
+        )
+    }
 }
 
 private fun runtimeConfigResolveWarning(error: Throwable): RuntimeConfigSnapshotWarning {
@@ -229,6 +279,20 @@ private fun runtimeConfigResolveWarning(error: Throwable): RuntimeConfigSnapshot
     }
 
     return RuntimeConfigSnapshotWarning(code = "runtimeConfig.warning.activeSnapshotUnavailable")
+}
+
+private fun ApplicationRuntimeConfigSnapshot.toOpsRuntimeConfigRouteSnapshot(): OpsRuntimeConfigRouteSnapshot {
+    return OpsRuntimeConfigRouteSnapshot(
+        tradingConfig = tradingConfig,
+        environment = runtimeConfigEnvironment,
+        warnings = runtimeConfigWarnings,
+    )
+}
+
+private fun ApplicationRuntimeConfigSnapshot.delegateKey(): String {
+    val snapshot = runtimeConfigSnapshot ?: return "env:${tradingConfig.hashCode()}"
+
+    return "${snapshot.versionId}:${snapshot.hash}"
 }
 
 private fun createApplicationRouteResources(
@@ -314,10 +378,10 @@ private fun createOpsRouteResources(
     return ApplicationOpsRouteResources(
         dependencies = OpsRouteDependencies(
             runtimeConfig = OpsRuntimeConfigRouteDependencies(
-                tradingConfig = runtime.tradingConfig,
-                environment = runtime.runtimeConfigEnvironment,
+                snapshotProvider = OpsRuntimeConfigSnapshotProvider {
+                    runtime.runtimeConfigState.snapshot().toOpsRuntimeConfigRouteSnapshot()
+                },
                 adminService = runtimeConfigAdminService,
-                warnings = runtime.runtimeConfigWarnings,
             ),
             risk = createOpsRiskRouteDependencies(
                 database = database,
@@ -346,7 +410,7 @@ private fun createOpsRiskRouteDependencies(
     database: ExposedDatabase?,
     opsOverrides: ApplicationOpsOverrides,
     riskStateRepository: RiskStateRepository?,
-    createdManualLlmLaunchService: DefaultManualLlmLaunchService?,
+    createdManualLlmLaunchService: CreatedManualLlmLaunchService?,
     runtime: ApplicationRuntimeResources,
 ): OpsRiskRouteDependencies {
     return OpsRiskRouteDependencies(
@@ -357,10 +421,9 @@ private fun createOpsRiskRouteDependencies(
                 clock = runtime.clock,
             )
         },
-        manualLlmLaunchService = if (runtime.tradingRuntimeAvailable) {
-            opsOverrides.manualLlmLaunchService ?: createdManualLlmLaunchService
-        } else {
-            null
+        manualLlmLaunchService = opsOverrides.manualLlmLaunchService ?: createdManualLlmLaunchService?.service,
+        runtimeAvailabilityProvider = OpsRuntimeAvailabilityProvider {
+            runtime.runtimeConfigState.snapshot().tradingRuntimeAvailable
         },
     )
 }
@@ -402,7 +465,7 @@ private fun createDefaultManualLlmLaunchService(
     databaseResources: ApplicationDatabaseResources,
     opsOverrides: ApplicationOpsOverrides,
     runtime: ApplicationRuntimeResources,
-): DefaultManualLlmLaunchService? {
+): CreatedManualLlmLaunchService? {
     val dataSource = databaseResources.dataSource
     val database = databaseResources.database
     val hasInjectedManualLaunchService = opsOverrides.manualLlmLaunchService != null
@@ -411,22 +474,95 @@ private fun createDefaultManualLlmLaunchService(
         return null
     }
 
-    if (!runtime.tradingRuntimeAvailable) {
-        return null
-    }
-
     if (dataSource == null || database == null) {
         return null
     }
 
-    return createManualLlmLaunchService(
+    if (!hasManualLlmLaunchServiceEnvironment(databaseResources.environment)) {
+        return null
+    }
+
+    val service = RecoveringManualLlmLaunchService(
         dataSource = dataSource,
         database = database,
         environment = databaseResources.environment,
-        tradingConfig = runtime.tradingConfig,
-        runtimeConfigSnapshot = runtime.runtimeConfigSnapshot,
+        runtimeConfigState = runtime.runtimeConfigState,
         clock = runtime.clock,
     )
+
+    return CreatedManualLlmLaunchService(
+        service = service,
+        close = service::close,
+    )
+}
+
+/**
+ * active runtime config が復旧した後に manual LLM launch service を遅延構築する service。
+ *
+ * @param dataSource PostgreSQL data source
+ * @param database Exposed database
+ * @param environment runner / invoker 用 environment
+ * @param runtimeConfigState active runtime config の現在状態
+ * @param clock service と runner に渡す clock
+ */
+private class RecoveringManualLlmLaunchService(
+    private val dataSource: HikariDataSource,
+    private val database: ExposedDatabase,
+    private val environment: Map<String, String>,
+    private val runtimeConfigState: ApplicationRuntimeConfigState,
+    private val clock: Clock,
+) : ManualLlmLaunchService, AutoCloseable {
+    private val lock = Any()
+    private var delegateKey: String? = null
+    private var delegate: DefaultManualLlmLaunchService? = null
+
+    override suspend fun launch(reason: String): Result<ManualLlmLaunchResult> {
+        val runtimeConfigSnapshot = runtimeConfigState.snapshot()
+
+        if (!runtimeConfigSnapshot.tradingRuntimeAvailable) {
+            return Result.success(ManualLlmLaunchResult.Rejected(RUNTIME_CONFIG_UNAVAILABLE_REASON))
+        }
+
+        val service = serviceFor(runtimeConfigSnapshot)
+            ?: return Result.success(ManualLlmLaunchResult.Rejected(MANUAL_LAUNCH_SERVICE_UNAVAILABLE_REASON))
+
+        return service.launch(reason)
+    }
+
+    override fun close() {
+        synchronized(lock) {
+            delegate?.close()
+            delegate = null
+            delegateKey = null
+        }
+    }
+
+    private fun serviceFor(runtimeConfigSnapshot: ApplicationRuntimeConfigSnapshot): DefaultManualLlmLaunchService? {
+        val nextDelegateKey = runtimeConfigSnapshot.delegateKey()
+
+        synchronized(lock) {
+            val currentDelegate = delegate
+
+            if (currentDelegate != null && delegateKey == nextDelegateKey) {
+                return currentDelegate
+            }
+
+            currentDelegate?.close()
+
+            val nextDelegate = createManualLlmLaunchService(
+                dataSource = dataSource,
+                database = database,
+                environment = environment,
+                tradingConfig = runtimeConfigSnapshot.tradingConfig,
+                runtimeConfigSnapshot = runtimeConfigSnapshot.runtimeConfigSnapshot,
+                clock = clock,
+            )
+            delegate = nextDelegate
+            delegateKey = nextDelegate?.let { nextDelegateKey }
+
+            return nextDelegate
+        }
+    }
 }
 
 private fun createDefaultLlmAuthService(
@@ -450,21 +586,33 @@ private fun createApplicationReadinessProbe(
     databaseResources: ApplicationDatabaseResources,
     runtime: ApplicationRuntimeResources,
 ): ReadinessProbe {
-    if (!runtime.tradingRuntimeAvailable) {
-        return ReadinessProbe { false }
-    }
-
     val baseReadinessProbe = runtime.readinessProbe ?: databaseReadinessProbe(databaseResources.database)
 
     if (databaseResources.database == null || runtime.readinessProbe != null) {
-        return baseReadinessProbe
+        return ReadinessProbe {
+            runtime.runtimeConfigState.snapshot().tradingRuntimeAvailable && baseReadinessProbe.isReady()
+        }
     }
 
-    return ReconcilerFreshnessReadinessProbe(
+    val reconcilerReadinessProbe = ReconcilerFreshnessReadinessProbe(
         delegate = baseReadinessProbe,
         reconcilerStatusProvider = runtime.reconcilerStatus,
         clock = runtime.clock,
     )
+
+    return ReadinessProbe {
+        val runtimeAvailable = runtime.runtimeConfigState.snapshot().tradingRuntimeAvailable
+
+        if (!runtimeAvailable) {
+            return@ReadinessProbe false
+        }
+
+        if (!runtime.tradingRuntimeAvailable) {
+            return@ReadinessProbe baseReadinessProbe.isReady()
+        }
+
+        reconcilerReadinessProbe.isReady()
+    }
 }
 
 private fun Application.installApplicationPlugins(webRoot: File?) {
@@ -559,7 +707,7 @@ private fun Application.subscribeApplicationShutdown(
         backgroundWorkers.obsidianWriterWorker?.close()
         backgroundWorkers.llmDaemonWorker?.close()
         opsResources.createdLlmAuthService?.close()
-        opsResources.createdManualLlmLaunchService?.close()
+        opsResources.createdManualLlmLaunchService?.close?.invoke()
         backgroundWorkers.reconcilerWorker?.close()
         databaseResources.dataSource?.close()
     }
@@ -610,6 +758,23 @@ private data class ApplicationRuntimeInputs(
 )
 
 /**
+ * active runtime config から解決した現在の runtime 状態。
+ *
+ * @param tradingConfig 取引 bot 全体の typed config
+ * @param tradingRuntimeAvailable 取引 runtime / manual trigger / daemon を起動できるか
+ * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
+ * @param runtimeConfigSnapshot active runtime config の監査 snapshot
+ * @param runtimeConfigWarnings runtime config catalog API で返す運用者向け warning
+ */
+private data class ApplicationRuntimeConfigSnapshot(
+    val tradingConfig: TradingBotConfig,
+    val tradingRuntimeAvailable: Boolean,
+    val runtimeConfigEnvironment: Map<String, String>,
+    val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
+    val runtimeConfigWarnings: List<RuntimeConfigSnapshotWarning>,
+)
+
+/**
  * Application.module の解決済み runtime resource。
  *
  * @param readinessProbe 外部から注入された readiness probe
@@ -617,9 +782,8 @@ private data class ApplicationRuntimeInputs(
  * @param clock worker と route に渡す clock
  * @param tradingConfig 取引 bot 全体の typed config
  * @param tradingRuntimeAvailable 取引 runtime / manual trigger / daemon を起動できるか
- * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  * @param runtimeConfigSnapshot 起動時に解決した runtime config snapshot
- * @param runtimeConfigWarnings runtime config catalog API で返す運用者向け warning
+ * @param runtimeConfigState active runtime config の現在状態 holder
  */
 private data class ApplicationRuntimeResources(
     val readinessProbe: ReadinessProbe?,
@@ -627,9 +791,8 @@ private data class ApplicationRuntimeResources(
     val clock: Clock,
     val tradingConfig: TradingBotConfig,
     val tradingRuntimeAvailable: Boolean,
-    val runtimeConfigEnvironment: Map<String, String>,
     val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
-    val runtimeConfigWarnings: List<RuntimeConfigSnapshotWarning>,
+    val runtimeConfigState: ApplicationRuntimeConfigState,
 )
 
 /**
@@ -695,6 +858,17 @@ private data class ApplicationRouteResources(
 )
 
 /**
+ * module が生成した manual LLM launch service と終了処理。
+ *
+ * @param service route に渡す manual LLM launch service
+ * @param close Application shutdown 時の終了処理
+ */
+private data class CreatedManualLlmLaunchService(
+    val service: ManualLlmLaunchService,
+    val close: () -> Unit,
+)
+
+/**
  * ops route の解決済み resource。
  *
  * @param dependencies ops route の依存関係
@@ -703,7 +877,7 @@ private data class ApplicationRouteResources(
  */
 private data class ApplicationOpsRouteResources(
     val dependencies: OpsRouteDependencies,
-    val createdManualLlmLaunchService: DefaultManualLlmLaunchService?,
+    val createdManualLlmLaunchService: CreatedManualLlmLaunchService?,
     val createdLlmAuthService: DefaultLlmAuthService?,
 )
 
@@ -726,6 +900,16 @@ private data class ApplicationBackgroundWorkers(
         obsidianWriterWorker != null ||
         reflectionRunnerWorker != null
 }
+
+/**
+ * runtime config が利用できないときの manual trigger 拒否理由。
+ */
+private const val RUNTIME_CONFIG_UNAVAILABLE_REASON = "runtime config is unavailable"
+
+/**
+ * manual LLM launch service を構築できないときの拒否理由。
+ */
+private const val MANUAL_LAUNCH_SERVICE_UNAVAILABLE_REASON = "manual LLM launch service is unavailable"
 
 /**
  * readiness 注入がない場合だけ DB DataSource を構築する。

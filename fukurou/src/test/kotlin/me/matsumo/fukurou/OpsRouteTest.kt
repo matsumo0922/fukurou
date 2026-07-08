@@ -632,9 +632,24 @@ class OpsRouteTest {
             RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
             deleteRuntimeConfigValue(database, "runner.maxToolCallsPerRun")
 
+            val manualService = CapturingManualLlmLaunchService(
+                ManualLlmLaunchResult.Accepted(
+                    invocationId = "manual-recovered",
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                ),
+            )
+            val reconcilerStatus = MutableReconcilerStatus()
+            reconcilerStatus.markReconciled(
+                reconciledAt = fixedInstant(),
+                startupFullReconcileCompleted = true,
+                lastMarketDataAt = fixedInstant(),
+            )
+
             application {
                 module(
                     clock = fixedClock(),
+                    reconcilerStatus = reconcilerStatus,
+                    opsManualLlmLaunchService = manualService,
                     databaseConfig = databaseConfig,
                 )
             }
@@ -660,6 +675,36 @@ class OpsRouteTest {
             assertEquals("runtimeConfig.validation.missingKeys", validationError.getValue("code").jsonPrimitive.content)
             assertEquals(HttpStatusCode.ServiceUnavailable, triggerResponse.status)
             assertEquals(HttpStatusCode.ServiceUnavailable, readyResponse.status)
+            assertEquals(emptyList(), manualService.reasons)
+
+            val draftResponse = client.post("/ops/runtime-config/drafts") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"values":{"runner.maxToolCallsPerRun":"12"},"note":"restore missing runtime key"}""")
+            }
+            val draftBody = Json.parseToJsonElement(draftResponse.bodyAsText()).jsonObject
+            val versionId = draftBody.getValue("version").jsonObject.getValue("id").jsonPrimitive.content
+            val activateResponse = client.post("/ops/runtime-config/drafts/$versionId/activate") {
+                contentType(ContentType.Application.Json)
+                setBody("""{}""")
+            }
+            val recoveredConfigResponse = client.get("/ops/runtime-config")
+            val recoveredTriggerResponse = client.post("/ops/trigger") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"operator restored runtime config"}""")
+            }
+            val recoveredReadyResponse = client.get("/health/ready")
+            val recoveredBody = Json.parseToJsonElement(recoveredConfigResponse.bodyAsText()).jsonObject
+            val recoveredWarnings = recoveredBody.getValue("warnings").jsonArray.map { element ->
+                element.jsonObject.getValue("code").jsonPrimitive.content
+            }
+
+            assertEquals(HttpStatusCode.Created, draftResponse.status)
+            assertEquals(HttpStatusCode.OK, activateResponse.status)
+            assertEquals(HttpStatusCode.OK, recoveredConfigResponse.status)
+            assertFalse(recoveredWarnings.contains("runtimeConfig.warning.activeValidationFailed"))
+            assertEquals(HttpStatusCode.Accepted, recoveredTriggerResponse.status)
+            assertEquals(HttpStatusCode.OK, recoveredReadyResponse.status)
+            assertEquals(listOf("operator restored runtime config"), manualService.reasons)
         } finally {
             container.stop()
         }
