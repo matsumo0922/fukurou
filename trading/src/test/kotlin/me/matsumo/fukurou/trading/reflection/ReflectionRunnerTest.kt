@@ -106,6 +106,53 @@ class ReflectionRunnerTest {
             deleteRecursively(vaultPath)
         }
     }
+
+    @Test
+    fun runOnce_mergesCanonicalSetupAliasesAndEscapesMarkdownTags() = runBlocking {
+        val vaultPath = Files.createTempDirectory("fukurou-reflection-tag-taxonomy")
+        val runner = reflectionRunner(
+            vaultPath = vaultPath,
+            trades = listOf(
+                closedTrade(
+                    positionId = "11111111-1111-1111-1111-111111111111",
+                    setupTags = listOf("Break Out", "Pipe|Tag"),
+                    tradePnlJpy = BigDecimal("390"),
+                ),
+                closedTrade(
+                    positionId = "77777777-7777-7777-7777-777777777777",
+                    setupTags = listOf("break\nout", "pipe|tag"),
+                    tradePnlJpy = BigDecimal("-110"),
+                ),
+            ),
+            linkedDecisionSetupTags = listOf("Break Out", "break\nout", "Pipe|Tag", "pipe|tag"),
+        )
+
+        try {
+            runner.runOnce().getOrThrow()
+
+            val weeklyReview = Files.readString(vaultPath.resolve("Knowledge/WeeklyReviews/2026-W27.md"))
+            val taxonomy = Files.readString(vaultPath.resolve("Knowledge/Setups/TagTaxonomy-2026-W27.md"))
+
+            assertTrue(
+                taxonomy.contains(
+                    "| break-out | Break Out, break out | 2 | 2 | 3.5454545455 | 0.5000000000 | 0.0933333334 |",
+                ),
+            )
+            assertTrue(
+                taxonomy.contains(
+                    "| pipe\\|tag | Pipe\\|Tag, pipe\\|tag | 2 | 2 | 3.5454545455 | 0.5000000000 | " +
+                        "0.0933333334 |",
+                ),
+            )
+            assertTrue(taxonomy.contains("- break-out: Break Out, break out"))
+            assertTrue(taxonomy.contains("- pipe\\|tag: Pipe\\|Tag, pipe\\|tag"))
+            assertFalse(taxonomy.contains("break\nout"))
+            assertTrue(weeklyReview.contains("| Pipe\\|Tag | 1 |"))
+            assertTrue(weeklyReview.contains("| pipe\\|tag | 1 |"))
+        } finally {
+            deleteRecursively(vaultPath)
+        }
+    }
 }
 
 private suspend fun reflectionRunner(
@@ -115,12 +162,13 @@ private suspend fun reflectionRunner(
     secondLlmRun: Boolean = false,
     closedTradesTruncated: Boolean = false,
     llmUsagesTruncated: Boolean = false,
+    trades: List<ClosedTradeFact> = listOf(closedTrade()),
+    linkedDecisionSetupTags: List<String> = listOf("breakout", "trend-follow"),
 ): ReflectionRunner {
     val decisionRepository = InMemoryDecisionRepository(FIXED_CLOCK)
     val llmRunRepository = InMemoryLlmRunRepository()
-    val trade = closedTrade()
     val evaluationRepository = StaticReflectionEvaluationRepository(
-        trades = listOf(trade),
+        trades = trades,
         decisionRunCount = if (secondDecision) 2 else 1,
         actionCounts = listOf(
             DecisionActionCount(action = DecisionAction.ENTER.name, count = 1),
@@ -131,7 +179,10 @@ private suspend fun reflectionRunner(
         llmUsagesTruncated = llmUsagesTruncated,
     )
 
-    submitLinkedDecision(decisionRepository)
+    submitLinkedDecision(
+        repository = decisionRepository,
+        setupTags = linkedDecisionSetupTags,
+    )
     if (secondDecision) {
         submitNoTradeDecision(decisionRepository)
     }
@@ -156,7 +207,7 @@ private suspend fun reflectionRunner(
     )
 }
 
-private suspend fun submitLinkedDecision(repository: InMemoryDecisionRepository) {
+private suspend fun submitLinkedDecision(repository: InMemoryDecisionRepository, setupTags: List<String>) {
     val result = repository.submitDecision(
         DecisionSubmission(
             invocationId = "run-linked",
@@ -165,7 +216,7 @@ private suspend fun submitLinkedDecision(repository: InMemoryDecisionRepository)
             systemPromptVersion = "system-prompt-v1",
             marketSnapshotId = "snapshot-1",
             action = DecisionAction.ENTER,
-            setupTags = listOf("breakout", "trend-follow"),
+            setupTags = setupTags,
             estimatedWinProbability = BigDecimal("0.73"),
             expectedRMultiple = BigDecimal("1.80"),
             roundTripCostR = BigDecimal("0.05"),
@@ -192,7 +243,7 @@ private suspend fun submitLinkedDecision(repository: InMemoryDecisionRepository)
                 invalidationConditionsJa = listOf("直近安値割れ", "出来高急減"),
                 targetPriceJpy = BigDecimal("10500000"),
                 timeStopAt = FIXED_INSTANT.plusSeconds(3600),
-                setupTags = listOf("breakout", "trend-follow"),
+                setupTags = setupTags,
             ),
         ),
     ).getOrThrow()
@@ -232,9 +283,13 @@ private suspend fun submitNoTradeDecision(repository: InMemoryDecisionRepository
     ).getOrThrow()
 }
 
-private fun closedTrade(): ClosedTradeFact {
+private fun closedTrade(
+    positionId: String = "11111111-1111-1111-1111-111111111111",
+    setupTags: List<String> = listOf("breakout"),
+    tradePnlJpy: BigDecimal = BigDecimal("390"),
+): ClosedTradeFact {
     return ClosedTradeFact(
-        positionId = UUID.fromString("11111111-1111-1111-1111-111111111111"),
+        positionId = UUID.fromString(positionId),
         openedAt = FIXED_INSTANT.plusSeconds(600),
         closedAt = FIXED_INSTANT.plusSeconds(7_200),
         sizeBtc = BigDecimal("0.005"),
@@ -242,9 +297,9 @@ private fun closedTrade(): ClosedTradeFact {
         initialProtectiveStopPriceJpy = BigDecimal("9700000"),
         highestPriceSinceEntryJpy = BigDecimal("10100000"),
         lowestPriceSinceEntryJpy = BigDecimal("9990000"),
-        tradePnlJpy = BigDecimal("390"),
+        tradePnlJpy = tradePnlJpy,
         estimatedWinProbability = BigDecimal("0.73"),
-        setupTags = listOf("breakout"),
+        setupTags = setupTags,
         llmProvider = "claude",
     )
 }

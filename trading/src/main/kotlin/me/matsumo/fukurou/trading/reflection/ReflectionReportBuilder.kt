@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.reflection
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.evaluation.CalibrationGroupStats
+import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
@@ -269,7 +270,7 @@ class ReflectionReportBuilder(
         val stats = performance.stats
 
         appendLine(
-            "| ${performance.setupTag} | ${stats.tradeCount} | ${stats.totalPnlJpy.toPlainString()} | " +
+            "| ${performance.setupTag.markdownCell()} | ${stats.tradeCount} | ${stats.totalPnlJpy.toPlainString()} | " +
                 "${stats.profitFactor.markdownNumberOrNull()} | ${stats.winRate.markdownNumberOrNull()} | " +
                 "${stats.expectedR.markdownNumberOrNull()} |",
         )
@@ -345,7 +346,7 @@ class ReflectionReportBuilder(
         appendLine("## $title")
         appendLine()
         groups.forEach { group ->
-            appendLine("### ${group.groupKey}")
+            appendLine("### ${group.groupKey.markdownText()}")
             appendLine()
             appendLine("| Bin | Trades | Avg Estimated P | Realized Win Rate |")
             appendLine("|---|---:|---:|---:|")
@@ -422,7 +423,7 @@ class ReflectionReportBuilder(
         appendLine("|---|---|---:|---:|---:|---:|---:|")
         tagSummaries.forEach { summary ->
             appendLine(
-                "| ${summary.canonicalTag} | ${summary.rawTags.joinToString(", ")} | " +
+                "| ${summary.canonicalTag.markdownCell()} | ${summary.rawTags.markdownCellList()} | " +
                     "${summary.decisionCount} | ${summary.tradeCount} | ${summary.profitFactor} | " +
                     "${summary.winRate} | ${summary.expectedR} |",
             )
@@ -441,7 +442,7 @@ class ReflectionReportBuilder(
         }
 
         aliasGroups.forEach { summary ->
-            appendLine("- ${summary.canonicalTag}: ${summary.rawTags.joinToString(", ")}")
+            appendLine("- ${summary.canonicalTag.markdownText()}: ${summary.rawTags.markdownTextList()}")
         }
         appendLine()
     }
@@ -455,12 +456,13 @@ class ReflectionReportBuilder(
             .flatMap { record -> record.recordSetupTags() }
             .groupBy { tag -> tag.normalizedTag() }
             .mapValues { entry -> entry.value.toSortedSet().toList() }
-        val setupPerformanceByTag = EvaluationMath.summarizeBySetup(data.closedTrades)
-            .associateBy { performance -> performance.setupTag.normalizedTag() }
+        val setupPerformanceByTag = data.closedTrades
+            .groupByCanonicalSetup()
+            .mapValues { entry -> EvaluationMath.summarizeTrades(entry.value) }
         val canonicalTags = (decisionCounts.keys + rawTagsByCanonical.keys + setupPerformanceByTag.keys).sorted()
 
         return canonicalTags.map { canonicalTag ->
-            val stats = setupPerformanceByTag[canonicalTag]?.stats
+            val stats = setupPerformanceByTag[canonicalTag]
 
             TagSummaryView(
                 canonicalTag = canonicalTag,
@@ -492,6 +494,19 @@ class ReflectionReportBuilder(
             .ifBlank { "unclassified" }
     }
 
+    private fun List<ClosedTradeFact>.groupByCanonicalSetup(): Map<String, List<ClosedTradeFact>> {
+        return flatMap { fact ->
+            fact.setupTags
+                .ifEmpty { listOf(UNCLASSIFIED_SETUP_TAG) }
+                .map { tag -> tag.normalizedTag() }
+                .distinct()
+                .map { canonicalTag -> canonicalTag to fact }
+        }.groupBy(
+            keySelector = { entry -> entry.first },
+            valueTransform = { entry -> entry.second },
+        )
+    }
+
     private fun StringBuilder.appendMetric(key: String, value: Any) {
         appendLine("| $key | $value |")
     }
@@ -521,9 +536,22 @@ class ReflectionReportBuilder(
     }
 
     private fun String.markdownCell(): String {
+        return markdownText()
+    }
+
+    private fun List<String>.markdownCellList(): String {
+        return joinToString(", ") { value -> value.markdownCell() }
+    }
+
+    private fun List<String>.markdownTextList(): String {
+        return joinToString(", ") { value -> value.markdownText() }
+    }
+
+    private fun String.markdownText(): String {
         return replace("|", "\\|")
             .replace("\n", " ")
             .replace("\r", " ")
+            .trim()
     }
 
     private fun <T> StringBuilder.appendEmptyMessageIfNeeded(values: List<T>) {
@@ -671,3 +699,8 @@ private const val YAML_CONTROL_CHARACTER_BOUNDARY = 0x20
  * tag 正規化用 whitespace regex。
  */
 private val WhitespaceRegex = Regex("\\s+")
+
+/**
+ * 未分類 setup tag 名。
+ */
+private const val UNCLASSIFIED_SETUP_TAG = "unclassified"
