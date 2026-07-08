@@ -1361,7 +1361,7 @@ private fun JdbcTransaction.appendFillEquitySnapshot(account: AccountSnapshot, c
         capturedAt = capturedAt,
     )
 
-    insertEquitySnapshot(snapshot, INSERT_EQUITY_SNAPSHOT_SQL)
+    insertEquitySnapshot(snapshot)
 }
 
 private fun JdbcTransaction.syncRiskStateEquity(

@@ -344,6 +344,16 @@ private const val SELECT_ORDER_POSITION_ID_SQL = """
 """
 
 /**
+ * 指定 order IDs の client_request_id を読む SQL。
+ */
+private const val SELECT_CLIENT_REQUEST_IDS_BY_ORDER_IDS_SQL = """
+    SELECT
+        client_request_id
+    FROM orders
+    WHERE id = ANY(?)
+"""
+
+/**
  * lowest watermark backfill test 用 position 行を追加する SQL。
  */
 private const val INSERT_BACKFILL_POSITION_SQL = """
@@ -3443,23 +3453,31 @@ private fun selectDecisionsInvocationIdIndexCount(database: ExposedDatabase): In
  */
 private fun selectClientRequestIdsByOrderIds(database: ExposedDatabase, orderIds: List<String>): List<String?> {
     return exposedTransaction(database) {
-        val placeholders = orderIds.joinToString(", ") { "?" }
-        val sql = "SELECT client_request_id FROM orders WHERE id IN ($placeholders)"
+        withUuidSqlArray(orderIds) { orderIdArray ->
+            jdbcConnection().prepareStatement(SELECT_CLIENT_REQUEST_IDS_BY_ORDER_IDS_SQL).use { statement ->
+                statement.setArray(1, orderIdArray)
+                statement.executeQuery().use { resultSet ->
+                    val clientRequestIds = mutableListOf<String?>()
 
-        jdbcConnection().prepareStatement(sql).use { statement ->
-            orderIds.forEachIndexed { orderIndex, orderId ->
-                statement.setObject(orderIndex + 1, UUID.fromString(orderId))
-            }
-            statement.executeQuery().use { resultSet ->
-                val clientRequestIds = mutableListOf<String?>()
+                    while (resultSet.next()) {
+                        clientRequestIds += resultSet.getString("client_request_id")
+                    }
 
-                while (resultSet.next()) {
-                    clientRequestIds += resultSet.getString("client_request_id")
+                    clientRequestIds
                 }
-
-                clientRequestIds
             }
         }
+    }
+}
+
+private fun <T> JdbcTransaction.withUuidSqlArray(ids: List<String>, block: (java.sql.Array) -> T): T {
+    val uuidArray = ids.map { id -> UUID.fromString(id) }.toTypedArray()
+    val sqlArray = jdbcConnection().createArrayOf("uuid", uuidArray)
+
+    try {
+        return block(sqlArray)
+    } finally {
+        sqlArray.free()
     }
 }
 

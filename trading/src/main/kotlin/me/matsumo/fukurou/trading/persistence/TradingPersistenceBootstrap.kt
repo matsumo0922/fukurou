@@ -866,6 +866,10 @@ private fun JdbcTransaction.verifyDecisionRuntimeSchemaObjects() {
     )
 }
 
+/**
+ * コードが所有する schema verification SQL を実行する。
+ */
+@Suppress("SqlSourceToSinkFlow")
 internal fun JdbcTransaction.verifySchemaBySql(sql: String, missingMessage: String) {
     jdbcConnection().prepareStatement(sql).use { statement ->
         statement.executeQuery().use { resultSet ->
@@ -874,6 +878,10 @@ internal fun JdbcTransaction.verifySchemaBySql(sql: String, missingMessage: Stri
     }
 }
 
+/**
+ * コードが所有する existence verification SQL を実行する。
+ */
+@Suppress("SqlSourceToSinkFlow")
 internal fun JdbcTransaction.verifyExistsBySql(sql: String, missingMessage: String) {
     jdbcConnection().prepareStatement(sql).use { statement ->
         statement.executeQuery().use { resultSet ->
@@ -882,6 +890,10 @@ internal fun JdbcTransaction.verifyExistsBySql(sql: String, missingMessage: Stri
     }
 }
 
+/**
+ * コードが所有する migration SQL を実行する。
+ */
+@Suppress("SqlSourceToSinkFlow")
 internal fun JdbcTransaction.executeUpdate(sql: String) {
     jdbcConnection().prepareStatement(sql).use { statement ->
         statement.executeUpdate()
