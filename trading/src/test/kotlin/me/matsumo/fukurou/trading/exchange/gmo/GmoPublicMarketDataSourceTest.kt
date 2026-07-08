@@ -94,6 +94,34 @@ class GmoPublicMarketDataSourceTest {
     }
 
     @Test
+    fun parseKlinesResponse_normalizesEpochMillisOpenTime() {
+        val candles = parseKlinesResponse(
+            responseBody = klineResponse("1751328000000"),
+            symbol = TradingSymbol.BTC,
+            interval = CandleInterval.FIVE_MINUTES,
+        )
+        val firstCandle = candles.first()
+
+        assertEquals("2025-07-01T00:00:00Z", firstCandle.openTime)
+    }
+
+    @Test
+    fun parseKlinesResponse_rejectsInvalidOpenTime() {
+        val exception = assertFailsWith<MarketDataParseException> {
+            parseKlinesResponse(
+                responseBody = klineResponse("not-an-instant"),
+                symbol = TradingSymbol.BTC,
+                interval = CandleInterval.FIVE_MINUTES,
+            )
+        }
+
+        assertEquals(
+            "GMO kline openTime must be epoch milliseconds or ISO-8601 instant: not-an-instant",
+            exception.message,
+        )
+    }
+
+    @Test
     fun parseOrderbookResponse_trimsDepth() {
         val orderbook = parseOrderbookResponse(ORDERBOOK_SUCCESS_RESPONSE, TradingSymbol.BTC, depth = 1)
 

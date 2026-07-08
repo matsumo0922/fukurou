@@ -45,6 +45,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.exchange.gmo.parseKlinesResponse
 import me.matsumo.fukurou.trading.market.IndicatorType
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
@@ -328,6 +329,67 @@ class GmoCoinMcpServerTest {
 
         assertEquals("VOLUME_Z_SCORE", volumeContent.getValue("indicator").jsonPrimitive.contentOrNull)
         assertClose(1.2247448714, indicatorValueAt(volumeContent, 2))
+    }
+
+    @Test
+    fun calcIndicator_returnsVwapSessionForEpochMillisKlineOpenTime() = runBlocking {
+        val server = testServer()
+        val responseBody = epochMillisIndicatorKlineResponse()
+
+        server.registerGmoCoinMarketTools(
+            marketDataSource = ParsedKlineMarketDataSource(responseBody),
+            clock = fixedClock(),
+        )
+
+        val result = callTool(
+            server = server,
+            toolName = "calc_indicator",
+            arguments = indicatorArguments(
+                indicator = "VWAP_SESSION",
+                limit = 6,
+            ),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertTrue(result.isError != true)
+        assertEquals("VWAP_SESSION", structuredContent.getValue("indicator").jsonPrimitive.contentOrNull)
+        assertClose(100.0, indicatorValueAt(structuredContent, 1))
+        assertFreshness(
+            structuredContent = structuredContent,
+            fetchedAt = fixedInstant().toString(),
+            sourceTimestamp = "2026-07-01T21:20:00Z",
+            stalenessMs = 225_600_000L,
+            staleAfterMs = 390_000L,
+            stale = true,
+            source = "GMO_PUBLIC_REST",
+        )
+    }
+
+    @Test
+    fun calcIndicator_returnsMarketDataParseErrorForInvalidKlineOpenTime() = runBlocking {
+        val server = testServer()
+        val responseBody = indicatorKlineResponse(
+            openTimes = listOf("not-an-instant"),
+        )
+
+        server.registerGmoCoinMarketTools(
+            marketDataSource = ParsedKlineMarketDataSource(responseBody),
+            clock = fixedClock(),
+        )
+
+        val result = callTool(
+            server = server,
+            toolName = "calc_indicator",
+            arguments = indicatorArguments(
+                indicator = "VWAP_SESSION",
+                limit = 1,
+            ),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertTrue(result.isError == true)
+        assertEquals("market_data_parse_error", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals("permanent", structuredContent.getValue("failure_kind").jsonPrimitive.contentOrNull)
     }
 
     @Test
@@ -661,6 +723,54 @@ private class IndicatorMarketDataSource(
 }
 
 /**
+ * GMO kline parser 経由の candle を返す fake market data source。
+ *
+ * @param responseBody GMO klines response body
+ */
+private class ParsedKlineMarketDataSource(
+    private val responseBody: String,
+) : MarketDataSource {
+
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return FakeMarketDataSource.getTicker(symbol)
+    }
+
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return runCatching {
+            val candles = parseKlinesResponse(
+                responseBody = responseBody,
+                symbol = symbol,
+                interval = interval,
+            )
+
+            candles.take(limit)
+        }
+    }
+
+    override suspend fun getOrderbook(
+        symbol: TradingSymbol,
+        depth: Int,
+    ): Result<Orderbook> {
+        return FakeMarketDataSource.getOrderbook(symbol, depth)
+    }
+
+    override suspend fun getTrades(
+        symbol: TradingSymbol,
+        limit: Int,
+    ): Result<List<RecentTrade>> {
+        return FakeMarketDataSource.getTrades(symbol, limit)
+    }
+
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
+        return FakeMarketDataSource.getSymbolRules(symbol)
+    }
+}
+
+/**
  * GMO Coin MCP test 用の fake market data source。
  */
 private object FakeMarketDataSource : MarketDataSource {
@@ -742,6 +852,56 @@ private object FakeMarketDataSource : MarketDataSource {
             ),
         )
     }
+}
+
+private fun epochMillisIndicatorKlineResponse(): String {
+    return indicatorKlineResponse(
+        openTimes = listOf(
+            "1782939300000",
+            "1782939600000",
+            "1782939900000",
+            "1782940200000",
+            "1782940500000",
+            "1782940800000",
+        ),
+    )
+}
+
+private fun indicatorKlineResponse(openTimes: List<String>): String {
+    val candleEntries = openTimes.indices.joinToString(separator = ",") { openTimeIndex ->
+        indicatorKlineEntryForIndex(openTimes, openTimeIndex)
+    }
+
+    return """
+    {
+      "status": 0,
+      "data": [
+        $candleEntries
+      ]
+    }
+    """.trimIndent()
+}
+
+private fun indicatorKlineEntryForIndex(openTimes: List<String>, openTimeIndex: Int): String {
+    val volume = (openTimeIndex + 1).toString()
+
+    return indicatorKlineEntry(
+        openTime = openTimes[openTimeIndex],
+        volume = volume,
+    )
+}
+
+private fun indicatorKlineEntry(openTime: String, volume: String): String {
+    return """
+    {
+      "openTime": "$openTime",
+      "open": "100.0",
+      "high": "101.0",
+      "low": "99.0",
+      "close": "100.0",
+      "volume": "$volume"
+    }
+    """.trimIndent()
 }
 
 private fun expandedIndicatorCandles(): List<Candle> {
