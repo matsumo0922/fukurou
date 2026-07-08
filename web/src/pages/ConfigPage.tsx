@@ -15,6 +15,7 @@ import {
   type RuntimeConfigGroup,
   type RuntimeConfigItem,
   type RuntimeConfigSnapshot,
+  type RuntimeConfigSnapshotWarning,
   type RuntimeConfigValidationError,
   type RuntimeConfigValidationResult,
   type RuntimeConfigVersionDetail,
@@ -185,6 +186,7 @@ export function ConfigPage() {
       {mutationError ? <ConfigMutationError error={mutationError} /> : null}
       {configQuery.data ? (
         <>
+          <ConfigWarningPanel warnings={configQuery.data.warnings ?? []} />
           <ConfigVersionPanel
             snapshot={configQuery.data}
             rollbackVersion={(versionId) => rollbackMutation.mutate(versionId)}
@@ -212,6 +214,43 @@ export function ConfigPage() {
         </>
       ) : null}
     </div>
+  );
+}
+
+function ConfigWarningPanel({ warnings }: { warnings: RuntimeConfigSnapshotWarning[] }) {
+  const { t } = useI18n();
+
+  if (warnings.length === 0) {
+    return null;
+  }
+
+  return (
+    <Panel className="panel--wide">
+      <div className="panel-heading">
+        <SlidersHorizontal size={18} aria-hidden="true" />
+        <h2>{t("config.warning.heading")}</h2>
+        <StatusPill label={`${warnings.length}`} tone="warning" />
+      </div>
+      <div className="config-warning-list">
+        {warnings.map((warning, warningIndex) => (
+          <div className="config-warning" key={`${warning.code}-${warningIndex}`}>
+            <span className="config-warning__message">{translatedOrFallback(warning.code, warning.code, t)}</span>
+            {warning.validation?.errors?.length ? (
+              <div className="config-validation-list">
+                {warning.validation.errors.map((error, errorIndex) => (
+                  <span
+                    className="config-validation-error"
+                    key={`${warning.code}-${error.code}-${error.key ?? "global"}-${errorIndex}`}
+                  >
+                    {validationErrorLabel(error, t)}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </Panel>
   );
 }
 

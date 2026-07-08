@@ -27,9 +27,11 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshot
+import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshotWarning
 import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedException
 import me.matsumo.fukurou.trading.config.RuntimeConfigValidationResult
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -581,11 +583,13 @@ data class OpsActivityCatalogItemResponse(
  * @param tradingConfig 取引 bot 全体の typed config
  * @param environment runtime config catalog API で参照する環境変数 map
  * @param adminService runtime config の draft / validate / activate 操作用 service
+ * @param warnings startup 時に検出した runtime config warning
  */
 internal data class OpsRuntimeConfigRouteDependencies(
     val tradingConfig: TradingBotConfig,
     val environment: Map<String, String>,
     val adminService: RuntimeConfigAdminService? = null,
+    val warnings: List<RuntimeConfigSnapshotWarning> = emptyList(),
 )
 
 /**
@@ -690,7 +694,9 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
     val adminService = runtimeConfig.adminService
 
     get("/ops/runtime-config") {
-        val versions = adminService?.listVersions()?.getOrThrow().orEmpty()
+        val versionsResult = adminService?.listVersions()
+        val versions = versionsResult?.getOrNull().orEmpty()
+        val warnings = runtimeConfig.warnings + versionHistoryWarning(versionsResult)
 
         call.respond(
             RuntimeConfigCatalog.snapshot(
@@ -699,11 +705,12 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
             ).copy(
                 activeVersion = versions.firstOrNull { version -> version.status == "ACTIVE" },
                 versions = versions,
+                warnings = warnings,
             ),
         )
     }.describe {
         summary = "runtime config catalog を取得する"
-        description = "code-owned catalog から実効 runtime config と version 履歴を返します。secret は設定有無だけを返し、値は返しません。"
+        description = "code-owned catalog から実効 runtime config と version 履歴を返します。version 履歴が一時的に取得できない場合も catalog と warning を返します。secret は設定有無だけを返し、値は返しません。"
         tag(OPS_TAG)
         responses {
             HttpStatusCode.OK {
@@ -875,6 +882,16 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
             }
         }
     }
+}
+
+private fun versionHistoryWarning(
+    result: Result<List<RuntimeConfigVersionSummary>>?,
+): List<RuntimeConfigSnapshotWarning> {
+    if (result == null || result.isSuccess) {
+        return emptyList()
+    }
+
+    return listOf(RuntimeConfigSnapshotWarning(code = "runtimeConfig.warning.versionHistoryUnavailable"))
 }
 
 @OptIn(ExperimentalKtorApi::class)

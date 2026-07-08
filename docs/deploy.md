@@ -198,6 +198,7 @@ Public Hostname は次のように設定する。
 - Service: `http://ktor:8080`
 
 Cloudflare Access で Service Auth policy を作成し、手元の検証環境には Service Token を保存する。NAS `.env` には Service Token を置かない。
+Access policy は `/app/*` と `/ops/*` を対象にし、runtime config draft / validate / activate / rollback を含む state-changing ops endpoints を Access なしで公開しない。
 
 ## 初回デプロイ確認
 

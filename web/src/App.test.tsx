@@ -126,6 +126,44 @@ describe("App", () => {
     expect(hasGetCall(fetchMock, "/ops/runtime-config", () => true)).toBe(true);
   });
 
+  it("shows runtime config warnings and validation errors", async () => {
+    stubSystemFetch({
+      runtimeConfigResponse: {
+        ...runtimeConfigResponse(),
+        versions: [],
+        warnings: [
+          {
+            code: "runtimeConfig.warning.activeValidationFailed",
+            validation: {
+              valid: false,
+              errors: [
+                {
+                  code: "runtimeConfig.validation.missingKeys",
+                  params: {
+                    keys: "runner.maxToolCallsPerRun",
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+    window.history.pushState({}, "", "/app/config");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Config" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Runtime config warnings" })).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Active runtime config is invalid. Trading workers and manual trigger are halted until a valid version is activated or rolled back.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Missing keys: runner.maxToolCallsPerRun.")).toBeInTheDocument();
+    expect(screen.getByText("No records")).toBeInTheDocument();
+  });
+
   it("shows runtime config rollback validation errors", async () => {
     const fetchMock = stubSystemFetch({
       runtimeConfigResponse: runtimeConfigResponseWithInactiveVersion(),

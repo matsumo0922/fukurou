@@ -94,7 +94,7 @@ make dev-web
 
 Vite dev server は既定で `http://localhost:8080` の Ktor API へ proxy します。接続先は `VITE_FUKUROU_API_TARGET` で上書きできます。
 
-WebUI の `Config` 画面（`/app/config`）は `/ops/runtime-config` を表示します。Runtime group は draft 編集、diff preview、validation、activate、rollback を扱います。Deployment group は read-only で表示し、Secrets group は設定有無だけを表示します。secret 値は API response と画面のどちらにも出しません。
+WebUI の `Config` 画面（`/app/config`）は `/ops/runtime-config` を表示します。Runtime group は draft 編集、diff preview、validation、activate、rollback を扱います。Deployment group は read-only で表示し、Secrets group は設定有無だけを表示します。warning がある場合は validation error を i18n 表示し、復旧操作の入口を維持します。secret 値は API response と画面のどちらにも出しません。
 
 WebUI の `Activity` 画面（`/app/activity`）は `/ops/activity` の decision / audit / paper execution timeline を表示します。監査イベントと判断アクションの表示名・説明は `/ops/activity/catalog` の i18n key catalog から解決し、audit event type filter も同じ catalog を使います。audit event type を選択していない場合、`RECONCILER_PASS_COMPLETED` は高頻度 heartbeat として既定で除外されます。paper execution は entry fill、STOP trigger、take-profit close、limit close、market close、または fallback の raw execution side として分類し、長い order / entry decision 理由は timeline list ではなく詳細 dialog に表示します。
 

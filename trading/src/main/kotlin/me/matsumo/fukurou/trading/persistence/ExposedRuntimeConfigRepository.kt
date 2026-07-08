@@ -4,6 +4,7 @@ package me.matsumo.fukurou.trading.persistence
 
 import me.matsumo.fukurou.trading.config.ActiveRuntimeConfigSnapshot
 import me.matsumo.fukurou.trading.config.ActiveRuntimeConfigSource
+import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
 import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
 import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigCandidateValidator
@@ -131,6 +132,17 @@ private const val SELECT_RUNTIME_CONFIG_VALUES_SQL = """
 """
 
 /**
+ * retention 対象の runtime config version ID を読む SQL。
+ */
+private const val SELECT_PRUNABLE_RUNTIME_CONFIG_VERSION_IDS_SQL = """
+    SELECT id
+    FROM runtime_config_versions
+    WHERE status = ?
+    ORDER BY COALESCE(activated_at, created_at) DESC, created_at DESC, id DESC
+    OFFSET ?
+"""
+
+/**
  * active runtime config version を inactive にする SQL。
  */
 private const val DEACTIVATE_RUNTIME_CONFIG_VERSION_SQL = """
@@ -166,6 +178,22 @@ private const val INSERT_RUNTIME_CONFIG_VALUE_SQL = """
     )
     VALUES (?, ?, ?)
     ON CONFLICT (version_id, config_key) DO NOTHING
+"""
+
+/**
+ * runtime config values を version ID で削除する SQL。
+ */
+private const val DELETE_RUNTIME_CONFIG_VALUES_BY_VERSION_ID_SQL = """
+    DELETE FROM runtime_config_values
+    WHERE version_id = ?
+"""
+
+/**
+ * runtime config version を ID で削除する SQL。
+ */
+private const val DELETE_RUNTIME_CONFIG_VERSION_BY_ID_SQL = """
+    DELETE FROM runtime_config_versions
+    WHERE id = ?
 """
 
 /**
@@ -357,12 +385,15 @@ class ExposedRuntimeConfigRepository(
 
                 val draft = requireRuntimeConfigVersion(draftId.toString())
                 val validation = RuntimeConfigCandidateValidator.validate(mergedValues, environment).validation
-
-                RuntimeConfigVersionDetail(
+                val detail = RuntimeConfigVersionDetail(
                     version = draft.toSummary(mergedValues),
                     values = mergedValues,
                     validation = validation,
                 )
+
+                pruneRuntimeConfigVersions()
+
+                detail
             }
         }
     }
@@ -418,12 +449,15 @@ class ExposedRuntimeConfigRepository(
                 activateRuntimeConfigVersion(targetVersion.versionId, now)
 
                 val activeVersion = requireRuntimeConfigVersion(targetVersion.versionId.toString())
-
-                RuntimeConfigActivationResult(
+                val result = RuntimeConfigActivationResult(
                     activeVersion = activeVersion.toSummary(values),
                     previousActiveVersionId = previousActiveVersionId,
                     validation = validation,
                 )
+
+                pruneRuntimeConfigVersions()
+
+                result
             }
         }
     }
@@ -630,6 +664,46 @@ private fun JdbcTransaction.selectRuntimeConfigValues(versionId: UUID): Map<Stri
                 }
             }
         }
+    }
+}
+
+private fun JdbcTransaction.pruneRuntimeConfigVersions() {
+    val prunableIds = listOf(
+        RUNTIME_CONFIG_STATUS_DRAFT,
+        RUNTIME_CONFIG_STATUS_INACTIVE,
+    ).flatMap { status -> selectPrunableRuntimeConfigVersionIds(status) }
+
+    prunableIds.forEach { versionId ->
+        deleteRuntimeConfigValues(versionId)
+        deleteRuntimeConfigVersion(versionId)
+    }
+}
+
+private fun JdbcTransaction.selectPrunableRuntimeConfigVersionIds(status: String): List<UUID> {
+    return jdbcConnection().prepareStatement(SELECT_PRUNABLE_RUNTIME_CONFIG_VERSION_IDS_SQL).use { statement ->
+        statement.setString(1, status)
+        statement.setInt(2, DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT)
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(resultSet.getObject("id", UUID::class.java))
+                }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.deleteRuntimeConfigValues(versionId: UUID) {
+    jdbcConnection().prepareStatement(DELETE_RUNTIME_CONFIG_VALUES_BY_VERSION_ID_SQL).use { statement ->
+        statement.setObject(1, versionId)
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.deleteRuntimeConfigVersion(versionId: UUID) {
+    jdbcConnection().prepareStatement(DELETE_RUNTIME_CONFIG_VERSION_BY_ID_SQL).use { statement ->
+        statement.setObject(1, versionId)
+        statement.executeUpdate()
     }
 }
 

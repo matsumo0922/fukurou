@@ -200,6 +200,38 @@ interface RuntimeConfigAdminService {
 const val DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT = 20
 
 /**
+ * code default と同等または保守側だけを runtime config として受け入れる key。
+ */
+internal val conservativeOnlyRuntimeConfigKeys = setOf(
+    "paper.fallbackMakerFeeRate",
+    "paper.fallbackTakerFeeRate",
+    "paper.fallbackSpreadBps",
+    "safety.maxRiskPerTradeRatio",
+    "safety.maxDrawdownRatio",
+    "safety.maxTotalExposureRatio",
+    "safety.minExpectedValueR",
+    "safety.minExpectedMoveToCostRatio",
+    "safety.maxTakerFeeRatio",
+    "safety.marketSlippageReserveBps",
+    "safety.dataQualityStaleAfter",
+    "safety.dataQualityCappedProbability",
+    "decision.falsificationFreshnessWindow",
+    "decision.restingEntryOrderTtl",
+    "runner.maxToolCallsPerRun",
+    "runner.maxActToolCallsPerRun",
+    "runner.perRunTimeout",
+    "runner.maxInvocationsPerHour",
+    "runner.maxInvocationsPerDay",
+    "daemon.pollInterval",
+    "daemon.flatHeartbeatInterval",
+    "daemon.holdingCheckInterval",
+    "killCriterion.minClosedTrades",
+    "killCriterion.minProfitFactor",
+    "gmoPublic.restPerSecond",
+    "gmoPublic.restBurst",
+)
+
+/**
  * runtime config candidate を typed config まで構築して検証した結果。
  *
  * @param validation WebUI に返せる validation 結果

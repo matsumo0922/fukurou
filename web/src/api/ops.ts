@@ -27,6 +27,7 @@ export type OpsRiskStateResponse = components["schemas"]["OpsRiskStateResponse"]
 export type RuntimeConfigGroup = components["schemas"]["RuntimeConfigGroup"];
 export type RuntimeConfigItem = components["schemas"]["RuntimeConfigItem"];
 export type RuntimeConfigSnapshot = components["schemas"]["RuntimeConfigSnapshot"];
+export type RuntimeConfigSnapshotWarning = components["schemas"]["RuntimeConfigSnapshotWarning"];
 export type RuntimeConfigActivationResult = components["schemas"]["RuntimeConfigActivationResult"];
 export type RuntimeConfigValidationError = components["schemas"]["RuntimeConfigValidationError"];
 export type RuntimeConfigValidationResult = components["schemas"]["RuntimeConfigValidationResult"];

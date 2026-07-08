@@ -490,7 +490,7 @@ export interface paths {
         };
         /**
          * runtime config catalog を取得する
-         * @description code-owned catalog から実効 runtime config と version 履歴を返します。secret は設定有無だけを返し、値は返しません。
+         * @description code-owned catalog から実効 runtime config と version 履歴を返します。version 履歴が一時的に取得できない場合も catalog と warning を返します。secret は設定有無だけを返し、値は返しません。
          */
         get: {
             parameters: {
@@ -1899,20 +1899,6 @@ export interface components {
             note?: string | null;
             hash: string;
         };
-        /** RuntimeConfigSnapshot */
-        RuntimeConfigSnapshot: {
-            groups: components["schemas"]["RuntimeConfigGroup"][];
-            activeVersion?: components["schemas"]["RuntimeConfigVersionSummary"] | null;
-            versions?: components["schemas"]["RuntimeConfigVersionSummary"][];
-        };
-        /** OpsRuntimeConfigDraftRequest */
-        OpsRuntimeConfigDraftRequest: {
-            baseVersionId?: string | null;
-            values: {
-                [key: string]: string;
-            };
-            note?: string | null;
-        };
         /** RuntimeConfigValidationError */
         RuntimeConfigValidationError: {
             code: string;
@@ -1925,6 +1911,26 @@ export interface components {
         RuntimeConfigValidationResult: {
             valid: boolean;
             errors?: components["schemas"]["RuntimeConfigValidationError"][];
+        };
+        /** RuntimeConfigSnapshotWarning */
+        RuntimeConfigSnapshotWarning: {
+            code: string;
+            validation?: components["schemas"]["RuntimeConfigValidationResult"] | null;
+        };
+        /** RuntimeConfigSnapshot */
+        RuntimeConfigSnapshot: {
+            groups: components["schemas"]["RuntimeConfigGroup"][];
+            activeVersion?: components["schemas"]["RuntimeConfigVersionSummary"] | null;
+            versions?: components["schemas"]["RuntimeConfigVersionSummary"][];
+            warnings?: components["schemas"]["RuntimeConfigSnapshotWarning"][];
+        };
+        /** OpsRuntimeConfigDraftRequest */
+        OpsRuntimeConfigDraftRequest: {
+            baseVersionId?: string | null;
+            values: {
+                [key: string]: string;
+            };
+            note?: string | null;
         };
         /** RuntimeConfigVersionDetail */
         RuntimeConfigVersionDetail: {

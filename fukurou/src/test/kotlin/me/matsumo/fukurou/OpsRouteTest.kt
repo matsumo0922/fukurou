@@ -52,10 +52,16 @@ import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
+import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
+import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import org.testcontainers.DockerClientFactory
+import org.testcontainers.containers.PostgreSQLContainer
 import java.io.File
 import java.math.BigDecimal
+import java.sql.Connection
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -66,6 +72,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
 /**
  * ops route の HTTP contract を検証するテスト。
@@ -539,6 +547,33 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_runtimeConfigReturnsCatalogWarningWhenVersionHistoryFails() = testApplication {
+        val adminService = FakeRuntimeConfigAdminService(
+            listVersionsFailure = IllegalStateException("version history unavailable"),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsRuntimeConfigAdminService = adminService,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/runtime-config")
+        val responseBody = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        val warnings = responseBody.getValue("warnings").jsonArray
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(responseBody.getValue("groups").jsonArray.isNotEmpty())
+        assertTrue(responseBody.getValue("versions").jsonArray.isEmpty())
+        assertEquals(
+            "runtimeConfig.warning.versionHistoryUnavailable",
+            warnings.single().jsonObject.getValue("code").jsonPrimitive.content,
+        )
+    }
+
+    @Test
     fun opsRoutes_runtimeConfigDraftActivationReturnsMachineReadableValidationErrors() = testApplication {
         val adminService = FakeRuntimeConfigAdminService()
 
@@ -570,6 +605,64 @@ class OpsRouteTest {
         assertEquals("runtimeConfig.validation.typedBetweenInclusive", validationError.getValue("code").jsonPrimitive.content)
         assertEquals("runner.maxToolCallsPerRun", validationError.getValue("key").jsonPrimitive.content)
         assertEquals("48", validationError.getValue("params").jsonObject.getValue("max").jsonPrimitive.content)
+    }
+
+    @Test
+    fun moduleKeepsRuntimeConfigRecoveryApiAvailableWhenActiveConfigIsInvalid() = testApplication {
+        if (!isDockerAvailable()) {
+            println("Skipping module runtime config recovery test because Docker is unavailable.")
+            return@testApplication
+        }
+
+        val container = FukurouPostgresContainer()
+        container.start()
+
+        try {
+            val databaseConfig = DatabaseConfig(
+                url = container.jdbcUrl,
+                user = container.username,
+                password = container.password,
+            )
+            val database = ExposedDatabase.connect(
+                url = databaseConfig.url,
+                driver = "org.postgresql.Driver",
+                user = databaseConfig.user,
+                password = databaseConfig.password,
+            )
+            RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+            deleteRuntimeConfigValue(database, "runner.maxToolCallsPerRun")
+
+            application {
+                module(
+                    clock = fixedClock(),
+                    databaseConfig = databaseConfig,
+                )
+            }
+
+            val configResponse = client.get("/ops/runtime-config")
+            val triggerResponse = client.post("/ops/trigger") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"operator recovery check"}""")
+            }
+            val readyResponse = client.get("/health/ready")
+            val responseBody = Json.parseToJsonElement(configResponse.bodyAsText()).jsonObject
+            val warning = responseBody.getValue("warnings").jsonArray.single().jsonObject
+            val validationError = warning
+                .getValue("validation")
+                .jsonObject
+                .getValue("errors")
+                .jsonArray
+                .single()
+                .jsonObject
+
+            assertEquals(HttpStatusCode.OK, configResponse.status)
+            assertEquals("runtimeConfig.warning.activeValidationFailed", warning.getValue("code").jsonPrimitive.content)
+            assertEquals("runtimeConfig.validation.missingKeys", validationError.getValue("code").jsonPrimitive.content)
+            assertEquals(HttpStatusCode.ServiceUnavailable, triggerResponse.status)
+            assertEquals(HttpStatusCode.ServiceUnavailable, readyResponse.status)
+        } finally {
+            container.stop()
+        }
     }
 
     @Test
@@ -1285,7 +1378,9 @@ private fun metadataValue(container: JsonObject, label: String): String {
         .content
 }
 
-private class FakeRuntimeConfigAdminService : RuntimeConfigAdminService {
+private class FakeRuntimeConfigAdminService(
+    private val listVersionsFailure: Throwable? = null,
+) : RuntimeConfigAdminService {
     private val versions = mutableMapOf<String, RuntimeConfigVersionDetail>()
     private var activeVersionId: String = "active-runtime-config"
     private var nextDraftId = 1
@@ -1305,6 +1400,8 @@ private class FakeRuntimeConfigAdminService : RuntimeConfigAdminService {
     }
 
     override fun listVersions(limit: Int): Result<List<RuntimeConfigVersionSummary>> {
+        listVersionsFailure?.let { failure -> return Result.failure(failure) }
+
         return Result.success(
             versions.values
                 .map { detail -> detail.version }
@@ -1532,3 +1629,38 @@ private class MutableClock(
 }
 
 private const val DUMMY_AUTH_CODE = "DUMMY-CODE"
+
+/**
+ * fukurou module integration test 用 Postgres image。
+ */
+private const val POSTGRES_IMAGE = "postgres:16-alpine"
+
+/**
+ * fukurou module test 用 Postgres container。
+ */
+private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
+
+private fun isDockerAvailable(): Boolean {
+    return runCatching {
+        DockerClientFactory.instance().client().pingCmd().exec()
+        true
+    }.getOrDefault(false)
+}
+
+private fun deleteRuntimeConfigValue(database: ExposedDatabase, key: String) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                DELETE FROM runtime_config_values
+                WHERE config_key = ?
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, key)
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun JdbcTransaction.jdbcConnection(): Connection {
+    return connection.connection as Connection
+}

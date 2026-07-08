@@ -16,6 +16,7 @@ import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
@@ -772,6 +773,75 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(previousActiveVersionId, rollback.activeVersion.id)
         assertEquals(defaultValues, repository.activeSnapshot().getOrThrow().values)
+    }
+
+    @Test
+    fun runtimeConfigDraftRejectsDeploymentAndSecretKeys() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedRuntimeConfigRepository(
+            database = database,
+            clock = fixedClock(),
+            environment = emptyMap(),
+        )
+        val readOnlyKeys = listOf(
+            "trading.mode",
+            "trading.symbol",
+            "gmoPublic.baseUrl",
+            "database.password",
+        )
+
+        readOnlyKeys.forEach { key ->
+            val result = repository.createDraft(
+                RuntimeConfigDraftCreation(
+                    baseVersionId = null,
+                    values = mapOf(key to "PAPER"),
+                    note = "read-only patch",
+                    createdBy = "test",
+                ),
+            )
+
+            assertTrue(result.isFailure, key)
+        }
+    }
+
+    @Test
+    fun runtimeConfigDraftRetentionKeepsActiveAndNewestDraftVersions() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedRuntimeConfigRepository(
+            database = database,
+            clock = fixedClock(),
+            environment = emptyMap(),
+        )
+
+        repeat(DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT + 2) { index ->
+            repository.createDraft(runtimeConfigDraftCreation("draft-$index")).getOrThrow()
+        }
+
+        val versions = repository.listVersions(limit = 100).getOrThrow()
+
+        assertEquals(1, versions.count { version -> version.status == "ACTIVE" })
+        assertEquals(DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT, versions.count { version -> version.status == "DRAFT" })
+    }
+
+    @Test
+    fun runtimeConfigInactiveRetentionKeepsActiveAndNewestRollbackVersions() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedRuntimeConfigRepository(
+            database = database,
+            clock = fixedClock(),
+            environment = emptyMap(),
+        )
+
+        repeat(DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT + 2) { index ->
+            val draft = repository.createDraft(runtimeConfigDraftCreation("activate-$index")).getOrThrow()
+
+            repository.activateDraft(draft.version.id).getOrThrow()
+        }
+
+        val versions = repository.listVersions(limit = 100).getOrThrow()
+
+        assertEquals(1, versions.count { version -> version.status == "ACTIVE" })
+        assertTrue(versions.count { version -> version.status == "INACTIVE" } <= DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT)
     }
 
     @Test
@@ -3791,6 +3861,15 @@ private fun runnerPhaseEvent(
         eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
         payload = """{"phase":"$phase","details":$details}""",
         occurredAt = occurredAt,
+    )
+}
+
+private fun runtimeConfigDraftCreation(note: String): RuntimeConfigDraftCreation {
+    return RuntimeConfigDraftCreation(
+        baseVersionId = null,
+        values = mapOf("runner.maxToolCallsPerRun" to "12"),
+        note = note,
+        createdBy = "test",
     )
 }
 

@@ -828,12 +828,26 @@ object RuntimeConfigCatalog {
  * @param groups 設定 group 一覧
  * @param activeVersion active runtime config version
  * @param versions runtime config version 履歴
+ * @param warnings catalog 表示は継続できるが運用者確認が必要な warning
  */
 @Serializable
 data class RuntimeConfigSnapshot(
     val groups: List<RuntimeConfigGroup>,
     val activeVersion: RuntimeConfigVersionSummary? = null,
     val versions: List<RuntimeConfigVersionSummary> = emptyList(),
+    val warnings: List<RuntimeConfigSnapshotWarning> = emptyList(),
+)
+
+/**
+ * runtime config snapshot の warning。
+ *
+ * @param code WebUI i18n 用の machine-readable code
+ * @param validation runtime config validation に由来する warning の詳細
+ */
+@Serializable
+data class RuntimeConfigSnapshotWarning(
+    val code: String,
+    val validation: RuntimeConfigValidationResult? = null,
 )
 
 /**
