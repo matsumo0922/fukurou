@@ -1,5 +1,3 @@
-@file:Suppress("LongParameterList", "detekt.LongParameterList")
-
 package me.matsumo.fukurou.trading.broker
 
 import me.matsumo.fukurou.trading.config.PaperMarketConfig
@@ -77,15 +75,21 @@ class InMemoryPaperLedgerRepository private constructor(
         clock: Clock = Clock.systemUTC(),
     ) : this(
         InMemoryPaperLedgerState(
-            accountSnapshot = accountSnapshot,
-            accountUpdatedAt = accountUpdatedAt,
-            positions = positions,
-            openOrders = openOrders,
-            executions = executions,
-            decisionRunIdsByPositionId = decisionRunIdsByPositionId,
-            equitySnapshotRepository = equitySnapshotRepository,
-            fallbackSymbolRules = fallbackSymbolRules,
-            clock = clock,
+            account = InMemoryPaperLedgerAccountSeed(
+                accountSnapshot = accountSnapshot,
+                accountUpdatedAt = accountUpdatedAt,
+            ),
+            records = InMemoryPaperLedgerRecordsSeed(
+                positions = positions,
+                openOrders = openOrders,
+                executions = executions,
+                decisionRunIdsByPositionId = decisionRunIdsByPositionId,
+            ),
+            runtime = InMemoryPaperLedgerRuntime(
+                equitySnapshotRepository = equitySnapshotRepository,
+                fallbackSymbolRules = fallbackSymbolRules,
+                clock = clock,
+            ),
         ),
     )
 
@@ -98,36 +102,66 @@ class InMemoryPaperLedgerRepository private constructor(
 }
 
 /**
- * InMemory paper ledger の共有 mutable state。
+ * InMemory paper ledger の account seed。
  *
  * @param accountSnapshot 残高 snapshot
  * @param accountUpdatedAt paper account 更新時刻
+ */
+private data class InMemoryPaperLedgerAccountSeed(
+    val accountSnapshot: AccountSnapshot,
+    val accountUpdatedAt: Instant,
+)
+
+/**
+ * InMemory paper ledger の記録 seed。
+ *
  * @param positions position 一覧
  * @param openOrders open order 一覧
  * @param executions execution 一覧
  * @param decisionRunIdsByPositionId position ID と LLM invocation ID の対応
+ */
+private data class InMemoryPaperLedgerRecordsSeed(
+    val positions: List<Position>,
+    val openOrders: List<Order>,
+    val executions: List<Execution>,
+    val decisionRunIdsByPositionId: Map<String, String?>,
+)
+
+/**
+ * InMemory paper ledger の runtime 依存。
+ *
  * @param equitySnapshotRepository equity snapshot 保存先
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  * @param clock paper ledger の作成時刻に使う clock
  */
-private class InMemoryPaperLedgerState(
-    accountSnapshot: AccountSnapshot,
-    accountUpdatedAt: Instant,
-    positions: List<Position>,
-    openOrders: List<Order>,
-    executions: List<Execution>,
-    decisionRunIdsByPositionId: Map<String, String?>,
+private data class InMemoryPaperLedgerRuntime(
     val equitySnapshotRepository: InMemoryEquitySnapshotRepository,
     val fallbackSymbolRules: SymbolRules,
     val clock: Clock,
+)
+
+/**
+ * InMemory paper ledger の共有 mutable state。
+ *
+ * @param account account seed
+ * @param records 記録 seed
+ * @param runtime runtime 依存
+ */
+private class InMemoryPaperLedgerState(
+    account: InMemoryPaperLedgerAccountSeed,
+    records: InMemoryPaperLedgerRecordsSeed,
+    runtime: InMemoryPaperLedgerRuntime,
 ) {
     private val lock = Any()
-    var accountSnapshot: AccountSnapshot = accountSnapshot
-    var accountUpdatedAt: Instant = accountUpdatedAt
-    val positions: MutableList<Position> = positions.toMutableList()
-    val orders: MutableList<Order> = openOrders.toMutableList()
-    val executions: MutableList<Execution> = executions.toMutableList()
-    val decisionRunIdsByPositionId: MutableMap<String, String?> = decisionRunIdsByPositionId.toMutableMap()
+    var accountSnapshot: AccountSnapshot = account.accountSnapshot
+    var accountUpdatedAt: Instant = account.accountUpdatedAt
+    val positions: MutableList<Position> = records.positions.toMutableList()
+    val orders: MutableList<Order> = records.openOrders.toMutableList()
+    val executions: MutableList<Execution> = records.executions.toMutableList()
+    val decisionRunIdsByPositionId: MutableMap<String, String?> = records.decisionRunIdsByPositionId.toMutableMap()
+    val equitySnapshotRepository: InMemoryEquitySnapshotRepository = runtime.equitySnapshotRepository
+    val fallbackSymbolRules: SymbolRules = runtime.fallbackSymbolRules
+    val clock: Clock = runtime.clock
 
     fun <T> read(block: InMemoryPaperLedgerState.() -> T): T {
         return synchronized(lock) { block() }
