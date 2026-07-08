@@ -592,7 +592,7 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
     get("/ops/runtime-config") {
         call.respond(
             RuntimeConfigCatalog.snapshot(
-                config = dependencies.runtimeConfig.tradingConfig,
+                tradingConfig = dependencies.runtimeConfig.tradingConfig,
                 environment = dependencies.runtimeConfig.environment,
             ),
         )
@@ -912,23 +912,7 @@ private fun Route.registerOpsLlmAuthLoginSessionRoute(llmAuthService: LlmAuthSer
 @OptIn(ExperimentalKtorApi::class)
 private fun Route.registerOpsLlmAuthTokenSubmitRoute(llmAuthService: LlmAuthService?) {
     post("/ops/llm-auth/{provider}/login/{sessionId}/token") {
-        val provider = call.requireLlmAuthProvider(call.parameters["provider"]) ?: return@post
-        val sessionId = call.requirePathValue(call.parameters["sessionId"], "sessionId is required") ?: return@post
-        val request = call.receiveBodyOrBadRequest<OpsLlmAuthTokenSubmitRequest>() ?: return@post
-        val tokenCode = call.requireLoginTokenCode(request) ?: return@post
-        val service = call.requireLlmAuthService(llmAuthService) ?: return@post
-        val result = service.submitLoginTokenCode(provider, sessionId, tokenCode).getOrThrow()
-
-        when (result) {
-            is LlmAuthLoginTokenSubmitResult.Accepted -> call.respond(
-                HttpStatusCode.Accepted,
-                result.session.toOpsLlmAuthTokenSubmitResponse(),
-            )
-            is LlmAuthLoginTokenSubmitResult.Rejected -> call.respond(
-                result.rejection.toHttpStatusCode(),
-                ErrorResponse(result.reason),
-            )
-        }
+        call.respondOpsLlmAuthTokenSubmit(llmAuthService)
     }.describe {
         summary = "Claude Code CLI auth token/code を送信する"
         description = "active な Claude Code login session の stdin へ token/code を 1 回だけ送信します。token/code の値は応答、audit payload、ログへ含めません。"
@@ -970,6 +954,26 @@ private fun Route.registerOpsLlmAuthTokenSubmitRoute(llmAuthService: LlmAuthServ
                 schema = jsonSchema<ErrorResponse>()
             }
         }
+    }
+}
+
+private suspend fun ApplicationCall.respondOpsLlmAuthTokenSubmit(llmAuthService: LlmAuthService?) {
+    val provider = requireLlmAuthProvider(parameters["provider"]) ?: return
+    val sessionId = requirePathValue(parameters["sessionId"], "sessionId is required") ?: return
+    val request = receiveBodyOrBadRequest<OpsLlmAuthTokenSubmitRequest>() ?: return
+    val tokenCode = requireLoginTokenCode(request) ?: return
+    val service = requireLlmAuthService(llmAuthService) ?: return
+    val result = service.submitLoginTokenCode(provider, sessionId, tokenCode).getOrThrow()
+
+    when (result) {
+        is LlmAuthLoginTokenSubmitResult.Accepted -> respond(
+            HttpStatusCode.Accepted,
+            result.session.toOpsLlmAuthTokenSubmitResponse(),
+        )
+        is LlmAuthLoginTokenSubmitResult.Rejected -> respond(
+            result.rejection.toHttpStatusCode(),
+            ErrorResponse(result.reason),
+        )
     }
 }
 
