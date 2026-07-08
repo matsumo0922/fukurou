@@ -232,6 +232,25 @@ class GmoCoinMcpServerTest {
     }
 
     @Test
+    fun getCandles_doesNotExpandLimitForIndicatorRequirements() = runBlocking {
+        val server = testServer()
+        val marketDataSource = IndicatorMarketDataSource(atrPercentileCandles(count = 113))
+
+        server.registerGmoCoinMarketTools(marketDataSource)
+
+        val arguments = buildJsonObject {
+            put("interval", CandleInterval.FIVE_MINUTES.apiValue)
+            put("limit", 100)
+        }
+
+        val result = callTool(server, "get_candles", arguments)
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertEquals(100, marketDataSource.requestedLimits.single())
+        assertEquals(100, structuredContent.getValue("count").jsonPrimitive.longOrNull?.toInt())
+    }
+
+    @Test
     fun getOrderbook_returnsFreshnessMetadataWithoutSourceTimestamp() = runBlocking {
         val server = testServer()
         server.registerGmoCoinMarketTools(
@@ -393,6 +412,116 @@ class GmoCoinMcpServerTest {
     }
 
     @Test
+    fun calcIndicator_returnsAtrPercentileForDefaultParamsWithoutLimit() = runBlocking {
+        val server = testServer()
+        val marketDataSource = IndicatorMarketDataSource(atrPercentileCandles(count = 113))
+
+        server.registerGmoCoinMarketTools(marketDataSource)
+
+        val result = callTool(
+            server = server,
+            toolName = "calc_indicator",
+            arguments = indicatorArguments(indicator = "ATR_PERCENTILE"),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertEquals(113, marketDataSource.requestedLimits.single())
+        assertEquals(113, structuredContent.getValue("candle_count").jsonPrimitive.longOrNull?.toInt())
+        assertCandleRequirement(
+            structuredContent = structuredContent,
+            requiredCandleCount = 113,
+            resolvedCandleLimit = 113,
+            sourceCandlesSufficient = true,
+        )
+        assertTrue(indicatorValueAt(structuredContent, 112) != null)
+    }
+
+    @Test
+    fun calcIndicator_expandsExplicitLimitBelowRequiredCandleCount() = runBlocking {
+        val server = testServer()
+        val marketDataSource = IndicatorMarketDataSource(atrPercentileCandles(count = 113))
+
+        server.registerGmoCoinMarketTools(marketDataSource)
+
+        val result = callTool(
+            server = server,
+            toolName = "calc_indicator",
+            arguments = indicatorArguments(
+                indicator = "ATR_PERCENTILE",
+                limit = 100,
+            ),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertEquals(113, marketDataSource.requestedLimits.single())
+        assertCandleRequirement(
+            structuredContent = structuredContent,
+            requiredCandleCount = 113,
+            resolvedCandleLimit = 113,
+            sourceCandlesSufficient = true,
+        )
+    }
+
+    @Test
+    fun calcIndicator_rejectsRequiredCandleCountBeyondMaxLimit() = runBlocking {
+        val server = testServer()
+        val marketDataSource = IndicatorMarketDataSource(atrPercentileCandles(count = 500))
+
+        server.registerGmoCoinMarketTools(marketDataSource)
+
+        val result = callTool(
+            server = server,
+            toolName = "calc_indicator",
+            arguments = indicatorArguments(
+                indicator = "ATR_PERCENTILE",
+                period = 400,
+                lookback = 102,
+            ),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertTrue(result.isError == true)
+        assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertTrue(marketDataSource.requestedLimits.isEmpty())
+    }
+
+    @Test
+    fun calcIndicator_returnsRequirementMetadataWhenSourceReturnsFewerCandlesThanRequired() = runBlocking {
+        val server = testServer()
+        val marketDataSource = IndicatorMarketDataSource(
+            candles = atrPercentileCandles(
+                count = 168,
+                interval = CandleInterval.ONE_HOUR,
+            ),
+        )
+
+        server.registerGmoCoinMarketTools(marketDataSource)
+
+        val result = callTool(
+            server = server,
+            toolName = "calc_indicator",
+            arguments = indicatorArguments(
+                indicator = "ATR_PERCENTILE",
+                interval = CandleInterval.ONE_HOUR,
+                period = 14,
+                lookback = 160,
+            ),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+        val values = indicatorValues(structuredContent)
+
+        assertEquals(173, marketDataSource.requestedLimits.single())
+        assertEquals(168, structuredContent.getValue("candle_count").jsonPrimitive.longOrNull?.toInt())
+        assertTrue(values.all { value -> value == null })
+        assertCandleRequirement(
+            structuredContent = structuredContent,
+            requiredCandleCount = 173,
+            resolvedCandleLimit = 173,
+            sourceCandlesSufficient = false,
+        )
+    }
+
+    @Test
     fun calcIndicator_returnsFreshnessMetadataFromUnderlyingCandles() = runBlocking {
         val server = testServer()
         server.registerGmoCoinMarketTools(
@@ -458,12 +587,13 @@ private suspend fun callTool(
 
 private fun indicatorArguments(
     indicator: String,
+    interval: CandleInterval = CandleInterval.FIVE_MINUTES,
     period: Int? = null,
     lookback: Int? = null,
-    limit: Int,
+    limit: Int? = null,
 ): JsonObject {
     return buildJsonObject {
-        put("interval", CandleInterval.FIVE_MINUTES.apiValue)
+        put("interval", interval.apiValue)
         put("indicator", indicator)
         put(
             "params",
@@ -474,7 +604,9 @@ private fun indicatorArguments(
                 if (lookback != null) {
                     put("lookback", lookback)
                 }
-                put("limit", limit)
+                if (limit != null) {
+                    put("limit", limit)
+                }
             },
         )
     }
@@ -487,6 +619,40 @@ private fun indicatorValueAt(structuredContent: JsonObject, valueIndex: Int): Do
         .getValue("value")
         .jsonPrimitive
         .doubleOrNull
+}
+
+private fun indicatorValues(structuredContent: JsonObject): List<Double?> {
+    return structuredContent.getValue("values")
+        .jsonArray
+        .map { valueElement ->
+            valueElement
+                .jsonObject
+                .getValue("value")
+                .jsonPrimitive
+                .doubleOrNull
+        }
+}
+
+private fun assertCandleRequirement(
+    structuredContent: JsonObject,
+    requiredCandleCount: Int,
+    resolvedCandleLimit: Int,
+    sourceCandlesSufficient: Boolean,
+) {
+    val candleRequirement = structuredContent.getValue("candle_requirement").jsonObject
+
+    assertEquals(
+        requiredCandleCount,
+        candleRequirement.getValue("required_candle_count").jsonPrimitive.longOrNull?.toInt(),
+    )
+    assertEquals(
+        resolvedCandleLimit,
+        candleRequirement.getValue("resolved_candle_limit").jsonPrimitive.longOrNull?.toInt(),
+    )
+    assertEquals(
+        sourceCandlesSufficient,
+        candleRequirement.getValue("source_candles_sufficient").jsonPrimitive.booleanOrNull,
+    )
 }
 
 private fun assertFreshness(
@@ -691,6 +857,8 @@ private class IndicatorMarketDataSource(
     private val candles: List<Candle>,
 ) : MarketDataSource {
 
+    val requestedLimits = mutableListOf<Int>()
+
     override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
         return FakeMarketDataSource.getTicker(symbol)
     }
@@ -700,6 +868,8 @@ private class IndicatorMarketDataSource(
         interval: CandleInterval,
         limit: Int,
     ): Result<List<Candle>> {
+        requestedLimits += limit
+
         return Result.success(candles.take(limit))
     }
 
@@ -928,6 +1098,41 @@ private fun expandedIndicatorCandles(): List<Candle> {
             volume = volumeValues[candleIndex].toString(),
         )
     }
+}
+
+private fun atrPercentileCandles(
+    count: Int,
+    interval: CandleInterval = CandleInterval.FIVE_MINUTES,
+): List<Candle> {
+    return (0 until count).map { candleIndex ->
+        atrPercentileCandle(candleIndex, interval)
+    }
+}
+
+private fun atrPercentileCandle(candleIndex: Int, interval: CandleInterval): Candle {
+    val trueRangeValue = candleIndex.toDouble() + 1.0
+
+    return Candle(
+        symbol = TradingSymbol.BTC.apiSymbol,
+        interval = interval,
+        openTime = atrPercentileOpenTime(candleIndex, interval),
+        open = "100.0",
+        high = (100.0 + trueRangeValue / 2.0).toString(),
+        low = (100.0 - trueRangeValue / 2.0).toString(),
+        close = "100.0",
+        volume = "1.0",
+    )
+}
+
+private fun atrPercentileOpenTime(candleIndex: Int, interval: CandleInterval): String {
+    val secondsPerCandle = when (interval) {
+        CandleInterval.ONE_HOUR -> 3_600L
+        else -> 300L
+    }
+
+    return fixedInstant()
+        .plusSeconds(secondsPerCandle * candleIndex.toLong())
+        .toString()
 }
 
 private fun fixedClock(): Clock {
