@@ -6,6 +6,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
@@ -608,7 +609,9 @@ class DefaultLlmAuthService(
     }
 
     private suspend fun waitForProcess(session: MutableLlmAuthLoginSession, reason: String) {
-        val completed = session.process.waitFor(config.loginTimeout.toMillis(), TimeUnit.MILLISECONDS)
+        val completed = withContext(Dispatchers.IO) {
+            session.process.waitFor(config.loginTimeout.toMillis(), TimeUnit.MILLISECONDS)
+        }
         val (status, eventType) = if (completed) {
             if (session.process.exitValue() == 0) {
                 LlmAuthLoginStatus.SUCCEEDED to CommandEventType.CLI_AUTH_LOGIN_COMPLETED
