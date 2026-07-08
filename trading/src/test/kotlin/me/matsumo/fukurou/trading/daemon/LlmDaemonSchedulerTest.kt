@@ -778,23 +778,27 @@ private fun schedulerFixture(
 ): SchedulerFixture {
     val scheduler = LlmDaemonScheduler(
         tradingConfig = tradingConfig,
-        riskStateRepository = riskStateRepository,
-        commandEventLog = eventLog,
-        launchReservationRepository = reservations,
-        openRiskReader = openRiskReader,
-        tickerReader = tickerReader,
-        positionsReader = positionsReader,
-        requestBase = OneShotRunnerRequest(
-            repositoryRoot = Path.of(".").toAbsolutePath().normalize(),
-            workingDirectory = Path.of(".").toAbsolutePath().normalize(),
-            mcpJarPath = "mcp/build/libs/fukurou-mcp-all.jar",
+        dependencies = LlmDaemonSchedulerDependencies(
+            riskStateRepository = riskStateRepository,
+            commandEventLog = eventLog,
+            launchReservationRepository = reservations,
+            openRiskReader = openRiskReader,
+            tickerReader = tickerReader,
+            positionsReader = positionsReader,
         ),
-        launchOneShot = { request ->
-            launches += request
-            Result.success(launchHandler(request))
-        },
-        clock = clock,
-        idGenerator = idGenerator,
+        runtime = LlmDaemonSchedulerRuntime(
+            requestBase = OneShotRunnerRequest(
+                repositoryRoot = Path.of(".").toAbsolutePath().normalize(),
+                workingDirectory = Path.of(".").toAbsolutePath().normalize(),
+                mcpJarPath = "mcp/build/libs/fukurou-mcp-all.jar",
+            ),
+            launchOneShot = { request ->
+                launches += request
+                Result.success(launchHandler(request))
+            },
+            clock = clock,
+            idGenerator = idGenerator,
+        ),
     )
 
     return SchedulerFixture(

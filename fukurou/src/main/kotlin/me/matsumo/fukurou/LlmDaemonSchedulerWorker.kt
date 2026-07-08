@@ -16,8 +16,12 @@ import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
+import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceDependencies
+import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceRuntime
 import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
@@ -187,15 +191,19 @@ private fun createLlmDaemonScheduler(
 
     return LlmDaemonScheduler(
         tradingConfig = tradingConfig,
-        riskStateRepository = components.tradingRuntime.riskStateRepository,
-        commandEventLog = components.tradingRuntime.commandEventLog,
-        launchReservationRepository = components.launchReservationRepository,
-        openRiskReader = components.tradingRuntime.openRiskReader(),
-        tickerReader = components.marketDataSource.tickerReader(tradingConfig),
-        positionsReader = components.tradingRuntime.positionsReader(),
-        requestBase = components.requestBase,
-        launchOneShot = components.launchOneShot,
-        clock = clock,
+        dependencies = LlmDaemonSchedulerDependencies(
+            riskStateRepository = components.tradingRuntime.riskStateRepository,
+            commandEventLog = components.tradingRuntime.commandEventLog,
+            launchReservationRepository = components.launchReservationRepository,
+            openRiskReader = components.tradingRuntime.openRiskReader(),
+            tickerReader = components.marketDataSource.tickerReader(tradingConfig),
+            positionsReader = components.tradingRuntime.positionsReader(),
+        ),
+        runtime = LlmDaemonSchedulerRuntime(
+            requestBase = components.requestBase,
+            launchOneShot = components.launchOneShot,
+            clock = clock,
+        ),
     )
 }
 
@@ -223,13 +231,17 @@ internal fun createManualLlmLaunchService(
 
     return DefaultManualLlmLaunchService(
         tradingConfig = tradingConfig,
-        riskStateRepository = components.tradingRuntime.riskStateRepository,
-        commandEventLog = components.tradingRuntime.commandEventLog,
-        launchReservationRepository = components.launchReservationRepository,
-        openRiskReader = components.tradingRuntime.openRiskReader(),
-        requestBase = components.requestBase,
-        launchOneShot = components.launchOneShot,
-        clock = clock,
+        dependencies = ManualLlmLaunchServiceDependencies(
+            riskStateRepository = components.tradingRuntime.riskStateRepository,
+            commandEventLog = components.tradingRuntime.commandEventLog,
+            launchReservationRepository = components.launchReservationRepository,
+            openRiskReader = components.tradingRuntime.openRiskReader(),
+        ),
+        runtime = ManualLlmLaunchServiceRuntime(
+            requestBase = components.requestBase,
+            launchOneShot = components.launchOneShot,
+            clock = clock,
+        ),
     )
 }
 

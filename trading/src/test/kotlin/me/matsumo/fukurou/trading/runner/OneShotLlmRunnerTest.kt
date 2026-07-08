@@ -30,6 +30,8 @@ import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
@@ -1266,23 +1268,27 @@ class OneShotLlmRunnerTest {
         )
         val scheduler = LlmDaemonScheduler(
             tradingConfig = TradingBotConfig(),
-            riskStateRepository = runtime.riskStateRepository,
-            commandEventLog = runtime.commandEventLog,
-            launchReservationRepository = InMemoryLlmLaunchReservationRepository(runtime.riskStateRepository),
-            openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
-            tickerReader = LlmDaemonTickerReader {
-                Result.success(
-                    LlmDaemonTickerSnapshot(
-                        lastPriceJpy = BigDecimal("10000000"),
-                        sourceTimestamp = fixedClock().instant(),
-                    ),
-                )
-            },
-            positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
-            requestBase = defaultRequest(),
-            launchOneShot = runner.asDaemonLauncher(),
-            clock = fixedClock(),
-            idGenerator = { UUID(0L, 42L) },
+            dependencies = LlmDaemonSchedulerDependencies(
+                riskStateRepository = runtime.riskStateRepository,
+                commandEventLog = runtime.commandEventLog,
+                launchReservationRepository = InMemoryLlmLaunchReservationRepository(runtime.riskStateRepository),
+                openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
+                tickerReader = LlmDaemonTickerReader {
+                    Result.success(
+                        LlmDaemonTickerSnapshot(
+                            lastPriceJpy = BigDecimal("10000000"),
+                            sourceTimestamp = fixedClock().instant(),
+                        ),
+                    )
+                },
+                positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
+            ),
+            runtime = LlmDaemonSchedulerRuntime(
+                requestBase = defaultRequest(),
+                launchOneShot = runner.asDaemonLauncher(),
+                clock = fixedClock(),
+                idGenerator = { UUID(0L, 42L) },
+            ),
         )
 
         val tickResult = assertIs<LlmDaemonTickResult.Launched>(scheduler.tick())

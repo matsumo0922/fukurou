@@ -165,19 +165,23 @@ class ManualLlmLaunchServiceTest {
         )
         val scheduler = LlmDaemonScheduler(
             tradingConfig = config,
-            riskStateRepository = riskStateRepository,
-            commandEventLog = eventLog,
-            launchReservationRepository = reservations,
-            openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
-            tickerReader = LlmDaemonTickerReader { error("ticker must not be read") },
-            positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
-            requestBase = defaultRequest(),
-            launchOneShot = { request ->
-                launchRequests += request
-                Result.success(successfulRunnerResult(request))
-            },
-            clock = clock,
-            idGenerator = idGenerator,
+            dependencies = LlmDaemonSchedulerDependencies(
+                riskStateRepository = riskStateRepository,
+                commandEventLog = eventLog,
+                launchReservationRepository = reservations,
+                openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
+                tickerReader = LlmDaemonTickerReader { error("ticker must not be read") },
+                positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
+            ),
+            runtime = LlmDaemonSchedulerRuntime(
+                requestBase = defaultRequest(),
+                launchOneShot = { request ->
+                    launchRequests += request
+                    Result.success(successfulRunnerResult(request))
+                },
+                clock = clock,
+                idGenerator = idGenerator,
+            ),
         )
 
         val firstHeartbeatResult = scheduler.tick()
@@ -442,18 +446,22 @@ private fun manualService(
 ): DefaultManualLlmLaunchService {
     return DefaultManualLlmLaunchService(
         tradingConfig = tradingConfig,
-        riskStateRepository = riskStateRepository,
-        commandEventLog = eventLog,
-        launchReservationRepository = reservations,
-        openRiskReader = LlmDaemonOpenRiskReader { Result.success(hasOpenRisk) },
-        requestBase = defaultRequest(),
-        launchOneShot = { request ->
-            launches += request
-            Result.success(launchHandler(request))
-        },
-        clock = clock,
-        idGenerator = idGenerator,
-        scope = scope,
+        dependencies = ManualLlmLaunchServiceDependencies(
+            riskStateRepository = riskStateRepository,
+            commandEventLog = eventLog,
+            launchReservationRepository = reservations,
+            openRiskReader = LlmDaemonOpenRiskReader { Result.success(hasOpenRisk) },
+        ),
+        runtime = ManualLlmLaunchServiceRuntime(
+            requestBase = defaultRequest(),
+            launchOneShot = { request ->
+                launches += request
+                Result.success(launchHandler(request))
+            },
+            clock = clock,
+            idGenerator = idGenerator,
+            scope = scope,
+        ),
     )
 }
 

@@ -68,33 +68,24 @@ sealed interface ManualLlmLaunchResult {
  * 予約 repository を正本として手動 LLM 起動を fire-and-forget で実行する service。
  *
  * @param tradingConfig 取引 bot 設定
- * @param riskStateRepository SOFT_HALT flat 判定に使う repository
- * @param commandEventLog 監査 log
- * @param launchReservationRepository LLM 起動予約 repository
- * @param openRiskReader 建玉 / open order の有無を読む境界
- * @param requestBase one-shot runner に渡す固定 request
- * @param launchOneShot one-shot runner 起動境界
- * @param clock 予約と監査時刻に使う clock
- * @param idGenerator invocation ID generator
- * @param warnLogger 非同期 runner 失敗の warning logger
- * @param scope runner を非同期実行する Application lifecycle-backed scope
+ * @param dependencies service が参照する repository / reader
+ * @param runtime service の実行時境界
  */
 class DefaultManualLlmLaunchService(
     private val tradingConfig: TradingBotConfig,
-    private val riskStateRepository: RiskStateRepository,
-    private val commandEventLog: CommandEventLog,
-    private val launchReservationRepository: LlmLaunchReservationRepository,
-    private val openRiskReader: LlmDaemonOpenRiskReader,
-    private val requestBase: OneShotRunnerRequest,
-    private val launchOneShot: suspend (OneShotRunnerRequest) -> Result<OneShotRunnerResult>,
-    private val clock: Clock = Clock.systemUTC(),
-    private val idGenerator: () -> UUID = { UUID.randomUUID() },
-    private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
-        logger = Logger.getLogger(DefaultManualLlmLaunchService::class.java.name),
-        clock = clock,
-    ),
-    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    dependencies: ManualLlmLaunchServiceDependencies,
+    runtime: ManualLlmLaunchServiceRuntime,
 ) : ManualLlmLaunchService, AutoCloseable {
+    private val riskStateRepository = dependencies.riskStateRepository
+    private val commandEventLog = dependencies.commandEventLog
+    private val launchReservationRepository = dependencies.launchReservationRepository
+    private val openRiskReader = dependencies.openRiskReader
+    private val requestBase = runtime.requestBase
+    private val launchOneShot = runtime.launchOneShot
+    private val clock = runtime.clock
+    private val idGenerator = runtime.idGenerator
+    private val warnLogger = runtime.warnLogger
+    private val scope = runtime.scope
 
     override suspend fun launch(reason: String): Result<ManualLlmLaunchResult> {
         return runCatching {
@@ -371,6 +362,43 @@ class DefaultManualLlmLaunchService(
         )
     }
 }
+
+/**
+ * 手動 LLM 起動 service が使う repository / reader 群。
+ *
+ * @param riskStateRepository SOFT_HALT flat 判定に使う repository
+ * @param commandEventLog 監査 log
+ * @param launchReservationRepository LLM 起動予約 repository
+ * @param openRiskReader 建玉 / open order の有無を読む境界
+ */
+data class ManualLlmLaunchServiceDependencies(
+    val riskStateRepository: RiskStateRepository,
+    val commandEventLog: CommandEventLog,
+    val launchReservationRepository: LlmLaunchReservationRepository,
+    val openRiskReader: LlmDaemonOpenRiskReader,
+)
+
+/**
+ * 手動 LLM 起動 service の起動境界と実行時依存。
+ *
+ * @param requestBase one-shot runner に渡す固定 request
+ * @param launchOneShot one-shot runner 起動境界
+ * @param clock 予約と監査時刻に使う clock
+ * @param idGenerator invocation ID generator
+ * @param warnLogger 非同期 runner 失敗の warning logger
+ * @param scope runner を非同期実行する Application lifecycle-backed scope
+ */
+data class ManualLlmLaunchServiceRuntime(
+    val requestBase: OneShotRunnerRequest,
+    val launchOneShot: suspend (OneShotRunnerRequest) -> Result<OneShotRunnerResult>,
+    val clock: Clock = Clock.systemUTC(),
+    val idGenerator: () -> UUID = { UUID.randomUUID() },
+    val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
+        logger = Logger.getLogger(DefaultManualLlmLaunchService::class.java.name),
+        clock = clock,
+    ),
+    val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+)
 
 private fun manualDecisionRunContext(invocationId: String): DecisionRunContext {
     return DecisionRunContext(
