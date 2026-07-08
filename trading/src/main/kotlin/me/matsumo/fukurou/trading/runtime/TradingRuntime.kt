@@ -139,9 +139,9 @@ data class TradingDatabaseConfig(
             }
 
             return TradingDatabaseConfig(
-                url = url,
-                user = user,
-                password = password,
+                url = requireNotNull(url),
+                user = requireNotNull(user),
+                password = requireNotNull(password),
             )
         }
     }
