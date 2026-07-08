@@ -336,10 +336,10 @@ ENTER 経路のフルコスト見積もり（Opus Proposer + xhigh Falsifier）:
 
 ## 11. 発見した問題（追加分）
 
-6. **Gradle configuration cache が `runOneShotLlm` の env 変更を無視する。** `org.gradle.configuration-cache=true` のため、JavaExec の子プロセス環境が最初の snapshot で固定される。計測時は `--no-configuration-cache` 必須。#27 の daemon 起動方式の設計入力（JavaExec 経由なら同じ罠がある）。
-7. **既定 enforced 構成では codex Falsifier が `submit_falsification` を提出できない**（`approval_policy="never"` が書き込み系 MCP tool 承認を自動拒否）。`FUKUROU_CODEX_FALSIFIER_ARGS="--yolo"` の明示 opt-in が実運用必須で、container 隔離（#27)が前提条件。
-8. **ENTER 経路の tool call 総予算（既定 30）が Proposer + Falsifier 合算で枯渇しうる**（実測 12.7 + 17 ≒ 30）。
-9. **Claude access token の期限が数時間**のため、read-only auth mount 単体では長期無人運転に不足。refresh 書き戻し or `setup-token` の検証が #27 に必要。
+1. **Gradle configuration cache が `runOneShotLlm` の env 変更を無視する。** `org.gradle.configuration-cache=true` のため、JavaExec の子プロセス環境が最初の snapshot で固定される。計測時は `--no-configuration-cache` 必須。#27 の daemon 起動方式の設計入力（JavaExec 経由なら同じ罠がある）。
+2. **既定 enforced 構成では codex Falsifier が `submit_falsification` を提出できない**（`approval_policy="never"` が書き込み系 MCP tool 承認を自動拒否）。`FUKUROU_CODEX_FALSIFIER_ARGS="--yolo"` の明示 opt-in が実運用必須で、container 隔離（#27)が前提条件。
+3. **ENTER 経路の tool call 総予算（既定 30）が Proposer + Falsifier 合算で枯渇しうる**（実測 12.7 + 17 ≒ 30）。
+4. **Claude access token の期限が数時間**のため、read-only auth mount 単体では長期無人運転に不足。refresh 書き戻し or `setup-token` の検証が #27 に必要。
 
 ## 12. 再判定
 
