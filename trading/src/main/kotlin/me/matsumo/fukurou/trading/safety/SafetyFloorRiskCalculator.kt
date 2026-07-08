@@ -369,7 +369,12 @@ internal class SafetyFloorRiskCalculator(
     }
 
     private fun slippageRatio(): BigDecimal {
-        return config.marketSlippageReserveBps.divide(BPS_DIVISOR, SAFETY_SCALE, RoundingMode.HALF_UP)
+        val effectiveSlippageBps = maxOf(
+            config.marketSlippageReserveBps,
+            paperExecutionConfig.marketSlippageBps,
+        )
+
+        return effectiveSlippageBps.divide(BPS_DIVISOR, SAFETY_SCALE, RoundingMode.HALF_UP)
     }
 
     private fun cappedProbabilityOrNull(probability: BigDecimal, context: SafetyFloorContext): BigDecimal? {

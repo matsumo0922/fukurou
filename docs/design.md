@@ -2620,6 +2620,8 @@ estimatedMaxLossJpy = roundedSizeBtc * perBtcRiskJpy + orderTypeAwareFeeEstimate
 
 [確定] MARKET entryの評価価格は `last` ではなく `ask + fixed slippage + ATR(5m,14) * volatilitySlippageMultiplier` として保守的に見積もる。SELL closeは `bid - fixed slippage - ATR(5m,14) * volatilitySlippageMultiplier` として保守的に見積もる。
 
+SafetyFloor の fixed slippage reserve は、SafetyFloor 側の `marketSlippageReserveBps` と paper 約定側の `marketSlippageBps` の大きい方を使い、pre-trade 見積もりが paper fill より小さい固定 slippage 前提にならないようにする。
+
 [確定事項の改訂: 2026-07-02] 安全床6「コスト上限」は、EVゲートと想定値幅/往復コスト比の下限で実体化する。往復コストはentry order typeに応じたtaker fee / maker rebate、保護exit側のtaker fee、spread、slippage reserveを含めてR換算し、`expectedMoveToCostRatio` が下限未満なら拒否する。
 
 ### 10.2 ATR損切り

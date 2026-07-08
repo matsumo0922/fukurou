@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.safety
 
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
@@ -265,6 +266,25 @@ class SafetyFloorTest {
         assertEquals("10115455.00000000", details.estimatedEntryPriceJpy)
         assertEquals("50602.56363750", details.requiredCashJpy)
         assertEquals("2180.35227500", details.orderRiskJpy)
+    }
+
+    @Test
+    fun placeOrderRiskDetails_usesPaperExecutionSlippageWhenHigherThanSafetyReserve() {
+        val details = SafetyFloor(
+            config = SafetyFloorConfig(marketSlippageReserveBps = BigDecimal("5")),
+            clock = fixedClock(),
+            paperExecutionConfig = PaperExecutionConfig(marketSlippageBps = BigDecimal("20")),
+        ).placeOrderRiskDetails(
+            command = entryCommand(),
+            context = safetyContext(
+                positions = emptyList(),
+                atr14Jpy = null,
+            ),
+        )
+
+        assertEquals("10130220.00000000", details.estimatedEntryPriceJpy)
+        assertEquals("50676.42555000", details.requiredCashJpy)
+        assertEquals("2398.97775000", details.orderRiskJpy)
     }
 
     @Test
