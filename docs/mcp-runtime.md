@@ -150,7 +150,7 @@ Reflection Runner の PromptCandidates は完了済み前週を対象に `REFLEC
 
 ## config
 
-runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB bootstrap が `runtime_config_versions` / `runtime_config_values` に初期 active version を作成する。DB-backed runtime では active DB config が `RUNTIME` key の正本で、legacy `FUKUROU_*` env より優先する。`.env` は secret / deployment / bootstrap 値に使う。主な legacy env 名:
+runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB bootstrap が `runtime_config_versions` / `runtime_config_values` に初期 active version を作成する。active snapshot に不足する code-owned catalog key がある場合、bootstrap は既存値を保持した complete snapshot を新しい active version として作成する。key の削除は無効化手段ではなく、bootstrap が catalog default で復元する。unknown key、不正値、validation failure は fail closed する。DB-backed runtime では active DB config が `RUNTIME` key の正本で、legacy `FUKUROU_*` env より優先する。`.env` は secret / deployment / bootstrap 値に使う。主な legacy env 名:
 
 | env | 既定 | 用途 |
 | --- | --- | --- |
@@ -158,6 +158,8 @@ runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB 
 | `FUKUROU_TRADING_MODE` | `PAPER` | `PAPER` のみ有効。`LIVE` は予約値で、現時点では起動時に拒否 |
 | `FUKUROU_PAPER_INITIAL_CASH_JPY` | `100000` | paper 初期 JPY 残高 |
 | `FUKUROU_MARKET_SLIPPAGE_BPS` | `5` | paper MARKET / STOP 約定 slippage |
+| `FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER` | `0.1` | paper MARKET / STOP 約定へ ATR(5m,14) から追加する slippage 係数 |
+| `FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS` | `5` | SafetyFloor の固定 slippage reserve。`FUKUROU_MARKET_SLIPPAGE_BPS` より小さい場合は paper 約定側の値を SafetyFloor 見積もりに使う |
 | `FUKUROU_MAX_RISK_PER_TRADE_RATIO` | `0.02` | 1 trade group 最大損失 |
 | `FUKUROU_MAX_DRAWDOWN_RATIO` | `-0.15` | HARD_HALT drawdown |
 | `FUKUROU_MAX_TOTAL_EXPOSURE_RATIO` | `0.80` | 合計 exposure 上限 |

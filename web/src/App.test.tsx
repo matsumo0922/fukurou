@@ -275,7 +275,7 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("BUY BTC execution")).toBeInTheDocument();
+    expect(await screen.findByText("BTC entry fill")).toBeInTheDocument();
     expect(screen.getAllByText("No trade").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Manual resume requested").length).toBeGreaterThan(0);
     expect(screen.getAllByText("operator").length).toBeGreaterThan(0);
@@ -286,10 +286,28 @@ describe("App", () => {
     const timelineItems = within(timeline).getAllByRole("listitem");
 
     expect(timelineItems.map((item) => within(item).getByRole("heading", { level: 2 }).textContent)).toEqual([
-      "BUY BTC execution",
+      "BTC entry fill",
       "Manual resume requested",
       "No trade",
     ]);
+    expect(within(timeline).queryByText("Entry reason stays in the detail dialog.")).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(timelineItems[0]).getByRole("button", {
+        name: "Open execution details for BTC entry fill",
+      }),
+    );
+
+    const detailsDialog = screen.getByRole("dialog", { name: "BTC entry fill" });
+
+    expect(within(detailsDialog).getByText("Entry reason stays in the detail dialog.")).toBeInTheDocument();
+    expect(within(detailsDialog).getByText("order-1")).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "BTC entry fill" })).not.toBeInTheDocument();
+    });
     expect(hasGetCall(fetchMock, "/ops/activity", (params) => params.get("limit") === "50")).toBe(true);
 
     fireEvent.click(screen.getByRole("button", { name: "Load older" }));
@@ -431,7 +449,7 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("BUY BTC execution")).toBeInTheDocument();
+    expect(await screen.findByText("BTC entry fill")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Load older" }));
     fireEvent.click(screen.getByRole("button", { name: "Audit" }));
@@ -1410,8 +1428,8 @@ function defaultLatestActivityEvents() {
     {
       id: "execution:execution-1",
       source: "execution",
-      kind: "BUY",
-      title: "BUY BTC execution",
+      kind: "ENTRY_FILL",
+      title: "BTC entry fill",
       detail: "0.01000000 BTC at 10000000 JPY",
       occurredAt: "2026-07-05T12:04:00.000Z",
       metadata: [
@@ -1432,6 +1450,83 @@ function defaultLatestActivityEvents() {
           value: "order-1",
         },
       ],
+      details: {
+        title: "BTC entry fill",
+        metadata: [
+          {
+            label: "execution",
+            value: "execution-1",
+          },
+          {
+            label: "side",
+            value: "BUY",
+          },
+          {
+            label: "size",
+            value: "0.01000000",
+          },
+          {
+            label: "price",
+            value: "10000000",
+          },
+          {
+            label: "realized pnl",
+            value: "0",
+          },
+          {
+            label: "fee",
+            value: "10",
+          },
+          {
+            label: "liquidity",
+            value: "TAKER",
+          },
+          {
+            label: "order",
+            value: "order-1",
+          },
+          {
+            label: "order type",
+            value: "MARKET",
+          },
+          {
+            label: "trigger price",
+            value: "none",
+          },
+          {
+            label: "take-profit price",
+            value: "10200000",
+          },
+          {
+            label: "order reason",
+            value: "Entry order reason stays in the detail dialog.",
+          },
+          {
+            label: "position",
+            value: "position-1",
+          },
+          {
+            label: "trade group",
+            value: "trade-group-1",
+          },
+          {
+            label: "decision action",
+            value: "ENTER",
+          },
+          {
+            label: "decision",
+            value: "decision-entry-1",
+          },
+          {
+            label: "decision run",
+            value: "entry-run-1",
+          },
+          {
+            label: "decision reason",
+            value: "Entry reason stays in the detail dialog.",
+          },
+        ],
+      },
     },
     {
       id: "audit:event-1",

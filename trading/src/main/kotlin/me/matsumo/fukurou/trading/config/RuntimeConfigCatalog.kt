@@ -113,6 +113,14 @@ object RuntimeConfigCatalog {
                     unit = "bps",
                 ),
                 runtimeItem(
+                    key = "paper.volatilitySlippageMultiplier",
+                    legacyEnvName = FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER_ENV,
+                    valueType = RuntimeConfigValueType.DECIMAL_STRING,
+                    defaultValue = defaults.config.paperExecution.volatilitySlippageMultiplier.toPlainString(),
+                    effectiveValue = config.paperExecution.volatilitySlippageMultiplier.toPlainString(),
+                    unit = null,
+                ),
+                runtimeItem(
                     key = "paper.fallbackMakerFeeRate",
                     legacyEnvName = FUKUROU_FALLBACK_MAKER_FEE_RATE_ENV,
                     valueType = RuntimeConfigValueType.DECIMAL_STRING,
@@ -1018,6 +1026,7 @@ private const val FUKUROU_TRADING_SYMBOL_ENV = "FUKUROU_TRADING_SYMBOL"
 private const val FUKUROU_TRADING_MODE_ENV = "FUKUROU_TRADING_MODE"
 private const val FUKUROU_PAPER_INITIAL_CASH_JPY_ENV = "FUKUROU_PAPER_INITIAL_CASH_JPY"
 private const val FUKUROU_MARKET_SLIPPAGE_BPS_ENV = "FUKUROU_MARKET_SLIPPAGE_BPS"
+private const val FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER_ENV = "FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER"
 private const val FUKUROU_FALLBACK_MAKER_FEE_RATE_ENV = "FUKUROU_FALLBACK_MAKER_FEE_RATE"
 private const val FUKUROU_FALLBACK_TAKER_FEE_RATE_ENV = "FUKUROU_FALLBACK_TAKER_FEE_RATE"
 private const val FUKUROU_FALLBACK_SPREAD_BPS_ENV = "FUKUROU_FALLBACK_SPREAD_BPS"

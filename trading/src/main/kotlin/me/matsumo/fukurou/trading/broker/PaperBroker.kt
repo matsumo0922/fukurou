@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.ProtectionStatus
@@ -60,6 +61,7 @@ import java.util.logging.Logger
  * @param safetyViolationRepository SafetyFloor violation repository
  * @param safetyFloor Broker 副作用前に実行する SafetyFloor
  * @param marketDataSource paper 約定に使う市場データ source
+ * @param paperExecutionConfig paper 約定近似設定
  * @param fillSimulator paper 約定 simulator
  * @param reconcilerStatusProvider ProtectionReconciler 状態 provider
  * @param clock 当日実現損益の対象日算出に使う clock
@@ -95,7 +97,8 @@ class PaperBroker private constructor(
         safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
         safetyFloor: SafetyFloor? = null,
         marketDataSource: MarketDataSource? = null,
-        fillSimulator: FillSimulator? = null,
+        paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
+        fillSimulator: PaperExecutionSimulator? = null,
         reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
         clock: Clock = Clock.systemUTC(),
         tradingDateZone: ZoneId = TRADING_DATE_ZONE,
@@ -113,11 +116,18 @@ class PaperBroker private constructor(
             safety = PaperBrokerSafetyServices(
                 riskStateCommandService = riskStateCommandService,
                 safetyViolationRepository = safetyViolationRepository,
-                safetyFloor = safetyFloor ?: SafetyFloor(clock = clock),
+                safetyFloor = safetyFloor ?: SafetyFloor(
+                    clock = clock,
+                    paperExecutionConfig = paperExecutionConfig,
+                ),
             ),
             market = PaperBrokerMarketServices(
                 marketDataSource = marketDataSource,
-                fillSimulator = fillSimulator ?: FillSimulator(clock = clock),
+                paperExecutionConfig = paperExecutionConfig,
+                fillSimulator = fillSimulator ?: DefaultPaperExecutionSimulator(
+                    config = paperExecutionConfig,
+                    clock = clock,
+                ),
                 warnLogger = warnLogger,
             ),
             time = PaperBrokerTimeConfig(
@@ -162,12 +172,14 @@ private data class PaperBrokerSafetyServices(
  * PaperBroker delegate 群で共有する market execution service。
  *
  * @param marketDataSource paper 約定に使う市場データ source
+ * @param paperExecutionConfig paper 約定近似設定
  * @param fillSimulator paper 約定 simulator
  * @param warnLogger rate-limited warn logger
  */
 private data class PaperBrokerMarketServices(
     val marketDataSource: MarketDataSource?,
-    val fillSimulator: FillSimulator,
+    val paperExecutionConfig: PaperExecutionConfig,
+    val fillSimulator: PaperExecutionSimulator,
     val warnLogger: RateLimitedWarnLogger,
 )
 
@@ -330,6 +342,7 @@ private class PaperBrokerTradeDelegate(
             val context = marketContextFactory.safetyContext(
                 ticker = ticker,
                 symbolRules = symbolRules,
+                includeAtr = true,
                 intentId = command.intentId,
             )
             val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
@@ -350,26 +363,25 @@ private class PaperBrokerTradeDelegate(
 
             validateSymbolRules(resolvedCommand, symbolRules)
             validateEntryPriceContract(resolvedCommand, ticker)
-            runtime.validateCashAvailability(resolvedCommand, ticker, symbolRules)
+            val marketFill = marketEntryFillOrNull(resolvedCommand, ticker, symbolRules)
 
-            if (resolvedCommand.orderType == OrderType.MARKET) {
-                val fill = runtime.market.fillSimulator.marketFill(
-                    resolvedCommand.side,
-                    resolvedCommand.sizeBtc,
-                    ticker,
-                    symbolRules,
-                )
-
+            if (marketFill != null) {
                 return@runCatching intentConsumer.fillMarketEntryAndConsumeIntent(
                     MarketEntryFillRequest(
                         command = resolvedCommand,
-                        fill = fill,
+                        fill = marketFill,
                         positionId = UUID.randomUUID(),
                         tradeGroupId = resolvedTradeGroupId,
                         stopOrderId = UUID.randomUUID(),
                     ),
                 )
             }
+
+            runtime.validateCashAvailability(
+                command = resolvedCommand,
+                ticker = ticker,
+                rules = symbolRules,
+            )
 
             intentConsumer.createRestingEntryOrderAndConsumeIntent(
                 RestingEntryOrderRequest(
@@ -381,6 +393,37 @@ private class PaperBrokerTradeDelegate(
         }
     }
 
+    private suspend fun marketEntryFillOrNull(
+        command: PlaceOrderCommand,
+        ticker: Ticker,
+        symbolRules: SymbolRules,
+    ): SimulatedFill? {
+        if (command.orderType != OrderType.MARKET) {
+            return null
+        }
+
+        val executionContext = runtime.paperSimulationContext(
+            symbol = command.symbol,
+            ticker = ticker,
+            rules = symbolRules,
+            includeOrderbook = true,
+            includeVolatilitySlippage = true,
+        )
+
+        runtime.validateCashAvailability(
+            command = command,
+            ticker = ticker,
+            rules = symbolRules,
+            executionContext = executionContext,
+        )
+
+        return runtime.market.fillSimulator.marketFill(
+            side = command.side,
+            sizeBtc = command.sizeBtc,
+            context = executionContext,
+        )
+    }
+
     override suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult> {
         return runCatching {
             validatePlaceOrderCommand(command)
@@ -390,6 +433,7 @@ private class PaperBrokerTradeDelegate(
             val context = marketContextFactory.safetyContext(
                 ticker = ticker,
                 symbolRules = symbolRules,
+                includeAtr = true,
                 intentId = command.intentId,
             )
             val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
@@ -418,7 +462,11 @@ private class PaperBrokerTradeDelegate(
 
             validateSymbolRules(resolvedCommand, symbolRules)
             validateEntryPriceContract(resolvedCommand, ticker)
-            runtime.validateCashAvailability(resolvedCommand, ticker, symbolRules)
+            runtime.validateCashAvailability(
+                command = resolvedCommand,
+                ticker = ticker,
+                rules = symbolRules,
+            )
 
             PreviewOrderResult(
                 accepted = true,
@@ -447,14 +495,20 @@ private class PaperBrokerTradeDelegate(
 
             val openPositions = runtime.stores.ledgerRepository.getOpenPositions().getOrThrow()
             val targetPositions = resolveCloseTargets(command, openPositions)
+            val executionContext = runtime.paperSimulationContext(
+                symbol = TradingSymbol.BTC,
+                ticker = ticker,
+                rules = symbolRules,
+                includeOrderbook = true,
+                includeVolatilitySlippage = true,
+            )
             val results = targetPositions.map { position ->
                 val closeCommand = command.forCloseTarget(position, targetPositions.size)
                 val closePlan = resolveCloseExecutionPlan(closeCommand, position, symbolRules)
                 val fill = runtime.market.fillSimulator.marketFill(
                     side = OrderSide.SELL,
                     sizeBtc = closePlan.sizeBtc,
-                    ticker = ticker,
-                    rules = symbolRules,
+                    context = executionContext,
                 )
 
                 runtime.stores.ledgerRepository.closePosition(
@@ -527,8 +581,13 @@ private class PaperBrokerReconcileDelegate(
 
     override suspend fun reconcile(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
         return runCatching {
+            val simulationContext = runtime.reconcileSimulationContext(tickSnapshot)
             val result = runtime.stores.ledgerRepository
-                .reconcile(tickSnapshot, runtime.market.fillSimulator)
+                .reconcile(
+                    tickSnapshot = tickSnapshot,
+                    simulator = runtime.market.fillSimulator,
+                    simulationContext = simulationContext,
+                )
                 .getOrThrow()
 
             safetyGate.activateHardHaltIfAccountDrawdownReached()
@@ -541,12 +600,19 @@ private class PaperBrokerReconcileDelegate(
         return runCatching {
             val ticker = tickSnapshot.requireTicker()
             val symbolRules = tickSnapshot.symbolRules ?: runtime.symbolRulesFor(TradingSymbol.BTC).getOrThrow()
+            val simulationContext = runtime.paperSimulationContext(
+                symbol = TradingSymbol.BTC,
+                ticker = ticker,
+                rules = symbolRules,
+                atr14Jpy = tickSnapshot.atr14Jpy?.toBigDecimalOrNull(),
+                includeOrderbook = true,
+                includeVolatilitySlippage = true,
+            )
 
             safetyGate.sweepOpenRisk(
                 reason = reasonJa,
                 auditContext = PaperTradeAuditContext.EMPTY,
-                ticker = ticker,
-                symbolRules = symbolRules,
+                simulationContext = simulationContext,
             )
         }
     }
@@ -599,7 +665,10 @@ private class PaperBrokerMarketContextFactory(
             symbolRules = symbolRules,
             entryIntent = entryIntent,
             atr14Jpy = if (includeAtr) {
-                atr14JpyFor(TradingSymbol.BTC)
+                runtime.atr14JpyFor(
+                    symbol = TradingSymbol.BTC,
+                    warnOnFailure = false,
+                )
             } else {
                 null
             },
@@ -618,31 +687,6 @@ private class PaperBrokerMarketContextFactory(
             )
             null
         }
-    }
-
-    private suspend fun atr14JpyFor(symbol: TradingSymbol): BigDecimal? {
-        val marketData = runtime.market.marketDataSource ?: return null
-        val candles = marketData.getCandles(
-            symbol = symbol,
-            interval = CandleInterval.FIVE_MINUTES,
-            limit = ATR_CANDLE_LIMIT,
-        )
-            .getOrNull()
-            ?: return null
-        val atr = IndicatorCalculator.calculate(
-            candles = candles,
-            indicator = IndicatorType.ATR,
-            params = IndicatorParams(period = ATR_PERIOD),
-        )
-            .getOrNull()
-            ?: return null
-        val latestAtr = atr.values
-            .lastOrNull { value -> value.value != null }
-            ?.value
-            ?: return null
-
-        return BigDecimal.valueOf(latestAtr)
-            .setScale(ATR_SCALE, RoundingMode.HALF_UP)
     }
 }
 
@@ -755,8 +799,7 @@ private class PaperBrokerSafetyGate(
     suspend fun sweepOpenRisk(
         reason: String,
         auditContext: PaperTradeAuditContext,
-        ticker: Ticker,
-        symbolRules: SymbolRules,
+        simulationContext: PaperSimulationContext,
     ): PaperTradeResult {
         val cancelResults = runtime.stores.ledgerRepository.getOpenOrders()
             .getOrThrow()
@@ -777,8 +820,7 @@ private class PaperBrokerSafetyGate(
                 val fill = runtime.market.fillSimulator.marketFill(
                     side = OrderSide.SELL,
                     sizeBtc = position.sizeBtc.toBigDecimal(),
-                    ticker = ticker,
-                    rules = symbolRules,
+                    context = simulationContext,
                 )
 
                 runtime.stores.ledgerRepository.closePosition(
@@ -841,7 +883,15 @@ private class PaperBrokerSafetyGate(
             runtime.stores.riskStateRepository.setHardHalt(reason, Instant.now(runtime.time.clock)).getOrThrow()
         }
 
-        return sweepOpenRisk(reason, command.auditContext(), ticker, symbolRules)
+        val simulationContext = runtime.paperSimulationContext(
+            symbol = TradingSymbol.BTC,
+            ticker = ticker,
+            rules = symbolRules,
+            includeOrderbook = true,
+            includeVolatilitySlippage = true,
+        )
+
+        return sweepOpenRisk(reason, command.auditContext(), simulationContext)
     }
 }
 
@@ -886,6 +936,156 @@ private suspend fun PaperBrokerRuntime.symbolRulesFor(symbol: TradingSymbol): Re
     }
 
     return marketData.getSymbolRules(symbol)
+}
+
+private suspend fun PaperBrokerRuntime.paperSimulationContext(
+    symbol: TradingSymbol,
+    ticker: Ticker,
+    rules: SymbolRules,
+    atr14Jpy: BigDecimal? = null,
+    includeOrderbook: Boolean,
+    includeVolatilitySlippage: Boolean,
+): PaperSimulationContext {
+    val orderbook = if (includeOrderbook) {
+        orderbookFor(symbol)
+    } else {
+        null
+    }
+    val volatilitySlippageJpy = if (includeVolatilitySlippage) {
+        volatilitySlippageJpyFor(symbol, atr14Jpy)
+    } else {
+        BigDecimal.ZERO
+    }
+
+    return PaperSimulationContext(
+        ticker = ticker,
+        rules = rules,
+        orderbook = orderbook,
+        orderbookLookupAttempted = includeOrderbook,
+        volatilitySlippageJpy = volatilitySlippageJpy,
+    )
+}
+
+private suspend fun PaperBrokerRuntime.reconcileSimulationContext(tickSnapshot: TickSnapshot): PaperSimulationContext {
+    val ticker = tickSnapshot.requireTicker()
+    val rules = tickSnapshot.symbolRules ?: symbolRulesFor(TradingSymbol.BTC).getOrThrow()
+    val lastPrice = tickSnapshot.lastPrice?.toBigDecimal() ?: ticker.last.toBigDecimal()
+    val immediateFillTriggered = immediateReconcileFillTriggered(lastPrice)
+
+    return paperSimulationContext(
+        symbol = TradingSymbol.BTC,
+        ticker = ticker,
+        rules = rules,
+        atr14Jpy = tickSnapshot.atr14Jpy?.toBigDecimalOrNull(),
+        includeOrderbook = immediateFillTriggered,
+        includeVolatilitySlippage = immediateFillTriggered,
+    )
+}
+
+private suspend fun PaperBrokerRuntime.immediateReconcileFillTriggered(lastPrice: BigDecimal): Boolean {
+    val openOrders = stores.ledgerRepository.getOpenOrders().getOrThrow()
+    val buyStopTriggered = openOrders.any { order -> order.isTriggeredBuyStop(lastPrice) }
+
+    if (buyStopTriggered) {
+        return true
+    }
+
+    return stores.ledgerRepository.getOpenPositions()
+        .getOrThrow()
+        .any { position -> position.immediateProtectionTriggered(lastPrice) }
+}
+
+private fun Order.isTriggeredBuyStop(lastPrice: BigDecimal): Boolean {
+    val triggerPrice = triggerPriceJpy?.toBigDecimalOrNull() ?: return false
+    val isBuyStop = side == OrderSide.BUY && orderType == OrderType.STOP
+    val isOpenBuyStop = status == OrderStatus.OPEN && isBuyStop
+    val hasReachedTrigger = lastPrice >= triggerPrice
+
+    return isOpenBuyStop && hasReachedTrigger
+}
+
+private fun Position.immediateProtectionTriggered(lastPrice: BigDecimal): Boolean {
+    val stopPrice = currentStopLossJpy?.toBigDecimalOrNull()
+    val takeProfitPrice = currentTakeProfitJpy?.toBigDecimalOrNull()
+    val stopTriggered = stopPrice != null && lastPrice <= stopPrice
+    val takeProfitTriggered = takeProfitPrice != null && lastPrice >= takeProfitPrice
+    val hasTriggeredProtection = stopTriggered || takeProfitTriggered
+
+    return status == PositionStatus.OPEN && hasTriggeredProtection
+}
+
+private suspend fun PaperBrokerRuntime.orderbookFor(symbol: TradingSymbol): Orderbook? {
+    return market.marketDataSource
+        ?.getOrderbook(symbol, PAPER_EXECUTION_ORDERBOOK_DEPTH)
+        ?.onFailure { throwable ->
+            market.warnLogger.warn(
+                key = PAPER_EXECUTION_ORDERBOOK_FETCH_LOG_KEY,
+                message = "PaperBroker could not fetch orderbook for paper execution; ticker fallback will be used.",
+                throwable = throwable,
+            )
+        }
+        ?.getOrNull()
+}
+
+private suspend fun PaperBrokerRuntime.volatilitySlippageJpyFor(
+    symbol: TradingSymbol,
+    atr14Jpy: BigDecimal?,
+): BigDecimal {
+    if (market.paperExecutionConfig.volatilitySlippageMultiplier.signum() == 0) {
+        return BigDecimal.ZERO
+    }
+
+    val resolvedAtr14Jpy = atr14Jpy ?: atr14JpyFor(
+        symbol = symbol,
+        warnOnFailure = true,
+    )
+
+    if (resolvedAtr14Jpy == null) {
+        market.warnLogger.warn(
+            key = PAPER_EXECUTION_ATR_FALLBACK_LOG_KEY,
+            message = "PaperBroker could not resolve ATR for paper volatility slippage; fixed bps slippage will be used.",
+        )
+
+        return BigDecimal.ZERO
+    }
+
+    return resolvedAtr14Jpy
+        .multiply(market.paperExecutionConfig.volatilitySlippageMultiplier)
+        .moneyScale()
+}
+
+private suspend fun PaperBrokerRuntime.atr14JpyFor(symbol: TradingSymbol, warnOnFailure: Boolean): BigDecimal? {
+    val marketData = market.marketDataSource ?: return null
+    val candles = marketData.getCandles(
+        symbol = symbol,
+        interval = CandleInterval.FIVE_MINUTES,
+        limit = ATR_CANDLE_LIMIT,
+    )
+        .onFailure { throwable ->
+            if (warnOnFailure) {
+                market.warnLogger.warn(
+                    key = PAPER_EXECUTION_ATR_FETCH_LOG_KEY,
+                    message = "PaperBroker could not fetch candles for paper ATR slippage.",
+                    throwable = throwable,
+                )
+            }
+        }
+        .getOrNull()
+        ?: return null
+    val atr = IndicatorCalculator.calculate(
+        candles = candles,
+        indicator = IndicatorType.ATR,
+        params = IndicatorParams(period = ATR_PERIOD),
+    )
+        .getOrNull()
+        ?: return null
+    val latestAtr = atr.values
+        .lastOrNull { value -> value.value != null }
+        ?.value
+        ?: return null
+
+    return BigDecimal.valueOf(latestAtr)
+        .setScale(ATR_SCALE, RoundingMode.HALF_UP)
 }
 
 private fun validatePlaceOrderCommand(command: PlaceOrderCommand) {
@@ -980,6 +1180,7 @@ private suspend fun PaperBrokerRuntime.validateCashAvailability(
     command: PlaceOrderCommand,
     ticker: Ticker,
     rules: SymbolRules,
+    executionContext: PaperSimulationContext? = null,
 ) {
     val balance = stores.ledgerRepository.getAccountSnapshot().getOrThrow()
     val openOrders = stores.ledgerRepository.getOpenOrders().getOrThrow()
@@ -987,7 +1188,7 @@ private suspend fun PaperBrokerRuntime.validateCashAvailability(
     val reservedCashJpy = openOrders
         .filter { order -> order.side == OrderSide.BUY && order.status == OrderStatus.OPEN }
         .sumOf { order -> order.estimatedBuyReservationJpy(ticker, rules, market.fillSimulator) }
-    val requiredCash = command.estimatedRequiredCash(ticker, rules, market.fillSimulator)
+    val requiredCash = command.estimatedRequiredCash(ticker, rules, market.fillSimulator, executionContext)
     val availableCash = cashJpy.subtract(reservedCashJpy).moneyScale()
 
     require(requiredCash <= availableCash) {
@@ -998,10 +1199,19 @@ private suspend fun PaperBrokerRuntime.validateCashAvailability(
 private fun PlaceOrderCommand.estimatedRequiredCash(
     ticker: Ticker,
     rules: SymbolRules,
-    fillSimulator: FillSimulator,
+    fillSimulator: PaperExecutionSimulator,
+    executionContext: PaperSimulationContext?,
 ): BigDecimal {
     if (orderType == OrderType.MARKET) {
-        val fill = fillSimulator.marketFill(side, sizeBtc, ticker, rules)
+        val fill = if (executionContext == null) {
+            fillSimulator.marketFill(side, sizeBtc, ticker, rules)
+        } else {
+            fillSimulator.marketFill(
+                side = side,
+                sizeBtc = sizeBtc,
+                context = executionContext,
+            )
+        }
         val notional = fill.priceJpy.multiply(sizeBtc)
 
         return requiredCashFor(
@@ -1027,7 +1237,7 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
 internal fun Order.estimatedBuyReservationJpy(
     ticker: Ticker,
     rules: SymbolRules,
-    fillSimulator: FillSimulator,
+    fillSimulator: PaperExecutionSimulator,
 ): BigDecimal {
     val price = when (orderType) {
         OrderType.MARKET -> fillSimulator.marketFill(side, sizeBtc.toBigDecimal(), ticker, rules).priceJpy
@@ -1219,6 +1429,26 @@ private const val ATR_PERIOD = 14
  * ATR の返却 scale。
  */
 private const val ATR_SCALE = 8
+
+/**
+ * paper 約定時に取得する orderbook depth。
+ */
+private const val PAPER_EXECUTION_ORDERBOOK_DEPTH = 50
+
+/**
+ * paper orderbook fetch fallback log の key。
+ */
+private const val PAPER_EXECUTION_ORDERBOOK_FETCH_LOG_KEY = "paper-execution-orderbook-fetch-fallback"
+
+/**
+ * paper ATR fetch fallback log の key。
+ */
+private const val PAPER_EXECUTION_ATR_FETCH_LOG_KEY = "paper-execution-atr-fetch-fallback"
+
+/**
+ * paper ATR unavailable fallback log の key。
+ */
+private const val PAPER_EXECUTION_ATR_FALLBACK_LOG_KEY = "paper-execution-atr-fallback"
 
 /**
  * orders.client_request_id の DB 最大長。

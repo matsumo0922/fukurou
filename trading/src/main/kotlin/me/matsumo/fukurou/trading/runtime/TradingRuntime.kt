@@ -5,7 +5,7 @@ import com.zaxxer.hikari.HikariDataSource
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.broker.Broker
-import me.matsumo.fukurou.trading.broker.FillSimulator
+import me.matsumo.fukurou.trading.broker.DefaultPaperExecutionSimulator
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.toInitialAccountSnapshot
@@ -233,16 +233,16 @@ object TradingRuntimeFactory {
             fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
             clock = clock,
         )
-        val broker = PaperBroker(
+        val brokerRepositories = InMemoryBrokerRepositories(
             ledgerRepository = ledgerRepository,
             riskStateRepository = riskStateRepository,
             riskStateCommandService = riskStateCommandService,
             decisionRepository = decisionRepository,
-            falsificationFreshnessWindow = tradingConfig.decisionProtocol.falsificationFreshnessWindow,
             safetyViolationRepository = safetyViolationRepository,
-            safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
+        )
+        val broker = tradingConfig.createInMemoryBroker(
+            repositories = brokerRepositories,
             marketDataSource = marketDataSource,
-            fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
             reconcilerStatusProvider = reconcilerStatusProvider,
             clock = clock,
         )
@@ -347,6 +347,49 @@ object TradingRuntimeFactory {
     }
 }
 
+/**
+ * in-memory PaperBroker 構築に使う repository / service 群。
+ *
+ * @param ledgerRepository paper ledger repository
+ * @param riskStateRepository risk_state repository
+ * @param riskStateCommandService risk_state 更新と audit をまとめる command service
+ * @param decisionRepository decision protocol repository
+ * @param safetyViolationRepository SafetyFloor violation repository
+ */
+private data class InMemoryBrokerRepositories(
+    val ledgerRepository: InMemoryPaperLedgerRepository,
+    val riskStateRepository: RiskStateRepository,
+    val riskStateCommandService: RiskStateCommandService,
+    val decisionRepository: DecisionRepository,
+    val safetyViolationRepository: SafetyViolationRepository,
+)
+
+private fun TradingBotConfig.createInMemoryBroker(
+    repositories: InMemoryBrokerRepositories,
+    marketDataSource: MarketDataSource?,
+    reconcilerStatusProvider: ReconcilerStatusProvider,
+    clock: Clock,
+): PaperBroker {
+    return PaperBroker(
+        ledgerRepository = repositories.ledgerRepository,
+        riskStateRepository = repositories.riskStateRepository,
+        riskStateCommandService = repositories.riskStateCommandService,
+        decisionRepository = repositories.decisionRepository,
+        falsificationFreshnessWindow = decisionProtocol.falsificationFreshnessWindow,
+        safetyViolationRepository = repositories.safetyViolationRepository,
+        safetyFloor = SafetyFloor(
+            config = safetyFloor,
+            clock = clock,
+            paperExecutionConfig = paperExecution,
+        ),
+        marketDataSource = marketDataSource,
+        paperExecutionConfig = paperExecution,
+        fillSimulator = DefaultPaperExecutionSimulator(paperExecution, clock),
+        reconcilerStatusProvider = reconcilerStatusProvider,
+        clock = clock,
+    )
+}
+
 private fun verifyPostgresSchema(connection: PostgresRuntimeConnection, context: PostgresRuntimeContext) {
     TradingPersistenceBootstrap(
         database = connection.database,
@@ -422,9 +465,14 @@ private fun createPostgresBroker(
         decisionRepository = repositories.decisionRepository,
         falsificationFreshnessWindow = context.tradingConfig.decisionProtocol.falsificationFreshnessWindow,
         safetyViolationRepository = safetyViolationRepository,
-        safetyFloor = SafetyFloor(context.tradingConfig.safetyFloor, context.clock),
+        safetyFloor = SafetyFloor(
+            config = context.tradingConfig.safetyFloor,
+            clock = context.clock,
+            paperExecutionConfig = context.tradingConfig.paperExecution,
+        ),
         marketDataSource = context.marketDataSource,
-        fillSimulator = FillSimulator(context.tradingConfig.paperExecution, context.clock),
+        paperExecutionConfig = context.tradingConfig.paperExecution,
+        fillSimulator = DefaultPaperExecutionSimulator(context.tradingConfig.paperExecution, context.clock),
         reconcilerStatusProvider = resolvedReconcilerStatusProvider,
         clock = context.clock,
     )

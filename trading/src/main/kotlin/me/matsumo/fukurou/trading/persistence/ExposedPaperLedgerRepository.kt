@@ -3,6 +3,10 @@ package me.matsumo.fukurou.trading.persistence
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.ExecutionActivityDecisionContext
+import me.matsumo.fukurou.trading.broker.ExecutionActivityOrderContext
+import me.matsumo.fukurou.trading.broker.ExecutionActivityPositionContext
+import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
 import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
@@ -15,6 +19,7 @@ import me.matsumo.fukurou.trading.broker.PaperLedgerOrderRepository
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
 import me.matsumo.fukurou.trading.config.PaperMarketConfig
+import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
@@ -575,7 +580,7 @@ private const val SELECT_EXECUTIONS_FOR_STABLE_FEED_SQL_PREFIX = """
         FROM paper_account
         WHERE id = ?
     )
-        AND 
+        AND
 """
 
 /**
@@ -583,6 +588,96 @@ private const val SELECT_EXECUTIONS_FOR_STABLE_FEED_SQL_PREFIX = """
  */
 private const val SELECT_EXECUTIONS_FOR_STABLE_FEED_SQL_SUFFIX = """
     ORDER BY executed_at DESC, CAST(id AS TEXT) ASC
+    LIMIT ?
+"""
+
+/**
+ * Activity timeline 用 execution context stable feed SELECT の列と join。
+ */
+private const val SELECT_EXECUTION_ACTIVITIES_FOR_STABLE_FEED_SQL_PREFIX = """
+    SELECT
+        e.id AS execution_id,
+        e.order_id AS execution_order_id,
+        e.position_id AS execution_position_id,
+        e.mode AS execution_mode,
+        e.symbol AS execution_symbol,
+        e.side AS execution_side,
+        e.price_jpy AS execution_price_jpy,
+        e.size_btc AS execution_size_btc,
+        e.fee_jpy AS execution_fee_jpy,
+        e.realized_pnl_jpy AS execution_realized_pnl_jpy,
+        e.liquidity AS execution_liquidity,
+        e.executed_at AS execution_executed_at,
+        direct_order.id AS context_order_id,
+        direct_order.order_type AS context_order_type,
+        direct_order.trigger_price_jpy AS context_trigger_price_jpy,
+        direct_order.take_profit_price_jpy AS context_take_profit_price_jpy,
+        direct_order.reason_ja AS context_order_reason_ja,
+        COALESCE(linked_position.id, e.position_id, direct_order.position_id) AS context_position_id,
+        COALESCE(linked_position.trade_group_id, direct_order.trade_group_id) AS context_trade_group_id,
+        entry_order.decision_run_id AS context_entry_decision_run_id,
+        entry_decision.id AS context_entry_decision_id,
+        entry_decision.action AS context_entry_decision_action,
+        entry_decision.reason_ja AS context_entry_decision_reason_ja
+    FROM executions e
+    LEFT JOIN orders direct_order
+        ON direct_order.id = e.order_id
+        AND direct_order.mode = e.mode
+    LEFT JOIN positions linked_position
+        ON linked_position.id = COALESCE(e.position_id, direct_order.position_id)
+        AND linked_position.mode = e.mode
+    LEFT JOIN LATERAL (
+        SELECT
+            candidate_entry_order.id,
+            candidate_entry_order.decision_run_id
+        FROM orders candidate_entry_order
+        WHERE candidate_entry_order.mode = e.mode
+            AND candidate_entry_order.side = 'BUY'
+            AND candidate_entry_order.decision_run_id IS NOT NULL
+            AND (
+                (
+                    linked_position.trade_group_id IS NOT NULL
+                    AND candidate_entry_order.trade_group_id = linked_position.trade_group_id
+                )
+                OR (
+                    direct_order.trade_group_id IS NOT NULL
+                    AND candidate_entry_order.trade_group_id = direct_order.trade_group_id
+                )
+                OR (
+                    e.position_id IS NOT NULL
+                    AND candidate_entry_order.position_id = e.position_id
+                )
+                OR (
+                    direct_order.position_id IS NOT NULL
+                    AND candidate_entry_order.position_id = direct_order.position_id
+                )
+            )
+        ORDER BY candidate_entry_order.created_at ASC, CAST(candidate_entry_order.id AS TEXT) ASC
+        LIMIT 1
+    ) entry_order ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT
+            decisions.id,
+            decisions.action,
+            decisions.reason_ja
+        FROM decisions
+        WHERE decisions.invocation_id = entry_order.decision_run_id
+        ORDER BY decisions.created_at DESC
+        LIMIT 1
+    ) entry_decision ON TRUE
+    WHERE e.mode = (
+        SELECT mode
+        FROM paper_account
+        WHERE id = ?
+    )
+        AND
+"""
+
+/**
+ * Activity timeline 用 execution context stable feed SELECT の並び順と件数制限。
+ */
+private const val SELECT_EXECUTION_ACTIVITIES_FOR_STABLE_FEED_SQL_SUFFIX = """
+    ORDER BY e.executed_at DESC, CAST(e.id AS TEXT) ASC
     LIMIT ?
 """
 
@@ -695,6 +790,20 @@ private class ExposedPaperLedgerExecutionReader(
 
     override suspend fun findSellExecutionsByPositionIds(positionIds: List<String>): Result<List<Execution>> {
         return readLedgerResult(database) { selectSellExecutionsByPositionIds(positionIds) }
+    }
+
+    override suspend fun findExecutionActivitiesForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+    ): Result<List<ExecutionActivityRecord>> {
+        return readLedgerResult(
+            database = database,
+            beforeRead = {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+            },
+        ) { selectExecutionActivitiesForStableFeed(cursor, limit) }
     }
 }
 
@@ -1088,6 +1197,25 @@ private fun JdbcTransaction.selectExecutionsForStableFeed(cursor: StableFeedCurs
     }
 }
 
+private fun JdbcTransaction.selectExecutionActivitiesForStableFeed(
+    cursor: StableFeedCursor,
+    limit: Int,
+): List<ExecutionActivityRecord> {
+    val sql = SELECT_EXECUTION_ACTIVITIES_FOR_STABLE_FEED_SQL_PREFIX +
+        stableFeedCursorCondition("e.executed_at", "e.id", cursor) +
+        SELECT_EXECUTION_ACTIVITIES_FOR_STABLE_FEED_SQL_SUFFIX
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        val limitParameterIndex = statement.bindStableFeedCursor(
+            startIndex = 2,
+            cursor = cursor,
+        )
+        statement.setInt(limitParameterIndex, limit)
+        statement.executeQuery().use { resultSet -> resultSet.toExecutionActivities() }
+    }
+}
+
 private fun ResultSet.toOrders(): List<Order> {
     return buildList {
         while (next()) {
@@ -1108,6 +1236,14 @@ private fun ResultSet.toExecutions(): List<Execution> {
     return buildList {
         while (next()) {
             add(toExecution())
+        }
+    }
+}
+
+private fun ResultSet.toExecutionActivities(): List<ExecutionActivityRecord> {
+    return buildList {
+        while (next()) {
+            add(toExecutionActivityRecord())
         }
     }
 }
@@ -1229,10 +1365,87 @@ private fun ResultSet.toExecution(): Execution {
     )
 }
 
+private fun ResultSet.toExecutionActivityRecord(): ExecutionActivityRecord {
+    return ExecutionActivityRecord(
+        execution = toActivityExecution(),
+        order = toExecutionActivityOrderContext(),
+        position = toExecutionActivityPositionContext(),
+        entryDecision = toExecutionActivityDecisionContext(),
+    )
+}
+
+private fun ResultSet.toActivityExecution(): Execution {
+    return Execution(
+        executionId = getUuid("execution_id").toString(),
+        orderId = getNullableUuid("execution_order_id")?.toString(),
+        positionId = getNullableUuid("execution_position_id")?.toString(),
+        symbol = getString("execution_symbol"),
+        mode = TradingMode.valueOf(getString("execution_mode")),
+        side = OrderSide.valueOf(getString("execution_side")),
+        priceJpy = getBigDecimal("execution_price_jpy").toPlainString(),
+        sizeBtc = getBigDecimal("execution_size_btc").toPlainString(),
+        feeJpy = getBigDecimal("execution_fee_jpy").toPlainString(),
+        realizedPnlJpy = getBigDecimal("execution_realized_pnl_jpy").toPlainString(),
+        liquidity = ExecutionLiquidity.valueOf(getString("execution_liquidity")),
+        executedAt = getInstant("execution_executed_at").toString(),
+    )
+}
+
+private fun ResultSet.toExecutionActivityOrderContext(): ExecutionActivityOrderContext? {
+    val orderId = getNullableUuid("context_order_id")?.toString() ?: return null
+
+    return ExecutionActivityOrderContext(
+        orderId = orderId,
+        orderType = OrderType.valueOf(getString("context_order_type")),
+        triggerPriceJpy = getNullableBigDecimal("context_trigger_price_jpy")?.toPlainString(),
+        takeProfitPriceJpy = getNullableBigDecimal("context_take_profit_price_jpy")?.toPlainString(),
+        reasonJa = getNullableString("context_order_reason_ja"),
+    )
+}
+
+private fun ResultSet.toExecutionActivityPositionContext(): ExecutionActivityPositionContext? {
+    val positionId = getNullableUuid("context_position_id")?.toString()
+    val tradeGroupId = getNullableUuid("context_trade_group_id")?.toString()
+
+    if (positionId == null && tradeGroupId == null) {
+        return null
+    }
+
+    return ExecutionActivityPositionContext(
+        positionId = positionId,
+        tradeGroupId = tradeGroupId,
+    )
+}
+
+private fun ResultSet.toExecutionActivityDecisionContext(): ExecutionActivityDecisionContext? {
+    val decisionRunId = getNullableString("context_entry_decision_run_id")
+    val decisionId = getNullableUuid("context_entry_decision_id")?.toString()
+    val rawAction = getNullableString("context_entry_decision_action")
+    val reasonJa = getNullableString("context_entry_decision_reason_ja")
+    val contextValues = listOf(decisionRunId, decisionId, rawAction, reasonJa)
+
+    if (contextValues.all { value -> value == null }) {
+        return null
+    }
+
+    return ExecutionActivityDecisionContext(
+        decisionId = decisionId,
+        decisionRunId = decisionRunId,
+        action = rawAction?.let { action -> DecisionAction.valueOf(action) },
+        reasonJa = reasonJa,
+    )
+}
+
 private fun ResultSet.getUuid(columnName: String): UUID {
     return getObject(columnName, UUID::class.java)
 }
 
 private fun ResultSet.getInstant(columnName: String): Instant {
     return Instant.ofEpochMilli(getLong(columnName))
+}
+
+private fun ResultSet.getNullableString(columnName: String): String? {
+    val value = getString(columnName)
+
+    return if (wasNull()) null else value
 }

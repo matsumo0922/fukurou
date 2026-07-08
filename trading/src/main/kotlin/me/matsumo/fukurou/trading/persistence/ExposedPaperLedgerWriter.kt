@@ -5,13 +5,14 @@ import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.EntryFillWriteRequest
-import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.MONEY_SCALE
 import me.matsumo.fukurou.trading.broker.MarketEntryFillRequest
+import me.matsumo.fukurou.trading.broker.PaperExecutionSimulator
 import me.matsumo.fukurou.trading.broker.PaperLedgerMutationRepository
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
+import me.matsumo.fukurou.trading.broker.PaperSimulationContext
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
@@ -25,8 +26,11 @@ import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.broker.btcScale
 import me.matsumo.fukurou.trading.broker.floorToStep
+import me.matsumo.fukurou.trading.broker.marketFill
 import me.matsumo.fukurou.trading.broker.moneyScale
 import me.matsumo.fukurou.trading.broker.ratioScale
+import me.matsumo.fukurou.trading.broker.restingEntryFill
+import me.matsumo.fukurou.trading.broker.stopFill
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -319,7 +323,11 @@ internal class ExposedPaperLedgerWriter(
     /**
      * tick に応じて resting order / protection を前進させる。
      */
-    override suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult> {
+    override suspend fun reconcile(
+        tickSnapshot: TickSnapshot,
+        simulator: PaperExecutionSimulator,
+        simulationContext: PaperSimulationContext?,
+    ): Result<PaperReconcileResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
@@ -333,6 +341,10 @@ internal class ExposedPaperLedgerWriter(
                         ticker = ticker,
                         rules = rules,
                         simulator = simulator,
+                        simulationContext = simulationContext ?: PaperSimulationContext(
+                            ticker = ticker,
+                            rules = rules,
+                        ),
                         lastPrice = lastPrice,
                     )
                     val progress = ReconcileProgress(
@@ -525,7 +537,12 @@ private fun JdbcTransaction.fillTriggeredEntryOrders(
         .filter { order -> order.isEntryTriggered(context.lastPrice) }
 
     triggeredOrders.forEach { order ->
-        val fill = order.createEntryFill(context.ticker, context.rules, context.simulator)
+        val fill = order.createEntryFill(
+            ticker = context.ticker,
+            rules = context.rules,
+            simulator = context.simulator,
+            simulationContext = context.simulationContext,
+        )
         val command = order.toPlaceOrderCommand()
         val positionId = UUID.randomUUID()
         val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
@@ -593,8 +610,7 @@ private fun JdbcTransaction.triggerStopProtection(
         OrderSide.SELL,
         position.sizeBtc.toBigDecimal(),
         stopPrice,
-        context.ticker,
-        context.rules,
+        context.simulationContext,
     )
     val realizedFill = fill.withRealizedPnl(position)
 
@@ -631,8 +647,7 @@ private fun JdbcTransaction.triggerTakeProfitProtection(
     val fill = context.simulator.marketFill(
         OrderSide.SELL,
         position.sizeBtc.toBigDecimal(),
-        context.ticker,
-        context.rules,
+        context.simulationContext,
     )
     val realizedFill = fill.withRealizedPnl(position)
     val closeOrderId = UUID.randomUUID()
@@ -1483,10 +1498,11 @@ private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
 private fun Order.createEntryFill(
     ticker: Ticker,
     rules: SymbolRules,
-    simulator: FillSimulator,
+    simulator: PaperExecutionSimulator,
+    simulationContext: PaperSimulationContext,
 ): SimulatedFill {
     return simulator.restingEntryFill(
-        RestingEntryFillRequest(
+        request = RestingEntryFillRequest(
             side = side,
             orderType = orderType,
             sizeBtc = sizeBtc.toBigDecimal(),
@@ -1495,6 +1511,7 @@ private fun Order.createEntryFill(
             ticker = ticker,
             rules = rules,
         ),
+        context = simulationContext,
     )
 }
 

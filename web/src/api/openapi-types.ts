@@ -1263,7 +1263,7 @@ export interface paths {
         };
         /**
          * Activity timeline を取得する
-         * @description decision、audit、paper execution を backend で統合し、cursor paging と source / audit eventType filter を適用して新しい順で返します。audit payload は返しません。
+         * @description decision、audit、paper execution を backend で統合し、cursor paging と source / audit eventType filter を適用して新しい順で返します。audit payload は返しません。timeline list 用 metadata は短い項目だけを返し、長い理由文や関連 context は details に返します。
          */
         get: {
             parameters: {
@@ -1754,6 +1754,11 @@ export interface components {
             label: string;
             value: string;
         };
+        /** OpsActivityDetailsResponse */
+        OpsActivityDetailsResponse: {
+            title: string;
+            metadata: components["schemas"]["OpsActivityMetadataResponse"][];
+        };
         /** OpsActivityEventResponse */
         OpsActivityEventResponse: {
             id: string;
@@ -1763,6 +1768,7 @@ export interface components {
             detail: string;
             occurredAt: string;
             metadata: components["schemas"]["OpsActivityMetadataResponse"][];
+            details?: components["schemas"]["OpsActivityDetailsResponse"] | null;
         };
         /** OpsActivityResponse */
         OpsActivityResponse: {

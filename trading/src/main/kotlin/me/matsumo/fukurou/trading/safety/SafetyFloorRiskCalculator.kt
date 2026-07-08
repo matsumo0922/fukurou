@@ -1,6 +1,8 @@
 package me.matsumo.fukurou.trading.safety
 
+import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.moneyScale
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
@@ -17,14 +19,19 @@ import java.time.Instant
 
 /**
  * SafetyFloor の金額、exposure、EV 計算を担当する。
+ * pre-trade 見積もりは板深さを取得せず、ticker ask / bid と slippage reserve で保守的に近似する。
+ * volatility slippage は entry 価格の price risk と往復 cost reserve の両方に含め、
+ * 急変時の価格不利と約定 cost を別々に安全方向へ見積もる。
  *
  * @param config 安全床しきい値
  * @param clock 市場データ鮮度判定に使う clock
+ * @param paperExecutionConfig paper 約定近似設定
  */
 @Suppress("TooManyFunctions")
 internal class SafetyFloorRiskCalculator(
     private val config: SafetyFloorConfig,
     private val clock: Clock,
+    private val paperExecutionConfig: PaperExecutionConfig,
 ) {
 
     /**
@@ -79,9 +86,9 @@ internal class SafetyFloorRiskCalculator(
         val askPrice = context.ticker.ask.toBigDecimal()
 
         return when (command.orderType) {
-            OrderType.MARKET -> applyPositiveSlippage(askPrice)
+            OrderType.MARKET -> applyPositiveSlippage(askPrice).add(volatilitySlippageJpy(context))
             OrderType.LIMIT -> requireNotNull(command.priceJpy)
-            OrderType.STOP -> applyPositiveSlippage(requireNotNull(command.priceJpy))
+            OrderType.STOP -> applyPositiveSlippage(requireNotNull(command.priceJpy)).add(volatilitySlippageJpy(context))
         }.safetyScale()
     }
 
@@ -295,12 +302,13 @@ internal class SafetyFloorRiskCalculator(
         val askPrice = context.ticker.ask.toBigDecimal()
 
         return when (order.orderType) {
-            OrderType.MARKET -> applyPositiveSlippage(askPrice)
+            OrderType.MARKET -> applyPositiveSlippage(askPrice).add(volatilitySlippageJpy(context))
             OrderType.LIMIT -> order.limitPriceJpy?.toBigDecimal() ?: askPrice
+            // STOP の未約定買い予約は trigger 到達時の不利約定を見込む。
             OrderType.STOP -> {
                 val triggerPrice = order.triggerPriceJpy?.toBigDecimal() ?: askPrice
 
-                applyPositiveSlippage(triggerPrice)
+                applyPositiveSlippage(triggerPrice).add(volatilitySlippageJpy(context))
             }
         }.safetyScale()
     }
@@ -445,16 +453,32 @@ internal class SafetyFloorRiskCalculator(
             symbolRules = context.symbolRules,
             slippageRatio = slippageRatio(),
         )
+        val volatilityReserve = volatilitySlippageJpy(context)
+            .multiply(sizeBtc)
+            .multiply(ROUND_TRIP_VOLATILITY_RESERVE_MULTIPLIER)
 
-        return costReserve.safetyScale()
+        return costReserve.add(volatilityReserve).safetyScale()
     }
 
     private fun applyPositiveSlippage(price: BigDecimal): BigDecimal {
         return price.multiply(BigDecimal.ONE.add(slippageRatio())).safetyScale()
     }
 
+    private fun volatilitySlippageJpy(context: SafetyFloorContext): BigDecimal {
+        val atr14Jpy = context.atr14Jpy ?: return BigDecimal.ZERO
+
+        return atr14Jpy
+            .multiply(paperExecutionConfig.volatilitySlippageMultiplier)
+            .moneyScale()
+    }
+
     private fun slippageRatio(): BigDecimal {
-        return config.marketSlippageReserveBps.divide(BPS_DIVISOR, SAFETY_SCALE, RoundingMode.HALF_UP)
+        val effectiveSlippageBps = maxOf(
+            config.marketSlippageReserveBps,
+            paperExecutionConfig.marketSlippageBps,
+        )
+
+        return effectiveSlippageBps.divide(BPS_DIVISOR, SAFETY_SCALE, RoundingMode.HALF_UP)
     }
 
     private fun cappedProbabilityOrNull(probability: BigDecimal, context: SafetyFloorContext): BigDecimal? {
@@ -488,3 +512,8 @@ internal data class ExpectedValueDetails(
     val probabilityUsed: BigDecimal,
     val probabilityCapApplied: Boolean,
 )
+
+/**
+ * entry と protective exit の 2 leg 分の volatility slippage reserve。
+ */
+private val ROUND_TRIP_VOLATILITY_RESERVE_MULTIPLIER = BigDecimal("2")

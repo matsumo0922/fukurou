@@ -53,6 +53,7 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -66,6 +67,7 @@ import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
 import java.math.BigDecimal
 import java.sql.SQLTimeoutException
+import java.sql.Types
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -164,6 +166,28 @@ private const val DELETE_RUNTIME_CONFIG_VALUE_SQL = """
 """
 
 /**
+ * active runtime config value をテスト用に upsert する SQL。
+ */
+private const val UPSERT_ACTIVE_RUNTIME_CONFIG_VALUE_SQL = """
+    INSERT INTO runtime_config_values (
+        version_id,
+        config_key,
+        config_value
+    )
+    VALUES (
+        (
+            SELECT id
+            FROM runtime_config_versions
+            WHERE status = 'ACTIVE'
+        ),
+        ?,
+        ?
+    )
+    ON CONFLICT (version_id, config_key) DO UPDATE
+    SET config_value = EXCLUDED.config_value
+"""
+
+/**
  * equity_snapshots table を削除する SQL。
  */
 private const val DROP_EQUITY_SNAPSHOTS_TABLE_SQL = "DROP TABLE equity_snapshots"
@@ -208,6 +232,28 @@ private const val SELECT_ORDERS_CLIENT_REQUEST_ID_INDEX_COUNT_SQL = """
     WHERE schemaname = current_schema()
         AND tablename = 'orders'
         AND indexname = 'idx_orders_client_request_id_unique'
+"""
+
+/**
+ * orders activity context entry index 件数を読む SQL。
+ */
+private const val SELECT_ORDERS_ACTIVITY_CONTEXT_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'orders'
+        AND indexname = 'idx_orders_activity_context_entry'
+"""
+
+/**
+ * decisions invocation_id lookup index 件数を読む SQL。
+ */
+private const val SELECT_DECISIONS_INVOCATION_ID_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'decisions'
+        AND indexname = 'idx_decisions_invocation_id_created_at'
 """
 
 /**
@@ -485,6 +531,86 @@ private const val INSERT_TEST_EXECUTION_SQL = """
 """
 
 /**
+ * Activity context join 検証用 order 行を追加する SQL。
+ */
+private const val INSERT_ACTIVITY_CONTEXT_ORDER_SQL = """
+    INSERT INTO orders (
+        id,
+        position_id,
+        trade_group_id,
+        mode,
+        symbol,
+        side,
+        order_type,
+        status,
+        size_btc,
+        limit_price_jpy,
+        trigger_price_jpy,
+        protective_stop_price_jpy,
+        take_profit_price_jpy,
+        estimated_win_probability,
+        reason_ja,
+        decision_run_id,
+        created_at,
+        updated_at
+    )
+    VALUES (
+        ?,
+        ?,
+        ?,
+        'PAPER',
+        'BTC',
+        ?,
+        ?,
+        'FILLED',
+        0.010000000000,
+        ?,
+        ?,
+        NULL,
+        ?,
+        0.950000000000,
+        ?,
+        ?,
+        ?,
+        ?
+    )
+"""
+
+/**
+ * Activity context join 検証用 execution 行を追加する SQL。
+ */
+private const val INSERT_ACTIVITY_CONTEXT_EXECUTION_SQL = """
+    INSERT INTO executions (
+        id,
+        order_id,
+        position_id,
+        mode,
+        symbol,
+        side,
+        price_jpy,
+        size_btc,
+        fee_jpy,
+        realized_pnl_jpy,
+        liquidity,
+        executed_at
+    )
+    VALUES (
+        ?,
+        ?,
+        ?,
+        'PAPER',
+        'BTC',
+        ?,
+        ?,
+        0.010000000000,
+        10.00000000,
+        ?,
+        'TAKER',
+        ?
+    )
+"""
+
+/**
  * Obsidian range query test 用 closed position 行を追加する SQL。
  */
 private const val INSERT_OBSIDIAN_CLOSED_POSITION_SQL = """
@@ -585,6 +711,8 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(ExposedRiskStateRepository(database).current().isSuccess)
         assertEquals(2, selectCommandEventLogIndexCount(database))
         assertEquals(1, selectOrdersClientRequestIdIndexCount(database))
+        assertEquals(1, selectOrdersActivityContextIndexCount(database))
+        assertEquals(1, selectDecisionsInvocationIdIndexCount(database))
         assertEquals(3, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
@@ -624,15 +752,66 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun runtimeConfigResolveFailsClosedWhenActiveValueIsMissing() = runPostgresTest {
+    fun runtimeConfigBootstrapBackfillsMissingCatalogKeyIntoNewActiveSnapshot() = runPostgresTest {
+        val defaultValues = RuntimeConfigCatalog.runtimeDefaultValues()
+        val missingKey = "paper.volatilitySlippageMultiplier"
+        val preservedKey = "runner.maxToolCallsPerRun"
+        val preservedValue = "12"
+
         RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
-        deleteRuntimeConfigValue(database, "runner.maxToolCallsPerRun")
+        upsertActiveRuntimeConfigValue(
+            database = database,
+            configKey = preservedKey,
+            configValue = preservedValue,
+        )
+        val originalSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+
+        deleteRuntimeConfigValue(database, missingKey)
+
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val expectedValues = defaultValues + mapOf(preservedKey to preservedValue)
+        val backfilledSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+        val resolution = RuntimeConfigResolver(ExposedRuntimeConfigRepository(database))
+            .resolve(emptyMap())
+            .getOrThrow()
+
+        assertTrue(originalSnapshot.versionId != backfilledSnapshot.versionId)
+        assertEquals(expectedValues, backfilledSnapshot.values)
+        assertEquals(calculateRuntimeConfigHash(expectedValues), backfilledSnapshot.hash)
+        assertEquals(backfilledSnapshot.versionId, resolution.auditSnapshot.versionId)
+        assertEquals(
+            defaultValues.getValue(missingKey),
+            resolution.typedEnvironment.getValue("FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER"),
+        )
+        assertEquals(
+            preservedValue,
+            resolution.typedEnvironment.getValue("FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT"),
+        )
+
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val idempotentSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+
+        assertEquals(backfilledSnapshot.versionId, idempotentSnapshot.versionId)
+        assertEquals(expectedValues, idempotentSnapshot.values)
+    }
+
+    @Test
+    fun runtimeConfigBootstrapFailsClosedWhenActiveValueHasUnknownKey() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        upsertActiveRuntimeConfigValue(
+            database = database,
+            configKey = "runtime.unknown",
+            configValue = "1",
+        )
 
         assertTrue(RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().isFailure)
+        assertTrue(TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().isFailure)
         assertTrue(
-            RuntimeConfigResolver(
-                ExposedRuntimeConfigRepository(database),
-            ).resolve(emptyMap()).isFailure,
+            RuntimeConfigResolver(ExposedRuntimeConfigRepository(database))
+                .resolve(emptyMap())
+                .isFailure,
         )
     }
 
@@ -1594,6 +1773,58 @@ class PostgresPersistenceIntegrationTest {
         assertEquals("0.002500000000", position.sizeBtc)
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertEquals(1, executions.count { execution -> execution.side == OrderSide.SELL })
+    }
+
+    @Test
+    fun paper_ledger_repository_links_executionActivityContextInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val command = postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("9900000"),
+            takeProfitPriceJpy = BigDecimal("10500000"),
+        )
+        val expectedDecisionRunId = "run-entry-${command.commandId}"
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        val entryOrderId = UUID.randomUUID()
+        val stopOrderId = UUID.randomUUID()
+        ExposedDecisionRepository(database, fixedClock())
+            .submitDecision(entryDecisionSubmission(command))
+            .getOrThrow()
+
+        insertActivityContextRows(
+            database = database,
+            positionId = positionId,
+            tradeGroupId = tradeGroupId,
+            entryOrderId = entryOrderId,
+            stopOrderId = stopOrderId,
+            decisionRunId = expectedDecisionRunId,
+        )
+
+        val activities = repository.findExecutionActivitiesForStableFeed(
+            cursor = StableFeedCursor(
+                occurredAt = fixedInstant().plusSeconds(1),
+                includesSameTimestamp = false,
+                afterId = null,
+            ),
+            limit = 10,
+        ).getOrThrow()
+        val stopActivity = activities.single { activity -> activity.execution.side == OrderSide.SELL }
+        val order = requireNotNull(stopActivity.order)
+        val position = requireNotNull(stopActivity.position)
+        val entryDecision = requireNotNull(stopActivity.entryDecision)
+
+        assertEquals(OrderType.STOP, order.orderType)
+        assertEquals("9800000.00000000", order.triggerPriceJpy)
+        assertEquals("activity stop trigger", order.reasonJa)
+        assertEquals(stopActivity.execution.positionId, position.positionId)
+        assertEquals(tradeGroupId.toString(), position.tradeGroupId)
+        assertEquals(expectedDecisionRunId, entryDecision.decisionRunId)
+        assertEquals(DecisionAction.ENTER, entryDecision.action)
+        assertEquals("integration entry", entryDecision.reasonJa)
+        assertTrue(entryDecision.decisionId != null)
     }
 
     @Test
@@ -2875,6 +3106,23 @@ private fun deleteRuntimeConfigValue(database: ExposedDatabase, configKey: Strin
 }
 
 /**
+ * active runtime config value を key 単位で upsert する。
+ */
+private fun upsertActiveRuntimeConfigValue(
+    database: ExposedDatabase,
+    configKey: String,
+    configValue: String,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(UPSERT_ACTIVE_RUNTIME_CONFIG_VALUE_SQL).use { statement ->
+            statement.setString(1, configKey)
+            statement.setString(2, configValue)
+            statement.executeUpdate()
+        }
+    }
+}
+
+/**
  * equity_snapshots table を削除する。
  */
 private fun dropEquitySnapshotsTable(database: ExposedDatabase) {
@@ -2944,6 +3192,36 @@ private fun selectOrdersClientRequestIdIndexCount(database: ExposedDatabase): In
         jdbcConnection().prepareStatement(SELECT_ORDERS_CLIENT_REQUEST_ID_INDEX_COUNT_SQL).use { statement ->
             statement.executeQuery().use { resultSet ->
                 require(resultSet.next()) { "orders client_request_id index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * orders activity context entry index 件数を読む。
+ */
+private fun selectOrdersActivityContextIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_ORDERS_ACTIVITY_CONTEXT_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "orders activity context index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * decisions invocation_id lookup index 件数を読む。
+ */
+private fun selectDecisionsInvocationIdIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_DECISIONS_INVOCATION_ID_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "decisions invocation_id index count did not return a row." }
 
                 resultSet.getInt(1)
             }
@@ -3171,6 +3449,53 @@ private fun insertLedgerRows(
 }
 
 /**
+ * execution activity context join 検証用 ledger fixture を追加する。
+ */
+private fun insertActivityContextRows(
+    database: ExposedDatabase,
+    positionId: UUID,
+    tradeGroupId: UUID,
+    entryOrderId: UUID,
+    stopOrderId: UUID,
+    decisionRunId: String,
+) {
+    exposedTransaction(database) {
+        insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+        insertActivityContextOrder(
+            orderId = entryOrderId,
+            positionId = positionId,
+            tradeGroupId = tradeGroupId,
+            side = OrderSide.BUY,
+            orderType = OrderType.LIMIT,
+            limitPriceJpy = BigDecimal("9900000"),
+            triggerPriceJpy = null,
+            takeProfitPriceJpy = BigDecimal("10500000"),
+            reasonJa = "integration entry",
+            decisionRunId = decisionRunId,
+        )
+        insertActivityContextOrder(
+            orderId = stopOrderId,
+            positionId = positionId,
+            tradeGroupId = tradeGroupId,
+            side = OrderSide.SELL,
+            orderType = OrderType.STOP,
+            limitPriceJpy = null,
+            triggerPriceJpy = BigDecimal("9800000"),
+            takeProfitPriceJpy = null,
+            reasonJa = "activity stop trigger",
+            decisionRunId = null,
+        )
+        insertActivityContextExecution(
+            orderId = stopOrderId,
+            positionId = positionId,
+            side = OrderSide.SELL,
+            priceJpy = BigDecimal("9800000"),
+            realizedPnlJpy = BigDecimal("1200"),
+        )
+    }
+}
+
+/**
  * Obsidian range query 検証用 closed position と約定を追加する。
  */
 private fun insertObsidianClosedPositionRows(
@@ -3304,6 +3629,70 @@ private fun JdbcTransaction.insertTestExecution(
         statement.setLong(5, executedAt.toEpochMilli())
         statement.executeUpdate()
     }
+}
+
+/**
+ * Activity context join 検証用 order 行を追加する。
+ */
+private fun JdbcTransaction.insertActivityContextOrder(
+    orderId: UUID,
+    positionId: UUID,
+    tradeGroupId: UUID,
+    side: OrderSide,
+    orderType: OrderType,
+    limitPriceJpy: BigDecimal?,
+    triggerPriceJpy: BigDecimal?,
+    takeProfitPriceJpy: BigDecimal?,
+    reasonJa: String,
+    decisionRunId: String?,
+) {
+    jdbcConnection().prepareStatement(INSERT_ACTIVITY_CONTEXT_ORDER_SQL).use { statement ->
+        statement.setObject(1, orderId)
+        statement.setObject(2, positionId)
+        statement.setObject(3, tradeGroupId)
+        statement.setString(4, side.name)
+        statement.setString(5, orderType.name)
+        statement.setNullableBigDecimal(6, limitPriceJpy)
+        statement.setNullableBigDecimal(7, triggerPriceJpy)
+        statement.setNullableBigDecimal(8, takeProfitPriceJpy)
+        statement.setString(9, reasonJa)
+        statement.setString(10, decisionRunId)
+        statement.setLong(11, fixedInstant().toEpochMilli())
+        statement.setLong(12, fixedInstant().toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+/**
+ * Activity context join 検証用 execution 行を追加する。
+ */
+private fun JdbcTransaction.insertActivityContextExecution(
+    orderId: UUID,
+    positionId: UUID,
+    side: OrderSide,
+    priceJpy: BigDecimal,
+    realizedPnlJpy: BigDecimal,
+) {
+    jdbcConnection().prepareStatement(INSERT_ACTIVITY_CONTEXT_EXECUTION_SQL).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setObject(2, orderId)
+        statement.setObject(3, positionId)
+        statement.setString(4, side.name)
+        statement.setBigDecimal(5, priceJpy)
+        statement.setBigDecimal(6, realizedPnlJpy)
+        statement.setLong(7, fixedInstant().toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+private fun java.sql.PreparedStatement.setNullableBigDecimal(index: Int, value: BigDecimal?) {
+    if (value == null) {
+        setNull(index, Types.NUMERIC)
+
+        return
+    }
+
+    setBigDecimal(index, value)
 }
 
 private fun commandEvent(

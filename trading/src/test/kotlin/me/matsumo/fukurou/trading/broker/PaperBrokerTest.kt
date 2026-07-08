@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
@@ -191,6 +192,80 @@ class PaperBrokerTest {
         assertEquals("10005000.00000000", positions.single().lowestPriceSinceEntryJpy)
         assertEquals(listOf(OrderType.STOP), orders.map { order -> order.orderType })
         assertEquals(1, executions.size)
+    }
+
+    @Test
+    fun place_order_market_entry_uses_orderbook_walk_and_atr_slippage() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = OrderbookAtrMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val result = broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+        val positions = broker.getPositions().getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertTrue(result.accepted)
+        assertEquals("10017406.00000000", positions.single().averageEntryPriceJpy)
+        assertEquals("10017406.00000000", executions.single().priceJpy)
+    }
+
+    @Test
+    fun place_order_market_entry_with_zero_volatility_multiplier_uses_fixed_bps_after_orderbook_walk() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = OrderbookAtrMarketDataSource,
+            paperExecutionConfig = PaperExecutionConfig(
+                volatilitySlippageMultiplier = BigDecimal.ZERO,
+            ),
+            clock = fixedClock(),
+        )
+
+        val result = broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertTrue(result.accepted)
+        assertEquals("10017006.00000000", executions.single().priceJpy)
+    }
+
+    @Test
+    fun place_order_market_entry_falls_back_when_orderbook_fetch_fails() = runBlocking {
+        val logger = Logger.getLogger(PaperBroker::class.java.name)
+        val handler = CapturingLogHandler()
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        logger.addHandler(handler)
+        try {
+            val result = broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+            val executions = repository.getExecutions().getOrThrow()
+
+            assertTrue(result.accepted)
+            assertEquals("10005000.00000000", executions.single().priceJpy)
+            assertTrue(
+                handler.messages.any { message ->
+                    message.contains("could not fetch orderbook for paper execution")
+                },
+            )
+        } finally {
+            logger.removeHandler(handler)
+        }
     }
 
     @Test
@@ -428,6 +503,35 @@ class PaperBrokerTest {
         assertTrue(closeResult.accepted)
         assertEquals(1, violationRepository.violations().size)
         assertEquals(0, broker.getPositions().getOrThrow().size)
+    }
+
+    @Test
+    fun close_position_uses_bid_orderbook_walk_and_atr_slippage() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc().copy(btcQuantity = "0.010000000000"),
+            positions = listOf(protectedPosition()),
+            openOrders = listOf(linkedStopOrder()),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = OrderbookAtrMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val result = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                closeAll = false,
+                reasonJa = "close with orderbook",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertTrue(result.accepted)
+        assertEquals("9984605.00000000", executions.single().priceJpy)
     }
 
     @Test
@@ -1342,6 +1446,27 @@ class PaperBrokerTest {
         assertEquals("9685155.00000000", closedPosition.lowestPriceSinceEntryJpy)
         assertEquals("9685155.00000000", closedPosition.currentPriceJpy)
     }
+
+    @Test
+    fun reconcile_stop_fill_uses_bid_orderbook_walk_and_tick_atr_slippage() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc().copy(btcQuantity = "0.010000000000"),
+            positions = listOf(protectedPosition()),
+            openOrders = listOf(linkedStopOrder()),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = StopOrderbookMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val result = broker.reconcile(stopGapTickSnapshotWithAtr()).getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertEquals(1, result.closedPositionIds.size)
+        assertEquals("9672761.00000000", executions.single().priceJpy)
+    }
 }
 
 private fun marketEntryCommand(
@@ -1457,6 +1582,13 @@ private fun stopGapTickSnapshot(): TickSnapshot {
 }
 
 /**
+ * STOP gap fill で tick ATR を含む bid 板歩きを検証するための tick。
+ */
+private fun stopGapTickSnapshotWithAtr(): TickSnapshot {
+    return stopGapTickSnapshot().copy(atr14Jpy = "4000")
+}
+
+/**
  * watermark の単調更新検証に使う tick。
  */
 private fun watermarkTickSnapshot(
@@ -1540,6 +1672,52 @@ private object FakeMarketDataSource : MarketDataSource {
                 tickSize = "1",
                 takerFee = "0.0005",
                 makerFee = "-0.0001",
+            ),
+        )
+    }
+}
+
+/**
+ * 板歩きと ATR slippage 検証用 fake market data。
+ */
+private object OrderbookAtrMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return Result.success(atrCandles(symbol, interval, limit))
+    }
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.success(
+            Orderbook(
+                symbol = symbol.apiSymbol,
+                bids = listOf(
+                    OrderbookLevel(price = "9990000", size = "0.0100"),
+                ),
+                asks = listOf(
+                    OrderbookLevel(price = "10000000", size = "0.0020"),
+                    OrderbookLevel(price = "10020000", size = "0.0030"),
+                ),
+            ),
+        )
+    }
+}
+
+/**
+ * STOP reconcile の bid 板歩き検証用 fake market data。
+ */
+private object StopOrderbookMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.success(
+            Orderbook(
+                symbol = symbol.apiSymbol,
+                bids = listOf(
+                    OrderbookLevel(price = "9690000", size = "0.0040"),
+                    OrderbookLevel(price = "9670000", size = "0.0060"),
+                ),
+                asks = emptyList(),
             ),
         )
     }
@@ -1899,6 +2077,25 @@ private fun decisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
             setupTags = listOf("test-setup"),
         ),
     )
+}
+
+private fun atrCandles(
+    symbol: TradingSymbol,
+    interval: CandleInterval,
+    limit: Int,
+): List<Candle> {
+    return (0 until limit).map { index ->
+        Candle(
+            symbol = symbol.apiSymbol,
+            interval = interval,
+            openTime = fixedInstant().plusSeconds(index.toLong() * 300).toString(),
+            open = "10000000",
+            high = "10002000",
+            low = "9998000",
+            close = "10000000",
+            volume = "1.0",
+        )
+    }
 }
 
 /**

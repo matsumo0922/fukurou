@@ -18,7 +18,12 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.broker.ExecutionActivityDecisionContext
+import me.matsumo.fukurou.trading.broker.ExecutionActivityOrderContext
+import me.matsumo.fukurou.trading.broker.ExecutionActivityPositionContext
+import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
+import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
@@ -37,6 +42,7 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import java.io.File
@@ -758,7 +764,7 @@ class OpsRouteTest {
         assertEquals(
             listOf(
                 "HARD_HALT_SET",
-                "BUY BTC execution",
+                "BTC entry fill",
                 "MANUAL_RESUME_REQUESTED",
             ),
             latestTitles,
@@ -769,6 +775,91 @@ class OpsRouteTest {
         assertEquals(HttpStatusCode.OK, auditFilterResponse.status)
         assertEquals(1, auditFilterEvents.size)
         assertEquals("HARD_HALT_SET", auditFilterEvents.single().getValue("kind").jsonPrimitive.content)
+    }
+
+    @Test
+    fun opsRoutes_activityExecutionDetailsExposeLinkedContextWithoutNoisyTimelineMetadata() = testApplication {
+        val entryReason = "entry reason stays inside the execution detail dialog"
+        val orderReason = "protective stop from risk floor"
+        val ledgerRepository = ActivityExecutionContextRepository(
+            activityRecords = listOf(
+                ExecutionActivityRecord(
+                    execution = execution(
+                        executionId = "execution-stop",
+                        executedAt = fixedInstant().plusSeconds(5),
+                        realizedPnlJpy = "-1200",
+                        side = OrderSide.SELL,
+                        orderId = "order-stop",
+                        positionId = "position-linked",
+                    ),
+                    order = ExecutionActivityOrderContext(
+                        orderId = "order-stop",
+                        orderType = OrderType.STOP,
+                        triggerPriceJpy = "9800000",
+                        takeProfitPriceJpy = null,
+                        reasonJa = orderReason,
+                    ),
+                    position = ExecutionActivityPositionContext(
+                        positionId = "position-linked",
+                        tradeGroupId = "trade-group-linked",
+                    ),
+                    entryDecision = ExecutionActivityDecisionContext(
+                        decisionId = "decision-entry",
+                        decisionRunId = "entry-run-1",
+                        action = DecisionAction.ENTER,
+                        reasonJa = entryReason,
+                    ),
+                ),
+                ExecutionActivityRecord(
+                    execution = execution(
+                        executionId = "execution-unlinked",
+                        executedAt = fixedInstant().plusSeconds(4),
+                        realizedPnlJpy = "0",
+                        side = OrderSide.SELL,
+                        orderId = null,
+                        positionId = null,
+                    ),
+                    order = null,
+                    position = null,
+                    entryDecision = null,
+                ),
+            ),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                clock = Clock.fixed(fixedInstant().plusSeconds(10), ZoneOffset.UTC),
+                opsPaperLedgerRepository = ledgerRepository,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/activity?source=execution&limit=10")
+        val responseText = response.bodyAsText()
+        val responseBody = Json.parseToJsonElement(responseText).jsonObject
+        val events = responseBody.getValue("events").jsonArray.map { element -> element.jsonObject }
+        val stopEvent = events.first()
+        val stopTimelineMetadata = stopEvent.getValue("metadata").toString()
+        val stopDetails = stopEvent.getValue("details").jsonObject
+        val missingLinkEvent = events.last()
+        val missingLinkDetails = missingLinkEvent.getValue("details").jsonObject
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertNoSecretLikeText(responseText)
+        assertEquals("STOP_TRIGGER", stopEvent.getValue("kind").jsonPrimitive.content)
+        assertEquals("BTC STOP trigger", stopEvent.getValue("title").jsonPrimitive.content)
+        assertFalse(stopTimelineMetadata.contains(entryReason))
+        assertFalse(stopTimelineMetadata.contains(orderReason))
+        assertEquals(orderReason, metadataValue(stopDetails, "order reason"))
+        assertEquals(entryReason, metadataValue(stopDetails, "decision reason"))
+        assertEquals("ENTER", metadataValue(stopDetails, "decision action"))
+        assertEquals("entry-run-1", metadataValue(stopDetails, "decision run"))
+        assertEquals("trade-group-linked", metadataValue(stopDetails, "trade group"))
+        assertEquals("SELL", missingLinkEvent.getValue("kind").jsonPrimitive.content)
+        assertEquals("SELL BTC execution", missingLinkEvent.getValue("title").jsonPrimitive.content)
+        assertEquals("not linked", metadataValue(missingLinkDetails, "order"))
+        assertEquals("not linked", metadataValue(missingLinkDetails, "decision reason"))
     }
 
     @Test
@@ -1055,11 +1146,12 @@ private fun execution(
     executedAt: Instant,
     realizedPnlJpy: String,
     side: OrderSide = OrderSide.BUY,
-    positionId: String = "position-$executionId",
+    orderId: String? = "order-$executionId",
+    positionId: String? = "position-$executionId",
 ): Execution {
     return Execution(
         executionId = executionId,
-        orderId = "order-$executionId",
+        orderId = orderId,
         positionId = positionId,
         symbol = "BTC",
         mode = TradingMode.PAPER,
@@ -1139,6 +1231,17 @@ private fun configItem(group: JsonObject, key: String): JsonObject {
         .single { item -> item.getValue("key").jsonPrimitive.content == key }
 }
 
+private fun metadataValue(container: JsonObject, label: String): String {
+    return container
+        .getValue("metadata")
+        .jsonArray
+        .map { item -> item.jsonObject }
+        .single { item -> item.getValue("label").jsonPrimitive.content == label }
+        .getValue("value")
+        .jsonPrimitive
+        .content
+}
+
 /**
  * read API response に混入してはいけない secret-like fixture。
  */
@@ -1149,6 +1252,37 @@ private val SECRET_FIXTURE_TEXTS = setOf(
     "anthropic-secret-token",
     DUMMY_AUTH_CODE,
 )
+
+/**
+ * Activity execution details route test 用 fake repository。
+ *
+ * @param activityRecords Activity execution read model として返す record
+ * @param delegate その他の paper ledger API を処理する delegate
+ */
+private class ActivityExecutionContextRepository(
+    private val activityRecords: List<ExecutionActivityRecord>,
+    delegate: PaperLedgerRepository = InMemoryPaperLedgerRepository(),
+) : PaperLedgerRepository by delegate {
+
+    override suspend fun findExecutionActivitiesForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+    ): Result<List<ExecutionActivityRecord>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            activityRecords
+                .filter { record -> cursor.accepts(Instant.parse(record.execution.executedAt), record.execution.executionId) }
+                .sortedWith(
+                    compareByDescending<ExecutionActivityRecord> { record -> Instant.parse(record.execution.executedAt) }
+                        .thenBy { record -> record.execution.executionId },
+                )
+                .take(limit)
+        }
+    }
+}
 
 /**
  * manual trigger route test 用 fake service。
