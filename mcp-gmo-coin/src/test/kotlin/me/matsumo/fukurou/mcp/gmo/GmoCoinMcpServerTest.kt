@@ -430,7 +430,7 @@ class GmoCoinMcpServerTest {
         assertCandleRequirement(
             structuredContent = structuredContent,
             requiredCandleCount = 113,
-            requestedCandleLimit = 113,
+            effectiveCandleLimit = 113,
             sourceCandlesSufficient = true,
         )
         assertTrue(indicatorValueAt(structuredContent, 112) != null)
@@ -457,7 +457,7 @@ class GmoCoinMcpServerTest {
         assertCandleRequirement(
             structuredContent = structuredContent,
             requiredCandleCount = 113,
-            requestedCandleLimit = 113,
+            effectiveCandleLimit = 113,
             sourceCandlesSufficient = true,
         )
     }
@@ -516,7 +516,7 @@ class GmoCoinMcpServerTest {
         assertCandleRequirement(
             structuredContent = structuredContent,
             requiredCandleCount = 173,
-            requestedCandleLimit = 173,
+            effectiveCandleLimit = 173,
             sourceCandlesSufficient = false,
         )
     }
@@ -636,7 +636,7 @@ private fun indicatorValues(structuredContent: JsonObject): List<Double?> {
 private fun assertCandleRequirement(
     structuredContent: JsonObject,
     requiredCandleCount: Int,
-    requestedCandleLimit: Int,
+    effectiveCandleLimit: Int,
     sourceCandlesSufficient: Boolean,
 ) {
     val candleRequirement = structuredContent.getValue("candle_requirement").jsonObject
@@ -646,8 +646,8 @@ private fun assertCandleRequirement(
         candleRequirement.getValue("required_candle_count").jsonPrimitive.longOrNull?.toInt(),
     )
     assertEquals(
-        requestedCandleLimit,
-        candleRequirement.getValue("requested_candle_limit").jsonPrimitive.longOrNull?.toInt(),
+        effectiveCandleLimit,
+        candleRequirement.getValue("effective_candle_limit").jsonPrimitive.longOrNull?.toInt(),
     )
     assertEquals(
         sourceCandlesSufficient,
