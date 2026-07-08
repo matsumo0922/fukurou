@@ -139,7 +139,7 @@ class OneShotLlmRunnerTest {
         }
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
-        val decisions = fixture.decisionRepository.decisions()
+        val decisions = fixture.decisionRepository.snapshots.decisions()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
         assertEquals(1, fixture.processRunner.launches.size)
@@ -179,7 +179,7 @@ class OneShotLlmRunnerTest {
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
         val positions = fixture.runtime.broker.getPositions().getOrThrow()
-        val consumptions = fixture.decisionRepository.intentConsumptions()
+        val consumptions = fixture.decisionRepository.snapshots.intentConsumptions()
 
         assertEquals(OneShotRunnerStatus.PAPER_ENTRY_PLACED, result.status)
         assertPaperEntryAccepted(assertNotNull(result.tradeResult))
@@ -774,7 +774,7 @@ class OneShotLlmRunnerTest {
 
         fixture.runner.runOneShot(defaultRequest()).getOrThrow()
 
-        val decision = fixture.decisionRepository.decisions().single()
+        val decision = fixture.decisionRepository.snapshots.decisions().single()
         val auditEvent = fixture.eventLog.events().first { event ->
             event.decisionRunContext.decisionRunId == decision.submission.invocationId
         }

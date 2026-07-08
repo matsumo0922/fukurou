@@ -471,7 +471,7 @@ class FukurouMcpServerTest {
         val result = server.tools.getValue("submit_decision").handler.invoke(TestClientConnection, request)
         val structuredContent = assertNotNull(result.structuredContent)
         val repository = runtime.decisionRepository as InMemoryDecisionRepository
-        val decisions = repository.decisions()
+        val decisions = repository.snapshots.decisions()
 
         assertTrue(result.isError != true)
         assertEquals("NO_TRADE", structuredContent.getValue("action").jsonPrimitive.contentOrNull)
@@ -501,7 +501,7 @@ class FukurouMcpServerTest {
             "expected_r_multiple is required.",
             structuredContent.getValue("message").jsonPrimitive.contentOrNull,
         )
-        assertEquals(0, repository.decisions().size)
+        assertEquals(0, repository.snapshots.decisions().size)
     }
 
     @Test
@@ -518,7 +518,7 @@ class FukurouMcpServerTest {
             arguments = noTradeDecisionArguments(expectedRMultiple = "-0.25"),
         )
         val repository = runtime.decisionRepository as InMemoryDecisionRepository
-        val noTradeExpectedRMultiple = repository.decisions().single().submission.expectedRMultiple
+        val noTradeExpectedRMultiple = repository.snapshots.decisions().single().submission.expectedRMultiple
 
         assertTrue(result.isError != true)
         assertEquals("-0.25", noTradeExpectedRMultiple?.toPlainString())
@@ -567,8 +567,8 @@ class FukurouMcpServerTest {
 
         assertTrue(falsificationResult.isError != true)
         assertEquals(FalsificationVerdict.APPROVED.name, structuredContent.getValue("verdict").jsonPrimitive.contentOrNull)
-        assertEquals(1, repository.tradeIntents().size)
-        assertEquals(1, repository.falsifications().size)
+        assertEquals(1, repository.snapshots.tradeIntents().size)
+        assertEquals(1, repository.snapshots.falsifications().size)
         assertTrue(duplicateResult.isError == true)
         assertEquals("invalid_request", duplicateContent.getValue("type").jsonPrimitive.contentOrNull)
     }
@@ -666,7 +666,7 @@ class FukurouMcpServerTest {
         )
         assertEquals(listOf("llm_run", "decision"), failureSources)
         assertTrue(runFailureSourceId?.contains("[TRUNCATED]") == true)
-        assertEquals(1, repository.decisions().size)
+        assertEquals(1, repository.snapshots.decisions().size)
         assertTrue(!structuredContent.toString().contains("fact_check"))
         assertTrue(!structuredContent.toString().contains("tool_evidence_ids"))
     }
@@ -780,7 +780,7 @@ class FukurouMcpServerTest {
         assertNotNull(riskDetails.getValue("estimated_entry_price_jpy").jsonPrimitive.contentOrNull)
         assertEquals(0, runtime.broker.getPositions().getOrThrow().size)
         assertEquals(0, runtime.broker.getOpenOrders().getOrThrow().size)
-        assertEquals(0, repository.intentConsumptions().size)
+        assertEquals(0, repository.snapshots.intentConsumptions().size)
     }
 
     @Test
@@ -878,8 +878,8 @@ class FukurouMcpServerTest {
         assertTrue(result.isError != true)
         assertEquals("ADJUST_PROTECTION", structuredContent.getValue("action").jsonPrimitive.contentOrNull)
         assertEquals("1", structuredContent.getValue("revision_count").jsonPrimitive.contentOrNull)
-        assertEquals(2, repository.tradePlans().size)
-        assertEquals(1, repository.tradeIntents().size)
+        assertEquals(2, repository.snapshots.tradePlans().size)
+        assertEquals(1, repository.snapshots.tradeIntents().size)
     }
 
     @Test
@@ -951,7 +951,7 @@ class FukurouMcpServerTest {
 
         assertTrue(resetRevisionResult.isError == true)
         assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
-        assertEquals(3, repository.tradePlans().size)
+        assertEquals(3, repository.snapshots.tradePlans().size)
     }
 
     @Test

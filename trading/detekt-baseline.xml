@@ -27,7 +27,6 @@
     <ID>LongParameterList:SafetyFloor.kt$( symbolText: String, sideText: String, orderTypeText: String, sizeBtc: BigDecimal, priceJpy: BigDecimal?, protectiveStopPriceJpy: BigDecimal, takeProfitPriceJpy: BigDecimal?, )</ID>
     <ID>LongParameterList:SafetyFloor.kt$SafetyFloor$( commandName: String, command: Any, rule: SafetyFloorRule, messageJa: String, measuredValue: String, limitValue: String, hardHaltRequired: Boolean = false, )</ID>
     <ID>TooManyFunctions:ExposedPaperLedgerRepository.kt$ExposedPaperLedgerRepository : IntentConsumingPaperLedgerRepository</ID>
-    <ID>TooManyFunctions:InMemoryDecisionRepository.kt$InMemoryDecisionRepository : AtomicIntentConsumptionRepository</ID>
     <ID>TooManyFunctions:InMemoryPaperLedgerRepository.kt$InMemoryPaperLedgerRepository : PaperLedgerRepository</ID>
     <ID>TooManyFunctions:PaperBroker.kt$PaperBroker : Broker</ID>
   </CurrentIssues>

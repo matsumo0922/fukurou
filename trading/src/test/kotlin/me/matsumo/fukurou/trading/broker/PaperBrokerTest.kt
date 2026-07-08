@@ -443,7 +443,7 @@ class PaperBrokerTest {
         val result = broker.placeOrder(command)
 
         assertTrue(result.isFailure)
-        assertEquals(0, decisionRepository.intentConsumptions().size)
+        assertEquals(0, decisionRepository.snapshots.intentConsumptions().size)
     }
 
     @Test
