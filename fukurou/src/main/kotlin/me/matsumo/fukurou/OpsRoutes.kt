@@ -17,6 +17,8 @@ import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.ExecutionActivityOrderContext
+import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshot
@@ -27,6 +29,8 @@ import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
@@ -459,6 +463,17 @@ private data class OpsActivitySortableEvent(
 )
 
 /**
+ * execution Activity event の分類 label。
+ *
+ * @param kind API kind
+ * @param title UI 表示用 title
+ */
+private data class ExecutionActivityLabel(
+    val kind: String,
+    val title: String,
+)
+
+/**
  * Activity timeline API の response body。
  *
  * @param events 新しい順の timeline event 一覧
@@ -481,7 +496,8 @@ data class OpsActivityResponse(
  * @param title UI 表示用 title
  * @param detail UI 表示用 detail
  * @param occurredAt 発生時刻
- * @param metadata 補助表示用 metadata
+ * @param metadata timeline list に表示する短い metadata
+ * @param details click-open dialog に表示する詳細 metadata
  */
 @Serializable
 data class OpsActivityEventResponse(
@@ -491,6 +507,19 @@ data class OpsActivityEventResponse(
     val title: String,
     val detail: String,
     val occurredAt: String,
+    val metadata: List<OpsActivityMetadataResponse>,
+    val details: OpsActivityDetailsResponse? = null,
+)
+
+/**
+ * Activity timeline API の詳細 payload。
+ *
+ * @param title dialog title
+ * @param metadata click-open dialog に表示する詳細 metadata
+ */
+@Serializable
+data class OpsActivityDetailsResponse(
+    val title: String,
     val metadata: List<OpsActivityMetadataResponse>,
 )
 
@@ -1145,7 +1174,7 @@ private fun Route.registerOpsActivityRoute(dependencies: OpsRouteDependencies) {
     }.describe {
         summary = "Activity timeline を取得する"
         description = "decision、audit、paper execution を backend で統合し、cursor paging と source / audit eventType filter を適用して新しい順で返します。" +
-            "audit payload は返しません。"
+            "audit payload は返しません。timeline list 用 metadata は短い項目だけを返し、長い理由文や関連 context は details に返します。"
         tag(OPS_TAG)
         parameters {
             query("limit") {
@@ -1384,7 +1413,7 @@ private suspend fun ApplicationCall.fetchExecutionActivityEvents(
     paperLedgerRepository: PaperLedgerRepository?,
 ): List<OpsActivityEventResponse>? {
     val repository = requirePaperLedgerRepository(paperLedgerRepository) ?: return null
-    val executions = repository.findExecutionsForStableFeed(
+    val executions = repository.findExecutionActivitiesForStableFeed(
         cursor = activityRequest.cursor.toStableFeedCursor(OpsActivitySource.EXECUTION),
         limit = activityRequest.fetchLimit,
     ).getOrThrow()
@@ -1998,14 +2027,15 @@ private fun AccountSnapshotWithUpdatedAt.toOpsAccountResponse(): OpsAccountRespo
     )
 }
 
-private fun Execution.toOpsActivityEventResponse(): OpsActivityEventResponse {
-    val response = toOpsExecutionResponse()
+private fun ExecutionActivityRecord.toOpsActivityEventResponse(): OpsActivityEventResponse {
+    val response = execution.toOpsExecutionResponse()
+    val activityLabel = toExecutionActivityLabel(response)
 
     return OpsActivityEventResponse(
         id = "execution:${response.executionId}",
         source = OpsActivitySource.EXECUTION.wireName,
-        kind = response.side,
-        title = "${response.side} ${response.symbol} execution",
+        kind = activityLabel.kind,
+        title = activityLabel.title,
         detail = "${response.sizeBtc} BTC at ${response.priceJpy} JPY",
         occurredAt = response.executedAt,
         metadata = listOf(
@@ -2023,10 +2053,166 @@ private fun Execution.toOpsActivityEventResponse(): OpsActivityEventResponse {
             ),
             OpsActivityMetadataResponse(
                 label = "order",
-                value = response.orderId ?: "not linked",
+                value = response.orderId ?: ACTIVITY_NOT_LINKED_VALUE,
             ),
         ),
+        details = OpsActivityDetailsResponse(
+            title = activityLabel.title,
+            metadata = toExecutionActivityDetailsMetadata(response),
+        ),
     )
+}
+
+private fun ExecutionActivityRecord.toExecutionActivityLabel(response: OpsExecutionResponse): ExecutionActivityLabel {
+    if (execution.side == OrderSide.BUY) {
+        return ExecutionActivityLabel(
+            kind = ACTIVITY_EXECUTION_KIND_ENTRY_FILL,
+            title = "${response.symbol} entry fill",
+        )
+    }
+
+    if (execution.side != OrderSide.SELL) {
+        return response.toGenericExecutionActivityLabel()
+    }
+
+    val directOrder = order ?: return response.toGenericExecutionActivityLabel()
+
+    return when {
+        directOrder.orderType == OrderType.STOP -> ExecutionActivityLabel(
+            kind = ACTIVITY_EXECUTION_KIND_STOP_TRIGGER,
+            title = "${response.symbol} STOP trigger",
+        )
+        directOrder.indicatesTakeProfitClose() -> ExecutionActivityLabel(
+            kind = ACTIVITY_EXECUTION_KIND_TAKE_PROFIT_CLOSE,
+            title = "${response.symbol} take-profit close",
+        )
+        directOrder.orderType == OrderType.LIMIT -> ExecutionActivityLabel(
+            kind = ACTIVITY_EXECUTION_KIND_LIMIT_CLOSE,
+            title = "${response.symbol} limit close",
+        )
+        directOrder.orderType == OrderType.MARKET -> ExecutionActivityLabel(
+            kind = ACTIVITY_EXECUTION_KIND_MARKET_CLOSE,
+            title = "${response.symbol} market close",
+        )
+        else -> response.toGenericExecutionActivityLabel()
+    }
+}
+
+private fun ExecutionActivityRecord.toExecutionActivityDetailsMetadata(
+    response: OpsExecutionResponse,
+): List<OpsActivityMetadataResponse> {
+    return response.toExecutionSummaryMetadata() +
+        toOrderContextMetadata() +
+        toPositionContextMetadata() +
+        toDecisionContextMetadata()
+}
+
+private fun OpsExecutionResponse.toExecutionSummaryMetadata(): List<OpsActivityMetadataResponse> {
+    return listOf(
+        OpsActivityMetadataResponse(
+            label = "execution",
+            value = executionId,
+        ),
+        OpsActivityMetadataResponse(
+            label = "side",
+            value = side,
+        ),
+        OpsActivityMetadataResponse(
+            label = "size",
+            value = sizeBtc,
+        ),
+        OpsActivityMetadataResponse(
+            label = "price",
+            value = priceJpy,
+        ),
+        OpsActivityMetadataResponse(
+            label = "realized pnl",
+            value = realizedPnlJpy,
+        ),
+        OpsActivityMetadataResponse(
+            label = "fee",
+            value = feeJpy,
+        ),
+        OpsActivityMetadataResponse(
+            label = "liquidity",
+            value = liquidity,
+        ),
+    )
+}
+
+private fun ExecutionActivityRecord.toOrderContextMetadata(): List<OpsActivityMetadataResponse> {
+    return listOf(
+        OpsActivityMetadataResponse(
+            label = "order",
+            value = order?.orderId ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "order type",
+            value = order?.orderType?.name ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "trigger price",
+            value = order?.triggerPriceJpy ?: ACTIVITY_NO_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "take-profit price",
+            value = order?.takeProfitPriceJpy ?: ACTIVITY_NO_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "order reason",
+            value = order?.reasonJa ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+    )
+}
+
+private fun ExecutionActivityRecord.toPositionContextMetadata(): List<OpsActivityMetadataResponse> {
+    return listOf(
+        OpsActivityMetadataResponse(
+            label = "position",
+            value = position?.positionId ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "trade group",
+            value = position?.tradeGroupId ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+    )
+}
+
+private fun ExecutionActivityRecord.toDecisionContextMetadata(): List<OpsActivityMetadataResponse> {
+    return listOf(
+        OpsActivityMetadataResponse(
+            label = "decision action",
+            value = entryDecision?.action?.name ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "decision",
+            value = entryDecision?.decisionId ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "decision run",
+            value = entryDecision?.decisionRunId ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "decision reason",
+            value = entryDecision?.reasonJa ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+    )
+}
+
+private fun OpsExecutionResponse.toGenericExecutionActivityLabel(): ExecutionActivityLabel {
+    return ExecutionActivityLabel(
+        kind = side,
+        title = "$side $symbol execution",
+    )
+}
+
+private fun ExecutionActivityOrderContext.indicatesTakeProfitClose(): Boolean {
+    val hasTakeProfitPrice = takeProfitPriceJpy != null
+    val lowerReason = reasonJa?.lowercase().orEmpty()
+    val reasonMentionsTakeProfit = lowerReason.contains("take profit") ||
+        lowerReason.contains("take-profit")
+
+    return hasTakeProfitPrice || reasonMentionsTakeProfit
 }
 
 private fun Execution.toOpsExecutionResponse(): OpsExecutionResponse {
@@ -2100,6 +2286,45 @@ private const val ACTIVITY_SOURCE_ALL = "all"
  * Activity cursor の要素数。
  */
 private const val ACTIVITY_CURSOR_PART_COUNT = 3
+
+/**
+ * Activity execution kind: entry fill。
+ */
+private const val ACTIVITY_EXECUTION_KIND_ENTRY_FILL = "ENTRY_FILL"
+
+/**
+ * Activity execution kind: STOP trigger。
+ */
+private const val ACTIVITY_EXECUTION_KIND_STOP_TRIGGER = "STOP_TRIGGER"
+
+/**
+ * Activity execution kind: take-profit close。
+ */
+private const val ACTIVITY_EXECUTION_KIND_TAKE_PROFIT_CLOSE = "TAKE_PROFIT_CLOSE"
+
+/**
+ * Activity execution kind: limit close。
+ */
+private const val ACTIVITY_EXECUTION_KIND_LIMIT_CLOSE = "LIMIT_CLOSE"
+
+/**
+ * Activity execution kind: market close。
+ */
+private const val ACTIVITY_EXECUTION_KIND_MARKET_CLOSE = "MARKET_CLOSE"
+
+/**
+ * Activity metadata の missing link 表示値。
+ *
+ * WebUI はこの wire 値を i18n sentinel として扱う。
+ */
+private const val ACTIVITY_NOT_LINKED_VALUE = "not linked"
+
+/**
+ * Activity metadata の空値表示値。
+ *
+ * WebUI はこの wire 値を i18n sentinel として扱う。
+ */
+private const val ACTIVITY_NO_VALUE = "none"
 
 /**
  * audit eventType 未指定時に activity timeline から除外する event_type。

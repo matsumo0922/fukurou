@@ -36,6 +36,7 @@ import java.util.UUID
  * @param openOrders open order 一覧
  * @param executions execution 一覧
  * @param decisionRunIdsByPositionId position ID と LLM invocation ID の対応
+ * @param decisionContextsByRunId decision run ID と entry decision context の対応
  * @param equitySnapshotRepository equity snapshot 保存先
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  * @param clock paper ledger の作成時刻に使う clock
@@ -70,6 +71,7 @@ class InMemoryPaperLedgerRepository private constructor(
         openOrders: List<Order> = emptyList(),
         executions: List<Execution> = emptyList(),
         decisionRunIdsByPositionId: Map<String, String?> = emptyMap(),
+        decisionContextsByRunId: Map<String, ExecutionActivityDecisionContext> = emptyMap(),
         equitySnapshotRepository: InMemoryEquitySnapshotRepository = InMemoryEquitySnapshotRepository(),
         fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
         clock: Clock = Clock.systemUTC(),
@@ -84,6 +86,7 @@ class InMemoryPaperLedgerRepository private constructor(
                 openOrders = openOrders,
                 executions = executions,
                 decisionRunIdsByPositionId = decisionRunIdsByPositionId,
+                decisionContextsByRunId = decisionContextsByRunId,
             ),
             runtime = InMemoryPaperLedgerRuntime(
                 equitySnapshotRepository = equitySnapshotRepository,
@@ -119,12 +122,14 @@ private data class InMemoryPaperLedgerAccountSeed(
  * @param openOrders open order 一覧
  * @param executions execution 一覧
  * @param decisionRunIdsByPositionId position ID と LLM invocation ID の対応
+ * @param decisionContextsByRunId decision run ID と entry decision context の対応
  */
 private data class InMemoryPaperLedgerRecordsSeed(
     val positions: List<Position>,
     val openOrders: List<Order>,
     val executions: List<Execution>,
     val decisionRunIdsByPositionId: Map<String, String?>,
+    val decisionContextsByRunId: Map<String, ExecutionActivityDecisionContext>,
 )
 
 /**
@@ -159,6 +164,8 @@ private class InMemoryPaperLedgerState(
     val orders: MutableList<Order> = records.openOrders.toMutableList()
     val executions: MutableList<Execution> = records.executions.toMutableList()
     val decisionRunIdsByPositionId: MutableMap<String, String?> = records.decisionRunIdsByPositionId.toMutableMap()
+    val decisionContextsByRunId: Map<String, ExecutionActivityDecisionContext> =
+        records.decisionContextsByRunId
     val equitySnapshotRepository: InMemoryEquitySnapshotRepository = runtime.equitySnapshotRepository
     val fallbackSymbolRules: SymbolRules = runtime.fallbackSymbolRules
     val clock: Clock = runtime.clock
@@ -282,6 +289,28 @@ private class InMemoryPaperLedgerExecutionReader(
                             .thenBy { execution -> execution.executionId },
                     )
                     .take(limit)
+            }
+        }
+    }
+
+    override suspend fun findExecutionActivitiesForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+    ): Result<List<ExecutionActivityRecord>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            state.read {
+                executions
+                    .filter { execution -> cursor.accepts(Instant.parse(execution.executedAt), execution.executionId) }
+                    .sortedWith(
+                        compareByDescending<Execution> { execution -> Instant.parse(execution.executedAt) }
+                            .thenBy { execution -> execution.executionId },
+                    )
+                    .take(limit)
+                    .map { execution -> toExecutionActivityRecord(execution) }
             }
         }
     }
@@ -887,6 +916,74 @@ private fun InMemoryPaperLedgerState.openOrdersLocked(): List<Order> {
     return orders.filter { order ->
         order.status == OrderStatus.OPEN || order.status == OrderStatus.PENDING_CANCEL
     }
+}
+
+private fun InMemoryPaperLedgerState.toExecutionActivityRecord(execution: Execution): ExecutionActivityRecord {
+    val directOrder = execution.orderId?.let { orderId -> orders.firstOrNull { order -> order.orderId == orderId } }
+    val position = findExecutionActivityPosition(execution, directOrder)
+    val orderContext = directOrder?.toExecutionActivityOrderContext()
+    val positionContext = execution.toExecutionActivityPositionContext(position, directOrder)
+    val decisionRunId = position?.positionId?.let { positionId -> decisionRunIdsByPositionId[positionId] }
+    val decisionContext = decisionRunId?.let { runId ->
+        decisionContextsByRunId[runId] ?: ExecutionActivityDecisionContext(
+            decisionId = null,
+            decisionRunId = runId,
+            action = null,
+            reasonJa = null,
+        )
+    }
+
+    return ExecutionActivityRecord(
+        execution = execution,
+        order = orderContext,
+        position = positionContext,
+        entryDecision = decisionContext,
+    )
+}
+
+private fun InMemoryPaperLedgerState.findExecutionActivityPosition(
+    execution: Execution,
+    directOrder: Order?,
+): Position? {
+    val linkedPositionId = execution.positionId ?: directOrder?.positionId
+    val linkedPosition = linkedPositionId?.let { positionId ->
+        positions.firstOrNull { position -> position.positionId == positionId }
+    }
+
+    if (linkedPosition != null) {
+        return linkedPosition
+    }
+
+    val tradeGroupId = directOrder?.tradeGroupId ?: return null
+
+    return positions.firstOrNull { position -> position.tradeGroupId == tradeGroupId }
+}
+
+private fun Order.toExecutionActivityOrderContext(): ExecutionActivityOrderContext {
+    return ExecutionActivityOrderContext(
+        orderId = orderId,
+        orderType = orderType,
+        triggerPriceJpy = triggerPriceJpy,
+        takeProfitPriceJpy = takeProfitPriceJpy,
+        reasonJa = reasonJa,
+    )
+}
+
+private fun Execution.toExecutionActivityPositionContext(
+    position: Position?,
+    directOrder: Order?,
+): ExecutionActivityPositionContext? {
+    val contextPositionId = position?.positionId ?: positionId ?: directOrder?.positionId
+    val contextTradeGroupId = position?.tradeGroupId ?: directOrder?.tradeGroupId
+
+    if (contextPositionId == null && contextTradeGroupId == null) {
+        return null
+    }
+
+    return ExecutionActivityPositionContext(
+        positionId = contextPositionId,
+        tradeGroupId = contextTradeGroupId,
+    )
 }
 
 private fun PlaceOrderCommand.toEntryOrder(

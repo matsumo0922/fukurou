@@ -10,6 +10,7 @@ export type EvaluationCostsResponse = components["schemas"]["EvaluationCostsResp
 export type OpsAccountResponse = components["schemas"]["OpsAccountResponse"];
 export type OpsActivityCatalogItemResponse = components["schemas"]["OpsActivityCatalogItemResponse"];
 export type OpsActivityCatalogResponse = components["schemas"]["OpsActivityCatalogResponse"];
+export type OpsActivityDetailsResponse = components["schemas"]["OpsActivityDetailsResponse"];
 export type OpsActivityEventResponse = components["schemas"]["OpsActivityEventResponse"];
 export type OpsActivityMetadataResponse = components["schemas"]["OpsActivityMetadataResponse"];
 export type OpsActivityResponse = components["schemas"]["OpsActivityResponse"];
@@ -35,6 +36,7 @@ export type ActivityTimelineSourceFilter = ActivityTimelineSource | "all";
 export type ActivityTimelineEvent = Omit<OpsActivityEventResponse, "metadata" | "source"> & {
   source: ActivityTimelineSource;
   metadata: OpsActivityMetadataResponse[];
+  details?: OpsActivityDetailsResponse | null;
 };
 
 export type ActivityTimelineSnapshot = {

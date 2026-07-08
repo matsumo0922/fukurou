@@ -1678,6 +1678,75 @@ a:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.activity-detail-dialog {
+  display: grid;
+  gap: 14px;
+  width: min(680px, 100%);
+  max-height: min(720px, 90vh);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+  padding: 16px;
+  overflow: auto;
+}
+
+.activity-detail-dialog__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.activity-detail-dialog__heading h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 1rem;
+  line-height: 1.3;
+}
+
+.activity-detail-dialog__summary {
+  margin: 0;
+  color: var(--ink-muted);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.activity-detail-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--line);
+}
+
+.activity-detail-list__item {
+  min-width: 0;
+  background: var(--surface-muted);
+  padding: 10px;
+}
+
+.activity-detail-list__item dt {
+  color: var(--ink-faint);
+  font-size: 0.69rem;
+  font-weight: 760;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.activity-detail-list__item dd {
+  margin: 6px 0 0;
+  color: var(--ink);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 920px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -1720,7 +1789,8 @@ a:focus-visible {
     grid-template-columns: 1fr;
   }
 
-  .activity-catalog-list {
+  .activity-catalog-list,
+  .activity-detail-list {
     grid-template-columns: 1fr;
   }
 }

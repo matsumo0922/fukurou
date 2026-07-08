@@ -272,6 +272,83 @@ function ActivityError({ error, retried }: { error: unknown; retried: () => void
   );
 }
 
+function ActivityDetailsDialog({
+  event,
+  catalog,
+  closed,
+}: {
+  event: ActivityTimelineEvent;
+  catalog: OpsActivityCatalogResponse | null;
+  closed: () => void;
+}) {
+  const { locale, t } = useI18n();
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const dialogTitle = event.details?.title ?? activityEventTitle(event, catalog, t);
+
+  useEffect(() => {
+    closeButtonRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    const keyDownHandled = (keyboardEvent: KeyboardEvent) => {
+      if (keyboardEvent.key === "Escape") {
+        closed();
+      }
+    };
+
+    window.addEventListener("keydown", keyDownHandled);
+
+    return () => window.removeEventListener("keydown", keyDownHandled);
+  }, [closed]);
+
+  if (!event.details) {
+    return null;
+  }
+
+  return (
+    <div
+      className="activity-catalog-dialog__backdrop"
+      onClick={(clickEvent) => {
+        if (clickEvent.target === clickEvent.currentTarget) {
+          closed();
+        }
+      }}
+    >
+      <div
+        className="activity-detail-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="activity-detail-dialog-title"
+      >
+        <div className="activity-detail-dialog__heading">
+          <h2 id="activity-detail-dialog-title">{dialogTitle}</h2>
+          <button
+            ref={closeButtonRef}
+            className="icon-only-button"
+            type="button"
+            aria-label={t("activity.details.close")}
+            title={t("activity.details.close")}
+            onClick={closed}
+          >
+            <X size={17} aria-hidden="true" />
+          </button>
+        </div>
+        <p className="activity-detail-dialog__summary">
+          {sourceLabel(event.source, t)} · {activityEventKindLabel(event, catalog, t)} · {formatDateTime(event.occurredAt, locale)}
+        </p>
+        <dl className="activity-detail-list">
+          {event.details.metadata.map((item) => (
+            <div className="activity-detail-list__item" key={item.label}>
+              <dt>{metadataLabel(item.label, t)}</dt>
+              <dd>{formatMetadataValue(item.label, item.value, t)}</dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+    </div>
+  );
+}
+
 function ActivityTimeline({
   timeline,
   loadedPageCount,
@@ -288,6 +365,7 @@ function ActivityTimeline({
   catalog: OpsActivityCatalogResponse | null;
 }) {
   const { locale, t } = useI18n();
+  const [selectedDetailsEvent, setSelectedDetailsEvent] = useState<ActivityTimelineEvent | null>(null);
   const events = newestFirstActivityTimelineEvents(timeline.events);
   const canLoadOlder = timeline.nextBefore !== null;
 
@@ -310,6 +388,21 @@ function ActivityTimeline({
                 <StatusPill label={sourceLabel(event.source, t)} tone={sourceTone(event.source)} />
                 <StatusPill label={activityEventKindLabel(event, catalog, t)} tone={eventTone(event)} />
                 <time dateTime={event.occurredAt}>{formatDateTime(event.occurredAt, locale)}</time>
+                {event.details ? (
+                  <button
+                    className="icon-only-button"
+                    type="button"
+                    aria-label={formatMessage(t("activity.details.open"), {
+                      title: activityEventTitle(event, catalog, t),
+                    })}
+                    title={formatMessage(t("activity.details.open"), {
+                      title: activityEventTitle(event, catalog, t),
+                    })}
+                    onClick={() => setSelectedDetailsEvent(event)}
+                  >
+                    <Info size={16} aria-hidden="true" />
+                  </button>
+                ) : null}
               </div>
               <h2>{activityEventTitle(event, catalog, t)}</h2>
               <p>{formatTimelineDetail(event, t)}</p>
@@ -333,6 +426,13 @@ function ActivityTimeline({
         {!canLoadOlder ? <span>{t("activity.noOlderRecords")}</span> : null}
       </div>
       {olderError ? <p className="timeline__paging-error">{describeError(olderError, locale)}</p> : null}
+      {selectedDetailsEvent?.details ? (
+        <ActivityDetailsDialog
+          event={selectedDetailsEvent}
+          catalog={catalog}
+          closed={() => setSelectedDetailsEvent(null)}
+        />
+      ) : null}
     </>
   );
 }
@@ -459,9 +559,30 @@ function activityEventKindLabel(
   catalog: OpsActivityCatalogResponse | null,
   t: (key: MessageKey) => string,
 ): string {
+  if (event.source === "execution") {
+    return executionKindLabel(event.kind, t);
+  }
+
   const definition = activityEventDefinition(event, catalog);
 
   return definition ? catalogMessage(definition.labelKey, event.kind, t) : event.kind;
+}
+
+function executionKindLabel(kind: string, t: (key: MessageKey) => string): string {
+  switch (kind) {
+    case "ENTRY_FILL":
+      return t("activity.executionKind.entryFill");
+    case "STOP_TRIGGER":
+      return t("activity.executionKind.stopTrigger");
+    case "TAKE_PROFIT_CLOSE":
+      return t("activity.executionKind.takeProfitClose");
+    case "LIMIT_CLOSE":
+      return t("activity.executionKind.limitClose");
+    case "MARKET_CLOSE":
+      return t("activity.executionKind.marketClose");
+    default:
+      return kind;
+  }
 }
 
 function activityEventDefinition(
@@ -579,6 +700,14 @@ function formatTimelineDetail(event: ActivityTimelineEvent, t: (key: MessageKey)
 
 function metadataLabel(label: string, t: (key: MessageKey) => string): string {
   switch (label) {
+    case "execution":
+      return t("activity.label.execution");
+    case "side":
+      return t("activity.label.side");
+    case "size":
+      return t("activity.label.size");
+    case "price":
+      return t("activity.label.price");
     case "estimated p":
       return t("activity.label.estimatedP");
     case "setup tags":
@@ -595,14 +724,50 @@ function metadataLabel(label: string, t: (key: MessageKey) => string): string {
       return t("activity.label.liquidity");
     case "order":
       return t("activity.label.order");
+    case "order type":
+      return t("activity.label.orderType");
+    case "trigger price":
+      return t("activity.label.triggerPrice");
+    case "take-profit price":
+      return t("activity.label.takeProfitPrice");
+    case "order reason":
+      return t("activity.label.orderReason");
+    case "position":
+      return t("activity.label.position");
+    case "trade group":
+      return t("activity.label.tradeGroup");
+    case "decision action":
+      return t("activity.label.decisionAction");
+    case "decision":
+      return t("activity.label.decision");
+    case "decision run":
+      return t("activity.label.decisionRun");
+    case "decision reason":
+      return t("activity.label.decisionReason");
     default:
       return label;
   }
 }
 
 function formatMetadataValue(label: string, value: string, t: (key: MessageKey) => string): string {
+  if (value === ACTIVITY_METADATA_NOT_LINKED_VALUE) {
+    return t("activity.notLinked");
+  }
+
+  if (value === ACTIVITY_METADATA_NONE_VALUE) {
+    return t("common.none");
+  }
+
   if (label === "estimated p") {
     return formatRatioAsPercent(value);
+  }
+
+  if (label === "size") {
+    return `${value} BTC`;
+  }
+
+  if (label === "price" || label === "trigger price" || label === "take-profit price") {
+    return formatJpy(value);
   }
 
   if (label === "realized pnl") {
@@ -613,12 +778,12 @@ function formatMetadataValue(label: string, value: string, t: (key: MessageKey) 
     return formatJpy(value);
   }
 
-  if (label === "order" && value === "not linked") {
-    return t("activity.notLinked");
-  }
-
   return value;
 }
+
+// Wire sentinels emitted by OpsRoutes activity metadata.
+const ACTIVITY_METADATA_NOT_LINKED_VALUE = "not linked";
+const ACTIVITY_METADATA_NONE_VALUE = "none";
 
 function mergeActivityTimelinePages(
   latestPage: ActivityTimelineSnapshot | null,
