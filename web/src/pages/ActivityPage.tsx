@@ -290,8 +290,8 @@ function ActivityDetailsDialog({
   }, []);
 
   useEffect(() => {
-    const keyDownHandled = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
+    const keyDownHandled = (keyboardEvent: KeyboardEvent) => {
+      if (keyboardEvent.key === "Escape") {
         closed();
       }
     };
@@ -750,11 +750,11 @@ function metadataLabel(label: string, t: (key: MessageKey) => string): string {
 }
 
 function formatMetadataValue(label: string, value: string, t: (key: MessageKey) => string): string {
-  if (value === "not linked") {
+  if (value === ACTIVITY_METADATA_NOT_LINKED_VALUE) {
     return t("activity.notLinked");
   }
 
-  if (value === "none") {
+  if (value === ACTIVITY_METADATA_NONE_VALUE) {
     return t("common.none");
   }
 
@@ -780,6 +780,10 @@ function formatMetadataValue(label: string, value: string, t: (key: MessageKey) 
 
   return value;
 }
+
+// Wire sentinels emitted by OpsRoutes activity metadata.
+const ACTIVITY_METADATA_NOT_LINKED_VALUE = "not linked";
+const ACTIVITY_METADATA_NONE_VALUE = "none";
 
 function mergeActivityTimelinePages(
   latestPage: ActivityTimelineSnapshot | null,

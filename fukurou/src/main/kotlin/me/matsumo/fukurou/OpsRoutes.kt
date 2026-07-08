@@ -2207,11 +2207,12 @@ private fun OpsExecutionResponse.toGenericExecutionActivityLabel(): ExecutionAct
 }
 
 private fun ExecutionActivityOrderContext.indicatesTakeProfitClose(): Boolean {
+    val hasTakeProfitPrice = takeProfitPriceJpy != null
     val lowerReason = reasonJa?.lowercase().orEmpty()
-
-    return takeProfitPriceJpy != null ||
-        lowerReason.contains("take profit") ||
+    val reasonMentionsTakeProfit = lowerReason.contains("take profit") ||
         lowerReason.contains("take-profit")
+
+    return hasTakeProfitPrice || reasonMentionsTakeProfit
 }
 
 private fun Execution.toOpsExecutionResponse(): OpsExecutionResponse {
@@ -2313,11 +2314,15 @@ private const val ACTIVITY_EXECUTION_KIND_MARKET_CLOSE = "MARKET_CLOSE"
 
 /**
  * Activity metadata の missing link 表示値。
+ *
+ * WebUI はこの wire 値を i18n sentinel として扱う。
  */
 private const val ACTIVITY_NOT_LINKED_VALUE = "not linked"
 
 /**
  * Activity metadata の空値表示値。
+ *
+ * WebUI はこの wire 値を i18n sentinel として扱う。
  */
 private const val ACTIVITY_NO_VALUE = "none"
 
