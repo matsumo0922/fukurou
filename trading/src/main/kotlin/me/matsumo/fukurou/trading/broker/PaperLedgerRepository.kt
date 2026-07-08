@@ -1,8 +1,10 @@
 package me.matsumo.fukurou.trading.broker
 
+import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
@@ -77,7 +79,73 @@ interface PaperLedgerExecutionRepository {
      * 安定 cursor 条件に一致する execution ledger の行を Activity timeline 用に新しい順で取得する。
      */
     suspend fun findExecutionsForStableFeed(cursor: StableFeedCursor, limit: Int): Result<List<Execution>>
+
+    /**
+     * 安定 cursor 条件に一致する execution Activity 行を、関連 context と一緒に新しい順で取得する。
+     */
+    suspend fun findExecutionActivitiesForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+    ): Result<List<ExecutionActivityRecord>>
 }
+
+/**
+ * Activity timeline の execution 表示に必要な関連 context。
+ *
+ * @param execution 約定本体
+ * @param order 直接紐づく order context
+ * @param position 約定または order から解決した position context
+ * @param entryDecision 同じ position / trade group の entry decision context
+ */
+data class ExecutionActivityRecord(
+    val execution: Execution,
+    val order: ExecutionActivityOrderContext?,
+    val position: ExecutionActivityPositionContext?,
+    val entryDecision: ExecutionActivityDecisionContext?,
+)
+
+/**
+ * Activity timeline の execution 詳細に表示する order context。
+ *
+ * @param orderId 注文 ID
+ * @param orderType 注文種別
+ * @param triggerPriceJpy STOP trigger 価格
+ * @param takeProfitPriceJpy take-profit 価格
+ * @param reasonJa order に保存された理由
+ */
+data class ExecutionActivityOrderContext(
+    val orderId: String,
+    val orderType: OrderType,
+    val triggerPriceJpy: String?,
+    val takeProfitPriceJpy: String?,
+    val reasonJa: String?,
+)
+
+/**
+ * Activity timeline の execution 詳細に表示する position context。
+ *
+ * @param positionId position ID
+ * @param tradeGroupId trade group ID
+ */
+data class ExecutionActivityPositionContext(
+    val positionId: String?,
+    val tradeGroupId: String?,
+)
+
+/**
+ * Activity timeline の execution 詳細に表示する entry decision context。
+ *
+ * @param decisionId decision ID
+ * @param decisionRunId daemon / CLI 起動単位の ID
+ * @param action LLM が提出した action
+ * @param reasonJa 判断理由
+ */
+data class ExecutionActivityDecisionContext(
+    val decisionId: String?,
+    val decisionRunId: String?,
+    val action: DecisionAction?,
+    val reasonJa: String?,
+)
 
 /**
  * paper ledger の closed position / 冪等 result 読み取り repository。

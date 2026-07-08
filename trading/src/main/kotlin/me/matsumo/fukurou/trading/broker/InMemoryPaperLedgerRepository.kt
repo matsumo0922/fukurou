@@ -285,6 +285,28 @@ private class InMemoryPaperLedgerExecutionReader(
             }
         }
     }
+
+    override suspend fun findExecutionActivitiesForStableFeed(
+        cursor: StableFeedCursor,
+        limit: Int,
+    ): Result<List<ExecutionActivityRecord>> {
+        return runCatching {
+            require(limit > 0) {
+                "limit must be greater than 0."
+            }
+
+            state.read {
+                executions
+                    .filter { execution -> cursor.accepts(Instant.parse(execution.executedAt), execution.executionId) }
+                    .sortedWith(
+                        compareByDescending<Execution> { execution -> Instant.parse(execution.executedAt) }
+                            .thenBy { execution -> execution.executionId },
+                    )
+                    .take(limit)
+                    .map { execution -> toExecutionActivityRecord(execution) }
+            }
+        }
+    }
 }
 
 /**
@@ -887,6 +909,74 @@ private fun InMemoryPaperLedgerState.openOrdersLocked(): List<Order> {
     return orders.filter { order ->
         order.status == OrderStatus.OPEN || order.status == OrderStatus.PENDING_CANCEL
     }
+}
+
+private fun InMemoryPaperLedgerState.toExecutionActivityRecord(execution: Execution): ExecutionActivityRecord {
+    val directOrder = execution.orderId?.let { orderId -> orders.firstOrNull { order -> order.orderId == orderId } }
+    val position = findExecutionActivityPosition(execution, directOrder)
+    val orderContext = directOrder?.toExecutionActivityOrderContext()
+    val positionContext = execution.toExecutionActivityPositionContext(position, directOrder)
+    val decisionRunId = position?.positionId?.let { positionId -> decisionRunIdsByPositionId[positionId] }
+    val decisionContext = decisionRunId?.let { runId ->
+        ExecutionActivityDecisionContext(
+            decisionId = null,
+            decisionRunId = runId,
+            action = null,
+            reasonJa = null,
+        )
+    }
+
+    return ExecutionActivityRecord(
+        execution = execution,
+        order = orderContext,
+        position = positionContext,
+        entryDecision = decisionContext,
+    )
+}
+
+private fun InMemoryPaperLedgerState.findExecutionActivityPosition(
+    execution: Execution,
+    directOrder: Order?,
+): Position? {
+    val linkedPositionId = execution.positionId ?: directOrder?.positionId
+    val linkedPosition = linkedPositionId?.let { positionId ->
+        positions.firstOrNull { position -> position.positionId == positionId }
+    }
+
+    if (linkedPosition != null) {
+        return linkedPosition
+    }
+
+    val tradeGroupId = directOrder?.tradeGroupId ?: return null
+
+    return positions.firstOrNull { position -> position.tradeGroupId == tradeGroupId }
+}
+
+private fun Order.toExecutionActivityOrderContext(): ExecutionActivityOrderContext {
+    return ExecutionActivityOrderContext(
+        orderId = orderId,
+        orderType = orderType,
+        triggerPriceJpy = triggerPriceJpy,
+        takeProfitPriceJpy = takeProfitPriceJpy,
+        reasonJa = reasonJa,
+    )
+}
+
+private fun Execution.toExecutionActivityPositionContext(
+    position: Position?,
+    directOrder: Order?,
+): ExecutionActivityPositionContext? {
+    val contextPositionId = position?.positionId ?: positionId ?: directOrder?.positionId
+    val contextTradeGroupId = position?.tradeGroupId ?: directOrder?.tradeGroupId
+
+    if (contextPositionId == null && contextTradeGroupId == null) {
+        return null
+    }
+
+    return ExecutionActivityPositionContext(
+        positionId = contextPositionId,
+        tradeGroupId = contextTradeGroupId,
+    )
 }
 
 private fun PlaceOrderCommand.toEntryOrder(
