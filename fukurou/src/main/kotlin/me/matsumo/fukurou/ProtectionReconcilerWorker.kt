@@ -120,55 +120,15 @@ internal fun startProtectionReconcilerWorker(
     clock: Clock = Clock.systemUTC(),
 ): ProtectionReconcilerWorker {
     val tradingConfig = TradingBotConfig.fromEnvironment()
-    val riskStateRepository = ExposedRiskStateRepository(database)
-    val commandEventLog = ExposedCommandEventLog(database)
-    val evaluationRepository = ExposedEvaluationRepository(database)
-    val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
-    val safetyViolationRepository = ExposedSafetyViolationRepository(database)
-    val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
-    val ledgerRepository = ExposedPaperLedgerRepository(database)
-    val marketDataSource = GmoPublicMarketDataSource.fromConfig(
-        config = tradingConfig.gmoPublicClient,
-        clock = clock,
-    )
-    val broker = PaperBroker(
-        ledgerRepository = ledgerRepository,
-        riskStateRepository = riskStateRepository,
-        riskStateCommandService = riskStateCommandService,
-        safetyViolationRepository = safetyViolationRepository,
-        safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
-        marketDataSource = marketDataSource,
-        fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
-        reconcilerStatusProvider = status,
-        clock = clock,
-    )
-    val reconciler = ProtectionReconciler(
-        riskStateRepository = riskStateRepository,
-        riskStateCommandService = riskStateCommandService,
-        commandEventLog = commandEventLog,
-        tradingLock = tradingLock,
-        tickStream = RestPollingTickStream(
-            marketDataSource = marketDataSource,
-            clock = clock,
-        ),
-        broker = broker,
-        killCriterionEvaluator = KillCriterionEvaluator(
-            config = tradingConfig.killCriterion,
-            riskStateRepository = riskStateRepository,
-            riskStateCommandService = riskStateCommandService,
-            commandEventLog = commandEventLog,
-            broker = broker,
-            statsSource = { evaluationRepository.fetchKillCriterionStats() },
-            clock = clock,
-        ),
-        equitySnapshotRecorder = EquitySnapshotRecorder(
-            accountSource = { ledgerRepository.getAccountSnapshot() },
-            repository = ExposedEquitySnapshotRepository(database),
-            clock = clock,
-        ),
+    val inputs = ProtectionReconcilerWorkerInputs(
+        dataSource = dataSource,
+        database = database,
         status = status,
         clock = clock,
+        tradingConfig = tradingConfig,
     )
+    val runtimeComponents = inputs.createRuntimeComponents()
+    val reconciler = runtimeComponents.createReconciler()
 
     return ProtectionReconcilerWorker(
         reconciler = reconciler,
@@ -182,3 +142,134 @@ internal fun startProtectionReconcilerWorker(
         clock = clock,
     ).start()
 }
+
+private fun ProtectionReconcilerWorkerInputs.createRuntimeComponents(): ProtectionReconcilerRuntimeComponents {
+    val repositories = createRepositories()
+    val marketDataSource = GmoPublicMarketDataSource.fromConfig(
+        config = tradingConfig.gmoPublicClient,
+        clock = clock,
+    )
+    val broker = createBroker(
+        repositories = repositories,
+        marketDataSource = marketDataSource,
+    )
+
+    return ProtectionReconcilerRuntimeComponents(
+        inputs = this,
+        repositories = repositories,
+        tradingLock = PostgresGlobalTradingLock(dataSource, clock),
+        marketDataSource = marketDataSource,
+        broker = broker,
+    )
+}
+
+private fun ProtectionReconcilerWorkerInputs.createRepositories(): ProtectionReconcilerRepositories {
+    return ProtectionReconcilerRepositories(
+        riskStateRepository = ExposedRiskStateRepository(database),
+        commandEventLog = ExposedCommandEventLog(database),
+        evaluationRepository = ExposedEvaluationRepository(database),
+        riskStateCommandService = ExposedRiskStateCommandService(database, clock),
+        safetyViolationRepository = ExposedSafetyViolationRepository(database),
+        ledgerRepository = ExposedPaperLedgerRepository(database),
+    )
+}
+
+private fun ProtectionReconcilerWorkerInputs.createBroker(
+    repositories: ProtectionReconcilerRepositories,
+    marketDataSource: GmoPublicMarketDataSource,
+): PaperBroker {
+    return PaperBroker(
+        ledgerRepository = repositories.ledgerRepository,
+        riskStateRepository = repositories.riskStateRepository,
+        riskStateCommandService = repositories.riskStateCommandService,
+        safetyViolationRepository = repositories.safetyViolationRepository,
+        safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
+        marketDataSource = marketDataSource,
+        fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
+        reconcilerStatusProvider = status,
+        clock = clock,
+    )
+}
+
+private fun ProtectionReconcilerRuntimeComponents.createReconciler(): ProtectionReconciler {
+    return ProtectionReconciler(
+        riskStateRepository = repositories.riskStateRepository,
+        riskStateCommandService = repositories.riskStateCommandService,
+        commandEventLog = repositories.commandEventLog,
+        tradingLock = tradingLock,
+        tickStream = RestPollingTickStream(
+            marketDataSource = marketDataSource,
+            clock = inputs.clock,
+        ),
+        broker = broker,
+        killCriterionEvaluator = KillCriterionEvaluator(
+            config = inputs.tradingConfig.killCriterion,
+            riskStateRepository = repositories.riskStateRepository,
+            riskStateCommandService = repositories.riskStateCommandService,
+            commandEventLog = repositories.commandEventLog,
+            broker = broker,
+            statsSource = { repositories.evaluationRepository.fetchKillCriterionStats() },
+            clock = inputs.clock,
+        ),
+        equitySnapshotRecorder = EquitySnapshotRecorder(
+            accountSource = { repositories.ledgerRepository.getAccountSnapshot() },
+            repository = ExposedEquitySnapshotRepository(inputs.database),
+            clock = inputs.clock,
+        ),
+        status = inputs.status,
+        clock = inputs.clock,
+    )
+}
+
+/**
+ * ProtectionReconcilerWorker を構築する入力。
+ *
+ * @param dataSource PostgreSQL data source
+ * @param database Exposed database
+ * @param status reconciler status holder
+ * @param clock worker と repository に渡す clock
+ * @param tradingConfig 取引 bot 全体の typed config
+ */
+private data class ProtectionReconcilerWorkerInputs(
+    val dataSource: HikariDataSource,
+    val database: ExposedDatabase,
+    val status: MutableReconcilerStatus,
+    val clock: Clock,
+    val tradingConfig: TradingBotConfig,
+)
+
+/**
+ * ProtectionReconciler が参照する repository 群。
+ *
+ * @param riskStateRepository risk_state repository
+ * @param commandEventLog command_event_log repository
+ * @param evaluationRepository evaluation repository
+ * @param riskStateCommandService risk_state command service
+ * @param safetyViolationRepository safety violation repository
+ * @param ledgerRepository paper ledger repository
+ */
+private data class ProtectionReconcilerRepositories(
+    val riskStateRepository: ExposedRiskStateRepository,
+    val commandEventLog: ExposedCommandEventLog,
+    val evaluationRepository: ExposedEvaluationRepository,
+    val riskStateCommandService: ExposedRiskStateCommandService,
+    val safetyViolationRepository: ExposedSafetyViolationRepository,
+    val ledgerRepository: ExposedPaperLedgerRepository,
+)
+
+/**
+ * ProtectionReconciler の組み立て済み runtime component。
+ *
+ * @param inputs worker 構築入力
+ * @param repositories repository 群
+ * @param tradingLock PostgreSQL backed trading lock
+ * @param marketDataSource GMO public market data source
+ * @param broker paper broker
+ */
+private data class ProtectionReconcilerRuntimeComponents(
+    val inputs: ProtectionReconcilerWorkerInputs,
+    val repositories: ProtectionReconcilerRepositories,
+    val tradingLock: PostgresGlobalTradingLock,
+    val marketDataSource: GmoPublicMarketDataSource,
+    val broker: PaperBroker,
+)

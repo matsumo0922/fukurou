@@ -506,24 +506,96 @@ data class OpsActivityMetadataResponse(
 )
 
 /**
+ * runtime config catalog route の依存関係。
+ *
+ * @param tradingConfig 取引 bot 全体の typed config
+ * @param environment runtime config catalog API で参照する環境変数 map
+ */
+internal data class OpsRuntimeConfigRouteDependencies(
+    val tradingConfig: TradingBotConfig,
+    val environment: Map<String, String>,
+)
+
+/**
+ * ops risk 操作用 route の依存関係。
+ *
+ * @param riskStateRepository risk_state repository
+ * @param riskStateCommandService risk_state command service
+ * @param manualLlmLaunchService manual LLM launch service
+ */
+internal data class OpsRiskRouteDependencies(
+    val riskStateRepository: RiskStateRepository?,
+    val riskStateCommandService: RiskStateCommandService?,
+    val manualLlmLaunchService: ManualLlmLaunchService?,
+)
+
+/**
+ * ops CLI auth route の依存関係。
+ *
+ * @param llmAuthService CLI auth service
+ */
+internal data class OpsAuthRouteDependencies(
+    val llmAuthService: LlmAuthService?,
+)
+
+/**
+ * ops feed 取得 route の依存関係。
+ *
+ * @param decisionRepository decision repository
+ * @param paperLedgerRepository paper ledger repository
+ * @param commandEventFeedReader command_event_log feed reader
+ */
+internal data class OpsFeedRouteDependencies(
+    val decisionRepository: DecisionRepository?,
+    val paperLedgerRepository: PaperLedgerRepository?,
+    val commandEventFeedReader: CommandEventFeedReader?,
+)
+
+/**
+ * ops route 全体の依存関係。
+ *
+ * @param runtimeConfig runtime config catalog route の依存関係
+ * @param risk risk 操作用 route の依存関係
+ * @param auth CLI auth route の依存関係
+ * @param feed feed 取得 route の依存関係
+ * @param clock 既定時刻と cursor 検証に使う clock
+ */
+internal data class OpsRouteDependencies(
+    val runtimeConfig: OpsRuntimeConfigRouteDependencies,
+    val risk: OpsRiskRouteDependencies,
+    val auth: OpsAuthRouteDependencies,
+    val feed: OpsFeedRouteDependencies,
+    val clock: Clock = Clock.systemUTC(),
+)
+
+/**
  * 運用系 route を定義する。
  */
-@Suppress("LongMethod", "CyclomaticComplexMethod", "LongParameterList")
 @OptIn(ExperimentalKtorApi::class)
-internal fun Route.opsRoutes(
-    riskStateRepository: RiskStateRepository?,
-    riskStateCommandService: RiskStateCommandService?,
-    manualLlmLaunchService: ManualLlmLaunchService?,
-    llmAuthService: LlmAuthService?,
-    decisionRepository: DecisionRepository?,
-    paperLedgerRepository: PaperLedgerRepository?,
-    commandEventFeedReader: CommandEventFeedReader?,
-    tradingConfig: TradingBotConfig,
-    runtimeConfigEnvironment: Map<String, String>,
-    clock: Clock = Clock.systemUTC(),
-) {
+internal fun Route.opsRoutes(dependencies: OpsRouteDependencies) {
+    registerOpsRuntimeConfigRoute(dependencies)
+    registerOpsHaltRoute(dependencies)
+    registerOpsResumeRoute(dependencies)
+    registerOpsRiskStateRoute(dependencies)
+    registerOpsTriggerRoute(dependencies)
+    registerOpsLlmAuthRoutes(dependencies)
+    registerOpsAccountRoute(dependencies)
+    registerOpsDecisionsRoute(dependencies)
+    registerOpsExecutionsRoute(dependencies)
+    registerOpsActivityRoute(dependencies)
+    registerOpsPositionsRoute(dependencies)
+    registerOpsAuditRoute(dependencies)
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependencies) {
     get("/ops/runtime-config") {
-        call.respond(RuntimeConfigCatalog.snapshot(tradingConfig, runtimeConfigEnvironment))
+        call.respond(
+            RuntimeConfigCatalog.snapshot(
+                config = dependencies.runtimeConfig.tradingConfig,
+                environment = dependencies.runtimeConfig.environment,
+            ),
+        )
     }.describe {
         summary = "runtime config catalog を取得する"
         description = "code-owned catalog から read-only の実効 runtime config を返します。secret は設定有無だけを返し、値は返しません。"
@@ -535,6 +607,11 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsHaltRoute(dependencies: OpsRouteDependencies) {
+    val riskStateCommandService = dependencies.risk.riskStateCommandService
 
     post("/ops/halt") {
         val request = call.receiveBodyOrBadRequest<OpsHaltRequest>() ?: return@post
@@ -575,6 +652,11 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsResumeRoute(dependencies: OpsRouteDependencies) {
+    val riskStateCommandService = dependencies.risk.riskStateCommandService
 
     post("/ops/resume") {
         val request = call.receiveBodyOrBadRequest<OpsResumeRequest>() ?: return@post
@@ -607,6 +689,11 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsRiskStateRoute(dependencies: OpsRouteDependencies) {
+    val riskStateRepository = dependencies.risk.riskStateRepository
 
     get("/ops/risk-state") {
         val repository = call.requireRiskStateRepository(riskStateRepository) ?: return@get
@@ -628,6 +715,11 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsTriggerRoute(dependencies: OpsRouteDependencies) {
+    val manualLlmLaunchService = dependencies.risk.manualLlmLaunchService
 
     post("/ops/trigger") {
         val request = call.receiveBodyOrBadRequest<OpsTriggerRequest>() ?: return@post
@@ -676,7 +768,20 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
 
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsLlmAuthRoutes(dependencies: OpsRouteDependencies) {
+    val llmAuthService = dependencies.auth.llmAuthService
+
+    registerOpsLlmAuthStatusRoute(llmAuthService)
+    registerOpsLlmAuthLoginStartRoute(llmAuthService)
+    registerOpsLlmAuthLoginSessionRoute(llmAuthService)
+    registerOpsLlmAuthTokenSubmitRoute(llmAuthService)
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsLlmAuthStatusRoute(llmAuthService: LlmAuthService?) {
     get("/ops/llm-auth") {
         val service = call.requireLlmAuthService(llmAuthService) ?: return@get
         val snapshot = service.snapshot().getOrThrow()
@@ -697,7 +802,10 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
 
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsLlmAuthLoginStartRoute(llmAuthService: LlmAuthService?) {
     post("/ops/llm-auth/{provider}/login") {
         val provider = call.requireLlmAuthProvider(call.parameters["provider"]) ?: return@post
         val request = call.receiveBodyOrBadRequest<OpsLlmAuthLoginRequest>() ?: return@post
@@ -749,7 +857,10 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
 
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsLlmAuthLoginSessionRoute(llmAuthService: LlmAuthService?) {
     get("/ops/llm-auth/{provider}/login/{sessionId}") {
         val provider = call.requireLlmAuthProvider(call.parameters["provider"]) ?: return@get
         val sessionId = call.requirePathValue(call.parameters["sessionId"], "sessionId is required") ?: return@get
@@ -796,7 +907,10 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
 
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsLlmAuthTokenSubmitRoute(llmAuthService: LlmAuthService?) {
     post("/ops/llm-auth/{provider}/login/{sessionId}/token") {
         val provider = call.requireLlmAuthProvider(call.parameters["provider"]) ?: return@post
         val sessionId = call.requirePathValue(call.parameters["sessionId"], "sessionId is required") ?: return@post
@@ -857,6 +971,11 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsAccountRoute(dependencies: OpsRouteDependencies) {
+    val paperLedgerRepository = dependencies.feed.paperLedgerRepository
 
     get("/ops/account") {
         val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
@@ -878,6 +997,12 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsDecisionsRoute(dependencies: OpsRouteDependencies) {
+    val decisionRepository = dependencies.feed.decisionRepository
+    val clock = dependencies.clock
 
     get("/ops/decisions") {
         val limit = call.requireLimit(
@@ -917,6 +1042,11 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsExecutionsRoute(dependencies: OpsRouteDependencies) {
+    val paperLedgerRepository = dependencies.feed.paperLedgerRepository
 
     get("/ops/executions") {
         val limit = call.requireLimit(
@@ -956,76 +1086,12 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
 
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsActivityRoute(dependencies: OpsRouteDependencies) {
     get("/ops/activity") {
-        val limit = call.requireLimit(
-            defaultLimit = DEFAULT_ACTIVITY_LIMIT,
-            maxLimit = MAX_ACTIVITY_LIMIT,
-        ) ?: return@get
-        val cursor = call.requireBeforeCursor(clock) ?: return@get
-        val sourceParameter = call.request.queryParameters["source"]?.trim()
-        val source = if (sourceParameter.isNullOrEmpty()) {
-            null
-        } else {
-            call.requireActivitySource(sourceParameter) ?: return@get
-        }
-        val auditEventTypes = call.requireAuditEventTypes() ?: return@get
-        val fetchLimit = limit + 1
-        val events = mutableListOf<OpsActivityEventResponse>()
-
-        if (source.matchesActivitySource(OpsActivitySource.DECISION)) {
-            val repository = call.requireDecisionRepository(decisionRepository) ?: return@get
-            val decisions = repository.findDecisionsForStableFeed(
-                cursor = cursor.toStableFeedCursor(OpsActivitySource.DECISION),
-                limit = fetchLimit,
-            ).getOrThrow()
-
-            events += decisions.map { record -> record.toOpsActivityEventResponse() }
-        }
-
-        if (source.matchesActivitySource(OpsActivitySource.AUDIT)) {
-            val reader = call.requireCommandEventFeedReader(commandEventFeedReader) ?: return@get
-            val excludeEventTypes = if (auditEventTypes.isEmpty()) {
-                DEFAULT_ACTIVITY_EXCLUDED_AUDIT_EVENT_TYPES
-            } else {
-                emptySet()
-            }
-            val auditEventTypesFilter = auditEventTypes.takeIf { eventTypes -> eventTypes.isNotEmpty() }
-            val auditEvents = reader.findEventsForStableFeed(
-                cursor = cursor.toStableFeedCursor(OpsActivitySource.AUDIT),
-                limit = fetchLimit,
-                eventTypes = auditEventTypesFilter,
-                excludeEventTypes = excludeEventTypes,
-            ).getOrThrow()
-
-            events += auditEvents.map { event -> event.toOpsActivityEventResponse() }
-        }
-
-        if (source.matchesActivitySource(OpsActivitySource.EXECUTION)) {
-            val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
-            val executions = repository.findExecutionsForStableFeed(
-                cursor = cursor.toStableFeedCursor(OpsActivitySource.EXECUTION),
-                limit = fetchLimit,
-            ).getOrThrow()
-
-            events += executions.map { execution -> execution.toOpsActivityEventResponse() }
-        }
-
-        val sortedEvents = newestFirstOpsActivityEvents(events).filter { event -> event.isOlderThan(cursor) }
-        val pageEvents = sortedEvents.take(limit)
-        val nextBefore = if (sortedEvents.size > limit) {
-            pageEvents.lastOrNull()?.toActivityCursorValue()
-        } else {
-            null
-        }
-
-        call.respond(
-            OpsActivityResponse(
-                events = pageEvents,
-                nextBefore = nextBefore,
-                limit = limit,
-            ),
-        )
+        call.respondOpsActivity(dependencies)
     }.describe {
         summary = "Activity timeline を取得する"
         description = "decision、audit、paper execution を backend で統合し、cursor paging と source / audit eventType filter を適用して新しい順で返します。" +
@@ -1066,6 +1132,11 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsPositionsRoute(dependencies: OpsRouteDependencies) {
+    val paperLedgerRepository = dependencies.feed.paperLedgerRepository
 
     get("/ops/positions") {
         val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
@@ -1093,6 +1164,11 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerOpsAuditRoute(dependencies: OpsRouteDependencies) {
+    val commandEventFeedReader = dependencies.feed.commandEventFeedReader
 
     get("/ops/audit") {
         val limit = call.requireLimit(
@@ -1149,6 +1225,138 @@ internal fun Route.opsRoutes(
             }
         }
     }
+}
+
+private suspend fun ApplicationCall.respondOpsActivity(dependencies: OpsRouteDependencies) {
+    val activityRequest = requireOpsActivityRequest(dependencies.clock) ?: return
+    val events = collectOpsActivityEvents(
+        activityRequest = activityRequest,
+        dependencies = dependencies,
+    ) ?: return
+    val sortedEvents = newestFirstOpsActivityEvents(events)
+        .filter { event -> event.isOlderThan(activityRequest.cursor) }
+    val pageEvents = sortedEvents.take(activityRequest.limit)
+    val nextBefore = if (sortedEvents.size > activityRequest.limit) {
+        pageEvents.lastOrNull()?.toActivityCursorValue()
+    } else {
+        null
+    }
+
+    respond(
+        OpsActivityResponse(
+            events = pageEvents,
+            nextBefore = nextBefore,
+            limit = activityRequest.limit,
+        ),
+    )
+}
+
+private suspend fun ApplicationCall.requireOpsActivityRequest(clock: Clock): OpsActivityRequest? {
+    val limit = requireLimit(
+        defaultLimit = DEFAULT_ACTIVITY_LIMIT,
+        maxLimit = MAX_ACTIVITY_LIMIT,
+    ) ?: return null
+    val cursor = requireBeforeCursor(clock) ?: return null
+    val sourceParameter = request.queryParameters["source"]?.trim()
+    val source = if (sourceParameter.isNullOrEmpty()) {
+        null
+    } else {
+        requireActivitySource(sourceParameter) ?: return null
+    }
+    val auditEventTypes = requireAuditEventTypes() ?: return null
+
+    return OpsActivityRequest(
+        limit = limit,
+        cursor = cursor,
+        source = source,
+        auditEventTypes = auditEventTypes,
+    )
+}
+
+private suspend fun ApplicationCall.collectOpsActivityEvents(
+    activityRequest: OpsActivityRequest,
+    dependencies: OpsRouteDependencies,
+): List<OpsActivityEventResponse>? {
+    val events = mutableListOf<OpsActivityEventResponse>()
+
+    if (activityRequest.source.matchesActivitySource(OpsActivitySource.DECISION)) {
+        events += fetchDecisionActivityEvents(activityRequest, dependencies.feed.decisionRepository) ?: return null
+    }
+
+    if (activityRequest.source.matchesActivitySource(OpsActivitySource.AUDIT)) {
+        events += fetchAuditActivityEvents(activityRequest, dependencies.feed.commandEventFeedReader) ?: return null
+    }
+
+    if (activityRequest.source.matchesActivitySource(OpsActivitySource.EXECUTION)) {
+        events += fetchExecutionActivityEvents(activityRequest, dependencies.feed.paperLedgerRepository) ?: return null
+    }
+
+    return events
+}
+
+private suspend fun ApplicationCall.fetchDecisionActivityEvents(
+    activityRequest: OpsActivityRequest,
+    decisionRepository: DecisionRepository?,
+): List<OpsActivityEventResponse>? {
+    val repository = requireDecisionRepository(decisionRepository) ?: return null
+    val decisions = repository.findDecisionsForStableFeed(
+        cursor = activityRequest.cursor.toStableFeedCursor(OpsActivitySource.DECISION),
+        limit = activityRequest.fetchLimit,
+    ).getOrThrow()
+
+    return decisions.map { record -> record.toOpsActivityEventResponse() }
+}
+
+private suspend fun ApplicationCall.fetchAuditActivityEvents(
+    activityRequest: OpsActivityRequest,
+    commandEventFeedReader: CommandEventFeedReader?,
+): List<OpsActivityEventResponse>? {
+    val reader = requireCommandEventFeedReader(commandEventFeedReader) ?: return null
+    val excludeEventTypes = if (activityRequest.auditEventTypes.isEmpty()) {
+        DEFAULT_ACTIVITY_EXCLUDED_AUDIT_EVENT_TYPES
+    } else {
+        emptySet()
+    }
+    val auditEventTypesFilter = activityRequest.auditEventTypes
+        .takeIf { eventTypes -> eventTypes.isNotEmpty() }
+    val auditEvents = reader.findEventsForStableFeed(
+        cursor = activityRequest.cursor.toStableFeedCursor(OpsActivitySource.AUDIT),
+        limit = activityRequest.fetchLimit,
+        eventTypes = auditEventTypesFilter,
+        excludeEventTypes = excludeEventTypes,
+    ).getOrThrow()
+
+    return auditEvents.map { event -> event.toOpsActivityEventResponse() }
+}
+
+private suspend fun ApplicationCall.fetchExecutionActivityEvents(
+    activityRequest: OpsActivityRequest,
+    paperLedgerRepository: PaperLedgerRepository?,
+): List<OpsActivityEventResponse>? {
+    val repository = requirePaperLedgerRepository(paperLedgerRepository) ?: return null
+    val executions = repository.findExecutionsForStableFeed(
+        cursor = activityRequest.cursor.toStableFeedCursor(OpsActivitySource.EXECUTION),
+        limit = activityRequest.fetchLimit,
+    ).getOrThrow()
+
+    return executions.map { execution -> execution.toOpsActivityEventResponse() }
+}
+
+/**
+ * Activity timeline request の解釈済み入力。
+ *
+ * @param limit 応答に含める最大件数
+ * @param cursor before cursor
+ * @param source 絞り込み対象 source
+ * @param auditEventTypes audit event_type の許可リスト
+ */
+private data class OpsActivityRequest(
+    val limit: Int,
+    val cursor: OpsActivityCursor,
+    val source: OpsActivitySource?,
+    val auditEventTypes: Set<CommandEventType>,
+) {
+    val fetchLimit: Int = limit + 1
 }
 
 private suspend inline fun <reified T : Any> ApplicationCall.receiveBodyOrBadRequest(): T? {

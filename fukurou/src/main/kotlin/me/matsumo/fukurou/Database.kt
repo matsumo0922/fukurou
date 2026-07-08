@@ -55,7 +55,9 @@ data class DatabaseConfig(
             val user = System.getenv(DB_USER_ENV)
             val password = System.getenv(DB_PASSWORD_ENV)
 
-            if (url.isNullOrBlank() || user.isNullOrBlank() || password.isNullOrBlank()) {
+            val hasMissingDatabaseConfig = listOf(url, user, password).any { value -> value.isNullOrBlank() }
+
+            if (hasMissingDatabaseConfig) {
                 return null
             }
 

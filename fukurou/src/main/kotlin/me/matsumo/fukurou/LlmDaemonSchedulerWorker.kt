@@ -175,12 +175,14 @@ private fun createLlmDaemonScheduler(
 ): LlmDaemonScheduler {
     val requestBase = oneShotRequestFromEnvironment(environment)
     val components = createLlmLaunchRuntimeComponents(
-        dataSource = dataSource,
-        database = database,
-        clock = clock,
-        environment = environment,
-        tradingConfig = tradingConfig,
-        requestBase = requestBase,
+        inputs = LlmLaunchRuntimeInputs(
+            dataSource = dataSource,
+            database = database,
+            clock = clock,
+            environment = environment,
+            tradingConfig = tradingConfig,
+            requestBase = requestBase,
+        ),
     )
 
     return LlmDaemonScheduler(
@@ -209,12 +211,14 @@ internal fun createManualLlmLaunchService(
 ): DefaultManualLlmLaunchService? {
     val requestBase = oneShotRequestFromRequiredEnvironment(environment) ?: return null
     val components = createLlmLaunchRuntimeComponents(
-        dataSource = dataSource,
-        database = database,
-        clock = clock,
-        environment = environment,
-        tradingConfig = tradingConfig,
-        requestBase = requestBase,
+        inputs = LlmLaunchRuntimeInputs(
+            dataSource = dataSource,
+            database = database,
+            clock = clock,
+            environment = environment,
+            tradingConfig = tradingConfig,
+            requestBase = requestBase,
+        ),
     )
 
     return DefaultManualLlmLaunchService(
@@ -229,43 +233,36 @@ internal fun createManualLlmLaunchService(
     )
 }
 
-private fun createLlmLaunchRuntimeComponents(
-    dataSource: HikariDataSource,
-    database: ExposedDatabase,
-    clock: Clock,
-    environment: Map<String, String>,
-    tradingConfig: TradingBotConfig,
-    requestBase: OneShotRunnerRequest,
-): LlmLaunchRuntimeComponents {
+private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): LlmLaunchRuntimeComponents {
     val marketDataSource = GmoPublicMarketDataSource.fromConfig(
-        config = tradingConfig.gmoPublicClient,
-        clock = clock,
+        config = inputs.tradingConfig.gmoPublicClient,
+        clock = inputs.clock,
     )
     val tradingRuntime = TradingRuntimeFactory.connectedPostgres(
-        dataSource = dataSource,
-        database = database,
-        clock = clock,
+        dataSource = inputs.dataSource,
+        database = inputs.database,
+        clock = inputs.clock,
         marketDataSource = marketDataSource,
-        tradingConfig = tradingConfig,
+        tradingConfig = inputs.tradingConfig,
     )
     val runner = OneShotLlmRunner(
         tradingRuntime = tradingRuntime,
-        tradingConfig = tradingConfig,
+        tradingConfig = inputs.tradingConfig,
         llmInvoker = ShellLlmInvoker(
             commandRenderer = DefaultLlmCommandRenderer(
-                config = LlmCommandRendererConfig.fromEnvironment(environment),
+                config = LlmCommandRendererConfig.fromEnvironment(inputs.environment),
             ),
             processRunner = ShellProcessRunner(),
         ),
-        parentEnvironment = environment,
-        clock = clock,
+        parentEnvironment = inputs.environment,
+        clock = inputs.clock,
     )
 
     return LlmLaunchRuntimeComponents(
         tradingRuntime = tradingRuntime,
         marketDataSource = marketDataSource,
-        launchReservationRepository = ExposedLlmLaunchReservationRepository(database),
-        requestBase = requestBase,
+        launchReservationRepository = ExposedLlmLaunchReservationRepository(inputs.database),
+        requestBase = inputs.requestBase,
         launchOneShot = runner.asDaemonLauncher(),
     )
 }
@@ -340,6 +337,25 @@ private fun Map<String, String>.requiredPath(name: String): Path? {
 private fun Map<String, String>.requiredString(name: String): String? {
     return this[name]?.trim()?.takeIf { value -> value.isNotEmpty() }
 }
+
+/**
+ * LLM 起動 runtime component の構築入力。
+ *
+ * @param dataSource PostgreSQL data source
+ * @param database Exposed database
+ * @param clock scheduler と runner に渡す clock
+ * @param environment runner / invoker 用 environment
+ * @param tradingConfig 取引 bot 全体の typed config
+ * @param requestBase one-shot runner の固定 request
+ */
+private data class LlmLaunchRuntimeInputs(
+    val dataSource: HikariDataSource,
+    val database: ExposedDatabase,
+    val clock: Clock,
+    val environment: Map<String, String>,
+    val tradingConfig: TradingBotConfig,
+    val requestBase: OneShotRunnerRequest,
+)
 
 /**
  * LLM 起動に必要な runtime component 群。
