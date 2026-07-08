@@ -285,6 +285,23 @@ data class GmoCoinKlineRequest(
 )
 
 /**
+ * calc_indicator tool の登録と実行に使う依存関係。
+ *
+ * @param marketDataSource 市場データ取得元
+ * @param toolExecutor market tool の実行境界
+ * @param indicatorCalculator indicator 計算境界
+ * @param klineRequestBudgetHook kline 取得を伴う tool 呼び出しの予算 hook
+ * @param clock response 鮮度 metadata を作る clock
+ */
+private data class GmoCoinCalcIndicatorToolDependencies(
+    val marketDataSource: MarketDataSource,
+    val toolExecutor: GmoCoinMarketToolExecutor,
+    val indicatorCalculator: GmoCoinIndicatorCalculator,
+    val klineRequestBudgetHook: GmoCoinKlineRequestBudgetHook,
+    val clock: Clock,
+)
+
+/**
  * GMO Coin market tools を任意の MCP server に登録する。
  *
  * @param marketDataSource 市場データ取得元
@@ -326,12 +343,13 @@ fun Server.registerGmoCoinMarketTools(
     )
     registerSymbolRulesTool(marketDataSource, toolExecutor)
     registerCalcIndicatorTool(
-        marketDataSource = marketDataSource,
-        toolExecutor = toolExecutor,
-        indicatorCalculator = indicatorCalculator,
-        klineRequestBudgetHook = klineRequestBudgetHook,
-        dailyKlineRequestLimit = dailyKlineRequestLimit,
-        clock = clock,
+        dependencies = GmoCoinCalcIndicatorToolDependencies(
+            marketDataSource = marketDataSource,
+            toolExecutor = toolExecutor,
+            indicatorCalculator = indicatorCalculator,
+            klineRequestBudgetHook = klineRequestBudgetHook,
+            clock = clock,
+        ),
     )
 }
 
@@ -479,14 +497,9 @@ private fun Server.registerSymbolRulesTool(
     }
 }
 
-private fun Server.registerCalcIndicatorTool(
-    marketDataSource: MarketDataSource,
-    toolExecutor: GmoCoinMarketToolExecutor,
-    indicatorCalculator: GmoCoinIndicatorCalculator,
-    klineRequestBudgetHook: GmoCoinKlineRequestBudgetHook,
-    dailyKlineRequestLimit: Int?,
-    clock: Clock,
-) {
+private fun Server.registerCalcIndicatorTool(dependencies: GmoCoinCalcIndicatorToolDependencies) {
+    val dailyKlineRequestLimit = dependencies.klineRequestBudgetHook.dailyKlineRequestLimit
+
     addTool(
         name = CALC_INDICATOR_TOOL,
         description = indicatorDescription(dailyKlineRequestLimit),
@@ -510,11 +523,7 @@ private fun Server.registerCalcIndicatorTool(
     ) { request ->
         handleCalcIndicator(
             request = request,
-            marketDataSource = marketDataSource,
-            toolExecutor = toolExecutor,
-            indicatorCalculator = indicatorCalculator,
-            klineRequestBudgetHook = klineRequestBudgetHook,
-            clock = clock,
+            dependencies = dependencies,
         )
     }
 }
@@ -622,19 +631,17 @@ private suspend fun handleGetSymbolRules(
 
 private suspend fun handleCalcIndicator(
     request: CallToolRequest,
-    marketDataSource: MarketDataSource,
-    toolExecutor: GmoCoinMarketToolExecutor,
-    indicatorCalculator: GmoCoinIndicatorCalculator,
-    klineRequestBudgetHook: GmoCoinKlineRequestBudgetHook,
-    clock: Clock,
+    dependencies: GmoCoinCalcIndicatorToolDependencies,
 ): CallToolResult {
-    val indicator = toolExecutor.execute(CALC_INDICATOR_TOOL, request) {
+    val indicator = dependencies.toolExecutor.execute(CALC_INDICATOR_TOOL, request) {
         val symbol = parseTradingSymbol(request.arguments?.get("symbol")?.jsonPrimitive?.contentOrNull).getOrThrow()
         val interval = parseCandleInterval(request.arguments?.get("interval")?.jsonPrimitive?.contentOrNull).getOrThrow()
         val indicatorType = parseIndicatorType(request.arguments?.get("indicator")?.jsonPrimitive?.contentOrNull).getOrThrow()
         val params = parseIndicatorParams(request).getOrThrow()
         val requestedLimit = parseIndicatorCandleLimit(request).getOrThrow()
-        val requiredCandleCount = indicatorCalculator.requiredCandleCount(indicatorType, params).getOrThrow()
+        val requiredCandleCount = dependencies.indicatorCalculator
+            .requiredCandleCount(indicatorType, params)
+            .getOrThrow()
         val limit = resolveIndicatorCandleLimit(requestedLimit, requiredCandleCount).getOrThrow()
         val klineRequest = GmoCoinKlineRequest(
             toolName = CALC_INDICATOR_TOOL,
@@ -642,10 +649,10 @@ private suspend fun handleCalcIndicator(
             limit = limit,
         )
 
-        klineRequestBudgetHook.check(klineRequest).getOrThrow()
+        dependencies.klineRequestBudgetHook.check(klineRequest).getOrThrow()
 
-        val candles = marketDataSource.getCandles(symbol, interval, limit).getOrThrow()
-        val result = indicatorCalculator.calculate(candles, indicatorType, params).getOrThrow()
+        val candles = dependencies.marketDataSource.getCandles(symbol, interval, limit).getOrThrow()
+        val result = dependencies.indicatorCalculator.calculate(candles, indicatorType, params).getOrThrow()
 
         IndicatorToolOutput(
             symbol = symbol.apiSymbol,
@@ -658,7 +665,7 @@ private suspend fun handleCalcIndicator(
             ),
             result = result,
             freshness = marketFreshness(
-                clock = clock,
+                clock = dependencies.clock,
                 sourceTimestamp = finalCandleSourceTimestamp(candles),
                 staleAfter = FreshnessDefaults.candleStaleAfter(interval),
             ),
@@ -667,7 +674,7 @@ private suspend fun handleCalcIndicator(
 
     return indicator.fold(
         onSuccess = { value -> indicatorResult(value) },
-        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+        onFailure = { throwable -> throwableResult(throwable, dependencies.toolExecutor) },
     )
 }
 
