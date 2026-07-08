@@ -32,6 +32,5 @@
     <ID>TooManyFunctions:InMemoryPaperLedgerRepository.kt$InMemoryPaperLedgerRepository : PaperLedgerRepository</ID>
     <ID>TooManyFunctions:PaperBroker.kt$PaperBroker : Broker</ID>
     <ID>TooManyFunctions:PaperLedgerRepository.kt$PaperLedgerRepository</ID>
-    <ID>TooManyFunctions:TradingPersistenceBootstrap.kt$me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap.kt</ID>
   </CurrentIssues>
 </SmellBaseline>

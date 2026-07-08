@@ -656,16 +656,15 @@ class TradingPersistenceBootstrap(
                     TradeIntentConsumptionsTable,
                     withLogs = false,
                 )
-                ensureCommandEventLogIndexes()
-                ensureOrderIndexes()
-                ensureLlmLaunchReservationIndexes()
-                ensureLlmRunIndexes()
-                ensureEquitySnapshotIndexes()
-                backfillOpenPositionLowestPrice()
+                ensureRuntimeSchemaObjects()
                 val now = Instant.now(clock)
 
                 ensureRiskStateRow(now, paperAccountConfig.initialCashJpy)
-                backfillRiskStateHardHalt()
+                jdbcConnection().prepareStatement(BACKFILL_RISK_STATE_HARD_HALT_SQL).use { statement ->
+                    statement.setString(1, RiskHaltState.HARD_HALT.name)
+                    statement.setString(2, RiskHaltState.RUNNING.name)
+                    statement.executeUpdate()
+                }
                 ensurePaperAccountRow(now, paperAccountConfig)
                 ensureRiskStateEquityPeak(now, paperAccountConfig.initialCashJpy)
                 ensureBootstrapEquitySnapshot(now)
@@ -679,21 +678,7 @@ class TradingPersistenceBootstrap(
     fun verifySchema(): Result<Unit> {
         return runCatching {
             exposedTransaction(database) {
-                verifyRiskStateSchema()
-                verifyCommandEventLogSchema()
-                verifyPaperAccountSchema()
-                verifyLlmRunsSchema()
-                verifyEquitySnapshotsSchema()
-                verifyPositionsSchema()
-                verifyOrdersSchema()
-                verifyLlmLaunchReservationsSchema()
-                verifyExecutionsSchema()
-                verifySafetyViolationsSchema()
-                verifyDecisionsSchema()
-                verifyTradePlansSchema()
-                verifyTradeIntentsSchema()
-                verifyFalsificationsSchema()
-                verifyTradeIntentConsumptionsSchema()
+                verifyRuntimeSchemaObjects()
                 selectRiskState(forUpdate = false)
                 selectPaperAccount()
             }
@@ -702,88 +687,40 @@ class TradingPersistenceBootstrap(
 }
 
 /**
- * rollback 用 hard_halt から state を補正する。
+ * runtime schema の補助 index / backfill を適用する。
  */
-internal fun JdbcTransaction.backfillRiskStateHardHalt() {
-    jdbcConnection().prepareStatement(BACKFILL_RISK_STATE_HARD_HALT_SQL).use { statement ->
-        statement.setString(1, RiskHaltState.HARD_HALT.name)
-        statement.setString(2, RiskHaltState.RUNNING.name)
-        statement.executeUpdate()
-    }
-}
-
-/**
- * risk_state schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyRiskStateSchema() {
-    verifySchemaBySql(
-        sql = VERIFY_RISK_STATE_SCHEMA_SQL,
-        missingMessage = "risk_state schema was not initialized.",
-    )
-}
-
-/**
- * command_event_log schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyCommandEventLogSchema() {
-    verifySchemaBySql(
-        sql = VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL,
-        missingMessage = "command_event_log schema was not initialized.",
-    )
-    verifyCommandEventLogIndexes()
-}
-
-/**
- * command_event_log の集計 index がなければ作成する。
- */
-internal fun JdbcTransaction.ensureCommandEventLogIndexes() {
+private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL)
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)
-}
-
-/**
- * orders の追加 index がなければ作成する。
- */
-internal fun JdbcTransaction.ensureOrderIndexes() {
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
-}
-
-/**
- * LLM 起動予約 index がなければ作成する。
- */
-internal fun JdbcTransaction.ensureLlmLaunchReservationIndexes() {
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
-}
-
-/**
- * llm_runs の追加 index がなければ作成する。
- */
-internal fun JdbcTransaction.ensureLlmRunIndexes() {
     executeUpdate(ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL)
-}
-
-/**
- * equity_snapshots の追加 index がなければ作成する。
- */
-internal fun JdbcTransaction.ensureEquitySnapshotIndexes() {
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_CAPTURED_AT_INDEX_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_DAILY_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_BOOTSTRAP_UNIQUE_INDEX_SQL)
-}
-
-/**
- * 既存 OPEN position に lowest watermark がなければ backfill する。
- */
-internal fun JdbcTransaction.backfillOpenPositionLowestPrice() {
     executeUpdate(BACKFILL_OPEN_POSITION_LOWEST_PRICE_SQL)
 }
 
 /**
- * command_event_log の集計 index が存在することを確認する。
+ * runtime schema と補助 index が存在することを確認する。
  */
-internal fun JdbcTransaction.verifyCommandEventLogIndexes() {
+private fun JdbcTransaction.verifyRuntimeSchemaObjects() {
+    verifyAccountRuntimeSchemaObjects()
+    verifyLedgerRuntimeSchemaObjects()
+    verifyDecisionRuntimeSchemaObjects()
+}
+
+private fun JdbcTransaction.verifyAccountRuntimeSchemaObjects() {
+    verifySchemaBySql(
+        sql = VERIFY_RISK_STATE_SCHEMA_SQL,
+        missingMessage = "risk_state schema was not initialized.",
+    )
+    verifySchemaBySql(
+        sql = VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL,
+        missingMessage = "command_event_log schema was not initialized.",
+    )
     verifyExistsBySql(
         sql = VERIFY_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL,
         missingMessage = "command_event_log ts/decision_run_id index was not initialized.",
@@ -792,22 +729,10 @@ internal fun JdbcTransaction.verifyCommandEventLogIndexes() {
         sql = VERIFY_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL,
         missingMessage = "command_event_log run/event/tool index was not initialized.",
     )
-}
-
-/**
- * paper_account schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyPaperAccountSchema() {
     verifySchemaBySql(
         sql = VERIFY_PAPER_ACCOUNT_SCHEMA_SQL,
         missingMessage = "paper_account schema was not initialized.",
     )
-}
-
-/**
- * llm_runs schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyLlmRunsSchema() {
     verifySchemaBySql(
         sql = VERIFY_LLM_RUNS_SCHEMA_SQL,
         missingMessage = "llm_runs schema was not initialized.",
@@ -816,12 +741,6 @@ internal fun JdbcTransaction.verifyLlmRunsSchema() {
         sql = VERIFY_LLM_RUNS_INDEX_COUNT_SQL,
         missingMessage = "llm_runs indexes were not initialized.",
     )
-}
-
-/**
- * equity_snapshots schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyEquitySnapshotsSchema() {
     verifySchemaBySql(
         sql = VERIFY_EQUITY_SNAPSHOTS_SCHEMA_SQL,
         missingMessage = "equity_snapshots schema was not initialized.",
@@ -832,20 +751,11 @@ internal fun JdbcTransaction.verifyEquitySnapshotsSchema() {
     )
 }
 
-/**
- * positions schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyPositionsSchema() {
+private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
     verifySchemaBySql(
         sql = VERIFY_POSITIONS_SCHEMA_SQL,
         missingMessage = "positions schema was not initialized.",
     )
-}
-
-/**
- * orders schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyOrdersSchema() {
     verifySchemaBySql(
         sql = VERIFY_ORDERS_SCHEMA_SQL,
         missingMessage = "orders schema was not initialized.",
@@ -854,12 +764,6 @@ internal fun JdbcTransaction.verifyOrdersSchema() {
         sql = VERIFY_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL,
         missingMessage = "orders client_request_id unique index was not initialized.",
     )
-}
-
-/**
- * llm_launch_reservations schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyLlmLaunchReservationsSchema() {
     verifySchemaBySql(
         sql = VERIFY_LLM_LAUNCH_RESERVATIONS_SCHEMA_SQL,
         missingMessage = "llm_launch_reservations schema was not initialized.",
@@ -868,72 +772,33 @@ internal fun JdbcTransaction.verifyLlmLaunchReservationsSchema() {
         sql = VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL,
         missingMessage = "llm_launch_reservations indexes were not initialized.",
     )
-}
-
-/**
- * executions schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyExecutionsSchema() {
     verifySchemaBySql(
         sql = VERIFY_EXECUTIONS_SCHEMA_SQL,
         missingMessage = "executions schema was not initialized.",
     )
-}
-
-/**
- * safety_violations schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifySafetyViolationsSchema() {
     verifySchemaBySql(
         sql = VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL,
         missingMessage = "safety_violations schema was not initialized.",
     )
 }
 
-/**
- * decisions schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyDecisionsSchema() {
+private fun JdbcTransaction.verifyDecisionRuntimeSchemaObjects() {
     verifySchemaBySql(
         sql = VERIFY_DECISIONS_SCHEMA_SQL,
         missingMessage = "decisions schema was not initialized.",
     )
-}
-
-/**
- * trade_plans schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyTradePlansSchema() {
     verifySchemaBySql(
         sql = VERIFY_TRADE_PLANS_SCHEMA_SQL,
         missingMessage = "trade_plans schema was not initialized.",
     )
-}
-
-/**
- * trade_intents schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyTradeIntentsSchema() {
     verifySchemaBySql(
         sql = VERIFY_TRADE_INTENTS_SCHEMA_SQL,
         missingMessage = "trade_intents schema was not initialized.",
     )
-}
-
-/**
- * falsifications schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyFalsificationsSchema() {
     verifySchemaBySql(
         sql = VERIFY_FALSIFICATIONS_SCHEMA_SQL,
         missingMessage = "falsifications schema was not initialized.",
     )
-}
-
-/**
- * trade_intent_consumptions schema が存在することを確認する。
- */
-internal fun JdbcTransaction.verifyTradeIntentConsumptionsSchema() {
     verifySchemaBySql(
         sql = VERIFY_TRADE_INTENT_CONSUMPTIONS_SCHEMA_SQL,
         missingMessage = "trade_intent_consumptions schema was not initialized.",
