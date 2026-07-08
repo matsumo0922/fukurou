@@ -285,7 +285,7 @@ class LlmDaemonSchedulerTest {
     fun transientTickFailureIsAuditedAndNextCycleContinues() = runBlocking {
         var readCount = 0
         val fixture = schedulerFixture(
-            openRiskReader = LlmDaemonOpenRiskReader {
+            openRiskReader = {
                 readCount += 1
 
                 if (readCount == 1) {
@@ -789,7 +789,7 @@ private fun schedulerFixture(
     launches: MutableList<OneShotRunnerRequest> = mutableListOf(),
     idGenerator: () -> UUID = deterministicIds(),
     hasOpenRisk: Boolean = false,
-    openRiskReader: LlmDaemonOpenRiskReader = LlmDaemonOpenRiskReader { Result.success(hasOpenRisk) },
+    openRiskReader: LlmDaemonOpenRiskReader = { Result.success(hasOpenRisk) },
     tickerReader: FakeTickerReader = FakeTickerReader(clock),
     positionsReader: FakePositionsReader = FakePositionsReader(),
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,

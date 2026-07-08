@@ -60,7 +60,7 @@ class ReconcilerFreshnessReadinessProbeTest {
  */
 private fun createProbe(status: MutableReconcilerStatus): ReconcilerFreshnessReadinessProbe {
     return ReconcilerFreshnessReadinessProbe(
-        delegate = ReadinessProbe { true },
+        delegate = { true },
         reconcilerStatusProvider = status,
         clock = Clock.fixed(Instant.parse("2026-07-02T00:00:10Z"), ZoneOffset.UTC),
         staleAfter = Duration.ofSeconds(30),
