@@ -15,6 +15,8 @@ import io.ktor.server.routing.routing
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
+import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -28,6 +30,8 @@ import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
+import me.matsumo.fukurou.trading.persistence.ExposedRuntimeConfigRepository
+import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
@@ -79,17 +83,20 @@ fun Application.module(
     opsPaperLedgerRepository: PaperLedgerRepository? = null,
     opsCommandEventLog: CommandEventLog? = null,
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
-    tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
+    tradingConfig: TradingBotConfig = TradingBotConfig(),
     runtimeConfigEnvironment: Map<String, String> = System.getenv(),
     webRoot: File? = webRootFromEnv(),
 ) {
     val databaseResources = createApplicationDatabaseResources(readinessProbe)
-    val runtime = ApplicationRuntimeResources(
-        readinessProbe = readinessProbe,
-        reconcilerStatus = reconcilerStatus,
-        clock = clock,
-        tradingConfig = tradingConfig,
-        runtimeConfigEnvironment = runtimeConfigEnvironment,
+    val runtime = createApplicationRuntimeResources(
+        databaseResources = databaseResources,
+        inputs = ApplicationRuntimeInputs(
+            readinessProbe = readinessProbe,
+            reconcilerStatus = reconcilerStatus,
+            clock = clock,
+            tradingConfig = tradingConfig,
+            runtimeConfigEnvironment = runtimeConfigEnvironment,
+        ),
     )
     val routeResources = createApplicationRouteResources(
         databaseResources = databaseResources,
@@ -131,6 +138,40 @@ private fun createApplicationDatabaseResources(readinessProbe: ReadinessProbe?):
         environment = System.getenv(),
         dataSource = dataSource,
         database = dataSource?.let { source -> ExposedDatabase.connect(source) },
+    )
+}
+
+private fun createApplicationRuntimeResources(
+    databaseResources: ApplicationDatabaseResources,
+    inputs: ApplicationRuntimeInputs,
+): ApplicationRuntimeResources {
+    val runtimeConfigResolution = databaseResources.database?.let { database ->
+        RuntimeConfigPersistenceBootstrap(
+            database = database,
+            clock = inputs.clock,
+        ).ensureSchema().getOrThrow()
+
+        RuntimeConfigResolver(
+            ExposedRuntimeConfigRepository(database),
+        ).resolve(databaseResources.environment).getOrThrow()
+    }
+    val resolvedTradingConfig = runtimeConfigResolution?.tradingConfig ?: inputs.tradingConfig
+
+    databaseResources.database?.let { database ->
+        TradingPersistenceBootstrap(
+            database = database,
+            clock = inputs.clock,
+            paperAccountConfig = resolvedTradingConfig.paperAccount,
+        ).ensureSchema().getOrThrow()
+    }
+
+    return ApplicationRuntimeResources(
+        readinessProbe = inputs.readinessProbe,
+        reconcilerStatus = inputs.reconcilerStatus,
+        clock = inputs.clock,
+        tradingConfig = resolvedTradingConfig,
+        runtimeConfigEnvironment = runtimeConfigResolution?.catalogEnvironment ?: inputs.runtimeConfigEnvironment,
+        runtimeConfigSnapshot = runtimeConfigResolution?.auditSnapshot,
     )
 }
 
@@ -270,6 +311,7 @@ private fun createDefaultManualLlmLaunchService(
         database = database,
         environment = databaseResources.environment,
         tradingConfig = runtime.tradingConfig,
+        runtimeConfigSnapshot = runtime.runtimeConfigSnapshot,
         clock = runtime.clock,
     )
 }
@@ -351,21 +393,26 @@ private fun startApplicationBackgroundWorkers(
         reconcilerWorker = startProtectionReconcilerWorker(
             dataSource = dataSource,
             database = database,
+            tradingConfig = runtime.tradingConfig,
             status = runtime.reconcilerStatus,
             clock = runtime.clock,
         ),
         llmDaemonWorker = startLlmDaemonSchedulerWorker(
             dataSource = dataSource,
             database = database,
+            tradingConfig = runtime.tradingConfig,
+            runtimeConfigSnapshot = runtime.runtimeConfigSnapshot,
             clock = runtime.clock,
         ),
         obsidianWriterWorker = startObsidianWriterWorker(
             database = database,
+            tradingConfig = runtime.tradingConfig,
             clock = runtime.clock,
             bootstrap = sharedPersistenceBootstrap,
         ),
         reflectionRunnerWorker = startReflectionRunnerWorker(
             database = database,
+            tradingConfig = runtime.tradingConfig,
             clock = runtime.clock,
             bootstrap = sharedPersistenceBootstrap,
         ),
@@ -425,7 +472,7 @@ private fun sharedTradingPersistenceBootstrap(
 }
 
 /**
- * Application.module の runtime 入力。
+ * Application.module が受け取る runtime 入力。
  *
  * @param readinessProbe 外部から注入された readiness probe
  * @param reconcilerStatus ProtectionReconciler の状態 holder
@@ -433,12 +480,31 @@ private fun sharedTradingPersistenceBootstrap(
  * @param tradingConfig 取引 bot 全体の typed config
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  */
+private data class ApplicationRuntimeInputs(
+    val readinessProbe: ReadinessProbe?,
+    val reconcilerStatus: MutableReconcilerStatus,
+    val clock: Clock,
+    val tradingConfig: TradingBotConfig,
+    val runtimeConfigEnvironment: Map<String, String>,
+)
+
+/**
+ * Application.module の解決済み runtime resource。
+ *
+ * @param readinessProbe 外部から注入された readiness probe
+ * @param reconcilerStatus ProtectionReconciler の状態 holder
+ * @param clock worker と route に渡す clock
+ * @param tradingConfig 取引 bot 全体の typed config
+ * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
+ * @param runtimeConfigSnapshot 起動時に解決した runtime config snapshot
+ */
 private data class ApplicationRuntimeResources(
     val readinessProbe: ReadinessProbe?,
     val reconcilerStatus: MutableReconcilerStatus,
     val clock: Clock,
     val tradingConfig: TradingBotConfig,
     val runtimeConfigEnvironment: Map<String, String>,
+    val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
 )
 
 /**

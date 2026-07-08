@@ -11,6 +11,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
@@ -137,10 +138,11 @@ class LlmDaemonSchedulerWorker(
 internal fun startLlmDaemonSchedulerWorker(
     dataSource: HikariDataSource,
     database: ExposedDatabase,
+    tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
+    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     clock: Clock = Clock.systemUTC(),
 ): LlmDaemonSchedulerWorker? {
     val environment = System.getenv()
-    val tradingConfig = TradingBotConfig.fromEnvironment(environment)
 
     if (!tradingConfig.daemon.enabled) {
         return null
@@ -150,11 +152,15 @@ internal fun startLlmDaemonSchedulerWorker(
         schedulerFactory = {
             runCatching {
                 createLlmDaemonScheduler(
-                    dataSource = dataSource,
-                    database = database,
-                    environment = environment,
-                    tradingConfig = tradingConfig,
-                    clock = clock,
+                    inputs = LlmLaunchRuntimeInputs(
+                        dataSource = dataSource,
+                        database = database,
+                        clock = clock,
+                        environment = environment,
+                        tradingConfig = tradingConfig,
+                        runtimeConfigSnapshot = runtimeConfigSnapshot,
+                        requestBase = oneShotRequestFromEnvironment(environment),
+                    ),
                 )
             }
         },
@@ -170,39 +176,26 @@ internal fun startLlmDaemonSchedulerWorker(
     ).start()
 }
 
-private fun createLlmDaemonScheduler(
-    dataSource: HikariDataSource,
-    database: ExposedDatabase,
-    environment: Map<String, String>,
-    tradingConfig: TradingBotConfig,
-    clock: Clock,
-): LlmDaemonScheduler {
-    val requestBase = oneShotRequestFromEnvironment(environment)
+private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonScheduler {
     val components = createLlmLaunchRuntimeComponents(
-        inputs = LlmLaunchRuntimeInputs(
-            dataSource = dataSource,
-            database = database,
-            clock = clock,
-            environment = environment,
-            tradingConfig = tradingConfig,
-            requestBase = requestBase,
-        ),
+        inputs = inputs,
     )
 
     return LlmDaemonScheduler(
-        tradingConfig = tradingConfig,
+        tradingConfig = inputs.tradingConfig,
+        runtimeConfigSnapshot = inputs.runtimeConfigSnapshot,
         dependencies = LlmDaemonSchedulerDependencies(
             riskStateRepository = components.tradingRuntime.riskStateRepository,
             commandEventLog = components.tradingRuntime.commandEventLog,
             launchReservationRepository = components.launchReservationRepository,
             openRiskReader = components.tradingRuntime.openRiskReader(),
-            tickerReader = components.marketDataSource.tickerReader(tradingConfig),
+            tickerReader = components.marketDataSource.tickerReader(inputs.tradingConfig),
             positionsReader = components.tradingRuntime.positionsReader(),
         ),
         runtime = LlmDaemonSchedulerRuntime(
             requestBase = components.requestBase,
             launchOneShot = components.launchOneShot,
-            clock = clock,
+            clock = inputs.clock,
         ),
     )
 }
@@ -215,6 +208,7 @@ internal fun createManualLlmLaunchService(
     database: ExposedDatabase,
     environment: Map<String, String>,
     tradingConfig: TradingBotConfig,
+    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     clock: Clock,
 ): DefaultManualLlmLaunchService? {
     val requestBase = oneShotRequestFromRequiredEnvironment(environment) ?: return null
@@ -225,12 +219,14 @@ internal fun createManualLlmLaunchService(
             clock = clock,
             environment = environment,
             tradingConfig = tradingConfig,
+            runtimeConfigSnapshot = runtimeConfigSnapshot,
             requestBase = requestBase,
         ),
     )
 
     return DefaultManualLlmLaunchService(
         tradingConfig = tradingConfig,
+        runtimeConfigSnapshot = runtimeConfigSnapshot,
         dependencies = ManualLlmLaunchServiceDependencies(
             riskStateRepository = components.tradingRuntime.riskStateRepository,
             commandEventLog = components.tradingRuntime.commandEventLog,
@@ -266,6 +262,7 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
             ),
             processRunner = ShellProcessRunner(),
         ),
+        runtimeConfigSnapshot = inputs.runtimeConfigSnapshot,
         parentEnvironment = inputs.environment,
         clock = inputs.clock,
     )
@@ -358,6 +355,7 @@ private fun Map<String, String>.requiredString(name: String): String? {
  * @param clock scheduler と runner に渡す clock
  * @param environment runner / invoker 用 environment
  * @param tradingConfig 取引 bot 全体の typed config
+ * @param runtimeConfigSnapshot 起動開始時に固定する runtime config snapshot
  * @param requestBase one-shot runner の固定 request
  */
 private data class LlmLaunchRuntimeInputs(
@@ -366,6 +364,7 @@ private data class LlmLaunchRuntimeInputs(
     val clock: Clock,
     val environment: Map<String, String>,
     val tradingConfig: TradingBotConfig,
+    val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
     val requestBase: OneShotRunnerRequest,
 )
 

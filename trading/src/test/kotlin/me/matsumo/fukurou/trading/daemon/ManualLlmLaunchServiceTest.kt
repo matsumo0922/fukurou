@@ -16,6 +16,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
@@ -393,6 +394,23 @@ class ManualLlmLaunchServiceTest {
         assertIs<ManualLlmLaunchResult.Accepted>(result)
         assertEquals(LlmDaemonTriggerKind.MANUAL, fixture.launches.single().triggerKind)
     }
+
+    @Test
+    fun manualLaunch_auditIncludesRuntimeConfigSnapshot() = runBlocking {
+        val runtimeConfigSnapshot = RuntimeConfigAuditSnapshot(
+            versionId = "runtime-version-1",
+            hash = "runtime-hash-1",
+        )
+        val fixture = manualFixture(runtimeConfigSnapshot = runtimeConfigSnapshot)
+
+        val result = fixture.service.launch("operator check").getOrThrow()
+        val launchedEvent = fixture.eventLog.events()
+            .single { event -> event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED }
+
+        assertIs<ManualLlmLaunchResult.Accepted>(result)
+        assertEquals("runtime-version-1", launchedEvent.decisionRunContext.runtimeConfigVersionId)
+        assertEquals("runtime-hash-1", launchedEvent.decisionRunContext.runtimeConfigHash)
+    }
 }
 
 private fun manualFixture(
@@ -406,6 +424,7 @@ private fun manualFixture(
     launches: MutableList<OneShotRunnerRequest> = mutableListOf(),
     idGenerator: () -> UUID = deterministicIds(),
     hasOpenRisk: Boolean = false,
+    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): ManualFixture {
@@ -418,6 +437,7 @@ private fun manualFixture(
         launches = launches,
         idGenerator = idGenerator,
         hasOpenRisk = hasOpenRisk,
+        runtimeConfigSnapshot = runtimeConfigSnapshot,
         scope = scope,
         launchHandler = launchHandler,
     )
@@ -441,11 +461,13 @@ private fun manualService(
     launches: MutableList<OneShotRunnerRequest>,
     idGenerator: () -> UUID,
     hasOpenRisk: Boolean = false,
+    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): DefaultManualLlmLaunchService {
     return DefaultManualLlmLaunchService(
         tradingConfig = tradingConfig,
+        runtimeConfigSnapshot = runtimeConfigSnapshot,
         dependencies = ManualLlmLaunchServiceDependencies(
             riskStateRepository = riskStateRepository,
             commandEventLog = eventLog,

@@ -14,6 +14,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
+import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
@@ -122,11 +123,13 @@ sealed interface LlmDaemonTickResult {
  * Ktor 常駐 process 内で one-shot runner を保守的に起動する daemon scheduler。
  *
  * @param tradingConfig 取引 bot 設定
+ * @param runtimeConfigSnapshot daemon loop 開始時に固定する runtime config snapshot
  * @param dependencies scheduler が参照する repository / reader
  * @param runtime scheduler の実行時境界
  */
 class LlmDaemonScheduler(
     private val tradingConfig: TradingBotConfig,
+    private val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     dependencies: LlmDaemonSchedulerDependencies,
     runtime: LlmDaemonSchedulerRuntime,
 ) {
@@ -624,6 +627,10 @@ class LlmDaemonScheduler(
                     put("pollIntervalSeconds", daemonConfig.pollInterval.seconds)
                     put("flatHeartbeatSeconds", daemonConfig.flatHeartbeatInterval.seconds)
                     put("holdingCheckSeconds", daemonConfig.holdingCheckInterval.seconds)
+                    runtimeConfigSnapshot?.let { snapshot ->
+                        put("runtimeConfigVersionId", snapshot.versionId)
+                        put("runtimeConfigHash", snapshot.hash)
+                    }
                 }.toString(),
                 occurredAt = Instant.now(clock),
             ),
@@ -648,6 +655,10 @@ class LlmDaemonScheduler(
                     put("triggerKey", trigger?.key)
                     put("eventName", trigger?.eventName)
                     put("observedAt", observedAt.toString())
+                    runtimeConfigSnapshot?.let { snapshot ->
+                        put("runtimeConfigVersionId", snapshot.versionId)
+                        put("runtimeConfigHash", snapshot.hash)
+                    }
                 }.toString(),
                 occurredAt = observedAt,
             ),
@@ -661,7 +672,7 @@ class LlmDaemonScheduler(
     ): Result<Unit> {
         return commandEventLog.append(
             CommandEvent(
-                decisionRunContext = daemonDecisionRunContext(invocationId),
+                decisionRunContext = daemonDecisionRunContext(invocationId, runtimeConfigSnapshot),
                 toolName = DAEMON_TOOL_NAME,
                 toolCallId = null,
                 clientRequestId = trigger.key,
@@ -672,6 +683,10 @@ class LlmDaemonScheduler(
                     put("eventName", trigger.eventName)
                     put("invocationId", invocationId)
                     put("observedAt", observedAt.toString())
+                    runtimeConfigSnapshot?.let { snapshot ->
+                        put("runtimeConfigVersionId", snapshot.versionId)
+                        put("runtimeConfigHash", snapshot.hash)
+                    }
                     trigger.details?.let { details ->
                         put("details", details)
                     }
@@ -689,7 +704,7 @@ class LlmDaemonScheduler(
     ): Result<Unit> {
         return commandEventLog.append(
             CommandEvent(
-                decisionRunContext = daemonDecisionRunContext(invocationId),
+                decisionRunContext = daemonDecisionRunContext(invocationId, runtimeConfigSnapshot),
                 toolName = DAEMON_TOOL_NAME,
                 toolCallId = null,
                 clientRequestId = trigger.key,
@@ -701,6 +716,10 @@ class LlmDaemonScheduler(
                     put("invocationId", invocationId)
                     put("status", status)
                     put("finishedAt", finishedAt.toString())
+                    runtimeConfigSnapshot?.let { snapshot ->
+                        put("runtimeConfigVersionId", snapshot.versionId)
+                        put("runtimeConfigHash", snapshot.hash)
+                    }
                 }.toString(),
                 occurredAt = finishedAt,
             ),
@@ -737,6 +756,10 @@ class LlmDaemonScheduler(
                     put("reason", DAEMON_SKIP_TICK_FAILED)
                     put("errorType", throwable.javaClass.simpleName)
                     put("observedAt", observedAt.toString())
+                    runtimeConfigSnapshot?.let { snapshot ->
+                        put("runtimeConfigVersionId", snapshot.versionId)
+                        put("runtimeConfigHash", snapshot.hash)
+                    }
                 }.toString(),
                 occurredAt = observedAt,
             ),
@@ -789,13 +812,18 @@ data class LlmDaemonSchedulerRuntime(
     ),
 )
 
-private fun daemonDecisionRunContext(invocationId: String): DecisionRunContext {
+private fun daemonDecisionRunContext(
+    invocationId: String,
+    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
+): DecisionRunContext {
     return DecisionRunContext(
         decisionRunId = invocationId,
         llmProvider = null,
         promptHash = null,
         systemPromptVersion = null,
         marketSnapshotId = null,
+        runtimeConfigVersionId = runtimeConfigSnapshot?.versionId,
+        runtimeConfigHash = runtimeConfigSnapshot?.hash,
     )
 }
 

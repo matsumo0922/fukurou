@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
@@ -152,6 +153,23 @@ class LlmDaemonSchedulerTest {
             fixture.eventLog.events()
                 .any { event -> event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED },
         )
+    }
+
+    @Test
+    fun launchAuditIncludesRuntimeConfigSnapshot() = runBlocking {
+        val runtimeConfigSnapshot = RuntimeConfigAuditSnapshot(
+            versionId = "runtime-version-1",
+            hash = "runtime-hash-1",
+        )
+        val fixture = schedulerFixture(runtimeConfigSnapshot = runtimeConfigSnapshot)
+
+        val result = fixture.scheduler.tick()
+        val launchedEvent = fixture.eventLog.events()
+            .single { event -> event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED }
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals("runtime-version-1", launchedEvent.decisionRunContext.runtimeConfigVersionId)
+        assertEquals("runtime-hash-1", launchedEvent.decisionRunContext.runtimeConfigHash)
     }
 
     @Test
@@ -774,10 +792,12 @@ private fun schedulerFixture(
     openRiskReader: LlmDaemonOpenRiskReader = LlmDaemonOpenRiskReader { Result.success(hasOpenRisk) },
     tickerReader: FakeTickerReader = FakeTickerReader(clock),
     positionsReader: FakePositionsReader = FakePositionsReader(),
+    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): SchedulerFixture {
     val scheduler = LlmDaemonScheduler(
         tradingConfig = tradingConfig,
+        runtimeConfigSnapshot = runtimeConfigSnapshot,
         dependencies = LlmDaemonSchedulerDependencies(
             riskStateRepository = riskStateRepository,
             commandEventLog = eventLog,

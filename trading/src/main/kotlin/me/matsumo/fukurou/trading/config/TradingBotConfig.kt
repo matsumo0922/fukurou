@@ -1,5 +1,7 @@
 package me.matsumo.fukurou.trading.config
 
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.domain.SymbolRules
@@ -981,6 +983,10 @@ private fun Map<String, String>.readGmoPublicClientConfig(): GmoPublicClientConf
 private fun Map<String, String>.readEconomicEventBlackouts(): List<EconomicEventBlackout> {
     val rawValue = readOptional(FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC_ENV) ?: return emptyList()
 
+    if (rawValue.startsWith("[")) {
+        return rawValue.toEconomicEventBlackoutsJson()
+    }
+
     return rawValue
         .split(";")
         .map { entry -> entry.trim() }
@@ -1008,6 +1014,30 @@ private fun String.toEconomicEventBlackout(): EconomicEventBlackout {
         blackoutBefore = Duration.ofMinutes(parts[3].trim().toLong()),
         blackoutAfter = Duration.ofMinutes(parts[4].trim().toLong()),
     )
+}
+
+private fun String.toEconomicEventBlackoutsJson(): List<EconomicEventBlackout> {
+    return Json.decodeFromString<List<EconomicEventBlackoutJson>>(this)
+        .map { entry -> entry.toDomain() }
+}
+
+@Serializable
+private data class EconomicEventBlackoutJson(
+    val eventId: String,
+    val eventName: String,
+    val eventAt: String,
+    val blackoutBeforeSeconds: Long,
+    val blackoutAfterSeconds: Long,
+) {
+    fun toDomain(): EconomicEventBlackout {
+        return EconomicEventBlackout(
+            eventId = eventId,
+            eventName = eventName,
+            eventAt = Instant.parse(eventAt),
+            blackoutBefore = Duration.ofSeconds(blackoutBeforeSeconds),
+            blackoutAfter = Duration.ofSeconds(blackoutAfterSeconds),
+        )
+    }
 }
 
 private fun Map<String, String>.readDecimal(name: String, defaultValue: BigDecimal): BigDecimal {

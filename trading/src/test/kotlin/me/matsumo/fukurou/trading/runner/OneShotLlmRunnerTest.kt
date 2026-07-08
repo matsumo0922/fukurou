@@ -25,6 +25,7 @@ import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.config.DecisionProtocolConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
@@ -733,6 +734,28 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun decisionRunAuditIncludesRuntimeConfigSnapshot() = runBlocking {
+        val runtimeConfigSnapshot = RuntimeConfigAuditSnapshot(
+            versionId = "runtime-version-1",
+            hash = "runtime-hash-1",
+        )
+        val fixture = runnerFixture(runtimeConfigSnapshot = runtimeConfigSnapshot) { cleanExit() }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val llmRun = requireNotNull(
+            fixture.runtime.llmRunRepository.findByInvocationId(result.invocationId).getOrThrow(),
+        )
+        val preflightPayload = fixture.eventLog.events()
+            .single { event -> event.isRunnerPhaseCompleted("preflight") }
+            .payloadJsonObject()
+
+        assertEquals("runtime-version-1", llmRun.runtimeConfigVersionId)
+        assertEquals("runtime-hash-1", llmRun.runtimeConfigHash)
+        assertEquals("runtime-version-1", preflightPayload.stringValue("runtimeConfigVersionId"))
+        assertEquals("runtime-hash-1", preflightPayload.stringValue("runtimeConfigHash"))
+    }
+
+    @Test
     fun maxInvocationsPerDayExceeded_rejectsLaunchAndAuditsNoTrade() = runBlocking {
         val config = TradingBotConfig(
             runner = LlmRunnerConfig(
@@ -1358,6 +1381,7 @@ private data class RequestCapturingRunnerFixture(
 private fun runnerFixture(
     config: TradingBotConfig = TradingBotConfig(),
     parentEnvironment: Map<String, String> = defaultParentEnvironment(),
+    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     runtimeTransform: (TradingRuntime) -> TradingRuntime = { runtime -> runtime },
     logger: (String) -> Unit = {},
     clock: Clock = fixedClock(),
@@ -1380,6 +1404,7 @@ private fun runnerFixture(
             commandRenderer = DefaultLlmCommandRenderer(),
             processRunner = processRunner,
         ),
+        runtimeConfigSnapshot = runtimeConfigSnapshot,
         parentEnvironment = parentEnvironment,
         clock = clock,
         logger = logger,

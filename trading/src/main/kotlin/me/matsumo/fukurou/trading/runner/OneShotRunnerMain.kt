@@ -1,7 +1,6 @@
 package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.runBlocking
-import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
@@ -14,7 +13,8 @@ import java.nio.file.Path
  */
 fun main() = runBlocking {
     val environment = System.getenv()
-    val tradingConfig = TradingBotConfig.fromEnvironment(environment)
+    val runtimeConfigResolution = TradingRuntimeFactory.resolveRuntimeConfigFromEnvironment(environment)
+    val tradingConfig = runtimeConfigResolution.tradingConfig
     val tradingRuntime = TradingRuntimeFactory.fromEnvironment(
         environment = environment,
         tradingConfig = tradingConfig,
@@ -31,6 +31,7 @@ fun main() = runBlocking {
                 processRunner = ShellProcessRunner(),
             ),
             parentEnvironment = environment,
+            runtimeConfigSnapshot = runtimeConfigResolution.auditSnapshot,
         )
         val repositoryRoot = Path.of(environment["FUKUROU_REPOSITORY_ROOT"] ?: ".")
             .toAbsolutePath()

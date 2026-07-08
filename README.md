@@ -72,7 +72,7 @@ make detekt
 make build
 ```
 
-runtime config は `.env.example` の `FUKUROU_*` で上書きできます。既定は BTC 現物 / `PAPER` / 仮想 10 万円です。`GET /ops/runtime-config` は code-owned catalog から実効設定を読み取り専用で返し、secret は設定済み / 未設定だけを返します。
+runtime config は DB 上の active version を code-owned catalog default に重ねて typed config として検証します。DB bootstrap は `runtime_config_versions` / `runtime_config_values` に初期 active version を作成します。`RUNTIME` key は active DB config が正本で、`.env` は secret / deployment / bootstrap 値に使います。`GET /ops/runtime-config` は code-owned catalog から実効設定を読み取り専用で返し、secret は設定済み / 未設定だけを返します。
 
 ## Web development
 
