@@ -73,7 +73,7 @@ make detekt
 make build
 ```
 
-runtime config は DB 上の active version を code-owned catalog default に重ねて typed config として検証します。DB bootstrap は `runtime_config_versions` / `runtime_config_values` に初期 active version を作成し、active snapshot に不足する code-owned catalog key がある場合は既存値を保持した complete snapshot を新しい active version として作成します。key の削除は無効化手段ではなく、bootstrap が catalog default で復元します。unknown key、不正値、validation failure は fail closed します。`RUNTIME` key は active DB config が正本で、`.env` は secret / deployment / bootstrap 値に使います。`GET /ops/runtime-config` は code-owned catalog から実効設定を読み取り専用で返し、secret は設定済み / 未設定だけを返します。
+runtime config は DB 上の active version を code-owned catalog default に重ねて typed config として検証します。DB bootstrap は `runtime_config_versions` / `runtime_config_values` に初期 active version を作成し、active snapshot に不足する code-owned catalog key がある場合は既存値を保持した complete snapshot を新しい active version として作成します。key の削除は無効化手段ではなく、bootstrap が catalog default で復元します。`RUNTIME` key は active DB config が正本で、`.env` は secret / deployment / bootstrap 値に使います。`GET /ops/runtime-config` は code-owned catalog から実効設定、version 履歴、warning を返し、secret は設定済み / 未設定だけを返します。active config が不正または一時的に読めない場合も WebUI と runtime config admin API は起動し、取引 runtime、manual trigger、daemon worker は fail closed します。draft / validate / activate / rollback は `/ops/runtime-config/drafts` と `/ops/runtime-config/versions/{versionId}/rollback` で行い、active 化と rollback は保存済み候補を現在の catalog / typed config で再検証します。valid な active version へ戻ると、runtime config warning、`/health/ready`、manual trigger gate は現在の active snapshot に基づいて再評価されます。
 
 ## Web development
 
@@ -94,7 +94,7 @@ make dev-web
 
 Vite dev server は既定で `http://localhost:8080` の Ktor API へ proxy します。接続先は `VITE_FUKUROU_API_TARGET` で上書きできます。
 
-WebUI の `Config` 画面（`/app/config`）は `/ops/runtime-config` を表示します。Runtime / Deployment / Secrets の各 group は読み取り専用で、secret 値は画面に表示しません。
+WebUI の `Config` 画面（`/app/config`）は `/ops/runtime-config` を表示します。Runtime group は draft 編集、diff preview、validation、activate、rollback を扱います。Deployment group は read-only で表示し、Secrets group は設定有無だけを表示します。warning がある場合は validation error を i18n 表示し、復旧操作の入口を維持します。secret 値は API response と画面のどちらにも出しません。
 
 WebUI の `Activity` 画面（`/app/activity`）は `/ops/activity` の decision / audit / paper execution timeline を表示します。監査イベントと判断アクションの表示名・説明は `/ops/activity/catalog` の i18n key catalog から解決し、audit event type filter も同じ catalog を使います。audit event type を選択していない場合、`RECONCILER_PASS_COMPLETED` は高頻度 heartbeat として既定で除外されます。paper execution は entry fill、STOP trigger、take-profit close、limit close、market close、または fallback の raw execution side として分類し、長い order / entry decision 理由は timeline list ではなく詳細 dialog に表示します。
 

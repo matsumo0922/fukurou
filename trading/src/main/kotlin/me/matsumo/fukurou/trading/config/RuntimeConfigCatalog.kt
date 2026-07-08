@@ -744,6 +744,8 @@ object RuntimeConfigCatalog {
             unit = unit,
             legacyEnvName = legacyEnvName,
             safetyTier = safetyTier,
+            editable = true,
+            applyMode = RuntimeConfigApplyMode.NEXT_RESTART,
         )
     }
 
@@ -765,6 +767,8 @@ object RuntimeConfigCatalog {
             unit = unit,
             legacyEnvName = legacyEnvName,
             safetyTier = safetyTier,
+            editable = false,
+            applyMode = RuntimeConfigApplyMode.PROCESS_RESTART,
         )
     }
 
@@ -796,6 +800,8 @@ object RuntimeConfigCatalog {
         unit: String?,
         legacyEnvName: String,
         safetyTier: RuntimeConfigSafetyTier,
+        editable: Boolean,
+        applyMode: RuntimeConfigApplyMode,
     ): RuntimeConfigItem {
         return RuntimeConfigItem(
             key = key,
@@ -807,8 +813,8 @@ object RuntimeConfigCatalog {
             unit = unit,
             valueConfigured = effectiveValue != null,
             legacyEnvName = legacyEnvName,
-            editable = false,
-            applyMode = RuntimeConfigApplyMode.PROCESS_RESTART,
+            editable = editable,
+            applyMode = applyMode,
             safetyTier = safetyTier,
             labelKey = "config.item.$key.label",
             descriptionKey = "config.item.$key.description",
@@ -820,10 +826,28 @@ object RuntimeConfigCatalog {
  * runtime config catalog API の snapshot。
  *
  * @param groups 設定 group 一覧
+ * @param activeVersion active runtime config version
+ * @param versions runtime config version 履歴
+ * @param warnings catalog 表示は継続できるが運用者確認が必要な warning
  */
 @Serializable
 data class RuntimeConfigSnapshot(
     val groups: List<RuntimeConfigGroup>,
+    val activeVersion: RuntimeConfigVersionSummary? = null,
+    val versions: List<RuntimeConfigVersionSummary> = emptyList(),
+    val warnings: List<RuntimeConfigSnapshotWarning> = emptyList(),
+)
+
+/**
+ * runtime config snapshot の warning。
+ *
+ * @param code WebUI i18n 用の machine-readable code
+ * @param validation runtime config validation に由来する warning の詳細
+ */
+@Serializable
+data class RuntimeConfigSnapshotWarning(
+    val code: String,
+    val validation: RuntimeConfigValidationResult? = null,
 )
 
 /**
@@ -934,6 +958,9 @@ enum class RuntimeConfigValueType {
  */
 @Serializable
 enum class RuntimeConfigApplyMode {
+    /** 次回 runtime 起動で反映する。 */
+    NEXT_RESTART,
+
     /** Ktor process の再起動で反映する。 */
     PROCESS_RESTART,
 }

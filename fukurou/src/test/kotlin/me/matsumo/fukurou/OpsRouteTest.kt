@@ -24,7 +24,16 @@ import me.matsumo.fukurou.trading.broker.ExecutionActivityPositionContext
 import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
+import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
+import me.matsumo.fukurou.trading.config.RuntimeConfigCandidateValidator
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
+import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
+import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedException
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -43,10 +52,16 @@ import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
+import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
+import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import org.testcontainers.DockerClientFactory
+import org.testcontainers.containers.PostgreSQLContainer
 import java.io.File
 import java.math.BigDecimal
+import java.sql.Connection
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -57,6 +72,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
 /**
  * ops route の HTTP contract を検証するテスト。
@@ -527,6 +544,236 @@ class OpsRouteTest {
             group = secretsGroup,
             key = "database.password",
         )
+    }
+
+    @Test
+    fun opsRoutes_runtimeConfigReturnsCatalogWarningWhenVersionHistoryFails() = testApplication {
+        val adminService = FakeRuntimeConfigAdminService(
+            listVersionsFailure = IllegalStateException("version history unavailable"),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsRuntimeConfigAdminService = adminService,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/runtime-config")
+        val responseBody = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        val warnings = responseBody.getValue("warnings").jsonArray
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(responseBody.getValue("groups").jsonArray.isNotEmpty())
+        assertTrue(responseBody.getValue("versions").jsonArray.isEmpty())
+        assertEquals(
+            "runtimeConfig.warning.versionHistoryUnavailable",
+            warnings.single().jsonObject.getValue("code").jsonPrimitive.content,
+        )
+    }
+
+    @Test
+    fun opsRoutes_runtimeConfigDraftActivationReturnsMachineReadableValidationErrors() = testApplication {
+        val adminService = FakeRuntimeConfigAdminService()
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsRuntimeConfigAdminService = adminService,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val draftResponse = client.post("/ops/runtime-config/drafts") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"values":{"runner.maxToolCallsPerRun":"49"},"note":"unsafe cap"}""")
+        }
+        val draftBody = Json.parseToJsonElement(draftResponse.bodyAsText()).jsonObject
+        val versionId = draftBody.getValue("version").jsonObject.getValue("id").jsonPrimitive.content
+        val activateResponse = client.post("/ops/runtime-config/drafts/$versionId/activate") {
+            contentType(ContentType.Application.Json)
+            setBody("""{}""")
+        }
+        val activateBody = Json.parseToJsonElement(activateResponse.bodyAsText()).jsonObject
+        val validationError = activateBody.getValue("errors").jsonArray.single().jsonObject
+
+        assertEquals(HttpStatusCode.Created, draftResponse.status)
+        assertEquals("false", draftBody.getValue("validation").jsonObject.getValue("valid").jsonPrimitive.content)
+        assertEquals(HttpStatusCode.Conflict, activateResponse.status)
+        assertEquals("false", activateBody.getValue("valid").jsonPrimitive.content)
+        assertEquals("runtimeConfig.validation.typedBetweenInclusive", validationError.getValue("code").jsonPrimitive.content)
+        assertEquals("runner.maxToolCallsPerRun", validationError.getValue("key").jsonPrimitive.content)
+        assertEquals("48", validationError.getValue("params").jsonObject.getValue("max").jsonPrimitive.content)
+    }
+
+    @Test
+    fun moduleKeepsRuntimeConfigRecoveryApiAvailableWhenActiveConfigIsInvalid() = testApplication {
+        if (!isDockerAvailable()) {
+            println("Skipping module runtime config recovery test because Docker is unavailable.")
+            return@testApplication
+        }
+
+        val container = FukurouPostgresContainer()
+        container.start()
+
+        try {
+            val databaseConfig = DatabaseConfig(
+                url = container.jdbcUrl,
+                user = container.username,
+                password = container.password,
+            )
+            val database = ExposedDatabase.connect(
+                url = databaseConfig.url,
+                driver = "org.postgresql.Driver",
+                user = databaseConfig.user,
+                password = databaseConfig.password,
+            )
+            RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+            updateRuntimeConfigValue(database = database, key = "runner.maxToolCallsPerRun", value = "49")
+
+            val manualService = CapturingManualLlmLaunchService(
+                ManualLlmLaunchResult.Accepted(
+                    invocationId = "manual-recovered",
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                ),
+            )
+            val reconcilerStatus = MutableReconcilerStatus()
+            reconcilerStatus.markReconciled(
+                reconciledAt = fixedInstant(),
+                startupFullReconcileCompleted = true,
+                lastMarketDataAt = fixedInstant(),
+            )
+
+            application {
+                module(
+                    clock = fixedClock(),
+                    reconcilerStatus = reconcilerStatus,
+                    opsManualLlmLaunchService = manualService,
+                    databaseConfig = databaseConfig,
+                )
+            }
+
+            val configResponse = client.get("/ops/runtime-config")
+            val triggerResponse = client.post("/ops/trigger") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"operator recovery check"}""")
+            }
+            val readyResponse = client.get("/health/ready")
+            val responseBody = Json.parseToJsonElement(configResponse.bodyAsText()).jsonObject
+            val warning = responseBody.getValue("warnings").jsonArray.single().jsonObject
+            val validationError = warning
+                .getValue("validation")
+                .jsonObject
+                .getValue("errors")
+                .jsonArray
+                .single()
+                .jsonObject
+
+            assertEquals(HttpStatusCode.OK, configResponse.status)
+            assertEquals("runtimeConfig.warning.activeValidationFailed", warning.getValue("code").jsonPrimitive.content)
+            assertEquals("runtimeConfig.validation.typedBetweenInclusive", validationError.getValue("code").jsonPrimitive.content)
+            assertEquals(HttpStatusCode.ServiceUnavailable, triggerResponse.status)
+            assertEquals(HttpStatusCode.ServiceUnavailable, readyResponse.status)
+            assertEquals(emptyList(), manualService.reasons)
+
+            val draftResponse = client.post("/ops/runtime-config/drafts") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"values":{"runner.maxToolCallsPerRun":"12"},"note":"restore runtime key"}""")
+            }
+            val draftBody = Json.parseToJsonElement(draftResponse.bodyAsText()).jsonObject
+            val versionId = draftBody.getValue("version").jsonObject.getValue("id").jsonPrimitive.content
+            val activateResponse = client.post("/ops/runtime-config/drafts/$versionId/activate") {
+                contentType(ContentType.Application.Json)
+                setBody("""{}""")
+            }
+            val recoveredConfigResponse = client.get("/ops/runtime-config")
+            val recoveredTriggerResponse = client.post("/ops/trigger") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"operator restored runtime config"}""")
+            }
+            val recoveredReadyResponse = client.get("/health/ready")
+            val recoveredBody = Json.parseToJsonElement(recoveredConfigResponse.bodyAsText()).jsonObject
+            val recoveredWarnings = recoveredBody.getValue("warnings").jsonArray.map { element ->
+                element.jsonObject.getValue("code").jsonPrimitive.content
+            }
+
+            assertEquals(HttpStatusCode.Created, draftResponse.status)
+            assertEquals(HttpStatusCode.OK, activateResponse.status)
+            assertEquals(HttpStatusCode.OK, recoveredConfigResponse.status)
+            assertFalse(recoveredWarnings.contains("runtimeConfig.warning.activeValidationFailed"))
+            assertEquals(HttpStatusCode.Accepted, recoveredTriggerResponse.status)
+            assertEquals(HttpStatusCode.OK, recoveredReadyResponse.status)
+            assertEquals(listOf("operator restored runtime config"), manualService.reasons)
+        } finally {
+            container.stop()
+        }
+    }
+
+    @Test
+    fun moduleRetriesRuntimeConfigSnapshotAfterTransientResolveFailure() = testApplication {
+        if (!isDockerAvailable()) {
+            println("Skipping module runtime config transient recovery test because Docker is unavailable.")
+            return@testApplication
+        }
+
+        val container = FukurouPostgresContainer()
+        container.start()
+
+        try {
+            val databaseConfig = DatabaseConfig(
+                url = container.jdbcUrl,
+                user = container.username,
+                password = container.password,
+            )
+            val database = ExposedDatabase.connect(
+                url = databaseConfig.url,
+                driver = "org.postgresql.Driver",
+                user = databaseConfig.user,
+                password = databaseConfig.password,
+            )
+            RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+            deleteRuntimeConfigValues(database)
+
+            val manualService = CapturingManualLlmLaunchService(
+                ManualLlmLaunchResult.Accepted(
+                    invocationId = "manual-after-transient-recovery",
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                ),
+            )
+
+            application {
+                module(
+                    clock = fixedClock(),
+                    opsManualLlmLaunchService = manualService,
+                    databaseConfig = databaseConfig,
+                )
+            }
+
+            val unavailableReadyResponse = client.get("/health/ready")
+            val unavailableTriggerResponse = client.post("/ops/trigger") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"operator checks transient failure"}""")
+            }
+
+            assertEquals(HttpStatusCode.ServiceUnavailable, unavailableReadyResponse.status)
+            assertEquals(HttpStatusCode.ServiceUnavailable, unavailableTriggerResponse.status)
+            assertEquals(emptyList(), manualService.reasons)
+
+            insertRuntimeConfigDefaultValues(database)
+
+            val recoveredReadyResponse = client.get("/health/ready")
+            val recoveredTriggerResponse = client.post("/ops/trigger") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"operator confirms transient recovery"}""")
+            }
+
+            assertEquals(HttpStatusCode.OK, recoveredReadyResponse.status)
+            assertEquals(HttpStatusCode.Accepted, recoveredTriggerResponse.status)
+            assertEquals(listOf("operator confirms transient recovery"), manualService.reasons)
+        } finally {
+            container.stop()
+        }
     }
 
     @Test
@@ -1242,6 +1489,111 @@ private fun metadataValue(container: JsonObject, label: String): String {
         .content
 }
 
+private class FakeRuntimeConfigAdminService(
+    private val listVersionsFailure: Throwable? = null,
+) : RuntimeConfigAdminService {
+    private val versions = mutableMapOf<String, RuntimeConfigVersionDetail>()
+    private var activeVersionId: String = "active-runtime-config"
+    private var nextDraftId = 1
+
+    init {
+        val values = RuntimeConfigCatalog.runtimeDefaultValues()
+        val activeVersion = RuntimeConfigVersionDetail(
+            version = versionSummary(
+                id = activeVersionId,
+                status = "ACTIVE",
+                values = values,
+            ),
+            values = values,
+            validation = RuntimeConfigCandidateValidator.validate(values, emptyMap()).validation,
+        )
+        versions[activeVersionId] = activeVersion
+    }
+
+    override fun listVersions(limit: Int): Result<List<RuntimeConfigVersionSummary>> {
+        listVersionsFailure?.let { failure -> return Result.failure(failure) }
+
+        return Result.success(
+            versions.values
+                .map { detail -> detail.version }
+                .take(limit),
+        )
+    }
+
+    override fun createDraft(request: RuntimeConfigDraftCreation): Result<RuntimeConfigVersionDetail> {
+        val baseValues = versions.getValue(request.baseVersionId ?: activeVersionId).values
+        val values = baseValues + request.values
+        val versionId = "draft-${nextDraftId++}"
+        val detail = RuntimeConfigVersionDetail(
+            version = versionSummary(
+                id = versionId,
+                status = "DRAFT",
+                values = values,
+                note = request.note,
+            ),
+            values = values,
+            validation = RuntimeConfigCandidateValidator.validate(values, emptyMap()).validation,
+        )
+        versions[versionId] = detail
+
+        return Result.success(detail)
+    }
+
+    override fun validateVersion(versionId: String): Result<RuntimeConfigVersionDetail> {
+        return Result.success(versions.getValue(versionId))
+    }
+
+    override fun activateDraft(versionId: String): Result<RuntimeConfigActivationResult> {
+        val detail = versions.getValue(versionId)
+
+        if (!detail.validation.valid) {
+            return Result.failure(RuntimeConfigValidationRejectedException(detail.validation))
+        }
+
+        val previousActiveVersionId = activeVersionId
+        activeVersionId = versionId
+        val activeDetail = detail.copy(
+            version = detail.version.copy(
+                status = "ACTIVE",
+                activatedAt = fixedInstant().toString(),
+            ),
+        )
+        versions[previousActiveVersionId] = versions.getValue(previousActiveVersionId).copy(
+            version = versions.getValue(previousActiveVersionId).version.copy(status = "INACTIVE"),
+        )
+        versions[versionId] = activeDetail
+
+        return Result.success(
+            RuntimeConfigActivationResult(
+                activeVersion = activeDetail.version,
+                previousActiveVersionId = previousActiveVersionId,
+                validation = detail.validation,
+            ),
+        )
+    }
+
+    override fun rollbackToVersion(versionId: String): Result<RuntimeConfigActivationResult> {
+        return activateDraft(versionId)
+    }
+
+    private fun versionSummary(
+        id: String,
+        status: String,
+        values: Map<String, String>,
+        note: String? = null,
+    ): RuntimeConfigVersionSummary {
+        return RuntimeConfigVersionSummary(
+            id = id,
+            status = status,
+            createdAt = fixedInstant().toString(),
+            activatedAt = if (status == "ACTIVE") fixedInstant().toString() else null,
+            createdBy = "test",
+            note = note,
+            hash = calculateRuntimeConfigHash(values),
+        )
+    }
+}
+
 /**
  * read API response に混入してはいけない secret-like fixture。
  */
@@ -1388,3 +1740,98 @@ private class MutableClock(
 }
 
 private const val DUMMY_AUTH_CODE = "DUMMY-CODE"
+
+/**
+ * fukurou module integration test 用 Postgres image。
+ */
+private const val POSTGRES_IMAGE = "postgres:16-alpine"
+
+/**
+ * fukurou module test 用 Postgres container。
+ */
+private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
+
+private fun isDockerAvailable(): Boolean {
+    return runCatching {
+        DockerClientFactory.instance().client().pingCmd().exec()
+        true
+    }.getOrDefault(false)
+}
+
+private fun deleteRuntimeConfigValues(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                DELETE FROM runtime_config_values
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun insertRuntimeConfigDefaultValues(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        val activeVersionId = requireActiveRuntimeConfigVersionId()
+
+        jdbcConnection().prepareStatement(
+            """
+                INSERT INTO runtime_config_values (
+                    version_id,
+                    config_key,
+                    config_value
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT (version_id, config_key) DO NOTHING
+            """.trimIndent(),
+        ).use { statement ->
+            RuntimeConfigCatalog.runtimeDefaultValues().toSortedMap().forEach { (key, value) ->
+                statement.setObject(1, activeVersionId)
+                statement.setString(2, key)
+                statement.setString(3, value)
+                statement.addBatch()
+            }
+            statement.executeBatch()
+        }
+    }
+}
+
+private fun JdbcTransaction.requireActiveRuntimeConfigVersionId(): UUID {
+    jdbcConnection().prepareStatement(
+        """
+            SELECT id
+            FROM runtime_config_versions
+            WHERE status = 'ACTIVE'
+        """.trimIndent(),
+    ).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "Active runtime config version was not found." }
+
+            return resultSet.getObject(1, UUID::class.java)
+        }
+    }
+}
+
+private fun updateRuntimeConfigValue(
+    database: ExposedDatabase,
+    key: String,
+    value: String,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                UPDATE runtime_config_values
+                SET config_value = ?
+                WHERE config_key = ?
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, value)
+            statement.setString(2, key)
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun JdbcTransaction.jdbcConnection(): Connection {
+    return connection.connection as Connection
+}

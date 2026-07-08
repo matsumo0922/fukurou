@@ -107,14 +107,14 @@ describe("App", () => {
     expect(screen.getAllByText(/JST/).length).toBeGreaterThan(1);
   });
 
-  it("shows read-only runtime config without exposing secret values", async () => {
+  it("shows editable runtime config without exposing secret values", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/config");
 
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Config" })).toBeInTheDocument();
-    expect(screen.getByText("Read-only effective runtime, deployment, and secret configuration.")).toBeInTheDocument();
+    expect(screen.getByText("Runtime config draft, validation, activation, rollback, deployment boundaries, and secret status.")).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Runtime" }, { timeout: 5_000 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Deployment" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Secrets" })).toBeInTheDocument();
@@ -124,6 +124,77 @@ describe("App", () => {
     expect(screen.getAllByText("configured").length).toBeGreaterThan(0);
     expect(screen.queryByText("super-secret-password")).not.toBeInTheDocument();
     expect(hasGetCall(fetchMock, "/ops/runtime-config", () => true)).toBe(true);
+  });
+
+  it("shows runtime config warnings and validation errors", async () => {
+    stubSystemFetch({
+      runtimeConfigResponse: {
+        ...runtimeConfigResponse(),
+        versions: [],
+        warnings: [
+          {
+            code: "runtimeConfig.warning.activeValidationFailed",
+            validation: {
+              valid: false,
+              errors: [
+                {
+                  code: "runtimeConfig.validation.missingKeys",
+                  params: {
+                    keys: "runner.maxToolCallsPerRun",
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+    window.history.pushState({}, "", "/app/config");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Config" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Runtime config warnings" })).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Active runtime config is invalid. Trading workers and manual trigger are halted until a valid version is activated or rolled back.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Missing keys: runner.maxToolCallsPerRun.")).toBeInTheDocument();
+    expect(screen.getByText("No records")).toBeInTheDocument();
+  });
+
+  it("shows runtime config rollback validation errors", async () => {
+    const fetchMock = stubSystemFetch({
+      runtimeConfigResponse: runtimeConfigResponseWithInactiveVersion(),
+      runtimeConfigRollbackResponse: {
+        status: 409,
+        body: {
+          valid: false,
+          errors: [
+            {
+              code: "runtimeConfig.validation.typedBetweenInclusive",
+              key: "runner.maxToolCallsPerRun",
+              params: {
+                min: "1",
+                max: "48",
+              },
+            },
+          ],
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/config");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Config" })).toBeInTheDocument();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Rollback" }));
+
+    expect(await screen.findByText("rollback rejected")).toBeInTheDocument();
+    expect(screen.getByText("runner.maxToolCallsPerRun must be between 1 and 48.")).toBeInTheDocument();
+    expect(hasPostCall(fetchMock, "/ops/runtime-config/versions/runtime-config-previous/rollback")).toBe(true);
   });
 
   it("starts in English and switches supported UI copy to Japanese", async () => {
@@ -744,6 +815,10 @@ type SystemFetchFixture = {
     body: unknown;
   };
   runtimeConfigResponse?: unknown;
+  runtimeConfigRollbackResponse?: {
+    status: number;
+    body: unknown;
+  };
   activityCatalogResponse?: {
     status: number;
     body: unknown;
@@ -798,6 +873,25 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
 
     if (path.startsWith("/ops/llm-auth/") && path.includes("/login/")) {
       return jsonResponse(fixture.llmAuthLoginSession ?? defaultLlmAuthLoginSession(providerFromLlmAuthPath(path)));
+    }
+
+    if (path.startsWith("/ops/runtime-config/versions/") && path.endsWith("/rollback")) {
+      if (method !== "POST") {
+        return jsonResponse({ message: "method not allowed" }, { status: 405 });
+      }
+
+      if (fixture.runtimeConfigRollbackResponse) {
+        return jsonResponse(
+          fixture.runtimeConfigRollbackResponse.body,
+          { status: fixture.runtimeConfigRollbackResponse.status },
+        );
+      }
+
+      return jsonResponse({
+        activeVersion: runtimeConfigResponse().activeVersion,
+        previousActiveVersionId: "runtime-config-active",
+        validation: { valid: true, errors: [] },
+      });
     }
 
     switch (path) {
@@ -1270,7 +1364,19 @@ function providerFromLlmAuthPath(path: string): string {
 }
 
 function runtimeConfigResponse() {
+  const activeVersion = {
+    id: "runtime-config-active",
+    status: "ACTIVE",
+    createdAt: "2026-07-05T12:00:00.000Z",
+    activatedAt: "2026-07-05T12:00:00.000Z",
+    createdBy: "bootstrap",
+    note: "code catalog defaults",
+    hash: "abcdef1234567890",
+  };
+
   return {
+    activeVersion,
+    versions: [activeVersion],
     groups: [
       {
         id: "runtime",
@@ -1336,6 +1442,24 @@ function runtimeConfigResponse() {
   };
 }
 
+function runtimeConfigResponseWithInactiveVersion() {
+  const response = runtimeConfigResponse();
+  const inactiveVersion = {
+    id: "runtime-config-previous",
+    status: "INACTIVE",
+    createdAt: "2026-07-05T11:00:00.000Z",
+    activatedAt: "2026-07-05T11:00:00.000Z",
+    createdBy: "webui",
+    note: "previous runtime config",
+    hash: "fedcba0987654321",
+  };
+
+  return {
+    ...response,
+    versions: [response.activeVersion, inactiveVersion],
+  };
+}
+
 function runtimeConfigItem({
   key,
   legacyEnvName,
@@ -1347,6 +1471,8 @@ function runtimeConfigItem({
   sourceKind,
   valueConfigured = true,
   safetyTier = "STANDARD",
+  editable = sourceKind === "RUNTIME",
+  applyMode = sourceKind === "RUNTIME" ? "NEXT_RESTART" : "PROCESS_RESTART",
 }: {
   key: string;
   legacyEnvName: string;
@@ -1358,6 +1484,8 @@ function runtimeConfigItem({
   sourceKind: string;
   valueConfigured?: boolean;
   safetyTier?: string;
+  editable?: boolean;
+  applyMode?: string;
 }) {
   return {
     key,
@@ -1369,8 +1497,8 @@ function runtimeConfigItem({
     unit,
     valueConfigured,
     legacyEnvName,
-    editable: false,
-    applyMode: "PROCESS_RESTART",
+    editable,
+    applyMode,
     safetyTier,
     labelKey: `config.item.${key}.label`,
     descriptionKey: `config.item.${key}.description`,

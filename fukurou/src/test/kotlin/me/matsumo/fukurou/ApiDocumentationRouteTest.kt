@@ -112,6 +112,26 @@ class ApiDocumentationRouteTest {
             summary = "runtime config catalog を取得する",
             tag = "ops",
         )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/runtime-config/drafts",
+            schemaRef = "#/components/schemas/OpsRuntimeConfigDraftRequest",
+        )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/runtime-config/drafts/{versionId}/validate",
+            schemaRef = "#/components/schemas/OpsRuntimeConfigVersionActionRequest",
+        )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/runtime-config/drafts/{versionId}/activate",
+            schemaRef = "#/components/schemas/OpsRuntimeConfigVersionActionRequest",
+        )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/runtime-config/versions/{versionId}/rollback",
+            schemaRef = "#/components/schemas/OpsRuntimeConfigVersionActionRequest",
+        )
         assertOperation(
             paths = paths,
             path = "/ops/decisions",

@@ -1,9 +1,11 @@
 package me.matsumo.fukurou.trading.config
 
+import java.math.BigDecimal
 import java.time.Duration
 import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -54,6 +56,46 @@ class RuntimeConfigResolverTest {
     }
 
     @Test
+    fun resolve_acceptsStandardRuntimeConfigAboveAbsoluteMinimumBelowDefault() {
+        val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
+            "obsidian.writeInterval" to "60",
+        )
+        val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
+
+        val result = resolver.resolve(emptyMap()).getOrThrow()
+
+        assertEquals(Duration.ofSeconds(60), result.tradingConfig.obsidian.writeInterval)
+        assertEquals("60", result.catalogEnvironment.getValue("FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS"))
+    }
+
+    @Test
+    fun validate_conservativeOnlyRuntimeConfigKeysAcceptBoundaryAndRejectOneStepOutside() {
+        val defaults = RuntimeConfigCatalog.runtimeDefaultValues()
+        val cases = conservativeBoundaryCases(defaults)
+
+        assertEquals(conservativeOnlyRuntimeConfigKeys, cases.map { case -> case.key }.toSet())
+
+        cases.forEach { case ->
+            val boundaryResult = RuntimeConfigCandidateValidator.validate(
+                values = defaults + mapOf(case.key to defaults.getValue(case.key)),
+                environment = emptyMap(),
+            )
+            val outsideResult = RuntimeConfigCandidateValidator.validate(
+                values = defaults + mapOf(case.key to case.outsideValue),
+                environment = emptyMap(),
+            )
+
+            assertTrue(boundaryResult.validation.valid, case.key)
+            assertTrue(boundaryResult.tradingConfig != null, case.key)
+            assertFalse(outsideResult.validation.valid, case.key)
+            assertTrue(
+                outsideResult.validation.errors.any { error -> error.key == case.key },
+                case.key,
+            )
+        }
+    }
+
+    @Test
     fun resolve_failsClosedWhenActiveRuntimeConfigIsMissingCatalogKey() {
         val values = RuntimeConfigCatalog.runtimeDefaultValues()
             .filterKeys { key -> key != "runner.maxToolCallsPerRun" }
@@ -68,9 +110,205 @@ class RuntimeConfigResolverTest {
             "runner.maxToolCallsPerRun" to "49",
         )
         val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
+        val result = resolver.resolve(emptyMap())
+        val exception = result.exceptionOrNull() as RuntimeConfigValidationRejectedException
+        val validationError = exception.validation.errors.single()
 
-        assertTrue(resolver.resolve(emptyMap()).isFailure)
+        assertTrue(result.isFailure)
+        assertEquals("runtimeConfig.validation.typedBetweenInclusive", validationError.code)
+        assertEquals("runner.maxToolCallsPerRun", validationError.key)
+        assertEquals("1", validationError.params.getValue("min"))
+        assertEquals("48", validationError.params.getValue("max"))
     }
+
+    @Test
+    fun resolve_failsClosedWhenStandardRuntimeConfigViolatesAbsoluteMinimum() {
+        val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
+            "obsidian.writeInterval" to "59",
+        )
+        val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
+        val result = resolver.resolve(emptyMap())
+        val exception = result.exceptionOrNull() as RuntimeConfigValidationRejectedException
+        val validationError = exception.validation.errors.single()
+
+        assertTrue(result.isFailure)
+        assertEquals("runtimeConfig.validation.typedGreaterThanOrEqual", validationError.code)
+        assertEquals("obsidian.writeInterval", validationError.key)
+        assertEquals("60", validationError.params.getValue("min"))
+    }
+}
+
+private data class ConservativeBoundaryCase(
+    val key: String,
+    val outsideValue: String,
+)
+
+@Suppress("LongMethod")
+private fun conservativeBoundaryCases(defaults: Map<String, String>): List<ConservativeBoundaryCase> {
+    return listOf(
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "paper.fallbackMakerFeeRate",
+            outsideValue = ::decimalBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "paper.fallbackTakerFeeRate",
+            outsideValue = ::decimalBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "paper.fallbackSpreadBps",
+            outsideValue = ::decimalBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "safety.maxRiskPerTradeRatio",
+            outsideValue = ::decimalAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "safety.maxDrawdownRatio",
+            outsideValue = ::decimalBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "safety.maxTotalExposureRatio",
+            outsideValue = ::decimalAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "safety.minExpectedValueR",
+            outsideValue = ::decimalBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "safety.minExpectedMoveToCostRatio",
+            outsideValue = ::decimalBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "safety.maxTakerFeeRatio",
+            outsideValue = ::decimalAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "safety.marketSlippageReserveBps",
+            outsideValue = ::decimalBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "safety.dataQualityStaleAfter",
+            outsideValue = ::longAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "safety.dataQualityCappedProbability",
+            outsideValue = ::decimalAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "decision.falsificationFreshnessWindow",
+            outsideValue = ::longAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "decision.restingEntryOrderTtl",
+            outsideValue = ::longAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "runner.maxToolCallsPerRun",
+            outsideValue = ::intAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "runner.maxActToolCallsPerRun",
+            outsideValue = ::intAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "runner.perRunTimeout",
+            outsideValue = ::longAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "runner.maxInvocationsPerHour",
+            outsideValue = ::intAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "runner.maxInvocationsPerDay",
+            outsideValue = ::intAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "daemon.pollInterval",
+            outsideValue = ::longBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "daemon.flatHeartbeatInterval",
+            outsideValue = ::longBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "daemon.holdingCheckInterval",
+            outsideValue = ::longBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "killCriterion.minClosedTrades",
+            outsideValue = ::intAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "killCriterion.minProfitFactor",
+            outsideValue = ::decimalBelowDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "gmoPublic.restPerSecond",
+            outsideValue = ::intAboveDefault,
+        ),
+        conservativeBoundaryCase(
+            defaults = defaults,
+            key = "gmoPublic.restBurst",
+            outsideValue = ::intAboveDefault,
+        ),
+    )
+}
+
+private fun conservativeBoundaryCase(
+    defaults: Map<String, String>,
+    key: String,
+    outsideValue: (Map<String, String>, String) -> String,
+): ConservativeBoundaryCase {
+    return ConservativeBoundaryCase(key, outsideValue(defaults, key))
+}
+
+private fun decimalBelowDefault(defaults: Map<String, String>, key: String): String {
+    return defaults.getValue(key).toBigDecimal().subtract(decimalStep(defaults.getValue(key))).toPlainString()
+}
+
+private fun decimalAboveDefault(defaults: Map<String, String>, key: String): String {
+    return defaults.getValue(key).toBigDecimal().add(decimalStep(defaults.getValue(key))).toPlainString()
+}
+
+private fun decimalStep(value: String): BigDecimal {
+    return if (value.contains(".")) BigDecimal("0.0001") else BigDecimal.ONE
+}
+
+private fun intAboveDefault(defaults: Map<String, String>, key: String): String {
+    return (defaults.getValue(key).toInt() + 1).toString()
+}
+
+private fun longAboveDefault(defaults: Map<String, String>, key: String): String {
+    return (defaults.getValue(key).toLong() + 1).toString()
+}
+
+private fun longBelowDefault(defaults: Map<String, String>, key: String): String {
+    return (defaults.getValue(key).toLong() - 1).toString()
 }
 
 private class FakeActiveRuntimeConfigSource(

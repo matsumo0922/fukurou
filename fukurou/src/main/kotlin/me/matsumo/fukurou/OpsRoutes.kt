@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou
 
 import io.ktor.http.HttpStatusCode
@@ -20,8 +22,16 @@ import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.ExecutionActivityOrderContext
 import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
+import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
+import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshot
+import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshotWarning
+import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedException
+import me.matsumo.fukurou.trading.config.RuntimeConfigValidationResult
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -570,12 +580,56 @@ data class OpsActivityCatalogItemResponse(
 /**
  * runtime config catalog route の依存関係。
  *
- * @param tradingConfig 取引 bot 全体の typed config
- * @param environment runtime config catalog API で参照する環境変数 map
+ * @param snapshotProvider active runtime config の現在状態 provider
+ * @param adminService runtime config の draft / validate / activate 操作用 service
  */
 internal data class OpsRuntimeConfigRouteDependencies(
+    val snapshotProvider: OpsRuntimeConfigSnapshotProvider,
+    val adminService: RuntimeConfigAdminService? = null,
+)
+
+/**
+ * runtime config catalog route が参照する現在状態。
+ *
+ * @param tradingConfig 取引 bot 全体の typed config
+ * @param environment runtime config catalog API で参照する環境変数 map
+ * @param warnings active runtime config の warning
+ */
+internal data class OpsRuntimeConfigRouteSnapshot(
     val tradingConfig: TradingBotConfig,
     val environment: Map<String, String>,
+    val warnings: List<RuntimeConfigSnapshotWarning> = emptyList(),
+)
+
+/**
+ * runtime config catalog route が現在状態を読む境界。
+ */
+internal fun interface OpsRuntimeConfigSnapshotProvider {
+    fun snapshot(): OpsRuntimeConfigRouteSnapshot
+}
+
+/**
+ * runtime config draft 作成 API の request body。
+ *
+ * @param baseVersionId draft の基準にする version ID。null の場合は active version
+ * @param values 変更する runtime config key と候補値
+ * @param note secret を含まない補足
+ */
+@Serializable
+data class OpsRuntimeConfigDraftRequest(
+    val baseVersionId: String? = null,
+    val values: Map<String, String>,
+    val note: String? = null,
+)
+
+/**
+ * runtime config version 操作 API の request body。
+ *
+ * @param reason secret を含まない操作理由
+ */
+@Serializable
+data class OpsRuntimeConfigVersionActionRequest(
+    val reason: String? = null,
 )
 
 /**
@@ -584,12 +638,21 @@ internal data class OpsRuntimeConfigRouteDependencies(
  * @param riskStateRepository risk_state repository
  * @param riskStateCommandService risk_state command service
  * @param manualLlmLaunchService manual LLM launch service
+ * @param runtimeAvailabilityProvider 取引 runtime が利用可能かを読む境界
  */
 internal data class OpsRiskRouteDependencies(
     val riskStateRepository: RiskStateRepository?,
     val riskStateCommandService: RiskStateCommandService?,
     val manualLlmLaunchService: ManualLlmLaunchService?,
+    val runtimeAvailabilityProvider: OpsRuntimeAvailabilityProvider = OpsRuntimeAvailabilityProvider { true },
 )
+
+/**
+ * 取引 runtime が利用可能かを読む境界。
+ */
+internal fun interface OpsRuntimeAvailabilityProvider {
+    fun isAvailable(): Boolean
+}
 
 /**
  * ops CLI auth route の依存関係。
@@ -650,25 +713,211 @@ internal fun Route.opsRoutes(dependencies: OpsRouteDependencies) {
 }
 
 @OptIn(ExperimentalKtorApi::class)
+@Suppress("CyclomaticComplexMethod", "LongMethod")
 private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependencies) {
+    val runtimeConfig = dependencies.runtimeConfig
+    val adminService = runtimeConfig.adminService
+
     get("/ops/runtime-config") {
+        val runtimeConfigSnapshot = runtimeConfig.snapshotProvider.snapshot()
+        val versionsResult = adminService?.listVersions()
+        val versions = versionsResult?.getOrNull().orEmpty()
+        val warnings = runtimeConfigSnapshot.warnings + versionHistoryWarning(versionsResult)
+
         call.respond(
             RuntimeConfigCatalog.snapshot(
-                tradingConfig = dependencies.runtimeConfig.tradingConfig,
-                environment = dependencies.runtimeConfig.environment,
+                tradingConfig = runtimeConfigSnapshot.tradingConfig,
+                environment = runtimeConfigSnapshot.environment,
+            ).copy(
+                activeVersion = versions.firstOrNull { version -> version.status == "ACTIVE" },
+                versions = versions,
+                warnings = warnings,
             ),
         )
     }.describe {
         summary = "runtime config catalog を取得する"
-        description = "code-owned catalog から read-only の実効 runtime config を返します。secret は設定有無だけを返し、値は返しません。"
+        description = "code-owned catalog から実効 runtime config と version 履歴を返します。version 履歴が一時的に取得できない場合も catalog と warning を返します。secret は設定有無だけを返し、値は返しません。"
         tag(OPS_TAG)
         responses {
             HttpStatusCode.OK {
-                description = "runtime config catalog です。"
+                description = "runtime config catalog と version 履歴です。"
                 schema = jsonSchema<RuntimeConfigSnapshot>()
             }
         }
     }
+
+    post("/ops/runtime-config/drafts") {
+        val request = call.receiveBodyOrBadRequest<OpsRuntimeConfigDraftRequest>() ?: return@post
+        val service = call.requireRuntimeConfigAdminService(adminService) ?: return@post
+        val result = service.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = request.baseVersionId,
+                values = request.values,
+                note = request.note,
+                createdBy = "webui",
+            ),
+        )
+        val response = call.respondRuntimeConfigResult(result) ?: return@post
+
+        call.respond(HttpStatusCode.Created, response)
+    }.describe {
+        summary = "runtime config draft を作成する"
+        description = "active または指定 version を基準に runtime config draft を作成し、現在の catalog / typed config で検証した結果を返します。"
+        tag(OPS_TAG)
+        requestBody {
+            description = "draft の基準 version と変更値です。"
+            required = true
+            schema = jsonSchema<OpsRuntimeConfigDraftRequest>()
+        }
+        responses {
+            HttpStatusCode.Created {
+                description = "作成した draft と validation 結果です。"
+                schema = jsonSchema<RuntimeConfigVersionDetail>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "request body、version ID、または変更対象 key が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "runtime config admin service が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    post("/ops/runtime-config/drafts/{versionId}/validate") {
+        call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
+        val versionId = call.requirePathValue(call.parameters["versionId"], "versionId is required") ?: return@post
+        val service = call.requireRuntimeConfigAdminService(adminService) ?: return@post
+        val response = call.respondRuntimeConfigResult(service.validateVersion(versionId)) ?: return@post
+
+        call.respond(response)
+    }.describe {
+        summary = "runtime config draft を検証する"
+        description = "保存済み draft を現在の catalog / typed config に対して再検証します。"
+        tag(OPS_TAG)
+        parameters {
+            path("versionId") {
+                description = "検証対象 draft の version ID です。"
+                schema = jsonSchema<String>()
+            }
+        }
+        requestBody {
+            description = "操作理由です。省略できます。"
+            required = true
+            schema = jsonSchema<OpsRuntimeConfigVersionActionRequest>()
+        }
+        responses {
+            HttpStatusCode.OK {
+                description = "draft と validation 結果です。"
+                schema = jsonSchema<RuntimeConfigVersionDetail>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "version ID が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "runtime config admin service が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    post("/ops/runtime-config/drafts/{versionId}/activate") {
+        call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
+        val versionId = call.requirePathValue(call.parameters["versionId"], "versionId is required") ?: return@post
+        val service = call.requireRuntimeConfigAdminService(adminService) ?: return@post
+        val result = service.activateDraft(versionId)
+        val response = call.respondRuntimeConfigResult(result) ?: return@post
+
+        call.respond(response)
+    }.describe {
+        summary = "runtime config draft を active 化する"
+        description = "保存済み draft を現在の catalog / typed config で再検証してから active 化します。"
+        tag(OPS_TAG)
+        parameters {
+            path("versionId") {
+                description = "active 化する draft の version ID です。"
+                schema = jsonSchema<String>()
+            }
+        }
+        requestBody {
+            description = "操作理由です。省略できます。"
+            required = true
+            schema = jsonSchema<OpsRuntimeConfigVersionActionRequest>()
+        }
+        responses {
+            HttpStatusCode.OK {
+                description = "active 化した version と validation 結果です。"
+                schema = jsonSchema<RuntimeConfigActivationResult>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "version ID または version 状態が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.Conflict {
+                description = "現在の catalog / typed config validation に失敗しました。"
+                schema = jsonSchema<RuntimeConfigValidationResult>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "runtime config admin service が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    post("/ops/runtime-config/versions/{versionId}/rollback") {
+        call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
+        val versionId = call.requirePathValue(call.parameters["versionId"], "versionId is required") ?: return@post
+        val service = call.requireRuntimeConfigAdminService(adminService) ?: return@post
+        val result = service.rollbackToVersion(versionId)
+        val response = call.respondRuntimeConfigResult(result) ?: return@post
+
+        call.respond(response)
+    }.describe {
+        summary = "runtime config version へ rollback する"
+        description = "保存済み inactive version を現在の catalog / typed config で再検証してから active 化します。"
+        tag(OPS_TAG)
+        parameters {
+            path("versionId") {
+                description = "rollback 先の version ID です。"
+                schema = jsonSchema<String>()
+            }
+        }
+        requestBody {
+            description = "操作理由です。省略できます。"
+            required = true
+            schema = jsonSchema<OpsRuntimeConfigVersionActionRequest>()
+        }
+        responses {
+            HttpStatusCode.OK {
+                description = "rollback 後の active version と validation 結果です。"
+                schema = jsonSchema<RuntimeConfigActivationResult>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "version ID または version 状態が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.Conflict {
+                description = "現在の catalog / typed config validation に失敗しました。"
+                schema = jsonSchema<RuntimeConfigValidationResult>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "runtime config admin service が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+}
+
+private fun versionHistoryWarning(
+    result: Result<List<RuntimeConfigVersionSummary>>?,
+): List<RuntimeConfigSnapshotWarning> {
+    if (result == null || result.isSuccess) {
+        return emptyList()
+    }
+
+    return listOf(RuntimeConfigSnapshotWarning(code = "runtimeConfig.warning.versionHistoryUnavailable"))
 }
 
 @OptIn(ExperimentalKtorApi::class)
@@ -782,10 +1031,18 @@ private fun Route.registerOpsRiskStateRoute(dependencies: OpsRouteDependencies) 
 @OptIn(ExperimentalKtorApi::class)
 private fun Route.registerOpsTriggerRoute(dependencies: OpsRouteDependencies) {
     val manualLlmLaunchService = dependencies.risk.manualLlmLaunchService
+    val runtimeAvailabilityProvider = dependencies.risk.runtimeAvailabilityProvider
 
     post("/ops/trigger") {
         val request = call.receiveBodyOrBadRequest<OpsTriggerRequest>() ?: return@post
         val reason = call.requireReason(request.reason) ?: return@post
+
+        if (!runtimeAvailabilityProvider.isAvailable()) {
+            call.respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("runtime config is unavailable"))
+
+            return@post
+        }
+
         val service = call.requireManualLlmLaunchService(manualLlmLaunchService) ?: return@post
         val result = service.launch(reason).getOrThrow()
 
@@ -1512,6 +1769,18 @@ private suspend fun ApplicationCall.requireLlmAuthService(service: LlmAuthServic
     return null
 }
 
+private suspend fun ApplicationCall.requireRuntimeConfigAdminService(
+    service: RuntimeConfigAdminService?,
+): RuntimeConfigAdminService? {
+    if (service != null) {
+        return service
+    }
+
+    respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("runtime config admin service is not configured"))
+
+    return null
+}
+
 private suspend fun ApplicationCall.requireLlmAuthProvider(rawProvider: String?): LlmAuthProvider? {
     val provider = rawProvider
         ?.trim()
@@ -1765,6 +2034,30 @@ private suspend fun ApplicationCall.respondConflictOrThrow(result: Result<RiskSt
         val errorMessage = requireNotNull(throwable.message)
 
         respond(HttpStatusCode.Conflict, ErrorResponse(errorMessage))
+
+        return null
+    }
+
+    throw throwable
+}
+
+private suspend fun <T : Any> ApplicationCall.respondRuntimeConfigResult(result: Result<T>): T? {
+    val value = result.getOrNull()
+
+    if (value != null) {
+        return value
+    }
+
+    val throwable = requireNotNull(result.exceptionOrNull())
+
+    if (throwable is RuntimeConfigValidationRejectedException) {
+        respond(HttpStatusCode.Conflict, throwable.validation)
+
+        return null
+    }
+
+    if (throwable is IllegalArgumentException) {
+        respond(HttpStatusCode.BadRequest, ErrorResponse(throwable.message ?: "runtime config request is invalid"))
 
         return null
     }

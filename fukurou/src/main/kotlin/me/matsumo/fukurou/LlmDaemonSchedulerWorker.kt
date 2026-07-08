@@ -241,6 +241,13 @@ internal fun createManualLlmLaunchService(
     )
 }
 
+/**
+ * manual LLM launch service の必須 environment が揃っているかを返す。
+ */
+internal fun hasManualLlmLaunchServiceEnvironment(environment: Map<String, String>): Boolean {
+    return oneShotRequestFromRequiredEnvironment(environment) != null
+}
+
 private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): LlmLaunchRuntimeComponents {
     val marketDataSource = GmoPublicMarketDataSource.fromConfig(
         config = inputs.tradingConfig.gmoPublicClient,
