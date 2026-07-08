@@ -659,7 +659,7 @@ private suspend fun handleCalcIndicator(
             candleCount = candles.size,
             candleRequirement = IndicatorCandleRequirementMetadata(
                 requiredCandleCount = requiredCandleCount,
-                effectiveCandleLimit = limit,
+                resolvedCandleLimit = limit,
                 sourceCandlesSufficient = candles.size >= requiredCandleCount,
             ),
             result = result,
@@ -943,7 +943,7 @@ private fun indicatorResult(output: IndicatorToolOutput): CallToolResult {
             put("candle_count", output.candleCount)
             putJsonObject("candle_requirement") {
                 put("required_candle_count", output.candleRequirement.requiredCandleCount)
-                put("effective_candle_limit", output.candleRequirement.effectiveCandleLimit)
+                put("resolved_candle_limit", output.candleRequirement.resolvedCandleLimit)
                 put("source_candles_sufficient", output.candleRequirement.sourceCandlesSufficient)
             }
             put("indicator", ToolJson.encodeToJsonElement(output.result.indicator))
@@ -1091,12 +1091,12 @@ private data class IndicatorToolOutput(
  * calc_indicator の candle 必要本数 metadata。
  *
  * @param requiredCandleCount indicator が非 null 値を返すために必要な最小 candle 本数
- * @param effectiveCandleLimit 既定値・明示 limit・必要本数から解決した取得 candle 上限
+ * @param resolvedCandleLimit 実際に data source へ要求した取得 candle 上限（必要本数を満たすため呼び出し元指定の limit を超えることがある）
  * @param sourceCandlesSufficient 供給側が必要本数以上の candle を返したかどうか
  */
 @Serializable
 private data class IndicatorCandleRequirementMetadata(
     val requiredCandleCount: Int,
-    val effectiveCandleLimit: Int,
+    val resolvedCandleLimit: Int,
     val sourceCandlesSufficient: Boolean,
 )
