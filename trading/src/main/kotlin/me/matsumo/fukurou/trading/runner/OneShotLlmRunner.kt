@@ -35,6 +35,7 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -240,6 +241,22 @@ class OneShotLlmRunner(
         clock = clock,
         idGenerator = idGenerator,
     )
+    private val requestFactory = OneShotLlmRequestFactory(
+        tradingConfig = tradingConfig,
+        parentEnvironment = parentEnvironment,
+    )
+    private val runAuditRecorder = OneShotRunAuditRecorder(
+        tradingRuntime = tradingRuntime,
+        processOutputRedactor = processOutputRedactor,
+        clock = clock,
+        logHuman = ::logHuman,
+    )
+    private val phaseInvoker = OneShotPhaseInvoker(
+        llmInvoker = llmInvoker,
+        processOutputRedactor = processOutputRedactor,
+        phaseAppender = runAuditRecorder::appendRunnerPhase,
+        logHuman = ::logHuman,
+    )
 
     /**
      * one-shot runner を 1 回実行する。
@@ -254,7 +271,7 @@ class OneShotLlmRunner(
             triggerKind = request.triggerKind,
             startedAt = clock.instant(),
         )
-        var failureContext = decisionRunContext(
+        var failureContext = requestFactory.decisionRunContext(
             invocationId = invocationId,
             provider = request.proposerProvider,
             promptHash = PROMPT_HASH_UNAVAILABLE,
@@ -262,62 +279,17 @@ class OneShotLlmRunner(
         )
 
         return try {
-            recordLlmRunStarted(llmRunStart)
-
-            val promptContent = readSystemPrompt(request.repositoryRoot)
-            val promptHash = SystemPromptV1.calculateContentHash(promptContent)
-            val proposerContext = decisionRunContext(
-                invocationId = invocationId,
-                provider = request.proposerProvider,
-                promptHash = promptHash,
-                marketSnapshotId = marketSnapshotId,
-            )
-            failureContext = proposerContext
-
-            val ttlSweepResult = decisionExecutionLifecycle.cancelExpiredRestingEntryOrders(proposerContext)
-            val result = if (ttlSweepResult.isFailure) {
-                recordNoTrade(
-                    context = proposerContext,
-                    reason = "stale_entry_order_ttl_cancel_failed",
-                    cause = ttlSweepResult.exceptionOrNull(),
-                ).getOrThrow()
-                logHuman("stale entry order ttl cancellation failed invocation=$invocationId")
-
-                OneShotRunnerResult(
+            val result = runOneShotBody(
+                OneShotRunBodyInput(
+                    request = request,
                     invocationId = invocationId,
-                    status = OneShotRunnerStatus.NO_TRADE_AUDITED,
-                    decision = null,
-                    intent = null,
-                    tradeResult = null,
-                )
-            } else {
-                val launchEligibility = launchEligibility(invocationId, proposerContext)
+                    marketSnapshotId = marketSnapshotId,
+                    llmRunStart = llmRunStart,
+                    failureContextUpdated = { context -> failureContext = context },
+                ),
+            )
 
-                if (!launchEligibility.canLaunch) {
-                    recordNoTrade(proposerContext, launchEligibility.rejectionReason, null).getOrThrow()
-                    logHuman("launch rejected invocation=$invocationId reason=${launchEligibility.rejectionReason}")
-
-                    OneShotRunnerResult(
-                        invocationId = invocationId,
-                        status = OneShotRunnerStatus.LAUNCH_REJECTED,
-                        decision = null,
-                        intent = null,
-                        tradeResult = null,
-                    )
-                } else {
-                    runOneShotAfterPreflight(
-                        request = request,
-                        invocationId = invocationId,
-                        promptContent = promptContent,
-                        promptHash = promptHash,
-                        marketSnapshotId = marketSnapshotId,
-                        proposerContext = proposerContext,
-                        failureContextUpdated = { context -> failureContext = context },
-                    )
-                }
-            }
-
-            finalizeLlmRun(
+            runAuditRecorder.finalizeLlmRun(
                 start = llmRunStart,
                 status = result.status.name,
                 cause = null,
@@ -325,116 +297,140 @@ class OneShotLlmRunner(
 
             Result.success(result)
         } catch (throwable: CancellationException) {
-            val auditResult = withContext(NonCancellable) {
-                recordNoTrade(failureContext, "caller_cancelled", throwable)
-            }
-            val finishResult = withContext(NonCancellable) {
-                finalizeLlmRun(
-                    start = llmRunStart,
-                    status = LLM_RUN_STATUS_CANCELLED,
-                    cause = throwable,
-                )
-            }
-            throwable.withSuppressedFailure(auditResult)
-            throwable.withSuppressedFailure(finishResult)
-
+            handleCancelledRun(failureContext, llmRunStart, throwable)
             throw throwable
         } catch (throwable: Throwable) {
-            val auditResult = recordNoTrade(failureContext, "caller_failed", throwable)
-            val finishResult = finalizeLlmRun(
-                start = llmRunStart,
-                status = LLM_RUN_STATUS_FAILED,
-                cause = throwable,
-            )
-
-            Result.failure(
-                throwable
-                    .withSuppressedFailure(auditResult)
-                    .withSuppressedFailure(finishResult),
-            )
+            Result.failure(handleFailedRun(failureContext, llmRunStart, throwable))
         }
     }
 
-    private suspend fun recordLlmRunStarted(start: LlmRunStart) {
-        tradingRuntime.llmRunRepository.insertRunning(start)
-            .onFailure { throwable ->
-                logRunRecordFailure(
-                    operation = "start",
-                    invocationId = start.invocationId,
-                    throwable = throwable,
-                )
-            }
-    }
-
-    private suspend fun finalizeLlmRun(
-        start: LlmRunStart,
-        status: String,
-        cause: Throwable?,
-    ): Result<Unit> {
-        val finish = LlmRunFinish(
-            invocationId = start.invocationId,
-            mode = start.mode,
-            symbol = start.symbol,
-            triggerKind = start.triggerKind,
-            status = status,
-            startedAt = start.startedAt,
-            finishedAt = clock.instant(),
-            errorMessage = cause?.redactedErrorMessage(),
-        )
-
-        return tradingRuntime.llmRunRepository.finish(finish)
-            .onFailure { throwable ->
-                logRunRecordFailure(
-                    operation = "finish",
-                    invocationId = start.invocationId,
-                    throwable = throwable,
-                )
-            }
-    }
-
-    private fun Throwable.redactedErrorMessage(): String {
-        val typeName = javaClass.simpleName
-        val detail = message.orEmpty()
-        val message = if (detail.isBlank()) typeName else "$typeName: $detail"
-
-        return processOutputRedactor.redactAndTruncate(message)
-    }
-
-    private fun logRunRecordFailure(
-        operation: String,
-        invocationId: String,
-        throwable: Throwable,
+    private suspend fun handleCancelledRun(
+        failureContext: DecisionRunContext,
+        llmRunStart: LlmRunStart,
+        throwable: CancellationException,
     ) {
-        logHuman(
-            "llm run $operation record failed invocation=$invocationId error=${throwable.javaClass.simpleName}",
+        val auditResult = withContext(NonCancellable) {
+            runAuditRecorder.recordNoTrade(
+                context = failureContext,
+                reason = "caller_cancelled",
+                cause = throwable,
+            )
+        }
+        val finishResult = withContext(NonCancellable) {
+            runAuditRecorder.finalizeLlmRun(
+                start = llmRunStart,
+                status = LLM_RUN_STATUS_CANCELLED,
+                cause = throwable,
+            )
+        }
+        throwable.withSuppressedFailure(auditResult)
+        throwable.withSuppressedFailure(finishResult)
+    }
+
+    private suspend fun handleFailedRun(
+        failureContext: DecisionRunContext,
+        llmRunStart: LlmRunStart,
+        throwable: Throwable,
+    ): Throwable {
+        val auditResult = runAuditRecorder.recordNoTrade(
+            context = failureContext,
+            reason = "caller_failed",
+            cause = throwable,
+        )
+        val finishResult = runAuditRecorder.finalizeLlmRun(
+            start = llmRunStart,
+            status = LLM_RUN_STATUS_FAILED,
+            cause = throwable,
+        )
+
+        return throwable
+            .withSuppressedFailure(auditResult)
+            .withSuppressedFailure(finishResult)
+    }
+
+    private suspend fun runOneShotBody(input: OneShotRunBodyInput): OneShotRunnerResult {
+        runAuditRecorder.recordLlmRunStarted(input.llmRunStart)
+
+        val promptContent = requestFactory.readSystemPrompt(input.request.repositoryRoot)
+        val promptHash = SystemPromptV1.calculateContentHash(promptContent)
+        val proposerContext = requestFactory.decisionRunContext(
+            invocationId = input.invocationId,
+            provider = input.request.proposerProvider,
+            promptHash = promptHash,
+            marketSnapshotId = input.marketSnapshotId,
+        )
+        input.failureContextUpdated(proposerContext)
+
+        val ttlSweepResult = decisionExecutionLifecycle.cancelExpiredRestingEntryOrders(proposerContext)
+        if (ttlSweepResult.isFailure) {
+            return recordTtlSweepFailure(input.invocationId, proposerContext, ttlSweepResult.exceptionOrNull())
+        }
+
+        val launchEligibility = launchEligibility(input.invocationId, proposerContext)
+        if (!launchEligibility.canLaunch) {
+            runAuditRecorder.recordNoTrade(
+                context = proposerContext,
+                reason = launchEligibility.rejectionReason,
+                cause = null,
+            ).getOrThrow()
+            logHuman("launch rejected invocation=${input.invocationId} reason=${launchEligibility.rejectionReason}")
+
+            return OneShotRunnerResult(
+                invocationId = input.invocationId,
+                status = OneShotRunnerStatus.LAUNCH_REJECTED,
+                decision = null,
+                intent = null,
+                tradeResult = null,
+            )
+        }
+
+        return runOneShotAfterPreflight(
+            OneShotAfterPreflightRequest(
+                request = input.request,
+                invocationId = input.invocationId,
+                promptContent = promptContent,
+                promptHash = promptHash,
+                marketSnapshotId = input.marketSnapshotId,
+                proposerContext = proposerContext,
+                failureContextUpdated = input.failureContextUpdated,
+            ),
         )
     }
 
-    private suspend fun runOneShotAfterPreflight(
-        request: OneShotRunnerRequest,
+    private suspend fun recordTtlSweepFailure(
         invocationId: String,
-        promptContent: String,
-        promptHash: String,
-        marketSnapshotId: String,
         proposerContext: DecisionRunContext,
-        failureContextUpdated: (DecisionRunContext) -> Unit,
+        cause: Throwable?,
     ): OneShotRunnerResult {
-        val proposerRequest = llmRequest(
+        runAuditRecorder.recordNoTrade(
+            context = proposerContext,
+            reason = "stale_entry_order_ttl_cancel_failed",
+            cause = cause,
+        ).getOrThrow()
+        logHuman("stale entry order ttl cancellation failed invocation=$invocationId")
+
+        return OneShotRunnerResult(
             invocationId = invocationId,
-            provider = request.proposerProvider,
-            phase = LlmInvocationPhase.PROPOSER,
-            prompt = buildProposerPrompt(promptContent),
-            decisionRunContext = proposerContext,
-            request = request,
-            intentId = null,
+            status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+            decision = null,
+            intent = null,
+            tradeResult = null,
         )
-        val proposerResult = invokePhase("proposer", proposerContext, proposerRequest).exceptionOrNull()
-        val decision = tradingRuntime.decisionRepository
-            .latestDecisionByInvocationId(invocationId)
-            .getOrThrow()
+    }
+
+    private suspend fun runOneShotAfterPreflight(input: OneShotAfterPreflightRequest): OneShotRunnerResult {
+        val request = input.request
+        val invocationId = input.invocationId
+        val proposerContext = input.proposerContext
+        val proposerResult = proposerDecision(input)
+        val decision = proposerResult.decision
 
         if (decision == null) {
-            recordNoTrade(proposerContext, "proposer_missing_decision", proposerResult).getOrThrow()
+            runAuditRecorder.recordNoTrade(
+                context = proposerContext,
+                reason = "proposer_missing_decision",
+                cause = proposerResult.failure,
+            ).getOrThrow()
 
             return OneShotRunnerResult(
                 invocationId = invocationId,
@@ -446,65 +442,99 @@ class OneShotLlmRunner(
         }
 
         if (decision.decision.submission.action != DecisionAction.ENTER) {
-            logHuman("decision saved invocation=$invocationId action=${decision.decision.submission.action}")
+            return handleNonEnterDecision(input, decision)
+        }
 
-            val lifecycleResult = when (decision.decision.submission.action) {
-                DecisionAction.EXIT -> decisionExecutionLifecycle.executeExitDecision(proposerContext, decision)
-                DecisionAction.ADJUST_PROTECTION -> decisionExecutionLifecycle.executeAdjustProtectionDecision(
-                    context = proposerContext,
-                    decision = decision,
-                )
-                DecisionAction.NO_TRADE -> null
-                DecisionAction.ENTER -> null
-            }
+        return runApprovedEntryFlow(input, decision)
+    }
 
-            if (lifecycleResult != null) {
-                return OneShotRunnerResult(
-                    invocationId = invocationId,
-                    status = lifecycleResult.status,
-                    decision = decision,
-                    intent = null,
-                    tradeResult = lifecycleResult.tradeResult,
-                )
-            }
+    private suspend fun proposerDecision(input: OneShotAfterPreflightRequest): ProposerDecisionResult {
+        val request = input.request
+        val proposerContext = input.proposerContext
+        val proposerRequest = requestFactory.llmRequest(
+            LlmRequestInput(
+                invocationId = input.invocationId,
+                provider = request.proposerProvider,
+                phase = LlmInvocationPhase.PROPOSER,
+                prompt = requestFactory.buildProposerPrompt(input.promptContent),
+                decisionRunContext = proposerContext,
+                request = request,
+                intentId = null,
+            ),
+        )
+        val proposerFailure = phaseInvoker
+            .invokePhase("proposer", proposerContext, proposerRequest)
+            .exceptionOrNull()
+        val decision = tradingRuntime.decisionRepository
+            .latestDecisionByInvocationId(input.invocationId)
+            .getOrThrow()
 
+        return ProposerDecisionResult(
+            decision = decision,
+            failure = proposerFailure,
+        )
+    }
+
+    private suspend fun handleNonEnterDecision(
+        input: OneShotAfterPreflightRequest,
+        decision: DecisionSubmissionResult,
+    ): OneShotRunnerResult {
+        logHuman("decision saved invocation=${input.invocationId} action=${decision.decision.submission.action}")
+
+        val lifecycleResult = when (decision.decision.submission.action) {
+            DecisionAction.EXIT -> decisionExecutionLifecycle.executeExitDecision(input.proposerContext, decision)
+            DecisionAction.ADJUST_PROTECTION -> decisionExecutionLifecycle.executeAdjustProtectionDecision(
+                context = input.proposerContext,
+                decision = decision,
+            )
+            DecisionAction.NO_TRADE -> null
+            DecisionAction.ENTER -> null
+        }
+
+        if (lifecycleResult != null) {
             return OneShotRunnerResult(
-                invocationId = invocationId,
-                status = OneShotRunnerStatus.NO_TRADE_DECISION,
+                invocationId = input.invocationId,
+                status = lifecycleResult.status,
                 decision = decision,
                 intent = null,
-                tradeResult = null,
+                tradeResult = lifecycleResult.tradeResult,
             )
         }
 
+        return OneShotRunnerResult(
+            invocationId = input.invocationId,
+            status = OneShotRunnerStatus.NO_TRADE_DECISION,
+            decision = decision,
+            intent = null,
+            tradeResult = null,
+        )
+    }
+
+    private suspend fun runApprovedEntryFlow(
+        input: OneShotAfterPreflightRequest,
+        decision: DecisionSubmissionResult,
+    ): OneShotRunnerResult {
+        val request = input.request
+        val invocationId = input.invocationId
+        val proposerContext = input.proposerContext
         val intent = requireNotNull(decision.tradeIntent) {
             "ENTER decision did not create trade intent."
         }
-        val falsifierContext = decisionRunContext(
+        val falsifierContext = requestFactory.decisionRunContext(
             invocationId = invocationId,
             provider = request.falsifierProvider,
-            promptHash = promptHash,
-            marketSnapshotId = marketSnapshotId,
+            promptHash = input.promptHash,
+            marketSnapshotId = input.marketSnapshotId,
         )
-        failureContextUpdated(falsifierContext)
-        val falsifierRequest = llmRequest(
-            invocationId = invocationId,
-            provider = request.falsifierProvider,
-            phase = LlmInvocationPhase.FALSIFIER,
-            prompt = buildFalsifierPrompt(promptContent, intent.intentId),
-            decisionRunContext = falsifierContext,
-            request = request,
-            intentId = intent.intentId,
-        )
+        input.failureContextUpdated(falsifierContext)
+        val falsifierResult = runFalsifierPhase(input, intent, falsifierContext)
 
-        val falsifierFailure = invokePhase("falsifier", falsifierContext, falsifierRequest).exceptionOrNull()
-        val falsification = tradingRuntime.decisionRepository
-            .latestFalsification(intent.intentId)
-            .getOrThrow()
-        val approved = falsification.isFreshApprovedAt(clock.instant(), tradingConfig.decisionProtocol.falsificationFreshnessWindow)
-
-        if (!approved) {
-            recordFalsificationNoTrade(falsifierContext, falsification, falsifierFailure).getOrThrow()
+        if (!falsifierResult.approved) {
+            recordFalsificationNoTrade(
+                context = falsifierContext,
+                falsification = falsifierResult.falsification,
+                cause = falsifierResult.failure,
+            ).getOrThrow()
 
             return OneShotRunnerResult(
                 invocationId = invocationId,
@@ -515,12 +545,16 @@ class OneShotLlmRunner(
             )
         }
 
-        failureContextUpdated(proposerContext)
+        input.failureContextUpdated(proposerContext)
         val placeResult = placeApprovedEntry(proposerContext, intent)
         val placed = placeResult.getOrNull()
 
         if (placed == null) {
-            recordNoTrade(proposerContext, "place_order_failed", placeResult.exceptionOrNull()).getOrThrow()
+            runAuditRecorder.recordNoTrade(
+                context = proposerContext,
+                reason = "place_order_failed",
+                cause = placeResult.exceptionOrNull(),
+            ).getOrThrow()
 
             return OneShotRunnerResult(
                 invocationId = invocationId,
@@ -546,6 +580,41 @@ class OneShotLlmRunner(
         )
     }
 
+    private suspend fun runFalsifierPhase(
+        input: OneShotAfterPreflightRequest,
+        intent: TradeIntentRecord,
+        falsifierContext: DecisionRunContext,
+    ): FalsifierPhaseResult {
+        val request = input.request
+        val falsifierRequest = requestFactory.llmRequest(
+            LlmRequestInput(
+                invocationId = input.invocationId,
+                provider = request.falsifierProvider,
+                phase = LlmInvocationPhase.FALSIFIER,
+                prompt = requestFactory.buildFalsifierPrompt(input.promptContent, intent.intentId),
+                decisionRunContext = falsifierContext,
+                request = request,
+                intentId = intent.intentId,
+            ),
+        )
+        val falsifierFailure = phaseInvoker
+            .invokePhase("falsifier", falsifierContext, falsifierRequest)
+            .exceptionOrNull()
+        val falsification = tradingRuntime.decisionRepository
+            .latestFalsification(intent.intentId)
+            .getOrThrow()
+        val approved = falsification.isFreshApprovedAt(
+            clock.instant(),
+            tradingConfig.decisionProtocol.falsificationFreshnessWindow,
+        )
+
+        return FalsifierPhaseResult(
+            falsification = falsification,
+            failure = falsifierFailure,
+            approved = approved,
+        )
+    }
+
     private suspend fun launchEligibility(invocationId: String, context: DecisionRunContext): RunnerLaunchEligibility {
         val hourlySince = clock.instant().minus(MAX_INVOCATION_COUNT_WINDOW)
         val dailySince = clock.instant().minus(MAX_DAILY_INVOCATION_COUNT_WINDOW)
@@ -560,7 +629,7 @@ class OneShotLlmRunner(
             else -> ""
         }
 
-        appendRunnerPhase(
+        runAuditRecorder.appendRunnerPhase(
             context = context,
             phase = "preflight",
             duration = Duration.ZERO,
@@ -580,118 +649,79 @@ class OneShotLlmRunner(
         )
     }
 
-    private suspend fun invokePhase(
-        phaseName: String,
-        context: DecisionRunContext,
-        request: LlmInvocationRequest,
-    ): Result<Unit> {
-        val startedAt = System.nanoTime()
-        val result = llmInvoker.invoke(request)
-        val duration = Duration.ofNanos(System.nanoTime() - startedAt)
-        val invocationResult = result.getOrNull()
-        val processResult = invocationResult?.processResult
-        val startFailureError = result.exceptionOrNull()
-            ?.takeIf { processResult == null }
-            ?.redactedQualifiedErrorMessage()
-        val usage = processResult?.let { completedProcess ->
-            usageForAudit(request.provider, completedProcess.stdout)
-        }
-        val authFailureSuspected = processResult?.authFailureSuspected() ?: false
-
-        appendRunnerPhase(
-            context = context,
-            phase = phaseName,
-            duration = duration,
-            details = buildJsonObject {
-                put("provider", request.provider.name.lowercase())
-                put("status", processResult?.status?.name ?: "FAILED_TO_START")
-                put("exitCode", processResult?.exitCode?.toString() ?: "null")
-                startFailureError?.let { error -> put("error", error) }
-                processResult?.let { completedProcess ->
-                    put("stdout", processOutputRedactor.redactAndTruncate(completedProcess.stdout))
-                    put("stderr", processOutputRedactor.redactAndTruncate(completedProcess.stderr))
-                }
-                if (authFailureSuspected) {
-                    put("authFailureSuspected", "true")
-                }
-                usage?.let { parsedUsage ->
-                    put("usage", LlmUsageParser.toJsonObject(parsedUsage))
-                }
-            },
-        ).getOrThrow()
-        logHuman("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
-        if (authFailureSuspected) {
-            logHuman(LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE)
-        }
-
-        val timedOut = processResult?.status == ProcessRunStatus.TIMED_OUT
-        val nonZeroExit = processResult?.exitCode?.let { exitCode -> exitCode != 0 } ?: false
-        val processFailed = when {
-            timedOut -> true
-            nonZeroExit -> true
-            else -> false
-        }
-
-        if (processFailed) {
-            return Result.failure(IllegalStateException("$phaseName process did not exit cleanly."))
-        }
-
-        return result.fold(
-            onSuccess = { Result.success(Unit) },
-            onFailure = { throwable -> Result.failure(throwable) },
-        )
-    }
-
     private suspend fun placeApprovedEntry(
         context: DecisionRunContext,
         intent: TradeIntentRecord,
     ): Result<PaperTradeResult> {
         val arrivedAtPlaceOrder = clock.instant()
         val decisionToPlaceOrderDuration = Duration.between(intent.createdAt, arrivedAtPlaceOrder)
+        val previewResult = previewApprovedEntry(context, intent)
+        val preview = previewResult.preview
+
+        if (preview == null) {
+            appendDecisionToPlaceOrderPhase(
+                input = DecisionToPlaceOrderPhaseInput(
+                    context = context,
+                    intent = intent,
+                    decisionToPlaceOrderDuration = decisionToPlaceOrderDuration,
+                    previewExecutionDuration = previewResult.duration,
+                    preview = null,
+                    placeOrderExecutionDuration = null,
+                    placeOrderHash = null,
+                    hashMismatchWarning = null,
+                    accepted = false,
+                ),
+            ).getOrThrow()
+
+            return Result.failure(requireNotNull(previewResult.failure))
+        }
+
+        return executeApprovedEntry(
+            context = context,
+            intent = intent,
+            decisionToPlaceOrderDuration = decisionToPlaceOrderDuration,
+            previewResult = previewResult,
+        )
+    }
+
+    private suspend fun previewApprovedEntry(
+        context: DecisionRunContext,
+        intent: TradeIntentRecord,
+    ): EntryPreviewResult {
         val previewStartedAt = System.nanoTime()
         val previewCall = GuardedToolCall(
             toolName = "preview_order",
             toolCallId = idGenerator().toString(),
             clientRequestId = "runner-preview-order-${intent.intentId}",
             decisionRunContext = context,
-            payload = buildJsonObject {
-                put("intentId", intent.intentId.toString())
-                put("source", "one_shot_runner")
-            }.toString(),
+            payload = runnerIntentPayload(intent),
         )
         val previewCommand = intent.toPlaceOrderCommand(previewCall)
         val previewResult = tradingRuntime.toolCallGuard.runReadOnlyTool(previewCall) {
             tradingRuntime.broker.previewOrder(previewCommand).getOrThrow()
         }
-        val previewExecutionDuration = Duration.ofNanos(System.nanoTime() - previewStartedAt)
-        val preview = previewResult.getOrNull()
 
-        if (preview == null) {
-            appendDecisionToPlaceOrderPhase(
-                context = context,
-                intent = intent,
-                decisionToPlaceOrderDuration = decisionToPlaceOrderDuration,
-                previewExecutionDuration = previewExecutionDuration,
-                preview = null,
-                placeOrderExecutionDuration = null,
-                placeOrderHash = null,
-                hashMismatchWarning = null,
-                accepted = false,
-            ).getOrThrow()
+        return EntryPreviewResult(
+            preview = previewResult.getOrNull(),
+            duration = Duration.ofNanos(System.nanoTime() - previewStartedAt),
+            failure = previewResult.exceptionOrNull(),
+        )
+    }
 
-            return Result.failure(requireNotNull(previewResult.exceptionOrNull()))
-        }
-
+    private suspend fun executeApprovedEntry(
+        context: DecisionRunContext,
+        intent: TradeIntentRecord,
+        decisionToPlaceOrderDuration: Duration,
+        previewResult: EntryPreviewResult,
+    ): Result<PaperTradeResult> {
+        val preview = requireNotNull(previewResult.preview)
         val executionStartedAt = System.nanoTime()
         val call = GuardedToolCall(
             toolName = "place_order",
             toolCallId = idGenerator().toString(),
             clientRequestId = "runner-place-order-${intent.intentId}",
             decisionRunContext = context,
-            payload = buildJsonObject {
-                put("intentId", intent.intentId.toString())
-                put("source", "one_shot_runner")
-            }.toString(),
+            payload = runnerIntentPayload(intent),
         )
         val command = intent.toPlaceOrderCommand(call)
         val placeOrderHash = command.toPreviewOrderNormalizedContent().calculatePreviewHash()
@@ -706,15 +736,17 @@ class OneShotLlmRunner(
         val placeOrderExecutionDuration = Duration.ofNanos(System.nanoTime() - executionStartedAt)
 
         appendDecisionToPlaceOrderPhase(
-            context = context,
-            intent = intent,
-            decisionToPlaceOrderDuration = decisionToPlaceOrderDuration,
-            previewExecutionDuration = previewExecutionDuration,
-            preview = preview,
-            placeOrderExecutionDuration = placeOrderExecutionDuration,
-            placeOrderHash = placeOrderHash,
-            hashMismatchWarning = hashMismatchWarning,
-            accepted = result.getOrNull()?.accepted ?: false,
+            input = DecisionToPlaceOrderPhaseInput(
+                context = context,
+                intent = intent,
+                decisionToPlaceOrderDuration = decisionToPlaceOrderDuration,
+                previewExecutionDuration = previewResult.duration,
+                preview = preview,
+                placeOrderExecutionDuration = placeOrderExecutionDuration,
+                placeOrderHash = placeOrderHash,
+                hashMismatchWarning = hashMismatchWarning,
+                accepted = result.getOrNull()?.accepted ?: false,
+            ),
         ).getOrThrow()
         if (result.getOrNull()?.accepted == false) {
             val noTradeReason = if (preview.accepted) {
@@ -722,47 +754,48 @@ class OneShotLlmRunner(
             } else {
                 "preview_order_rejected"
             }
-            recordNoTrade(context, noTradeReason, null).getOrThrow()
+            runAuditRecorder.recordNoTrade(
+                context = context,
+                reason = noTradeReason,
+                cause = null,
+            ).getOrThrow()
         }
 
         return result
     }
 
-    private suspend fun appendDecisionToPlaceOrderPhase(
-        context: DecisionRunContext,
-        intent: TradeIntentRecord,
-        decisionToPlaceOrderDuration: Duration,
-        previewExecutionDuration: Duration,
-        preview: PreviewOrderResult?,
-        placeOrderExecutionDuration: Duration?,
-        placeOrderHash: String?,
-        hashMismatchWarning: String?,
-        accepted: Boolean,
-    ): Result<Unit> {
-        return appendRunnerPhase(
-            context = context,
+    private fun runnerIntentPayload(intent: TradeIntentRecord): String {
+        return buildJsonObject {
+            put("intentId", intent.intentId.toString())
+            put("source", "one_shot_runner")
+        }.toString()
+    }
+
+    private suspend fun appendDecisionToPlaceOrderPhase(input: DecisionToPlaceOrderPhaseInput): Result<Unit> {
+        return runAuditRecorder.appendRunnerPhase(
+            context = input.context,
             phase = "decision_to_place_order",
-            duration = decisionToPlaceOrderDuration,
+            duration = input.decisionToPlaceOrderDuration,
             details = buildJsonObject {
-                put("intentId", intent.intentId.toString())
-                put("previewExecutionMillis", previewExecutionDuration.toMillis())
-                put("previewAccepted", preview?.accepted ?: false)
-                preview?.let { previewResult ->
+                put("intentId", input.intent.intentId.toString())
+                put("previewExecutionMillis", input.previewExecutionDuration.toMillis())
+                put("previewAccepted", input.preview?.accepted ?: false)
+                input.preview?.let { previewResult ->
                     put("previewHash", previewResult.previewHash)
                     previewResult.safetyViolation?.let { violation ->
                         put("previewSafetyViolationRule", violation.rule.name)
                     }
                 }
-                if (placeOrderExecutionDuration != null) {
-                    put("placeOrderExecutionMillis", placeOrderExecutionDuration.toMillis())
+                if (input.placeOrderExecutionDuration != null) {
+                    put("placeOrderExecutionMillis", input.placeOrderExecutionDuration.toMillis())
                 }
-                if (placeOrderHash != null) {
-                    put("placeOrderHash", placeOrderHash)
+                if (input.placeOrderHash != null) {
+                    put("placeOrderHash", input.placeOrderHash)
                 }
-                if (hashMismatchWarning != null) {
-                    put("previewHashMismatchWarning", hashMismatchWarning)
+                if (input.hashMismatchWarning != null) {
+                    put("previewHashMismatchWarning", input.hashMismatchWarning)
                 }
-                put("accepted", accepted)
+                put("accepted", input.accepted)
             },
         )
     }
@@ -799,7 +832,7 @@ class OneShotLlmRunner(
             Duration.between(createdAt, clock.instant()).toMillis()
         }
 
-        appendRunnerPhase(
+        runAuditRecorder.appendRunnerPhase(
             context = context,
             phase = "falsifier_verdict_check",
             duration = Duration.ZERO,
@@ -811,10 +844,70 @@ class OneShotLlmRunner(
             },
         ).getOrThrow()
 
-        return recordNoTrade(context, reason, cause)
+        return runAuditRecorder.recordNoTrade(
+            context = context,
+            reason = reason,
+            cause = cause,
+        )
     }
 
-    private suspend fun recordNoTrade(
+    private fun logHuman(message: String) {
+        logger("[fukurou-runner] $message")
+    }
+}
+
+/**
+ * OneShot runner の監査 record 保存を担当する helper。
+ *
+ * @param tradingRuntime trading runtime
+ * @param processOutputRedactor process 出力の redactor
+ * @param clock audit timestamp 用 clock
+ * @param logHuman 人間向け runner log 出力
+ */
+private class OneShotRunAuditRecorder(
+    private val tradingRuntime: TradingRuntime,
+    private val processOutputRedactor: SecretRedactor,
+    private val clock: Clock,
+    private val logHuman: (String) -> Unit,
+) {
+    suspend fun recordLlmRunStarted(start: LlmRunStart) {
+        tradingRuntime.llmRunRepository.insertRunning(start)
+            .onFailure { throwable ->
+                logRunRecordFailure(
+                    operation = "start",
+                    invocationId = start.invocationId,
+                    throwable = throwable,
+                )
+            }
+    }
+
+    suspend fun finalizeLlmRun(
+        start: LlmRunStart,
+        status: String,
+        cause: Throwable?,
+    ): Result<Unit> {
+        val finish = LlmRunFinish(
+            invocationId = start.invocationId,
+            mode = start.mode,
+            symbol = start.symbol,
+            triggerKind = start.triggerKind,
+            status = status,
+            startedAt = start.startedAt,
+            finishedAt = clock.instant(),
+            errorMessage = cause?.redactedErrorMessage(),
+        )
+
+        return tradingRuntime.llmRunRepository.finish(finish)
+            .onFailure { throwable ->
+                logRunRecordFailure(
+                    operation = "finish",
+                    invocationId = start.invocationId,
+                    throwable = throwable,
+                )
+            }
+    }
+
+    suspend fun recordNoTrade(
         context: DecisionRunContext,
         reason: String,
         cause: Throwable?,
@@ -830,7 +923,7 @@ class OneShotLlmRunner(
         )
     }
 
-    private suspend fun appendRunnerPhase(
+    suspend fun appendRunnerPhase(
         context: DecisionRunContext,
         phase: String,
         duration: Duration,
@@ -855,6 +948,116 @@ class OneShotLlmRunner(
         )
     }
 
+    private fun Throwable.redactedErrorMessage(): String {
+        val typeName = javaClass.simpleName
+        val detail = message.orEmpty()
+        val message = if (detail.isBlank()) typeName else "$typeName: $detail"
+
+        return processOutputRedactor.redactAndTruncate(message)
+    }
+
+    private fun logRunRecordFailure(
+        operation: String,
+        invocationId: String,
+        throwable: Throwable,
+    ) {
+        logHuman(
+            "llm run $operation record failed invocation=$invocationId error=${throwable.javaClass.simpleName}",
+        )
+    }
+}
+
+/**
+ * OneShot runner の LLM phase 実行と監査 payload 生成を担当する helper。
+ *
+ * @param llmInvoker LLM invocation 境界
+ * @param processOutputRedactor process 出力の redactor
+ * @param phaseAppender runner phase 監査保存 callback
+ * @param logHuman 人間向け runner log 出力
+ */
+private class OneShotPhaseInvoker(
+    private val llmInvoker: LlmInvoker,
+    private val processOutputRedactor: SecretRedactor,
+    private val phaseAppender: suspend (DecisionRunContext, String, Duration, JsonObject) -> Result<Unit>,
+    private val logHuman: (String) -> Unit,
+) {
+    suspend fun invokePhase(
+        phaseName: String,
+        context: DecisionRunContext,
+        request: LlmInvocationRequest,
+    ): Result<Unit> {
+        val startedAt = System.nanoTime()
+        val result = llmInvoker.invoke(request)
+        val duration = Duration.ofNanos(System.nanoTime() - startedAt)
+        val invocationResult = result.getOrNull()
+        val processResult = invocationResult?.processResult
+        val startFailureError = result.exceptionOrNull()
+            ?.takeIf { processResult == null }
+            ?.redactedQualifiedErrorMessage()
+        val usage = processResult?.let { completedProcess ->
+            usageForAudit(request.provider, completedProcess.stdout)
+        }
+        val authFailureSuspected = processResult?.authFailureSuspected() ?: false
+
+        phaseAppender(
+            context,
+            phaseName,
+            duration,
+            invocationAuditDetails(
+                request = request,
+                processResult = processResult,
+                startFailureError = startFailureError,
+                authFailureSuspected = authFailureSuspected,
+                usage = usage,
+            ),
+        ).getOrThrow()
+        logHuman("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
+        if (authFailureSuspected) {
+            logHuman(LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE)
+        }
+
+        if (processFailed(processResult)) {
+            return Result.failure(IllegalStateException("$phaseName process did not exit cleanly."))
+        }
+
+        return result.fold(
+            onSuccess = { Result.success(Unit) },
+            onFailure = { throwable -> Result.failure(throwable) },
+        )
+    }
+
+    private fun invocationAuditDetails(
+        request: LlmInvocationRequest,
+        processResult: ProcessRunResult?,
+        startFailureError: String?,
+        authFailureSuspected: Boolean,
+        usage: LlmUsageDetails?,
+    ): JsonObject {
+        return buildJsonObject {
+            put("provider", request.provider.name.lowercase())
+            put("status", processResult?.status?.name ?: "FAILED_TO_START")
+            put("exitCode", processResult?.exitCode?.toString() ?: "null")
+            startFailureError?.let { error -> put("error", error) }
+            processResult?.let { completedProcess ->
+                put("stdout", processOutputRedactor.redactAndTruncate(completedProcess.stdout))
+                put("stderr", processOutputRedactor.redactAndTruncate(completedProcess.stderr))
+            }
+            if (authFailureSuspected) {
+                put("authFailureSuspected", "true")
+            }
+            usage?.let { parsedUsage ->
+                put("usage", LlmUsageParser.toJsonObject(parsedUsage))
+            }
+        }
+    }
+
+    private fun processFailed(processResult: ProcessRunResult?): Boolean {
+        val timedOut = processResult?.status == ProcessRunStatus.TIMED_OUT
+        val nonZeroExit = processResult?.exitCode?.let { exitCode -> exitCode != 0 } ?: false
+
+        return timedOut || nonZeroExit
+    }
+
     private fun Throwable.redactedQualifiedErrorMessage(): String {
         val detail = message.orEmpty()
         val auditMessage = "${javaClass.name}: $detail"
@@ -862,33 +1065,51 @@ class OneShotLlmRunner(
         return processOutputRedactor.redactAndTruncate(auditMessage)
     }
 
-    private fun llmRequest(
-        invocationId: String,
-        provider: LlmProvider,
-        phase: LlmInvocationPhase,
-        prompt: String,
-        decisionRunContext: DecisionRunContext,
-        request: OneShotRunnerRequest,
-        intentId: UUID?,
-    ): LlmInvocationRequest {
-        val allowedTools = allowedToolsForPhase(phase, request.cliConfig)
+    private fun usageForAudit(provider: LlmProvider, stdout: String) = when (provider) {
+        LlmProvider.CLAUDE -> LlmUsageParser.parseClaudeStdout(stdout)
+        LlmProvider.CODEX -> null
+    }
+
+    private fun ProcessRunResult.authFailureSuspected(): Boolean {
+        val exitFailed = exitCode?.let { completedExitCode -> completedExitCode != 0 } ?: false
+        val combinedOutput = "$stdout\n$stderr"
+        val outputContainsAuthFailure = LLM_CLI_AUTH_FAILURE_PATTERNS.any { pattern ->
+            combinedOutput.contains(pattern, ignoreCase = true)
+        }
+
+        return exitFailed && outputContainsAuthFailure
+    }
+}
+
+/**
+ * OneShot runner の LLM request / prompt / environment を組み立てる factory。
+ *
+ * @param tradingConfig trading config
+ * @param parentEnvironment 親 process environment
+ */
+private class OneShotLlmRequestFactory(
+    private val tradingConfig: TradingBotConfig,
+    private val parentEnvironment: Map<String, String>,
+) {
+    fun llmRequest(input: LlmRequestInput): LlmInvocationRequest {
+        val allowedTools = allowedToolsForPhase(input.phase, input.request.cliConfig)
 
         return LlmInvocationRequest(
-            invocationId = invocationId,
-            provider = provider,
-            phase = phase,
-            prompt = prompt,
+            invocationId = input.invocationId,
+            provider = input.provider,
+            phase = input.phase,
+            prompt = input.prompt,
             timeout = tradingConfig.runner.perRunTimeout,
-            workingDirectory = request.workingDirectory,
-            decisionRunContext = decisionRunContext,
+            workingDirectory = input.request.workingDirectory,
+            decisionRunContext = input.decisionRunContext,
             mcpServer = mcpServerConfig(
-                mcpJarPath = request.mcpJarPath,
-                context = decisionRunContext,
-                cliConfig = request.cliConfig,
+                mcpJarPath = input.request.mcpJarPath,
+                context = input.decisionRunContext,
+                cliConfig = input.request.cliConfig,
                 allowedTools = allowedTools,
-                provider = provider,
+                provider = input.provider,
             ),
-            environment = childEnvironment(decisionRunContext, intentId),
+            environment = childEnvironment(input.decisionRunContext, input.intentId),
             allowedTools = allowedTools,
         )
     }
@@ -964,7 +1185,7 @@ class OneShotLlmRunner(
         )
     }
 
-    private fun decisionRunContext(
+    fun decisionRunContext(
         invocationId: String,
         provider: LlmProvider,
         promptHash: String,
@@ -979,11 +1200,11 @@ class OneShotLlmRunner(
         )
     }
 
-    private fun readSystemPrompt(repositoryRoot: Path): String {
+    fun readSystemPrompt(repositoryRoot: Path): String {
         return Files.readString(repositoryRoot.resolve(SystemPromptV1.RELATIVE_PATH))
     }
 
-    private fun buildProposerPrompt(systemPrompt: String): String {
+    fun buildProposerPrompt(systemPrompt: String): String {
         return """
             |$systemPrompt
             |
@@ -992,7 +1213,7 @@ class OneShotLlmRunner(
         """.trimMargin()
     }
 
-    private fun buildFalsifierPrompt(systemPrompt: String, intentId: UUID): String {
+    fun buildFalsifierPrompt(systemPrompt: String, intentId: UUID): String {
         return """
             |$systemPrompt
             |
@@ -1017,25 +1238,6 @@ class OneShotLlmRunner(
         return shortMcpToolNames(allowedTools)
             .filter { toolName -> toolName in CODEX_AUTO_APPROVED_WRITE_TOOL_NAMES }
             .distinct()
-    }
-
-    private fun logHuman(message: String) {
-        logger("[fukurou-runner] $message")
-    }
-
-    private fun usageForAudit(provider: LlmProvider, stdout: String) = when (provider) {
-        LlmProvider.CLAUDE -> LlmUsageParser.parseClaudeStdout(stdout)
-        LlmProvider.CODEX -> null
-    }
-
-    private fun ProcessRunResult.authFailureSuspected(): Boolean {
-        val exitFailed = exitCode?.let { completedExitCode -> completedExitCode != 0 } ?: false
-        val combinedOutput = "$stdout\n$stderr"
-        val outputContainsAuthFailure = LLM_CLI_AUTH_FAILURE_PATTERNS.any { pattern ->
-            combinedOutput.contains(pattern, ignoreCase = true)
-        }
-
-        return exitFailed && outputContainsAuthFailure
     }
 }
 
@@ -1097,6 +1299,127 @@ val MAX_INVOCATION_COUNT_WINDOW: Duration = Duration.ofHours(1)
  * daily invocation cap の集計 window。
  */
 val MAX_DAILY_INVOCATION_COUNT_WINDOW: Duration = Duration.ofDays(1)
+
+/**
+ * one-shot 実行本体の入力。
+ *
+ * @param request runner 実行要求
+ * @param invocationId runner 起動 ID
+ * @param marketSnapshotId market snapshot ID
+ * @param llmRunStart LLM run 開始 record
+ * @param failureContextUpdated failure audit context 更新 callback
+ */
+private data class OneShotRunBodyInput(
+    val request: OneShotRunnerRequest,
+    val invocationId: String,
+    val marketSnapshotId: String,
+    val llmRunStart: LlmRunStart,
+    val failureContextUpdated: (DecisionRunContext) -> Unit,
+)
+
+/**
+ * preflight 後の one-shot 実行入力。
+ *
+ * @param request runner 実行要求
+ * @param invocationId runner 起動 ID
+ * @param promptContent system prompt 本文
+ * @param promptHash system prompt hash
+ * @param marketSnapshotId market snapshot ID
+ * @param proposerContext proposer decision run context
+ * @param failureContextUpdated failure audit context 更新 callback
+ */
+private data class OneShotAfterPreflightRequest(
+    val request: OneShotRunnerRequest,
+    val invocationId: String,
+    val promptContent: String,
+    val promptHash: String,
+    val marketSnapshotId: String,
+    val proposerContext: DecisionRunContext,
+    val failureContextUpdated: (DecisionRunContext) -> Unit,
+)
+
+/**
+ * decision から place_order までの runner phase 監査入力。
+ *
+ * @param context decision run context
+ * @param intent entry intent
+ * @param decisionToPlaceOrderDuration decision 作成から place_order 終了までの経過
+ * @param previewExecutionDuration preview_order 実行時間
+ * @param preview preview_order 結果
+ * @param placeOrderExecutionDuration place_order 実行時間
+ * @param placeOrderHash place_order normalized hash
+ * @param hashMismatchWarning preview / place_order hash mismatch warning
+ * @param accepted place_order が受理されたか
+ */
+private data class DecisionToPlaceOrderPhaseInput(
+    val context: DecisionRunContext,
+    val intent: TradeIntentRecord,
+    val decisionToPlaceOrderDuration: Duration,
+    val previewExecutionDuration: Duration,
+    val preview: PreviewOrderResult?,
+    val placeOrderExecutionDuration: Duration?,
+    val placeOrderHash: String?,
+    val hashMismatchWarning: String?,
+    val accepted: Boolean,
+)
+
+/**
+ * LLM invocation request 作成入力。
+ *
+ * @param invocationId runner 起動 ID
+ * @param provider LLM provider
+ * @param phase LLM phase
+ * @param prompt LLM に渡す prompt
+ * @param decisionRunContext decision run context
+ * @param request runner 実行要求
+ * @param intentId falsifier 対象 intent ID
+ */
+private data class LlmRequestInput(
+    val invocationId: String,
+    val provider: LlmProvider,
+    val phase: LlmInvocationPhase,
+    val prompt: String,
+    val decisionRunContext: DecisionRunContext,
+    val request: OneShotRunnerRequest,
+    val intentId: UUID?,
+)
+
+/**
+ * proposer phase 後に runner が参照する decision と phase failure。
+ *
+ * @param decision 保存済み decision
+ * @param failure proposer phase の失敗
+ */
+private data class ProposerDecisionResult(
+    val decision: DecisionSubmissionResult?,
+    val failure: Throwable?,
+)
+
+/**
+ * falsifier phase 後の verdict 判定結果。
+ *
+ * @param falsification 保存済み falsification
+ * @param failure falsifier phase の失敗
+ * @param approved fresh APPROVED verdict なら true
+ */
+private data class FalsifierPhaseResult(
+    val falsification: FalsificationRecord?,
+    val failure: Throwable?,
+    val approved: Boolean,
+)
+
+/**
+ * runner deterministic entry の preview 結果。
+ *
+ * @param preview preview_order 結果
+ * @param duration preview_order 実行時間
+ * @param failure preview_order 失敗
+ */
+private data class EntryPreviewResult(
+    val preview: PreviewOrderResult?,
+    val duration: Duration,
+    val failure: Throwable?,
+)
 
 /**
  * runner 起動可否の判定結果。
