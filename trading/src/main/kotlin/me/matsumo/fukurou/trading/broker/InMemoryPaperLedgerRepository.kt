@@ -36,6 +36,7 @@ import java.util.UUID
  * @param openOrders open order 一覧
  * @param executions execution 一覧
  * @param decisionRunIdsByPositionId position ID と LLM invocation ID の対応
+ * @param decisionContextsByRunId decision run ID と entry decision context の対応
  * @param equitySnapshotRepository equity snapshot 保存先
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  * @param clock paper ledger の作成時刻に使う clock
@@ -70,6 +71,7 @@ class InMemoryPaperLedgerRepository private constructor(
         openOrders: List<Order> = emptyList(),
         executions: List<Execution> = emptyList(),
         decisionRunIdsByPositionId: Map<String, String?> = emptyMap(),
+        decisionContextsByRunId: Map<String, ExecutionActivityDecisionContext> = emptyMap(),
         equitySnapshotRepository: InMemoryEquitySnapshotRepository = InMemoryEquitySnapshotRepository(),
         fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
         clock: Clock = Clock.systemUTC(),
@@ -84,6 +86,7 @@ class InMemoryPaperLedgerRepository private constructor(
                 openOrders = openOrders,
                 executions = executions,
                 decisionRunIdsByPositionId = decisionRunIdsByPositionId,
+                decisionContextsByRunId = decisionContextsByRunId,
             ),
             runtime = InMemoryPaperLedgerRuntime(
                 equitySnapshotRepository = equitySnapshotRepository,
@@ -119,12 +122,14 @@ private data class InMemoryPaperLedgerAccountSeed(
  * @param openOrders open order 一覧
  * @param executions execution 一覧
  * @param decisionRunIdsByPositionId position ID と LLM invocation ID の対応
+ * @param decisionContextsByRunId decision run ID と entry decision context の対応
  */
 private data class InMemoryPaperLedgerRecordsSeed(
     val positions: List<Position>,
     val openOrders: List<Order>,
     val executions: List<Execution>,
     val decisionRunIdsByPositionId: Map<String, String?>,
+    val decisionContextsByRunId: Map<String, ExecutionActivityDecisionContext>,
 )
 
 /**
@@ -159,6 +164,8 @@ private class InMemoryPaperLedgerState(
     val orders: MutableList<Order> = records.openOrders.toMutableList()
     val executions: MutableList<Execution> = records.executions.toMutableList()
     val decisionRunIdsByPositionId: MutableMap<String, String?> = records.decisionRunIdsByPositionId.toMutableMap()
+    val decisionContextsByRunId: Map<String, ExecutionActivityDecisionContext> =
+        records.decisionContextsByRunId
     val equitySnapshotRepository: InMemoryEquitySnapshotRepository = runtime.equitySnapshotRepository
     val fallbackSymbolRules: SymbolRules = runtime.fallbackSymbolRules
     val clock: Clock = runtime.clock
@@ -918,7 +925,7 @@ private fun InMemoryPaperLedgerState.toExecutionActivityRecord(execution: Execut
     val positionContext = execution.toExecutionActivityPositionContext(position, directOrder)
     val decisionRunId = position?.positionId?.let { positionId -> decisionRunIdsByPositionId[positionId] }
     val decisionContext = decisionRunId?.let { runId ->
-        ExecutionActivityDecisionContext(
+        decisionContextsByRunId[runId] ?: ExecutionActivityDecisionContext(
             decisionId = null,
             decisionRunId = runId,
             action = null,

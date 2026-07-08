@@ -234,6 +234,25 @@ private const val ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL = """
 """
 
 /**
+ * Activity execution context join 用の entry order index を作る SQL。
+ */
+private const val ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_orders_activity_context_entry
+    ON orders (mode, side, trade_group_id, created_at, id)
+    WHERE decision_run_id IS NOT NULL
+        AND trade_group_id IS NOT NULL
+"""
+
+/**
+ * Activity execution context join 用の decision lookup index を作る SQL。
+ */
+private const val ENSURE_DECISIONS_INVOCATION_ID_CREATED_AT_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_decisions_invocation_id_created_at
+    ON decisions (invocation_id, created_at DESC)
+    WHERE invocation_id IS NOT NULL
+"""
+
+/**
  * LLM 起動予約の invocation_id unique index を作る SQL。
  */
 private const val ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL = """
@@ -322,6 +341,28 @@ private const val VERIFY_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL = """
     WHERE schemaname = current_schema()
         AND tablename = 'orders'
         AND indexname = 'idx_orders_client_request_id_unique'
+"""
+
+/**
+ * Activity execution context join 用 entry order index 存在を確認する SQL。
+ */
+private const val VERIFY_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'orders'
+        AND indexname = 'idx_orders_activity_context_entry'
+"""
+
+/**
+ * Activity execution context join 用 decision lookup index 存在を確認する SQL。
+ */
+private const val VERIFY_DECISIONS_INVOCATION_ID_CREATED_AT_INDEX_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'decisions'
+        AND indexname = 'idx_decisions_invocation_id_created_at'
 """
 
 /**
@@ -701,6 +742,8 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL)
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL)
+    executeUpdate(ENSURE_DECISIONS_INVOCATION_ID_CREATED_AT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
@@ -773,6 +816,10 @@ private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
         sql = VERIFY_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL,
         missingMessage = "orders client_request_id unique index was not initialized.",
     )
+    verifyExistsBySql(
+        sql = VERIFY_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL,
+        missingMessage = "orders activity context entry index was not initialized.",
+    )
     verifySchemaBySql(
         sql = VERIFY_LLM_LAUNCH_RESERVATIONS_SCHEMA_SQL,
         missingMessage = "llm_launch_reservations schema was not initialized.",
@@ -795,6 +842,10 @@ private fun JdbcTransaction.verifyDecisionRuntimeSchemaObjects() {
     verifySchemaBySql(
         sql = VERIFY_DECISIONS_SCHEMA_SQL,
         missingMessage = "decisions schema was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_DECISIONS_INVOCATION_ID_CREATED_AT_INDEX_SQL,
+        missingMessage = "decisions invocation_id/created_at index was not initialized.",
     )
     verifySchemaBySql(
         sql = VERIFY_TRADE_PLANS_SCHEMA_SQL,

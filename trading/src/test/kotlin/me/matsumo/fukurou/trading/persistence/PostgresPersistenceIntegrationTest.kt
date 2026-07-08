@@ -202,6 +202,28 @@ private const val SELECT_ORDERS_CLIENT_REQUEST_ID_INDEX_COUNT_SQL = """
 """
 
 /**
+ * orders activity context entry index 件数を読む SQL。
+ */
+private const val SELECT_ORDERS_ACTIVITY_CONTEXT_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'orders'
+        AND indexname = 'idx_orders_activity_context_entry'
+"""
+
+/**
+ * decisions invocation_id lookup index 件数を読む SQL。
+ */
+private const val SELECT_DECISIONS_INVOCATION_ID_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'decisions'
+        AND indexname = 'idx_decisions_invocation_id_created_at'
+"""
+
+/**
  * LLM 起動予約 index 件数を読む SQL。
  */
 private const val SELECT_LLM_LAUNCH_RESERVATION_INDEX_COUNT_SQL = """
@@ -656,6 +678,8 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(ExposedRiskStateRepository(database).current().isSuccess)
         assertEquals(2, selectCommandEventLogIndexCount(database))
         assertEquals(1, selectOrdersClientRequestIdIndexCount(database))
+        assertEquals(1, selectOrdersActivityContextIndexCount(database))
+        assertEquals(1, selectDecisionsInvocationIdIndexCount(database))
         assertEquals(3, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
@@ -2918,6 +2942,36 @@ private fun selectOrdersClientRequestIdIndexCount(database: ExposedDatabase): In
         jdbcConnection().prepareStatement(SELECT_ORDERS_CLIENT_REQUEST_ID_INDEX_COUNT_SQL).use { statement ->
             statement.executeQuery().use { resultSet ->
                 require(resultSet.next()) { "orders client_request_id index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * orders activity context entry index 件数を読む。
+ */
+private fun selectOrdersActivityContextIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_ORDERS_ACTIVITY_CONTEXT_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "orders activity context index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/**
+ * decisions invocation_id lookup index 件数を読む。
+ */
+private fun selectDecisionsInvocationIdIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_DECISIONS_INVOCATION_ID_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "decisions invocation_id index count did not return a row." }
 
                 resultSet.getInt(1)
             }
