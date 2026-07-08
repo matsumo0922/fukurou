@@ -1884,7 +1884,7 @@ private suspend fun ApplicationCall.requireLimit(defaultLimit: Int, maxLimit: In
     val limitIsValid = parsedLimit != null && parsedLimit > 0
 
     if (limitIsValid) {
-        return requireNotNull(parsedLimit).coerceAtMost(maxLimit)
+        return parsedLimit.coerceAtMost(maxLimit)
     }
 
     respond(HttpStatusCode.BadRequest, ErrorResponse("limit must be a positive integer"))
@@ -1943,7 +1943,7 @@ private suspend fun ApplicationCall.requireBeforeCursor(clock: Clock): OpsActivi
 
     if (cursorIsValid) {
         return OpsActivityCursor(
-            occurredAt = requireNotNull(occurredAt),
+            occurredAt = occurredAt,
             source = source,
             eventId = eventId,
             sourceEventId = sourceEventId,

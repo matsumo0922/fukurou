@@ -562,7 +562,9 @@ private fun JdbcTransaction.fillTriggeredEntryOrders(
         }
         val command = order.toPlaceOrderCommand()
         val positionId = UUID.randomUUID()
-        val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
+        val orderTradeGroupId = order.tradeGroupId
+            ?: error("Triggered entry order must have trade group ID.")
+        val tradeGroupId = UUID.fromString(orderTradeGroupId)
         val stopOrderId = UUID.randomUUID()
 
         if (!hasCashForBuyFill(fill)) {
