@@ -2,8 +2,6 @@
 <SmellBaseline>
   <ManuallySuppressedIssues/>
   <CurrentIssues>
-    <ID>ComplexCondition:TradingRuntime.kt$TradingDatabaseConfig.Companion$url.isNullOrBlank() || user.isNullOrBlank() || password.isNullOrBlank()</ID>
-    <ID>CyclomaticComplexMethod:IndicatorCalculator.kt$IndicatorCalculator$fun requiredCandleCount(indicator: IndicatorType, params: IndicatorParams = IndicatorParams()): Result&lt;Int></ID>
     <ID>CyclomaticComplexMethod:OneShotLlmRunner.kt$OneShotLlmRunner$private suspend fun invokePhase( phaseName: String, context: DecisionRunContext, request: LlmInvocationRequest, ): Result&lt;Unit></ID>
     <ID>LargeClass:ExposedPaperLedgerWriter.kt$ExposedPaperLedgerWriter</ID>
     <ID>LargeClass:InMemoryPaperLedgerRepository.kt$InMemoryPaperLedgerRepository : PaperLedgerRepository</ID>
@@ -13,15 +11,12 @@
     <ID>LongMethod:OneShotLlmRunner.kt$OneShotLlmRunner$private suspend fun runOneShotAfterPreflight( request: OneShotRunnerRequest, invocationId: String, promptContent: String, promptHash: String, marketSnapshotId: String, proposerContext: DecisionRunContext, failureContextUpdated: (DecisionRunContext) -> Unit, ): OneShotRunnerResult</ID>
     <ID>LongMethod:OneShotLlmRunner.kt$OneShotLlmRunner$suspend fun runOneShot(request: OneShotRunnerRequest): Result&lt;OneShotRunnerResult></ID>
     <ID>LongMethod:TradingRuntime.kt$TradingRuntimeFactory$fun connectedPostgres( dataSource: HikariDataSource, database: ExposedDatabase, clock: Clock = Clock.systemUTC(), reconcilerStatusProvider: ReconcilerStatusProvider? = null, marketDataSource: MarketDataSource? = null, tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(), closeDataSource: Boolean = false, ): TradingRuntime</ID>
-    <ID>LongParameterList:DefaultLlmCommandRenderer.kt$( args: List&lt;String>, environment: Map&lt;String, String>, workingDirectory: java.nio.file.Path, timeout: java.time.Duration, stdin: String?, cleanupPaths: List&lt;Path>, )</ID>
-    <ID>LongParameterList:EvaluationMath.kt$EvaluationMath$( candles: List&lt;Candle>, dailyPnlFacts: List&lt;DailyTradePnlFact>, baselineEquityJpy: BigDecimal, fromDate: LocalDate, toDateInclusive: LocalDate, zoneId: ZoneId, )</ID>
     <ID>LongParameterList:ExposedPaperLedgerWriter.kt$ExposedPaperLedgerWriter$( command: PlaceOrderCommand, fill: SimulatedFill, positionId: UUID, tradeGroupId: UUID, entryOrderId: UUID, stopOrderId: UUID, )</ID>
     <ID>LongParameterList:ExposedPaperLedgerWriter.kt$ExposedPaperLedgerWriter$( command: PlaceOrderCommand, fill: SimulatedFill, positionId: UUID, tradeGroupId: UUID, stopOrderId: UUID, intentId: UUID, consumedAt: Instant, )</ID>
     <ID>LongParameterList:ExposedPaperLedgerWriter.kt$ExposedPaperLedgerWriter$( orderId: String, positionId: String, mode: TradingMode, side: OrderSide, fill: SimulatedFill, auditContext: PaperTradeAuditContext, )</ID>
     <ID>LongParameterList:ExposedPaperLedgerWriter.kt$ExposedPaperLedgerWriter$( positionId: String, lastPrice: BigDecimal, highestPrice: BigDecimal, lowestPrice: BigDecimal, unrealizedPnl: BigDecimal, tightenedStop: BigDecimal?, )</ID>
     <ID>LongParameterList:ExposedPaperLedgerWriter.kt$ExposedPaperLedgerWriter$( ticker: Ticker, rules: SymbolRules, simulator: FillSimulator, lastPrice: BigDecimal, triggeredOrderIds: MutableList&lt;String>, closedPositionIds: MutableList&lt;String>, executionIds: MutableList&lt;String>, )</ID>
     <ID>LongParameterList:ExposedPaperLedgerWriter.kt$ExposedPaperLedgerWriter$( ticker: Ticker, rules: SymbolRules, simulator: FillSimulator, lastPrice: BigDecimal, triggeredOrderIds: MutableList&lt;String>, executionIds: MutableList&lt;String>, )</ID>
-    <ID>LongParameterList:FillSimulator.kt$FillSimulator$( side: OrderSide, orderType: OrderType, sizeBtc: BigDecimal, limitPriceJpy: BigDecimal?, triggerPriceJpy: BigDecimal?, ticker: Ticker, rules: SymbolRules, )</ID>
     <ID>LongParameterList:InMemoryPaperLedgerRepository.kt$InMemoryPaperLedgerRepository$( command: PlaceOrderCommand, fill: SimulatedFill, positionId: UUID, tradeGroupId: UUID, entryOrderId: UUID, stopOrderId: UUID, insertEntryOrder: Boolean, )</ID>
     <ID>LongParameterList:InMemoryPaperLedgerRepository.kt$InMemoryPaperLedgerRepository$( ticker: Ticker, rules: SymbolRules, simulator: FillSimulator, lastPrice: BigDecimal, triggeredOrderIds: MutableList&lt;String>, closedPositionIds: MutableList&lt;String>, executionIds: MutableList&lt;String>, )</ID>
     <ID>LongParameterList:InMemoryPaperLedgerRepository.kt$InMemoryPaperLedgerRepository$( ticker: Ticker, rules: SymbolRules, simulator: FillSimulator, lastPrice: BigDecimal, triggeredOrderIds: MutableList&lt;String>, executionIds: MutableList&lt;String>, )</ID>

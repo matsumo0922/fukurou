@@ -141,21 +141,23 @@ class EvaluationMathTest {
     @Test
     fun benchmarkCalculatesBuyHoldNoTradeAndBotSeries() {
         val result = EvaluationMath.benchmark(
-            candles = listOf(
-                dailyCandle("2026-07-01", "100"),
-                dailyCandle("2026-07-02", "110"),
-                dailyCandle("2026-07-03", "120"),
-            ),
-            dailyPnlFacts = listOf(
-                DailyTradePnlFact(
-                    closedAt = Instant.parse("2026-07-02T12:00:00Z"),
-                    pnlJpy = BigDecimal("10"),
+            BenchmarkCalculationRequest(
+                candles = listOf(
+                    dailyCandle("2026-07-01", "100"),
+                    dailyCandle("2026-07-02", "110"),
+                    dailyCandle("2026-07-03", "120"),
                 ),
+                dailyPnlFacts = listOf(
+                    DailyTradePnlFact(
+                        closedAt = Instant.parse("2026-07-02T12:00:00Z"),
+                        pnlJpy = BigDecimal("10"),
+                    ),
+                ),
+                baselineEquityJpy = BigDecimal("1000"),
+                fromDate = LocalDate.parse("2026-07-01"),
+                toDateInclusive = LocalDate.parse("2026-07-03"),
+                zoneId = ZoneId.of("Asia/Tokyo"),
             ),
-            baselineEquityJpy = BigDecimal("1000"),
-            fromDate = LocalDate.parse("2026-07-01"),
-            toDateInclusive = LocalDate.parse("2026-07-03"),
-            zoneId = ZoneId.of("Asia/Tokyo"),
         )
 
         assertEquals(3, result.points.size)

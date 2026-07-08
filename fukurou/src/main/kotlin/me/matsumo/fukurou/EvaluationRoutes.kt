@@ -12,6 +12,7 @@ import kotlinx.serialization.Serializable
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.evaluation.BenchmarkCalculationRequest
 import me.matsumo.fukurou.trading.evaluation.BenchmarkPoint
 import me.matsumo.fukurou.trading.evaluation.BenchmarkResult
 import me.matsumo.fukurou.trading.evaluation.CalibrationBinStats
@@ -252,12 +253,14 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
             limit = dailyCandleLimit,
         ).getOrThrow()
         val benchmark = EvaluationMath.benchmark(
-            candles = candles,
-            dailyPnlFacts = dailyPnl,
-            baselineEquityJpy = baselineEquityJpy,
-            fromDate = dateRange.fromDate,
-            toDateInclusive = dateRange.toDate,
-            zoneId = EvaluationZone,
+            BenchmarkCalculationRequest(
+                candles = candles,
+                dailyPnlFacts = dailyPnl,
+                baselineEquityJpy = baselineEquityJpy,
+                fromDate = dateRange.fromDate,
+                toDateInclusive = dateRange.toDate,
+                zoneId = EvaluationZone,
+            ),
         )
 
         call.respond(

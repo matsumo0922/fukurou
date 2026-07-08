@@ -140,12 +140,14 @@ class DefaultLlmCommandRenderer(
 
         return runCatching {
             config.claudeCommandTemplate.toRenderedCommand(
-                args = args,
-                environment = request.environment,
-                workingDirectory = request.workingDirectory,
-                timeout = request.timeout,
-                stdin = null,
-                cleanupPaths = mcpConfigFile.cleanupPaths,
+                RenderedCommandRequest(
+                    args = args,
+                    environment = request.environment,
+                    workingDirectory = request.workingDirectory,
+                    timeout = request.timeout,
+                    stdin = null,
+                    cleanupPaths = mcpConfigFile.cleanupPaths,
+                ),
             )
         }.getOrElse { throwable ->
             mcpConfigFile.cleanupPaths.deleteGeneratedPaths()
@@ -176,12 +178,14 @@ class DefaultLlmCommandRenderer(
 
         return runCatching {
             config.codexCommandTemplate.toRenderedCommand(
-                args = args,
-                environment = commandEnvironment,
-                workingDirectory = request.workingDirectory,
-                timeout = request.timeout,
-                stdin = null,
-                cleanupPaths = codexHome.cleanupPaths,
+                RenderedCommandRequest(
+                    args = args,
+                    environment = commandEnvironment,
+                    workingDirectory = request.workingDirectory,
+                    timeout = request.timeout,
+                    stdin = null,
+                    cleanupPaths = codexHome.cleanupPaths,
+                ),
             )
         }.getOrElse { throwable ->
             codexHome.cleanupPaths.deleteGeneratedPaths()
@@ -203,24 +207,36 @@ private fun LlmCommandRendererConfig.codexModelArgs(): List<String> {
     return listOf("-m", model)
 }
 
-private fun List<String>.toRenderedCommand(
-    args: List<String>,
-    environment: Map<String, String>,
-    workingDirectory: java.nio.file.Path,
-    timeout: java.time.Duration,
-    stdin: String?,
-    cleanupPaths: List<Path>,
-): RenderedLlmCommand {
+private fun List<String>.toRenderedCommand(request: RenderedCommandRequest): RenderedLlmCommand {
     return RenderedLlmCommand(
         executable = first(),
-        args = drop(1) + args,
-        environment = environment,
-        workingDirectory = workingDirectory,
-        timeout = timeout,
-        stdin = stdin,
-        cleanupPaths = cleanupPaths,
+        args = drop(1) + request.args,
+        environment = request.environment,
+        workingDirectory = request.workingDirectory,
+        timeout = request.timeout,
+        stdin = request.stdin,
+        cleanupPaths = request.cleanupPaths,
     )
 }
+
+/**
+ * CLI command template に追加する実行時情報。
+ *
+ * @param args template の後ろに連結する引数
+ * @param environment process environment
+ * @param workingDirectory process working directory
+ * @param timeout process timeout
+ * @param stdin process stdin
+ * @param cleanupPaths process 終了後に削除する path
+ */
+private data class RenderedCommandRequest(
+    val args: List<String>,
+    val environment: Map<String, String>,
+    val workingDirectory: java.nio.file.Path,
+    val timeout: java.time.Duration,
+    val stdin: String?,
+    val cleanupPaths: List<Path>,
+)
 
 private fun LlmMcpServerConfig.toClaudeMcpConfigJson(): String {
     return buildJsonObject {

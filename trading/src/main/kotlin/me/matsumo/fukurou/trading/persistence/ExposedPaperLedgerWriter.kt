@@ -9,6 +9,7 @@ import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.RestingEntryFillRequest
 import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.broker.btcScale
@@ -1071,13 +1072,15 @@ private fun Order.createEntryFill(
     simulator: FillSimulator,
 ): SimulatedFill {
     return simulator.restingEntryFill(
-        side = side,
-        orderType = orderType,
-        sizeBtc = sizeBtc.toBigDecimal(),
-        limitPriceJpy = limitPriceJpy?.toBigDecimal(),
-        triggerPriceJpy = triggerPriceJpy?.toBigDecimal(),
-        ticker = ticker,
-        rules = rules,
+        RestingEntryFillRequest(
+            side = side,
+            orderType = orderType,
+            sizeBtc = sizeBtc.toBigDecimal(),
+            limitPriceJpy = limitPriceJpy?.toBigDecimal(),
+            triggerPriceJpy = triggerPriceJpy?.toBigDecimal(),
+            ticker = ticker,
+            rules = rules,
+        ),
     )
 }
 

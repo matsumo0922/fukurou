@@ -132,8 +132,9 @@ data class TradingDatabaseConfig(
             val url = environment[DB_URL_ENV]
             val user = environment[DB_USER_ENV]
             val password = environment[DB_PASSWORD_ENV]
+            val missingRequiredConfig = listOf(url, user, password).any { value -> value.isNullOrBlank() }
 
-            if (url.isNullOrBlank() || user.isNullOrBlank() || password.isNullOrBlank()) {
+            if (missingRequiredConfig) {
                 return null
             }
 

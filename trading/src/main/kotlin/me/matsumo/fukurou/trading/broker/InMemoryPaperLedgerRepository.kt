@@ -1000,13 +1000,15 @@ private fun Order.createEntryFill(
     simulator: FillSimulator,
 ): SimulatedFill {
     return simulator.restingEntryFill(
-        side = side,
-        orderType = orderType,
-        sizeBtc = sizeBtc.toBigDecimal(),
-        limitPriceJpy = limitPriceJpy?.toBigDecimal(),
-        triggerPriceJpy = triggerPriceJpy?.toBigDecimal(),
-        ticker = ticker,
-        rules = rules,
+        RestingEntryFillRequest(
+            side = side,
+            orderType = orderType,
+            sizeBtc = sizeBtc.toBigDecimal(),
+            limitPriceJpy = limitPriceJpy?.toBigDecimal(),
+            triggerPriceJpy = triggerPriceJpy?.toBigDecimal(),
+            ticker = ticker,
+            rules = rules,
+        ),
     )
 }
 

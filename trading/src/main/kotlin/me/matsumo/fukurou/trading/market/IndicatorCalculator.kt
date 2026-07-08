@@ -133,60 +133,11 @@ object IndicatorCalculator {
      */
     fun requiredCandleCount(indicator: IndicatorType, params: IndicatorParams = IndicatorParams()): Result<Int> {
         return runCatching {
-            when (indicator) {
-                IndicatorType.ATR -> {
-                    val period = validatePeriod(params.period ?: DEFAULT_ATR_PERIOD, "period")
+            val requiredCandleCount = requireNotNull(RequiredCandleCountResolvers[indicator]) {
+                "Unsupported indicator: $indicator"
+            }.invoke(params)
 
-                    validateRequiredCandleCount(period.toLong())
-                }
-                IndicatorType.EMA -> {
-                    val period = validatePeriod(params.period ?: DEFAULT_EMA_PERIOD, "period")
-
-                    validateRequiredCandleCount(period.toLong())
-                }
-                IndicatorType.RSI -> {
-                    val period = validatePeriod(params.period ?: DEFAULT_RSI_PERIOD, "period")
-
-                    validateRequiredCandleCount(period.toLong() + 1L)
-                }
-                IndicatorType.SMA -> {
-                    val period = validatePeriod(params.period ?: DEFAULT_SMA_PERIOD, "period")
-
-                    validateRequiredCandleCount(period.toLong())
-                }
-                IndicatorType.MACD -> {
-                    val fastPeriod = validatePeriod(
-                        period = params.fastPeriod ?: DEFAULT_MACD_FAST_PERIOD,
-                        name = "fast_period",
-                    )
-                    val slowPeriod = validatePeriod(
-                        period = params.slowPeriod ?: DEFAULT_MACD_SLOW_PERIOD,
-                        name = "slow_period",
-                    )
-                    val signalPeriod = validatePeriod(
-                        period = params.signalPeriod ?: DEFAULT_MACD_SIGNAL_PERIOD,
-                        name = "signal_period",
-                    )
-
-                    require(fastPeriod < slowPeriod) {
-                        "fast_period must be smaller than slow_period."
-                    }
-
-                    validateRequiredCandleCount(slowPeriod.toLong() + signalPeriod.toLong() - 1L)
-                }
-                IndicatorType.ATR_PERCENTILE -> {
-                    val period = validatePeriod(params.period ?: DEFAULT_ATR_PERCENTILE_PERIOD, "period")
-                    val lookback = validateLookback(params.lookback ?: DEFAULT_ATR_PERCENTILE_LOOKBACK)
-
-                    validateRequiredCandleCount(period.toLong() + lookback.toLong() - 1L)
-                }
-                IndicatorType.VWAP_SESSION -> validateRequiredCandleCount(1L)
-                IndicatorType.VOLUME_Z_SCORE -> {
-                    val period = validatePeriod(params.period ?: DEFAULT_VOLUME_Z_SCORE_PERIOD, "period")
-
-                    validateRequiredCandleCount(period.toLong())
-                }
-            }
+            validateRequiredCandleCount(requiredCandleCount)
         }.mapError()
     }
 
@@ -502,6 +453,57 @@ private fun validateRequiredCandleCount(requiredCandleCount: Long): Int {
     }
 
     return requiredCandleCount.toInt()
+}
+
+private val RequiredCandleCountResolvers = mapOf<IndicatorType, (IndicatorParams) -> Long>(
+    IndicatorType.ATR to { params -> singlePeriodRequiredCount(params, DEFAULT_ATR_PERIOD) },
+    IndicatorType.EMA to { params -> singlePeriodRequiredCount(params, DEFAULT_EMA_PERIOD) },
+    IndicatorType.RSI to { params -> rsiRequiredCount(params) },
+    IndicatorType.SMA to { params -> singlePeriodRequiredCount(params, DEFAULT_SMA_PERIOD) },
+    IndicatorType.MACD to { params -> macdRequiredCount(params) },
+    IndicatorType.ATR_PERCENTILE to { params -> atrPercentileRequiredCount(params) },
+    IndicatorType.VWAP_SESSION to { 1L },
+    IndicatorType.VOLUME_Z_SCORE to { params -> singlePeriodRequiredCount(params, DEFAULT_VOLUME_Z_SCORE_PERIOD) },
+)
+
+private fun singlePeriodRequiredCount(params: IndicatorParams, defaultPeriod: Int): Long {
+    val period = validatePeriod(params.period ?: defaultPeriod, "period")
+
+    return period.toLong()
+}
+
+private fun rsiRequiredCount(params: IndicatorParams): Long {
+    val period = validatePeriod(params.period ?: DEFAULT_RSI_PERIOD, "period")
+
+    return period.toLong() + 1L
+}
+
+private fun macdRequiredCount(params: IndicatorParams): Long {
+    val fastPeriod = validatePeriod(
+        period = params.fastPeriod ?: DEFAULT_MACD_FAST_PERIOD,
+        name = "fast_period",
+    )
+    val slowPeriod = validatePeriod(
+        period = params.slowPeriod ?: DEFAULT_MACD_SLOW_PERIOD,
+        name = "slow_period",
+    )
+    val signalPeriod = validatePeriod(
+        period = params.signalPeriod ?: DEFAULT_MACD_SIGNAL_PERIOD,
+        name = "signal_period",
+    )
+
+    require(fastPeriod < slowPeriod) {
+        "fast_period must be smaller than slow_period."
+    }
+
+    return slowPeriod.toLong() + signalPeriod.toLong() - 1L
+}
+
+private fun atrPercentileRequiredCount(params: IndicatorParams): Long {
+    val period = validatePeriod(params.period ?: DEFAULT_ATR_PERCENTILE_PERIOD, "period")
+    val lookback = validateLookback(params.lookback ?: DEFAULT_ATR_PERCENTILE_LOOKBACK)
+
+    return period.toLong() + lookback.toLong() - 1L
 }
 
 private fun trueRange(
