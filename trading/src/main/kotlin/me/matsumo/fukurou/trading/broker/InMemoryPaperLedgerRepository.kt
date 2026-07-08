@@ -885,9 +885,7 @@ private class InMemoryPaperLedgerMutationWriter(
             order.positionId == positionId && order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.status == OrderStatus.OPEN
         }
 
-        require(stopOrderIndex >= 0) {
-            "linked protective STOP order was not found."
-        }
+        if (stopOrderIndex < 0) return
 
         orders[stopOrderIndex] = orders[stopOrderIndex].copy(
             triggerPriceJpy = stopPrice.moneyScale().toPlainString(),

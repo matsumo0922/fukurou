@@ -497,9 +497,7 @@ private fun JdbcTransaction.insertTradeIntentConsumption(
         statement.setObject(2, intentId)
         statement.setObject(3, orderId)
         statement.setLong(4, consumedAt.toEpochMilli())
-        require(statement.executeUpdate() > 0) {
-            "linked protective STOP order was not found."
-        }
+        statement.executeUpdate()
     }
 }
 
