@@ -377,7 +377,11 @@ private fun validateTypedConfigConstraints(
         requireLongGreaterThanOrEqualKey(values, "daemon.priceMoveCooldown", "daemon.pollInterval")
         requireDecimalGreaterThan(values, "daemon.stopProximityRemainingRThreshold", BigDecimal.ZERO)
         requireLongGreaterThanOrEqualKey(values, "daemon.stopProximityCooldown", "daemon.pollInterval")
-        requireLongGreaterThanOrEqualDefault(values, runtimeItemsByKey, "obsidian.writeInterval")
+        requireLongGreaterThanOrEqual(
+            values = values,
+            key = "obsidian.writeInterval",
+            min = MIN_OBSIDIAN_WRITE_INTERVAL.seconds,
+        )
         requireIntBetweenInclusive(
             values = values,
             key = "killCriterion.minClosedTrades",
@@ -545,7 +549,18 @@ private fun MutableList<RuntimeConfigValidationError>.requireLongGreaterThanOrEq
     runtimeItemsByKey: Map<String, RuntimeConfigItem>,
     key: String,
 ) {
-    val min = defaultLong(runtimeItemsByKey, key)
+    requireLongGreaterThanOrEqual(
+        values = values,
+        key = key,
+        min = defaultLong(runtimeItemsByKey, key),
+    )
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireLongGreaterThanOrEqual(
+    values: Map<String, String>,
+    key: String,
+    min: Long,
+) {
     val value = values.getValue(key).toLong()
 
     if (value < min) {

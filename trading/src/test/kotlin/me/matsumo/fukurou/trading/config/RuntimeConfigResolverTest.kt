@@ -54,6 +54,19 @@ class RuntimeConfigResolverTest {
     }
 
     @Test
+    fun resolve_acceptsStandardRuntimeConfigAboveAbsoluteMinimumBelowDefault() {
+        val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
+            "obsidian.writeInterval" to "60",
+        )
+        val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
+
+        val result = resolver.resolve(emptyMap()).getOrThrow()
+
+        assertEquals(Duration.ofSeconds(60), result.tradingConfig.obsidian.writeInterval)
+        assertEquals("60", result.catalogEnvironment.getValue("FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS"))
+    }
+
+    @Test
     fun resolve_failsClosedWhenActiveRuntimeConfigIsMissingCatalogKey() {
         val values = RuntimeConfigCatalog.runtimeDefaultValues()
             .filterKeys { key -> key != "runner.maxToolCallsPerRun" }
@@ -77,6 +90,22 @@ class RuntimeConfigResolverTest {
         assertEquals("runner.maxToolCallsPerRun", validationError.key)
         assertEquals("1", validationError.params.getValue("min"))
         assertEquals("48", validationError.params.getValue("max"))
+    }
+
+    @Test
+    fun resolve_failsClosedWhenStandardRuntimeConfigViolatesAbsoluteMinimum() {
+        val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
+            "obsidian.writeInterval" to "59",
+        )
+        val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
+        val result = resolver.resolve(emptyMap())
+        val exception = result.exceptionOrNull() as RuntimeConfigValidationRejectedException
+        val validationError = exception.validation.errors.single()
+
+        assertTrue(result.isFailure)
+        assertEquals("runtimeConfig.validation.typedGreaterThanOrEqual", validationError.code)
+        assertEquals("obsidian.writeInterval", validationError.key)
+        assertEquals("60", validationError.params.getValue("min"))
     }
 }
 
