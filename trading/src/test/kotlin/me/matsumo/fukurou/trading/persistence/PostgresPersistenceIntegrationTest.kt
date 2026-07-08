@@ -95,6 +95,17 @@ private const val HIKARI_POOL_SIZE = 4
 private const val DELETE_RISK_STATE_ROW_SQL = "DELETE FROM risk_state WHERE id = ?"
 
 /**
+ * OPEN protective STOP order を削除する SQL。
+ */
+private const val DELETE_OPEN_STOP_ORDER_SQL = """
+    DELETE FROM orders
+    WHERE position_id = ?
+        AND side = ?
+        AND order_type = ?
+        AND status = ?
+"""
+
+/**
  * risk_state の state column を削除する SQL。
  */
 private const val DROP_RISK_STATE_STATE_COLUMN_SQL = "ALTER TABLE risk_state DROP COLUMN state"
@@ -1545,6 +1556,47 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun paper_execution_allows_partial_close_when_linked_stop_order_is_missing() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+        val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
+        deleteOpenStopOrder(database, positionId)
+
+        val result = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = positionId,
+                closeAll = false,
+                closeRatio = BigDecimal("0.50"),
+                reasonJa = "partial close without stop integration",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val position = broker.getPositions().getOrThrow().single()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertTrue(result.accepted)
+        assertEquals("0.002500000000", position.sizeBtc)
+        assertEquals(0, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(1, executions.count { execution -> execution.side == OrderSide.SELL })
+    }
+
+    @Test
     fun paper_execution_linksRestingLimitEntryOrderToClosedTradeEvaluation() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -1601,7 +1653,7 @@ class PostgresPersistenceIntegrationTest {
         val evaluatedTrade = EvaluationMath.evaluateTrade(trade)
 
         assertEquals(false, tradeResult.truncated)
-        assertEquals(0, requireNotNull(trade.initialProtectiveStopPriceJpy).compareTo(BigDecimal("9700000.00000000")))
+        assertEquals(0, requireNotNull(trade.entryWeightedProtectiveStopPriceJpy).compareTo(BigDecimal("9700000.00000000")))
         assertEquals("9900000.00000000", trade.highestPriceSinceEntryJpy.toPlainString())
         assertEquals("9685155.00000000", trade.lowestPriceSinceEntryJpy?.toPlainString())
         assertEquals("9900000.00000000", closedWatermark.highestPriceSinceEntryJpy)
@@ -1725,7 +1777,7 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(false, tradeResult.truncated)
         assertEquals(listOf("integration-entry"), trade.setupTags)
-        assertEquals(0, requireNotNull(trade.initialProtectiveStopPriceJpy).compareTo(BigDecimal("9700000.00000000")))
+        assertEquals(0, requireNotNull(trade.entryWeightedProtectiveStopPriceJpy).compareTo(BigDecimal("9700000.00000000")))
         assertEquals("10100000.00000000", trade.highestPriceSinceEntryJpy.toPlainString())
         assertEquals("10005000.00000000", trade.lowestPriceSinceEntryJpy?.toPlainString())
         assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
@@ -1818,7 +1870,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(2, executions.count { execution -> execution.side == OrderSide.SELL })
         assertEquals("0.005", trade.sizeBtc.stripTrailingZeros().toPlainString())
         assertEquals("10005000", trade.averageEntryPriceJpy.stripTrailingZeros().toPlainString())
-        assertEquals("9758000", trade.initialProtectiveStopPriceJpy?.stripTrailingZeros()?.toPlainString())
+        assertEquals("9758000", trade.entryWeightedProtectiveStopPriceJpy?.stripTrailingZeros()?.toPlainString())
         assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
         assertEquals("247000", evaluatedTrade.initialRiskPriceWidthJpy?.stripTrailingZeros()?.toPlainString())
     }
@@ -2698,6 +2750,21 @@ private fun deleteRiskStateRow(database: ExposedDatabase) {
     exposedTransaction(database) {
         jdbcConnection().prepareStatement(DELETE_RISK_STATE_ROW_SQL).use { statement ->
             statement.setInt(1, RISK_STATE_SINGLE_ROW_ID)
+            statement.executeUpdate()
+        }
+    }
+}
+
+/**
+ * 指定 position の OPEN protective STOP order を削除する。
+ */
+private fun deleteOpenStopOrder(database: ExposedDatabase, positionId: UUID) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(DELETE_OPEN_STOP_ORDER_SQL).use { statement ->
+            statement.setObject(1, positionId)
+            statement.setString(2, OrderSide.SELL.name)
+            statement.setString(3, OrderType.STOP.name)
+            statement.setString(4, "OPEN")
             statement.executeUpdate()
         }
     }

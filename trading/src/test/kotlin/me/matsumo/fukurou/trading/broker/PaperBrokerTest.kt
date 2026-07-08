@@ -524,6 +524,39 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun close_position_with_partial_ratio_allows_missing_linked_stop_order() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc(),
+            positions = listOf(protectedPosition()),
+            openOrders = emptyList(),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val result = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                closeAll = false,
+                closeRatio = BigDecimal("0.50"),
+                reasonJa = "test partial close without stop",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val position = broker.getPositions().getOrThrow().single()
+        val sellExecution = repository.getExecutions().getOrThrow().single()
+
+        assertTrue(result.accepted)
+        assertEquals("0.005000000000", position.sizeBtc)
+        assertEquals(0, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(OrderSide.SELL, sellExecution.side)
+    }
+
+    @Test
     fun close_position_promotes_dust_remainder_to_full_close() = runBlocking {
         val tinyPosition = protectedPosition().copy(sizeBtc = "0.000250000000")
         val repository = InMemoryPaperLedgerRepository(

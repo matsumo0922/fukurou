@@ -71,7 +71,7 @@ class EvaluationMathTest {
         )
         val invalidRisk = trade(
             pnlJpy = "20",
-            initialProtectiveStopPriceJpy = BigDecimal("100"),
+            entryWeightedProtectiveStopPriceJpy = BigDecimal("100"),
             highestPriceSinceEntryJpy = BigDecimal("130"),
             lowestPriceSinceEntryJpy = BigDecimal("95"),
         )
@@ -311,7 +311,7 @@ private fun trade(
     probability: BigDecimal = BigDecimal("0.50"),
     setupTags: List<String> = listOf("setup"),
     llmProvider: String? = "claude",
-    initialProtectiveStopPriceJpy: BigDecimal? = BigDecimal("90"),
+    entryWeightedProtectiveStopPriceJpy: BigDecimal? = BigDecimal("90"),
     highestPriceSinceEntryJpy: BigDecimal = BigDecimal("120"),
     lowestPriceSinceEntryJpy: BigDecimal? = BigDecimal("90"),
 ): ClosedTradeFact {
@@ -321,7 +321,7 @@ private fun trade(
         closedAt = Instant.parse("2026-07-02T00:00:00Z"),
         sizeBtc = BigDecimal.ONE,
         averageEntryPriceJpy = BigDecimal("100"),
-        initialProtectiveStopPriceJpy = initialProtectiveStopPriceJpy,
+        entryWeightedProtectiveStopPriceJpy = entryWeightedProtectiveStopPriceJpy,
         highestPriceSinceEntryJpy = highestPriceSinceEntryJpy,
         lowestPriceSinceEntryJpy = lowestPriceSinceEntryJpy,
         tradePnlJpy = BigDecimal(pnlJpy),

@@ -497,7 +497,9 @@ private fun JdbcTransaction.insertTradeIntentConsumption(
         statement.setObject(2, intentId)
         statement.setObject(3, orderId)
         statement.setLong(4, consumedAt.toEpochMilli())
-        statement.executeUpdate()
+        require(statement.executeUpdate() > 0) {
+            "linked protective STOP order was not found."
+        }
     }
 }
 
@@ -1070,9 +1072,7 @@ private fun JdbcTransaction.updateLinkedStopOrder(
         statement.setString(6, OrderType.STOP.name)
         statement.setString(7, OrderStatus.OPEN.name)
 
-        require(statement.executeUpdate() > 0) {
-            "linked protective STOP order was not found."
-        }
+        statement.executeUpdate()
     }
 }
 
@@ -1102,9 +1102,7 @@ private fun JdbcTransaction.updateLinkedStopOrderSize(
         statement.setString(6, OrderType.STOP.name)
         statement.setString(7, OrderStatus.OPEN.name)
 
-        require(statement.executeUpdate() > 0) {
-            "linked protective STOP order was not found."
-        }
+        statement.executeUpdate()
     }
 }
 

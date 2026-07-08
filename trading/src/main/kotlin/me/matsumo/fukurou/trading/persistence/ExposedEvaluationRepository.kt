@@ -485,7 +485,7 @@ private fun ResultSet.toClosedTradeFact(): ClosedTradeFact {
         closedAt = getInstant("closed_at"),
         sizeBtc = getBigDecimal("size_btc"),
         averageEntryPriceJpy = getBigDecimal("average_entry_price_jpy"),
-        initialProtectiveStopPriceJpy = getNullableBigDecimal("protective_stop_price_jpy"),
+        entryWeightedProtectiveStopPriceJpy = getNullableBigDecimal("protective_stop_price_jpy"),
         highestPriceSinceEntryJpy = getBigDecimal("highest_price_since_entry_jpy"),
         lowestPriceSinceEntryJpy = getNullableBigDecimal("lowest_price_since_entry_jpy"),
         tradePnlJpy = getBigDecimal("trade_pnl_jpy"),

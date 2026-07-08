@@ -300,10 +300,11 @@ private class InMemoryPaperLedgerExecutionReader(
             }
 
             state.read {
-                executions
+                val sortedExecutions = executions
                     .filter { execution -> Instant.parse(execution.executedAt) < before }
                     .sortedByDescending { execution -> Instant.parse(execution.executedAt) }
-                    .take(limit)
+
+                sortedExecutions.take(limit)
             }
         }
     }
@@ -315,15 +316,30 @@ private class InMemoryPaperLedgerExecutionReader(
             }
 
             state.read {
-                executions
+                val sortedExecutions = executions
                     .filter { execution -> cursor.accepts(Instant.parse(execution.executedAt), execution.executionId) }
                     .sortedWith(
                         compareByDescending<Execution> { execution -> Instant.parse(execution.executedAt) }
                             .thenBy { execution -> execution.executionId },
                     )
-                    .take(limit)
+
+                sortedExecutions.take(limit)
             }
         }
+    }
+
+    override suspend fun findSellExecutionsByPositionIds(positionIds: List<String>): Result<List<Execution>> {
+        if (positionIds.isEmpty()) return Result.success(emptyList())
+
+        val positionIdSet = positionIds.toSet()
+
+        return Result.success(
+            state.read {
+                executions
+                    .filter { execution -> execution.side == OrderSide.SELL && execution.positionId in positionIdSet }
+                    .sortedByDescending { execution -> Instant.parse(execution.executedAt) }
+            },
+        )
     }
 }
 
@@ -888,9 +904,7 @@ private class InMemoryPaperLedgerMutationWriter(
             order.positionId == positionId && order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.status == OrderStatus.OPEN
         }
 
-        require(stopOrderIndex >= 0) {
-            "linked protective STOP order was not found."
-        }
+        if (stopOrderIndex < 0) return
 
         orders[stopOrderIndex] = orders[stopOrderIndex].copy(
             sizeBtc = sizeBtc.btcScale().toPlainString(),

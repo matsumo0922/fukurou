@@ -320,7 +320,7 @@ private fun testTrade(): ClosedTradeFact {
         closedAt = Instant.parse("2026-07-02T00:00:00Z"),
         sizeBtc = BigDecimal("0.01"),
         averageEntryPriceJpy = BigDecimal("10000000"),
-        initialProtectiveStopPriceJpy = BigDecimal("9900000"),
+        entryWeightedProtectiveStopPriceJpy = BigDecimal("9900000"),
         highestPriceSinceEntryJpy = BigDecimal("10100000"),
         lowestPriceSinceEntryJpy = BigDecimal("9950000"),
         tradePnlJpy = BigDecimal("100"),

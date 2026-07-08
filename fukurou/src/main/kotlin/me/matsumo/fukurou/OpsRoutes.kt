@@ -27,7 +27,6 @@ import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
-import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
@@ -1195,11 +1194,9 @@ private fun Route.registerOpsPositionsRoute(dependencies: OpsRouteDependencies) 
         val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
         val positions = repository.getOpenPositions().getOrThrow()
         val openOrders = repository.getOpenOrders().getOrThrow()
-        val openPositionIds = positions.map { position -> position.positionId }.toSet()
-        val sellExecutions = repository.getExecutions()
+        val openPositionIds = positions.map { position -> position.positionId }
+        val sellExecutions = repository.findSellExecutionsByPositionIds(openPositionIds)
             .getOrThrow()
-            .filter { execution -> execution.side == OrderSide.SELL && execution.positionId in openPositionIds }
-            .sortedByDescending { execution -> Instant.parse(execution.executedAt) }
 
         call.respond(
             OpsPositionsResponse(

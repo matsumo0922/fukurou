@@ -77,6 +77,11 @@ interface PaperLedgerExecutionRepository {
      * 安定 cursor 条件に一致する execution ledger の行を Activity timeline 用に新しい順で取得する。
      */
     suspend fun findExecutionsForStableFeed(cursor: StableFeedCursor, limit: Int): Result<List<Execution>>
+
+    /**
+     * 指定 position に紐づく SELL execution を新しい順で返す。
+     */
+    suspend fun findSellExecutionsByPositionIds(positionIds: List<String>): Result<List<Execution>>
 }
 
 /**

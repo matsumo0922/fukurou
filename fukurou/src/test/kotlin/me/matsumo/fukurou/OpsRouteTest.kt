@@ -601,6 +601,20 @@ class OpsRouteTest {
                     side = OrderSide.SELL,
                     positionId = "position-1",
                 ),
+                execution(
+                    executionId = "entry-buy",
+                    executedAt = fixedInstant().plusSeconds(2),
+                    realizedPnlJpy = "0",
+                    side = OrderSide.BUY,
+                    positionId = "position-1",
+                ),
+                execution(
+                    executionId = "closed-position-sell",
+                    executedAt = fixedInstant().plusSeconds(3),
+                    realizedPnlJpy = "80",
+                    side = OrderSide.SELL,
+                    positionId = "position-closed",
+                ),
             ),
         )
 
