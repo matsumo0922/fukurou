@@ -5,6 +5,65 @@ import org.jetbrains.exposed.v1.core.Table
 import java.math.BigDecimal
 
 /**
+ * runtime config の version 状態を表す Exposed table。
+ */
+object RuntimeConfigVersionsTable : Table("runtime_config_versions") {
+    /**
+     * version ID。
+     */
+    val id = uuid("id")
+
+    /**
+     * version 状態。
+     */
+    val status = varchar("status", length = 32)
+
+    /**
+     * version 作成時刻。epoch millis で保存する。
+     */
+    val createdAt = long("created_at")
+
+    /**
+     * active 化された時刻。epoch millis で保存する。
+     */
+    val activatedAt = long("activated_at").nullable()
+
+    /**
+     * 作成元。
+     */
+    val createdBy = varchar("created_by", length = 128)
+
+    /**
+     * secret を含まない補足。
+     */
+    val note = text("note").nullable()
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/**
+ * runtime config version ごとの値を表す Exposed table。
+ */
+object RuntimeConfigValuesTable : Table("runtime_config_values") {
+    /**
+     * runtime_config_versions の version ID。
+     */
+    val versionId = uuid("version_id").references(RuntimeConfigVersionsTable.id)
+
+    /**
+     * code-owned runtime config key。
+     */
+    val configKey = varchar("config_key", length = 128)
+
+    /**
+     * catalog valueType に対応する保存値。
+     */
+    val configValue = text("config_value")
+
+    override val primaryKey = PrimaryKey(versionId, configKey)
+}
+
+/**
  * risk_state single row の固定 ID。
  */
 internal const val RISK_STATE_SINGLE_ROW_ID = 1
@@ -176,6 +235,16 @@ object LlmRunsTable : Table("llm_runs") {
      * redaction / truncate 済みのエラー message。
      */
     val errorMessage = text("error_message").nullable()
+
+    /**
+     * 起動開始時の runtime config version ID。
+     */
+    val runtimeConfigVersionId = varchar("runtime_config_version_id", length = 64).nullable()
+
+    /**
+     * 起動開始時の runtime config content hash。
+     */
+    val runtimeConfigHash = varchar("runtime_config_hash", length = 64).nullable()
 
     override val primaryKey = PrimaryKey(invocationId)
 }
@@ -671,6 +740,16 @@ object CommandEventLogTable : Table("command_event_log") {
      * market snapshot ID。
      */
     val marketSnapshotId = varchar("market_snapshot_id", length = 128).nullable()
+
+    /**
+     * 判断開始時の runtime config version ID。
+     */
+    val runtimeConfigVersionId = varchar("runtime_config_version_id", length = 64).nullable()
+
+    /**
+     * 判断開始時の runtime config content hash。
+     */
+    val runtimeConfigHash = varchar("runtime_config_hash", length = 64).nullable()
 
     override val primaryKey = PrimaryKey(id)
 }

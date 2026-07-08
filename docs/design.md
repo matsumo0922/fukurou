@@ -1292,7 +1292,7 @@ interface GmoSymbolMapper {
 
 [確定事項の改訂: 2026-07-04] 2026-07-03 の「評価 API は DB schema を追加しない」は、評価 API 専用の集計 table / SQL view / kline 永続化を増やさないという意味に限定する。`llm_runs` と `equity_snapshots` は評価 API の集計結果ではなく、runner 起動単位と paper equity 推移の一次 append-only 記録であるため追加対象に含める。
 
-`llm_runs` は `invocation_id` を primary key とし、`mode`、`symbol`、nullable な daemon `trigger_kind`、`status`、epoch millis の `started_at` / `finished_at`、redaction / truncate 済み `error_message` だけを保存する。旧スケッチの `provider` は phase ごとの `command_event_log` に残すため run-level には持たない。`stdout_path` / `stderr_path` も持たず、stdout / stderr は従来通り redaction 後の runner phase audit に残す。
+`llm_runs` は `invocation_id` を primary key とし、`mode`、`symbol`、nullable な daemon `trigger_kind`、`status`、epoch millis の `started_at` / `finished_at`、redaction / truncate 済み `error_message`、開始時 runtime config の `runtime_config_version_id` / `runtime_config_hash` を保存する。LLM provider は phase ごとの `command_event_log` に残すため run-level には持たない。`stdout_path` / `stderr_path` も持たず、stdout / stderr は redaction 後の runner phase audit に残す。
 
 `equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP`）、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。旧スケッチからの差分として、日次重複防止のため JST 日付を物理列 `trading_date` として持ち、`reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置く。`drawdown_ratio` は旧案の decimal(12,8) ではなく、正本である `paper_account` と同じ decimal(20,10) に揃える。BOOTSTRAP は並行 bootstrap でも mode ごとに 1 件に収まるよう `reason = 'BOOTSTRAP'` に限定した `(mode, reason)` partial unique index で防御する。FILL は paper account 更新と同一 transaction で追加する。
 
@@ -2739,19 +2739,19 @@ import org.jetbrains.exposed.sql.javatime.timestamp
 /**
  * LLMの1回起動を記録するテーブル。
  */
-object LlmRunsTable : UUIDTable("llm_runs") {
-    val triggerId = uuid("trigger_id").nullable()
-    val provider = varchar("provider", 32)
+object LlmRunsTable : Table("llm_runs") {
+    val invocationId = varchar("invocation_id", 128)
     val mode = varchar("mode", 16)
     val symbol = varchar("symbol", 32)
+    val triggerKind = varchar("trigger_kind", 64).nullable()
     val status = varchar("status", 32)
-    val startedAt = timestamp("started_at")
-    val finishedAt = timestamp("finished_at").nullable()
-    val timedOut = bool("timed_out").default(false)
-    val exitCode = integer("exit_code").nullable()
-    val stdoutPath = varchar("stdout_path", 512).nullable()
-    val stderrPath = varchar("stderr_path", 512).nullable()
+    val startedAt = long("started_at")
+    val finishedAt = long("finished_at").nullable()
     val errorMessage = text("error_message").nullable()
+    val runtimeConfigVersionId = varchar("runtime_config_version_id", 64).nullable()
+    val runtimeConfigHash = varchar("runtime_config_hash", 64).nullable()
+
+    override val primaryKey = PrimaryKey(invocationId)
 }
 
 /**
@@ -3448,9 +3448,9 @@ security:
 
 [確定] secretsは `.env` / 環境変数。コード外・ログに出さない。
 
-### 13.2.1 Step6実装状態
+### 13.2.1 Runtime config 実装状態
 
-[実装済み: 2026-07-02] runtime config は `TradingBotConfig` を正本とし、symbol / mode / paper 初期残高 / paper slippage / fallback fee / SafetyFloor thresholds / GMO Public REST timeout・rate-limit・retry を typed config として集約する。既存 env contract の `FUKUROU_TRADING_MODE` と `FUKUROU_PAPER_INITIAL_CASH_JPY` は維持し、新しい `FUKUROU_*` env は未設定なら既定値へ戻る。`LIVE` は typed model の予約値だが、`LiveGmoBroker` 実装前は env 起動を fail closed する。SafetyFloor thresholds と fallback fee / spread は既定値と同等またはより保守的な値だけ受理する。
+runtime config は code-owned `RuntimeConfigCatalog` が管理する項目を `runtime_config_versions` / `runtime_config_values` の active version として保持し、DB active snapshot を `TradingBotConfig` へ解決する。bootstrap は active version が存在しない場合に catalog default から初期 active snapshot を作成する。DB-backed runtime では `RUNTIME` key は active DB config が正本で、legacy `FUKUROU_*` env より優先する。active snapshot に catalog 不一致、欠損、不正値、validation failure がある場合は fail closed する。decision run / manual trigger / daemon launch の audit には runtime config version id と hash を残し、in-flight run は開始時 snapshot を使い切る。`LIVE` は typed model の予約値だが、`LiveGmoBroker` 実装前は起動時に fail closed する。SafetyFloor thresholds と fallback fee / spread は既定値と同等またはより保守的な値だけ受理する。
 
 [実装済み: 2026-07-02] GMO Public market data client は `:trading.exchange.gmo` 境界で、client-side token bucket、指数 backoff retry、request timeout、temporary/permanent の typed error 分類を行う。rate-limit env は既定 10 req/s / burst 10 以下だけ受理する。`:mcp` は error response に分類を載せるだけで、rate-limit や retry の業務ロジックは持たない。
 
@@ -3574,7 +3574,7 @@ DB_PASSWORD=replace_me
 | GMO ERR-626 busy | 短時間retry。POSTは盲目retryしない |
 | GMO ERR-5003 rate | token bucketを絞る。run中ならLLMへRATE_LIMITEDを返す |
 | 残高不足 | Safety/Exchange rejectとして保存。LLMには再サイズ要求 |
-| CLI timeout | プロセスkill、`llm_runs.timed_out=true`、バックストップのみ |
+| CLI timeout | プロセス kill、`llm_runs.status = FAILED` と redaction 済み `error_message` を保存し、バックストップのみ |
 | MCP down | CLI起動せず、保有中はSTOP監視だけ実行 |
 | DB busy / lock timeout | PostgreSQL statement timeout / lock timeout + retry。長時間失敗ならHALT |
 | Obsidian write失敗 | DBを真実とし、後で再生成可能なoutboxへ入れる |

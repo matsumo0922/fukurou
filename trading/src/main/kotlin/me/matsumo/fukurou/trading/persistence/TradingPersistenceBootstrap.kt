@@ -142,7 +142,9 @@ private const val VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL = """
         llm_provider,
         prompt_hash,
         system_prompt_version,
-        market_snapshot_id
+        market_snapshot_id,
+        runtime_config_version_id,
+        runtime_config_hash
     FROM command_event_log
     LIMIT 0
 """
@@ -178,7 +180,9 @@ private const val VERIFY_LLM_RUNS_SCHEMA_SQL = """
         status,
         started_at,
         finished_at,
-        error_message
+        error_message,
+        runtime_config_version_id,
+        runtime_config_hash
     FROM llm_runs
     LIMIT 0
 """
@@ -639,6 +643,8 @@ class TradingPersistenceBootstrap(
             exposedTransaction(database) {
                 @Suppress("DEPRECATION")
                 SchemaUtils.createMissingTablesAndColumns(
+                    RuntimeConfigVersionsTable,
+                    RuntimeConfigValuesTable,
                     RiskStateTable,
                     PaperAccountTable,
                     LlmRunsTable,
@@ -659,6 +665,7 @@ class TradingPersistenceBootstrap(
                 ensureRuntimeSchemaObjects()
                 val now = Instant.now(clock)
 
+                ensureInitialActiveRuntimeConfigVersion(now)
                 ensureRiskStateRow(now, paperAccountConfig.initialCashJpy)
                 jdbcConnection().prepareStatement(BACKFILL_RISK_STATE_HARD_HALT_SQL).use { statement ->
                     statement.setString(1, RiskHaltState.HARD_HALT.name)
@@ -690,6 +697,7 @@ class TradingPersistenceBootstrap(
  * runtime schema の補助 index / backfill を適用する。
  */
 private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
+    ensureRuntimeConfigIndexes()
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL)
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
@@ -707,6 +715,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
  * runtime schema と補助 index が存在することを確認する。
  */
 private fun JdbcTransaction.verifyRuntimeSchemaObjects() {
+    verifyRuntimeConfigSchema()
     verifyAccountRuntimeSchemaObjects()
     verifyLedgerRuntimeSchemaObjects()
     verifyDecisionRuntimeSchemaObjects()
@@ -805,7 +814,7 @@ private fun JdbcTransaction.verifyDecisionRuntimeSchemaObjects() {
     )
 }
 
-private fun JdbcTransaction.verifySchemaBySql(sql: String, missingMessage: String) {
+internal fun JdbcTransaction.verifySchemaBySql(sql: String, missingMessage: String) {
     jdbcConnection().prepareStatement(sql).use { statement ->
         statement.executeQuery().use { resultSet ->
             requireNotNull(resultSet.metaData) { missingMessage }
@@ -813,7 +822,7 @@ private fun JdbcTransaction.verifySchemaBySql(sql: String, missingMessage: Strin
     }
 }
 
-private fun JdbcTransaction.verifyExistsBySql(sql: String, missingMessage: String) {
+internal fun JdbcTransaction.verifyExistsBySql(sql: String, missingMessage: String) {
     jdbcConnection().prepareStatement(sql).use { statement ->
         statement.executeQuery().use { resultSet ->
             require(resultSet.next()) { missingMessage }
@@ -821,7 +830,7 @@ private fun JdbcTransaction.verifyExistsBySql(sql: String, missingMessage: Strin
     }
 }
 
-private fun JdbcTransaction.executeUpdate(sql: String) {
+internal fun JdbcTransaction.executeUpdate(sql: String) {
     jdbcConnection().prepareStatement(sql).use { statement ->
         statement.executeUpdate()
     }

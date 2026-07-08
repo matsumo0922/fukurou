@@ -116,10 +116,10 @@ class ProtectionReconcilerWorker(
 internal fun startProtectionReconcilerWorker(
     dataSource: HikariDataSource,
     database: ExposedDatabase,
+    tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     status: MutableReconcilerStatus,
     clock: Clock = Clock.systemUTC(),
 ): ProtectionReconcilerWorker {
-    val tradingConfig = TradingBotConfig.fromEnvironment()
     val inputs = ProtectionReconcilerWorkerInputs(
         dataSource = dataSource,
         database = database,

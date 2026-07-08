@@ -26,6 +26,16 @@ const val FUKUROU_SYSTEM_PROMPT_VERSION_ENV = "FUKUROU_SYSTEM_PROMPT_VERSION"
 const val FUKUROU_MARKET_SNAPSHOT_ID_ENV = "FUKUROU_MARKET_SNAPSHOT_ID"
 
 /**
+ * runtime config version ID を子プロセスへ伝播する環境変数名。
+ */
+const val FUKUROU_RUNTIME_CONFIG_VERSION_ID_ENV = "FUKUROU_RUNTIME_CONFIG_VERSION_ID"
+
+/**
+ * runtime config hash を子プロセスへ伝播する環境変数名。
+ */
+const val FUKUROU_RUNTIME_CONFIG_HASH_ENV = "FUKUROU_RUNTIME_CONFIG_HASH"
+
+/**
  * 1 回の LLM 起動に紐づく監査コンテキスト。
  *
  * @param decisionRunId daemon が `FUKUROU_INVOCATION_ID` として渡す起動 ID
@@ -33,6 +43,8 @@ const val FUKUROU_MARKET_SNAPSHOT_ID_ENV = "FUKUROU_MARKET_SNAPSHOT_ID"
  * @param promptHash 利用した prompt の hash
  * @param systemPromptVersion system prompt の版
  * @param marketSnapshotId 判断前に固定した market snapshot ID
+ * @param runtimeConfigVersionId 判断開始時の runtime config version ID
+ * @param runtimeConfigHash 判断開始時の runtime config content hash
  */
 data class DecisionRunContext(
     val decisionRunId: String?,
@@ -40,6 +52,8 @@ data class DecisionRunContext(
     val promptHash: String?,
     val systemPromptVersion: String?,
     val marketSnapshotId: String?,
+    val runtimeConfigVersionId: String? = null,
+    val runtimeConfigHash: String? = null,
 ) {
     companion object {
         /**
@@ -51,6 +65,8 @@ data class DecisionRunContext(
             promptHash = null,
             systemPromptVersion = null,
             marketSnapshotId = null,
+            runtimeConfigVersionId = null,
+            runtimeConfigHash = null,
         )
 
         /**
@@ -63,6 +79,8 @@ data class DecisionRunContext(
                 promptHash = environment.blankToNull(FUKUROU_PROMPT_HASH_ENV),
                 systemPromptVersion = environment.blankToNull(FUKUROU_SYSTEM_PROMPT_VERSION_ENV),
                 marketSnapshotId = environment.blankToNull(FUKUROU_MARKET_SNAPSHOT_ID_ENV),
+                runtimeConfigVersionId = environment.blankToNull(FUKUROU_RUNTIME_CONFIG_VERSION_ID_ENV),
+                runtimeConfigHash = environment.blankToNull(FUKUROU_RUNTIME_CONFIG_HASH_ENV),
             )
         }
     }

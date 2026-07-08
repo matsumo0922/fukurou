@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -68,11 +69,13 @@ sealed interface ManualLlmLaunchResult {
  * 予約 repository を正本として手動 LLM 起動を fire-and-forget で実行する service。
  *
  * @param tradingConfig 取引 bot 設定
+ * @param runtimeConfigSnapshot 手動起動開始時に固定する runtime config snapshot
  * @param dependencies service が参照する repository / reader
  * @param runtime service の実行時境界
  */
 class DefaultManualLlmLaunchService(
     private val tradingConfig: TradingBotConfig,
+    private val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     dependencies: ManualLlmLaunchServiceDependencies,
     runtime: ManualLlmLaunchServiceRuntime,
 ) : ManualLlmLaunchService, AutoCloseable {
@@ -306,6 +309,10 @@ class DefaultManualLlmLaunchService(
                     put("triggerKey", LLM_MANUAL_TRIGGER_KEY)
                     put("eventName", null as String?)
                     put("observedAt", observedAt.toString())
+                    runtimeConfigSnapshot?.let { snapshot ->
+                        put("runtimeConfigVersionId", snapshot.versionId)
+                        put("runtimeConfigHash", snapshot.hash)
+                    }
                 }.toString(),
                 occurredAt = observedAt,
             ),
@@ -319,7 +326,7 @@ class DefaultManualLlmLaunchService(
     ): Result<Unit> {
         return commandEventLog.append(
             CommandEvent(
-                decisionRunContext = manualDecisionRunContext(invocationId),
+                decisionRunContext = manualDecisionRunContext(invocationId, runtimeConfigSnapshot),
                 toolName = MANUAL_TOOL_NAME,
                 toolCallId = null,
                 clientRequestId = LLM_MANUAL_TRIGGER_KEY,
@@ -331,6 +338,10 @@ class DefaultManualLlmLaunchService(
                     put("invocationId", invocationId)
                     put("observedAt", observedAt.toString())
                     put("reason", reason)
+                    runtimeConfigSnapshot?.let { snapshot ->
+                        put("runtimeConfigVersionId", snapshot.versionId)
+                        put("runtimeConfigHash", snapshot.hash)
+                    }
                 }.toString(),
                 occurredAt = observedAt,
             ),
@@ -344,7 +355,7 @@ class DefaultManualLlmLaunchService(
     ): Result<Unit> {
         return commandEventLog.append(
             CommandEvent(
-                decisionRunContext = manualDecisionRunContext(invocationId),
+                decisionRunContext = manualDecisionRunContext(invocationId, runtimeConfigSnapshot),
                 toolName = MANUAL_TOOL_NAME,
                 toolCallId = null,
                 clientRequestId = LLM_MANUAL_TRIGGER_KEY,
@@ -356,6 +367,10 @@ class DefaultManualLlmLaunchService(
                     put("invocationId", invocationId)
                     put("status", status)
                     put("finishedAt", finishedAt.toString())
+                    runtimeConfigSnapshot?.let { snapshot ->
+                        put("runtimeConfigVersionId", snapshot.versionId)
+                        put("runtimeConfigHash", snapshot.hash)
+                    }
                 }.toString(),
                 occurredAt = finishedAt,
             ),
@@ -400,13 +415,18 @@ data class ManualLlmLaunchServiceRuntime(
     val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
 )
 
-private fun manualDecisionRunContext(invocationId: String): DecisionRunContext {
+private fun manualDecisionRunContext(
+    invocationId: String,
+    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
+): DecisionRunContext {
     return DecisionRunContext(
         decisionRunId = invocationId,
         llmProvider = null,
         promptHash = null,
         systemPromptVersion = null,
         marketSnapshotId = null,
+        runtimeConfigVersionId = runtimeConfigSnapshot?.versionId,
+        runtimeConfigHash = runtimeConfigSnapshot?.hash,
     )
 }
 

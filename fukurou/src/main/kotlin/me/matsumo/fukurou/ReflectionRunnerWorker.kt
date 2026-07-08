@@ -139,11 +139,10 @@ class ReflectionRunnerWorker(
 internal fun startReflectionRunnerWorker(
     database: ExposedDatabase,
     environment: Map<String, String> = System.getenv(),
+    tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(environment),
     clock: Clock = Clock.systemUTC(),
     bootstrap: (() -> Result<Unit>)? = null,
 ): ReflectionRunnerWorker? {
-    val tradingConfig = TradingBotConfig.fromEnvironment(environment)
-
     if (!tradingConfig.obsidian.enabled) {
         return null
     }

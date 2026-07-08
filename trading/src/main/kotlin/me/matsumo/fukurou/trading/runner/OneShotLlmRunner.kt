@@ -13,6 +13,8 @@ import me.matsumo.fukurou.trading.audit.FUKUROU_INVOCATION_ID_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_LLM_PROVIDER_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_MARKET_SNAPSHOT_ID_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_PROMPT_HASH_ENV
+import me.matsumo.fukurou.trading.audit.FUKUROU_RUNTIME_CONFIG_HASH_ENV
+import me.matsumo.fukurou.trading.audit.FUKUROU_RUNTIME_CONFIG_VERSION_ID_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_SYSTEM_PROMPT_VERSION_ENV
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
@@ -22,6 +24,8 @@ import me.matsumo.fukurou.trading.broker.calculatePreviewHash
 import me.matsumo.fukurou.trading.broker.toPreviewOrderNormalizedContent
 import me.matsumo.fukurou.trading.config.FUKUROU_MCP_ACT_TOOL_CALL_LIMIT_ENV
 import me.matsumo.fukurou.trading.config.FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT_ENV
+import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -216,6 +220,7 @@ data class OneShotRunnerResult(
  * @param tradingRuntime trading runtime
  * @param tradingConfig trading config
  * @param llmInvoker LLM 起動境界
+ * @param runtimeConfigSnapshot 起動開始時に固定する runtime config snapshot
  * @param parentEnvironment 親 process environment
  * @param clock audit timestamp 用 clock
  * @param idGenerator invocation / tool call ID generator
@@ -225,6 +230,7 @@ class OneShotLlmRunner(
     private val tradingRuntime: TradingRuntime,
     private val tradingConfig: TradingBotConfig,
     private val llmInvoker: LlmInvoker,
+    private val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     private val parentEnvironment: Map<String, String> = System.getenv(),
     private val clock: Clock = Clock.systemUTC(),
     private val idGenerator: () -> UUID = { UUID.randomUUID() },
@@ -246,6 +252,7 @@ class OneShotLlmRunner(
     )
     private val requestFactory = OneShotLlmRequestFactory(
         tradingConfig = tradingConfig,
+        runtimeConfigSnapshot = runtimeConfigSnapshot,
         parentEnvironment = parentEnvironment,
     )
     private val runAuditRecorder = OneShotRunAuditRecorder(
@@ -271,6 +278,8 @@ class OneShotLlmRunner(
             symbol = tradingConfig.symbol,
             triggerKind = request.triggerKind,
             startedAt = clock.instant(),
+            runtimeConfigVersionId = runtimeConfigSnapshot?.versionId,
+            runtimeConfigHash = runtimeConfigSnapshot?.hash,
         )
         var failureContext = requestFactory.decisionRunContext(
             invocationId = invocationId,
@@ -896,6 +905,8 @@ private class OneShotRunAuditRecorder(
             startedAt = start.startedAt,
             finishedAt = clock.instant(),
             errorMessage = cause?.redactedErrorMessage(),
+            runtimeConfigVersionId = start.runtimeConfigVersionId,
+            runtimeConfigHash = start.runtimeConfigHash,
         )
 
         return tradingRuntime.llmRunRepository.finish(finish)
@@ -933,6 +944,8 @@ private class OneShotRunAuditRecorder(
         val payload = buildJsonObject {
             put("phase", phase)
             put("durationMillis", duration.toMillis())
+            context.runtimeConfigVersionId?.let { versionId -> put("runtimeConfigVersionId", versionId) }
+            context.runtimeConfigHash?.let { hash -> put("runtimeConfigHash", hash) }
             put("details", details)
         }.toString()
 
@@ -1000,6 +1013,7 @@ private class OneShotPhaseInvoker(
  */
 private class OneShotLlmRequestFactory(
     private val tradingConfig: TradingBotConfig,
+    private val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
     private val parentEnvironment: Map<String, String>,
 ) {
     fun llmRequest(input: LlmRequestInput): LlmInvocationRequest {
@@ -1061,9 +1075,12 @@ private class OneShotLlmRequestFactory(
         val configEnvironment = parentEnvironment
             .filterKeys { key -> key.startsWith("FUKUROU_") }
             .filterKeys { key -> !isForbiddenSecretEnvKey(key) }
+            .filterKeys { key -> key !in RuntimeConfigCatalog.runtimeLegacyEnvNames() }
+        val runtimeEnvironment = RuntimeConfigCatalog.runtimeEnvironment(tradingConfig)
         val mcpAllowedTools = shortMcpToolNames(allowedTools).joinToString(",")
 
         return configEnvironment +
+            runtimeEnvironment +
             databaseEnvironment +
             runEnvironment +
             mapOf(
@@ -1087,13 +1104,23 @@ private class OneShotLlmRequestFactory(
     }
 
     private fun runEnvironment(context: DecisionRunContext): Map<String, String> {
-        return mapOf(
+        val requiredEnvironment = mapOf(
             FUKUROU_INVOCATION_ID_ENV to requireNotNull(context.decisionRunId),
             FUKUROU_LLM_PROVIDER_ENV to requireNotNull(context.llmProvider),
             FUKUROU_PROMPT_HASH_ENV to requireNotNull(context.promptHash),
             FUKUROU_SYSTEM_PROMPT_VERSION_ENV to requireNotNull(context.systemPromptVersion),
             FUKUROU_MARKET_SNAPSHOT_ID_ENV to requireNotNull(context.marketSnapshotId),
         )
+        val runtimeConfigEnvironment = buildMap {
+            context.runtimeConfigVersionId?.let { versionId ->
+                put(FUKUROU_RUNTIME_CONFIG_VERSION_ID_ENV, versionId)
+            }
+            context.runtimeConfigHash?.let { hash ->
+                put(FUKUROU_RUNTIME_CONFIG_HASH_ENV, hash)
+            }
+        }
+
+        return requiredEnvironment + runtimeConfigEnvironment
     }
 
     fun decisionRunContext(
@@ -1108,6 +1135,8 @@ private class OneShotLlmRequestFactory(
             promptHash = promptHash,
             systemPromptVersion = SystemPromptV1.VERSION,
             marketSnapshotId = marketSnapshotId,
+            runtimeConfigVersionId = runtimeConfigSnapshot?.versionId,
+            runtimeConfigHash = runtimeConfigSnapshot?.hash,
         )
     }
 

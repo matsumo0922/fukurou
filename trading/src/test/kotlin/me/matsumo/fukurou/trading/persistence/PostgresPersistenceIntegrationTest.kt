@@ -17,6 +17,9 @@ import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
+import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
+import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
@@ -127,6 +130,27 @@ private const val DROP_COMMAND_EVENT_LOG_TABLE_SQL = "DROP TABLE command_event_l
  * llm_runs table を削除する SQL。
  */
 private const val DROP_LLM_RUNS_TABLE_SQL = "DROP TABLE llm_runs"
+
+/**
+ * active runtime config version を無効化する SQL。
+ */
+private const val DEACTIVATE_RUNTIME_CONFIG_VERSIONS_SQL = """
+    UPDATE runtime_config_versions
+    SET status = 'INACTIVE'
+"""
+
+/**
+ * runtime config values を削除する SQL。
+ */
+private const val DELETE_RUNTIME_CONFIG_VALUES_SQL = "DELETE FROM runtime_config_values"
+
+/**
+ * runtime config value を key 単位で削除する SQL。
+ */
+private const val DELETE_RUNTIME_CONFIG_VALUE_SQL = """
+    DELETE FROM runtime_config_values
+    WHERE config_key = ?
+"""
 
 /**
  * equity_snapshots table を削除する SQL。
@@ -554,6 +578,51 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, selectLlmRunIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
         assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
+    }
+
+    @Test
+    fun bootstrap_createsActiveRuntimeConfigSnapshotFromCatalogDefaults() = runPostgresTest {
+        val expectedValues = RuntimeConfigCatalog.runtimeDefaultValues()
+
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val snapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+
+        assertEquals(expectedValues, snapshot.values)
+        assertEquals(calculateRuntimeConfigHash(expectedValues), snapshot.hash)
+    }
+
+    @Test
+    fun runtimeConfigBootstrapDoesNotRecreateActiveWhenExistingVersionHasNoActive() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        deactivateRuntimeConfigVersions(database)
+
+        assertTrue(RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().isFailure)
+        assertTrue(TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().isFailure)
+        assertTrue(ExposedRuntimeConfigRepository(database).activeSnapshot().isFailure)
+    }
+
+    @Test
+    fun runtimeConfigBootstrapDoesNotBackfillDefaultsWhenActiveValuesAreEmpty() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        deleteRuntimeConfigValues(database)
+
+        assertTrue(RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().isFailure)
+        assertTrue(TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().isFailure)
+        assertTrue(ExposedRuntimeConfigRepository(database).activeSnapshot().isFailure)
+    }
+
+    @Test
+    fun runtimeConfigResolveFailsClosedWhenActiveValueIsMissing() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        deleteRuntimeConfigValue(database, "runner.maxToolCallsPerRun")
+
+        assertTrue(RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().isFailure)
+        assertTrue(
+            RuntimeConfigResolver(
+                ExposedRuntimeConfigRepository(database),
+            ).resolve(emptyMap()).isFailure,
+        )
     }
 
     @Test
@@ -1081,6 +1150,8 @@ class PostgresPersistenceIntegrationTest {
                 toolName = "daemon-latest",
                 eventType = CommandEventType.DAEMON_TRIGGER_LAUNCHED,
                 occurredAt = fixedInstant().plusSeconds(2),
+                runtimeConfigVersionId = "runtime-version-1",
+                runtimeConfigHash = "runtime-hash-1",
             ),
         ).getOrThrow()
 
@@ -1098,6 +1169,8 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf("daemon-latest", "daemon-new"), allEvents.map { event -> event.toolName })
         assertEquals(listOf("daemon-latest"), filteredEvents.map { event -> event.toolName })
         assertEquals(CommandEventType.DAEMON_TRIGGER_LAUNCHED, filteredEvents.single().eventType)
+        assertEquals("runtime-version-1", filteredEvents.single().decisionRunContext.runtimeConfigVersionId)
+        assertEquals("runtime-hash-1", filteredEvents.single().decisionRunContext.runtimeConfigHash)
         assertEquals(listOf("tool-old"), excludedEvents.map { event -> event.toolName })
     }
 
@@ -2608,6 +2681,40 @@ private fun dropLlmRunsTable(database: ExposedDatabase) {
 }
 
 /**
+ * active runtime config version をなくす。
+ */
+private fun deactivateRuntimeConfigVersions(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(DEACTIVATE_RUNTIME_CONFIG_VERSIONS_SQL).use { statement ->
+            statement.executeUpdate()
+        }
+    }
+}
+
+/**
+ * runtime config values をすべて削除する。
+ */
+private fun deleteRuntimeConfigValues(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(DELETE_RUNTIME_CONFIG_VALUES_SQL).use { statement ->
+            statement.executeUpdate()
+        }
+    }
+}
+
+/**
+ * runtime config value を key 単位で削除する。
+ */
+private fun deleteRuntimeConfigValue(database: ExposedDatabase, configKey: String) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(DELETE_RUNTIME_CONFIG_VALUE_SQL).use { statement ->
+            statement.setString(1, configKey)
+            statement.executeUpdate()
+        }
+    }
+}
+
+/**
  * equity_snapshots table を削除する。
  */
 private fun dropEquitySnapshotsTable(database: ExposedDatabase) {
@@ -3043,9 +3150,19 @@ private fun commandEvent(
     toolName: String,
     eventType: CommandEventType,
     occurredAt: Instant,
+    runtimeConfigVersionId: String? = null,
+    runtimeConfigHash: String? = null,
 ): CommandEvent {
     return CommandEvent(
-        decisionRunContext = DecisionRunContext.EMPTY,
+        decisionRunContext = DecisionRunContext(
+            decisionRunId = null,
+            llmProvider = null,
+            promptHash = null,
+            systemPromptVersion = null,
+            marketSnapshotId = null,
+            runtimeConfigVersionId = runtimeConfigVersionId,
+            runtimeConfigHash = runtimeConfigHash,
+        ),
         toolName = toolName,
         toolCallId = null,
         clientRequestId = null,

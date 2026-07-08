@@ -9,6 +9,8 @@ import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.toInitialAccountSnapshot
+import me.matsumo.fukurou.trading.config.RuntimeConfigResolution
+import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
@@ -29,8 +31,10 @@ import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedReconcilerStatusProvider
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
+import me.matsumo.fukurou.trading.persistence.ExposedRuntimeConfigRepository
 import me.matsumo.fukurou.trading.persistence.ExposedSafetyViolationRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
+import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.NoReconcilerStatusProvider
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
@@ -151,6 +155,34 @@ data class TradingDatabaseConfig(
  * trading runtime repository を構築する factory。
  */
 object TradingRuntimeFactory {
+
+    /**
+     * DB active runtime config を環境変数の deployment / secret 値と合成して解決する。
+     */
+    fun resolveRuntimeConfigFromEnvironment(
+        environment: Map<String, String> = System.getenv(),
+        clock: Clock = Clock.systemUTC(),
+    ): RuntimeConfigResolution {
+        val databaseConfig = requireNotNull(TradingDatabaseConfig.fromEnvironment(environment)) {
+            "DB_URL, DB_USER, and DB_PASSWORD are required for runtime config resolution."
+        }
+        val dataSource = createDataSource(databaseConfig)
+
+        try {
+            val database = ExposedDatabase.connect(dataSource)
+
+            RuntimeConfigPersistenceBootstrap(
+                database = database,
+                clock = clock,
+            ).ensureSchema().getOrThrow()
+
+            return RuntimeConfigResolver(
+                ExposedRuntimeConfigRepository(database),
+            ).resolve(environment).getOrThrow()
+        } finally {
+            dataSource.close()
+        }
+    }
 
     /**
      * 環境変数から DB-backed runtime を構築する。DB 設定が欠けている場合は fail closed する。

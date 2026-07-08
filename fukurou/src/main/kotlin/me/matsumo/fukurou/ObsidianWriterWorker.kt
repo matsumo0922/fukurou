@@ -121,11 +121,10 @@ class ObsidianWriterWorker(
 internal fun startObsidianWriterWorker(
     database: ExposedDatabase,
     environment: Map<String, String> = System.getenv(),
+    tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(environment),
     clock: Clock = Clock.systemUTC(),
     bootstrap: (() -> Result<Unit>)? = null,
 ): ObsidianWriterWorker? {
-    val tradingConfig = TradingBotConfig.fromEnvironment(environment)
-
     if (!tradingConfig.obsidian.enabled) {
         return null
     }

@@ -28,9 +28,11 @@ private const val INSERT_LLM_RUN_RUNNING_SQL = """
         status,
         started_at,
         finished_at,
-        error_message
+        error_message,
+        runtime_config_version_id,
+        runtime_config_hash
     )
-    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
     ON CONFLICT (invocation_id) DO NOTHING
 """
 
@@ -46,14 +48,18 @@ private const val UPSERT_LLM_RUN_FINISH_SQL = """
         status,
         started_at,
         finished_at,
-        error_message
+        error_message,
+        runtime_config_version_id,
+        runtime_config_hash
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (invocation_id) DO UPDATE
     SET
         status = EXCLUDED.status,
         finished_at = EXCLUDED.finished_at,
-        error_message = EXCLUDED.error_message
+        error_message = EXCLUDED.error_message,
+        runtime_config_version_id = EXCLUDED.runtime_config_version_id,
+        runtime_config_hash = EXCLUDED.runtime_config_hash
 """
 
 /**
@@ -68,7 +74,9 @@ private const val SELECT_LLM_RUN_BY_INVOCATION_ID_SQL = """
         status,
         started_at,
         finished_at,
-        error_message
+        error_message,
+        runtime_config_version_id,
+        runtime_config_hash
     FROM llm_runs
     WHERE invocation_id = ?
 """
@@ -85,7 +93,9 @@ private const val SELECT_LLM_RUNS_STARTED_BETWEEN_SQL = """
         latest_runs.status,
         latest_runs.started_at,
         latest_runs.finished_at,
-        latest_runs.error_message
+        latest_runs.error_message,
+        latest_runs.runtime_config_version_id,
+        latest_runs.runtime_config_hash
     FROM (
         SELECT
             invocation_id,
@@ -95,7 +105,9 @@ private const val SELECT_LLM_RUNS_STARTED_BETWEEN_SQL = """
             status,
             started_at,
             finished_at,
-            error_message
+            error_message,
+            runtime_config_version_id,
+            runtime_config_hash
         FROM llm_runs
         WHERE started_at >= ?
             AND started_at < ?
@@ -175,6 +187,8 @@ private fun JdbcTransaction.insertRunningLlmRun(start: LlmRunStart) {
         statement.setString(4, start.triggerKind?.name)
         statement.setString(5, LLM_RUN_STATUS_RUNNING)
         statement.setLong(6, start.startedAt.toEpochMilli())
+        statement.setString(7, start.runtimeConfigVersionId)
+        statement.setString(8, start.runtimeConfigHash)
         statement.executeUpdate()
     }
 }
@@ -189,6 +203,8 @@ private fun JdbcTransaction.finishLlmRun(finish: LlmRunFinish) {
         statement.setLong(6, finish.startedAt.toEpochMilli())
         statement.setLong(7, finish.finishedAt.toEpochMilli())
         statement.setString(8, finish.errorMessage)
+        statement.setString(9, finish.runtimeConfigVersionId)
+        statement.setString(10, finish.runtimeConfigHash)
         statement.executeUpdate()
     }
 }
@@ -238,5 +254,7 @@ private fun ResultSet.toLlmRunRecord(): LlmRunRecord {
         startedAt = Instant.ofEpochMilli(getLong("started_at")),
         finishedAt = finishedAt,
         errorMessage = getString("error_message"),
+        runtimeConfigVersionId = getString("runtime_config_version_id"),
+        runtimeConfigHash = getString("runtime_config_hash"),
     )
 }

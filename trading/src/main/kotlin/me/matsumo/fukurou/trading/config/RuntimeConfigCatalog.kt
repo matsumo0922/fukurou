@@ -24,6 +24,50 @@ import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
 object RuntimeConfigCatalog {
 
     /**
+     * runtime group の catalog item 一覧を返す。
+     */
+    fun runtimeItems(tradingConfig: TradingBotConfig = TradingBotConfig()): List<RuntimeConfigItem> {
+        return runtimeGroup(
+            config = tradingConfig,
+            environment = emptyMap(),
+            defaults = RuntimeConfigDefaults(),
+        ).items
+    }
+
+    /**
+     * runtime group の legacy env 名一覧を返す。
+     */
+    fun runtimeLegacyEnvNames(): Set<String> {
+        return runtimeItems().map { item -> item.legacyEnvName }.toSet()
+    }
+
+    /**
+     * code catalog default を runtime config key ごとに返す。
+     */
+    fun runtimeDefaultValues(): Map<String, String> {
+        return runtimeItems().associate { item ->
+            val defaultValue = requireNotNull(item.defaultValue) {
+                "Runtime config default value must not be null: ${item.key}"
+            }
+
+            item.key to defaultValue
+        }
+    }
+
+    /**
+     * typed config と等価な runtime env map を返す。
+     */
+    fun runtimeEnvironment(tradingConfig: TradingBotConfig): Map<String, String> {
+        return runtimeItems(tradingConfig).associate { item ->
+            val effectiveValue = requireNotNull(item.effectiveValue) {
+                "Runtime config effective value must not be null: ${item.key}"
+            }
+
+            item.legacyEnvName to effectiveValue
+        }
+    }
+
+    /**
      * 実効設定 snapshot を作る。
      */
     fun snapshot(

@@ -28,6 +28,8 @@ const val LLM_RUN_STATUS_CANCELLED = "CANCELLED"
  * @param symbol 取引対象 symbol
  * @param triggerKind daemon trigger 種別。手動起動では null
  * @param startedAt 起動開始時刻
+ * @param runtimeConfigVersionId 開始時 runtime config version ID
+ * @param runtimeConfigHash 開始時 runtime config content hash
  */
 data class LlmRunStart(
     val invocationId: String,
@@ -35,6 +37,8 @@ data class LlmRunStart(
     val symbol: TradingSymbol,
     val triggerKind: LlmDaemonTriggerKind?,
     val startedAt: Instant,
+    val runtimeConfigVersionId: String? = null,
+    val runtimeConfigHash: String? = null,
 )
 
 /**
@@ -48,6 +52,8 @@ data class LlmRunStart(
  * @param startedAt 起動開始時刻
  * @param finishedAt 終了時刻
  * @param errorMessage redaction / truncate 済みのエラー message
+ * @param runtimeConfigVersionId 開始時 runtime config version ID
+ * @param runtimeConfigHash 開始時 runtime config content hash
  */
 data class LlmRunFinish(
     val invocationId: String,
@@ -58,6 +64,8 @@ data class LlmRunFinish(
     val startedAt: Instant,
     val finishedAt: Instant,
     val errorMessage: String?,
+    val runtimeConfigVersionId: String? = null,
+    val runtimeConfigHash: String? = null,
 )
 
 /**
@@ -71,6 +79,8 @@ data class LlmRunFinish(
  * @param startedAt 起動開始時刻
  * @param finishedAt 終了時刻
  * @param errorMessage redaction / truncate 済みのエラー message
+ * @param runtimeConfigVersionId 開始時 runtime config version ID
+ * @param runtimeConfigHash 開始時 runtime config content hash
  */
 data class LlmRunRecord(
     val invocationId: String,
@@ -81,6 +91,8 @@ data class LlmRunRecord(
     val startedAt: Instant,
     val finishedAt: Instant?,
     val errorMessage: String?,
+    val runtimeConfigVersionId: String? = null,
+    val runtimeConfigHash: String? = null,
 )
 
 /**
@@ -135,6 +147,8 @@ class InMemoryLlmRunRepository : LlmRunRepository {
                         startedAt = start.startedAt,
                         finishedAt = null,
                         errorMessage = null,
+                        runtimeConfigVersionId = start.runtimeConfigVersionId,
+                        runtimeConfigHash = start.runtimeConfigHash,
                     ),
                 )
                 statusHistory.getOrPut(start.invocationId) { mutableListOf() }.add(LLM_RUN_STATUS_RUNNING)
@@ -152,6 +166,8 @@ class InMemoryLlmRunRepository : LlmRunRepository {
                         status = finish.status,
                         finishedAt = finish.finishedAt,
                         errorMessage = finish.errorMessage,
+                        runtimeConfigVersionId = finish.runtimeConfigVersionId,
+                        runtimeConfigHash = finish.runtimeConfigHash,
                     )
                 } else {
                     records[finish.invocationId] = LlmRunRecord(
@@ -163,6 +179,8 @@ class InMemoryLlmRunRepository : LlmRunRepository {
                         startedAt = finish.startedAt,
                         finishedAt = finish.finishedAt,
                         errorMessage = finish.errorMessage,
+                        runtimeConfigVersionId = finish.runtimeConfigVersionId,
+                        runtimeConfigHash = finish.runtimeConfigHash,
                     )
                 }
                 statusHistory.getOrPut(finish.invocationId) { mutableListOf() }.add(finish.status)

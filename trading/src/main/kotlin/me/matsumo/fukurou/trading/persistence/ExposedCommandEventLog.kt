@@ -32,9 +32,11 @@ private const val INSERT_COMMAND_EVENT_SQL = """
         llm_provider,
         prompt_hash,
         system_prompt_version,
-        market_snapshot_id
+        market_snapshot_id,
+        runtime_config_version_id,
+        runtime_config_hash
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 /**
@@ -82,7 +84,9 @@ private const val SELECT_COMMAND_EVENTS_SQL_PREFIX = """
         llm_provider,
         prompt_hash,
         system_prompt_version,
-        market_snapshot_id
+        market_snapshot_id,
+        runtime_config_version_id,
+        runtime_config_hash
     FROM command_event_log
 """
 
@@ -267,6 +271,8 @@ internal fun JdbcTransaction.insertEvent(event: CommandEvent) {
         statement.setNullableString(10, event.decisionRunContext.promptHash)
         statement.setNullableString(11, event.decisionRunContext.systemPromptVersion)
         statement.setNullableString(12, event.decisionRunContext.marketSnapshotId)
+        statement.setNullableString(13, event.decisionRunContext.runtimeConfigVersionId)
+        statement.setNullableString(14, event.decisionRunContext.runtimeConfigHash)
         statement.executeUpdate()
     }
 }
@@ -433,6 +439,8 @@ private fun ResultSet.toCommandEvent(): CommandEvent {
             promptHash = getString("prompt_hash"),
             systemPromptVersion = getString("system_prompt_version"),
             marketSnapshotId = getString("market_snapshot_id"),
+            runtimeConfigVersionId = getString("runtime_config_version_id"),
+            runtimeConfigHash = getString("runtime_config_hash"),
         ),
         toolName = getString("tool_name"),
         toolCallId = getString("tool_call_id"),
