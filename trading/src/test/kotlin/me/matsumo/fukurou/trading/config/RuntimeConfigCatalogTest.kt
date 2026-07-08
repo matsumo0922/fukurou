@@ -37,6 +37,8 @@ class RuntimeConfigCatalogTest {
         assertEquals("https://example.test/public", deploymentItems.getValue("gmoPublic.baseUrl").effectiveValue)
         assertFalse(deploymentItems.getValue("trading.mode").editable)
         assertFalse(runtimeItems.getValue("safety.maxRiskPerTradeRatio").editable)
+        assertEquals(RuntimeConfigSafetyTier.GUARDED, runtimeItems.getValue("gmoPublic.restPerSecond").safetyTier)
+        assertEquals(RuntimeConfigSafetyTier.GUARDED, runtimeItems.getValue("gmoPublic.restBurst").safetyTier)
         assertTrue(secretItems.getValue("database.password").valueConfigured)
         assertNull(secretItems.getValue("database.password").currentValue)
         assertNull(secretItems.getValue("database.password").effectiveValue)

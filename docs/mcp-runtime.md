@@ -188,6 +188,8 @@ runner 上限も保守側の override だけを許可する。総 tool call は 
 
 `GET /ops/runtime-config` は code-owned `RuntimeConfigCatalog` から Runtime / Deployment / Secrets の実効設定を読み取り専用で返す。Runtime group は `TradingBotConfig` 由来の typed config、Deployment group は `FUKUROU_GMO_PUBLIC_BASE_URL`、LLM command template、MCP server command / args / tool allowlist などの deploy 境界、Secrets group は DB password や Cloudflare token などの設定有無を表す。`/app/config` は同じ catalog を表示し、secret 値は API response と画面のどちらにも出さない。
 
+Deployment group の env は `/ops/runtime-config` と `/app/config` に raw value として表示されるため、command template、common args、working directory、repository root、tool allowlist には secret を入れない。
+
 ## secrets / CLI auth
 
 - Docker image に Claude / Codex の auth token、GMO private key、Cloudflare token を焼き込まない。
