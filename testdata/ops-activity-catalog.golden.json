@@ -1,0 +1,161 @@
+{
+  "sourceFilters": [
+    {
+      "value": "all",
+      "labelKey": "activity.catalog.source.all.label",
+      "descriptionKey": "activity.catalog.source.all.description"
+    },
+    {
+      "value": "decision",
+      "labelKey": "activity.catalog.source.decision.label",
+      "descriptionKey": "activity.catalog.source.decision.description"
+    },
+    {
+      "value": "audit",
+      "labelKey": "activity.catalog.source.audit.label",
+      "descriptionKey": "activity.catalog.source.audit.description"
+    },
+    {
+      "value": "execution",
+      "labelKey": "activity.catalog.source.execution.label",
+      "descriptionKey": "activity.catalog.source.execution.description"
+    }
+  ],
+  "auditEventTypes": [
+    {
+      "value": "TOOL_CALL_COMPLETED",
+      "labelKey": "activity.catalog.audit.toolCallCompleted.label",
+      "descriptionKey": "activity.catalog.audit.toolCallCompleted.description"
+    },
+    {
+      "value": "TOOL_CALL_REJECTED_BY_HARD_HALT",
+      "labelKey": "activity.catalog.audit.toolCallRejectedByHardHalt.label",
+      "descriptionKey": "activity.catalog.audit.toolCallRejectedByHardHalt.description"
+    },
+    {
+      "value": "NO_TRADE_EXIT",
+      "labelKey": "activity.catalog.audit.noTradeExit.label",
+      "descriptionKey": "activity.catalog.audit.noTradeExit.description"
+    },
+    {
+      "value": "RECONCILER_STARTED",
+      "labelKey": "activity.catalog.audit.reconcilerStarted.label",
+      "descriptionKey": "activity.catalog.audit.reconcilerStarted.description"
+    },
+    {
+      "value": "RECONCILER_PASS_COMPLETED",
+      "labelKey": "activity.catalog.audit.reconcilerPassCompleted.label",
+      "descriptionKey": "activity.catalog.audit.reconcilerPassCompleted.description"
+    },
+    {
+      "value": "RECONCILER_PASS_FAILED",
+      "labelKey": "activity.catalog.audit.reconcilerPassFailed.label",
+      "descriptionKey": "activity.catalog.audit.reconcilerPassFailed.description"
+    },
+    {
+      "value": "RECONCILER_PASS_RECOVERED",
+      "labelKey": "activity.catalog.audit.reconcilerPassRecovered.label",
+      "descriptionKey": "activity.catalog.audit.reconcilerPassRecovered.description"
+    },
+    {
+      "value": "HARD_HALT_SET",
+      "labelKey": "activity.catalog.audit.hardHaltSet.label",
+      "descriptionKey": "activity.catalog.audit.hardHaltSet.description"
+    },
+    {
+      "value": "SOFT_HALT_SET",
+      "labelKey": "activity.catalog.audit.softHaltSet.label",
+      "descriptionKey": "activity.catalog.audit.softHaltSet.description"
+    },
+    {
+      "value": "KILL_CRITERION_BREACHED",
+      "labelKey": "activity.catalog.audit.killCriterionBreached.label",
+      "descriptionKey": "activity.catalog.audit.killCriterionBreached.description"
+    },
+    {
+      "value": "MANUAL_RESUME_REQUESTED",
+      "labelKey": "activity.catalog.audit.manualResumeRequested.label",
+      "descriptionKey": "activity.catalog.audit.manualResumeRequested.description"
+    },
+    {
+      "value": "RUNNER_PHASE_COMPLETED",
+      "labelKey": "activity.catalog.audit.runnerPhaseCompleted.label",
+      "descriptionKey": "activity.catalog.audit.runnerPhaseCompleted.description"
+    },
+    {
+      "value": "DECISION_LIFECYCLE_COMPLETED",
+      "labelKey": "activity.catalog.audit.decisionLifecycleCompleted.label",
+      "descriptionKey": "activity.catalog.audit.decisionLifecycleCompleted.description"
+    },
+    {
+      "value": "DAEMON_STARTED",
+      "labelKey": "activity.catalog.audit.daemonStarted.label",
+      "descriptionKey": "activity.catalog.audit.daemonStarted.description"
+    },
+    {
+      "value": "DAEMON_TRIGGER_SKIPPED",
+      "labelKey": "activity.catalog.audit.daemonTriggerSkipped.label",
+      "descriptionKey": "activity.catalog.audit.daemonTriggerSkipped.description"
+    },
+    {
+      "value": "DAEMON_TRIGGER_LAUNCHED",
+      "labelKey": "activity.catalog.audit.daemonTriggerLaunched.label",
+      "descriptionKey": "activity.catalog.audit.daemonTriggerLaunched.description"
+    },
+    {
+      "value": "DAEMON_INVOCATION_COMPLETED",
+      "labelKey": "activity.catalog.audit.daemonInvocationCompleted.label",
+      "descriptionKey": "activity.catalog.audit.daemonInvocationCompleted.description"
+    },
+    {
+      "value": "CLI_AUTH_LOGIN_STARTED",
+      "labelKey": "activity.catalog.audit.cliAuthLoginStarted.label",
+      "descriptionKey": "activity.catalog.audit.cliAuthLoginStarted.description"
+    },
+    {
+      "value": "CLI_AUTH_LOGIN_TOKEN_SUBMITTED",
+      "labelKey": "activity.catalog.audit.cliAuthLoginTokenSubmitted.label",
+      "descriptionKey": "activity.catalog.audit.cliAuthLoginTokenSubmitted.description"
+    },
+    {
+      "value": "CLI_AUTH_LOGIN_COMPLETED",
+      "labelKey": "activity.catalog.audit.cliAuthLoginCompleted.label",
+      "descriptionKey": "activity.catalog.audit.cliAuthLoginCompleted.description"
+    },
+    {
+      "value": "CLI_AUTH_LOGIN_FAILED",
+      "labelKey": "activity.catalog.audit.cliAuthLoginFailed.label",
+      "descriptionKey": "activity.catalog.audit.cliAuthLoginFailed.description"
+    },
+    {
+      "value": "CLI_AUTH_LOGIN_TIMED_OUT",
+      "labelKey": "activity.catalog.audit.cliAuthLoginTimedOut.label",
+      "descriptionKey": "activity.catalog.audit.cliAuthLoginTimedOut.description"
+    }
+  ],
+  "decisionActions": [
+    {
+      "value": "ENTER",
+      "labelKey": "activity.catalog.decision.enter.label",
+      "descriptionKey": "activity.catalog.decision.enter.description"
+    },
+    {
+      "value": "EXIT",
+      "labelKey": "activity.catalog.decision.exit.label",
+      "descriptionKey": "activity.catalog.decision.exit.description"
+    },
+    {
+      "value": "ADJUST_PROTECTION",
+      "labelKey": "activity.catalog.decision.adjustProtection.label",
+      "descriptionKey": "activity.catalog.decision.adjustProtection.description"
+    },
+    {
+      "value": "NO_TRADE",
+      "labelKey": "activity.catalog.decision.noTrade.label",
+      "descriptionKey": "activity.catalog.decision.noTrade.description"
+    }
+  ],
+  "defaultExcludedAuditEventTypes": [
+    "RECONCILER_PASS_COMPLETED"
+  ]
+}

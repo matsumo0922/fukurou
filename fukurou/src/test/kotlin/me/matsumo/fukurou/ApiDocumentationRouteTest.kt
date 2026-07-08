@@ -132,6 +132,12 @@ class ApiDocumentationRouteTest {
         )
         assertOperation(
             paths = paths,
+            path = "/ops/activity/catalog",
+            summary = "Activity 表示用 catalog を取得する",
+            tag = "ops",
+        )
+        assertOperation(
+            paths = paths,
             path = "/ops/positions",
             summary = "open position と open order の raw feed を取得する",
             tag = "ops",

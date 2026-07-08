@@ -39,6 +39,7 @@ import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import java.io.File
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
@@ -746,6 +747,25 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_activityCatalogMatchesSharedGoldenWithoutRepositories() = testApplication {
+        application {
+            module(
+                readinessProbe = { true },
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/activity/catalog")
+        val responseText = response.bodyAsText()
+        val expectedJson = Json.parseToJsonElement(readSharedTestdata("ops-activity-catalog.golden.json"))
+        val actualJson = Json.parseToJsonElement(responseText)
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertNoSecretLikeText(responseText)
+        assertEquals(expectedJson, actualJson)
+    }
+
+    @Test
     fun opsRoutes_activityCursorKeepsUnshownEventsWithSameTimestamp() = testApplication {
         val eventLog = InMemoryCommandEventLog()
         val occurredAt = fixedInstant().plusSeconds(7)
@@ -1043,6 +1063,17 @@ private fun auditEvent(
         payload = payload,
         occurredAt = occurredAt,
     )
+}
+
+private fun readSharedTestdata(fileName: String): String {
+    val candidates = listOf(
+        File("testdata", fileName),
+        File("../testdata", fileName),
+    )
+    val testdataFile = candidates.firstOrNull { candidate -> candidate.isFile }
+        ?: error("shared testdata not found: $fileName")
+
+    return testdataFile.readText()
 }
 
 private fun assertNoSecretLikeText(responseText: String) {

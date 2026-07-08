@@ -1215,6 +1215,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ops/activity/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Activity 表示用 catalog を取得する
+         * @description Activity 画面で source、audit event_type、decision action を人間向け文言へ解決するための code-owned catalog です。値は filter / kind / localStorage と同じ raw wire value のまま返し、人間向け文言は WebUI i18n key で返します。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Activity 表示用 catalog です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsActivityCatalogResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ops/activity": {
         parameters: {
             query?: never;
@@ -1696,6 +1735,19 @@ export interface components {
         /** OpsExecutionsResponse */
         OpsExecutionsResponse: {
             executions: components["schemas"]["OpsExecutionResponse"][];
+        };
+        /** OpsActivityCatalogItemResponse */
+        OpsActivityCatalogItemResponse: {
+            value: string;
+            labelKey: string;
+            descriptionKey: string;
+        };
+        /** OpsActivityCatalogResponse */
+        OpsActivityCatalogResponse: {
+            sourceFilters: components["schemas"]["OpsActivityCatalogItemResponse"][];
+            auditEventTypes: components["schemas"]["OpsActivityCatalogItemResponse"][];
+            decisionActions: components["schemas"]["OpsActivityCatalogItemResponse"][];
+            defaultExcludedAuditEventTypes: string[];
         };
         /** OpsActivityMetadataResponse */
         OpsActivityMetadataResponse: {
