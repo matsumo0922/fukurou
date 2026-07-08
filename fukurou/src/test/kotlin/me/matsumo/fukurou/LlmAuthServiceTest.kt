@@ -3,6 +3,8 @@ package me.matsumo.fukurou
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
+import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_PERSISTENT_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.HOME_ENV
 import java.io.ByteArrayInputStream
 import java.io.OutputStream
@@ -15,6 +17,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
@@ -34,7 +37,50 @@ class LlmAuthServiceTest {
 
             assertIs<LlmAuthLoginStartResult.Accepted>(result)
             assertEquals(listOf("claude", "auth", "login"), processStarter.commands.single())
-            assertEquals(mapOf(HOME_ENV to cliHome.toString()), processStarter.environments.single())
+            assertEquals(
+                mapOf(
+                    TEST_PATH_ENV to TEST_PATH_VALUE,
+                    HOME_ENV to cliHome.toString(),
+                ),
+                processStarter.environments.single(),
+            )
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun fromEnvironmentPreservesPathAndDropsSecretEnvironment() = runBlocking {
+        val cliHome = Files.createTempDirectory("fukurou-llm-auth-home")
+        val codexHome = cliHome.resolve(".codex")
+        val processStarter = RecordingLlmAuthProcessStarter()
+        val service = DefaultLlmAuthService(
+            config = LlmAuthServiceConfig.fromEnvironment(
+                mapOf(
+                    HOME_ENV to cliHome.toString(),
+                    TEST_PATH_ENV to TEST_PATH_VALUE,
+                    SECRET_ENV to "secret-value",
+                    FUKUROU_CODEX_PERSISTENT_HOME_ENV to codexHome.toString(),
+                ),
+            ),
+            processStarter = processStarter,
+            idGenerator = SequentialUuidGenerator(),
+        )
+
+        try {
+            val result = service.startLogin(LlmAuthProvider.CODEX, "operator re-auth").getOrThrow()
+
+            assertIs<LlmAuthLoginStartResult.Accepted>(result)
+            assertEquals(
+                mapOf(
+                    TEST_PATH_ENV to TEST_PATH_VALUE,
+                    HOME_ENV to cliHome.toString(),
+                    CODEX_HOME_ENV to codexHome.toString(),
+                    FUKUROU_CODEX_PERSISTENT_HOME_ENV to codexHome.toString(),
+                ),
+                processStarter.environments.single(),
+            )
+            assertFalse(processStarter.environments.single().containsKey(SECRET_ENV))
         } finally {
             service.close()
         }
@@ -44,6 +90,7 @@ class LlmAuthServiceTest {
     fun jvmProcessStarterClearsParentEnvironment() {
         val workingDirectory = Files.createTempDirectory("fukurou-llm-auth-process")
         val environment = mapOf(
+            TEST_PATH_ENV to TEST_PATH_VALUE,
             HOME_ENV to workingDirectory.toString(),
             "FUKUROU_SAFE_AUTH_ENV" to "safe",
         )
@@ -103,6 +150,7 @@ class LlmAuthServiceTest {
                 codexCommandTemplate = listOf("codex"),
                 cliHome = cliHome,
                 codexHome = cliHome.resolve(".codex"),
+                inheritedLoginEnvironment = mapOf(TEST_PATH_ENV to TEST_PATH_VALUE),
                 startupCaptureTimeout = Duration.ZERO,
             ),
             processStarter = processStarter,
@@ -224,3 +272,6 @@ private class SequentialUuidGenerator : () -> UUID {
 }
 
 private const val EXIT_CODE_DESTROYED = 143
+private const val TEST_PATH_ENV = "PATH"
+private const val TEST_PATH_VALUE = "/opt/fukurou/bin:/usr/bin"
+private const val SECRET_ENV = "DB_PASSWORD"

@@ -228,6 +228,7 @@ interface LlmAuthService {
  * @param codexCommandTemplate Codex CLI command template
  * @param cliHome Claude/Codex login state を置く共通 home
  * @param codexHome Codex CLI home
+ * @param inheritedLoginEnvironment login CLI 起動に必要な非 secret env
  * @param loginTimeout login process timeout
  * @param startupCaptureTimeout login start 応答前に URL / code を待つ時間
  */
@@ -236,6 +237,7 @@ data class LlmAuthServiceConfig(
     val codexCommandTemplate: List<String>,
     val cliHome: Path,
     val codexHome: Path,
+    val inheritedLoginEnvironment: Map<String, String> = System.getenv().safeLlmAuthEnvironment(),
     val loginTimeout: Duration = DEFAULT_LLM_AUTH_LOGIN_TIMEOUT,
     val startupCaptureTimeout: Duration = DEFAULT_LLM_AUTH_STARTUP_CAPTURE_TIMEOUT,
 ) {
@@ -260,6 +262,7 @@ data class LlmAuthServiceConfig(
                 codexCommandTemplate = rendererConfig.codexCommandTemplate,
                 cliHome = cliHome,
                 codexHome = codexHome,
+                inheritedLoginEnvironment = environment.safeLlmAuthEnvironment(),
             )
         }
     }
@@ -571,7 +574,7 @@ class DefaultLlmAuthService(
     }
 
     private fun LlmAuthProvider.loginEnvironment(): Map<String, String> {
-        return when (this) {
+        val providerEnvironment = when (this) {
             LlmAuthProvider.CLAUDE -> mapOf(
                 HOME_ENV to config.cliHome.toString(),
             )
@@ -581,7 +584,19 @@ class DefaultLlmAuthService(
                 FUKUROU_CODEX_PERSISTENT_HOME_ENV to config.codexHome.toString(),
             )
         }
+
+        return config.inheritedLoginEnvironment + providerEnvironment
     }
+}
+
+private fun Map<String, String>.safeLlmAuthEnvironment(): Map<String, String> {
+    return LLM_AUTH_INHERITED_ENV_NAMES
+        .mapNotNull { name ->
+            val value = this[name]?.takeIf { candidate -> candidate.isNotBlank() }
+
+            value?.let { safeValue -> name to safeValue }
+        }
+        .toMap()
 }
 
 /**
@@ -749,12 +764,14 @@ private const val CLAUDE_HOME_DIRECTORY = ".claude"
 private const val CODEX_AUTH_FILE_NAME = "auth.json"
 private const val STARTUP_CAPTURE_POLL_MILLIS = 100L
 private const val DESTROY_GRACE_MILLIS = 500L
+private const val PATH_ENV = "PATH"
 private val DEFAULT_LLM_AUTH_LOGIN_TIMEOUT: Duration = Duration.ofMinutes(10)
 private val DEFAULT_LLM_AUTH_STARTUP_CAPTURE_TIMEOUT: Duration = Duration.ofSeconds(2)
 private val CLAUDE_AUTH_MARKERS = listOf(
     "$CLAUDE_HOME_DIRECTORY/.credentials.json",
     "$CLAUDE_HOME_DIRECTORY/credentials.json",
 )
+private val LLM_AUTH_INHERITED_ENV_NAMES = setOf(PATH_ENV)
 private val URL_REGEX = Regex("""https?://\S+""")
 private val USER_CODE_REGEX =
     Regex("""(?i)\b(?:user\s+code|verification\s+code|code)\b[^A-Z0-9]*([A-Z0-9]{4}(?:-[A-Z0-9]{4}){0,2})""")
