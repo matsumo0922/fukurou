@@ -153,6 +153,28 @@ private const val DELETE_RUNTIME_CONFIG_VALUE_SQL = """
 """
 
 /**
+ * active runtime config value をテスト用に upsert する SQL。
+ */
+private const val UPSERT_ACTIVE_RUNTIME_CONFIG_VALUE_SQL = """
+    INSERT INTO runtime_config_values (
+        version_id,
+        config_key,
+        config_value
+    )
+    VALUES (
+        (
+            SELECT id
+            FROM runtime_config_versions
+            WHERE status = 'ACTIVE'
+        ),
+        ?,
+        ?
+    )
+    ON CONFLICT (version_id, config_key) DO UPDATE
+    SET config_value = EXCLUDED.config_value
+"""
+
+/**
  * equity_snapshots table を削除する SQL。
  */
 private const val DROP_EQUITY_SNAPSHOTS_TABLE_SQL = "DROP TABLE equity_snapshots"
@@ -613,15 +635,66 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun runtimeConfigResolveFailsClosedWhenActiveValueIsMissing() = runPostgresTest {
+    fun runtimeConfigBootstrapBackfillsMissingCatalogKeyIntoNewActiveSnapshot() = runPostgresTest {
+        val defaultValues = RuntimeConfigCatalog.runtimeDefaultValues()
+        val missingKey = "paper.volatilitySlippageMultiplier"
+        val preservedKey = "runner.maxToolCallsPerRun"
+        val preservedValue = "12"
+
         RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
-        deleteRuntimeConfigValue(database, "runner.maxToolCallsPerRun")
+        upsertActiveRuntimeConfigValue(
+            database = database,
+            configKey = preservedKey,
+            configValue = preservedValue,
+        )
+        val originalSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+
+        deleteRuntimeConfigValue(database, missingKey)
+
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val expectedValues = defaultValues + mapOf(preservedKey to preservedValue)
+        val backfilledSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+        val resolution = RuntimeConfigResolver(ExposedRuntimeConfigRepository(database))
+            .resolve(emptyMap())
+            .getOrThrow()
+
+        assertTrue(originalSnapshot.versionId != backfilledSnapshot.versionId)
+        assertEquals(expectedValues, backfilledSnapshot.values)
+        assertEquals(calculateRuntimeConfigHash(expectedValues), backfilledSnapshot.hash)
+        assertEquals(backfilledSnapshot.versionId, resolution.auditSnapshot.versionId)
+        assertEquals(
+            defaultValues.getValue(missingKey),
+            resolution.typedEnvironment.getValue("FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER"),
+        )
+        assertEquals(
+            preservedValue,
+            resolution.typedEnvironment.getValue("FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT"),
+        )
+
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val idempotentSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+
+        assertEquals(backfilledSnapshot.versionId, idempotentSnapshot.versionId)
+        assertEquals(expectedValues, idempotentSnapshot.values)
+    }
+
+    @Test
+    fun runtimeConfigBootstrapFailsClosedWhenActiveValueHasUnknownKey() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        upsertActiveRuntimeConfigValue(
+            database = database,
+            configKey = "runtime.unknown",
+            configValue = "1",
+        )
 
         assertTrue(RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().isFailure)
+        assertTrue(TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().isFailure)
         assertTrue(
-            RuntimeConfigResolver(
-                ExposedRuntimeConfigRepository(database),
-            ).resolve(emptyMap()).isFailure,
+            RuntimeConfigResolver(ExposedRuntimeConfigRepository(database))
+                .resolve(emptyMap())
+                .isFailure,
         )
     }
 
@@ -2709,6 +2782,23 @@ private fun deleteRuntimeConfigValue(database: ExposedDatabase, configKey: Strin
     exposedTransaction(database) {
         jdbcConnection().prepareStatement(DELETE_RUNTIME_CONFIG_VALUE_SQL).use { statement ->
             statement.setString(1, configKey)
+            statement.executeUpdate()
+        }
+    }
+}
+
+/**
+ * active runtime config value を key 単位で upsert する。
+ */
+private fun upsertActiveRuntimeConfigValue(
+    database: ExposedDatabase,
+    configKey: String,
+    configValue: String,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(UPSERT_ACTIVE_RUNTIME_CONFIG_VALUE_SQL).use { statement ->
+            statement.setString(1, configKey)
+            statement.setString(2, configValue)
             statement.executeUpdate()
         }
     }
