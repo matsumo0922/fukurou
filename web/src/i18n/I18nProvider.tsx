@@ -22,7 +22,7 @@ export function I18nProvider({ children }: I18nProviderProps) {
     () => ({
       locale,
       setLocale,
-      t: (key: MessageKey) => messages[locale][key],
+      t: (key: MessageKey) => messages[locale][key] ?? key,
     }),
     [locale],
   );

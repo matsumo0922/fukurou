@@ -27,6 +27,7 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Overview/ })).toHaveAttribute("href", "/app/overview");
     expect(screen.getByRole("link", { name: /Activity/ })).toHaveAttribute("href", "/app/activity");
+    expect(screen.getByRole("link", { name: /Config/ })).toHaveAttribute("href", "/app/config");
     expect(screen.getByRole("link", { name: /Controls/ })).toHaveAttribute("href", "/app/controls");
     expect(screen.getByRole("link", { name: /Evaluation/ })).toHaveAttribute("href", "/app/evaluation");
     expect(screen.getByRole("link", { name: /System/ })).toHaveAttribute("href", "/app/system");
@@ -94,6 +95,25 @@ describe("App", () => {
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
     expect(screen.getAllByText("local-sha").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/JST/).length).toBeGreaterThan(1);
+  });
+
+  it("shows read-only runtime config without exposing secret values", async () => {
+    const fetchMock = stubSystemFetch();
+    window.history.pushState({}, "", "/app/config");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Config" })).toBeInTheDocument();
+    expect(screen.getByText("Read-only effective runtime, deployment, and secret configuration.")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Runtime" }, { timeout: 5_000 })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Deployment" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Secrets" })).toBeInTheDocument();
+    expect(screen.getByText("GMO public base URL")).toBeInTheDocument();
+    expect(screen.getAllByText("FUKUROU_GMO_PUBLIC_BASE_URL").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("https://api.coin.z.com/public").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("configured").length).toBeGreaterThan(0);
+    expect(screen.queryByText("super-secret-password")).not.toBeInTheDocument();
+    expect(hasGetCall(fetchMock, "/ops/runtime-config", () => true)).toBe(true);
   });
 
   it("starts in English and switches supported UI copy to Japanese", async () => {
@@ -626,6 +646,7 @@ type SystemFetchFixture = {
     status: number;
     body: unknown;
   };
+  runtimeConfigResponse?: unknown;
   activityOlderResponse?: Promise<Response>;
 };
 
@@ -771,6 +792,8 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
           drawdownRatio: "0.025",
           updatedAt: "2026-07-05T12:01:00.000Z",
         });
+      case "/ops/runtime-config":
+        return jsonResponse(fixture.runtimeConfigResponse ?? runtimeConfigResponse());
       case "/ops/activity":
         if (requestSearchParams(input).has("before") && fixture.activityOlderResponse) {
           return fixture.activityOlderResponse;
@@ -1125,6 +1148,114 @@ function defaultLlmAuthTokenSubmitResponse() {
 
 function providerFromLlmAuthPath(path: string): string {
   return path.includes("/claude/") ? "claude" : "codex";
+}
+
+function runtimeConfigResponse() {
+  return {
+    groups: [
+      {
+        id: "runtime",
+        labelKey: "config.group.runtime.label",
+        descriptionKey: "config.group.runtime.description",
+        items: [
+          runtimeConfigItem({
+            key: "runner.maxToolCallsPerRun",
+            legacyEnvName: "FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT",
+            valueType: "INT",
+            defaultValue: "48",
+            effectiveValue: "48",
+            unit: "calls",
+            sourceKind: "RUNTIME",
+          }),
+        ],
+      },
+      {
+        id: "deployment",
+        labelKey: "config.group.deployment.label",
+        descriptionKey: "config.group.deployment.description",
+        items: [
+          runtimeConfigItem({
+            key: "gmoPublic.baseUrl",
+            legacyEnvName: "FUKUROU_GMO_PUBLIC_BASE_URL",
+            valueType: "URL",
+            defaultValue: "https://api.coin.z.com/public",
+            currentValue: "https://api.coin.z.com/public",
+            effectiveValue: "https://api.coin.z.com/public",
+            sourceKind: "DEPLOYMENT",
+            safetyTier: "DEPLOYMENT_BOUNDARY",
+          }),
+          runtimeConfigItem({
+            key: "llm.claudeCommandTemplate",
+            legacyEnvName: "FUKUROU_CLAUDE_COMMAND_TEMPLATE",
+            valueType: "STRING_LIST",
+            defaultValue: "claude",
+            effectiveValue: "claude",
+            sourceKind: "DEPLOYMENT",
+            safetyTier: "DEPLOYMENT_BOUNDARY",
+          }),
+        ],
+      },
+      {
+        id: "secrets",
+        labelKey: "config.group.secrets.label",
+        descriptionKey: "config.group.secrets.description",
+        items: [
+          runtimeConfigItem({
+            key: "database.password",
+            legacyEnvName: "DB_PASSWORD",
+            valueType: "SECRET_STATUS",
+            defaultValue: null,
+            currentValue: null,
+            effectiveValue: null,
+            sourceKind: "SECRET",
+            valueConfigured: true,
+            safetyTier: "SECRET",
+          }),
+        ],
+      },
+    ],
+  };
+}
+
+function runtimeConfigItem({
+  key,
+  legacyEnvName,
+  valueType,
+  defaultValue,
+  currentValue = null,
+  effectiveValue,
+  unit = null,
+  sourceKind,
+  valueConfigured = true,
+  safetyTier = "STANDARD",
+}: {
+  key: string;
+  legacyEnvName: string;
+  valueType: string;
+  defaultValue: string | null;
+  currentValue?: string | null;
+  effectiveValue: string | null;
+  unit?: string | null;
+  sourceKind: string;
+  valueConfigured?: boolean;
+  safetyTier?: string;
+}) {
+  return {
+    key,
+    sourceKind,
+    valueType,
+    defaultValue,
+    currentValue,
+    effectiveValue,
+    unit,
+    valueConfigured,
+    legacyEnvName,
+    editable: false,
+    applyMode: "PROCESS_RESTART",
+    safetyTier,
+    labelKey: `config.item.${key}.label`,
+    descriptionKey: `config.item.${key}.description`,
+  };
 }
 
 function activityTimelineResponse(searchParams: URLSearchParams) {

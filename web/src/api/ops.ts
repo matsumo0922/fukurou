@@ -21,6 +21,9 @@ export type OpsLlmAuthResponse = components["schemas"]["OpsLlmAuthResponse"];
 export type OpsLlmAuthTokenSubmitResponse = components["schemas"]["OpsLlmAuthTokenSubmitResponse"];
 export type OpsPositionsResponse = components["schemas"]["OpsPositionsResponse"];
 export type OpsRiskStateResponse = components["schemas"]["OpsRiskStateResponse"];
+export type RuntimeConfigGroup = components["schemas"]["RuntimeConfigGroup"];
+export type RuntimeConfigItem = components["schemas"]["RuntimeConfigItem"];
+export type RuntimeConfigSnapshot = components["schemas"]["RuntimeConfigSnapshot"];
 export type OpsTriggerResponse = components["schemas"]["OpsTriggerResponse"];
 
 export type LlmAuthProvider = "claude" | "codex";
@@ -115,6 +118,13 @@ export const opsLlmAuthQuery = queryOptions({
   queryFn: () => getJson("/ops/llm-auth"),
   staleTime: 15_000,
   refetchInterval: 30_000,
+});
+
+export const opsRuntimeConfigQuery = queryOptions({
+  queryKey: ["ops", "runtime-config"],
+  queryFn: () => getJson("/ops/runtime-config"),
+  staleTime: 60_000,
+  refetchInterval: 60_000,
 });
 
 export const evaluationSummaryQuery = queryOptions({

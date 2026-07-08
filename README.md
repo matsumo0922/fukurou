@@ -39,6 +39,7 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `GET /health/ready`
 - `/evaluation/*`
 - `/ops/*`
+- `GET /ops/runtime-config`
 - `GET /swagger`
 - `GET /openapi.json`
 
@@ -71,7 +72,7 @@ make detekt
 make build
 ```
 
-runtime config は `.env.example` の `FUKUROU_*` で上書きできます。既定は BTC 現物 / `PAPER` / 仮想 10 万円です。
+runtime config は `.env.example` の `FUKUROU_*` で上書きできます。既定は BTC 現物 / `PAPER` / 仮想 10 万円です。`GET /ops/runtime-config` は code-owned catalog から実効設定を読み取り専用で返し、secret は設定済み / 未設定だけを返します。
 
 ## Web development
 
@@ -91,6 +92,8 @@ make dev-web
 `make dev-api` は `.env` を dotenvx で読み込み、ローカル PostgreSQL 向けの `DB_URL` / `DB_USER` / `DB_PASSWORD` を補完して Ktor を起動します。
 
 Vite dev server は既定で `http://localhost:8080` の Ktor API へ proxy します。接続先は `VITE_FUKUROU_API_TARGET` で上書きできます。
+
+WebUI の `Config` 画面（`/app/config`）は `/ops/runtime-config` を表示します。Runtime / Deployment / Secrets の各 group は読み取り専用で、secret 値は画面に表示しません。
 
 Web 側の検証は次を使います。
 
