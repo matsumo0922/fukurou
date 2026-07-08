@@ -265,6 +265,8 @@ class OpsRouteTest {
             status = LlmAuthLoginStatus.RUNNING,
             authorizationUrl = "https://auth.example.com/device",
             userCode = "ABCD-EFGH",
+            tokenSubmitAvailable = false,
+            tokenSubmitted = false,
             detail = "authorization challenge emitted",
             startedAt = fixedInstant(),
             expiresAt = fixedInstant().plusSeconds(600),
@@ -333,6 +335,142 @@ class OpsRouteTest {
         assertEquals(HttpStatusCode.BadRequest, invalidProviderResponse.status)
         assertEquals(HttpStatusCode.Conflict, conflictResponse.status)
         assertEquals(HttpStatusCode.NotFound, missingSessionResponse.status)
+    }
+
+    @Test
+    fun opsRoutes_llmAuthClaudeTokenSubmitAcceptsOnceWithoutSecrets() = testApplication {
+        val submittedSession = LlmAuthLoginSessionSnapshot(
+            provider = LlmAuthProvider.CLAUDE,
+            sessionId = "session-1",
+            status = LlmAuthLoginStatus.RUNNING,
+            authorizationUrl = "https://auth.example.com/oauth",
+            userCode = null,
+            tokenSubmitAvailable = false,
+            tokenSubmitted = true,
+            detail = "authorization token/code submitted; waiting for CLI completion",
+            startedAt = fixedInstant(),
+            expiresAt = fixedInstant().plusSeconds(600),
+            completedAt = null,
+        )
+        val service = CapturingLlmAuthService(
+            tokenSubmitResults = mutableListOf(
+                LlmAuthLoginTokenSubmitResult.Accepted(submittedSession),
+            ),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsLlmAuthService = service,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.post("/ops/llm-auth/claude/login/session-1/token") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"code":"$DUMMY_AUTH_CODE"}""")
+        }
+        val responseBody = response.bodyAsText()
+
+        assertEquals(HttpStatusCode.Accepted, response.status)
+        assertTrue(responseBody.contains(""""provider":"claude""""))
+        assertTrue(responseBody.contains(""""tokenSubmitted":true"""))
+        assertEquals(
+            listOf(Triple(LlmAuthProvider.CLAUDE, "session-1", DUMMY_AUTH_CODE)),
+            service.tokenSubmitRequests,
+        )
+        assertNoSecretLikeText(responseBody)
+    }
+
+    @Test
+    fun opsRoutes_llmAuthTokenSubmitRejectsInvalidProviderAndBody() = testApplication {
+        val service = CapturingLlmAuthService(
+            tokenSubmitResults = mutableListOf(
+                LlmAuthLoginTokenSubmitResult.Rejected(
+                    rejection = LlmAuthLoginTokenSubmitRejection.UNSUPPORTED_PROVIDER,
+                    reason = "provider does not accept token/code submit",
+                ),
+            ),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsLlmAuthService = service,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val blankCodeResponse = client.post("/ops/llm-auth/claude/login/session-1/token") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"code":"   "}""")
+        }
+        val ambiguousBodyResponse = client.post("/ops/llm-auth/claude/login/session-1/token") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"token":"$DUMMY_AUTH_CODE","code":"$DUMMY_AUTH_CODE"}""")
+        }
+        val invalidProviderResponse = client.post("/ops/llm-auth/unknown/login/session-1/token") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"code":"$DUMMY_AUTH_CODE"}""")
+        }
+        val codexResponse = client.post("/ops/llm-auth/codex/login/session-1/token") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"code":"$DUMMY_AUTH_CODE"}""")
+        }
+
+        assertEquals(HttpStatusCode.BadRequest, blankCodeResponse.status)
+        assertEquals(HttpStatusCode.BadRequest, ambiguousBodyResponse.status)
+        assertEquals(HttpStatusCode.BadRequest, invalidProviderResponse.status)
+        assertEquals(HttpStatusCode.BadRequest, codexResponse.status)
+        assertNoSecretLikeText(codexResponse.bodyAsText())
+    }
+
+    @Test
+    fun opsRoutes_llmAuthTokenSubmitRejectsMissingTerminalAndDuplicateSession() = testApplication {
+        val service = CapturingLlmAuthService(
+            tokenSubmitResults = mutableListOf(
+                LlmAuthLoginTokenSubmitResult.Rejected(
+                    rejection = LlmAuthLoginTokenSubmitRejection.SESSION_NOT_FOUND,
+                    reason = "login session not found",
+                ),
+                LlmAuthLoginTokenSubmitResult.Rejected(
+                    rejection = LlmAuthLoginTokenSubmitRejection.SESSION_NOT_RUNNING,
+                    reason = "login session is not running",
+                ),
+                LlmAuthLoginTokenSubmitResult.Rejected(
+                    rejection = LlmAuthLoginTokenSubmitRejection.ALREADY_SUBMITTED,
+                    reason = "login token/code already submitted",
+                ),
+            ),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsLlmAuthService = service,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val missingSessionResponse = client.post("/ops/llm-auth/claude/login/missing/token") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"code":"$DUMMY_AUTH_CODE"}""")
+        }
+        val terminalSessionResponse = client.post("/ops/llm-auth/claude/login/session-1/token") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"code":"$DUMMY_AUTH_CODE"}""")
+        }
+        val duplicateSubmitResponse = client.post("/ops/llm-auth/claude/login/session-1/token") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"code":"$DUMMY_AUTH_CODE"}""")
+        }
+
+        assertEquals(HttpStatusCode.NotFound, missingSessionResponse.status)
+        assertEquals(HttpStatusCode.Conflict, terminalSessionResponse.status)
+        assertEquals(HttpStatusCode.Conflict, duplicateSubmitResponse.status)
+        assertNoSecretLikeText(missingSessionResponse.bodyAsText())
+        assertNoSecretLikeText(terminalSessionResponse.bodyAsText())
+        assertNoSecretLikeText(duplicateSubmitResponse.bodyAsText())
     }
 
     @Test
@@ -872,6 +1010,7 @@ private val SECRET_FIXTURE_TEXTS = setOf(
     "gmo-secret-api-key",
     "cloudflare-secret-token",
     "anthropic-secret-token",
+    DUMMY_AUTH_CODE,
 )
 
 /**
@@ -898,6 +1037,7 @@ private class CapturingManualLlmLaunchService(
  * @param snapshot status API で返す snapshot
  * @param startResult login start API で返す結果
  * @param sessions poll API で返す session map
+ * @param tokenSubmitResults token/code submit API で返す結果 queue
  */
 private class CapturingLlmAuthService(
     private val snapshot: LlmAuthSnapshot = LlmAuthSnapshot(
@@ -906,9 +1046,16 @@ private class CapturingLlmAuthService(
     ),
     private val startResult: LlmAuthLoginStartResult = LlmAuthLoginStartResult.Rejected("login not configured"),
     private val sessions: Map<String, LlmAuthLoginSessionSnapshot> = emptyMap(),
+    private val tokenSubmitResults: MutableList<LlmAuthLoginTokenSubmitResult> = mutableListOf(
+        LlmAuthLoginTokenSubmitResult.Rejected(
+            rejection = LlmAuthLoginTokenSubmitRejection.STDIN_UNAVAILABLE,
+            reason = "login process stdin is unavailable",
+        ),
+    ),
 ) : LlmAuthService {
 
     val loginRequests = mutableListOf<Pair<LlmAuthProvider, String>>()
+    val tokenSubmitRequests = mutableListOf<Triple<LlmAuthProvider, String, String>>()
 
     override suspend fun snapshot(): Result<LlmAuthSnapshot> {
         return Result.success(snapshot)
@@ -927,6 +1074,16 @@ private class CapturingLlmAuthService(
         val session = sessions[sessionId]?.takeIf { candidate -> candidate.provider == provider }
 
         return Result.success(session)
+    }
+
+    override suspend fun submitLoginTokenCode(
+        provider: LlmAuthProvider,
+        sessionId: String,
+        tokenCode: String,
+    ): Result<LlmAuthLoginTokenSubmitResult> {
+        tokenSubmitRequests += Triple(provider, sessionId, tokenCode)
+
+        return Result.success(tokenSubmitResults.removeFirst())
     }
 }
 
@@ -958,3 +1115,5 @@ private class MutableClock(
         currentInstant = currentInstant.plus(duration)
     }
 }
+
+private const val DUMMY_AUTH_CODE = "DUMMY-CODE"

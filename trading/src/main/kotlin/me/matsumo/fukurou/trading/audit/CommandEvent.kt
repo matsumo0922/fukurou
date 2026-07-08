@@ -99,6 +99,11 @@ enum class CommandEventType {
     CLI_AUTH_LOGIN_STARTED,
 
     /**
+     * CLI auth login process へ token/code を送信した。
+     */
+    CLI_AUTH_LOGIN_TOKEN_SUBMITTED,
+
+    /**
      * CLI auth login process が成功した。
      */
     CLI_AUTH_LOGIN_COMPLETED,

@@ -12,6 +12,7 @@ import {
   opsPositionsQuery,
   opsRiskStateQuery,
   requestOpsLlmAuthLogin,
+  requestOpsLlmAuthTokenCodeSubmit,
   requestOpsHalt,
   requestOpsResume,
   requestOpsTrigger,
@@ -39,6 +40,18 @@ type ControlNotice = {
 type ActiveLlmAuthLogin = {
   provider: LlmAuthProvider;
   session: OpsLlmAuthLoginResponse;
+};
+
+type LlmAuthLoginSessionPanelProps = {
+  session: OpsLlmAuthLoginResponse | null;
+  isTokenSubmitPending: boolean;
+  tokenCodeSubmitted: (session: OpsLlmAuthLoginResponse, tokenCode: string) => void;
+};
+
+type LlmAuthTokenSubmitFormProps = {
+  session: OpsLlmAuthLoginResponse;
+  isPending: boolean;
+  submitted: (tokenCode: string) => void;
 };
 
 type ActionButtonTone = "neutral" | "warning" | "critical";
@@ -185,13 +198,69 @@ export function ControlsPage() {
       });
     },
   });
+  const llmAuthTokenSubmitMutation = useMutation({
+    mutationFn: requestOpsLlmAuthTokenCodeSubmit,
+    onSuccess: (response, variables) => {
+      queryClient.setQueryData<OpsLlmAuthLoginResponse>(
+        ["ops", "llm-auth", variables.provider, "login", variables.sessionId],
+        (currentSession) => currentSession
+          ? {
+              ...currentSession,
+              status: response.status,
+              tokenSubmitAvailable: false,
+              tokenSubmitted: response.tokenSubmitted,
+              detail: response.detail,
+            }
+          : currentSession,
+      );
+      setActiveLlmAuthLogin((currentLogin) => {
+        if (!currentLogin) {
+          return currentLogin;
+        }
+
+        const sessionMatched = currentLogin.provider === variables.provider &&
+          currentLogin.session.sessionId === variables.sessionId;
+
+        if (!sessionMatched) {
+          return currentLogin;
+        }
+
+        return {
+          provider: currentLogin.provider,
+          session: {
+            ...currentLogin.session,
+            status: response.status,
+            tokenSubmitAvailable: false,
+            tokenSubmitted: response.tokenSubmitted,
+            detail: response.detail,
+          },
+        };
+      });
+      setNotice({
+        tone: "neutral",
+        title: t("controls.notice.llmAuthTokenSubmittedTitle"),
+        detail: formatMessage(t("controls.notice.llmAuthTokenSubmitted"), {
+          provider: providerDisplayName(variables.provider),
+          sessionId: variables.sessionId,
+        }),
+      });
+    },
+    onError: (error) => {
+      setNotice({
+        tone: "critical",
+        title: t("controls.notice.llmAuthTokenSubmitFailed"),
+        detail: describeControlError(error, t),
+      });
+    },
+  });
   const isRefreshing = riskStateQuery.isFetching || positionsQuery.isFetching || llmAuthLoginSessionQuery.isFetching;
   const isOperationInFlight =
     softHaltMutation.isPending ||
     hardHaltMutation.isPending ||
     resumeMutation.isPending ||
     triggerMutation.isPending ||
-    llmAuthLoginMutation.isPending;
+    llmAuthLoginMutation.isPending ||
+    llmAuthTokenSubmitMutation.isPending;
   const refreshed = () => {
     void riskStateQuery.refetch();
     void positionsQuery.refetch();
@@ -354,6 +423,18 @@ export function ControlsPage() {
         </div>
         <LlmAuthLoginSessionPanel
           session={llmAuthLoginSessionQuery.data ?? activeLlmAuthLogin?.session ?? null}
+          isTokenSubmitPending={llmAuthTokenSubmitMutation.isPending}
+          tokenCodeSubmitted={(session, tokenCode) => {
+            if (session.provider !== "claude") {
+              return;
+            }
+
+            llmAuthTokenSubmitMutation.mutate({
+              provider: "claude",
+              sessionId: session.sessionId,
+              tokenCode,
+            });
+          }}
         />
       </Panel>
     </div>
@@ -488,7 +569,11 @@ function HaltSemantics() {
   );
 }
 
-function LlmAuthLoginSessionPanel({ session }: { session: OpsLlmAuthLoginResponse | null }) {
+function LlmAuthLoginSessionPanel({
+  session,
+  isTokenSubmitPending,
+  tokenCodeSubmitted,
+}: LlmAuthLoginSessionPanelProps) {
   const { locale, t } = useI18n();
 
   if (!session) {
@@ -537,7 +622,101 @@ function LlmAuthLoginSessionPanel({ session }: { session: OpsLlmAuthLoginRespons
           <p>{t("controls.detail.authorizationPending")}</p>
         )}
       </div>
+      <LlmAuthTokenSubmitForm
+        key={session.sessionId}
+        session={session}
+        isPending={isTokenSubmitPending}
+        submitted={(tokenCode) => tokenCodeSubmitted(session, tokenCode)}
+      />
     </div>
+  );
+}
+
+function LlmAuthTokenSubmitForm({
+  session,
+  isPending,
+  submitted,
+}: LlmAuthTokenSubmitFormProps) {
+  const { t } = useI18n();
+  const [tokenCode, setTokenCode] = useState("");
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const inputId = `${session.sessionId}-token-code`;
+  const errorId = `${session.sessionId}-token-code-error`;
+  const isClaudeSession = session.provider === "claude";
+  const canSubmit = isClaudeSession && session.status === "running" && session.tokenSubmitAvailable;
+  const hasSubmitted = isClaudeSession && session.tokenSubmitted;
+
+  if (!isClaudeSession) {
+    return null;
+  }
+
+  const tokenCodeChanged = (event: ChangeEvent<HTMLInputElement>) => {
+    setTokenCode(event.target.value);
+    setValidationError(null);
+  };
+  const tokenCodeFormSubmitted = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (!canSubmit || isPending) {
+      return;
+    }
+
+    const trimmedTokenCode = tokenCode.trim();
+
+    if (!trimmedTokenCode) {
+      setValidationError(t("controls.validation.tokenCodeRequired"));
+
+      return;
+    }
+
+    if (trimmedTokenCode.includes("\n") || trimmedTokenCode.includes("\r")) {
+      setValidationError(t("controls.validation.tokenCodeSingleLine"));
+
+      return;
+    }
+
+    setValidationError(null);
+    setTokenCode("");
+    submitted(trimmedTokenCode);
+  };
+
+  return (
+    <form className="llm-auth-session__token-submit" onSubmit={tokenCodeFormSubmitted}>
+      {hasSubmitted ? (
+        <p className="llm-auth-session__token-status" role="status">
+          {t("controls.detail.tokenSubmitted")}
+        </p>
+      ) : null}
+      {canSubmit || isPending ? (
+        <>
+          <label className="control-action__label" htmlFor={inputId}>
+            {t("controls.label.tokenCode")}
+          </label>
+          <div className="llm-auth-session__token-row">
+            <input
+              id={inputId}
+              className="llm-auth-session__token-input"
+              type="password"
+              value={tokenCode}
+              placeholder={t("controls.action.llmAuthToken.placeholder")}
+              autoComplete="one-time-code"
+              spellCheck={false}
+              aria-describedby={validationError ? errorId : undefined}
+              onChange={tokenCodeChanged}
+              disabled={!canSubmit || isPending}
+            />
+            <button className="icon-text-button" type="submit" disabled={!canSubmit || isPending}>
+              {isPending ? t("controls.action.llmAuthToken.pending") : t("controls.action.llmAuthToken.submit")}
+            </button>
+          </div>
+          {validationError ? (
+            <p className="control-action__error" id={errorId} role="alert">
+              {validationError}
+            </p>
+          ) : null}
+        </>
+      ) : null}
+    </form>
   );
 }
 

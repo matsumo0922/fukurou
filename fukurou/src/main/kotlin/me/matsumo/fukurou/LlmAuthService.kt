@@ -158,6 +158,62 @@ sealed interface LlmAuthLoginStartResult {
 }
 
 /**
+ * CLI auth login token/code submit 結果。
+ */
+sealed interface LlmAuthLoginTokenSubmitResult {
+
+    /**
+     * token/code を CLI process へ送信した。
+     *
+     * @param session login session snapshot
+     */
+    data class Accepted(
+        val session: LlmAuthLoginSessionSnapshot,
+    ) : LlmAuthLoginTokenSubmitResult
+
+    /**
+     * token/code を CLI process へ送信しなかった。
+     *
+     * @param rejection 拒否分類
+     * @param reason secret を含まない拒否理由
+     */
+    data class Rejected(
+        val rejection: LlmAuthLoginTokenSubmitRejection,
+        val reason: String,
+    ) : LlmAuthLoginTokenSubmitResult
+}
+
+/**
+ * CLI auth login token/code submit の拒否分類。
+ */
+enum class LlmAuthLoginTokenSubmitRejection {
+    /**
+     * provider が token/code submit を受け付けない。
+     */
+    UNSUPPORTED_PROVIDER,
+
+    /**
+     * session が存在しない。
+     */
+    SESSION_NOT_FOUND,
+
+    /**
+     * session が実行中ではない。
+     */
+    SESSION_NOT_RUNNING,
+
+    /**
+     * session はすでに token/code を受け付けた。
+     */
+    ALREADY_SUBMITTED,
+
+    /**
+     * CLI process の stdin へ書き込めない。
+     */
+    STDIN_UNAVAILABLE,
+}
+
+/**
  * CLI auth login session snapshot。
  *
  * @param provider provider
@@ -165,6 +221,8 @@ sealed interface LlmAuthLoginStartResult {
  * @param status login process 状態
  * @param authorizationUrl browser 承認用 URL
  * @param userCode device auth code
+ * @param tokenSubmitAvailable token/code submit を受け付けるか
+ * @param tokenSubmitted token/code submit 済みか
  * @param detail secret を含まない補足
  * @param startedAt 開始時刻
  * @param expiresAt timeout 時刻
@@ -176,6 +234,8 @@ data class LlmAuthLoginSessionSnapshot(
     val status: LlmAuthLoginStatus,
     val authorizationUrl: String?,
     val userCode: String?,
+    val tokenSubmitAvailable: Boolean,
+    val tokenSubmitted: Boolean,
     val detail: String?,
     val startedAt: Instant,
     val expiresAt: Instant,
@@ -219,6 +279,15 @@ interface LlmAuthService {
      * login session の現在状態を返す。
      */
     suspend fun loginSession(provider: LlmAuthProvider, sessionId: String): Result<LlmAuthLoginSessionSnapshot?>
+
+    /**
+     * active Claude login session へ token/code を 1 回だけ送信する。
+     */
+    suspend fun submitLoginTokenCode(
+        provider: LlmAuthProvider,
+        sessionId: String,
+        tokenCode: String,
+    ): Result<LlmAuthLoginTokenSubmitResult>
 }
 
 /**
@@ -347,6 +416,52 @@ class DefaultLlmAuthService(
         }
     }
 
+    override suspend fun submitLoginTokenCode(
+        provider: LlmAuthProvider,
+        sessionId: String,
+        tokenCode: String,
+    ): Result<LlmAuthLoginTokenSubmitResult> {
+        return runCatching {
+            evictExpiredLoginSessions()
+
+            val trimmedTokenCode = tokenCode.trim()
+
+            require(trimmedTokenCode.isNotEmpty()) {
+                "tokenCode must not be blank."
+            }
+            require(!trimmedTokenCode.containsLineBreak()) {
+                "tokenCode must be a single line."
+            }
+            require(trimmedTokenCode.length <= MAX_LLM_AUTH_TOKEN_CODE_LENGTH) {
+                "tokenCode is too long."
+            }
+
+            val session = sessions[sessionId]
+
+            if (provider != LlmAuthProvider.CLAUDE) {
+                return@runCatching LlmAuthLoginTokenSubmitResult.Rejected(
+                    rejection = LlmAuthLoginTokenSubmitRejection.UNSUPPORTED_PROVIDER,
+                    reason = "provider does not accept token/code submit",
+                )
+            }
+
+            if (session == null || session.provider != provider) {
+                return@runCatching LlmAuthLoginTokenSubmitResult.Rejected(
+                    rejection = LlmAuthLoginTokenSubmitRejection.SESSION_NOT_FOUND,
+                    reason = "login session not found",
+                )
+            }
+
+            val result = session.submitTokenCode(trimmedTokenCode)
+
+            if (result is LlmAuthLoginTokenSubmitResult.Accepted) {
+                appendTokenSubmitAudit(result.session)
+            }
+
+            result
+        }
+    }
+
     override fun close() {
         sessions.values.forEach { session -> session.destroyProcess() }
 
@@ -437,6 +552,7 @@ class DefaultLlmAuthService(
             )
 
             sessions[sessionId] = session
+            session.prepareStdin()
             appendLoginAudit(
                 LlmAuthAuditRecord(
                     provider = provider,
@@ -589,6 +705,28 @@ class DefaultLlmAuthService(
         ).getOrThrow()
     }
 
+    private suspend fun appendTokenSubmitAudit(session: LlmAuthLoginSessionSnapshot) {
+        val eventLog = commandEventLog ?: return
+        val payload = buildJsonObject {
+            put("provider", session.provider.wireName)
+            put("sessionId", session.sessionId)
+            put("status", session.status.wireName)
+            put("detail", session.detail ?: "")
+        }.toString()
+
+        eventLog.append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext.EMPTY,
+                toolName = "cli-auth",
+                toolCallId = null,
+                clientRequestId = session.sessionId,
+                eventType = CommandEventType.CLI_AUTH_LOGIN_TOKEN_SUBMITTED,
+                payload = payload,
+                occurredAt = Instant.now(clock),
+            ),
+        ).getOrThrow()
+    }
+
     private fun LlmAuthProvider.authHomePath(): Path {
         return when (this) {
             LlmAuthProvider.CLAUDE -> config.cliHome.resolve(CLAUDE_HOME_DIRECTORY)
@@ -667,7 +805,6 @@ internal object JvmLlmAuthProcessStarter : LlmAuthProcessStarter {
         }
 
         val process = processBuilder.start()
-        process.outputStream.close()
 
         return process
     }
@@ -696,16 +833,29 @@ private class MutableLlmAuthLoginSession(
     @Volatile
     private var completedAt: Instant? = null
 
+    @Volatile
+    private var tokenSubmittedAt: Instant? = null
+
+    @Synchronized
+    fun prepareStdin() {
+        if (provider == LlmAuthProvider.CODEX) {
+            closeProcessInput()
+        }
+    }
+
+    @Synchronized
     fun isRunning(): Boolean {
         return status == LlmAuthLoginStatus.RUNNING
     }
 
+    @Synchronized
     fun isTerminalExpired(now: Instant, retention: Duration): Boolean {
         val completed = completedAt ?: return false
 
         return !completed.plus(retention).isAfter(now)
     }
 
+    @Synchronized
     fun observeCliLine(line: String) {
         val extractedUrl = extractAuthorizationUrl(line)
         val extractedCode = extractUserCode(line)
@@ -726,7 +876,45 @@ private class MutableLlmAuthLoginSession(
         }
     }
 
+    @Synchronized
+    fun submitTokenCode(tokenCode: String): LlmAuthLoginTokenSubmitResult {
+        if (status != LlmAuthLoginStatus.RUNNING) {
+            return LlmAuthLoginTokenSubmitResult.Rejected(
+                rejection = LlmAuthLoginTokenSubmitRejection.SESSION_NOT_RUNNING,
+                reason = "login session is not running",
+            )
+        }
+
+        if (tokenSubmittedAt != null) {
+            return LlmAuthLoginTokenSubmitResult.Rejected(
+                rejection = LlmAuthLoginTokenSubmitRejection.ALREADY_SUBMITTED,
+                reason = "login token/code already submitted",
+            )
+        }
+
+        val tokenCodeLine = "$tokenCode\n".toByteArray(StandardCharsets.UTF_8)
+        val writeSucceeded = runCatching {
+            process.outputStream.write(tokenCodeLine)
+            process.outputStream.flush()
+        }.isSuccess
+
+        if (!writeSucceeded) {
+            return LlmAuthLoginTokenSubmitResult.Rejected(
+                rejection = LlmAuthLoginTokenSubmitRejection.STDIN_UNAVAILABLE,
+                reason = "login process stdin is unavailable",
+            )
+        }
+
+        tokenSubmittedAt = Instant.now(clock)
+        detail = "authorization token/code submitted; waiting for CLI completion"
+        closeProcessInputQuietly()
+
+        return LlmAuthLoginTokenSubmitResult.Accepted(snapshot())
+    }
+
+    @Synchronized
     fun complete(status: LlmAuthLoginStatus) {
+        closeProcessInputQuietly()
         this.status = status
         completedAt = Instant.now(clock)
         detail = when (status) {
@@ -737,7 +925,10 @@ private class MutableLlmAuthLoginSession(
         }
     }
 
+    @Synchronized
     fun destroyProcess() {
+        closeProcessInputQuietly()
+
         if (!process.isAlive) {
             return
         }
@@ -751,18 +942,34 @@ private class MutableLlmAuthLoginSession(
         }
     }
 
+    @Synchronized
     fun snapshot(): LlmAuthLoginSessionSnapshot {
+        val tokenSubmitted = tokenSubmittedAt != null
+        val tokenSubmitAvailable = provider == LlmAuthProvider.CLAUDE &&
+            status == LlmAuthLoginStatus.RUNNING &&
+            !tokenSubmitted
+
         return LlmAuthLoginSessionSnapshot(
             provider = provider,
             sessionId = sessionId,
             status = status,
             authorizationUrl = authorizationUrl,
             userCode = userCode,
+            tokenSubmitAvailable = tokenSubmitAvailable,
+            tokenSubmitted = tokenSubmitted,
             detail = detail,
             startedAt = startedAt,
             expiresAt = expiresAt,
             completedAt = completedAt,
         )
+    }
+
+    private fun closeProcessInput() {
+        process.outputStream.close()
+    }
+
+    private fun closeProcessInputQuietly() {
+        runCatching { closeProcessInput() }
     }
 }
 
@@ -809,7 +1016,12 @@ private fun String.isSafeAuthorizationUrl(): Boolean {
     return !forbiddenQuery
 }
 
+private fun String.containsLineBreak(): Boolean {
+    return any { character -> character == '\n' || character == '\r' }
+}
+
 private const val DEFAULT_LLM_CLI_HOME_PATH = "/tmp/fukurou-cli-home"
+private const val MAX_LLM_AUTH_TOKEN_CODE_LENGTH = 4096
 private const val CLAUDE_HOME_DIRECTORY = ".claude"
 private const val CODEX_AUTH_FILE_NAME = "auth.json"
 private const val STARTUP_CAPTURE_POLL_MILLIS = 100L

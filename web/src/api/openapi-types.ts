@@ -926,6 +926,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ops/llm-auth/{provider}/login/{sessionId}/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Claude Code CLI auth token/code を送信する
+         * @description active な Claude Code login session の stdin へ token/code を 1 回だけ送信します。token/code の値は応答、audit payload、ログへ含めません。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description claude です。codex は device auth のため token/code submit を受け付けません。 */
+                    provider: string;
+                    /** @description login start 応答の sessionId です。 */
+                    sessionId: string;
+                };
+                cookie?: never;
+            };
+            /** @description token または code の片方だけを指定します。値は保存・返却しません。 */
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["OpsLlmAuthTokenSubmitRequest"];
+                };
+            };
+            responses: {
+                /** @description token/code を CLI process へ送信しました。 */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsLlmAuthTokenSubmitResponse"];
+                    };
+                };
+                /** @description provider、sessionId、request body、または token/code が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description login session が見つかりません。 */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description login session が active でない、または token/code はすでに送信済みです。 */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description CLI auth service が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ops/account": {
         parameters: {
             query?: never;
@@ -1476,10 +1561,25 @@ export interface components {
             status: string;
             authorizationUrl?: string | null;
             userCode?: string | null;
+            tokenSubmitAvailable: boolean;
+            tokenSubmitted: boolean;
             detail?: string | null;
             startedAt: string;
             expiresAt: string;
             completedAt?: string | null;
+        };
+        /** OpsLlmAuthTokenSubmitRequest */
+        OpsLlmAuthTokenSubmitRequest: {
+            token?: string | null;
+            code?: string | null;
+        };
+        /** OpsLlmAuthTokenSubmitResponse */
+        OpsLlmAuthTokenSubmitResponse: {
+            provider: string;
+            sessionId: string;
+            status: string;
+            tokenSubmitted: boolean;
+            detail?: string | null;
         };
         /** OpsAccountResponse */
         OpsAccountResponse: {

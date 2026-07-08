@@ -18,6 +18,7 @@ export type OpsHaltLevel = components["schemas"]["OpsHaltRequest"]["level"];
 export type OpsLlmAuthLoginResponse = components["schemas"]["OpsLlmAuthLoginResponse"];
 export type OpsLlmAuthProviderResponse = components["schemas"]["OpsLlmAuthProviderResponse"];
 export type OpsLlmAuthResponse = components["schemas"]["OpsLlmAuthResponse"];
+export type OpsLlmAuthTokenSubmitResponse = components["schemas"]["OpsLlmAuthTokenSubmitResponse"];
 export type OpsPositionsResponse = components["schemas"]["OpsPositionsResponse"];
 export type OpsRiskStateResponse = components["schemas"]["OpsRiskStateResponse"];
 export type OpsTriggerResponse = components["schemas"]["OpsTriggerResponse"];
@@ -68,6 +69,7 @@ export const ACTIVITY_AUDIT_EVENT_TYPES = [
   "DAEMON_TRIGGER_LAUNCHED",
   "DAEMON_INVOCATION_COMPLETED",
   "CLI_AUTH_LOGIN_STARTED",
+  "CLI_AUTH_LOGIN_TOKEN_SUBMITTED",
   "CLI_AUTH_LOGIN_COMPLETED",
   "CLI_AUTH_LOGIN_FAILED",
   "CLI_AUTH_LOGIN_TIMED_OUT",
@@ -203,6 +205,21 @@ export function opsLlmAuthLoginSessionQuery(provider: LlmAuthProvider, sessionId
       return status && isTerminalLlmAuthLoginStatus(status) ? false : 2_000;
     },
   });
+}
+
+export async function requestOpsLlmAuthTokenCodeSubmit({
+  provider,
+  sessionId,
+  tokenCode,
+}: {
+  provider: LlmAuthProvider;
+  sessionId: string;
+  tokenCode: string;
+}): Promise<OpsLlmAuthTokenSubmitResponse> {
+  const path = `/ops/llm-auth/${provider}/login/${encodeURIComponent(sessionId)}/token` as "/ops/llm-auth/{provider}/login/{sessionId}/token";
+  const response = await postJsonResponse(path, { code: tokenCode }, [202] as const);
+
+  return response.data;
 }
 
 function isTerminalLlmAuthLoginStatus(status: OpsLlmAuthLoginResponse["status"]): boolean {

@@ -189,7 +189,7 @@ runner 上限も保守側の override だけを許可する。総 tool call は 
 ## secrets / CLI auth
 
 - Docker image に Claude / Codex の auth token、GMO private key、Cloudflare token を焼き込まない。
-- Production の Claude / Codex login flow は WebUI Controls から reason 付きで開始し、必要時だけ SSH / `docker exec` を fallback とする。login state は `llm-home` volume 配下の `HOME=/tmp/fukurou-cli-home` に保存する。
+- Production の Claude / Codex login flow は WebUI Controls から reason 付きで開始し、必要時だけ SSH / `docker exec` を fallback とする。Claude は browser flow が返した token/code を WebUI から active session へ 1 回だけ送信し、Codex は device auth flow のまま token/code 入力欄を使わない。login state は `llm-home` volume 配下の `HOME=/tmp/fukurou-cli-home` に保存する。
 - Codex は `FUKUROU_CODEX_PERSISTENT_HOME=/tmp/fukurou-cli-home/.codex` を明示したときだけ、renderer がその場の `config.toml` を上書きする。local 開発の実 `HOME/.codex/config.toml` を汚さないため、`HOME` から永続 mode を推測しない。
 - Claude / Codex CLI の access token 更新は CLI に任せる。refresh token が失効または revoke された場合だけ、WebUI または fallback で再ログインする。
 - WebUI System は `/ops/llm-auth` で CLI auth 状態を表示する。`/health` / `/health/ready` は Ktor / DB / reconciler readiness の意味だけを持つ。

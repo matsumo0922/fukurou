@@ -95,6 +95,11 @@ class ApiDocumentationRouteTest {
             summary = "CLI auth login session を取得する",
             tag = "ops",
         )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/llm-auth/{provider}/login/{sessionId}/token",
+            schemaRef = "#/components/schemas/OpsLlmAuthTokenSubmitRequest",
+        )
         assertOperation(
             paths = paths,
             path = "/ops/account",
