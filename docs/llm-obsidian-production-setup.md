@@ -44,7 +44,7 @@ ssh dxp4800plus \
   'sudo docker exec -u root fukurou-ktor sh -lc "chown -R 10001:999 /tmp/fukurou-cli-home /tmp/fukurou-cli-cache"'
 ```
 
-WebUI の System 画面は `/ops/llm-auth` を読み、Claude Code / Codex の login state を表示する。CLI auth は `/health` / `/health/ready` には混ぜないため、CLI が logged_out でも Ktor / DB / reconciler readiness の意味は変わらない。
+WebUI の System 画面は `/ops/llm-auth` を読み、Claude Code / Codex の login state を表示する。CLI auth は `/health` / `/health/ready` には混ぜないため、CLI が logged_out でも Ktor / DB / reconciler readiness の意味は変わらない。login state は非 secret の credential marker file で判定するため、CLI が keychain など marker file 以外へ credential を保存する構成では System が logged_out を示す場合がある。その場合は fallback 手順と smoke test で実際の CLI auth を確認する。
 
 WebUI の Controls 画面で `CLI Auth` を開き、Claude Code または Codex の login を reason 付きで開始する。応答に `authorizationUrl` と `userCode` が出た場合は、手元の browser で承認する。WebUI / API / audit payload は access token、refresh token、API key、credential file content を返さない。audit には provider、session ID、reason、status、secret を含まない detail だけを残す。
 

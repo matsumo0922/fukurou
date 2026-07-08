@@ -231,6 +231,7 @@ interface LlmAuthService {
  * @param inheritedLoginEnvironment login CLI 起動に必要な非 secret env
  * @param loginTimeout login process timeout
  * @param startupCaptureTimeout login start 応答前に URL / code を待つ時間
+ * @param terminalSessionRetention 完了済み login session を polling 用に保持する時間
  */
 data class LlmAuthServiceConfig(
     val claudeCommandTemplate: List<String>,
@@ -240,7 +241,14 @@ data class LlmAuthServiceConfig(
     val inheritedLoginEnvironment: Map<String, String> = System.getenv().safeLlmAuthEnvironment(),
     val loginTimeout: Duration = DEFAULT_LLM_AUTH_LOGIN_TIMEOUT,
     val startupCaptureTimeout: Duration = DEFAULT_LLM_AUTH_STARTUP_CAPTURE_TIMEOUT,
+    val terminalSessionRetention: Duration = DEFAULT_LLM_AUTH_TERMINAL_SESSION_RETENTION,
 ) {
+    init {
+        require(!terminalSessionRetention.isNegative) {
+            "terminalSessionRetention must not be negative."
+        }
+    }
+
     companion object {
         /**
          * 環境変数から CLI auth service 設定を構築する。
@@ -292,6 +300,8 @@ class DefaultLlmAuthService(
 
     override suspend fun snapshot(): Result<LlmAuthSnapshot> {
         return runCatching {
+            evictExpiredLoginSessions()
+
             val checkedAt = Instant.now(clock)
 
             LlmAuthSnapshot(
@@ -308,6 +318,8 @@ class DefaultLlmAuthService(
 
     override suspend fun startLogin(provider: LlmAuthProvider, reason: String): Result<LlmAuthLoginStartResult> {
         return runCatching {
+            evictExpiredLoginSessions()
+
             val trimmedReason = reason.trim()
 
             require(trimmedReason.isNotEmpty()) {
@@ -323,6 +335,8 @@ class DefaultLlmAuthService(
         sessionId: String,
     ): Result<LlmAuthLoginSessionSnapshot?> {
         return runCatching {
+            evictExpiredLoginSessions()
+
             val session = sessions[sessionId] ?: return@runCatching null
 
             if (session.provider != provider) {
@@ -512,6 +526,29 @@ class DefaultLlmAuthService(
                 detail = session.snapshot().detail,
             ),
         )
+        scheduleTerminalSessionCleanup(session)
+    }
+
+    private fun scheduleTerminalSessionCleanup(session: MutableLlmAuthLoginSession) {
+        scope.launch {
+            val retentionMillis = config.terminalSessionRetention.toMillis()
+
+            if (retentionMillis > 0) {
+                delay(retentionMillis)
+            }
+
+            sessions.remove(session.sessionId, session)
+        }
+    }
+
+    private fun evictExpiredLoginSessions() {
+        val now = Instant.now(clock)
+
+        sessions.forEach { (sessionId, session) ->
+            if (session.isTerminalExpired(now, config.terminalSessionRetention)) {
+                sessions.remove(sessionId, session)
+            }
+        }
     }
 
     private suspend fun waitForStartupCapture(session: MutableLlmAuthLoginSession) {
@@ -629,7 +666,10 @@ internal object JvmLlmAuthProcessStarter : LlmAuthProcessStarter {
             putAll(environment)
         }
 
-        return processBuilder.start()
+        val process = processBuilder.start()
+        process.outputStream.close()
+
+        return process
     }
 }
 
@@ -658,6 +698,12 @@ private class MutableLlmAuthLoginSession(
 
     fun isRunning(): Boolean {
         return status == LlmAuthLoginStatus.RUNNING
+    }
+
+    fun isTerminalExpired(now: Instant, retention: Duration): Boolean {
+        val completed = completedAt ?: return false
+
+        return !completed.plus(retention).isAfter(now)
     }
 
     fun observeCliLine(line: String) {
@@ -748,6 +794,10 @@ private fun String.isSafeAuthorizationUrl(): Boolean {
         return false
     }
 
+    if (uri.rawFragment != null) {
+        return false
+    }
+
     val query = uri.rawQuery ?: return true
     val forbiddenQuery = query
         .split("&")
@@ -767,6 +817,7 @@ private const val DESTROY_GRACE_MILLIS = 500L
 private const val PATH_ENV = "PATH"
 private val DEFAULT_LLM_AUTH_LOGIN_TIMEOUT: Duration = Duration.ofMinutes(10)
 private val DEFAULT_LLM_AUTH_STARTUP_CAPTURE_TIMEOUT: Duration = Duration.ofSeconds(2)
+private val DEFAULT_LLM_AUTH_TERMINAL_SESSION_RETENTION: Duration = Duration.ofMinutes(30)
 private val CLAUDE_AUTH_MARKERS = listOf(
     "$CLAUDE_HOME_DIRECTORY/.credentials.json",
     "$CLAUDE_HOME_DIRECTORY/credentials.json",

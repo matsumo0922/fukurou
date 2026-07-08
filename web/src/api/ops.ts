@@ -197,8 +197,16 @@ export function opsLlmAuthLoginSessionQuery(provider: LlmAuthProvider, sessionId
     queryKey: ["ops", "llm-auth", provider, "login", sessionId],
     queryFn: () => getJson(path),
     staleTime: 0,
-    refetchInterval: 2_000,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+
+      return status && isTerminalLlmAuthLoginStatus(status) ? false : 2_000;
+    },
   });
+}
+
+function isTerminalLlmAuthLoginStatus(status: OpsLlmAuthLoginResponse["status"]): boolean {
+  return status === "succeeded" || status === "failed" || status === "timed_out";
 }
 
 export async function fetchActivityTimeline({

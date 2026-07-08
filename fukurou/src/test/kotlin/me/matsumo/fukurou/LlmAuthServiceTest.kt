@@ -2,6 +2,7 @@ package me.matsumo.fukurou
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_PERSISTENT_HOME_ENV
@@ -19,6 +20,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class LlmAuthServiceTest {
@@ -116,6 +118,79 @@ class LlmAuthServiceTest {
     }
 
     @Test
+    fun jvmProcessStarterClosesStdinWithEof() {
+        val workingDirectory = Files.createTempDirectory("fukurou-llm-auth-process")
+        val process = JvmLlmAuthProcessStarter.start(
+            command = listOf(
+                "/bin/sh",
+                "-c",
+                "if read line; then echo HAS_INPUT; else echo EOF; fi",
+            ),
+            environment = mapOf(
+                TEST_PATH_ENV to TEST_PATH_VALUE,
+                HOME_ENV to workingDirectory.toString(),
+            ),
+            workingDirectory = workingDirectory,
+        )
+        val completed = process.waitFor(2, TimeUnit.SECONDS)
+
+        if (!completed) {
+            process.destroyForcibly()
+        }
+
+        assertTrue(completed)
+        assertEquals(0, process.exitValue())
+        assertEquals("EOF", process.inputStream.bufferedReader().readText().trim())
+    }
+
+    @Test
+    fun startLoginRejectsAuthorizationUrlWithSecretFragment() = runBlocking {
+        val processStarter = RecordingLlmAuthProcessStarter(
+            stdout = "Open https://auth.example/device#access_token=secret-value\n",
+        )
+        val service = createService(
+            processStarter = processStarter,
+            startupCaptureTimeout = Duration.ofMillis(100),
+        )
+
+        try {
+            val result = service.startLogin(LlmAuthProvider.CODEX, "operator re-auth").getOrThrow()
+            val accepted = assertIs<LlmAuthLoginStartResult.Accepted>(result)
+
+            assertNull(accepted.session.authorizationUrl)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun completedLoginSessionIsEvictedAfterRetention() = runBlocking {
+        val service = createService(
+            processStarter = RecordingLlmAuthProcessStarter(completed = true),
+            terminalSessionRetention = Duration.ZERO,
+        )
+
+        try {
+            val result = service.startLogin(LlmAuthProvider.CLAUDE, "operator re-auth").getOrThrow()
+            val accepted = assertIs<LlmAuthLoginStartResult.Accepted>(result)
+
+            repeat(20) {
+                val session = service.loginSession(LlmAuthProvider.CLAUDE, accepted.session.sessionId).getOrThrow()
+
+                if (session == null) {
+                    return@runBlocking
+                }
+
+                delay(10)
+            }
+
+            assertNull(service.loginSession(LlmAuthProvider.CLAUDE, accepted.session.sessionId).getOrThrow())
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
     fun startLoginRejectsConcurrentProviderRequestBeforeProcessReturns() = runBlocking {
         val processStarter = BlockingLlmAuthProcessStarter()
         val service = createService(processStarter = processStarter)
@@ -143,6 +218,8 @@ class LlmAuthServiceTest {
     private fun createService(
         cliHome: Path = Files.createTempDirectory("fukurou-llm-auth-home"),
         processStarter: LlmAuthProcessStarter,
+        startupCaptureTimeout: Duration = Duration.ZERO,
+        terminalSessionRetention: Duration = Duration.ofMinutes(30),
     ): DefaultLlmAuthService {
         return DefaultLlmAuthService(
             config = LlmAuthServiceConfig(
@@ -151,7 +228,8 @@ class LlmAuthServiceTest {
                 cliHome = cliHome,
                 codexHome = cliHome.resolve(".codex"),
                 inheritedLoginEnvironment = mapOf(TEST_PATH_ENV to TEST_PATH_VALUE),
-                startupCaptureTimeout = Duration.ZERO,
+                startupCaptureTimeout = startupCaptureTimeout,
+                terminalSessionRetention = terminalSessionRetention,
             ),
             processStarter = processStarter,
             idGenerator = SequentialUuidGenerator(),
@@ -159,7 +237,10 @@ class LlmAuthServiceTest {
     }
 }
 
-private class RecordingLlmAuthProcessStarter : LlmAuthProcessStarter {
+private class RecordingLlmAuthProcessStarter(
+    private val stdout: String = "",
+    private val completed: Boolean = false,
+) : LlmAuthProcessStarter {
 
     val commands = mutableListOf<List<String>>()
     val environments = mutableListOf<Map<String, String>>()
@@ -172,7 +253,10 @@ private class RecordingLlmAuthProcessStarter : LlmAuthProcessStarter {
         commands += command
         environments += environment
 
-        return RunningLlmAuthProcess()
+        return RunningLlmAuthProcess(
+            stdout = stdout,
+            completed = completed,
+        )
     }
 }
 
@@ -207,19 +291,22 @@ private class BlockingLlmAuthProcessStarter : LlmAuthProcessStarter {
     }
 }
 
-private class RunningLlmAuthProcess : Process() {
+private class RunningLlmAuthProcess(
+    private val stdout: String = "",
+    completed: Boolean = false,
+) : Process() {
 
     private val destroyed = CountDownLatch(1)
 
     @Volatile
-    private var alive = true
+    private var alive = !completed
 
     override fun getOutputStream(): OutputStream {
         return OutputStream.nullOutputStream()
     }
 
     override fun getInputStream(): ByteArrayInputStream {
-        return ByteArrayInputStream(ByteArray(0))
+        return ByteArrayInputStream(stdout.toByteArray())
     }
 
     override fun getErrorStream(): ByteArrayInputStream {
@@ -227,12 +314,20 @@ private class RunningLlmAuthProcess : Process() {
     }
 
     override fun waitFor(): Int {
+        if (!alive) {
+            return EXIT_CODE_SUCCESS
+        }
+
         destroyed.await()
 
         return EXIT_CODE_DESTROYED
     }
 
     override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+        if (!alive) {
+            return true
+        }
+
         return destroyed.await(timeout, unit)
     }
 
@@ -241,7 +336,7 @@ private class RunningLlmAuthProcess : Process() {
             throw IllegalThreadStateException("process is still running")
         }
 
-        return EXIT_CODE_DESTROYED
+        return if (destroyed.count == 0L) EXIT_CODE_DESTROYED else EXIT_CODE_SUCCESS
     }
 
     override fun destroy() {
@@ -271,6 +366,7 @@ private class SequentialUuidGenerator : () -> UUID {
     }
 }
 
+private const val EXIT_CODE_SUCCESS = 0
 private const val EXIT_CODE_DESTROYED = 143
 private const val TEST_PATH_ENV = "PATH"
 private const val TEST_PATH_VALUE = "/opt/fukurou/bin:/usr/bin"
