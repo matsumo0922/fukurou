@@ -2,7 +2,7 @@
 
 Fukurou production で Claude Code / Codex CLI auth と Obsidian vault を準備し、`FUKUROU_OBSIDIAN_ENABLED` / `FUKUROU_LLM_DAEMON_ENABLED` を有効化する前に確認する手順。
 
-Obsidian Writer / deterministic Reflection Runner と LLM daemon は独立した worker であり、同時に有効化する必要はない。Obsidian Writer / Reflection Runner は DB の内容を Markdown へ機械的に書き出すだけなので、LLM auth が無くても単独で有効化できる。LLM daemon は Claude / Codex CLI auth と MCP runtime の疎通確認後に有効化する。
+Obsidian Writer / Reflection Runner と LLM daemon は独立した worker であり、同時に有効化する必要はない。Obsidian Writer / Reflection Runner は DB 由来の deterministic Markdown を生成し、完了済み前週の `Knowledge/PromptCandidates/` だけ低優先の LLM CLI を使う。CLI auth がない場合でも deterministic note は生成され、PromptCandidates は fail-closed status note と backoff に留まる。LLM daemon は Claude / Codex CLI auth と MCP runtime の疎通確認後に有効化する。
 
 ## 現在の推奨順序
 
@@ -112,7 +112,7 @@ ssh dxp4800plus \
 
 ## Enable Obsidian Writer / Reflection Runner
 
-Obsidian Writer / deterministic Reflection Runner は LLM daemon と独立している。先にこれだけ有効化してよい。`FUKUROU_OBSIDIAN_ENABLED=true` では、Trade / Daily note の機械再生成と、`Knowledge/DailyReflections/`、`Knowledge/WeeklyReviews/`、`Knowledge/Calibration/`、`Knowledge/Setups/` への deterministic reflection report 生成が同じ Ktor process 内で動く。
+Obsidian Writer / Reflection Runner は LLM daemon と独立している。先にこれだけ有効化してよい。`FUKUROU_OBSIDIAN_ENABLED=true` では、Trade / Daily note の機械再生成と、`Knowledge/DailyReflections/`、`Knowledge/WeeklyReviews/`、`Knowledge/Calibration/`、`Knowledge/Setups/` への deterministic reflection report 生成、`Knowledge/PromptCandidates/` への週次 prompt candidate note 生成が同じ Ktor process 内で動く。
 
 ```dotenv
 FUKUROU_OBSIDIAN_ENABLED=true
@@ -121,6 +121,9 @@ FUKUROU_REFLECTION_QUERY_LIMIT=1000
 FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS=180
 FUKUROU_REFLECTION_RECENT_DECISION_LIMIT=50
 FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT=30
+FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER=CLAUDE
+FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS=60
+FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS=2
 FUKUROU_LLM_DAEMON_ENABLED=false
 ```
 
@@ -134,7 +137,9 @@ find /srv/fukurou/obsidian-vault -maxdepth 4 -type f | sort | head -50
 
 Writer は DB を正本として、frontmatter、機械導出できる数値、空見出し骨組みだけを書く。解釈的本文や `Knowledge/` の中身は reflection runner の責務であり、ここでは生成しない。
 
-Reflection Runner は DB を正本として、日次・週次・confidence calibration・setup tag taxonomy の Markdown を deterministic に生成する。LLM CLI は呼び出さず、PromptCandidates は生成せず、system prompt や trading config を自動変更しない。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。
+Reflection Runner は DB を正本として、日次・週次・confidence calibration・setup tag taxonomy の Markdown を deterministic に生成する。PromptCandidates は完了済み前週を対象に LLM CLI で生成し、JSON schema を満たす候補だけを `requires_human_approval: true` の note として保存する。Daily reflection は LLM を呼ばない。PromptCandidates は system prompt や trading config を自動変更せず、人間承認前の候補だけを残す。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。
+
+PromptCandidates は `generated` / `invalid_output` / `input_truncated` / `budget_deferred` / `llm_failed` / `failed_backoff` の status を frontmatter に保存する。`budget_deferred` は試行回数を増やさず、`llm_failed` は 24 時間 backoff 後に同じ週で最大 2 回まで再試行する。trading の RUNNING 予約、HARD_HALT、または LLM hour/day cap の headroom 不足がある場合は LLM を呼ばず deterministic report だけを生成する。
 
 Reflection Runner の loop は `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` と `FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS` の大きい方を使う。Markdown 本文には生成時刻だけで変わる field を書かず、対象 period の DB データが変わらない tick は unchanged として扱う。日付または週の境界直前に保存された decision / trade を確定ノートへ反映するため、current period と previous period の Daily / Weekly / TagTaxonomy report を同じ tick で再生成する。
 

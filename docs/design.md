@@ -1319,7 +1319,7 @@ kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `K
 
 benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は期間開始時点の paper equity（paper 初期資金 + 期間開始前の累計 realized trade PnL）とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
 
-LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`proposer` / `falsifier`）だけを集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、保存済み `details.usage` がない過去行は redacted `details.stdout` から可能な範囲で fallback parse する。Codex phase や parse 不能 phase は usage 欠落として数える。取得は既定 20,000 行で bounded にし、超過時は `/evaluation/costs` の `truncated` で示す。
+LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、保存済み `details.usage` がない過去行は redacted `details.stdout` から可能な範囲で fallback parse する。Codex phase や parse 不能 phase は usage 欠落として数える。取得は既定 20,000 行で bounded にし、超過時は `/evaluation/costs` の `truncated` で示す。
 
 ## 6. 発火エンジンと呼び出しモデル（A-7）
 
@@ -3020,7 +3020,7 @@ Instruments/BTC.md
 
 [実装済み: 2026-07-04] 実装 package は新 module `:trading.knowledge` ではなく、既存 `:trading` module の `me.matsumo.fukurou.trading.knowledge` とする。A-2 は既存 repository と typed config に薄く乗るだけで、module 分割による依存境界を増やす段階ではないため。
 
-A-3 の deterministic Reflection Runner は、同じ vault に `Knowledge/DailyReflections/YYYY-MM-DD.md`、`Knowledge/WeeklyReviews/YYYY-Www.md`、`Knowledge/Calibration/ConfidenceCalibration.md`、`Knowledge/Setups/TagTaxonomy-YYYY-Www.md` を生成する。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。Reflection Runner は current period と previous period の Daily / Weekly / TagTaxonomy report を再生成し、境界直前に保存された decision / trade を確定ノートへ反映する。
+Reflection Runner は、同じ vault に `Knowledge/DailyReflections/YYYY-MM-DD.md`、`Knowledge/WeeklyReviews/YYYY-Www.md`、`Knowledge/Calibration/ConfidenceCalibration.md`、`Knowledge/Setups/TagTaxonomy-YYYY-Www.md`、`Knowledge/PromptCandidates/YYYY-Www.md` を生成する。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。Reflection Runner は current period と previous period の Daily / Weekly / TagTaxonomy report を再生成し、境界直前に保存された decision / trade を確定ノートへ反映する。
 
 ### 11.4 Trade note frontmatter例
 
@@ -3257,9 +3257,9 @@ SORT created DESC
 
 ### 12.1 役割
 
-[確定] Reflection Runner は日次＋週次で `Knowledge/` に deterministic report を書く。
+[確定] Reflection Runner は日次＋週次で `Knowledge/` に deterministic report と週次 PromptCandidates を書く。
 
-Reflection Runner は LLM CLI を呼び出さず、売買 act 系ツールも持たない。read-only DB と vault write だけで report を再生成し、失敗しても trading / scheduler / DB record には影響させない。
+Reflection Runner は deterministic report を read-only DB と vault write だけで再生成する。完了済み前週の PromptCandidates だけ LLM CLI を呼び出し、売買 act 系ツールと MCP server は渡さない。LLM 呼び出しに失敗しても trading / scheduler の売買判断には影響させず、status note と `llm_runs` / `command_event_log` に結果を残す。
 
 Reflection Runner の loop は `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` と `FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS` の大きい方を使う。Markdown 本文には生成時刻だけで変わる field を書かず、対象 period の DB データが変わらない tick は unchanged として扱う。Recent Decisions は `FUKUROU_REFLECTION_RECENT_DECISION_LIMIT` 件まで表示し、confidence calibration は `FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS` 日の安定した取引日境界 window を読む。
 
@@ -3316,7 +3316,7 @@ Reflection Runner の loop は `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` と `FU
 - `Knowledge/Calibration/ConfidenceCalibration.md`
 - `Knowledge/Setups/TagTaxonomy-YYYY-Www.md`
 - `Knowledge/Setups/TagTaxonomy-<previous YYYY-Www>.md`
-- `Knowledge/PromptCandidates/` は deterministic runner では生成しない
+- `Knowledge/PromptCandidates/YYYY-Www.md`
 
 週次の分析:
 
@@ -3331,18 +3331,18 @@ Reflection Runner の loop は `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` と `FU
 
 ### 12.4 Knowledge更新の安全策
 
-Reflection Runner は Knowledge report を直接更新するが、system prompt や trading config は自動変更しない。PromptCandidates も deterministic runner では生成しない。
+Reflection Runner は Knowledge report と PromptCandidates を直接更新するが、system prompt や trading config は自動変更しない。PromptCandidates は `requires_human_approval: true` の候補 note であり、自動適用しない。
 
 ```text
 Knowledge update: 自動可
-PromptCandidates: 自動不可
+PromptCandidates: 候補生成のみ自動可
 Config change: 自動不可
 Safety Floor change: 不可
 ```
 
 ### 12.5 振り返り用プロンプト境界
 
-Reflection Runner は deterministic report のみを生成し、LLM prompt は実行しない。confidence の較正、sample size warning、truncation flag、setup tag taxonomy は DB から機械的に算出し、Obsidian Markdown として保存する。
+Reflection Runner は deterministic report を LLM なしで生成し、完了済み前週の PromptCandidates だけ LLM prompt を実行する。confidence の較正、sample size warning、truncation flag、setup tag taxonomy は DB から機械的に算出し、Obsidian Markdown として保存する。PromptCandidates は LLM output を strict JSON schema で検証し、`target = SystemPromptV1`、`requiresHumanApproval = true`、deterministic report に紐づく evidence を満たす候補だけを保存する。`generated` / `invalid_output` / `input_truncated` / `budget_deferred` / `llm_failed` / `failed_backoff` の status を frontmatter に残す。
 
 ---
 
@@ -3615,8 +3615,8 @@ LLM CLI:
 | GMO WS subscribe | 1 req/s | 起動/再接続時 |
 | MCP tool calls | 30/run | LLM暴走防止 |
 | act tool calls | 3/run | 過剰売買防止 |
-| LLM calls (trading) | 12/hour | サブスク/ToS/制限対策 |
-| LLM calls (reflection) | 日次1 + 週次1 | 振り返りも同じサブスクを消費。トレード用12/hとは別枠だが合算で管理する |
+| LLM calls (trading) | 4/hour, 96/day | サブスク/ToS/制限対策 |
+| LLM calls (reflection) | 完了済み前週の PromptCandidates のみ | trading と同じ cap を消費し、1時間で1回分・24時間で4回分の headroom がない場合は起動しない |
 
 Private POSTは取引所上限より安全側に、bot内部の実効上限を `5 req/s` 程度へ下げてもよい。設定は上の既定を上限として、実運用で調整する。
 
@@ -3939,7 +3939,7 @@ maxDD = min((equity - equityPeak) / equityPeak)
    - confidence bucketごとの実現勝率、期待R、Brier風スコアを週次で計算する。
 
 7. プロンプト改善パイプライン
-   - PromptCandidates パイプラインは未実装。deterministic Reflection Runner は `PromptCandidates/` を生成しない。
+   - Reflection Runner は完了済み前週の PromptCandidates を生成し、自動適用は行わない。
 
 ### 16.4 確定事項からの逸脱提案
 

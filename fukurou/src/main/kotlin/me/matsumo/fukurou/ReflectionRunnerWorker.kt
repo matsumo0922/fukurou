@@ -11,15 +11,26 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
+import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
+import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
+import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
+import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reflection.ReflectionDataCollector
+import me.matsumo.fukurou.trading.reflection.ReflectionPromptCandidateGenerator
+import me.matsumo.fukurou.trading.reflection.ReflectionPromptCandidateGeneratorRuntime
+import me.matsumo.fukurou.trading.reflection.ReflectionPromptCandidateLlmRuntime
+import me.matsumo.fukurou.trading.reflection.ReflectionPromptCandidatePersistence
 import me.matsumo.fukurou.trading.reflection.ReflectionReportBuilder
 import me.matsumo.fukurou.trading.reflection.ReflectionRunner
 import me.matsumo.fukurou.trading.reflection.ReflectionVaultWriter
+import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.nio.file.Path
 import java.time.Clock
@@ -31,6 +42,11 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
  * Reflection runner failure log の rate limit key。
  */
 private const val REFLECTION_RUNNER_FAILURE_LOG_KEY = "reflection-runner-worker-failure"
+
+/**
+ * LLM CLI working directory の環境変数名。
+ */
+private const val FUKUROU_LLM_WORKING_DIRECTORY_ENV = "FUKUROU_LLM_WORKING_DIRECTORY"
 
 /**
  * ReflectionRunnerWorker 用 logger。
@@ -167,11 +183,17 @@ private fun createReflectionRunner(
     val vaultPath = Path.of(tradingConfig.obsidian.vaultPath)
         .toAbsolutePath()
         .normalize()
+    val workingDirectory = Path.of(environment[FUKUROU_LLM_WORKING_DIRECTORY_ENV] ?: ".")
+        .toAbsolutePath()
+        .normalize()
+    val redactor = SecretRedactor.fromEnvironment(environment)
+    val commandEventLog = ExposedCommandEventLog(database)
+    val llmRunRepository = ExposedLlmRunRepository(database)
 
     return ReflectionRunner(
         dataCollector = ReflectionDataCollector(
             decisionRepository = ExposedDecisionRepository(database, clock),
-            llmRunRepository = ExposedLlmRunRepository(database),
+            llmRunRepository = llmRunRepository,
             evaluationRepository = ExposedEvaluationRepository(database),
             clock = clock,
             queryLimit = tradingConfig.reflection.queryLimit,
@@ -184,7 +206,35 @@ private fun createReflectionRunner(
         ),
         vaultWriter = ReflectionVaultWriter(
             vaultPath = vaultPath,
-            redactor = SecretRedactor.fromEnvironment(environment),
+            redactor = redactor,
+        ),
+        promptCandidateGenerator = ReflectionPromptCandidateGenerator(
+            tradingConfig = tradingConfig,
+            runtime = ReflectionPromptCandidateGeneratorRuntime(
+                llm = ReflectionPromptCandidateLlmRuntime(
+                    llmInvoker = ShellLlmInvoker(
+                        commandRenderer = DefaultLlmCommandRenderer(
+                            config = LlmCommandRendererConfig.fromEnvironment(environment),
+                        ),
+                        processRunner = ShellProcessRunner(),
+                    ),
+                    auditor = LlmInvocationAuditor(
+                        commandEventLog = commandEventLog,
+                        redactor = redactor,
+                        clock = clock,
+                        humanLogger = { message -> REFLECTION_WORKER_LOGGER.info(message) },
+                    ),
+                    workingDirectory = workingDirectory,
+                    parentEnvironment = environment,
+                    redactor = redactor,
+                ),
+                persistence = ReflectionPromptCandidatePersistence(
+                    llmRunRepository = llmRunRepository,
+                    launchReservationRepository = ExposedLlmLaunchReservationRepository(database),
+                ),
+                clock = clock,
+                logger = { message -> REFLECTION_WORKER_LOGGER.warning(message) },
+            ),
         ),
     )
 }

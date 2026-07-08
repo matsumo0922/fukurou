@@ -32,6 +32,11 @@ enum class LlmInvocationPhase {
      * entry intent を反証する Falsifier phase。
      */
     FALSIFIER,
+
+    /**
+     * 週次 reflection から prompt candidate を生成する phase。
+     */
+    REFLECTION,
 }
 
 /**
@@ -62,7 +67,7 @@ data class LlmMcpServerConfig(
  * @param timeout CLI 起動 timeout
  * @param workingDirectory CLI process の working directory
  * @param decisionRunContext MCP audit へ伝播する context
- * @param mcpServer stdio MCP server 設定
+ * @param mcpServer stdio MCP server 設定。null の場合は MCP を登録しない
  * @param environment CLI process へ allowlist で渡す環境変数
  * @param allowedTools CLI に許可する MCP tool 名
  */
@@ -74,7 +79,7 @@ data class LlmInvocationRequest(
     val timeout: Duration,
     val workingDirectory: Path,
     val decisionRunContext: DecisionRunContext,
-    val mcpServer: LlmMcpServerConfig,
+    val mcpServer: LlmMcpServerConfig?,
     val environment: Map<String, String>,
     val allowedTools: List<String>,
 )

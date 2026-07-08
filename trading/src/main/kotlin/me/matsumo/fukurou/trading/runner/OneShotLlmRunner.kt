@@ -35,15 +35,11 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
-import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
-import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
-import me.matsumo.fukurou.trading.invoker.ProcessRunResult
-import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.readOptionalEnv
 import me.matsumo.fukurou.trading.invoker.splitCommandTemplate
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
@@ -235,6 +231,13 @@ class OneShotLlmRunner(
     private val logger: (String) -> Unit = { message -> println(message) },
 ) {
     private val processOutputRedactor = SecretRedactor.fromEnvironment(parentEnvironment)
+    private val invocationAuditor = LlmInvocationAuditor(
+        commandEventLog = tradingRuntime.commandEventLog,
+        redactor = processOutputRedactor,
+        clock = clock,
+        humanLogger = { message -> logHuman(message) },
+        authFailureMessage = LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE,
+    )
     private val decisionExecutionLifecycle = DecisionExecutionLifecycle(
         tradingRuntime = tradingRuntime,
         tradingConfig = tradingConfig,
@@ -253,9 +256,7 @@ class OneShotLlmRunner(
     )
     private val phaseInvoker = OneShotPhaseInvoker(
         llmInvoker = llmInvoker,
-        processOutputRedactor = processOutputRedactor,
-        phaseAppender = runAuditRecorder::appendRunnerPhase,
-        logHuman = ::logHuman,
+        invocationAuditor = invocationAuditor,
     )
 
     /**
@@ -968,116 +969,26 @@ private class OneShotRunAuditRecorder(
 }
 
 /**
- * OneShot runner の LLM phase 実行と監査 payload 生成を担当する helper。
+ * OneShot runner の LLM phase 実行を共通 auditor へ委譲する helper。
  *
  * @param llmInvoker LLM invocation 境界
- * @param processOutputRedactor process 出力の redactor
- * @param phaseAppender runner phase 監査保存 callback
- * @param logHuman 人間向け runner log 出力
+ * @param invocationAuditor LLM phase audit helper
  */
 private class OneShotPhaseInvoker(
     private val llmInvoker: LlmInvoker,
-    private val processOutputRedactor: SecretRedactor,
-    private val phaseAppender: suspend (DecisionRunContext, String, Duration, JsonObject) -> Result<Unit>,
-    private val logHuman: (String) -> Unit,
+    private val invocationAuditor: LlmInvocationAuditor,
 ) {
     suspend fun invokePhase(
         phaseName: String,
         context: DecisionRunContext,
         request: LlmInvocationRequest,
     ): Result<Unit> {
-        val startedAt = System.nanoTime()
-        val result = llmInvoker.invoke(request)
-        val duration = Duration.ofNanos(System.nanoTime() - startedAt)
-        val invocationResult = result.getOrNull()
-        val processResult = invocationResult?.processResult
-        val startFailureError = result.exceptionOrNull()
-            ?.takeIf { processResult == null }
-            ?.redactedQualifiedErrorMessage()
-        val usage = processResult?.let { completedProcess ->
-            usageForAudit(request.provider, completedProcess.stdout)
-        }
-        val authFailureSuspected = processResult?.authFailureSuspected() ?: false
-
-        phaseAppender(
-            context,
-            phaseName,
-            duration,
-            invocationAuditDetails(
-                request = request,
-                processResult = processResult,
-                startFailureError = startFailureError,
-                authFailureSuspected = authFailureSuspected,
-                usage = usage,
-            ),
-        ).getOrThrow()
-        logHuman("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
-        if (authFailureSuspected) {
-            logHuman(LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE)
-        }
-
-        if (processFailed(processResult)) {
-            return Result.failure(IllegalStateException("$phaseName process did not exit cleanly."))
-        }
-
-        return result.fold(
-            onSuccess = { Result.success(Unit) },
-            onFailure = { throwable -> Result.failure(throwable) },
-        )
-    }
-
-    private fun invocationAuditDetails(
-        request: LlmInvocationRequest,
-        processResult: ProcessRunResult?,
-        startFailureError: String?,
-        authFailureSuspected: Boolean,
-        usage: LlmUsageDetails?,
-    ): JsonObject {
-        return buildJsonObject {
-            put("provider", request.provider.name.lowercase())
-            put("status", processResult?.status?.name ?: "FAILED_TO_START")
-            put("exitCode", processResult?.exitCode?.toString() ?: "null")
-            startFailureError?.let { error -> put("error", error) }
-            processResult?.let { completedProcess ->
-                put("stdout", processOutputRedactor.redactAndTruncate(completedProcess.stdout))
-                put("stderr", processOutputRedactor.redactAndTruncate(completedProcess.stderr))
-            }
-            if (authFailureSuspected) {
-                put("authFailureSuspected", "true")
-            }
-            usage?.let { parsedUsage ->
-                put("usage", LlmUsageParser.toJsonObject(parsedUsage))
-            }
-        }
-    }
-
-    private fun processFailed(processResult: ProcessRunResult?): Boolean {
-        val timedOut = processResult?.status == ProcessRunStatus.TIMED_OUT
-        val nonZeroExit = processResult?.exitCode?.let { exitCode -> exitCode != 0 } ?: false
-
-        return timedOut || nonZeroExit
-    }
-
-    private fun Throwable.redactedQualifiedErrorMessage(): String {
-        val detail = message.orEmpty()
-        val auditMessage = "${javaClass.name}: $detail"
-
-        return processOutputRedactor.redactAndTruncate(auditMessage)
-    }
-
-    private fun usageForAudit(provider: LlmProvider, stdout: String) = when (provider) {
-        LlmProvider.CLAUDE -> LlmUsageParser.parseClaudeStdout(stdout)
-        LlmProvider.CODEX -> null
-    }
-
-    private fun ProcessRunResult.authFailureSuspected(): Boolean {
-        val exitFailed = exitCode?.let { completedExitCode -> completedExitCode != 0 } ?: false
-        val combinedOutput = "$stdout\n$stderr"
-        val outputContainsAuthFailure = LLM_CLI_AUTH_FAILURE_PATTERNS.any { pattern ->
-            combinedOutput.contains(pattern, ignoreCase = true)
-        }
-
-        return exitFailed && outputContainsAuthFailure
+        return invocationAuditor.invokeAndAudit(
+            phaseName = phaseName,
+            context = context,
+            request = request,
+            llmInvoker = llmInvoker,
+        ).map { }
     }
 }
 
@@ -1227,6 +1138,7 @@ private class OneShotLlmRequestFactory(
         return when (phase) {
             LlmInvocationPhase.PROPOSER -> cliConfig.proposerAllowedTools
             LlmInvocationPhase.FALSIFIER -> cliConfig.falsifierAllowedTools
+            LlmInvocationPhase.REFLECTION -> emptyList()
         }
     }
 
@@ -1240,30 +1152,6 @@ private class OneShotLlmRequestFactory(
             .distinct()
     }
 }
-
-/**
- * LLM CLI 認証失敗の可能性を運用ログへ伝える案内。
- */
-private const val LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE =
-    "LLM CLI authentication failure suspected. Login runbook: " +
-        "docs/llm-obsidian-production-setup.md" +
-        "（claude: docker exec -it fukurou-ktor claude → /login、" +
-        "codex: docker exec -it fukurou-ktor codex login --device-auth）"
-
-/**
- * LLM CLI 認証失敗を疑うための出力断片。
- *
- * stdout / stderr の raw output に対する推定シグナルであり、provider や CLI version によっては
- * false positive を含みうる。fail-closed の挙動は変えず、運用上の気づきだけを追加する。
- */
-private val LLM_CLI_AUTH_FAILURE_PATTERNS = listOf(
-    "invalid authentication",
-    "401",
-    "unauthorized",
-    "not logged in",
-    "token expired",
-    "please run /login",
-)
 
 /**
  * Falsifier へ intent ID だけを渡す環境変数名。

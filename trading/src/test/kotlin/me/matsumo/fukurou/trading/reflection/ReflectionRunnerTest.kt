@@ -38,6 +38,7 @@ import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -233,6 +234,188 @@ class ReflectionRunnerTest {
             deleteRecursively(vaultPath)
         }
     }
+
+    @Test
+    fun runOnce_writesPromptCandidateStatusAndDeterministicReportsWhenHardHalted() = runBlocking {
+        val vaultPath = Files.createTempDirectory("fukurou-reflection-hard-halt")
+        val fixture = reflectionPromptCandidateGeneratorFixture()
+        fixture.riskStateRepository.setHardHalt("test halt", FIXED_INSTANT).getOrThrow()
+        val runner = reflectionRunner(
+            vaultPath = vaultPath,
+            promptCandidateGenerator = fixture.generator,
+        )
+
+        try {
+            val summary = runner.runOnce().getOrThrow()
+            val dailyReflection = Files.readString(vaultPath.resolve("Knowledge/DailyReflections/2026-07-02.md"))
+            val promptCandidates = Files.readString(vaultPath.resolve("Knowledge/PromptCandidates/2026-W26.md"))
+            val state = requireNotNull(parseReflectionPromptCandidateNoteState(promptCandidates))
+
+            assertEquals(8, summary.writtenFiles)
+            assertTrue(dailyReflection.contains("type: \"daily_reflection\""))
+            assertFalse(Files.exists(vaultPath.resolve("Knowledge/PromptCandidates/2026-W27.md")))
+            assertEquals(ReflectionPromptCandidateGenerationStatus.BUDGET_DEFERRED, state.status)
+            assertEquals(0, state.attemptCount)
+            assertTrue(fixture.invoker.requests.isEmpty())
+        } finally {
+            deleteRecursively(vaultPath)
+        }
+    }
+
+    @Test
+    fun runOnce_writesPromptCandidatesForPreviousCompletedWeek() = runBlocking {
+        val vaultPath = Files.createTempDirectory("fukurou-reflection-previous-week")
+        val fixture = reflectionPromptCandidateGeneratorFixture(
+            processResult = Result.success(
+                cleanReflectionProcess(validPromptCandidateJson().replace("2026-W27", "2026-W26")),
+            ),
+        )
+        val runner = reflectionRunner(
+            vaultPath = vaultPath,
+            promptCandidateGenerator = fixture.generator,
+        )
+
+        try {
+            val summary = runner.runOnce().getOrThrow()
+            val promptCandidates = Files.readString(vaultPath.resolve("Knowledge/PromptCandidates/2026-W26.md"))
+            val request = fixture.invoker.requests.single()
+
+            assertEquals(8, summary.writtenFiles)
+            assertTrue(promptCandidates.contains("# Prompt Candidates 2026-W26"))
+            assertTrue(request.prompt.contains("Deterministic weekly report ID: 2026-W26"))
+            assertFalse(Files.exists(vaultPath.resolve("Knowledge/PromptCandidates/2026-W27.md")))
+        } finally {
+            deleteRecursively(vaultPath)
+        }
+    }
+
+    @Test
+    fun runOnce_doesNotCallPromptCandidateLlmBeforeRetryTime() = runBlocking {
+        val vaultPath = Files.createTempDirectory("fukurou-reflection-retry-wait")
+        val promptCandidatePath = vaultPath.resolve("Knowledge/PromptCandidates/2026-W26.md")
+        val existingContent = promptCandidateStateMarkdown(
+            status = ReflectionPromptCandidateGenerationStatus.BUDGET_DEFERRED,
+            attemptCount = 0,
+            nextRetryAfter = Instant.parse("2026-07-03T13:00:00Z"),
+        )
+        val fixture = reflectionPromptCandidateGeneratorFixture()
+        val runner = reflectionRunner(
+            vaultPath = vaultPath,
+            promptCandidateGenerator = fixture.generator,
+        )
+
+        try {
+            Files.createDirectories(promptCandidatePath.parent)
+            Files.writeString(promptCandidatePath, existingContent)
+
+            val summary = runner.runOnce().getOrThrow()
+
+            assertEquals(7, summary.writtenFiles)
+            assertTrue(fixture.invoker.requests.isEmpty())
+            assertEquals(existingContent, Files.readString(promptCandidatePath))
+        } finally {
+            deleteRecursively(vaultPath)
+        }
+    }
+
+    @Test
+    fun runOnce_doesNotRetryTerminalPromptCandidateStatuses() = runBlocking {
+        val terminalStatuses = listOf(
+            ReflectionPromptCandidateGenerationStatus.GENERATED,
+            ReflectionPromptCandidateGenerationStatus.INVALID_OUTPUT,
+            ReflectionPromptCandidateGenerationStatus.INPUT_TRUNCATED,
+            ReflectionPromptCandidateGenerationStatus.FAILED_BACKOFF,
+        )
+
+        terminalStatuses.forEach { status ->
+            assertTerminalPromptCandidateStatusNotRetried(status)
+        }
+    }
+
+    @Test
+    fun runOnce_retriesLlmFailedAfterRetryTimeAndStopsAtMaxAttempts() = runBlocking {
+        val vaultPath = Files.createTempDirectory("fukurou-reflection-retry-failed")
+        val promptCandidatePath = vaultPath.resolve("Knowledge/PromptCandidates/2026-W26.md")
+        val fixture = reflectionPromptCandidateGeneratorFixture(
+            processResult = Result.success(failingReflectionProcess()),
+            tradingConfig = promptCandidateTradingConfig(
+                reflectionConfig = ReflectionConfig(promptCandidateMaxAttemptsPerPeriod = 2),
+            ),
+        )
+        val runner = reflectionRunner(
+            vaultPath = vaultPath,
+            promptCandidateGenerator = fixture.generator,
+        )
+
+        try {
+            Files.createDirectories(promptCandidatePath.parent)
+            Files.writeString(
+                promptCandidatePath,
+                promptCandidateStateMarkdown(
+                    status = ReflectionPromptCandidateGenerationStatus.LLM_FAILED,
+                    attemptCount = 1,
+                    nextRetryAfter = Instant.parse("2026-07-02T00:00:00Z"),
+                ),
+            )
+
+            runner.runOnce().getOrThrow()
+
+            val promptCandidates = Files.readString(promptCandidatePath)
+            val state = requireNotNull(parseReflectionPromptCandidateNoteState(promptCandidates))
+
+            assertEquals(ReflectionPromptCandidateGenerationStatus.FAILED_BACKOFF, state.status)
+            assertEquals(2, state.attemptCount)
+            assertEquals(1, fixture.invoker.requests.size)
+        } finally {
+            deleteRecursively(vaultPath)
+        }
+    }
+
+    @Test
+    fun parsePromptCandidateState_ignoresBrokenNextRetryAfter() {
+        val state = requireNotNull(
+            parseReflectionPromptCandidateNoteState(
+                """
+                    |---
+                    |generation_status: "budget_deferred"
+                    |attempt_count: 0
+                    |next_retry_after: "not-an-instant"
+                    |---
+                """.trimMargin(),
+            ),
+        )
+
+        assertEquals(ReflectionPromptCandidateGenerationStatus.BUDGET_DEFERRED, state.status)
+        assertNull(state.nextRetryAfter)
+    }
+}
+
+private suspend fun assertTerminalPromptCandidateStatusNotRetried(status: ReflectionPromptCandidateGenerationStatus) {
+    val vaultPath = Files.createTempDirectory("fukurou-reflection-terminal")
+    val promptCandidatePath = vaultPath.resolve("Knowledge/PromptCandidates/2026-W26.md")
+    val existingContent = promptCandidateStateMarkdown(
+        status = status,
+        attemptCount = if (status == ReflectionPromptCandidateGenerationStatus.FAILED_BACKOFF) 2 else 1,
+        nextRetryAfter = null,
+    )
+    val fixture = reflectionPromptCandidateGeneratorFixture()
+    val runner = reflectionRunner(
+        vaultPath = vaultPath,
+        promptCandidateGenerator = fixture.generator,
+    )
+
+    try {
+        Files.createDirectories(promptCandidatePath.parent)
+        Files.writeString(promptCandidatePath, existingContent)
+
+        val summary = runner.runOnce().getOrThrow()
+
+        assertEquals(7, summary.writtenFiles)
+        assertTrue(fixture.invoker.requests.isEmpty())
+        assertEquals(existingContent, Files.readString(promptCandidatePath))
+    } finally {
+        deleteRecursively(vaultPath)
+    }
 }
 
 private suspend fun reflectionRunner(
@@ -246,6 +429,7 @@ private suspend fun reflectionRunner(
     linkedDecisionSetupTags: List<String> = listOf("breakout", "trend-follow"),
     recentDecisionLimit: Int = DEFAULT_REFLECTION_RECENT_DECISION_LIMIT,
     writerClock: Clock = WRITER_CLOCK,
+    promptCandidateGenerator: ReflectionPromptCandidateGenerator? = null,
 ): ReflectionRunner {
     val decisionRepository = InMemoryDecisionRepository(FIXED_CLOCK)
     val llmRunRepository = InMemoryLlmRunRepository()
@@ -292,6 +476,7 @@ private suspend fun reflectionRunner(
             vaultPath = vaultPath,
             redactor = SecretRedactor(setOf("reflection-secret-token")),
         ),
+        promptCandidateGenerator = promptCandidateGenerator,
     )
 }
 
@@ -432,6 +617,23 @@ private fun assertReflectionSecretRedacted(vararg contents: String) {
         assertFalse(content.contains("reflection-secret-token"))
         assertTrue(content.contains("[REDACTED]") || !content.contains("判断"))
     }
+}
+
+private fun promptCandidateStateMarkdown(
+    status: ReflectionPromptCandidateGenerationStatus,
+    attemptCount: Int,
+    nextRetryAfter: Instant?,
+): String {
+    return """
+        |---
+        |type: "prompt_candidates"
+        |generation_status: "${status.wireValue}"
+        |attempt_count: $attemptCount
+        |next_retry_after: ${nextRetryAfter?.let { instant -> "\"$instant\"" } ?: "null"}
+        |---
+        |# Existing Prompt Candidates
+        |
+    """.trimMargin()
 }
 
 private class StaticReflectionEvaluationRepository(

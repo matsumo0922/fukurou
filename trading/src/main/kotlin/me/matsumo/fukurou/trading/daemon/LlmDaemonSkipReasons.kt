@@ -19,5 +19,9 @@ internal fun LlmLaunchReservationRejectionReason.toDaemonSkipReason(): String {
         LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION -> "concurrent_invocation"
         LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR -> "max_invocations_per_hour_exceeded"
         LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY -> "max_invocations_per_day_exceeded"
+        LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM ->
+            "reflection_hourly_headroom_insufficient"
+        LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM ->
+            "reflection_daily_headroom_insufficient"
     }
 }

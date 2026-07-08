@@ -962,8 +962,8 @@ class OneShotLlmRunnerTest {
             request.phase == LlmInvocationPhase.FALSIFIER
         }
 
-        assertEquals(emptyList(), proposerRequest.mcpServer.autoApprovedTools)
-        assertEquals(listOf("submit_falsification"), falsifierRequest.mcpServer.autoApprovedTools)
+        assertEquals(emptyList(), requireNotNull(proposerRequest.mcpServer).autoApprovedTools)
+        assertEquals(listOf("submit_falsification"), requireNotNull(falsifierRequest.mcpServer).autoApprovedTools)
         assertTrue(proposerRequest.allowedTools.contains("mcp__fukurou-mcp__get_trade_intent"))
         assertTrue(proposerRequest.allowedTools.contains("mcp__fukurou-mcp__knowledge_get_recent_lessons"))
         assertTrue(proposerRequest.allowedTools.contains("mcp__fukurou-mcp__knowledge_search_similar_setups"))
@@ -986,7 +986,7 @@ class OneShotLlmRunnerTest {
         val proposerRequest = fixture.invoker.requests.single()
 
         assertEquals(LlmProvider.CODEX, proposerRequest.provider)
-        assertEquals(listOf("submit_decision"), proposerRequest.mcpServer.autoApprovedTools)
+        assertEquals(listOf("submit_decision"), requireNotNull(proposerRequest.mcpServer).autoApprovedTools)
     }
 
     @Test
@@ -1007,7 +1007,7 @@ class OneShotLlmRunnerTest {
             request.phase == LlmInvocationPhase.FALSIFIER
         }
 
-        assertEquals(emptyList(), falsifierRequest.mcpServer.autoApprovedTools)
+        assertEquals(emptyList(), requireNotNull(falsifierRequest.mcpServer).autoApprovedTools)
     }
 
     @Test
@@ -1551,6 +1551,7 @@ private class RequestCapturingLlmInvoker(
             LlmInvocationPhase.FALSIFIER -> {
                 submitFalsificationFromRequest(repository, request, FalsificationVerdict.APPROVED).getOrThrow()
             }
+            LlmInvocationPhase.REFLECTION -> Unit
         }
 
         return Result.success(
