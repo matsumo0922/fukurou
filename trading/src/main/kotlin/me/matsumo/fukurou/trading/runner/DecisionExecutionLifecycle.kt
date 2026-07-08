@@ -392,7 +392,7 @@ internal class DecisionExecutionLifecycle(
             auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
         )
 
-        return tradingRuntime.toolCallGuard.runTradeTool(call) {
+        return tradingRuntime.toolCallGuard.runRiskReducingTradeTool(call) {
             tradingRuntime.broker.closePosition(command).getOrThrow()
         }.getOrThrow()
     }

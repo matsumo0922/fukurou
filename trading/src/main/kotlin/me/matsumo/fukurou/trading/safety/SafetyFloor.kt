@@ -790,10 +790,7 @@ class SafetyFloor(
     }
 
     private fun validateGroupRisk(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
-        val targetTradeGroupId = command.tradeGroupId?.toString()
-        val groupRisk = riskCalculator.groupRiskBeforeOrder(context, targetTradeGroupId)
-            .add(riskCalculator.orderRisk(command, context))
-            .safetyScale()
+        val groupRisk = riskCalculator.groupRiskAfterOrder(command, context)
         val limit = context.account.totalEquityJpy.toBigDecimal()
             .multiply(config.maxRiskPerTradeRatio)
             .safetyScale()

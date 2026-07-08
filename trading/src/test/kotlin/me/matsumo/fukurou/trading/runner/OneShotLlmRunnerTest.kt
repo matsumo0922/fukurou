@@ -280,6 +280,33 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun exitDecision_closesSingleOpenPositionDuringHardHalt() = runBlocking {
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.EXIT).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        seedApprovedEntry(fixture)
+        fixture.runtime.riskStateRepository.setHardHalt("test hard halt", fixedInstant()).getOrThrow()
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
+        val closeEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "close_position"
+        }
+        val hardHaltRejections = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_REJECTED_BY_HARD_HALT
+        }
+
+        assertEquals(OneShotRunnerStatus.PAPER_EXIT_EXECUTED, result.status)
+        assertEquals(0, openPositions.size)
+        assertEquals(1, closeEvents.size)
+        assertEquals(0, hardHaltRejections.size)
+    }
+
+    @Test
     fun exitDecision_closesSingleOpenPositionWhenRestingEntryOrderAlsoExists() = runBlocking {
         val fixture = runnerFixture { command ->
             if (command.isProposerLaunch()) {

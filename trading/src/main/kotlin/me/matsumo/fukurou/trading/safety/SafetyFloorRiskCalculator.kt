@@ -38,7 +38,7 @@ internal class SafetyFloorRiskCalculator(
         val estimatedEntryPrice = estimatedEntryPrice(command, context)
         val groupRiskBeforeOrder = groupRiskBeforeOrder(context, targetTradeGroupId)
         val orderRisk = orderRisk(command, context)
-        val groupRiskAfterOrder = groupRiskBeforeOrder.add(orderRisk).safetyScale()
+        val groupRiskAfterOrder = groupRiskAfterOrder(command, context)
         val maxRiskPerTrade = context.account.totalEquityJpy.toBigDecimal()
             .multiply(config.maxRiskPerTradeRatio)
             .safetyScale()
@@ -98,6 +98,28 @@ internal class SafetyFloorRiskCalculator(
             .sumOf { order -> orderRisk(order, context) }
 
         return positionRisk.add(openOrderRisk).safetyScale()
+    }
+
+    /**
+     * 対象 trade group の注文後 risk を返す。ADD_LONG は merge 後の平均取得単価と STOP で評価する。
+     */
+    fun groupRiskAfterOrder(command: PlaceOrderCommand, context: SafetyFloorContext): BigDecimal {
+        val targetTradeGroupId = command.tradeGroupId?.toString()
+        val targetPositions = context.positions.filterTargetPositions(targetTradeGroupId)
+
+        if (targetPositions.isEmpty()) {
+            return groupRiskBeforeOrder(context, targetTradeGroupId)
+                .add(orderRisk(command, context))
+                .safetyScale()
+        }
+
+        val mergedPositionRisk = mergedPositionRisk(command, context, targetPositions)
+        val openOrderRisk = context.openOrders
+            .filterTargetOrders(targetTradeGroupId)
+            .filter { order -> order.side == OrderSide.BUY && order.status == OrderStatus.OPEN }
+            .sumOf { order -> orderRisk(order, context) }
+
+        return mergedPositionRisk.add(openOrderRisk).safetyScale()
     }
 
     /**
@@ -310,6 +332,37 @@ internal class SafetyFloorRiskCalculator(
             entryPrice = entryPrice,
             stopPrice = stopPrice,
             entryOrderType = order.orderType,
+            context = context,
+        )
+    }
+
+    private fun mergedPositionRisk(
+        command: PlaceOrderCommand,
+        context: SafetyFloorContext,
+        targetPositions: List<Position>,
+    ): BigDecimal {
+        val existingSize = targetPositions.sumOf { position -> position.sizeBtc.toBigDecimal() }
+        val commandEntryPrice = estimatedEntryPrice(command, context)
+        val mergedSize = existingSize.add(command.sizeBtc)
+        val weightedEntryTotal = targetPositions.sumOf { position ->
+            position.averageEntryPriceJpy.toBigDecimal().multiply(position.sizeBtc.toBigDecimal())
+        }.add(commandEntryPrice.multiply(command.sizeBtc))
+        val mergedEntryPrice = weightedEntryTotal.divide(
+            mergedSize,
+            SAFETY_SCALE,
+            RoundingMode.HALF_UP,
+        )
+        val stopCandidates = targetPositions
+            .mapNotNull { position -> position.currentStopLossJpy?.toBigDecimal() } + command.protectiveStopPriceJpy
+        val mergedStopPrice = stopCandidates
+            .maxOrNull()
+            ?: BigDecimal.ZERO
+
+        return tradeRisk(
+            sizeBtc = mergedSize,
+            entryPrice = mergedEntryPrice,
+            stopPrice = mergedStopPrice,
+            entryOrderType = OrderType.MARKET,
             context = context,
         )
     }

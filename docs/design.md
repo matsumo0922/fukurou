@@ -1681,7 +1681,7 @@ ECSR-R Framework
     "timeStopAt": "ISO-8601 datetime or null"
   },
   "exitPlan": {
-    "closeRatio": "0.00-1.00 decimal string",
+    "closeRatio": "0 < closeRatio <= 1.0 decimal string",
     "newStopLossJpy": "decimal string or null",
     "takeProfitJpy": "decimal string or null",
     "continueReasonJa": "保有継続理由 or null"

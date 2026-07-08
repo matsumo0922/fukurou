@@ -1398,7 +1398,7 @@ private suspend fun handleClosePosition(
     tradingRuntime: TradingRuntime,
     call: GuardedToolCall,
 ): CallToolResult {
-    val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
+    val result = tradingRuntime.toolCallGuard.runRiskReducingTradeTool(call) {
         val command = parseClosePositionCommand(request, call).getOrThrow()
 
         tradingRuntime.broker.closePosition(command).getOrThrow()

@@ -601,6 +601,53 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun place_order_add_long_group_risk_uses_merged_position_with_tightened_stop() = runBlocking {
+        val tradeGroupId = UUID.fromString("10000000-0000-0000-0000-000000000001")
+        val violationRepository = InMemorySafetyViolationRepository()
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc().copy(
+                btcQuantity = "0.005000000000",
+                btcMarkPriceJpy = "10100000.00000000",
+                totalEquityJpy = "100000.00000000",
+                equityPeakJpy = "100000.00000000",
+            ),
+            positions = listOf(
+                protectedPosition().copy(
+                    sizeBtc = "0.005000000000",
+                    currentStopLossJpy = "9600000.00000000",
+                    unrealizedR = "1.200000",
+                ),
+            ),
+            openOrders = listOf(
+                linkedStopOrder().copy(
+                    sizeBtc = "0.005000000000",
+                    triggerPriceJpy = "9600000.00000000",
+                ),
+            ),
+        )
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
+                sizeBtc = BigDecimal("0.0010"),
+                tradeGroupId = tradeGroupId,
+                protectiveStopPriceJpy = BigDecimal("9990000"),
+                takeProfitPriceJpy = BigDecimal("10600000"),
+                estimatedWinProbability = BigDecimal("0.99"),
+            ),
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
+        val position = broker.getPositions().getOrThrow().single()
+
+        assertTrue(result.accepted)
+        assertEquals("0.006000000000", position.sizeBtc)
+        assertEquals("9990000.00000000", position.currentStopLossJpy)
+        assertEquals(0, violationRepository.violations().size)
+    }
+
+    @Test
     fun safety_floor_rejects_add_long_when_pyramid_add_count_reaches_limit() = runBlocking {
         val tradeGroupId = UUID.fromString("10000000-0000-0000-0000-000000000001")
         val violationRepository = InMemorySafetyViolationRepository()
