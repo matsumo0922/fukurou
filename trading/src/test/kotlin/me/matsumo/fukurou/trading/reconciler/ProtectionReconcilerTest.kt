@@ -923,7 +923,7 @@ private fun reconcilerDecisionSubmission(command: PlaceOrderCommand): DecisionSu
 
 private fun reconcilerEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderCommand {
     return PlaceOrderCommand(
-        commandId = java.util.UUID.randomUUID(),
+        commandId = UUID.randomUUID(),
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
         orderType = OrderType.MARKET,
@@ -940,7 +940,7 @@ private fun reconcilerEntryCommand(takeProfitPriceJpy: BigDecimal): PlaceOrderCo
 
 private fun restingReconcilerEntryCommand(sizeBtc: BigDecimal = BigDecimal("0.0050")): PlaceOrderCommand {
     return PlaceOrderCommand(
-        commandId = java.util.UUID.randomUUID(),
+        commandId = UUID.randomUUID(),
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
         orderType = OrderType.LIMIT,

@@ -283,13 +283,13 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
     )
 }
 
-private fun me.matsumo.fukurou.trading.runtime.TradingRuntime.openRiskReader(): LlmDaemonOpenRiskReader {
+private fun TradingRuntime.openRiskReader(): LlmDaemonOpenRiskReader {
     return LlmDaemonOpenRiskReader {
         runCatching { hasOpenRisk() }
     }
 }
 
-private suspend fun me.matsumo.fukurou.trading.runtime.TradingRuntime.hasOpenRisk(): Boolean {
+private suspend fun TradingRuntime.hasOpenRisk(): Boolean {
     val positions = broker.getPositions().getOrThrow()
     val openOrders = broker.getOpenOrders().getOrThrow()
 
@@ -307,7 +307,7 @@ private fun GmoPublicMarketDataSource.tickerReader(tradingConfig: TradingBotConf
     }
 }
 
-private fun me.matsumo.fukurou.trading.runtime.TradingRuntime.positionsReader(): LlmDaemonPositionsReader {
+private fun TradingRuntime.positionsReader(): LlmDaemonPositionsReader {
     return LlmDaemonPositionsReader {
         broker.getPositions()
     }
