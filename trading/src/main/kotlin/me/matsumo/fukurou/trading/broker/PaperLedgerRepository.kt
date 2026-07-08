@@ -81,12 +81,27 @@ interface PaperLedgerExecutionRepository {
     suspend fun findExecutionsForStableFeed(cursor: StableFeedCursor, limit: Int): Result<List<Execution>>
 
     /**
+     * 指定 position に紐づく SELL execution を新しい順で返す。
+     */
+    suspend fun findSellExecutionsByPositionIds(positionIds: List<String>): Result<List<Execution>>
+
+    /**
      * 安定 cursor 条件に一致する execution Activity 行を、関連 context と一緒に新しい順で取得する。
      */
     suspend fun findExecutionActivitiesForStableFeed(
         cursor: StableFeedCursor,
         limit: Int,
     ): Result<List<ExecutionActivityRecord>>
+}
+
+/**
+ * paper ledger の order 履歴読み取り repository。
+ */
+interface PaperLedgerOrderRepository {
+    /**
+     * 指定 trade group に紐づく order 履歴を作成順で返す。
+     */
+    suspend fun findOrdersByTradeGroupId(tradeGroupId: UUID): Result<List<Order>>
 }
 
 /**
@@ -216,6 +231,7 @@ interface PaperLedgerMutationRepository {
 interface PaperLedgerRepository :
     PaperLedgerAccountRepository,
     PaperLedgerExecutionRepository,
+    PaperLedgerOrderRepository,
     PaperLedgerHistoryRepository,
     PaperLedgerMutationRepository
 
@@ -352,6 +368,7 @@ data class ReconcileProgress(
  * @param highestPrice entry 後最高価格
  * @param lowestPrice entry 後最安価格
  * @param unrealizedPnl 未実現損益
+ * @param unrealizedR 未実現 R
  * @param tightenedStop tighten 後の stop 価格
  */
 data class PositionMarkUpdate(
@@ -360,5 +377,6 @@ data class PositionMarkUpdate(
     val highestPrice: BigDecimal,
     val lowestPrice: BigDecimal,
     val unrealizedPnl: BigDecimal,
+    val unrealizedR: BigDecimal,
     val tightenedStop: BigDecimal?,
 )

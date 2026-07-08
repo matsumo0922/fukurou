@@ -13,6 +13,8 @@ import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.Execution
+import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
@@ -587,6 +589,379 @@ class PaperBrokerTest {
 
         assertTrue(updateResult.accepted)
         assertTrue(closeResult.accepted)
+    }
+
+    @Test
+    fun close_position_with_partial_ratio_keeps_position_open_and_reduces_stop_size() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc(),
+            positions = listOf(protectedPosition()),
+            openOrders = listOf(linkedStopOrder()),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val result = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                closeAll = false,
+                closeRatio = BigDecimal("0.50"),
+                reasonJa = "test partial close",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val position = broker.getPositions().getOrThrow().single()
+        val stopOrder = broker.getOpenOrders().getOrThrow().single()
+        val sellExecution = repository.getExecutions().getOrThrow().single()
+
+        assertTrue(result.accepted)
+        assertEquals("0.005000000000", position.sizeBtc)
+        assertEquals(PositionStatus.OPEN, position.status)
+        assertEquals("0.005000000000", stopOrder.sizeBtc)
+        assertEquals(OrderSide.SELL, sellExecution.side)
+        assertEquals("0.005000000000", sellExecution.sizeBtc)
+    }
+
+    @Test
+    fun close_position_with_partial_ratio_allows_missing_linked_stop_order() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc(),
+            positions = listOf(protectedPosition()),
+            openOrders = emptyList(),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val result = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                closeAll = false,
+                closeRatio = BigDecimal("0.50"),
+                reasonJa = "test partial close without stop",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val position = broker.getPositions().getOrThrow().single()
+        val sellExecution = repository.getExecutions().getOrThrow().single()
+
+        assertTrue(result.accepted)
+        assertEquals("0.005000000000", position.sizeBtc)
+        assertEquals(0, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(OrderSide.SELL, sellExecution.side)
+    }
+
+    @Test
+    fun close_position_promotes_dust_remainder_to_full_close() = runBlocking {
+        val tinyPosition = protectedPosition().copy(sizeBtc = "0.000250000000")
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc().copy(btcQuantity = "0.000250000000"),
+            positions = listOf(tinyPosition),
+            openOrders = listOf(linkedStopOrder().copy(sizeBtc = "0.000250000000")),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val result = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                closeAll = false,
+                closeRatio = BigDecimal("0.80"),
+                reasonJa = "test dust close",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val closedPosition = repository.getAllPositionsForTest().single()
+        val sellExecution = repository.getExecutions().getOrThrow().single()
+
+        assertTrue(result.accepted)
+        assertEquals(0, broker.getPositions().getOrThrow().size)
+        assertEquals(PositionStatus.CLOSED, closedPosition.status)
+        assertEquals("0.000250000000", sellExecution.sizeBtc)
+    }
+
+    @Test
+    fun place_order_add_long_merges_into_existing_position_and_tightens_stop() = runBlocking {
+        val tradeGroupId = UUID.fromString("10000000-0000-0000-0000-000000000001")
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = highEquityAccountSnapshotWithBtc(),
+            positions = listOf(protectedPosition().copy(unrealizedR = "1.200000")),
+            openOrders = listOf(linkedStopOrder()),
+        )
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
+                sizeBtc = BigDecimal("0.0010"),
+                tradeGroupId = tradeGroupId,
+                protectiveStopPriceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10600000"),
+                estimatedWinProbability = BigDecimal("0.99"),
+            ),
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
+        val position = broker.getPositions().getOrThrow().single()
+        val stopOrder = broker.getOpenOrders().getOrThrow().single()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertTrue(result.accepted)
+        assertEquals(1, broker.getPositions().getOrThrow().size)
+        assertEquals("0.011000000000", position.sizeBtc)
+        assertEquals("10000454.54545455", position.averageEntryPriceJpy)
+        assertEquals(1, position.pyramidAddCount)
+        assertEquals("9900000.00000000", position.currentStopLossJpy)
+        assertEquals("0.011000000000", stopOrder.sizeBtc)
+        assertEquals("9900000.00000000", stopOrder.triggerPriceJpy)
+        assertEquals(listOf(OrderSide.BUY), executions.map { execution -> execution.side })
+    }
+
+    @Test
+    fun place_order_add_long_group_risk_uses_merged_position_with_tightened_stop() = runBlocking {
+        val tradeGroupId = UUID.fromString("10000000-0000-0000-0000-000000000001")
+        val violationRepository = InMemorySafetyViolationRepository()
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc().copy(
+                btcQuantity = "0.005000000000",
+                btcMarkPriceJpy = "10100000.00000000",
+                totalEquityJpy = "100000.00000000",
+                equityPeakJpy = "100000.00000000",
+            ),
+            positions = listOf(
+                protectedPosition().copy(
+                    sizeBtc = "0.005000000000",
+                    currentStopLossJpy = "9600000.00000000",
+                    unrealizedR = "1.200000",
+                ),
+            ),
+            openOrders = listOf(
+                linkedStopOrder().copy(
+                    sizeBtc = "0.005000000000",
+                    triggerPriceJpy = "9600000.00000000",
+                ),
+            ),
+        )
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
+                sizeBtc = BigDecimal("0.0010"),
+                tradeGroupId = tradeGroupId,
+                protectiveStopPriceJpy = BigDecimal("9990000"),
+                takeProfitPriceJpy = BigDecimal("10600000"),
+                estimatedWinProbability = BigDecimal("0.99"),
+            ),
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
+        val position = broker.getPositions().getOrThrow().single()
+
+        assertTrue(result.accepted)
+        assertEquals("0.006000000000", position.sizeBtc)
+        assertEquals("9990000.00000000", position.currentStopLossJpy)
+        assertEquals(0, violationRepository.violations().size)
+    }
+
+    @Test
+    fun safety_floor_rejects_add_long_when_pyramid_add_count_reaches_limit() = runBlocking {
+        val tradeGroupId = UUID.fromString("10000000-0000-0000-0000-000000000001")
+        val violationRepository = InMemorySafetyViolationRepository()
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc(),
+            positions = listOf(protectedPosition().copy(pyramidAddCount = 2, unrealizedR = "3.000000")),
+            openOrders = listOf(linkedStopOrder()),
+        )
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
+                sizeBtc = BigDecimal("0.0010"),
+                tradeGroupId = tradeGroupId,
+                protectiveStopPriceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10600000"),
+                estimatedWinProbability = BigDecimal("0.99"),
+            ),
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
+
+        assertFalse(result.accepted)
+        assertEquals(SafetyFloorRule.PYRAMID_ADD_LIMIT, result.safetyViolation?.rule)
+        assertEquals("0.010000000000", broker.getPositions().getOrThrow().single().sizeBtc)
+    }
+
+    @Test
+    fun safety_floor_rejects_add_long_without_required_unrealized_r() = runBlocking {
+        val tradeGroupId = UUID.fromString("10000000-0000-0000-0000-000000000001")
+        val violationRepository = InMemorySafetyViolationRepository()
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc(),
+            positions = listOf(protectedPosition().copy(pyramidAddCount = 1, unrealizedR = "1.500000")),
+            openOrders = listOf(linkedStopOrder()),
+        )
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
+                sizeBtc = BigDecimal("0.0010"),
+                tradeGroupId = tradeGroupId,
+                protectiveStopPriceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10600000"),
+                estimatedWinProbability = BigDecimal("0.99"),
+            ),
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
+
+        assertFalse(result.accepted)
+        assertEquals(SafetyFloorRule.PYRAMID_PROFIT_GATE, result.safetyViolation?.rule)
+    }
+
+    @Test
+    fun safety_floor_rejects_add_long_when_add_risk_exceeds_half_initial_budget() = runBlocking {
+        val tradeGroupId = UUID.fromString("10000000-0000-0000-0000-000000000001")
+        val violationRepository = InMemorySafetyViolationRepository()
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshotWithBtc(),
+            positions = listOf(protectedPosition().copy(sizeBtc = "0.001000000000", unrealizedR = "1.200000")),
+            openOrders = listOf(linkedStopOrder().copy(sizeBtc = "0.001000000000")),
+        )
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
+                sizeBtc = BigDecimal("0.0030"),
+                tradeGroupId = tradeGroupId,
+                protectiveStopPriceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10600000"),
+                estimatedWinProbability = BigDecimal("0.99"),
+            ),
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
+
+        assertFalse(result.accepted)
+        assertEquals(SafetyFloorRule.PYRAMID_ADD_RISK_LIMIT, result.safetyViolation?.rule)
+    }
+
+    @Test
+    fun safety_floor_uses_initial_entry_risk_budget_for_second_add_long() = runBlocking {
+        val tradeGroupId = UUID.fromString("10000000-0000-0000-0000-000000000001")
+        val initialOrderId = "20000000-0000-0000-0000-000000000010"
+        val violationRepository = InMemorySafetyViolationRepository()
+        val initialEntryOrder = order(
+            orderId = initialOrderId,
+            positionId = "00000000-0000-0000-0000-000000000001",
+            tradeGroupId = tradeGroupId.toString(),
+            orderType = OrderType.MARKET,
+            side = OrderSide.BUY,
+            status = OrderStatus.FILLED,
+        ).copy(
+            sizeBtc = "0.001000000000",
+            protectiveStopPriceJpy = "9900000.00000000",
+            createdAt = fixedInstant().minusSeconds(120).toString(),
+        )
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = highEquityAccountSnapshotWithBtc(),
+            positions = listOf(
+                protectedPosition().copy(
+                    sizeBtc = "0.003000000000",
+                    currentStopLossJpy = "9900000.00000000",
+                    pyramidAddCount = 1,
+                    unrealizedR = "2.200000",
+                ),
+            ),
+            openOrders = listOf(
+                initialEntryOrder,
+                linkedStopOrder().copy(
+                    sizeBtc = "0.003000000000",
+                    triggerPriceJpy = "9900000.00000000",
+                ),
+            ),
+            executions = listOf(initialBuyExecution(orderId = initialOrderId)),
+        )
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
+                sizeBtc = BigDecimal("0.0010"),
+                tradeGroupId = tradeGroupId,
+                protectiveStopPriceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10600000"),
+                estimatedWinProbability = BigDecimal("0.99"),
+            ),
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
+
+        assertFalse(result.accepted)
+        assertEquals(SafetyFloorRule.PYRAMID_ADD_RISK_LIMIT, result.safetyViolation?.rule)
+    }
+
+    @Test
+    fun hard_halt_allows_close_position_as_risk_reducing_operation() = runBlocking {
+        val riskStateRepository = InMemoryRiskStateRepository(
+            clock = fixedClock(),
+            initialState = RiskState(
+                state = RiskHaltState.HARD_HALT,
+                drawdownRatio = BigDecimal("-0.2000000000"),
+                equityPeak = BigDecimal("100000"),
+                haltReason = "test hard halt",
+                haltAt = fixedInstant(),
+                updatedAt = fixedInstant(),
+            ),
+        )
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = drawdownAccountSnapshotWithBtc(),
+            positions = listOf(protectedPosition()),
+            openOrders = listOf(linkedStopOrder()),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        val result = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
+                closeAll = false,
+                closeRatio = BigDecimal("0.25"),
+                reasonJa = "test reduce during hard halt",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+
+        assertTrue(result.accepted)
+        assertEquals("0.007500000000", broker.getPositions().getOrThrow().single().sizeBtc)
     }
 
     @Test
@@ -1435,6 +1810,13 @@ private fun highEquityLowCashAccountSnapshot(): AccountSnapshot {
     )
 }
 
+private fun highEquityAccountSnapshotWithBtc(): AccountSnapshot {
+    return accountSnapshotWithBtc().copy(
+        totalEquityJpy = "200000.00000000",
+        equityPeakJpy = "200000.00000000",
+    )
+}
+
 private fun drawdownAccountSnapshotWithBtc(): AccountSnapshot {
     return accountSnapshot().copy(
         cashJpy = "49000.00000000",
@@ -1578,6 +1960,23 @@ private fun order(
         clientRequestId = null,
         createdAt = fixedInstant().toString(),
         updatedAt = fixedInstant().toString(),
+    )
+}
+
+private fun initialBuyExecution(orderId: String): Execution {
+    return Execution(
+        executionId = "30000000-0000-0000-0000-000000000010",
+        orderId = orderId,
+        positionId = "00000000-0000-0000-0000-000000000001",
+        symbol = "BTC",
+        mode = TradingMode.PAPER,
+        side = OrderSide.BUY,
+        priceJpy = "10000000.00000000",
+        sizeBtc = "0.001000000000",
+        feeJpy = "5.00000000",
+        realizedPnlJpy = "0.00000000",
+        liquidity = ExecutionLiquidity.TAKER,
+        executedAt = fixedInstant().minusSeconds(119).toString(),
     )
 }
 

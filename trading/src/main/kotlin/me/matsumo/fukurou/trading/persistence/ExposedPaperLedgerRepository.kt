@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.broker.PaperLedgerAccountRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerExecutionRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerHistoryRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerMutationRepository
+import me.matsumo.fukurou.trading.broker.PaperLedgerOrderRepository
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
 import me.matsumo.fukurou.trading.config.PaperMarketConfig
@@ -441,6 +442,41 @@ private const val SELECT_EXECUTIONS_BY_POSITION_IDS_SUFFIX = """
 """
 
 /**
+ * position IDs に対応する SELL executions を読む SQL prefix。
+ */
+private const val SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_PREFIX = """
+    SELECT
+        id,
+        order_id,
+        position_id,
+        mode,
+        symbol,
+        side,
+        price_jpy,
+        size_btc,
+        fee_jpy,
+        realized_pnl_jpy,
+        liquidity,
+        executed_at
+    FROM executions
+    WHERE position_id IN (
+"""
+
+/**
+ * position IDs に対応する SELL executions を読む SQL suffix。
+ */
+private const val SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_SUFFIX = """
+    )
+        AND side = ?
+        AND mode = (
+            SELECT mode
+            FROM paper_account
+            WHERE id = ?
+        )
+    ORDER BY executed_at DESC
+"""
+
+/**
  * execution ledger を読む SQL。
  */
 private const val SELECT_EXECUTIONS_SQL = """
@@ -752,6 +788,10 @@ private class ExposedPaperLedgerExecutionReader(
         ) { selectExecutionsForStableFeed(cursor, limit) }
     }
 
+    override suspend fun findSellExecutionsByPositionIds(positionIds: List<String>): Result<List<Execution>> {
+        return readLedgerResult(database) { selectSellExecutionsByPositionIds(positionIds) }
+    }
+
     override suspend fun findExecutionActivitiesForStableFeed(
         cursor: StableFeedCursor,
         limit: Int,
@@ -764,6 +804,19 @@ private class ExposedPaperLedgerExecutionReader(
                 }
             },
         ) { selectExecutionActivitiesForStableFeed(cursor, limit) }
+    }
+}
+
+/**
+ * Exposed/JDBC で paper ledger の order 履歴を読む repository。
+ *
+ * @param database Exposed database
+ */
+private class ExposedPaperLedgerOrderReader(
+    private val database: ExposedDatabase,
+) : PaperLedgerOrderRepository {
+    override suspend fun findOrdersByTradeGroupId(tradeGroupId: UUID): Result<List<Order>> {
+        return readLedgerResult(database) { selectOrdersByTradeGroupId(tradeGroupId.toString()) }
     }
 }
 
@@ -811,10 +864,12 @@ class ExposedPaperLedgerRepository private constructor(
     private val writer: ExposedPaperLedgerWriter,
     accountRepository: PaperLedgerAccountRepository,
     executionRepository: PaperLedgerExecutionRepository,
+    orderRepository: PaperLedgerOrderRepository,
     historyRepository: PaperLedgerHistoryRepository,
 ) : IntentConsumingPaperLedgerRepository,
     PaperLedgerAccountRepository by accountRepository,
     PaperLedgerExecutionRepository by executionRepository,
+    PaperLedgerOrderRepository by orderRepository,
     PaperLedgerHistoryRepository by historyRepository,
     PaperLedgerMutationRepository by writer {
 
@@ -825,6 +880,7 @@ class ExposedPaperLedgerRepository private constructor(
         writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules),
         accountRepository = ExposedPaperLedgerAccountReader(database),
         executionRepository = ExposedPaperLedgerExecutionReader(database),
+        orderRepository = ExposedPaperLedgerOrderReader(database),
         historyRepository = ExposedPaperLedgerHistoryReader(database),
     )
 
@@ -1073,6 +1129,24 @@ private fun JdbcTransaction.selectExecutionsByPositionIds(positionIds: List<Stri
         }
         statement.setInt(positionIds.size + 1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.setInt(positionIds.size + 2, MAX_EXECUTIONS_PER_CLOSED_POSITION)
+        statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
+    }
+}
+
+private fun JdbcTransaction.selectSellExecutionsByPositionIds(positionIds: List<String>): List<Execution> {
+    if (positionIds.isEmpty()) {
+        return emptyList()
+    }
+
+    val placeholders = positionIds.joinToString(separator = ",") { "?" }
+    val sql = "$SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_PREFIX$placeholders$SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_SUFFIX"
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        positionIds.forEachIndexed { index, positionId ->
+            statement.setObject(index + 1, UUID.fromString(positionId))
+        }
+        statement.setString(positionIds.size + 1, OrderSide.SELL.name)
+        statement.setInt(positionIds.size + 2, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
     }
 }

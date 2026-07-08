@@ -265,11 +265,13 @@ data class OpsDecisionResponse(
  *
  * @param positions open position 一覧
  * @param openOrders open order 一覧
+ * @param sellExecutions open position に紐づく SELL execution 一覧
  */
 @Serializable
 data class OpsPositionsResponse(
     val positions: List<Position>,
     val openOrders: List<Order>,
+    val sellExecutions: List<OpsExecutionResponse>,
 )
 
 /**
@@ -1221,16 +1223,20 @@ private fun Route.registerOpsPositionsRoute(dependencies: OpsRouteDependencies) 
         val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
         val positions = repository.getOpenPositions().getOrThrow()
         val openOrders = repository.getOpenOrders().getOrThrow()
+        val openPositionIds = positions.map { position -> position.positionId }
+        val sellExecutions = repository.findSellExecutionsByPositionIds(openPositionIds)
+            .getOrThrow()
 
         call.respond(
             OpsPositionsResponse(
                 positions = positions,
                 openOrders = openOrders,
+                sellExecutions = sellExecutions.map { execution -> execution.toOpsExecutionResponse() },
             ),
         )
     }.describe {
         summary = "open position と open order の raw feed を取得する"
-        description = "paper ledger の open position と open order を集計せずに返します。"
+        description = "paper ledger の open position、open order、open position に紐づく SELL execution を集計せずに返します。"
         tag(OPS_TAG)
         responses {
             HttpStatusCode.OK {

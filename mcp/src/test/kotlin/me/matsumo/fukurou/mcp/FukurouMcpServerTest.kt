@@ -818,6 +818,44 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun closePositionTool_allowsRiskReducingCloseDuringHardHalt() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = PreviewMarketDataSource,
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = PreviewMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+        val intentId = submitApprovedEnterIntent(server)
+        val placeOrderResult = callTool(server, "place_order", placeOrderArguments(intentId))
+
+        assertTrue(placeOrderResult.isError != true)
+
+        val positionId = runtime.broker.getPositions().getOrThrow().single().positionId
+
+        runtime.riskStateRepository.setHardHalt("test hard halt", fixedInstant()).getOrThrow()
+
+        val closeResult = callTool(
+            server = server,
+            toolName = "close_position",
+            arguments = closePositionArguments(
+                positionId = positionId,
+                closeRatio = "0.50",
+            ),
+        )
+        val structuredContent = assertNotNull(closeResult.structuredContent)
+        val remainingPosition = runtime.broker.getPositions().getOrThrow().single()
+        val eventTypes = (runtime.commandEventLog as InMemoryCommandEventLog).events().map { event -> event.eventType }
+
+        assertTrue(closeResult.isError != true)
+        assertEquals(true, structuredContent.getValue("accepted").jsonPrimitive.booleanOrNull)
+        assertEquals("0.002500000000", remainingPosition.sizeBtc)
+        assertTrue(!eventTypes.contains(CommandEventType.TOOL_CALL_REJECTED_BY_HARD_HALT))
+    }
+
+    @Test
     fun submitFalsificationTool_rejectsMissingIntentId() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
@@ -1355,6 +1393,12 @@ private fun placeOrderArguments(intentId: String, sizeBtc: String = "0.0050") = 
     put("take_profit_price_jpy", "10500000")
     put("estimated_win_probability", "0.73")
     put("reason", "preview test order")
+}
+
+private fun closePositionArguments(positionId: String, closeRatio: String? = null) = buildJsonObject {
+    put("position_id", positionId)
+    closeRatio?.let { value -> put("close_ratio", value) }
+    put("reason", "hard halt reduce test")
 }
 
 /**

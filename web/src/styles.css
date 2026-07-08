@@ -1127,6 +1127,10 @@ a:focus-visible {
   background: var(--line);
 }
 
+.compact-list__row--positions {
+  grid-template-columns: minmax(70px, 0.7fr) minmax(120px, 1fr) minmax(110px, 1fr) minmax(130px, 1fr) minmax(180px, 1.6fr);
+}
+
 .compact-list__row > span {
   min-width: 0;
   background: var(--surface-muted);

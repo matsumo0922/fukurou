@@ -280,6 +280,33 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun exitDecision_closesSingleOpenPositionDuringHardHalt() = runBlocking {
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.EXIT).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        seedApprovedEntry(fixture)
+        fixture.runtime.riskStateRepository.setHardHalt("test hard halt", fixedInstant()).getOrThrow()
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
+        val closeEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "close_position"
+        }
+        val hardHaltRejections = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_REJECTED_BY_HARD_HALT
+        }
+
+        assertEquals(OneShotRunnerStatus.PAPER_EXIT_EXECUTED, result.status)
+        assertEquals(0, openPositions.size)
+        assertEquals(1, closeEvents.size)
+        assertEquals(0, hardHaltRejections.size)
+    }
+
+    @Test
     fun exitDecision_closesSingleOpenPositionWhenRestingEntryOrderAlsoExists() = runBlocking {
         val fixture = runnerFixture { command ->
             if (command.isProposerLaunch()) {
@@ -296,6 +323,7 @@ class OneShotLlmRunnerTest {
                 priceJpy = BigDecimal("9900000"),
                 sizeBtc = BigDecimal("0.0010"),
             ),
+            tradeGroupId = UUID.randomUUID(),
         )
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
@@ -355,10 +383,12 @@ class OneShotLlmRunnerTest {
         seedApprovedEntry(
             fixture = fixture,
             entryIntent = entryIntentDraft(sizeBtc = BigDecimal("0.0010")),
+            tradeGroupId = UUID.randomUUID(),
         )
         seedApprovedEntry(
             fixture = fixture,
             entryIntent = entryIntentDraft(sizeBtc = BigDecimal("0.0010")),
+            tradeGroupId = UUID.randomUUID(),
         )
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
@@ -1852,6 +1882,7 @@ private fun openPosition(
 private suspend fun seedApprovedEntry(
     fixture: RunnerFixture,
     entryIntent: EntryIntentDraft = entryIntentDraft(),
+    tradeGroupId: UUID? = null,
 ): DecisionSubmissionResult {
     val decision = fixture.decisionRepository.submitDecision(
         seedEntryDecisionSubmission(entryIntent),
@@ -1866,7 +1897,7 @@ private suspend fun seedApprovedEntry(
         ),
     ).getOrThrow()
 
-    fixture.runtime.broker.placeOrder(intent.toSeedPlaceOrderCommand()).getOrThrow()
+    fixture.runtime.broker.placeOrder(intent.toSeedPlaceOrderCommand(tradeGroupId)).getOrThrow()
 
     return decision
 }
@@ -1894,7 +1925,7 @@ private fun seedEntryDecisionSubmission(entryIntent: EntryIntentDraft): Decision
     )
 }
 
-private fun TradeIntentRecord.toSeedPlaceOrderCommand(): PlaceOrderCommand {
+private fun TradeIntentRecord.toSeedPlaceOrderCommand(tradeGroupId: UUID? = null): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
         intentId = intentId,
@@ -1903,7 +1934,7 @@ private fun TradeIntentRecord.toSeedPlaceOrderCommand(): PlaceOrderCommand {
         orderType = draft.orderType,
         sizeBtc = draft.sizeBtc,
         priceJpy = draft.priceJpy,
-        tradeGroupId = null,
+        tradeGroupId = tradeGroupId,
         protectiveStopPriceJpy = draft.protectiveStopPriceJpy,
         takeProfitPriceJpy = draft.takeProfitPriceJpy,
         estimatedWinProbability = estimatedWinProbability,

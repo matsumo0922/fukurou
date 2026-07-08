@@ -15,7 +15,7 @@ object EvaluationMath {
      * closed trade fact へ R 系指標を付与する。
      */
     fun evaluateTrade(fact: ClosedTradeFact): EvaluatedTrade {
-        val riskWidth = fact.initialProtectiveStopPriceJpy
+        val riskWidth = fact.entryWeightedProtectiveStopPriceJpy
             ?.let { stopPrice -> fact.averageEntryPriceJpy.subtract(stopPrice) }
             ?.takeIf { width -> width > BigDecimal.ZERO }
         val riskAmount = riskWidth

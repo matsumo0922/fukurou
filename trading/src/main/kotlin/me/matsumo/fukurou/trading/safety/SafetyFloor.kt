@@ -8,6 +8,7 @@ import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.EntryIntentSafetySnapshot
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
+import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
@@ -41,6 +42,21 @@ enum class SafetyFloorRule {
      * 含み損の long position に買い増そうとした。
      */
     NO_AVERAGING_DOWN,
+
+    /**
+     * ピラミッディングの最大追加回数を超えた。
+     */
+    PYRAMID_ADD_LIMIT,
+
+    /**
+     * ピラミッディングに必要な含み益 R に届かなかった。
+     */
+    PYRAMID_PROFIT_GATE,
+
+    /**
+     * ピラミッディング追加分の risk が初回 risk budget の 50% を超えた。
+     */
+    PYRAMID_ADD_RISK_LIMIT,
 
     /**
      * equity peak からの drawdown が HARD_HALT 閾値へ到達した。
@@ -261,6 +277,8 @@ data class DataQualityCapConfig(
  * @param riskState DB risk_state snapshot
  * @param positions open position 一覧
  * @param openOrders open order 一覧
+ * @param tradeGroupOrders 評価対象 trade group に紐づく order 履歴
+ * @param tradeGroupExecutions 評価対象 trade group に紐づく execution 履歴
  * @param ticker 最新 ticker
  * @param symbolRules 取引所 symbol rule
  * @param entryIntent entry intent / falsification / consumption snapshot
@@ -272,6 +290,8 @@ data class SafetyFloorContext(
     val riskState: RiskState,
     val positions: List<Position>,
     val openOrders: List<Order>,
+    val tradeGroupOrders: List<Order> = emptyList(),
+    val tradeGroupExecutions: List<Execution> = emptyList(),
     val ticker: Ticker,
     val symbolRules: SymbolRules,
     val entryIntent: EntryIntentSafetySnapshot? = null,
@@ -411,6 +431,7 @@ class SafetyFloor(
         validateFalsifierGate(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateStopLoss(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateNoAveragingDown(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validatePyramidingGates(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateSymbolFeeRates(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateGroupRisk(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateTotalExposure(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
@@ -459,11 +480,10 @@ class SafetyFloor(
     }
 
     /**
-     * close_position の実行前に HARD_HALT 到達だけを検証する。
+     * close_position は risk-reducing 操作なので HARD_HALT 中も許可する。
      */
+    @Suppress("UnusedParameter")
     fun evaluateClosePosition(command: ClosePositionCommand, context: SafetyFloorContext): SafetyFloorVerdict {
-        detectHardHalt(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
-
         return SafetyFloorVerdict.Accepted
     }
 
@@ -482,10 +502,6 @@ class SafetyFloor(
 
     private fun detectHardHalt(command: UpdateProtectionCommand, context: SafetyFloorContext): SafetyViolation? {
         return detectHardHalt(commandName = "update_protection", command = command, context = context)
-    }
-
-    private fun detectHardHalt(command: ClosePositionCommand, context: SafetyFloorContext): SafetyViolation? {
-        return detectHardHalt(commandName = "close_position", command = command, context = context)
     }
 
     private fun detectHardHalt(command: CancelOrderCommand, context: SafetyFloorContext): SafetyViolation? {
@@ -667,11 +683,117 @@ class SafetyFloor(
         )
     }
 
-    private fun validateGroupRisk(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
-        val targetTradeGroupId = command.tradeGroupId?.toString()
-        val groupRisk = riskCalculator.groupRiskBeforeOrder(context, targetTradeGroupId)
-            .add(riskCalculator.orderRisk(command, context))
+    private fun validatePyramidingGates(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
+        val targetTradeGroupId = command.tradeGroupId?.toString() ?: return null
+        val targetPositions = context.positions.filterTargetPositions(targetTradeGroupId)
+
+        if (targetPositions.isEmpty()) {
+            return null
+        }
+
+        validatePyramidStopTightening(command, targetPositions)?.let { violation -> return violation }
+        validatePyramidAddCount(command, targetPositions)?.let { violation -> return violation }
+        validatePyramidProfit(command, targetPositions)?.let { violation -> return violation }
+        validatePyramidAddRisk(command, context, targetTradeGroupId)?.let { violation -> return violation }
+
+        return null
+    }
+
+    private fun validatePyramidStopTightening(
+        command: PlaceOrderCommand,
+        targetPositions: List<Position>,
+    ): SafetyViolation? {
+        val loosenedPosition = targetPositions.firstOrNull { position ->
+            val currentStop = position.currentStopLossJpy?.toBigDecimal()
+
+            currentStop != null && command.protectiveStopPriceJpy < currentStop
+        } ?: return null
+        val currentStop = requireNotNull(loosenedPosition.currentStopLossJpy)
+
+        return violation(
+            commandName = "place_order",
+            command = command,
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.STOP_LOSS_LOOSENING,
+                messageJa = "ADD_LONG の protective_stop_price_jpy は既存 STOP を損失拡大方向へ緩められません。",
+                measuredValue = command.protectiveStopPriceJpy.toPlainString(),
+                limitValue = ">=${currentStop.toBigDecimal().toPlainString()}",
+            ),
+        )
+    }
+
+    private fun validatePyramidAddCount(
+        command: PlaceOrderCommand,
+        targetPositions: List<Position>,
+    ): SafetyViolation? {
+        val maxAddCount = targetPositions.maxOf { position -> position.pyramidAddCount }
+
+        if (maxAddCount < MAX_PYRAMID_ADD_COUNT) {
+            return null
+        }
+
+        return violation(
+            commandName = "place_order",
+            command = command,
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.PYRAMID_ADD_LIMIT,
+                messageJa = "ピラミッディング追加回数が上限 2 回に達しているため、ADD_LONG を拒否します。",
+                measuredValue = maxAddCount.toString(),
+                limitValue = "<$MAX_PYRAMID_ADD_COUNT",
+            ),
+        )
+    }
+
+    private fun validatePyramidProfit(command: PlaceOrderCommand, targetPositions: List<Position>): SafetyViolation? {
+        val insufficientPosition = targetPositions.firstOrNull { position ->
+            val requiredR = BigDecimal(position.pyramidAddCount + 1)
+
+            position.unrealizedR.toBigDecimal() < requiredR
+        } ?: return null
+        val requiredR = BigDecimal(insufficientPosition.pyramidAddCount + 1)
+
+        return violation(
+            commandName = "place_order",
+            command = command,
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.PYRAMID_PROFIT_GATE,
+                messageJa = "含み益 R がピラミッディング条件に届かないため、ADD_LONG を拒否します。",
+                measuredValue = insufficientPosition.unrealizedR,
+                limitValue = ">=${requiredR.toPlainString()}",
+            ),
+        )
+    }
+
+    private fun validatePyramidAddRisk(
+        command: PlaceOrderCommand,
+        context: SafetyFloorContext,
+        targetTradeGroupId: String,
+    ): SafetyViolation? {
+        val addRisk = riskCalculator.orderRisk(command, context)
+        val initialRiskBudget = riskCalculator.initialTradeGroupRiskBudget(context, targetTradeGroupId)
+            ?: riskCalculator.groupRiskBeforeOrder(context, targetTradeGroupId)
+        val addRiskLimit = initialRiskBudget
+            .multiply(PYRAMID_ADD_RISK_RATIO)
             .safetyScale()
+
+        if (addRisk <= addRiskLimit) {
+            return null
+        }
+
+        return violation(
+            commandName = "place_order",
+            command = command,
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.PYRAMID_ADD_RISK_LIMIT,
+                messageJa = "ADD_LONG の追加 risk が初回 risk budget の 50% を超えるため拒否します。",
+                measuredValue = addRisk.toPlainString(),
+                limitValue = addRiskLimit.toPlainString(),
+            ),
+        )
+    }
+
+    private fun validateGroupRisk(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
+        val groupRisk = riskCalculator.groupRiskAfterOrder(command, context)
         val limit = context.account.totalEquityJpy.toBigDecimal()
             .multiply(config.maxRiskPerTradeRatio)
             .safetyScale()
@@ -1120,6 +1242,16 @@ private fun violationPayload(
  * SafetyFloor 計算 scale。
  */
 internal const val SAFETY_SCALE = 8
+
+/**
+ * ピラミッディングの最大追加回数。
+ */
+private const val MAX_PYRAMID_ADD_COUNT = 2
+
+/**
+ * 追加 risk の初回 risk budget に対する上限比率。
+ */
+private val PYRAMID_ADD_RISK_RATIO = BigDecimal("0.50")
 
 /**
  * bps 分母。

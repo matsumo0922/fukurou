@@ -936,6 +936,7 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         return jsonResponse({
           positions: [],
           openOrders: [],
+          sellExecutions: [],
         });
       case "/ops/executions":
         return jsonResponse({

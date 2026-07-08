@@ -567,7 +567,7 @@ private fun closedTrade(
         closedAt = FIXED_INSTANT.plusSeconds(7_200),
         sizeBtc = BigDecimal("0.005"),
         averageEntryPriceJpy = BigDecimal("10000000"),
-        initialProtectiveStopPriceJpy = BigDecimal("9700000"),
+        entryWeightedProtectiveStopPriceJpy = BigDecimal("9700000"),
         highestPriceSinceEntryJpy = BigDecimal("10100000"),
         lowestPriceSinceEntryJpy = BigDecimal("9990000"),
         tradePnlJpy = tradePnlJpy,

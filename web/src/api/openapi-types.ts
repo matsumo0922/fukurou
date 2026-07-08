@@ -1329,7 +1329,7 @@ export interface paths {
         };
         /**
          * open position と open order の raw feed を取得する
-         * @description paper ledger の open position と open order を集計せずに返します。
+         * @description paper ledger の open position、open order、open position に紐づく SELL execution を集計せずに返します。
          */
         get: {
             parameters: {
@@ -1830,6 +1830,7 @@ export interface components {
         OpsPositionsResponse: {
             positions: components["schemas"]["Position"][];
             openOrders: components["schemas"]["Order"][];
+            sellExecutions: components["schemas"]["OpsExecutionResponse"][];
         };
         /** OpsAuditEventResponse */
         OpsAuditEventResponse: {

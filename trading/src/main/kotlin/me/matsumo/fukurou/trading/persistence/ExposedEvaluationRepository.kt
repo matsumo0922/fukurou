@@ -36,8 +36,6 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
             p.id,
             p.opened_at,
             p.closed_at,
-            p.size_btc,
-            p.average_entry_price_jpy,
             p.highest_price_since_entry_jpy,
             p.lowest_price_since_entry_jpy
         FROM positions p
@@ -63,6 +61,18 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
             AND o.intent_id IS NOT NULL
         ORDER BY o.position_id, o.created_at ASC
     ),
+    entry_fills AS (
+        SELECT
+            e.position_id,
+            SUM(e.size_btc) AS entry_size_btc,
+            SUM(e.price_jpy * e.size_btc) / NULLIF(SUM(e.size_btc), 0) AS average_entry_price_jpy,
+            SUM(o.protective_stop_price_jpy * e.size_btc) / NULLIF(SUM(e.size_btc), 0) AS protective_stop_price_jpy
+        FROM executions e
+        JOIN orders o ON o.id = e.order_id
+        JOIN closed_positions p ON p.id = e.position_id
+        WHERE e.side = 'BUY'
+        GROUP BY e.position_id
+    ),
     position_pnl AS (
         SELECT
             e.position_id,
@@ -76,9 +86,9 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         p.id AS position_id,
         p.opened_at,
         p.closed_at,
-        p.size_btc,
-        p.average_entry_price_jpy,
-        eo.protective_stop_price_jpy,
+        COALESCE(ef.entry_size_btc, 0) AS size_btc,
+        COALESCE(ef.average_entry_price_jpy, 0) AS average_entry_price_jpy,
+        COALESCE(ef.protective_stop_price_jpy, eo.protective_stop_price_jpy) AS protective_stop_price_jpy,
         p.highest_price_since_entry_jpy,
         p.lowest_price_since_entry_jpy,
         COALESCE(position_pnl.sell_realized_pnl_jpy, 0) - COALESCE(position_pnl.entry_fee_jpy, 0) AS trade_pnl_jpy,
@@ -87,6 +97,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         d.llm_provider
     FROM closed_positions p
     LEFT JOIN entry_orders eo ON eo.position_id = p.id
+    LEFT JOIN entry_fills ef ON ef.position_id = p.id
     LEFT JOIN position_pnl ON position_pnl.position_id = p.id
     LEFT JOIN trade_intents ti ON ti.id = eo.intent_id
     LEFT JOIN decisions d ON d.id = ti.decision_id
@@ -474,7 +485,7 @@ private fun ResultSet.toClosedTradeFact(): ClosedTradeFact {
         closedAt = getInstant("closed_at"),
         sizeBtc = getBigDecimal("size_btc"),
         averageEntryPriceJpy = getBigDecimal("average_entry_price_jpy"),
-        initialProtectiveStopPriceJpy = getNullableBigDecimal("protective_stop_price_jpy"),
+        entryWeightedProtectiveStopPriceJpy = getNullableBigDecimal("protective_stop_price_jpy"),
         highestPriceSinceEntryJpy = getBigDecimal("highest_price_since_entry_jpy"),
         lowestPriceSinceEntryJpy = getNullableBigDecimal("lowest_price_since_entry_jpy"),
         tradePnlJpy = getBigDecimal("trade_pnl_jpy"),

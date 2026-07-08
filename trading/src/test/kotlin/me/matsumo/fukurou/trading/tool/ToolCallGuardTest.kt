@@ -107,6 +107,26 @@ class ToolCallGuardTest {
     }
 
     @Test
+    fun hard_halt_allows_risk_reducing_trade_tool_with_global_lock_and_audit() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val guard = createGuard(
+            eventLog = eventLog,
+            riskStateRepository = riskStateRepository,
+        )
+
+        riskStateRepository.setHardHalt("test halt", fixedInstant()).getOrThrow()
+
+        val result = guard.runRiskReducingTradeTool(createCall(toolName = "close_position")) {
+            "position reduced"
+        }
+        val eventTypes = eventLog.events().map { event -> event.eventType }
+
+        assertEquals("position reduced", result.getOrThrow())
+        assertEquals(listOf(CommandEventType.TOOL_CALL_COMPLETED), eventTypes)
+    }
+
+    @Test
     fun decision_run_id_is_logged_on_tool_call() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
         val guard = createGuard(eventLog = eventLog)

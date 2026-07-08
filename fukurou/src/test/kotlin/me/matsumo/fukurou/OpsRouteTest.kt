@@ -599,6 +599,29 @@ class OpsRouteTest {
         val ledgerRepository = InMemoryPaperLedgerRepository(
             positions = listOf(openPosition()),
             openOrders = listOf(openOrder()),
+            executions = listOf(
+                execution(
+                    executionId = "partial-sell",
+                    executedAt = fixedInstant().plusSeconds(1),
+                    realizedPnlJpy = "120",
+                    side = OrderSide.SELL,
+                    positionId = "position-1",
+                ),
+                execution(
+                    executionId = "entry-buy",
+                    executedAt = fixedInstant().plusSeconds(2),
+                    realizedPnlJpy = "0",
+                    side = OrderSide.BUY,
+                    positionId = "position-1",
+                ),
+                execution(
+                    executionId = "closed-position-sell",
+                    executedAt = fixedInstant().plusSeconds(3),
+                    realizedPnlJpy = "80",
+                    side = OrderSide.SELL,
+                    positionId = "position-closed",
+                ),
+            ),
         )
 
         application {
@@ -614,11 +637,13 @@ class OpsRouteTest {
         val responseBody = Json.parseToJsonElement(responseText).jsonObject
         val positions = responseBody.getValue("positions").jsonArray
         val openOrders = responseBody.getValue("openOrders").jsonArray
+        val sellExecutions = responseBody.getValue("sellExecutions").jsonArray
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertNoSecretLikeText(responseText)
         assertEquals("position-1", positions.single().jsonObject.getValue("positionId").jsonPrimitive.content)
         assertEquals("order-1", openOrders.single().jsonObject.getValue("orderId").jsonPrimitive.content)
+        assertEquals("partial-sell", sellExecutions.single().jsonObject.getValue("executionId").jsonPrimitive.content)
     }
 
     @Test

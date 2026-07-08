@@ -356,7 +356,7 @@ object PositionsTable : Table("positions") {
     val closedAt = long("closed_at").nullable()
 
     /**
-     * BTC 数量。
+     * 未決済 BTC 残量。closed position の初期数量と決済履歴は executions から復元する。
      */
     val sizeBtc = decimal("size_btc", precision = 24, scale = 12)
 

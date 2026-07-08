@@ -214,6 +214,15 @@ private data class PaperBrokerRuntime(
 )
 
 /**
+ * close_position で実際に決済する数量。
+ *
+ * @param sizeBtc 決済数量
+ */
+private data class CloseExecutionPlan(
+    val sizeBtc: BigDecimal,
+)
+
+/**
  * PaperBroker の read boundary 実装。
  *
  * @param runtime PaperBroker runtime context
@@ -338,9 +347,15 @@ private class PaperBrokerTradeDelegate(
             )
             val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
             val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
+            val safetyContext = marketContextFactory.safetyContext(
+                ticker = ticker,
+                symbolRules = symbolRules,
+                intentId = command.intentId,
+                tradeGroupId = resolvedTradeGroupId,
+            )
 
             safetyGate.enforceSafetyFloor(
-                verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(resolvedCommand, context),
+                verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(resolvedCommand, safetyContext),
                 command = resolvedCommand,
                 ticker = ticker,
                 symbolRules = symbolRules,
@@ -423,10 +438,16 @@ private class PaperBrokerTradeDelegate(
             )
             val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
             val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
-            val riskDetails = runtime.safety.safetyFloor.placeOrderRiskDetails(resolvedCommand, context)
+            val safetyContext = marketContextFactory.safetyContext(
+                ticker = ticker,
+                symbolRules = symbolRules,
+                intentId = command.intentId,
+                tradeGroupId = resolvedTradeGroupId,
+            )
+            val riskDetails = runtime.safety.safetyFloor.placeOrderRiskDetails(resolvedCommand, safetyContext)
             val normalizedOrderContent = command.toPreviewOrderNormalizedContent()
             val previewHash = normalizedOrderContent.calculatePreviewHash()
-            val verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(resolvedCommand, context)
+            val verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(resolvedCommand, safetyContext)
 
             if (verdict is SafetyFloorVerdict.Rejected) {
                 return@runCatching PreviewOrderResult(
@@ -459,7 +480,7 @@ private class PaperBrokerTradeDelegate(
 
     override suspend fun closePosition(command: ClosePositionCommand): Result<PaperTradeResult> {
         return runCatching {
-            validateReason(command.reasonJa)
+            validateClosePositionCommand(command)
 
             val ticker = runtime.tickerFor(TradingSymbol.BTC).getOrThrow()
             val symbolRules = runtime.symbolRulesFor(TradingSymbol.BTC).getOrThrow()
@@ -483,9 +504,10 @@ private class PaperBrokerTradeDelegate(
             )
             val results = targetPositions.map { position ->
                 val closeCommand = command.forCloseTarget(position, targetPositions.size)
+                val closePlan = resolveCloseExecutionPlan(closeCommand, position, symbolRules)
                 val fill = runtime.market.fillSimulator.marketFill(
                     side = OrderSide.SELL,
-                    sizeBtc = position.sizeBtc.toBigDecimal(),
+                    sizeBtc = closePlan.sizeBtc,
                     context = executionContext,
                 )
 
@@ -609,6 +631,7 @@ private class PaperBrokerMarketContextFactory(
         symbolRules: SymbolRules,
         includeAtr: Boolean = false,
         intentId: UUID? = null,
+        tradeGroupId: UUID? = null,
     ): SafetyFloorContext {
         val observedAt = Instant.now(runtime.time.clock)
         val entryIntent = intentId?.let { requestedIntentId ->
@@ -618,12 +641,26 @@ private class PaperBrokerMarketContextFactory(
                 freshnessWindow = runtime.time.falsificationFreshnessWindow,
             ).getOrThrow()
         }
+        val tradeGroupOrders = tradeGroupId
+            ?.let { requestedTradeGroupId ->
+                runtime.stores.ledgerRepository.findOrdersByTradeGroupId(requestedTradeGroupId).getOrThrow()
+            }
+            .orEmpty()
+        val tradeGroupOrderIds = tradeGroupOrders.map { order -> order.orderId }.toSet()
+        val tradeGroupExecutions = if (tradeGroupOrderIds.isEmpty()) {
+            emptyList()
+        } else {
+            runtime.stores.ledgerRepository.getExecutions().getOrThrow()
+                .filter { execution -> execution.orderId in tradeGroupOrderIds }
+        }
 
         return SafetyFloorContext(
             account = runtime.stores.ledgerRepository.getAccountSnapshot().getOrThrow(),
             riskState = runtime.stores.riskStateRepository.current().getOrThrow(),
             positions = runtime.stores.ledgerRepository.getOpenPositions().getOrThrow(),
             openOrders = runtime.stores.ledgerRepository.getOpenOrders().getOrThrow(),
+            tradeGroupOrders = tradeGroupOrders,
+            tradeGroupExecutions = tradeGroupExecutions,
             ticker = ticker,
             symbolRules = symbolRules,
             entryIntent = entryIntent,
@@ -1065,6 +1102,17 @@ private fun validatePlaceOrderCommand(command: PlaceOrderCommand) {
     }
 }
 
+private fun validateClosePositionCommand(command: ClosePositionCommand) {
+    validateReason(command.reasonJa)
+
+    require(command.closeRatio > BigDecimal.ZERO && command.closeRatio <= BigDecimal.ONE) {
+        "closeRatio must be greater than zero and less than or equal to 1."
+    }
+    require(!(command.closeAll && command.closeRatio.compareTo(BigDecimal.ONE) != 0)) {
+        "closeAll=true cannot be combined with a partial closeRatio."
+    }
+}
+
 private fun validateSymbolRules(command: PlaceOrderCommand, rules: SymbolRules) {
     val minOrderSize = rules.minOrderSize.toBigDecimal()
     val sizeStep = rules.sizeStep.toBigDecimal()
@@ -1258,6 +1306,30 @@ private fun resolveCloseTargets(command: ClosePositionCommand, openPositions: Li
     }
 
     return targetPositions
+}
+
+private fun resolveCloseExecutionPlan(
+    command: ClosePositionCommand,
+    position: Position,
+    symbolRules: SymbolRules,
+): CloseExecutionPlan {
+    val positionSize = position.sizeBtc.toBigDecimal()
+    val sizeStep = symbolRules.sizeStep.toBigDecimal()
+    val requestedSize = if (command.closeAll || command.closeRatio.compareTo(BigDecimal.ONE) == 0) {
+        positionSize
+    } else {
+        positionSize.multiply(command.closeRatio).floorToStep(sizeStep)
+    }
+
+    require(requestedSize > BigDecimal.ZERO) {
+        "closeRatio is too small for GMO sizeStep $sizeStep."
+    }
+
+    val remainingSize = positionSize.subtract(requestedSize)
+    val shouldPromoteToFullClose = remainingSize > BigDecimal.ZERO && remainingSize < sizeStep
+    val closeSize = if (shouldPromoteToFullClose) positionSize else requestedSize
+
+    return CloseExecutionPlan(sizeBtc = closeSize.btcScale())
 }
 
 private fun mergeTradeResults(results: List<PaperTradeResult>, messageJa: String): PaperTradeResult {

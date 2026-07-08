@@ -66,6 +66,17 @@ class ToolCallGuard(
     }
 
     /**
+     * risk を減らす trade 系 tool を global lock の内側で実行する。HARD_HALT 中も通す。
+     */
+    suspend fun <T> runRiskReducingTradeTool(call: GuardedToolCall, block: suspend () -> T): Result<T> {
+        return runLockedTool(
+            call = call,
+            enforceHardHalt = false,
+            block = block,
+        )
+    }
+
+    /**
      * decision 系 tool を global lock と audit の内側で実行する。HARD_HALT 中も decision 記録は通す。
      */
     suspend fun <T> runDecisionTool(call: GuardedToolCall, block: suspend () -> T): Result<T> {

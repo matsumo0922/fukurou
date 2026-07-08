@@ -212,8 +212,8 @@ class ObsidianVaultWriter(
         decision: DecisionJournalRecord?,
     ): String? {
         val position = closedPosition.position
-        val entryExecution = closedPosition.entryExecution()
         val exitExecution = closedPosition.exitExecution()
+        val tradeSizeBtc = closedPosition.entrySizeBtc()
         val entryTime = position.openedAt.toJstText()
         val exitTime = requireNotNull(position.closedAt).toJstText()
         val setupTags = decision?.decision?.submission?.setupTags.orEmpty()
@@ -232,7 +232,7 @@ class ObsidianVaultWriter(
             appendLine("exit_time: ${exitTime.yamlQuoted()}")
             appendLine("entry_price_jpy: ${position.averageEntryPriceJpy}")
             appendLine("exit_price_jpy: ${exitExecution?.priceJpy ?: position.currentPriceJpy}")
-            appendLine("size_btc: ${position.sizeBtc}")
+            appendLine("size_btc: ${tradeSizeBtc.toPlainString()}")
             appendLine("realized_pnl_jpy: ${tradePnlJpy.toMoneyText()}")
             appendLine("fee_jpy: ${feeJpy.toMoneyText()}")
             appendYamlList("setup_tags", setupTags)
@@ -246,8 +246,6 @@ class ObsidianVaultWriter(
             ExistingMarkdownBody.Missing -> buildTradeBody(
                 closedPosition = closedPosition,
                 decision = decision,
-                entryExecution = entryExecution,
-                exitExecution = exitExecution,
             )
             is ExistingMarkdownBody.Parsed -> existingBody.body
             ExistingMarkdownBody.Unparseable -> return null
@@ -256,12 +254,7 @@ class ObsidianVaultWriter(
         return frontmatter + body
     }
 
-    private fun buildTradeBody(
-        closedPosition: ClosedPaperPosition,
-        decision: DecisionJournalRecord?,
-        entryExecution: Execution?,
-        exitExecution: Execution?,
-    ): String {
+    private fun buildTradeBody(closedPosition: ClosedPaperPosition, decision: DecisionJournalRecord?): String {
         val position = closedPosition.position
         val decisionReason = decision?.decision?.submission?.reasonJa.orEmpty()
 
@@ -278,7 +271,7 @@ class ObsidianVaultWriter(
             appendFalsification(decision)
             appendLine()
             appendLine("## 実行")
-            appendExecution(entryExecution, exitExecution, closedPosition)
+            appendExecution(closedPosition)
             appendLine()
             appendLine("## 学び候補")
         }
@@ -307,15 +300,11 @@ class ObsidianVaultWriter(
         appendLine("- reason: ${falsification.reasonJa}")
     }
 
-    private fun StringBuilder.appendExecution(
-        entryExecution: Execution?,
-        exitExecution: Execution?,
-        closedPosition: ClosedPaperPosition,
-    ) {
-        entryExecution?.let { execution ->
+    private fun StringBuilder.appendExecution(closedPosition: ClosedPaperPosition) {
+        closedPosition.entryExecutions().forEach { execution ->
             appendLine("- entry: ${execution.priceJpy} JPY / ${execution.sizeBtc} BTC / ${execution.executedAt.toJstText()}")
         }
-        exitExecution?.let { execution ->
+        closedPosition.exitExecutions().forEach { execution ->
             appendLine("- exit: ${execution.priceJpy} JPY / ${execution.sizeBtc} BTC / ${execution.executedAt.toJstText()}")
         }
         appendLine("- fee: ${closedPosition.totalFeeJpy().toMoneyText()} JPY")
@@ -455,16 +444,24 @@ class ObsidianVaultWriter(
         return "Daily/${tradingDate.year}/${tradingDate.monthValue.twoDigits()}/$tradingDate.md"
     }
 
-    private fun ClosedPaperPosition.entryExecution(): Execution? {
-        return executions
-            .filter { execution -> execution.side == OrderSide.BUY }
-            .minByOrNull { execution -> Instant.parse(execution.executedAt) }
+    private fun ClosedPaperPosition.exitExecution(): Execution? {
+        return exitExecutions().lastOrNull()
     }
 
-    private fun ClosedPaperPosition.exitExecution(): Execution? {
+    private fun ClosedPaperPosition.entryExecutions(): List<Execution> {
+        return executions
+            .filter { execution -> execution.side == OrderSide.BUY }
+            .sortedBy { execution -> Instant.parse(execution.executedAt) }
+    }
+
+    private fun ClosedPaperPosition.exitExecutions(): List<Execution> {
         return executions
             .filter { execution -> execution.side == OrderSide.SELL }
-            .maxByOrNull { execution -> Instant.parse(execution.executedAt) }
+            .sortedBy { execution -> Instant.parse(execution.executedAt) }
+    }
+
+    private fun ClosedPaperPosition.entrySizeBtc(): BigDecimal {
+        return entryExecutions().sumOf { execution -> execution.sizeBtc.toBigDecimal() }
     }
 
     private fun ClosedPaperPosition.totalFeeJpy(): BigDecimal {
