@@ -273,7 +273,7 @@ describe("App", () => {
     expect(screen.getByText(/newest first/)).toBeInTheDocument();
     expect(screen.getByText(/3\/50 records/)).toBeInTheDocument();
 
-    const timeline = screen.getByRole("list", { name: "Activity timeline" });
+    const timeline = await screen.findByRole("list", { name: "Activity timeline" });
     const timelineItems = within(timeline).getAllByRole("listitem");
 
     expect(timelineItems.map((item) => within(item).getByRole("heading", { level: 2 }).textContent)).toEqual([
@@ -368,7 +368,7 @@ describe("App", () => {
       await Promise.resolve();
     });
 
-    const timeline = screen.getByRole("list", { name: "Activity timeline" });
+    const timeline = await screen.findByRole("list", { name: "Activity timeline" });
 
     expect(within(timeline).queryByText("HARD_HALT_SET")).not.toBeInTheDocument();
     expect(within(timeline).getAllByText("MANUAL_RESUME_REQUESTED").length).toBeGreaterThan(0);
