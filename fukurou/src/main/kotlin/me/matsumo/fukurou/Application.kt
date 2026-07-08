@@ -16,6 +16,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
@@ -63,7 +64,6 @@ fun interface ReadinessProbe {
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  * @param webRoot WebUI の build output を配信する filesystem root。null なら Web 配信を無効にする
  */
-@Suppress("LongMethod", "CyclomaticComplexMethod")
 fun Application.module(
     readinessProbe: ReadinessProbe? = null,
     revision: String = currentRevisionFromEnv(),
@@ -83,75 +83,232 @@ fun Application.module(
     runtimeConfigEnvironment: Map<String, String> = System.getenv(),
     webRoot: File? = webRootFromEnv(),
 ) {
-    val environment = System.getenv()
-    val databaseDataSource = createDataSourceIfConfigured(readinessProbe)
-    val database = databaseDataSource?.let { dataSource -> ExposedDatabase.connect(dataSource) }
-    val resolvedEvaluationRepository = evaluationRepository ?: database?.let { connectedDatabase ->
+    val databaseResources = createApplicationDatabaseResources(readinessProbe)
+    val runtime = ApplicationRuntimeResources(
+        readinessProbe = readinessProbe,
+        reconcilerStatus = reconcilerStatus,
+        clock = clock,
+        tradingConfig = tradingConfig,
+        runtimeConfigEnvironment = runtimeConfigEnvironment,
+    )
+    val routeResources = createApplicationRouteResources(
+        databaseResources = databaseResources,
+        evaluationOverrides = ApplicationEvaluationOverrides(
+            repository = evaluationRepository,
+            riskStateRepository = evaluationRiskStateRepository,
+            marketDataSource = evaluationMarketDataSource,
+        ),
+        opsOverrides = ApplicationOpsOverrides(
+            riskStateCommandService = opsRiskStateCommandService,
+            manualLlmLaunchService = opsManualLlmLaunchService,
+            llmAuthService = opsLlmAuthService,
+            decisionRepository = opsDecisionRepository,
+            paperLedgerRepository = opsPaperLedgerRepository,
+            commandEventLog = opsCommandEventLog,
+            commandEventFeedReader = opsCommandEventFeedReader,
+        ),
+        runtime = runtime,
+    )
+
+    installApplicationPlugins(webRoot)
+
+    routing {
+        healthRoutes(routeResources.readinessProbe, reconcilerStatus)
+        revisionRoute(revision)
+        evaluationRoutes(routeResources.evaluation)
+        opsRoutes(routeResources.ops.dependencies)
+        apiDocumentationRoutes()
+    }
+
+    val backgroundWorkers = startApplicationBackgroundWorkers(databaseResources, runtime)
+    subscribeApplicationShutdown(databaseResources, routeResources.ops, backgroundWorkers)
+}
+
+private fun createApplicationDatabaseResources(readinessProbe: ReadinessProbe?): ApplicationDatabaseResources {
+    val dataSource = createDataSourceIfConfigured(readinessProbe)
+
+    return ApplicationDatabaseResources(
+        environment = System.getenv(),
+        dataSource = dataSource,
+        database = dataSource?.let { source -> ExposedDatabase.connect(source) },
+    )
+}
+
+private fun createApplicationRouteResources(
+    databaseResources: ApplicationDatabaseResources,
+    evaluationOverrides: ApplicationEvaluationOverrides,
+    opsOverrides: ApplicationOpsOverrides,
+    runtime: ApplicationRuntimeResources,
+): ApplicationRouteResources {
+    val riskStateRepository = evaluationOverrides.riskStateRepository ?: databaseResources.database?.let { database ->
+        ExposedRiskStateRepository(database)
+    }
+
+    return ApplicationRouteResources(
+        readinessProbe = createApplicationReadinessProbe(databaseResources, runtime),
+        evaluation = createEvaluationRouteDependencies(
+            databaseResources = databaseResources,
+            overrides = evaluationOverrides,
+            riskStateRepository = riskStateRepository,
+            runtime = runtime,
+        ),
+        ops = createOpsRouteResources(
+            databaseResources = databaseResources,
+            opsOverrides = opsOverrides,
+            riskStateRepository = riskStateRepository,
+            runtime = runtime,
+        ),
+    )
+}
+
+private fun createEvaluationRouteDependencies(
+    databaseResources: ApplicationDatabaseResources,
+    overrides: ApplicationEvaluationOverrides,
+    riskStateRepository: RiskStateRepository?,
+    runtime: ApplicationRuntimeResources,
+): EvaluationRouteDependencies {
+    val database = databaseResources.database
+    val evaluationRepository = overrides.repository ?: database?.let { connectedDatabase ->
         ExposedEvaluationRepository(connectedDatabase)
     }
-    val resolvedEvaluationRiskStateRepository = evaluationRiskStateRepository ?: database?.let { connectedDatabase ->
-        ExposedRiskStateRepository(connectedDatabase)
-    }
-    val resolvedOpsRiskStateCommandService = opsRiskStateCommandService ?: database?.let { connectedDatabase ->
-        ExposedRiskStateCommandService(
-            database = connectedDatabase,
-            clock = clock,
-        )
-    }
-    val resolvedOpsDecisionRepository = opsDecisionRepository ?: database?.let { connectedDatabase ->
-        ExposedDecisionRepository(
-            database = connectedDatabase,
-            clock = clock,
-        )
-    }
-    val resolvedOpsPaperLedgerRepository = opsPaperLedgerRepository ?: database?.let { connectedDatabase ->
-        ExposedPaperLedgerRepository(connectedDatabase)
-    }
-    val createdOpsCommandEventLog = database?.let { connectedDatabase ->
-        ExposedCommandEventLog(connectedDatabase)
-    }
-    val resolvedOpsCommandEventLog: CommandEventLog? = opsCommandEventLog ?: createdOpsCommandEventLog
-    val resolvedOpsCommandEventFeedReader: CommandEventFeedReader? = opsCommandEventFeedReader ?: createdOpsCommandEventLog
-    val shouldCreateManualLlmLaunchService = opsManualLlmLaunchService == null && databaseDataSource != null && database != null
-    val createdManualLlmLaunchService = if (shouldCreateManualLlmLaunchService) {
-        createManualLlmLaunchService(
-            dataSource = databaseDataSource,
-            database = database,
-            environment = environment,
-            tradingConfig = tradingConfig,
-            clock = clock,
-        )
-    } else {
-        null
-    }
-    val resolvedOpsManualLlmLaunchService = opsManualLlmLaunchService ?: createdManualLlmLaunchService
-    val createdLlmAuthService = if (opsLlmAuthService == null) {
-        DefaultLlmAuthService(
-            config = LlmAuthServiceConfig.fromEnvironment(environment),
-            commandEventLog = resolvedOpsCommandEventLog,
-            clock = clock,
-        )
-    } else {
-        null
-    }
-    val resolvedOpsLlmAuthService = opsLlmAuthService ?: createdLlmAuthService
-    val resolvedEvaluationMarketDataSource = evaluationMarketDataSource ?: database?.let {
+    val marketDataSource = overrides.marketDataSource ?: database?.let {
         GmoPublicMarketDataSource.fromConfig(
-            config = tradingConfig.gmoPublicClient,
-            clock = clock,
-        )
-    }
-    val baseReadinessProbe = readinessProbe ?: databaseReadinessProbe(database)
-    val resolvedReadinessProbe = if (database == null || readinessProbe != null) {
-        baseReadinessProbe
-    } else {
-        ReconcilerFreshnessReadinessProbe(
-            delegate = baseReadinessProbe,
-            reconcilerStatusProvider = reconcilerStatus,
-            clock = clock,
+            config = runtime.tradingConfig.gmoPublicClient,
+            clock = runtime.clock,
         )
     }
 
+    return EvaluationRouteDependencies(
+        repository = evaluationRepository,
+        riskStateRepository = riskStateRepository,
+        marketDataSource = marketDataSource,
+        tradingConfig = runtime.tradingConfig,
+        clock = runtime.clock,
+    )
+}
+
+private fun createOpsRouteResources(
+    databaseResources: ApplicationDatabaseResources,
+    opsOverrides: ApplicationOpsOverrides,
+    riskStateRepository: RiskStateRepository?,
+    runtime: ApplicationRuntimeResources,
+): ApplicationOpsRouteResources {
+    val database = databaseResources.database
+    val createdManualLlmLaunchService = createDefaultManualLlmLaunchService(
+        databaseResources = databaseResources,
+        opsOverrides = opsOverrides,
+        runtime = runtime,
+    )
+    val createdCommandEventLog = database?.let { connectedDatabase ->
+        ExposedCommandEventLog(connectedDatabase)
+    }
+    val commandEventLog = opsOverrides.commandEventLog ?: createdCommandEventLog
+    val createdLlmAuthService = createDefaultLlmAuthService(
+        databaseResources = databaseResources,
+        opsOverrides = opsOverrides,
+        commandEventLog = commandEventLog,
+        runtime = runtime,
+    )
+
+    return ApplicationOpsRouteResources(
+        dependencies = OpsRouteDependencies(
+            runtimeConfig = OpsRuntimeConfigRouteDependencies(
+                tradingConfig = runtime.tradingConfig,
+                environment = runtime.runtimeConfigEnvironment,
+            ),
+            risk = OpsRiskRouteDependencies(
+                riskStateRepository = riskStateRepository,
+                riskStateCommandService = opsOverrides.riskStateCommandService ?: database?.let { connectedDatabase ->
+                    ExposedRiskStateCommandService(
+                        database = connectedDatabase,
+                        clock = runtime.clock,
+                    )
+                },
+                manualLlmLaunchService = opsOverrides.manualLlmLaunchService ?: createdManualLlmLaunchService,
+            ),
+            auth = OpsAuthRouteDependencies(
+                llmAuthService = opsOverrides.llmAuthService ?: createdLlmAuthService,
+            ),
+            feed = OpsFeedRouteDependencies(
+                decisionRepository = opsOverrides.decisionRepository ?: database?.let { connectedDatabase ->
+                    ExposedDecisionRepository(
+                        database = connectedDatabase,
+                        clock = runtime.clock,
+                    )
+                },
+                paperLedgerRepository = opsOverrides.paperLedgerRepository ?: database?.let { connectedDatabase ->
+                    ExposedPaperLedgerRepository(connectedDatabase)
+                },
+                commandEventFeedReader = opsOverrides.commandEventFeedReader ?: createdCommandEventLog,
+            ),
+            clock = runtime.clock,
+        ),
+        createdManualLlmLaunchService = createdManualLlmLaunchService,
+        createdLlmAuthService = createdLlmAuthService,
+    )
+}
+
+private fun createDefaultManualLlmLaunchService(
+    databaseResources: ApplicationDatabaseResources,
+    opsOverrides: ApplicationOpsOverrides,
+    runtime: ApplicationRuntimeResources,
+): DefaultManualLlmLaunchService? {
+    val dataSource = databaseResources.dataSource
+    val database = databaseResources.database
+    val hasInjectedManualLaunchService = opsOverrides.manualLlmLaunchService != null
+
+    if (hasInjectedManualLaunchService) {
+        return null
+    }
+
+    if (dataSource == null || database == null) {
+        return null
+    }
+
+    return createManualLlmLaunchService(
+        dataSource = dataSource,
+        database = database,
+        environment = databaseResources.environment,
+        tradingConfig = runtime.tradingConfig,
+        clock = runtime.clock,
+    )
+}
+
+private fun createDefaultLlmAuthService(
+    databaseResources: ApplicationDatabaseResources,
+    opsOverrides: ApplicationOpsOverrides,
+    commandEventLog: CommandEventLog?,
+    runtime: ApplicationRuntimeResources,
+): DefaultLlmAuthService? {
+    if (opsOverrides.llmAuthService != null) {
+        return null
+    }
+
+    return DefaultLlmAuthService(
+        config = LlmAuthServiceConfig.fromEnvironment(databaseResources.environment),
+        commandEventLog = commandEventLog,
+        clock = runtime.clock,
+    )
+}
+
+private fun createApplicationReadinessProbe(
+    databaseResources: ApplicationDatabaseResources,
+    runtime: ApplicationRuntimeResources,
+): ReadinessProbe {
+    val baseReadinessProbe = runtime.readinessProbe ?: databaseReadinessProbe(databaseResources.database)
+
+    if (databaseResources.database == null || runtime.readinessProbe != null) {
+        return baseReadinessProbe
+    }
+
+    return ReconcilerFreshnessReadinessProbe(
+        delegate = baseReadinessProbe,
+        reconcilerStatusProvider = runtime.reconcilerStatus,
+        clock = runtime.clock,
+    )
+}
+
+private fun Application.installApplicationPlugins(webRoot: File?) {
     install(CallLogging)
     install(ContentNegotiation) {
         json(ApiJson)
@@ -171,97 +328,72 @@ fun Application.module(
             call.respond(status, ErrorResponse("not found"))
         }
     }
+}
 
-    routing {
-        healthRoutes(resolvedReadinessProbe, reconcilerStatus)
-        revisionRoute(revision)
-        evaluationRoutes(
-            repository = resolvedEvaluationRepository,
-            riskStateRepository = resolvedEvaluationRiskStateRepository,
-            marketDataSource = resolvedEvaluationMarketDataSource,
-            tradingConfig = tradingConfig,
-            clock = clock,
-        )
-        opsRoutes(
-            riskStateRepository = resolvedEvaluationRiskStateRepository,
-            riskStateCommandService = resolvedOpsRiskStateCommandService,
-            manualLlmLaunchService = resolvedOpsManualLlmLaunchService,
-            llmAuthService = resolvedOpsLlmAuthService,
-            decisionRepository = resolvedOpsDecisionRepository,
-            paperLedgerRepository = resolvedOpsPaperLedgerRepository,
-            commandEventFeedReader = resolvedOpsCommandEventFeedReader,
-            tradingConfig = tradingConfig,
-            runtimeConfigEnvironment = runtimeConfigEnvironment,
-            clock = clock,
-        )
-        apiDocumentationRoutes()
+private fun startApplicationBackgroundWorkers(
+    databaseResources: ApplicationDatabaseResources,
+    runtime: ApplicationRuntimeResources,
+): ApplicationBackgroundWorkers {
+    val dataSource = databaseResources.dataSource
+    val database = databaseResources.database
+
+    if (dataSource == null || database == null) {
+        return ApplicationBackgroundWorkers()
     }
 
-    val reconcilerWorker = if (databaseDataSource != null && database != null) {
-        startProtectionReconcilerWorker(
-            dataSource = databaseDataSource,
+    val sharedPersistenceBootstrap = sharedTradingPersistenceBootstrap(
+        database = database,
+        tradingConfig = runtime.tradingConfig,
+        clock = runtime.clock,
+    )
+
+    return ApplicationBackgroundWorkers(
+        reconcilerWorker = startProtectionReconcilerWorker(
+            dataSource = dataSource,
             database = database,
-            status = reconcilerStatus,
-            clock = clock,
-        )
-    } else {
-        null
-    }
-    val llmDaemonWorker = if (databaseDataSource != null && database != null) {
-        startLlmDaemonSchedulerWorker(
-            dataSource = databaseDataSource,
+            status = runtime.reconcilerStatus,
+            clock = runtime.clock,
+        ),
+        llmDaemonWorker = startLlmDaemonSchedulerWorker(
+            dataSource = dataSource,
             database = database,
-            clock = clock,
-        )
-    } else {
-        null
-    }
-    val sharedPersistenceBootstrap = if (database != null) {
-        sharedTradingPersistenceBootstrap(
+            clock = runtime.clock,
+        ),
+        obsidianWriterWorker = startObsidianWriterWorker(
             database = database,
-            tradingConfig = tradingConfig,
-            clock = clock,
-        )
-    } else {
-        null
-    }
-    val obsidianWriterWorker = if (databaseDataSource != null && database != null) {
-        startObsidianWriterWorker(
-            database = database,
-            clock = clock,
+            clock = runtime.clock,
             bootstrap = sharedPersistenceBootstrap,
-        )
-    } else {
-        null
-    }
-    val reflectionRunnerWorker = if (databaseDataSource != null && database != null) {
-        startReflectionRunnerWorker(
+        ),
+        reflectionRunnerWorker = startReflectionRunnerWorker(
             database = database,
-            clock = clock,
+            clock = runtime.clock,
             bootstrap = sharedPersistenceBootstrap,
-        )
-    } else {
-        null
-    }
-    val hasBackgroundWorker = reconcilerWorker != null ||
-        llmDaemonWorker != null ||
-        obsidianWriterWorker != null ||
-        reflectionRunnerWorker != null
-    val hasClosableResource = databaseDataSource != null ||
-        hasBackgroundWorker ||
-        createdManualLlmLaunchService != null ||
-        createdLlmAuthService != null
+        ),
+    )
+}
 
-    if (hasClosableResource) {
-        monitor.subscribe(ApplicationStopped) {
-            reflectionRunnerWorker?.close()
-            obsidianWriterWorker?.close()
-            llmDaemonWorker?.close()
-            createdLlmAuthService?.close()
-            createdManualLlmLaunchService?.close()
-            reconcilerWorker?.close()
-            databaseDataSource?.close()
-        }
+private fun Application.subscribeApplicationShutdown(
+    databaseResources: ApplicationDatabaseResources,
+    opsResources: ApplicationOpsRouteResources,
+    backgroundWorkers: ApplicationBackgroundWorkers,
+) {
+    val hasClosableResource = databaseResources.dataSource != null ||
+        backgroundWorkers.hasWorker ||
+        opsResources.createdManualLlmLaunchService != null ||
+        opsResources.createdLlmAuthService != null
+
+    if (!hasClosableResource) {
+        return
+    }
+
+    monitor.subscribe(ApplicationStopped) {
+        backgroundWorkers.reflectionRunnerWorker?.close()
+        backgroundWorkers.obsidianWriterWorker?.close()
+        backgroundWorkers.llmDaemonWorker?.close()
+        opsResources.createdLlmAuthService?.close()
+        opsResources.createdManualLlmLaunchService?.close()
+        backgroundWorkers.reconcilerWorker?.close()
+        databaseResources.dataSource?.close()
     }
 }
 
@@ -290,6 +422,116 @@ private fun sharedTradingPersistenceBootstrap(
             }
         }
     }
+}
+
+/**
+ * Application.module の runtime 入力。
+ *
+ * @param readinessProbe 外部から注入された readiness probe
+ * @param reconcilerStatus ProtectionReconciler の状態 holder
+ * @param clock worker と route に渡す clock
+ * @param tradingConfig 取引 bot 全体の typed config
+ * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
+ */
+private data class ApplicationRuntimeResources(
+    val readinessProbe: ReadinessProbe?,
+    val reconcilerStatus: MutableReconcilerStatus,
+    val clock: Clock,
+    val tradingConfig: TradingBotConfig,
+    val runtimeConfigEnvironment: Map<String, String>,
+)
+
+/**
+ * Application.module が使う DB resource。
+ *
+ * @param environment process environment
+ * @param dataSource DB 接続用 data source
+ * @param database Exposed database
+ */
+private data class ApplicationDatabaseResources(
+    val environment: Map<String, String>,
+    val dataSource: HikariDataSource?,
+    val database: ExposedDatabase?,
+)
+
+/**
+ * 評価 API の外部注入 override。
+ *
+ * @param repository 評価 repository
+ * @param riskStateRepository risk_state repository
+ * @param marketDataSource 評価用 market data source
+ */
+private data class ApplicationEvaluationOverrides(
+    val repository: EvaluationRepository?,
+    val riskStateRepository: RiskStateRepository?,
+    val marketDataSource: MarketDataSource?,
+)
+
+/**
+ * ops API の外部注入 override。
+ *
+ * @param riskStateCommandService risk_state command service
+ * @param manualLlmLaunchService manual LLM launch service
+ * @param llmAuthService CLI auth service
+ * @param decisionRepository decision repository
+ * @param paperLedgerRepository paper ledger repository
+ * @param commandEventLog command_event_log writer
+ * @param commandEventFeedReader command_event_log feed reader
+ */
+private data class ApplicationOpsOverrides(
+    val riskStateCommandService: RiskStateCommandService?,
+    val manualLlmLaunchService: ManualLlmLaunchService?,
+    val llmAuthService: LlmAuthService?,
+    val decisionRepository: DecisionRepository?,
+    val paperLedgerRepository: PaperLedgerRepository?,
+    val commandEventLog: CommandEventLog?,
+    val commandEventFeedReader: CommandEventFeedReader?,
+)
+
+/**
+ * route 登録に渡す解決済み resource。
+ *
+ * @param readinessProbe health route に渡す readiness probe
+ * @param evaluation 評価系 route の依存関係
+ * @param ops ops route の依存関係
+ */
+private data class ApplicationRouteResources(
+    val readinessProbe: ReadinessProbe,
+    val evaluation: EvaluationRouteDependencies,
+    val ops: ApplicationOpsRouteResources,
+)
+
+/**
+ * ops route の解決済み resource。
+ *
+ * @param dependencies ops route の依存関係
+ * @param createdManualLlmLaunchService module が生成した close 対象 service
+ * @param createdLlmAuthService module が生成した close 対象 CLI auth service
+ */
+private data class ApplicationOpsRouteResources(
+    val dependencies: OpsRouteDependencies,
+    val createdManualLlmLaunchService: DefaultManualLlmLaunchService?,
+    val createdLlmAuthService: DefaultLlmAuthService?,
+)
+
+/**
+ * Application lifecycle に紐づく background worker。
+ *
+ * @param reconcilerWorker protection reconciler worker
+ * @param llmDaemonWorker LLM daemon scheduler worker
+ * @param obsidianWriterWorker Obsidian writer worker
+ * @param reflectionRunnerWorker reflection report worker
+ */
+private data class ApplicationBackgroundWorkers(
+    val reconcilerWorker: ProtectionReconcilerWorker? = null,
+    val llmDaemonWorker: LlmDaemonSchedulerWorker? = null,
+    val obsidianWriterWorker: ObsidianWriterWorker? = null,
+    val reflectionRunnerWorker: ReflectionRunnerWorker? = null,
+) {
+    val hasWorker: Boolean = reconcilerWorker != null ||
+        llmDaemonWorker != null ||
+        obsidianWriterWorker != null ||
+        reflectionRunnerWorker != null
 }
 
 /**

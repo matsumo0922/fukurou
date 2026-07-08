@@ -52,9 +52,9 @@ data class OpenOrdersWithUpdatedAt(
 )
 
 /**
- * paper broker の読み取り・副作用境界。
+ * paper broker の読み取り境界。
  */
-interface Broker {
+interface BrokerReadBoundary {
     /**
      * 現在の残高 snapshot を返す。
      */
@@ -94,7 +94,12 @@ interface Broker {
      * 口座 status と、その算出に使った paper account snapshot の更新時刻を返す。
      */
     suspend fun getAccountStatusWithUpdatedAt(): Result<AccountStatusWithUpdatedAt>
+}
 
+/**
+ * paper broker の注文副作用境界。
+ */
+interface BrokerTradeBoundary {
     /**
      * paper entry 注文を受け付ける。
      */
@@ -119,7 +124,12 @@ interface Broker {
      * paper order を cancel する。
      */
     suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult>
+}
 
+/**
+ * paper broker の reconcile / halt sweep 境界。
+ */
+interface BrokerReconcileBoundary {
     /**
      * tick をもとに paper ledger を決定的に前進させる。
      */
@@ -130,3 +140,8 @@ interface Broker {
      */
     suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult>
 }
+
+/**
+ * paper broker の読み取り・副作用境界。
+ */
+interface Broker : BrokerReadBoundary, BrokerTradeBoundary, BrokerReconcileBoundary

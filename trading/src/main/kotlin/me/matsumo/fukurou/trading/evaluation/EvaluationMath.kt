@@ -109,17 +109,10 @@ object EvaluationMath {
     /**
      * 日足と realized PnL から benchmark 系列を計算する。
      */
-    fun benchmark(
-        candles: List<Candle>,
-        dailyPnlFacts: List<DailyTradePnlFact>,
-        baselineEquityJpy: BigDecimal,
-        fromDate: LocalDate,
-        toDateInclusive: LocalDate,
-        zoneId: ZoneId,
-    ): BenchmarkResult {
-        val candlePoints = candles
-            .mapNotNull { candle -> candle.toDailyCloseOrNull(zoneId) }
-            .filter { point -> !point.date.isBefore(fromDate) && !point.date.isAfter(toDateInclusive) }
+    fun benchmark(request: BenchmarkCalculationRequest): BenchmarkResult {
+        val candlePoints = request.candles
+            .mapNotNull { candle -> candle.toDailyCloseOrNull(request.zoneId) }
+            .filter { point -> !point.date.isBefore(request.fromDate) && !point.date.isAfter(request.toDateInclusive) }
             .sortedBy { point -> point.date }
         val firstClose = candlePoints.firstOrNull()?.closeJpy
 
@@ -132,10 +125,10 @@ object EvaluationMath {
             )
         }
 
-        val pnlByDate = dailyPnlFacts
-            .groupBy { fact -> fact.closedAt.atZone(zoneId).toLocalDate() }
+        val pnlByDate = request.dailyPnlFacts
+            .groupBy { fact -> fact.closedAt.atZone(request.zoneId).toLocalDate() }
             .mapValues { entry -> entry.value.sumOfBigDecimal { fact -> fact.pnlJpy } }
-        val buyAndHoldBtc = baselineEquityJpy.divideEvaluation(firstClose)
+        val buyAndHoldBtc = request.baselineEquityJpy.divideEvaluation(firstClose)
         var cumulativeBotPnl = BigDecimal.ZERO
         val points = candlePoints.map { point ->
             cumulativeBotPnl = cumulativeBotPnl.add(pnlByDate[point.date] ?: BigDecimal.ZERO)
@@ -143,8 +136,8 @@ object EvaluationMath {
             BenchmarkPoint(
                 date = point.date,
                 buyAndHoldEquityJpy = buyAndHoldBtc.multiply(point.closeJpy).evaluationScale(),
-                noTradeEquityJpy = baselineEquityJpy.evaluationScale(),
-                botEquityJpy = baselineEquityJpy.add(cumulativeBotPnl).evaluationScale(),
+                noTradeEquityJpy = request.baselineEquityJpy.evaluationScale(),
+                botEquityJpy = request.baselineEquityJpy.add(cumulativeBotPnl).evaluationScale(),
             )
         }
 
@@ -242,6 +235,25 @@ object EvaluationMath {
         )
     }
 }
+
+/**
+ * benchmark 系列の計算入力。
+ *
+ * @param candles 日足 candle
+ * @param dailyPnlFacts 日次 realized PnL fact
+ * @param baselineEquityJpy 期間開始時点の基準 equity
+ * @param fromDate 集計開始日
+ * @param toDateInclusive 集計終了日
+ * @param zoneId 日付境界に使う timezone
+ */
+data class BenchmarkCalculationRequest(
+    val candles: List<Candle>,
+    val dailyPnlFacts: List<DailyTradePnlFact>,
+    val baselineEquityJpy: BigDecimal,
+    val fromDate: LocalDate,
+    val toDateInclusive: LocalDate,
+    val zoneId: ZoneId,
+)
 
 /**
  * 日次 close price point。

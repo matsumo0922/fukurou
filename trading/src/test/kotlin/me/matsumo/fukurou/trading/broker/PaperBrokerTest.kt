@@ -443,7 +443,7 @@ class PaperBrokerTest {
         val result = broker.placeOrder(command)
 
         assertTrue(result.isFailure)
-        assertEquals(0, decisionRepository.intentConsumptions().size)
+        assertEquals(0, decisionRepository.snapshots.intentConsumptions().size)
     }
 
     @Test
@@ -1426,21 +1426,11 @@ private class FailingPlaceOrderLedgerRepository(
     private val delegate: PaperLedgerRepository = InMemoryPaperLedgerRepository(),
 ) : PaperLedgerRepository by delegate {
 
-    override suspend fun fillMarketEntry(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        stopOrderId: UUID,
-    ): Result<PaperTradeResult> {
+    override suspend fun fillMarketEntry(request: MarketEntryFillRequest): Result<PaperTradeResult> {
         return Result.failure(IllegalStateException("ledger write failed"))
     }
 
-    override suspend fun createRestingEntryOrder(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-    ): Result<PaperTradeResult> {
+    override suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
         return Result.failure(IllegalStateException("ledger write failed"))
     }
 }

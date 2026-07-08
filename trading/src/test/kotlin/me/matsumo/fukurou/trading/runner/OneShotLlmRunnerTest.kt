@@ -30,6 +30,8 @@ import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
@@ -137,7 +139,7 @@ class OneShotLlmRunnerTest {
         }
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
-        val decisions = fixture.decisionRepository.decisions()
+        val decisions = fixture.decisionRepository.snapshots.decisions()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
         assertEquals(1, fixture.processRunner.launches.size)
@@ -177,7 +179,7 @@ class OneShotLlmRunnerTest {
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
         val positions = fixture.runtime.broker.getPositions().getOrThrow()
-        val consumptions = fixture.decisionRepository.intentConsumptions()
+        val consumptions = fixture.decisionRepository.snapshots.intentConsumptions()
 
         assertEquals(OneShotRunnerStatus.PAPER_ENTRY_PLACED, result.status)
         assertPaperEntryAccepted(assertNotNull(result.tradeResult))
@@ -772,7 +774,7 @@ class OneShotLlmRunnerTest {
 
         fixture.runner.runOneShot(defaultRequest()).getOrThrow()
 
-        val decision = fixture.decisionRepository.decisions().single()
+        val decision = fixture.decisionRepository.snapshots.decisions().single()
         val auditEvent = fixture.eventLog.events().first { event ->
             event.decisionRunContext.decisionRunId == decision.submission.invocationId
         }
@@ -1266,23 +1268,27 @@ class OneShotLlmRunnerTest {
         )
         val scheduler = LlmDaemonScheduler(
             tradingConfig = TradingBotConfig(),
-            riskStateRepository = runtime.riskStateRepository,
-            commandEventLog = runtime.commandEventLog,
-            launchReservationRepository = InMemoryLlmLaunchReservationRepository(runtime.riskStateRepository),
-            openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
-            tickerReader = LlmDaemonTickerReader {
-                Result.success(
-                    LlmDaemonTickerSnapshot(
-                        lastPriceJpy = BigDecimal("10000000"),
-                        sourceTimestamp = fixedClock().instant(),
-                    ),
-                )
-            },
-            positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
-            requestBase = defaultRequest(),
-            launchOneShot = runner.asDaemonLauncher(),
-            clock = fixedClock(),
-            idGenerator = { UUID(0L, 42L) },
+            dependencies = LlmDaemonSchedulerDependencies(
+                riskStateRepository = runtime.riskStateRepository,
+                commandEventLog = runtime.commandEventLog,
+                launchReservationRepository = InMemoryLlmLaunchReservationRepository(runtime.riskStateRepository),
+                openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
+                tickerReader = LlmDaemonTickerReader {
+                    Result.success(
+                        LlmDaemonTickerSnapshot(
+                            lastPriceJpy = BigDecimal("10000000"),
+                            sourceTimestamp = fixedClock().instant(),
+                        ),
+                    )
+                },
+                positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
+            ),
+            runtime = LlmDaemonSchedulerRuntime(
+                requestBase = defaultRequest(),
+                launchOneShot = runner.asDaemonLauncher(),
+                clock = fixedClock(),
+                idGenerator = { UUID(0L, 42L) },
+            ),
         )
 
         val tickResult = assertIs<LlmDaemonTickResult.Launched>(scheduler.tick())

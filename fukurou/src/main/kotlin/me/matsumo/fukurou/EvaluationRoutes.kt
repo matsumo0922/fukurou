@@ -12,6 +12,7 @@ import kotlinx.serialization.Serializable
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.evaluation.BenchmarkCalculationRequest
 import me.matsumo.fukurou.trading.evaluation.BenchmarkPoint
 import me.matsumo.fukurou.trading.evaluation.BenchmarkResult
 import me.matsumo.fukurou.trading.evaluation.CalibrationBinStats
@@ -61,20 +62,40 @@ private const val MAX_DAILY_CANDLE_LIMIT = 500
 private val EvaluationZone = ZoneId.of("Asia/Tokyo")
 
 /**
+ * 評価系 route の依存関係。
+ *
+ * @param repository 評価 repository
+ * @param riskStateRepository risk_state repository
+ * @param marketDataSource 評価用 market data source
+ * @param tradingConfig 取引 bot 全体の typed config
+ * @param clock 日付既定値に使う clock
+ */
+internal data class EvaluationRouteDependencies(
+    val repository: EvaluationRepository?,
+    val riskStateRepository: RiskStateRepository?,
+    val marketDataSource: MarketDataSource?,
+    val tradingConfig: TradingBotConfig,
+    val clock: Clock = Clock.systemUTC(),
+)
+
+/**
  * 評価系 route を定義する。
  */
 @OptIn(ExperimentalKtorApi::class)
-internal fun Route.evaluationRoutes(
-    repository: EvaluationRepository?,
-    riskStateRepository: RiskStateRepository?,
-    marketDataSource: MarketDataSource?,
-    tradingConfig: TradingBotConfig,
-    clock: Clock = Clock.systemUTC(),
-) {
+internal fun Route.evaluationRoutes(dependencies: EvaluationRouteDependencies) {
+    registerEvaluationSummaryRoute(dependencies)
+    registerEvaluationSetupsRoute(dependencies)
+    registerEvaluationCalibrationRoute(dependencies)
+    registerEvaluationBenchmarkRoute(dependencies)
+    registerEvaluationCostsRoute(dependencies)
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDependencies) {
     get("/evaluation/summary") {
-        val dateRange = call.parseEvaluationDateRange(clock) ?: return@get
-        val evaluationRepository = call.requireEvaluationRepository(repository) ?: return@get
-        val evaluationRiskStateRepository = call.requireRiskStateRepository(riskStateRepository) ?: return@get
+        val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
+        val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
+        val evaluationRiskStateRepository = call.requireRiskStateRepository(dependencies.riskStateRepository) ?: return@get
         val period = dateRange.toPeriod()
         val tradeResult = evaluationRepository.fetchClosedTrades(period).getOrThrow()
         val runCount = evaluationRepository.countDecisionRuns(period).getOrThrow()
@@ -82,8 +103,8 @@ internal fun Route.evaluationRoutes(
         val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
         val riskState = evaluationRiskStateRepository.current().getOrThrow()
         val candles = call.fetchDailyCandlesOrEmpty(
-            marketDataSource = marketDataSource,
-            tradingConfig = tradingConfig,
+            marketDataSource = dependencies.marketDataSource,
+            tradingConfig = dependencies.tradingConfig,
             dateRange = dateRange,
         ) ?: return@get
         val regimes = EvaluationMath.classifyMarketRegimes(candles, EvaluationZone)
@@ -95,8 +116,8 @@ internal fun Route.evaluationRoutes(
                 performance = EvaluationPerformanceResponse.fromStats(EvaluationMath.summarizeTrades(tradeResult.trades)),
                 killCriterion = EvaluationKillCriterionResponse.fromStats(
                     stats = killStats,
-                    minClosedTrades = tradingConfig.killCriterion.minClosedTrades,
-                    minProfitFactor = tradingConfig.killCriterion.minProfitFactor,
+                    minClosedTrades = dependencies.tradingConfig.killCriterion.minClosedTrades,
+                    minProfitFactor = dependencies.tradingConfig.killCriterion.minProfitFactor,
                     hardHalt = riskState.state == RiskHaltState.HARD_HALT,
                 ),
                 runRates = EvaluationRunRatesResponse.fromStats(EvaluationMath.decisionRunRates(runCount, actionCounts)),
@@ -126,15 +147,18 @@ internal fun Route.evaluationRoutes(
             }
         }
     }
+}
 
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerEvaluationSetupsRoute(dependencies: EvaluationRouteDependencies) {
     get("/evaluation/setups") {
-        val dateRange = call.parseEvaluationDateRange(clock) ?: return@get
-        val evaluationRepository = call.requireEvaluationRepository(repository) ?: return@get
+        val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
+        val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
         val period = dateRange.toPeriod()
         val tradeResult = evaluationRepository.fetchClosedTrades(period).getOrThrow()
         val candles = call.fetchDailyCandlesOrEmpty(
-            marketDataSource = marketDataSource,
-            tradingConfig = tradingConfig,
+            marketDataSource = dependencies.marketDataSource,
+            tradingConfig = dependencies.tradingConfig,
             dateRange = dateRange,
         ) ?: return@get
         val regimes = EvaluationMath.classifyMarketRegimes(candles, EvaluationZone)
@@ -171,10 +195,13 @@ internal fun Route.evaluationRoutes(
             }
         }
     }
+}
 
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerEvaluationCalibrationRoute(dependencies: EvaluationRouteDependencies) {
     get("/evaluation/calibration") {
-        val dateRange = call.parseEvaluationDateRange(clock) ?: return@get
-        val evaluationRepository = call.requireEvaluationRepository(repository) ?: return@get
+        val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
+        val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
         val tradeResult = evaluationRepository.fetchClosedTrades(dateRange.toPeriod()).getOrThrow()
 
         call.respond(
@@ -206,11 +233,14 @@ internal fun Route.evaluationRoutes(
             }
         }
     }
+}
 
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRouteDependencies) {
     get("/evaluation/benchmark") {
-        val dateRange = call.parseEvaluationDateRange(clock) ?: return@get
-        val evaluationRepository = call.requireEvaluationRepository(repository) ?: return@get
-        val evaluationMarketDataSource = call.requireMarketDataSource(marketDataSource) ?: return@get
+        val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
+        val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
+        val evaluationMarketDataSource = call.requireMarketDataSource(dependencies.marketDataSource) ?: return@get
         val period = dateRange.toPeriod()
         val initialCashJpy = evaluationRepository.fetchInitialCashJpy().getOrThrow()
         val priorPnlJpy = evaluationRepository.sumTradePnlBefore(period.from).getOrThrow()
@@ -218,17 +248,19 @@ internal fun Route.evaluationRoutes(
         val dailyPnl = evaluationRepository.fetchDailyTradePnl(period).getOrThrow()
         val dailyCandleLimit = call.requireDailyCandleLimit(dateRange) ?: return@get
         val candles = evaluationMarketDataSource.getCandles(
-            symbol = tradingConfig.symbol,
+            symbol = dependencies.tradingConfig.symbol,
             interval = CandleInterval.ONE_DAY,
             limit = dailyCandleLimit,
         ).getOrThrow()
         val benchmark = EvaluationMath.benchmark(
-            candles = candles,
-            dailyPnlFacts = dailyPnl,
-            baselineEquityJpy = baselineEquityJpy,
-            fromDate = dateRange.fromDate,
-            toDateInclusive = dateRange.toDate,
-            zoneId = EvaluationZone,
+            BenchmarkCalculationRequest(
+                candles = candles,
+                dailyPnlFacts = dailyPnl,
+                baselineEquityJpy = baselineEquityJpy,
+                fromDate = dateRange.fromDate,
+                toDateInclusive = dateRange.toDate,
+                zoneId = EvaluationZone,
+            ),
         )
 
         call.respond(
@@ -259,10 +291,13 @@ internal fun Route.evaluationRoutes(
             }
         }
     }
+}
 
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerEvaluationCostsRoute(dependencies: EvaluationRouteDependencies) {
     get("/evaluation/costs") {
-        val dateRange = call.parseEvaluationDateRange(clock) ?: return@get
-        val evaluationRepository = call.requireEvaluationRepository(repository) ?: return@get
+        val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
+        val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
         val usageResult = evaluationRepository.fetchLlmPhaseUsages(dateRange.toPeriod()).getOrThrow()
         val costs = EvaluationMath.summarizeLlmCosts(usageResult.facts)
 

@@ -122,35 +122,25 @@ sealed interface LlmDaemonTickResult {
  * Ktor 常駐 process 内で one-shot runner を保守的に起動する daemon scheduler。
  *
  * @param tradingConfig 取引 bot 設定
- * @param riskStateRepository HARD_HALT 判定用 repository
- * @param commandEventLog 監査 log
- * @param launchReservationRepository LLM 起動予約 repository
- * @param openRiskReader 建玉 / open order の有無を読む境界
- * @param tickerReader 価格 trigger 用 ticker 読み取り境界
- * @param positionsReader STOP 接近 trigger 用 position 読み取り境界
- * @param requestBase one-shot runner に渡す固定 request
- * @param launchOneShot one-shot runner 起動境界
- * @param clock cadence と監査時刻に使う clock
- * @param idGenerator invocation ID generator
- * @param warnLogger tick 失敗の rate-limited warning logger
+ * @param dependencies scheduler が参照する repository / reader
+ * @param runtime scheduler の実行時境界
  */
 class LlmDaemonScheduler(
     private val tradingConfig: TradingBotConfig,
-    private val riskStateRepository: RiskStateRepository,
-    private val commandEventLog: CommandEventLog,
-    private val launchReservationRepository: LlmLaunchReservationRepository,
-    private val openRiskReader: LlmDaemonOpenRiskReader,
-    private val tickerReader: LlmDaemonTickerReader,
-    private val positionsReader: LlmDaemonPositionsReader,
-    private val requestBase: OneShotRunnerRequest,
-    private val launchOneShot: suspend (OneShotRunnerRequest) -> Result<OneShotRunnerResult>,
-    private val clock: Clock = Clock.systemUTC(),
-    private val idGenerator: () -> UUID = { UUID.randomUUID() },
-    private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
-        logger = Logger.getLogger(LlmDaemonScheduler::class.java.name),
-        clock = clock,
-    ),
+    dependencies: LlmDaemonSchedulerDependencies,
+    runtime: LlmDaemonSchedulerRuntime,
 ) {
+    private val riskStateRepository = dependencies.riskStateRepository
+    private val commandEventLog = dependencies.commandEventLog
+    private val launchReservationRepository = dependencies.launchReservationRepository
+    private val openRiskReader = dependencies.openRiskReader
+    private val tickerReader = dependencies.tickerReader
+    private val positionsReader = dependencies.positionsReader
+    private val requestBase = runtime.requestBase
+    private val launchOneShot = runtime.launchOneShot
+    private val clock = runtime.clock
+    private val idGenerator = runtime.idGenerator
+    private val warnLogger = runtime.warnLogger
     private val daemonConfig: LlmDaemonConfig = tradingConfig.daemon
     private val priceSamples = mutableListOf<LlmDaemonPriceSample>()
 
@@ -759,6 +749,45 @@ class LlmDaemonScheduler(
         }
     }
 }
+
+/**
+ * daemon scheduler が使う repository / reader 群。
+ *
+ * @param riskStateRepository HARD_HALT 判定用 repository
+ * @param commandEventLog 監査 log
+ * @param launchReservationRepository LLM 起動予約 repository
+ * @param openRiskReader 建玉 / open order の有無を読む境界
+ * @param tickerReader 価格 trigger 用 ticker 読み取り境界
+ * @param positionsReader STOP 接近 trigger 用 position 読み取り境界
+ */
+data class LlmDaemonSchedulerDependencies(
+    val riskStateRepository: RiskStateRepository,
+    val commandEventLog: CommandEventLog,
+    val launchReservationRepository: LlmLaunchReservationRepository,
+    val openRiskReader: LlmDaemonOpenRiskReader,
+    val tickerReader: LlmDaemonTickerReader,
+    val positionsReader: LlmDaemonPositionsReader,
+)
+
+/**
+ * daemon scheduler の起動境界と実行時依存。
+ *
+ * @param requestBase one-shot runner に渡す固定 request
+ * @param launchOneShot one-shot runner 起動境界
+ * @param clock cadence と監査時刻に使う clock
+ * @param idGenerator invocation ID generator
+ * @param warnLogger tick 失敗の rate-limited warning logger
+ */
+data class LlmDaemonSchedulerRuntime(
+    val requestBase: OneShotRunnerRequest,
+    val launchOneShot: suspend (OneShotRunnerRequest) -> Result<OneShotRunnerResult>,
+    val clock: Clock = Clock.systemUTC(),
+    val idGenerator: () -> UUID = { UUID.randomUUID() },
+    val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
+        logger = Logger.getLogger(LlmDaemonScheduler::class.java.name),
+        clock = clock,
+    ),
+)
 
 private fun daemonDecisionRunContext(invocationId: String): DecisionRunContext {
     return DecisionRunContext(

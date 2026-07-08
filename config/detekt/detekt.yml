@@ -10,19 +10,29 @@ complexity:
     threshold: 3
   LongMethod:
     active: true
+    excludes:
+      - '**/src/test/**'
     # Composable は UI 構造の記述で行数が伸びるため除外
     ignoreAnnotated:
       - 'Composable'
   LongParameterList:
     active: true
+    excludes:
+      - '**/src/test/**'
     ignoreDefaultParameters: true
     # Composable は引数が多くなる設計のため除外
     ignoreAnnotated:
       - 'Composable'
   TooManyFunctions:
     active: true
+    excludes:
+      - '**/src/test/**'
     # 小さな private Composable へ分割するスタイルと衝突するため private は数えない
     ignorePrivate: true
+  LargeClass:
+    active: true
+    excludes:
+      - '**/src/test/**'
 
 coroutines:
   active: true
@@ -135,4 +145,3 @@ formatting:
     active: false
   Filename:
     active: false
-

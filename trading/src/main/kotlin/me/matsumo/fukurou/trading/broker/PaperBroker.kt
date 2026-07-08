@@ -65,31 +65,20 @@ import java.util.logging.Logger
  * @param clock 当日実現損益の対象日算出に使う clock
  * @param tradingDateZone 当日判定に使う timezone
  */
-class PaperBroker(
-    internal val ledgerRepository: PaperLedgerRepository,
-    private val riskStateRepository: RiskStateRepository,
-    private val riskStateCommandService: RiskStateCommandService? = null,
-    private val decisionRepository: DecisionRepository = InMemoryDecisionRepository(),
-    private val falsificationFreshnessWindow: Duration = DecisionProtocolConfig().falsificationFreshnessWindow,
-    private val safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
-    safetyFloor: SafetyFloor? = null,
-    internal val marketDataSource: MarketDataSource? = null,
-    fillSimulator: FillSimulator? = null,
-    private val reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
-    private val clock: Clock = Clock.systemUTC(),
-    private val tradingDateZone: ZoneId = TRADING_DATE_ZONE,
-    private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
-        logger = paperBrokerLogger,
-        clock = clock,
-    ),
-) : Broker {
+class PaperBroker private constructor(
+    private val runtime: PaperBrokerRuntime,
+) : BrokerReadBoundary by PaperBrokerReadDelegate(runtime),
+    BrokerTradeBoundary by PaperBrokerTradeDelegate(runtime),
+    BrokerReconcileBoundary by PaperBrokerReconcileDelegate(runtime),
+    Broker {
 
-    private val safetyFloor = safetyFloor ?: SafetyFloor(clock = clock)
-    internal val fillSimulator = fillSimulator ?: FillSimulator(clock = clock)
+    internal val ledgerRepository = runtime.stores.ledgerRepository
+    internal val marketDataSource = runtime.market.marketDataSource
+    internal val fillSimulator = runtime.market.fillSimulator
 
     init {
         val hasAtomicLedgerRepository = ledgerRepository is IntentConsumingPaperLedgerRepository
-        val hasAtomicDecisionRepository = decisionRepository is AtomicIntentConsumptionRepository
+        val hasAtomicDecisionRepository = runtime.stores.decisionRepository is AtomicIntentConsumptionRepository
         val hasAtomicIntentConsumption = hasAtomicLedgerRepository || hasAtomicDecisionRepository
 
         require(hasAtomicIntentConsumption) {
@@ -97,28 +86,151 @@ class PaperBroker(
         }
     }
 
+    constructor(
+        ledgerRepository: PaperLedgerRepository,
+        riskStateRepository: RiskStateRepository,
+        riskStateCommandService: RiskStateCommandService? = null,
+        decisionRepository: DecisionRepository = InMemoryDecisionRepository(),
+        falsificationFreshnessWindow: Duration = DecisionProtocolConfig().falsificationFreshnessWindow,
+        safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
+        safetyFloor: SafetyFloor? = null,
+        marketDataSource: MarketDataSource? = null,
+        fillSimulator: FillSimulator? = null,
+        reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
+        clock: Clock = Clock.systemUTC(),
+        tradingDateZone: ZoneId = TRADING_DATE_ZONE,
+        warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
+            logger = paperBrokerLogger,
+            clock = clock,
+        ),
+    ) : this(
+        runtime = PaperBrokerRuntime(
+            stores = PaperBrokerStores(
+                ledgerRepository = ledgerRepository,
+                riskStateRepository = riskStateRepository,
+                decisionRepository = decisionRepository,
+            ),
+            safety = PaperBrokerSafetyServices(
+                riskStateCommandService = riskStateCommandService,
+                safetyViolationRepository = safetyViolationRepository,
+                safetyFloor = safetyFloor ?: SafetyFloor(clock = clock),
+            ),
+            market = PaperBrokerMarketServices(
+                marketDataSource = marketDataSource,
+                fillSimulator = fillSimulator ?: FillSimulator(clock = clock),
+                warnLogger = warnLogger,
+            ),
+            time = PaperBrokerTimeConfig(
+                clock = clock,
+                tradingDateZone = tradingDateZone,
+                falsificationFreshnessWindow = falsificationFreshnessWindow,
+            ),
+            reconcilerStatusProvider = reconcilerStatusProvider,
+        ),
+    )
+}
+
+private val paperBrokerLogger: Logger = Logger.getLogger(PaperBroker::class.java.name)
+
+/**
+ * PaperBroker delegate 群で共有する repository。
+ *
+ * @param ledgerRepository paper ledger repository
+ * @param riskStateRepository risk_state repository
+ * @param decisionRepository decision / intent / falsification repository
+ */
+private data class PaperBrokerStores(
+    val ledgerRepository: PaperLedgerRepository,
+    val riskStateRepository: RiskStateRepository,
+    val decisionRepository: DecisionRepository,
+)
+
+/**
+ * PaperBroker delegate 群で共有する SafetyFloor 関連 service。
+ *
+ * @param riskStateCommandService risk_state 更新と audit をまとめる service
+ * @param safetyViolationRepository SafetyFloor violation repository
+ * @param safetyFloor Broker 副作用前に実行する SafetyFloor
+ */
+private data class PaperBrokerSafetyServices(
+    val riskStateCommandService: RiskStateCommandService?,
+    val safetyViolationRepository: SafetyViolationRepository,
+    val safetyFloor: SafetyFloor,
+)
+
+/**
+ * PaperBroker delegate 群で共有する market execution service。
+ *
+ * @param marketDataSource paper 約定に使う市場データ source
+ * @param fillSimulator paper 約定 simulator
+ * @param warnLogger rate-limited warn logger
+ */
+private data class PaperBrokerMarketServices(
+    val marketDataSource: MarketDataSource?,
+    val fillSimulator: FillSimulator,
+    val warnLogger: RateLimitedWarnLogger,
+)
+
+/**
+ * PaperBroker delegate 群で共有する時刻設定。
+ *
+ * @param clock audit / 約定時刻用 clock
+ * @param tradingDateZone 当日判定に使う timezone
+ * @param falsificationFreshnessWindow fresh APPROVED falsification とみなす時間窓
+ */
+private data class PaperBrokerTimeConfig(
+    val clock: Clock,
+    val tradingDateZone: ZoneId,
+    val falsificationFreshnessWindow: Duration,
+)
+
+/**
+ * PaperBroker delegate 群で共有する runtime context。
+ *
+ * @param stores repository 群
+ * @param safety SafetyFloor 関連 service
+ * @param market market execution service
+ * @param time 時刻設定
+ * @param reconcilerStatusProvider ProtectionReconciler 状態 provider
+ */
+private data class PaperBrokerRuntime(
+    val stores: PaperBrokerStores,
+    val safety: PaperBrokerSafetyServices,
+    val market: PaperBrokerMarketServices,
+    val time: PaperBrokerTimeConfig,
+    val reconcilerStatusProvider: ReconcilerStatusProvider,
+)
+
+/**
+ * PaperBroker の read boundary 実装。
+ *
+ * @param runtime PaperBroker runtime context
+ */
+private class PaperBrokerReadDelegate(
+    private val runtime: PaperBrokerRuntime,
+) : BrokerReadBoundary {
     override suspend fun getBalance(): Result<AccountSnapshot> {
-        return ledgerRepository.getAccountSnapshot()
+        return runtime.stores.ledgerRepository.getAccountSnapshot()
     }
 
     override suspend fun getBalanceWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
-        return ledgerRepository.getAccountSnapshotWithUpdatedAt()
+        return runtime.stores.ledgerRepository.getAccountSnapshotWithUpdatedAt()
     }
 
     override suspend fun getPositions(): Result<List<Position>> {
-        return ledgerRepository.getOpenPositions()
+        return runtime.stores.ledgerRepository.getOpenPositions()
     }
 
     override suspend fun getPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt> {
-        return ledgerRepository.getOpenPositionsWithUpdatedAt()
+        return runtime.stores.ledgerRepository.getOpenPositionsWithUpdatedAt()
     }
 
     override suspend fun getOpenOrders(): Result<List<Order>> {
-        return ledgerRepository.getOpenOrders()
+        return runtime.stores.ledgerRepository.getOpenOrders()
     }
 
     override suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt> {
-        return ledgerRepository.getOpenOrdersWithUpdatedAt()
+        return runtime.stores.ledgerRepository.getOpenOrdersWithUpdatedAt()
     }
 
     override suspend fun getAccountStatus(): Result<AccountStatus> {
@@ -127,14 +239,16 @@ class PaperBroker(
 
     override suspend fun getAccountStatusWithUpdatedAt(): Result<AccountStatusWithUpdatedAt> {
         return runCatching {
-            val accountSnapshotWithUpdatedAt = ledgerRepository.getAccountSnapshotWithUpdatedAt().getOrThrow()
+            val accountSnapshotWithUpdatedAt = runtime.stores.ledgerRepository
+                .getAccountSnapshotWithUpdatedAt()
+                .getOrThrow()
             val accountSnapshot = accountSnapshotWithUpdatedAt.accountSnapshot
-            val riskState = riskStateRepository.current().getOrThrow()
-            val positions = ledgerRepository.getOpenPositions().getOrThrow()
-            val openOrders = ledgerRepository.getOpenOrders().getOrThrow()
-            val reconcilerStatus = reconcilerStatusProvider.snapshot()
-            val today = LocalDate.now(clock.withZone(tradingDateZone))
-            val todayRealizedPnlJpy = ledgerRepository.getRealizedPnlForDate(today).getOrThrow()
+            val riskState = runtime.stores.riskStateRepository.current().getOrThrow()
+            val positions = runtime.stores.ledgerRepository.getOpenPositions().getOrThrow()
+            val openOrders = runtime.stores.ledgerRepository.getOpenOrders().getOrThrow()
+            val reconcilerStatus = runtime.reconcilerStatusProvider.snapshot()
+            val today = LocalDate.now(runtime.time.clock.withZone(runtime.time.tradingDateZone))
+            val todayRealizedPnlJpy = runtime.stores.ledgerRepository.getRealizedPnlForDate(today).getOrThrow()
 
             AccountStatusWithUpdatedAt(
                 accountStatus = AccountStatus(
@@ -147,209 +261,6 @@ class PaperBroker(
                     protectionStatus = protectionStatus(positions, openOrders, reconcilerStatus),
                 ),
                 updatedAt = accountSnapshotWithUpdatedAt.updatedAt,
-            )
-        }
-    }
-
-    override suspend fun placeOrder(command: PlaceOrderCommand): Result<PaperTradeResult> {
-        return runCatching {
-            validatePlaceOrderCommand(command)
-
-            findExistingPlaceOrderResult(command)?.let { existingResult ->
-                return@runCatching existingResult
-            }
-
-            val ticker = tickerFor(command.symbol).getOrThrow()
-            val symbolRules = symbolRulesFor(command.symbol).getOrThrow()
-            val context = safetyContext(
-                ticker = ticker,
-                symbolRules = symbolRules,
-                intentId = command.intentId,
-            )
-            val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
-            val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
-
-            enforceSafetyFloor(
-                verdict = safetyFloor.evaluatePlaceOrder(resolvedCommand, context),
-                command = resolvedCommand,
-                ticker = ticker,
-                symbolRules = symbolRules,
-            )?.let { rejectedResult -> return@runCatching rejectedResult }
-
-            validateSymbolRules(resolvedCommand, symbolRules)
-            validateEntryPriceContract(resolvedCommand, ticker)
-            validateCashAvailability(resolvedCommand, ticker, symbolRules)
-
-            if (resolvedCommand.orderType == OrderType.MARKET) {
-                val fill = fillSimulator.marketFill(resolvedCommand.side, resolvedCommand.sizeBtc, ticker, symbolRules)
-                val entryOrderId = resolvedCommand.commandId
-
-                return@runCatching fillMarketEntryAndConsumeIntent(
-                    command = resolvedCommand,
-                    fill = fill,
-                    positionId = UUID.randomUUID(),
-                    tradeGroupId = resolvedTradeGroupId,
-                    entryOrderId = entryOrderId,
-                    stopOrderId = UUID.randomUUID(),
-                )
-            }
-
-            val orderId = UUID.randomUUID()
-
-            createRestingEntryOrderAndConsumeIntent(
-                command = resolvedCommand,
-                orderId = orderId,
-                tradeGroupId = resolvedTradeGroupId,
-            )
-        }
-    }
-
-    override suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult> {
-        return runCatching {
-            validatePlaceOrderCommand(command)
-
-            val ticker = tickerFor(command.symbol).getOrThrow()
-            val symbolRules = symbolRulesFor(command.symbol).getOrThrow()
-            val context = safetyContext(
-                ticker = ticker,
-                symbolRules = symbolRules,
-                intentId = command.intentId,
-            )
-            val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
-            val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
-            val riskDetails = safetyFloor.placeOrderRiskDetails(resolvedCommand, context)
-            val normalizedOrderContent = command.toPreviewOrderNormalizedContent()
-            val previewHash = normalizedOrderContent.calculatePreviewHash()
-            val verdict = safetyFloor.evaluatePlaceOrder(resolvedCommand, context)
-
-            if (verdict is SafetyFloorVerdict.Rejected) {
-                return@runCatching PreviewOrderResult(
-                    accepted = false,
-                    previewHash = previewHash,
-                    normalizedOrderContent = normalizedOrderContent,
-                    riskDetails = riskDetails,
-                    messageJa = verdict.violation.messageJa,
-                    safetyViolation = verdict.violation,
-                )
-            }
-
-            validateSymbolRules(resolvedCommand, symbolRules)
-            validateEntryPriceContract(resolvedCommand, ticker)
-            validateCashAvailability(resolvedCommand, ticker, symbolRules)
-
-            PreviewOrderResult(
-                accepted = true,
-                previewHash = previewHash,
-                normalizedOrderContent = normalizedOrderContent,
-                riskDetails = riskDetails,
-                messageJa = "paper entry 注文 preview は SafetyFloor と broker 事前検証を通過しました。",
-            )
-        }
-    }
-
-    override suspend fun closePosition(command: ClosePositionCommand): Result<PaperTradeResult> {
-        return runCatching {
-            validateReason(command.reasonJa)
-
-            val ticker = tickerFor(TradingSymbol.BTC).getOrThrow()
-            val symbolRules = symbolRulesFor(TradingSymbol.BTC).getOrThrow()
-            val context = safetyContext(ticker, symbolRules)
-
-            enforceSafetyFloor(
-                verdict = safetyFloor.evaluateClosePosition(command, context),
-                command = command,
-                ticker = ticker,
-                symbolRules = symbolRules,
-            )?.let { rejectedResult -> return@runCatching rejectedResult }
-
-            val openPositions = ledgerRepository.getOpenPositions().getOrThrow()
-            val targetPositions = resolveCloseTargets(command, openPositions)
-            val results = targetPositions.map { position ->
-                val closeCommand = command.forCloseTarget(position, targetPositions.size)
-                val fill = fillSimulator.marketFill(
-                    side = OrderSide.SELL,
-                    sizeBtc = position.sizeBtc.toBigDecimal(),
-                    ticker = ticker,
-                    rules = symbolRules,
-                )
-
-                ledgerRepository.closePosition(
-                    command = closeCommand,
-                    positionId = UUID.fromString(position.positionId),
-                    orderId = UUID.randomUUID(),
-                    fill = fill,
-                ).getOrThrow()
-            }
-
-            mergeTradeResults(results, "position を close しました。")
-        }
-    }
-
-    override suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult> {
-        return runCatching {
-            validateReason(command.reasonJa)
-            validateProtectionUpdateHasChange(command)
-
-            val ticker = tickerFor(TradingSymbol.BTC).getOrThrow()
-            val symbolRules = symbolRulesFor(TradingSymbol.BTC).getOrThrow()
-            val context = safetyContext(
-                ticker = ticker,
-                symbolRules = symbolRules,
-                includeAtr = true,
-            )
-
-            enforceSafetyFloor(
-                verdict = safetyFloor.evaluateUpdateProtection(command, context),
-                command = command,
-                ticker = ticker,
-                symbolRules = symbolRules,
-            )?.let { rejectedResult -> return@runCatching rejectedResult }
-
-            validateStopPriceIfPresent(command, ticker, symbolRules)
-
-            ledgerRepository.updateProtection(command).getOrThrow()
-        }
-    }
-
-    override suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult> {
-        return runCatching {
-            validateReason(command.reasonJa)
-
-            val ticker = tickerFor(TradingSymbol.BTC).getOrThrow()
-            val symbolRules = symbolRulesFor(TradingSymbol.BTC).getOrThrow()
-            val context = safetyContext(ticker, symbolRules)
-
-            enforceSafetyFloor(
-                verdict = safetyFloor.evaluateCancelOrder(command, context),
-                command = command,
-                ticker = ticker,
-                symbolRules = symbolRules,
-            )?.let { rejectedResult -> return@runCatching rejectedResult }
-
-            ledgerRepository.cancelOrder(command).getOrThrow()
-        }
-    }
-
-    override suspend fun reconcile(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
-        return runCatching {
-            val result = ledgerRepository.reconcile(tickSnapshot, fillSimulator).getOrThrow()
-
-            activateHardHaltIfAccountDrawdownReached()
-
-            result
-        }
-    }
-
-    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult> {
-        return runCatching {
-            val ticker = tickSnapshot.requireTicker()
-            val symbolRules = tickSnapshot.symbolRules ?: symbolRulesFor(TradingSymbol.BTC).getOrThrow()
-
-            sweepOpenRisk(
-                reason = reasonJa,
-                auditContext = PaperTradeAuditContext.EMPTY,
-                ticker = ticker,
-                symbolRules = symbolRules,
             )
         }
     }
@@ -383,27 +294,270 @@ class PaperBroker(
             tradingLockOwner = null,
         )
     }
+}
 
-    private suspend fun safetyContext(
+/**
+ * PaperBroker の trade boundary 実装。
+ *
+ * @param runtime PaperBroker runtime context
+ */
+private class PaperBrokerTradeDelegate(
+    private val runtime: PaperBrokerRuntime,
+) : BrokerTradeBoundary {
+    private val marketContextFactory = PaperBrokerMarketContextFactory(runtime)
+    private val intentConsumer = PaperBrokerEntryIntentConsumer(runtime)
+    private val safetyGate = PaperBrokerSafetyGate(runtime)
+
+    override suspend fun placeOrder(command: PlaceOrderCommand): Result<PaperTradeResult> {
+        return runCatching {
+            validatePlaceOrderCommand(command)
+
+            runtime.findExistingPlaceOrderResult(command)?.let { existingResult ->
+                return@runCatching existingResult
+            }
+
+            val ticker = runtime.tickerFor(command.symbol).getOrThrow()
+            val symbolRules = runtime.symbolRulesFor(command.symbol).getOrThrow()
+            val context = marketContextFactory.safetyContext(
+                ticker = ticker,
+                symbolRules = symbolRules,
+                intentId = command.intentId,
+            )
+            val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
+            val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
+
+            safetyGate.enforceSafetyFloor(
+                verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(resolvedCommand, context),
+                command = resolvedCommand,
+                ticker = ticker,
+                symbolRules = symbolRules,
+            )?.let { rejectedResult -> return@runCatching rejectedResult }
+
+            validateSymbolRules(resolvedCommand, symbolRules)
+            validateEntryPriceContract(resolvedCommand, ticker)
+            runtime.validateCashAvailability(resolvedCommand, ticker, symbolRules)
+
+            if (resolvedCommand.orderType == OrderType.MARKET) {
+                val fill = runtime.market.fillSimulator.marketFill(
+                    resolvedCommand.side,
+                    resolvedCommand.sizeBtc,
+                    ticker,
+                    symbolRules,
+                )
+
+                return@runCatching intentConsumer.fillMarketEntryAndConsumeIntent(
+                    MarketEntryFillRequest(
+                        command = resolvedCommand,
+                        fill = fill,
+                        positionId = UUID.randomUUID(),
+                        tradeGroupId = resolvedTradeGroupId,
+                        stopOrderId = UUID.randomUUID(),
+                    ),
+                )
+            }
+
+            intentConsumer.createRestingEntryOrderAndConsumeIntent(
+                RestingEntryOrderRequest(
+                    command = resolvedCommand,
+                    orderId = UUID.randomUUID(),
+                    tradeGroupId = resolvedTradeGroupId,
+                ),
+            )
+        }
+    }
+
+    override suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult> {
+        return runCatching {
+            validatePlaceOrderCommand(command)
+
+            val ticker = runtime.tickerFor(command.symbol).getOrThrow()
+            val symbolRules = runtime.symbolRulesFor(command.symbol).getOrThrow()
+            val context = marketContextFactory.safetyContext(
+                ticker = ticker,
+                symbolRules = symbolRules,
+                intentId = command.intentId,
+            )
+            val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
+            val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
+            val riskDetails = runtime.safety.safetyFloor.placeOrderRiskDetails(resolvedCommand, context)
+            val normalizedOrderContent = command.toPreviewOrderNormalizedContent()
+            val previewHash = normalizedOrderContent.calculatePreviewHash()
+            val verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(resolvedCommand, context)
+
+            if (verdict is SafetyFloorVerdict.Rejected) {
+                return@runCatching PreviewOrderResult(
+                    accepted = false,
+                    previewHash = previewHash,
+                    normalizedOrderContent = normalizedOrderContent,
+                    riskDetails = riskDetails,
+                    messageJa = verdict.violation.messageJa,
+                    safetyViolation = verdict.violation,
+                )
+            }
+
+            validateSymbolRules(resolvedCommand, symbolRules)
+            validateEntryPriceContract(resolvedCommand, ticker)
+            runtime.validateCashAvailability(resolvedCommand, ticker, symbolRules)
+
+            PreviewOrderResult(
+                accepted = true,
+                previewHash = previewHash,
+                normalizedOrderContent = normalizedOrderContent,
+                riskDetails = riskDetails,
+                messageJa = "paper entry 注文 preview は SafetyFloor と broker 事前検証を通過しました。",
+            )
+        }
+    }
+
+    override suspend fun closePosition(command: ClosePositionCommand): Result<PaperTradeResult> {
+        return runCatching {
+            validateReason(command.reasonJa)
+
+            val ticker = runtime.tickerFor(TradingSymbol.BTC).getOrThrow()
+            val symbolRules = runtime.symbolRulesFor(TradingSymbol.BTC).getOrThrow()
+            val context = marketContextFactory.safetyContext(ticker, symbolRules)
+
+            safetyGate.enforceSafetyFloor(
+                verdict = runtime.safety.safetyFloor.evaluateClosePosition(command, context),
+                command = command,
+                ticker = ticker,
+                symbolRules = symbolRules,
+            )?.let { rejectedResult -> return@runCatching rejectedResult }
+
+            val openPositions = runtime.stores.ledgerRepository.getOpenPositions().getOrThrow()
+            val targetPositions = resolveCloseTargets(command, openPositions)
+            val results = targetPositions.map { position ->
+                val closeCommand = command.forCloseTarget(position, targetPositions.size)
+                val fill = runtime.market.fillSimulator.marketFill(
+                    side = OrderSide.SELL,
+                    sizeBtc = position.sizeBtc.toBigDecimal(),
+                    ticker = ticker,
+                    rules = symbolRules,
+                )
+
+                runtime.stores.ledgerRepository.closePosition(
+                    command = closeCommand,
+                    positionId = UUID.fromString(position.positionId),
+                    orderId = UUID.randomUUID(),
+                    fill = fill,
+                ).getOrThrow()
+            }
+
+            mergeTradeResults(results, "position を close しました。")
+        }
+    }
+
+    override suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult> {
+        return runCatching {
+            validateReason(command.reasonJa)
+            validateProtectionUpdateHasChange(command)
+
+            val ticker = runtime.tickerFor(TradingSymbol.BTC).getOrThrow()
+            val symbolRules = runtime.symbolRulesFor(TradingSymbol.BTC).getOrThrow()
+            val context = marketContextFactory.safetyContext(
+                ticker = ticker,
+                symbolRules = symbolRules,
+                includeAtr = true,
+            )
+
+            safetyGate.enforceSafetyFloor(
+                verdict = runtime.safety.safetyFloor.evaluateUpdateProtection(command, context),
+                command = command,
+                ticker = ticker,
+                symbolRules = symbolRules,
+            )?.let { rejectedResult -> return@runCatching rejectedResult }
+
+            validateStopPriceIfPresent(command, ticker, symbolRules)
+
+            runtime.stores.ledgerRepository.updateProtection(command).getOrThrow()
+        }
+    }
+
+    override suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult> {
+        return runCatching {
+            validateReason(command.reasonJa)
+
+            val ticker = runtime.tickerFor(TradingSymbol.BTC).getOrThrow()
+            val symbolRules = runtime.symbolRulesFor(TradingSymbol.BTC).getOrThrow()
+            val context = marketContextFactory.safetyContext(ticker, symbolRules)
+
+            safetyGate.enforceSafetyFloor(
+                verdict = runtime.safety.safetyFloor.evaluateCancelOrder(command, context),
+                command = command,
+                ticker = ticker,
+                symbolRules = symbolRules,
+            )?.let { rejectedResult -> return@runCatching rejectedResult }
+
+            runtime.stores.ledgerRepository.cancelOrder(command).getOrThrow()
+        }
+    }
+}
+
+/**
+ * PaperBroker の reconcile boundary 実装。
+ *
+ * @param runtime PaperBroker runtime context
+ */
+private class PaperBrokerReconcileDelegate(
+    private val runtime: PaperBrokerRuntime,
+) : BrokerReconcileBoundary {
+    private val safetyGate = PaperBrokerSafetyGate(runtime)
+
+    override suspend fun reconcile(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
+        return runCatching {
+            val result = runtime.stores.ledgerRepository
+                .reconcile(tickSnapshot, runtime.market.fillSimulator)
+                .getOrThrow()
+
+            safetyGate.activateHardHaltIfAccountDrawdownReached()
+
+            result
+        }
+    }
+
+    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult> {
+        return runCatching {
+            val ticker = tickSnapshot.requireTicker()
+            val symbolRules = tickSnapshot.symbolRules ?: runtime.symbolRulesFor(TradingSymbol.BTC).getOrThrow()
+
+            safetyGate.sweepOpenRisk(
+                reason = reasonJa,
+                auditContext = PaperTradeAuditContext.EMPTY,
+                ticker = ticker,
+                symbolRules = symbolRules,
+            )
+        }
+    }
+}
+
+/**
+ * SafetyFloor 評価に渡す market context を組み立てる helper。
+ *
+ * @param runtime PaperBroker runtime context
+ */
+private class PaperBrokerMarketContextFactory(
+    private val runtime: PaperBrokerRuntime,
+) {
+    suspend fun safetyContext(
         ticker: Ticker,
         symbolRules: SymbolRules,
         includeAtr: Boolean = false,
         intentId: UUID? = null,
     ): SafetyFloorContext {
-        val observedAt = Instant.now(clock)
+        val observedAt = Instant.now(runtime.time.clock)
         val entryIntent = intentId?.let { requestedIntentId ->
-            decisionRepository.entryIntentSafetySnapshot(
+            runtime.stores.decisionRepository.entryIntentSafetySnapshot(
                 intentId = requestedIntentId,
                 observedAt = observedAt,
-                freshnessWindow = falsificationFreshnessWindow,
+                freshnessWindow = runtime.time.falsificationFreshnessWindow,
             ).getOrThrow()
         }
 
         return SafetyFloorContext(
-            account = ledgerRepository.getAccountSnapshot().getOrThrow(),
-            riskState = riskStateRepository.current().getOrThrow(),
-            positions = ledgerRepository.getOpenPositions().getOrThrow(),
-            openOrders = ledgerRepository.getOpenOrders().getOrThrow(),
+            account = runtime.stores.ledgerRepository.getAccountSnapshot().getOrThrow(),
+            riskState = runtime.stores.riskStateRepository.current().getOrThrow(),
+            positions = runtime.stores.ledgerRepository.getOpenPositions().getOrThrow(),
+            openOrders = runtime.stores.ledgerRepository.getOpenOrders().getOrThrow(),
             ticker = ticker,
             symbolRules = symbolRules,
             entryIntent = entryIntent,
@@ -420,7 +574,7 @@ class PaperBroker(
         return try {
             Instant.parse(timestamp)
         } catch (exception: DateTimeParseException) {
-            warnLogger.warn(
+            runtime.market.warnLogger.warn(
                 key = "paper-broker-ticker-timestamp-parse-failure",
                 message = "PaperBroker could not parse ticker timestamp. Data quality probability cap will fail closed.",
                 throwable = exception,
@@ -429,87 +583,8 @@ class PaperBroker(
         }
     }
 
-    private fun requireEntryIntentId(command: PlaceOrderCommand): UUID {
-        return requireNotNull(command.intentId) {
-            "intentId is required for entry order."
-        }
-    }
-
-    private suspend fun fillMarketEntryAndConsumeIntent(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        entryOrderId: UUID,
-        stopOrderId: UUID,
-    ): PaperTradeResult {
-        val intentId = requireEntryIntentId(command)
-        val consumedAt = Instant.now(clock)
-        val atomicRepository = ledgerRepository as? IntentConsumingPaperLedgerRepository
-
-        if (atomicRepository != null) {
-            return atomicRepository.fillMarketEntryAndConsumeIntent(
-                command = command,
-                fill = fill,
-                positionId = positionId,
-                tradeGroupId = tradeGroupId,
-                stopOrderId = stopOrderId,
-                intentId = intentId,
-                consumedAt = consumedAt,
-            ).getOrThrow()
-        }
-
-        return atomicDecisionRepository().consumeIntentAfterLedgerWrite(
-            intentId = intentId,
-            orderId = entryOrderId,
-            consumedAt = consumedAt,
-        ) {
-            ledgerRepository.fillMarketEntry(
-                command = command,
-                fill = fill,
-                positionId = positionId,
-                tradeGroupId = tradeGroupId,
-                stopOrderId = stopOrderId,
-            ).getOrThrow()
-        }.getOrThrow()
-    }
-
-    private suspend fun createRestingEntryOrderAndConsumeIntent(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-    ): PaperTradeResult {
-        val intentId = requireEntryIntentId(command)
-        val consumedAt = Instant.now(clock)
-        val atomicRepository = ledgerRepository as? IntentConsumingPaperLedgerRepository
-
-        if (atomicRepository != null) {
-            return atomicRepository.createRestingEntryOrderAndConsumeIntent(
-                command = command,
-                orderId = orderId,
-                tradeGroupId = tradeGroupId,
-                intentId = intentId,
-                consumedAt = consumedAt,
-            ).getOrThrow()
-        }
-
-        return atomicDecisionRepository().consumeIntentAfterLedgerWrite(
-            intentId = intentId,
-            orderId = orderId,
-            consumedAt = consumedAt,
-        ) {
-            ledgerRepository.createRestingEntryOrder(command, orderId, tradeGroupId).getOrThrow()
-        }.getOrThrow()
-    }
-
-    private fun atomicDecisionRepository(): AtomicIntentConsumptionRepository {
-        return requireNotNull(decisionRepository as? AtomicIntentConsumptionRepository) {
-            "PaperBroker requires AtomicIntentConsumptionRepository for non-transactional ledger repositories."
-        }
-    }
-
     private suspend fun atr14JpyFor(symbol: TradingSymbol): BigDecimal? {
-        val marketData = marketDataSource ?: return null
+        val marketData = runtime.market.marketDataSource ?: return null
         val candles = marketData.getCandles(
             symbol = symbol,
             interval = CandleInterval.FIVE_MINUTES,
@@ -532,8 +607,92 @@ class PaperBroker(
         return BigDecimal.valueOf(latestAtr)
             .setScale(ATR_SCALE, RoundingMode.HALF_UP)
     }
+}
 
-    private suspend fun enforceSafetyFloor(
+/**
+ * entry intent の atomic consumption と ledger write をまとめる helper。
+ *
+ * @param runtime PaperBroker runtime context
+ */
+private class PaperBrokerEntryIntentConsumer(
+    private val runtime: PaperBrokerRuntime,
+) {
+    suspend fun fillMarketEntryAndConsumeIntent(request: MarketEntryFillRequest): PaperTradeResult {
+        val intentId = requireEntryIntentId(request.command)
+        val consumedAt = Instant.now(runtime.time.clock)
+        val atomicRepository = runtime.stores.ledgerRepository as? IntentConsumingPaperLedgerRepository
+        val consumption = TradeIntentConsumptionRequest(
+            intentId = intentId,
+            consumedAt = consumedAt,
+        )
+
+        if (atomicRepository != null) {
+            return atomicRepository.fillMarketEntryAndConsumeIntent(
+                IntentConsumingMarketEntryFillRequest(
+                    entry = request,
+                    consumption = consumption,
+                ),
+            ).getOrThrow()
+        }
+
+        return atomicDecisionRepository().consumeIntentAfterLedgerWrite(
+            intentId = intentId,
+            orderId = request.command.commandId,
+            consumedAt = consumedAt,
+        ) {
+            runtime.stores.ledgerRepository.fillMarketEntry(request).getOrThrow()
+        }.getOrThrow()
+    }
+
+    suspend fun createRestingEntryOrderAndConsumeIntent(request: RestingEntryOrderRequest): PaperTradeResult {
+        val intentId = requireEntryIntentId(request.command)
+        val consumedAt = Instant.now(runtime.time.clock)
+        val atomicRepository = runtime.stores.ledgerRepository as? IntentConsumingPaperLedgerRepository
+        val consumption = TradeIntentConsumptionRequest(
+            intentId = intentId,
+            consumedAt = consumedAt,
+        )
+
+        if (atomicRepository != null) {
+            return atomicRepository.createRestingEntryOrderAndConsumeIntent(
+                IntentConsumingRestingEntryOrderRequest(
+                    order = request,
+                    consumption = consumption,
+                ),
+            ).getOrThrow()
+        }
+
+        return atomicDecisionRepository().consumeIntentAfterLedgerWrite(
+            intentId = intentId,
+            orderId = request.orderId,
+            consumedAt = consumedAt,
+        ) {
+            runtime.stores.ledgerRepository.createRestingEntryOrder(request).getOrThrow()
+        }.getOrThrow()
+    }
+
+    private fun requireEntryIntentId(command: PlaceOrderCommand): UUID {
+        return requireNotNull(command.intentId) {
+            "intentId is required for entry order."
+        }
+    }
+
+    private fun atomicDecisionRepository(): AtomicIntentConsumptionRepository {
+        return requireNotNull(runtime.stores.decisionRepository as? AtomicIntentConsumptionRepository) {
+            "PaperBroker requires AtomicIntentConsumptionRepository for non-transactional ledger repositories."
+        }
+    }
+}
+
+/**
+ * SafetyFloor violation と HARD_HALT 副作用を処理する helper。
+ *
+ * @param runtime PaperBroker runtime context
+ */
+private class PaperBrokerSafetyGate(
+    private val runtime: PaperBrokerRuntime,
+) {
+    suspend fun enforceSafetyFloor(
         verdict: SafetyFloorVerdict,
         command: Any,
         ticker: Ticker,
@@ -545,7 +704,7 @@ class PaperBroker(
 
         val violation = (verdict as SafetyFloorVerdict.Rejected).violation
 
-        safetyViolationRepository.append(violation).getOrThrow()
+        runtime.safety.safetyViolationRepository.append(violation).getOrThrow()
 
         val sweepResult = if (violation.hardHaltRequired) {
             activateHardHaltAndSweep(violation, command, ticker, symbolRules)
@@ -556,35 +715,17 @@ class PaperBroker(
         return rejectedTradeResult(violation, sweepResult)
     }
 
-    private suspend fun activateHardHaltAndSweep(
-        violation: SafetyViolation,
-        command: Any,
-        ticker: Ticker,
-        symbolRules: SymbolRules,
-    ): PaperTradeResult {
-        val reason = "SafetyFloor HARD_HALT: ${violation.rule.name}"
-        val decisionRunContext = command.auditContext().decisionRunContext
-
-        if (riskStateCommandService != null) {
-            riskStateCommandService.setHardHalt(reason, decisionRunContext).getOrThrow()
-        } else {
-            riskStateRepository.setHardHalt(reason, Instant.now(clock)).getOrThrow()
-        }
-
-        return sweepOpenRisk(reason, command.auditContext(), ticker, symbolRules)
-    }
-
-    private suspend fun sweepOpenRisk(
+    suspend fun sweepOpenRisk(
         reason: String,
         auditContext: PaperTradeAuditContext,
         ticker: Ticker,
         symbolRules: SymbolRules,
     ): PaperTradeResult {
-        val cancelResults = ledgerRepository.getOpenOrders()
+        val cancelResults = runtime.stores.ledgerRepository.getOpenOrders()
             .getOrThrow()
             .filterNot { order -> order.isLinkedProtectiveStop() }
             .map { order ->
-                ledgerRepository.cancelOrder(
+                runtime.stores.ledgerRepository.cancelOrder(
                     CancelOrderCommand(
                         commandId = UUID.randomUUID(),
                         orderId = UUID.fromString(order.orderId),
@@ -593,17 +734,17 @@ class PaperBroker(
                     ),
                 ).getOrThrow()
             }
-        val closeResults = ledgerRepository.getOpenPositions()
+        val closeResults = runtime.stores.ledgerRepository.getOpenPositions()
             .getOrThrow()
             .map { position ->
-                val fill = fillSimulator.marketFill(
+                val fill = runtime.market.fillSimulator.marketFill(
                     side = OrderSide.SELL,
                     sizeBtc = position.sizeBtc.toBigDecimal(),
                     ticker = ticker,
                     rules = symbolRules,
                 )
 
-                ledgerRepository.closePosition(
+                runtime.stores.ledgerRepository.closePosition(
                     command = ClosePositionCommand(
                         commandId = UUID.randomUUID(),
                         positionId = UUID.fromString(position.positionId),
@@ -617,18 +758,21 @@ class PaperBroker(
                 ).getOrThrow()
             }
 
-        return mergeTradeResults(cancelResults + closeResults, "HARD_HALT 掃引で open order を取消し、open position を close しました。")
+        return mergeTradeResults(
+            results = cancelResults + closeResults,
+            messageJa = "HARD_HALT 掃引で open order を取消し、open position を close しました。",
+        )
     }
 
-    private suspend fun activateHardHaltIfAccountDrawdownReached() {
-        val accountSnapshot = ledgerRepository.getAccountSnapshot().getOrThrow()
+    suspend fun activateHardHaltIfAccountDrawdownReached() {
+        val accountSnapshot = runtime.stores.ledgerRepository.getAccountSnapshot().getOrThrow()
         val drawdownRatio = accountSnapshot.drawdownRatio.toBigDecimal()
 
         if (drawdownRatio > SafetyFloorDefaults.maxDrawdownRatio) {
             return
         }
 
-        val riskState = riskStateRepository.current().getOrThrow()
+        val riskState = runtime.stores.riskStateRepository.current().getOrThrow()
 
         if (riskState.state == RiskHaltState.HARD_HALT) {
             return
@@ -636,15 +780,33 @@ class PaperBroker(
 
         val reason = "Paper account drawdown reached HARD_HALT threshold."
 
-        if (riskStateCommandService != null) {
-            riskStateCommandService.setHardHalt(reason, PaperTradeAuditContext.EMPTY.decisionRunContext).getOrThrow()
+        if (runtime.safety.riskStateCommandService != null) {
+            runtime.safety.riskStateCommandService
+                .setHardHalt(reason, PaperTradeAuditContext.EMPTY.decisionRunContext)
+                .getOrThrow()
         } else {
-            riskStateRepository.setHardHalt(reason, Instant.now(clock)).getOrThrow()
+            runtime.stores.riskStateRepository.setHardHalt(reason, Instant.now(runtime.time.clock)).getOrThrow()
         }
     }
-}
 
-private val paperBrokerLogger: Logger = Logger.getLogger(PaperBroker::class.java.name)
+    private suspend fun activateHardHaltAndSweep(
+        violation: SafetyViolation,
+        command: Any,
+        ticker: Ticker,
+        symbolRules: SymbolRules,
+    ): PaperTradeResult {
+        val reason = "SafetyFloor HARD_HALT: ${violation.rule.name}"
+        val decisionRunContext = command.auditContext().decisionRunContext
+
+        if (runtime.safety.riskStateCommandService != null) {
+            runtime.safety.riskStateCommandService.setHardHalt(reason, decisionRunContext).getOrThrow()
+        } else {
+            runtime.stores.riskStateRepository.setHardHalt(reason, Instant.now(runtime.time.clock)).getOrThrow()
+        }
+
+        return sweepOpenRisk(reason, command.auditContext(), ticker, symbolRules)
+    }
+}
 
 private fun ClosePositionCommand.forCloseTarget(position: Position, targetCount: Int): ClosePositionCommand {
     if (targetCount <= 1) {
@@ -666,23 +828,23 @@ private fun String.deriveCloseAllClientRequestId(positionId: String): String {
     return boundedBase + suffix
 }
 
-private suspend fun PaperBroker.findExistingPlaceOrderResult(command: PlaceOrderCommand): PaperTradeResult? {
+private suspend fun PaperBrokerRuntime.findExistingPlaceOrderResult(command: PlaceOrderCommand): PaperTradeResult? {
     val clientRequestId = command.auditContext.clientRequestId?.takeIf { requestId -> requestId.isNotBlank() }
         ?: return null
 
-    return ledgerRepository.findPlaceOrderResultByClientRequestId(clientRequestId).getOrThrow()
+    return stores.ledgerRepository.findPlaceOrderResultByClientRequestId(clientRequestId).getOrThrow()
 }
 
-private suspend fun PaperBroker.tickerFor(symbol: TradingSymbol): Result<Ticker> {
-    val marketData = requireNotNull(marketDataSource) {
+private suspend fun PaperBrokerRuntime.tickerFor(symbol: TradingSymbol): Result<Ticker> {
+    val marketData = requireNotNull(market.marketDataSource) {
         "MarketDataSource is required for paper execution."
     }
 
     return marketData.getTicker(symbol)
 }
 
-private suspend fun PaperBroker.symbolRulesFor(symbol: TradingSymbol): Result<SymbolRules> {
-    val marketData = requireNotNull(marketDataSource) {
+private suspend fun PaperBrokerRuntime.symbolRulesFor(symbol: TradingSymbol): Result<SymbolRules> {
+    val marketData = requireNotNull(market.marketDataSource) {
         "MarketDataSource is required for paper execution."
     }
 
@@ -766,18 +928,18 @@ private fun validateStopEntryPrice(price: BigDecimal?, ask: BigDecimal) {
     }
 }
 
-private suspend fun PaperBroker.validateCashAvailability(
+private suspend fun PaperBrokerRuntime.validateCashAvailability(
     command: PlaceOrderCommand,
     ticker: Ticker,
     rules: SymbolRules,
 ) {
-    val balance = ledgerRepository.getAccountSnapshot().getOrThrow()
-    val openOrders = ledgerRepository.getOpenOrders().getOrThrow()
+    val balance = stores.ledgerRepository.getAccountSnapshot().getOrThrow()
+    val openOrders = stores.ledgerRepository.getOpenOrders().getOrThrow()
     val cashJpy = balance.cashJpy.toBigDecimal()
     val reservedCashJpy = openOrders
         .filter { order -> order.side == OrderSide.BUY && order.status == OrderStatus.OPEN }
-        .sumOf { order -> order.estimatedBuyReservationJpy(ticker, rules, fillSimulator) }
-    val requiredCash = command.estimatedRequiredCash(ticker, rules, fillSimulator)
+        .sumOf { order -> order.estimatedBuyReservationJpy(ticker, rules, market.fillSimulator) }
+    val requiredCash = command.estimatedRequiredCash(ticker, rules, market.fillSimulator)
     val availableCash = cashJpy.subtract(reservedCashJpy).moneyScale()
 
     require(requiredCash <= availableCash) {

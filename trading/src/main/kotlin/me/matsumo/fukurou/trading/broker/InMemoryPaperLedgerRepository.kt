@@ -40,33 +40,153 @@ import java.util.UUID
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  * @param clock paper ledger の作成時刻に使う clock
  */
-class InMemoryPaperLedgerRepository(
-    accountSnapshot: AccountSnapshot = PaperAccountConfig().toInitialAccountSnapshot(),
-    accountUpdatedAt: Instant = Instant.EPOCH,
-    positions: List<Position> = emptyList(),
-    openOrders: List<Order> = emptyList(),
-    executions: List<Execution> = emptyList(),
-    decisionRunIdsByPositionId: Map<String, String?> = emptyMap(),
-    internal val equitySnapshotRepository: InMemoryEquitySnapshotRepository = InMemoryEquitySnapshotRepository(),
-    private val fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
-    private val clock: Clock = Clock.systemUTC(),
-) : PaperLedgerRepository {
+class InMemoryPaperLedgerRepository private constructor(
+    private val state: InMemoryPaperLedgerState,
+    accountRepository: PaperLedgerAccountRepository,
+    executionRepository: PaperLedgerExecutionRepository,
+    historyRepository: PaperLedgerHistoryRepository,
+    mutationRepository: PaperLedgerMutationRepository,
+) : PaperLedgerRepository,
+    PaperLedgerAccountRepository by accountRepository,
+    PaperLedgerExecutionRepository by executionRepository,
+    PaperLedgerHistoryRepository by historyRepository,
+    PaperLedgerMutationRepository by mutationRepository {
 
+    internal val equitySnapshotRepository: InMemoryEquitySnapshotRepository
+        get() = state.equitySnapshotRepository
+
+    private constructor(state: InMemoryPaperLedgerState) : this(
+        state = state,
+        accountRepository = InMemoryPaperLedgerAccountReader(state),
+        executionRepository = InMemoryPaperLedgerExecutionReader(state),
+        historyRepository = InMemoryPaperLedgerHistoryReader(state),
+        mutationRepository = InMemoryPaperLedgerMutationWriter(state),
+    )
+
+    constructor(
+        accountSnapshot: AccountSnapshot = PaperAccountConfig().toInitialAccountSnapshot(),
+        accountUpdatedAt: Instant = Instant.EPOCH,
+        positions: List<Position> = emptyList(),
+        openOrders: List<Order> = emptyList(),
+        executions: List<Execution> = emptyList(),
+        decisionRunIdsByPositionId: Map<String, String?> = emptyMap(),
+        equitySnapshotRepository: InMemoryEquitySnapshotRepository = InMemoryEquitySnapshotRepository(),
+        fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
+        clock: Clock = Clock.systemUTC(),
+    ) : this(
+        InMemoryPaperLedgerState(
+            account = InMemoryPaperLedgerAccountSeed(
+                accountSnapshot = accountSnapshot,
+                accountUpdatedAt = accountUpdatedAt,
+            ),
+            records = InMemoryPaperLedgerRecordsSeed(
+                positions = positions,
+                openOrders = openOrders,
+                executions = executions,
+                decisionRunIdsByPositionId = decisionRunIdsByPositionId,
+            ),
+            runtime = InMemoryPaperLedgerRuntime(
+                equitySnapshotRepository = equitySnapshotRepository,
+                fallbackSymbolRules = fallbackSymbolRules,
+                clock = clock,
+            ),
+        ),
+    )
+
+    /**
+     * unit test で closed position を含む watermark 確定値を検証するため、全 position を返す。
+     */
+    internal fun getAllPositionsForTest(): List<Position> {
+        return state.read { positions.toList() }
+    }
+}
+
+/**
+ * InMemory paper ledger の account seed。
+ *
+ * @param accountSnapshot 残高 snapshot
+ * @param accountUpdatedAt paper account 更新時刻
+ */
+private data class InMemoryPaperLedgerAccountSeed(
+    val accountSnapshot: AccountSnapshot,
+    val accountUpdatedAt: Instant,
+)
+
+/**
+ * InMemory paper ledger の記録 seed。
+ *
+ * @param positions position 一覧
+ * @param openOrders open order 一覧
+ * @param executions execution 一覧
+ * @param decisionRunIdsByPositionId position ID と LLM invocation ID の対応
+ */
+private data class InMemoryPaperLedgerRecordsSeed(
+    val positions: List<Position>,
+    val openOrders: List<Order>,
+    val executions: List<Execution>,
+    val decisionRunIdsByPositionId: Map<String, String?>,
+)
+
+/**
+ * InMemory paper ledger の runtime 依存。
+ *
+ * @param equitySnapshotRepository equity snapshot 保存先
+ * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
+ * @param clock paper ledger の作成時刻に使う clock
+ */
+private data class InMemoryPaperLedgerRuntime(
+    val equitySnapshotRepository: InMemoryEquitySnapshotRepository,
+    val fallbackSymbolRules: SymbolRules,
+    val clock: Clock,
+)
+
+/**
+ * InMemory paper ledger の共有 mutable state。
+ *
+ * @param account account seed
+ * @param records 記録 seed
+ * @param runtime runtime 依存
+ */
+private class InMemoryPaperLedgerState(
+    account: InMemoryPaperLedgerAccountSeed,
+    records: InMemoryPaperLedgerRecordsSeed,
+    runtime: InMemoryPaperLedgerRuntime,
+) {
     private val lock = Any()
-    private var accountSnapshot: AccountSnapshot = accountSnapshot
-    private var accountUpdatedAt: Instant = accountUpdatedAt
-    private val positions = positions.toMutableList()
-    private val orders = openOrders.toMutableList()
-    private val executions = executions.toMutableList()
-    private val decisionRunIdsByPositionId = decisionRunIdsByPositionId.toMutableMap()
+    var accountSnapshot: AccountSnapshot = account.accountSnapshot
+    var accountUpdatedAt: Instant = account.accountUpdatedAt
+    val positions: MutableList<Position> = records.positions.toMutableList()
+    val orders: MutableList<Order> = records.openOrders.toMutableList()
+    val executions: MutableList<Execution> = records.executions.toMutableList()
+    val decisionRunIdsByPositionId: MutableMap<String, String?> = records.decisionRunIdsByPositionId.toMutableMap()
+    val equitySnapshotRepository: InMemoryEquitySnapshotRepository = runtime.equitySnapshotRepository
+    val fallbackSymbolRules: SymbolRules = runtime.fallbackSymbolRules
+    val clock: Clock = runtime.clock
 
+    fun <T> read(block: InMemoryPaperLedgerState.() -> T): T {
+        return synchronized(lock) { block() }
+    }
+
+    fun <T> write(block: InMemoryPaperLedgerState.() -> T): T {
+        return synchronized(lock) { block() }
+    }
+}
+
+/**
+ * InMemory paper ledger の account / position / order 読み取り boundary。
+ *
+ * @param state 共有 mutable state
+ */
+private class InMemoryPaperLedgerAccountReader(
+    private val state: InMemoryPaperLedgerState,
+) : PaperLedgerAccountRepository {
     override suspend fun getAccountSnapshot(): Result<AccountSnapshot> {
-        return Result.success(synchronized(lock) { accountSnapshot })
+        return Result.success(state.read { accountSnapshot })
     }
 
     override suspend fun getAccountSnapshotWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
         return Result.success(
-            synchronized(lock) {
+            state.read {
                 AccountSnapshotWithUpdatedAt(
                     accountSnapshot = accountSnapshot,
                     updatedAt = accountUpdatedAt,
@@ -76,16 +196,12 @@ class InMemoryPaperLedgerRepository(
     }
 
     override suspend fun getOpenPositions(): Result<List<Position>> {
-        return Result.success(
-            synchronized(lock) {
-                openPositionsLocked()
-            },
-        )
+        return Result.success(state.read { openPositionsLocked() })
     }
 
     override suspend fun getOpenPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt> {
         return Result.success(
-            synchronized(lock) {
+            state.read {
                 PositionsWithUpdatedAt(
                     positions = openPositionsLocked(),
                     updatedAt = accountUpdatedAt,
@@ -94,24 +210,13 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
-    /**
-     * unit test で closed position を含む watermark 確定値を検証するため、全 position を返す。
-     */
-    internal fun getAllPositionsForTest(): List<Position> {
-        return synchronized(lock) { positions.toList() }
-    }
-
     override suspend fun getOpenOrders(): Result<List<Order>> {
-        return Result.success(
-            synchronized(lock) {
-                openOrdersLocked()
-            },
-        )
+        return Result.success(state.read { openOrdersLocked() })
     }
 
     override suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt> {
         return Result.success(
-            synchronized(lock) {
+            state.read {
                 OpenOrdersWithUpdatedAt(
                     openOrders = openOrdersLocked(),
                     updatedAt = accountUpdatedAt,
@@ -122,14 +227,23 @@ class InMemoryPaperLedgerRepository(
 
     override suspend fun getRealizedPnlForDate(date: LocalDate): Result<BigDecimal> {
         return Result.success(
-            synchronized(lock) {
+            state.read {
                 executions.sumOf { execution -> execution.realizedPnlJpy.toBigDecimal() }
             },
         )
     }
+}
 
+/**
+ * InMemory paper ledger の execution 読み取り boundary。
+ *
+ * @param state 共有 mutable state
+ */
+private class InMemoryPaperLedgerExecutionReader(
+    private val state: InMemoryPaperLedgerState,
+) : PaperLedgerExecutionRepository {
     override suspend fun getExecutions(): Result<List<Execution>> {
-        return Result.success(synchronized(lock) { executions.toList() })
+        return Result.success(state.read { executions.toList() })
     }
 
     override suspend fun getRecentExecutions(limit: Int): Result<List<Execution>> {
@@ -145,7 +259,7 @@ class InMemoryPaperLedgerRepository(
                 "limit must be greater than 0."
             }
 
-            synchronized(lock) {
+            state.read {
                 executions
                     .filter { execution -> Instant.parse(execution.executedAt) < before }
                     .sortedByDescending { execution -> Instant.parse(execution.executedAt) }
@@ -160,7 +274,7 @@ class InMemoryPaperLedgerRepository(
                 "limit must be greater than 0."
             }
 
-            synchronized(lock) {
+            state.read {
                 executions
                     .filter { execution -> cursor.accepts(Instant.parse(execution.executedAt), execution.executionId) }
                     .sortedWith(
@@ -171,7 +285,16 @@ class InMemoryPaperLedgerRepository(
             }
         }
     }
+}
 
+/**
+ * InMemory paper ledger の履歴読み取り boundary。
+ *
+ * @param state 共有 mutable state
+ */
+private class InMemoryPaperLedgerHistoryReader(
+    private val state: InMemoryPaperLedgerState,
+) : PaperLedgerHistoryRepository {
     override suspend fun findClosedPositionsClosedBetween(
         from: Instant,
         toExclusive: Instant,
@@ -182,7 +305,7 @@ class InMemoryPaperLedgerRepository(
                 "limit must be greater than 0."
             }
 
-            synchronized(lock) {
+            state.read {
                 positions
                     .filter { position -> position.status == PositionStatus.CLOSED }
                     .mapNotNull { position -> position.toClosedPositionWithParsedInstantOrNull() }
@@ -209,57 +332,45 @@ class InMemoryPaperLedgerRepository(
         }
     }
 
-    private fun Position.toClosedPositionWithParsedInstantOrNull(): ClosedPositionWithParsedInstant? {
-        val closedAtText = closedAt ?: return null
-
-        return ClosedPositionWithParsedInstant(
-            position = this,
-            closedAt = Instant.parse(closedAtText),
-        )
-    }
-
     override suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?> {
         return Result.success(
-            synchronized(lock) {
+            state.read {
                 findPlaceOrderResultByClientRequestIdLocked(clientRequestId)
             },
         )
     }
+}
 
-    override suspend fun fillMarketEntry(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        stopOrderId: UUID,
-    ): Result<PaperTradeResult> {
+/**
+ * InMemory paper ledger の mutation boundary。
+ *
+ * @param state 共有 mutable state
+ */
+private class InMemoryPaperLedgerMutationWriter(
+    private val state: InMemoryPaperLedgerState,
+) : PaperLedgerMutationRepository {
+    override suspend fun fillMarketEntry(request: MarketEntryFillRequest): Result<PaperTradeResult> {
         return runCatching {
-            synchronized(lock) {
+            state.write {
                 fillEntryLocked(
-                    command = command,
-                    fill = fill,
-                    positionId = positionId,
-                    tradeGroupId = tradeGroupId,
-                    entryOrderId = command.commandId,
-                    stopOrderId = stopOrderId,
-                    insertEntryOrder = true,
+                    EntryFillWriteRequest(
+                        entry = request,
+                        entryOrderId = request.command.commandId,
+                        insertEntryOrder = true,
+                    ),
                 )
             }
         }
     }
 
-    override suspend fun createRestingEntryOrder(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-    ): Result<PaperTradeResult> {
+    override suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
         return runCatching {
-            synchronized(lock) {
+            state.write {
                 val recordedAt = Instant.now(clock)
-                val order = command.toEntryOrder(
-                    orderId = orderId,
+                val order = request.command.toEntryOrder(
+                    orderId = request.orderId,
                     positionId = null,
-                    tradeGroupId = tradeGroupId,
+                    tradeGroupId = request.tradeGroupId,
                     status = OrderStatus.OPEN,
                     recordedAt = recordedAt,
                 )
@@ -285,7 +396,7 @@ class InMemoryPaperLedgerRepository(
         fill: SimulatedFill,
     ): Result<PaperTradeResult> {
         return runCatching {
-            synchronized(lock) {
+            state.write {
                 closePositionLocked(
                     positionId = positionId.toString(),
                     orderId = orderId,
@@ -298,7 +409,7 @@ class InMemoryPaperLedgerRepository(
 
     override suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult> {
         return runCatching {
-            synchronized(lock) {
+            state.write {
                 val positionIndex = positions.indexOfFirst { position -> position.positionId == command.positionId.toString() }
 
                 require(positionIndex >= 0) {
@@ -340,7 +451,7 @@ class InMemoryPaperLedgerRepository(
 
     override suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult> {
         return runCatching {
-            synchronized(lock) {
+            state.write {
                 val orderIndex = orders.indexOfFirst { order -> order.orderId == command.orderId.toString() }
 
                 require(orderIndex >= 0) {
@@ -376,13 +487,24 @@ class InMemoryPaperLedgerRepository(
 
     override suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult> {
         return runCatching {
-            synchronized(lock) {
+            state.write {
                 val ticker = tickSnapshot.requireTicker()
                 val rules = tickSnapshot.symbolRules ?: fallbackSymbolRules
                 val lastPrice = tickSnapshot.lastPrice?.toBigDecimal() ?: ticker.last.toBigDecimal()
                 val triggeredOrderIds = mutableListOf<String>()
                 val closedPositionIds = mutableListOf<String>()
                 val executionIds = mutableListOf<String>()
+                val reconcileContext = ReconcileMarketContext(
+                    ticker = ticker,
+                    rules = rules,
+                    simulator = simulator,
+                    lastPrice = lastPrice,
+                )
+                val progress = ReconcileProgress(
+                    triggeredOrderIds = triggeredOrderIds,
+                    closedPositionIds = closedPositionIds,
+                    executionIds = executionIds,
+                )
 
                 updateMarksLocked(
                     lastPrice = lastPrice,
@@ -392,8 +514,8 @@ class InMemoryPaperLedgerRepository(
                 )
 
                 if (!accountSnapshot.isHardHaltDrawdownReached()) {
-                    fillTriggeredEntryOrdersLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, executionIds)
-                    triggerPositionProtectionsLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, closedPositionIds, executionIds)
+                    fillTriggeredEntryOrdersLocked(reconcileContext, progress)
+                    triggerPositionProtectionsLocked(reconcileContext, progress)
                 }
 
                 PaperReconcileResult(
@@ -406,7 +528,7 @@ class InMemoryPaperLedgerRepository(
         }
     }
 
-    private fun closePositionLocked(
+    private fun InMemoryPaperLedgerState.closePositionLocked(
         positionId: String,
         orderId: UUID,
         fill: SimulatedFill,
@@ -459,44 +581,16 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
-    private fun findPlaceOrderResultByClientRequestIdLocked(clientRequestId: String): PaperTradeResult? {
-        val entryOrder = orders.firstOrNull { order ->
-            order.clientRequestId == clientRequestId && order.side == OrderSide.BUY
-        } ?: return null
-        val tradeGroupId = requireNotNull(entryOrder.tradeGroupId)
-        val relatedOrders = orders.filter { order -> order.tradeGroupId == tradeGroupId }
-        val relatedOrderIds = relatedOrders.map { order -> order.orderId }.toSet()
-        val relatedPositionIds = positions
-            .filter { position -> position.tradeGroupId == tradeGroupId }
-            .map { position -> position.positionId }
-        val relatedExecutionIds = executions
-            .filter { execution -> execution.orderId in relatedOrderIds }
-            .map { execution -> execution.executionId }
-
-        return PaperTradeResult(
-            accepted = true,
-            status = entryOrder.status,
-            orderIds = relatedOrders.map { order -> order.orderId },
-            positionIds = relatedPositionIds,
-            executionIds = relatedExecutionIds,
-            messageJa = "client_request_id に一致する既存 paper entry を返しました。",
-        )
-    }
-
-    private fun fillTriggeredEntryOrdersLocked(
-        ticker: Ticker,
-        rules: SymbolRules,
-        simulator: FillSimulator,
-        lastPrice: BigDecimal,
-        triggeredOrderIds: MutableList<String>,
-        executionIds: MutableList<String>,
+    private fun InMemoryPaperLedgerState.fillTriggeredEntryOrdersLocked(
+        context: ReconcileMarketContext,
+        progress: ReconcileProgress,
     ) {
         val entryOrders = orders
             .filter { order -> order.status == OrderStatus.OPEN && order.side == OrderSide.BUY }
-            .filter { order -> order.isEntryTriggered(lastPrice) }
+            .filter { order -> order.isEntryTriggered(context.lastPrice) }
 
         entryOrders.forEach { order ->
-            val fill = order.createEntryFill(ticker, rules, simulator)
+            val fill = order.createEntryFill(context.ticker, context.rules, context.simulator)
             val positionId = UUID.randomUUID()
             val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
             val stopOrderId = UUID.randomUUID()
@@ -504,52 +598,50 @@ class InMemoryPaperLedgerRepository(
 
             if (!accountSnapshot.hasCashForBuyFill(fill)) {
                 markOrderStatusLocked(order.orderId, OrderStatus.REJECTED, "reconciler entry rejected: insufficient paper cash")
-                triggeredOrderIds += order.orderId
+                progress.triggeredOrderIds += order.orderId
 
                 return@forEach
             }
 
             markOrderStatusLocked(order.orderId, OrderStatus.FILLED)
             fillEntryLocked(
-                command = command,
-                fill = fill,
-                positionId = positionId,
-                tradeGroupId = tradeGroupId,
-                entryOrderId = UUID.fromString(order.orderId),
-                stopOrderId = stopOrderId,
-                insertEntryOrder = false,
+                EntryFillWriteRequest(
+                    entry = MarketEntryFillRequest(
+                        command = command,
+                        fill = fill,
+                        positionId = positionId,
+                        tradeGroupId = tradeGroupId,
+                        stopOrderId = stopOrderId,
+                    ),
+                    entryOrderId = UUID.fromString(order.orderId),
+                    insertEntryOrder = false,
+                ),
             )
-            triggeredOrderIds += order.orderId
-            executionIds += fill.executionId.toString()
+            progress.triggeredOrderIds += order.orderId
+            progress.executionIds += fill.executionId.toString()
         }
     }
 
-    private fun fillEntryLocked(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        entryOrderId: UUID,
-        stopOrderId: UUID,
-        insertEntryOrder: Boolean,
-    ): PaperTradeResult {
+    private fun InMemoryPaperLedgerState.fillEntryLocked(request: EntryFillWriteRequest): PaperTradeResult {
+        val command = request.entry.command
+        val fill = request.entry.fill
         val recordedAt = fill.executedAt
         val entryOrder = command.toEntryOrder(
-            orderId = entryOrderId,
-            positionId = positionId,
-            tradeGroupId = tradeGroupId,
+            orderId = request.entryOrderId,
+            positionId = request.entry.positionId,
+            tradeGroupId = request.entry.tradeGroupId,
             status = OrderStatus.FILLED,
             recordedAt = recordedAt,
         )
         val stopOrder = command.toProtectiveStopOrder(
-            orderId = stopOrderId,
-            positionId = positionId,
-            tradeGroupId = tradeGroupId,
+            orderId = request.entry.stopOrderId,
+            positionId = request.entry.positionId,
+            tradeGroupId = request.entry.tradeGroupId,
             recordedAt = recordedAt,
         )
-        val position = command.toOpenPosition(positionId, tradeGroupId, fill)
+        val position = command.toOpenPosition(request.entry.positionId, request.entry.tradeGroupId, fill)
 
-        if (insertEntryOrder) {
+        if (request.insertEntryOrder) {
             orders += entryOrder
         }
         orders += stopOrder
@@ -570,26 +662,27 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
-    private fun triggerPositionProtectionsLocked(
-        ticker: Ticker,
-        rules: SymbolRules,
-        simulator: FillSimulator,
-        lastPrice: BigDecimal,
-        triggeredOrderIds: MutableList<String>,
-        closedPositionIds: MutableList<String>,
-        executionIds: MutableList<String>,
+    private fun InMemoryPaperLedgerState.triggerPositionProtectionsLocked(
+        context: ReconcileMarketContext,
+        progress: ReconcileProgress,
     ) {
         val openPositions = positions.filter { position -> position.status == PositionStatus.OPEN }
 
         openPositions.forEach { position ->
             val stopPrice = position.currentStopLossJpy?.toBigDecimal()
             val takeProfitPrice = position.currentTakeProfitJpy?.toBigDecimal()
-            val stopTriggered = stopPrice != null && lastPrice <= stopPrice
-            val takeProfitTriggered = takeProfitPrice != null && lastPrice >= takeProfitPrice
+            val stopTriggered = stopPrice != null && context.lastPrice <= stopPrice
+            val takeProfitTriggered = takeProfitPrice != null && context.lastPrice >= takeProfitPrice
 
             if (stopTriggered) {
                 val stopOrder = linkedStopOrder(position.positionId)
-                val fill = simulator.stopFill(OrderSide.SELL, position.sizeBtc.toBigDecimal(), requireNotNull(stopPrice), ticker, rules)
+                val fill = context.simulator.stopFill(
+                    OrderSide.SELL,
+                    position.sizeBtc.toBigDecimal(),
+                    requireNotNull(stopPrice),
+                    context.ticker,
+                    context.rules,
+                )
                 val result = closePositionLocked(
                     positionId = position.positionId,
                     orderId = UUID.fromString(requireNotNull(stopOrder).orderId),
@@ -598,9 +691,9 @@ class InMemoryPaperLedgerRepository(
                 )
 
                 markOrderStatusLocked(stopOrder.orderId, OrderStatus.FILLED)
-                triggeredOrderIds += stopOrder.orderId
-                closedPositionIds += position.positionId
-                executionIds += result.executionIds
+                progress.triggeredOrderIds += stopOrder.orderId
+                progress.closedPositionIds += position.positionId
+                progress.executionIds += result.executionIds
 
                 return@forEach
             }
@@ -608,10 +701,15 @@ class InMemoryPaperLedgerRepository(
             if (takeProfitTriggered) {
                 linkedStopOrder(position.positionId)?.let { stopOrder ->
                     markOrderStatusLocked(stopOrder.orderId, OrderStatus.CANCELED)
-                    triggeredOrderIds += stopOrder.orderId
+                    progress.triggeredOrderIds += stopOrder.orderId
                 }
 
-                val fill = simulator.marketFill(OrderSide.SELL, position.sizeBtc.toBigDecimal(), ticker, rules)
+                val fill = context.simulator.marketFill(
+                    OrderSide.SELL,
+                    position.sizeBtc.toBigDecimal(),
+                    context.ticker,
+                    context.rules,
+                )
                 val result = closePositionLocked(
                     positionId = position.positionId,
                     orderId = UUID.randomUUID(),
@@ -619,13 +717,13 @@ class InMemoryPaperLedgerRepository(
                     reasonJa = "reconciler virtual take profit trigger",
                 )
 
-                closedPositionIds += position.positionId
-                executionIds += result.executionIds
+                progress.closedPositionIds += position.positionId
+                progress.executionIds += result.executionIds
             }
         }
     }
 
-    private fun updateMarksLocked(
+    private fun InMemoryPaperLedgerState.updateMarksLocked(
         lastPrice: BigDecimal,
         atr14Jpy: BigDecimal?,
         rules: SymbolRules,
@@ -667,7 +765,7 @@ class InMemoryPaperLedgerRepository(
         accountUpdatedAt = updatedAt
     }
 
-    private fun updateLinkedStopOrderLocked(
+    private fun InMemoryPaperLedgerState.updateLinkedStopOrderLocked(
         positionId: String,
         stopPrice: BigDecimal,
         reasonJa: String,
@@ -686,7 +784,7 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
-    private fun cancelOpenStopOrdersLocked(positionId: String, reasonJa: String) {
+    private fun InMemoryPaperLedgerState.cancelOpenStopOrdersLocked(positionId: String, reasonJa: String) {
         orders.replaceAll { order ->
             val isLinkedOpenStop = order.positionId == positionId &&
                 order.side == OrderSide.SELL &&
@@ -704,7 +802,7 @@ class InMemoryPaperLedgerRepository(
         }
     }
 
-    private fun markOrderStatusLocked(
+    private fun InMemoryPaperLedgerState.markOrderStatusLocked(
         orderId: String,
         status: OrderStatus,
         reasonJa: String? = null,
@@ -719,29 +817,64 @@ class InMemoryPaperLedgerRepository(
         }
     }
 
-    private fun linkedStopOrder(positionId: String): Order? {
+    private fun InMemoryPaperLedgerState.linkedStopOrder(positionId: String): Order? {
         return orders.firstOrNull { order ->
             order.positionId == positionId && order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.status == OrderStatus.OPEN
         }
     }
 
-    private fun openPositionsLocked(): List<Position> {
-        return positions.filter { position -> position.status == PositionStatus.OPEN }
-    }
-
-    private fun openOrdersLocked(): List<Order> {
-        return orders.filter { order ->
-            order.status == OrderStatus.OPEN || order.status == OrderStatus.PENDING_CANCEL
-        }
-    }
-
-    private fun appendFillEquitySnapshot(capturedAt: Instant) {
+    private fun InMemoryPaperLedgerState.appendFillEquitySnapshot(capturedAt: Instant) {
         val snapshot = accountSnapshot.toFillEquitySnapshotRecord(
             id = UUID.randomUUID(),
             capturedAt = capturedAt,
         )
 
         equitySnapshotRepository.appendSnapshot(snapshot)
+    }
+}
+
+private fun Position.toClosedPositionWithParsedInstantOrNull(): ClosedPositionWithParsedInstant? {
+    val closedAtText = closedAt ?: return null
+
+    return ClosedPositionWithParsedInstant(
+        position = this,
+        closedAt = Instant.parse(closedAtText),
+    )
+}
+
+private fun InMemoryPaperLedgerState.findPlaceOrderResultByClientRequestIdLocked(
+    clientRequestId: String,
+): PaperTradeResult? {
+    val entryOrder = orders.firstOrNull { order ->
+        order.clientRequestId == clientRequestId && order.side == OrderSide.BUY
+    } ?: return null
+    val tradeGroupId = requireNotNull(entryOrder.tradeGroupId)
+    val relatedOrders = orders.filter { order -> order.tradeGroupId == tradeGroupId }
+    val relatedOrderIds = relatedOrders.map { order -> order.orderId }.toSet()
+    val relatedPositionIds = positions
+        .filter { position -> position.tradeGroupId == tradeGroupId }
+        .map { position -> position.positionId }
+    val relatedExecutionIds = executions
+        .filter { execution -> execution.orderId in relatedOrderIds }
+        .map { execution -> execution.executionId }
+
+    return PaperTradeResult(
+        accepted = true,
+        status = entryOrder.status,
+        orderIds = relatedOrders.map { order -> order.orderId },
+        positionIds = relatedPositionIds,
+        executionIds = relatedExecutionIds,
+        messageJa = "client_request_id に一致する既存 paper entry を返しました。",
+    )
+}
+
+private fun InMemoryPaperLedgerState.openPositionsLocked(): List<Position> {
+    return positions.filter { position -> position.status == PositionStatus.OPEN }
+}
+
+private fun InMemoryPaperLedgerState.openOrdersLocked(): List<Order> {
+    return orders.filter { order ->
+        order.status == OrderStatus.OPEN || order.status == OrderStatus.PENDING_CANCEL
     }
 }
 
@@ -1000,13 +1133,15 @@ private fun Order.createEntryFill(
     simulator: FillSimulator,
 ): SimulatedFill {
     return simulator.restingEntryFill(
-        side = side,
-        orderType = orderType,
-        sizeBtc = sizeBtc.toBigDecimal(),
-        limitPriceJpy = limitPriceJpy?.toBigDecimal(),
-        triggerPriceJpy = triggerPriceJpy?.toBigDecimal(),
-        ticker = ticker,
-        rules = rules,
+        RestingEntryFillRequest(
+            side = side,
+            orderType = orderType,
+            sizeBtc = sizeBtc.toBigDecimal(),
+            limitPriceJpy = limitPriceJpy?.toBigDecimal(),
+            triggerPriceJpy = triggerPriceJpy?.toBigDecimal(),
+            ticker = ticker,
+            rules = rules,
+        ),
     )
 }
 

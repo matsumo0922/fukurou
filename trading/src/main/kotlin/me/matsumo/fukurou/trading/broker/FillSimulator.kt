@@ -105,31 +105,23 @@ class FillSimulator(
     /**
      * resting entry order の約定を注文種別に応じて計算する。
      */
-    fun restingEntryFill(
-        side: OrderSide,
-        orderType: OrderType,
-        sizeBtc: BigDecimal,
-        limitPriceJpy: BigDecimal?,
-        triggerPriceJpy: BigDecimal?,
-        ticker: Ticker,
-        rules: SymbolRules,
-    ): SimulatedFill {
-        return when (orderType) {
+    fun restingEntryFill(request: RestingEntryFillRequest): SimulatedFill {
+        return when (request.orderType) {
             OrderType.LIMIT -> restingLimitFill(
-                sizeBtc = sizeBtc,
-                limitPriceJpy = requireNotNull(limitPriceJpy) {
+                sizeBtc = request.sizeBtc,
+                limitPriceJpy = requireNotNull(request.limitPriceJpy) {
                     "LIMIT entry order requires limitPriceJpy."
                 },
-                rules = rules,
+                rules = request.rules,
             )
             OrderType.STOP -> stopFill(
-                side = side,
-                sizeBtc = sizeBtc,
-                triggerPriceJpy = requireNotNull(triggerPriceJpy) {
+                side = request.side,
+                sizeBtc = request.sizeBtc,
+                triggerPriceJpy = requireNotNull(request.triggerPriceJpy) {
                     "STOP entry order requires triggerPriceJpy."
                 },
-                ticker = ticker,
-                rules = rules,
+                ticker = request.ticker,
+                rules = request.rules,
             )
             OrderType.MARKET -> error("MARKET entry is not a resting order.")
         }
@@ -171,6 +163,27 @@ class FillSimulator(
         return config.marketSlippageBps.divide(BPS_DIVISOR, PRICE_CALCULATION_SCALE, RoundingMode.HALF_UP)
     }
 }
+
+/**
+ * resting entry order の約定計算入力。
+ *
+ * @param side 注文 side
+ * @param orderType 注文種別
+ * @param sizeBtc 注文数量
+ * @param limitPriceJpy LIMIT 価格
+ * @param triggerPriceJpy STOP trigger 価格
+ * @param ticker 現在 ticker
+ * @param rules symbol rule
+ */
+data class RestingEntryFillRequest(
+    val side: OrderSide,
+    val orderType: OrderType,
+    val sizeBtc: BigDecimal,
+    val limitPriceJpy: BigDecimal?,
+    val triggerPriceJpy: BigDecimal?,
+    val ticker: Ticker,
+    val rules: SymbolRules,
+)
 
 /**
  * JPY 金額を DB scale に丸める。

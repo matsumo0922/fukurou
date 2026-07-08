@@ -28,6 +28,18 @@ class InMemoryDecisionRepository(
     private val falsifications = mutableListOf<FalsificationRecord>()
     private val intentConsumptions = mutableListOf<TradeIntentConsumptionRecord>()
 
+    /**
+     * 保存済み record の snapshot 読み取り境界。
+     */
+    val snapshots = InMemoryDecisionSnapshots(
+        mutex = mutex,
+        decisions = decisions,
+        tradePlans = tradePlans,
+        tradeIntents = tradeIntents,
+        falsifications = falsifications,
+        intentConsumptions = intentConsumptions,
+    )
+
     override suspend fun submitDecision(submission: DecisionSubmission): Result<DecisionSubmissionResult> {
         return runCatching {
             mutex.withLock {
@@ -222,7 +234,13 @@ class InMemoryDecisionRepository(
     ): Result<TradeIntentConsumptionRecord> {
         return runCatching {
             mutex.withLock {
-                appendIntentConsumptionLocked(intentId, orderId, consumedAt)
+                appendIntentConsumptionLocked(
+                    tradeIntents = tradeIntents,
+                    intentConsumptions = intentConsumptions,
+                    intentId = intentId,
+                    orderId = orderId,
+                    consumedAt = consumedAt,
+                )
             }
         }
     }
@@ -236,11 +254,21 @@ class InMemoryDecisionRepository(
         mutex.lock()
 
         return try {
-            validateConsumableIntentLocked(intentId)
+            validateConsumableIntentLocked(
+                tradeIntents = tradeIntents,
+                intentConsumptions = intentConsumptions,
+                intentId = intentId,
+            )
 
             val result = ledgerBlock()
 
-            appendIntentConsumptionLocked(intentId, orderId, consumedAt)
+            appendIntentConsumptionLocked(
+                tradeIntents = tradeIntents,
+                intentConsumptions = intentConsumptions,
+                intentId = intentId,
+                orderId = orderId,
+                consumedAt = consumedAt,
+            )
 
             Result.success(result)
         } catch (throwable: Throwable) {
@@ -250,6 +278,42 @@ class InMemoryDecisionRepository(
         }
     }
 
+    private fun DecisionRecord.toJournalRecordLocked(): DecisionJournalRecord {
+        val tradeIntent = tradeIntents.firstOrNull { intent -> intent.decisionId == decisionId }
+        val tradePlan = tradePlans.firstOrNull { plan -> plan.decisionId == decisionId }
+        val falsification = tradeIntent?.let { intent ->
+            falsifications
+                .filter { candidate -> candidate.intentId == intent.intentId }
+                .maxByOrNull { candidate -> candidate.createdAt }
+        }
+
+        return DecisionJournalRecord(
+            decision = this,
+            tradeIntent = tradeIntent,
+            tradePlan = tradePlan,
+            falsification = falsification,
+        )
+    }
+}
+
+/**
+ * InMemoryDecisionRepository の保存済み record snapshot reader。
+ *
+ * @param mutex repository state を守る mutex
+ * @param decisions 保存済み decision
+ * @param tradePlans 保存済み trade plan
+ * @param tradeIntents 保存済み trade intent
+ * @param falsifications 保存済み falsification
+ * @param intentConsumptions 保存済み intent consumption
+ */
+class InMemoryDecisionSnapshots internal constructor(
+    private val mutex: Mutex,
+    private val decisions: List<DecisionRecord>,
+    private val tradePlans: List<TradePlanRecord>,
+    private val tradeIntents: List<TradeIntentRecord>,
+    private val falsifications: List<FalsificationRecord>,
+    private val intentConsumptions: List<TradeIntentConsumptionRecord>,
+) {
     /**
      * 保存済み decision の snapshot を返す。
      */
@@ -284,50 +348,43 @@ class InMemoryDecisionRepository(
     suspend fun intentConsumptions(): List<TradeIntentConsumptionRecord> {
         return mutex.withLock { intentConsumptions.toList() }
     }
+}
 
-    private fun DecisionRecord.toJournalRecordLocked(): DecisionJournalRecord {
-        val tradeIntent = tradeIntents.firstOrNull { intent -> intent.decisionId == decisionId }
-        val tradePlan = tradePlans.firstOrNull { plan -> plan.decisionId == decisionId }
-        val falsification = tradeIntent?.let { intent ->
-            falsifications
-                .filter { candidate -> candidate.intentId == intent.intentId }
-                .maxByOrNull { candidate -> candidate.createdAt }
-        }
+private fun appendIntentConsumptionLocked(
+    tradeIntents: List<TradeIntentRecord>,
+    intentConsumptions: MutableList<TradeIntentConsumptionRecord>,
+    intentId: UUID,
+    orderId: UUID?,
+    consumedAt: Instant,
+): TradeIntentConsumptionRecord {
+    validateConsumableIntentLocked(
+        tradeIntents = tradeIntents,
+        intentConsumptions = intentConsumptions,
+        intentId = intentId,
+    )
 
-        return DecisionJournalRecord(
-            decision = this,
-            tradeIntent = tradeIntent,
-            tradePlan = tradePlan,
-            falsification = falsification,
-        )
+    val record = TradeIntentConsumptionRecord(
+        consumptionId = UUID.randomUUID(),
+        intentId = intentId,
+        orderId = orderId,
+        consumedAt = consumedAt,
+    )
+
+    intentConsumptions += record
+
+    return record
+}
+
+private fun validateConsumableIntentLocked(
+    tradeIntents: List<TradeIntentRecord>,
+    intentConsumptions: List<TradeIntentConsumptionRecord>,
+    intentId: UUID,
+) {
+    require(tradeIntents.any { intent -> intent.intentId == intentId }) {
+        "trade intent was not found."
     }
-
-    private fun appendIntentConsumptionLocked(
-        intentId: UUID,
-        orderId: UUID?,
-        consumedAt: Instant,
-    ): TradeIntentConsumptionRecord {
-        validateConsumableIntentLocked(intentId)
-
-        val record = TradeIntentConsumptionRecord(
-            consumptionId = UUID.randomUUID(),
-            intentId = intentId,
-            orderId = orderId,
-            consumedAt = consumedAt,
-        )
-
-        intentConsumptions += record
-
-        return record
-    }
-
-    private fun validateConsumableIntentLocked(intentId: UUID) {
-        require(tradeIntents.any { intent -> intent.intentId == intentId }) {
-            "trade intent was not found."
-        }
-        require(intentConsumptions.none { consumption -> consumption.intentId == intentId }) {
-            "trade intent was already consumed."
-        }
+    require(intentConsumptions.none { consumption -> consumption.intentId == intentId }) {
+        "trade intent was already consumed."
     }
 }
 
