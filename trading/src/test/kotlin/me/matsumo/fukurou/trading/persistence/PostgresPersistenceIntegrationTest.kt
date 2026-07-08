@@ -1601,12 +1601,12 @@ class PostgresPersistenceIntegrationTest {
         val evaluatedTrade = EvaluationMath.evaluateTrade(trade)
 
         assertEquals(false, tradeResult.truncated)
-        assertEquals("9700000.00000000", trade.initialProtectiveStopPriceJpy?.toPlainString())
+        assertEquals(0, requireNotNull(trade.initialProtectiveStopPriceJpy).compareTo(BigDecimal("9700000.00000000")))
         assertEquals("9900000.00000000", trade.highestPriceSinceEntryJpy.toPlainString())
         assertEquals("9685155.00000000", trade.lowestPriceSinceEntryJpy?.toPlainString())
         assertEquals("9900000.00000000", closedWatermark.highestPriceSinceEntryJpy)
         assertEquals("9685155.00000000", closedWatermark.lowestPriceSinceEntryJpy)
-        assertEquals("200000.00000000", evaluatedTrade.initialRiskPriceWidthJpy?.toPlainString())
+        assertEquals(0, requireNotNull(evaluatedTrade.initialRiskPriceWidthJpy).compareTo(BigDecimal("200000.00000000")))
         assertEquals("-1.0934878875", evaluatedTrade.realizedR?.toPlainString())
         assertEquals("1.0742250000", evaluatedTrade.maeR?.toPlainString())
         assertEquals("0.0000000000", evaluatedTrade.mfeR?.toPlainString())
@@ -1725,12 +1725,102 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(false, tradeResult.truncated)
         assertEquals(listOf("integration-entry"), trade.setupTags)
-        assertEquals("9700000.00000000", trade.initialProtectiveStopPriceJpy?.toPlainString())
+        assertEquals(0, requireNotNull(trade.initialProtectiveStopPriceJpy).compareTo(BigDecimal("9700000.00000000")))
         assertEquals("10100000.00000000", trade.highestPriceSinceEntryJpy.toPlainString())
         assertEquals("10005000.00000000", trade.lowestPriceSinceEntryJpy?.toPlainString())
         assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
         assertEquals(1, killStats.closedTrades)
         assertNull(killStats.profitFactor)
+    }
+
+    @Test
+    fun evaluation_repository_treats_partial_closes_and_adds_as_one_closed_trade() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val firstEntry = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                sizeBtc = BigDecimal("0.0040"),
+                takeProfitPriceJpy = BigDecimal("11000000"),
+            ),
+        )
+
+        broker.placeOrder(firstEntry).getOrThrow()
+        repository.reconcile(
+            tickSnapshot = watermarkTickSnapshot("10400000"),
+            simulator = FillSimulator(clock = fixedClock()),
+        ).getOrThrow()
+
+        val addEntry = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                sizeBtc = BigDecimal("0.0010"),
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                estimatedWinProbability = BigDecimal("0.99"),
+                protectiveStopPriceJpy = BigDecimal("9990000"),
+            ),
+        )
+
+        broker.placeOrder(addEntry).getOrThrow()
+        val positionAfterAdd = broker.getPositions().getOrThrow().single()
+
+        broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString(positionAfterAdd.positionId),
+                closeAll = false,
+                closeRatio = BigDecimal("0.50"),
+                reasonJa = "partial close integration",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.fromString(positionAfterAdd.positionId),
+                closeAll = false,
+                reasonJa = "final close integration",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+
+        val evaluationRepository = ExposedEvaluationRepository(database)
+        val tradeResult = evaluationRepository.fetchClosedTrades(
+            EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val trade = tradeResult.trades.single()
+        val executions = repository.getExecutions().getOrThrow()
+        val expectedPnl = executions
+            .filter { execution -> execution.side == OrderSide.SELL }
+            .sumOf { execution -> execution.realizedPnlJpy.toBigDecimal() }
+            .subtract(
+                executions
+                    .filter { execution -> execution.side == OrderSide.BUY }
+                    .sumOf { execution -> execution.feeJpy.toBigDecimal() },
+            )
+        val evaluatedTrade = EvaluationMath.evaluateTrade(trade)
+        val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
+
+        assertEquals(1, killStats.closedTrades)
+        assertEquals(2, executions.count { execution -> execution.side == OrderSide.BUY })
+        assertEquals(2, executions.count { execution -> execution.side == OrderSide.SELL })
+        assertEquals("0.005", trade.sizeBtc.stripTrailingZeros().toPlainString())
+        assertEquals("10005000", trade.averageEntryPriceJpy.stripTrailingZeros().toPlainString())
+        assertEquals("9758000", trade.initialProtectiveStopPriceJpy?.stripTrailingZeros()?.toPlainString())
+        assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
+        assertEquals("247000", evaluatedTrade.initialRiskPriceWidthJpy?.stripTrailingZeros()?.toPlainString())
     }
 
     @Test
@@ -1825,7 +1915,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun paper_execution_closeAllDoesNotReuseClientRequestIdAcrossCloseOrders() = runPostgresTest {
+    fun paper_execution_closeAllSuffixesClientRequestIdAfterMergedAdds() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
@@ -1848,13 +1938,17 @@ class PostgresPersistenceIntegrationTest {
         val secondEntry = approvedPostgresEntryCommand(
             repository = decisionRepository,
             command = postgresEntryCommand(
-                sizeBtc = BigDecimal("0.0030"),
+                sizeBtc = BigDecimal("0.0010"),
                 takeProfitPriceJpy = BigDecimal("10600000"),
                 clientRequestId = "entry-close-all-2",
             ),
         )
 
         broker.placeOrder(firstEntry).getOrThrow()
+        repository.reconcile(
+            tickSnapshot = watermarkTickSnapshot("10400000"),
+            simulator = FillSimulator(clock = fixedClock()),
+        ).getOrThrow()
         broker.placeOrder(secondEntry).getOrThrow()
         val closeResult = broker.closePosition(
             ClosePositionCommand(
@@ -1867,9 +1961,7 @@ class PostgresPersistenceIntegrationTest {
         ).getOrThrow()
         val positions = repository.getOpenPositions().getOrThrow()
         val closeClientRequestIds = selectClientRequestIdsByOrderIds(database, closeResult.orderIds)
-        val expectedCloseClientRequestIds = closeResult.positionIds
-            .map { positionId -> "close-all-request:$positionId" }
-            .sorted()
+        val expectedCloseClientRequestIds = listOf("close-all-request")
         val watermarks = closeResult.positionIds
             .map { positionId ->
                 selectPositionWatermark(
@@ -1879,15 +1971,15 @@ class PostgresPersistenceIntegrationTest {
             }
 
         assertTrue(closeResult.accepted)
-        assertEquals(2, closeResult.orderIds.size)
+        assertEquals(1, closeResult.orderIds.size)
         assertEquals(expectedCloseClientRequestIds, closeClientRequestIds.filterNotNull().sorted())
         assertEquals(0, positions.size)
         assertEquals(
-            listOf("10005000.00000000", "10005000.00000000"),
+            listOf("10400000.00000000"),
             watermarks.map { watermark -> watermark.highestPriceSinceEntryJpy },
         )
         assertEquals(
-            listOf("9985005.00000000", "9985005.00000000"),
+            listOf("9985005.00000000"),
             watermarks.map { watermark -> watermark.lowestPriceSinceEntryJpy },
         )
     }
@@ -2345,6 +2437,7 @@ private fun postgresEntryCommand(
     orderType: OrderType = OrderType.MARKET,
     priceJpy: BigDecimal? = null,
     sizeBtc: BigDecimal = BigDecimal("0.0050"),
+    protectiveStopPriceJpy: BigDecimal = BigDecimal("9700000"),
     takeProfitPriceJpy: BigDecimal,
     estimatedWinProbability: BigDecimal = BigDecimal("0.95"),
     clientRequestId: String? = null,
@@ -2357,7 +2450,7 @@ private fun postgresEntryCommand(
         sizeBtc = sizeBtc,
         priceJpy = priceJpy,
         tradeGroupId = null,
-        protectiveStopPriceJpy = BigDecimal("9700000"),
+        protectiveStopPriceJpy = protectiveStopPriceJpy,
         takeProfitPriceJpy = takeProfitPriceJpy,
         estimatedWinProbability = estimatedWinProbability,
         reasonJa = "integration entry",

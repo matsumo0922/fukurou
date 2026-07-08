@@ -51,9 +51,9 @@ data class EvaluationLlmUsageQueryResult(
  * @param positionId position ID
  * @param openedAt position 開設時刻
  * @param closedAt position 決済時刻
- * @param sizeBtc position 数量
- * @param averageEntryPriceJpy 平均 entry 価格
- * @param initialProtectiveStopPriceJpy 初期 protective stop 価格
+ * @param sizeBtc entry BUY execution の合計数量
+ * @param averageEntryPriceJpy entry BUY execution の数量加重平均価格
+ * @param initialProtectiveStopPriceJpy entry BUY order の数量加重 protective stop 価格
  * @param highestPriceSinceEntryJpy entry 以降の最高値
  * @param lowestPriceSinceEntryJpy entry 以降の最安値。null は MAE 集計対象外
  * @param tradePnlJpy entry fee 控除後の trade 損益

@@ -593,6 +593,15 @@ class OpsRouteTest {
         val ledgerRepository = InMemoryPaperLedgerRepository(
             positions = listOf(openPosition()),
             openOrders = listOf(openOrder()),
+            executions = listOf(
+                execution(
+                    executionId = "partial-sell",
+                    executedAt = fixedInstant().plusSeconds(1),
+                    realizedPnlJpy = "120",
+                    side = OrderSide.SELL,
+                    positionId = "position-1",
+                ),
+            ),
         )
 
         application {
@@ -608,11 +617,13 @@ class OpsRouteTest {
         val responseBody = Json.parseToJsonElement(responseText).jsonObject
         val positions = responseBody.getValue("positions").jsonArray
         val openOrders = responseBody.getValue("openOrders").jsonArray
+        val sellExecutions = responseBody.getValue("sellExecutions").jsonArray
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertNoSecretLikeText(responseText)
         assertEquals("position-1", positions.single().jsonObject.getValue("positionId").jsonPrimitive.content)
         assertEquals("order-1", openOrders.single().jsonObject.getValue("orderId").jsonPrimitive.content)
+        assertEquals("partial-sell", sellExecutions.single().jsonObject.getValue("executionId").jsonPrimitive.content)
     }
 
     @Test
@@ -1029,14 +1040,16 @@ private fun execution(
     executionId: String,
     executedAt: Instant,
     realizedPnlJpy: String,
+    side: OrderSide = OrderSide.BUY,
+    positionId: String = "position-$executionId",
 ): Execution {
     return Execution(
         executionId = executionId,
         orderId = "order-$executionId",
-        positionId = "position-$executionId",
+        positionId = positionId,
         symbol = "BTC",
         mode = TradingMode.PAPER,
-        side = OrderSide.BUY,
+        side = side,
         priceJpy = "10100000",
         sizeBtc = "0.01000000",
         feeJpy = "10",

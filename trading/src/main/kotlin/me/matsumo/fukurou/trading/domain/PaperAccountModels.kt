@@ -164,7 +164,7 @@ data class AccountSnapshot(
  * @param status position 状態
  * @param openedAt 開設時刻
  * @param closedAt 決済時刻
- * @param sizeBtc BTC 数量
+ * @param sizeBtc 未決済 BTC 残量。closed position の初期数量と決済履歴は execution から復元する。
  * @param averageEntryPriceJpy 平均取得単価
  * @param currentPriceJpy 現在評価価格
  * @param currentStopLossJpy 現在の保護 STOP 価格

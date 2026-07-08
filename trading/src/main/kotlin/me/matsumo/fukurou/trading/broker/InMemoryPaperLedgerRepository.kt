@@ -44,11 +44,13 @@ class InMemoryPaperLedgerRepository private constructor(
     private val state: InMemoryPaperLedgerState,
     accountRepository: PaperLedgerAccountRepository,
     executionRepository: PaperLedgerExecutionRepository,
+    orderRepository: PaperLedgerOrderRepository,
     historyRepository: PaperLedgerHistoryRepository,
     mutationRepository: PaperLedgerMutationRepository,
 ) : PaperLedgerRepository,
     PaperLedgerAccountRepository by accountRepository,
     PaperLedgerExecutionRepository by executionRepository,
+    PaperLedgerOrderRepository by orderRepository,
     PaperLedgerHistoryRepository by historyRepository,
     PaperLedgerMutationRepository by mutationRepository {
 
@@ -59,6 +61,7 @@ class InMemoryPaperLedgerRepository private constructor(
         state = state,
         accountRepository = InMemoryPaperLedgerAccountReader(state),
         executionRepository = InMemoryPaperLedgerExecutionReader(state),
+        orderRepository = InMemoryPaperLedgerOrderReader(state),
         historyRepository = InMemoryPaperLedgerHistoryReader(state),
         mutationRepository = InMemoryPaperLedgerMutationWriter(state),
     )
@@ -126,6 +129,26 @@ private data class InMemoryPaperLedgerRecordsSeed(
     val executions: List<Execution>,
     val decisionRunIdsByPositionId: Map<String, String?>,
 )
+
+/**
+ * InMemory close_position 後の position 更新結果。
+ *
+ * @param position 更新後の position
+ * @param remainingSize close 後に残る BTC 数量
+ */
+private data class InMemoryClosePositionUpdate(
+    val position: Position,
+    val remainingSize: BigDecimal,
+) {
+
+    val isPartialClose: Boolean = remainingSize > BigDecimal.ZERO
+
+    val messageJa: String = if (isPartialClose) {
+        "position を部分 close しました。"
+    } else {
+        "position を close しました。"
+    }
+}
 
 /**
  * InMemory paper ledger の runtime 依存。
@@ -229,6 +252,23 @@ private class InMemoryPaperLedgerAccountReader(
         return Result.success(
             state.read {
                 executions.sumOf { execution -> execution.realizedPnlJpy.toBigDecimal() }
+            },
+        )
+    }
+}
+
+/**
+ * InMemory paper ledger の order 履歴読み取り boundary。
+ *
+ * @param state 共有 mutable state
+ */
+private class InMemoryPaperLedgerOrderReader(
+    private val state: InMemoryPaperLedgerState,
+) : PaperLedgerOrderRepository {
+    override suspend fun findOrdersByTradeGroupId(tradeGroupId: UUID): Result<List<Order>> {
+        return Result.success(
+            state.read {
+                orders.filter { order -> order.tradeGroupId == tradeGroupId.toString() }
             },
         )
     }
@@ -545,28 +585,37 @@ private class InMemoryPaperLedgerMutationWriter(
         require(position.status == PositionStatus.OPEN) {
             "position is not open."
         }
+        require(fill.sizeBtc <= position.sizeBtc.toBigDecimal()) {
+            "close size exceeds open position size."
+        }
 
         val realizedFill = fill.withRealizedPnl(position)
-        val closeOrder = closeOrder(orderId, position, reasonJa, fill.executedAt)
-        val closedPosition = position.withWatermarkPrice(realizedFill.priceJpy).copy(
-            status = PositionStatus.CLOSED,
-            closedAt = realizedFill.executedAt.toString(),
-            currentPriceJpy = realizedFill.priceJpy.toPlainString(),
-            currentStopLossJpy = null,
-            currentTakeProfitJpy = null,
-            unrealizedPnlJpy = BigDecimal.ZERO.moneyScale().toPlainString(),
-            unrealizedR = BigDecimal.ZERO.toPlainString(),
+        val closeOrder = closeOrder(
+            orderId = orderId,
+            position = position,
+            sizeBtc = realizedFill.sizeBtc,
+            reasonJa = reasonJa,
+            recordedAt = fill.executedAt,
         )
+        val remainingSize = position.sizeBtc.toBigDecimal()
+            .subtract(realizedFill.sizeBtc)
+            .btcScale()
+        val positionWithWatermark = position.withWatermarkPrice(realizedFill.priceJpy)
+        val closeUpdate = positionWithWatermark.toClosePositionUpdate(realizedFill, remainingSize)
 
         orders += closeOrder
-        positions[positionIndex] = closedPosition
+        positions[positionIndex] = closeUpdate.position
         executions += realizedFill.toExecution(
             orderId = closeOrder.orderId,
             positionId = position.positionId,
             mode = position.mode,
             side = OrderSide.SELL,
         )
-        cancelOpenStopOrdersLocked(position.positionId, reasonJa)
+        if (closeUpdate.isPartialClose) {
+            updateLinkedStopOrderSizeLocked(position.positionId, closeUpdate.remainingSize, reasonJa)
+        } else {
+            cancelOpenStopOrdersLocked(position.positionId, reasonJa)
+        }
         accountSnapshot = accountSnapshot.afterSellFill(realizedFill)
         accountUpdatedAt = realizedFill.executedAt
         appendFillEquitySnapshot(realizedFill.executedAt)
@@ -577,7 +626,7 @@ private class InMemoryPaperLedgerMutationWriter(
             orderIds = listOf(closeOrder.orderId),
             positionIds = listOf(position.positionId),
             executionIds = listOf(realizedFill.executionId.toString()),
-            messageJa = "position を close しました。",
+            messageJa = closeUpdate.messageJa,
         )
     }
 
@@ -626,28 +675,33 @@ private class InMemoryPaperLedgerMutationWriter(
         val command = request.entry.command
         val fill = request.entry.fill
         val recordedAt = fill.executedAt
+        val existingPositionIndex = positions.indexOfFirst { position ->
+            position.status == PositionStatus.OPEN && position.tradeGroupId == request.entry.tradeGroupId.toString()
+        }
+        val existingPosition = positions.getOrNull(existingPositionIndex)
+        val targetPositionId = existingPosition
+            ?.positionId
+            ?.let { value -> UUID.fromString(value) }
+            ?: request.entry.positionId
         val entryOrder = command.toEntryOrder(
             orderId = request.entryOrderId,
-            positionId = request.entry.positionId,
+            positionId = targetPositionId,
             tradeGroupId = request.entry.tradeGroupId,
             status = OrderStatus.FILLED,
             recordedAt = recordedAt,
         )
-        val stopOrder = command.toProtectiveStopOrder(
-            orderId = request.entry.stopOrderId,
-            positionId = request.entry.positionId,
-            tradeGroupId = request.entry.tradeGroupId,
-            recordedAt = recordedAt,
-        )
-        val position = command.toOpenPosition(request.entry.positionId, request.entry.tradeGroupId, fill)
 
         if (request.insertEntryOrder) {
             orders += entryOrder
+        } else {
+            updateRestingEntryOrderFillLocked(entryOrder.orderId, targetPositionId.toString(), command.reasonJa)
         }
-        orders += stopOrder
-        positions += position
-        decisionRunIdsByPositionId[position.positionId] = command.auditContext.decisionRunContext.decisionRunId
-        executions += fill.toExecution(entryOrder.orderId, position.positionId, command)
+        val updatedStopOrderId = upsertPositionForEntryFillLocked(
+            request = request,
+            existingPosition = existingPosition,
+            existingPositionIndex = existingPositionIndex,
+        )
+        executions += fill.toExecution(entryOrder.orderId, targetPositionId.toString(), command)
         accountSnapshot = accountSnapshot.afterBuyFill(fill)
         accountUpdatedAt = fill.executedAt
         appendFillEquitySnapshot(fill.executedAt)
@@ -655,10 +709,49 @@ private class InMemoryPaperLedgerMutationWriter(
         return PaperTradeResult(
             accepted = true,
             status = OrderStatus.FILLED,
-            orderIds = listOf(entryOrder.orderId, stopOrder.orderId),
-            positionIds = listOf(position.positionId),
+            orderIds = listOf(entryOrder.orderId, updatedStopOrderId),
+            positionIds = listOf(targetPositionId.toString()),
             executionIds = listOf(fill.executionId.toString()),
-            messageJa = "paper entry を約定し、保護 STOP を作成しました。",
+            messageJa = if (existingPosition == null) {
+                "paper entry を約定し、保護 STOP を作成しました。"
+            } else {
+                "paper entry を既存 position に合算しました。"
+            },
+        )
+    }
+
+    private fun InMemoryPaperLedgerState.upsertPositionForEntryFillLocked(
+        request: EntryFillWriteRequest,
+        existingPosition: Position?,
+        existingPositionIndex: Int,
+    ): String {
+        val command = request.entry.command
+        val fill = request.entry.fill
+
+        if (existingPosition == null) {
+            val stopOrder = command.toProtectiveStopOrder(
+                orderId = request.entry.stopOrderId,
+                positionId = request.entry.positionId,
+                tradeGroupId = request.entry.tradeGroupId,
+                recordedAt = fill.executedAt,
+            )
+            val position = command.toOpenPosition(request.entry.positionId, request.entry.tradeGroupId, fill)
+
+            orders += stopOrder
+            positions += position
+            decisionRunIdsByPositionId[position.positionId] = command.auditContext.decisionRunContext.decisionRunId
+
+            return stopOrder.orderId
+        }
+
+        val mergedPosition = existingPosition.mergeEntryFill(command, fill)
+
+        positions[existingPositionIndex] = mergedPosition
+
+        return updateLinkedStopOrderForMergedEntryLocked(
+            position = mergedPosition,
+            stopPrice = mergedPosition.currentStopLossJpy?.toBigDecimal(),
+            reasonJa = command.reasonJa,
         )
     }
 
@@ -747,6 +840,7 @@ private class InMemoryPaperLedgerMutationWriter(
             val currentStop = position.currentStopLossJpy?.toBigDecimal()
             val tightenedStop = listOfNotNull(currentStop, trailingStop).maxOrNull()
             val unrealizedPnl = lastPrice.subtract(entryPrice).multiply(sizeBtc).moneyScale()
+            val unrealizedR = position.unrealizedRAt(lastPrice)
 
             if (tightenedStop != currentStop && tightenedStop != null) {
                 updateLinkedStopOrderLocked(position.positionId, tightenedStop, "reconciler atr trailing floor")
@@ -756,6 +850,7 @@ private class InMemoryPaperLedgerMutationWriter(
                 currentPriceJpy = lastPrice.moneyScale().toPlainString(),
                 currentStopLossJpy = tightenedStop?.moneyScale()?.toPlainString(),
                 unrealizedPnlJpy = unrealizedPnl.toPlainString(),
+                unrealizedR = unrealizedR,
                 highestPriceSinceEntryJpy = highestPrice.moneyScale().toPlainString(),
                 lowestPriceSinceEntryJpy = lowestPrice.moneyScale().toPlainString(),
             )
@@ -780,6 +875,68 @@ private class InMemoryPaperLedgerMutationWriter(
 
         orders[stopOrderIndex] = orders[stopOrderIndex].copy(
             triggerPriceJpy = stopPrice.moneyScale().toPlainString(),
+            reasonJa = reasonJa,
+        )
+    }
+
+    private fun InMemoryPaperLedgerState.updateLinkedStopOrderSizeLocked(
+        positionId: String,
+        sizeBtc: BigDecimal,
+        reasonJa: String,
+    ) {
+        val stopOrderIndex = orders.indexOfFirst { order ->
+            order.positionId == positionId && order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.status == OrderStatus.OPEN
+        }
+
+        require(stopOrderIndex >= 0) {
+            "linked protective STOP order was not found."
+        }
+
+        orders[stopOrderIndex] = orders[stopOrderIndex].copy(
+            sizeBtc = sizeBtc.btcScale().toPlainString(),
+            reasonJa = reasonJa,
+        )
+    }
+
+    private fun InMemoryPaperLedgerState.updateLinkedStopOrderForMergedEntryLocked(
+        position: Position,
+        stopPrice: BigDecimal?,
+        reasonJa: String,
+    ): String {
+        val stopOrderIndex = orders.indexOfFirst { order ->
+            order.positionId == position.positionId &&
+                order.side == OrderSide.SELL &&
+                order.orderType == OrderType.STOP &&
+                order.status == OrderStatus.OPEN
+        }
+
+        require(stopOrderIndex >= 0) {
+            "linked protective STOP order was not found."
+        }
+
+        orders[stopOrderIndex] = orders[stopOrderIndex].copy(
+            sizeBtc = position.sizeBtc,
+            triggerPriceJpy = stopPrice?.moneyScale()?.toPlainString() ?: orders[stopOrderIndex].triggerPriceJpy,
+            reasonJa = "merged entry protective stop: $reasonJa",
+        )
+
+        return orders[stopOrderIndex].orderId
+    }
+
+    private fun InMemoryPaperLedgerState.updateRestingEntryOrderFillLocked(
+        orderId: String,
+        positionId: String,
+        reasonJa: String,
+    ) {
+        val orderIndex = orders.indexOfFirst { order -> order.orderId == orderId }
+
+        require(orderIndex >= 0) {
+            "resting entry order was not found."
+        }
+
+        orders[orderIndex] = orders[orderIndex].copy(
+            positionId = positionId,
+            status = OrderStatus.FILLED,
             reasonJa = reasonJa,
         )
     }
@@ -964,6 +1121,72 @@ private fun PlaceOrderCommand.toOpenPosition(
     )
 }
 
+private fun Position.mergeEntryFill(command: PlaceOrderCommand, fill: SimulatedFill): Position {
+    val currentSize = sizeBtc.toBigDecimal()
+    val addedSize = fill.sizeBtc
+    val mergedSize = currentSize.add(addedSize).btcScale()
+    val mergedEntryPrice = averageEntryPriceJpy.toBigDecimal()
+        .multiply(currentSize)
+        .add(fill.priceJpy.multiply(addedSize))
+        .divide(mergedSize, MONEY_SCALE, java.math.RoundingMode.HALF_UP)
+        .moneyScale()
+    val currentStop = currentStopLossJpy?.toBigDecimal()
+    val requestedStop = command.protectiveStopPriceJpy
+    val mergedStop = listOfNotNull(currentStop, requestedStop).maxOrNull()
+    val mergedTakeProfit = command.takeProfitPriceJpy
+        ?.moneyScale()
+        ?.toPlainString()
+        ?: currentTakeProfitJpy
+    val highestPrice = maxOf(highestPriceSinceEntryJpy.toBigDecimal(), fill.priceJpy)
+    val currentLowestPrice = lowestPriceSinceEntryJpy?.toBigDecimal() ?: fill.priceJpy
+    val lowestPrice = minOf(currentLowestPrice, fill.priceJpy)
+    val markedPosition = copy(
+        sizeBtc = mergedSize.toPlainString(),
+        averageEntryPriceJpy = mergedEntryPrice.toPlainString(),
+        currentPriceJpy = fill.priceJpy.moneyScale().toPlainString(),
+        currentStopLossJpy = mergedStop?.moneyScale()?.toPlainString(),
+        currentTakeProfitJpy = mergedTakeProfit,
+        pyramidAddCount = pyramidAddCount + 1,
+        highestPriceSinceEntryJpy = highestPrice.moneyScale().toPlainString(),
+        lowestPriceSinceEntryJpy = lowestPrice.moneyScale().toPlainString(),
+    )
+
+    return markedPosition.copy(
+        unrealizedPnlJpy = markedPosition.unrealizedPnlAt(fill.priceJpy, mergedSize),
+        unrealizedR = markedPosition.unrealizedRAt(fill.priceJpy),
+    )
+}
+
+private fun Position.toClosePositionUpdate(
+    fill: SimulatedFill,
+    remainingSize: BigDecimal,
+): InMemoryClosePositionUpdate {
+    val updatedPosition = if (remainingSize > BigDecimal.ZERO) {
+        copy(
+            sizeBtc = remainingSize.toPlainString(),
+            currentPriceJpy = fill.priceJpy.toPlainString(),
+            unrealizedPnlJpy = unrealizedPnlAt(fill.priceJpy, remainingSize),
+            unrealizedR = unrealizedRAt(fill.priceJpy),
+        )
+    } else {
+        copy(
+            status = PositionStatus.CLOSED,
+            closedAt = fill.executedAt.toString(),
+            sizeBtc = BigDecimal.ZERO.btcScale().toPlainString(),
+            currentPriceJpy = fill.priceJpy.toPlainString(),
+            currentStopLossJpy = null,
+            currentTakeProfitJpy = null,
+            unrealizedPnlJpy = BigDecimal.ZERO.moneyScale().toPlainString(),
+            unrealizedR = BigDecimal.ZERO.ratioScale().toPlainString(),
+        )
+    }
+
+    return InMemoryClosePositionUpdate(
+        position = updatedPosition,
+        remainingSize = remainingSize,
+    )
+}
+
 private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
     val price = limitPriceJpy?.toBigDecimal() ?: triggerPriceJpy?.toBigDecimal()
 
@@ -1023,6 +1246,7 @@ private fun SimulatedFill.toExecution(
 private fun closeOrder(
     orderId: UUID,
     position: Position,
+    sizeBtc: BigDecimal,
     reasonJa: String,
     recordedAt: Instant,
 ): Order {
@@ -1036,7 +1260,7 @@ private fun closeOrder(
         side = OrderSide.SELL,
         orderType = OrderType.MARKET,
         status = OrderStatus.FILLED,
-        sizeBtc = position.sizeBtc,
+        sizeBtc = sizeBtc.btcScale().toPlainString(),
         limitPriceJpy = null,
         triggerPriceJpy = null,
         protectiveStopPriceJpy = null,
@@ -1065,6 +1289,30 @@ private fun Position.withWatermarkPrice(priceJpy: BigDecimal): Position {
         highestPriceSinceEntryJpy = highestPrice.moneyScale().toPlainString(),
         lowestPriceSinceEntryJpy = lowestPrice.moneyScale().toPlainString(),
     )
+}
+
+private fun Position.unrealizedPnlAt(priceJpy: BigDecimal, sizeBtc: BigDecimal): String {
+    return priceJpy
+        .subtract(averageEntryPriceJpy.toBigDecimal())
+        .multiply(sizeBtc)
+        .moneyScale()
+        .toPlainString()
+}
+
+private fun Position.unrealizedRAt(priceJpy: BigDecimal): String {
+    val entryPrice = averageEntryPriceJpy.toBigDecimal()
+    val stopPrice = currentStopLossJpy?.toBigDecimal() ?: return BigDecimal.ZERO.ratioScale().toPlainString()
+    val riskWidth = entryPrice.subtract(stopPrice)
+
+    if (riskWidth <= BigDecimal.ZERO) {
+        return BigDecimal.ZERO.ratioScale().toPlainString()
+    }
+
+    return priceJpy
+        .subtract(entryPrice)
+        .divide(riskWidth, RATIO_SCALE, java.math.RoundingMode.HALF_UP)
+        .ratioScale()
+        .toPlainString()
 }
 
 private fun AccountSnapshot.afterBuyFill(fill: SimulatedFill): AccountSnapshot {

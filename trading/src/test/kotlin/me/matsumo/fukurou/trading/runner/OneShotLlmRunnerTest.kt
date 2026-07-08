@@ -296,6 +296,7 @@ class OneShotLlmRunnerTest {
                 priceJpy = BigDecimal("9900000"),
                 sizeBtc = BigDecimal("0.0010"),
             ),
+            tradeGroupId = UUID.randomUUID(),
         )
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
@@ -355,10 +356,12 @@ class OneShotLlmRunnerTest {
         seedApprovedEntry(
             fixture = fixture,
             entryIntent = entryIntentDraft(sizeBtc = BigDecimal("0.0010")),
+            tradeGroupId = UUID.randomUUID(),
         )
         seedApprovedEntry(
             fixture = fixture,
             entryIntent = entryIntentDraft(sizeBtc = BigDecimal("0.0010")),
+            tradeGroupId = UUID.randomUUID(),
         )
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
@@ -1852,6 +1855,7 @@ private fun openPosition(
 private suspend fun seedApprovedEntry(
     fixture: RunnerFixture,
     entryIntent: EntryIntentDraft = entryIntentDraft(),
+    tradeGroupId: UUID? = null,
 ): DecisionSubmissionResult {
     val decision = fixture.decisionRepository.submitDecision(
         seedEntryDecisionSubmission(entryIntent),
@@ -1866,7 +1870,7 @@ private suspend fun seedApprovedEntry(
         ),
     ).getOrThrow()
 
-    fixture.runtime.broker.placeOrder(intent.toSeedPlaceOrderCommand()).getOrThrow()
+    fixture.runtime.broker.placeOrder(intent.toSeedPlaceOrderCommand(tradeGroupId)).getOrThrow()
 
     return decision
 }
@@ -1894,7 +1898,7 @@ private fun seedEntryDecisionSubmission(entryIntent: EntryIntentDraft): Decision
     )
 }
 
-private fun TradeIntentRecord.toSeedPlaceOrderCommand(): PlaceOrderCommand {
+private fun TradeIntentRecord.toSeedPlaceOrderCommand(tradeGroupId: UUID? = null): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
         intentId = intentId,
@@ -1903,7 +1907,7 @@ private fun TradeIntentRecord.toSeedPlaceOrderCommand(): PlaceOrderCommand {
         orderType = draft.orderType,
         sizeBtc = draft.sizeBtc,
         priceJpy = draft.priceJpy,
-        tradeGroupId = null,
+        tradeGroupId = tradeGroupId,
         protectiveStopPriceJpy = draft.protectiveStopPriceJpy,
         takeProfitPriceJpy = draft.takeProfitPriceJpy,
         estimatedWinProbability = estimatedWinProbability,

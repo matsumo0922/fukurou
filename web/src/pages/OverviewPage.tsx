@@ -25,7 +25,7 @@ import { Metric } from "../ui/components/Metric";
 import { Panel } from "../ui/components/Panel";
 import { SectionHeader } from "../ui/components/SectionHeader";
 import { StatusPill, type StatusTone } from "../ui/components/StatusPill";
-import { describeError, formatDateTime } from "../ui/format";
+import { describeError, formatDateTime, formatTime } from "../ui/format";
 import { formatBtc, formatDecimal, formatJpy, formatRatioAsPercent, formatSignedJpy } from "../ui/numberFormat";
 
 export function OverviewPage() {
@@ -351,6 +351,15 @@ function PositionExposurePanel({ positionsQuery }: { positionsQuery: UseQueryRes
   }
 
   const hasExposure = positionsQuery.data.positions.length > 0 || positionsQuery.data.openOrders.length > 0;
+  const sellExecutionsByPositionId = new Map<string, OpsPositionsResponse["sellExecutions"]>();
+
+  positionsQuery.data.sellExecutions.forEach((execution) => {
+    if (!execution.positionId) {
+      return;
+    }
+
+    sellExecutionsByPositionId.set(execution.positionId, [...(sellExecutionsByPositionId.get(execution.positionId) ?? []), execution]);
+  });
 
   if (!hasExposure) {
     return (
@@ -393,16 +402,29 @@ function PositionExposurePanel({ positionsQuery }: { positionsQuery: UseQueryRes
         ]}
       />
       <div className="compact-list" aria-label="Open positions">
-        {positionsQuery.data.positions.map((position) => (
-          <div className="compact-list__row" key={position.positionId}>
-            <span>{position.symbol}</span>
-            <span>{formatBtc(position.sizeBtc)}</span>
-            <span>{formatSignedJpy(position.unrealizedPnlJpy)}</span>
-            <span>
-              {t("overview.detail.stop")} {formatJpy(position.currentStopLossJpy)}
-            </span>
-          </div>
-        ))}
+        {positionsQuery.data.positions.map((position) => {
+          const sellExecutions = sellExecutionsByPositionId.get(position.positionId) ?? [];
+
+          return (
+            <div className="compact-list__row compact-list__row--positions" key={position.positionId}>
+              <span>{position.symbol}</span>
+              <span>
+                {t("overview.detail.remaining")} {formatBtc(position.sizeBtc)}
+              </span>
+              <span>{formatSignedJpy(position.unrealizedPnlJpy)}</span>
+              <span>
+                {t("overview.detail.stop")} {formatJpy(position.currentStopLossJpy)}
+              </span>
+              <span>
+                {sellExecutions.length === 0
+                  ? t("overview.detail.noPartialCloses")
+                  : sellExecutions
+                      .map((execution) => `${formatBtc(execution.sizeBtc)} ${formatSignedJpy(execution.realizedPnlJpy)} ${formatTime(execution.executedAt)}`)
+                      .join(" / ")}
+              </span>
+            </div>
+          );
+        })}
       </div>
     </Panel>
   );

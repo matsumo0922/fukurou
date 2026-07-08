@@ -21,6 +21,7 @@ import java.time.Instant
  * @param config 安全床しきい値
  * @param clock 市場データ鮮度判定に使う clock
  */
+@Suppress("TooManyFunctions")
 internal class SafetyFloorRiskCalculator(
     private val config: SafetyFloorConfig,
     private val clock: Clock,
@@ -100,21 +101,51 @@ internal class SafetyFloorRiskCalculator(
     }
 
     /**
+     * 対象 trade group の初回 BUY risk budget を返す。
+     */
+    fun initialTradeGroupRiskBudget(context: SafetyFloorContext, tradeGroupId: String): BigDecimal? {
+        val initialOrder = context.tradeGroupOrders
+            .filterTargetOrders(tradeGroupId)
+            .filter { order -> order.side == OrderSide.BUY }
+            .filterNot { order -> order.status == OrderStatus.CANCELED || order.status == OrderStatus.REJECTED }
+            .minByOrNull { order -> Instant.parse(order.createdAt) }
+            ?: return null
+        val initialExecution = context.tradeGroupExecutions
+            .filter { execution -> execution.orderId == initialOrder.orderId && execution.side == OrderSide.BUY }
+            .minByOrNull { execution -> Instant.parse(execution.executedAt) }
+        val stopPrice = initialOrder.protectiveStopPriceJpy?.toBigDecimal() ?: return null
+        val sizeBtc = initialExecution
+            ?.sizeBtc
+            ?.toBigDecimal()
+            ?: initialOrder.sizeBtc.toBigDecimal()
+        val entryPrice = initialExecution
+            ?.priceJpy
+            ?.toBigDecimal()
+            ?.safetyScale()
+            ?: estimatedEntryPrice(initialOrder, context)
+
+        return tradeRisk(
+            sizeBtc = sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = stopPrice,
+            entryOrderType = initialOrder.orderType,
+            context = context,
+        )
+    }
+
+    /**
      * place_order command 単体の最大損失見積もりを返す。
      */
     fun orderRisk(command: PlaceOrderCommand, context: SafetyFloorContext): BigDecimal {
         val entryPrice = estimatedEntryPrice(command, context)
-        val stopPrice = command.protectiveStopPriceJpy
-        val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(command.sizeBtc)
-        val costReserve = roundTripCost(
+
+        return tradeRisk(
             sizeBtc = command.sizeBtc,
             entryPrice = entryPrice,
-            stopPrice = stopPrice,
+            stopPrice = command.protectiveStopPriceJpy,
             entryOrderType = command.orderType,
             context = context,
         )
-
-        return priceRisk.add(costReserve).safetyScale()
     }
 
     /**
@@ -273,12 +304,29 @@ internal class SafetyFloorRiskCalculator(
         val entryPrice = estimatedEntryPrice(order, context)
         val stopPrice = order.protectiveStopPriceJpy?.toBigDecimal() ?: BigDecimal.ZERO
         val sizeBtc = order.sizeBtc.toBigDecimal()
+
+        return tradeRisk(
+            sizeBtc = sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = stopPrice,
+            entryOrderType = order.orderType,
+            context = context,
+        )
+    }
+
+    private fun tradeRisk(
+        sizeBtc: BigDecimal,
+        entryPrice: BigDecimal,
+        stopPrice: BigDecimal,
+        entryOrderType: OrderType,
+        context: SafetyFloorContext,
+    ): BigDecimal {
         val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(sizeBtc)
         val costReserve = roundTripCost(
             sizeBtc = sizeBtc,
             entryPrice = entryPrice,
             stopPrice = stopPrice,
-            entryOrderType = order.orderType,
+            entryOrderType = entryOrderType,
             context = context,
         )
 

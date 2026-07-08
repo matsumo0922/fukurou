@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.broker.PaperLedgerAccountRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerExecutionRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerHistoryRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerMutationRepository
+import me.matsumo.fukurou.trading.broker.PaperLedgerOrderRepository
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
 import me.matsumo.fukurou.trading.config.PaperMarketConfig
@@ -659,6 +660,19 @@ private class ExposedPaperLedgerExecutionReader(
 }
 
 /**
+ * Exposed/JDBC で paper ledger の order 履歴を読む repository。
+ *
+ * @param database Exposed database
+ */
+private class ExposedPaperLedgerOrderReader(
+    private val database: ExposedDatabase,
+) : PaperLedgerOrderRepository {
+    override suspend fun findOrdersByTradeGroupId(tradeGroupId: UUID): Result<List<Order>> {
+        return readLedgerResult(database) { selectOrdersByTradeGroupId(tradeGroupId.toString()) }
+    }
+}
+
+/**
  * Exposed/JDBC で paper ledger の履歴系読み取りを行う repository。
  *
  * @param database Exposed database
@@ -702,10 +716,12 @@ class ExposedPaperLedgerRepository private constructor(
     private val writer: ExposedPaperLedgerWriter,
     accountRepository: PaperLedgerAccountRepository,
     executionRepository: PaperLedgerExecutionRepository,
+    orderRepository: PaperLedgerOrderRepository,
     historyRepository: PaperLedgerHistoryRepository,
 ) : IntentConsumingPaperLedgerRepository,
     PaperLedgerAccountRepository by accountRepository,
     PaperLedgerExecutionRepository by executionRepository,
+    PaperLedgerOrderRepository by orderRepository,
     PaperLedgerHistoryRepository by historyRepository,
     PaperLedgerMutationRepository by writer {
 
@@ -716,6 +732,7 @@ class ExposedPaperLedgerRepository private constructor(
         writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules),
         accountRepository = ExposedPaperLedgerAccountReader(database),
         executionRepository = ExposedPaperLedgerExecutionReader(database),
+        orderRepository = ExposedPaperLedgerOrderReader(database),
         historyRepository = ExposedPaperLedgerHistoryReader(database),
     )
 

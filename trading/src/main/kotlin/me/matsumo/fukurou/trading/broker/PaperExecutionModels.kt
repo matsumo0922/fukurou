@@ -86,6 +86,7 @@ data class PlaceOrderCommand(
  * @param commandId command ID
  * @param positionId 対象 position ID
  * @param closeAll 全 open position を閉じるか
+ * @param closeRatio 対象 position 残量のうち決済する比率
  * @param reasonJa 判断理由
  * @param auditContext audit context
  */
@@ -93,6 +94,7 @@ data class ClosePositionCommand(
     val commandId: UUID,
     val positionId: UUID?,
     val closeAll: Boolean,
+    val closeRatio: BigDecimal = BigDecimal.ONE,
     val reasonJa: String,
     val auditContext: PaperTradeAuditContext,
 )

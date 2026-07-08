@@ -834,7 +834,7 @@ private fun Server.registerClosePositionTool(
     addLimitedTool(
         definition = LimitedToolDefinition(
             name = CLOSE_POSITION_TOOL,
-            description = "Close one open paper position, or all open paper positions when all=true. reason is required.",
+            description = "Close one open paper position partially or fully, or all open paper positions when all=true. reason is required.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("position_id") {
@@ -846,6 +846,10 @@ private fun Server.registerClosePositionTool(
                         put("description", "Close all open positions.")
                         put("default", false)
                     }
+                    putDecimalStringSchema(
+                        name = "close_ratio",
+                        description = "Optional decimal string ratio of remaining position size to close. Defaults to 1.00.",
+                    )
                     putReasonSchema()
                     putClientRequestIdSchema()
                 },
@@ -1774,10 +1778,21 @@ private fun parsePlaceOrderCommand(request: CallToolRequest, call: GuardedToolCa
 
 private fun parseClosePositionCommand(request: CallToolRequest, call: GuardedToolCall): Result<ClosePositionCommand> {
     return runCatching {
+        val closeAll = parseBooleanArgument(request, "all", defaultValue = false)
+        val closeRatioSpecified = request.arguments?.containsKey("close_ratio") == true
+        val closeRatio = parseOptionalBigDecimalArgument(request, "close_ratio")
+            .getOrThrow()
+            ?: BigDecimal.ONE
+
+        require(!(closeAll && closeRatioSpecified)) {
+            "all=true cannot be combined with close_ratio."
+        }
+
         ClosePositionCommand(
             commandId = UUID.randomUUID(),
             positionId = request.stringArgument("position_id")?.let { value -> UUID.fromString(value) },
-            closeAll = parseBooleanArgument(request, "all", defaultValue = false),
+            closeAll = closeAll,
+            closeRatio = closeRatio,
             reasonJa = parseReason(request).getOrThrow(),
             auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
         )
