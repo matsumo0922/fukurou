@@ -68,14 +68,12 @@ class ObsidianWriterWorkerTest {
             clock = FIXED_CLOCK,
         )
 
-        try {
+        worker.use {
             worker.start()
 
             withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
                 secondAttemptCompleted.await()
             }
-        } finally {
-            worker.close()
         }
 
         assertTrue(attempts.get() >= 2)
@@ -107,14 +105,12 @@ class ObsidianWriterWorkerTest {
             clock = FIXED_CLOCK,
         )
 
-        try {
+        worker.use {
             worker.start()
 
             withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
                 secondWriteCompleted.await()
             }
-        } finally {
-            worker.close()
         }
 
         assertEquals(1, bootstrapAttempts.get())

@@ -40,15 +40,13 @@ class ProtectionReconcilerWorkerTest {
             interval = Duration.ofMillis(10),
         )
 
-        try {
+        worker.use {
             worker.start()
             withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
                 while (status.snapshot().lastReconciledAt == null) {
                     delay(10.toDuration(DurationUnit.MILLISECONDS))
                 }
             }
-        } finally {
-            worker.close()
         }
 
         assertNotNull(status.snapshot().lastReconciledAt)
@@ -79,15 +77,13 @@ class ProtectionReconcilerWorkerTest {
             },
         )
 
-        try {
+        worker.use {
             worker.start()
             withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
                 while (status.snapshot().lastReconciledAt == null) {
                     delay(10.toDuration(DurationUnit.MILLISECONDS))
                 }
             }
-        } finally {
-            worker.close()
         }
 
         assertTrue(attempts.get() >= 2)

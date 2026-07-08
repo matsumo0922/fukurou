@@ -166,9 +166,7 @@ object TradingRuntimeFactory {
         val databaseConfig = requireNotNull(TradingDatabaseConfig.fromEnvironment(environment)) {
             "DB_URL, DB_USER, and DB_PASSWORD are required for runtime config resolution."
         }
-        val dataSource = createDataSource(databaseConfig)
-
-        try {
+        createDataSource(databaseConfig).use { dataSource ->
             val database = ExposedDatabase.connect(dataSource)
 
             RuntimeConfigPersistenceBootstrap(
@@ -179,8 +177,6 @@ object TradingRuntimeFactory {
             return RuntimeConfigResolver(
                 ExposedRuntimeConfigRepository(database),
             ).resolve(environment).getOrThrow()
-        } finally {
-            dataSource.close()
         }
     }
 

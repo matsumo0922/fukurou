@@ -3145,9 +3145,7 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
     container.start()
 
     try {
-        val dataSource = createDataSource(container)
-
-        try {
+        createDataSource(container).use { dataSource ->
             val database = ExposedDatabase.connect(dataSource)
             val context = PostgresTestContext(
                 container = container,
@@ -3156,8 +3154,6 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
             )
 
             context.block()
-        } finally {
-            dataSource.close()
         }
     } finally {
         container.stop()
