@@ -3,7 +3,6 @@
   <ManuallySuppressedIssues/>
   <CurrentIssues>
     <ID>CyclomaticComplexMethod:OneShotLlmRunner.kt$OneShotLlmRunner$private suspend fun invokePhase( phaseName: String, context: DecisionRunContext, request: LlmInvocationRequest, ): Result&lt;Unit></ID>
-    <ID>LargeClass:InMemoryPaperLedgerRepository.kt$InMemoryPaperLedgerRepository : PaperLedgerRepository</ID>
     <ID>LargeClass:OneShotLlmRunner.kt$OneShotLlmRunner</ID>
     <ID>LongMethod:OneShotLlmRunner.kt$OneShotLlmRunner$private suspend fun placeApprovedEntry( context: DecisionRunContext, intent: TradeIntentRecord, ): Result&lt;PaperTradeResult></ID>
     <ID>LongMethod:OneShotLlmRunner.kt$OneShotLlmRunner$private suspend fun runOneShotAfterPreflight( request: OneShotRunnerRequest, invocationId: String, promptContent: String, promptHash: String, marketSnapshotId: String, proposerContext: DecisionRunContext, failureContextUpdated: (DecisionRunContext) -> Unit, ): OneShotRunnerResult</ID>
@@ -11,7 +10,6 @@
     <ID>LongParameterList:OneShotLlmRunner.kt$OneShotLlmRunner$( context: DecisionRunContext, intent: TradeIntentRecord, decisionToPlaceOrderDuration: Duration, previewExecutionDuration: Duration, preview: PreviewOrderResult?, placeOrderExecutionDuration: Duration?, placeOrderHash: String?, hashMismatchWarning: String?, accepted: Boolean, )</ID>
     <ID>LongParameterList:OneShotLlmRunner.kt$OneShotLlmRunner$( invocationId: String, provider: LlmProvider, phase: LlmInvocationPhase, prompt: String, decisionRunContext: DecisionRunContext, request: OneShotRunnerRequest, intentId: UUID?, )</ID>
     <ID>LongParameterList:OneShotLlmRunner.kt$OneShotLlmRunner$( request: OneShotRunnerRequest, invocationId: String, promptContent: String, promptHash: String, marketSnapshotId: String, proposerContext: DecisionRunContext, failureContextUpdated: (DecisionRunContext) -> Unit, )</ID>
-    <ID>TooManyFunctions:InMemoryPaperLedgerRepository.kt$InMemoryPaperLedgerRepository : PaperLedgerRepository</ID>
     <ID>TooManyFunctions:PaperBroker.kt$PaperBroker : Broker</ID>
   </CurrentIssues>
 </SmellBaseline>
