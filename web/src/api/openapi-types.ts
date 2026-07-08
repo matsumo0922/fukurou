@@ -490,7 +490,7 @@ export interface paths {
         };
         /**
          * runtime config catalog を取得する
-         * @description code-owned catalog から read-only の実効 runtime config を返します。secret は設定有無だけを返し、値は返しません。
+         * @description code-owned catalog から実効 runtime config と version 履歴を返します。secret は設定有無だけを返し、値は返しません。
          */
         get: {
             parameters: {
@@ -501,7 +501,7 @@ export interface paths {
             };
             requestBody?: never;
             responses: {
-                /** @description runtime config catalog です。 */
+                /** @description runtime config catalog と version 履歴です。 */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -514,6 +514,281 @@ export interface paths {
         };
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/runtime-config/drafts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * runtime config draft を作成する
+         * @description active または指定 version を基準に runtime config draft を作成し、現在の catalog / typed config で検証した結果を返します。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            /** @description draft の基準 version と変更値です。 */
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["OpsRuntimeConfigDraftRequest"];
+                };
+            };
+            responses: {
+                /** @description 作成した draft と validation 結果です。 */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RuntimeConfigVersionDetail"];
+                    };
+                };
+                /** @description request body、version ID、または変更対象 key が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description runtime config admin service が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/runtime-config/drafts/{versionId}/validate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * runtime config draft を検証する
+         * @description 保存済み draft を現在の catalog / typed config に対して再検証します。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 検証対象 draft の version ID です。 */
+                    versionId: string;
+                };
+                cookie?: never;
+            };
+            /** @description 操作理由です。省略できます。 */
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["OpsRuntimeConfigVersionActionRequest"];
+                };
+            };
+            responses: {
+                /** @description draft と validation 結果です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RuntimeConfigVersionDetail"];
+                    };
+                };
+                /** @description version ID が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description runtime config admin service が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/runtime-config/drafts/{versionId}/activate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * runtime config draft を active 化する
+         * @description 保存済み draft を現在の catalog / typed config で再検証してから active 化します。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description active 化する draft の version ID です。 */
+                    versionId: string;
+                };
+                cookie?: never;
+            };
+            /** @description 操作理由です。省略できます。 */
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["OpsRuntimeConfigVersionActionRequest"];
+                };
+            };
+            responses: {
+                /** @description active 化した version と validation 結果です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RuntimeConfigActivationResult"];
+                    };
+                };
+                /** @description version ID または version 状態が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description 現在の catalog / typed config validation に失敗しました。 */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RuntimeConfigValidationResult"];
+                    };
+                };
+                /** @description runtime config admin service が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/runtime-config/versions/{versionId}/rollback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * runtime config version へ rollback する
+         * @description 保存済み inactive version を現在の catalog / typed config で再検証してから active 化します。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description rollback 先の version ID です。 */
+                    versionId: string;
+                };
+                cookie?: never;
+            };
+            /** @description 操作理由です。省略できます。 */
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["OpsRuntimeConfigVersionActionRequest"];
+                };
+            };
+            responses: {
+                /** @description rollback 後の active version と validation 結果です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RuntimeConfigActivationResult"];
+                    };
+                };
+                /** @description version ID または version 状態が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description 現在の catalog / typed config validation に失敗しました。 */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RuntimeConfigValidationResult"];
+                    };
+                };
+                /** @description runtime config admin service が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
         delete?: never;
         options?: never;
         head?: never;
@@ -1601,7 +1876,7 @@ export interface components {
             legacyEnvName: string;
             editable: boolean;
             /** @enum {string} */
-            applyMode: "PROCESS_RESTART";
+            applyMode: "NEXT_RESTART" | "PROCESS_RESTART";
             /** @enum {string} */
             safetyTier: "STANDARD" | "GUARDED" | "SAFETY_CRITICAL" | "DEPLOYMENT_BOUNDARY" | "SECRET";
             labelKey: string;
@@ -1614,9 +1889,60 @@ export interface components {
             descriptionKey: string;
             items: components["schemas"]["RuntimeConfigItem"][];
         };
+        /** RuntimeConfigVersionSummary */
+        RuntimeConfigVersionSummary: {
+            id: string;
+            status: string;
+            createdAt: string;
+            activatedAt?: string | null;
+            createdBy: string;
+            note?: string | null;
+            hash: string;
+        };
         /** RuntimeConfigSnapshot */
         RuntimeConfigSnapshot: {
             groups: components["schemas"]["RuntimeConfigGroup"][];
+            activeVersion?: components["schemas"]["RuntimeConfigVersionSummary"] | null;
+            versions?: components["schemas"]["RuntimeConfigVersionSummary"][];
+        };
+        /** OpsRuntimeConfigDraftRequest */
+        OpsRuntimeConfigDraftRequest: {
+            baseVersionId?: string | null;
+            values: {
+                [key: string]: string;
+            };
+            note?: string | null;
+        };
+        /** RuntimeConfigValidationError */
+        RuntimeConfigValidationError: {
+            code: string;
+            key?: string | null;
+            params?: {
+                [key: string]: string;
+            };
+        };
+        /** RuntimeConfigValidationResult */
+        RuntimeConfigValidationResult: {
+            valid: boolean;
+            errors?: components["schemas"]["RuntimeConfigValidationError"][];
+        };
+        /** RuntimeConfigVersionDetail */
+        RuntimeConfigVersionDetail: {
+            version: components["schemas"]["RuntimeConfigVersionSummary"];
+            values: {
+                [key: string]: string;
+            };
+            validation: components["schemas"]["RuntimeConfigValidationResult"];
+        };
+        /** OpsRuntimeConfigVersionActionRequest */
+        OpsRuntimeConfigVersionActionRequest: {
+            reason?: string | null;
+        };
+        /** RuntimeConfigActivationResult */
+        RuntimeConfigActivationResult: {
+            activeVersion: components["schemas"]["RuntimeConfigVersionSummary"];
+            previousActiveVersionId?: string | null;
+            validation: components["schemas"]["RuntimeConfigValidationResult"];
         };
         /** OpsHaltRequest */
         OpsHaltRequest: {

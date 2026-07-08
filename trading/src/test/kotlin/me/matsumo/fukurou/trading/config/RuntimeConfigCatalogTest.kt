@@ -36,7 +36,8 @@ class RuntimeConfigCatalogTest {
         assertEquals(RuntimeConfigSourceKind.DEPLOYMENT, deploymentItems.getValue("runner.proposerAllowedTools").sourceKind)
         assertEquals("https://example.test/public", deploymentItems.getValue("gmoPublic.baseUrl").effectiveValue)
         assertFalse(deploymentItems.getValue("trading.mode").editable)
-        assertFalse(runtimeItems.getValue("safety.maxRiskPerTradeRatio").editable)
+        assertTrue(runtimeItems.getValue("safety.maxRiskPerTradeRatio").editable)
+        assertEquals(RuntimeConfigApplyMode.NEXT_RESTART, runtimeItems.getValue("safety.maxRiskPerTradeRatio").applyMode)
         assertEquals(
             "FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER",
             runtimeItems.getValue("paper.volatilitySlippageMultiplier").legacyEnvName,

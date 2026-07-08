@@ -1,8 +1,18 @@
+@file:Suppress("ImportOrdering", "LongMethod", "TooManyFunctions")
+
 package me.matsumo.fukurou.trading.persistence
 
 import me.matsumo.fukurou.trading.config.ActiveRuntimeConfigSnapshot
 import me.matsumo.fukurou.trading.config.ActiveRuntimeConfigSource
+import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
+import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
+import me.matsumo.fukurou.trading.config.RuntimeConfigCandidateValidator
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
+import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
+import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
+import me.matsumo.fukurou.trading.config.requireValid
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import java.sql.ResultSet
@@ -18,6 +28,11 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 private const val RUNTIME_CONFIG_STATUS_ACTIVE = "ACTIVE"
 
 /**
+ * draft runtime config の状態名。
+ */
+private const val RUNTIME_CONFIG_STATUS_DRAFT = "DRAFT"
+
+/**
  * inactive runtime config の状態名。
  */
 private const val RUNTIME_CONFIG_STATUS_INACTIVE = "INACTIVE"
@@ -26,6 +41,11 @@ private const val RUNTIME_CONFIG_STATUS_INACTIVE = "INACTIVE"
  * bootstrap 由来の runtime config 作成者。
  */
 private const val RUNTIME_CONFIG_BOOTSTRAP_CREATED_BY = "bootstrap"
+
+/**
+ * WebUI 由来の runtime config 作成者。
+ */
+private const val RUNTIME_CONFIG_WEBUI_CREATED_BY = "webui"
 
 /**
  * bootstrap 由来の runtime config note。
@@ -43,9 +63,44 @@ private const val RUNTIME_CONFIG_CATALOG_BACKFILL_NOTE_PREFIX = "code catalog de
 private const val SELECT_ACTIVE_RUNTIME_CONFIG_VERSION_SQL = """
     SELECT
         id,
-        activated_at
+        status,
+        created_at,
+        activated_at,
+        created_by,
+        note
     FROM runtime_config_versions
     WHERE status = ?
+"""
+
+/**
+ * runtime config version 一覧を読む SQL。
+ */
+private const val SELECT_RUNTIME_CONFIG_VERSIONS_SQL = """
+    SELECT
+        id,
+        status,
+        created_at,
+        activated_at,
+        created_by,
+        note
+    FROM runtime_config_versions
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?
+"""
+
+/**
+ * runtime config version を ID で読む SQL。
+ */
+private const val SELECT_RUNTIME_CONFIG_VERSION_BY_ID_SQL = """
+    SELECT
+        id,
+        status,
+        created_at,
+        activated_at,
+        created_by,
+        note
+    FROM runtime_config_versions
+    WHERE id = ?
 """
 
 /**
@@ -76,7 +131,17 @@ private const val SELECT_RUNTIME_CONFIG_VALUES_SQL = """
 """
 
 /**
- * active runtime config version を作る SQL。
+ * active runtime config version を inactive にする SQL。
+ */
+private const val DEACTIVATE_RUNTIME_CONFIG_VERSION_SQL = """
+    UPDATE runtime_config_versions
+    SET status = ?
+    WHERE id = ?
+        AND status = ?
+"""
+
+/**
+ * runtime config version を追加する SQL。
  */
 private const val INSERT_RUNTIME_CONFIG_VERSION_SQL = """
     INSERT INTO runtime_config_versions (
@@ -91,16 +156,6 @@ private const val INSERT_RUNTIME_CONFIG_VERSION_SQL = """
 """
 
 /**
- * active runtime config version を inactive にする SQL。
- */
-private const val DEACTIVATE_RUNTIME_CONFIG_VERSION_SQL = """
-    UPDATE runtime_config_versions
-    SET status = ?
-    WHERE id = ?
-        AND status = ?
-"""
-
-/**
  * runtime config value を追加する SQL。
  */
 private const val INSERT_RUNTIME_CONFIG_VALUE_SQL = """
@@ -111,6 +166,26 @@ private const val INSERT_RUNTIME_CONFIG_VALUE_SQL = """
     )
     VALUES (?, ?, ?)
     ON CONFLICT (version_id, config_key) DO NOTHING
+"""
+
+/**
+ * active runtime config version を inactive にする SQL。
+ */
+private const val DEACTIVATE_ACTIVE_RUNTIME_CONFIG_VERSION_SQL = """
+    UPDATE runtime_config_versions
+    SET status = ?
+    WHERE status = ?
+"""
+
+/**
+ * runtime config version を active にする SQL。
+ */
+private const val ACTIVATE_RUNTIME_CONFIG_VERSION_SQL = """
+    UPDATE runtime_config_versions
+    SET
+        status = ?,
+        activated_at = ?
+    WHERE id = ?
 """
 
 /**
@@ -214,10 +289,14 @@ class RuntimeConfigPersistenceBootstrap(
  * Exposed/JDBC で active runtime config を読む repository。
  *
  * @param database Exposed database
+ * @param clock version timestamp に使う clock
+ * @param environment typed config validation に使う process environment
  */
 class ExposedRuntimeConfigRepository(
     private val database: ExposedDatabase,
-) : ActiveRuntimeConfigSource {
+    private val clock: Clock = Clock.systemUTC(),
+    private val environment: Map<String, String> = System.getenv(),
+) : ActiveRuntimeConfigSource, RuntimeConfigAdminService {
 
     override fun activeSnapshot(): Result<ActiveRuntimeConfigSnapshot> {
         return runCatching {
@@ -231,8 +310,119 @@ class ExposedRuntimeConfigRepository(
 
                 ActiveRuntimeConfigSnapshot(
                     versionId = version.versionId.toString(),
-                    activatedAt = version.activatedAt,
+                    activatedAt = requireNotNull(version.activatedAt) {
+                        "Active runtime config version must have activated_at."
+                    },
                     values = values,
+                )
+            }
+        }
+    }
+
+    override fun listVersions(limit: Int): Result<List<RuntimeConfigVersionSummary>> {
+        return runCatching {
+            exposedTransaction(database) {
+                selectRuntimeConfigVersions(limit)
+                    .map { row -> row.toSummary(selectRuntimeConfigValues(row.versionId)) }
+            }
+        }
+    }
+
+    override fun createDraft(request: RuntimeConfigDraftCreation): Result<RuntimeConfigVersionDetail> {
+        return runCatching {
+            exposedTransaction(database) {
+                val baseVersion = request.baseVersionId
+                    ?.let { versionId -> requireRuntimeConfigVersion(versionId) }
+                    ?: requireSingleActiveRuntimeConfigVersion()
+                val baseValues = selectRuntimeConfigValues(baseVersion.versionId)
+                val mergedValues = baseValues + validateDraftPatchValues(request.values)
+                val draftId = UUID.randomUUID()
+                val now = Instant.now(clock)
+                val createdBy = request.createdBy.trim().ifBlank { RUNTIME_CONFIG_WEBUI_CREATED_BY }
+
+                insertRuntimeConfigVersion(
+                    RuntimeConfigVersionInsert(
+                        versionId = draftId,
+                        status = RUNTIME_CONFIG_STATUS_DRAFT,
+                        createdAt = now,
+                        activatedAt = null,
+                        createdBy = createdBy,
+                        note = request.note?.trim()?.takeIf { note -> note.isNotEmpty() },
+                    ),
+                )
+                insertRuntimeConfigValues(
+                    versionId = draftId,
+                    values = mergedValues,
+                )
+
+                val draft = requireRuntimeConfigVersion(draftId.toString())
+                val validation = RuntimeConfigCandidateValidator.validate(mergedValues, environment).validation
+
+                RuntimeConfigVersionDetail(
+                    version = draft.toSummary(mergedValues),
+                    values = mergedValues,
+                    validation = validation,
+                )
+            }
+        }
+    }
+
+    override fun validateVersion(versionId: String): Result<RuntimeConfigVersionDetail> {
+        return runCatching {
+            exposedTransaction(database) {
+                val version = requireRuntimeConfigVersion(versionId)
+                val values = selectRuntimeConfigValues(version.versionId)
+
+                RuntimeConfigVersionDetail(
+                    version = version.toSummary(values),
+                    values = values,
+                    validation = RuntimeConfigCandidateValidator.validate(values, environment).validation,
+                )
+            }
+        }
+    }
+
+    override fun activateDraft(versionId: String): Result<RuntimeConfigActivationResult> {
+        return activateVersion(
+            versionId = versionId,
+            allowedStatuses = setOf(RUNTIME_CONFIG_STATUS_DRAFT),
+        )
+    }
+
+    override fun rollbackToVersion(versionId: String): Result<RuntimeConfigActivationResult> {
+        return activateVersion(
+            versionId = versionId,
+            allowedStatuses = setOf(RUNTIME_CONFIG_STATUS_INACTIVE),
+        )
+    }
+
+    private fun activateVersion(
+        versionId: String,
+        allowedStatuses: Set<String>,
+    ): Result<RuntimeConfigActivationResult> {
+        return runCatching {
+            exposedTransaction(database) {
+                val targetVersion = requireRuntimeConfigVersion(versionId)
+
+                require(targetVersion.status in allowedStatuses) {
+                    "runtime config version ${targetVersion.versionId} status ${targetVersion.status} cannot be activated"
+                }
+
+                val values = selectRuntimeConfigValues(targetVersion.versionId)
+                val validation = RuntimeConfigCandidateValidator.validate(values, environment).validation
+                validation.requireValid()
+
+                val previousActiveVersionId = requireSingleActiveRuntimeConfigVersion().versionId.toString()
+                val now = Instant.now(clock)
+                deactivateActiveRuntimeConfigVersion()
+                activateRuntimeConfigVersion(targetVersion.versionId, now)
+
+                val activeVersion = requireRuntimeConfigVersion(targetVersion.versionId.toString())
+
+                RuntimeConfigActivationResult(
+                    activeVersion = activeVersion.toSummary(values),
+                    previousActiveVersionId = previousActiveVersionId,
+                    validation = validation,
                 )
             }
         }
@@ -301,6 +491,41 @@ private fun JdbcTransaction.selectActiveRuntimeConfigVersions(): List<RuntimeCon
                     add(resultSet.toRuntimeConfigVersionRow())
                 }
             }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectRuntimeConfigVersions(limit: Int): List<RuntimeConfigVersionRow> {
+    return jdbcConnection().prepareStatement(SELECT_RUNTIME_CONFIG_VERSIONS_SQL).use { statement ->
+        statement.setInt(1, limit.coerceIn(1, 100))
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(resultSet.toRuntimeConfigVersionRow())
+                }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.requireRuntimeConfigVersion(versionId: String): RuntimeConfigVersionRow {
+    val uuid = runCatching { UUID.fromString(versionId) }.getOrNull()
+    require(uuid != null) {
+        "runtime config version id is invalid"
+    }
+
+    return requireRuntimeConfigVersion(uuid)
+}
+
+private fun JdbcTransaction.requireRuntimeConfigVersion(versionId: UUID): RuntimeConfigVersionRow {
+    return jdbcConnection().prepareStatement(SELECT_RUNTIME_CONFIG_VERSION_BY_ID_SQL).use { statement ->
+        statement.setObject(1, versionId)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) {
+                "runtime config version was not found"
+            }
+
+            resultSet.toRuntimeConfigVersionRow()
         }
     }
 }
@@ -443,6 +668,31 @@ private fun JdbcTransaction.deactivateRuntimeConfigVersion(versionId: UUID) {
     }
 }
 
+private fun JdbcTransaction.insertRuntimeConfigVersion(insert: RuntimeConfigVersionInsert) {
+    jdbcConnection().prepareStatement(INSERT_RUNTIME_CONFIG_VERSION_SQL).use { statement ->
+        statement.setObject(1, insert.versionId)
+        statement.setString(2, insert.status)
+        statement.setLong(3, insert.createdAt.toEpochMilli())
+        if (insert.activatedAt == null) {
+            statement.setNull(4, java.sql.Types.BIGINT)
+        } else {
+            statement.setLong(4, insert.activatedAt.toEpochMilli())
+        }
+        statement.setString(5, insert.createdBy)
+        statement.setString(6, insert.note)
+        statement.executeUpdate()
+    }
+}
+
+private data class RuntimeConfigVersionInsert(
+    val versionId: UUID,
+    val status: String,
+    val createdAt: Instant,
+    val activatedAt: Instant?,
+    val createdBy: String,
+    val note: String?,
+)
+
 private fun JdbcTransaction.insertRuntimeConfigValues(versionId: UUID, values: Map<String, String>) {
     jdbcConnection().prepareStatement(INSERT_RUNTIME_CONFIG_VALUE_SQL).use { statement ->
         values.toSortedMap().forEach { (key, value) ->
@@ -459,23 +709,74 @@ private fun runtimeConfigCatalogBackfillNote(missingKeys: Set<String>): String {
     return "$RUNTIME_CONFIG_CATALOG_BACKFILL_NOTE_PREFIX: ${missingKeys.sorted().joinToString(",")}"
 }
 
+private fun JdbcTransaction.deactivateActiveRuntimeConfigVersion() {
+    jdbcConnection().prepareStatement(DEACTIVATE_ACTIVE_RUNTIME_CONFIG_VERSION_SQL).use { statement ->
+        statement.setString(1, RUNTIME_CONFIG_STATUS_INACTIVE)
+        statement.setString(2, RUNTIME_CONFIG_STATUS_ACTIVE)
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.activateRuntimeConfigVersion(versionId: UUID, now: Instant) {
+    jdbcConnection().prepareStatement(ACTIVATE_RUNTIME_CONFIG_VERSION_SQL).use { statement ->
+        statement.setString(1, RUNTIME_CONFIG_STATUS_ACTIVE)
+        statement.setLong(2, now.toEpochMilli())
+        statement.setObject(3, versionId)
+        statement.executeUpdate()
+    }
+}
+
+private fun validateDraftPatchValues(values: Map<String, String>): Map<String, String> {
+    val runtimeItems = RuntimeConfigCatalog.runtimeItems().associateBy { item -> item.key }
+
+    values.keys.forEach { key ->
+        val item = runtimeItems[key]
+
+        require(item != null) {
+            "runtime config key is unknown: $key"
+        }
+        require(item.editable) {
+            "runtime config key is read-only: $key"
+        }
+    }
+
+    return values.mapValues { (_, value) -> value.trim() }
+}
+
 private fun ResultSet.toRuntimeConfigVersionRow(): RuntimeConfigVersionRow {
     val activatedAtMillis = getLong("activated_at")
-
-    require(!wasNull()) {
-        "Active runtime config version must have activated_at."
-    }
+    val activatedAt = if (wasNull()) null else Instant.ofEpochMilli(activatedAtMillis)
 
     return RuntimeConfigVersionRow(
         versionId = getObject("id", UUID::class.java),
-        activatedAt = Instant.ofEpochMilli(activatedAtMillis),
+        status = getString("status"),
+        createdAt = Instant.ofEpochMilli(getLong("created_at")),
+        activatedAt = activatedAt,
+        createdBy = getString("created_by"),
+        note = getString("note"),
     )
 }
 
 private data class RuntimeConfigVersionRow(
     val versionId: UUID,
-    val activatedAt: Instant,
-)
+    val status: String,
+    val createdAt: Instant,
+    val activatedAt: Instant?,
+    val createdBy: String,
+    val note: String?,
+) {
+    fun toSummary(values: Map<String, String>): RuntimeConfigVersionSummary {
+        return RuntimeConfigVersionSummary(
+            id = versionId.toString(),
+            status = status,
+            createdAt = createdAt.toString(),
+            activatedAt = activatedAt?.toString(),
+            createdBy = createdBy,
+            note = note,
+            hash = calculateRuntimeConfigHash(values),
+        )
+    }
+}
 
 private data class RuntimeConfigCatalogKeyDiff(
     val unknownKeys: Set<String>,

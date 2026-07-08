@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
+import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
@@ -729,6 +730,48 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(expectedValues, snapshot.values)
         assertEquals(calculateRuntimeConfigHash(expectedValues), snapshot.hash)
+    }
+
+    @Test
+    fun runtimeConfigDraftActivationRevalidatesAndRollbackRestoresPreviousVersion() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedRuntimeConfigRepository(
+            database = database,
+            clock = fixedClock(),
+            environment = emptyMap(),
+        )
+        val defaultValues = RuntimeConfigCatalog.runtimeDefaultValues()
+        val unsafeDraft = repository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = null,
+                values = mapOf("runner.maxToolCallsPerRun" to "49"),
+                note = "unsafe tool call cap",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+
+        assertEquals(false, unsafeDraft.validation.valid)
+        assertTrue(repository.activateDraft(unsafeDraft.version.id).isFailure)
+        assertEquals(defaultValues, repository.activeSnapshot().getOrThrow().values)
+
+        val validDraft = repository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = null,
+                values = mapOf("runner.maxToolCallsPerRun" to "12"),
+                note = "lower tool call cap",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+        val activated = repository.activateDraft(validDraft.version.id).getOrThrow()
+
+        assertEquals("ACTIVE", activated.activeVersion.status)
+        assertEquals("12", repository.activeSnapshot().getOrThrow().values.getValue("runner.maxToolCallsPerRun"))
+
+        val previousActiveVersionId = requireNotNull(activated.previousActiveVersionId)
+        val rollback = repository.rollbackToVersion(previousActiveVersionId).getOrThrow()
+
+        assertEquals(previousActiveVersionId, rollback.activeVersion.id)
+        assertEquals(defaultValues, repository.activeSnapshot().getOrThrow().values)
     }
 
     @Test

@@ -496,6 +496,99 @@ a:focus-visible {
   line-height: 1.45;
 }
 
+.config-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.config-version-list,
+.config-diff-list,
+.config-validation-list {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.config-version-list__empty {
+  color: var(--ink-muted);
+  font-size: 0.84rem;
+}
+
+.config-version {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  padding-top: 9px;
+}
+
+.config-version:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.config-version__main,
+.config-version__meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+  color: var(--ink-muted);
+  font-size: 0.8rem;
+}
+
+.config-version__id,
+.config-version__meta span {
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.config-operation-state {
+  display: flex;
+  margin-bottom: 10px;
+}
+
+.config-diff {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) repeat(2, minmax(160px, 1fr));
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  color: var(--ink-muted);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  padding-top: 9px;
+}
+
+.config-diff:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.config-diff__key {
+  color: var(--ink);
+  font-weight: 720;
+}
+
+.config-validation-list {
+  margin-top: 10px;
+}
+
+.config-validation-error {
+  color: var(--red);
+  font-size: 0.82rem;
+  font-weight: 700;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
 .config-table {
   display: grid;
   min-width: 0;
@@ -504,10 +597,10 @@ a:focus-visible {
 
 .config-table__row {
   display: grid;
-  grid-template-columns: minmax(220px, 1.35fr) repeat(3, minmax(130px, 0.8fr)) minmax(280px, 1.4fr);
+  grid-template-columns: minmax(220px, 1.35fr) repeat(3, minmax(130px, 0.8fr)) minmax(170px, 0.9fr) minmax(280px, 1.4fr);
   gap: 10px;
   align-items: start;
-  min-width: 980px;
+  min-width: 1160px;
   border-top: 1px solid var(--line);
   padding: 11px 0;
 }
@@ -567,6 +660,45 @@ a:focus-visible {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.config-draft-input {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  padding: 8px 9px;
+}
+
+.config-draft-input:focus {
+  border-color: var(--blue);
+  outline: 3px solid rgb(48 95 134 / 18%);
+  outline-offset: 0;
+}
+
+.config-draft-input--multiline {
+  resize: vertical;
+}
+
+.config-draft-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+
+.config-draft-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--blue);
 }
 
 .activity-filters {
@@ -1844,6 +1976,8 @@ a:focus-visible {
 
   .compact-list__row,
   .evaluation-table__row,
+  .config-version,
+  .config-diff,
   .timeline__metadata {
     grid-template-columns: 1fr;
   }

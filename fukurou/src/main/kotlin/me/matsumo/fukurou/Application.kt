@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou
 
 import com.zaxxer.hikari.HikariDataSource
@@ -15,6 +17,7 @@ import io.ktor.server.routing.routing
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -64,6 +67,7 @@ fun interface ReadinessProbe {
  * @param opsPaperLedgerRepository ops API 用 paper ledger repository。null なら DB 設定から構築する
  * @param opsCommandEventLog ops API 用 command_event_log writer。null なら DB 設定から構築する
  * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
+ * @param opsRuntimeConfigAdminService ops API 用 runtime config admin service。null なら DB 設定から構築する
  * @param tradingConfig trading runtime config
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  * @param webRoot WebUI の build output を配信する filesystem root。null なら Web 配信を無効にする
@@ -83,6 +87,7 @@ fun Application.module(
     opsPaperLedgerRepository: PaperLedgerRepository? = null,
     opsCommandEventLog: CommandEventLog? = null,
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
+    opsRuntimeConfigAdminService: RuntimeConfigAdminService? = null,
     tradingConfig: TradingBotConfig = TradingBotConfig(),
     runtimeConfigEnvironment: Map<String, String> = System.getenv(),
     webRoot: File? = webRootFromEnv(),
@@ -113,6 +118,7 @@ fun Application.module(
             paperLedgerRepository = opsPaperLedgerRepository,
             commandEventLog = opsCommandEventLog,
             commandEventFeedReader = opsCommandEventFeedReader,
+            runtimeConfigAdminService = opsRuntimeConfigAdminService,
         ),
         runtime = runtime,
     )
@@ -152,7 +158,11 @@ private fun createApplicationRuntimeResources(
         ).ensureSchema().getOrThrow()
 
         RuntimeConfigResolver(
-            ExposedRuntimeConfigRepository(database),
+            ExposedRuntimeConfigRepository(
+                database = database,
+                clock = inputs.clock,
+                environment = databaseResources.environment,
+            ),
         ).resolve(databaseResources.environment).getOrThrow()
     }
     val resolvedTradingConfig = runtimeConfigResolution?.tradingConfig ?: inputs.tradingConfig
@@ -250,12 +260,15 @@ private fun createOpsRouteResources(
         commandEventLog = commandEventLog,
         runtime = runtime,
     )
+    val runtimeConfigAdminService = opsOverrides.runtimeConfigAdminService
+        ?: createRuntimeConfigAdminService(databaseResources, runtime)
 
     return ApplicationOpsRouteResources(
         dependencies = OpsRouteDependencies(
             runtimeConfig = OpsRuntimeConfigRouteDependencies(
                 tradingConfig = runtime.tradingConfig,
                 environment = runtime.runtimeConfigEnvironment,
+                adminService = runtimeConfigAdminService,
             ),
             risk = OpsRiskRouteDependencies(
                 riskStateRepository = riskStateRepository,
@@ -286,6 +299,19 @@ private fun createOpsRouteResources(
         ),
         createdManualLlmLaunchService = createdManualLlmLaunchService,
         createdLlmAuthService = createdLlmAuthService,
+    )
+}
+
+private fun createRuntimeConfigAdminService(
+    databaseResources: ApplicationDatabaseResources,
+    runtime: ApplicationRuntimeResources,
+): RuntimeConfigAdminService? {
+    val database = databaseResources.database ?: return null
+
+    return ExposedRuntimeConfigRepository(
+        database = database,
+        clock = runtime.clock,
+        environment = databaseResources.environment,
     )
 }
 
@@ -543,6 +569,7 @@ private data class ApplicationEvaluationOverrides(
  * @param paperLedgerRepository paper ledger repository
  * @param commandEventLog command_event_log writer
  * @param commandEventFeedReader command_event_log feed reader
+ * @param runtimeConfigAdminService runtime config admin service
  */
 private data class ApplicationOpsOverrides(
     val riskStateCommandService: RiskStateCommandService?,
@@ -552,6 +579,7 @@ private data class ApplicationOpsOverrides(
     val paperLedgerRepository: PaperLedgerRepository?,
     val commandEventLog: CommandEventLog?,
     val commandEventFeedReader: CommandEventFeedReader?,
+    val runtimeConfigAdminService: RuntimeConfigAdminService?,
 )
 
 /**

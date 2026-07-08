@@ -24,7 +24,16 @@ import me.matsumo.fukurou.trading.broker.ExecutionActivityPositionContext
 import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
+import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
+import me.matsumo.fukurou.trading.config.RuntimeConfigCandidateValidator
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
+import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
+import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedException
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
+import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -527,6 +536,38 @@ class OpsRouteTest {
             group = secretsGroup,
             key = "database.password",
         )
+    }
+
+    @Test
+    fun opsRoutes_runtimeConfigDraftActivationReturnsMachineReadableValidationErrors() = testApplication {
+        val adminService = FakeRuntimeConfigAdminService()
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsRuntimeConfigAdminService = adminService,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val draftResponse = client.post("/ops/runtime-config/drafts") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"values":{"runner.maxToolCallsPerRun":"49"},"note":"unsafe cap"}""")
+        }
+        val draftBody = Json.parseToJsonElement(draftResponse.bodyAsText()).jsonObject
+        val versionId = draftBody.getValue("version").jsonObject.getValue("id").jsonPrimitive.content
+        val activateResponse = client.post("/ops/runtime-config/drafts/$versionId/activate") {
+            contentType(ContentType.Application.Json)
+            setBody("""{}""")
+        }
+        val activateBody = Json.parseToJsonElement(activateResponse.bodyAsText()).jsonObject
+        val validationError = activateBody.getValue("errors").jsonArray.single().jsonObject
+
+        assertEquals(HttpStatusCode.Created, draftResponse.status)
+        assertEquals("false", draftBody.getValue("validation").jsonObject.getValue("valid").jsonPrimitive.content)
+        assertEquals(HttpStatusCode.Conflict, activateResponse.status)
+        assertEquals("false", activateBody.getValue("valid").jsonPrimitive.content)
+        assertEquals("runtimeConfig.validation.typedConfig", validationError.getValue("code").jsonPrimitive.content)
     }
 
     @Test
@@ -1240,6 +1281,107 @@ private fun metadataValue(container: JsonObject, label: String): String {
         .getValue("value")
         .jsonPrimitive
         .content
+}
+
+private class FakeRuntimeConfigAdminService : RuntimeConfigAdminService {
+    private val versions = mutableMapOf<String, RuntimeConfigVersionDetail>()
+    private var activeVersionId: String = "active-runtime-config"
+    private var nextDraftId = 1
+
+    init {
+        val values = RuntimeConfigCatalog.runtimeDefaultValues()
+        val activeVersion = RuntimeConfigVersionDetail(
+            version = versionSummary(
+                id = activeVersionId,
+                status = "ACTIVE",
+                values = values,
+            ),
+            values = values,
+            validation = RuntimeConfigCandidateValidator.validate(values, emptyMap()).validation,
+        )
+        versions[activeVersionId] = activeVersion
+    }
+
+    override fun listVersions(limit: Int): Result<List<RuntimeConfigVersionSummary>> {
+        return Result.success(
+            versions.values
+                .map { detail -> detail.version }
+                .take(limit),
+        )
+    }
+
+    override fun createDraft(request: RuntimeConfigDraftCreation): Result<RuntimeConfigVersionDetail> {
+        val baseValues = versions.getValue(request.baseVersionId ?: activeVersionId).values
+        val values = baseValues + request.values
+        val versionId = "draft-${nextDraftId++}"
+        val detail = RuntimeConfigVersionDetail(
+            version = versionSummary(
+                id = versionId,
+                status = "DRAFT",
+                values = values,
+                note = request.note,
+            ),
+            values = values,
+            validation = RuntimeConfigCandidateValidator.validate(values, emptyMap()).validation,
+        )
+        versions[versionId] = detail
+
+        return Result.success(detail)
+    }
+
+    override fun validateVersion(versionId: String): Result<RuntimeConfigVersionDetail> {
+        return Result.success(versions.getValue(versionId))
+    }
+
+    override fun activateDraft(versionId: String): Result<RuntimeConfigActivationResult> {
+        val detail = versions.getValue(versionId)
+
+        if (!detail.validation.valid) {
+            return Result.failure(RuntimeConfigValidationRejectedException(detail.validation))
+        }
+
+        val previousActiveVersionId = activeVersionId
+        activeVersionId = versionId
+        val activeDetail = detail.copy(
+            version = detail.version.copy(
+                status = "ACTIVE",
+                activatedAt = fixedInstant().toString(),
+            ),
+        )
+        versions[previousActiveVersionId] = versions.getValue(previousActiveVersionId).copy(
+            version = versions.getValue(previousActiveVersionId).version.copy(status = "INACTIVE"),
+        )
+        versions[versionId] = activeDetail
+
+        return Result.success(
+            RuntimeConfigActivationResult(
+                activeVersion = activeDetail.version,
+                previousActiveVersionId = previousActiveVersionId,
+                validation = detail.validation,
+            ),
+        )
+    }
+
+    override fun rollbackToVersion(versionId: String): Result<RuntimeConfigActivationResult> {
+        return activateDraft(versionId)
+    }
+
+    private fun versionSummary(
+        id: String,
+        status: String,
+        values: Map<String, String>,
+        note: String? = null,
+    ): RuntimeConfigVersionSummary {
+        return RuntimeConfigVersionSummary(
+            id = id,
+            status = status,
+            createdAt = fixedInstant().toString(),
+            activatedAt = if (status == "ACTIVE") fixedInstant().toString() else null,
+            createdBy = "test",
+            note = note,
+            hash = calculateRuntimeConfigHash(values),
+        )
+    }
 }
 
 /**

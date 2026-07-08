@@ -27,6 +27,11 @@ export type OpsRiskStateResponse = components["schemas"]["OpsRiskStateResponse"]
 export type RuntimeConfigGroup = components["schemas"]["RuntimeConfigGroup"];
 export type RuntimeConfigItem = components["schemas"]["RuntimeConfigItem"];
 export type RuntimeConfigSnapshot = components["schemas"]["RuntimeConfigSnapshot"];
+export type RuntimeConfigActivationResult = components["schemas"]["RuntimeConfigActivationResult"];
+export type RuntimeConfigValidationError = components["schemas"]["RuntimeConfigValidationError"];
+export type RuntimeConfigValidationResult = components["schemas"]["RuntimeConfigValidationResult"];
+export type RuntimeConfigVersionDetail = components["schemas"]["RuntimeConfigVersionDetail"];
+export type RuntimeConfigVersionSummary = components["schemas"]["RuntimeConfigVersionSummary"];
 export type OpsTriggerResponse = components["schemas"]["OpsTriggerResponse"];
 
 export type LlmAuthProvider = "claude" | "codex";
@@ -216,6 +221,39 @@ export async function requestOpsLlmAuthTokenCodeSubmit({
   const response = await postJsonResponse(path, { code: tokenCode }, [202] as const);
 
   return response.data;
+}
+
+export async function createRuntimeConfigDraft({
+  values,
+  baseVersionId = null,
+  note = null,
+}: {
+  values: Record<string, string>;
+  baseVersionId?: string | null;
+  note?: string | null;
+}): Promise<RuntimeConfigVersionDetail> {
+  const response = await postJsonResponse("/ops/runtime-config/drafts", { baseVersionId, values, note }, [201] as const);
+
+  return response.data;
+}
+
+export async function validateRuntimeConfigDraft(versionId: string): Promise<RuntimeConfigVersionDetail> {
+  const path = `/ops/runtime-config/drafts/${encodeURIComponent(versionId)}/validate` as "/ops/runtime-config/drafts/{versionId}/validate";
+  const response = await postJsonResponse(path, {}, [200] as const);
+
+  return response.data;
+}
+
+export async function activateRuntimeConfigDraft(versionId: string) {
+  const path = `/ops/runtime-config/drafts/${encodeURIComponent(versionId)}/activate` as "/ops/runtime-config/drafts/{versionId}/activate";
+
+  return postJsonResponse(path, {}, [200, 409] as const);
+}
+
+export async function rollbackRuntimeConfigVersion(versionId: string) {
+  const path = `/ops/runtime-config/versions/${encodeURIComponent(versionId)}/rollback` as "/ops/runtime-config/versions/{versionId}/rollback";
+
+  return postJsonResponse(path, {}, [200, 409] as const);
 }
 
 function isTerminalLlmAuthLoginStatus(status: OpsLlmAuthLoginResponse["status"]): boolean {

@@ -107,14 +107,14 @@ describe("App", () => {
     expect(screen.getAllByText(/JST/).length).toBeGreaterThan(1);
   });
 
-  it("shows read-only runtime config without exposing secret values", async () => {
+  it("shows editable runtime config without exposing secret values", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/config");
 
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Config" })).toBeInTheDocument();
-    expect(screen.getByText("Read-only effective runtime, deployment, and secret configuration.")).toBeInTheDocument();
+    expect(screen.getByText("Runtime config draft, validation, activation, rollback, deployment boundaries, and secret status.")).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Runtime" }, { timeout: 5_000 })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Deployment" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Secrets" })).toBeInTheDocument();
@@ -1270,7 +1270,19 @@ function providerFromLlmAuthPath(path: string): string {
 }
 
 function runtimeConfigResponse() {
+  const activeVersion = {
+    id: "runtime-config-active",
+    status: "ACTIVE",
+    createdAt: "2026-07-05T12:00:00.000Z",
+    activatedAt: "2026-07-05T12:00:00.000Z",
+    createdBy: "bootstrap",
+    note: "code catalog defaults",
+    hash: "abcdef1234567890",
+  };
+
   return {
+    activeVersion,
+    versions: [activeVersion],
     groups: [
       {
         id: "runtime",
@@ -1347,6 +1359,8 @@ function runtimeConfigItem({
   sourceKind,
   valueConfigured = true,
   safetyTier = "STANDARD",
+  editable = sourceKind === "RUNTIME",
+  applyMode = sourceKind === "RUNTIME" ? "NEXT_RESTART" : "PROCESS_RESTART",
 }: {
   key: string;
   legacyEnvName: string;
@@ -1358,6 +1372,8 @@ function runtimeConfigItem({
   sourceKind: string;
   valueConfigured?: boolean;
   safetyTier?: string;
+  editable?: boolean;
+  applyMode?: string;
 }) {
   return {
     key,
@@ -1369,8 +1385,8 @@ function runtimeConfigItem({
     unit,
     valueConfigured,
     legacyEnvName,
-    editable: false,
-    applyMode: "PROCESS_RESTART",
+    editable,
+    applyMode,
     safetyTier,
     labelKey: `config.item.${key}.label`,
     descriptionKey: `config.item.${key}.description`,
