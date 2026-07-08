@@ -10,6 +10,7 @@ import {
   ACTIVITY_TIMELINE_FILTER_STORAGE_KEY,
   ACTIVITY_TIMELINE_SOURCE_FILTERS,
   DEFAULT_ACTIVITY_TIMELINE_FILTERS,
+  activityTimelineRequestFilters,
   activityTimelineQuery,
   fetchActivityTimeline,
   newestFirstActivityTimelineEvents,
@@ -42,8 +43,12 @@ export function ActivityPage() {
   const timelineVersionRef = useRef(0);
   const hasLoadedOlderPages = olderPages.length > 0;
   const catalogQuery = useQuery(opsActivityCatalogQuery);
-  const timelineQuery = useQuery(activityTimelineQuery(filters, undefined, !hasLoadedOlderPages));
   const catalog = catalogQuery.data ?? null;
+  const requestFilters = useMemo(
+    () => activityTimelineRequestFilters(filters, catalog),
+    [catalog, filters],
+  );
+  const timelineQuery = useQuery(activityTimelineQuery(requestFilters, undefined, !hasLoadedOlderPages));
   const visibleTimeline = useMemo(
     () => mergeActivityTimelinePages(timelineQuery.data ?? null, olderPages),
     [olderPages, timelineQuery.data],
@@ -88,7 +93,7 @@ export function ActivityPage() {
     const requestVersion = timelineVersionRef.current;
 
     void loadOlderActivityPage({
-      filters,
+      filters: requestFilters,
       latestPage: timelineQuery.data ?? null,
       olderPages,
       setOlderPages,

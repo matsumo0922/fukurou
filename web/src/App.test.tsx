@@ -7,9 +7,15 @@ import { ACTIVITY_TIMELINE_FILTER_STORAGE_KEY } from "./api/ops";
 import { LOCALE_STORAGE_KEY } from "./i18n/messages";
 import { formatDateTime } from "./ui/format";
 
+type ActivityCatalogGolden = {
+  auditEventTypes: Array<{
+    value: string;
+  }>;
+};
+
 const activityCatalogGolden = JSON.parse(
   readFileSync(resolve(process.cwd(), "../testdata/ops-activity-catalog.golden.json"), "utf8"),
-) as unknown;
+) as ActivityCatalogGolden;
 
 describe("App", () => {
   afterEach(() => {
@@ -345,6 +351,13 @@ describe("App", () => {
         ),
       ).toBe(true);
     });
+    expect(
+      hasGetCall(
+        fetchMock,
+        "/ops/activity",
+        (params) => params.getAll("auditEventType").includes("STALE_EVENT"),
+      ),
+    ).toBe(false);
     await waitFor(() => {
       expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
         source: "audit",
@@ -384,7 +397,7 @@ describe("App", () => {
         auditEventTypes: ["STALE_EVENT"],
       }),
     );
-    stubSystemFetch({
+    const fetchMock = stubSystemFetch({
       activityCatalogResponse: {
         status: 500,
         body: { message: "catalog unavailable" },
@@ -396,6 +409,13 @@ describe("App", () => {
 
     expect(await screen.findByText("NO_TRADE decision")).toBeInTheDocument();
     expect(screen.getByLabelText("STALE_EVENT")).toBeChecked();
+    expect(
+      hasGetCall(
+        fetchMock,
+        "/ops/activity",
+        (params) => params.getAll("auditEventType").includes("STALE_EVENT"),
+      ),
+    ).toBe(false);
     expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
       source: "all",
       auditEventTypes: ["STALE_EVENT"],
@@ -870,11 +890,19 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
 
         return jsonResponse(activityCatalogGolden);
       case "/ops/activity":
-        if (requestSearchParams(input).has("before") && fixture.activityOlderResponse) {
-          return fixture.activityOlderResponse;
-        }
+        {
+          const searchParams = requestSearchParams(input);
 
-        return jsonResponse(activityTimelineResponse(requestSearchParams(input)));
+          if (unknownAuditEventTypes(searchParams).length > 0) {
+            return jsonResponse({ message: "Unknown auditEventType" }, { status: 400 });
+          }
+
+          if (searchParams.has("before") && fixture.activityOlderResponse) {
+            return fixture.activityOlderResponse;
+          }
+
+          return jsonResponse(activityTimelineResponse(searchParams));
+        }
       case "/ops/decisions":
         return jsonResponse({
           decisions: [
@@ -1353,6 +1381,12 @@ function activityTimelineResponse(searchParams: URLSearchParams) {
     nextBefore: before ? null : "2026-07-05T12:02:00.000Z|decision|decision:decision-1",
     limit: 50,
   };
+}
+
+function unknownAuditEventTypes(searchParams: URLSearchParams): string[] {
+  const knownAuditEventTypes = new Set(activityCatalogGolden.auditEventTypes.map((item) => item.value));
+
+  return searchParams.getAll("auditEventType").filter((eventType) => !knownAuditEventTypes.has(eventType));
 }
 
 function activityTimelineOlderPage() {

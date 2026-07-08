@@ -282,6 +282,20 @@ export function pruneActivityTimelineFilters(
   };
 }
 
+export function activityTimelineRequestFilters(
+  filters: ActivityTimelineFilters,
+  catalog: OpsActivityCatalogResponse | null,
+): ActivityTimelineFilters {
+  if (!catalog) {
+    return {
+      ...filters,
+      auditEventTypes: [],
+    };
+  }
+
+  return pruneActivityTimelineFilters(filters, catalog);
+}
+
 export function newestFirstActivityTimelineEvents(events: ActivityTimelineEvent[]): ActivityTimelineEvent[] {
   return [...events].sort(compareTimelineEvents);
 }

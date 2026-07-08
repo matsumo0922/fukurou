@@ -3,9 +3,12 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { messages } from "../i18n/messages";
 import {
+  activityTimelineRequestFilters,
   newestFirstActivityTimelineEvents,
+  type ActivityTimelineFilters,
   type ActivityTimelineEvent,
   type ActivityTimelineSource,
+  type OpsActivityCatalogResponse,
 } from "./ops";
 
 type CatalogGoldenItem = {
@@ -18,6 +21,7 @@ type CatalogGolden = {
   sourceFilters: CatalogGoldenItem[];
   auditEventTypes: CatalogGoldenItem[];
   decisionActions: CatalogGoldenItem[];
+  defaultExcludedAuditEventTypes: string[];
 };
 
 const activityCatalogGolden = JSON.parse(
@@ -55,6 +59,30 @@ describe("ops activity timeline helpers", () => {
     catalogKeys.forEach((key) => {
       expect(enMessages[key]).toBeTypeOf("string");
       expect(jaMessages[key]).toBeTypeOf("string");
+    });
+  });
+
+  it("omits saved audit filters from requests until the catalog is available", () => {
+    const filters: ActivityTimelineFilters = {
+      source: "audit",
+      auditEventTypes: ["HARD_HALT_SET", "STALE_EVENT"],
+    };
+
+    expect(activityTimelineRequestFilters(filters, null)).toEqual({
+      source: "audit",
+      auditEventTypes: [],
+    });
+  });
+
+  it("keeps only catalog-known audit filters in requests", () => {
+    const filters: ActivityTimelineFilters = {
+      source: "audit",
+      auditEventTypes: ["HARD_HALT_SET", "STALE_EVENT"],
+    };
+
+    expect(activityTimelineRequestFilters(filters, activityCatalogGolden as OpsActivityCatalogResponse)).toEqual({
+      source: "audit",
+      auditEventTypes: ["HARD_HALT_SET"],
     });
   });
 });
