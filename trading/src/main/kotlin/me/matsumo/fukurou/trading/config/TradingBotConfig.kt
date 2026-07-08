@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
+import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.reflection.ReflectionConfig
 import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
@@ -567,6 +568,24 @@ private const val FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT_ENV =
     "FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT"
 
 /**
+ * PromptCandidates 生成 LLM provider の環境変数名。
+ */
+private const val FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER_ENV =
+    "FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER"
+
+/**
+ * PromptCandidates 生成 LLM timeout 秒数の環境変数名。
+ */
+private const val FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS_ENV =
+    "FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS"
+
+/**
+ * 週ごとの PromptCandidates 生成最大試行回数の環境変数名。
+ */
+private const val FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS_ENV =
+    "FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS"
+
+/**
  * kill 基準の最小 closed trade 数の環境変数名。
  */
 private const val FUKUROU_KILL_MIN_CLOSED_TRADES_ENV = "FUKUROU_KILL_MIN_CLOSED_TRADES"
@@ -959,6 +978,17 @@ private fun Map<String, String>.readReflectionConfig(): ReflectionConfig {
         sampleWarningTradeCount = readOptional(FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT_ENV)
             ?.toInt()
             ?: defaults.sampleWarningTradeCount,
+        promptCandidateProvider = readOptional(FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER_ENV)
+            ?.let { value -> LlmProvider.valueOf(value.uppercase()) }
+            ?: defaults.promptCandidateProvider,
+        promptCandidateTimeout = Duration.ofSeconds(
+            readOptional(FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS_ENV)
+                ?.toLong()
+                ?: defaults.promptCandidateTimeout.seconds,
+        ),
+        promptCandidateMaxAttemptsPerPeriod = readOptional(
+            FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS_ENV,
+        )?.toInt() ?: defaults.promptCandidateMaxAttemptsPerPeriod,
     )
 }
 

@@ -579,6 +579,11 @@ private const val PROPOSER_PHASE = "proposer"
 private const val FALSIFIER_PHASE = "falsifier"
 
 /**
+ * reflection phase 名。
+ */
+private const val REFLECTION_PHASE = "reflection"
+
+/**
  * 較正 bin 数。
  */
 private const val CALIBRATION_BIN_COUNT = 10
@@ -609,5 +614,5 @@ private const val VOLATILITY_WINDOW = 14
 private val RANGE_THRESHOLD_RATIO = BigDecimal("0.005")
 
 private fun LlmPhaseUsageFact.isLlmInvocationPhase(): Boolean {
-    return phase == PROPOSER_PHASE || phase == FALSIFIER_PHASE
+    return phase == PROPOSER_PHASE || phase == FALSIFIER_PHASE || phase == REFLECTION_PHASE
 }

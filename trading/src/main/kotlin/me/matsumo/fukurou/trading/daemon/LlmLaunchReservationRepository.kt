@@ -41,6 +41,11 @@ enum class LlmDaemonTriggerKind {
      * 運用者の手動 API による即時起動。
      */
     MANUAL,
+
+    /**
+     * 週次 reflection による prompt candidate 生成。
+     */
+    REFLECTION,
 }
 
 /**
@@ -147,6 +152,16 @@ enum class LlmLaunchReservationRejectionReason {
      * 直近 24 時間の起動上限に達していた。
      */
     MAX_INVOCATIONS_PER_DAY,
+
+    /**
+     * reflection 用に残すべき 1 時間 headroom を下回っていた。
+     */
+    INSUFFICIENT_REFLECTION_HOURLY_HEADROOM,
+
+    /**
+     * reflection 用に残すべき 24 時間 headroom を下回っていた。
+     */
+    INSUFFICIENT_REFLECTION_DAILY_HEADROOM,
 }
 
 /**
@@ -177,7 +192,7 @@ interface LlmLaunchReservationRepository {
     suspend fun latestFinishedReservedAt(triggerKey: String): Result<Instant?>
 
     /**
-     * stale ではない RUNNING 予約が存在するか返す。
+     * stale ではない trading RUNNING 予約が存在するか返す。
      */
     suspend fun hasFreshRunningReservation(activeSince: Instant): Result<Boolean>
 }
@@ -245,12 +260,7 @@ class InMemoryLlmLaunchReservationRepository(
     override suspend fun hasFreshRunningReservation(activeSince: Instant): Result<Boolean> {
         return runCatching {
             mutex.withLock {
-                reservations.any { reservation ->
-                    val activeStatus = reservation.status == LlmLaunchReservationStatus.RUNNING
-                    val freshEnough = !reservation.reservedAt.isBefore(activeSince)
-
-                    activeStatus && freshEnough
-                }
+                reservations.any { reservation -> reservation.isFreshTradingRunning(activeSince) }
             }
         }
     }
@@ -259,10 +269,13 @@ class InMemoryLlmLaunchReservationRepository(
         val activeSince = request.reservedAt.minus(request.activeReservationStaleAfter)
 
         return reservations.firstOrNull { reservation ->
-            val activeStatus = reservation.status == LlmLaunchReservationStatus.RUNNING
-            val freshEnough = !reservation.reservedAt.isBefore(activeSince)
+            val freshRunning = reservation.isFreshRunning(activeSince)
+            val blockingForRequest = when (request.triggerKind) {
+                LlmDaemonTriggerKind.REFLECTION -> true
+                else -> reservation.triggerKind != LlmDaemonTriggerKind.REFLECTION
+            }
 
-            activeStatus && freshEnough
+            freshRunning && blockingForRequest
         }
     }
 
@@ -279,8 +292,22 @@ class InMemoryLlmLaunchReservationRepository(
 
         val hourlyCount = countReservationsSince(request.reservedAt.minus(request.hourlyWindow))
         val dailyCount = countReservationsSince(request.reservedAt.minus(request.dailyWindow))
-        val hourlyExceeded = hourlyCount >= request.runnerConfig.maxInvocationsPerHour
-        val dailyExceeded = dailyCount >= request.runnerConfig.maxInvocationsPerDay
+        val hourlyRemaining = request.runnerConfig.maxInvocationsPerHour - hourlyCount
+        val dailyRemaining = request.runnerConfig.maxInvocationsPerDay - dailyCount
+        val reflectionRequest = request.triggerKind == LlmDaemonTriggerKind.REFLECTION
+        val hourlyExceeded = hourlyRemaining <= 0
+        val dailyExceeded = dailyRemaining <= 0
+
+        if (reflectionRequest && hourlyRemaining <= REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS) {
+            return LlmLaunchReservationOutcome.Rejected(
+                LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM,
+            )
+        }
+        if (reflectionRequest && dailyRemaining <= REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS) {
+            return LlmLaunchReservationOutcome.Rejected(
+                LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM,
+            )
+        }
 
         if (hourlyExceeded) {
             return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR)
@@ -330,4 +357,31 @@ private data class LlmLaunchReservationRecord(
     val reservedAt: Instant,
     val finishedAt: Instant?,
     val reason: String?,
-)
+) {
+    /**
+     * stale 判定込みで RUNNING か返す。
+     */
+    fun isFreshRunning(activeSince: Instant): Boolean {
+        val activeStatus = status == LlmLaunchReservationStatus.RUNNING
+        val freshEnough = !reservedAt.isBefore(activeSince)
+
+        return activeStatus && freshEnough
+    }
+
+    /**
+     * stale 判定込みで trading RUNNING か返す。
+     */
+    fun isFreshTradingRunning(activeSince: Instant): Boolean {
+        return triggerKind != LlmDaemonTriggerKind.REFLECTION && isFreshRunning(activeSince)
+    }
+}
+
+/**
+ * reflection が開始前に残す 1 時間 LLM 起動 headroom。
+ */
+const val REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS = 1
+
+/**
+ * reflection が開始前に残す 24 時間 LLM 起動 headroom。
+ */
+const val REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS = 4

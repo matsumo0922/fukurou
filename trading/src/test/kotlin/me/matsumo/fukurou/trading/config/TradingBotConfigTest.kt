@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.config
 
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.invoker.LlmProvider
 import java.math.BigDecimal
 import java.time.Duration
 import kotlin.test.Test
@@ -47,6 +48,9 @@ class TradingBotConfigTest {
         assertEquals(180, config.reflection.calibrationLookbackDays)
         assertEquals(50, config.reflection.recentDecisionLimit)
         assertEquals(30, config.reflection.sampleWarningTradeCount)
+        assertEquals(LlmProvider.CLAUDE, config.reflection.promptCandidateProvider)
+        assertEquals(Duration.ofSeconds(60), config.reflection.promptCandidateTimeout)
+        assertEquals(2, config.reflection.promptCandidateMaxAttemptsPerPeriod)
         assertEquals(100, config.killCriterion.minClosedTrades)
         assertEquals(BigDecimal("0.8"), config.killCriterion.minProfitFactor)
         assertEquals(10, config.gmoPublicClient.rateLimit.permitsPerSecond)
@@ -107,6 +111,9 @@ class TradingBotConfigTest {
                 "FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS" to "90",
                 "FUKUROU_REFLECTION_RECENT_DECISION_LIMIT" to "25",
                 "FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT" to "20",
+                "FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER" to "codex",
+                "FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS" to "90",
+                "FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS" to "3",
                 "FUKUROU_KILL_MIN_CLOSED_TRADES" to "50",
                 "FUKUROU_KILL_MIN_PROFIT_FACTOR" to "0.9",
                 "FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC" to
@@ -165,6 +172,9 @@ class TradingBotConfigTest {
         assertEquals(90, config.reflection.calibrationLookbackDays)
         assertEquals(25, config.reflection.recentDecisionLimit)
         assertEquals(20, config.reflection.sampleWarningTradeCount)
+        assertEquals(LlmProvider.CODEX, config.reflection.promptCandidateProvider)
+        assertEquals(Duration.ofSeconds(90), config.reflection.promptCandidateTimeout)
+        assertEquals(3, config.reflection.promptCandidateMaxAttemptsPerPeriod)
         assertEquals(50, config.killCriterion.minClosedTrades)
         assertEquals(BigDecimal("0.9"), config.killCriterion.minProfitFactor)
         assertEquals(1, config.safetyFloor.economicEventBlackouts.size)
@@ -373,6 +383,21 @@ class TradingBotConfigTest {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT" to "0"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER" to "unknown"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS" to "121"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS" to "0"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

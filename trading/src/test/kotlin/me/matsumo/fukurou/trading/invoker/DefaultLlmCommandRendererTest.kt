@@ -115,6 +115,43 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
+    fun renderClaude_withoutMcpOmitsMcpArgsAndAllowedTools() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CLAUDE,
+            phase = LlmInvocationPhase.REFLECTION,
+            mcpServerName = null,
+            allowedTools = listOf("mcp__custom-mcp__submit_decision"),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+
+        assertFalse(command.args.contains("--mcp-config"))
+        assertFalse(command.args.contains("--strict-mcp-config"))
+        assertFalse(command.args.contains("--allowedTools"))
+        assertTrue(command.cleanupPaths.isEmpty())
+    }
+
+    @Test
+    fun renderCodex_withoutMcpWritesEmptyConfig() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.REFLECTION,
+            mcpServerName = null,
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val codexHome = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV]))
+        val configContent = Files.readString(codexHome.resolve(CODEX_CONFIG_FILE_NAME))
+
+        assertEquals("", configContent)
+        assertTrue(command.args.contains("--skip-git-repo-check"))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
     fun renderClaude_ignoresCodexAutoApprovedTools() {
         val renderer = DefaultLlmCommandRenderer()
         val request = request(
@@ -476,7 +513,7 @@ class DefaultLlmCommandRendererTest {
     private fun request(
         provider: LlmProvider,
         phase: LlmInvocationPhase,
-        mcpServerName: String,
+        mcpServerName: String?,
         allowedTools: List<String> = emptyList(),
         mcpEnvironment: Map<String, String> = mapOf("FUKUROU_INVOCATION_ID" to "invocation-test"),
         environment: Map<String, String> = emptyMap(),
@@ -496,13 +533,15 @@ class DefaultLlmCommandRendererTest {
                 systemPromptVersion = "system-prompt-v1",
                 marketSnapshotId = "snapshot",
             ),
-            mcpServer = LlmMcpServerConfig(
-                name = mcpServerName,
-                command = "java",
-                args = listOf("-jar", "mcp.jar"),
-                environment = mcpEnvironment,
-                autoApprovedTools = autoApprovedTools,
-            ),
+            mcpServer = mcpServerName?.let { serverName ->
+                LlmMcpServerConfig(
+                    name = serverName,
+                    command = "java",
+                    args = listOf("-jar", "mcp.jar"),
+                    environment = mcpEnvironment,
+                    autoApprovedTools = autoApprovedTools,
+                )
+            },
             environment = environment,
             allowedTools = allowedTools,
         )

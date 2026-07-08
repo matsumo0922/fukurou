@@ -283,12 +283,23 @@ class EvaluationMathTest {
                     ),
                 ),
                 llmUsageFact(phase = "falsifier", provider = "codex", usage = null),
+                llmUsageFact(
+                    phase = "reflection",
+                    provider = "claude",
+                    usage = LlmUsageDetails(
+                        totalCostUsd = BigDecimal("0.05"),
+                        numTurns = 1,
+                        durationMs = 500,
+                        usage = null,
+                        modelUsages = emptyList(),
+                    ),
+                ),
             ),
         )
 
-        assertEquals(2, stats.phaseCount)
+        assertEquals(3, stats.phaseCount)
         assertEquals(1, stats.missingUsagePhaseCount)
-        assertEquals("0.2500000000", stats.totalCostUsd.toPlainString())
+        assertEquals("0.3000000000", stats.totalCostUsd.toPlainString())
         assertEquals(listOf("claude", "codex"), stats.byProvider.map { provider -> provider.provider })
         assertEquals(10L, stats.byModel.single().inputTokens)
     }

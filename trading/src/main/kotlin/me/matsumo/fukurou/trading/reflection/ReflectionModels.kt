@@ -5,6 +5,7 @@ import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.LlmPhaseUsageFact
 import me.matsumo.fukurou.trading.evaluation.LlmRunRecord
+import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import java.time.Duration
 import java.time.Instant
@@ -41,6 +42,31 @@ const val DEFAULT_REFLECTION_SAMPLE_WARNING_TRADE_COUNT = 30
 const val DEFAULT_REFLECTION_RECENT_DECISION_LIMIT = 50
 
 /**
+ * 週次 PromptCandidates 生成 LLM の既定 timeout。
+ */
+val DEFAULT_REFLECTION_LLM_TIMEOUT: Duration = Duration.ofSeconds(60)
+
+/**
+ * 週次 PromptCandidates 生成 LLM timeout の許容上限。
+ */
+val MAX_REFLECTION_LLM_TIMEOUT: Duration = Duration.ofSeconds(120)
+
+/**
+ * 週次 PromptCandidates 生成の期間あたり既定最大試行回数。
+ */
+const val DEFAULT_REFLECTION_MAX_ATTEMPTS_PER_PERIOD = 2
+
+/**
+ * `llm_failed` 後の既定 backoff。
+ */
+val DEFAULT_REFLECTION_RETRY_BACKOFF: Duration = Duration.ofHours(24)
+
+/**
+ * budget deferred 後に再試行可能にする既定 delay。
+ */
+val DEFAULT_REFLECTION_BUDGET_RETRY_DELAY: Duration = Duration.ofHours(1)
+
+/**
  * deterministic reflection runner 設定。
  *
  * @param minInterval runner loop の最小間隔
@@ -48,6 +74,11 @@ const val DEFAULT_REFLECTION_RECENT_DECISION_LIMIT = 50
  * @param calibrationLookbackDays confidence calibration が参照する日数
  * @param recentDecisionLimit Recent Decisions に表示する最大行数
  * @param sampleWarningTradeCount sample size warning を出す closed trade 件数
+ * @param promptCandidateProvider PromptCandidates 生成に使う LLM provider
+ * @param promptCandidateTimeout PromptCandidates 生成 LLM の timeout
+ * @param promptCandidateMaxAttemptsPerPeriod 同じ週に LLM を試行する最大回数
+ * @param promptCandidateRetryBackoff `llm_failed` 後の再試行 backoff
+ * @param promptCandidateBudgetRetryDelay budget deferred 後の再試行 delay
  */
 data class ReflectionConfig(
     val minInterval: Duration = DEFAULT_REFLECTION_MIN_INTERVAL,
@@ -55,8 +86,17 @@ data class ReflectionConfig(
     val calibrationLookbackDays: Int = DEFAULT_REFLECTION_CALIBRATION_LOOKBACK_DAYS,
     val recentDecisionLimit: Int = DEFAULT_REFLECTION_RECENT_DECISION_LIMIT,
     val sampleWarningTradeCount: Int = DEFAULT_REFLECTION_SAMPLE_WARNING_TRADE_COUNT,
+    val promptCandidateProvider: LlmProvider = LlmProvider.CLAUDE,
+    val promptCandidateTimeout: Duration = DEFAULT_REFLECTION_LLM_TIMEOUT,
+    val promptCandidateMaxAttemptsPerPeriod: Int = DEFAULT_REFLECTION_MAX_ATTEMPTS_PER_PERIOD,
+    val promptCandidateRetryBackoff: Duration = DEFAULT_REFLECTION_RETRY_BACKOFF,
+    val promptCandidateBudgetRetryDelay: Duration = DEFAULT_REFLECTION_BUDGET_RETRY_DELAY,
 ) {
     init {
+        val promptCandidateTimeoutIsPositive = !promptCandidateTimeout.isNegative && !promptCandidateTimeout.isZero
+        val promptCandidateTimeoutIsWithinCap = promptCandidateTimeoutIsPositive &&
+            promptCandidateTimeout <= MAX_REFLECTION_LLM_TIMEOUT
+
         require(minInterval >= MIN_REFLECTION_MIN_INTERVAL) {
             "minInterval must be greater than or equal to ${MIN_REFLECTION_MIN_INTERVAL.seconds} seconds."
         }
@@ -71,6 +111,19 @@ data class ReflectionConfig(
         }
         require(sampleWarningTradeCount > 0) {
             "sampleWarningTradeCount must be greater than 0."
+        }
+        require(promptCandidateTimeoutIsWithinCap) {
+            "promptCandidateTimeout must be greater than 0 and less than or equal to " +
+                "${MAX_REFLECTION_LLM_TIMEOUT.seconds} seconds."
+        }
+        require(promptCandidateMaxAttemptsPerPeriod > 0) {
+            "promptCandidateMaxAttemptsPerPeriod must be greater than 0."
+        }
+        require(!promptCandidateRetryBackoff.isNegative && !promptCandidateRetryBackoff.isZero) {
+            "promptCandidateRetryBackoff must be greater than 0."
+        }
+        require(!promptCandidateBudgetRetryDelay.isNegative && !promptCandidateBudgetRetryDelay.isZero) {
+            "promptCandidateBudgetRetryDelay must be greater than 0."
         }
     }
 }

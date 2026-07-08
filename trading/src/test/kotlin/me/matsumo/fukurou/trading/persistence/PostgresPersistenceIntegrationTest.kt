@@ -998,6 +998,44 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun llm_launch_reservation_treatsReflectionAsLowPriorityInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val reflectionOutcome = repository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "reflection-run",
+                config = LlmRunnerConfig(),
+                triggerKind = LlmDaemonTriggerKind.REFLECTION,
+            ),
+        ).getOrThrow()
+        val reflectionOnlyRunning = repository.hasFreshRunningReservation(fixedInstant().minus(Duration.ofMinutes(30)))
+            .getOrThrow()
+        val tradingOutcome = repository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "trading-run",
+                config = LlmRunnerConfig(),
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+            ),
+        ).getOrThrow()
+        val reflectionBlockedOutcome = repository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "reflection-run-2",
+                config = LlmRunnerConfig(),
+                triggerKind = LlmDaemonTriggerKind.REFLECTION,
+            ),
+        ).getOrThrow()
+
+        assertEquals(LlmLaunchReservationOutcome.Reserved("reflection-run"), reflectionOutcome)
+        assertEquals(false, reflectionOnlyRunning)
+        assertEquals(LlmLaunchReservationOutcome.Reserved("trading-run"), tradingOutcome)
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION),
+            reflectionBlockedOutcome,
+        )
+    }
+
+    @Test
     fun llm_launch_reservation_ignoresDaemonLaunchAuditForCapInPostgresPath() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -1648,8 +1686,16 @@ class PostgresPersistenceIntegrationTest {
             runnerPhaseEvent(
                 phase = "proposer",
                 provider = "claude",
-                occurredAt = fixedInstant().plusMillis(3),
+                occurredAt = fixedInstant().plusMillis(4),
                 stdout = """{"total_cost_usd":0.30}""",
+            ),
+        ).getOrThrow()
+        eventLog.append(
+            runnerPhaseEvent(
+                phase = "reflection",
+                provider = "claude",
+                occurredAt = fixedInstant().plusMillis(3),
+                stdout = """{"total_cost_usd":0.10}""",
             ),
         ).getOrThrow()
 
@@ -1659,13 +1705,14 @@ class PostgresPersistenceIntegrationTest {
                 from = fixedInstant().minusSeconds(1),
                 toExclusive = fixedInstant().plusSeconds(1),
             ),
-            limit = 2,
+            limit = 3,
         ).getOrThrow()
 
         assertTrue(usageResult.truncated)
-        assertEquals(listOf("proposer", "falsifier"), usageResult.facts.map { fact -> fact.phase })
+        assertEquals(listOf("proposer", "falsifier", "reflection"), usageResult.facts.map { fact -> fact.phase })
         assertEquals("0.20", usageResult.facts.first().usage?.totalCostUsd?.toPlainString())
         assertEquals(null, usageResult.facts[1].usage)
+        assertEquals("0.10", usageResult.facts[2].usage?.totalCostUsd?.toPlainString())
     }
 
     @Test
@@ -2276,11 +2323,12 @@ private fun llmLaunchReservationRequest(
     invocationId: String,
     config: LlmRunnerConfig,
     reservedAt: Instant = fixedInstant(),
+    triggerKind: LlmDaemonTriggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
 ): LlmLaunchReservationRequest {
     return LlmLaunchReservationRequest(
         invocationId = invocationId,
-        triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
-        triggerKey = "flat-heartbeat",
+        triggerKind = triggerKind,
+        triggerKey = "test:${triggerKind.name.lowercase()}:$invocationId",
         reservedAt = reservedAt,
         runnerConfig = config,
         hourlyWindow = Duration.ofHours(1),

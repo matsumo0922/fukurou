@@ -119,12 +119,16 @@ class DefaultLlmCommandRenderer(
     }
 
     private fun renderClaude(request: LlmInvocationRequest): RenderedLlmCommand {
-        val allowedTools = request.allowedTools.joinToString(",")
         val mcpConfigFile = writePrivateConfigFile(
             prefix = "claude-mcp-config",
             suffix = ".json",
-            content = request.mcpServer.toClaudeMcpConfigJson(),
+            content = request.mcpServer?.toClaudeMcpConfigJson() ?: EMPTY_CLAUDE_MCP_CONFIG_JSON,
         )
+        val allowedTools = if (request.mcpServer == null) {
+            ""
+        } else {
+            request.allowedTools.joinToString(",")
+        }
         val baseArgs = listOf(
             "-p",
             request.prompt,
@@ -136,7 +140,15 @@ class DefaultLlmCommandRenderer(
             "--allowedTools",
             allowedTools,
         )
-        val args = baseArgs + mcpArgs + ENFORCED_CLAUDE_COMMON_ARGS
+        val noMcpIsolationArgs = if (request.mcpServer == null) {
+            listOf(
+                "--bare",
+            )
+        } else {
+            emptyList()
+        }
+        val args = baseArgs + noMcpIsolationArgs + mcpArgs + CLAUDE_BUILTIN_TOOL_DISABLE_ARGS +
+            ENFORCED_CLAUDE_COMMON_ARGS
 
         return runCatching {
             config.claudeCommandTemplate.toRenderedCommand(
@@ -254,6 +266,8 @@ private fun LlmMcpServerConfig.toClaudeMcpConfigJson(): String {
     }.toString()
 }
 
+private const val EMPTY_CLAUDE_MCP_CONFIG_JSON = """{"mcpServers":{}}"""
+
 private fun LlmMcpServerConfig.toCodexConfigToml(): String {
     return buildString {
         append("[mcp_servers.")
@@ -305,7 +319,7 @@ private fun String.tomlKey(): String {
 }
 
 private fun writeCodexHome(
-    mcpServer: LlmMcpServerConfig,
+    mcpServer: LlmMcpServerConfig?,
     environment: Map<String, String>,
     persistentHome: Path?,
 ): PrivateConfigPath {
@@ -316,14 +330,14 @@ private fun writeCodexHome(
     return writeTemporaryCodexHome(mcpServer, environment)
 }
 
-private fun writePersistentCodexHome(mcpServer: LlmMcpServerConfig, directory: Path): PrivateConfigPath {
+private fun writePersistentCodexHome(mcpServer: LlmMcpServerConfig?, directory: Path): PrivateConfigPath {
     Files.createDirectories(directory)
     directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
 
     val configFile = directory.resolve(CODEX_CONFIG_FILE_NAME)
     Files.writeString(
         configFile,
-        mcpServer.toCodexConfigToml(),
+        mcpServer?.toCodexConfigToml().orEmpty(),
         StandardOpenOption.CREATE,
         StandardOpenOption.TRUNCATE_EXISTING,
         StandardOpenOption.WRITE,
@@ -337,7 +351,7 @@ private fun writePersistentCodexHome(mcpServer: LlmMcpServerConfig, directory: P
 }
 
 private fun writeTemporaryCodexHome(
-    mcpServer: LlmMcpServerConfig,
+    mcpServer: LlmMcpServerConfig?,
     environment: Map<String, String>,
 ): PrivateConfigPath {
     val directory = Files.createTempDirectory("fukurou-codex-home-")
@@ -347,7 +361,7 @@ private fun writeTemporaryCodexHome(
         val configFile = directory.resolve(CODEX_CONFIG_FILE_NAME)
         Files.writeString(
             configFile,
-            mcpServer.toCodexConfigToml(),
+            mcpServer?.toCodexConfigToml().orEmpty(),
             StandardOpenOption.CREATE_NEW,
             StandardOpenOption.WRITE,
         )
@@ -482,6 +496,16 @@ val ENFORCED_CLAUDE_COMMON_ARGS = listOf(
 )
 
 /**
+ * Claude built-in tool を無効化する引数。
+ *
+ * MCP tool は `--allowedTools` で別に明示する。
+ */
+val CLAUDE_BUILTIN_TOOL_DISABLE_ARGS = listOf(
+    "--tools",
+    "",
+)
+
+/**
  * Codex headless 実行の既定共通引数。
  */
 val DEFAULT_CODEX_COMMON_ARGS = emptyList<String>()
@@ -517,9 +541,21 @@ val DEFAULT_CODEX_FALSIFIER_ARGS = emptyList<String>()
  * Claude common args で上書きさせない安全境界 flag。
  */
 val CLAUDE_COMMON_ARG_FORBIDDEN_FLAGS = setOf(
+    "--add-dir",
+    "--agent",
+    "--agents",
+    "--allowed-tools",
     "--mcp-config",
+    "--plugin-dir",
+    "--plugin-url",
+    "--setting-sources",
+    "--settings",
+    "--strict-mcp-config",
+    "--tools",
     "--allowedTools",
+    "--bare",
     "--permission-mode",
+    "--allow-dangerously-skip-permissions",
     "--dangerously-skip-permissions",
 )
 

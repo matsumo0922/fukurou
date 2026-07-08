@@ -2,12 +2,15 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
+import me.matsumo.fukurou.trading.daemon.REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS
+import me.matsumo.fukurou.trading.daemon.REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Instant
@@ -40,6 +43,7 @@ private const val COUNT_ACTIVE_LLM_LAUNCH_RESERVATIONS_SQL = """
     FROM llm_launch_reservations
     WHERE status = ?
         AND reserved_at >= ?
+        AND (? OR trigger_kind <> ?)
 """
 
 /**
@@ -144,7 +148,7 @@ class ExposedLlmLaunchReservationRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    countActiveReservations(activeSince) > 0
+                    countFreshTradingReservations(activeSince) > 0
                 }
             }
         }
@@ -161,7 +165,7 @@ private fun JdbcTransaction.tryReserveInTransaction(
     }
 
     val activeSince = request.reservedAt.minus(request.activeReservationStaleAfter)
-    val activeCount = countActiveReservations(activeSince)
+    val activeCount = countBlockingActiveReservations(request, activeSince)
 
     if (activeCount > 0) {
         return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION)
@@ -169,8 +173,22 @@ private fun JdbcTransaction.tryReserveInTransaction(
 
     val hourlyCount = countDistinctLaunchesSince(request.reservedAt.minus(request.hourlyWindow))
     val dailyCount = countDistinctLaunchesSince(request.reservedAt.minus(request.dailyWindow))
-    val hourlyExceeded = hourlyCount >= request.runnerConfig.maxInvocationsPerHour
-    val dailyExceeded = dailyCount >= request.runnerConfig.maxInvocationsPerDay
+    val hourlyRemaining = request.runnerConfig.maxInvocationsPerHour - hourlyCount
+    val dailyRemaining = request.runnerConfig.maxInvocationsPerDay - dailyCount
+    val reflectionRequest = request.triggerKind == LlmDaemonTriggerKind.REFLECTION
+    val hourlyExceeded = hourlyRemaining <= 0
+    val dailyExceeded = dailyRemaining <= 0
+
+    if (reflectionRequest && hourlyRemaining <= REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS) {
+        return LlmLaunchReservationOutcome.Rejected(
+            LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM,
+        )
+    }
+    if (reflectionRequest && dailyRemaining <= REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS) {
+        return LlmLaunchReservationOutcome.Rejected(
+            LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM,
+        )
+    }
 
     if (hourlyExceeded) {
         return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR)
@@ -184,10 +202,31 @@ private fun JdbcTransaction.tryReserveInTransaction(
     return LlmLaunchReservationOutcome.Reserved(request.invocationId)
 }
 
-private fun JdbcTransaction.countActiveReservations(activeSince: Instant): Int {
+private fun JdbcTransaction.countBlockingActiveReservations(
+    request: LlmLaunchReservationRequest,
+    activeSince: Instant,
+): Int {
+    val includeReflection = request.triggerKind == LlmDaemonTriggerKind.REFLECTION
+
+    return countActiveReservations(
+        activeSince = activeSince,
+        includeReflection = includeReflection,
+    )
+}
+
+private fun JdbcTransaction.countFreshTradingReservations(activeSince: Instant): Int {
+    return countActiveReservations(
+        activeSince = activeSince,
+        includeReflection = false,
+    )
+}
+
+private fun JdbcTransaction.countActiveReservations(activeSince: Instant, includeReflection: Boolean): Int {
     return jdbcConnection().prepareStatement(COUNT_ACTIVE_LLM_LAUNCH_RESERVATIONS_SQL).use { statement ->
         statement.setString(1, LlmLaunchReservationStatus.RUNNING.name)
         statement.setLong(2, activeSince.toEpochMilli())
+        statement.setBoolean(3, includeReflection)
+        statement.setString(4, LlmDaemonTriggerKind.REFLECTION.name)
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.getInt(1) else 0
         }
