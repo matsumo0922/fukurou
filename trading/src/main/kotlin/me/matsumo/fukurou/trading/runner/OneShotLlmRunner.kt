@@ -1164,6 +1164,7 @@ fun defaultFalsifierAllowedTools(serverName: String): List<String> {
  * Proposer が既定で呼べる MCP tool の短い名前。
  */
 private val DEFAULT_PROPOSER_TOOL_NAMES = listOf(
+    "get_trade_intent",
     "get_ticker",
     "get_candles",
     "get_orderbook",
