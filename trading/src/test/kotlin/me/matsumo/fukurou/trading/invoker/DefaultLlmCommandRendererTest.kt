@@ -115,7 +115,7 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
-    fun renderClaude_withoutMcpOmitsMcpArgsAndAllowedTools() {
+    fun renderClaude_withoutMcpDisablesToolsAndMcpDiscovery() {
         val renderer = DefaultLlmCommandRenderer()
         val request = request(
             provider = LlmProvider.CLAUDE,
@@ -125,11 +125,18 @@ class DefaultLlmCommandRendererTest {
         )
 
         val command = renderer.render(request).getOrThrow()
+        val mcpConfigPath = Path.of(command.args[command.args.indexOf("--mcp-config") + 1])
+        val allowedToolsIndex = command.args.indexOf("--allowedTools")
+        val toolsIndex = command.args.indexOf("--tools")
 
-        assertFalse(command.args.contains("--mcp-config"))
-        assertFalse(command.args.contains("--strict-mcp-config"))
-        assertFalse(command.args.contains("--allowedTools"))
-        assertTrue(command.cleanupPaths.isEmpty())
+        assertTrue(command.args.contains("--bare"))
+        assertTrue(command.args.contains("--strict-mcp-config"))
+        assertEquals("""{"mcpServers":{}}""", Files.readString(mcpConfigPath))
+        assertEquals("", command.args[allowedToolsIndex + 1])
+        assertEquals("", command.args[toolsIndex + 1])
+        assertTrue(command.cleanupPaths.contains(mcpConfigPath))
+
+        command.deleteCleanupPaths()
     }
 
     @Test
@@ -425,6 +432,21 @@ class DefaultLlmCommandRendererTest {
         assertFailsWith<IllegalArgumentException> {
             LlmCommandRendererConfig(
                 claudeCommonArgs = listOf("--mcp-config=unsafe.json"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                claudeCommonArgs = listOf("--tools", "default"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                claudeCommonArgs = listOf("--bare"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                claudeCommonArgs = listOf("--settings", "unsafe.json"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

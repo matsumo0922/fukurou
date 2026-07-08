@@ -187,7 +187,7 @@ internal fun parseReflectionPromptCandidateNoteState(content: String): Reflectio
     val nextRetryAfter = fields["next_retry_after"]
         ?.yamlScalarValue()
         ?.takeUnless { value -> value == "null" || value.isBlank() }
-        ?.let { value -> Instant.parse(value) }
+        ?.let { value -> runCatching { Instant.parse(value) }.getOrNull() }
 
     return ReflectionPromptCandidateNoteState(
         status = status,

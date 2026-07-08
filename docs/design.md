@@ -3259,7 +3259,7 @@ SORT created DESC
 
 [確定] Reflection Runner は日次＋週次で `Knowledge/` に deterministic report と週次 PromptCandidates を書く。
 
-Reflection Runner は deterministic report を read-only DB と vault write だけで再生成する。週次 PromptCandidates だけ LLM CLI を呼び出し、売買 act 系ツールと MCP server は渡さない。LLM 呼び出しに失敗しても trading / scheduler の売買判断には影響させず、status note と `llm_runs` / `command_event_log` に結果を残す。
+Reflection Runner は deterministic report を read-only DB と vault write だけで再生成する。完了済み前週の PromptCandidates だけ LLM CLI を呼び出し、売買 act 系ツールと MCP server は渡さない。LLM 呼び出しに失敗しても trading / scheduler の売買判断には影響させず、status note と `llm_runs` / `command_event_log` に結果を残す。
 
 Reflection Runner の loop は `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` と `FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS` の大きい方を使う。Markdown 本文には生成時刻だけで変わる field を書かず、対象 period の DB データが変わらない tick は unchanged として扱う。Recent Decisions は `FUKUROU_REFLECTION_RECENT_DECISION_LIMIT` 件まで表示し、confidence calibration は `FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS` 日の安定した取引日境界 window を読む。
 
@@ -3342,7 +3342,7 @@ Safety Floor change: 不可
 
 ### 12.5 振り返り用プロンプト境界
 
-Reflection Runner は deterministic report を LLM なしで生成し、週次 PromptCandidates だけ LLM prompt を実行する。confidence の較正、sample size warning、truncation flag、setup tag taxonomy は DB から機械的に算出し、Obsidian Markdown として保存する。PromptCandidates は LLM output を strict JSON schema で検証し、`target = SystemPromptV1`、`requiresHumanApproval = true`、deterministic report に紐づく evidence を満たす候補だけを保存する。`generated` / `invalid_output` / `input_truncated` / `budget_deferred` / `llm_failed` / `failed_backoff` の status を frontmatter に残す。
+Reflection Runner は deterministic report を LLM なしで生成し、完了済み前週の PromptCandidates だけ LLM prompt を実行する。confidence の較正、sample size warning、truncation flag、setup tag taxonomy は DB から機械的に算出し、Obsidian Markdown として保存する。PromptCandidates は LLM output を strict JSON schema で検証し、`target = SystemPromptV1`、`requiresHumanApproval = true`、deterministic report に紐づく evidence を満たす候補だけを保存する。`generated` / `invalid_output` / `input_truncated` / `budget_deferred` / `llm_failed` / `failed_backoff` の status を frontmatter に残す。
 
 ---
 
@@ -3616,7 +3616,7 @@ LLM CLI:
 | MCP tool calls | 30/run | LLM暴走防止 |
 | act tool calls | 3/run | 過剰売買防止 |
 | LLM calls (trading) | 4/hour, 96/day | サブスク/ToS/制限対策 |
-| LLM calls (reflection) | 週次 PromptCandidates のみ | trading と同じ cap を消費し、1時間で1回分・24時間で4回分の headroom がない場合は起動しない |
+| LLM calls (reflection) | 完了済み前週の PromptCandidates のみ | trading と同じ cap を消費し、1時間で1回分・24時間で4回分の headroom がない場合は起動しない |
 
 Private POSTは取引所上限より安全側に、bot内部の実効上限を `5 req/s` 程度へ下げてもよい。設定は上の既定を上限として、実運用で調整する。
 
@@ -3939,7 +3939,7 @@ maxDD = min((equity - equityPeak) / equityPeak)
    - confidence bucketごとの実現勝率、期待R、Brier風スコアを週次で計算する。
 
 7. プロンプト改善パイプライン
-   - Reflection Runner は週次 PromptCandidates を生成し、自動適用は行わない。
+   - Reflection Runner は完了済み前週の PromptCandidates を生成し、自動適用は行わない。
 
 ### 16.4 確定事項からの逸脱提案
 

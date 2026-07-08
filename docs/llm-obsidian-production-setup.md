@@ -2,7 +2,7 @@
 
 Fukurou production で Claude Code / Codex CLI auth と Obsidian vault を準備し、`FUKUROU_OBSIDIAN_ENABLED` / `FUKUROU_LLM_DAEMON_ENABLED` を有効化する前に確認する手順。
 
-Obsidian Writer / Reflection Runner と LLM daemon は独立した worker であり、同時に有効化する必要はない。Obsidian Writer / Reflection Runner は DB 由来の deterministic Markdown を生成し、週次の `Knowledge/PromptCandidates/` だけ低優先の LLM CLI を使う。CLI auth がない場合でも deterministic note は生成され、PromptCandidates は fail-closed status note と backoff に留まる。LLM daemon は Claude / Codex CLI auth と MCP runtime の疎通確認後に有効化する。
+Obsidian Writer / Reflection Runner と LLM daemon は独立した worker であり、同時に有効化する必要はない。Obsidian Writer / Reflection Runner は DB 由来の deterministic Markdown を生成し、完了済み前週の `Knowledge/PromptCandidates/` だけ低優先の LLM CLI を使う。CLI auth がない場合でも deterministic note は生成され、PromptCandidates は fail-closed status note と backoff に留まる。LLM daemon は Claude / Codex CLI auth と MCP runtime の疎通確認後に有効化する。
 
 ## 現在の推奨順序
 
@@ -137,7 +137,7 @@ find /srv/fukurou/obsidian-vault -maxdepth 4 -type f | sort | head -50
 
 Writer は DB を正本として、frontmatter、機械導出できる数値、空見出し骨組みだけを書く。解釈的本文や `Knowledge/` の中身は reflection runner の責務であり、ここでは生成しない。
 
-Reflection Runner は DB を正本として、日次・週次・confidence calibration・setup tag taxonomy の Markdown を deterministic に生成する。週次 PromptCandidates は LLM CLI で JSON schema を満たす候補だけを `requires_human_approval: true` の note として保存する。Daily reflection は LLM を呼ばない。PromptCandidates は system prompt や trading config を自動変更せず、人間承認前の候補だけを残す。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。
+Reflection Runner は DB を正本として、日次・週次・confidence calibration・setup tag taxonomy の Markdown を deterministic に生成する。PromptCandidates は完了済み前週を対象に LLM CLI で生成し、JSON schema を満たす候補だけを `requires_human_approval: true` の note として保存する。Daily reflection は LLM を呼ばない。PromptCandidates は system prompt や trading config を自動変更せず、人間承認前の候補だけを残す。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。
 
 PromptCandidates は `generated` / `invalid_output` / `input_truncated` / `budget_deferred` / `llm_failed` / `failed_backoff` の status を frontmatter に保存する。`budget_deferred` は試行回数を増やさず、`llm_failed` は 24 時間 backoff 後に同じ週で最大 2 回まで再試行する。trading の RUNNING 予約、HARD_HALT、または LLM hour/day cap の headroom 不足がある場合は LLM を呼ばず deterministic report だけを生成する。
 

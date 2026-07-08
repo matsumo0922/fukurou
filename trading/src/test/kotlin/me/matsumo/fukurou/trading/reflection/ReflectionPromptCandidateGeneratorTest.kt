@@ -107,4 +107,19 @@ class ReflectionPromptCandidateGeneratorTest {
         assertTrue(fixture.invoker.requests.isEmpty())
         assertTrue(fixture.llmRunRepository.records().isEmpty())
     }
+
+    @Test
+    fun generate_finishesReservationWhenInvokerThrowsUnexpectedly() = runBlocking {
+        val fixture = reflectionPromptCandidateGeneratorFixture(
+            thrownFailure = IllegalStateException("unexpected failure"),
+        )
+
+        val firstGeneration = fixture.generator.generate(reflectionDataset(), existingState = null).getOrThrow()
+        val secondGeneration = fixture.generator.generate(reflectionDataset(), existingState = null).getOrThrow()
+
+        assertEquals(ReflectionPromptCandidateGenerationStatus.LLM_FAILED, firstGeneration.generatedStatus())
+        assertEquals(ReflectionPromptCandidateGenerationStatus.LLM_FAILED, secondGeneration.generatedStatus())
+        assertEquals(2, fixture.invoker.requests.size)
+        assertEquals(listOf("FAILED", "FAILED"), fixture.llmRunRepository.records().map { record -> record.status })
+    }
 }

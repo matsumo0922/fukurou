@@ -24,10 +24,11 @@ class ReflectionRunner(
         return try {
             val dataset = dataCollector.collect().getOrThrow()
             val deterministicReports = reportBuilder.build(dataset).getOrThrow()
+            val promptCandidateDataset = dataset.promptCandidateDataset()
             val reports = promptCandidateGenerator
                 ?.generate(
-                    dataset = dataset,
-                    existingState = vaultWriter.readPromptCandidateState(dataset.weekId).getOrThrow(),
+                    dataset = promptCandidateDataset,
+                    existingState = vaultWriter.readPromptCandidateState(promptCandidateDataset.weekId).getOrThrow(),
                 )
                 ?.getOrThrow()
                 ?.let { promptCandidates ->
@@ -42,4 +43,11 @@ class ReflectionRunner(
             Result.failure(throwable)
         }
     }
+}
+
+private fun ReflectionDataset.promptCandidateDataset(): ReflectionDataset {
+    return copy(
+        weekId = previousWeekId,
+        weekly = previousWeekly,
+    )
 }

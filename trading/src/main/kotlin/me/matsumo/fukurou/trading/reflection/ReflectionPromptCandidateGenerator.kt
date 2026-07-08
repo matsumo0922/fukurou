@@ -194,34 +194,44 @@ class ReflectionPromptCandidateGenerator(
 
         recordLlmRunStarted(start)
 
-        val request = llmRequest(
-            dataset = dataset,
-            invocationId = invocationId,
-            startedAt = startedAt,
-        )
-        val auditResult = auditor.invokeAndAudit(
-            phaseName = REFLECTION_PHASE_NAME,
-            context = request.decisionRunContext,
-            request = request,
-            llmInvoker = llmInvoker,
-        )
-        val failure = auditResult.exceptionOrNull()
+        return try {
+            val request = llmRequest(
+                dataset = dataset,
+                invocationId = invocationId,
+                startedAt = startedAt,
+            )
+            val auditResult = auditor.invokeAndAudit(
+                phaseName = REFLECTION_PHASE_NAME,
+                context = request.decisionRunContext,
+                request = request,
+                llmInvoker = llmInvoker,
+            )
+            val failure = auditResult.exceptionOrNull()
 
-        if (failure != null) {
-            finishFailedRun(start, failure)
+            if (failure != null) {
+                finishFailedRun(start, failure)
 
-            return failedAttemptFile(dataset, attemptCount, failure)
+                return failedAttemptFile(dataset, attemptCount, failure)
+            }
+
+            val stdout = auditResult.getOrThrow().invocationResult.processResult.stdout
+            val validation = validateOutput(stdout, dataset)
+
+            promptCandidateFileForValidation(
+                dataset = dataset,
+                attemptCount = attemptCount,
+                start = start,
+                validation = validation,
+            )
+        } catch (throwable: CancellationException) {
+            finishFailedRun(start, throwable)
+
+            throw throwable
+        } catch (throwable: Throwable) {
+            finishFailedRun(start, throwable)
+
+            failedAttemptFile(dataset, attemptCount, throwable)
         }
-
-        val stdout = auditResult.getOrThrow().invocationResult.processResult.stdout
-        val validation = validateOutput(stdout, dataset)
-
-        return promptCandidateFileForValidation(
-            dataset = dataset,
-            attemptCount = attemptCount,
-            start = start,
-            validation = validation,
-        )
     }
 
     private suspend fun promptCandidateFileForValidation(
