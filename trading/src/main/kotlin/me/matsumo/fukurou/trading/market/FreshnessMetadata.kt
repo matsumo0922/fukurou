@@ -66,7 +66,7 @@ data class FreshnessMetadata(
  */
 fun JsonObject.withFreshness(freshness: FreshnessMetadata): JsonObject {
     return buildJsonObject {
-        this@withFreshness.forEach { fieldName, value ->
+        for ((fieldName, value) in this@withFreshness) {
             put(fieldName, value)
         }
         put("freshness", Json.encodeToJsonElement(freshness))
