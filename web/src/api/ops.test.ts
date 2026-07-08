@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { messages } from "../i18n/messages";
+import { readActivityCatalogGolden } from "../test/activityCatalogGolden";
 import {
   activityTimelineRequestFilters,
   newestFirstActivityTimelineEvents,
@@ -24,9 +23,7 @@ type CatalogGolden = {
   defaultExcludedAuditEventTypes: string[];
 };
 
-const activityCatalogGolden = JSON.parse(
-  readFileSync(resolve(process.cwd(), "../testdata/ops-activity-catalog.golden.json"), "utf8"),
-) as CatalogGolden;
+const activityCatalogGolden = readActivityCatalogGolden<CatalogGolden>();
 
 describe("ops activity timeline helpers", () => {
   it("sorts same-timestamp events with the backend source and id tie-break", () => {

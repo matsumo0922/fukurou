@@ -1,10 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import App from "./App";
 import { ACTIVITY_TIMELINE_FILTER_STORAGE_KEY } from "./api/ops";
 import { LOCALE_STORAGE_KEY } from "./i18n/messages";
+import { readActivityCatalogGolden } from "./test/activityCatalogGolden";
 import { formatDateTime } from "./ui/format";
 
 type ActivityCatalogGolden = {
@@ -13,9 +12,7 @@ type ActivityCatalogGolden = {
   }>;
 };
 
-const activityCatalogGolden = JSON.parse(
-  readFileSync(resolve(process.cwd(), "../testdata/ops-activity-catalog.golden.json"), "utf8"),
-) as ActivityCatalogGolden;
+const activityCatalogGolden = readActivityCatalogGolden<ActivityCatalogGolden>();
 
 describe("App", () => {
   afterEach(() => {

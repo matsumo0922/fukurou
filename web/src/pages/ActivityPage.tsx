@@ -64,6 +64,7 @@ export function ActivityPage() {
       return;
     }
 
+    // Defer UI/storage normalization until catalog-backed request filters have rendered.
     const timeoutId = window.setTimeout(() => {
       setFilters((currentFilters) => {
         const prunedFilters = pruneActivityTimelineFilters(currentFilters, catalogQuery.data);
@@ -346,9 +347,14 @@ function ActivityCatalogDialog({
   closed: () => void;
 }) {
   const { t } = useI18n();
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const defaultExcludedAuditEventTypes = catalog
     ? defaultExcludedAuditEventSummary(catalog, t)
     : "RECONCILER_PASS_COMPLETED";
+
+  useEffect(() => {
+    closeButtonRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     const keyDownHandled = (event: KeyboardEvent) => {
@@ -380,6 +386,7 @@ function ActivityCatalogDialog({
         <div className="activity-catalog-dialog__heading">
           <h2 id="activity-catalog-dialog-title">{t("activity.catalog.title")}</h2>
           <button
+            ref={closeButtonRef}
             className="icon-only-button"
             type="button"
             aria-label={t("activity.catalog.close")}
