@@ -4,11 +4,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.audit.CommandEventType
+import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_PERSISTENT_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.HOME_ENV
 import java.io.ByteArrayInputStream
 import java.io.OutputStream
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
@@ -118,7 +121,7 @@ class LlmAuthServiceTest {
     }
 
     @Test
-    fun jvmProcessStarterClosesStdinWithEof() {
+    fun jvmProcessStarterExposesPipeForCallerManagedEof() {
         val workingDirectory = Files.createTempDirectory("fukurou-llm-auth-process")
         val process = JvmLlmAuthProcessStarter.start(
             command = listOf(
@@ -132,6 +135,7 @@ class LlmAuthServiceTest {
             ),
             workingDirectory = workingDirectory,
         )
+        process.outputStream.close()
         val completed = process.waitFor(2, TimeUnit.SECONDS)
 
         if (!completed) {
@@ -141,6 +145,107 @@ class LlmAuthServiceTest {
         assertTrue(completed)
         assertEquals(0, process.exitValue())
         assertEquals("EOF", process.inputStream.bufferedReader().readText().trim())
+    }
+
+    @Test
+    fun startLoginKeepsClaudeStdinOpenAndSubmitsTokenCodeOnce() = runBlocking {
+        val processStarter = RecordingLlmAuthProcessStarter()
+        val service = createService(processStarter = processStarter)
+
+        try {
+            val startResult = service.startLogin(LlmAuthProvider.CLAUDE, "operator re-auth").getOrThrow()
+            val accepted = assertIs<LlmAuthLoginStartResult.Accepted>(startResult)
+            val process = processStarter.processes.single()
+
+            assertFalse(process.stdinClosed())
+            assertTrue(accepted.session.tokenSubmitAvailable)
+            assertFalse(accepted.session.tokenSubmitted)
+
+            val submitResult = service
+                .submitLoginTokenCode(
+                    provider = LlmAuthProvider.CLAUDE,
+                    sessionId = accepted.session.sessionId,
+                    tokenCode = DUMMY_AUTH_CODE,
+                )
+                .getOrThrow()
+            val submitted = assertIs<LlmAuthLoginTokenSubmitResult.Accepted>(submitResult)
+            val duplicateSubmitResult = service
+                .submitLoginTokenCode(
+                    provider = LlmAuthProvider.CLAUDE,
+                    sessionId = accepted.session.sessionId,
+                    tokenCode = DUMMY_AUTH_CODE,
+                )
+                .getOrThrow()
+            val duplicateRejected = assertIs<LlmAuthLoginTokenSubmitResult.Rejected>(duplicateSubmitResult)
+
+            assertEquals("$DUMMY_AUTH_CODE\n", process.stdinText())
+            assertTrue(process.stdinClosed())
+            assertFalse(submitted.session.tokenSubmitAvailable)
+            assertTrue(submitted.session.tokenSubmitted)
+            assertEquals(LlmAuthLoginTokenSubmitRejection.ALREADY_SUBMITTED, duplicateRejected.rejection)
+            assertEquals("$DUMMY_AUTH_CODE\n", process.stdinText())
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun startLoginClosesCodexStdinAndRejectsTokenCodeSubmit() = runBlocking {
+        val processStarter = RecordingLlmAuthProcessStarter()
+        val service = createService(processStarter = processStarter)
+
+        try {
+            val startResult = service.startLogin(LlmAuthProvider.CODEX, "operator re-auth").getOrThrow()
+            val accepted = assertIs<LlmAuthLoginStartResult.Accepted>(startResult)
+            val process = processStarter.processes.single()
+            val submitResult = service
+                .submitLoginTokenCode(
+                    provider = LlmAuthProvider.CODEX,
+                    sessionId = accepted.session.sessionId,
+                    tokenCode = "$DUMMY_AUTH_CODE\nignored",
+                )
+                .getOrThrow()
+            val rejected = assertIs<LlmAuthLoginTokenSubmitResult.Rejected>(submitResult)
+
+            assertTrue(process.stdinClosed())
+            assertEquals("", process.stdinText())
+            assertFalse(accepted.session.tokenSubmitAvailable)
+            assertFalse(accepted.session.tokenSubmitted)
+            assertEquals(LlmAuthLoginTokenSubmitRejection.UNSUPPORTED_PROVIDER, rejected.rejection)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun submitLoginTokenCodeAuditsWithoutSubmittedValue() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val processStarter = RecordingLlmAuthProcessStarter()
+        val service = createService(
+            processStarter = processStarter,
+            commandEventLog = eventLog,
+        )
+
+        try {
+            val startResult = service.startLogin(LlmAuthProvider.CLAUDE, "operator re-auth").getOrThrow()
+            val accepted = assertIs<LlmAuthLoginStartResult.Accepted>(startResult)
+
+            service
+                .submitLoginTokenCode(
+                    provider = LlmAuthProvider.CLAUDE,
+                    sessionId = accepted.session.sessionId,
+                    tokenCode = DUMMY_AUTH_CODE,
+                )
+                .getOrThrow()
+
+            val events = eventLog.events()
+            val payloads = events.joinToString(separator = "\n") { event -> event.payload }
+
+            assertTrue(events.any { event -> event.eventType == CommandEventType.CLI_AUTH_LOGIN_TOKEN_SUBMITTED })
+            assertFalse(payloads.contains(DUMMY_AUTH_CODE))
+        } finally {
+            service.close()
+        }
     }
 
     @Test
@@ -218,6 +323,7 @@ class LlmAuthServiceTest {
     private fun createService(
         cliHome: Path = Files.createTempDirectory("fukurou-llm-auth-home"),
         processStarter: LlmAuthProcessStarter,
+        commandEventLog: InMemoryCommandEventLog? = null,
         startupCaptureTimeout: Duration = Duration.ZERO,
         terminalSessionRetention: Duration = Duration.ofMinutes(30),
     ): DefaultLlmAuthService {
@@ -231,6 +337,7 @@ class LlmAuthServiceTest {
                 startupCaptureTimeout = startupCaptureTimeout,
                 terminalSessionRetention = terminalSessionRetention,
             ),
+            commandEventLog = commandEventLog,
             processStarter = processStarter,
             idGenerator = SequentialUuidGenerator(),
         )
@@ -244,6 +351,7 @@ private class RecordingLlmAuthProcessStarter(
 
     val commands = mutableListOf<List<String>>()
     val environments = mutableListOf<Map<String, String>>()
+    val processes = mutableListOf<RunningLlmAuthProcess>()
 
     override fun start(
         command: List<String>,
@@ -253,10 +361,13 @@ private class RecordingLlmAuthProcessStarter(
         commands += command
         environments += environment
 
-        return RunningLlmAuthProcess(
+        val process = RunningLlmAuthProcess(
             stdout = stdout,
             completed = completed,
         )
+        processes += process
+
+        return process
     }
 }
 
@@ -297,12 +408,13 @@ private class RunningLlmAuthProcess(
 ) : Process() {
 
     private val destroyed = CountDownLatch(1)
+    private val stdin = RecordingProcessInputStream()
 
     @Volatile
     private var alive = !completed
 
     override fun getOutputStream(): OutputStream {
-        return OutputStream.nullOutputStream()
+        return stdin
     }
 
     override fun getInputStream(): ByteArrayInputStream {
@@ -353,6 +465,39 @@ private class RunningLlmAuthProcess(
     override fun isAlive(): Boolean {
         return alive
     }
+
+    fun stdinClosed(): Boolean {
+        return stdin.closed
+    }
+
+    fun stdinText(): String {
+        return stdin.text()
+    }
+}
+
+private class RecordingProcessInputStream : OutputStream() {
+
+    private val bytes = mutableListOf<Byte>()
+
+    @Volatile
+    var closed = false
+        private set
+
+    override fun write(value: Int) {
+        check(!closed) {
+            "stdin is closed"
+        }
+
+        bytes += value.toByte()
+    }
+
+    override fun close() {
+        closed = true
+    }
+
+    fun text(): String {
+        return bytes.toByteArray().toString(StandardCharsets.UTF_8)
+    }
 }
 
 private class SequentialUuidGenerator : () -> UUID {
@@ -371,3 +516,4 @@ private const val EXIT_CODE_DESTROYED = 143
 private const val TEST_PATH_ENV = "PATH"
 private const val TEST_PATH_VALUE = "/opt/fukurou/bin:/usr/bin"
 private const val SECRET_ENV = "DB_PASSWORD"
+private const val DUMMY_AUTH_CODE = "DUMMY-CODE"

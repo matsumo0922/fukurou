@@ -917,6 +917,48 @@ a:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.llm-auth-session__token-submit {
+  display: grid;
+  gap: 8px;
+}
+
+.llm-auth-session__token-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.llm-auth-session__token-input {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  color: var(--ink);
+  font: inherit;
+  line-height: 1.5;
+  padding: 10px 11px;
+}
+
+.llm-auth-session__token-input:focus {
+  border-color: var(--blue);
+  outline: 3px solid rgb(48 95 134 / 18%);
+  outline-offset: 0;
+}
+
+.llm-auth-session__token-input:disabled {
+  opacity: 0.68;
+}
+
+.llm-auth-session__token-status {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 0.84rem;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
 .endpoint-table {
   display: grid;
   border: 1px solid var(--line);
@@ -1478,7 +1520,8 @@ a:focus-visible {
   .metric-grid,
   .page-grid--two,
   .data-strip,
-  .evaluation-action-grid {
+  .evaluation-action-grid,
+  .llm-auth-session__token-row {
     grid-template-columns: 1fr;
   }
 

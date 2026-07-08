@@ -46,7 +46,7 @@ ssh dxp4800plus \
 
 WebUI の System 画面は `/ops/llm-auth` を読み、Claude Code / Codex の login state を表示する。CLI auth は `/health` / `/health/ready` には混ぜないため、CLI が logged_out でも Ktor / DB / reconciler readiness の意味は変わらない。login state は非 secret の credential marker file で判定するため、CLI が keychain など marker file 以外へ credential を保存する構成では System が logged_out を示す場合がある。その場合は fallback 手順と smoke test で実際の CLI auth を確認する。
 
-WebUI の Controls 画面で `CLI Auth` を開き、Claude Code または Codex の login を reason 付きで開始する。応答に `authorizationUrl` と `userCode` が出た場合は、手元の browser で承認する。WebUI / API / audit payload は access token、refresh token、API key、credential file content を返さない。audit には provider、session ID、reason、status、secret を含まない detail だけを残す。
+WebUI の Controls 画面で `CLI Auth` を開き、Claude Code または Codex の login を reason 付きで開始する。Claude Code は表示された `authorizationUrl` を手元の browser で開き、browser flow が返した token/code を Claude Code session 専用の入力欄から 1 回だけ送信する。Codex は device auth flow のまま進め、WebUI に token/code 入力欄を出さない。WebUI / API / audit payload は access token、refresh token、API key、credential file content、送信した token/code を返さない。audit には provider、session ID、reason、status、secret を含まない detail だけを残す。
 
 CLI login state は production compose の `llm-home` volume が正本である。
 

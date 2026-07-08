@@ -148,6 +148,8 @@ data class OpsLlmAuthLoginRequest(
  * @param status login process 状態
  * @param authorizationUrl browser 承認用 URL
  * @param userCode device auth code
+ * @param tokenSubmitAvailable token/code submit を受け付けるか
+ * @param tokenSubmitted token/code submit 済みか
  * @param detail secret を含まない補足
  * @param startedAt 開始時刻
  * @param expiresAt timeout 時刻
@@ -160,10 +162,42 @@ data class OpsLlmAuthLoginResponse(
     val status: String,
     val authorizationUrl: String?,
     val userCode: String?,
+    val tokenSubmitAvailable: Boolean,
+    val tokenSubmitted: Boolean,
     val detail: String?,
     val startedAt: String,
     val expiresAt: String,
     val completedAt: String?,
+)
+
+/**
+ * Claude Code CLI auth token/code submit API の request body。
+ *
+ * @param token ブラウザ認可後に CLI へ渡す token。API は値を保存・返却しない
+ * @param code ブラウザ認可後に CLI へ渡す code。API は値を保存・返却しない
+ */
+@Serializable
+data class OpsLlmAuthTokenSubmitRequest(
+    val token: String? = null,
+    val code: String? = null,
+)
+
+/**
+ * Claude Code CLI auth token/code submit API の response body。
+ *
+ * @param provider provider wire name
+ * @param sessionId login session ID
+ * @param status login process 状態
+ * @param tokenSubmitted token/code submit 済みか
+ * @param detail secret を含まない補足
+ */
+@Serializable
+data class OpsLlmAuthTokenSubmitResponse(
+    val provider: String,
+    val sessionId: String,
+    val status: String,
+    val tokenSubmitted: Boolean,
+    val detail: String?,
 )
 
 /**
@@ -744,6 +778,67 @@ internal fun Route.opsRoutes(
         }
     }
 
+    post("/ops/llm-auth/{provider}/login/{sessionId}/token") {
+        val provider = call.requireLlmAuthProvider(call.parameters["provider"]) ?: return@post
+        val sessionId = call.requirePathValue(call.parameters["sessionId"], "sessionId is required") ?: return@post
+        val request = call.receiveBodyOrBadRequest<OpsLlmAuthTokenSubmitRequest>() ?: return@post
+        val tokenCode = call.requireLoginTokenCode(request) ?: return@post
+        val service = call.requireLlmAuthService(llmAuthService) ?: return@post
+        val result = service.submitLoginTokenCode(provider, sessionId, tokenCode).getOrThrow()
+
+        when (result) {
+            is LlmAuthLoginTokenSubmitResult.Accepted -> call.respond(
+                HttpStatusCode.Accepted,
+                result.session.toOpsLlmAuthTokenSubmitResponse(),
+            )
+            is LlmAuthLoginTokenSubmitResult.Rejected -> call.respond(
+                result.rejection.toHttpStatusCode(),
+                ErrorResponse(result.reason),
+            )
+        }
+    }.describe {
+        summary = "Claude Code CLI auth token/code を送信する"
+        description = "active な Claude Code login session の stdin へ token/code を 1 回だけ送信します。token/code の値は応答、audit payload、ログへ含めません。"
+        tag(OPS_TAG)
+        parameters {
+            path("provider") {
+                description = "claude です。codex は device auth のため token/code submit を受け付けません。"
+                schema = jsonSchema<String>()
+            }
+            path("sessionId") {
+                description = "login start 応答の sessionId です。"
+                schema = jsonSchema<String>()
+            }
+        }
+        requestBody {
+            description = "token または code の片方だけを指定します。値は保存・返却しません。"
+            required = true
+            schema = jsonSchema<OpsLlmAuthTokenSubmitRequest>()
+        }
+        responses {
+            HttpStatusCode.Accepted {
+                description = "token/code を CLI process へ送信しました。"
+                schema = jsonSchema<OpsLlmAuthTokenSubmitResponse>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "provider、sessionId、request body、または token/code が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.NotFound {
+                description = "login session が見つかりません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.Conflict {
+                description = "login session が active でない、または token/code はすでに送信済みです。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "CLI auth service が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
     get("/ops/account") {
         val repository = call.requirePaperLedgerRepository(paperLedgerRepository) ?: return@get
         val accountSnapshot = repository.getAccountSnapshotWithUpdatedAt().getOrThrow()
@@ -1131,6 +1226,33 @@ private suspend fun ApplicationCall.requirePathValue(rawValue: String?, errorMes
     return null
 }
 
+private suspend fun ApplicationCall.requireLoginTokenCode(request: OpsLlmAuthTokenSubmitRequest): String? {
+    val tokenCodeCandidates = listOf(request.token, request.code)
+        .mapNotNull { value -> value?.trim()?.takeIf { candidate -> candidate.isNotEmpty() } }
+
+    if (tokenCodeCandidates.size != 1) {
+        respond(HttpStatusCode.BadRequest, ErrorResponse("token or code must be provided once"))
+
+        return null
+    }
+
+    val tokenCode = tokenCodeCandidates.single()
+
+    if (tokenCode.containsLlmAuthTokenCodeLineBreak()) {
+        respond(HttpStatusCode.BadRequest, ErrorResponse("token or code must be a single line"))
+
+        return null
+    }
+
+    if (tokenCode.length > MAX_LLM_AUTH_TOKEN_CODE_LENGTH) {
+        respond(HttpStatusCode.BadRequest, ErrorResponse("token or code is too long"))
+
+        return null
+    }
+
+    return tokenCode
+}
+
 private suspend fun ApplicationCall.requireDecisionRepository(repository: DecisionRepository?): DecisionRepository? {
     if (repository != null) {
         return repository
@@ -1139,6 +1261,16 @@ private suspend fun ApplicationCall.requireDecisionRepository(repository: Decisi
     respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("decision repository is not configured"))
 
     return null
+}
+
+private fun LlmAuthLoginTokenSubmitRejection.toHttpStatusCode(): HttpStatusCode {
+    return when (this) {
+        LlmAuthLoginTokenSubmitRejection.UNSUPPORTED_PROVIDER -> HttpStatusCode.BadRequest
+        LlmAuthLoginTokenSubmitRejection.SESSION_NOT_FOUND -> HttpStatusCode.NotFound
+        LlmAuthLoginTokenSubmitRejection.SESSION_NOT_RUNNING -> HttpStatusCode.Conflict
+        LlmAuthLoginTokenSubmitRejection.ALREADY_SUBMITTED -> HttpStatusCode.Conflict
+        LlmAuthLoginTokenSubmitRejection.STDIN_UNAVAILABLE -> HttpStatusCode.Conflict
+    }
 }
 
 private suspend fun ApplicationCall.requirePaperLedgerRepository(
@@ -1417,10 +1549,22 @@ private fun LlmAuthLoginSessionSnapshot.toOpsLlmAuthLoginResponse(): OpsLlmAuthL
         status = status.wireName,
         authorizationUrl = authorizationUrl,
         userCode = userCode,
+        tokenSubmitAvailable = tokenSubmitAvailable,
+        tokenSubmitted = tokenSubmitted,
         detail = detail,
         startedAt = startedAt.toString(),
         expiresAt = expiresAt.toString(),
         completedAt = completedAt?.toString(),
+    )
+}
+
+private fun LlmAuthLoginSessionSnapshot.toOpsLlmAuthTokenSubmitResponse(): OpsLlmAuthTokenSubmitResponse {
+    return OpsLlmAuthTokenSubmitResponse(
+        provider = provider.wireName,
+        sessionId = sessionId,
+        status = status.wireName,
+        tokenSubmitted = tokenSubmitted,
+        detail = detail,
     )
 }
 

@@ -499,6 +499,42 @@ describe("App", () => {
     expect(postBody(fetchMock, "/ops/llm-auth/codex/login")).toEqual({
       reason: "operator requested Codex re-auth",
     });
+    expect(screen.queryByLabelText("token/code")).not.toBeInTheDocument();
+  });
+
+  it("submits a Claude login token code without echoing it", async () => {
+    const fetchMock = stubSystemFetch({
+      llmAuthLoginSession: defaultLlmAuthLoginSession("claude"),
+    });
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("Claude Code login reason"), {
+      target: {
+        value: "operator requested Claude re-auth",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review Claude Code login" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm Claude Code login" }));
+
+    expect(await screen.findByText("CLI auth login started")).toBeInTheDocument();
+
+    const tokenCodeInput = screen.getByLabelText("token/code");
+
+    fireEvent.change(tokenCodeInput, {
+      target: {
+        value: "DUMMY-CODE",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Submit token/code" }));
+
+    expect(await screen.findByText("Claude auth token/code submitted")).toBeInTheDocument();
+    expect(postBody(fetchMock, "/ops/llm-auth/claude/login/session-1/token")).toEqual({
+      code: "DUMMY-CODE",
+    });
+    expect(screen.queryByDisplayValue("DUMMY-CODE")).not.toBeInTheDocument();
+    expect(screen.getByText("Token/code submitted. Waiting for CLI completion.")).toBeInTheDocument();
   });
 
   it("shows halt 409 refusal reasons in user-facing language", async () => {
@@ -576,6 +612,11 @@ type SystemFetchFixture = {
     status: number;
     body: unknown;
   };
+  llmAuthLoginSession?: ReturnType<typeof defaultLlmAuthLoginSession>;
+  llmAuthTokenSubmitResponse?: {
+    status: number;
+    body: unknown;
+  };
   haltResponse?: {
     status: number;
     body: unknown;
@@ -606,6 +647,21 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
     const path = requestPath(input);
     const method = requestMethod(input, init);
 
+    if (path.startsWith("/ops/llm-auth/") && path.endsWith("/token")) {
+      if (method !== "POST") {
+        return jsonResponse({ message: "method not allowed" }, { status: 405 });
+      }
+
+      if (fixture.llmAuthTokenSubmitResponse) {
+        return jsonResponse(
+          fixture.llmAuthTokenSubmitResponse.body,
+          { status: fixture.llmAuthTokenSubmitResponse.status },
+        );
+      }
+
+      return jsonResponse(defaultLlmAuthTokenSubmitResponse(), { status: 202 });
+    }
+
     if (path.startsWith("/ops/llm-auth/") && path.endsWith("/login")) {
       if (method !== "POST") {
         return jsonResponse({ message: "method not allowed" }, { status: 405 });
@@ -615,11 +671,11 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         return jsonResponse(fixture.llmAuthLoginResponse.body, { status: fixture.llmAuthLoginResponse.status });
       }
 
-      return jsonResponse(defaultLlmAuthLoginSession(), { status: 202 });
+      return jsonResponse(fixture.llmAuthLoginSession ?? defaultLlmAuthLoginSession(providerFromLlmAuthPath(path)), { status: 202 });
     }
 
     if (path.startsWith("/ops/llm-auth/") && path.includes("/login/")) {
-      return jsonResponse(defaultLlmAuthLoginSession());
+      return jsonResponse(fixture.llmAuthLoginSession ?? defaultLlmAuthLoginSession(providerFromLlmAuthPath(path)));
     }
 
     switch (path) {
@@ -1041,18 +1097,34 @@ function defaultLlmAuthResponse() {
   };
 }
 
-function defaultLlmAuthLoginSession() {
+function defaultLlmAuthLoginSession(provider = "codex") {
   return {
-    provider: "codex",
+    provider,
     sessionId: "session-1",
     status: "running",
     authorizationUrl: "https://auth.example.com/device",
-    userCode: "ABCD-EFGH",
+    userCode: provider === "codex" ? "ABCD-EFGH" : null,
+    tokenSubmitAvailable: provider === "claude",
+    tokenSubmitted: false,
     detail: "authorization challenge emitted",
     startedAt: "2026-07-05T12:00:00.000Z",
     expiresAt: "2026-07-05T12:10:00.000Z",
     completedAt: null,
   };
+}
+
+function defaultLlmAuthTokenSubmitResponse() {
+  return {
+    provider: "claude",
+    sessionId: "session-1",
+    status: "running",
+    tokenSubmitted: true,
+    detail: "authorization token/code submitted; waiting for CLI completion",
+  };
+}
+
+function providerFromLlmAuthPath(path: string): string {
+  return path.includes("/claude/") ? "claude" : "codex";
 }
 
 function activityTimelineResponse(searchParams: URLSearchParams) {
