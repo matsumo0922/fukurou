@@ -2,9 +2,5 @@
 <SmellBaseline>
   <ManuallySuppressedIssues/>
   <CurrentIssues>
-    <ID>CyclomaticComplexMethod:FukurouMcpServer.kt$private fun throwableResult(throwable: Throwable): CallToolResult</ID>
-    <ID>LongMethod:FukurouMcpServer.kt$FukurouMcpServer$internal fun createServer(): Server</ID>
-    <ID>LongParameterList:FukurouMcpServer.kt$( name: String, description: String, inputSchema: ToolSchema, toolAnnotations: ToolAnnotations, kind: McpToolCallKind, decisionRunContext: DecisionRunContext, toolCallLimiter: McpToolCallLimiter, handler: suspend (CallToolRequest, GuardedToolCall) -> CallToolResult, )</ID>
-    <ID>LongParameterList:FukurouMcpServer.kt$( request: CallToolRequest, toolName: String, decisionRunContext: DecisionRunContext, toolCallLimiter: McpToolCallLimiter, kind: McpToolCallKind, handler: suspend (CallToolRequest, GuardedToolCall) -> CallToolResult, )</ID>
   </CurrentIssues>
 </SmellBaseline>

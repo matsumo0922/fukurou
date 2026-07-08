@@ -112,6 +112,7 @@ import java.math.BigDecimal
 import java.time.Clock
 import java.time.Instant
 import java.util.UUID
+import kotlin.reflect.KClass
 
 /**
  * MCP server 名。
@@ -310,6 +311,53 @@ private val ToolJson = Json {
 }
 
 /**
+ * MCP error response の type に写像する例外型一覧。
+ */
+private val ToolErrorTypes: List<Pair<KClass<out Throwable>, String>> = listOf(
+    HardHaltTradingRejectedException::class to "hard_halt",
+    NoTradeExitException::class to "no_trade",
+    ToolCallLimitExceededException::class to "tool_call_limit_exceeded",
+    ToolCallLimitUnavailableException::class to "tool_call_limit_unavailable",
+    ToolCallNotAllowedException::class to "tool_call_not_allowed",
+    ToolCompletionAuditFailedException::class to "audit_failed_after_execution",
+    MarketInvalidRequestException::class to "invalid_request",
+    GmoRateLimitException::class to "rate_limited",
+    GmoApiStatusException::class to "gmo_status_error",
+    GmoHttpException::class to "gmo_http_error",
+    MarketNetworkException::class to "network_error",
+    MarketDataParseException::class to "market_data_parse_error",
+    IllegalArgumentException::class to "invalid_request",
+)
+
+/**
+ * MCP tool の登録情報。
+ *
+ * @param name tool 名
+ * @param description tool description
+ * @param inputSchema tool input schema
+ * @param toolAnnotations MCP tool annotations
+ * @param kind tool call 上限で扱う種別
+ */
+private data class LimitedToolDefinition(
+    val name: String,
+    val description: String,
+    val inputSchema: ToolSchema,
+    val toolAnnotations: ToolAnnotations,
+    val kind: McpToolCallKind,
+)
+
+/**
+ * MCP tool の上限制御で共有する実行文脈。
+ *
+ * @param decisionRunContext 呼び出し元の decision run context
+ * @param toolCallLimiter tool call 上限制御
+ */
+private data class LimitedToolContext(
+    val decisionRunContext: DecisionRunContext,
+    val toolCallLimiter: McpToolCallLimiter,
+)
+
+/**
  * fukurou MCP stdio server のエントリポイント。
  */
 fun main() {
@@ -382,7 +430,15 @@ class FukurouMcpServer(
     }
 
     internal fun createServer(): Server {
-        val server = Server(
+        val server = createMcpServer()
+
+        registerTools(server)
+
+        return server
+    }
+
+    private fun createMcpServer(): Server {
+        return Server(
             serverInfo = Implementation(
                 name = MCP_SERVER_NAME,
                 version = MCP_SERVER_VERSION,
@@ -393,7 +449,17 @@ class FukurouMcpServer(
                 ),
             ),
         )
+    }
 
+    private fun registerTools(server: Server) {
+        registerMarketDataTools(server)
+        registerReadOnlyTools(server)
+        registerDecisionTools(server)
+        registerTradeTools(server)
+        registerDiagnosticTools(server)
+    }
+
+    private fun registerMarketDataTools(server: Server) {
         server.registerGmoCoinMarketTools(
             marketDataSource = marketDataSource,
             toolExecutor = AuditedGmoCoinMarketToolExecutor(
@@ -404,6 +470,9 @@ class FukurouMcpServer(
             klineRequestBudgetHook = DescribedGmoCoinKlineRequestBudgetHook(GMO_MAX_DAILY_KLINE_REQUESTS),
             clock = clock,
         )
+    }
+
+    private fun registerReadOnlyTools(server: Server) {
         server.registerBalanceTool(
             tradingRuntime = tradingRuntime,
             decisionRunContext = decisionRunContext,
@@ -441,17 +510,24 @@ class FukurouMcpServer(
             toolCallLimiter = toolCallLimiter,
         )
         server.registerTradeIntentTool(tradingRuntime, decisionRunContext, toolCallLimiter)
+    }
+
+    private fun registerDecisionTools(server: Server) {
         server.registerSubmitDecisionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerSubmitFalsificationTool(tradingRuntime, decisionRunContext, toolCallLimiter)
+    }
+
+    private fun registerTradeTools(server: Server) {
         server.registerPreviewOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerPlaceOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerClosePositionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerUpdateProtectionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
         server.registerCancelOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter)
+    }
+
+    private fun registerDiagnosticTools(server: Server) {
         server.registerRejectDummyTradeTool(tradingRuntime.toolCallGuard, decisionRunContext, toolCallLimiter)
         server.registerSimulateToolTimeoutTool(tradingRuntime.toolCallGuard, decisionRunContext, toolCallLimiter)
-
-        return server
     }
 }
 
@@ -532,27 +608,20 @@ private fun mcpAllowedToolNamesFromEnvironment(): Set<String>? {
 }
 
 private fun Server.addLimitedTool(
-    name: String,
-    description: String,
-    inputSchema: ToolSchema,
-    toolAnnotations: ToolAnnotations,
-    kind: McpToolCallKind,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
+    definition: LimitedToolDefinition,
+    context: LimitedToolContext,
     handler: suspend (CallToolRequest, GuardedToolCall) -> CallToolResult,
 ) {
     addTool(
-        name = name,
-        description = description,
-        inputSchema = inputSchema,
-        toolAnnotations = toolAnnotations,
+        name = definition.name,
+        description = definition.description,
+        inputSchema = definition.inputSchema,
+        toolAnnotations = definition.toolAnnotations,
     ) { request ->
         handleLimitedTool(
             request = request,
-            toolName = name,
-            decisionRunContext = decisionRunContext,
-            toolCallLimiter = toolCallLimiter,
-            kind = kind,
+            definition = definition,
+            context = context,
             handler = handler,
         )
     }
@@ -560,14 +629,12 @@ private fun Server.addLimitedTool(
 
 private suspend fun handleLimitedTool(
     request: CallToolRequest,
-    toolName: String,
-    decisionRunContext: DecisionRunContext,
-    toolCallLimiter: McpToolCallLimiter,
-    kind: McpToolCallKind,
+    definition: LimitedToolDefinition,
+    context: LimitedToolContext,
     handler: suspend (CallToolRequest, GuardedToolCall) -> CallToolResult,
 ): CallToolResult {
-    val call = request.toGuardedToolCall(toolName, decisionRunContext)
-    val limitError = limitErrorOrNull(toolCallLimiter, call, kind)
+    val call = request.toGuardedToolCall(definition.name, context.decisionRunContext)
+    val limitError = limitErrorOrNull(context.toolCallLimiter, call, definition.kind)
 
     if (limitError != null) {
         return limitError
@@ -576,57 +643,68 @@ private suspend fun handleLimitedTool(
     return handler(request, call)
 }
 
+private fun limitedToolContext(
+    decisionRunContext: DecisionRunContext,
+    toolCallLimiter: McpToolCallLimiter,
+): LimitedToolContext {
+    return LimitedToolContext(
+        decisionRunContext = decisionRunContext,
+        toolCallLimiter = toolCallLimiter,
+    )
+}
+
 private fun Server.registerSubmitDecisionTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = SUBMIT_DECISION_TOOL,
-        description = "Submit the structured LLM decision. ENTER creates a trade intent and TradePlan.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("action") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "ENTER, EXIT, ADJUST_PROTECTION, or NO_TRADE.")
-                    put("enum", ToolJson.encodeToJsonElement(DecisionAction.entries.map { action -> action.name }))
-                }
-                putStringArraySchema("setup_tags", "Setup taxonomy tags.")
-                putDecimalStringSchema("estimated_win_probability", "Estimated win probability from 0 to 1.")
-                putDecimalStringSchema("expected_r_multiple", "Required expected R for every action. Submit 0 when no setup or managed-plan residual R is unavailable; negative values are valid.")
-                putDecimalStringSchema("round_trip_cost_r", "Round-trip cost expressed in R.")
-                putStringArraySchema("tool_evidence_ids", "Tool call IDs used as decision evidence.")
-                putJsonObject("fact_check") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Fact-check JSON string.")
-                }
-                putJsonObject("self_review") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Self-review JSON string.")
-                }
-                putJsonObject("reason_ja") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Decision reason in Japanese.")
-                }
-                putStringArraySchema("missing_data_ja", "Missing data list for NO_TRADE and calibration.")
-                putStringArraySchema("no_trade_conditions_ja", "Conditions to wait for before trading.")
-                putEntryIntentDecisionSchemas()
-                putTradePlanDecisionSchemas()
-                putClientRequestIdSchema()
-            },
-            required = listOf(
-                "action",
-                "estimated_win_probability",
-                "expected_r_multiple",
-                "fact_check",
-                "self_review",
-                "reason_ja",
+        definition = LimitedToolDefinition(
+            name = SUBMIT_DECISION_TOOL,
+            description = "Submit the structured LLM decision. ENTER creates a trade intent and TradePlan.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("action") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "ENTER, EXIT, ADJUST_PROTECTION, or NO_TRADE.")
+                        put("enum", ToolJson.encodeToJsonElement(DecisionAction.entries.map { action -> action.name }))
+                    }
+                    putStringArraySchema("setup_tags", "Setup taxonomy tags.")
+                    putDecimalStringSchema("estimated_win_probability", "Estimated win probability from 0 to 1.")
+                    putDecimalStringSchema("expected_r_multiple", "Required expected R for every action. Submit 0 when no setup or managed-plan residual R is unavailable; negative values are valid.")
+                    putDecimalStringSchema("round_trip_cost_r", "Round-trip cost expressed in R.")
+                    putStringArraySchema("tool_evidence_ids", "Tool call IDs used as decision evidence.")
+                    putJsonObject("fact_check") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Fact-check JSON string.")
+                    }
+                    putJsonObject("self_review") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Self-review JSON string.")
+                    }
+                    putJsonObject("reason_ja") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Decision reason in Japanese.")
+                    }
+                    putStringArraySchema("missing_data_ja", "Missing data list for NO_TRADE and calibration.")
+                    putStringArraySchema("no_trade_conditions_ja", "Conditions to wait for before trading.")
+                    putEntryIntentDecisionSchemas()
+                    putTradePlanDecisionSchemas()
+                    putClientRequestIdSchema()
+                },
+                required = listOf(
+                    "action",
+                    "estimated_win_probability",
+                    "expected_r_multiple",
+                    "fact_check",
+                    "self_review",
+                    "reason_ja",
+                ),
             ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+            kind = McpToolCallKind.DECISION,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-        kind = McpToolCallKind.DECISION,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handleSubmitDecision(request, tradingRuntime, decisionRunContext, call)
     }
@@ -638,35 +716,36 @@ private fun Server.registerSubmitFalsificationTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = SUBMIT_FALSIFICATION_TOOL,
-        description = "Submit an APPROVED or REJECTED Falsifier verdict for one trade intent.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("intent_id") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Trade intent UUID.")
-                }
-                putJsonObject("verdict") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "APPROVED or REJECTED.")
-                    put("enum", ToolJson.encodeToJsonElement(FalsificationVerdict.entries.map { verdict -> verdict.name }))
-                }
-                putJsonObject("llm_provider") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Falsifier provider name.")
-                }
-                putJsonObject("reason_ja") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Falsifier reason in Japanese.")
-                }
-                putClientRequestIdSchema()
-            },
-            required = listOf("intent_id", "verdict", "reason_ja"),
+        definition = LimitedToolDefinition(
+            name = SUBMIT_FALSIFICATION_TOOL,
+            description = "Submit an APPROVED or REJECTED Falsifier verdict for one trade intent.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("intent_id") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Trade intent UUID.")
+                    }
+                    putJsonObject("verdict") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "APPROVED or REJECTED.")
+                        put("enum", ToolJson.encodeToJsonElement(FalsificationVerdict.entries.map { verdict -> verdict.name }))
+                    }
+                    putJsonObject("llm_provider") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Falsifier provider name.")
+                    }
+                    putJsonObject("reason_ja") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Falsifier reason in Japanese.")
+                    }
+                    putClientRequestIdSchema()
+                },
+                required = listOf("intent_id", "verdict", "reason_ja"),
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+            kind = McpToolCallKind.DECISION,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-        kind = McpToolCallKind.DECISION,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handleSubmitFalsification(request, tradingRuntime, decisionRunContext, call)
     }
@@ -678,16 +757,17 @@ private fun Server.registerPreviewOrderTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = PREVIEW_ORDER_TOOL,
-        description = "Dry-run a paper BTC entry order before place_order. Uses the same input shape and SafetyFloor path, but creates no orders or executions.",
-        inputSchema = ToolSchema(
-            properties = buildPlaceOrderToolProperties(),
-            required = PLACE_ORDER_REQUIRED_ARGUMENTS,
+        definition = LimitedToolDefinition(
+            name = PREVIEW_ORDER_TOOL,
+            description = "Dry-run a paper BTC entry order before place_order. Uses the same input shape and SafetyFloor path, but creates no orders or executions.",
+            inputSchema = ToolSchema(
+                properties = buildPlaceOrderToolProperties(),
+                required = PLACE_ORDER_REQUIRED_ARGUMENTS,
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+            kind = McpToolCallKind.READ_ONLY,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-        kind = McpToolCallKind.READ_ONLY,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handlePreviewOrder(request, tradingRuntime, call)
     }
@@ -699,16 +779,17 @@ private fun Server.registerPlaceOrderTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = PLACE_ORDER_TOOL,
-        description = "Place a paper BTC entry order with a fresh approved intent. intent_id, protective_stop_price_jpy, and reason are required.",
-        inputSchema = ToolSchema(
-            properties = buildPlaceOrderToolProperties(),
-            required = PLACE_ORDER_REQUIRED_ARGUMENTS,
+        definition = LimitedToolDefinition(
+            name = PLACE_ORDER_TOOL,
+            description = "Place a paper BTC entry order with a fresh approved intent. intent_id, protective_stop_price_jpy, and reason are required.",
+            inputSchema = ToolSchema(
+                properties = buildPlaceOrderToolProperties(),
+                required = PLACE_ORDER_REQUIRED_ARGUMENTS,
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+            kind = McpToolCallKind.TRADE,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-        kind = McpToolCallKind.TRADE,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handlePlaceOrder(request, tradingRuntime, call)
     }
@@ -751,28 +832,29 @@ private fun Server.registerClosePositionTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = CLOSE_POSITION_TOOL,
-        description = "Close one open paper position, or all open paper positions when all=true. reason is required.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("position_id") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Position UUID. Required unless all=true.")
-                }
-                putJsonObject("all") {
-                    put("type", "boolean")
-                    put("description", "Close all open positions.")
-                    put("default", false)
-                }
-                putReasonSchema()
-                putClientRequestIdSchema()
-            },
-            required = listOf("reason"),
+        definition = LimitedToolDefinition(
+            name = CLOSE_POSITION_TOOL,
+            description = "Close one open paper position, or all open paper positions when all=true. reason is required.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("position_id") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Position UUID. Required unless all=true.")
+                    }
+                    putJsonObject("all") {
+                        put("type", "boolean")
+                        put("description", "Close all open positions.")
+                        put("default", false)
+                    }
+                    putReasonSchema()
+                    putClientRequestIdSchema()
+                },
+                required = listOf("reason"),
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+            kind = McpToolCallKind.TRADE,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-        kind = McpToolCallKind.TRADE,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handleClosePosition(request, tradingRuntime, call)
     }
@@ -784,25 +866,26 @@ private fun Server.registerUpdateProtectionTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = UPDATE_PROTECTION_TOOL,
-        description = "Update a paper position protective STOP and/or virtual TP. reason is required.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("position_id") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Position UUID.")
-                }
-                putDecimalStringSchema("new_stop_price_jpy", "New protective STOP price.")
-                putNullableDecimalStringSchema("new_take_profit_price_jpy", "New virtual TP price. Use null to clear.")
-                putReasonSchema()
-                putClientRequestIdSchema()
-            },
-            required = listOf("position_id", "reason"),
+        definition = LimitedToolDefinition(
+            name = UPDATE_PROTECTION_TOOL,
+            description = "Update a paper position protective STOP and/or virtual TP. reason is required.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("position_id") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Position UUID.")
+                    }
+                    putDecimalStringSchema("new_stop_price_jpy", "New protective STOP price.")
+                    putNullableDecimalStringSchema("new_take_profit_price_jpy", "New virtual TP price. Use null to clear.")
+                    putReasonSchema()
+                    putClientRequestIdSchema()
+                },
+                required = listOf("position_id", "reason"),
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+            kind = McpToolCallKind.TRADE,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-        kind = McpToolCallKind.TRADE,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handleUpdateProtection(request, tradingRuntime, call)
     }
@@ -814,23 +897,24 @@ private fun Server.registerCancelOrderTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = CANCEL_ORDER_TOOL,
-        description = "Cancel an open paper order. Protective STOP cancellation is rejected; use update_protection or close_position.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("order_id") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Order UUID.")
-                }
-                putReasonSchema()
-                putClientRequestIdSchema()
-            },
-            required = listOf("order_id", "reason"),
+        definition = LimitedToolDefinition(
+            name = CANCEL_ORDER_TOOL,
+            description = "Cancel an open paper order. Protective STOP cancellation is rejected; use update_protection or close_position.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("order_id") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Order UUID.")
+                    }
+                    putReasonSchema()
+                    putClientRequestIdSchema()
+                },
+                required = listOf("order_id", "reason"),
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+            kind = McpToolCallKind.TRADE,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-        kind = McpToolCallKind.TRADE,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handleCancelOrder(request, tradingRuntime, call)
     }
@@ -843,13 +927,14 @@ private fun Server.registerBalanceTool(
     clock: Clock,
 ) {
     addLimitedTool(
-        name = GET_BALANCE_TOOL,
-        description = "Get paper account balance and equity snapshot. Response includes paper ledger freshness metadata.",
-        inputSchema = ToolSchema(),
-        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-        kind = McpToolCallKind.READ_ONLY,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        definition = LimitedToolDefinition(
+            name = GET_BALANCE_TOOL,
+            description = "Get paper account balance and equity snapshot. Response includes paper ledger freshness metadata.",
+            inputSchema = ToolSchema(),
+            toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+            kind = McpToolCallKind.READ_ONLY,
+        ),
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { _, call ->
         handleGetBalance(
             tradingRuntime = tradingRuntime,
@@ -866,13 +951,14 @@ private fun Server.registerPositionsTool(
     clock: Clock,
 ) {
     addLimitedTool(
-        name = GET_POSITIONS_TOOL,
-        description = "Get open paper positions from the bot-managed position ledger. Response includes paper ledger freshness metadata.",
-        inputSchema = ToolSchema(),
-        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-        kind = McpToolCallKind.READ_ONLY,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        definition = LimitedToolDefinition(
+            name = GET_POSITIONS_TOOL,
+            description = "Get open paper positions from the bot-managed position ledger. Response includes paper ledger freshness metadata.",
+            inputSchema = ToolSchema(),
+            toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+            kind = McpToolCallKind.READ_ONLY,
+        ),
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { _, call ->
         handleGetPositions(
             tradingRuntime = tradingRuntime,
@@ -889,13 +975,14 @@ private fun Server.registerOpenOrdersTool(
     clock: Clock,
 ) {
     addLimitedTool(
-        name = GET_OPEN_ORDERS_TOOL,
-        description = "Get open paper orders including protective STOP orders. Response includes paper ledger freshness metadata.",
-        inputSchema = ToolSchema(),
-        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-        kind = McpToolCallKind.READ_ONLY,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        definition = LimitedToolDefinition(
+            name = GET_OPEN_ORDERS_TOOL,
+            description = "Get open paper orders including protective STOP orders. Response includes paper ledger freshness metadata.",
+            inputSchema = ToolSchema(),
+            toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+            kind = McpToolCallKind.READ_ONLY,
+        ),
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { _, call ->
         handleGetOpenOrders(
             tradingRuntime = tradingRuntime,
@@ -912,13 +999,14 @@ private fun Server.registerAccountStatusTool(
     clock: Clock,
 ) {
     addLimitedTool(
-        name = GET_ACCOUNT_STATUS_TOOL,
-        description = "Get paper account status and DB-backed risk_state. Response includes paper ledger freshness metadata.",
-        inputSchema = ToolSchema(),
-        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-        kind = McpToolCallKind.READ_ONLY,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        definition = LimitedToolDefinition(
+            name = GET_ACCOUNT_STATUS_TOOL,
+            description = "Get paper account status and DB-backed risk_state. Response includes paper ledger freshness metadata.",
+            inputSchema = ToolSchema(),
+            toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+            kind = McpToolCallKind.READ_ONLY,
+        ),
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { _, call ->
         handleGetAccountStatus(
             tradingRuntime = tradingRuntime,
@@ -935,31 +1023,32 @@ private fun Server.registerKnowledgeRecentLessonsTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = KNOWLEDGE_GET_RECENT_LESSONS_TOOL,
-        description = "Return bounded DB-backed recent lessons, failure patterns, and reflection summaries.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putSymbolSchema()
-                putJsonObject("limit") {
-                    put("type", JSON_TYPE_INTEGER)
-                    put("description", "Maximum number of lessons to return.")
-                    put("default", DEFAULT_KNOWLEDGE_RECENT_LESSONS_LIMIT)
-                    put("minimum", 1)
-                    put("maximum", MAX_KNOWLEDGE_RECENT_LESSONS_LIMIT)
-                }
-                putJsonObject("lookback_days") {
-                    put("type", JSON_TYPE_INTEGER)
-                    put("description", "Number of past days to inspect.")
-                    put("default", DEFAULT_KNOWLEDGE_RECENT_LESSONS_LOOKBACK_DAYS)
-                    put("minimum", 1)
-                    put("maximum", MAX_KNOWLEDGE_LOOKBACK_DAYS)
-                }
-            },
+        definition = LimitedToolDefinition(
+            name = KNOWLEDGE_GET_RECENT_LESSONS_TOOL,
+            description = "Return bounded DB-backed recent lessons, failure patterns, and reflection summaries.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putSymbolSchema()
+                    putJsonObject("limit") {
+                        put("type", JSON_TYPE_INTEGER)
+                        put("description", "Maximum number of lessons to return.")
+                        put("default", DEFAULT_KNOWLEDGE_RECENT_LESSONS_LIMIT)
+                        put("minimum", 1)
+                        put("maximum", MAX_KNOWLEDGE_RECENT_LESSONS_LIMIT)
+                    }
+                    putJsonObject("lookback_days") {
+                        put("type", JSON_TYPE_INTEGER)
+                        put("description", "Number of past days to inspect.")
+                        put("default", DEFAULT_KNOWLEDGE_RECENT_LESSONS_LOOKBACK_DAYS)
+                        put("minimum", 1)
+                        put("maximum", MAX_KNOWLEDGE_LOOKBACK_DAYS)
+                    }
+                },
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+            kind = McpToolCallKind.READ_ONLY,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-        kind = McpToolCallKind.READ_ONLY,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handleKnowledgeRecentLessons(request, tradingRuntime, knowledgeService, call)
     }
@@ -972,40 +1061,41 @@ private fun Server.registerKnowledgeSimilarSetupsTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL,
-        description = "Search bounded DB-backed past decisions and outcomes by setup tags or signal context.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putSymbolSchema()
-                putStringArraySchema("setup_tags", "Setup taxonomy tags to match.")
-                putJsonObject("regime") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Short market regime label or description.")
-                }
-                putJsonObject("signal_summary") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Short signal summary for text matching.")
-                }
-                putJsonObject("limit") {
-                    put("type", JSON_TYPE_INTEGER)
-                    put("description", "Maximum number of similar decisions to return.")
-                    put("default", DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LIMIT)
-                    put("minimum", 1)
-                    put("maximum", MAX_KNOWLEDGE_SIMILAR_SETUPS_LIMIT)
-                }
-                putJsonObject("lookback_days") {
-                    put("type", JSON_TYPE_INTEGER)
-                    put("description", "Number of past days to inspect.")
-                    put("default", DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LOOKBACK_DAYS)
-                    put("minimum", 1)
-                    put("maximum", MAX_KNOWLEDGE_LOOKBACK_DAYS)
-                }
-            },
+        definition = LimitedToolDefinition(
+            name = KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL,
+            description = "Search bounded DB-backed past decisions and outcomes by setup tags or signal context.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putSymbolSchema()
+                    putStringArraySchema("setup_tags", "Setup taxonomy tags to match.")
+                    putJsonObject("regime") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Short market regime label or description.")
+                    }
+                    putJsonObject("signal_summary") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Short signal summary for text matching.")
+                    }
+                    putJsonObject("limit") {
+                        put("type", JSON_TYPE_INTEGER)
+                        put("description", "Maximum number of similar decisions to return.")
+                        put("default", DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LIMIT)
+                        put("minimum", 1)
+                        put("maximum", MAX_KNOWLEDGE_SIMILAR_SETUPS_LIMIT)
+                    }
+                    putJsonObject("lookback_days") {
+                        put("type", JSON_TYPE_INTEGER)
+                        put("description", "Number of past days to inspect.")
+                        put("default", DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LOOKBACK_DAYS)
+                        put("minimum", 1)
+                        put("maximum", MAX_KNOWLEDGE_LOOKBACK_DAYS)
+                    }
+                },
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+            kind = McpToolCallKind.READ_ONLY,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-        kind = McpToolCallKind.READ_ONLY,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handleKnowledgeSimilarSetups(request, tradingRuntime, knowledgeService, call)
     }
@@ -1017,21 +1107,22 @@ private fun Server.registerTradeIntentTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = GET_TRADE_INTENT_TOOL,
-        description = "Get a persisted trade intent and its TradePlan by intent_id for Falsifier review.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("intent_id") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Trade intent UUID.")
-                }
-            },
-            required = listOf("intent_id"),
+        definition = LimitedToolDefinition(
+            name = GET_TRADE_INTENT_TOOL,
+            description = "Get a persisted trade intent and its TradePlan by intent_id for Falsifier review.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("intent_id") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Trade intent UUID.")
+                    }
+                },
+                required = listOf("intent_id"),
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+            kind = McpToolCallKind.READ_ONLY,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-        kind = McpToolCallKind.READ_ONLY,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handleGetTradeIntent(request, tradingRuntime, call)
     }
@@ -1043,21 +1134,22 @@ private fun Server.registerRejectDummyTradeTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = REJECT_DUMMY_TRADE_TOOL,
-        description = "Reject-only dummy trade tool for headless approval and no-trade safety checks.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("reason") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Reason text to prove the tool was called intentionally.")
-                }
-            },
-            required = listOf("reason"),
+        definition = LimitedToolDefinition(
+            name = REJECT_DUMMY_TRADE_TOOL,
+            description = "Reject-only dummy trade tool for headless approval and no-trade safety checks.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("reason") {
+                        put("type", JSON_TYPE_STRING)
+                        put("description", "Reason text to prove the tool was called intentionally.")
+                    }
+                },
+                required = listOf("reason"),
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
+            kind = McpToolCallKind.TRADE,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = false),
-        kind = McpToolCallKind.TRADE,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handleRejectDummyTrade(request, toolCallGuard, call)
     }
@@ -1069,23 +1161,24 @@ private fun Server.registerSimulateToolTimeoutTool(
     toolCallLimiter: McpToolCallLimiter,
 ) {
     addLimitedTool(
-        name = SIMULATE_TOOL_TIMEOUT_TOOL,
-        description = "Sleep without side effects so headless callers can verify timeout handling ends in no-trade.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("delay_ms") {
-                    put("type", JSON_TYPE_INTEGER)
-                    put("description", "Delay duration in milliseconds.")
-                    put("default", DEFAULT_SIMULATED_TIMEOUT_DELAY_MS)
-                    put("minimum", MIN_SIMULATED_TIMEOUT_DELAY_MS)
-                    put("maximum", MAX_SIMULATED_TIMEOUT_DELAY_MS)
-                }
-            },
+        definition = LimitedToolDefinition(
+            name = SIMULATE_TOOL_TIMEOUT_TOOL,
+            description = "Sleep without side effects so headless callers can verify timeout handling ends in no-trade.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("delay_ms") {
+                        put("type", JSON_TYPE_INTEGER)
+                        put("description", "Delay duration in milliseconds.")
+                        put("default", DEFAULT_SIMULATED_TIMEOUT_DELAY_MS)
+                        put("minimum", MIN_SIMULATED_TIMEOUT_DELAY_MS)
+                        put("maximum", MAX_SIMULATED_TIMEOUT_DELAY_MS)
+                    }
+                },
+            ),
+            toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+            kind = McpToolCallKind.READ_ONLY,
         ),
-        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
-        kind = McpToolCallKind.READ_ONLY,
-        decisionRunContext = decisionRunContext,
-        toolCallLimiter = toolCallLimiter,
+        context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
         handleSimulateToolTimeout(request, toolCallGuard, call)
     }
@@ -2259,27 +2352,19 @@ private fun JsonObjectBuilder.putNullableString(name: String, value: String?) {
 }
 
 private fun throwableResult(throwable: Throwable): CallToolResult {
-    val type = when (throwable) {
-        is HardHaltTradingRejectedException -> "hard_halt"
-        is NoTradeExitException -> "no_trade"
-        is ToolCallLimitExceededException -> "tool_call_limit_exceeded"
-        is ToolCallLimitUnavailableException -> "tool_call_limit_unavailable"
-        is ToolCallNotAllowedException -> "tool_call_not_allowed"
-        is ToolCompletionAuditFailedException -> "audit_failed_after_execution"
-        is MarketInvalidRequestException -> "invalid_request"
-        is GmoRateLimitException -> "rate_limited"
-        is GmoApiStatusException -> "gmo_status_error"
-        is GmoHttpException -> "gmo_http_error"
-        is MarketNetworkException -> "network_error"
-        is MarketDataParseException -> "market_data_parse_error"
-        is IllegalArgumentException -> "invalid_request"
-        else -> "tool_call_failed"
-    }
+    val type = toolErrorType(throwable)
     val executed = if (throwable is ToolCompletionAuditFailedException) throwable.executed else null
 
     val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
 
     return errorResult(type, throwable.message.orEmpty(), executed, failureKind)
+}
+
+private fun toolErrorType(throwable: Throwable): String {
+    return ToolErrorTypes
+        .firstOrNull { (errorClass, _) -> errorClass.isInstance(throwable) }
+        ?.second
+        ?: "tool_call_failed"
 }
 
 private fun errorResult(
