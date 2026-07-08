@@ -18,8 +18,12 @@ import me.matsumo.fukurou.trading.audit.FUKUROU_MARKET_SNAPSHOT_ID_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_PROMPT_HASH_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_SYSTEM_PROMPT_VERSION_ENV
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
+import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
+import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.config.DecisionProtocolConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
@@ -34,11 +38,13 @@ import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
+import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -46,9 +52,13 @@ import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.domain.PositionSide
+import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.InMemoryLlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
@@ -86,7 +96,9 @@ import java.math.BigDecimal
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.Test
@@ -173,6 +185,338 @@ class OneShotLlmRunnerTest {
         assertEquals(1, positions.size)
         assertEquals(1, consumptions.size)
         assertEquals(result.intent?.intentId, consumptions.single().intentId)
+    }
+
+    @Test
+    fun staleRestingEntryOrderTtl_cancelsBeforeProposerDecision() = runBlocking {
+        val clock = MutableTestClock(fixedInstant())
+        val config = TradingBotConfig(
+            decisionProtocol = DecisionProtocolConfig(restingEntryOrderTtl = Duration.ofMinutes(30)),
+        )
+        val fixture = runnerFixture(config = config, clock = clock) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        seedApprovedEntry(
+            fixture = fixture,
+            entryIntent = entryIntentDraft(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+            ),
+        )
+        clock.advance(Duration.ofMinutes(31))
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val openOrders = fixture.runtime.broker.getOpenOrders().getOrThrow()
+        val cancelEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "cancel_order"
+        }
+        val violations = (fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository).violations()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
+        assertEquals(0, openOrders.size)
+        assertEquals(1, cancelEvents.size)
+        assertTrue(cancelEvents.single().payload.contains("resting_entry_order_ttl_exceeded"))
+        assertTrue(
+            fixture.eventLog.events().any { event ->
+                event.eventType == CommandEventType.DECISION_LIFECYCLE_COMPLETED &&
+                    event.payload.contains("stale_resting_entry_ttl_sweep")
+            },
+        )
+        assertTrue(violations.isEmpty())
+    }
+
+    @Test
+    fun lifecycleAudit_recordsElapsedDurationMillis() = runBlocking {
+        val clock = TickingTestClock(
+            currentInstant = fixedInstant(),
+            tick = Duration.ofMillis(25),
+        )
+        val fixture = runnerFixture(clock = clock) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            }
+
+            cleanExit()
+        }
+
+        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val lifecyclePayload = fixture.eventLog.events()
+            .singleLifecyclePayload("stale_resting_entry_ttl_sweep")
+        val durationMillis = lifecyclePayload.stringValue("durationMillis").toLong()
+
+        assertTrue(durationMillis > 0)
+    }
+
+    @Test
+    fun exitDecision_closesSingleOpenPositionDeterministically() = runBlocking {
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.EXIT).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        seedApprovedEntry(fixture)
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
+        val closeEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "close_position"
+        }
+        val violations = (fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository).violations()
+
+        assertEquals(OneShotRunnerStatus.PAPER_EXIT_EXECUTED, result.status)
+        assertEquals(OrderStatus.FILLED, assertNotNull(result.tradeResult).status)
+        assertEquals(0, openPositions.size)
+        assertEquals(1, closeEvents.size)
+        assertTrue(violations.isEmpty())
+    }
+
+    @Test
+    fun exitDecision_closesSingleOpenPositionWhenRestingEntryOrderAlsoExists() = runBlocking {
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.EXIT).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        seedApprovedEntry(fixture)
+        seedApprovedEntry(
+            fixture = fixture,
+            entryIntent = entryIntentDraft(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                sizeBtc = BigDecimal("0.0010"),
+            ),
+        )
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
+        val openOrders = fixture.runtime.broker.getOpenOrders().getOrThrow()
+        val closeEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "close_position"
+        }
+
+        assertEquals(OneShotRunnerStatus.PAPER_EXIT_EXECUTED, result.status)
+        assertEquals(0, openPositions.size)
+        assertEquals(1, openOrders.size)
+        assertEquals(1, closeEvents.size)
+    }
+
+    @Test
+    fun exitDecision_cancelsSingleRestingEntryOrderDeterministically() = runBlocking {
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.EXIT).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        seedApprovedEntry(
+            fixture = fixture,
+            entryIntent = entryIntentDraft(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+            ),
+        )
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val openOrders = fixture.runtime.broker.getOpenOrders().getOrThrow()
+        val cancelEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "cancel_order"
+        }
+        val violations = (fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository).violations()
+
+        assertEquals(OneShotRunnerStatus.PAPER_EXIT_EXECUTED, result.status)
+        assertEquals(OrderStatus.CANCELED, assertNotNull(result.tradeResult).status)
+        assertEquals(0, openOrders.size)
+        assertEquals(1, cancelEvents.size)
+        assertTrue(cancelEvents.single().payload.contains("exit_decision_cancel_resting_entry_order"))
+        assertTrue(violations.isEmpty())
+    }
+
+    @Test
+    fun exitDecision_multipleOpenPositionsFailsClosed() = runBlocking {
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.EXIT).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        seedApprovedEntry(
+            fixture = fixture,
+            entryIntent = entryIntentDraft(sizeBtc = BigDecimal("0.0010")),
+        )
+        seedApprovedEntry(
+            fixture = fixture,
+            entryIntent = entryIntentDraft(sizeBtc = BigDecimal("0.0010")),
+        )
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
+        val closeEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "close_position"
+        }
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(2, openPositions.size)
+        assertEquals(0, closeEvents.size)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("exit_target_ambiguous"))
+    }
+
+    @Test
+    fun adjustProtectionDecision_updatesTakeProfitWithoutStopWidening() = runBlocking {
+        lateinit var parentTradePlanId: UUID
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(
+                    repository = fixtureRepository,
+                    command = command,
+                    action = DecisionAction.ADJUST_PROTECTION,
+                    tradePlan = tradePlanDraft(
+                        parentTradePlanId = parentTradePlanId,
+                        revisionCount = 1,
+                        targetPriceJpy = BigDecimal("10600000"),
+                    ),
+                ).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        val seedDecision = seedApprovedEntry(fixture)
+        parentTradePlanId = requireNotNull(seedDecision.tradePlan).tradePlanId
+        val stopBefore = fixture.runtime.broker.getPositions().getOrThrow().single().currentStopLossJpy
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val position = fixture.runtime.broker.getPositions().getOrThrow().single()
+        val updateEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "update_protection"
+        }
+        val violations = (fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository).violations()
+
+        assertEquals(OneShotRunnerStatus.PAPER_PROTECTION_UPDATED, result.status)
+        assertEquals(OrderStatus.OPEN, assertNotNull(result.tradeResult).status)
+        assertEquals(stopBefore, position.currentStopLossJpy)
+        assertEquals("10600000", position.currentTakeProfitJpy)
+        assertEquals(1, updateEvents.size)
+        assertTrue(updateEvents.single().payload.contains("newStopPriceJpy"))
+        assertTrue(violations.isEmpty())
+    }
+
+    @Test
+    fun adjustProtectionDecision_missingTargetPriceFailsClosed() = runBlocking {
+        lateinit var parentTradePlanId: UUID
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(
+                    repository = fixtureRepository,
+                    command = command,
+                    action = DecisionAction.ADJUST_PROTECTION,
+                    tradePlan = tradePlanDraft(
+                        parentTradePlanId = parentTradePlanId,
+                        revisionCount = 1,
+                        targetPriceJpy = null,
+                    ),
+                ).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        val seedDecision = seedApprovedEntry(fixture)
+        parentTradePlanId = requireNotNull(seedDecision.tradePlan).tradePlanId
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val updateEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "update_protection"
+        }
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(0, updateEvents.size)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("adjust_protection_missing_target_price"))
+    }
+
+    @Test
+    fun adjustProtectionDecision_unprotectedPositionFailsClosed() = runBlocking {
+        lateinit var parentTradePlanId: UUID
+        val config = TradingBotConfig()
+        val fixture = runnerFixture(
+            config = config,
+            runtimeTransform = { runtime ->
+                runtime.withPaperLedger(
+                    positions = listOf(openPosition(currentStopLossJpy = null)),
+                    config = config,
+                )
+            },
+        ) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(
+                    repository = fixtureRepository,
+                    command = command,
+                    action = DecisionAction.ADJUST_PROTECTION,
+                    tradePlan = tradePlanDraft(
+                        parentTradePlanId = parentTradePlanId,
+                        revisionCount = 1,
+                        targetPriceJpy = BigDecimal("10600000"),
+                    ),
+                ).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        val seedDecision = fixture.decisionRepository.submitDecision(
+            seedEntryDecisionSubmission(entryIntentDraft()),
+        ).getOrThrow()
+        parentTradePlanId = requireNotNull(seedDecision.tradePlan).tradePlanId
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val updateEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "update_protection"
+        }
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(0, updateEvents.size)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("adjust_protection_unprotected_position"))
+    }
+
+    @Test
+    fun adjustProtectionDecision_takeProfitAtOrBelowCurrentPriceFailsClosed() = runBlocking {
+        lateinit var parentTradePlanId: UUID
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(
+                    repository = fixtureRepository,
+                    command = command,
+                    action = DecisionAction.ADJUST_PROTECTION,
+                    tradePlan = tradePlanDraft(
+                        parentTradePlanId = parentTradePlanId,
+                        revisionCount = 1,
+                        targetPriceJpy = BigDecimal("9900000"),
+                    ),
+                ).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        val seedDecision = seedApprovedEntry(fixture)
+        parentTradePlanId = requireNotNull(seedDecision.tradePlan).tradePlanId
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val position = fixture.runtime.broker.getPositions().getOrThrow().single()
+        val updateEvents = fixture.eventLog.events().filter { event ->
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "update_protection"
+        }
+        val currentTakeProfitPrice = requireNotNull(position.currentTakeProfitJpy).toBigDecimal()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(0, BigDecimal("10500000").compareTo(currentTakeProfitPrice))
+        assertEquals(0, updateEvents.size)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("adjust_protection_invalid_take_profit_price"))
     }
 
     @Test
@@ -1010,11 +1354,12 @@ private fun runnerFixture(
     parentEnvironment: Map<String, String> = defaultParentEnvironment(),
     runtimeTransform: (TradingRuntime) -> TradingRuntime = { runtime -> runtime },
     logger: (String) -> Unit = {},
+    clock: Clock = fixedClock(),
     launchHandler: suspend (RenderedLlmCommand) -> ProcessRunResult,
 ): RunnerFixture {
     val runtime = runtimeTransform(
         TradingRuntimeFactory.inMemory(
-            clock = fixedClock(),
+            clock = clock,
             marketDataSource = FakeMarketDataSource,
             tradingConfig = config,
         ),
@@ -1030,7 +1375,7 @@ private fun runnerFixture(
             processRunner = processRunner,
         ),
         parentEnvironment = parentEnvironment,
-        clock = fixedClock(),
+        clock = clock,
         logger = logger,
     )
     fixtureRepository = decisionRepository
@@ -1084,6 +1429,37 @@ private fun TradingRuntime.withHardHaltDrawdown(config: TradingBotConfig): Tradi
         riskStateCommandService = drawdownRiskStateCommandService,
         broker = drawdownBroker,
         toolCallGuard = drawdownToolCallGuard,
+    )
+}
+
+private fun TradingRuntime.withPaperLedger(
+    positions: List<Position>,
+    config: TradingBotConfig,
+    clock: Clock = fixedClock(),
+): TradingRuntime {
+    val baseBroker = broker as PaperBroker
+    val ledgerRepository = InMemoryPaperLedgerRepository(
+        accountUpdatedAt = clock.instant(),
+        positions = positions,
+        fallbackSymbolRules = config.paperMarket.toSymbolRules(config.symbol),
+        clock = clock,
+    )
+    val paperBroker = PaperBroker(
+        ledgerRepository = ledgerRepository,
+        riskStateRepository = riskStateRepository,
+        riskStateCommandService = riskStateCommandService,
+        decisionRepository = decisionRepository,
+        falsificationFreshnessWindow = config.decisionProtocol.falsificationFreshnessWindow,
+        safetyViolationRepository = safetyViolationRepository,
+        safetyFloor = SafetyFloor(config.safetyFloor, clock),
+        marketDataSource = baseBroker.marketDataSource,
+        fillSimulator = baseBroker.fillSimulator,
+        clock = clock,
+    )
+
+    return copy(
+        equitySnapshotRepository = ledgerRepository.equitySnapshotRepository,
+        broker = paperBroker,
     )
 }
 
@@ -1263,12 +1639,14 @@ private suspend fun submitDecision(
     command: RenderedLlmCommand,
     action: DecisionAction,
     estimatedWinProbability: BigDecimal = BigDecimal("0.60"),
+    tradePlan: TradePlanDraft? = null,
 ): Result<Unit> {
     return repository.submitDecision(
         decisionSubmission(
             command = command,
             action = action,
             estimatedWinProbability = estimatedWinProbability,
+            tradePlan = tradePlan,
         ),
     ).fold(
         onSuccess = { Result.success(Unit) },
@@ -1327,6 +1705,7 @@ private fun decisionSubmission(
     command: RenderedLlmCommand,
     action: DecisionAction,
     estimatedWinProbability: BigDecimal = BigDecimal("0.60"),
+    tradePlan: TradePlanDraft? = null,
 ): DecisionSubmission {
     return DecisionSubmission(
         invocationId = command.environment[FUKUROU_INVOCATION_ID_ENV],
@@ -1337,7 +1716,7 @@ private fun decisionSubmission(
         action = action,
         setupTags = if (action == DecisionAction.ENTER) listOf("runner-test") else emptyList(),
         estimatedWinProbability = estimatedWinProbability,
-        expectedRMultiple = if (action == DecisionAction.ENTER) BigDecimal("2.0") else null,
+        expectedRMultiple = if (action == DecisionAction.ENTER) BigDecimal("2.0") else BigDecimal.ZERO,
         roundTripCostR = if (action == DecisionAction.ENTER) BigDecimal("0.1") else null,
         toolEvidenceIds = listOf("tool-1"),
         factCheckJson = "{}",
@@ -1346,7 +1725,7 @@ private fun decisionSubmission(
         missingDataJa = emptyList(),
         noTradeConditionsJa = emptyList(),
         entryIntent = if (action == DecisionAction.ENTER) entryIntentDraft() else null,
-        tradePlan = if (action == DecisionAction.ENTER) tradePlanDraft() else null,
+        tradePlan = tradePlan ?: if (action == DecisionAction.ENTER) tradePlanDraft() else null,
     )
 }
 
@@ -1362,7 +1741,7 @@ private fun decisionSubmissionFromRequest(request: LlmInvocationRequest, action:
         action = action,
         setupTags = if (action == DecisionAction.ENTER) listOf("runner-test") else emptyList(),
         estimatedWinProbability = BigDecimal("0.60"),
-        expectedRMultiple = if (action == DecisionAction.ENTER) BigDecimal("2.0") else null,
+        expectedRMultiple = if (action == DecisionAction.ENTER) BigDecimal("2.0") else BigDecimal.ZERO,
         roundTripCostR = if (action == DecisionAction.ENTER) BigDecimal("0.1") else null,
         toolEvidenceIds = listOf("tool-1"),
         factCheckJson = "{}",
@@ -1375,28 +1754,129 @@ private fun decisionSubmissionFromRequest(request: LlmInvocationRequest, action:
     )
 }
 
-private fun entryIntentDraft(): EntryIntentDraft {
+private fun entryIntentDraft(
+    orderType: OrderType = OrderType.MARKET,
+    priceJpy: BigDecimal? = null,
+    sizeBtc: BigDecimal = BigDecimal("0.0050"),
+    takeProfitPriceJpy: BigDecimal? = BigDecimal("10500000"),
+): EntryIntentDraft {
     return EntryIntentDraft(
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
-        orderType = OrderType.MARKET,
-        sizeBtc = BigDecimal("0.0050"),
-        priceJpy = null,
+        orderType = orderType,
+        sizeBtc = sizeBtc,
+        priceJpy = priceJpy,
         protectiveStopPriceJpy = BigDecimal("9700000"),
-        takeProfitPriceJpy = BigDecimal("10500000"),
+        takeProfitPriceJpy = takeProfitPriceJpy,
     )
 }
 
-private fun tradePlanDraft(): TradePlanDraft {
+private fun tradePlanDraft(
+    parentTradePlanId: UUID? = null,
+    revisionCount: Int = 0,
+    targetPriceJpy: BigDecimal? = BigDecimal("10500000"),
+): TradePlanDraft {
     return TradePlanDraft(
-        parentTradePlanId = null,
-        revisionCount = 0,
+        parentTradePlanId = parentTradePlanId,
+        revisionCount = revisionCount,
         symbol = TradingSymbol.BTC,
         thesisJa = "runner test thesis",
         invalidationConditionsJa = listOf("runner test invalidation"),
-        targetPriceJpy = BigDecimal("10500000"),
+        targetPriceJpy = targetPriceJpy,
         timeStopAt = null,
         setupTags = listOf("runner-test"),
+    )
+}
+
+private fun openPosition(
+    currentStopLossJpy: String? = "9700000",
+    currentTakeProfitJpy: String? = "10500000",
+): Position {
+    val positionId = UUID.randomUUID().toString()
+    val tradeGroupId = UUID.randomUUID().toString()
+
+    return Position(
+        positionId = positionId,
+        tradeGroupId = tradeGroupId,
+        symbol = TradingSymbol.BTC.apiSymbol,
+        mode = TradingMode.PAPER,
+        side = PositionSide.LONG,
+        status = PositionStatus.OPEN,
+        openedAt = fixedInstant().toString(),
+        closedAt = null,
+        sizeBtc = "0.0050",
+        averageEntryPriceJpy = "10000000",
+        currentPriceJpy = "10000000",
+        currentStopLossJpy = currentStopLossJpy,
+        currentTakeProfitJpy = currentTakeProfitJpy,
+        unrealizedPnlJpy = "0",
+        unrealizedR = "0",
+        pyramidAddCount = 0,
+        highestPriceSinceEntryJpy = "10000000",
+        lowestPriceSinceEntryJpy = "10000000",
+    )
+}
+
+private suspend fun seedApprovedEntry(
+    fixture: RunnerFixture,
+    entryIntent: EntryIntentDraft = entryIntentDraft(),
+): DecisionSubmissionResult {
+    val decision = fixture.decisionRepository.submitDecision(
+        seedEntryDecisionSubmission(entryIntent),
+    ).getOrThrow()
+    val intent = requireNotNull(decision.tradeIntent)
+    fixture.decisionRepository.submitFalsification(
+        FalsificationSubmission(
+            intentId = intent.intentId,
+            verdict = FalsificationVerdict.APPROVED,
+            llmProvider = "codex",
+            reasonJa = "runner seed falsifier verdict",
+        ),
+    ).getOrThrow()
+
+    fixture.runtime.broker.placeOrder(intent.toSeedPlaceOrderCommand()).getOrThrow()
+
+    return decision
+}
+
+private fun seedEntryDecisionSubmission(entryIntent: EntryIntentDraft): DecisionSubmission {
+    return DecisionSubmission(
+        invocationId = "seed-entry-${UUID.randomUUID()}",
+        llmProvider = "seed",
+        promptHash = "seed-prompt-hash",
+        systemPromptVersion = SystemPromptV1.VERSION,
+        marketSnapshotId = "seed-market-snapshot",
+        action = DecisionAction.ENTER,
+        setupTags = listOf("runner-seed"),
+        estimatedWinProbability = BigDecimal("0.60"),
+        expectedRMultiple = BigDecimal("2.0"),
+        roundTripCostR = BigDecimal("0.1"),
+        toolEvidenceIds = listOf("seed-tool"),
+        factCheckJson = "{}",
+        selfReviewJson = "{}",
+        reasonJa = "runner seed entry",
+        missingDataJa = emptyList(),
+        noTradeConditionsJa = emptyList(),
+        entryIntent = entryIntent,
+        tradePlan = tradePlanDraft(),
+    )
+}
+
+private fun TradeIntentRecord.toSeedPlaceOrderCommand(): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = UUID.randomUUID(),
+        intentId = intentId,
+        symbol = draft.symbol,
+        side = draft.side,
+        orderType = draft.orderType,
+        sizeBtc = draft.sizeBtc,
+        priceJpy = draft.priceJpy,
+        tradeGroupId = null,
+        protectiveStopPriceJpy = draft.protectiveStopPriceJpy,
+        takeProfitPriceJpy = draft.takeProfitPriceJpy,
+        estimatedWinProbability = estimatedWinProbability,
+        reasonJa = "runner seed paper entry",
+        auditContext = PaperTradeAuditContext.EMPTY,
     )
 }
 
@@ -1482,6 +1962,20 @@ private fun List<CommandEvent>.singleRunnerPhaseDetails(phase: String): JsonObje
     assertEquals(phase, payload.stringValue("phase"))
 
     return payload.getValue("details").jsonObject
+}
+
+private fun List<CommandEvent>.singleLifecyclePayload(phase: String): JsonObject {
+    val event = single { event ->
+        val lifecycleCompleted = event.eventType == CommandEventType.DECISION_LIFECYCLE_COMPLETED
+        val phaseMatched = event.payload.contains("\"phase\":\"$phase\"")
+
+        lifecycleCompleted && phaseMatched
+    }
+    val payload = event.payloadJsonObject()
+
+    assertEquals(phase, payload.stringValue("phase"))
+
+    return payload
 }
 
 private fun List<CommandEvent>.singleNoTradePayload(): JsonObject {
@@ -1600,4 +2094,65 @@ private fun fixedInstant(): Instant {
 
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+/**
+ * runner test 内で時刻を明示的に進める Clock。
+ *
+ * @param currentInstant 現在時刻
+ * @param currentZone clock zone
+ */
+private class MutableTestClock(
+    private var currentInstant: Instant,
+    private val currentZone: ZoneId = ZoneOffset.UTC,
+) : Clock() {
+
+    override fun getZone(): ZoneId {
+        return currentZone
+    }
+
+    override fun withZone(zone: ZoneId): Clock {
+        return MutableTestClock(currentInstant, zone)
+    }
+
+    override fun instant(): Instant {
+        return currentInstant
+    }
+
+    fun advance(duration: Duration) {
+        currentInstant = currentInstant.plus(duration)
+    }
+}
+
+/**
+ * instant() 呼び出しごとに一定量進む Clock。
+ *
+ * @param currentInstant 現在時刻
+ * @param tick 1 回の instant() で進める時間
+ * @param currentZone clock zone
+ */
+private class TickingTestClock(
+    private var currentInstant: Instant,
+    private val tick: Duration,
+    private val currentZone: ZoneId = ZoneOffset.UTC,
+) : Clock() {
+
+    override fun getZone(): ZoneId {
+        return currentZone
+    }
+
+    override fun withZone(zone: ZoneId): Clock {
+        return TickingTestClock(
+            currentInstant = currentInstant,
+            tick = tick,
+            currentZone = zone,
+        )
+    }
+
+    override fun instant(): Instant {
+        val instant = currentInstant
+        currentInstant = currentInstant.plus(tick)
+
+        return instant
+    }
 }

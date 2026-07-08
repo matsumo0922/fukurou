@@ -18,7 +18,7 @@ class SystemPromptV1Test {
         val content = Files.readString(promptPath)
         val contentHash = SystemPromptV1.calculateContentHash(content)
 
-        assertEquals("system-prompt-v1.7", SystemPromptV1.VERSION)
+        assertEquals("system-prompt-v1.8", SystemPromptV1.VERSION)
         assertTrue(content.contains("submit_decision"))
         assertTrue(content.contains("submit_falsification"))
         assertTrue(content.contains("preview_order"))
@@ -34,6 +34,8 @@ class SystemPromptV1Test {
         assertTrue(content.contains("APPROVED 後に runner"))
         assertTrue(content.contains("条件を変えて再試行せず"))
         assertTrue(content.contains("entry が成立しなかったものとして記録"))
+        assertTrue(content.contains("未約定 entry order は TTL sweep に委ねます"))
+        assertTrue(content.contains("target が現在価格と STOP の両方を上回る場合"))
         assertTrue(content.contains("読み替えられる余地を残してはいけません"))
         assertFalse(content.contains("`place_order` の前に必ず `preview_order` を呼び"))
         assertEquals(64, contentHash.length)

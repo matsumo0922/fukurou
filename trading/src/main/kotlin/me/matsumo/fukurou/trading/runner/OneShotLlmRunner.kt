@@ -176,6 +176,16 @@ enum class OneShotRunnerStatus {
     PAPER_ENTRY_PLACED,
 
     /**
+     * EXIT decision を runner が決定論的に実行した。
+     */
+    PAPER_EXIT_EXECUTED,
+
+    /**
+     * ADJUST_PROTECTION decision を runner が決定論的に実行した。
+     */
+    PAPER_PROTECTION_UPDATED,
+
+    /**
      * fail-closed no-trade audit を記録して終了した。
      */
     NO_TRADE_AUDITED,
@@ -224,6 +234,12 @@ class OneShotLlmRunner(
     private val logger: (String) -> Unit = { message -> println(message) },
 ) {
     private val processOutputRedactor = SecretRedactor.fromEnvironment(parentEnvironment)
+    private val decisionExecutionLifecycle = DecisionExecutionLifecycle(
+        tradingRuntime = tradingRuntime,
+        tradingConfig = tradingConfig,
+        clock = clock,
+        idGenerator = idGenerator,
+    )
 
     /**
      * one-shot runner を 1 回実行する。
@@ -258,28 +274,47 @@ class OneShotLlmRunner(
             )
             failureContext = proposerContext
 
-            val launchEligibility = launchEligibility(invocationId, proposerContext)
-            val result = if (!launchEligibility.canLaunch) {
-                recordNoTrade(proposerContext, launchEligibility.rejectionReason, null).getOrThrow()
-                logHuman("launch rejected invocation=$invocationId reason=${launchEligibility.rejectionReason}")
+            val ttlSweepResult = decisionExecutionLifecycle.cancelExpiredRestingEntryOrders(proposerContext)
+            val result = if (ttlSweepResult.isFailure) {
+                recordNoTrade(
+                    context = proposerContext,
+                    reason = "stale_entry_order_ttl_cancel_failed",
+                    cause = ttlSweepResult.exceptionOrNull(),
+                ).getOrThrow()
+                logHuman("stale entry order ttl cancellation failed invocation=$invocationId")
 
                 OneShotRunnerResult(
                     invocationId = invocationId,
-                    status = OneShotRunnerStatus.LAUNCH_REJECTED,
+                    status = OneShotRunnerStatus.NO_TRADE_AUDITED,
                     decision = null,
                     intent = null,
                     tradeResult = null,
                 )
             } else {
-                runOneShotAfterPreflight(
-                    request = request,
-                    invocationId = invocationId,
-                    promptContent = promptContent,
-                    promptHash = promptHash,
-                    marketSnapshotId = marketSnapshotId,
-                    proposerContext = proposerContext,
-                    failureContextUpdated = { context -> failureContext = context },
-                )
+                val launchEligibility = launchEligibility(invocationId, proposerContext)
+
+                if (!launchEligibility.canLaunch) {
+                    recordNoTrade(proposerContext, launchEligibility.rejectionReason, null).getOrThrow()
+                    logHuman("launch rejected invocation=$invocationId reason=${launchEligibility.rejectionReason}")
+
+                    OneShotRunnerResult(
+                        invocationId = invocationId,
+                        status = OneShotRunnerStatus.LAUNCH_REJECTED,
+                        decision = null,
+                        intent = null,
+                        tradeResult = null,
+                    )
+                } else {
+                    runOneShotAfterPreflight(
+                        request = request,
+                        invocationId = invocationId,
+                        promptContent = promptContent,
+                        promptHash = promptHash,
+                        marketSnapshotId = marketSnapshotId,
+                        proposerContext = proposerContext,
+                        failureContextUpdated = { context -> failureContext = context },
+                    )
+                }
             }
 
             finalizeLlmRun(
@@ -412,6 +447,26 @@ class OneShotLlmRunner(
 
         if (decision.decision.submission.action != DecisionAction.ENTER) {
             logHuman("decision saved invocation=$invocationId action=${decision.decision.submission.action}")
+
+            val lifecycleResult = when (decision.decision.submission.action) {
+                DecisionAction.EXIT -> decisionExecutionLifecycle.executeExitDecision(proposerContext, decision)
+                DecisionAction.ADJUST_PROTECTION -> decisionExecutionLifecycle.executeAdjustProtectionDecision(
+                    context = proposerContext,
+                    decision = decision,
+                )
+                DecisionAction.NO_TRADE -> null
+                DecisionAction.ENTER -> null
+            }
+
+            if (lifecycleResult != null) {
+                return OneShotRunnerResult(
+                    invocationId = invocationId,
+                    status = lifecycleResult.status,
+                    decision = decision,
+                    intent = null,
+                    tradeResult = lifecycleResult.tradeResult,
+                )
+            }
 
             return OneShotRunnerResult(
                 invocationId = invocationId,

@@ -168,6 +168,34 @@ WITH query_window AS (
         extract(epoch from '${until_jst}'::timestamptz) * 1000 AS until_ms
 )
 SELECT
+    'LIFECYCLE'
+    || '|' || to_char(to_timestamp(ts / 1000.0) AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS')
+    || '|' || COALESCE(decision_run_id, '<none>')
+    || '|' || COALESCE(payload::jsonb ->> 'phase', '<none>')
+    || '|' || COALESCE(payload::jsonb #>> '{details,operation}', '<none>')
+    || '|' || COALESCE(payload::jsonb #>> '{details,reason}', '<none>')
+    || '|accepted=' || COALESCE(payload::jsonb #>> '{details,accepted}', '<none>')
+    || '|ttlSeconds=' || COALESCE(payload::jsonb #>> '{details,ttlSeconds}', '<none>')
+    || '|expiredOrderCount=' || COALESCE(payload::jsonb #>> '{details,expiredOrderCount}', '<none>')
+    || '|cancelSuccessCount=' || COALESCE(payload::jsonb #>> '{details,cancelSuccessCount}', '<none>')
+    || '|cancelFailureCount=' || COALESCE(payload::jsonb #>> '{details,cancelFailureCount}', '<none>')
+    || '|canceledOrderIds=' || COALESCE(replace(payload::jsonb #>> '{details,canceledOrderIds}', '|', '/'), '<none>')
+    || '|failedOrderIds=' || COALESCE(replace(payload::jsonb #>> '{details,failedOrderIds}', '|', '/'), '<none>')
+    || '|failureSummaries=' || COALESCE(replace(regexp_replace(payload::jsonb #>> '{details,failureSummaries}', '\\s+', ' ', 'g'), '|', '/'), '<none>')
+    || '|evidence=' || COALESCE(replace(regexp_replace((payload::jsonb #> '{details,evidence}')::text, '\\s+', ' ', 'g'), '|', '/'), '<none>')
+FROM command_event_log
+CROSS JOIN query_window
+WHERE event_type = 'DECISION_LIFECYCLE_COMPLETED'
+    AND ts > query_window.since_ms
+    AND ts <= query_window.until_ms
+ORDER BY ts ASC;
+
+WITH query_window AS (
+    SELECT
+        extract(epoch from '${since_jst}'::timestamptz) * 1000 AS since_ms,
+        extract(epoch from '${until_jst}'::timestamptz) * 1000 AS until_ms
+)
+SELECT
     'SKIP'
     || '|' || to_char(to_timestamp(ts / 1000.0) AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS')
     || '|' || COALESCE(payload::jsonb ->> 'reason', '<none>')

@@ -23,6 +23,7 @@ class TradingBotConfigTest {
         assertEquals(BigDecimal("0.80"), config.safetyFloor.maxTotalExposureRatio)
         assertEquals(Duration.ofSeconds(60), config.safetyFloor.dataQualityCap.staleAfter)
         assertEquals(BigDecimal("0.5"), config.safetyFloor.dataQualityCap.cappedProbability)
+        assertEquals(Duration.ofMinutes(30), config.decisionProtocol.restingEntryOrderTtl)
         assertEquals(48, config.runner.maxToolCallsPerRun)
         assertEquals(3, config.runner.maxActToolCallsPerRun)
         assertEquals(Duration.ofSeconds(180), config.runner.perRunTimeout)
@@ -66,6 +67,7 @@ class TradingBotConfigTest {
                 "FUKUROU_MAX_TAKER_FEE_RATIO" to "0.0008",
                 "FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS" to "8",
                 "FUKUROU_FALSIFICATION_FRESHNESS_SECONDS" to "90",
+                "FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS" to "600",
                 "FUKUROU_GMO_PUBLIC_BASE_URL" to "https://example.test/public",
                 "FUKUROU_GMO_CONNECT_TIMEOUT_MS" to "3000",
                 "FUKUROU_GMO_REQUEST_TIMEOUT_MS" to "4000",
@@ -118,6 +120,7 @@ class TradingBotConfigTest {
         assertEquals(BigDecimal("0.0008"), config.safetyFloor.maxTakerFeeRatio)
         assertEquals(BigDecimal("8"), config.safetyFloor.marketSlippageReserveBps)
         assertEquals(Duration.ofSeconds(90), config.decisionProtocol.falsificationFreshnessWindow)
+        assertEquals(Duration.ofSeconds(600), config.decisionProtocol.restingEntryOrderTtl)
         assertEquals("https://example.test/public", config.gmoPublicClient.baseUrl)
         assertEquals(Duration.ofMillis(3000), config.gmoPublicClient.connectTimeout)
         assertEquals(Duration.ofMillis(4000), config.gmoPublicClient.requestTimeout)
@@ -240,6 +243,16 @@ class TradingBotConfigTest {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_FALSIFICATION_FRESHNESS_SECONDS" to "0"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS" to "1801"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS" to "0"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

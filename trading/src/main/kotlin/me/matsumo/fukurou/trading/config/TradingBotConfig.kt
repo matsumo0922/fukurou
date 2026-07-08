@@ -317,16 +317,23 @@ data class KillCriterionConfig(
  * decision / Falsifier protocol の保守的な設定。
  *
  * @param falsificationFreshnessWindow fresh APPROVED とみなす時間窓
+ * @param restingEntryOrderTtl runner が stale resting entry order を cancel するまでの TTL
  */
 data class DecisionProtocolConfig(
     val falsificationFreshnessWindow: Duration = DEFAULT_FALSIFICATION_FRESHNESS_WINDOW,
+    val restingEntryOrderTtl: Duration = DEFAULT_RESTING_ENTRY_ORDER_TTL,
 ) {
     init {
         val windowIsPositive = !falsificationFreshnessWindow.isNegative && !falsificationFreshnessWindow.isZero
         val windowIsAtOrBelowDefault = falsificationFreshnessWindow <= DEFAULT_FALSIFICATION_FRESHNESS_WINDOW
+        val ttlIsPositive = !restingEntryOrderTtl.isNegative && !restingEntryOrderTtl.isZero
+        val ttlIsAtOrBelowDefault = restingEntryOrderTtl <= DEFAULT_RESTING_ENTRY_ORDER_TTL
 
         require(windowIsPositive && windowIsAtOrBelowDefault) {
             "falsificationFreshnessWindow must be greater than 0 and less than or equal to 120 seconds."
+        }
+        require(ttlIsPositive && ttlIsAtOrBelowDefault) {
+            "restingEntryOrderTtl must be greater than 0 and less than or equal to 1800 seconds."
         }
     }
 }
@@ -420,6 +427,11 @@ private const val FUKUROU_DATA_QUALITY_CAPPED_PROBABILITY_ENV = "FUKUROU_DATA_QU
  * fresh falsification 判定 window 秒数の環境変数名。
  */
 private const val FUKUROU_FALSIFICATION_FRESHNESS_SECONDS_ENV = "FUKUROU_FALSIFICATION_FRESHNESS_SECONDS"
+
+/**
+ * resting entry order を stale とみなす TTL 秒数の環境変数名。
+ */
+private const val FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS_ENV = "FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS"
 
 /**
  * 1 MCP server instance あたりの総 tool call 上限の環境変数名。
@@ -546,6 +558,11 @@ private val DEFAULT_MARKET_SLIPPAGE_BPS = BigDecimal("5")
  * fresh falsification の既定 window。
  */
 private val DEFAULT_FALSIFICATION_FRESHNESS_WINDOW = Duration.ofSeconds(120)
+
+/**
+ * resting entry order の既定 TTL。
+ */
+val DEFAULT_RESTING_ENTRY_ORDER_TTL: Duration = Duration.ofMinutes(30)
 
 /**
  * 1 MCP server instance あたりの既定総 tool call 上限。
@@ -794,6 +811,11 @@ private fun Map<String, String>.readDecisionProtocolConfig(): DecisionProtocolCo
             readOptional(FUKUROU_FALSIFICATION_FRESHNESS_SECONDS_ENV)
                 ?.toLong()
                 ?: DEFAULT_FALSIFICATION_FRESHNESS_WINDOW.seconds,
+        ),
+        restingEntryOrderTtl = Duration.ofSeconds(
+            readOptional(FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_RESTING_ENTRY_ORDER_TTL.seconds,
         ),
     )
 }

@@ -22,6 +22,7 @@ import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.math.BigDecimal
+import java.time.Clock
 import java.time.Instant
 import java.time.LocalDate
 import java.util.UUID
@@ -37,6 +38,7 @@ import java.util.UUID
  * @param decisionRunIdsByPositionId position ID と LLM invocation ID の対応
  * @param equitySnapshotRepository equity snapshot 保存先
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
+ * @param clock paper ledger の作成時刻に使う clock
  */
 class InMemoryPaperLedgerRepository(
     accountSnapshot: AccountSnapshot = PaperAccountConfig().toInitialAccountSnapshot(),
@@ -47,6 +49,7 @@ class InMemoryPaperLedgerRepository(
     decisionRunIdsByPositionId: Map<String, String?> = emptyMap(),
     internal val equitySnapshotRepository: InMemoryEquitySnapshotRepository = InMemoryEquitySnapshotRepository(),
     private val fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
+    private val clock: Clock = Clock.systemUTC(),
 ) : PaperLedgerRepository {
 
     private val lock = Any()
@@ -258,11 +261,13 @@ class InMemoryPaperLedgerRepository(
     ): Result<PaperTradeResult> {
         return runCatching {
             synchronized(lock) {
+                val recordedAt = Instant.now(clock)
                 val order = command.toEntryOrder(
                     orderId = orderId,
                     positionId = null,
                     tradeGroupId = tradeGroupId,
                     status = OrderStatus.OPEN,
+                    recordedAt = recordedAt,
                 )
 
                 orders += order
@@ -426,7 +431,7 @@ class InMemoryPaperLedgerRepository(
         }
 
         val realizedFill = fill.withRealizedPnl(position)
-        val closeOrder = closeOrder(orderId, position, reasonJa)
+        val closeOrder = closeOrder(orderId, position, reasonJa, fill.executedAt)
         val closedPosition = position.withWatermarkPrice(realizedFill.priceJpy).copy(
             status = PositionStatus.CLOSED,
             closedAt = realizedFill.executedAt.toString(),
@@ -534,13 +539,20 @@ class InMemoryPaperLedgerRepository(
         stopOrderId: UUID,
         insertEntryOrder: Boolean,
     ): PaperTradeResult {
+        val recordedAt = fill.executedAt
         val entryOrder = command.toEntryOrder(
             orderId = entryOrderId,
             positionId = positionId,
             tradeGroupId = tradeGroupId,
             status = OrderStatus.FILLED,
+            recordedAt = recordedAt,
         )
-        val stopOrder = command.toProtectiveStopOrder(stopOrderId, positionId, tradeGroupId)
+        val stopOrder = command.toProtectiveStopOrder(
+            orderId = stopOrderId,
+            positionId = positionId,
+            tradeGroupId = tradeGroupId,
+            recordedAt = recordedAt,
+        )
         val position = command.toOpenPosition(positionId, tradeGroupId, fill)
 
         if (insertEntryOrder) {
@@ -736,6 +748,7 @@ private fun PlaceOrderCommand.toEntryOrder(
     positionId: UUID?,
     tradeGroupId: UUID,
     status: OrderStatus,
+    recordedAt: Instant,
 ): Order {
     return Order(
         orderId = orderId.toString(),
@@ -755,12 +768,17 @@ private fun PlaceOrderCommand.toEntryOrder(
         estimatedWinProbability = estimatedWinProbability.ratioScale().toPlainString(),
         reasonJa = reasonJa,
         clientRequestId = auditContext.clientRequestId,
-        createdAt = fillInstantText(),
-        updatedAt = fillInstantText(),
+        createdAt = recordedAt.toString(),
+        updatedAt = recordedAt.toString(),
     )
 }
 
-private fun PlaceOrderCommand.toProtectiveStopOrder(orderId: UUID, positionId: UUID, tradeGroupId: UUID): Order {
+private fun PlaceOrderCommand.toProtectiveStopOrder(
+    orderId: UUID,
+    positionId: UUID,
+    tradeGroupId: UUID,
+    recordedAt: Instant,
+): Order {
     return Order(
         orderId = orderId.toString(),
         intentId = null,
@@ -779,8 +797,8 @@ private fun PlaceOrderCommand.toProtectiveStopOrder(orderId: UUID, positionId: U
         estimatedWinProbability = null,
         reasonJa = "protective stop: $reasonJa",
         clientRequestId = auditContext.clientRequestId,
-        createdAt = fillInstantText(),
-        updatedAt = fillInstantText(),
+        createdAt = recordedAt.toString(),
+        updatedAt = recordedAt.toString(),
     )
 }
 
@@ -859,7 +877,12 @@ private fun SimulatedFill.toExecution(
     )
 }
 
-private fun closeOrder(orderId: UUID, position: Position, reasonJa: String): Order {
+private fun closeOrder(
+    orderId: UUID,
+    position: Position,
+    reasonJa: String,
+    recordedAt: Instant,
+): Order {
     return Order(
         orderId = orderId.toString(),
         intentId = null,
@@ -877,8 +900,8 @@ private fun closeOrder(orderId: UUID, position: Position, reasonJa: String): Ord
         takeProfitPriceJpy = null,
         reasonJa = reasonJa,
         clientRequestId = null,
-        createdAt = fillInstantText(),
-        updatedAt = fillInstantText(),
+        createdAt = recordedAt.toString(),
+        updatedAt = recordedAt.toString(),
     )
 }
 
@@ -971,10 +994,6 @@ private fun Order.createEntryFill(ticker: Ticker, rules: SymbolRules, simulator:
         ticker = ticker,
         rules = rules,
     )
-}
-
-private fun fillInstantText(): String {
-    return java.time.Instant.EPOCH.toString()
 }
 
 /**
