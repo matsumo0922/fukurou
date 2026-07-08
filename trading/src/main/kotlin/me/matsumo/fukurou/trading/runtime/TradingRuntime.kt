@@ -5,7 +5,7 @@ import com.zaxxer.hikari.HikariDataSource
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.broker.Broker
-import me.matsumo.fukurou.trading.broker.FillSimulator
+import me.matsumo.fukurou.trading.broker.DefaultPaperExecutionSimulator
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.toInitialAccountSnapshot
@@ -242,7 +242,7 @@ object TradingRuntimeFactory {
             safetyViolationRepository = safetyViolationRepository,
             safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
             marketDataSource = marketDataSource,
-            fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
+            fillSimulator = DefaultPaperExecutionSimulator(tradingConfig.paperExecution, clock),
             reconcilerStatusProvider = reconcilerStatusProvider,
             clock = clock,
         )
@@ -424,7 +424,7 @@ private fun createPostgresBroker(
         safetyViolationRepository = safetyViolationRepository,
         safetyFloor = SafetyFloor(context.tradingConfig.safetyFloor, context.clock),
         marketDataSource = context.marketDataSource,
-        fillSimulator = FillSimulator(context.tradingConfig.paperExecution, context.clock),
+        fillSimulator = DefaultPaperExecutionSimulator(context.tradingConfig.paperExecution, context.clock),
         reconcilerStatusProvider = resolvedReconcilerStatusProvider,
         clock = context.clock,
     )

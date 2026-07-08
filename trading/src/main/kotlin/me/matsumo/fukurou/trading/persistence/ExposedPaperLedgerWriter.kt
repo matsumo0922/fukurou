@@ -5,10 +5,10 @@ import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.EntryFillWriteRequest
-import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.MarketEntryFillRequest
+import me.matsumo.fukurou.trading.broker.PaperExecutionSimulator
 import me.matsumo.fukurou.trading.broker.PaperLedgerMutationRepository
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
@@ -23,8 +23,11 @@ import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.broker.btcScale
 import me.matsumo.fukurou.trading.broker.floorToStep
+import me.matsumo.fukurou.trading.broker.marketFill
 import me.matsumo.fukurou.trading.broker.moneyScale
 import me.matsumo.fukurou.trading.broker.ratioScale
+import me.matsumo.fukurou.trading.broker.restingEntryFill
+import me.matsumo.fukurou.trading.broker.stopFill
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -291,7 +294,10 @@ internal class ExposedPaperLedgerWriter(
     /**
      * tick に応じて resting order / protection を前進させる。
      */
-    override suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult> {
+    override suspend fun reconcile(
+        tickSnapshot: TickSnapshot,
+        simulator: PaperExecutionSimulator,
+    ): Result<PaperReconcileResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
@@ -1229,7 +1235,7 @@ private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
 private fun Order.createEntryFill(
     ticker: Ticker,
     rules: SymbolRules,
-    simulator: FillSimulator,
+    simulator: PaperExecutionSimulator,
 ): SimulatedFill {
     return simulator.restingEntryFill(
         RestingEntryFillRequest(

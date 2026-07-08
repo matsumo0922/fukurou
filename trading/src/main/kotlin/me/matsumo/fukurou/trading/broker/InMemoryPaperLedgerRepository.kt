@@ -485,7 +485,10 @@ private class InMemoryPaperLedgerMutationWriter(
         }
     }
 
-    override suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult> {
+    override suspend fun reconcile(
+        tickSnapshot: TickSnapshot,
+        simulator: PaperExecutionSimulator,
+    ): Result<PaperReconcileResult> {
         return runCatching {
             state.write {
                 val ticker = tickSnapshot.requireTicker()
@@ -1130,7 +1133,7 @@ private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
 private fun Order.createEntryFill(
     ticker: Ticker,
     rules: SymbolRules,
-    simulator: FillSimulator,
+    simulator: PaperExecutionSimulator,
 ): SimulatedFill {
     return simulator.restingEntryFill(
         RestingEntryFillRequest(

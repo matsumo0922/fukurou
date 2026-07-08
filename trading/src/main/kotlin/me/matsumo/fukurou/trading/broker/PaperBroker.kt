@@ -95,7 +95,7 @@ class PaperBroker private constructor(
         safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
         safetyFloor: SafetyFloor? = null,
         marketDataSource: MarketDataSource? = null,
-        fillSimulator: FillSimulator? = null,
+        fillSimulator: PaperExecutionSimulator? = null,
         reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
         clock: Clock = Clock.systemUTC(),
         tradingDateZone: ZoneId = TRADING_DATE_ZONE,
@@ -117,7 +117,7 @@ class PaperBroker private constructor(
             ),
             market = PaperBrokerMarketServices(
                 marketDataSource = marketDataSource,
-                fillSimulator = fillSimulator ?: FillSimulator(clock = clock),
+                fillSimulator = fillSimulator ?: DefaultPaperExecutionSimulator(clock = clock),
                 warnLogger = warnLogger,
             ),
             time = PaperBrokerTimeConfig(
@@ -167,7 +167,7 @@ private data class PaperBrokerSafetyServices(
  */
 private data class PaperBrokerMarketServices(
     val marketDataSource: MarketDataSource?,
-    val fillSimulator: FillSimulator,
+    val fillSimulator: PaperExecutionSimulator,
     val warnLogger: RateLimitedWarnLogger,
 )
 
@@ -950,7 +950,7 @@ private suspend fun PaperBrokerRuntime.validateCashAvailability(
 private fun PlaceOrderCommand.estimatedRequiredCash(
     ticker: Ticker,
     rules: SymbolRules,
-    fillSimulator: FillSimulator,
+    fillSimulator: PaperExecutionSimulator,
 ): BigDecimal {
     if (orderType == OrderType.MARKET) {
         val fill = fillSimulator.marketFill(side, sizeBtc, ticker, rules)
@@ -979,7 +979,7 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
 internal fun Order.estimatedBuyReservationJpy(
     ticker: Ticker,
     rules: SymbolRules,
-    fillSimulator: FillSimulator,
+    fillSimulator: PaperExecutionSimulator,
 ): BigDecimal {
     val price = when (orderType) {
         OrderType.MARKET -> fillSimulator.marketFill(side, sizeBtc.toBigDecimal(), ticker, rules).priceJpy
