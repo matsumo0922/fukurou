@@ -665,7 +665,7 @@ class TradingPersistenceBootstrap(
                 ensureRuntimeSchemaObjects()
                 val now = Instant.now(clock)
 
-                ensureInitialActiveRuntimeConfigVersion(now)
+                ensureActiveRuntimeConfigVersion(now)
                 ensureRiskStateRow(now, paperAccountConfig.initialCashJpy)
                 jdbcConnection().prepareStatement(BACKFILL_RISK_STATE_HARD_HALT_SQL).use { statement ->
                     statement.setString(1, RiskHaltState.HARD_HALT.name)
