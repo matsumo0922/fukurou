@@ -39,6 +39,14 @@ private const val SELECT_ACTIVE_RUNTIME_CONFIG_VERSION_SQL = """
 """
 
 /**
+ * runtime config version 件数を読む SQL。
+ */
+private const val COUNT_RUNTIME_CONFIG_VERSIONS_SQL = """
+    SELECT COUNT(*)
+    FROM runtime_config_versions
+"""
+
+/**
  * runtime config values を読む SQL。
  */
 private const val SELECT_RUNTIME_CONFIG_VALUES_SQL = """
@@ -48,15 +56,6 @@ private const val SELECT_RUNTIME_CONFIG_VALUES_SQL = """
     FROM runtime_config_values
     WHERE version_id = ?
     ORDER BY config_key ASC
-"""
-
-/**
- * runtime config values 件数を読む SQL。
- */
-private const val COUNT_RUNTIME_CONFIG_VALUES_SQL = """
-    SELECT COUNT(*)
-    FROM runtime_config_values
-    WHERE version_id = ?
 """
 
 /**
@@ -216,21 +215,17 @@ internal fun JdbcTransaction.ensureRuntimeConfigIndexes() {
 }
 
 internal fun JdbcTransaction.ensureInitialActiveRuntimeConfigVersion(now: Instant) {
-    if (selectActiveRuntimeConfigVersions().isEmpty()) {
+    if (countRuntimeConfigVersions() == 0) {
         val versionId = UUID.randomUUID()
 
         insertBootstrapRuntimeConfigVersion(versionId, now)
-    }
-
-    val activeVersion = requireSingleActiveRuntimeConfigVersion()
-    val valueCount = countRuntimeConfigValues(activeVersion.versionId)
-
-    if (valueCount == 0) {
         insertRuntimeConfigValues(
-            versionId = activeVersion.versionId,
+            versionId = versionId,
             values = RuntimeConfigCatalog.runtimeDefaultValues(),
         )
     }
+
+    verifyActiveRuntimeConfigVersionValues()
 }
 
 internal fun JdbcTransaction.verifyRuntimeConfigSchema() {
@@ -246,7 +241,15 @@ internal fun JdbcTransaction.verifyRuntimeConfigSchema() {
         sql = VERIFY_RUNTIME_CONFIG_INDEX_COUNT_SQL,
         missingMessage = "runtime config indexes were not initialized.",
     )
-    requireSingleActiveRuntimeConfigVersion()
+    verifyActiveRuntimeConfigVersionValues()
+}
+
+private fun JdbcTransaction.countRuntimeConfigVersions(): Int {
+    return jdbcConnection().prepareStatement(COUNT_RUNTIME_CONFIG_VERSIONS_SQL).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            if (resultSet.next()) resultSet.getInt(1) else 0
+        }
+    }
 }
 
 private fun JdbcTransaction.selectActiveRuntimeConfigVersions(): List<RuntimeConfigVersionRow> {
@@ -272,6 +275,27 @@ private fun JdbcTransaction.requireSingleActiveRuntimeConfigVersion(): RuntimeCo
     return versions.single()
 }
 
+private fun JdbcTransaction.verifyActiveRuntimeConfigVersionValues() {
+    val activeVersion = requireSingleActiveRuntimeConfigVersion()
+    val values = selectRuntimeConfigValues(activeVersion.versionId)
+
+    require(values.isNotEmpty()) {
+        "Active runtime config has no values."
+    }
+
+    val expectedKeys = RuntimeConfigCatalog.runtimeDefaultValues().keys
+    val activeKeys = values.keys
+    val unknownKeys = activeKeys - expectedKeys
+    val missingKeys = expectedKeys - activeKeys
+
+    require(unknownKeys.isEmpty()) {
+        "Active runtime config contains catalog-incompatible keys: ${unknownKeys.sorted()}"
+    }
+    require(missingKeys.isEmpty()) {
+        "Active runtime config is missing catalog keys: ${missingKeys.sorted()}"
+    }
+}
+
 private fun JdbcTransaction.selectRuntimeConfigValues(versionId: UUID): Map<String, String> {
     return jdbcConnection().prepareStatement(SELECT_RUNTIME_CONFIG_VALUES_SQL).use { statement ->
         statement.setObject(1, versionId)
@@ -281,15 +305,6 @@ private fun JdbcTransaction.selectRuntimeConfigValues(versionId: UUID): Map<Stri
                     put(resultSet.getString("config_key"), resultSet.getString("config_value"))
                 }
             }
-        }
-    }
-}
-
-private fun JdbcTransaction.countRuntimeConfigValues(versionId: UUID): Int {
-    return jdbcConnection().prepareStatement(COUNT_RUNTIME_CONFIG_VALUES_SQL).use { statement ->
-        statement.setObject(1, versionId)
-        statement.executeQuery().use { resultSet ->
-            if (resultSet.next()) resultSet.getInt(1) else 0
         }
     }
 }
