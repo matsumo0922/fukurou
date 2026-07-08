@@ -394,45 +394,71 @@ class DefaultLlmAuthService(
     }
 
     private suspend fun startLoginUnsafe(provider: LlmAuthProvider, reason: String): LlmAuthLoginStartResult {
-        val activeSessionId = activeSessions[provider]
-        val activeSession = activeSessionId?.let { sessionId -> sessions[sessionId] }
+        val sessionId = idGenerator().toString()
+        val sessionReserved = reserveLoginSession(provider, sessionId)
 
-        if (activeSession?.isRunning() == true) {
+        if (!sessionReserved) {
             return LlmAuthLoginStartResult.Rejected("login already in progress")
         }
 
-        val sessionId = idGenerator().toString()
-        val startedAt = Instant.now(clock)
-        val process = processStarter.start(
-            command = provider.loginCommand(),
-            environment = provider.loginEnvironment(),
-            workingDirectory = config.cliHome,
-        )
-        val session = MutableLlmAuthLoginSession(
-            provider = provider,
-            sessionId = sessionId,
-            process = process,
-            startedAt = startedAt,
-            expiresAt = startedAt.plus(config.loginTimeout),
-            clock = clock,
-        )
+        var session: MutableLlmAuthLoginSession? = null
 
-        sessions[sessionId] = session
-        activeSessions[provider] = sessionId
-        appendLoginAudit(
-            LlmAuthAuditRecord(
+        try {
+            val startedAt = Instant.now(clock)
+            val process = processStarter.start(
+                command = provider.loginCommand(),
+                environment = provider.loginEnvironment(),
+                workingDirectory = config.cliHome,
+            )
+            session = MutableLlmAuthLoginSession(
                 provider = provider,
                 sessionId = sessionId,
-                eventType = CommandEventType.CLI_AUTH_LOGIN_STARTED,
-                reason = reason,
-                status = LlmAuthLoginStatus.RUNNING,
-                detail = "login process started",
-            ),
-        )
-        launchReaders(session, reason)
-        waitForStartupCapture(session)
+                process = process,
+                startedAt = startedAt,
+                expiresAt = startedAt.plus(config.loginTimeout),
+                clock = clock,
+            )
 
-        return LlmAuthLoginStartResult.Accepted(session.snapshot())
+            sessions[sessionId] = session
+            appendLoginAudit(
+                LlmAuthAuditRecord(
+                    provider = provider,
+                    sessionId = sessionId,
+                    eventType = CommandEventType.CLI_AUTH_LOGIN_STARTED,
+                    reason = reason,
+                    status = LlmAuthLoginStatus.RUNNING,
+                    detail = "login process started",
+                ),
+            )
+            launchReaders(session, reason)
+            waitForStartupCapture(session)
+
+            return LlmAuthLoginStartResult.Accepted(session.snapshot())
+        } catch (throwable: Throwable) {
+            activeSessions.remove(provider, sessionId)
+            sessions.remove(sessionId)
+            session?.destroyProcess()
+
+            throw throwable
+        }
+    }
+
+    private fun reserveLoginSession(provider: LlmAuthProvider, sessionId: String): Boolean {
+        var reserved = false
+
+        activeSessions.compute(provider) { _, activeSessionId ->
+            val activeSession = activeSessionId?.let { existingSessionId -> sessions[existingSessionId] }
+            val loginIsReserved = activeSessionId != null && activeSession == null
+
+            if (loginIsReserved || activeSession?.isRunning() == true) {
+                activeSessionId
+            } else {
+                reserved = true
+                sessionId
+            }
+        }
+
+        return reserved
     }
 
     private fun launchReaders(session: MutableLlmAuthLoginSession, reason: String) {
@@ -539,7 +565,7 @@ class DefaultLlmAuthService(
 
     private fun LlmAuthProvider.loginCommand(): List<String> {
         return when (this) {
-            LlmAuthProvider.CLAUDE -> config.claudeCommandTemplate + listOf("login")
+            LlmAuthProvider.CLAUDE -> config.claudeCommandTemplate + listOf("auth", "login")
             LlmAuthProvider.CODEX -> config.codexCommandTemplate + listOf("login", "--device-auth")
         }
     }
@@ -572,7 +598,7 @@ fun interface LlmAuthProcessStarter {
     ): Process
 }
 
-private object JvmLlmAuthProcessStarter : LlmAuthProcessStarter {
+internal object JvmLlmAuthProcessStarter : LlmAuthProcessStarter {
     override fun start(
         command: List<String>,
         environment: Map<String, String>,
@@ -583,7 +609,10 @@ private object JvmLlmAuthProcessStarter : LlmAuthProcessStarter {
         val processBuilder = ProcessBuilder(command)
             .directory(workingDirectory.toFile())
             .redirectInput(ProcessBuilder.Redirect.PIPE)
-        processBuilder.environment().putAll(environment)
+        processBuilder.environment().apply {
+            clear()
+            putAll(environment)
+        }
 
         return processBuilder.start()
     }
