@@ -4,6 +4,8 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.domain.SymbolRules
+import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
@@ -103,22 +105,12 @@ interface PaperLedgerMutationRepository {
     /**
      * MARKET entry を約定済みとして保存し、保護 STOP を作成する。
      */
-    suspend fun fillMarketEntry(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        stopOrderId: UUID,
-    ): Result<PaperTradeResult>
+    suspend fun fillMarketEntry(request: MarketEntryFillRequest): Result<PaperTradeResult>
 
     /**
      * resting entry intent を未約定 order として保存する。
      */
-    suspend fun createRestingEntryOrder(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-    ): Result<PaperTradeResult>
+    suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult>
 
     /**
      * position を成行相当で close する。
@@ -163,23 +155,136 @@ interface IntentConsumingPaperLedgerRepository : PaperLedgerRepository {
      * MARKET entry と intent consumption を同一 commit 境界で保存する。
      */
     suspend fun fillMarketEntryAndConsumeIntent(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        stopOrderId: UUID,
-        intentId: UUID,
-        consumedAt: Instant,
+        request: IntentConsumingMarketEntryFillRequest,
     ): Result<PaperTradeResult>
 
     /**
      * resting entry order と intent consumption を同一 commit 境界で保存する。
      */
     suspend fun createRestingEntryOrderAndConsumeIntent(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-        intentId: UUID,
-        consumedAt: Instant,
+        request: IntentConsumingRestingEntryOrderRequest,
     ): Result<PaperTradeResult>
 }
+
+/**
+ * MARKET entry の約定保存入力。
+ *
+ * @param command place_order command
+ * @param fill paper 約定
+ * @param positionId 作成する position ID
+ * @param tradeGroupId entry / stop / position を束ねる trade group ID
+ * @param stopOrderId 作成する protective STOP order ID
+ */
+data class MarketEntryFillRequest(
+    val command: PlaceOrderCommand,
+    val fill: SimulatedFill,
+    val positionId: UUID,
+    val tradeGroupId: UUID,
+    val stopOrderId: UUID,
+)
+
+/**
+ * resting entry order の保存入力。
+ *
+ * @param command place_order command
+ * @param orderId 作成する order ID
+ * @param tradeGroupId entry order を束ねる trade group ID
+ */
+data class RestingEntryOrderRequest(
+    val command: PlaceOrderCommand,
+    val orderId: UUID,
+    val tradeGroupId: UUID,
+)
+
+/**
+ * intent consumption の保存入力。
+ *
+ * @param intentId 消費する trade intent ID
+ * @param consumedAt 消費時刻
+ */
+data class TradeIntentConsumptionRequest(
+    val intentId: UUID,
+    val consumedAt: Instant,
+)
+
+/**
+ * MARKET entry と intent consumption の同時保存入力。
+ *
+ * @param entry MARKET entry の保存入力
+ * @param consumption intent consumption の保存入力
+ */
+data class IntentConsumingMarketEntryFillRequest(
+    val entry: MarketEntryFillRequest,
+    val consumption: TradeIntentConsumptionRequest,
+)
+
+/**
+ * resting entry order と intent consumption の同時保存入力。
+ *
+ * @param order resting entry order の保存入力
+ * @param consumption intent consumption の保存入力
+ */
+data class IntentConsumingRestingEntryOrderRequest(
+    val order: RestingEntryOrderRequest,
+    val consumption: TradeIntentConsumptionRequest,
+)
+
+/**
+ * entry fill を ledger に反映する内部入力。
+ *
+ * @param entry MARKET entry の保存入力
+ * @param entryOrderId 約定済み entry order ID
+ * @param insertEntryOrder entry order 行も作成するなら true
+ */
+data class EntryFillWriteRequest(
+    val entry: MarketEntryFillRequest,
+    val entryOrderId: UUID,
+    val insertEntryOrder: Boolean,
+)
+
+/**
+ * reconcile 中に共有する市場入力。
+ *
+ * @param ticker 最新 ticker
+ * @param rules symbol rule
+ * @param simulator paper fill simulator
+ * @param lastPrice mark / trigger 判定価格
+ */
+data class ReconcileMarketContext(
+    val ticker: Ticker,
+    val rules: SymbolRules,
+    val simulator: FillSimulator,
+    val lastPrice: BigDecimal,
+)
+
+/**
+ * reconcile 中に蓄積する更新結果。
+ *
+ * @param triggeredOrderIds trigger した order ID
+ * @param closedPositionIds close した position ID
+ * @param executionIds 作成した execution ID
+ */
+data class ReconcileProgress(
+    val triggeredOrderIds: MutableList<String>,
+    val closedPositionIds: MutableList<String>,
+    val executionIds: MutableList<String>,
+)
+
+/**
+ * position mark 更新入力。
+ *
+ * @param positionId 更新する position ID
+ * @param lastPrice mark 価格
+ * @param highestPrice entry 後最高価格
+ * @param lowestPrice entry 後最安価格
+ * @param unrealizedPnl 未実現損益
+ * @param tightenedStop tighten 後の stop 価格
+ */
+data class PositionMarkUpdate(
+    val positionId: String,
+    val lastPrice: BigDecimal,
+    val highestPrice: BigDecimal,
+    val lowestPrice: BigDecimal,
+    val unrealizedPnl: BigDecimal,
+    val tightenedStop: BigDecimal?,
+)

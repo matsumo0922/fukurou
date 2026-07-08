@@ -182,24 +182,24 @@ class PaperBroker(
 
             if (resolvedCommand.orderType == OrderType.MARKET) {
                 val fill = fillSimulator.marketFill(resolvedCommand.side, resolvedCommand.sizeBtc, ticker, symbolRules)
-                val entryOrderId = resolvedCommand.commandId
 
                 return@runCatching fillMarketEntryAndConsumeIntent(
-                    command = resolvedCommand,
-                    fill = fill,
-                    positionId = UUID.randomUUID(),
-                    tradeGroupId = resolvedTradeGroupId,
-                    entryOrderId = entryOrderId,
-                    stopOrderId = UUID.randomUUID(),
+                    MarketEntryFillRequest(
+                        command = resolvedCommand,
+                        fill = fill,
+                        positionId = UUID.randomUUID(),
+                        tradeGroupId = resolvedTradeGroupId,
+                        stopOrderId = UUID.randomUUID(),
+                    ),
                 )
             }
 
-            val orderId = UUID.randomUUID()
-
             createRestingEntryOrderAndConsumeIntent(
-                command = resolvedCommand,
-                orderId = orderId,
-                tradeGroupId = resolvedTradeGroupId,
+                RestingEntryOrderRequest(
+                    command = resolvedCommand,
+                    orderId = UUID.randomUUID(),
+                    tradeGroupId = resolvedTradeGroupId,
+                ),
             )
         }
     }
@@ -435,70 +435,57 @@ class PaperBroker(
         }
     }
 
-    private suspend fun fillMarketEntryAndConsumeIntent(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        entryOrderId: UUID,
-        stopOrderId: UUID,
-    ): PaperTradeResult {
-        val intentId = requireEntryIntentId(command)
+    private suspend fun fillMarketEntryAndConsumeIntent(request: MarketEntryFillRequest): PaperTradeResult {
+        val intentId = requireEntryIntentId(request.command)
         val consumedAt = Instant.now(clock)
         val atomicRepository = ledgerRepository as? IntentConsumingPaperLedgerRepository
+        val consumption = TradeIntentConsumptionRequest(
+            intentId = intentId,
+            consumedAt = consumedAt,
+        )
 
         if (atomicRepository != null) {
             return atomicRepository.fillMarketEntryAndConsumeIntent(
-                command = command,
-                fill = fill,
-                positionId = positionId,
-                tradeGroupId = tradeGroupId,
-                stopOrderId = stopOrderId,
-                intentId = intentId,
-                consumedAt = consumedAt,
+                IntentConsumingMarketEntryFillRequest(
+                    entry = request,
+                    consumption = consumption,
+                ),
             ).getOrThrow()
         }
 
         return atomicDecisionRepository().consumeIntentAfterLedgerWrite(
             intentId = intentId,
-            orderId = entryOrderId,
+            orderId = request.command.commandId,
             consumedAt = consumedAt,
         ) {
-            ledgerRepository.fillMarketEntry(
-                command = command,
-                fill = fill,
-                positionId = positionId,
-                tradeGroupId = tradeGroupId,
-                stopOrderId = stopOrderId,
-            ).getOrThrow()
+            ledgerRepository.fillMarketEntry(request).getOrThrow()
         }.getOrThrow()
     }
 
-    private suspend fun createRestingEntryOrderAndConsumeIntent(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-    ): PaperTradeResult {
-        val intentId = requireEntryIntentId(command)
+    private suspend fun createRestingEntryOrderAndConsumeIntent(request: RestingEntryOrderRequest): PaperTradeResult {
+        val intentId = requireEntryIntentId(request.command)
         val consumedAt = Instant.now(clock)
         val atomicRepository = ledgerRepository as? IntentConsumingPaperLedgerRepository
+        val consumption = TradeIntentConsumptionRequest(
+            intentId = intentId,
+            consumedAt = consumedAt,
+        )
 
         if (atomicRepository != null) {
             return atomicRepository.createRestingEntryOrderAndConsumeIntent(
-                command = command,
-                orderId = orderId,
-                tradeGroupId = tradeGroupId,
-                intentId = intentId,
-                consumedAt = consumedAt,
+                IntentConsumingRestingEntryOrderRequest(
+                    order = request,
+                    consumption = consumption,
+                ),
             ).getOrThrow()
         }
 
         return atomicDecisionRepository().consumeIntentAfterLedgerWrite(
             intentId = intentId,
-            orderId = orderId,
+            orderId = request.orderId,
             consumedAt = consumedAt,
         ) {
-            ledgerRepository.createRestingEntryOrder(command, orderId, tradeGroupId).getOrThrow()
+            ledgerRepository.createRestingEntryOrder(request).getOrThrow()
         }.getOrThrow()
     }
 

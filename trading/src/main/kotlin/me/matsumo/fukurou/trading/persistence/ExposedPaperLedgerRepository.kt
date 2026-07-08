@@ -6,12 +6,15 @@ import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.FillSimulator
+import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingPaperLedgerRepository
+import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
+import me.matsumo.fukurou.trading.broker.MarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.OpenOrdersWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
-import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.PaperMarketConfig
@@ -744,58 +747,24 @@ class ExposedPaperLedgerRepository(
         }
     }
 
-    override suspend fun fillMarketEntry(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        stopOrderId: UUID,
-    ): Result<PaperTradeResult> {
-        return writer.fillMarketEntry(command, fill, positionId, tradeGroupId, stopOrderId)
+    override suspend fun fillMarketEntry(request: MarketEntryFillRequest): Result<PaperTradeResult> {
+        return writer.fillMarketEntry(request)
     }
 
-    override suspend fun createRestingEntryOrder(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-    ): Result<PaperTradeResult> {
-        return writer.createRestingEntryOrder(command, orderId, tradeGroupId)
+    override suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
+        return writer.createRestingEntryOrder(request)
     }
 
     override suspend fun fillMarketEntryAndConsumeIntent(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        stopOrderId: UUID,
-        intentId: UUID,
-        consumedAt: Instant,
+        request: IntentConsumingMarketEntryFillRequest,
     ): Result<PaperTradeResult> {
-        return writer.fillMarketEntryAndConsumeIntent(
-            command = command,
-            fill = fill,
-            positionId = positionId,
-            tradeGroupId = tradeGroupId,
-            stopOrderId = stopOrderId,
-            intentId = intentId,
-            consumedAt = consumedAt,
-        )
+        return writer.fillMarketEntryAndConsumeIntent(request)
     }
 
     override suspend fun createRestingEntryOrderAndConsumeIntent(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-        intentId: UUID,
-        consumedAt: Instant,
+        request: IntentConsumingRestingEntryOrderRequest,
     ): Result<PaperTradeResult> {
-        return writer.createRestingEntryOrderAndConsumeIntent(
-            command = command,
-            orderId = orderId,
-            tradeGroupId = tradeGroupId,
-            intentId = intentId,
-            consumedAt = consumedAt,
-        )
+        return writer.createRestingEntryOrderAndConsumeIntent(request)
     }
 
     override suspend fun closePosition(

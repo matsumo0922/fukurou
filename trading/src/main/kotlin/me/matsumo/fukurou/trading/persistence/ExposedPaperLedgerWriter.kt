@@ -4,12 +4,20 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
+import me.matsumo.fukurou.trading.broker.EntryFillWriteRequest
 import me.matsumo.fukurou.trading.broker.FillSimulator
+import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
+import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
+import me.matsumo.fukurou.trading.broker.MarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.PositionMarkUpdate
+import me.matsumo.fukurou.trading.broker.ReconcileMarketContext
+import me.matsumo.fukurou.trading.broker.ReconcileProgress
 import me.matsumo.fukurou.trading.broker.RestingEntryFillRequest
+import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.broker.btcScale
@@ -58,17 +66,17 @@ internal class ExposedPaperLedgerWriter(
     /**
      * MARKET entry を約定済みとして保存する。
      */
-    suspend fun fillMarketEntry(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        stopOrderId: UUID,
-    ): Result<PaperTradeResult> {
+    suspend fun fillMarketEntry(request: MarketEntryFillRequest): Result<PaperTradeResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    insertEntryFill(command, fill, positionId, tradeGroupId, command.commandId, stopOrderId)
+                    insertEntryFill(
+                        EntryFillWriteRequest(
+                            entry = request,
+                            entryOrderId = request.command.commandId,
+                            insertEntryOrder = true,
+                        ),
+                    )
                 }
             }
         }
@@ -77,20 +85,16 @@ internal class ExposedPaperLedgerWriter(
     /**
      * resting entry intent を保存する。
      */
-    suspend fun createRestingEntryOrder(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-    ): Result<PaperTradeResult> {
+    suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    insertEntryOrder(command, orderId, null, tradeGroupId, OrderStatus.OPEN)
+                    insertEntryOrder(request.command, request.orderId, null, request.tradeGroupId, OrderStatus.OPEN)
 
                     PaperTradeResult(
                         accepted = true,
                         status = OrderStatus.OPEN,
-                        orderIds = listOf(orderId.toString()),
+                        orderIds = listOf(request.orderId.toString()),
                         positionIds = emptyList(),
                         executionIds = emptyList(),
                         messageJa = "resting entry intent を保存しました。",
@@ -104,19 +108,23 @@ internal class ExposedPaperLedgerWriter(
      * MARKET entry と intent consumption を同一 transaction で保存する。
      */
     suspend fun fillMarketEntryAndConsumeIntent(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        stopOrderId: UUID,
-        intentId: UUID,
-        consumedAt: Instant,
+        request: IntentConsumingMarketEntryFillRequest,
     ): Result<PaperTradeResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    insertTradeIntentConsumption(intentId, command.commandId, consumedAt)
-                    insertEntryFill(command, fill, positionId, tradeGroupId, command.commandId, stopOrderId)
+                    insertTradeIntentConsumption(
+                        request.consumption.intentId,
+                        request.entry.command.commandId,
+                        request.consumption.consumedAt,
+                    )
+                    insertEntryFill(
+                        EntryFillWriteRequest(
+                            entry = request.entry,
+                            entryOrderId = request.entry.command.commandId,
+                            insertEntryOrder = true,
+                        ),
+                    )
                 }
             }
         }
@@ -126,22 +134,28 @@ internal class ExposedPaperLedgerWriter(
      * resting entry order と intent consumption を同一 transaction で保存する。
      */
     suspend fun createRestingEntryOrderAndConsumeIntent(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-        intentId: UUID,
-        consumedAt: Instant,
+        request: IntentConsumingRestingEntryOrderRequest,
     ): Result<PaperTradeResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    insertTradeIntentConsumption(intentId, orderId, consumedAt)
-                    insertEntryOrder(command, orderId, null, tradeGroupId, OrderStatus.OPEN)
+                    insertTradeIntentConsumption(
+                        request.consumption.intentId,
+                        request.order.orderId,
+                        request.consumption.consumedAt,
+                    )
+                    insertEntryOrder(
+                        request.order.command,
+                        request.order.orderId,
+                        null,
+                        request.order.tradeGroupId,
+                        OrderStatus.OPEN,
+                    )
 
                     PaperTradeResult(
                         accepted = true,
                         status = OrderStatus.OPEN,
-                        orderIds = listOf(orderId.toString()),
+                        orderIds = listOf(request.order.orderId.toString()),
                         positionIds = emptyList(),
                         executionIds = emptyList(),
                         messageJa = "resting entry intent を保存しました。",
@@ -168,7 +182,16 @@ internal class ExposedPaperLedgerWriter(
                     val realizedFill = fill.withRealizedPnl(position)
 
                     insertCloseOrder(orderId, position, command.reasonJa, command.auditContext)
-                    insertExecution(closeOrderId, position.positionId, position.mode, OrderSide.SELL, realizedFill, command.auditContext)
+                    insertExecution(
+                        ExecutionInsertRequest(
+                            orderId = closeOrderId,
+                            positionId = position.positionId,
+                            mode = position.mode,
+                            side = OrderSide.SELL,
+                            fill = realizedFill,
+                            auditContext = command.auditContext,
+                        ),
+                    )
                     closePositionRow(position, realizedFill)
                     cancelOpenStopOrders(position.positionId, command.reasonJa)
                     updateAccountAfterSell(realizedFill)
@@ -263,12 +286,23 @@ internal class ExposedPaperLedgerWriter(
                     val triggeredOrderIds = mutableListOf<String>()
                     val closedPositionIds = mutableListOf<String>()
                     val executionIds = mutableListOf<String>()
+                    val reconcileContext = ReconcileMarketContext(
+                        ticker = ticker,
+                        rules = rules,
+                        simulator = simulator,
+                        lastPrice = lastPrice,
+                    )
+                    val progress = ReconcileProgress(
+                        triggeredOrderIds = triggeredOrderIds,
+                        closedPositionIds = closedPositionIds,
+                        executionIds = executionIds,
+                    )
 
                     updateMarks(lastPrice, tickSnapshot.atr14Jpy?.toBigDecimal(), rules)
 
                     if (!paperAccountHardHaltReached()) {
-                        fillTriggeredEntryOrders(ticker, rules, simulator, lastPrice, triggeredOrderIds, executionIds)
-                        triggerPositionProtections(ticker, rules, simulator, lastPrice, triggeredOrderIds, closedPositionIds, executionIds)
+                        fillTriggeredEntryOrders(reconcileContext, progress)
+                        triggerPositionProtections(reconcileContext, progress)
                     }
 
                     PaperReconcileResult(
@@ -282,25 +316,43 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 
-    private fun JdbcTransaction.insertEntryFill(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        entryOrderId: UUID,
-        stopOrderId: UUID,
-    ): PaperTradeResult {
-        insertEntryOrder(command, entryOrderId, positionId, tradeGroupId, OrderStatus.FILLED)
-        insertPosition(command, fill, positionId, tradeGroupId)
-        insertExecution(entryOrderId.toString(), positionId.toString(), TradingMode.PAPER, command.side, fill, command.auditContext)
-        insertProtectiveStopOrder(command, stopOrderId, positionId, tradeGroupId)
+    private fun JdbcTransaction.insertEntryFill(request: EntryFillWriteRequest): PaperTradeResult {
+        val command = request.entry.command
+        val fill = request.entry.fill
+
+        if (request.insertEntryOrder) {
+            insertEntryOrder(
+                command,
+                request.entryOrderId,
+                request.entry.positionId,
+                request.entry.tradeGroupId,
+                OrderStatus.FILLED,
+            )
+        }
+        insertPosition(command, fill, request.entry.positionId, request.entry.tradeGroupId)
+        insertExecution(
+            ExecutionInsertRequest(
+                orderId = request.entryOrderId.toString(),
+                positionId = request.entry.positionId.toString(),
+                mode = TradingMode.PAPER,
+                side = command.side,
+                fill = fill,
+                auditContext = command.auditContext,
+            ),
+        )
+        insertProtectiveStopOrder(
+            command,
+            request.entry.stopOrderId,
+            request.entry.positionId,
+            request.entry.tradeGroupId,
+        )
         updateAccountAfterBuy(fill)
 
         return PaperTradeResult(
             accepted = true,
             status = OrderStatus.FILLED,
-            orderIds = listOf(entryOrderId.toString(), stopOrderId.toString()),
-            positionIds = listOf(positionId.toString()),
+            orderIds = listOf(request.entryOrderId.toString(), request.entry.stopOrderId.toString()),
+            positionIds = listOf(request.entry.positionId.toString()),
             executionIds = listOf(fill.executionId.toString()),
             messageJa = "paper entry を約定し、保護 STOP を作成しました。",
         )
@@ -351,20 +403,13 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 
-    private fun JdbcTransaction.fillTriggeredEntryOrders(
-        ticker: Ticker,
-        rules: SymbolRules,
-        simulator: FillSimulator,
-        lastPrice: BigDecimal,
-        triggeredOrderIds: MutableList<String>,
-        executionIds: MutableList<String>,
-    ) {
+    private fun JdbcTransaction.fillTriggeredEntryOrders(context: ReconcileMarketContext, progress: ReconcileProgress) {
         val triggeredOrders = selectOpenOrders()
             .filter { order -> order.status == OrderStatus.OPEN && order.side == OrderSide.BUY }
-            .filter { order -> order.isEntryTriggered(lastPrice) }
+            .filter { order -> order.isEntryTriggered(context.lastPrice) }
 
         triggeredOrders.forEach { order ->
-            val fill = order.createEntryFill(ticker, rules, simulator)
+            val fill = order.createEntryFill(context.ticker, context.rules, context.simulator)
             val command = order.toPlaceOrderCommand()
             val positionId = UUID.randomUUID()
             val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
@@ -372,7 +417,7 @@ internal class ExposedPaperLedgerWriter(
 
             if (!hasCashForBuyFill(fill)) {
                 updateOrderStatus(order.orderId, OrderStatus.REJECTED, "reconciler entry rejected: insufficient paper cash")
-                triggeredOrderIds += order.orderId
+                progress.triggeredOrderIds += order.orderId
 
                 return@forEach
             }
@@ -383,66 +428,116 @@ internal class ExposedPaperLedgerWriter(
                 positionId = positionId,
                 reasonJa = order.reasonJa.orEmpty(),
             )
-            insertExecution(order.orderId, positionId.toString(), TradingMode.PAPER, order.side, fill, command.auditContext)
+            insertExecution(
+                ExecutionInsertRequest(
+                    orderId = order.orderId,
+                    positionId = positionId.toString(),
+                    mode = TradingMode.PAPER,
+                    side = order.side,
+                    fill = fill,
+                    auditContext = command.auditContext,
+                ),
+            )
             insertProtectiveStopOrder(command, stopOrderId, positionId, tradeGroupId)
             updateAccountAfterBuy(fill)
 
-            triggeredOrderIds += order.orderId
-            executionIds += fill.executionId.toString()
+            progress.triggeredOrderIds += order.orderId
+            progress.executionIds += fill.executionId.toString()
         }
     }
 
     private fun JdbcTransaction.triggerPositionProtections(
-        ticker: Ticker,
-        rules: SymbolRules,
-        simulator: FillSimulator,
-        lastPrice: BigDecimal,
-        triggeredOrderIds: MutableList<String>,
-        closedPositionIds: MutableList<String>,
-        executionIds: MutableList<String>,
+        context: ReconcileMarketContext,
+        progress: ReconcileProgress,
     ) {
         selectOpenPositions().forEach { position ->
             val stopPrice = position.currentStopLossJpy?.toBigDecimal()
             val takeProfitPrice = position.currentTakeProfitJpy?.toBigDecimal()
-            val stopTriggered = stopPrice != null && lastPrice <= stopPrice
-            val takeProfitTriggered = takeProfitPrice != null && lastPrice >= takeProfitPrice
+            val stopTriggered = stopPrice != null && context.lastPrice <= stopPrice
+            val takeProfitTriggered = takeProfitPrice != null && context.lastPrice >= takeProfitPrice
 
             if (stopTriggered) {
-                val stopOrder = requireLinkedStopOrder(position.positionId)
-                val fill = simulator.stopFill(OrderSide.SELL, position.sizeBtc.toBigDecimal(), requireNotNull(stopPrice), ticker, rules)
-                val realizedFill = fill.withRealizedPnl(position)
-
-                updateOrderStatus(stopOrder.orderId, OrderStatus.FILLED, "reconciler stop trigger")
-                insertExecution(stopOrder.orderId, position.positionId, position.mode, OrderSide.SELL, realizedFill, PaperTradeAuditContext.EMPTY)
-                closePositionRow(position, realizedFill)
-                updateAccountAfterSell(realizedFill)
-
-                triggeredOrderIds += stopOrder.orderId
-                closedPositionIds += position.positionId
-                executionIds += realizedFill.executionId.toString()
+                triggerStopProtection(position, requireNotNull(stopPrice), context, progress)
 
                 return@forEach
             }
 
             if (takeProfitTriggered) {
-                requireLinkedStopOrder(position.positionId).let { stopOrder ->
-                    updateOrderStatus(stopOrder.orderId, OrderStatus.CANCELED, "reconciler virtual take profit trigger")
-                    triggeredOrderIds += stopOrder.orderId
-                }
-
-                val fill = simulator.marketFill(OrderSide.SELL, position.sizeBtc.toBigDecimal(), ticker, rules)
-                val realizedFill = fill.withRealizedPnl(position)
-                val closeOrderId = UUID.randomUUID()
-
-                insertCloseOrder(closeOrderId, position, "reconciler virtual take profit trigger", PaperTradeAuditContext.EMPTY)
-                insertExecution(closeOrderId.toString(), position.positionId, position.mode, OrderSide.SELL, realizedFill, PaperTradeAuditContext.EMPTY)
-                closePositionRow(position, realizedFill)
-                updateAccountAfterSell(realizedFill)
-
-                closedPositionIds += position.positionId
-                executionIds += realizedFill.executionId.toString()
+                triggerTakeProfitProtection(position, context, progress)
             }
         }
+    }
+
+    private fun JdbcTransaction.triggerStopProtection(
+        position: Position,
+        stopPrice: BigDecimal,
+        context: ReconcileMarketContext,
+        progress: ReconcileProgress,
+    ) {
+        val stopOrder = requireLinkedStopOrder(position.positionId)
+        val fill = context.simulator.stopFill(
+            OrderSide.SELL,
+            position.sizeBtc.toBigDecimal(),
+            stopPrice,
+            context.ticker,
+            context.rules,
+        )
+        val realizedFill = fill.withRealizedPnl(position)
+
+        updateOrderStatus(stopOrder.orderId, OrderStatus.FILLED, "reconciler stop trigger")
+        insertExecution(
+            ExecutionInsertRequest(
+                orderId = stopOrder.orderId,
+                positionId = position.positionId,
+                mode = position.mode,
+                side = OrderSide.SELL,
+                fill = realizedFill,
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        )
+        closePositionRow(position, realizedFill)
+        updateAccountAfterSell(realizedFill)
+
+        progress.triggeredOrderIds += stopOrder.orderId
+        progress.closedPositionIds += position.positionId
+        progress.executionIds += realizedFill.executionId.toString()
+    }
+
+    private fun JdbcTransaction.triggerTakeProfitProtection(
+        position: Position,
+        context: ReconcileMarketContext,
+        progress: ReconcileProgress,
+    ) {
+        requireLinkedStopOrder(position.positionId).let { stopOrder ->
+            updateOrderStatus(stopOrder.orderId, OrderStatus.CANCELED, "reconciler virtual take profit trigger")
+            progress.triggeredOrderIds += stopOrder.orderId
+        }
+
+        val fill = context.simulator.marketFill(
+            OrderSide.SELL,
+            position.sizeBtc.toBigDecimal(),
+            context.ticker,
+            context.rules,
+        )
+        val realizedFill = fill.withRealizedPnl(position)
+        val closeOrderId = UUID.randomUUID()
+
+        insertCloseOrder(closeOrderId, position, "reconciler virtual take profit trigger", PaperTradeAuditContext.EMPTY)
+        insertExecution(
+            ExecutionInsertRequest(
+                orderId = closeOrderId.toString(),
+                positionId = position.positionId,
+                mode = position.mode,
+                side = OrderSide.SELL,
+                fill = realizedFill,
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        )
+        closePositionRow(position, realizedFill)
+        updateAccountAfterSell(realizedFill)
+
+        progress.closedPositionIds += position.positionId
+        progress.executionIds += realizedFill.executionId.toString()
     }
 
     private fun JdbcTransaction.updateMarks(
@@ -466,12 +561,14 @@ internal class ExposedPaperLedgerWriter(
             val unrealizedPnl = lastPrice.subtract(entryPrice).multiply(sizeBtc).moneyScale()
 
             updatePositionMark(
-                positionId = position.positionId,
-                lastPrice = lastPrice,
-                highestPrice = highestPrice,
-                lowestPrice = lowestPrice,
-                unrealizedPnl = unrealizedPnl,
-                tightenedStop = tightenedStop,
+                PositionMarkUpdate(
+                    positionId = position.positionId,
+                    lastPrice = lastPrice,
+                    highestPrice = highestPrice,
+                    lowestPrice = lowestPrice,
+                    unrealizedPnl = unrealizedPnl,
+                    tightenedStop = tightenedStop,
+                ),
             )
 
             if (tightenedStop != null && tightenedStop != currentStop) {
@@ -634,14 +731,7 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 
-    private fun JdbcTransaction.insertExecution(
-        orderId: String,
-        positionId: String,
-        mode: TradingMode,
-        side: OrderSide,
-        fill: SimulatedFill,
-        auditContext: PaperTradeAuditContext,
-    ) {
+    private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
         prepare(
             """
                 INSERT INTO executions (
@@ -653,31 +743,24 @@ internal class ExposedPaperLedgerWriter(
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
         ).use { statement ->
-            statement.setObject(1, fill.executionId)
-            statement.setObject(2, UUID.fromString(orderId))
-            statement.setObject(3, UUID.fromString(positionId))
-            statement.setString(4, mode.name)
+            statement.setObject(1, request.fill.executionId)
+            statement.setObject(2, UUID.fromString(request.orderId))
+            statement.setObject(3, UUID.fromString(request.positionId))
+            statement.setString(4, request.mode.name)
             statement.setString(5, TradingSymbol.BTC.apiSymbol)
-            statement.setString(6, side.name)
-            statement.setBigDecimal(7, fill.priceJpy.moneyScale())
-            statement.setBigDecimal(8, fill.sizeBtc.btcScale())
-            statement.setBigDecimal(9, fill.feeJpy.moneyScale())
-            statement.setBigDecimal(10, fill.realizedPnlJpy.moneyScale())
-            statement.setString(11, fill.liquidity.name)
-            statement.setLong(12, fill.executedAt.toEpochMilli())
-            statement.bindAudit(13, auditContext)
+            statement.setString(6, request.side.name)
+            statement.setBigDecimal(7, request.fill.priceJpy.moneyScale())
+            statement.setBigDecimal(8, request.fill.sizeBtc.btcScale())
+            statement.setBigDecimal(9, request.fill.feeJpy.moneyScale())
+            statement.setBigDecimal(10, request.fill.realizedPnlJpy.moneyScale())
+            statement.setString(11, request.fill.liquidity.name)
+            statement.setLong(12, request.fill.executedAt.toEpochMilli())
+            statement.bindAudit(13, request.auditContext)
             statement.executeUpdate()
         }
     }
 
-    private fun JdbcTransaction.updatePositionMark(
-        positionId: String,
-        lastPrice: BigDecimal,
-        highestPrice: BigDecimal,
-        lowestPrice: BigDecimal,
-        unrealizedPnl: BigDecimal,
-        tightenedStop: BigDecimal?,
-    ) {
+    private fun JdbcTransaction.updatePositionMark(update: PositionMarkUpdate) {
         prepare(
             """
                 UPDATE positions
@@ -689,12 +772,12 @@ internal class ExposedPaperLedgerWriter(
                 WHERE id = ?
             """,
         ).use { statement ->
-            statement.setBigDecimal(1, lastPrice.moneyScale())
-            statement.setNullableBigDecimal(2, tightenedStop?.moneyScale())
-            statement.setBigDecimal(3, unrealizedPnl.moneyScale())
-            statement.setBigDecimal(4, highestPrice.moneyScale())
-            statement.setBigDecimal(5, lowestPrice.moneyScale())
-            statement.setObject(6, UUID.fromString(positionId))
+            statement.setBigDecimal(1, update.lastPrice.moneyScale())
+            statement.setNullableBigDecimal(2, update.tightenedStop?.moneyScale())
+            statement.setBigDecimal(3, update.unrealizedPnl.moneyScale())
+            statement.setBigDecimal(4, update.highestPrice.moneyScale())
+            statement.setBigDecimal(5, update.lowestPrice.moneyScale())
+            statement.setObject(6, UUID.fromString(update.positionId))
             statement.executeUpdate()
         }
     }
@@ -1057,6 +1140,25 @@ private fun PreparedStatement.bindAudit(startIndex: Int, auditContext: PaperTrad
     setString(startIndex + 5, auditContext.decisionRunContext.systemPromptVersion)
     setString(startIndex + 6, auditContext.decisionRunContext.marketSnapshotId)
 }
+
+/**
+ * execution insert の入力。
+ *
+ * @param orderId execution が紐づく order ID
+ * @param positionId execution が紐づく position ID
+ * @param mode trading mode
+ * @param side execution side
+ * @param fill paper 約定
+ * @param auditContext audit context
+ */
+private data class ExecutionInsertRequest(
+    val orderId: String,
+    val positionId: String,
+    val mode: TradingMode,
+    val side: OrderSide,
+    val fill: SimulatedFill,
+    val auditContext: PaperTradeAuditContext,
+)
 
 private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
     return when (orderType) {

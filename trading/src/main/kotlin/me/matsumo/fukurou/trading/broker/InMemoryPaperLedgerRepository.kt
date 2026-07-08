@@ -226,40 +226,28 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
-    override suspend fun fillMarketEntry(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        stopOrderId: UUID,
-    ): Result<PaperTradeResult> {
+    override suspend fun fillMarketEntry(request: MarketEntryFillRequest): Result<PaperTradeResult> {
         return runCatching {
             synchronized(lock) {
                 fillEntryLocked(
-                    command = command,
-                    fill = fill,
-                    positionId = positionId,
-                    tradeGroupId = tradeGroupId,
-                    entryOrderId = command.commandId,
-                    stopOrderId = stopOrderId,
-                    insertEntryOrder = true,
+                    EntryFillWriteRequest(
+                        entry = request,
+                        entryOrderId = request.command.commandId,
+                        insertEntryOrder = true,
+                    ),
                 )
             }
         }
     }
 
-    override suspend fun createRestingEntryOrder(
-        command: PlaceOrderCommand,
-        orderId: UUID,
-        tradeGroupId: UUID,
-    ): Result<PaperTradeResult> {
+    override suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
         return runCatching {
             synchronized(lock) {
                 val recordedAt = Instant.now(clock)
-                val order = command.toEntryOrder(
-                    orderId = orderId,
+                val order = request.command.toEntryOrder(
+                    orderId = request.orderId,
                     positionId = null,
-                    tradeGroupId = tradeGroupId,
+                    tradeGroupId = request.tradeGroupId,
                     status = OrderStatus.OPEN,
                     recordedAt = recordedAt,
                 )
@@ -383,6 +371,17 @@ class InMemoryPaperLedgerRepository(
                 val triggeredOrderIds = mutableListOf<String>()
                 val closedPositionIds = mutableListOf<String>()
                 val executionIds = mutableListOf<String>()
+                val reconcileContext = ReconcileMarketContext(
+                    ticker = ticker,
+                    rules = rules,
+                    simulator = simulator,
+                    lastPrice = lastPrice,
+                )
+                val progress = ReconcileProgress(
+                    triggeredOrderIds = triggeredOrderIds,
+                    closedPositionIds = closedPositionIds,
+                    executionIds = executionIds,
+                )
 
                 updateMarksLocked(
                     lastPrice = lastPrice,
@@ -392,8 +391,8 @@ class InMemoryPaperLedgerRepository(
                 )
 
                 if (!accountSnapshot.isHardHaltDrawdownReached()) {
-                    fillTriggeredEntryOrdersLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, executionIds)
-                    triggerPositionProtectionsLocked(ticker, rules, simulator, lastPrice, triggeredOrderIds, closedPositionIds, executionIds)
+                    fillTriggeredEntryOrdersLocked(reconcileContext, progress)
+                    triggerPositionProtectionsLocked(reconcileContext, progress)
                 }
 
                 PaperReconcileResult(
@@ -483,20 +482,13 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
-    private fun fillTriggeredEntryOrdersLocked(
-        ticker: Ticker,
-        rules: SymbolRules,
-        simulator: FillSimulator,
-        lastPrice: BigDecimal,
-        triggeredOrderIds: MutableList<String>,
-        executionIds: MutableList<String>,
-    ) {
+    private fun fillTriggeredEntryOrdersLocked(context: ReconcileMarketContext, progress: ReconcileProgress) {
         val entryOrders = orders
             .filter { order -> order.status == OrderStatus.OPEN && order.side == OrderSide.BUY }
-            .filter { order -> order.isEntryTriggered(lastPrice) }
+            .filter { order -> order.isEntryTriggered(context.lastPrice) }
 
         entryOrders.forEach { order ->
-            val fill = order.createEntryFill(ticker, rules, simulator)
+            val fill = order.createEntryFill(context.ticker, context.rules, context.simulator)
             val positionId = UUID.randomUUID()
             val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
             val stopOrderId = UUID.randomUUID()
@@ -504,52 +496,50 @@ class InMemoryPaperLedgerRepository(
 
             if (!accountSnapshot.hasCashForBuyFill(fill)) {
                 markOrderStatusLocked(order.orderId, OrderStatus.REJECTED, "reconciler entry rejected: insufficient paper cash")
-                triggeredOrderIds += order.orderId
+                progress.triggeredOrderIds += order.orderId
 
                 return@forEach
             }
 
             markOrderStatusLocked(order.orderId, OrderStatus.FILLED)
             fillEntryLocked(
-                command = command,
-                fill = fill,
-                positionId = positionId,
-                tradeGroupId = tradeGroupId,
-                entryOrderId = UUID.fromString(order.orderId),
-                stopOrderId = stopOrderId,
-                insertEntryOrder = false,
+                EntryFillWriteRequest(
+                    entry = MarketEntryFillRequest(
+                        command = command,
+                        fill = fill,
+                        positionId = positionId,
+                        tradeGroupId = tradeGroupId,
+                        stopOrderId = stopOrderId,
+                    ),
+                    entryOrderId = UUID.fromString(order.orderId),
+                    insertEntryOrder = false,
+                ),
             )
-            triggeredOrderIds += order.orderId
-            executionIds += fill.executionId.toString()
+            progress.triggeredOrderIds += order.orderId
+            progress.executionIds += fill.executionId.toString()
         }
     }
 
-    private fun fillEntryLocked(
-        command: PlaceOrderCommand,
-        fill: SimulatedFill,
-        positionId: UUID,
-        tradeGroupId: UUID,
-        entryOrderId: UUID,
-        stopOrderId: UUID,
-        insertEntryOrder: Boolean,
-    ): PaperTradeResult {
+    private fun fillEntryLocked(request: EntryFillWriteRequest): PaperTradeResult {
+        val command = request.entry.command
+        val fill = request.entry.fill
         val recordedAt = fill.executedAt
         val entryOrder = command.toEntryOrder(
-            orderId = entryOrderId,
-            positionId = positionId,
-            tradeGroupId = tradeGroupId,
+            orderId = request.entryOrderId,
+            positionId = request.entry.positionId,
+            tradeGroupId = request.entry.tradeGroupId,
             status = OrderStatus.FILLED,
             recordedAt = recordedAt,
         )
         val stopOrder = command.toProtectiveStopOrder(
-            orderId = stopOrderId,
-            positionId = positionId,
-            tradeGroupId = tradeGroupId,
+            orderId = request.entry.stopOrderId,
+            positionId = request.entry.positionId,
+            tradeGroupId = request.entry.tradeGroupId,
             recordedAt = recordedAt,
         )
-        val position = command.toOpenPosition(positionId, tradeGroupId, fill)
+        val position = command.toOpenPosition(request.entry.positionId, request.entry.tradeGroupId, fill)
 
-        if (insertEntryOrder) {
+        if (request.insertEntryOrder) {
             orders += entryOrder
         }
         orders += stopOrder
@@ -570,26 +560,24 @@ class InMemoryPaperLedgerRepository(
         )
     }
 
-    private fun triggerPositionProtectionsLocked(
-        ticker: Ticker,
-        rules: SymbolRules,
-        simulator: FillSimulator,
-        lastPrice: BigDecimal,
-        triggeredOrderIds: MutableList<String>,
-        closedPositionIds: MutableList<String>,
-        executionIds: MutableList<String>,
-    ) {
+    private fun triggerPositionProtectionsLocked(context: ReconcileMarketContext, progress: ReconcileProgress) {
         val openPositions = positions.filter { position -> position.status == PositionStatus.OPEN }
 
         openPositions.forEach { position ->
             val stopPrice = position.currentStopLossJpy?.toBigDecimal()
             val takeProfitPrice = position.currentTakeProfitJpy?.toBigDecimal()
-            val stopTriggered = stopPrice != null && lastPrice <= stopPrice
-            val takeProfitTriggered = takeProfitPrice != null && lastPrice >= takeProfitPrice
+            val stopTriggered = stopPrice != null && context.lastPrice <= stopPrice
+            val takeProfitTriggered = takeProfitPrice != null && context.lastPrice >= takeProfitPrice
 
             if (stopTriggered) {
                 val stopOrder = linkedStopOrder(position.positionId)
-                val fill = simulator.stopFill(OrderSide.SELL, position.sizeBtc.toBigDecimal(), requireNotNull(stopPrice), ticker, rules)
+                val fill = context.simulator.stopFill(
+                    OrderSide.SELL,
+                    position.sizeBtc.toBigDecimal(),
+                    requireNotNull(stopPrice),
+                    context.ticker,
+                    context.rules,
+                )
                 val result = closePositionLocked(
                     positionId = position.positionId,
                     orderId = UUID.fromString(requireNotNull(stopOrder).orderId),
@@ -598,9 +586,9 @@ class InMemoryPaperLedgerRepository(
                 )
 
                 markOrderStatusLocked(stopOrder.orderId, OrderStatus.FILLED)
-                triggeredOrderIds += stopOrder.orderId
-                closedPositionIds += position.positionId
-                executionIds += result.executionIds
+                progress.triggeredOrderIds += stopOrder.orderId
+                progress.closedPositionIds += position.positionId
+                progress.executionIds += result.executionIds
 
                 return@forEach
             }
@@ -608,10 +596,15 @@ class InMemoryPaperLedgerRepository(
             if (takeProfitTriggered) {
                 linkedStopOrder(position.positionId)?.let { stopOrder ->
                     markOrderStatusLocked(stopOrder.orderId, OrderStatus.CANCELED)
-                    triggeredOrderIds += stopOrder.orderId
+                    progress.triggeredOrderIds += stopOrder.orderId
                 }
 
-                val fill = simulator.marketFill(OrderSide.SELL, position.sizeBtc.toBigDecimal(), ticker, rules)
+                val fill = context.simulator.marketFill(
+                    OrderSide.SELL,
+                    position.sizeBtc.toBigDecimal(),
+                    context.ticker,
+                    context.rules,
+                )
                 val result = closePositionLocked(
                     positionId = position.positionId,
                     orderId = UUID.randomUUID(),
@@ -619,8 +612,8 @@ class InMemoryPaperLedgerRepository(
                     reasonJa = "reconciler virtual take profit trigger",
                 )
 
-                closedPositionIds += position.positionId
-                executionIds += result.executionIds
+                progress.closedPositionIds += position.positionId
+                progress.executionIds += result.executionIds
             }
         }
     }
