@@ -5,7 +5,6 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.encodeToJsonElement
-import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import java.time.Clock
 import java.time.Duration
