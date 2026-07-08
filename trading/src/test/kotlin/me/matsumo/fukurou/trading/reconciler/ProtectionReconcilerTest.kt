@@ -56,6 +56,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * ProtectionReconciler の startup full pass と loop contract を検証するテスト。
@@ -95,9 +97,9 @@ class ProtectionReconcilerTest {
             reconciler.runLoop(Duration.ofMillis(10))
         }
 
-        withTimeout(500) {
+        withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
             while (lock.acquisitionCount < 2) {
-                delay(10)
+                delay(10.toDuration(DurationUnit.MILLISECONDS))
             }
         }
         job.cancelAndJoin()
@@ -118,9 +120,9 @@ class ProtectionReconcilerTest {
             reconciler.runLoop(Duration.ofMillis(10))
         }
 
-        withTimeout(500) {
+        withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
             while (status.snapshot().lastReconciledAt == null) {
-                delay(10)
+                delay(10.toDuration(DurationUnit.MILLISECONDS))
             }
         }
         job.cancelAndJoin()
@@ -164,9 +166,9 @@ class ProtectionReconcilerTest {
             reconciler.runLoop(Duration.ofMillis(10))
         }
 
-        withTimeout(500) {
+        withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
             while (!status.snapshot().startupFullReconcileCompleted) {
-                delay(10)
+                delay(10.toDuration(DurationUnit.MILLISECONDS))
             }
         }
         job.cancelAndJoin()

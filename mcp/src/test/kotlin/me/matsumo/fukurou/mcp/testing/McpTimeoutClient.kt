@@ -9,6 +9,8 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.io.asSink
 import kotlinx.io.asSource
 import kotlinx.io.buffered
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * timeout 再現 tool を stdio MCP server 経由で呼び、呼び出し元 timeout が no-trade で終了できることを検証する client。
@@ -52,7 +54,7 @@ fun main(args: Array<String>) = runBlocking {
 
 private suspend fun verifyCallerTimeout(client: Client) {
     val timedOut = runCatching {
-        withTimeout(200) {
+        withTimeout(200.toDuration(DurationUnit.MILLISECONDS)) {
             client.callTool(
                 name = "simulate_tool_timeout",
                 arguments = mapOf("delay_ms" to 60_000),

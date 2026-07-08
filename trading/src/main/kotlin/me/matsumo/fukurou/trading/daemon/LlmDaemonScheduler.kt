@@ -35,6 +35,8 @@ import java.time.Duration
 import java.time.Instant
 import java.util.UUID
 import java.util.logging.Logger
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * daemon scheduler が参照する open risk 状態。
@@ -155,7 +157,7 @@ class LlmDaemonScheduler(
 
         while (currentCoroutineContext().isActive) {
             tick()
-            delay(interval.toMillis())
+            delay(interval.toMillis().toDuration(DurationUnit.MILLISECONDS))
         }
     }
 

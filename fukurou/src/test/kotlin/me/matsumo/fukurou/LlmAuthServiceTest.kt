@@ -25,6 +25,8 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 class LlmAuthServiceTest {
 
@@ -286,7 +288,7 @@ class LlmAuthServiceTest {
                     return@runBlocking
                 }
 
-                delay(10)
+                delay(10.toDuration(DurationUnit.MILLISECONDS))
             }
 
             assertNull(service.loginSession(LlmAuthProvider.CLAUDE, accepted.session.sessionId).getOrThrow())

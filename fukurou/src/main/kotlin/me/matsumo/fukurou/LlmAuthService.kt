@@ -32,6 +32,8 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * CLI auth provider。
@@ -644,7 +646,7 @@ class DefaultLlmAuthService(
             val retentionMillis = config.terminalSessionRetention.toMillis()
 
             if (retentionMillis > 0) {
-                delay(retentionMillis)
+                delay(retentionMillis.toDuration(DurationUnit.MILLISECONDS))
             }
 
             sessions.remove(session.sessionId, session)
@@ -672,7 +674,7 @@ class DefaultLlmAuthService(
                 return
             }
 
-            delay(STARTUP_CAPTURE_POLL_MILLIS)
+            delay(STARTUP_CAPTURE_POLL_MILLIS.toDuration(DurationUnit.MILLISECONDS))
         }
     }
 

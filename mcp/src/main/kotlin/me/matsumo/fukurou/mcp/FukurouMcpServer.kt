@@ -115,6 +115,8 @@ import java.time.Clock
 import java.time.Instant
 import java.util.UUID
 import kotlin.reflect.KClass
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * MCP server 名。
@@ -1493,7 +1495,7 @@ private suspend fun handleSimulateToolTimeout(
     val result = toolCallGuard.runReadOnlyTool(call) {
         val delayMs = parseDelayMs(request).getOrThrow()
 
-        delay(delayMs)
+        delay(delayMs.toDuration(DurationUnit.MILLISECONDS))
 
         CallToolResult(
             content = listOf(TextContent("Completed simulated wait without side effects.")),

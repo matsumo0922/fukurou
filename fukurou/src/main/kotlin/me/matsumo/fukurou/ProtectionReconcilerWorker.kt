@@ -33,6 +33,8 @@ import me.matsumo.fukurou.trading.safety.SafetyFloor
 import java.time.Clock
 import java.time.Duration
 import java.util.logging.Logger
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
@@ -97,7 +99,7 @@ class ProtectionReconcilerWorker(
                     )
                 }
 
-                delay(interval.toMillis())
+                delay(interval.toMillis().toDuration(DurationUnit.MILLISECONDS))
             }
         }
 

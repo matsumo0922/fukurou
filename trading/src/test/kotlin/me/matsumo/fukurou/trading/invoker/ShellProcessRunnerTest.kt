@@ -12,6 +12,8 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * ShellProcessRunner の process tree timeout contract を検証するテスト。
@@ -165,7 +167,7 @@ class ShellProcessRunnerTest {
                 return Files.readString(childPidFile).trim().toLong()
             }
 
-            delay(CHILD_PID_FILE_WAIT_DELAY_MS)
+            delay(CHILD_PID_FILE_WAIT_DELAY_MS.toDuration(DurationUnit.MILLISECONDS))
         }
 
         error("child pid file was not written: $childPidFile")

@@ -26,6 +26,8 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.logging.Logger
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * ProtectionReconciler の lock owner 名。
@@ -139,11 +141,11 @@ class ProtectionReconciler(
                 logPassFailure(ReconcilePassKind.STARTUP_FULL, throwable)
             }
 
-            delay(interval.toMillis())
+            delay(interval.toMillis().toDuration(DurationUnit.MILLISECONDS))
         }
 
         while (currentCoroutineContext().isActive) {
-            delay(interval.toMillis())
+            delay(interval.toMillis().toDuration(DurationUnit.MILLISECONDS))
 
             val loopResult = reconcileOnce(ReconcilePassKind.LOOP)
 

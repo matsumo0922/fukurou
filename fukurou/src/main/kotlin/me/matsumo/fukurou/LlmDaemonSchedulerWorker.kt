@@ -45,6 +45,8 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.logging.Logger
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
@@ -119,7 +121,7 @@ class LlmDaemonSchedulerWorker(
                     throwable = throwable,
                 )
 
-                delay(interval.toMillis())
+                delay(interval.toMillis().toDuration(DurationUnit.MILLISECONDS))
             }
         }
 

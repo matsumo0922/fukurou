@@ -36,6 +36,8 @@ import java.nio.file.Path
 import java.time.Clock
 import java.time.Duration
 import java.util.logging.Logger
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
@@ -95,7 +97,7 @@ class ReflectionRunnerWorker(
                     warnLoopFailure(requireNotNull(loopResult.exceptionOrNull()))
                 }
 
-                delay(interval.toMillis())
+                delay(interval.toMillis().toDuration(DurationUnit.MILLISECONDS))
             }
         }
 
@@ -111,7 +113,7 @@ class ReflectionRunnerWorker(
             }
 
             warnLoopFailure(requireNotNull(bootstrapResult.exceptionOrNull()))
-            delay(interval.toMillis())
+            delay(interval.toMillis().toDuration(DurationUnit.MILLISECONDS))
         }
     }
 

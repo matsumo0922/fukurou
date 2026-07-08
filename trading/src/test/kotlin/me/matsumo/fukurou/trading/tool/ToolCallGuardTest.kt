@@ -28,6 +28,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * ToolCallGuard の no-trade / HARD_HALT / lock contract を検証するテスト。
@@ -241,7 +243,7 @@ private suspend fun recordConcurrentSection(activeCount: AtomicInteger, maxActiv
     val currentActiveCount = activeCount.incrementAndGet()
     maxActiveCount.updateAndGet { previousMaxCount -> maxOf(previousMaxCount, currentActiveCount) }
 
-    delay(50)
+    delay(50.toDuration(DurationUnit.MILLISECONDS))
 
     activeCount.decrementAndGet()
 }

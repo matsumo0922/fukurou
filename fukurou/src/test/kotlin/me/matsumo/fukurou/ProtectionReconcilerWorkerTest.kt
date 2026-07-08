@@ -16,6 +16,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * Ktor backend worker が ProtectionReconciler loop を起動することを検証するテスト。
@@ -40,9 +42,9 @@ class ProtectionReconcilerWorkerTest {
 
         try {
             worker.start()
-            withTimeout(500) {
+            withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
                 while (status.snapshot().lastReconciledAt == null) {
-                    delay(10)
+                    delay(10.toDuration(DurationUnit.MILLISECONDS))
                 }
             }
         } finally {
@@ -79,9 +81,9 @@ class ProtectionReconcilerWorkerTest {
 
         try {
             worker.start()
-            withTimeout(500) {
+            withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
                 while (status.snapshot().lastReconciledAt == null) {
-                    delay(10)
+                    delay(10.toDuration(DurationUnit.MILLISECONDS))
                 }
             }
         } finally {
