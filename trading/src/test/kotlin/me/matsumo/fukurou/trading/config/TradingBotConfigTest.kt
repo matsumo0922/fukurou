@@ -21,6 +21,8 @@ class TradingBotConfigTest {
         assertEquals(TradingSymbol.BTC, config.symbol)
         assertEquals(TradingMode.PAPER, config.mode)
         assertEquals(BigDecimal("100000"), config.paperAccount.initialCashJpy)
+        assertEquals(BigDecimal("5"), config.paperExecution.marketSlippageBps)
+        assertEquals(BigDecimal("0.1"), config.paperExecution.volatilitySlippageMultiplier)
         assertEquals(BigDecimal("0.80"), config.safetyFloor.maxTotalExposureRatio)
         assertEquals(Duration.ofSeconds(60), config.safetyFloor.dataQualityCap.staleAfter)
         assertEquals(BigDecimal("0.5"), config.safetyFloor.dataQualityCap.cappedProbability)
@@ -64,6 +66,7 @@ class TradingBotConfigTest {
                 "FUKUROU_TRADING_MODE" to "paper",
                 "FUKUROU_PAPER_INITIAL_CASH_JPY" to "250000",
                 "FUKUROU_MARKET_SLIPPAGE_BPS" to "7",
+                "FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER" to "0.2",
                 "FUKUROU_FALLBACK_MAKER_FEE_RATE" to "0.0000",
                 "FUKUROU_FALLBACK_TAKER_FEE_RATE" to "0.0006",
                 "FUKUROU_MAX_RISK_PER_TRADE_RATIO" to "0.015",
@@ -125,6 +128,7 @@ class TradingBotConfigTest {
         assertEquals(TradingMode.PAPER, config.mode)
         assertEquals(BigDecimal("250000"), config.paperAccount.initialCashJpy)
         assertEquals(BigDecimal("7"), config.paperExecution.marketSlippageBps)
+        assertEquals(BigDecimal("0.2"), config.paperExecution.volatilitySlippageMultiplier)
         assertEquals(BigDecimal("0.0000"), config.paperMarket.fallbackMakerFeeRate)
         assertEquals(BigDecimal("0.0006"), config.paperMarket.fallbackTakerFeeRate)
         assertEquals(BigDecimal("0.015"), config.safetyFloor.maxRiskPerTradeRatio)
@@ -203,6 +207,11 @@ class TradingBotConfigTest {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_MARKET_SLIPPAGE_BPS" to "-1"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER" to "-0.1"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

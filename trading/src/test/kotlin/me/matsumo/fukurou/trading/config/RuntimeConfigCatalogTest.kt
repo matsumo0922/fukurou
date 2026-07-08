@@ -37,6 +37,10 @@ class RuntimeConfigCatalogTest {
         assertEquals("https://example.test/public", deploymentItems.getValue("gmoPublic.baseUrl").effectiveValue)
         assertFalse(deploymentItems.getValue("trading.mode").editable)
         assertFalse(runtimeItems.getValue("safety.maxRiskPerTradeRatio").editable)
+        assertEquals(
+            "FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER",
+            runtimeItems.getValue("paper.volatilitySlippageMultiplier").legacyEnvName,
+        )
         assertEquals(RuntimeConfigSafetyTier.GUARDED, runtimeItems.getValue("gmoPublic.restPerSecond").safetyTier)
         assertEquals(RuntimeConfigSafetyTier.GUARDED, runtimeItems.getValue("gmoPublic.restBurst").safetyTier)
         assertTrue(secretItems.getValue("database.password").valueConfigured)

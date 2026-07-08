@@ -135,7 +135,11 @@ interface PaperLedgerMutationRepository {
     /**
      * tick をもとに resting order / protection を決定的に前進させる。
      */
-    suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult>
+    suspend fun reconcile(
+        tickSnapshot: TickSnapshot,
+        simulator: PaperExecutionSimulator,
+        simulationContext: PaperSimulationContext? = null,
+    ): Result<PaperReconcileResult>
 }
 
 /**
@@ -247,13 +251,15 @@ data class EntryFillWriteRequest(
  *
  * @param ticker 最新 ticker
  * @param rules symbol rule
- * @param simulator paper fill simulator
+ * @param simulator paper execution simulator
+ * @param simulationContext paper execution simulator に渡す市場 context
  * @param lastPrice mark / trigger 判定価格
  */
 data class ReconcileMarketContext(
     val ticker: Ticker,
     val rules: SymbolRules,
-    val simulator: FillSimulator,
+    val simulator: PaperExecutionSimulator,
+    val simulationContext: PaperSimulationContext,
     val lastPrice: BigDecimal,
 )
 

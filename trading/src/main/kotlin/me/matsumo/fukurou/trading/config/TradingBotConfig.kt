@@ -74,6 +74,10 @@ data class TradingBotConfig(
                 name = FUKUROU_MARKET_SLIPPAGE_BPS_ENV,
                 defaultValue = DEFAULT_MARKET_SLIPPAGE_BPS,
             )
+            val volatilitySlippageMultiplier = environment.readDecimal(
+                name = FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER_ENV,
+                defaultValue = DEFAULT_VOLATILITY_SLIPPAGE_MULTIPLIER,
+            )
 
             require(initialCashJpy > BigDecimal.ZERO) {
                 "$FUKUROU_PAPER_INITIAL_CASH_JPY_ENV must be greater than 0."
@@ -88,6 +92,7 @@ data class TradingBotConfig(
                 ),
                 paperExecution = PaperExecutionConfig(
                     marketSlippageBps = marketSlippageBps,
+                    volatilitySlippageMultiplier = volatilitySlippageMultiplier,
                 ),
                 paperMarket = paperMarket,
                 safetyFloor = environment.readSafetyFloorConfig(),
@@ -366,6 +371,12 @@ private const val FUKUROU_PAPER_INITIAL_CASH_JPY_ENV = "FUKUROU_PAPER_INITIAL_CA
 private const val FUKUROU_MARKET_SLIPPAGE_BPS_ENV = "FUKUROU_MARKET_SLIPPAGE_BPS"
 
 /**
+ * paper volatility slippage multiplier の環境変数名。
+ */
+private const val FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER_ENV =
+    "FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER"
+
+/**
  * paper fallback maker fee の環境変数名。
  */
 private const val FUKUROU_FALLBACK_MAKER_FEE_RATE_ENV = "FUKUROU_FALLBACK_MAKER_FEE_RATE"
@@ -606,6 +617,11 @@ private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("100000")
  * MARKET / STOP の既定 slippage bps。
  */
 private val DEFAULT_MARKET_SLIPPAGE_BPS = BigDecimal("5")
+
+/**
+ * ATR 由来 slippage 係数の既定値。
+ */
+private val DEFAULT_VOLATILITY_SLIPPAGE_MULTIPLIER = BigDecimal("0.1")
 
 /**
  * fresh falsification の既定 window。

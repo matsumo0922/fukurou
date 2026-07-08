@@ -485,7 +485,11 @@ private class InMemoryPaperLedgerMutationWriter(
         }
     }
 
-    override suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult> {
+    override suspend fun reconcile(
+        tickSnapshot: TickSnapshot,
+        simulator: PaperExecutionSimulator,
+        simulationContext: PaperSimulationContext?,
+    ): Result<PaperReconcileResult> {
         return runCatching {
             state.write {
                 val ticker = tickSnapshot.requireTicker()
@@ -498,6 +502,10 @@ private class InMemoryPaperLedgerMutationWriter(
                     ticker = ticker,
                     rules = rules,
                     simulator = simulator,
+                    simulationContext = simulationContext ?: PaperSimulationContext(
+                        ticker = ticker,
+                        rules = rules,
+                    ),
                     lastPrice = lastPrice,
                 )
                 val progress = ReconcileProgress(
@@ -590,7 +598,12 @@ private class InMemoryPaperLedgerMutationWriter(
             .filter { order -> order.isEntryTriggered(context.lastPrice) }
 
         entryOrders.forEach { order ->
-            val fill = order.createEntryFill(context.ticker, context.rules, context.simulator)
+            val fill = order.createEntryFill(
+                ticker = context.ticker,
+                rules = context.rules,
+                simulator = context.simulator,
+                simulationContext = context.simulationContext,
+            )
             val positionId = UUID.randomUUID()
             val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
             val stopOrderId = UUID.randomUUID()
@@ -680,8 +693,7 @@ private class InMemoryPaperLedgerMutationWriter(
                     OrderSide.SELL,
                     position.sizeBtc.toBigDecimal(),
                     requireNotNull(stopPrice),
-                    context.ticker,
-                    context.rules,
+                    context.simulationContext,
                 )
                 val result = closePositionLocked(
                     positionId = position.positionId,
@@ -707,8 +719,7 @@ private class InMemoryPaperLedgerMutationWriter(
                 val fill = context.simulator.marketFill(
                     OrderSide.SELL,
                     position.sizeBtc.toBigDecimal(),
-                    context.ticker,
-                    context.rules,
+                    context.simulationContext,
                 )
                 val result = closePositionLocked(
                     positionId = position.positionId,
@@ -1130,10 +1141,11 @@ private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
 private fun Order.createEntryFill(
     ticker: Ticker,
     rules: SymbolRules,
-    simulator: FillSimulator,
+    simulator: PaperExecutionSimulator,
+    simulationContext: PaperSimulationContext,
 ): SimulatedFill {
     return simulator.restingEntryFill(
-        RestingEntryFillRequest(
+        request = RestingEntryFillRequest(
             side = side,
             orderType = orderType,
             sizeBtc = sizeBtc.toBigDecimal(),
@@ -1142,6 +1154,7 @@ private fun Order.createEntryFill(
             ticker = ticker,
             rules = rules,
         ),
+        context = simulationContext,
     )
 }
 

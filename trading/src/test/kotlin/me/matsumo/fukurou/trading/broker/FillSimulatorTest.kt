@@ -2,6 +2,8 @@ package me.matsumo.fukurou.trading.broker
 
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import java.math.BigDecimal
@@ -52,15 +54,112 @@ class FillSimulatorTest {
     fun resting_limit_uses_limit_price_and_maker_rebate() {
         val simulator = FillSimulator(clock = fixedClock())
 
-        val fill = simulator.restingLimitFill(
-            sizeBtc = BigDecimal("0.0100"),
-            limitPriceJpy = BigDecimal("9900000"),
-            rules = symbolRules(),
+        val update = simulator.simulatePendingLimit(
+            request = PendingLimitExecutionRequest(
+                side = OrderSide.BUY,
+                sizeBtc = BigDecimal("0.0100"),
+                limitPriceJpy = BigDecimal("9900000"),
+            ),
+            context = paperSimulationContext(),
         )
+        val fill = requireNotNull(update.fill)
 
         assertEquals("9900000.00000000", fill.priceJpy.toPlainString())
         assertEquals("-9.90000000", fill.feeJpy.toPlainString())
         assertEquals(ExecutionLiquidity.MAKER, fill.liquidity)
+    }
+
+    @Test
+    fun market_buy_walks_asks_and_applies_adverse_slippage() {
+        val simulator = FillSimulator(clock = fixedClock())
+
+        val fill = simulator.marketFill(
+            side = OrderSide.BUY,
+            sizeBtc = BigDecimal("0.0100"),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    asks = listOf(
+                        OrderbookLevel(price = "10000000", size = "0.0050"),
+                        OrderbookLevel(price = "10010000", size = "0.0050"),
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals("10010002.50000000", fill.priceJpy.toPlainString())
+        assertEquals(ExecutionLiquidity.TAKER, fill.liquidity)
+    }
+
+    @Test
+    fun market_sell_walks_bids_and_applies_adverse_slippage() {
+        val simulator = FillSimulator(clock = fixedClock())
+
+        val fill = simulator.marketFill(
+            side = OrderSide.SELL,
+            sizeBtc = BigDecimal("0.0100"),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    bids = listOf(
+                        OrderbookLevel(price = "9990000", size = "0.0050"),
+                        OrderbookLevel(price = "9980000", size = "0.0050"),
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals("9980007.50000000", fill.priceJpy.toPlainString())
+        assertEquals(ExecutionLiquidity.TAKER, fill.liquidity)
+    }
+
+    @Test
+    fun market_buy_fills_missing_depth_with_conservative_residual_price() {
+        val simulator = FillSimulator(clock = fixedClock())
+
+        val fill = simulator.marketFill(
+            side = OrderSide.BUY,
+            sizeBtc = BigDecimal("0.0150"),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    asks = listOf(
+                        OrderbookLevel(price = "10000000", size = "0.0050"),
+                        OrderbookLevel(price = "10010000", size = "0.0050"),
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals("10013339.16750000", fill.priceJpy.toPlainString())
+    }
+
+    @Test
+    fun market_buy_adds_volatility_slippage_after_fixed_bps() {
+        val simulator = FillSimulator(clock = fixedClock())
+
+        val fill = simulator.marketFill(
+            side = OrderSide.BUY,
+            sizeBtc = BigDecimal("0.0100"),
+            context = paperSimulationContext(
+                volatilitySlippageJpy = BigDecimal("1000"),
+            ),
+        )
+
+        assertEquals("10006000.00000000", fill.priceJpy.toPlainString())
+    }
+
+    @Test
+    fun market_sell_clamps_adverse_slippage_to_zero() {
+        val simulator = FillSimulator(clock = fixedClock())
+
+        val fill = simulator.marketFill(
+            side = OrderSide.SELL,
+            sizeBtc = BigDecimal("0.0100"),
+            context = paperSimulationContext(
+                volatilitySlippageJpy = BigDecimal("20000000"),
+            ),
+        )
+
+        assertEquals("0.00000000", fill.priceJpy.toPlainString())
+        assertEquals("0.00000000", fill.feeJpy.toPlainString())
     }
 }
 
@@ -91,6 +190,30 @@ private fun symbolRules(): SymbolRules {
         tickSize = "1",
         takerFee = "0.0005",
         makerFee = "-0.0001",
+    )
+}
+
+private fun paperSimulationContext(
+    orderbook: Orderbook? = null,
+    volatilitySlippageJpy: BigDecimal = BigDecimal.ZERO,
+): PaperSimulationContext {
+    return PaperSimulationContext(
+        ticker = ticker(),
+        rules = symbolRules(),
+        orderbook = orderbook,
+        orderbookLookupAttempted = orderbook != null,
+        volatilitySlippageJpy = volatilitySlippageJpy,
+    )
+}
+
+private fun orderbook(
+    bids: List<OrderbookLevel> = listOf(OrderbookLevel(price = "9990000", size = "0.0100")),
+    asks: List<OrderbookLevel> = listOf(OrderbookLevel(price = "10000000", size = "0.0100")),
+): Orderbook {
+    return Orderbook(
+        symbol = "BTC",
+        bids = bids,
+        asks = asks,
     )
 }
 
