@@ -179,7 +179,7 @@ a:focus-visible {
 .top-status-bar__clock {
   min-width: 0;
   color: var(--ink-muted);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.79rem;
   overflow-wrap: anywhere;
 }
@@ -317,7 +317,7 @@ a:focus-visible {
 .metric__value {
   margin: 10px 0 0;
   color: var(--ink);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 1.18rem;
   font-weight: 760;
   line-height: 1.25;
@@ -338,7 +338,7 @@ a:focus-visible {
   min-height: 24px;
   border: 1px solid currentColor;
   border-radius: 999px;
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.72rem;
   font-weight: 720;
   line-height: 1;
@@ -665,7 +665,7 @@ a:focus-visible {
 .config-table__env,
 .config-table__value {
   color: var(--ink-muted);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.78rem;
   overflow-wrap: anywhere;
 }
@@ -834,7 +834,7 @@ a:focus-visible {
 
 .checkbox-chip span {
   min-width: 0;
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.72rem;
   overflow-wrap: anywhere;
 }
@@ -874,7 +874,7 @@ a:focus-visible {
 .data-strip dd {
   margin: 6px 0 0;
   color: var(--ink);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.88rem;
   overflow-wrap: anywhere;
 }
@@ -922,7 +922,7 @@ a:focus-visible {
   gap: 10px;
   min-height: 42px;
   color: var(--ink-muted);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.9rem;
 }
 
@@ -1134,7 +1134,7 @@ a:focus-visible {
 
 .confirmation-step__reason {
   color: var(--ink-muted);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.8rem;
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -1181,7 +1181,7 @@ a:focus-visible {
 .llm-auth-session__url p {
   margin: 0;
   color: var(--ink-muted);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.8rem;
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -1262,7 +1262,7 @@ a:focus-visible {
 }
 
 .endpoint-table__path {
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.86rem;
 }
 
@@ -1291,7 +1291,7 @@ a:focus-visible {
   min-width: 0;
   background: var(--surface-muted);
   color: var(--ink);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.8rem;
   padding: 10px;
   overflow-wrap: anywhere;
@@ -1337,7 +1337,7 @@ a:focus-visible {
 
 .evaluation-action-grid__item strong {
   color: var(--ink);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.9rem;
 }
 
@@ -1372,7 +1372,7 @@ a:focus-visible {
   min-width: 0;
   background: var(--surface-muted);
   color: var(--ink);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.78rem;
   padding: 10px;
   overflow-wrap: anywhere;
@@ -1480,7 +1480,7 @@ a:focus-visible {
 
 .calibration-group__heading span {
   color: var(--ink-muted);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.76rem;
 }
 
@@ -1501,7 +1501,7 @@ a:focus-visible {
   gap: 10px;
   min-width: 0;
   color: var(--ink-muted);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.72rem;
 }
 
@@ -1558,7 +1558,7 @@ a:focus-visible {
 
 .benchmark-return strong {
   color: var(--ink);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.82rem;
   text-align: right;
 }
@@ -1592,7 +1592,7 @@ a:focus-visible {
 .timeline__freshness {
   margin: -2px 0 12px;
   color: var(--ink-muted);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.79rem;
 }
 
@@ -1660,7 +1660,7 @@ a:focus-visible {
 
 .timeline__header time {
   color: var(--ink-muted);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.78rem;
 }
 
@@ -1704,7 +1704,7 @@ a:focus-visible {
 .timeline__metadata dd {
   margin: 5px 0 0;
   color: var(--ink);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.78rem;
   overflow-wrap: anywhere;
 }
@@ -1824,7 +1824,7 @@ a:focus-visible {
 
 .activity-catalog-list__item code {
   color: var(--ink-faint);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.68rem;
   font-weight: 700;
   overflow-wrap: anywhere;
@@ -1869,7 +1869,7 @@ a:focus-visible {
 .activity-detail-dialog__summary {
   margin: 0;
   color: var(--ink-muted);
-  font-family: var(--mono);
+  font-family: var(--mono), monospace;
   font-size: 0.78rem;
   line-height: 1.5;
 }
