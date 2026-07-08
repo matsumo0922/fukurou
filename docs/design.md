@@ -2966,22 +2966,6 @@ object OverridesTable : UUIDTable("overrides") {
     val expiresAt = timestamp("expires_at").nullable()
 }
 
-/**
- * Knowledgeノートとの対応関係を保存するテーブル。
- */
-object KnowledgeNotesTable : UUIDTable("knowledge_notes") {
-    val notePath = varchar("note_path", 512)
-    val noteType = varchar("note_type", 64)
-    val title = varchar("title", 256)
-    val relatedDecisionId = reference("related_decision_id", DecisionsTable, onDelete = ReferenceOption.SET_NULL).nullable()
-    val relatedOrderId = reference("related_order_id", OrdersTable, onDelete = ReferenceOption.SET_NULL).nullable()
-    val createdAt = timestamp("created_at")
-    val updatedAt = timestamp("updated_at")
-
-    init {
-        uniqueIndex("ux_knowledge_note_path", notePath)
-    }
-}
 ```
 
 ### 11.3 Obsidian Vault構成
@@ -3012,15 +2996,15 @@ Instruments/BTC.md
 00_MOC/Knowledge Index.md
 ```
 
-#### 2026-07-04 A-2 Obsidian Writer 実装補足
+#### Obsidian Writer / Reflection Runner 出力方針
 
-[実装済み: 2026-07-04] A-2 の Obsidian Writer は、PostgreSQL を正本として Daily / Trade Markdown を機械的に再生成する。生成対象は frontmatter、DB から直接導出できる数値、decision / TradePlan / falsification / execution の保存済み文字列、空の振り返り見出しだけに限定する。相場解釈、良し悪しの判断、教訓、失敗パターン、Knowledge note 本文、calibration 文は A-3 reflection runner の責務であり、A-2 では生成しない。
+Obsidian Writer は、PostgreSQL を正本として Daily / Trade Markdown を機械的に再生成する。生成対象は frontmatter、DB から直接導出できる数値、decision / TradePlan / falsification / execution の保存済み文字列、空の振り返り見出しだけに限定する。相場解釈、良し悪しの判断、教訓、失敗パターン、Knowledge note 本文、calibration 文は Reflection Runner の責務であり、Obsidian Writer では生成しない。
 
-[実装済み: 2026-07-04] outbox table と `knowledge_notes` table は A-2 では追加しない。note は DB 状態の純粋な派生物として扱い、writer tick ごとに同じ入力から同じ Markdown を組み立てる。既存 file と内容が同じ場合は書き換えず、差分がある場合だけ同一 directory 内の一時 file へ書いてから atomic replace を試みる。vault 書き込みに失敗しても trading / DB record には影響させず、次 tick で自然復旧させる。vault を削除した場合も、DB から復元できる。
+outbox table と `knowledge_notes` table は使わない。note は DB 状態の純粋な派生物として扱い、writer tick ごとに同じ入力から同じ Markdown を組み立てる。既存 file と内容が同じ場合は書き換えず、差分がある場合だけ同一 directory 内の一時 file へ書いてから atomic replace を試みる。vault 書き込みに失敗しても trading / DB record には影響させず、次 tick で自然復旧させる。vault を削除した場合も、DB から復元できる。
 
-[実装済み: 2026-07-04] 実装 package は新 module `:trading.knowledge` ではなく、既存 `:trading` module の `me.matsumo.fukurou.trading.knowledge` とする。A-2 は既存 repository と typed config に薄く乗るだけで、module 分割による依存境界を増やす段階ではないため。
+Obsidian Writer は既存 `:trading` module の `me.matsumo.fukurou.trading.knowledge` に置く。既存 repository と typed config に薄く乗るだけで、module 分割による依存境界は増やさない。
 
-Reflection Runner は、同じ vault に `Knowledge/DailyReflections/YYYY-MM-DD.md`、`Knowledge/WeeklyReviews/YYYY-Www.md`、`Knowledge/Calibration/ConfidenceCalibration.md`、`Knowledge/Setups/TagTaxonomy-YYYY-Www.md`、`Knowledge/PromptCandidates/YYYY-Www.md` を生成する。Daily note は A-2 Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。Reflection Runner は current period と previous period の Daily / Weekly / TagTaxonomy report を再生成し、境界直前に保存された decision / trade を確定ノートへ反映する。
+Reflection Runner は、同じ vault に `Knowledge/DailyReflections/YYYY-MM-DD.md`、`Knowledge/WeeklyReviews/YYYY-Www.md`、`Knowledge/Calibration/ConfidenceCalibration.md`、`Knowledge/Setups/TagTaxonomy-YYYY-Www.md`、`Knowledge/PromptCandidates/YYYY-Www.md` を生成する。Daily note は Obsidian Writer の所有物であり、Reflection Runner は `Daily/` 配下を更新しない。Reflection Runner は current period と previous period の Daily / Weekly / TagTaxonomy report を再生成し、境界直前に保存された decision / trade を確定ノートへ反映する。
 
 ### 11.4 Trade note frontmatter例
 
@@ -3577,7 +3561,7 @@ DB_PASSWORD=replace_me
 | CLI timeout | プロセス kill、`llm_runs.status = FAILED` と redaction 済み `error_message` を保存し、バックストップのみ |
 | MCP down | CLI起動せず、保有中はSTOP監視だけ実行 |
 | DB busy / lock timeout | PostgreSQL statement timeout / lock timeout + retry。長時間失敗ならHALT |
-| Obsidian write失敗 | DBを真実とし、後で再生成可能なoutboxへ入れる |
+| Obsidian write失敗 | DBを真実とし、次 tick で同じ DB 入力から Vault note を再生成する |
 | データstale | 新規act禁止。保有中STOPは保守的に扱う |
 
 ### 14.2 リトライ方針
@@ -3595,8 +3579,9 @@ POST注文系:
   同一clientOrderIdの重複発注をDB unique indexで防止
 
 Obsidian write:
-  retry up to 3 times
-  失敗時は knowledge_outbox に保存
+  同一 directory 内の一時 file から atomic replace する
+  失敗時は worker warning に残し、次 tick で DB から再生成する
+  outbox table は使わない
 
 LLM CLI:
   同一triggerでの即時retryはしない
@@ -3810,7 +3795,7 @@ maxDD = min((equity - equityPeak) / equityPeak)
 | 未保護ポジション発生 | 0件 |
 | 起動時復旧不能 | 0件 |
 | CLI timeout率 | 5%未満 |
-| DB/Obsidian write失敗の未処理outbox | 0件 |
+| DB/Obsidian write失敗からの再生成不能 | 0件 |
 | 推定勝率pの較正 | bucket別の実現勝率と大きく乖離しない |
 | MAE/MFE記録率 | 100% |
 | override適用時のPF | 非overrideより著しく悪くない |
@@ -3915,7 +3900,7 @@ maxDD = min((equity - equityPeak) / equityPeak)
 | 保護処理の停止 | 損失拡大 | PAPERではProtectionReconcilerを常駐させ、STOP/virtual TPをDBから復元する。LIVEでは現物STOPを優先して置き、virtual TPはReconcilerが管理する。Docker restart＋起動時復旧 |
 | CLI認証切れ | 判断停止 | バックストップのみ稼働、通知、認証status監視 |
 | GMO API制限/障害 | 発注・決済失敗 | レート制限、retry、緊急halt、状態照会 |
-| Obsidian write失敗 | 知識欠損 | DBを真実、outbox再生成 |
+| Obsidian write失敗 | 知識欠損 | DBを真実、次 tick 再生成、vault 削除時もDBから復元 |
 | override乱用 | ルール形骸化 | 理由必須、期限付き、週次分析、安全床は不可 |
 
 ### 16.3 今後の拡張
