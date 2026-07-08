@@ -202,7 +202,7 @@ class LlmAuthServiceTest {
                 .submitLoginTokenCode(
                     provider = LlmAuthProvider.CODEX,
                     sessionId = accepted.session.sessionId,
-                    tokenCode = DUMMY_AUTH_CODE,
+                    tokenCode = "$DUMMY_AUTH_CODE\nignored",
                 )
                 .getOrThrow()
             val rejected = assertIs<LlmAuthLoginTokenSubmitResult.Rejected>(submitResult)

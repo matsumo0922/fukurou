@@ -37,7 +37,6 @@ import java.time.Instant
  * ops API の OpenAPI tag。
  */
 private const val OPS_TAG = "ops"
-private const val MAX_LLM_AUTH_TOKEN_CODE_LENGTH = 4096
 
 /**
  * halt request の level。
@@ -1239,7 +1238,7 @@ private suspend fun ApplicationCall.requireLoginTokenCode(request: OpsLlmAuthTok
 
     val tokenCode = tokenCodeCandidates.single()
 
-    if (tokenCode.containsLineBreak()) {
+    if (tokenCode.containsLlmAuthTokenCodeLineBreak()) {
         respond(HttpStatusCode.BadRequest, ErrorResponse("token or code must be a single line"))
 
         return null
@@ -1272,10 +1271,6 @@ private fun LlmAuthLoginTokenSubmitRejection.toHttpStatusCode(): HttpStatusCode 
         LlmAuthLoginTokenSubmitRejection.ALREADY_SUBMITTED -> HttpStatusCode.Conflict
         LlmAuthLoginTokenSubmitRejection.STDIN_UNAVAILABLE -> HttpStatusCode.Conflict
     }
-}
-
-private fun String.containsLineBreak(): Boolean {
-    return any { character -> character == '\n' || character == '\r' }
 }
 
 private suspend fun ApplicationCall.requirePaperLedgerRepository(

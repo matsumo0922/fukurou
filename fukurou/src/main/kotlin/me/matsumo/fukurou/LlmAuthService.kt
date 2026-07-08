@@ -424,20 +424,6 @@ class DefaultLlmAuthService(
         return runCatching {
             evictExpiredLoginSessions()
 
-            val trimmedTokenCode = tokenCode.trim()
-
-            require(trimmedTokenCode.isNotEmpty()) {
-                "tokenCode must not be blank."
-            }
-            require(!trimmedTokenCode.containsLineBreak()) {
-                "tokenCode must be a single line."
-            }
-            require(trimmedTokenCode.length <= MAX_LLM_AUTH_TOKEN_CODE_LENGTH) {
-                "tokenCode is too long."
-            }
-
-            val session = sessions[sessionId]
-
             if (provider != LlmAuthProvider.CLAUDE) {
                 return@runCatching LlmAuthLoginTokenSubmitResult.Rejected(
                     rejection = LlmAuthLoginTokenSubmitRejection.UNSUPPORTED_PROVIDER,
@@ -445,11 +431,25 @@ class DefaultLlmAuthService(
                 )
             }
 
+            val session = sessions[sessionId]
+
             if (session == null || session.provider != provider) {
                 return@runCatching LlmAuthLoginTokenSubmitResult.Rejected(
                     rejection = LlmAuthLoginTokenSubmitRejection.SESSION_NOT_FOUND,
                     reason = "login session not found",
                 )
+            }
+
+            val trimmedTokenCode = tokenCode.trim()
+
+            require(trimmedTokenCode.isNotEmpty()) {
+                "tokenCode must not be blank."
+            }
+            require(!trimmedTokenCode.containsLlmAuthTokenCodeLineBreak()) {
+                "tokenCode must be a single line."
+            }
+            require(trimmedTokenCode.length <= MAX_LLM_AUTH_TOKEN_CODE_LENGTH) {
+                "tokenCode is too long."
             }
 
             val result = session.submitTokenCode(trimmedTokenCode)
@@ -1016,12 +1016,7 @@ private fun String.isSafeAuthorizationUrl(): Boolean {
     return !forbiddenQuery
 }
 
-private fun String.containsLineBreak(): Boolean {
-    return any { character -> character == '\n' || character == '\r' }
-}
-
 private const val DEFAULT_LLM_CLI_HOME_PATH = "/tmp/fukurou-cli-home"
-private const val MAX_LLM_AUTH_TOKEN_CODE_LENGTH = 4096
 private const val CLAUDE_HOME_DIRECTORY = ".claude"
 private const val CODEX_AUTH_FILE_NAME = "auth.json"
 private const val STARTUP_CAPTURE_POLL_MILLIS = 100L
