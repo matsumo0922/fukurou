@@ -284,68 +284,185 @@ object TradingRuntimeFactory {
         tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
         closeDataSource: Boolean = false,
     ): TradingRuntime {
-        TradingPersistenceBootstrap(
-            database = database,
-            clock = clock,
-            paperAccountConfig = tradingConfig.paperAccount,
-        ).verifySchema().getOrThrow()
+        val connection = PostgresRuntimeConnection(dataSource, database, closeDataSource)
+        val context = PostgresRuntimeContext(clock, reconcilerStatusProvider, marketDataSource, tradingConfig)
 
-        val riskStateRepository = ExposedRiskStateRepository(database)
-        val commandEventLog = ExposedCommandEventLog(database)
-        val llmRunRepository = ExposedLlmRunRepository(database)
-        val equitySnapshotRepository = ExposedEquitySnapshotRepository(database)
-        val evaluationRepository = ExposedEvaluationRepository(database)
-        val decisionRepository = ExposedDecisionRepository(database, clock)
-        val riskStateCommandService = ExposedRiskStateCommandService(database, clock)
-        val safetyViolationRepository = ExposedSafetyViolationRepository(database)
-        val resolvedReconcilerStatusProvider = reconcilerStatusProvider ?: ExposedReconcilerStatusProvider(database)
-        val broker = PaperBroker(
-            ledgerRepository = ExposedPaperLedgerRepository(
-                database = database,
-                fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
-            ),
-            riskStateRepository = riskStateRepository,
-            riskStateCommandService = riskStateCommandService,
-            decisionRepository = decisionRepository,
-            falsificationFreshnessWindow = tradingConfig.decisionProtocol.falsificationFreshnessWindow,
-            safetyViolationRepository = safetyViolationRepository,
-            safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
-            marketDataSource = marketDataSource,
-            fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
-            reconcilerStatusProvider = resolvedReconcilerStatusProvider,
-            clock = clock,
-        )
-        val tradingLock = PostgresGlobalTradingLock(dataSource, clock)
-        val callerNoTradeGuard = CallerNoTradeGuard(commandEventLog, clock)
-        val toolCallGuard = ToolCallGuard(
-            riskStateRepository = riskStateRepository,
-            commandEventLog = commandEventLog,
-            tradingLock = tradingLock,
-            clock = clock,
-        )
-        val closeAction = if (closeDataSource) {
-            { dataSource.close() }
+        verifyPostgresSchema(connection, context)
+
+        val repositories = createPostgresRepositories(connection, context)
+        val services = createPostgresServices(connection, context, repositories)
+        val closeAction = if (connection.closeDataSource) {
+            { connection.dataSource.close() }
         } else {
             {}
         }
 
         return TradingRuntime(
-            riskStateRepository = riskStateRepository,
-            riskStateCommandService = riskStateCommandService,
-            commandEventLog = commandEventLog,
-            llmRunRepository = llmRunRepository,
-            equitySnapshotRepository = equitySnapshotRepository,
-            evaluationRepository = evaluationRepository,
-            decisionRepository = decisionRepository,
-            safetyViolationRepository = safetyViolationRepository,
-            broker = broker,
-            tradingLock = tradingLock,
-            toolCallGuard = toolCallGuard,
-            callerNoTradeGuard = callerNoTradeGuard,
+            riskStateRepository = repositories.riskStateRepository,
+            riskStateCommandService = services.riskStateCommandService,
+            commandEventLog = repositories.commandEventLog,
+            llmRunRepository = repositories.llmRunRepository,
+            equitySnapshotRepository = repositories.equitySnapshotRepository,
+            evaluationRepository = repositories.evaluationRepository,
+            decisionRepository = repositories.decisionRepository,
+            safetyViolationRepository = services.safetyViolationRepository,
+            broker = services.broker,
+            tradingLock = services.tradingLock,
+            toolCallGuard = services.toolCallGuard,
+            callerNoTradeGuard = services.callerNoTradeGuard,
             close = closeAction,
         )
     }
 }
+
+private fun verifyPostgresSchema(connection: PostgresRuntimeConnection, context: PostgresRuntimeContext) {
+    TradingPersistenceBootstrap(
+        database = connection.database,
+        clock = context.clock,
+        paperAccountConfig = context.tradingConfig.paperAccount,
+    ).verifySchema().getOrThrow()
+}
+
+private fun createPostgresRepositories(
+    connection: PostgresRuntimeConnection,
+    context: PostgresRuntimeContext,
+): PostgresRuntimeRepositories {
+    return PostgresRuntimeRepositories(
+        riskStateRepository = ExposedRiskStateRepository(connection.database),
+        commandEventLog = ExposedCommandEventLog(connection.database),
+        llmRunRepository = ExposedLlmRunRepository(connection.database),
+        equitySnapshotRepository = ExposedEquitySnapshotRepository(connection.database),
+        evaluationRepository = ExposedEvaluationRepository(connection.database),
+        decisionRepository = ExposedDecisionRepository(connection.database, context.clock),
+    )
+}
+
+private fun createPostgresServices(
+    connection: PostgresRuntimeConnection,
+    context: PostgresRuntimeContext,
+    repositories: PostgresRuntimeRepositories,
+): PostgresRuntimeServices {
+    val riskStateCommandService = ExposedRiskStateCommandService(connection.database, context.clock)
+    val safetyViolationRepository = ExposedSafetyViolationRepository(connection.database)
+    val tradingLock = PostgresGlobalTradingLock(connection.dataSource, context.clock)
+    val broker = createPostgresBroker(
+        connection = connection,
+        context = context,
+        repositories = repositories,
+        riskStateCommandService = riskStateCommandService,
+        safetyViolationRepository = safetyViolationRepository,
+    )
+    val callerNoTradeGuard = CallerNoTradeGuard(repositories.commandEventLog, context.clock)
+    val toolCallGuard = ToolCallGuard(
+        riskStateRepository = repositories.riskStateRepository,
+        commandEventLog = repositories.commandEventLog,
+        tradingLock = tradingLock,
+        clock = context.clock,
+    )
+
+    return PostgresRuntimeServices(
+        riskStateCommandService = riskStateCommandService,
+        safetyViolationRepository = safetyViolationRepository,
+        broker = broker,
+        tradingLock = tradingLock,
+        callerNoTradeGuard = callerNoTradeGuard,
+        toolCallGuard = toolCallGuard,
+    )
+}
+
+private fun createPostgresBroker(
+    connection: PostgresRuntimeConnection,
+    context: PostgresRuntimeContext,
+    repositories: PostgresRuntimeRepositories,
+    riskStateCommandService: RiskStateCommandService,
+    safetyViolationRepository: SafetyViolationRepository,
+): PaperBroker {
+    val resolvedReconcilerStatusProvider = context.reconcilerStatusProvider
+        ?: ExposedReconcilerStatusProvider(connection.database)
+
+    return PaperBroker(
+        ledgerRepository = ExposedPaperLedgerRepository(
+            database = connection.database,
+            fallbackSymbolRules = context.tradingConfig.paperMarket.toSymbolRules(context.tradingConfig.symbol),
+        ),
+        riskStateRepository = repositories.riskStateRepository,
+        riskStateCommandService = riskStateCommandService,
+        decisionRepository = repositories.decisionRepository,
+        falsificationFreshnessWindow = context.tradingConfig.decisionProtocol.falsificationFreshnessWindow,
+        safetyViolationRepository = safetyViolationRepository,
+        safetyFloor = SafetyFloor(context.tradingConfig.safetyFloor, context.clock),
+        marketDataSource = context.marketDataSource,
+        fillSimulator = FillSimulator(context.tradingConfig.paperExecution, context.clock),
+        reconcilerStatusProvider = resolvedReconcilerStatusProvider,
+        clock = context.clock,
+    )
+}
+
+/**
+ * Postgres runtime の接続 resource。
+ *
+ * @param dataSource JDBC data source
+ * @param database Exposed database
+ * @param closeDataSource runtime close 時に data source を閉じるなら true
+ */
+private data class PostgresRuntimeConnection(
+    val dataSource: HikariDataSource,
+    val database: ExposedDatabase,
+    val closeDataSource: Boolean,
+)
+
+/**
+ * Postgres runtime の構築 context。
+ *
+ * @param clock runtime clock
+ * @param reconcilerStatusProvider injected reconciler status provider
+ * @param marketDataSource injected market data source
+ * @param tradingConfig trading bot config
+ */
+private data class PostgresRuntimeContext(
+    val clock: Clock,
+    val reconcilerStatusProvider: ReconcilerStatusProvider?,
+    val marketDataSource: MarketDataSource?,
+    val tradingConfig: TradingBotConfig,
+)
+
+/**
+ * Postgres runtime の repository 群。
+ *
+ * @param riskStateRepository risk state repository
+ * @param commandEventLog command event log
+ * @param llmRunRepository LLM run repository
+ * @param equitySnapshotRepository equity snapshot repository
+ * @param evaluationRepository evaluation repository
+ * @param decisionRepository decision repository
+ */
+private data class PostgresRuntimeRepositories(
+    val riskStateRepository: ExposedRiskStateRepository,
+    val commandEventLog: ExposedCommandEventLog,
+    val llmRunRepository: ExposedLlmRunRepository,
+    val equitySnapshotRepository: ExposedEquitySnapshotRepository,
+    val evaluationRepository: ExposedEvaluationRepository,
+    val decisionRepository: ExposedDecisionRepository,
+)
+
+/**
+ * Postgres runtime の service / guard 群。
+ *
+ * @param riskStateCommandService risk state command service
+ * @param safetyViolationRepository safety violation repository
+ * @param broker broker boundary
+ * @param tradingLock global trading lock
+ * @param callerNoTradeGuard caller no-trade guard
+ * @param toolCallGuard tool call guard
+ */
+private data class PostgresRuntimeServices(
+    val riskStateCommandService: RiskStateCommandService,
+    val safetyViolationRepository: SafetyViolationRepository,
+    val broker: Broker,
+    val tradingLock: TradingLock,
+    val callerNoTradeGuard: CallerNoTradeGuard,
+    val toolCallGuard: ToolCallGuard,
+)
 
 /**
  * HikariCP の DataSource を作る。
