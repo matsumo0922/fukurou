@@ -230,6 +230,28 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun lifecycleAudit_recordsElapsedDurationMillis() = runBlocking {
+        val clock = TickingTestClock(
+            currentInstant = fixedInstant(),
+            tick = Duration.ofMillis(25),
+        )
+        val fixture = runnerFixture(clock = clock) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            }
+
+            cleanExit()
+        }
+
+        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val lifecyclePayload = fixture.eventLog.events()
+            .singleLifecyclePayload("stale_resting_entry_ttl_sweep")
+        val durationMillis = lifecyclePayload.stringValue("durationMillis").toLong()
+
+        assertTrue(durationMillis > 0)
+    }
+
+    @Test
     fun exitDecision_closesSingleOpenPositionDeterministically() = runBlocking {
         val fixture = runnerFixture { command ->
             if (command.isProposerLaunch()) {
@@ -1942,6 +1964,20 @@ private fun List<CommandEvent>.singleRunnerPhaseDetails(phase: String): JsonObje
     return payload.getValue("details").jsonObject
 }
 
+private fun List<CommandEvent>.singleLifecyclePayload(phase: String): JsonObject {
+    val event = single { event ->
+        val lifecycleCompleted = event.eventType == CommandEventType.DECISION_LIFECYCLE_COMPLETED
+        val phaseMatched = event.payload.contains("\"phase\":\"$phase\"")
+
+        lifecycleCompleted && phaseMatched
+    }
+    val payload = event.payloadJsonObject()
+
+    assertEquals(phase, payload.stringValue("phase"))
+
+    return payload
+}
+
 private fun List<CommandEvent>.singleNoTradePayload(): JsonObject {
     val event = single { event -> event.eventType == CommandEventType.NO_TRADE_EXIT }
 
@@ -2085,5 +2121,38 @@ private class MutableTestClock(
 
     fun advance(duration: Duration) {
         currentInstant = currentInstant.plus(duration)
+    }
+}
+
+/**
+ * instant() 呼び出しごとに一定量進む Clock。
+ *
+ * @param currentInstant 現在時刻
+ * @param tick 1 回の instant() で進める時間
+ * @param currentZone clock zone
+ */
+private class TickingTestClock(
+    private var currentInstant: Instant,
+    private val tick: Duration,
+    private val currentZone: ZoneId = ZoneOffset.UTC,
+) : Clock() {
+
+    override fun getZone(): ZoneId {
+        return currentZone
+    }
+
+    override fun withZone(zone: ZoneId): Clock {
+        return TickingTestClock(
+            currentInstant = currentInstant,
+            tick = tick,
+            currentZone = zone,
+        )
+    }
+
+    override fun instant(): Instant {
+        val instant = currentInstant
+        currentInstant = currentInstant.plus(tick)
+
+        return instant
     }
 }

@@ -50,7 +50,8 @@ internal class DecisionExecutionLifecycle(
      */
     suspend fun cancelExpiredRestingEntryOrders(context: DecisionRunContext): Result<List<PaperTradeResult>> {
         return runCatching {
-            val observedAt = Instant.now(clock)
+            val startedAt = Instant.now(clock)
+            val observedAt = startedAt
             val openOrders = tradingRuntime.broker.getOpenOrders().getOrThrow()
             val expiredOrders = openOrders.filter { order ->
                 order.isExpiredRestingEntryOrder(
@@ -90,6 +91,7 @@ internal class DecisionExecutionLifecycle(
             appendLifecyclePhase(
                 context = context,
                 phase = "stale_resting_entry_ttl_sweep",
+                startedAt = startedAt,
                 details = buildJsonObject {
                     put("ttlSeconds", tradingConfig.decisionProtocol.restingEntryOrderTtl.seconds)
                     put("expiredOrderCount", expiredOrders.size)
@@ -112,6 +114,7 @@ internal class DecisionExecutionLifecycle(
         context: DecisionRunContext,
         decision: DecisionSubmissionResult,
     ): DecisionLifecycleExecutionResult {
+        val startedAt = Instant.now(clock)
         val openPositions = tradingRuntime.broker.getPositions().getOrThrow()
         val openEntryOrders = openRestingEntryOrders()
         val target = resolveExitTarget(openPositions, openEntryOrders)
@@ -121,6 +124,7 @@ internal class DecisionExecutionLifecycle(
                 context = context,
                 phase = "exit_execution",
                 failure = target.failure,
+                startedAt = startedAt,
             ).getOrThrow()
             recordNoTrade(context, target.failure.reason, null).getOrThrow()
 
@@ -146,6 +150,7 @@ internal class DecisionExecutionLifecycle(
                 context = context,
                 phase = "exit_execution",
                 failure = DecisionLifecycleFailure("exit_execution_failed"),
+                startedAt = startedAt,
             ).getOrThrow()
             recordNoTrade(context, "exit_execution_failed", throwable).getOrThrow()
 
@@ -160,6 +165,7 @@ internal class DecisionExecutionLifecycle(
             phase = "exit_execution",
             operation = target.operationName,
             result = result,
+            startedAt = startedAt,
         ).getOrThrow()
 
         return DecisionLifecycleExecutionResult(
@@ -175,6 +181,7 @@ internal class DecisionExecutionLifecycle(
         context: DecisionRunContext,
         decision: DecisionSubmissionResult,
     ): DecisionLifecycleExecutionResult {
+        val startedAt = Instant.now(clock)
         val openPositions = tradingRuntime.broker.getPositions().getOrThrow()
         val targetPosition = openPositions.singleOrNull()
         val failClosedFailure = adjustProtectionFailClosedFailure(decision, openPositions, targetPosition)
@@ -184,6 +191,7 @@ internal class DecisionExecutionLifecycle(
                 context = context,
                 phase = "adjust_protection_execution",
                 failure = failClosedFailure,
+                startedAt = startedAt,
             ).getOrThrow()
             recordNoTrade(context, failClosedFailure.reason, null).getOrThrow()
 
@@ -206,6 +214,7 @@ internal class DecisionExecutionLifecycle(
                 context = context,
                 phase = "adjust_protection_execution",
                 failure = DecisionLifecycleFailure("adjust_protection_execution_failed"),
+                startedAt = startedAt,
             ).getOrThrow()
             recordNoTrade(context, "adjust_protection_execution_failed", throwable).getOrThrow()
 
@@ -220,6 +229,7 @@ internal class DecisionExecutionLifecycle(
             phase = "adjust_protection_execution",
             operation = "update_protection",
             result = result,
+            startedAt = startedAt,
         ).getOrThrow()
 
         return DecisionLifecycleExecutionResult(
@@ -470,10 +480,12 @@ internal class DecisionExecutionLifecycle(
         phase: String,
         operation: String,
         result: PaperTradeResult,
+        startedAt: Instant,
     ): Result<Unit> {
         return appendLifecyclePhase(
             context = context,
             phase = phase,
+            startedAt = startedAt,
             details = buildJsonObject {
                 put("operation", operation)
                 put("accepted", result.accepted)
@@ -488,10 +500,12 @@ internal class DecisionExecutionLifecycle(
         context: DecisionRunContext,
         phase: String,
         failure: DecisionLifecycleFailure,
+        startedAt: Instant,
     ): Result<Unit> {
         return appendLifecyclePhase(
             context = context,
             phase = phase,
+            startedAt = startedAt,
             details = buildJsonObject {
                 put("accepted", false)
                 put("reason", failure.reason)
@@ -503,11 +517,16 @@ internal class DecisionExecutionLifecycle(
     private suspend fun appendLifecyclePhase(
         context: DecisionRunContext,
         phase: String,
+        startedAt: Instant,
         details: JsonObject,
     ): Result<Unit> {
+        val occurredAt = Instant.now(clock)
+        val durationMillis = Duration.between(startedAt, occurredAt)
+            .toMillis()
+            .coerceAtLeast(0L)
         val payload = buildJsonObject {
             put("phase", phase)
-            put("durationMillis", 0)
+            put("durationMillis", durationMillis)
             put("details", details)
         }.toString()
 
@@ -519,7 +538,7 @@ internal class DecisionExecutionLifecycle(
                 clientRequestId = context.decisionRunId,
                 eventType = CommandEventType.DECISION_LIFECYCLE_COMPLETED,
                 payload = payload,
-                occurredAt = Instant.now(clock),
+                occurredAt = occurredAt,
             ),
         )
     }
