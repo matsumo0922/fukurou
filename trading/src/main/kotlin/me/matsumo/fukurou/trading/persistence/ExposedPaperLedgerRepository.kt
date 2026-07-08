@@ -3,20 +3,16 @@ package me.matsumo.fukurou.trading.persistence
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
-import me.matsumo.fukurou.trading.broker.CancelOrderCommand
-import me.matsumo.fukurou.trading.broker.ClosePositionCommand
-import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
-import me.matsumo.fukurou.trading.broker.MarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.OpenOrdersWithUpdatedAt
-import me.matsumo.fukurou.trading.broker.PaperReconcileResult
+import me.matsumo.fukurou.trading.broker.PaperLedgerAccountRepository
+import me.matsumo.fukurou.trading.broker.PaperLedgerExecutionRepository
+import me.matsumo.fukurou.trading.broker.PaperLedgerHistoryRepository
+import me.matsumo.fukurou.trading.broker.PaperLedgerMutationRepository
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
-import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
-import me.matsumo.fukurou.trading.broker.SimulatedFill
-import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.PaperMarketConfig
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
@@ -33,7 +29,6 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
-import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
@@ -581,179 +576,148 @@ private val TradingDateZone = ZoneId.of("Asia/Tokyo")
 private const val MAX_EXECUTIONS_PER_CLOSED_POSITION = 32
 
 /**
- * Exposed/JDBC で paper ledger を読む repository。
+ * Exposed/JDBC で paper ledger の account / position / order を読む repository。
  *
  * @param database Exposed database
- * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  */
-class ExposedPaperLedgerRepository(
+private class ExposedPaperLedgerAccountReader(
     private val database: ExposedDatabase,
-    fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
-) : IntentConsumingPaperLedgerRepository {
-
-    private val writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules)
-
+) : PaperLedgerAccountRepository {
     override suspend fun getAccountSnapshot(): Result<AccountSnapshot> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    selectPaperAccount()
-                }
-            }
-        }
+        return readLedgerResult(database) { selectPaperAccount() }
     }
 
     override suspend fun getAccountSnapshotWithUpdatedAt(): Result<AccountSnapshotWithUpdatedAt> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    selectPaperAccountWithUpdatedAt()
-                }
-            }
-        }
+        return readLedgerResult(database) { selectPaperAccountWithUpdatedAt() }
     }
 
     override suspend fun getOpenPositions(): Result<List<Position>> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    selectOpenPositions()
-                }
-            }
-        }
+        return readLedgerResult(database) { selectOpenPositions() }
     }
 
     override suspend fun getOpenPositionsWithUpdatedAt(): Result<PositionsWithUpdatedAt> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    selectOpenPositionsWithUpdatedAt()
-                }
-            }
-        }
+        return readLedgerResult(database) { selectOpenPositionsWithUpdatedAt() }
     }
 
     override suspend fun getOpenOrders(): Result<List<Order>> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    selectOpenOrders()
-                }
-            }
-        }
+        return readLedgerResult(database) { selectOpenOrders() }
     }
 
     override suspend fun getOpenOrdersWithUpdatedAt(): Result<OpenOrdersWithUpdatedAt> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    selectOpenOrdersWithUpdatedAt()
-                }
-            }
-        }
+        return readLedgerResult(database) { selectOpenOrdersWithUpdatedAt() }
     }
 
     override suspend fun getRealizedPnlForDate(date: LocalDate): Result<BigDecimal> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    selectRealizedPnlForDate(date)
-                }
-            }
-        }
+        return readLedgerResult(database) { selectRealizedPnlForDate(date) }
     }
+}
 
+/**
+ * Exposed/JDBC で paper ledger の execution を読む repository。
+ *
+ * @param database Exposed database
+ */
+private class ExposedPaperLedgerExecutionReader(
+    private val database: ExposedDatabase,
+) : PaperLedgerExecutionRepository {
     override suspend fun getExecutions(): Result<List<Execution>> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    selectExecutions()
-                }
-            }
-        }
+        return readLedgerResult(database) { selectExecutions() }
     }
 
     override suspend fun getRecentExecutions(limit: Int): Result<List<Execution>> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
+        return readLedgerResult(
+            database = database,
+            beforeRead = {
                 require(limit > 0) {
                     "limit must be greater than 0."
                 }
-
-                exposedTransaction(database) {
-                    selectRecentExecutions(limit)
-                }
-            }
-        }
+            },
+        ) { selectRecentExecutions(limit) }
     }
 
     override suspend fun findExecutionsBefore(before: Instant, limit: Int): Result<List<Execution>> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
+        return readLedgerResult(
+            database = database,
+            beforeRead = {
                 require(limit > 0) {
                     "limit must be greater than 0."
                 }
-
-                exposedTransaction(database) {
-                    selectExecutionsBefore(before, limit)
-                }
-            }
-        }
+            },
+        ) { selectExecutionsBefore(before, limit) }
     }
 
     override suspend fun findExecutionsForStableFeed(cursor: StableFeedCursor, limit: Int): Result<List<Execution>> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
+        return readLedgerResult(
+            database = database,
+            beforeRead = {
                 require(limit > 0) {
                     "limit must be greater than 0."
                 }
-
-                exposedTransaction(database) {
-                    selectExecutionsForStableFeed(cursor, limit)
-                }
-            }
-        }
+            },
+        ) { selectExecutionsForStableFeed(cursor, limit) }
     }
+}
 
+/**
+ * Exposed/JDBC で paper ledger の履歴系読み取りを行う repository。
+ *
+ * @param database Exposed database
+ */
+private class ExposedPaperLedgerHistoryReader(
+    private val database: ExposedDatabase,
+) : PaperLedgerHistoryRepository {
     override suspend fun findClosedPositionsClosedBetween(
         from: Instant,
         toExclusive: Instant,
         limit: Int,
     ): Result<List<ClosedPaperPosition>> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
+        return readLedgerResult(
+            database = database,
+            beforeRead = {
                 require(limit > 0) {
                     "limit must be greater than 0."
                 }
-
-                exposedTransaction(database) {
-                    selectClosedPositionsClosedBetween(
-                        from = from,
-                        toExclusive = toExclusive,
-                        limit = limit,
-                    )
-                }
-            }
+            },
+        ) {
+            selectClosedPositionsClosedBetween(
+                from = from,
+                toExclusive = toExclusive,
+                limit = limit,
+            )
         }
     }
 
     override suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    findPlaceOrderResultByClientRequestId(clientRequestId)
-                }
-            }
-        }
+        return readLedgerResult(database) { findPlaceOrderResultByClientRequestId(clientRequestId) }
     }
+}
 
-    override suspend fun fillMarketEntry(request: MarketEntryFillRequest): Result<PaperTradeResult> {
-        return writer.fillMarketEntry(request)
-    }
+/**
+ * Exposed/JDBC で paper ledger を読む repository。
+ *
+ * @param database Exposed database
+ * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
+ */
+class ExposedPaperLedgerRepository private constructor(
+    private val writer: ExposedPaperLedgerWriter,
+    accountRepository: PaperLedgerAccountRepository,
+    executionRepository: PaperLedgerExecutionRepository,
+    historyRepository: PaperLedgerHistoryRepository,
+) : IntentConsumingPaperLedgerRepository,
+    PaperLedgerAccountRepository by accountRepository,
+    PaperLedgerExecutionRepository by executionRepository,
+    PaperLedgerHistoryRepository by historyRepository,
+    PaperLedgerMutationRepository by writer {
 
-    override suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
-        return writer.createRestingEntryOrder(request)
-    }
+    constructor(
+        database: ExposedDatabase,
+        fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
+    ) : this(
+        writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules),
+        accountRepository = ExposedPaperLedgerAccountReader(database),
+        executionRepository = ExposedPaperLedgerExecutionReader(database),
+        historyRepository = ExposedPaperLedgerHistoryReader(database),
+    )
 
     override suspend fun fillMarketEntryAndConsumeIntent(
         request: IntentConsumingMarketEntryFillRequest,
@@ -766,26 +730,21 @@ class ExposedPaperLedgerRepository(
     ): Result<PaperTradeResult> {
         return writer.createRestingEntryOrderAndConsumeIntent(request)
     }
+}
 
-    override suspend fun closePosition(
-        command: ClosePositionCommand,
-        positionId: UUID,
-        orderId: UUID,
-        fill: SimulatedFill,
-    ): Result<PaperTradeResult> {
-        return writer.closePosition(command, positionId, orderId, fill)
-    }
+private suspend fun <T> readLedgerResult(
+    database: ExposedDatabase,
+    beforeRead: () -> Unit = {},
+    read: JdbcTransaction.() -> T,
+): Result<T> {
+    return withContext(Dispatchers.IO) {
+        runCatching {
+            beforeRead()
 
-    override suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult> {
-        return writer.updateProtection(command)
-    }
-
-    override suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult> {
-        return writer.cancelOrder(command)
-    }
-
-    override suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult> {
-        return writer.reconcile(tickSnapshot, simulator)
+            exposedTransaction(database) {
+                read()
+            }
+        }
     }
 }
 
