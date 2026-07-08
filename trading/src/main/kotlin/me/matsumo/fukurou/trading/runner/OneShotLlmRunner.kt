@@ -437,7 +437,6 @@ class OneShotLlmRunner(
     }
 
     private suspend fun runOneShotAfterPreflight(input: OneShotAfterPreflightRequest): OneShotRunnerResult {
-        val request = input.request
         val invocationId = input.invocationId
         val proposerContext = input.proposerContext
         val proposerResult = proposerDecision(input)
