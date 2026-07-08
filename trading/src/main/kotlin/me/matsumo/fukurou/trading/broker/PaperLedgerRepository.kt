@@ -13,9 +13,9 @@ import java.time.LocalDate
 import java.util.UUID
 
 /**
- * paper ledger の読み書き repository。
+ * paper ledger の account / position / order 読み取り repository。
  */
-interface PaperLedgerRepository {
+interface PaperLedgerAccountRepository {
     /**
      * paper account の残高 snapshot を返す。
      */
@@ -50,7 +50,12 @@ interface PaperLedgerRepository {
      * 指定日の実現損益合計を返す。
      */
     suspend fun getRealizedPnlForDate(date: LocalDate): Result<BigDecimal>
+}
 
+/**
+ * paper ledger の execution 読み取り repository。
+ */
+interface PaperLedgerExecutionRepository {
     /**
      * execution ledger の読み取りを返す。
      */
@@ -70,7 +75,12 @@ interface PaperLedgerRepository {
      * 安定 cursor 条件に一致する execution ledger の行を Activity timeline 用に新しい順で取得する。
      */
     suspend fun findExecutionsForStableFeed(cursor: StableFeedCursor, limit: Int): Result<List<Execution>>
+}
 
+/**
+ * paper ledger の closed position / 冪等 result 読み取り repository。
+ */
+interface PaperLedgerHistoryRepository {
     /**
      * 指定範囲に close された position と関連 executions を返す。
      */
@@ -84,7 +94,12 @@ interface PaperLedgerRepository {
      * client_request_id に対応する既存 place_order 結果を返す。
      */
     suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?>
+}
 
+/**
+ * paper ledger の mutation repository。
+ */
+interface PaperLedgerMutationRepository {
     /**
      * MARKET entry を約定済みとして保存し、保護 STOP を作成する。
      */
@@ -130,6 +145,15 @@ interface PaperLedgerRepository {
      */
     suspend fun reconcile(tickSnapshot: TickSnapshot, simulator: FillSimulator): Result<PaperReconcileResult>
 }
+
+/**
+ * paper ledger の読み書き repository。
+ */
+interface PaperLedgerRepository :
+    PaperLedgerAccountRepository,
+    PaperLedgerExecutionRepository,
+    PaperLedgerHistoryRepository,
+    PaperLedgerMutationRepository
 
 /**
  * entry order と intent consumption を同一 commit 境界で保存できる paper ledger repository。

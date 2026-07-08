@@ -26,11 +26,9 @@
     <ID>LongParameterList:PaperLedgerRepository.kt$IntentConsumingPaperLedgerRepository$( command: PlaceOrderCommand, fill: SimulatedFill, positionId: UUID, tradeGroupId: UUID, stopOrderId: UUID, intentId: UUID, consumedAt: Instant, )</ID>
     <ID>LongParameterList:SafetyFloor.kt$( symbolText: String, sideText: String, orderTypeText: String, sizeBtc: BigDecimal, priceJpy: BigDecimal?, protectiveStopPriceJpy: BigDecimal, takeProfitPriceJpy: BigDecimal?, )</ID>
     <ID>LongParameterList:SafetyFloor.kt$SafetyFloor$( commandName: String, command: Any, rule: SafetyFloorRule, messageJa: String, measuredValue: String, limitValue: String, hardHaltRequired: Boolean = false, )</ID>
-    <ID>TooManyFunctions:Broker.kt$Broker</ID>
     <ID>TooManyFunctions:ExposedPaperLedgerRepository.kt$ExposedPaperLedgerRepository : IntentConsumingPaperLedgerRepository</ID>
     <ID>TooManyFunctions:InMemoryDecisionRepository.kt$InMemoryDecisionRepository : AtomicIntentConsumptionRepository</ID>
     <ID>TooManyFunctions:InMemoryPaperLedgerRepository.kt$InMemoryPaperLedgerRepository : PaperLedgerRepository</ID>
     <ID>TooManyFunctions:PaperBroker.kt$PaperBroker : Broker</ID>
-    <ID>TooManyFunctions:PaperLedgerRepository.kt$PaperLedgerRepository</ID>
   </CurrentIssues>
 </SmellBaseline>
