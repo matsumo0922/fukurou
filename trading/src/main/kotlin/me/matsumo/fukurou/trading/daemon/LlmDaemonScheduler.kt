@@ -318,7 +318,7 @@ class LlmDaemonScheduler(
 
     private suspend fun selectTrigger(hasOpenRisk: Boolean, observedAt: Instant): LlmDaemonTrigger? {
         if (hasOpenRisk) {
-            val marketEvaluation = marketEvaluationIfNeeded(hasOpenRisk, observedAt)
+            val marketEvaluation = marketEvaluationIfNeeded(true, observedAt)
 
             return stopProximityTriggerIfDue(marketEvaluation, observedAt)
                 ?: priceMoveTriggerIfDue(marketEvaluation, observedAt)
@@ -331,7 +331,7 @@ class LlmDaemonScheduler(
             return eventTrigger
         }
 
-        val marketEvaluation = marketEvaluationIfNeeded(hasOpenRisk, observedAt)
+        val marketEvaluation = marketEvaluationIfNeeded(false, observedAt)
 
         return priceMoveTriggerIfDue(marketEvaluation, observedAt)
             ?: flatHeartbeatTriggerIfDue(observedAt)

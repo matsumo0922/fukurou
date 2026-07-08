@@ -354,10 +354,10 @@ internal class DecisionExecutionLifecycle(
                 ),
             )
         }
-        if (openPositions.isEmpty() && openEntryOrders.size == 1) {
+        if (openEntryOrders.size == 1) {
             return ExitExecutionTarget.CancelEntryOrder(openEntryOrders.single())
         }
-        if (openPositions.isEmpty() && openEntryOrders.isEmpty()) {
+        if (openEntryOrders.isEmpty()) {
             return ExitExecutionTarget.FailClosed(
                 exitFailure(
                     reason = "exit_target_not_found",

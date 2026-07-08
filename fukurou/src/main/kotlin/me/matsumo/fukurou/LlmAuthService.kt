@@ -617,17 +617,16 @@ class DefaultLlmAuthService(
 
     private suspend fun waitForProcess(session: MutableLlmAuthLoginSession, reason: String) {
         val completed = session.process.waitFor(config.loginTimeout.toMillis(), TimeUnit.MILLISECONDS)
-        val status = if (completed) {
-            if (session.process.exitValue() == 0) LlmAuthLoginStatus.SUCCEEDED else LlmAuthLoginStatus.FAILED
+        val (status, eventType) = if (completed) {
+            if (session.process.exitValue() == 0) {
+                LlmAuthLoginStatus.SUCCEEDED to CommandEventType.CLI_AUTH_LOGIN_COMPLETED
+            } else {
+                LlmAuthLoginStatus.FAILED to CommandEventType.CLI_AUTH_LOGIN_FAILED
+            }
         } else {
             session.destroyProcess()
-            LlmAuthLoginStatus.TIMED_OUT
-        }
-        val eventType = when (status) {
-            LlmAuthLoginStatus.SUCCEEDED -> CommandEventType.CLI_AUTH_LOGIN_COMPLETED
-            LlmAuthLoginStatus.FAILED -> CommandEventType.CLI_AUTH_LOGIN_FAILED
-            LlmAuthLoginStatus.TIMED_OUT -> CommandEventType.CLI_AUTH_LOGIN_TIMED_OUT
-            LlmAuthLoginStatus.RUNNING -> CommandEventType.CLI_AUTH_LOGIN_STARTED
+
+            LlmAuthLoginStatus.TIMED_OUT to CommandEventType.CLI_AUTH_LOGIN_TIMED_OUT
         }
 
         session.complete(status)
