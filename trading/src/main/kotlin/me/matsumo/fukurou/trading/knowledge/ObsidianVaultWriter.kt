@@ -740,7 +740,7 @@ private const val FRONTMATTER_START = "---\n"
 private const val FRONTMATTER_END = "\n---\n"
 
 /**
- * YAML double quoted scalar にそのまま入れない制御文字の境界。
+ * YAML double-quoted scalar にそのまま入れない制御文字の境界。
  */
 private const val YAML_CONTROL_CHARACTER_BOUNDARY = 0x20
 
