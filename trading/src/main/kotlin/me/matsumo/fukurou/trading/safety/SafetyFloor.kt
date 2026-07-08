@@ -8,15 +8,10 @@ import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.EntryIntentSafetySnapshot
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
-import me.matsumo.fukurou.trading.domain.OrderSide
-import me.matsumo.fukurou.trading.domain.OrderStatus
-import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
-import me.matsumo.fukurou.trading.domain.requiredCashFor
-import me.matsumo.fukurou.trading.domain.roundTripCostReserveFor
 import me.matsumo.fukurou.trading.domain.unsafeOrderFeeRateReasonOrNull
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
@@ -338,6 +333,23 @@ data class SafetyViolation(
 )
 
 /**
+ * SafetyFloor 拒否理由の rule と比較値。
+ *
+ * @param rule 違反した rule
+ * @param messageJa 呼び出し元向け日本語 message
+ * @param measuredValue 実測または申告された値
+ * @param limitValue 安全床の上限または下限
+ * @param hardHaltRequired HARD_HALT と掃引が必要か
+ */
+private data class SafetyViolationDetails(
+    val rule: SafetyFloorRule,
+    val messageJa: String,
+    val measuredValue: String,
+    val limitValue: String,
+    val hardHaltRequired: Boolean = false,
+)
+
+/**
  * place_order / preview_order の SafetyFloor 計算詳細。
  *
  * @param estimatedEntryPriceJpy SafetyFloor が見積もった entry 価格
@@ -375,19 +387,6 @@ data class SafetyFloorPlaceOrderRiskDetails(
 )
 
 /**
- * EV 計算の途中結果。
- *
- * @param expectedValueR EV の R 倍
- * @param probabilityUsed EV 計算に使った勝率
- * @param probabilityCapApplied データ鮮度 cap が適用されたか
- */
-private data class ExpectedValueDetails(
-    val expectedValueR: BigDecimal,
-    val probabilityUsed: BigDecimal,
-    val probabilityCapApplied: Boolean,
-)
-
-/**
  * Broker 副作用の手前で強制する安全床。
  *
  * @param config 安全床しきい値
@@ -397,6 +396,7 @@ class SafetyFloor(
     private val config: SafetyFloorConfig = SafetyFloorConfig(),
     private val clock: Clock = Clock.systemUTC(),
 ) {
+    private val riskCalculator = SafetyFloorRiskCalculator(config, clock)
 
     /**
      * place_order の entry intent を検証する。
@@ -425,42 +425,7 @@ class SafetyFloor(
         command: PlaceOrderCommand,
         context: SafetyFloorContext,
     ): SafetyFloorPlaceOrderRiskDetails {
-        val targetTradeGroupId = command.tradeGroupId?.toString()
-        val estimatedEntryPrice = estimatedEntryPrice(command, context)
-        val groupRiskBeforeOrder = groupRiskBeforeOrder(context, targetTradeGroupId)
-        val orderRisk = orderRisk(command, context)
-        val groupRiskAfterOrder = groupRiskBeforeOrder.add(orderRisk).safetyScale()
-        val maxRiskPerTrade = context.account.totalEquityJpy.toBigDecimal()
-            .multiply(config.maxRiskPerTradeRatio)
-            .safetyScale()
-        val currentExposure = currentExposure(context)
-        val orderExposure = orderExposure(command, context)
-        val totalExposureAfterOrder = currentExposure.add(orderExposure).safetyScale()
-        val maxTotalExposure = context.account.totalEquityJpy.toBigDecimal()
-            .multiply(config.maxTotalExposureRatio)
-            .safetyScale()
-        val expectedValueDetails = expectedValueDetailsOrNull(command, context)
-
-        return SafetyFloorPlaceOrderRiskDetails(
-            estimatedEntryPriceJpy = estimatedEntryPrice.toPlainString(),
-            orderRiskJpy = orderRisk.toPlainString(),
-            groupRiskBeforeOrderJpy = groupRiskBeforeOrder.toPlainString(),
-            groupRiskAfterOrderJpy = groupRiskAfterOrder.toPlainString(),
-            maxRiskPerTradeJpy = maxRiskPerTrade.toPlainString(),
-            currentExposureJpy = currentExposure.toPlainString(),
-            orderExposureJpy = orderExposure.toPlainString(),
-            totalExposureAfterOrderJpy = totalExposureAfterOrder.toPlainString(),
-            maxTotalExposureJpy = maxTotalExposure.toPlainString(),
-            availableCashJpy = availableCash(context).toPlainString(),
-            requiredCashJpy = orderRequiredCash(command, context).toPlainString(),
-            expectedValueR = expectedValueDetails?.expectedValueR?.toPlainString(),
-            expectedMoveToCostRatio = expectedMoveToCostRatioOrNull(command, context)?.toPlainString(),
-            probabilityUsedForExpectedValue = expectedValueDetails
-                ?.probabilityUsed
-                ?.toPlainString()
-                ?: command.estimatedWinProbability.toPlainString(),
-            probabilityCapApplied = expectedValueDetails?.probabilityCapApplied ?: false,
-        )
+        return riskCalculator.placeOrderRiskDetails(command, context)
     }
 
     /**
@@ -542,11 +507,13 @@ class SafetyFloor(
         return violation(
             commandName = commandName,
             command = command,
-            rule = SafetyFloorRule.MAX_DRAWDOWN_HALT,
-            messageJa = "最大 DD が HARD_HALT 閾値に到達したため、全注文取消と全建玉 close を実行して取引を停止します。",
-            measuredValue = measuredDrawdown.toPlainString(),
-            limitValue = config.maxDrawdownRatio.toPlainString(),
-            hardHaltRequired = true,
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.MAX_DRAWDOWN_HALT,
+                messageJa = "最大 DD が HARD_HALT 閾値に到達したため、全注文取消と全建玉 close を実行して取引を停止します。",
+                measuredValue = measuredDrawdown.toPlainString(),
+                limitValue = config.maxDrawdownRatio.toPlainString(),
+                hardHaltRequired = true,
+            ),
         )
     }
 
@@ -558,10 +525,12 @@ class SafetyFloor(
         return violation(
             commandName = "place_order",
             command = command,
-            rule = SafetyFloorRule.SOFT_HALT_ENTRY_BLOCKED,
-            messageJa = "SOFT_HALT 中のため、新規 entry は拒否します。",
-            measuredValue = RiskHaltState.SOFT_HALT.name,
-            limitValue = RiskHaltState.RUNNING.name,
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.SOFT_HALT_ENTRY_BLOCKED,
+                messageJa = "SOFT_HALT 中のため、新規 entry は拒否します。",
+                measuredValue = RiskHaltState.SOFT_HALT.name,
+                limitValue = RiskHaltState.RUNNING.name,
+            ),
         )
     }
 
@@ -570,29 +539,35 @@ class SafetyFloor(
             ?: return violation(
                 commandName = "place_order",
                 command = command,
-                rule = SafetyFloorRule.MISSING_FRESH_FALSIFICATION,
-                messageJa = "intent_id がないため、新規 entry は拒否します。",
-                measuredValue = "null",
-                limitValue = "fresh_approved_intent_required",
+                details = SafetyViolationDetails(
+                    rule = SafetyFloorRule.MISSING_FRESH_FALSIFICATION,
+                    messageJa = "intent_id がないため、新規 entry は拒否します。",
+                    measuredValue = "null",
+                    limitValue = "fresh_approved_intent_required",
+                ),
             )
         val snapshot = context.entryIntent
             ?: return violation(
                 commandName = "place_order",
                 command = command,
-                rule = SafetyFloorRule.MISSING_FRESH_FALSIFICATION,
-                messageJa = "指定された intent_id に対応する fresh APPROVED falsification がありません。",
-                measuredValue = intentId.toString(),
-                limitValue = "fresh_approved_intent_required",
+                details = SafetyViolationDetails(
+                    rule = SafetyFloorRule.MISSING_FRESH_FALSIFICATION,
+                    messageJa = "指定された intent_id に対応する fresh APPROVED falsification がありません。",
+                    measuredValue = intentId.toString(),
+                    limitValue = "fresh_approved_intent_required",
+                ),
             )
 
         if (snapshot.consumed) {
             return violation(
                 commandName = "place_order",
                 command = command,
-                rule = SafetyFloorRule.INTENT_CONSUMED,
-                messageJa = "指定された intent_id は既に消費済みです。",
-                measuredValue = intentId.toString(),
-                limitValue = "unused_intent_required",
+                details = SafetyViolationDetails(
+                    rule = SafetyFloorRule.INTENT_CONSUMED,
+                    messageJa = "指定された intent_id は既に消費済みです。",
+                    measuredValue = intentId.toString(),
+                    limitValue = "unused_intent_required",
+                ),
             )
         }
         if (!snapshot.freshApproved) {
@@ -601,10 +576,12 @@ class SafetyFloor(
             return violation(
                 commandName = "place_order",
                 command = command,
-                rule = SafetyFloorRule.MISSING_FRESH_FALSIFICATION,
-                messageJa = "fresh な APPROVED falsification がないため、新規 entry は拒否します。",
-                measuredValue = verdict,
-                limitValue = "fresh_approved",
+                details = SafetyViolationDetails(
+                    rule = SafetyFloorRule.MISSING_FRESH_FALSIFICATION,
+                    messageJa = "fresh な APPROVED falsification がないため、新規 entry は拒否します。",
+                    measuredValue = verdict,
+                    limitValue = "fresh_approved",
+                ),
             )
         }
 
@@ -636,15 +613,17 @@ class SafetyFloor(
         return violation(
             commandName = "place_order",
             command = command,
-            rule = SafetyFloorRule.INTENT_MISMATCH,
-            messageJa = "entry intent の宣言値と place_order の実引数が一致しません。",
-            measuredValue = command.intentComparisonValue(),
-            limitValue = intent.intentComparisonValue(),
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.INTENT_MISMATCH,
+                messageJa = "entry intent の宣言値と place_order の実引数が一致しません。",
+                measuredValue = command.intentComparisonValue(),
+                limitValue = intent.intentComparisonValue(),
+            ),
         )
     }
 
     private fun validateStopLoss(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
-        val entryPrice = estimatedEntryPrice(command, context)
+        val entryPrice = riskCalculator.estimatedEntryPrice(command, context)
         val stopPrice = command.protectiveStopPriceJpy
         val stopLossValid = stopPrice > BigDecimal.ZERO && stopPrice < entryPrice
 
@@ -655,10 +634,12 @@ class SafetyFloor(
         return violation(
             commandName = "place_order",
             command = command,
-            rule = SafetyFloorRule.STOP_LOSS_REQUIRED,
-            messageJa = "protective_stop_price_jpy は long entry の想定 entry 価格より下に必須です。",
-            measuredValue = stopPrice.toPlainString(),
-            limitValue = "entry_price_below_${entryPrice.toPlainString()}",
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.STOP_LOSS_REQUIRED,
+                messageJa = "protective_stop_price_jpy は long entry の想定 entry 価格より下に必須です。",
+                measuredValue = stopPrice.toPlainString(),
+                limitValue = "entry_price_below_${entryPrice.toPlainString()}",
+            ),
         )
     }
 
@@ -674,17 +655,19 @@ class SafetyFloor(
         return violation(
             commandName = "place_order",
             command = command,
-            rule = SafetyFloorRule.NO_AVERAGING_DOWN,
-            messageJa = "含み損の BTC long に対する買い増しはナンピンとして拒否します。",
-            measuredValue = losingPosition.unrealizedPnlJpy,
-            limitValue = ">=0",
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.NO_AVERAGING_DOWN,
+                messageJa = "含み損の BTC long に対する買い増しはナンピンとして拒否します。",
+                measuredValue = losingPosition.unrealizedPnlJpy,
+                limitValue = ">=0",
+            ),
         )
     }
 
     private fun validateGroupRisk(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
         val targetTradeGroupId = command.tradeGroupId?.toString()
-        val groupRisk = groupRiskBeforeOrder(context, targetTradeGroupId)
-            .add(orderRisk(command, context))
+        val groupRisk = riskCalculator.groupRiskBeforeOrder(context, targetTradeGroupId)
+            .add(riskCalculator.orderRisk(command, context))
             .safetyScale()
         val limit = context.account.totalEquityJpy.toBigDecimal()
             .multiply(config.maxRiskPerTradeRatio)
@@ -697,16 +680,18 @@ class SafetyFloor(
         return violation(
             commandName = "place_order",
             command = command,
-            rule = SafetyFloorRule.MAX_RISK_PER_TRADE,
-            messageJa = "trade group の最大損失見積もりが equity の 2% を超えています。",
-            measuredValue = groupRisk.toPlainString(),
-            limitValue = limit.toPlainString(),
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.MAX_RISK_PER_TRADE,
+                messageJa = "trade group の最大損失見積もりが equity の 2% を超えています。",
+                measuredValue = groupRisk.toPlainString(),
+                limitValue = limit.toPlainString(),
+            ),
         )
     }
 
     private fun validateTotalExposure(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
-        val exposureAfterOrder = currentExposure(context)
-            .add(orderExposure(command, context))
+        val exposureAfterOrder = riskCalculator.currentExposure(context)
+            .add(riskCalculator.orderExposure(command, context))
             .safetyScale()
         val limit = context.account.totalEquityJpy.toBigDecimal()
             .multiply(config.maxTotalExposureRatio)
@@ -719,10 +704,12 @@ class SafetyFloor(
         return violation(
             commandName = "place_order",
             command = command,
-            rule = SafetyFloorRule.MAX_TOTAL_EXPOSURE,
-            messageJa = "合計 exposure が equity の 80% 上限を超えています。",
-            measuredValue = exposureAfterOrder.toPlainString(),
-            limitValue = limit.toPlainString(),
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.MAX_TOTAL_EXPOSURE,
+                messageJa = "合計 exposure が equity の 80% 上限を超えています。",
+                measuredValue = exposureAfterOrder.toPlainString(),
+                limitValue = limit.toPlainString(),
+            ),
         )
     }
 
@@ -738,10 +725,12 @@ class SafetyFloor(
             return violation(
                 commandName = "place_order",
                 command = command,
-                rule = SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT,
-                messageJa = "取引所 fee rate が SafetyFloor の許容範囲外です。",
-                measuredValue = measuredFeeRates,
-                limitValue = config.maxTakerFeeRatio.toPlainString(),
+                details = SafetyViolationDetails(
+                    rule = SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT,
+                    messageJa = "取引所 fee rate が SafetyFloor の許容範囲外です。",
+                    measuredValue = measuredFeeRates,
+                    limitValue = config.maxTakerFeeRatio.toPlainString(),
+                ),
             )
         }
 
@@ -749,8 +738,8 @@ class SafetyFloor(
     }
 
     private fun validateBalanceAndCost(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
-        val availableCash = availableCash(context)
-        val requiredCash = orderRequiredCash(command, context)
+        val availableCash = riskCalculator.availableCash(context)
+        val requiredCash = riskCalculator.orderRequiredCash(command, context)
         if (requiredCash <= availableCash) {
             return null
         }
@@ -758,10 +747,12 @@ class SafetyFloor(
         return violation(
             commandName = "place_order",
             command = command,
-            rule = SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT,
-            messageJa = "paper JPY 残高と未約定買い予約を超える発注は拒否します。",
-            measuredValue = requiredCash.toPlainString(),
-            limitValue = availableCash.toPlainString(),
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT,
+                messageJa = "paper JPY 残高と未約定買い予約を超える発注は拒否します。",
+                measuredValue = requiredCash.toPlainString(),
+                limitValue = availableCash.toPlainString(),
+            ),
         )
     }
 
@@ -773,10 +764,12 @@ class SafetyFloor(
             return violation(
                 commandName = "place_order",
                 command = command,
-                rule = SafetyFloorRule.INVALID_WIN_PROBABILITY,
-                messageJa = "estimated_win_probability は 0 以上 1 以下である必要があります。",
-                measuredValue = probability.toPlainString(),
-                limitValue = "0..1",
+                details = SafetyViolationDetails(
+                    rule = SafetyFloorRule.INVALID_WIN_PROBABILITY,
+                    messageJa = "estimated_win_probability は 0 以上 1 以下である必要があります。",
+                    measuredValue = probability.toPlainString(),
+                    limitValue = "0..1",
+                ),
             )
         }
 
@@ -784,12 +777,14 @@ class SafetyFloor(
             ?: return violation(
                 commandName = "place_order",
                 command = command,
-                rule = SafetyFloorRule.MISSING_TARGET_PRICE,
-                messageJa = "take_profit_price_jpy がないため、EV を計算できない entry は拒否します。",
-                measuredValue = "null",
-                limitValue = "required",
+                details = SafetyViolationDetails(
+                    rule = SafetyFloorRule.MISSING_TARGET_PRICE,
+                    messageJa = "take_profit_price_jpy がないため、EV を計算できない entry は拒否します。",
+                    measuredValue = "null",
+                    limitValue = "required",
+                ),
             )
-        val expectedValueDetails = expectedValueDetails(command, context, takeProfitPrice)
+        val expectedValueDetails = riskCalculator.expectedValueDetails(command, context, takeProfitPrice)
         val expectedValueR = expectedValueDetails.expectedValueR
         val probabilityCapSuffix = if (expectedValueDetails.probabilityCapApplied) {
             probabilityCapSuffix(expectedValueDetails.probabilityUsed)
@@ -801,10 +796,12 @@ class SafetyFloor(
             return violation(
                 commandName = "place_order",
                 command = command,
-                rule = SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE,
-                messageJa = "推定勝率、目標価格、STOP、往復 cost から計算した EV が 0 以下です。$probabilityCapSuffix",
-                measuredValue = expectedValueR.toPlainString(),
-                limitValue = ">0",
+                details = SafetyViolationDetails(
+                    rule = SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE,
+                    messageJa = "推定勝率、目標価格、STOP、往復 cost から計算した EV が 0 以下です。$probabilityCapSuffix",
+                    measuredValue = expectedValueR.toPlainString(),
+                    limitValue = ">0",
+                ),
             )
         }
 
@@ -815,15 +812,17 @@ class SafetyFloor(
         return violation(
             commandName = "place_order",
             command = command,
-            rule = SafetyFloorRule.EXPECTED_VALUE_GATE,
-            messageJa = "推定勝率、目標価格、STOP、往復 cost から計算した EV が保守的な初期しきい値を下回っています。$probabilityCapSuffix",
-            measuredValue = expectedValueR.toPlainString(),
-            limitValue = config.minExpectedValueR.toPlainString(),
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.EXPECTED_VALUE_GATE,
+                messageJa = "推定勝率、目標価格、STOP、往復 cost から計算した EV が保守的な初期しきい値を下回っています。$probabilityCapSuffix",
+                measuredValue = expectedValueR.toPlainString(),
+                limitValue = config.minExpectedValueR.toPlainString(),
+            ),
         )
     }
 
     private fun validateExpectedMoveToCost(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyViolation? {
-        val impliedRatio = expectedMoveToCostRatioOrNull(command, context) ?: return null
+        val impliedRatio = riskCalculator.expectedMoveToCostRatioOrNull(command, context) ?: return null
 
         if (impliedRatio >= config.minExpectedMoveToCostRatio) {
             return null
@@ -832,10 +831,12 @@ class SafetyFloor(
         return violation(
             commandName = "place_order",
             command = command,
-            rule = SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO,
-            messageJa = "TP から逆算した想定値幅 / 往復 cost 比が不足しています。",
-            measuredValue = impliedRatio.toPlainString(),
-            limitValue = config.minExpectedMoveToCostRatio.toPlainString(),
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO,
+                messageJa = "TP から逆算した想定値幅 / 往復 cost 比が不足しています。",
+                measuredValue = impliedRatio.toPlainString(),
+                limitValue = config.minExpectedMoveToCostRatio.toPlainString(),
+            ),
         )
     }
 
@@ -853,10 +854,12 @@ class SafetyFloor(
         return violation(
             commandName = "update_protection",
             command = command,
-            rule = SafetyFloorRule.STOP_LOSS_LOOSENING,
-            messageJa = "STOP を損失拡大方向へ緩める update_protection は拒否します。",
-            measuredValue = newStopPrice.toPlainString(),
-            limitValue = ">=${currentStop.toPlainString()}",
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.STOP_LOSS_LOOSENING,
+                messageJa = "STOP を損失拡大方向へ緩める update_protection は拒否します。",
+                measuredValue = newStopPrice.toPlainString(),
+                limitValue = ">=${currentStop.toPlainString()}",
+            ),
         )
     }
 
@@ -878,10 +881,12 @@ class SafetyFloor(
         return violation(
             commandName = "update_protection",
             command = command,
-            rule = SafetyFloorRule.ATR_TRAILING_FLOOR,
-            messageJa = "STOP を ATR trailing 床より下へ置く update_protection は拒否します。",
-            measuredValue = newStopPrice.toPlainString(),
-            limitValue = ">=${atrFloor.toPlainString()}",
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.ATR_TRAILING_FLOOR,
+                messageJa = "STOP を ATR trailing 床より下へ置く update_protection は拒否します。",
+                measuredValue = newStopPrice.toPlainString(),
+                limitValue = ">=${atrFloor.toPlainString()}",
+            ),
         )
     }
 
@@ -899,37 +904,40 @@ class SafetyFloor(
         return violation(
             commandName = "update_protection",
             command = command,
-            rule = SafetyFloorRule.IMMEDIATE_STOP_TRIGGER,
-            messageJa = "SELL STOP が即時約定方向の価格なので拒否します。",
-            measuredValue = newStopPrice.toPlainString(),
-            limitValue = "<${bidPrice.toPlainString()}",
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.IMMEDIATE_STOP_TRIGGER,
+                messageJa = "SELL STOP が即時約定方向の価格なので拒否します。",
+                measuredValue = newStopPrice.toPlainString(),
+                limitValue = "<${bidPrice.toPlainString()}",
+            ),
         )
     }
 
     private fun violation(
         commandName: String,
         command: Any,
-        rule: SafetyFloorRule,
-        messageJa: String,
-        measuredValue: String,
-        limitValue: String,
-        hardHaltRequired: Boolean = false,
+        details: SafetyViolationDetails,
     ): SafetyViolation {
         val auditContext = command.auditContextOrNull()
 
         return SafetyViolation(
-            rule = rule,
-            messageJa = messageJa,
-            measuredValue = measuredValue,
-            limitValue = limitValue,
+            rule = details.rule,
+            messageJa = details.messageJa,
+            measuredValue = details.measuredValue,
+            limitValue = details.limitValue,
             commandName = commandName,
             commandId = command.commandIdOrNull(),
             orderId = command.orderIdOrNull(),
             decisionRunId = auditContext?.decisionRunContext?.decisionRunId,
             toolCallId = auditContext?.toolCallId,
             clientRequestId = auditContext?.clientRequestId,
-            hardHaltRequired = hardHaltRequired,
-            payloadJson = violationPayload(rule, measuredValue, limitValue, hardHaltRequired),
+            hardHaltRequired = details.hardHaltRequired,
+            payloadJson = violationPayload(
+                rule = details.rule,
+                measuredValue = details.measuredValue,
+                limitValue = details.limitValue,
+                hardHaltRequired = details.hardHaltRequired,
+            ),
             createdAt = Instant.now(clock),
         )
     }
@@ -942,284 +950,13 @@ class SafetyFloor(
         return violation(
             commandName = "place_order",
             command = command,
-            rule = SafetyFloorRule.ECONOMIC_EVENT_BLACKOUT,
-            messageJa = "高影響経済イベント ${activeEvent.eventName} の blackout window 中のため、新規 entry は拒否します。",
-            measuredValue = observedAt.toString(),
-            limitValue = "${activeEvent.eventAt.minus(activeEvent.blackoutBefore)}..${activeEvent.eventAt.plus(activeEvent.blackoutAfter)}",
+            details = SafetyViolationDetails(
+                rule = SafetyFloorRule.ECONOMIC_EVENT_BLACKOUT,
+                messageJa = "高影響経済イベント ${activeEvent.eventName} の blackout window 中のため、新規 entry は拒否します。",
+                measuredValue = observedAt.toString(),
+                limitValue = "${activeEvent.eventAt.minus(activeEvent.blackoutBefore)}..${activeEvent.eventAt.plus(activeEvent.blackoutAfter)}",
+            ),
         )
-    }
-
-    private fun estimatedEntryPrice(command: PlaceOrderCommand, context: SafetyFloorContext): BigDecimal {
-        val askPrice = context.ticker.ask.toBigDecimal()
-
-        return when (command.orderType) {
-            OrderType.MARKET -> applyPositiveSlippage(askPrice)
-            OrderType.LIMIT -> requireNotNull(command.priceJpy)
-            OrderType.STOP -> applyPositiveSlippage(requireNotNull(command.priceJpy))
-        }.safetyScale()
-    }
-
-    private fun estimatedEntryPrice(order: Order, context: SafetyFloorContext): BigDecimal {
-        val askPrice = context.ticker.ask.toBigDecimal()
-
-        return when (order.orderType) {
-            OrderType.MARKET -> applyPositiveSlippage(askPrice)
-            OrderType.LIMIT -> order.limitPriceJpy?.toBigDecimal() ?: askPrice
-            OrderType.STOP -> {
-                val triggerPrice = order.triggerPriceJpy?.toBigDecimal() ?: askPrice
-
-                applyPositiveSlippage(triggerPrice)
-            }
-        }.safetyScale()
-    }
-
-    private fun groupRiskBeforeOrder(context: SafetyFloorContext, tradeGroupId: String?): BigDecimal {
-        val positionRisk = context.positions
-            .filterTargetPositions(tradeGroupId)
-            .sumOf { position -> positionRisk(position, context) }
-        val openOrderRisk = context.openOrders
-            .filterTargetOrders(tradeGroupId)
-            .filter { order -> order.side == OrderSide.BUY && order.status == OrderStatus.OPEN }
-            .sumOf { order -> orderRisk(order, context) }
-
-        return positionRisk.add(openOrderRisk).safetyScale()
-    }
-
-    private fun positionRisk(position: Position, context: SafetyFloorContext): BigDecimal {
-        val sizeBtc = position.sizeBtc.toBigDecimal()
-        val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
-        val stopPrice = position.currentStopLossJpy?.toBigDecimal() ?: BigDecimal.ZERO
-        val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(sizeBtc)
-        // Position は entry order type を保持しないため、既存 position の entry leg は taker 近似で保守的に評価する。
-        val costReserve = roundTripCost(
-            sizeBtc = sizeBtc,
-            entryPrice = entryPrice,
-            stopPrice = stopPrice,
-            entryOrderType = OrderType.MARKET,
-            context = context,
-        )
-
-        return priceRisk.add(costReserve).safetyScale()
-    }
-
-    private fun orderRisk(command: PlaceOrderCommand, context: SafetyFloorContext): BigDecimal {
-        val entryPrice = estimatedEntryPrice(command, context)
-        val stopPrice = command.protectiveStopPriceJpy
-        val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(command.sizeBtc)
-        val costReserve = roundTripCost(
-            sizeBtc = command.sizeBtc,
-            entryPrice = entryPrice,
-            stopPrice = stopPrice,
-            entryOrderType = command.orderType,
-            context = context,
-        )
-
-        return priceRisk.add(costReserve).safetyScale()
-    }
-
-    private fun orderRisk(order: Order, context: SafetyFloorContext): BigDecimal {
-        val entryPrice = estimatedEntryPrice(order, context)
-        val stopPrice = order.protectiveStopPriceJpy?.toBigDecimal() ?: BigDecimal.ZERO
-        val sizeBtc = order.sizeBtc.toBigDecimal()
-        val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(sizeBtc)
-        val costReserve = roundTripCost(
-            sizeBtc = sizeBtc,
-            entryPrice = entryPrice,
-            stopPrice = stopPrice,
-            entryOrderType = order.orderType,
-            context = context,
-        )
-
-        return priceRisk.add(costReserve).safetyScale()
-    }
-
-    private fun currentExposure(context: SafetyFloorContext): BigDecimal {
-        val positionExposure = context.positions
-            .filter { position -> position.status == PositionStatus.OPEN }
-            .sumOf { position ->
-                position.sizeBtc.toBigDecimal().multiply(position.currentPriceJpy.toBigDecimal())
-            }
-        val buyOrderExposure = context.openOrders
-            .filter { order -> order.side == OrderSide.BUY && order.status == OrderStatus.OPEN }
-            .sumOf { order -> orderExposure(order, context) }
-
-        return positionExposure.add(buyOrderExposure).safetyScale()
-    }
-
-    private fun orderExposure(command: PlaceOrderCommand, context: SafetyFloorContext): BigDecimal {
-        return estimatedEntryPrice(command, context).multiply(command.sizeBtc).safetyScale()
-    }
-
-    private fun orderExposure(order: Order, context: SafetyFloorContext): BigDecimal {
-        val price = estimatedEntryPrice(order, context)
-
-        return price.multiply(order.sizeBtc.toBigDecimal()).safetyScale()
-    }
-
-    private fun availableCash(context: SafetyFloorContext): BigDecimal {
-        val reservedCash = context.openOrders
-            .filter { order -> order.side == OrderSide.BUY && order.status == OrderStatus.OPEN }
-            .sumOf { order -> orderRequiredCash(order, context) }
-
-        return context.account.cashJpy.toBigDecimal()
-            .subtract(reservedCash)
-            .safetyScale()
-    }
-
-    private fun orderRequiredCash(command: PlaceOrderCommand, context: SafetyFloorContext): BigDecimal {
-        val entryPrice = estimatedEntryPrice(command, context)
-        val notional = entryPrice.multiply(command.sizeBtc)
-        val requiredCash = requiredCashFor(
-            notional = notional,
-            orderType = command.orderType,
-            symbolRules = context.symbolRules,
-        )
-
-        return requiredCash.safetyScale()
-    }
-
-    private fun orderRequiredCash(order: Order, context: SafetyFloorContext): BigDecimal {
-        val price = estimatedEntryPrice(order, context)
-        val notional = price.multiply(order.sizeBtc.toBigDecimal())
-        val requiredCash = requiredCashFor(
-            notional = notional,
-            orderType = order.orderType,
-            symbolRules = context.symbolRules,
-        )
-
-        return requiredCash.safetyScale()
-    }
-
-    private fun entryRiskAmount(
-        sizeBtc: BigDecimal,
-        entryPrice: BigDecimal,
-        stopPrice: BigDecimal,
-    ): BigDecimal {
-        return entryPrice.subtract(stopPrice)
-            .maxZero()
-            .multiply(sizeBtc)
-            .safetyScale()
-    }
-
-    private fun expectedRMultiple(
-        sizeBtc: BigDecimal,
-        entryPrice: BigDecimal,
-        takeProfitPrice: BigDecimal,
-        riskAmount: BigDecimal,
-    ): BigDecimal {
-        val expectedReward = takeProfitPrice.subtract(entryPrice)
-            .maxZero()
-            .multiply(sizeBtc)
-            .safetyScale()
-
-        return expectedReward.divideOrZero(riskAmount)
-    }
-
-    private fun roundTripCost(
-        sizeBtc: BigDecimal,
-        entryPrice: BigDecimal,
-        stopPrice: BigDecimal,
-        entryOrderType: OrderType,
-        context: SafetyFloorContext,
-    ): BigDecimal {
-        val entryNotional = entryPrice.multiply(sizeBtc)
-        val exitNotional = stopPrice.multiply(sizeBtc)
-        val costReserve = roundTripCostReserveFor(
-            entryNotional = entryNotional,
-            exitNotional = exitNotional,
-            entryOrderType = entryOrderType,
-            symbolRules = context.symbolRules,
-            slippageRatio = slippageRatio(),
-        )
-
-        return costReserve.safetyScale()
-    }
-
-    private fun applyPositiveSlippage(price: BigDecimal): BigDecimal {
-        return price.multiply(BigDecimal.ONE.add(slippageRatio())).safetyScale()
-    }
-
-    private fun slippageRatio(): BigDecimal {
-        return config.marketSlippageReserveBps.divide(BPS_DIVISOR, SAFETY_SCALE, RoundingMode.HALF_UP)
-    }
-
-    private fun cappedProbabilityOrNull(probability: BigDecimal, context: SafetyFloorContext): BigDecimal? {
-        val marketDataObservedAt = context.marketDataObservedAt
-        val stale = if (marketDataObservedAt == null) {
-            true
-        } else {
-            val staleDuration = Duration.between(marketDataObservedAt, Instant.now(clock))
-
-            staleDuration > config.dataQualityCap.staleAfter
-        }
-        val capWouldReduceProbability = probability > config.dataQualityCap.cappedProbability
-
-        if (!stale || !capWouldReduceProbability) {
-            return null
-        }
-
-        return config.dataQualityCap.cappedProbability
-    }
-
-    private fun expectedValueDetailsOrNull(
-        command: PlaceOrderCommand,
-        context: SafetyFloorContext,
-    ): ExpectedValueDetails? {
-        val takeProfitPrice = command.takeProfitPriceJpy ?: return null
-        val probability = command.estimatedWinProbability
-        val probabilityInRange = probability >= BigDecimal.ZERO && probability <= BigDecimal.ONE
-
-        if (!probabilityInRange) {
-            return null
-        }
-
-        return expectedValueDetails(command, context, takeProfitPrice)
-    }
-
-    private fun expectedValueDetails(
-        command: PlaceOrderCommand,
-        context: SafetyFloorContext,
-        takeProfitPrice: BigDecimal,
-    ): ExpectedValueDetails {
-        val probability = command.estimatedWinProbability
-        val cappedProbability = cappedProbabilityOrNull(probability, context)
-        val probabilityForExpectedValue = cappedProbability ?: probability
-        val entryPrice = estimatedEntryPrice(command, context)
-        val riskAmount = entryRiskAmount(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy)
-        val expectedRMultiple = expectedRMultiple(command.sizeBtc, entryPrice, takeProfitPrice, riskAmount)
-        val roundTripCostR = roundTripCost(
-            sizeBtc = command.sizeBtc,
-            entryPrice = entryPrice,
-            stopPrice = command.protectiveStopPriceJpy,
-            entryOrderType = command.orderType,
-            context = context,
-        ).divideOrZero(riskAmount)
-        val expectedValueR = probabilityForExpectedValue
-            .multiply(expectedRMultiple)
-            .subtract(BigDecimal.ONE.subtract(probabilityForExpectedValue))
-            .subtract(roundTripCostR)
-            .safetyScale()
-
-        return ExpectedValueDetails(
-            expectedValueR = expectedValueR,
-            probabilityUsed = probabilityForExpectedValue,
-            probabilityCapApplied = cappedProbability != null,
-        )
-    }
-
-    private fun expectedMoveToCostRatioOrNull(command: PlaceOrderCommand, context: SafetyFloorContext): BigDecimal? {
-        val takeProfitPrice = command.takeProfitPriceJpy ?: return null
-        val entryPrice = estimatedEntryPrice(command, context)
-        val expectedMove = takeProfitPrice.subtract(entryPrice).maxZero().multiply(command.sizeBtc)
-        val roundTripCost = roundTripCost(
-            sizeBtc = command.sizeBtc,
-            entryPrice = entryPrice,
-            stopPrice = command.protectiveStopPriceJpy,
-            entryOrderType = command.orderType,
-            context = context,
-        )
-
-        return expectedMove.divideOrZero(roundTripCost)
     }
 
     private fun probabilityCapSuffix(cappedProbability: BigDecimal): String {
@@ -1227,7 +964,7 @@ class SafetyFloor(
     }
 }
 
-private fun List<Position>.filterTargetPositions(tradeGroupId: String?): List<Position> {
+internal fun List<Position>.filterTargetPositions(tradeGroupId: String?): List<Position> {
     if (tradeGroupId != null) {
         return filter { position -> position.tradeGroupId == tradeGroupId && position.status == PositionStatus.OPEN }
     }
@@ -1235,7 +972,7 @@ private fun List<Position>.filterTargetPositions(tradeGroupId: String?): List<Po
     return filter { position -> position.status == PositionStatus.OPEN }
 }
 
-private fun List<Order>.filterTargetOrders(tradeGroupId: String?): List<Order> {
+internal fun List<Order>.filterTargetOrders(tradeGroupId: String?): List<Order> {
     if (tradeGroupId != null) {
         return filter { order -> order.tradeGroupId == tradeGroupId }
     }
@@ -1260,47 +997,64 @@ private fun BigDecimal?.sameAmountAs(other: BigDecimal?): Boolean {
 
 private fun PlaceOrderCommand.intentComparisonValue(): String {
     return intentComparisonValue(
-        symbolText = symbol.apiSymbol,
-        sideText = side.name,
-        orderTypeText = orderType.name,
-        sizeBtc = sizeBtc,
-        priceJpy = priceJpy,
-        protectiveStopPriceJpy = protectiveStopPriceJpy,
-        takeProfitPriceJpy = takeProfitPriceJpy,
+        value = EntryIntentComparisonValue(
+            symbolText = symbol.apiSymbol,
+            sideText = side.name,
+            orderTypeText = orderType.name,
+            sizeBtc = sizeBtc,
+            priceJpy = priceJpy,
+            protectiveStopPriceJpy = protectiveStopPriceJpy,
+            takeProfitPriceJpy = takeProfitPriceJpy,
+        ),
     )
 }
 
 private fun EntryIntentDraft.intentComparisonValue(): String {
     return intentComparisonValue(
-        symbolText = symbol.apiSymbol,
-        sideText = side.name,
-        orderTypeText = orderType.name,
-        sizeBtc = sizeBtc,
-        priceJpy = priceJpy,
-        protectiveStopPriceJpy = protectiveStopPriceJpy,
-        takeProfitPriceJpy = takeProfitPriceJpy,
+        value = EntryIntentComparisonValue(
+            symbolText = symbol.apiSymbol,
+            sideText = side.name,
+            orderTypeText = orderType.name,
+            sizeBtc = sizeBtc,
+            priceJpy = priceJpy,
+            protectiveStopPriceJpy = protectiveStopPriceJpy,
+            takeProfitPriceJpy = takeProfitPriceJpy,
+        ),
     )
 }
 
-private fun intentComparisonValue(
-    symbolText: String,
-    sideText: String,
-    orderTypeText: String,
-    sizeBtc: BigDecimal,
-    priceJpy: BigDecimal?,
-    protectiveStopPriceJpy: BigDecimal,
-    takeProfitPriceJpy: BigDecimal?,
-): String {
-    return "symbol=$symbolText,side=$sideText,type=$orderTypeText,size=${sizeBtc.toPlainString()}," +
-        "entry=${priceJpy?.toPlainString()},stop=${protectiveStopPriceJpy.toPlainString()}," +
-        "tp=${takeProfitPriceJpy?.toPlainString()}"
+private fun intentComparisonValue(value: EntryIntentComparisonValue): String {
+    return "symbol=${value.symbolText},side=${value.sideText},type=${value.orderTypeText}," +
+        "size=${value.sizeBtc.toPlainString()},entry=${value.priceJpy?.toPlainString()}," +
+        "stop=${value.protectiveStopPriceJpy.toPlainString()},tp=${value.takeProfitPriceJpy?.toPlainString()}"
 }
 
-private fun BigDecimal.maxZero(): BigDecimal {
+/**
+ * entry intent と place_order の比較文字列に使う値。
+ *
+ * @param symbolText symbol 表示文字列
+ * @param sideText side 表示文字列
+ * @param orderTypeText order type 表示文字列
+ * @param sizeBtc BTC size
+ * @param priceJpy entry price
+ * @param protectiveStopPriceJpy protective stop price
+ * @param takeProfitPriceJpy take profit price
+ */
+private data class EntryIntentComparisonValue(
+    val symbolText: String,
+    val sideText: String,
+    val orderTypeText: String,
+    val sizeBtc: BigDecimal,
+    val priceJpy: BigDecimal?,
+    val protectiveStopPriceJpy: BigDecimal,
+    val takeProfitPriceJpy: BigDecimal?,
+)
+
+internal fun BigDecimal.maxZero(): BigDecimal {
     return maxOf(this, BigDecimal.ZERO)
 }
 
-private fun BigDecimal.divideOrZero(divisor: BigDecimal): BigDecimal {
+internal fun BigDecimal.divideOrZero(divisor: BigDecimal): BigDecimal {
     if (divisor.compareTo(BigDecimal.ZERO) == 0) {
         return BigDecimal.ZERO.safetyScale()
     }
@@ -1308,11 +1062,11 @@ private fun BigDecimal.divideOrZero(divisor: BigDecimal): BigDecimal {
     return divide(divisor, SAFETY_SCALE, RoundingMode.HALF_UP).safetyScale()
 }
 
-private fun BigDecimal.safetyScale(): BigDecimal {
+internal fun BigDecimal.safetyScale(): BigDecimal {
     return setScale(SAFETY_SCALE, RoundingMode.HALF_UP)
 }
 
-private fun BigDecimal.floorToStep(step: BigDecimal): BigDecimal {
+internal fun BigDecimal.floorToStep(step: BigDecimal): BigDecimal {
     if (step.compareTo(BigDecimal.ZERO) == 0) {
         return this
     }
@@ -1362,12 +1116,12 @@ private fun violationPayload(
 /**
  * SafetyFloor 計算 scale。
  */
-private const val SAFETY_SCALE = 8
+internal const val SAFETY_SCALE = 8
 
 /**
  * bps 分母。
  */
-private val BPS_DIVISOR = BigDecimal("10000")
+internal val BPS_DIVISOR = BigDecimal("10000")
 
 /**
  * 1 trade group の既定最大損失割合。
