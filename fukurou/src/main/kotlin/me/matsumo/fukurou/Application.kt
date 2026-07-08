@@ -213,9 +213,11 @@ private class ApplicationRuntimeConfigState(
         cachedSnapshot?.let { snapshot -> return snapshot }
 
         return synchronized(lock) {
-            cachedSnapshot ?: resolveSnapshot().also { snapshot ->
-                cachedSnapshot = snapshot
-            }
+            cachedSnapshot ?: resolveSnapshot().also { resolution ->
+                if (resolution.cacheable) {
+                    cachedSnapshot = resolution.snapshot
+                }
+            }.snapshot
         }
     }
 
@@ -225,19 +227,53 @@ private class ApplicationRuntimeConfigState(
         }
     }
 
-    private fun resolveSnapshot(): ApplicationRuntimeConfigSnapshot {
+    private fun resolveSnapshot(): ApplicationRuntimeConfigSnapshotResolution {
         return runCatching {
             snapshotUnsafe()
-        }.getOrElse { error ->
-            ApplicationRuntimeConfigSnapshot(
-                tradingConfig = inputs.tradingConfig,
-                tradingRuntimeAvailable = false,
-                runtimeConfigEnvironment = inputs.runtimeConfigEnvironment,
-                runtimeConfigSnapshot = null,
-                runtimeConfigWarnings = listOf(runtimeConfigResolveWarning(error)),
-            )
+        }.fold(
+            onSuccess = { snapshot ->
+                ApplicationRuntimeConfigSnapshotResolution(
+                    snapshot = snapshot,
+                    cacheable = snapshot.isCacheable(),
+                )
+            },
+            onFailure = { error ->
+                val snapshot = ApplicationRuntimeConfigSnapshot(
+                    tradingConfig = inputs.tradingConfig,
+                    tradingRuntimeAvailable = false,
+                    runtimeConfigEnvironment = inputs.runtimeConfigEnvironment,
+                    runtimeConfigSnapshot = null,
+                    runtimeConfigWarnings = listOf(runtimeConfigResolveWarning(error)),
+                )
+
+                ApplicationRuntimeConfigSnapshotResolution(
+                    snapshot = snapshot,
+                    cacheable = error is RuntimeConfigValidationRejectedException,
+                )
+            },
+        )
+    }
+
+    private fun ApplicationRuntimeConfigSnapshot.isCacheable(): Boolean {
+        if (tradingRuntimeAvailable) {
+            return true
+        }
+
+        return runtimeConfigWarnings.any { warning ->
+            warning.code == RUNTIME_CONFIG_ACTIVE_VALIDATION_FAILED_WARNING
         }
     }
+
+    /**
+     * snapshot 解決結果と cache 可否。
+     *
+     * @param snapshot route / runtime gate に返す snapshot
+     * @param cacheable 次回以降の hot path で再利用してよいか
+     */
+    private data class ApplicationRuntimeConfigSnapshotResolution(
+        val snapshot: ApplicationRuntimeConfigSnapshot,
+        val cacheable: Boolean,
+    )
 
     private fun snapshotUnsafe(): ApplicationRuntimeConfigSnapshot {
         val database = databaseResources.database
@@ -298,7 +334,7 @@ private fun runtimeConfigResolveWarning(error: Throwable): RuntimeConfigSnapshot
 
     if (validationError != null) {
         return RuntimeConfigSnapshotWarning(
-            code = "runtimeConfig.warning.activeValidationFailed",
+            code = RUNTIME_CONFIG_ACTIVE_VALIDATION_FAILED_WARNING,
             validation = validationError.validation,
         )
     }
@@ -981,6 +1017,11 @@ private const val RUNTIME_CONFIG_UNAVAILABLE_REASON = "runtime config is unavail
  * manual LLM launch service を構築できないときの拒否理由。
  */
 private const val MANUAL_LAUNCH_SERVICE_UNAVAILABLE_REASON = "manual LLM launch service is unavailable"
+
+/**
+ * active runtime config validation failure の warning code。
+ */
+private const val RUNTIME_CONFIG_ACTIVE_VALIDATION_FAILED_WARNING = "runtimeConfig.warning.activeValidationFailed"
 
 /**
  * readiness 注入がない場合だけ DB DataSource を構築する。

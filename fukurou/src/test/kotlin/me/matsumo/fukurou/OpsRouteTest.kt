@@ -711,6 +711,72 @@ class OpsRouteTest {
     }
 
     @Test
+    fun moduleRetriesRuntimeConfigSnapshotAfterTransientResolveFailure() = testApplication {
+        if (!isDockerAvailable()) {
+            println("Skipping module runtime config transient recovery test because Docker is unavailable.")
+            return@testApplication
+        }
+
+        val container = FukurouPostgresContainer()
+        container.start()
+
+        try {
+            val databaseConfig = DatabaseConfig(
+                url = container.jdbcUrl,
+                user = container.username,
+                password = container.password,
+            )
+            val database = ExposedDatabase.connect(
+                url = databaseConfig.url,
+                driver = "org.postgresql.Driver",
+                user = databaseConfig.user,
+                password = databaseConfig.password,
+            )
+            RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+            deleteRuntimeConfigValues(database)
+
+            val manualService = CapturingManualLlmLaunchService(
+                ManualLlmLaunchResult.Accepted(
+                    invocationId = "manual-after-transient-recovery",
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                ),
+            )
+
+            application {
+                module(
+                    clock = fixedClock(),
+                    opsManualLlmLaunchService = manualService,
+                    databaseConfig = databaseConfig,
+                )
+            }
+
+            val unavailableReadyResponse = client.get("/health/ready")
+            val unavailableTriggerResponse = client.post("/ops/trigger") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"operator checks transient failure"}""")
+            }
+
+            assertEquals(HttpStatusCode.ServiceUnavailable, unavailableReadyResponse.status)
+            assertEquals(HttpStatusCode.ServiceUnavailable, unavailableTriggerResponse.status)
+            assertEquals(emptyList(), manualService.reasons)
+
+            insertRuntimeConfigDefaultValues(database)
+
+            val recoveredReadyResponse = client.get("/health/ready")
+            val recoveredTriggerResponse = client.post("/ops/trigger") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"operator confirms transient recovery"}""")
+            }
+
+            assertEquals(HttpStatusCode.OK, recoveredReadyResponse.status)
+            assertEquals(HttpStatusCode.Accepted, recoveredTriggerResponse.status)
+            assertEquals(listOf("operator confirms transient recovery"), manualService.reasons)
+        } finally {
+            container.stop()
+        }
+    }
+
+    @Test
     fun opsRoutes_accountReturnsCurrentSnapshotWithUpdatedAt() = testApplication {
         val ledgerRepository = InMemoryPaperLedgerRepository(
             accountSnapshot = accountSnapshot(),
@@ -1690,6 +1756,60 @@ private fun isDockerAvailable(): Boolean {
         DockerClientFactory.instance().client().pingCmd().exec()
         true
     }.getOrDefault(false)
+}
+
+private fun deleteRuntimeConfigValues(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                DELETE FROM runtime_config_values
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun insertRuntimeConfigDefaultValues(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        val activeVersionId = requireActiveRuntimeConfigVersionId()
+
+        jdbcConnection().prepareStatement(
+            """
+                INSERT INTO runtime_config_values (
+                    version_id,
+                    config_key,
+                    config_value
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT (version_id, config_key) DO NOTHING
+            """.trimIndent(),
+        ).use { statement ->
+            RuntimeConfigCatalog.runtimeDefaultValues().toSortedMap().forEach { (key, value) ->
+                statement.setObject(1, activeVersionId)
+                statement.setString(2, key)
+                statement.setString(3, value)
+                statement.addBatch()
+            }
+            statement.executeBatch()
+        }
+    }
+}
+
+private fun JdbcTransaction.requireActiveRuntimeConfigVersionId(): UUID {
+    jdbcConnection().prepareStatement(
+        """
+            SELECT id
+            FROM runtime_config_versions
+            WHERE status = 'ACTIVE'
+        """.trimIndent(),
+    ).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "Active runtime config version was not found." }
+
+            return resultSet.getObject(1, UUID::class.java)
+        }
+    }
 }
 
 private fun updateRuntimeConfigValue(
