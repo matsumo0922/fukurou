@@ -44,6 +44,7 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
+import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
@@ -245,6 +246,16 @@ private const val SELECT_POSITION_WATERMARK_SQL = """
         highest_price_since_entry_jpy,
         lowest_price_since_entry_jpy
     FROM positions
+    WHERE id = ?
+"""
+
+/**
+ * order の position link を読む SQL。
+ */
+private const val SELECT_ORDER_POSITION_ID_SQL = """
+    SELECT
+        position_id
+    FROM orders
     WHERE id = ?
 """
 
@@ -1420,6 +1431,74 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf(OrderSide.BUY, OrderSide.SELL), executions.map { execution -> execution.side })
         assertEquals("10005000.00000000", watermark.highestPriceSinceEntryJpy)
         assertEquals("9685155.00000000", watermark.lowestPriceSinceEntryJpy)
+    }
+
+    @Test
+    fun paper_execution_linksRestingLimitEntryOrderToClosedTradeEvaluation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+
+        val placeResult = broker.placeOrder(command).getOrThrow()
+        val entryOrderId = UUID.fromString(placeResult.orderIds.single())
+
+        assertEquals(0, broker.getPositions().getOrThrow().size)
+        assertNull(selectOrderPositionId(database, entryOrderId))
+
+        repository.reconcile(
+            tickSnapshot = watermarkTickSnapshot("9900000"),
+            simulator = FillSimulator(clock = fixedClock()),
+        ).getOrThrow()
+
+        val position = broker.getPositions().getOrThrow().single()
+        val positionId = UUID.fromString(position.positionId)
+        val openWatermark = selectPositionWatermark(database, positionId)
+
+        assertEquals(positionId, selectOrderPositionId(database, entryOrderId))
+        assertEquals("9900000.00000000", openWatermark.highestPriceSinceEntryJpy)
+        assertEquals("9900000.00000000", openWatermark.lowestPriceSinceEntryJpy)
+
+        repository.reconcile(
+            tickSnapshot = stopTickSnapshot(),
+            simulator = FillSimulator(clock = fixedClock()),
+        ).getOrThrow()
+
+        val closedWatermark = selectPositionWatermark(database, positionId)
+        val tradeResult = ExposedEvaluationRepository(database).fetchClosedTrades(
+            EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val trade = tradeResult.trades.single()
+        val evaluatedTrade = EvaluationMath.evaluateTrade(trade)
+
+        assertEquals(false, tradeResult.truncated)
+        assertEquals("9700000.00000000", trade.initialProtectiveStopPriceJpy?.toPlainString())
+        assertEquals("9900000.00000000", trade.highestPriceSinceEntryJpy.toPlainString())
+        assertEquals("9685155.00000000", trade.lowestPriceSinceEntryJpy?.toPlainString())
+        assertEquals("9900000.00000000", closedWatermark.highestPriceSinceEntryJpy)
+        assertEquals("9685155.00000000", closedWatermark.lowestPriceSinceEntryJpy)
+        assertEquals("200000.00000000", evaluatedTrade.initialRiskPriceWidthJpy?.toPlainString())
+        assertEquals("-1.0934878875", evaluatedTrade.realizedR?.toPlainString())
+        assertEquals("1.0742250000", evaluatedTrade.maeR?.toPlainString())
+        assertEquals("0.0000000000", evaluatedTrade.mfeR?.toPlainString())
     }
 
     @Test
@@ -2699,6 +2778,24 @@ private fun selectPositionWatermark(database: ExposedDatabase, positionId: UUID)
                         .getBigDecimal("lowest_price_since_entry_jpy")
                         ?.toPlainString(),
                 )
+            }
+        }
+    }
+}
+
+/**
+ * order に紐付いた position ID を読む。
+ */
+private fun selectOrderPositionId(database: ExposedDatabase, orderId: UUID): UUID? {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_ORDER_POSITION_ID_SQL).use { statement ->
+            statement.setObject(1, orderId)
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) {
+                    "order position link did not return a row."
+                }
+
+                resultSet.getNullableUuid("position_id")
             }
         }
     }

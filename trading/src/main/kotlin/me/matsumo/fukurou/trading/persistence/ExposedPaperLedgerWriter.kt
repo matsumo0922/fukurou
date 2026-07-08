@@ -376,8 +376,12 @@ internal class ExposedPaperLedgerWriter(
                 return@forEach
             }
 
-            updateOrderStatus(order.orderId, OrderStatus.FILLED, order.reasonJa.orEmpty())
             insertPosition(command, fill, positionId, tradeGroupId)
+            updateRestingEntryOrderFill(
+                orderId = order.orderId,
+                positionId = positionId,
+                reasonJa = order.reasonJa.orEmpty(),
+            )
             insertExecution(order.orderId, positionId.toString(), TradingMode.PAPER, order.side, fill, command.auditContext)
             insertProtectiveStopOrder(command, stopOrderId, positionId, tradeGroupId)
             updateAccountAfterBuy(fill)
@@ -798,6 +802,40 @@ internal class ExposedPaperLedgerWriter(
             statement.setLong(3, nowMillis())
             statement.setObject(4, UUID.fromString(orderId))
             statement.executeUpdate()
+        }
+    }
+
+    private fun JdbcTransaction.updateRestingEntryOrderFill(
+        orderId: String,
+        positionId: UUID,
+        reasonJa: String,
+    ) {
+        prepare(
+            """
+                UPDATE orders
+                SET status = ?,
+                    position_id = ?,
+                    reason_ja = ?,
+                    updated_at = ?
+                WHERE id = ?
+                    AND side = ?
+                    AND order_type IN (?, ?)
+                    AND status = ?
+            """,
+        ).use { statement ->
+            statement.setString(1, OrderStatus.FILLED.name)
+            statement.setObject(2, positionId)
+            statement.setString(3, reasonJa)
+            statement.setLong(4, nowMillis())
+            statement.setObject(5, UUID.fromString(orderId))
+            statement.setString(6, OrderSide.BUY.name)
+            statement.setString(7, OrderType.LIMIT.name)
+            statement.setString(8, OrderType.STOP.name)
+            statement.setString(9, OrderStatus.OPEN.name)
+
+            require(statement.executeUpdate() == 1) {
+                "resting entry order was not found."
+            }
         }
     }
 
