@@ -53,6 +53,7 @@ import kotlin.test.assertTrue
 /**
  * ops route の HTTP contract を検証するテスト。
  */
+@Suppress("LargeClass")
 class OpsRouteTest {
 
     @Test
@@ -211,6 +212,127 @@ class OpsRouteTest {
 
         assertEquals(HttpStatusCode.Conflict, response.status)
         assertTrue(response.bodyAsText().contains("concurrent_invocation"))
+    }
+
+    @Test
+    fun opsRoutes_llmAuthReturnsProviderStatusesWithoutSecrets() = testApplication {
+        val service = CapturingLlmAuthService(
+            snapshot = LlmAuthSnapshot(
+                providers = listOf(
+                    LlmAuthProviderStatus(
+                        provider = LlmAuthProvider.CLAUDE,
+                        status = LlmAuthStatus.LOGGED_IN,
+                        detail = "credential marker present",
+                        homePath = "/tmp/fukurou-cli-home/.claude",
+                        checkedAt = fixedInstant(),
+                    ),
+                    LlmAuthProviderStatus(
+                        provider = LlmAuthProvider.CODEX,
+                        status = LlmAuthStatus.LOGGED_OUT,
+                        detail = "credential marker not found",
+                        homePath = "/tmp/fukurou-cli-home/.codex",
+                        checkedAt = fixedInstant(),
+                    ),
+                ),
+                checkedAt = fixedInstant(),
+            ),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsLlmAuthService = service,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/llm-auth")
+        val responseBody = response.bodyAsText()
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(responseBody.contains(""""provider":"claude""""))
+        assertTrue(responseBody.contains(""""status":"logged_in""""))
+        assertTrue(responseBody.contains(""""provider":"codex""""))
+        assertTrue(responseBody.contains(""""status":"logged_out""""))
+        assertNoSecretLikeText(responseBody)
+    }
+
+    @Test
+    fun opsRoutes_llmAuthLoginStartsAndPollsSessionWithoutSecrets() = testApplication {
+        val session = LlmAuthLoginSessionSnapshot(
+            provider = LlmAuthProvider.CODEX,
+            sessionId = "session-1",
+            status = LlmAuthLoginStatus.RUNNING,
+            authorizationUrl = "https://auth.example.com/device",
+            userCode = "ABCD-EFGH",
+            detail = "authorization challenge emitted",
+            startedAt = fixedInstant(),
+            expiresAt = fixedInstant().plusSeconds(600),
+            completedAt = null,
+        )
+        val service = CapturingLlmAuthService(
+            startResult = LlmAuthLoginStartResult.Accepted(session),
+            sessions = mapOf("session-1" to session),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsLlmAuthService = service,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val startResponse = client.post("/ops/llm-auth/codex/login") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"reason":"  operator requested Codex re-auth  "}""")
+        }
+        val pollResponse = client.get("/ops/llm-auth/codex/login/session-1")
+        val startBody = startResponse.bodyAsText()
+        val pollBody = pollResponse.bodyAsText()
+
+        assertEquals(HttpStatusCode.Accepted, startResponse.status)
+        assertEquals(HttpStatusCode.OK, pollResponse.status)
+        assertTrue(startBody.contains(""""provider":"codex""""))
+        assertTrue(startBody.contains(""""authorizationUrl":"https://auth.example.com/device""""))
+        assertTrue(startBody.contains(""""userCode":"ABCD-EFGH""""))
+        assertEquals(listOf(LlmAuthProvider.CODEX to "operator requested Codex re-auth"), service.loginRequests)
+        assertNoSecretLikeText(startBody)
+        assertNoSecretLikeText(pollBody)
+    }
+
+    @Test
+    fun opsRoutes_llmAuthLoginRejectsInvalidInputAndConcurrentSession() = testApplication {
+        val service = CapturingLlmAuthService(
+            startResult = LlmAuthLoginStartResult.Rejected("login already in progress"),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsLlmAuthService = service,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val blankReasonResponse = client.post("/ops/llm-auth/claude/login") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"reason":"   "}""")
+        }
+        val invalidProviderResponse = client.post("/ops/llm-auth/unknown/login") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"reason":"operator requested auth"}""")
+        }
+        val conflictResponse = client.post("/ops/llm-auth/claude/login") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"reason":"operator requested auth"}""")
+        }
+        val missingSessionResponse = client.get("/ops/llm-auth/claude/login/missing-session")
+
+        assertEquals(HttpStatusCode.BadRequest, blankReasonResponse.status)
+        assertEquals(HttpStatusCode.BadRequest, invalidProviderResponse.status)
+        assertEquals(HttpStatusCode.Conflict, conflictResponse.status)
+        assertEquals(HttpStatusCode.NotFound, missingSessionResponse.status)
     }
 
     @Test
@@ -767,6 +889,44 @@ private class CapturingManualLlmLaunchService(
         reasons += reason
 
         return Result.success(result)
+    }
+}
+
+/**
+ * ops route test 用 CLI auth fake service。
+ *
+ * @param snapshot status API で返す snapshot
+ * @param startResult login start API で返す結果
+ * @param sessions poll API で返す session map
+ */
+private class CapturingLlmAuthService(
+    private val snapshot: LlmAuthSnapshot = LlmAuthSnapshot(
+        providers = emptyList(),
+        checkedAt = fixedInstant(),
+    ),
+    private val startResult: LlmAuthLoginStartResult = LlmAuthLoginStartResult.Rejected("login not configured"),
+    private val sessions: Map<String, LlmAuthLoginSessionSnapshot> = emptyMap(),
+) : LlmAuthService {
+
+    val loginRequests = mutableListOf<Pair<LlmAuthProvider, String>>()
+
+    override suspend fun snapshot(): Result<LlmAuthSnapshot> {
+        return Result.success(snapshot)
+    }
+
+    override suspend fun startLogin(provider: LlmAuthProvider, reason: String): Result<LlmAuthLoginStartResult> {
+        loginRequests += provider to reason
+
+        return Result.success(startResult)
+    }
+
+    override suspend fun loginSession(
+        provider: LlmAuthProvider,
+        sessionId: String,
+    ): Result<LlmAuthLoginSessionSnapshot?> {
+        val session = sessions[sessionId]?.takeIf { candidate -> candidate.provider == provider }
+
+        return Result.success(session)
     }
 }
 

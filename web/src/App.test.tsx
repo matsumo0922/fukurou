@@ -86,8 +86,12 @@ describe("App", () => {
     expect(await screen.findByText("GET /health")).toBeInTheDocument();
     expect(screen.getByText("GET /health/ready")).toBeInTheDocument();
     expect(screen.getByText("GET /revision")).toBeInTheDocument();
+    expect(screen.getByText("GET /ops/llm-auth")).toBeInTheDocument();
     expect(screen.getByText("status=ok")).toBeInTheDocument();
     expect(screen.getByText("status=ready")).toBeInTheDocument();
+    expect(screen.getByText("claude=logged_in, codex=logged_out")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "CLI auth status" })).toBeInTheDocument();
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
     expect(screen.getAllByText("local-sha").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/JST/).length).toBeGreaterThan(1);
   });
@@ -472,6 +476,31 @@ describe("App", () => {
     expect(screen.getByText(/hourly LLM invocation cap has already been reached/)).toBeInTheDocument();
   });
 
+  it("starts confirmed CLI auth login and displays the authorization challenge", async () => {
+    const fetchMock = stubSystemFetch();
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("Codex login reason"), {
+      target: {
+        value: "operator requested Codex re-auth",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review Codex login" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm Codex login" }));
+
+    expect(await screen.findByText("CLI auth login started")).toBeInTheDocument();
+    expect(screen.getByText("ABCD-EFGH")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "https://auth.example.com/device" })).toHaveAttribute(
+      "href",
+      "https://auth.example.com/device",
+    );
+    expect(postBody(fetchMock, "/ops/llm-auth/codex/login")).toEqual({
+      reason: "operator requested Codex re-auth",
+    });
+  });
+
   it("shows halt 409 refusal reasons in user-facing language", async () => {
     stubSystemFetch({
       haltResponse: {
@@ -532,6 +561,21 @@ type SystemFetchFixture = {
   };
   revision?: string;
   readinessStatus?: number;
+  llmAuth?: {
+    providers: Array<{
+      provider: string;
+      displayName: string;
+      status: string;
+      detail?: string | null;
+      homePath: string;
+      checkedAt: string;
+    }>;
+    checkedAt: string;
+  };
+  llmAuthLoginResponse?: {
+    status: number;
+    body: unknown;
+  };
   haltResponse?: {
     status: number;
     body: unknown;
@@ -554,12 +598,29 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
     lastReconciledAt: null,
     lastMarketDataAt: null,
   };
+  const llmAuth = fixture.llmAuth ?? defaultLlmAuthResponse();
   const revision = fixture.revision ?? "test-sha";
   const readinessStatus = fixture.readinessStatus ?? 200;
 
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = requestPath(input);
     const method = requestMethod(input, init);
+
+    if (path.startsWith("/ops/llm-auth/") && path.endsWith("/login")) {
+      if (method !== "POST") {
+        return jsonResponse({ message: "method not allowed" }, { status: 405 });
+      }
+
+      if (fixture.llmAuthLoginResponse) {
+        return jsonResponse(fixture.llmAuthLoginResponse.body, { status: fixture.llmAuthLoginResponse.status });
+      }
+
+      return jsonResponse(defaultLlmAuthLoginSession(), { status: 202 });
+    }
+
+    if (path.startsWith("/ops/llm-auth/") && path.includes("/login/")) {
+      return jsonResponse(defaultLlmAuthLoginSession());
+    }
 
     switch (path) {
       case "/health":
@@ -573,6 +634,8 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
             "Content-Type": "text/plain",
           },
         });
+      case "/ops/llm-auth":
+        return jsonResponse(llmAuth);
       case "/ops/risk-state":
         return jsonResponse({
           state: "RUNNING",
@@ -952,6 +1015,44 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
   vi.stubGlobal("fetch", fetchMock);
 
   return fetchMock;
+}
+
+function defaultLlmAuthResponse() {
+  return {
+    providers: [
+      {
+        provider: "claude",
+        displayName: "Claude Code",
+        status: "logged_in",
+        detail: "credential marker present",
+        homePath: "/tmp/fukurou-cli-home/.claude",
+        checkedAt: "2026-07-05T12:00:00.000Z",
+      },
+      {
+        provider: "codex",
+        displayName: "Codex",
+        status: "logged_out",
+        detail: "credential marker not found",
+        homePath: "/tmp/fukurou-cli-home/.codex",
+        checkedAt: "2026-07-05T12:00:00.000Z",
+      },
+    ],
+    checkedAt: "2026-07-05T12:00:00.000Z",
+  };
+}
+
+function defaultLlmAuthLoginSession() {
+  return {
+    provider: "codex",
+    sessionId: "session-1",
+    status: "running",
+    authorizationUrl: "https://auth.example.com/device",
+    userCode: "ABCD-EFGH",
+    detail: "authorization challenge emitted",
+    startedAt: "2026-07-05T12:00:00.000Z",
+    expiresAt: "2026-07-05T12:10:00.000Z",
+    completedAt: null,
+  };
 }
 
 function activityTimelineResponse(searchParams: URLSearchParams) {

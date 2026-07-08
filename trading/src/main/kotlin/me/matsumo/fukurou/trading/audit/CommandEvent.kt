@@ -92,6 +92,26 @@ enum class CommandEventType {
      * LLM daemon scheduler が one-shot 起動結果を記録した。
      */
     DAEMON_INVOCATION_COMPLETED,
+
+    /**
+     * CLI auth login process を開始した。
+     */
+    CLI_AUTH_LOGIN_STARTED,
+
+    /**
+     * CLI auth login process が成功した。
+     */
+    CLI_AUTH_LOGIN_COMPLETED,
+
+    /**
+     * CLI auth login process が失敗した。
+     */
+    CLI_AUTH_LOGIN_FAILED,
+
+    /**
+     * CLI auth login process が timeout した。
+     */
+    CLI_AUTH_LOGIN_TIMED_OUT,
 }
 
 /**

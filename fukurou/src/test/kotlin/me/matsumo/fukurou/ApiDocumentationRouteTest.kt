@@ -80,6 +80,23 @@ class ApiDocumentationRouteTest {
         )
         assertOperation(
             paths = paths,
+            path = "/ops/llm-auth",
+            summary = "CLI auth 状態を取得する",
+            tag = "ops",
+        )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/llm-auth/{provider}/login",
+            schemaRef = "#/components/schemas/OpsLlmAuthLoginRequest",
+        )
+        assertOperation(
+            paths = paths,
+            path = "/ops/llm-auth/{provider}/login/{sessionId}",
+            summary = "CLI auth login session を取得する",
+            tag = "ops",
+        )
+        assertOperation(
+            paths = paths,
             path = "/ops/account",
             summary = "paper account snapshot を取得する",
             tag = "ops",

@@ -15,10 +15,14 @@ export type OpsAuditEventResponse = components["schemas"]["OpsAuditEventResponse
 export type OpsDecisionResponse = components["schemas"]["OpsDecisionResponse"];
 export type OpsExecutionResponse = components["schemas"]["OpsExecutionResponse"];
 export type OpsHaltLevel = components["schemas"]["OpsHaltRequest"]["level"];
+export type OpsLlmAuthLoginResponse = components["schemas"]["OpsLlmAuthLoginResponse"];
+export type OpsLlmAuthProviderResponse = components["schemas"]["OpsLlmAuthProviderResponse"];
+export type OpsLlmAuthResponse = components["schemas"]["OpsLlmAuthResponse"];
 export type OpsPositionsResponse = components["schemas"]["OpsPositionsResponse"];
 export type OpsRiskStateResponse = components["schemas"]["OpsRiskStateResponse"];
 export type OpsTriggerResponse = components["schemas"]["OpsTriggerResponse"];
 
+export type LlmAuthProvider = "claude" | "codex";
 export type ActivityTimelineSource = "audit" | "decision" | "execution";
 export type ActivityTimelineSourceFilter = ActivityTimelineSource | "all";
 
@@ -44,6 +48,8 @@ export const ACTIVITY_TIMELINE_FILTER_STORAGE_KEY = "fukurou.web.activity.filter
 
 export const ACTIVITY_TIMELINE_SOURCE_FILTERS = ["all", "decision", "audit", "execution"] as const;
 
+export const LLM_AUTH_PROVIDERS = ["claude", "codex"] as const;
+
 export const ACTIVITY_AUDIT_EVENT_TYPES = [
   "TOOL_CALL_COMPLETED",
   "TOOL_CALL_REJECTED_BY_HARD_HALT",
@@ -61,6 +67,10 @@ export const ACTIVITY_AUDIT_EVENT_TYPES = [
   "DAEMON_TRIGGER_SKIPPED",
   "DAEMON_TRIGGER_LAUNCHED",
   "DAEMON_INVOCATION_COMPLETED",
+  "CLI_AUTH_LOGIN_STARTED",
+  "CLI_AUTH_LOGIN_COMPLETED",
+  "CLI_AUTH_LOGIN_FAILED",
+  "CLI_AUTH_LOGIN_TIMED_OUT",
 ] as const;
 
 export const DEFAULT_ACTIVITY_TIMELINE_FILTERS: ActivityTimelineFilters = {
@@ -94,6 +104,13 @@ export const opsDecisionsQuery = queryOptions({
 export const opsPositionsQuery = queryOptions({
   queryKey: ["ops", "positions"],
   queryFn: () => getJson("/ops/positions"),
+  staleTime: 15_000,
+  refetchInterval: 30_000,
+});
+
+export const opsLlmAuthQuery = queryOptions({
+  queryKey: ["ops", "llm-auth"],
+  queryFn: () => getJson("/ops/llm-auth"),
   staleTime: 15_000,
   refetchInterval: 30_000,
 });
@@ -158,6 +175,38 @@ export async function requestOpsTrigger(reason: string): Promise<OpsTriggerRespo
   const response = await postJsonResponse("/ops/trigger", { reason }, [202] as const);
 
   return response.data;
+}
+
+export async function requestOpsLlmAuthLogin({
+  provider,
+  reason,
+}: {
+  provider: LlmAuthProvider;
+  reason: string;
+}): Promise<OpsLlmAuthLoginResponse> {
+  const path = `/ops/llm-auth/${provider}/login` as "/ops/llm-auth/{provider}/login";
+  const response = await postJsonResponse(path, { reason }, [202] as const);
+
+  return response.data;
+}
+
+export function opsLlmAuthLoginSessionQuery(provider: LlmAuthProvider, sessionId: string) {
+  const path = `/ops/llm-auth/${provider}/login/${encodeURIComponent(sessionId)}` as "/ops/llm-auth/{provider}/login/{sessionId}";
+
+  return queryOptions({
+    queryKey: ["ops", "llm-auth", provider, "login", sessionId],
+    queryFn: () => getJson(path),
+    staleTime: 0,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+
+      return status && isTerminalLlmAuthLoginStatus(status) ? false : 2_000;
+    },
+  });
+}
+
+function isTerminalLlmAuthLoginStatus(status: OpsLlmAuthLoginResponse["status"]): boolean {
+  return status === "succeeded" || status === "failed" || status === "timed_out";
 }
 
 export async function fetchActivityTimeline({

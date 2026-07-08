@@ -7,7 +7,7 @@ Step6 時点の `fukurou-mcp` runtime と Docker 配線の正本メモ。
 - `:mcp` は stdio server として `mcp/build/libs/fukurou-mcp-all.jar` を生成する。
 - `:mcp-gmo-coin` は GMO Coin Public API の market read tools を提供する library module で、standalone 用に `mcp-gmo-coin/build/libs/gmo-coin-mcp-all.jar` も生成できる。
 - Docker image には Ktor 用 `/app/app.jar`、fukurou MCP 用 `/app/fukurou-mcp-all.jar`、standalone GMO Coin MCP 用 `/app/gmo-coin-mcp-all.jar` を同梱する。
-- production image には daemon 既定構成で使う `claude` / `codex` CLI も同梱する。ただし auth token は image に入れず、container 内でログインした state を `llm-home` volume に保存する。
+- production image には daemon 既定構成で使う `claude` / `codex` CLI も同梱する。ただし auth token は image に入れず、WebUI または fallback で作成した login state を `llm-home` volume に保存する。
 - container の entrypoint は Ktor のまま。daemon / CLI 実装時は、同一 image 内の MCP fat jar を `java -jar /app/fukurou-mcp-all.jar` で stdio 子プロセスとして起動する。
 - production runtime の MCP server process は `fukurou-mcp` 1 つだけ。`:mcp` は `:mcp-gmo-coin` の market tools を同一 `Server` に埋め込み、account / trade / test tools と一緒に公開する。
 - `:mcp-gmo-coin` は tool schema、引数 parse、`:trading` への委譲だけを持つ。rate-limit / retry / error 分類は `:trading.exchange.gmo` の GMO Public client 境界で行う。
@@ -100,7 +100,7 @@ FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC=
 
 runner の成功判定は DB が唯一の正本であり、LLM の stdout や exit code から decision は parse しない。Proposer 終了後に `FUKUROU_INVOCATION_ID` に紐づく `decisions` 行を読み、行がなければ `CallerNoTradeGuard` で no-trade audit を残して fail closed する。`ENTER` decision の場合だけ Falsifier を起動し、fresh な `APPROVED` が DB にあるときだけ persisted `trade_intents` の宣言値から `PlaceOrderCommand` を組み立て、`ToolCallGuard.runTradeTool -> PaperBroker -> SafetyFloor` の既存経路へ流す。order placement 用の第三 LLM session は起動しない。
 
-runner が CLI に渡す MCP config は、MCP server env を親 process 継承任せにしない。DB credential を含むため、Claude では permission 0600 の一時 JSON file を作り、その path だけを `--mcp-config` に渡す。Codex では `CODEX_HOME/config.toml` に書き、`mcp_servers.*.env.*` を `-c` argv へ展開しない。production では `FUKUROU_CODEX_PERSISTENT_HOME=/tmp/fukurou-cli-home/.codex` を明示し、container 内でログインした Codex home に config だけを in-place 生成する。local など未設定時は従来どおり一時 `CODEX_HOME` を作り、親 `CODEX_HOME/auth.json`（未設定時は `HOME/.codex/auth.json`）が存在する場合だけ 0600 で copy する。概念的には少なくとも以下を MCP server env へ明示する。
+runner が CLI に渡す MCP config は、MCP server env を親 process 継承任せにしない。DB credential を含むため、Claude では permission 0600 の一時 JSON file を作り、その path だけを `--mcp-config` に渡す。Codex では `CODEX_HOME/config.toml` に書き、`mcp_servers.*.env.*` を `-c` argv へ展開しない。production では `FUKUROU_CODEX_PERSISTENT_HOME=/tmp/fukurou-cli-home/.codex` を明示し、`llm-home` volume 内の Codex home に config だけを in-place 生成する。local など未設定時は従来どおり一時 `CODEX_HOME` を作り、親 `CODEX_HOME/auth.json`（未設定時は `HOME/.codex/auth.json`）が存在する場合だけ 0600 で copy する。概念的には少なくとも以下を MCP server env へ明示する。
 
 ```json
 {
@@ -189,9 +189,10 @@ runner 上限も保守側の override だけを許可する。総 tool call は 
 ## secrets / CLI auth
 
 - Docker image に Claude / Codex の auth token、GMO private key、Cloudflare token を焼き込まない。
-- Production の Claude / Codex login state は container 内でログインし、`llm-home` volume 配下の `HOME=/tmp/fukurou-cli-home` に保存する。
+- Production の Claude / Codex login flow は WebUI Controls から reason 付きで開始し、必要時だけ SSH / `docker exec` を fallback とする。login state は `llm-home` volume 配下の `HOME=/tmp/fukurou-cli-home` に保存する。
 - Codex は `FUKUROU_CODEX_PERSISTENT_HOME=/tmp/fukurou-cli-home/.codex` を明示したときだけ、renderer がその場の `config.toml` を上書きする。local 開発の実 `HOME/.codex/config.toml` を汚さないため、`HOME` から永続 mode を推測しない。
-- Claude / Codex CLI の access token 更新は CLI に任せる。refresh token が失効または revoke された場合だけ、container 内で再ログインする。
+- Claude / Codex CLI の access token 更新は CLI に任せる。refresh token が失効または revoke された場合だけ、WebUI または fallback で再ログインする。
+- WebUI System は `/ops/llm-auth` で CLI auth 状態を表示する。`/health` / `/health/ready` は Ktor / DB / reconciler readiness の意味だけを持つ。
 - auth 失効や permission prompt で decision / falsification row が保存されない場合、runner は DB-as-truth により no-trade audit を残して次 cycle に進む。
 - CLI process が非 0 exit で認証失敗らしい stdout / stderr を出した場合、runner は `RUNNER_PHASE_COMPLETED.details.authFailureSuspected = "true"` と login runbook の warn log を追加する。
 - 既知制約: Falsifier の CLI process env には DB credentials を渡さないが、Falsifier が起動する MCP server config には現時点で full DB credentials が入る。read-only DB user 分離は follow-up とする。

@@ -733,6 +733,199 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ops/llm-auth": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * CLI auth 状態を取得する
+         * @description Claude Code / Codex CLI の login state を専用 endpoint で返します。token や credential file の内容は返しません。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description CLI auth provider 別状態です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsLlmAuthResponse"];
+                    };
+                };
+                /** @description CLI auth service が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/llm-auth/{provider}/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * CLI auth login flow を開始する
+         * @description Claude Code / Codex CLI の login flow を reason 付きで開始します。応答には token や credential file の内容を含めません。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description claude または codex です。 */
+                    provider: string;
+                };
+                cookie?: never;
+            };
+            /** @description login flow を開始する理由です。 */
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["OpsLlmAuthLoginRequest"];
+                };
+            };
+            responses: {
+                /** @description login process を開始しました。 */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsLlmAuthLoginResponse"];
+                    };
+                };
+                /** @description provider、request body、または reason が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description 同じ provider の login process がすでに実行中です。 */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description CLI auth service が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/llm-auth/{provider}/login/{sessionId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * CLI auth login session を取得する
+         * @description 開始済み login flow の現在状態と、CLI が出した authorization URL / user code を返します。token や credential file の内容は返しません。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description claude または codex です。 */
+                    provider: string;
+                    /** @description login start 応答の sessionId です。 */
+                    sessionId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description login session の現在状態です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsLlmAuthLoginResponse"];
+                    };
+                };
+                /** @description provider または sessionId が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description login session が見つかりません。 */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description CLI auth service が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ops/account": {
         parameters: {
             query?: never;
@@ -1257,6 +1450,36 @@ export interface components {
         OpsTriggerResponse: {
             invocationId: string;
             triggerKind: string;
+        };
+        /** OpsLlmAuthProviderResponse */
+        OpsLlmAuthProviderResponse: {
+            provider: string;
+            displayName: string;
+            status: string;
+            detail?: string | null;
+            homePath: string;
+            checkedAt: string;
+        };
+        /** OpsLlmAuthResponse */
+        OpsLlmAuthResponse: {
+            providers: components["schemas"]["OpsLlmAuthProviderResponse"][];
+            checkedAt: string;
+        };
+        /** OpsLlmAuthLoginRequest */
+        OpsLlmAuthLoginRequest: {
+            reason: string;
+        };
+        /** OpsLlmAuthLoginResponse */
+        OpsLlmAuthLoginResponse: {
+            provider: string;
+            sessionId: string;
+            status: string;
+            authorizationUrl?: string | null;
+            userCode?: string | null;
+            detail?: string | null;
+            startedAt: string;
+            expiresAt: string;
+            completedAt?: string | null;
         };
         /** OpsAccountResponse */
         OpsAccountResponse: {
