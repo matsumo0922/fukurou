@@ -69,7 +69,9 @@ export function SidebarNav() {
   return (
     <aside className="sidebar" aria-label={t("sidebar.primaryNavigation")}>
       <div className="sidebar__brand">
-        <img className="sidebar__mark" src="/fukurou-mark.svg" alt="" aria-hidden="true" />
+        <span className="sidebar__mark" aria-hidden="true">
+          🦉
+        </span>
         <div>
           <p className="sidebar__eyebrow">Fukurou</p>
           <p className="sidebar__title">Operations</p>

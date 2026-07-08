@@ -31,6 +31,7 @@ describe("App", () => {
     expect(screen.getByRole("link", { name: /Controls/ })).toHaveAttribute("href", "/app/controls");
     expect(screen.getByRole("link", { name: /Evaluation/ })).toHaveAttribute("href", "/app/evaluation");
     expect(screen.getByRole("link", { name: /System/ })).toHaveAttribute("href", "/app/system");
+    expect(screen.getByText("🦉")).toBeInTheDocument();
     expect(screen.queryByText("Notes")).not.toBeInTheDocument();
   });
 

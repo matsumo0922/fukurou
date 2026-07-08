@@ -76,9 +76,13 @@ a:focus-visible {
 }
 
 .sidebar__mark {
+  display: grid;
+  place-items: center;
   width: 38px;
   height: 38px;
   flex: 0 0 auto;
+  font-size: 1.7rem;
+  line-height: 1;
 }
 
 .sidebar__eyebrow {
