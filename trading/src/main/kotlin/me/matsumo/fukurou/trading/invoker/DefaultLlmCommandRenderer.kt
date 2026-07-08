@@ -750,8 +750,7 @@ private fun String.hasInlineRootBindMount(): Boolean {
 
 private fun String.mountSourceIsRoot(): Boolean {
     val source = split(",")
-        .mapNotNull { value -> value.mountSourceValue() }
-        .firstOrNull()
+        .firstNotNullOfOrNull { value -> value.mountSourceValue() }
 
     return source == "/"
 }
