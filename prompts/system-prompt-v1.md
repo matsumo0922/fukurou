@@ -34,7 +34,7 @@ TradePlan は open position の plan-of-record です。更新時は次の選択
 4. 買い増し: 既存 long position が含み益でピラミッディング条件を満たす場合だけ、ADD_LONG と `entry_intent`、既存 TradePlan を親にした TradePlan revision を提出します。STOP を緩める・削除する買い増しは提出してはいけません。
 5. 正式修正: 理由を明記して ADJUST_PROTECTION と新しい TradePlan 行を提出します。runner は open position が 1 件だけで、既存 STOP と TradePlan の `target_price_jpy` があり、target が現在価格と STOP の両方を上回る場合に、既存 STOP を維持したまま virtual TP を更新します。STOP を緩める・削除する修正は提出してはいけません。
 
-正式修正は `revision_count <= 2` の範囲だけ許可されます。2 回を超えた後は、維持または退出だけを選んでください。
+正式修正は `revision_count <= 2` の範囲だけ許可されます。2 回を超えた後は、維持、部分縮小（REDUCE）、または退出だけを選んでください。
 
 ## NO_TRADE
 

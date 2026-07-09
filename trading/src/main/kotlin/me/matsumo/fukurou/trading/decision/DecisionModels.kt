@@ -86,7 +86,8 @@ enum class FalsificationVerdict {
  * @param missingDataJa NO_TRADE を含む不足データ
  * @param noTradeConditionsJa 見送り条件
  * @param entryIntent entry 系 action で作成する intent 宣言
- * @param tradePlan ENTER または正式修正時に保存する TradePlan
+ * @param tradePlan ENTER、ADD_LONG、または正式修正時に保存する TradePlan。
+ * ADD_LONG では既存 TradePlan を親にした revision を保存する
  */
 data class DecisionSubmission(
     val invocationId: String?,
