@@ -3360,7 +3360,7 @@ risk:
   atrStopMultiplier: "2.0"
   trailingAtrMultiplier: "2.0"
   minExpectedValueR: "0.0"
-  minExpectedMoveToCostRatio: "2.0"
+  minExpectedMoveToCostRatio: "2.5"
   maxDailyEntries: 5
   maxTradePlanRevisions: 2
   requireStopLoss: true

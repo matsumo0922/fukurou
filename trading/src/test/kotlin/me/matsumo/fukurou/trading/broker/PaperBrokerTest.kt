@@ -1178,8 +1178,8 @@ class PaperBrokerTest {
         val command = approvedCommand(
             repository = decisionRepository,
             command = marketEntryCommand(
-                protectiveStopPriceJpy = BigDecimal("9700000"),
-                takeProfitPriceJpy = BigDecimal("10062000"),
+                protectiveStopPriceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10048000"),
                 estimatedWinProbability = BigDecimal.ONE,
             ),
         )

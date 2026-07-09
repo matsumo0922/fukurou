@@ -24,13 +24,14 @@ class TradingBotConfigTest {
         assertEquals(BigDecimal("5"), config.paperExecution.marketSlippageBps)
         assertEquals(BigDecimal("0.1"), config.paperExecution.volatilitySlippageMultiplier)
         assertEquals(BigDecimal("0.80"), config.safetyFloor.maxTotalExposureRatio)
+        assertEquals(BigDecimal("2.5"), config.safetyFloor.minExpectedMoveToCostRatio)
         assertEquals(Duration.ofSeconds(60), config.safetyFloor.dataQualityCap.staleAfter)
         assertEquals(BigDecimal("0.5"), config.safetyFloor.dataQualityCap.cappedProbability)
         assertEquals(Duration.ofMinutes(30), config.decisionProtocol.restingEntryOrderTtl)
         assertEquals(48, config.runner.maxToolCallsPerRun)
         assertEquals(3, config.runner.maxActToolCallsPerRun)
         assertEquals(Duration.ofSeconds(180), config.runner.perRunTimeout)
-        assertEquals(4, config.runner.maxInvocationsPerHour)
+        assertEquals(6, config.runner.maxInvocationsPerHour)
         assertEquals(96, config.runner.maxInvocationsPerDay)
         assertEquals(false, config.daemon.enabled)
         assertEquals(Duration.ofMinutes(15), config.daemon.flatHeartbeatInterval)
@@ -246,7 +247,7 @@ class TradingBotConfigTest {
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO" to "2.5"),
+                mapOf("FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO" to "2.4999"),
             )
         }
         assertFailsWith<IllegalArgumentException> {
@@ -316,7 +317,7 @@ class TradingBotConfigTest {
         }
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
-                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "5"),
+                mapOf("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "7"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

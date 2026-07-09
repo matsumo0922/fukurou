@@ -69,6 +69,22 @@ class RuntimeConfigResolverTest {
     }
 
     @Test
+    fun resolve_preservesExplicitOperatorOverridesForPaperReviewDefaults() {
+        val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
+            "safety.minExpectedMoveToCostRatio" to "3.0",
+            "runner.maxInvocationsPerHour" to "4",
+        )
+        val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
+
+        val result = resolver.resolve(emptyMap()).getOrThrow()
+
+        assertEquals(BigDecimal("3.0"), result.tradingConfig.safetyFloor.minExpectedMoveToCostRatio)
+        assertEquals(4, result.tradingConfig.runner.maxInvocationsPerHour)
+        assertEquals("3.0", result.typedEnvironment.getValue("FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO"))
+        assertEquals("4", result.typedEnvironment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"))
+    }
+
+    @Test
     fun validate_conservativeOnlyRuntimeConfigKeysAcceptBoundaryAndRejectOneStepOutside() {
         val defaults = RuntimeConfigCatalog.runtimeDefaultValues()
         val cases = conservativeBoundaryCases(defaults)

@@ -76,4 +76,19 @@ class RuntimeConfigCatalogTest {
         assertFalse(renderedValues.contains("postgres-secret"))
         assertNotNull(secrets.getValue("cloudflare.tunnelToken").labelKey)
     }
+
+    @Test
+    fun runtimeDefaultValues_exposePaperReviewDefaults() {
+        val defaultValues = RuntimeConfigCatalog.runtimeDefaultValues()
+        val defaultEnvironment = RuntimeConfigCatalog.runtimeEnvironment(TradingBotConfig())
+
+        assertEquals("2.5", defaultValues.getValue("safety.minExpectedMoveToCostRatio"))
+        assertEquals("6", defaultValues.getValue("runner.maxInvocationsPerHour"))
+        assertEquals("96", defaultValues.getValue("runner.maxInvocationsPerDay"))
+        assertEquals("900", defaultValues.getValue("daemon.flatHeartbeatInterval"))
+        assertEquals("2.5", defaultEnvironment.getValue("FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO"))
+        assertEquals("6", defaultEnvironment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"))
+        assertEquals("96", defaultEnvironment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY"))
+        assertEquals("900", defaultEnvironment.getValue("FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS"))
+    }
 }

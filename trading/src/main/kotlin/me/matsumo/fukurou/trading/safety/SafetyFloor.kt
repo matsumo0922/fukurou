@@ -234,7 +234,7 @@ data class SafetyFloorConfig(
             "minExpectedValueR must be greater than or equal to 0.10."
         }
         require(minExpectedMoveToCostRatio >= DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO) {
-            "minExpectedMoveToCostRatio must be greater than or equal to 3.0."
+            "minExpectedMoveToCostRatio must be greater than or equal to 2.5."
         }
         require(maxOrderFeeIsConservative) {
             "maxTakerFeeRatio must stay between 0 and 0.0010 as the order fee / maker rebate cap."
@@ -1276,7 +1276,7 @@ private val DEFAULT_MIN_EXPECTED_VALUE_R = BigDecimal("0.10")
 /**
  * 想定値幅 / 往復 cost の既定最小比率。
  */
-private val DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO = BigDecimal("3.0")
+private val DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO = BigDecimal("2.5")
 
 /**
  * 既定 order fee / maker rebate 絶対値上限。

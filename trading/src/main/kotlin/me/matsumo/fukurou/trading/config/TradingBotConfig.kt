@@ -658,7 +658,7 @@ val MAX_LLM_PER_RUN_TIMEOUT: Duration = Duration.ofSeconds(600)
 /**
  * 直近 1 時間の既定 runner 起動上限。
  */
-const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 4
+const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 6
 
 /**
  * 直近 24 時間の既定 runner 起動上限。
@@ -845,7 +845,7 @@ private fun Map<String, String>.readSafetyFloorConfig(): SafetyFloorConfig {
         ),
         minExpectedMoveToCostRatio = readDecimal(
             name = FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO_ENV,
-            defaultValue = BigDecimal("3.0"),
+            defaultValue = BigDecimal("2.5"),
         ),
         dataQualityCap = readDataQualityCapConfig(),
         maxTakerFeeRatio = readDecimal(
