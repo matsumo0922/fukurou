@@ -48,7 +48,7 @@
 
 [確定事項の改訂: 2026-07-03] 2026-07-02 の「flat時15分定期発火廃止」は、サブスク枠の実数が未確定な段階で token 消費を抑えるための保守運用案だった。Claude Max / Codex Pro 20x の Usage UI と #28 の token / cost 集計で消費を別途監視する前提で、学習データ収集を優先し、daemon 学習期は flat / 保有中とも 15分 cadence を暫定採用する。
 
-- 既定値は flat heartbeat 15分、保有中 check 15分、max invocations per hour 4、daily cap 96 とする。
+- 既定値は flat heartbeat 15分、保有中 check 15分、max invocations per hour 4、daily cap 96 とする（2026-07-09 の改訂値は §1.2.2 を参照）。
 - 経済イベント trigger も同じ hourly / daily 予算を消費し、heartbeat とは別枠にしない。
 - flat 15分運転では rolling 1時間予算が heartbeat で飽和しやすいため、経済イベント trigger は最大約15分遅延して heartbeat 枠を置き換える可能性がある。
 - 96起動/日 x 実測 token は日次消費が大きいため、Usage UI と #28 の集計で過剰消費が見えた場合は cadence を再調整する。
@@ -57,7 +57,7 @@
 
 [確定事項の改訂: 2026-07-09] paper trading 1週目の週次反省会を受け、runtime catalog default と system prompt を調整する。`safety.minExpectedMoveToCostRatio` の既定値は 2.5、`runner.maxInvocationsPerHour` の既定値は 6、`runner.maxInvocationsPerDay` は 96、flat heartbeat は 15分とする。hourly cap には event trigger 用の余地が生まれるが、flat heartbeat 単独で daily cap 96 を消費できるため、同日内の event trigger は後続 heartbeat と日次予算を共有する。production の active runtime config に明示値が保存済みの場合、catalog default 変更では上書きされないため、`/ops/runtime-config` の draft / activate で active 値を更新する。
 
-system prompt v1.9 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
+system prompt v1.10 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
 
 ### 1.3 本設計の方針
 

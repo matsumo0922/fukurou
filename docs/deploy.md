@@ -248,8 +248,10 @@ draft_id="$(scripts/prod-curl \
     "note": "paper trading weekly review defaults"
   }' | jq -r '.version.id')"
 
-scripts/prod-curl -X POST "/ops/runtime-config/drafts/${draft_id}/validate"
-scripts/prod-curl -X POST "/ops/runtime-config/drafts/${draft_id}/activate"
+scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/validate" \
+  --json '{"reason":"paper trading weekly review defaults"}'
+scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/activate" \
+  --json '{"reason":"paper trading weekly review defaults"}'
 scripts/prod-curl /ops/runtime-config
 ```
 
