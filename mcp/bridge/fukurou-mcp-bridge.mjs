@@ -127,7 +127,8 @@ function loadSnapshot(snapshotPath) {
 class FukurouMcpBridge {
   constructor(options, snapshot) {
     this.options = options;
-    this.snapshot = filterSnapshotTools(snapshot, process.env[ALLOWED_TOOLS_ENV]);
+    this.allowedToolNames = parseAllowedToolNames(process.env[ALLOWED_TOOLS_ENV]);
+    this.snapshot = filterSnapshotTools(snapshot, this.allowedToolNames);
     this.backend = null;
     this.ready = false;
     this.exiting = false;
@@ -210,7 +211,7 @@ class FukurouMcpBridge {
 
     if (message.method === TOOLS_LIST_METHOD && hasRequestId(message)) {
       if (this.ready) {
-        this.forwardToBackend(message);
+        this.forwardToolsListToBackend(message);
         return;
       }
 
@@ -285,13 +286,33 @@ class FukurouMcpBridge {
         return;
       }
 
-      warnIfToolSnapshotDiffers(this.snapshot.toolsListResult, message.result);
+      warnIfToolSnapshotDiffers(
+        this.snapshot.toolsListResult,
+        filterToolsListResult(message.result, this.allowedToolNames),
+      );
     });
     this.forwardToBackend({
       jsonrpc: JSON_RPC_VERSION,
       id: requestId,
       method: TOOLS_LIST_METHOD,
       params: {},
+    });
+  }
+
+  forwardToolsListToBackend(clientMessage) {
+    const requestId = this.nextInternalId("client-tools-list");
+    this.internalHandlers.set(requestId, (message) => {
+      this.writeClientResponse({
+        ...message,
+        id: clientMessage.id,
+        result: message.result === undefined
+          ? undefined
+          : filterToolsListResult(message.result, this.allowedToolNames),
+      });
+    });
+    this.forwardToBackend({
+      ...clientMessage,
+      id: requestId,
     });
   }
 
@@ -637,18 +658,29 @@ function warnIfToolSnapshotDiffers(snapshotResult, backendResult) {
   writeBridgeError(`tools/list snapshot mismatch missing_from_backend=${missing} extra_from_backend=${extra}`);
 }
 
-function filterSnapshotTools(snapshot, rawAllowedTools) {
-  const allowedToolNames = parseAllowedToolNames(rawAllowedTools);
+function filterSnapshotTools(snapshot, allowedToolNames) {
   if (allowedToolNames === null) return snapshot;
 
   return {
     ...snapshot,
     toolsListResult: {
       ...snapshot.toolsListResult,
-      tools: snapshot.toolsListResult.tools.filter((tool) =>
-        isObject(tool) && allowedToolNames.has(tool.name)),
+      tools: filterTools(snapshot.toolsListResult.tools, allowedToolNames),
     },
   };
+}
+
+function filterToolsListResult(result, allowedToolNames) {
+  if (allowedToolNames === null || !isObject(result) || !Array.isArray(result.tools)) return result;
+
+  return {
+    ...result,
+    tools: filterTools(result.tools, allowedToolNames),
+  };
+}
+
+function filterTools(tools, allowedToolNames) {
+  return tools.filter((tool) => isObject(tool) && allowedToolNames.has(tool.name));
 }
 
 function parseAllowedToolNames(rawAllowedTools) {

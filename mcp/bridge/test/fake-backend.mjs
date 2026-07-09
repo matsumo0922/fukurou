@@ -129,7 +129,7 @@ function parseAllowedTools(rawValue) {
 }
 
 function filteredTools() {
-  if (allowedTools === null) return tools;
+  if (process.env.FAKE_BACKEND_IGNORE_ALLOWED_TOOLS === "true" || allowedTools === null) return tools;
 
   return tools.filter((toolName) => allowedTools.has(toolName));
 }

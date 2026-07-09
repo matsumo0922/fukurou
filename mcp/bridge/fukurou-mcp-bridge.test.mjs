@@ -71,6 +71,7 @@ test("tools/list snapshot response is filtered by FUKUROU_MCP_ALLOWED_TOOLS", as
     backendEnv: {
       FAKE_BACKEND_INIT_DELAY_MS: "100",
       FAKE_BACKEND_TOOLS: "read_tool,trade_tool,submit_decision",
+      FAKE_BACKEND_IGNORE_ALLOWED_TOOLS: "true",
     },
   });
 
@@ -99,6 +100,45 @@ test("tools/list snapshot response is filtered by FUKUROU_MCP_ALLOWED_TOOLS", as
     await new Promise((resolve) => {
       setTimeout(resolve, 50);
     });
+    assert.doesNotMatch(bridge.stderrText(), /tools\/list snapshot mismatch/);
+
+    await bridge.close();
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("tools/list after backend readiness is filtered by FUKUROU_MCP_ALLOWED_TOOLS", async () => {
+  const context = await createBridgeContext({
+    snapshotTools: ["read_tool", "trade_tool", "submit_decision"],
+    backendEnv: {
+      FAKE_BACKEND_TOOLS: "read_tool,trade_tool,submit_decision",
+      FAKE_BACKEND_IGNORE_ALLOWED_TOOLS: "true",
+    },
+  });
+
+  try {
+    const bridge = context.spawnBridge({
+      env: {
+        FUKUROU_MCP_ALLOWED_TOOLS: "read_tool,submit_decision",
+      },
+    });
+    bridge.send(initializeRequest("init"));
+    await bridge.readJson();
+    await waitForBackendReady(context);
+
+    bridge.send({
+      jsonrpc: "2.0",
+      id: "list-after-ready-filtered",
+      method: "tools/list",
+      params: {},
+    });
+
+    const response = await bridge.readJson();
+    assert.deepEqual(
+      response.result.tools.map((tool) => tool.name),
+      ["read_tool", "submit_decision"],
+    );
     assert.doesNotMatch(bridge.stderrText(), /tools\/list snapshot mismatch/);
 
     await bridge.close();
