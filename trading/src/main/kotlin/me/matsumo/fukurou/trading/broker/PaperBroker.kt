@@ -544,6 +544,7 @@ private class PaperBrokerTradeDelegate(
         val safetyContext = marketContextFactory.safetyContext(
             ticker = ticker,
             symbolRules = symbolRules,
+            includeOrderbook = true,
             intentId = command.intentId,
             tradeGroupId = tradeGroupId,
         )
@@ -717,6 +718,7 @@ private class PaperBrokerMarketContextFactory(
         ticker: Ticker,
         symbolRules: SymbolRules,
         includeAtr: Boolean = false,
+        includeOrderbook: Boolean = false,
         intentId: UUID? = null,
         tradeGroupId: UUID? = null,
     ): SafetyFloorContext {
@@ -740,6 +742,11 @@ private class PaperBrokerMarketContextFactory(
             runtime.stores.ledgerRepository.getExecutions().getOrThrow()
                 .filter { execution -> execution.orderId in tradeGroupOrderIds }
         }
+        val orderbook = if (includeOrderbook) {
+            runtime.orderbookFor(TradingSymbol.BTC)
+        } else {
+            null
+        }
 
         return SafetyFloorContext(
             account = runtime.stores.ledgerRepository.getAccountSnapshot().getOrThrow(),
@@ -749,6 +756,8 @@ private class PaperBrokerMarketContextFactory(
             tradeGroupOrders = tradeGroupOrders,
             tradeGroupExecutions = tradeGroupExecutions,
             ticker = ticker,
+            orderbook = orderbook,
+            orderbookLookupAttempted = includeOrderbook,
             symbolRules = symbolRules,
             entryIntent = entryIntent,
             atr14Jpy = if (includeAtr) {

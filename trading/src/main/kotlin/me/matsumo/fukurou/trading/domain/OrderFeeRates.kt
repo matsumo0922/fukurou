@@ -10,13 +10,16 @@ internal val DEFAULT_MAX_ORDER_FEE_RATE: BigDecimal = BigDecimal("0.0010")
 /**
  * entry 注文種別に対応する fee rate を返す。
  */
-internal fun entryFeeRateFor(orderType: OrderType, symbolRules: SymbolRules): BigDecimal {
+internal fun entryFeeRateFor(
+    orderType: OrderType,
+    symbolRules: SymbolRules,
+    entryLiquidity: ExecutionLiquidity = defaultEntryLiquidityFor(orderType),
+): BigDecimal {
     val takerFeeRate = symbolRules.takerFee.toBigDecimal()
 
-    return when (orderType) {
-        OrderType.LIMIT -> symbolRules.makerFee.toBigDecimal()
-        OrderType.MARKET -> takerFeeRate
-        OrderType.STOP -> takerFeeRate
+    return when (entryLiquidity) {
+        ExecutionLiquidity.MAKER -> symbolRules.makerFee.toBigDecimal()
+        ExecutionLiquidity.TAKER -> takerFeeRate
     }
 }
 
@@ -34,8 +37,15 @@ internal fun cashFeeReserveFor(
     notional: BigDecimal,
     orderType: OrderType,
     symbolRules: SymbolRules,
+    entryLiquidity: ExecutionLiquidity = defaultEntryLiquidityFor(orderType),
 ): BigDecimal {
-    val fee = notional.multiply(entryFeeRateFor(orderType, symbolRules))
+    val fee = notional.multiply(
+        entryFeeRateFor(
+            orderType = orderType,
+            symbolRules = symbolRules,
+            entryLiquidity = entryLiquidity,
+        ),
+    )
 
     return maxOf(fee, BigDecimal.ZERO)
 }
@@ -47,12 +57,14 @@ internal fun requiredCashFor(
     notional: BigDecimal,
     orderType: OrderType,
     symbolRules: SymbolRules,
+    entryLiquidity: ExecutionLiquidity = defaultEntryLiquidityFor(orderType),
 ): BigDecimal {
     return notional.add(
         cashFeeReserveFor(
             notional = notional,
             orderType = orderType,
             symbolRules = symbolRules,
+            entryLiquidity = entryLiquidity,
         ),
     )
 }
@@ -67,29 +79,43 @@ internal fun roundTripCostReserveFor(
     entryOrderType: OrderType,
     symbolRules: SymbolRules,
     slippageRatio: BigDecimal,
+    entryLiquidity: ExecutionLiquidity = defaultEntryLiquidityFor(entryOrderType),
 ): BigDecimal {
-    val entryFee = entryNotional.multiply(entryFeeRateFor(entryOrderType, symbolRules))
+    val entryFee = entryNotional.multiply(
+        entryFeeRateFor(
+            orderType = entryOrderType,
+            symbolRules = symbolRules,
+            entryLiquidity = entryLiquidity,
+        ),
+    )
     val exitFee = exitNotional.multiply(protectiveExitFeeRateFor(symbolRules))
     val feeReserve = entryFee.add(exitFee)
     val slippageReserve = roundTripSlippageNotional(
         entryNotional = entryNotional,
         exitNotional = exitNotional,
-        entryOrderType = entryOrderType,
+        entryLiquidity = entryLiquidity,
     ).multiply(slippageRatio)
 
     return feeReserve.add(slippageReserve).max(BigDecimal.ZERO)
 }
 
+private fun defaultEntryLiquidityFor(orderType: OrderType): ExecutionLiquidity {
+    return when (orderType) {
+        OrderType.LIMIT -> ExecutionLiquidity.MAKER
+        OrderType.MARKET,
+        OrderType.STOP,
+        -> ExecutionLiquidity.TAKER
+    }
+}
+
 private fun roundTripSlippageNotional(
     entryNotional: BigDecimal,
     exitNotional: BigDecimal,
-    entryOrderType: OrderType,
+    entryLiquidity: ExecutionLiquidity,
 ): BigDecimal {
-    return when (entryOrderType) {
-        OrderType.LIMIT -> exitNotional
-        OrderType.MARKET,
-        OrderType.STOP,
-        -> entryNotional.add(exitNotional)
+    return when (entryLiquidity) {
+        ExecutionLiquidity.MAKER -> exitNotional
+        ExecutionLiquidity.TAKER -> entryNotional.add(exitNotional)
     }
 }
 

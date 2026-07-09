@@ -168,7 +168,7 @@ class DefaultLlmDaemonPreFilter(
 
     private fun buildPrompt(request: LlmDaemonPreFilterRequest, snapshot: LlmDaemonPreFilterSnapshot): String {
         return """
-            |You are the Fukurou daemon pre-filter running on Claude Haiku.
+            |You are the Fukurou daemon pre-filter.
             |Decide whether a full trading LLM run is needed for this heartbeat-family trigger.
             |Return exactly one token: YES or NO.
             |
@@ -195,7 +195,7 @@ class DefaultLlmDaemonPreFilter(
             decisionRunId = invocationId,
             llmProvider = LlmProvider.CLAUDE.name.lowercase(),
             promptHash = promptHash,
-            systemPromptVersion = SystemPromptV1.VERSION,
+            systemPromptVersion = DAEMON_PRE_FILTER_PROMPT_VERSION,
             marketSnapshotId = marketSnapshotId,
             runtimeConfigVersionId = runtimeConfigSnapshot?.versionId,
             runtimeConfigHash = runtimeConfigSnapshot?.hash,
@@ -428,8 +428,8 @@ private fun List<Candle>.latestAtr14JpyOrNull(): BigDecimal? {
 
 private fun parsePreFilterDecision(stdout: String): LlmDaemonPreFilterDecision {
     val decisionText = stdout.extractPreFilterDecisionText()
-    val firstToken = decisionText
-        .lineSequence()
+    val lines = decisionText.lineSequence().toList()
+    val firstToken = lines
         .firstOrNull { line -> line.isNotBlank() }
         ?.trim()
         ?.uppercase()
@@ -437,7 +437,17 @@ private fun parsePreFilterDecision(stdout: String): LlmDaemonPreFilterDecision {
     return when (firstToken) {
         "YES" -> LlmDaemonPreFilterDecision.RUN_FULL
         "NO" -> LlmDaemonPreFilterDecision.SKIP_NO_CHANGE
-        else -> error("Pre-filter output must be exactly YES or NO.")
+        else -> {
+            val nonBlankLineCount = lines.count { line -> line.isNotBlank() }
+            val firstTokenLength = firstToken?.length ?: 0
+
+            error(
+                "Pre-filter output must be exactly YES or NO. " +
+                    "lineCount=${lines.size}, " +
+                    "nonBlankLineCount=$nonBlankLineCount, " +
+                    "firstTokenLength=$firstTokenLength.",
+            )
+        }
     }
 }
 
@@ -488,6 +498,7 @@ private const val PRE_FILTER_DECISION_LIMIT = 200
 private const val PRE_FILTER_TEXT_LIMIT = 480
 private const val PRE_FILTER_DECIMAL_SCALE = 8
 private const val PRE_FILTER_FAILURE_LOG_KEY = "llm-daemon-pre-filter-failure"
+private const val DAEMON_PRE_FILTER_PROMPT_VERSION = "daemon-pre-filter-v1"
 private val PRE_FILTER_DECISION_LOOKBACK: Duration = Duration.ofDays(7)
 
 private val PreFilterStdoutJson = Json {

@@ -27,6 +27,9 @@ import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 /**
  * LlmDaemonPreFilter の Claude stdout parsing を検証するテスト。
@@ -55,6 +58,8 @@ class LlmDaemonPreFilterTest {
 
         assertEquals(LlmDaemonPreFilterDecision.RUN_FULL, decision)
         assertEquals(LlmInvocationPhase.PRE_FILTER, invoker.requests.single().phase)
+        assertEquals("daemon-pre-filter-v1", invoker.requests.single().decisionRunContext.systemPromptVersion)
+        assertFalse(invoker.requests.single().prompt.contains("Claude Haiku"))
     }
 
     @Test
@@ -90,6 +95,27 @@ class LlmDaemonPreFilterTest {
             .getOrThrow()
 
         assertEquals(LlmDaemonPreFilterDecision.RUN_FULL, decision)
+    }
+
+    @Test
+    fun defaultPreFilterFailureIncludesOnlyOutputMetadata() = runBlocking {
+        val invoker = StaticPreFilterLlmInvoker(
+            stdout = """
+                MAYBE
+                previous decision thesis should stay private
+            """.trimIndent(),
+        )
+
+        val throwable = preFilter(invoker)
+            .evaluate(preFilterRequest())
+            .exceptionOrNull()
+        val message = assertNotNull(throwable).message.orEmpty()
+
+        assertTrue(message.contains("lineCount=2"))
+        assertTrue(message.contains("nonBlankLineCount=2"))
+        assertTrue(message.contains("firstTokenLength=5"))
+        assertFalse(message.contains("MAYBE"))
+        assertFalse(message.contains("previous decision thesis"))
     }
 }
 

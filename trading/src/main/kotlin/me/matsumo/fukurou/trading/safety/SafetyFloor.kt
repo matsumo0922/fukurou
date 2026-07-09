@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.decision.EntryIntentSafetySnapshot
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
@@ -281,6 +282,8 @@ data class DataQualityCapConfig(
  * @param tradeGroupOrders 評価対象 trade group に紐づく order 履歴
  * @param tradeGroupExecutions 評価対象 trade group に紐づく execution 履歴
  * @param ticker 最新 ticker
+ * @param orderbook SafetyFloor 評価時点で取得できた板情報
+ * @param orderbookLookupAttempted 板情報の取得を試みたなら true
  * @param symbolRules 取引所 symbol rule
  * @param entryIntent entry intent / falsification / consumption snapshot
  * @param atr14Jpy 5分足 ATR(14)
@@ -294,6 +297,8 @@ data class SafetyFloorContext(
     val tradeGroupOrders: List<Order> = emptyList(),
     val tradeGroupExecutions: List<Execution> = emptyList(),
     val ticker: Ticker,
+    val orderbook: Orderbook? = null,
+    val orderbookLookupAttempted: Boolean = false,
     val symbolRules: SymbolRules,
     val entryIntent: EntryIntentSafetySnapshot? = null,
     val atr14Jpy: BigDecimal? = null,

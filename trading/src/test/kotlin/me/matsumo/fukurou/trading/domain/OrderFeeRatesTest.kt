@@ -47,6 +47,20 @@ class OrderFeeRatesTest {
     }
 
     @Test
+    fun roundTripCostReserveFor_usesTakerCostForCrossingLimit() {
+        val reserve = roundTripCostReserveFor(
+            entryNotional = BigDecimal("10000"),
+            exitNotional = BigDecimal("9000"),
+            entryOrderType = OrderType.LIMIT,
+            symbolRules = symbolRules(),
+            slippageRatio = BigDecimal("0.0005"),
+            entryLiquidity = ExecutionLiquidity.TAKER,
+        )
+
+        assertEquals(BigDecimal("19.0000"), reserve)
+    }
+
+    @Test
     fun unsafeOrderFeeRateReasonOrNull_acceptsConservativeMakerRebateAndPositiveTakerFee() {
         val unsafeReason = unsafeOrderFeeRateReasonOrNull(symbolRules())
 
