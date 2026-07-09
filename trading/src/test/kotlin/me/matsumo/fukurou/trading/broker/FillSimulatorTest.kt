@@ -6,12 +6,19 @@ import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.logging.Handler
+import java.util.logging.LogRecord
+import java.util.logging.Logger
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * FillSimulator の paper 約定価格と手数料 contract を検証するテスト。
@@ -67,6 +74,160 @@ class FillSimulatorTest {
         assertEquals("9900000.00000000", fill.priceJpy.toPlainString())
         assertEquals("-9.90000000", fill.feeJpy.toPlainString())
         assertEquals(ExecutionLiquidity.MAKER, fill.liquidity)
+    }
+
+    @Test
+    fun crossing_limit_uses_executable_book_depth_and_taker_fee() {
+        val simulator = FillSimulator(clock = fixedClock())
+
+        val fill = simulator.limitTakerFill(
+            side = OrderSide.BUY,
+            sizeBtc = BigDecimal("0.0100"),
+            limitPriceJpy = BigDecimal("10020000"),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    asks = listOf(
+                        OrderbookLevel(price = "10000000", size = "0.0020"),
+                        OrderbookLevel(price = "10020000", size = "0.0030"),
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals("10016000.00000000", fill.priceJpy.toPlainString())
+        assertEquals("50.08000000", fill.feeJpy.toPlainString())
+        assertEquals(ExecutionLiquidity.TAKER, fill.liquidity)
+    }
+
+    @Test
+    fun resting_limit_records_fak_divergence_memo_when_board_depth_is_partial() {
+        val simulator = FillSimulator(clock = fixedClock())
+
+        val update = simulator.simulatePendingLimit(
+            request = PendingLimitExecutionRequest(
+                side = OrderSide.BUY,
+                sizeBtc = BigDecimal("0.0100"),
+                limitPriceJpy = BigDecimal("9900000"),
+            ),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    asks = listOf(
+                        OrderbookLevel(price = "9890000", size = "0.0040"),
+                        OrderbookLevel(price = "9910000", size = "0.0060"),
+                    ),
+                ),
+                queueFillRatio = BigDecimal("0.50"),
+            ),
+        )
+        val fill = requireNotNull(update.fill)
+        val memo = requireNotNull(update.divergenceMemo)
+
+        assertEquals("0.010000000000", fill.sizeBtc.toPlainString())
+        assertEquals(ExecutionLiquidity.MAKER, fill.liquidity)
+        assertEquals(LIMIT_PARTIAL_FAK_DIVERGENCE_KIND, memo.kind)
+        assertEquals("0.010000000000", memo.requestedSizeBtc.toPlainString())
+        assertEquals("0.002000000000", memo.hypotheticalFilledSizeBtc.toPlainString())
+        assertEquals("0.008000000000", memo.hypotheticalRemainingSizeBtc.toPlainString())
+        assertEquals("0.004000000000", memo.boardDepthBtc.toPlainString())
+        assertEquals("0.5000000000", memo.queueFillRatio.toPlainString())
+        assertEquals("9890000.00000000", memo.bestAskJpy?.toPlainString())
+    }
+
+    @Test
+    fun resting_limit_omits_fak_divergence_memo_when_board_depth_is_sufficient() {
+        val simulator = FillSimulator(clock = fixedClock())
+
+        val update = simulator.simulatePendingLimit(
+            request = PendingLimitExecutionRequest(
+                side = OrderSide.BUY,
+                sizeBtc = BigDecimal("0.0100"),
+                limitPriceJpy = BigDecimal("9900000"),
+            ),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    asks = listOf(OrderbookLevel(price = "9890000", size = "0.0100")),
+                ),
+            ),
+        )
+
+        assertNull(update.divergenceMemo)
+    }
+
+    @Test
+    fun limit_reach_uses_best_ask_for_buy_and_best_bid_for_sell() {
+        val buyReached = limitOrderReached(
+            side = OrderSide.BUY,
+            limitPriceJpy = BigDecimal("9900000"),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    asks = listOf(OrderbookLevel(price = "9900000", size = "0.0100")),
+                ),
+            ),
+            lastPrice = BigDecimal("10000000"),
+        )
+        val buyPending = limitOrderReached(
+            side = OrderSide.BUY,
+            limitPriceJpy = BigDecimal("9900000"),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    asks = listOf(OrderbookLevel(price = "9910000", size = "0.0100")),
+                ),
+            ),
+            lastPrice = BigDecimal("9800000"),
+        )
+        val sellReached = limitOrderReached(
+            side = OrderSide.SELL,
+            limitPriceJpy = BigDecimal("10100000"),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    bids = listOf(OrderbookLevel(price = "10100000", size = "0.0100")),
+                ),
+            ),
+            lastPrice = BigDecimal("10000000"),
+        )
+        val sellPending = limitOrderReached(
+            side = OrderSide.SELL,
+            limitPriceJpy = BigDecimal("10100000"),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    bids = listOf(OrderbookLevel(price = "10090000", size = "0.0100")),
+                ),
+            ),
+            lastPrice = BigDecimal("10200000"),
+        )
+
+        assertTrue(buyReached)
+        assertFalse(buyPending)
+        assertTrue(sellReached)
+        assertFalse(sellPending)
+    }
+
+    @Test
+    fun limit_reach_falls_back_to_last_price_and_warns_when_orderbook_is_unavailable() {
+        val logger = Logger.getLogger("test-limit-reach-fallback")
+        val handler = FillSimulatorCapturingLogHandler()
+
+        logger.addHandler(handler)
+        try {
+            val reached = limitOrderReached(
+                side = OrderSide.BUY,
+                limitPriceJpy = BigDecimal("9900000"),
+                context = paperSimulationContext(
+                    orderbook = null,
+                    orderbookLookupAttempted = true,
+                ),
+                lastPrice = BigDecimal("9800000"),
+                warnLogger = RateLimitedWarnLogger(
+                    logger = logger,
+                    clock = fixedClock(),
+                ),
+            )
+
+            assertTrue(reached)
+            assertTrue(handler.messages.any { message -> message.contains("falling back to last price") })
+        } finally {
+            logger.removeHandler(handler)
+        }
     }
 
     @Test
@@ -195,14 +356,17 @@ private fun symbolRules(): SymbolRules {
 
 private fun paperSimulationContext(
     orderbook: Orderbook? = null,
+    orderbookLookupAttempted: Boolean = orderbook != null,
     volatilitySlippageJpy: BigDecimal = BigDecimal.ZERO,
+    queueFillRatio: BigDecimal = BigDecimal.ONE,
 ): PaperSimulationContext {
     return PaperSimulationContext(
         ticker = ticker(),
         rules = symbolRules(),
         orderbook = orderbook,
-        orderbookLookupAttempted = orderbook != null,
+        orderbookLookupAttempted = orderbookLookupAttempted,
         volatilitySlippageJpy = volatilitySlippageJpy,
+        queueFillRatio = queueFillRatio,
     )
 }
 
@@ -229,4 +393,16 @@ private fun fixedInstant(): Instant {
  */
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+private class FillSimulatorCapturingLogHandler : Handler() {
+    val messages = mutableListOf<String>()
+
+    override fun publish(record: LogRecord) {
+        messages += record.message
+    }
+
+    override fun flush() = Unit
+
+    override fun close() = Unit
 }

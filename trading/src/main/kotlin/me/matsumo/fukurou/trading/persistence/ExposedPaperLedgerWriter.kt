@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.broker.MONEY_SCALE
 import me.matsumo.fukurou.trading.broker.MarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.PaperExecutionSimulator
 import me.matsumo.fukurou.trading.broker.PaperLedgerMutationRepository
+import me.matsumo.fukurou.trading.broker.PaperOrderUpdate
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperSimulationContext
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
@@ -26,11 +27,13 @@ import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.broker.btcScale
 import me.matsumo.fukurou.trading.broker.floorToStep
+import me.matsumo.fukurou.trading.broker.limitOrderReached
 import me.matsumo.fukurou.trading.broker.marketFill
 import me.matsumo.fukurou.trading.broker.moneyScale
 import me.matsumo.fukurou.trading.broker.ratioScale
-import me.matsumo.fukurou.trading.broker.restingEntryFill
+import me.matsumo.fukurou.trading.broker.restingEntryUpdate
 import me.matsumo.fukurou.trading.broker.stopFill
+import me.matsumo.fukurou.trading.broker.withOrderContext
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -365,6 +368,7 @@ internal class ExposedPaperLedgerWriter(
                         triggeredOrderIds = triggeredOrderIds,
                         closedPositionIds = closedPositionIds,
                         executionIds = executionIds,
+                        divergenceMemos = progress.divergenceMemos.toList(),
                     )
                 }
             }
@@ -534,15 +538,18 @@ private fun JdbcTransaction.fillTriggeredEntryOrders(
 ) {
     val triggeredOrders = selectOpenOrders()
         .filter { order -> order.status == OrderStatus.OPEN && order.side == OrderSide.BUY }
-        .filter { order -> order.isEntryTriggered(context.lastPrice) }
+        .filter { order -> order.isEntryTriggered(context) }
 
     triggeredOrders.forEach { order ->
-        val fill = order.createEntryFill(
+        val orderUpdate = order.createEntryUpdate(
             ticker = context.ticker,
             rules = context.rules,
             simulator = context.simulator,
             simulationContext = context.simulationContext,
         )
+        val fill = requireNotNull(orderUpdate.fill) {
+            "Triggered entry order must create a fill."
+        }
         val command = order.toPlaceOrderCommand()
         val positionId = UUID.randomUUID()
         val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
@@ -572,6 +579,9 @@ private fun JdbcTransaction.fillTriggeredEntryOrders(
 
         progress.triggeredOrderIds += order.orderId
         progress.executionIds += fill.executionId.toString()
+        orderUpdate.divergenceMemo
+            ?.withOrderContext(order)
+            ?.let { memo -> progress.divergenceMemos += memo }
     }
 }
 
@@ -1487,21 +1497,30 @@ private data class ExecutionInsertRequest(
     val auditContext: PaperTradeAuditContext,
 )
 
-private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
+private fun Order.isEntryTriggered(context: ReconcileMarketContext): Boolean {
     return when (orderType) {
         OrderType.MARKET -> false
-        OrderType.LIMIT -> limitPriceJpy?.toBigDecimal()?.let { price -> lastPrice <= price } ?: false
-        OrderType.STOP -> triggerPriceJpy?.toBigDecimal()?.let { price -> lastPrice >= price } ?: false
+        OrderType.LIMIT -> {
+            val limitPrice = limitPriceJpy?.toBigDecimal()
+
+            limitPrice != null && limitOrderReached(
+                side = side,
+                limitPriceJpy = limitPrice,
+                context = context.simulationContext,
+                lastPrice = context.lastPrice,
+            )
+        }
+        OrderType.STOP -> triggerPriceJpy?.toBigDecimal()?.let { price -> context.lastPrice >= price } ?: false
     }
 }
 
-private fun Order.createEntryFill(
+private fun Order.createEntryUpdate(
     ticker: Ticker,
     rules: SymbolRules,
     simulator: PaperExecutionSimulator,
     simulationContext: PaperSimulationContext,
-): SimulatedFill {
-    return simulator.restingEntryFill(
+): PaperOrderUpdate {
+    return simulator.restingEntryUpdate(
         request = RestingEntryFillRequest(
             side = side,
             orderType = orderType,

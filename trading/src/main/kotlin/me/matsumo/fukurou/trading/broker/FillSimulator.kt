@@ -1,13 +1,13 @@
 package me.matsumo.fukurou.trading.broker
 
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
+import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
-import me.matsumo.fukurou.trading.domain.entryFeeRateFor
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -54,15 +54,17 @@ interface PaperExecutionSimulator {
  * 即時 taker 約定の入力。
  *
  * @param side 注文 side
- * @param orderType 注文種別。MARKET / STOP を扱う
+ * @param orderType 注文種別。MARKET / STOP / crossing LIMIT を扱う
  * @param sizeBtc 注文数量
  * @param triggerPriceJpy STOP trigger 価格
+ * @param limitPriceJpy crossing LIMIT 価格
  */
 data class ImmediateExecutionRequest(
     val side: OrderSide,
     val orderType: OrderType,
     val sizeBtc: BigDecimal,
     val triggerPriceJpy: BigDecimal? = null,
+    val limitPriceJpy: BigDecimal? = null,
 )
 
 /**
@@ -103,11 +105,13 @@ data class PaperSimulationContext(
  * @param fill 発生した約定。未約定なら null
  * @param remainingSizeBtc 残数量
  * @param expired 注文が失効したか
+ * @param divergenceMemo paper の all-or-none 約定と FAK 部分約定推定の乖離 memo
  */
 data class PaperOrderUpdate(
     val fill: SimulatedFill?,
     val remainingSizeBtc: BigDecimal,
     val expired: Boolean,
+    val divergenceMemo: PaperExecutionDivergenceMemo? = null,
 )
 
 /**
@@ -133,13 +137,13 @@ class DefaultPaperExecutionSimulator(
         val price = when (request.orderType) {
             OrderType.MARKET -> marketPrice(request.side, request.sizeBtc, context)
             OrderType.STOP -> stopPrice(request, context)
-            OrderType.LIMIT -> error("LIMIT order is not an immediate taker order.")
+            OrderType.LIMIT -> limitTakerPrice(request, context)
         }
 
         return fill(
             sizeBtc = request.sizeBtc,
             priceJpy = price,
-            feeRate = entryFeeRateFor(request.orderType, context.rules),
+            feeRate = context.rules.takerFee.toBigDecimal(),
             liquidity = ExecutionLiquidity.TAKER,
         )
     }
@@ -151,14 +155,16 @@ class DefaultPaperExecutionSimulator(
         val fill = fill(
             sizeBtc = request.sizeBtc,
             priceJpy = request.limitPriceJpy,
-            feeRate = entryFeeRateFor(OrderType.LIMIT, context.rules),
+            feeRate = context.rules.makerFee.toBigDecimal(),
             liquidity = ExecutionLiquidity.MAKER,
         )
+        val divergenceMemo = limitFillDivergenceMemo(request, context)
 
         return PaperOrderUpdate(
             fill = fill,
             remainingSizeBtc = BigDecimal.ZERO.btcScale(),
             expired = false,
+            divergenceMemo = divergenceMemo,
         )
     }
 
@@ -197,6 +203,87 @@ class DefaultPaperExecutionSimulator(
             OrderSide.BUY -> maxOf(triggerPriceJpy, slippagePrice)
             OrderSide.SELL -> minOf(triggerPriceJpy, slippagePrice)
         }
+    }
+
+    private fun limitTakerPrice(request: ImmediateExecutionRequest, context: PaperSimulationContext): BigDecimal {
+        val limitPriceJpy = requireNotNull(request.limitPriceJpy) {
+            "LIMIT taker order requires limitPriceJpy."
+        }
+        val orderbook = context.orderbook ?: return fallbackTickerPrice(request.side, context)
+        val depth = orderbook.limitExecutableDepth(request.side, limitPriceJpy)
+
+        if (depth.invalidLevelFound) {
+            warnLogger.warn(
+                key = ORDERBOOK_INVALID_LEVEL_LOG_KEY,
+                message = "Paper execution ignored invalid orderbook levels.",
+            )
+        }
+        if (depth.levels.isEmpty()) {
+            warnLogger.warn(
+                key = ORDERBOOK_FALLBACK_LOG_KEY,
+                message = "Paper LIMIT taker orderbook has no executable levels; falling back to ticker price.",
+            )
+
+            return fallbackTickerPrice(request.side, context)
+        }
+
+        val walkResult = walkLimitLevels(
+            levels = depth.levels,
+            requestedSizeBtc = request.sizeBtc,
+            limitPriceJpy = limitPriceJpy,
+        )
+
+        if (walkResult.depthExhausted) {
+            warnLogger.warn(
+                key = LIMIT_ORDERBOOK_DEPTH_EXHAUSTED_LOG_KEY,
+                message = "Paper LIMIT taker orderbook depth is insufficient; filling residual at limit price.",
+            )
+        }
+
+        return walkResult.priceJpy
+    }
+
+    private fun limitFillDivergenceMemo(
+        request: PendingLimitExecutionRequest,
+        context: PaperSimulationContext,
+    ): PaperExecutionDivergenceMemo? {
+        val orderbook = context.orderbook ?: return null
+        val depth = orderbook.limitExecutableDepth(request.side, request.limitPriceJpy)
+
+        if (depth.invalidLevelFound) {
+            warnLogger.warn(
+                key = ORDERBOOK_INVALID_LEVEL_LOG_KEY,
+                message = "Paper execution ignored invalid orderbook levels.",
+            )
+        }
+
+        val requestedSize = request.sizeBtc.btcScale()
+        val queueFillRatio = context.queueFillRatio.max(BigDecimal.ZERO)
+        val hypotheticalFilledSize = depth.availableSizeBtc
+            .multiply(queueFillRatio)
+            .min(request.sizeBtc)
+            .btcScale()
+        val hypotheticalRemainingSize = request.sizeBtc
+            .subtract(hypotheticalFilledSize)
+            .max(BigDecimal.ZERO)
+            .btcScale()
+
+        if (hypotheticalRemainingSize <= BigDecimal.ZERO) {
+            return null
+        }
+
+        return PaperExecutionDivergenceMemo(
+            kind = LIMIT_PARTIAL_FAK_DIVERGENCE_KIND,
+            side = request.side,
+            limitPriceJpy = request.limitPriceJpy.moneyScale(),
+            requestedSizeBtc = requestedSize,
+            hypotheticalFilledSizeBtc = hypotheticalFilledSize,
+            hypotheticalRemainingSizeBtc = hypotheticalRemainingSize,
+            boardDepthBtc = depth.availableSizeBtc.btcScale(),
+            queueFillRatio = queueFillRatio.ratioScale(),
+            bestBidJpy = depth.bestBidJpy?.moneyScale(),
+            bestAskJpy = depth.bestAskJpy?.moneyScale(),
+        )
     }
 
     private fun fill(
@@ -326,6 +413,41 @@ class DefaultPaperExecutionSimulator(
         )
     }
 
+    private fun walkLimitLevels(
+        levels: List<ParsedOrderbookLevel>,
+        requestedSizeBtc: BigDecimal,
+        limitPriceJpy: BigDecimal,
+    ): OrderbookWalkResult {
+        require(requestedSizeBtc > BigDecimal.ZERO) {
+            "requestedSizeBtc must be greater than zero."
+        }
+
+        var remainingSizeBtc = requestedSizeBtc
+        var notionalJpy = BigDecimal.ZERO
+
+        levels.forEach { level ->
+            if (remainingSizeBtc <= BigDecimal.ZERO) {
+                return@forEach
+            }
+
+            val fillSizeBtc = minOf(level.sizeBtc, remainingSizeBtc)
+
+            notionalJpy = notionalJpy.add(level.priceJpy.multiply(fillSizeBtc))
+            remainingSizeBtc = remainingSizeBtc.subtract(fillSizeBtc)
+        }
+
+        val depthExhausted = remainingSizeBtc > BigDecimal.ZERO
+
+        if (depthExhausted) {
+            notionalJpy = notionalJpy.add(limitPriceJpy.multiply(remainingSizeBtc))
+        }
+
+        return OrderbookWalkResult(
+            priceJpy = notionalJpy.divide(requestedSizeBtc, PRICE_CALCULATION_SCALE, RoundingMode.HALF_UP),
+            depthExhausted = depthExhausted,
+        )
+    }
+
     private fun residualDepthPrice(side: OrderSide, lastLevelPrice: BigDecimal): BigDecimal {
         val penaltyRatio = maxOf(slippageRatio(), MIN_DEPTH_EXHAUSTION_PENALTY_RATIO)
 
@@ -342,7 +464,7 @@ class DefaultPaperExecutionSimulator(
  * @param priceJpy 価格
  * @param sizeBtc 数量
  */
-private data class ParsedOrderbookLevel(
+internal data class ParsedOrderbookLevel(
     val priceJpy: BigDecimal,
     val sizeBtc: BigDecimal,
 )
@@ -353,9 +475,26 @@ private data class ParsedOrderbookLevel(
  * @param usableLevels 約定計算に使える level
  * @param invalidLevelFound invalid level が含まれていたか
  */
-private data class ParsedOrderbookLevels(
+internal data class ParsedOrderbookLevels(
     val usableLevels: List<ParsedOrderbookLevel>,
     val invalidLevelFound: Boolean,
+)
+
+/**
+ * LIMIT 価格までに約定可能な反対側板深さ。
+ *
+ * @param levels LIMIT 価格内の反対側 level
+ * @param availableSizeBtc LIMIT 価格内の合計数量
+ * @param invalidLevelFound invalid level が含まれていたか
+ * @param bestBidJpy parsed best bid
+ * @param bestAskJpy parsed best ask
+ */
+internal data class LimitExecutableOrderbookDepth(
+    val levels: List<ParsedOrderbookLevel>,
+    val availableSizeBtc: BigDecimal,
+    val invalidLevelFound: Boolean,
+    val bestBidJpy: BigDecimal?,
+    val bestAskJpy: BigDecimal?,
 )
 
 /**
@@ -369,13 +508,125 @@ private data class OrderbookWalkResult(
     val depthExhausted: Boolean,
 )
 
-private fun List<OrderbookLevel>.toAdverseAskLevels(): ParsedOrderbookLevels {
+internal fun limitOrderCrossesBook(
+    side: OrderSide,
+    limitPriceJpy: BigDecimal,
+    context: PaperSimulationContext,
+): Boolean {
+    val orderbook = context.orderbook ?: return false
+    val bestOppositeQuote = orderbook.bestOppositeQuoteJpy(side) ?: return false
+
+    return when (side) {
+        OrderSide.BUY -> limitPriceJpy >= bestOppositeQuote
+        OrderSide.SELL -> limitPriceJpy <= bestOppositeQuote
+    }
+}
+
+internal fun limitOrderReached(
+    side: OrderSide,
+    limitPriceJpy: BigDecimal,
+    context: PaperSimulationContext,
+    lastPrice: BigDecimal,
+    warnLogger: RateLimitedWarnLogger = limitReachWarnLogger,
+): Boolean {
+    context.orderbook?.let { orderbook ->
+        val bestOppositeQuote = orderbook.bestOppositeQuoteJpy(side)
+
+        if (bestOppositeQuote != null) {
+            return when (side) {
+                OrderSide.BUY -> bestOppositeQuote <= limitPriceJpy
+                OrderSide.SELL -> bestOppositeQuote >= limitPriceJpy
+            }
+        }
+
+        warnLogger.warn(
+            key = LIMIT_REACH_ORDERBOOK_FALLBACK_LOG_KEY,
+            message = "Paper LIMIT reach check orderbook has no usable opposite quote; falling back to last price.",
+        )
+
+        return limitOrderReachedByLastPrice(side, limitPriceJpy, lastPrice)
+    }
+
+    if (context.orderbookLookupAttempted) {
+        warnLogger.warn(
+            key = LIMIT_REACH_ORDERBOOK_FALLBACK_LOG_KEY,
+            message = "Paper LIMIT reach check orderbook is unavailable; falling back to last price.",
+        )
+    }
+
+    return limitOrderReachedByLastPrice(side, limitPriceJpy, lastPrice)
+}
+
+internal fun PaperExecutionDivergenceMemo.withOrderContext(order: Order): PaperExecutionDivergenceMemo {
+    return copy(
+        orderId = order.orderId,
+        intentId = order.intentId,
+        tradeGroupId = order.tradeGroupId,
+        clientRequestId = order.clientRequestId,
+        symbol = order.symbol,
+    )
+}
+
+internal fun Orderbook.limitExecutableDepth(
+    side: OrderSide,
+    limitPriceJpy: BigDecimal,
+): LimitExecutableOrderbookDepth {
+    val oppositeLevels = when (side) {
+        OrderSide.BUY -> asks.toAdverseAskLevels()
+        OrderSide.SELL -> bids.toAdverseBidLevels()
+    }
+    val executableLevels = oppositeLevels.usableLevels.filter { level ->
+        when (side) {
+            OrderSide.BUY -> level.priceJpy <= limitPriceJpy
+            OrderSide.SELL -> level.priceJpy >= limitPriceJpy
+        }
+    }
+    val availableSizeBtc = executableLevels.fold(BigDecimal.ZERO) { totalSize, level ->
+        totalSize.add(level.sizeBtc)
+    }
+
+    return LimitExecutableOrderbookDepth(
+        levels = executableLevels,
+        availableSizeBtc = availableSizeBtc,
+        invalidLevelFound = oppositeLevels.invalidLevelFound,
+        bestBidJpy = bestBidJpy(),
+        bestAskJpy = bestAskJpy(),
+    )
+}
+
+private fun Orderbook.bestOppositeQuoteJpy(side: OrderSide): BigDecimal? {
+    return when (side) {
+        OrderSide.BUY -> bestAskJpy()
+        OrderSide.SELL -> bestBidJpy()
+    }
+}
+
+private fun Orderbook.bestBidJpy(): BigDecimal? {
+    return bids.toAdverseBidLevels().usableLevels.firstOrNull()?.priceJpy
+}
+
+private fun Orderbook.bestAskJpy(): BigDecimal? {
+    return asks.toAdverseAskLevels().usableLevels.firstOrNull()?.priceJpy
+}
+
+private fun limitOrderReachedByLastPrice(
+    side: OrderSide,
+    limitPriceJpy: BigDecimal,
+    lastPrice: BigDecimal,
+): Boolean {
+    return when (side) {
+        OrderSide.BUY -> lastPrice <= limitPriceJpy
+        OrderSide.SELL -> lastPrice >= limitPriceJpy
+    }
+}
+
+internal fun List<OrderbookLevel>.toAdverseAskLevels(): ParsedOrderbookLevels {
     return toParsedOrderbookLevels().let { levels ->
         levels.copy(usableLevels = levels.usableLevels.sortedBy { level -> level.priceJpy })
     }
 }
 
-private fun List<OrderbookLevel>.toAdverseBidLevels(): ParsedOrderbookLevels {
+internal fun List<OrderbookLevel>.toAdverseBidLevels(): ParsedOrderbookLevels {
     return toParsedOrderbookLevels().let { levels ->
         levels.copy(usableLevels = levels.usableLevels.sortedByDescending { level -> level.priceJpy })
     }
@@ -507,4 +758,23 @@ private const val ORDERBOOK_INVALID_LEVEL_LOG_KEY = "paper-execution-orderbook-i
  */
 private const val ORDERBOOK_DEPTH_EXHAUSTED_LOG_KEY = "paper-execution-orderbook-depth-exhausted"
 
+/**
+ * LIMIT taker depth exhaustion log の key。
+ */
+private const val LIMIT_ORDERBOOK_DEPTH_EXHAUSTED_LOG_KEY = "paper-execution-limit-orderbook-depth-exhausted"
+
+/**
+ * LIMIT reach fallback log の key。
+ */
+private const val LIMIT_REACH_ORDERBOOK_FALLBACK_LOG_KEY = "paper-limit-reach-orderbook-fallback"
+
+/**
+ * LIMIT FAK 乖離 memo の種別。
+ */
+internal const val LIMIT_PARTIAL_FAK_DIVERGENCE_KIND = "LIMIT_PARTIAL_FAK_DIVERGENCE"
+
 private val paperExecutionLogger: Logger = Logger.getLogger(DefaultPaperExecutionSimulator::class.java.name)
+
+private val limitReachWarnLogger = RateLimitedWarnLogger(
+    logger = Logger.getLogger("me.matsumo.fukurou.trading.broker.LimitOrderReach"),
+)

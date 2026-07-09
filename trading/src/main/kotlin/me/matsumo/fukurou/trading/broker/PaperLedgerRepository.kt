@@ -353,11 +353,13 @@ data class ReconcileMarketContext(
  * @param triggeredOrderIds trigger した order ID
  * @param closedPositionIds close した position ID
  * @param executionIds 作成した execution ID
+ * @param divergenceMemos paper/live 乖離を audit に渡す structured memo
  */
 data class ReconcileProgress(
     val triggeredOrderIds: MutableList<String>,
     val closedPositionIds: MutableList<String>,
     val executionIds: MutableList<String>,
+    val divergenceMemos: MutableList<PaperExecutionDivergenceMemo> = mutableListOf(),
 )
 
 /**

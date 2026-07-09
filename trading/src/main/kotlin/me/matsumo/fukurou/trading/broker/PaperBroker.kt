@@ -363,13 +363,13 @@ private class PaperBrokerTradeDelegate(
 
             validateSymbolRules(resolvedCommand, symbolRules)
             validateEntryPriceContract(resolvedCommand, ticker)
-            val marketFill = marketEntryFillOrNull(resolvedCommand, ticker, symbolRules)
+            val immediateFill = immediateEntryFillOrNull(resolvedCommand, ticker, symbolRules)
 
-            if (marketFill != null) {
+            if (immediateFill != null) {
                 return@runCatching intentConsumer.fillMarketEntryAndConsumeIntent(
                     MarketEntryFillRequest(
                         command = resolvedCommand,
-                        fill = marketFill,
+                        fill = immediateFill,
                         positionId = UUID.randomUUID(),
                         tradeGroupId = resolvedTradeGroupId,
                         stopOrderId = UUID.randomUUID(),
@@ -393,15 +393,23 @@ private class PaperBrokerTradeDelegate(
         }
     }
 
-    private suspend fun marketEntryFillOrNull(
+    private suspend fun immediateEntryFillOrNull(
         command: PlaceOrderCommand,
         ticker: Ticker,
         symbolRules: SymbolRules,
     ): SimulatedFill? {
-        if (command.orderType != OrderType.MARKET) {
-            return null
+        return when (command.orderType) {
+            OrderType.MARKET -> marketEntryFill(command, ticker, symbolRules)
+            OrderType.LIMIT -> crossingLimitEntryFillOrNull(command, ticker, symbolRules)
+            OrderType.STOP -> null
         }
+    }
 
+    private suspend fun marketEntryFill(
+        command: PlaceOrderCommand,
+        ticker: Ticker,
+        symbolRules: SymbolRules,
+    ): SimulatedFill {
         val executionContext = runtime.paperSimulationContext(
             symbol = command.symbol,
             ticker = ticker,
@@ -422,6 +430,43 @@ private class PaperBrokerTradeDelegate(
             sizeBtc = command.sizeBtc,
             context = executionContext,
         )
+    }
+
+    private suspend fun crossingLimitEntryFillOrNull(
+        command: PlaceOrderCommand,
+        ticker: Ticker,
+        symbolRules: SymbolRules,
+    ): SimulatedFill? {
+        val limitPriceJpy = requireNotNull(command.priceJpy) {
+            "LIMIT order requires priceJpy."
+        }
+        val executionContext = runtime.paperSimulationContext(
+            symbol = command.symbol,
+            ticker = ticker,
+            rules = symbolRules,
+            includeOrderbook = true,
+            includeVolatilitySlippage = false,
+        )
+
+        if (!limitOrderCrossesBook(command.side, limitPriceJpy, executionContext)) {
+            return null
+        }
+
+        val fill = runtime.market.fillSimulator.limitTakerFill(
+            side = command.side,
+            sizeBtc = command.sizeBtc,
+            limitPriceJpy = limitPriceJpy,
+            context = executionContext,
+        )
+
+        runtime.validateCashAvailability(
+            command = command,
+            ticker = ticker,
+            rules = symbolRules,
+            immediateFill = fill,
+        )
+
+        return fill
     }
 
     override suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult> {
@@ -971,13 +1016,14 @@ private suspend fun PaperBrokerRuntime.reconcileSimulationContext(tickSnapshot: 
     val rules = tickSnapshot.symbolRules ?: symbolRulesFor(TradingSymbol.BTC).getOrThrow()
     val lastPrice = tickSnapshot.lastPrice?.toBigDecimal() ?: ticker.last.toBigDecimal()
     val immediateFillTriggered = immediateReconcileFillTriggered(lastPrice)
+    val orderbookNeeded = immediateFillTriggered || openLimitEntryOrderExists()
 
     return paperSimulationContext(
         symbol = TradingSymbol.BTC,
         ticker = ticker,
         rules = rules,
         atr14Jpy = tickSnapshot.atr14Jpy?.toBigDecimalOrNull(),
-        includeOrderbook = immediateFillTriggered,
+        includeOrderbook = orderbookNeeded,
         includeVolatilitySlippage = immediateFillTriggered,
     )
 }
@@ -993,6 +1039,16 @@ private suspend fun PaperBrokerRuntime.immediateReconcileFillTriggered(lastPrice
     return stores.ledgerRepository.getOpenPositions()
         .getOrThrow()
         .any { position -> position.immediateProtectionTriggered(lastPrice) }
+}
+
+private suspend fun PaperBrokerRuntime.openLimitEntryOrderExists(): Boolean {
+    return stores.ledgerRepository.getOpenOrders()
+        .getOrThrow()
+        .any { order ->
+            order.status == OrderStatus.OPEN &&
+                order.side == OrderSide.BUY &&
+                order.orderType == OrderType.LIMIT
+        }
 }
 
 private fun Order.isTriggeredBuyStop(lastPrice: BigDecimal): Boolean {
@@ -1180,6 +1236,7 @@ private suspend fun PaperBrokerRuntime.validateCashAvailability(
     command: PlaceOrderCommand,
     ticker: Ticker,
     rules: SymbolRules,
+    immediateFill: SimulatedFill? = null,
     executionContext: PaperSimulationContext? = null,
 ) {
     val balance = stores.ledgerRepository.getAccountSnapshot().getOrThrow()
@@ -1188,12 +1245,20 @@ private suspend fun PaperBrokerRuntime.validateCashAvailability(
     val reservedCashJpy = openOrders
         .filter { order -> order.side == OrderSide.BUY && order.status == OrderStatus.OPEN }
         .sumOf { order -> order.estimatedBuyReservationJpy(ticker, rules, market.fillSimulator) }
-    val requiredCash = command.estimatedRequiredCash(ticker, rules, market.fillSimulator, executionContext)
+    val requiredCash = immediateFill?.requiredCashForBuy()
+        ?: command.estimatedRequiredCash(ticker, rules, market.fillSimulator, executionContext)
     val availableCash = cashJpy.subtract(reservedCashJpy).moneyScale()
 
     require(requiredCash <= availableCash) {
         "Insufficient JPY cash for paper order. required=$requiredCash available=$availableCash."
     }
+}
+
+private fun SimulatedFill.requiredCashForBuy(): BigDecimal {
+    val notional = priceJpy.multiply(sizeBtc)
+    val cashFee = feeJpy.max(BigDecimal.ZERO)
+
+    return notional.add(cashFee).moneyScale()
 }
 
 private fun PlaceOrderCommand.estimatedRequiredCash(

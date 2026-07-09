@@ -28,6 +28,7 @@ import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
@@ -410,6 +411,47 @@ class ProtectionReconcilerTest {
         assertEquals(0, broker.getPositions().getOrThrow().size)
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun reconcile_pass_records_limit_fak_divergence_memo_in_completed_audit_payload() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val eventLog = InMemoryCommandEventLog()
+        val marketDataSource = MutableReconcilerOrderbookMarketDataSource(
+            orderbook = reconcilerOrderbookWithAsk("10010000"),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = restingReconcilerEntryCommand(),
+            ),
+        ).getOrThrow()
+        marketDataSource.orderbook = reconcilerOrderbookWithAsk(price = "10000000", size = "0.0020")
+        val reconciler = createReconciler(
+            eventLog = eventLog,
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(limitReachTickSnapshot())),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+        val payload = eventLog.events()
+            .last { event -> event.eventType == CommandEventType.RECONCILER_PASS_COMPLETED }
+            .payload
+
+        assertTrue(result.isSuccess)
+        assertTrue(payload.contains(""""paperExecutionDivergenceMemos""""))
+        assertTrue(payload.contains(""""hypotheticalRemainingSizeBtc":"0.003000000000""""))
+        assertTrue(payload.contains(""""orderId""""))
     }
 
     @Test
@@ -798,6 +840,17 @@ private fun neutralBtcTickSnapshot(): TickSnapshot {
     )
 }
 
+private fun limitReachTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "10050000",
+        bidPrice = "10040000",
+        askPrice = "10050000",
+        symbolRules = reconcilerSymbolRules(),
+    )
+}
+
 private fun drawdownHaltTickSnapshot(): TickSnapshot {
     return TickSnapshot(
         symbol = "BTC",
@@ -913,6 +966,14 @@ private fun reconcilerSymbolRules(): SymbolRules {
     )
 }
 
+private fun reconcilerOrderbookWithAsk(price: String, size: String = "0.0100"): Orderbook {
+    return Orderbook(
+        symbol = "BTC",
+        bids = listOf(OrderbookLevel(price = "9990000", size = "0.0100")),
+        asks = listOf(OrderbookLevel(price = price, size = size)),
+    )
+}
+
 /**
  * Reconciler broker integration test 用 fake market data。
  */
@@ -950,6 +1011,19 @@ private object ReconcilerFakeMarketDataSource : MarketDataSource {
 
     override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
         return Result.success(reconcilerSymbolRules())
+    }
+}
+
+/**
+ * Reconciler の LIMIT board relation を差し替える fake market data。
+ *
+ * @param orderbook 現在返す orderbook
+ */
+private class MutableReconcilerOrderbookMarketDataSource(
+    var orderbook: Orderbook,
+) : MarketDataSource by ReconcilerFakeMarketDataSource {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.success(orderbook)
     }
 }
 
