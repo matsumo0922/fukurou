@@ -968,7 +968,7 @@ object DecisionsTable : Table("decisions") {
     val missingDataJa = text("missing_data_ja")
 
     /**
-     * 見送り条件一覧 JSON。
+     * NO_TRADE 時に次回評価へ残した entry trigger / invalidation 条件一覧 JSON。
      */
     val noTradeConditionsJa = text("no_trade_conditions_ja")
 

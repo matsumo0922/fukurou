@@ -13,6 +13,7 @@ import me.matsumo.fukurou.trading.reflection.ReflectionConfig
 import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
+import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.math.BigDecimal
 import java.time.Duration
 import java.time.Instant
@@ -845,7 +846,7 @@ private fun Map<String, String>.readSafetyFloorConfig(): SafetyFloorConfig {
         ),
         minExpectedMoveToCostRatio = readDecimal(
             name = FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO_ENV,
-            defaultValue = BigDecimal("2.5"),
+            defaultValue = SafetyFloorDefaults.minExpectedMoveToCostRatio,
         ),
         dataQualityCap = readDataQualityCapConfig(),
         maxTakerFeeRatio = readDecimal(

@@ -212,7 +212,7 @@ Claude / Codex のプラン枠:
 | --- | ---: | --- |
 | flat 時ハートビート間隔 | 6 時間 | flat だけで 4 起動 / 日に抑える |
 | 保有中 LLM check 間隔 | 3 時間 | ProtectionReconciler が deterministic に保護を維持する前提で、LLM 判断は抑える |
-| `maxInvocationsPerHour` | 1 | 初期案の 12/hour は subscription 枠に対して高すぎる |
+| `maxInvocationsPerHour` | 1 | 2026-07-03 時点の現行 12/hour は subscription 枠に対して高すぎる |
 | 追加推奨: daily cap | 4 / day | #27 の scope に入れられるなら追加すべき。hourly cap だけでは日次・週次枠を守れない |
 
 20-50 起動 / 日を成立させたい場合の代替案:

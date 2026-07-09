@@ -83,7 +83,7 @@ data class KnowledgeSimilarSetupsQuery(
  * @param reasonJa 判断理由の短縮版
  * @param selfReviewSummary self review の短縮版
  * @param missingDataJa 不足データの短縮版
- * @param noTradeConditionsJa 見送り条件の短縮版
+ * @param noTradeConditionsJa NO_TRADE 時に次回評価へ残した entry trigger / invalidation 条件の短縮版
  * @param tradePlanSummary TradePlan の短縮版
  * @param falsificationSummary Falsifier verdict の短縮版
  */

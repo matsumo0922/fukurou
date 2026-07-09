@@ -256,7 +256,7 @@ data class OpsDecisionsResponse(
  * @param setupTags setup tag 一覧
  * @param estimatedWinProbability LLM 申告の推定勝率
  * @param reasonJa 判断理由
- * @param noTradeConditionsJa 見送り条件
+ * @param noTradeConditionsJa NO_TRADE 時に次回評価へ残した entry trigger / invalidation 条件
  * @param createdAt 作成時刻
  */
 @Serializable
