@@ -122,6 +122,7 @@ internal fun startProtectionReconcilerWorker(
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     status: MutableReconcilerStatus,
     clock: Clock = Clock.systemUTC(),
+    onStaleLlmRunsRecovered: (Int) -> Unit = {},
 ): ProtectionReconcilerWorker {
     val inputs = ProtectionReconcilerWorkerInputs(
         dataSource = dataSource,
@@ -141,6 +142,7 @@ internal fun startProtectionReconcilerWorker(
                 clock = clock,
                 paperAccountConfig = tradingConfig.paperAccount,
                 staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
+                onStaleLlmRunsRecovered = onStaleLlmRunsRecovered,
             ).ensureSchema()
         },
         clock = clock,

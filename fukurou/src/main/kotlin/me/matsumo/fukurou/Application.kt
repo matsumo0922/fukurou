@@ -115,7 +115,7 @@ fun Application.module(
             tradingConfig = tradingConfig,
             runtimeConfigEnvironment = runtimeConfigEnvironment,
             onStaleLlmRunsRecovered = { count ->
-                log.warn("Recovered {} stale llm_runs rows at startup.", count)
+                log.warn("Recovered {} stale llm_runs rows during persistence bootstrap.", count)
             },
         ),
     )
@@ -187,6 +187,7 @@ private fun createApplicationRuntimeResources(
         tradingRuntimeAvailable = runtimeConfigSnapshot.tradingRuntimeAvailable,
         runtimeConfigSnapshot = runtimeConfigSnapshot.runtimeConfigSnapshot,
         runtimeConfigState = runtimeConfigState,
+        onStaleLlmRunsRecovered = inputs.onStaleLlmRunsRecovered,
     )
 }
 
@@ -769,6 +770,7 @@ private fun startApplicationBackgroundWorkers(
         database = database,
         tradingConfig = runtime.tradingConfig,
         clock = runtime.clock,
+        onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
     )
 
     return ApplicationBackgroundWorkers(
@@ -778,6 +780,7 @@ private fun startApplicationBackgroundWorkers(
             tradingConfig = runtime.tradingConfig,
             status = runtime.reconcilerStatus,
             clock = runtime.clock,
+            onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
         ),
         llmDaemonWorker = startLlmDaemonSchedulerWorker(
             dataSource = dataSource,
@@ -785,6 +788,7 @@ private fun startApplicationBackgroundWorkers(
             tradingConfig = runtime.tradingConfig,
             runtimeConfigSnapshot = runtime.runtimeConfigSnapshot,
             clock = runtime.clock,
+            onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
         ),
         obsidianWriterWorker = startObsidianWriterWorker(
             database = database,
@@ -830,6 +834,7 @@ private fun sharedTradingPersistenceBootstrap(
     database: ExposedDatabase,
     tradingConfig: TradingBotConfig,
     clock: Clock,
+    onStaleLlmRunsRecovered: (Int) -> Unit,
 ): () -> Result<Unit> {
     val lock = Any()
     var completed = false
@@ -844,6 +849,7 @@ private fun sharedTradingPersistenceBootstrap(
                     clock = clock,
                     paperAccountConfig = tradingConfig.paperAccount,
                     staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
+                    onStaleLlmRunsRecovered = onStaleLlmRunsRecovered,
                 ).ensureSchema().also { result ->
                     if (result.isSuccess) {
                         completed = true
@@ -900,6 +906,7 @@ private data class ApplicationRuntimeConfigSnapshot(
  * @param tradingRuntimeAvailable 取引 runtime / manual trigger / daemon を起動できるか
  * @param runtimeConfigSnapshot 起動時に解決した runtime config snapshot
  * @param runtimeConfigState active runtime config の現在状態 holder
+ * @param onStaleLlmRunsRecovered stale llm_runs 回収件数の通知
  */
 private data class ApplicationRuntimeResources(
     val readinessProbe: ReadinessProbe?,
@@ -909,6 +916,7 @@ private data class ApplicationRuntimeResources(
     val tradingRuntimeAvailable: Boolean,
     val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
     val runtimeConfigState: ApplicationRuntimeConfigState,
+    val onStaleLlmRunsRecovered: (Int) -> Unit,
 )
 
 /**

@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
+import me.matsumo.fukurou.trading.reflection.MAX_REFLECTION_LLM_TIMEOUT
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
@@ -24,10 +25,10 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 private const val STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER = 3L
 
 /**
- * 起動時に stale な llm_runs を FAILED へ回収するときの固定 error_message。
+ * persistence bootstrap で stale な llm_runs を FAILED へ回収するときの固定 error_message。
  */
 internal const val STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE =
-    "LLM run was interrupted by a previous process or container shutdown and recovered at startup."
+    "LLM run was interrupted by a previous process or container shutdown and recovered during persistence bootstrap."
 
 /**
  * risk_state 初期行を作る SQL。
@@ -783,7 +784,10 @@ class TradingPersistenceBootstrap(
  * stale な RUNNING llm_runs の回収閾値を取引設定から算出する。
  */
 fun TradingBotConfig.staleLlmRunRecoveryThreshold(): Duration {
-    return runner.perRunTimeout.multipliedBy(STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER)
+    val runnerThreshold = runner.perRunTimeout.multipliedBy(STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER)
+    val reflectionThreshold = MAX_REFLECTION_LLM_TIMEOUT.multipliedBy(STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER)
+
+    return runnerThreshold.coerceAtLeast(reflectionThreshold)
 }
 
 /**

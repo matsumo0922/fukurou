@@ -21,6 +21,7 @@ import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
@@ -1155,6 +1156,15 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(LLM_RUN_STATUS_FAILED, alreadyFinishedRun.status)
         assertEquals(alreadyFinishedAt, alreadyFinishedRun.finishedAt)
         assertEquals("already failed", alreadyFinishedRun.errorMessage)
+    }
+
+    @Test
+    fun staleLlmRunRecoveryThreshold_keepsReflectionTimeoutFloor() {
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(perRunTimeout = Duration.ofSeconds(30)),
+        )
+
+        assertEquals(Duration.ofSeconds(360), config.staleLlmRunRecoveryThreshold())
     }
 
     @Test

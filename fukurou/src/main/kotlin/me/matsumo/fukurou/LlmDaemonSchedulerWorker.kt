@@ -144,6 +144,7 @@ internal fun startLlmDaemonSchedulerWorker(
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     clock: Clock = Clock.systemUTC(),
+    onStaleLlmRunsRecovered: (Int) -> Unit = {},
 ): LlmDaemonSchedulerWorker? {
     val environment = System.getenv()
 
@@ -174,6 +175,7 @@ internal fun startLlmDaemonSchedulerWorker(
                 clock = clock,
                 paperAccountConfig = tradingConfig.paperAccount,
                 staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
+                onStaleLlmRunsRecovered = onStaleLlmRunsRecovered,
             ).ensureSchema()
         },
         clock = clock,
