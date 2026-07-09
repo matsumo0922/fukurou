@@ -155,7 +155,7 @@ Reflection Runner の PromptCandidates は完了済み前週を対象に `REFLEC
 runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB bootstrap が `runtime_config_versions` / `runtime_config_values` に初期 active version を作成する。active snapshot に不足する code-owned catalog key がある場合、bootstrap は既存値を保持した complete snapshot を新しい active version として作成する。key の削除は無効化手段ではなく、bootstrap が catalog default で復元する。unknown key、不正値、validation failure は fail closed する。DB-backed runtime では active DB config が `RUNTIME` key の正本で、legacy `FUKUROU_*` env より優先する。`.env` は secret / deployment / bootstrap 値に使う。主な legacy env 名:
 
 | env                                                   | 既定                                   | 用途                                                                                                       |
-| ----------------------------------------------------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+|---|---|---|
 | `FUKUROU_TRADING_SYMBOL`                              | `BTC`                                | 取引対象 symbol                                                                                              |
 | `FUKUROU_TRADING_MODE`                                | `PAPER`                              | `PAPER` のみ有効。`LIVE` は予約値で、現時点では起動時に拒否                                                                    |
 | `FUKUROU_PAPER_INITIAL_CASH_JPY`                      | `100000`                             | paper 初期 JPY 残高                                                                                          |
