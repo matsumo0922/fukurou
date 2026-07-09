@@ -4,16 +4,31 @@ import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
+import me.matsumo.fukurou.trading.reflection.MAX_REFLECTION_LLM_TIMEOUT
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import java.math.BigDecimal
 import java.sql.Connection
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
+
+/**
+ * stale な llm_runs を回収するまでの per-run timeout 乗数。
+ */
+private const val STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER = 3L
+
+/**
+ * persistence bootstrap で stale な llm_runs を FAILED へ回収するときの固定 error_message。
+ */
+internal const val STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE =
+    "LLM run was interrupted by a previous process or container shutdown and recovered during persistence bootstrap."
 
 /**
  * risk_state 初期行を作る SQL。
@@ -124,6 +139,20 @@ private const val BACKFILL_OPEN_POSITION_LOWEST_PRICE_SQL = """
     SET lowest_price_since_entry_jpy = LEAST(average_entry_price_jpy, current_price_jpy)
     WHERE status = 'OPEN'
         AND lowest_price_since_entry_jpy IS NULL
+"""
+
+/**
+ * stale な RUNNING llm_runs を FAILED へ回収する SQL。
+ */
+private const val RECOVER_STALE_LLM_RUNS_SQL = """
+    UPDATE llm_runs
+    SET
+        status = ?,
+        finished_at = ?,
+        error_message = ?
+    WHERE status = ?
+        AND finished_at IS NULL
+        AND started_at < ?
 """
 
 /**
@@ -670,19 +699,30 @@ private const val VERIFY_TRADE_INTENT_CONSUMPTIONS_SCHEMA_SQL = """
  * @param database Exposed database
  * @param clock 初期 risk_state の updatedAt に使う clock
  * @param paperAccountConfig paper account 初期化設定
+ * @param staleLlmRunRecoveryThreshold stale な RUNNING llm_runs と判定する経過時間
+ * @param onStaleLlmRunsRecovered stale llm_runs 回収件数の通知
  */
 class TradingPersistenceBootstrap(
     private val database: ExposedDatabase,
     private val clock: Clock = Clock.systemUTC(),
     private val paperAccountConfig: PaperAccountConfig = TradingBotConfig.fromEnvironment().paperAccount,
+    private val staleLlmRunRecoveryThreshold: Duration =
+        TradingBotConfig.fromEnvironment().staleLlmRunRecoveryThreshold(),
+    private val onStaleLlmRunsRecovered: (Int) -> Unit = {},
 ) {
+
+    init {
+        val thresholdIsPositive = !staleLlmRunRecoveryThreshold.isNegative && !staleLlmRunRecoveryThreshold.isZero
+
+        require(thresholdIsPositive) { "staleLlmRunRecoveryThreshold must be greater than 0." }
+    }
 
     /**
      * Exposed table と risk_state single row を用意する。
      */
     fun ensureSchema(): Result<Unit> {
         return runCatching {
-            exposedTransaction(database) {
+            val recoveredCount = exposedTransaction(database) {
                 @Suppress("DEPRECATION")
                 SchemaUtils.createMissingTablesAndColumns(
                     RuntimeConfigVersionsTable,
@@ -717,6 +757,11 @@ class TradingPersistenceBootstrap(
                 ensurePaperAccountRow(now, paperAccountConfig)
                 ensureRiskStateEquityPeak(now, paperAccountConfig.initialCashJpy)
                 ensureBootstrapEquitySnapshot(now)
+                recoverStaleLlmRuns(now, staleLlmRunRecoveryThreshold)
+            }
+
+            if (recoveredCount > 0) {
+                onStaleLlmRunsRecovered(recoveredCount)
             }
         }
     }
@@ -733,6 +778,16 @@ class TradingPersistenceBootstrap(
             }
         }
     }
+}
+
+/**
+ * stale な RUNNING llm_runs の回収閾値を取引設定から算出する。
+ */
+fun TradingBotConfig.staleLlmRunRecoveryThreshold(): Duration {
+    val runnerThreshold = runner.perRunTimeout.multipliedBy(STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER)
+    val reflectionThreshold = MAX_REFLECTION_LLM_TIMEOUT.multipliedBy(STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER)
+
+    return runnerThreshold.coerceAtLeast(reflectionThreshold)
 }
 
 /**
@@ -958,6 +1013,23 @@ internal fun JdbcTransaction.ensureBootstrapEquitySnapshot(now: Instant) {
         statement.setLong(4, now.toEpochMilli())
         statement.setInt(5, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeUpdate()
+    }
+}
+
+/**
+ * stale な RUNNING llm_runs を FAILED へ回収する。
+ */
+internal fun JdbcTransaction.recoverStaleLlmRuns(now: Instant, threshold: Duration): Int {
+    val cutoff = now.minus(threshold)
+
+    jdbcConnection().prepareStatement(RECOVER_STALE_LLM_RUNS_SQL).use { statement ->
+        statement.setString(1, LLM_RUN_STATUS_FAILED)
+        statement.setLong(2, now.toEpochMilli())
+        statement.setString(3, STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE)
+        statement.setString(4, LLM_RUN_STATUS_RUNNING)
+        statement.setLong(5, cutoff.toEpochMilli())
+
+        return statement.executeUpdate()
     }
 }
 

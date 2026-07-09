@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
 import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_JAR_PATH_ENV
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
 import me.matsumo.fukurou.trading.runner.OneShotRunnerCliConfig
@@ -143,6 +144,7 @@ internal fun startLlmDaemonSchedulerWorker(
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     clock: Clock = Clock.systemUTC(),
+    onStaleLlmRunsRecovered: (Int) -> Unit = {},
 ): LlmDaemonSchedulerWorker? {
     val environment = System.getenv()
 
@@ -172,6 +174,8 @@ internal fun startLlmDaemonSchedulerWorker(
                 database = database,
                 clock = clock,
                 paperAccountConfig = tradingConfig.paperAccount,
+                staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
+                onStaleLlmRunsRecovered = onStaleLlmRunsRecovered,
             ).ensureSchema()
         },
         clock = clock,

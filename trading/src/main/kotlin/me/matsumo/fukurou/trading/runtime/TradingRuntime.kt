@@ -36,6 +36,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedSafetyViolationRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
 import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
 import me.matsumo.fukurou.trading.reconciler.NoReconcilerStatusProvider
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
@@ -391,6 +392,7 @@ private fun verifyPostgresSchema(connection: PostgresRuntimeConnection, context:
         database = connection.database,
         clock = context.clock,
         paperAccountConfig = context.tradingConfig.paperAccount,
+        staleLlmRunRecoveryThreshold = context.tradingConfig.staleLlmRunRecoveryThreshold(),
     ).verifySchema().getOrThrow()
 }
 

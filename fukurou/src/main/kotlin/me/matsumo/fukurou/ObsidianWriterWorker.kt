@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.nio.file.Path
 import java.time.Clock
@@ -148,6 +149,7 @@ internal fun startObsidianWriterWorker(
                 database = database,
                 clock = clock,
                 paperAccountConfig = tradingConfig.paperAccount,
+                staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
             ).ensureSchema()
         },
         clock = clock,

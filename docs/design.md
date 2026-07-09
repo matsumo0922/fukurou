@@ -1302,6 +1302,8 @@ interface GmoSymbolMapper {
 
 `llm_runs` は `invocation_id` を primary key とし、`mode`、`symbol`、nullable な daemon `trigger_kind`、`status`、epoch millis の `started_at` / `finished_at`、redaction / truncate 済み `error_message`、開始時 runtime config の `runtime_config_version_id` / `runtime_config_hash` を保存する。LLM provider は phase ごとの `command_event_log` に残すため run-level には持たない。`stdout_path` / `stderr_path` も持たず、stdout / stderr は redaction 後の runner phase audit に残す。
 
+persistence bootstrap は、`status = RUNNING` かつ `finished_at IS NULL` の `llm_runs` のうち、`started_at` が `runner.perRunTimeout` と reflection PromptCandidates の timeout 上限の大きい方の3倍より古い行を `FAILED` に回収する。回収時は `finished_at` に bootstrap 時刻を保存し、`error_message` には前回プロセスまたは container shutdown で中断された run を bootstrap で回収したことを示す固定 message を保存する。閾値以内の新しい `RUNNING` 行と終了済みの行は変更しない。
+
 `equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP`）、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。旧スケッチからの差分として、日次重複防止のため JST 日付を物理列 `trading_date` として持ち、`reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置く。`drawdown_ratio` は旧案の decimal(12,8) ではなく、正本である `paper_account` と同じ decimal(20,10) に揃える。BOOTSTRAP は並行 bootstrap でも mode ごとに 1 件に収まるよう `reason = 'BOOTSTRAP'` に限定した `(mode, reason)` partial unique index で防御する。FILL は paper account 更新と同一 transaction で追加する。
 
 評価式は次の通り。
