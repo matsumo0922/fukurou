@@ -33,7 +33,7 @@ fun main(args: Array<String>) = runBlocking {
         .start()
 
     val transport = StdioClientTransport(
-        input = process.inputStream.asSource().buffered(),
+        input = JsonOnlyStdoutInputStream(process.inputStream).asSource().buffered(),
         output = process.outputStream.asSink().buffered(),
     )
     val client = Client(
