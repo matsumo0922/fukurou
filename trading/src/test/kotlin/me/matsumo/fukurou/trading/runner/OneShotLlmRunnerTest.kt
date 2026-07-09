@@ -895,17 +895,23 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun proposerSuccess_omitsAuthFailureSignalEvenWhenOutputMentionsAuthText() = runBlocking {
-        val fixture = runnerFixture {
-            cleanExit(stdout = "API Error: 401 Invalid authentication credentials")
+    fun proposerAuthFailureExitZero_recordsOperationalSignalAndMissingDecisionReason() = runBlocking {
+        val humanLogs = mutableListOf<String>()
+        val fixture = runnerFixture(
+            logger = { message -> humanLogs += message },
+        ) {
+            cleanExit(stdout = """{"type":"result","is_error":true,"result":"Not logged in"}""")
         }
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
         val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
-        assertFalse(proposerDetails.containsKey("authFailureSuspected"))
+        assertEquals("true", proposerDetails.stringValue("authFailureSuspected"))
         assertEquals("0", proposerDetails.stringValue("exitCode"))
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
+        assertFalse(fixture.eventLog.events().containsNoTradeReason("proposer_no_tool_calls"))
+        assertTrue(humanLogs.any { message -> message.isAuthFailureRunbookLog() })
     }
 
     @Test
@@ -1010,7 +1016,6 @@ class OneShotLlmRunnerTest {
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertEquals(1, fixture.processRunner.launches.size)
-        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_no_tool_calls"))
     }
 
     @Test

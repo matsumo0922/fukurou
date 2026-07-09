@@ -145,13 +145,12 @@ class LlmInvocationAuditor(
     }
 
     private fun ProcessRunResult.authFailureSuspected(): Boolean {
-        val exitFailed = exitCode?.let { completedExitCode -> completedExitCode != 0 } ?: false
         val combinedOutput = "$stdout\n$stderr"
         val outputContainsAuthFailure = LLM_CLI_AUTH_FAILURE_PATTERNS.any { pattern ->
             combinedOutput.contains(pattern, ignoreCase = true)
         }
 
-        return exitFailed && outputContainsAuthFailure
+        return outputContainsAuthFailure
     }
 
     private fun ProcessRunResult.didFail(): Boolean {

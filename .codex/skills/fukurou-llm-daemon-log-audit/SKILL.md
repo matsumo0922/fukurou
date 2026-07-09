@@ -45,7 +45,7 @@ Fukurou production の LLM daemon と paper trading 状態を、API と PostgreS
 ## Interpreting Rows
 
 - `NO_TRADE_DECISION`: Proposer が正常終了し、`decisions` に `NO_TRADE` を保存した。理由・p・expectedR を説明する。
-- `NO_TRADE_AUDITED`: 判断保存まで到達しない、または EXIT / ADJUST_PROTECTION の対象が曖昧・不正で fail-closed し、`NO_TRADE_EXIT` 監査を残した。`proposer_no_tool_calls` は Proposer が正常終了し、判断未保存かつ許可済み tool call 0 件の状態として説明する。`proposer_missing_decision`、`exit=1`、`FAILED_TO_START`、`authFailureSuspected=true`、`exit_target_ambiguous`、`adjust_protection_invalid_take_profit_price` なども原因として説明する。
+- `NO_TRADE_AUDITED`: 判断保存まで到達しない、または EXIT / ADJUST_PROTECTION の対象が曖昧・不正で fail-closed し、`NO_TRADE_EXIT` 監査を残した。`proposer_no_tool_calls` は Proposer が process failure / `authFailureSuspected=true` なしで完了し、判断未保存かつ許可済み tool call 0 件の状態として説明する。認証失敗や quota/API error が疑われる場合は `authFailureSuspected=true` と `proposer_missing_decision` を原因として説明する。`exit=1`、`FAILED_TO_START`、`exit_target_ambiguous`、`adjust_protection_invalid_take_profit_price` なども原因として説明する。
 - `PAPER_ENTRY_PLACED`: paper order / position / execution を追加確認し、発注・約定・STOP/TP 保護の状態を分けて報告する。
 - `PAPER_EXIT_EXECUTED`: runner が EXIT decision を `close_position` または `cancel_order` に写像した。`LIFECYCLE|...|exit_execution|...` と paper ledger の positions / orders / executions を確認し、position close と resting entry cancel を分けて説明する。
 - `PAPER_PROTECTION_UPDATED`: runner が ADJUST_PROTECTION decision を `update_protection` に写像した。`LIFECYCLE|...|adjust_protection_execution|...` と position の STOP / virtual TP を確認し、STOP が維持され TP だけ更新されたことを説明する。
