@@ -211,7 +211,7 @@ Cloudflare Access は `/app/*` と `/ops/*` を保護し、runtime config draft 
 - Claude / Codex CLI の access token 更新は CLI に任せる。refresh token が失効または revoke された場合だけ、WebUI または fallback で再ログインする。
 - WebUI System は `/ops/llm-auth` で CLI auth 状態を表示する。`/health` / `/health/ready` は Ktor / DB / reconciler readiness の意味だけを持つ。
 - auth 失効や permission prompt で decision / falsification row が保存されない場合、runner は DB-as-truth により no-trade audit を残して次 cycle に進む。
-- CLI process が認証失敗らしい CLI error output を出した場合、runner は exit code にかかわらず `RUNNER_PHASE_COMPLETED.details.authFailureSuspected = "true"` と login runbook の warn log を追加する。
+- CLI process が非 0 exit、または `is_error: true` を含む CLI 出力で認証失敗らしい stdout / stderr を出した場合、runner は `RUNNER_PHASE_COMPLETED.details.authFailureSuspected = "true"` と login runbook の warn log を追加する。
 - 既知制約: Falsifier の CLI process env には DB credentials を渡さないが、Falsifier が起動する MCP server config には現時点で full DB credentials が入る。read-only DB user 分離は follow-up とする。
 
 ## paper / live の構造的乖離
