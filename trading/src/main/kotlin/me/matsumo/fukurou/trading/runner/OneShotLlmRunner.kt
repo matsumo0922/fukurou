@@ -488,16 +488,15 @@ class OneShotLlmRunner(
         )
         val proposerAudit = phaseInvoker
             .invokePhase("proposer", proposerContext, proposerRequest)
-        val proposerFailure = proposerAudit.exceptionOrNull()
-        val authFailureSuspected = proposerAudit.getOrNull()?.authFailureSuspected ?: false
         val decision = tradingRuntime.decisionRepository
             .latestDecisionByInvocationId(input.invocationId)
             .getOrThrow()
 
         return ProposerDecisionResult(
             decision = decision,
-            failure = proposerFailure,
-            authFailureSuspected = authFailureSuspected,
+            failure = proposerAudit.exceptionOrNull(),
+            authFailureSuspected = proposerAudit.getOrNull()?.authFailureSuspected ?: false,
+            cliErrorReported = proposerAudit.getOrNull()?.cliErrorReported ?: false,
         )
     }
 
@@ -1348,11 +1347,13 @@ private data class LlmRequestInput(
  * @param decision 保存済み decision
  * @param failure proposer phase の失敗
  * @param authFailureSuspected CLI 認証失敗らしい出力を検出したか
+ * @param cliErrorReported CLI が error 終了を報告する出力を検出したか
  */
 private data class ProposerDecisionResult(
     val decision: DecisionSubmissionResult?,
     val failure: Throwable?,
     val authFailureSuspected: Boolean,
+    val cliErrorReported: Boolean,
 )
 
 private suspend fun noDecisionAuditReason(
@@ -1364,6 +1365,9 @@ private suspend fun noDecisionAuditReason(
         return PROPOSER_MISSING_DECISION_REASON
     }
     if (proposerResult.authFailureSuspected) {
+        return PROPOSER_MISSING_DECISION_REASON
+    }
+    if (proposerResult.cliErrorReported) {
         return PROPOSER_MISSING_DECISION_REASON
     }
 

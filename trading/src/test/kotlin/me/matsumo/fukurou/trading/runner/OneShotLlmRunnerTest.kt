@@ -816,6 +816,30 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun proposerCliErrorExitZeroWithoutAuth_recordsMissingDecisionReasonAndCliErrorSignal() = runBlocking {
+        val humanLogs = mutableListOf<String>()
+        val fixture = runnerFixture(
+            logger = { message -> humanLogs += message },
+        ) {
+            cleanExit(
+                stdout = "MCP transport returned an application error",
+                stderr = """{"type":"result","is_error":true,"result":"MCP server disconnected"}""",
+            )
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertNull(result.decision)
+        assertEquals("true", proposerDetails.stringValue("cliErrorReported"))
+        assertFalse(proposerDetails.containsKey("authFailureSuspected"))
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
+        assertFalse(fixture.eventLog.events().containsNoTradeReason("proposer_no_tool_calls"))
+        assertFalse(humanLogs.any { message -> message.isAuthFailureRunbookLog() })
+    }
+
+    @Test
     fun proposerNormalExitWithToolCallAndNoDecision_recordsMissingDecisionReason() = runBlocking {
         lateinit var eventLog: InMemoryCommandEventLog
         val fixture = runnerFixture(
@@ -862,7 +886,9 @@ class OneShotLlmRunnerTest {
         val fixture = runnerFixture(
             logger = { message -> humanLogs += message },
         ) {
-            nonZeroExit(stdout = "API Error: 401 Invalid authentication credentials")
+            nonZeroExit(
+                stdout = "API Error: 401 Invalid authentication credentials",
+            )
         }
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
@@ -870,6 +896,7 @@ class OneShotLlmRunnerTest {
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertEquals("true", proposerDetails.stringValue("authFailureSuspected"))
+        assertFalse(proposerDetails.containsKey("cliErrorReported"))
         assertEquals("1", proposerDetails.stringValue("exitCode"))
         assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
         assertTrue(humanLogs.any { message -> message.isAuthFailureRunbookLog() })
@@ -890,6 +917,7 @@ class OneShotLlmRunnerTest {
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertFalse(proposerDetails.containsKey("authFailureSuspected"))
+        assertFalse(proposerDetails.containsKey("cliErrorReported"))
         assertEquals("1", proposerDetails.stringValue("exitCode"))
         assertFalse(authFailureLogFound)
     }
@@ -908,6 +936,7 @@ class OneShotLlmRunnerTest {
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertEquals("true", proposerDetails.stringValue("authFailureSuspected"))
+        assertEquals("true", proposerDetails.stringValue("cliErrorReported"))
         assertEquals("0", proposerDetails.stringValue("exitCode"))
         assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
         assertFalse(fixture.eventLog.events().containsNoTradeReason("proposer_no_tool_calls"))
@@ -925,7 +954,9 @@ class OneShotLlmRunnerTest {
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertFalse(proposerDetails.containsKey("authFailureSuspected"))
+        assertFalse(proposerDetails.containsKey("cliErrorReported"))
         assertEquals("0", proposerDetails.stringValue("exitCode"))
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_no_tool_calls"))
     }
 
     @Test
