@@ -42,13 +42,12 @@ class RuntimeConfigEnvironmentRoundTripTest {
         val defaultEnvironment = RuntimeConfigCatalog.runtimeEnvironment(TradingBotConfig())
         val nonDefaultEnvironment = RuntimeConfigCatalog.runtimeEnvironment(nonDefaultRuntimeConfig())
 
-        val unperturbedNames = defaultEnvironment
+        val unperturbedValues = defaultEnvironment
             .filter { (name, value) -> nonDefaultEnvironment[name] == value }
-            .keys
 
         assertEquals(
-            emptySet(),
-            unperturbedNames,
+            emptyMap(),
+            unperturbedValues,
             "round-trip の判別力を保つため、全 runtime key を default と異なる値にしてください。",
         )
     }
@@ -67,6 +66,7 @@ private fun assertRuntimeEnvironmentRoundTrips(config: TradingBotConfig): Map<St
 private fun nonDefaultRuntimeConfig(): TradingBotConfig {
     val config = TradingBotConfig()
 
+    // round-trip の判別力を保つための perturb 値であり、取引運用の推奨値ではない。
     return config.copy(
         paperAccount = config.paperAccount.copy(
             initialCashJpy = BigDecimal("123456.7800"),
