@@ -3461,7 +3461,7 @@ runtime config は code-owned `RuntimeConfigCatalog` が管理する項目を `r
 
 [実装済み: 2026-07-02] GMO Public market data client は `:trading.exchange.gmo` 境界で、client-side token bucket、指数 backoff retry、request timeout、temporary/permanent の typed error 分類を行う。rate-limit env は既定 10 req/s / burst 10 以下だけ受理する。`:mcp` は error response に分類を載せるだけで、rate-limit や retry の業務ロジックは持たない。
 
-Docker image は Ktor 用 `/app/app.jar` に加えて MCP stdio 用 `/app/fukurou-mcp-all.jar`、handshake bridge 用 `/app/fukurou-mcp-bridge.mjs`、bridge snapshot 用 `/app/fukurou-mcp-tools.json` を同梱する。entrypoint は Ktor のままで、daemon / CLI runtime は `node /app/fukurou-mcp-bridge.mjs --snapshot /app/fukurou-mcp-tools.json ${mcpJarPath}` を stdio 子プロセスとして起動する。bridge は `FUKUROU_MCP_ALLOWED_TOOLS` で snapshot の tool 一覧を phase ごとに絞り、`initialize` / `tools/list` に snapshot から即答する。裏側で起動する JVM backend の handshake が完了するまで、bridge は実処理 request を順序保持 queue する。
+[実装済み: 2026-07-02] Docker image は Ktor 用 `/app/app.jar` に加えて MCP stdio 用 `/app/fukurou-mcp-all.jar` を同梱する。entrypoint は Ktor のままで、将来 daemon / CLI runtime が `java -jar /app/fukurou-mcp-all.jar` を stdio 子プロセスとして起動する。
 
 [実装済み: 2026-07-02] paper / live の構造的乖離は `docs/mcp-runtime.md` に明記する。特に paper STOP は `ProtectionReconciler` 停止中に作動しない一方、live native STOP は取引所側で作動するため、paper の方が保護が弱い。
 
@@ -3511,8 +3511,6 @@ services:
       DB_PASSWORD: ${POSTGRES_PASSWORD}
       OBSIDIAN_VAULT_PATH: /vault
       FUKUROU_MCP_JAR_PATH: /app/fukurou-mcp-all.jar
-      FUKUROU_MCP_SERVER_COMMAND: node
-      FUKUROU_MCP_SERVER_ARGS: /app/fukurou-mcp-bridge.mjs --snapshot /app/fukurou-mcp-tools.json $${mcpJarPath}
       FUKUROU_CODEX_PERSISTENT_HOME: /tmp/fukurou-cli-home/.codex
       HOME: /tmp/fukurou-cli-home
       XDG_CACHE_HOME: /tmp/fukurou-cli-cache
