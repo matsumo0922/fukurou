@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.config
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
 import java.math.BigDecimal
 import java.time.Duration
 import kotlin.test.Test
@@ -201,6 +202,15 @@ class TradingBotConfigTest {
 
         assertEquals(Duration.ofSeconds(180), defaultTimeoutConfig.runner.perRunTimeout)
         assertEquals(Duration.ofSeconds(600), maxTimeoutConfig.runner.perRunTimeout)
+    }
+
+    @Test
+    fun staleLlmRunRecoveryThreshold_keepsReflectionTimeoutFloor() {
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(perRunTimeout = Duration.ofSeconds(30)),
+        )
+
+        assertEquals(Duration.ofSeconds(360), config.staleLlmRunRecoveryThreshold())
     }
 
     @Test
