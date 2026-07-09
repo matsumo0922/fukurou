@@ -14,6 +14,7 @@ dependencies {
     implementation(platform(libs.kotlin.bom))
 
     implementation(project(":trading"))
+    implementation(project(":mcp-core"))
     implementation(project(":mcp-gmo-coin"))
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.json)

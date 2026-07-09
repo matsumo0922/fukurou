@@ -23,8 +23,7 @@ fun TickSnapshot.requireTicker(): Ticker {
 }
 
 private fun TickSnapshot.firstAvailablePrice(): String {
-    return listOf(lastPrice, bidPrice, askPrice)
-        .filterNotNull()
+    return listOfNotNull(lastPrice, bidPrice, askPrice)
         .firstOrNull { price -> price.isNotBlank() }
         ?: error("TickSnapshot must include lastPrice, bidPrice, or askPrice.")
 }

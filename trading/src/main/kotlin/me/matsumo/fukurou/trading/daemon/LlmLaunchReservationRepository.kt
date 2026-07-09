@@ -292,28 +292,9 @@ class InMemoryLlmLaunchReservationRepository(
 
         val hourlyCount = countReservationsSince(request.reservedAt.minus(request.hourlyWindow))
         val dailyCount = countReservationsSince(request.reservedAt.minus(request.dailyWindow))
-        val hourlyRemaining = request.runnerConfig.maxInvocationsPerHour - hourlyCount
-        val dailyRemaining = request.runnerConfig.maxInvocationsPerDay - dailyCount
-        val reflectionRequest = request.triggerKind == LlmDaemonTriggerKind.REFLECTION
-        val hourlyExceeded = hourlyRemaining <= 0
-        val dailyExceeded = dailyRemaining <= 0
 
-        if (reflectionRequest && hourlyRemaining <= REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS) {
-            return LlmLaunchReservationOutcome.Rejected(
-                LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM,
-            )
-        }
-        if (reflectionRequest && dailyRemaining <= REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS) {
-            return LlmLaunchReservationOutcome.Rejected(
-                LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM,
-            )
-        }
-
-        if (hourlyExceeded) {
-            return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR)
-        }
-        if (dailyExceeded) {
-            return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY)
+        launchBudgetRejection(request, hourlyCount, dailyCount)?.let { rejectionReason ->
+            return LlmLaunchReservationOutcome.Rejected(rejectionReason)
         }
 
         reservations += LlmLaunchReservationRecord(
@@ -385,3 +366,31 @@ const val REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS = 1
  * reflection が開始前に残す 24 時間 LLM 起動 headroom。
  */
 const val REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS = 4
+
+internal fun launchBudgetRejection(
+    request: LlmLaunchReservationRequest,
+    hourlyCount: Int,
+    dailyCount: Int,
+): LlmLaunchReservationRejectionReason? {
+    val hourlyRemaining = request.runnerConfig.maxInvocationsPerHour - hourlyCount
+    val dailyRemaining = request.runnerConfig.maxInvocationsPerDay - dailyCount
+    val reflectionRequest = request.triggerKind == LlmDaemonTriggerKind.REFLECTION
+    val hourlyExceeded = hourlyRemaining <= 0
+    val dailyExceeded = dailyRemaining <= 0
+
+    if (reflectionRequest && hourlyRemaining <= REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS) {
+        return LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM
+    }
+    if (reflectionRequest && dailyRemaining <= REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS) {
+        return LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM
+    }
+
+    if (hourlyExceeded) {
+        return LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR
+    }
+    if (dailyExceeded) {
+        return LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY
+    }
+
+    return null
+}

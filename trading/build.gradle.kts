@@ -16,6 +16,15 @@ dependencies {
 
     testImplementation(kotlin("test"))
     testImplementation(libs.testcontainers.postgresql)
+
+    constraints {
+        testImplementation(libs.commons.compress) {
+            because(
+                "Testcontainers pulls commons-compress 1.24.0; " +
+                    "1.26.0+ fixes CVE-2024-25710/CVE-2024-26308.",
+            )
+        }
+    }
 }
 
 tasks.register<JavaExec>("runOneShotLlm") {

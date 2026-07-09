@@ -23,21 +23,21 @@ Fukurou production の LLM daemon と paper trading 状態を、API と PostgreS
 1. fukurou repo の `AGENTS.md`（共通ルールは `CLAUDE.md` / `AGENTS.md` から辿れる）を確認する。
 2. API で production の現在値を確認する。
 
-```bash
-scripts/prod-curl "/revision" -fsS
-scripts/prod-curl "/health/ready" -fsS
-scripts/prod-curl "/evaluation/summary?from=<JST-date>&to=<JST-date>" -fsS
-scripts/prod-curl "/evaluation/costs?from=<JST-date>&to=<JST-date>" -fsS
-```
+   ```bash
+   scripts/prod-curl "/revision" -fsS
+   scripts/prod-curl "/health/ready" -fsS
+   scripts/prod-curl "/evaluation/summary?from=<JST-date>&to=<JST-date>" -fsS
+   scripts/prod-curl "/evaluation/costs?from=<JST-date>&to=<JST-date>" -fsS
+   ```
 
 3. 時系列が必要なら helper script を使う。
 
-```bash
-.codex/skills/fukurou-llm-daemon-log-audit/scripts/query-fukurou-llm-daemon-log.sh \
-  --since "2026-07-04 23:57:27+09"
-```
+   ```bash
+   .codex/skills/fukurou-llm-daemon-log-audit/scripts/query-fukurou-llm-daemon-log.sh \
+     --since "2026-07-04 23:57:27+09"
+   ```
 
-`FUKUROU_PROD_SSH_HOST` と `FUKUROU_POSTGRES_CONTAINER` で接続先を上書きできる。既定は `dxp4800plus` / `fukurou-postgres`。
+   `FUKUROU_PROD_SSH_HOST` と `FUKUROU_POSTGRES_CONTAINER` で接続先を上書きできる。既定は `dxp4800plus` / `fukurou-postgres`。
 
 4. `RUN|...` を時系列表へ変換する。`LIFECYCLE|...` は TTL cancel / EXIT / ADJUST_PROTECTION の runner 決定論的副作用として該当 run に紐づける。`SKIP|...` は daemon が起動しなかった判断として別にまとめる。
 5. `PAPER|...`、`RISK|...`、`LEDGER|...` から paper trading の実取引有無を結論づける。

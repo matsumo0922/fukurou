@@ -54,11 +54,10 @@ internal class DecisionExecutionLifecycle(
     suspend fun cancelExpiredRestingEntryOrders(context: DecisionRunContext): Result<List<PaperTradeResult>> {
         return runCatching {
             val startedAt = Instant.now(clock)
-            val observedAt = startedAt
             val openOrders = tradingRuntime.broker.getOpenOrders().getOrThrow()
             val expiredOrders = openOrders.filter { order ->
                 order.isExpiredRestingEntryOrder(
-                    observedAt = observedAt,
+                    observedAt = startedAt,
                     ttl = tradingConfig.decisionProtocol.restingEntryOrderTtl,
                 )
             }
@@ -355,10 +354,10 @@ internal class DecisionExecutionLifecycle(
                 ),
             )
         }
-        if (openPositions.isEmpty() && openEntryOrders.size == 1) {
+        if (openEntryOrders.size == 1) {
             return ExitExecutionTarget.CancelEntryOrder(openEntryOrders.single())
         }
-        if (openPositions.isEmpty() && openEntryOrders.isEmpty()) {
+        if (openEntryOrders.isEmpty()) {
             return ExitExecutionTarget.FailClosed(
                 exitFailure(
                     reason = "exit_target_not_found",
@@ -393,20 +392,15 @@ internal class DecisionExecutionLifecycle(
 
         val position = requireNotNull(targetPosition)
         val stopPriceText = position.currentStopLossJpy
-
-        if (stopPriceText == null) {
-            return DecisionLifecycleFailure(
+            ?: return DecisionLifecycleFailure(
                 reason = "adjust_protection_unprotected_position",
                 details = buildJsonObject {
                     put("positionId", position.positionId)
                 },
             )
-        }
 
         val targetPrice = decision.tradePlan?.draft?.targetPriceJpy
-
-        if (targetPrice == null) {
-            return DecisionLifecycleFailure(
+            ?: return DecisionLifecycleFailure(
                 reason = "adjust_protection_missing_target_price",
                 details = buildJsonObject {
                     put("positionId", position.positionId)
@@ -414,7 +408,6 @@ internal class DecisionExecutionLifecycle(
                     put("currentStopLossJpy", stopPriceText)
                 },
             )
-        }
 
         val currentPrice = position.currentPriceJpy.toBigDecimalOrNull()
             ?: return DecisionLifecycleFailure(

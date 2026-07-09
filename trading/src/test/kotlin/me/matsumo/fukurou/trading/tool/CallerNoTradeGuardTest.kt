@@ -21,6 +21,8 @@ import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * CallerNoTradeGuard の caller boundary failure audit を検証するテスト。
@@ -34,8 +36,8 @@ class CallerNoTradeGuardTest {
 
         val result = runCatching {
             guard.run(createInvocation()) {
-                withTimeout(10) {
-                    delay(1_000)
+                withTimeout(10.toDuration(DurationUnit.MILLISECONDS)) {
+                    delay(1_000.toDuration(DurationUnit.MILLISECONDS))
                 }
             }
         }

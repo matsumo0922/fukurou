@@ -12,6 +12,8 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * ShellProcessRunner の process tree timeout contract を検証するテスト。
@@ -78,7 +80,7 @@ class ShellProcessRunnerTest {
 
         val tempDirectory = Files.createTempDirectory("fukurou-process-runner-test")
         val childPidFile = tempDirectory.resolve("child.pid")
-        val script = "(/bin/sleep 30) & child_pid=$!; echo \$child_pid > ${childPidFile.shellQuoted()}; wait \$child_pid"
+        val script = $$"(/bin/sleep 30) & child_pid=$!; echo $child_pid > $${childPidFile.shellQuoted()}; wait $child_pid"
         val command = RenderedLlmCommand(
             executable = shellPath.toString(),
             args = listOf("-c", script),
@@ -133,7 +135,7 @@ class ShellProcessRunnerTest {
         val tempDirectory = Files.createTempDirectory("fukurou-process-runner-cancel-test")
         val childPidFile = tempDirectory.resolve("child.pid")
         val cleanupFile = Files.createTempFile(tempDirectory, "secret-config", ".json")
-        val script = "(/bin/sleep 30) & child_pid=$!; echo \$child_pid > ${childPidFile.shellQuoted()}; wait \$child_pid"
+        val script = $$"(/bin/sleep 30) & child_pid=$!; echo $child_pid > $${childPidFile.shellQuoted()}; wait $child_pid"
         val command = RenderedLlmCommand(
             executable = shellPath.toString(),
             args = listOf("-c", script),
@@ -165,7 +167,7 @@ class ShellProcessRunnerTest {
                 return Files.readString(childPidFile).trim().toLong()
             }
 
-            delay(CHILD_PID_FILE_WAIT_DELAY_MS)
+            delay(CHILD_PID_FILE_WAIT_DELAY_MS.toDuration(DurationUnit.MILLISECONDS))
         }
 
         error("child pid file was not written: $childPidFile")

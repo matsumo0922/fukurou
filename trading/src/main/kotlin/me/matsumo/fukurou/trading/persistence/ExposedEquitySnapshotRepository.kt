@@ -18,7 +18,7 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 /**
  * equity_snapshots を append-only で追加する SQL。
  */
-internal const val INSERT_EQUITY_SNAPSHOT_SQL = """
+private const val INSERT_EQUITY_SNAPSHOT_SQL = """
     INSERT INTO equity_snapshots (
         id,
         mode,
@@ -89,7 +89,7 @@ class ExposedEquitySnapshotRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    insertEquitySnapshot(snapshot, INSERT_EQUITY_SNAPSHOT_SQL)
+                    insertEquitySnapshot(snapshot)
                 }
             }
         }
@@ -99,7 +99,7 @@ class ExposedEquitySnapshotRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    insertEquitySnapshot(snapshot, INSERT_DAILY_EQUITY_SNAPSHOT_SQL)
+                    insertDailyEquitySnapshotIfAbsent(snapshot)
                 }
             }
         }
@@ -117,10 +117,20 @@ class ExposedEquitySnapshotRepository(
 }
 
 /**
- * equity snapshot を指定 SQL で追加する。
+ * equity snapshot を追加する。
  */
-internal fun JdbcTransaction.insertEquitySnapshot(snapshot: EquitySnapshotRecord, sql: String) {
-    jdbcConnection().prepareStatement(sql).use { statement ->
+internal fun JdbcTransaction.insertEquitySnapshot(snapshot: EquitySnapshotRecord) {
+    jdbcConnection().prepareStatement(INSERT_EQUITY_SNAPSHOT_SQL).use { statement ->
+        statement.bindEquitySnapshot(snapshot)
+        statement.executeUpdate()
+    }
+}
+
+/**
+ * DAILY equity snapshot を日次一意で追加する。
+ */
+private fun JdbcTransaction.insertDailyEquitySnapshotIfAbsent(snapshot: EquitySnapshotRecord) {
+    jdbcConnection().prepareStatement(INSERT_DAILY_EQUITY_SNAPSHOT_SQL).use { statement ->
         statement.bindEquitySnapshot(snapshot)
         statement.executeUpdate()
     }

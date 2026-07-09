@@ -7,7 +7,6 @@ import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.EntryFillWriteRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
-import me.matsumo.fukurou.trading.broker.MONEY_SCALE
 import me.matsumo.fukurou.trading.broker.MarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.PaperExecutionSimulator
 import me.matsumo.fukurou.trading.broker.PaperLedgerMutationRepository
@@ -18,7 +17,6 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.PositionMarkUpdate
-import me.matsumo.fukurou.trading.broker.RATIO_SCALE
 import me.matsumo.fukurou.trading.broker.ReconcileMarketContext
 import me.matsumo.fukurou.trading.broker.ReconcileProgress
 import me.matsumo.fukurou.trading.broker.RestingEntryFillRequest
@@ -26,13 +24,20 @@ import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.broker.btcScale
-import me.matsumo.fukurou.trading.broker.floorToStep
+import me.matsumo.fukurou.trading.broker.emptyReconcileProgress
+import me.matsumo.fukurou.trading.broker.hasTightenedStop
 import me.matsumo.fukurou.trading.broker.limitOrderReached
 import me.matsumo.fukurou.trading.broker.marketFill
+import me.matsumo.fukurou.trading.broker.mergeEntryFill
 import me.matsumo.fukurou.trading.broker.moneyScale
 import me.matsumo.fukurou.trading.broker.ratioScale
 import me.matsumo.fukurou.trading.broker.restingEntryUpdate
 import me.matsumo.fukurou.trading.broker.stopFill
+import me.matsumo.fukurou.trading.broker.toPaperReconcileResult
+import me.matsumo.fukurou.trading.broker.toPositionMarkUpdate
+import me.matsumo.fukurou.trading.broker.toReconcileMarketContext
+import me.matsumo.fukurou.trading.broker.unrealizedPnlAt
+import me.matsumo.fukurou.trading.broker.unrealizedRAt
 import me.matsumo.fukurou.trading.broker.withEntryCommandContext
 import me.matsumo.fukurou.trading.broker.withOrderContext
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
@@ -49,7 +54,6 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
-import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
@@ -335,42 +339,26 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    val ticker = tickSnapshot.requireTicker()
-                    val rules = tickSnapshot.symbolRules ?: fallbackSymbolRules
-                    val lastPrice = (tickSnapshot.lastPrice ?: ticker.last).toBigDecimal()
-                    val triggeredOrderIds = mutableListOf<String>()
-                    val closedPositionIds = mutableListOf<String>()
-                    val executionIds = mutableListOf<String>()
-                    val reconcileContext = ReconcileMarketContext(
-                        ticker = ticker,
-                        rules = rules,
+                    val reconcileContext = tickSnapshot.toReconcileMarketContext(
+                        fallbackSymbolRules = fallbackSymbolRules,
                         simulator = simulator,
-                        simulationContext = simulationContext ?: PaperSimulationContext(
-                            ticker = ticker,
-                            rules = rules,
-                        ),
-                        lastPrice = lastPrice,
+                        simulationContext = simulationContext,
                     )
-                    val progress = ReconcileProgress(
-                        triggeredOrderIds = triggeredOrderIds,
-                        closedPositionIds = closedPositionIds,
-                        executionIds = executionIds,
-                    )
+                    val progress = emptyReconcileProgress()
 
-                    updateMarks(lastPrice, tickSnapshot.atr14Jpy?.toBigDecimal(), rules, clock)
+                    updateMarks(
+                        lastPrice = reconcileContext.lastPrice,
+                        atr14Jpy = tickSnapshot.atr14Jpy?.toBigDecimal(),
+                        rules = reconcileContext.rules,
+                        clock = clock,
+                    )
 
                     if (!paperAccountHardHaltReached()) {
                         fillTriggeredEntryOrders(reconcileContext, progress, clock)
                         triggerPositionProtections(reconcileContext, progress, clock)
                     }
 
-                    PaperReconcileResult(
-                        advanced = triggeredOrderIds.isNotEmpty() || closedPositionIds.isNotEmpty(),
-                        triggeredOrderIds = triggeredOrderIds,
-                        closedPositionIds = closedPositionIds,
-                        executionIds = executionIds,
-                        divergenceMemos = progress.divergenceMemos.toList(),
-                    )
+                    progress.toPaperReconcileResult()
                 }
             }
         }
@@ -562,7 +550,9 @@ private fun JdbcTransaction.fillTriggeredEntryOrders(
         }
         val command = order.toPlaceOrderCommand()
         val positionId = UUID.randomUUID()
-        val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
+        val orderTradeGroupId = order.tradeGroupId
+            ?: error("Triggered entry order must have trade group ID.")
+        val tradeGroupId = UUID.fromString(orderTradeGroupId)
         val stopOrderId = UUID.randomUUID()
 
         if (!hasCashForBuyFill(fill)) {
@@ -607,7 +597,7 @@ private fun JdbcTransaction.triggerPositionProtections(
         val takeProfitTriggered = takeProfitPrice != null && context.lastPrice >= takeProfitPrice
 
         if (stopTriggered) {
-            triggerStopProtection(position, requireNotNull(stopPrice), context, progress, clock)
+            triggerStopProtection(position, stopPrice, context, progress, clock)
 
             return@forEach
         }
@@ -706,35 +696,21 @@ private fun JdbcTransaction.updateMarks(
     clock: Clock,
 ) {
     selectOpenPositions().forEach { position ->
-        val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
-        val sizeBtc = position.sizeBtc.toBigDecimal()
-        val highestPrice = maxOf(position.highestPriceSinceEntryJpy.toBigDecimal(), lastPrice)
-        val currentLowestPrice = position.lowestPriceSinceEntryJpy?.toBigDecimal() ?: lastPrice
-        val lowestPrice = minOf(currentLowestPrice, lastPrice)
-        val trailingStop = atr14Jpy?.let { atrValue ->
-            highestPrice
-                .subtract(atrValue.multiply(SafetyFloorDefaults.trailingAtrMultiplier))
-                .floorToStep(rules.tickSize.toBigDecimal())
-        }
-        val currentStop = position.currentStopLossJpy?.toBigDecimal()
-        val tightenedStop = listOfNotNull(currentStop, trailingStop).maxOrNull()
-        val unrealizedPnl = lastPrice.subtract(entryPrice).multiply(sizeBtc).moneyScale()
-        val unrealizedR = position.unrealizedRAt(lastPrice).toBigDecimal()
-
-        updatePositionMark(
-            PositionMarkUpdate(
-                positionId = position.positionId,
-                lastPrice = lastPrice,
-                highestPrice = highestPrice,
-                lowestPrice = lowestPrice,
-                unrealizedPnl = unrealizedPnl,
-                unrealizedR = unrealizedR,
-                tightenedStop = tightenedStop,
-            ),
+        val markUpdate = position.toPositionMarkUpdate(
+            lastPrice = lastPrice,
+            atr14Jpy = atr14Jpy,
+            rules = rules,
         )
 
-        if (tightenedStop != null && tightenedStop != currentStop) {
-            updateLinkedStopOrder(position.positionId, tightenedStop, "reconciler atr trailing floor", clock)
+        updatePositionMark(markUpdate)
+
+        if (position.hasTightenedStop(markUpdate)) {
+            updateLinkedStopOrder(
+                position.positionId,
+                checkNotNull(markUpdate.tightenedStop),
+                "reconciler atr trailing floor",
+                clock,
+            )
         }
     }
 
@@ -1100,10 +1076,7 @@ private fun JdbcTransaction.updateLinkedStopOrder(
         statement.setBigDecimal(1, stopPrice.moneyScale())
         statement.setString(2, reasonJa)
         statement.setLong(3, nowMillis(clock))
-        statement.setObject(4, UUID.fromString(positionId))
-        statement.setString(5, OrderSide.SELL.name)
-        statement.setString(6, OrderType.STOP.name)
-        statement.setString(7, OrderStatus.OPEN.name)
+        statement.bindOpenStopOrderFilter(startIndex = 4, positionId = positionId)
 
         statement.executeUpdate()
     }
@@ -1130,10 +1103,7 @@ private fun JdbcTransaction.updateLinkedStopOrderSize(
         statement.setBigDecimal(1, sizeBtc.btcScale())
         statement.setString(2, reasonJa)
         statement.setLong(3, nowMillis(clock))
-        statement.setObject(4, UUID.fromString(positionId))
-        statement.setString(5, OrderSide.SELL.name)
-        statement.setString(6, OrderType.STOP.name)
-        statement.setString(7, OrderStatus.OPEN.name)
+        statement.bindOpenStopOrderFilter(startIndex = 4, positionId = positionId)
 
         statement.executeUpdate()
     }
@@ -1246,12 +1216,16 @@ private fun JdbcTransaction.cancelOpenStopOrders(
         statement.setString(1, OrderStatus.CANCELED.name)
         statement.setString(2, reasonJa)
         statement.setLong(3, nowMillis(clock))
-        statement.setObject(4, UUID.fromString(positionId))
-        statement.setString(5, OrderSide.SELL.name)
-        statement.setString(6, OrderType.STOP.name)
-        statement.setString(7, OrderStatus.OPEN.name)
+        statement.bindOpenStopOrderFilter(startIndex = 4, positionId = positionId)
         statement.executeUpdate()
     }
+}
+
+private fun PreparedStatement.bindOpenStopOrderFilter(startIndex: Int, positionId: String) {
+    setObject(startIndex, UUID.fromString(positionId))
+    setString(startIndex + 1, OrderSide.SELL.name)
+    setString(startIndex + 2, OrderType.STOP.name)
+    setString(startIndex + 3, OrderStatus.OPEN.name)
 }
 
 private fun JdbcTransaction.updateAccountAfterBuy(fill: SimulatedFill, clock: Clock) {
@@ -1359,7 +1333,7 @@ private fun JdbcTransaction.appendFillEquitySnapshot(account: AccountSnapshot, c
         capturedAt = capturedAt,
     )
 
-    insertEquitySnapshot(snapshot, INSERT_EQUITY_SNAPSHOT_SQL)
+    insertEquitySnapshot(snapshot)
 }
 
 private fun JdbcTransaction.syncRiskStateEquity(
@@ -1565,72 +1539,12 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
     )
 }
 
-private fun Position.mergeEntryFill(command: PlaceOrderCommand, fill: SimulatedFill): Position {
-    val currentSize = sizeBtc.toBigDecimal()
-    val addedSize = fill.sizeBtc
-    val mergedSize = currentSize.add(addedSize).btcScale()
-    val mergedEntryPrice = averageEntryPriceJpy.toBigDecimal()
-        .multiply(currentSize)
-        .add(fill.priceJpy.multiply(addedSize))
-        .divide(mergedSize, MONEY_SCALE, RoundingMode.HALF_UP)
-        .moneyScale()
-    val currentStop = currentStopLossJpy?.toBigDecimal()
-    val requestedStop = command.protectiveStopPriceJpy
-    val mergedStop = listOfNotNull(currentStop, requestedStop).maxOrNull()
-    val mergedTakeProfit = command.takeProfitPriceJpy
-        ?.moneyScale()
-        ?.toPlainString()
-        ?: currentTakeProfitJpy
-    val highestPrice = maxOf(highestPriceSinceEntryJpy.toBigDecimal(), fill.priceJpy)
-    val currentLowestPrice = lowestPriceSinceEntryJpy?.toBigDecimal() ?: fill.priceJpy
-    val lowestPrice = minOf(currentLowestPrice, fill.priceJpy)
-    val markedPosition = copy(
-        sizeBtc = mergedSize.toPlainString(),
-        averageEntryPriceJpy = mergedEntryPrice.toPlainString(),
-        currentPriceJpy = fill.priceJpy.moneyScale().toPlainString(),
-        currentStopLossJpy = mergedStop?.moneyScale()?.toPlainString(),
-        currentTakeProfitJpy = mergedTakeProfit,
-        pyramidAddCount = pyramidAddCount + 1,
-        highestPriceSinceEntryJpy = highestPrice.moneyScale().toPlainString(),
-        lowestPriceSinceEntryJpy = lowestPrice.moneyScale().toPlainString(),
-    )
-
-    return markedPosition.copy(
-        unrealizedPnlJpy = markedPosition.unrealizedPnlAt(fill.priceJpy, mergedSize),
-        unrealizedR = markedPosition.unrealizedRAt(fill.priceJpy),
-    )
-}
-
 private fun SimulatedFill.withRealizedPnl(position: Position): SimulatedFill {
     val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
     val grossPnl = priceJpy.subtract(entryPrice).multiply(sizeBtc)
     val realizedPnl = grossPnl.subtract(feeJpy).moneyScale()
 
     return copy(realizedPnlJpy = realizedPnl)
-}
-
-private fun Position.unrealizedPnlAt(priceJpy: BigDecimal, sizeBtc: BigDecimal): String {
-    return priceJpy
-        .subtract(averageEntryPriceJpy.toBigDecimal())
-        .multiply(sizeBtc)
-        .moneyScale()
-        .toPlainString()
-}
-
-private fun Position.unrealizedRAt(priceJpy: BigDecimal): String {
-    val entryPrice = averageEntryPriceJpy.toBigDecimal()
-    val stopPrice = currentStopLossJpy?.toBigDecimal() ?: return BigDecimal.ZERO.ratioScale().toPlainString()
-    val riskWidth = entryPrice.subtract(stopPrice)
-
-    if (riskWidth <= BigDecimal.ZERO) {
-        return BigDecimal.ZERO.ratioScale().toPlainString()
-    }
-
-    return priceJpy
-        .subtract(entryPrice)
-        .divide(riskWidth, RATIO_SCALE, RoundingMode.HALF_UP)
-        .ratioScale()
-        .toPlainString()
 }
 
 private fun drawdownRatio(totalEquity: BigDecimal, equityPeak: BigDecimal): BigDecimal {

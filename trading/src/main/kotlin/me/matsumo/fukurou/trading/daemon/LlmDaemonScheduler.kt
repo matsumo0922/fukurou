@@ -35,6 +35,8 @@ import java.time.Duration
 import java.time.Instant
 import java.util.UUID
 import java.util.logging.Logger
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * daemon scheduler が参照する open risk 状態。
@@ -155,7 +157,7 @@ class LlmDaemonScheduler(
 
         while (currentCoroutineContext().isActive) {
             tick()
-            delay(interval.toMillis())
+            delay(interval.toMillis().toDuration(DurationUnit.MILLISECONDS))
         }
     }
 
@@ -212,10 +214,7 @@ class LlmDaemonScheduler(
         }
 
         val trigger = selectTrigger(hasOpenRisk, observedAt)
-
-        if (trigger == null) {
-            return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
-        }
+            ?: return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
 
         return reserveAndLaunch(trigger, observedAt)
     }
@@ -318,7 +317,7 @@ class LlmDaemonScheduler(
 
     private suspend fun selectTrigger(hasOpenRisk: Boolean, observedAt: Instant): LlmDaemonTrigger? {
         if (hasOpenRisk) {
-            val marketEvaluation = marketEvaluationIfNeeded(hasOpenRisk, observedAt)
+            val marketEvaluation = marketEvaluationIfNeeded(true, observedAt)
 
             return stopProximityTriggerIfDue(marketEvaluation, observedAt)
                 ?: priceMoveTriggerIfDue(marketEvaluation, observedAt)
@@ -331,7 +330,7 @@ class LlmDaemonScheduler(
             return eventTrigger
         }
 
-        val marketEvaluation = marketEvaluationIfNeeded(hasOpenRisk, observedAt)
+        val marketEvaluation = marketEvaluationIfNeeded(false, observedAt)
 
         return priceMoveTriggerIfDue(marketEvaluation, observedAt)
             ?: flatHeartbeatTriggerIfDue(observedAt)

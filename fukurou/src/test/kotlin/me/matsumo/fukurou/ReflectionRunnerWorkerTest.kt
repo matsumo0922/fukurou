@@ -31,6 +31,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * ReflectionRunnerWorker の起動 gate と loop 継続を検証するテスト。
@@ -100,7 +102,7 @@ class ReflectionRunnerWorkerTest {
         try {
             worker.start()
 
-            withTimeout(1_000) {
+            withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
                 secondAttemptCompleted.await()
             }
         } finally {

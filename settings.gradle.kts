@@ -21,5 +21,6 @@ dependencyResolutionManagement {
 
 include(":fukurou")
 include(":mcp")
+include(":mcp-core")
 include(":mcp-gmo-coin")
 include(":trading")

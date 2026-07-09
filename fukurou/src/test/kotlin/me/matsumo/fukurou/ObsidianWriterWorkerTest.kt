@@ -15,6 +15,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * ObsidianWriterWorker の起動 gate と loop 継続を検証するテスト。
@@ -66,14 +68,12 @@ class ObsidianWriterWorkerTest {
             clock = FIXED_CLOCK,
         )
 
-        try {
+        worker.use {
             worker.start()
 
-            withTimeout(1_000) {
+            withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
                 secondAttemptCompleted.await()
             }
-        } finally {
-            worker.close()
         }
 
         assertTrue(attempts.get() >= 2)
@@ -105,14 +105,12 @@ class ObsidianWriterWorkerTest {
             clock = FIXED_CLOCK,
         )
 
-        try {
+        worker.use {
             worker.start()
 
-            withTimeout(1_000) {
+            withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
                 secondWriteCompleted.await()
             }
-        } finally {
-            worker.close()
         }
 
         assertEquals(1, bootstrapAttempts.get())

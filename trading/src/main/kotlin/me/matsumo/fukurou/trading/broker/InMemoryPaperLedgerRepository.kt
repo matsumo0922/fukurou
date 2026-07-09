@@ -19,7 +19,6 @@ import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
-import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.math.BigDecimal
 import java.time.Clock
@@ -392,12 +391,13 @@ private class InMemoryPaperLedgerHistoryReader(
 
             state.read {
                 positions
+                    .asSequence()
                     .filter { position -> position.status == PositionStatus.CLOSED }
                     .mapNotNull { position -> position.toClosedPositionWithParsedInstantOrNull() }
                     .filter { closedPosition ->
                         val closedAt = closedPosition.closedAt
 
-                        closedAt >= from && closedAt < toExclusive
+                        closedAt in from..<toExclusive
                     }
                     .sortedByDescending { closedPosition -> closedPosition.closedAt }
                     .take(limit)
@@ -413,6 +413,7 @@ private class InMemoryPaperLedgerHistoryReader(
                                 .sortedBy { execution -> Instant.parse(execution.executedAt) },
                         )
                     }
+                    .toList()
             }
         }
     }
@@ -577,32 +578,17 @@ private class InMemoryPaperLedgerMutationWriter(
     ): Result<PaperReconcileResult> {
         return runCatching {
             state.write {
-                val ticker = tickSnapshot.requireTicker()
-                val rules = tickSnapshot.symbolRules ?: fallbackSymbolRules
-                val lastPrice = tickSnapshot.lastPrice?.toBigDecimal() ?: ticker.last.toBigDecimal()
-                val triggeredOrderIds = mutableListOf<String>()
-                val closedPositionIds = mutableListOf<String>()
-                val executionIds = mutableListOf<String>()
-                val reconcileContext = ReconcileMarketContext(
-                    ticker = ticker,
-                    rules = rules,
+                val reconcileContext = tickSnapshot.toReconcileMarketContext(
+                    fallbackSymbolRules = fallbackSymbolRules,
                     simulator = simulator,
-                    simulationContext = simulationContext ?: PaperSimulationContext(
-                        ticker = ticker,
-                        rules = rules,
-                    ),
-                    lastPrice = lastPrice,
+                    simulationContext = simulationContext,
                 )
-                val progress = ReconcileProgress(
-                    triggeredOrderIds = triggeredOrderIds,
-                    closedPositionIds = closedPositionIds,
-                    executionIds = executionIds,
-                )
+                val progress = emptyReconcileProgress()
 
                 updateMarksLocked(
-                    lastPrice = lastPrice,
+                    lastPrice = reconcileContext.lastPrice,
                     atr14Jpy = tickSnapshot.atr14Jpy?.toBigDecimal(),
-                    rules = rules,
+                    rules = reconcileContext.rules,
                     updatedAt = tickSnapshot.observedAt,
                 )
 
@@ -611,13 +597,7 @@ private class InMemoryPaperLedgerMutationWriter(
                     triggerPositionProtectionsLocked(reconcileContext, progress)
                 }
 
-                PaperReconcileResult(
-                    advanced = triggeredOrderIds.isNotEmpty() || closedPositionIds.isNotEmpty(),
-                    triggeredOrderIds = triggeredOrderIds,
-                    closedPositionIds = closedPositionIds,
-                    executionIds = executionIds,
-                    divergenceMemos = progress.divergenceMemos.toList(),
-                )
+                progress.toPaperReconcileResult()
             }
         }
     }
@@ -703,7 +683,9 @@ private class InMemoryPaperLedgerMutationWriter(
                 "Triggered entry order must create a fill."
             }
             val positionId = UUID.randomUUID()
-            val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
+            val orderTradeGroupId = order.tradeGroupId
+                ?: error("Triggered entry order must have trade group ID.")
+            val tradeGroupId = UUID.fromString(orderTradeGroupId)
             val stopOrderId = UUID.randomUUID()
             val command = order.toPlaceOrderCommand()
 
@@ -842,7 +824,7 @@ private class InMemoryPaperLedgerMutationWriter(
                 val fill = context.simulator.stopFill(
                     OrderSide.SELL,
                     position.sizeBtc.toBigDecimal(),
-                    requireNotNull(stopPrice),
+                    stopPrice,
                     context.simulationContext,
                 )
                 val result = closePositionLocked(
@@ -895,32 +877,27 @@ private class InMemoryPaperLedgerMutationWriter(
                 return@replaceAll position
             }
 
-            val entryPrice = position.averageEntryPriceJpy.toBigDecimal()
-            val sizeBtc = position.sizeBtc.toBigDecimal()
-            val highestPrice = maxOf(position.highestPriceSinceEntryJpy.toBigDecimal(), lastPrice)
-            val currentLowestPrice = position.lowestPriceSinceEntryJpy?.toBigDecimal() ?: lastPrice
-            val lowestPrice = minOf(currentLowestPrice, lastPrice)
-            val trailingStop = atr14Jpy?.let { atrValue ->
-                highestPrice
-                    .subtract(atrValue.multiply(SafetyFloorDefaults.trailingAtrMultiplier))
-                    .floorToStep(rules.tickSize.toBigDecimal())
-            }
-            val currentStop = position.currentStopLossJpy?.toBigDecimal()
-            val tightenedStop = listOfNotNull(currentStop, trailingStop).maxOrNull()
-            val unrealizedPnl = lastPrice.subtract(entryPrice).multiply(sizeBtc).moneyScale()
-            val unrealizedR = position.unrealizedRAt(lastPrice)
+            val markUpdate = position.toPositionMarkUpdate(
+                lastPrice = lastPrice,
+                atr14Jpy = atr14Jpy,
+                rules = rules,
+            )
 
-            if (tightenedStop != currentStop && tightenedStop != null) {
-                updateLinkedStopOrderLocked(position.positionId, tightenedStop, "reconciler atr trailing floor")
+            if (position.hasTightenedStop(markUpdate)) {
+                updateLinkedStopOrderLocked(
+                    position.positionId,
+                    checkNotNull(markUpdate.tightenedStop),
+                    "reconciler atr trailing floor",
+                )
             }
 
             position.copy(
-                currentPriceJpy = lastPrice.moneyScale().toPlainString(),
-                currentStopLossJpy = tightenedStop?.moneyScale()?.toPlainString(),
-                unrealizedPnlJpy = unrealizedPnl.toPlainString(),
-                unrealizedR = unrealizedR,
-                highestPriceSinceEntryJpy = highestPrice.moneyScale().toPlainString(),
-                lowestPriceSinceEntryJpy = lowestPrice.moneyScale().toPlainString(),
+                currentPriceJpy = markUpdate.lastPrice.moneyScale().toPlainString(),
+                currentStopLossJpy = markUpdate.tightenedStop?.moneyScale()?.toPlainString(),
+                unrealizedPnlJpy = markUpdate.unrealizedPnl.toPlainString(),
+                unrealizedR = markUpdate.unrealizedR.toPlainString(),
+                highestPriceSinceEntryJpy = markUpdate.highestPrice.moneyScale().toPlainString(),
+                lowestPriceSinceEntryJpy = markUpdate.lowestPrice.moneyScale().toPlainString(),
             )
         }
 
@@ -1253,42 +1230,6 @@ private fun PlaceOrderCommand.toOpenPosition(
     )
 }
 
-private fun Position.mergeEntryFill(command: PlaceOrderCommand, fill: SimulatedFill): Position {
-    val currentSize = sizeBtc.toBigDecimal()
-    val addedSize = fill.sizeBtc
-    val mergedSize = currentSize.add(addedSize).btcScale()
-    val mergedEntryPrice = averageEntryPriceJpy.toBigDecimal()
-        .multiply(currentSize)
-        .add(fill.priceJpy.multiply(addedSize))
-        .divide(mergedSize, MONEY_SCALE, java.math.RoundingMode.HALF_UP)
-        .moneyScale()
-    val currentStop = currentStopLossJpy?.toBigDecimal()
-    val requestedStop = command.protectiveStopPriceJpy
-    val mergedStop = listOfNotNull(currentStop, requestedStop).maxOrNull()
-    val mergedTakeProfit = command.takeProfitPriceJpy
-        ?.moneyScale()
-        ?.toPlainString()
-        ?: currentTakeProfitJpy
-    val highestPrice = maxOf(highestPriceSinceEntryJpy.toBigDecimal(), fill.priceJpy)
-    val currentLowestPrice = lowestPriceSinceEntryJpy?.toBigDecimal() ?: fill.priceJpy
-    val lowestPrice = minOf(currentLowestPrice, fill.priceJpy)
-    val markedPosition = copy(
-        sizeBtc = mergedSize.toPlainString(),
-        averageEntryPriceJpy = mergedEntryPrice.toPlainString(),
-        currentPriceJpy = fill.priceJpy.moneyScale().toPlainString(),
-        currentStopLossJpy = mergedStop?.moneyScale()?.toPlainString(),
-        currentTakeProfitJpy = mergedTakeProfit,
-        pyramidAddCount = pyramidAddCount + 1,
-        highestPriceSinceEntryJpy = highestPrice.moneyScale().toPlainString(),
-        lowestPriceSinceEntryJpy = lowestPrice.moneyScale().toPlainString(),
-    )
-
-    return markedPosition.copy(
-        unrealizedPnlJpy = markedPosition.unrealizedPnlAt(fill.priceJpy, mergedSize),
-        unrealizedR = markedPosition.unrealizedRAt(fill.priceJpy),
-    )
-}
-
 private fun Position.toClosePositionUpdate(
     fill: SimulatedFill,
     remainingSize: BigDecimal,
@@ -1421,30 +1362,6 @@ private fun Position.withWatermarkPrice(priceJpy: BigDecimal): Position {
         highestPriceSinceEntryJpy = highestPrice.moneyScale().toPlainString(),
         lowestPriceSinceEntryJpy = lowestPrice.moneyScale().toPlainString(),
     )
-}
-
-private fun Position.unrealizedPnlAt(priceJpy: BigDecimal, sizeBtc: BigDecimal): String {
-    return priceJpy
-        .subtract(averageEntryPriceJpy.toBigDecimal())
-        .multiply(sizeBtc)
-        .moneyScale()
-        .toPlainString()
-}
-
-private fun Position.unrealizedRAt(priceJpy: BigDecimal): String {
-    val entryPrice = averageEntryPriceJpy.toBigDecimal()
-    val stopPrice = currentStopLossJpy?.toBigDecimal() ?: return BigDecimal.ZERO.ratioScale().toPlainString()
-    val riskWidth = entryPrice.subtract(stopPrice)
-
-    if (riskWidth <= BigDecimal.ZERO) {
-        return BigDecimal.ZERO.ratioScale().toPlainString()
-    }
-
-    return priceJpy
-        .subtract(entryPrice)
-        .divide(riskWidth, RATIO_SCALE, java.math.RoundingMode.HALF_UP)
-        .ratioScale()
-        .toPlainString()
 }
 
 private fun AccountSnapshot.afterBuyFill(fill: SimulatedFill): AccountSnapshot {

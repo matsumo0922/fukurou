@@ -437,7 +437,6 @@ class OneShotLlmRunner(
     }
 
     private suspend fun runOneShotAfterPreflight(input: OneShotAfterPreflightRequest): OneShotRunnerResult {
-        val request = input.request
         val invocationId = input.invocationId
         val proposerContext = input.proposerContext
         val proposerResult = proposerDecision(input)
@@ -1221,7 +1220,7 @@ const val DEFAULT_RUNNER_MCP_SERVER_COMMAND = "java"
 /**
  * MCP jar path placeholder。
  */
-const val MCP_JAR_PATH_PLACEHOLDER = "\${mcpJarPath}"
+const val MCP_JAR_PATH_PLACEHOLDER = $$"${mcpJarPath}"
 
 /**
  * prompt 読み込み前の caller failure audit に使う placeholder。

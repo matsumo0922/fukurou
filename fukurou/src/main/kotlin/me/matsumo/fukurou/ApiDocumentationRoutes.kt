@@ -10,7 +10,6 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.openapi.OpenApiDocSource
 import io.ktor.server.routing.openapi.hide
 import io.ktor.utils.io.ExperimentalKtorApi
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 /**

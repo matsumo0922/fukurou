@@ -367,10 +367,9 @@ private suspend fun ApplicationCall.requireMarketDataSource(marketDataSource: Ma
 
 private suspend fun ApplicationCall.parseEvaluationDateRange(clock: Clock): EvaluationDateRange? {
     val today = LocalDate.now(clock.withZone(EvaluationZone))
-    val defaultToDate = today
     val defaultFromDate = today.minusDays(DEFAULT_EVALUATION_DAYS)
     val fromResult = parseDateParameter("from", defaultFromDate)
-    val toResult = parseDateParameter("to", defaultToDate)
+    val toResult = parseDateParameter("to", today)
 
     if (fromResult.isFailure || toResult.isFailure) {
         respond(HttpStatusCode.BadRequest, ErrorResponse("from and to must be ISO-8601 dates"))

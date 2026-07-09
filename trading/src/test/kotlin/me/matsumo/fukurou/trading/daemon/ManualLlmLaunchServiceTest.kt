@@ -38,6 +38,8 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * ManualLlmLaunchService の reservation / audit / lifecycle contract を検証するテスト。
@@ -170,9 +172,9 @@ class ManualLlmLaunchServiceTest {
                 riskStateRepository = riskStateRepository,
                 commandEventLog = eventLog,
                 launchReservationRepository = reservations,
-                openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
-                tickerReader = LlmDaemonTickerReader { error("ticker must not be read") },
-                positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
+                openRiskReader = { Result.success(false) },
+                tickerReader = { error("ticker must not be read") },
+                positionsReader = { Result.success(emptyList()) },
             ),
             runtime = LlmDaemonSchedulerRuntime(
                 requestBase = defaultRequest(),
@@ -353,7 +355,7 @@ class ManualLlmLaunchServiceTest {
             closeResult.complete(runCatching { fixture.service.close() }.exceptionOrNull())
         }
         closeStarted.await()
-        withTimeout(FINISH_TIMEOUT_MILLIS) {
+        withTimeout(FINISH_TIMEOUT_MILLIS.toDuration(DurationUnit.MILLISECONDS)) {
             while (!scopeJob.isCancelled) {
                 yield()
             }
@@ -363,7 +365,7 @@ class ManualLlmLaunchServiceTest {
 
         queuedDispatcher.runQueuedTasks()
         closeThread.join(CLOSE_THREAD_JOIN_TIMEOUT_MILLIS)
-        val finish = withTimeout(FINISH_TIMEOUT_MILLIS) {
+        val finish = withTimeout(FINISH_TIMEOUT_MILLIS.toDuration(DurationUnit.MILLISECONDS)) {
             fixture.reservations.nextFinish()
         }
         val hasFreshRunningReservationAfterClose = fixture.reservations
@@ -472,7 +474,7 @@ private fun manualService(
             riskStateRepository = riskStateRepository,
             commandEventLog = eventLog,
             launchReservationRepository = reservations,
-            openRiskReader = LlmDaemonOpenRiskReader { Result.success(hasOpenRisk) },
+            openRiskReader = { Result.success(hasOpenRisk) },
         ),
         runtime = ManualLlmLaunchServiceRuntime(
             requestBase = defaultRequest(),

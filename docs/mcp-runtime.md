@@ -154,44 +154,44 @@ Reflection Runner の PromptCandidates は完了済み前週を対象に `REFLEC
 
 runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB bootstrap が `runtime_config_versions` / `runtime_config_values` に初期 active version を作成する。active snapshot に不足する code-owned catalog key がある場合、bootstrap は既存値を保持した complete snapshot を新しい active version として作成する。key の削除は無効化手段ではなく、bootstrap が catalog default で復元する。unknown key、不正値、validation failure は fail closed する。DB-backed runtime では active DB config が `RUNTIME` key の正本で、legacy `FUKUROU_*` env より優先する。`.env` は secret / deployment / bootstrap 値に使う。主な legacy env 名:
 
-| env | 既定 | 用途 |
-| --- | --- | --- |
-| `FUKUROU_TRADING_SYMBOL` | `BTC` | 取引対象 symbol |
-| `FUKUROU_TRADING_MODE` | `PAPER` | `PAPER` のみ有効。`LIVE` は予約値で、現時点では起動時に拒否 |
-| `FUKUROU_PAPER_INITIAL_CASH_JPY` | `100000` | paper 初期 JPY 残高 |
-| `FUKUROU_MARKET_SLIPPAGE_BPS` | `5` | paper MARKET / STOP 約定 slippage |
-| `FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER` | `0.1` | paper MARKET / STOP 約定へ ATR(5m,14) から追加する slippage 係数 |
-| `FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS` | `5` | SafetyFloor の固定 slippage reserve。`FUKUROU_MARKET_SLIPPAGE_BPS` より小さい場合は paper 約定側の値を SafetyFloor 見積もりに使う |
-| `FUKUROU_MAX_RISK_PER_TRADE_RATIO` | `0.02` | 1 trade group 最大損失 |
-| `FUKUROU_MAX_DRAWDOWN_RATIO` | `-0.15` | HARD_HALT drawdown |
-| `FUKUROU_MAX_TOTAL_EXPOSURE_RATIO` | `0.80` | 合計 exposure 上限 |
-| `FUKUROU_GMO_PUBLIC_REST_PER_SECOND` | `10` | GMO Public REST client-side limit。10 以下だけ許可 |
-| `FUKUROU_GMO_RETRY_MAX_ATTEMPTS` | `3` | 一時失敗 retry 回数 |
-| `FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT` | `48` | 1 decision run あたりの総 tool call 上限 |
-| `FUKUROU_MCP_ACT_TOOL_CALL_LIMIT` | `3` | 1 decision run あたりの trade 系 tool call 上限 |
-| `FUKUROU_LLM_RUN_TIMEOUT_SECONDS` | `180` | 1 CLI 起動 timeout |
-| `FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR` | `6` | runner が audit / DB から数える 1 時間起動上限 |
-| `FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY` | `96` | runner / daemon が audit / DB から数える 24 時間起動上限。15 分 cadence を 24 時間維持する初期値 |
-| `FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS` | `1800` | runner が stale resting entry order を自動 cancel する TTL。既定より長い値は拒否 |
-| `FUKUROU_LLM_DAEMON_ENABLED` | `false` | Ktor process 内 daemon scheduler の有効化。production compose は true |
-| `FUKUROU_LLM_DAEMON_POLL_SECONDS` | `60` | daemon loop の確認間隔。60 秒以上だけ許可 |
-| `FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS` | `900` | flat heartbeat。15 分以上だけ許可 |
-| `FUKUROU_LLM_HOLDING_CHECK_SECONDS` | `900` | holding dense check。15 分以上だけ許可 |
-| `FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC` | 未指定 | `id\|name\|eventAtUtc\|beforeMinutes\|afterMinutes` を `;` 区切りで列挙 |
-| `FUKUROU_OBSIDIAN_ENABLED` | `false` | Obsidian Writer / Reflection Runner の有効化 |
-| `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` | `3600` | Reflection Runner loop の最小間隔 |
-| `FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER` | `CLAUDE` | 完了済み前週の PromptCandidates に使う LLM provider |
-| `FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS` | `60` | PromptCandidates の LLM timeout。120 秒以下だけ許可 |
-| `FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS` | `2` | 同じ対象週の PromptCandidates LLM 最大試行回数 |
-| `FUKUROU_MCP_JAR_PATH` | `mcp/build/libs/fukurou-mcp-all.jar` | one-shot runner が stdio 子プロセスとして起動する MCP fat jar |
-| `FUKUROU_MCP_SERVER_NAME` | `fukurou-mcp` | Claude / Codex に登録する MCP server 名 |
-| `FUKUROU_MCP_SERVER_COMMAND` | `java` | MCP server 起動 command |
-| `FUKUROU_MCP_SERVER_ARGS` | 未指定 | MCP server 起動引数。未指定時は `-jar <FUKUROU_MCP_JAR_PATH>` |
-| `FUKUROU_CLAUDE_COMMAND_TEMPLATE` | `claude` | Claude CLI 起動 command template |
-| `FUKUROU_CODEX_COMMAND_TEMPLATE` | `codex` | Codex CLI 起動 command template。sandbox wrapper prefix を含められる |
-| `FUKUROU_CLAUDE_MODEL` | 未指定 | Claude CLI に渡す model 名 |
-| `FUKUROU_CODEX_MODEL` | 未指定 | Codex CLI に渡す model 名 |
-| `FUKUROU_MCP_ALLOWED_TOOLS` | runner が設定 | MCP server instance 内で許可する short tool 名。通常は手動設定しない |
+| env                                                   | 既定                                   | 用途                                                                                                       |
+|-------------------------------------------------------|--------------------------------------|----------------------------------------------------------------------------------------------------------|
+| `FUKUROU_TRADING_SYMBOL`                              | `BTC`                                | 取引対象 symbol                                                                                              |
+| `FUKUROU_TRADING_MODE`                                | `PAPER`                              | `PAPER` のみ有効。`LIVE` は予約値で、現時点では起動時に拒否                                                                    |
+| `FUKUROU_PAPER_INITIAL_CASH_JPY`                      | `100000`                             | paper 初期 JPY 残高                                                                                          |
+| `FUKUROU_MARKET_SLIPPAGE_BPS`                         | `5`                                  | paper MARKET / STOP 約定 slippage                                                                          |
+| `FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER`              | `0.1`                                | paper MARKET / STOP 約定へ ATR(5m,14) から追加する slippage 係数                                                    |
+| `FUKUROU_MARKET_SLIPPAGE_RESERVE_BPS`                 | `5`                                  | SafetyFloor の固定 slippage reserve。`FUKUROU_MARKET_SLIPPAGE_BPS` より小さい場合は paper 約定側の値を SafetyFloor 見積もりに使う |
+| `FUKUROU_MAX_RISK_PER_TRADE_RATIO`                    | `0.02`                               | 1 trade group 最大損失                                                                                       |
+| `FUKUROU_MAX_DRAWDOWN_RATIO`                          | `-0.15`                              | HARD_HALT drawdown                                                                                       |
+| `FUKUROU_MAX_TOTAL_EXPOSURE_RATIO`                    | `0.80`                               | 合計 exposure 上限                                                                                           |
+| `FUKUROU_GMO_PUBLIC_REST_PER_SECOND`                  | `10`                                 | GMO Public REST client-side limit。10 以下だけ許可                                                              |
+| `FUKUROU_GMO_RETRY_MAX_ATTEMPTS`                      | `3`                                  | 一時失敗 retry 回数                                                                                            |
+| `FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT`                   | `48`                                 | 1 decision run あたりの総 tool call 上限                                                                        |
+| `FUKUROU_MCP_ACT_TOOL_CALL_LIMIT`                     | `3`                                  | 1 decision run あたりの trade 系 tool call 上限                                                                 |
+| `FUKUROU_LLM_RUN_TIMEOUT_SECONDS`                     | `180`                                | 1 CLI 起動 timeout                                                                                         |
+| `FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR`                | `6`                                  | runner が audit / DB から数える 1 時間起動上限                                                                       |
+| `FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY`                 | `96`                                 | runner / daemon が audit / DB から数える 24 時間起動上限。15 分 cadence を 24 時間維持する初期値                                 |
+| `FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS`             | `1800`                               | runner が stale resting entry order を自動 cancel する TTL。既定より長い値は拒否                                          |
+| `FUKUROU_LLM_DAEMON_ENABLED`                          | `false`                              | Ktor process 内 daemon scheduler の有効化。production compose は true                                           |
+| `FUKUROU_LLM_DAEMON_POLL_SECONDS`                     | `60`                                 | daemon loop の確認間隔。60 秒以上だけ許可                                                                             |
+| `FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS`                  | `900`                                | flat heartbeat。15 分以上だけ許可                                                                                |
+| `FUKUROU_LLM_HOLDING_CHECK_SECONDS`                   | `900`                                | holding dense check。15 分以上だけ許可                                                                           |
+| `FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC`                | 未指定                                  | `id,name,eventAtUtc,beforeMinutes,afterMinutes` 形式を `;` 区切りで列挙                                           |
+| `FUKUROU_OBSIDIAN_ENABLED`                            | `false`                              | Obsidian Writer / Reflection Runner の有効化                                                                 |
+| `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS`             | `3600`                               | Reflection Runner loop の最小間隔                                                                             |
+| `FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER`        | `CLAUDE`                             | 完了済み前週の PromptCandidates に使う LLM provider                                                                |
+| `FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS` | `60`                                 | PromptCandidates の LLM timeout。120 秒以下だけ許可                                                               |
+| `FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS`    | `2`                                  | 同じ対象週の PromptCandidates LLM 最大試行回数                                                                       |
+| `FUKUROU_MCP_JAR_PATH`                                | `mcp/build/libs/fukurou-mcp-all.jar` | one-shot runner が stdio 子プロセスとして起動する MCP fat jar                                                         |
+| `FUKUROU_MCP_SERVER_NAME`                             | `fukurou-mcp`                        | Claude / Codex に登録する MCP server 名                                                                        |
+| `FUKUROU_MCP_SERVER_COMMAND`                          | `java`                               | MCP server 起動 command                                                                                    |
+| `FUKUROU_MCP_SERVER_ARGS`                             | 未指定                                  | MCP server 起動引数。未指定時は `-jar FUKUROU_MCP_JAR_PATH`                                                        |
+| `FUKUROU_CLAUDE_COMMAND_TEMPLATE`                     | `claude`                             | Claude CLI 起動 command template                                                                           |
+| `FUKUROU_CODEX_COMMAND_TEMPLATE`                      | `codex`                              | Codex CLI 起動 command template。sandbox wrapper prefix を含められる                                              |
+| `FUKUROU_CLAUDE_MODEL`                                | 未指定                                  | Claude CLI に渡す model 名                                                                                   |
+| `FUKUROU_CODEX_MODEL`                                 | 未指定                                  | Codex CLI に渡す model 名                                                                                    |
+| `FUKUROU_MCP_ALLOWED_TOOLS`                           | runner が設定                           | MCP server instance 内で許可する short tool 名。通常は手動設定しない                                                       |
 
 SafetyFloor 系値と fallback fee / spread は、既定値と同等またはより保守的な値だけ許可する。GMO Public REST の rate-limit も既定 10 req/s / burst 10 以下だけ許可する。GMO Public REST の timeout / retry backoff も runtime config で管理する。GMO `/public/v1/symbols` が取得できる場合、paper 手数料は取引所 rule を優先する。
 

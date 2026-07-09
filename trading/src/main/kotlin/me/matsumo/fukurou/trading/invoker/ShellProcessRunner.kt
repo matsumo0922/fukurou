@@ -11,6 +11,8 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Comparator
 import java.util.concurrent.TimeUnit
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * JVM の ProcessBuilder を使う ProcessRunner。
@@ -44,7 +46,7 @@ class ShellProcessRunner : ProcessRunner {
 
                 writeStdin(process, command.stdin)
 
-                val exitCode = withTimeoutOrNull(command.timeout.toMillis()) {
+                val exitCode = withTimeoutOrNull(command.timeout.toMillis().toDuration(DurationUnit.MILLISECONDS)) {
                     withContext(Dispatchers.IO) {
                         process.waitFor()
                     }

@@ -138,7 +138,7 @@ class GmoCoinMcpServerTest {
         val result = server.tools.getValue("get_candles").handler.invoke(TestClientConnection, request)
         val structuredContent = assertNotNull(result.structuredContent)
 
-        assertTrue(result.isError == true)
+        assertEquals(true, result.isError)
         assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertEquals("permanent", structuredContent.getValue("failure_kind").jsonPrimitive.contentOrNull)
     }
@@ -406,7 +406,7 @@ class GmoCoinMcpServerTest {
         )
         val structuredContent = assertNotNull(result.structuredContent)
 
-        assertTrue(result.isError == true)
+        assertEquals(true, result.isError)
         assertEquals("market_data_parse_error", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertEquals("permanent", structuredContent.getValue("failure_kind").jsonPrimitive.contentOrNull)
     }
@@ -480,7 +480,7 @@ class GmoCoinMcpServerTest {
         )
         val structuredContent = assertNotNull(result.structuredContent)
 
-        assertTrue(result.isError == true)
+        assertEquals(true, result.isError)
         assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertTrue(marketDataSource.requestedLimits.isEmpty())
     }

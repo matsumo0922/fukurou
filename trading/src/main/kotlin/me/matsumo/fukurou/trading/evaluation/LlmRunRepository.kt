@@ -208,7 +208,7 @@ class InMemoryLlmRunRepository : LlmRunRepository {
 
             synchronized(lock) {
                 records.values
-                    .filter { record -> record.startedAt >= from && record.startedAt < toExclusive }
+                    .filter { record -> record.startedAt in from..<toExclusive }
                     .sortedByDescending { record -> record.startedAt }
                     .take(limit)
                     .sortedBy { record -> record.startedAt }

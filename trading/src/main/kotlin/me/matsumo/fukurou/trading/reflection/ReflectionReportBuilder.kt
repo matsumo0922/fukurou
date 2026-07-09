@@ -13,6 +13,8 @@ import me.matsumo.fukurou.trading.evaluation.LlmCostStats
 import me.matsumo.fukurou.trading.evaluation.SetupPerformance
 import me.matsumo.fukurou.trading.evaluation.TradePerformanceStats
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
+import me.matsumo.fukurou.trading.knowledge.appendYamlList
+import me.matsumo.fukurou.trading.knowledge.yamlQuoted
 import java.math.BigDecimal
 import java.time.LocalDate
 import java.time.ZoneId
@@ -147,10 +149,7 @@ class ReflectionReportBuilder(
         appendLine("period: ${context.periodLabel.yamlQuoted()}")
         appendLine("date: ${context.tradingDate.toString().yamlQuoted()}")
         appendLine("week: ${context.weekId.yamlQuoted()}")
-        appendLine("symbol: ${tradingConfig.symbol.apiSymbol.yamlQuoted()}")
-        appendLine("mode: ${tradingConfig.mode.name.yamlQuoted()}")
-        appendLine("period_start: ${data.period.from.toOffsetText().yamlQuoted()}")
-        appendLine("period_end: ${data.period.toExclusive.toOffsetText().yamlQuoted()}")
+        appendPeriodFrontmatter(data)
         appendLine("decision_runs: ${data.decisionRunCount}")
         appendLine("decisions: ${data.decisions.size}")
         appendLine("closed_trades: ${data.closedTrades.size}")
@@ -163,11 +162,7 @@ class ReflectionReportBuilder(
         appendLine("llm_phase_count: ${stats.costStats.phaseCount}")
         appendLine("llm_missing_usage_phases: ${stats.costStats.missingUsagePhaseCount}")
         appendLine("sample_size_warning: ${stats.sampleSizeWarning}")
-        appendLine("truncated: ${data.truncation.any}")
-        appendLine("decision_truncated: ${data.truncation.decisions}")
-        appendLine("llm_run_truncated: ${data.truncation.llmRuns}")
-        appendLine("closed_trade_truncated: ${data.truncation.closedTrades}")
-        appendLine("llm_usage_truncated: ${data.truncation.llmUsages}")
+        appendTruncationFrontmatter(data)
         appendYamlList("tags", context.reportTags)
         appendLine("---")
         appendLine()
@@ -348,17 +343,10 @@ class ReflectionReportBuilder(
         appendLine("---")
         appendLine("type: ${"confidence_calibration".yamlQuoted()}")
         appendLine("period: ${data.period.id.yamlQuoted()}")
-        appendLine("symbol: ${tradingConfig.symbol.apiSymbol.yamlQuoted()}")
-        appendLine("mode: ${tradingConfig.mode.name.yamlQuoted()}")
-        appendLine("period_start: ${data.period.from.toOffsetText().yamlQuoted()}")
-        appendLine("period_end: ${data.period.toExclusive.toOffsetText().yamlQuoted()}")
+        appendPeriodFrontmatter(data)
         appendLine("closed_trades: ${data.closedTrades.size}")
         appendLine("sample_size_warning: $sampleSizeWarning")
-        appendLine("truncated: ${data.truncation.any}")
-        appendLine("decision_truncated: ${data.truncation.decisions}")
-        appendLine("llm_run_truncated: ${data.truncation.llmRuns}")
-        appendLine("closed_trade_truncated: ${data.truncation.closedTrades}")
-        appendLine("llm_usage_truncated: ${data.truncation.llmUsages}")
+        appendTruncationFrontmatter(data)
         appendYamlList(
             key = "tags",
             values = listOf("reflection", "confidence-calibration", tradingConfig.symbol.apiSymbol.lowercase()),
@@ -420,18 +408,11 @@ class ReflectionReportBuilder(
         appendLine("---")
         appendLine("type: ${"setup_tag_taxonomy".yamlQuoted()}")
         appendLine("week: ${weekId.yamlQuoted()}")
-        appendLine("symbol: ${tradingConfig.symbol.apiSymbol.yamlQuoted()}")
-        appendLine("mode: ${tradingConfig.mode.name.yamlQuoted()}")
-        appendLine("period_start: ${data.period.from.toOffsetText().yamlQuoted()}")
-        appendLine("period_end: ${data.period.toExclusive.toOffsetText().yamlQuoted()}")
+        appendPeriodFrontmatter(data)
         appendLine("tag_count: ${tagSummaries.size}")
         appendLine("alias_candidate_count: ${aliasGroups.size}")
         appendLine("sample_size_warning: $sampleSizeWarning")
-        appendLine("truncated: ${data.truncation.any}")
-        appendLine("decision_truncated: ${data.truncation.decisions}")
-        appendLine("llm_run_truncated: ${data.truncation.llmRuns}")
-        appendLine("closed_trade_truncated: ${data.truncation.closedTrades}")
-        appendLine("llm_usage_truncated: ${data.truncation.llmUsages}")
+        appendTruncationFrontmatter(data)
         appendYamlList("tags", listOf("reflection", "setup-taxonomy", tradingConfig.symbol.apiSymbol.lowercase()))
         appendLine("---")
         appendLine()
@@ -584,16 +565,19 @@ class ReflectionReportBuilder(
         appendLine()
     }
 
-    private fun StringBuilder.appendYamlList(key: String, values: List<String>) {
-        if (values.isEmpty()) {
-            appendLine("$key: []")
-            return
-        }
+    private fun StringBuilder.appendPeriodFrontmatter(data: ReflectionWindowData) {
+        appendLine("symbol: ${tradingConfig.symbol.apiSymbol.yamlQuoted()}")
+        appendLine("mode: ${tradingConfig.mode.name.yamlQuoted()}")
+        appendLine("period_start: ${data.period.from.toOffsetText().yamlQuoted()}")
+        appendLine("period_end: ${data.period.toExclusive.toOffsetText().yamlQuoted()}")
+    }
 
-        appendLine("$key:")
-        values.forEach { value ->
-            appendLine("  - ${value.yamlQuoted()}")
-        }
+    private fun StringBuilder.appendTruncationFrontmatter(data: ReflectionWindowData) {
+        appendLine("truncated: ${data.truncation.any}")
+        appendLine("decision_truncated: ${data.truncation.decisions}")
+        appendLine("llm_run_truncated: ${data.truncation.llmRuns}")
+        appendLine("closed_trade_truncated: ${data.truncation.closedTrades}")
+        appendLine("llm_usage_truncated: ${data.truncation.llmUsages}")
     }
 
     private fun BigDecimal?.yamlNumberOrNull(): String {
@@ -602,31 +586,6 @@ class ReflectionReportBuilder(
 
     private fun BigDecimal?.markdownNumberOrNull(): String {
         return this?.toPlainString() ?: "null"
-    }
-
-    private fun String.yamlQuoted(): String {
-        val escaped = buildString {
-            this@yamlQuoted.forEach { character ->
-                when (character) {
-                    '\\' -> append("\\\\")
-                    '"' -> append("\\\"")
-                    '\n' -> append("\\n")
-                    '\r' -> append("\\r")
-                    '\t' -> append("\\t")
-                    else -> appendYamlCharacter(character)
-                }
-            }
-        }
-
-        return "\"$escaped\""
-    }
-
-    private fun StringBuilder.appendYamlCharacter(character: Char) {
-        if (character.code < YAML_CONTROL_CHARACTER_BOUNDARY) {
-            append(' ')
-        } else {
-            append(character)
-        }
     }
 
     private fun java.time.Instant.toOffsetText(): String {
@@ -720,11 +679,6 @@ private data class TagSummaryView(
     val winRate: String,
     val expectedR: String,
 )
-
-/**
- * YAML double quoted scalar にそのまま入れない制御文字の境界。
- */
-private const val YAML_CONTROL_CHARACTER_BOUNDARY = 0x20
 
 /**
  * tag 正規化用 whitespace regex。

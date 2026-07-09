@@ -9,8 +9,7 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
-import me.matsumo.fukurou.trading.daemon.REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS
-import me.matsumo.fukurou.trading.daemon.REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS
+import me.matsumo.fukurou.trading.daemon.launchBudgetRejection
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Instant
@@ -173,28 +172,9 @@ private fun JdbcTransaction.tryReserveInTransaction(
 
     val hourlyCount = countDistinctLaunchesSince(request.reservedAt.minus(request.hourlyWindow))
     val dailyCount = countDistinctLaunchesSince(request.reservedAt.minus(request.dailyWindow))
-    val hourlyRemaining = request.runnerConfig.maxInvocationsPerHour - hourlyCount
-    val dailyRemaining = request.runnerConfig.maxInvocationsPerDay - dailyCount
-    val reflectionRequest = request.triggerKind == LlmDaemonTriggerKind.REFLECTION
-    val hourlyExceeded = hourlyRemaining <= 0
-    val dailyExceeded = dailyRemaining <= 0
 
-    if (reflectionRequest && hourlyRemaining <= REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS) {
-        return LlmLaunchReservationOutcome.Rejected(
-            LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM,
-        )
-    }
-    if (reflectionRequest && dailyRemaining <= REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS) {
-        return LlmLaunchReservationOutcome.Rejected(
-            LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM,
-        )
-    }
-
-    if (hourlyExceeded) {
-        return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR)
-    }
-    if (dailyExceeded) {
-        return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY)
+    launchBudgetRejection(request, hourlyCount, dailyCount)?.let { rejectionReason ->
+        return LlmLaunchReservationOutcome.Rejected(rejectionReason)
     }
 
     insertReservation(request)

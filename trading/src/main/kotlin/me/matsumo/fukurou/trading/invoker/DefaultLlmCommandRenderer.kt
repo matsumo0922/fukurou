@@ -244,7 +244,7 @@ private fun List<String>.toRenderedCommand(request: RenderedCommandRequest): Ren
 private data class RenderedCommandRequest(
     val args: List<String>,
     val environment: Map<String, String>,
-    val workingDirectory: java.nio.file.Path,
+    val workingDirectory: Path,
     val timeout: java.time.Duration,
     val stdin: String?,
     val cleanupPaths: List<Path>,
@@ -750,8 +750,7 @@ private fun String.hasInlineRootBindMount(): Boolean {
 
 private fun String.mountSourceIsRoot(): Boolean {
     val source = split(",")
-        .mapNotNull { value -> value.mountSourceValue() }
-        .firstOrNull()
+        .firstNotNullOfOrNull { value -> value.mountSourceValue() }
 
     return source == "/"
 }

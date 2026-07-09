@@ -18,6 +18,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
+import me.matsumo.fukurou.mcp.runtime.mcpErrorResult
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.Orderbook
@@ -1007,32 +1008,7 @@ private fun throwableResult(throwable: Throwable, toolExecutor: GmoCoinMarketToo
 
     val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
 
-    return errorResult(type, throwable.message.orEmpty(), executed, failureKind)
-}
-
-private fun errorResult(
-    type: String,
-    message: String,
-    executed: Boolean? = null,
-    failureKind: String? = null,
-): CallToolResult {
-    val resolvedMessage = message.ifBlank { "unknown error" }
-
-    return CallToolResult(
-        content = listOf(TextContent(resolvedMessage)),
-        structuredContent = buildJsonObject {
-            put("error", true)
-            put("type", type)
-            put("message", resolvedMessage)
-            if (executed != null) {
-                put("executed", executed)
-            }
-            if (failureKind != null) {
-                put("failure_kind", failureKind)
-            }
-        },
-        isError = true,
-    )
+    return mcpErrorResult(type, throwable.message.orEmpty(), executed, failureKind)
 }
 
 private fun candlesDescription(dailyKlineRequestLimit: Int?): String {

@@ -45,6 +45,8 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.logging.Logger
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
@@ -119,7 +121,7 @@ class LlmDaemonSchedulerWorker(
                     throwable = throwable,
                 )
 
-                delay(interval.toMillis())
+                delay(interval.toMillis().toDuration(DurationUnit.MILLISECONDS))
             }
         }
 
@@ -283,13 +285,13 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
     )
 }
 
-private fun me.matsumo.fukurou.trading.runtime.TradingRuntime.openRiskReader(): LlmDaemonOpenRiskReader {
+private fun TradingRuntime.openRiskReader(): LlmDaemonOpenRiskReader {
     return LlmDaemonOpenRiskReader {
         runCatching { hasOpenRisk() }
     }
 }
 
-private suspend fun me.matsumo.fukurou.trading.runtime.TradingRuntime.hasOpenRisk(): Boolean {
+private suspend fun TradingRuntime.hasOpenRisk(): Boolean {
     val positions = broker.getPositions().getOrThrow()
     val openOrders = broker.getOpenOrders().getOrThrow()
 
@@ -307,7 +309,7 @@ private fun GmoPublicMarketDataSource.tickerReader(tradingConfig: TradingBotConf
     }
 }
 
-private fun me.matsumo.fukurou.trading.runtime.TradingRuntime.positionsReader(): LlmDaemonPositionsReader {
+private fun TradingRuntime.positionsReader(): LlmDaemonPositionsReader {
     return LlmDaemonPositionsReader {
         broker.getPositions()
     }

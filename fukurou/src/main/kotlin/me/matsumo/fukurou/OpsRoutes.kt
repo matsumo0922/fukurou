@@ -1044,9 +1044,8 @@ private fun Route.registerOpsTriggerRoute(dependencies: OpsRouteDependencies) {
         }
 
         val service = call.requireManualLlmLaunchService(manualLlmLaunchService) ?: return@post
-        val result = service.launch(reason).getOrThrow()
 
-        when (result) {
+        when (val result = service.launch(reason).getOrThrow()) {
             is ManualLlmLaunchResult.Accepted -> call.respond(
                 HttpStatusCode.Accepted,
                 OpsTriggerResponse(
@@ -1130,9 +1129,8 @@ private fun Route.registerOpsLlmAuthLoginStartRoute(llmAuthService: LlmAuthServi
         val request = call.receiveBodyOrBadRequest<OpsLlmAuthLoginRequest>() ?: return@post
         val reason = call.requireReason(request.reason) ?: return@post
         val service = call.requireLlmAuthService(llmAuthService) ?: return@post
-        val result = service.startLogin(provider, reason).getOrThrow()
 
-        when (result) {
+        when (val result = service.startLogin(provider, reason).getOrThrow()) {
             is LlmAuthLoginStartResult.Accepted -> call.respond(
                 HttpStatusCode.Accepted,
                 result.session.toOpsLlmAuthLoginResponse(),
@@ -1282,9 +1280,8 @@ private suspend fun ApplicationCall.respondOpsLlmAuthTokenSubmit(llmAuthService:
     val request = receiveBodyOrBadRequest<OpsLlmAuthTokenSubmitRequest>() ?: return
     val tokenCode = requireLoginTokenCode(request) ?: return
     val service = requireLlmAuthService(llmAuthService) ?: return
-    val result = service.submitLoginTokenCode(provider, sessionId, tokenCode).getOrThrow()
 
-    when (result) {
+    when (val result = service.submitLoginTokenCode(provider, sessionId, tokenCode).getOrThrow()) {
         is LlmAuthLoginTokenSubmitResult.Accepted -> respond(
             HttpStatusCode.Accepted,
             result.session.toOpsLlmAuthTokenSubmitResponse(),
@@ -1884,7 +1881,7 @@ private suspend fun ApplicationCall.requireLimit(defaultLimit: Int, maxLimit: In
     val limitIsValid = parsedLimit != null && parsedLimit > 0
 
     if (limitIsValid) {
-        return requireNotNull(parsedLimit).coerceAtMost(maxLimit)
+        return parsedLimit.coerceAtMost(maxLimit)
     }
 
     respond(HttpStatusCode.BadRequest, ErrorResponse("limit must be a positive integer"))
@@ -1943,7 +1940,7 @@ private suspend fun ApplicationCall.requireBeforeCursor(clock: Clock): OpsActivi
 
     if (cursorIsValid) {
         return OpsActivityCursor(
-            occurredAt = requireNotNull(occurredAt),
+            occurredAt = occurredAt,
             source = source,
             eventId = eventId,
             sourceEventId = sourceEventId,
@@ -2163,6 +2160,7 @@ private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalo
         CommandEventType.CLI_AUTH_LOGIN_COMPLETED -> "cliAuthLoginCompleted"
         CommandEventType.CLI_AUTH_LOGIN_FAILED -> "cliAuthLoginFailed"
         CommandEventType.CLI_AUTH_LOGIN_TIMED_OUT -> "cliAuthLoginTimedOut"
+        CommandEventType.CLI_AUTH_CLOSE_WAIT_TIMED_OUT -> "cliAuthCloseWaitTimedOut"
     }
 
     return activityCatalogItem(name, "activity.catalog.audit.$keySuffix")

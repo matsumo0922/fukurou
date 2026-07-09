@@ -357,9 +357,9 @@ private const val SELECT_POSITIONS_BY_TRADE_GROUP_ID_SQL = """
 """
 
 /**
- * order IDs に対応する executions を読む SQL prefix。
+ * order IDs に対応する executions を読む SQL。
  */
-private const val SELECT_EXECUTIONS_BY_ORDER_IDS_PREFIX = """
+private const val SELECT_EXECUTIONS_BY_ORDER_IDS_SQL = """
     SELECT
         id,
         order_id,
@@ -374,14 +374,7 @@ private const val SELECT_EXECUTIONS_BY_ORDER_IDS_PREFIX = """
         liquidity,
         executed_at
     FROM executions
-    WHERE order_id IN (
-"""
-
-/**
- * order IDs に対応する executions を読む SQL suffix。
- */
-private const val SELECT_EXECUTIONS_BY_ORDER_IDS_SUFFIX = """
-    )
+    WHERE order_id = ANY(?)
         AND mode = (
             SELECT mode
             FROM paper_account
@@ -391,9 +384,9 @@ private const val SELECT_EXECUTIONS_BY_ORDER_IDS_SUFFIX = """
 """
 
 /**
- * position IDs に対応する executions を読む SQL prefix。
+ * position IDs に対応する executions を読む SQL。
  */
-private const val SELECT_EXECUTIONS_BY_POSITION_IDS_PREFIX = """
+private const val SELECT_EXECUTIONS_BY_POSITION_IDS_SQL = """
     SELECT
         bounded_executions.id,
         bounded_executions.order_id,
@@ -423,14 +416,7 @@ private const val SELECT_EXECUTIONS_BY_POSITION_IDS_PREFIX = """
             executed_at,
             ROW_NUMBER() OVER (PARTITION BY position_id ORDER BY executed_at ASC) AS position_execution_number
         FROM executions
-        WHERE position_id IN (
-"""
-
-/**
- * position IDs に対応する executions を読む SQL suffix。
- */
-private const val SELECT_EXECUTIONS_BY_POSITION_IDS_SUFFIX = """
-        )
+        WHERE position_id = ANY(?)
             AND mode = (
                 SELECT mode
                 FROM paper_account
@@ -442,9 +428,9 @@ private const val SELECT_EXECUTIONS_BY_POSITION_IDS_SUFFIX = """
 """
 
 /**
- * position IDs に対応する SELL executions を読む SQL prefix。
+ * position IDs に対応する SELL executions を読む SQL。
  */
-private const val SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_PREFIX = """
+private const val SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_SQL = """
     SELECT
         id,
         order_id,
@@ -459,14 +445,7 @@ private const val SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_PREFIX = """
         liquidity,
         executed_at
     FROM executions
-    WHERE position_id IN (
-"""
-
-/**
- * position IDs に対応する SELL executions を読む SQL suffix。
- */
-private const val SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_SUFFIX = """
-    )
+    WHERE position_id = ANY(?)
         AND side = ?
         AND mode = (
             SELECT mode
@@ -1103,15 +1082,12 @@ private fun JdbcTransaction.selectExecutionsByOrderIds(orderIds: List<String>): 
         return emptyList()
     }
 
-    val placeholders = orderIds.joinToString(separator = ",") { "?" }
-    val sql = "$SELECT_EXECUTIONS_BY_ORDER_IDS_PREFIX$placeholders$SELECT_EXECUTIONS_BY_ORDER_IDS_SUFFIX"
-
-    return jdbcConnection().prepareStatement(sql).use { statement ->
-        orderIds.forEachIndexed { index, orderId ->
-            statement.setObject(index + 1, UUID.fromString(orderId))
+    return withUuidSqlArray(orderIds) { orderIdArray ->
+        jdbcConnection().prepareStatement(SELECT_EXECUTIONS_BY_ORDER_IDS_SQL).use { statement ->
+            statement.setArray(1, orderIdArray)
+            statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
+            statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
         }
-        statement.setInt(orderIds.size + 1, PAPER_ACCOUNT_SINGLE_ROW_ID)
-        statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
     }
 }
 
@@ -1120,16 +1096,24 @@ private fun JdbcTransaction.selectExecutionsByPositionIds(positionIds: List<Stri
         return emptyList()
     }
 
-    val placeholders = positionIds.joinToString(separator = ",") { "?" }
-    val sql = "$SELECT_EXECUTIONS_BY_POSITION_IDS_PREFIX$placeholders$SELECT_EXECUTIONS_BY_POSITION_IDS_SUFFIX"
-
-    return jdbcConnection().prepareStatement(sql).use { statement ->
-        positionIds.forEachIndexed { index, positionId ->
-            statement.setObject(index + 1, UUID.fromString(positionId))
+    return withUuidSqlArray(positionIds) { positionIdArray ->
+        jdbcConnection().prepareStatement(SELECT_EXECUTIONS_BY_POSITION_IDS_SQL).use { statement ->
+            statement.setArray(1, positionIdArray)
+            statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
+            statement.setInt(3, MAX_EXECUTIONS_PER_CLOSED_POSITION)
+            statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
         }
-        statement.setInt(positionIds.size + 1, PAPER_ACCOUNT_SINGLE_ROW_ID)
-        statement.setInt(positionIds.size + 2, MAX_EXECUTIONS_PER_CLOSED_POSITION)
-        statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
+    }
+}
+
+private fun <T> JdbcTransaction.withUuidSqlArray(ids: List<String>, block: (java.sql.Array) -> T): T {
+    val uuidArray = ids.map { id -> UUID.fromString(id) }.toTypedArray()
+    val sqlArray = jdbcConnection().createArrayOf("uuid", uuidArray)
+
+    try {
+        return block(sqlArray)
+    } finally {
+        sqlArray.free()
     }
 }
 
@@ -1138,16 +1122,13 @@ private fun JdbcTransaction.selectSellExecutionsByPositionIds(positionIds: List<
         return emptyList()
     }
 
-    val placeholders = positionIds.joinToString(separator = ",") { "?" }
-    val sql = "$SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_PREFIX$placeholders$SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_SUFFIX"
-
-    return jdbcConnection().prepareStatement(sql).use { statement ->
-        positionIds.forEachIndexed { index, positionId ->
-            statement.setObject(index + 1, UUID.fromString(positionId))
+    return withUuidSqlArray(positionIds) { positionIdArray ->
+        jdbcConnection().prepareStatement(SELECT_SELL_EXECUTIONS_BY_POSITION_IDS_SQL).use { statement ->
+            statement.setArray(1, positionIdArray)
+            statement.setString(2, OrderSide.SELL.name)
+            statement.setInt(3, PAPER_ACCOUNT_SINGLE_ROW_ID)
+            statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
         }
-        statement.setString(positionIds.size + 1, OrderSide.SELL.name)
-        statement.setInt(positionIds.size + 2, PAPER_ACCOUNT_SINGLE_ROW_ID)
-        statement.executeQuery().use { resultSet -> resultSet.toExecutions() }
     }
 }
 

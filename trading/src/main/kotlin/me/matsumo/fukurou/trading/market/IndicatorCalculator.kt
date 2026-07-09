@@ -607,7 +607,7 @@ private fun ema(values: List<Double>, period: Int): List<Double?> {
     result[period - 1] = currentEma
 
     for (valueIndex in period until values.size) {
-        currentEma = (values[valueIndex] - currentEma) * multiplier + currentEma
+        currentEma += (values[valueIndex] - currentEma) * multiplier
         result[valueIndex] = currentEma
     }
 

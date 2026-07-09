@@ -2,18 +2,9 @@ package me.matsumo.fukurou.mcp.gmo
 
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
-import io.modelcontextprotocol.kotlin.sdk.server.StdioServerTransport
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
 import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.runBlocking
-import kotlinx.io.asSink
-import kotlinx.io.asSource
-import kotlinx.io.buffered
+import me.matsumo.fukurou.mcp.runtime.runStdioMcpServer
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoUnlimitedDailyKlineRequestBudget
@@ -52,29 +43,7 @@ class GmoCoinMcpServer(
      * 標準入出力に MCP server を接続し、client から閉じられるまで待機する。
      */
     fun run() {
-        val server = createServer()
-        val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val transport = StdioServerTransport(
-            input = System.`in`.asSource().buffered(),
-            output = System.out.asSink().buffered(),
-        ) {
-            scope = transportScope
-            handlerDispatcher = Dispatchers.Default
-            ioDispatcher = Dispatchers.IO
-        }
-
-        runBlocking {
-            try {
-                val session = server.createSession(transport)
-                val done = Job()
-                session.onClose {
-                    done.complete()
-                }
-                done.join()
-            } finally {
-                transportScope.cancel()
-            }
-        }
+        createServer().runStdioMcpServer()
     }
 
     internal fun createServer(): Server {

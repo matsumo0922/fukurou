@@ -227,7 +227,7 @@ class ApiDocumentationRouteTest {
             .getValue("schema")
             .jsonObject
 
-        assertEquals(schemaRef, schema.getValue("\$ref").jsonPrimitive.content)
+        assertEquals(schemaRef, schema.getValue($$"$ref").jsonPrimitive.content)
     }
 
     private fun assertGetQueryParameter(
