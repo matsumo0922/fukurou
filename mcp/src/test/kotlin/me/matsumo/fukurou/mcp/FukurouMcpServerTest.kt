@@ -20,6 +20,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import io.modelcontextprotocol.kotlin.sdk.types.ResourceUpdatedNotification
 import io.modelcontextprotocol.kotlin.sdk.types.ServerNotification
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.booleanOrNull
@@ -455,6 +456,26 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun submitDecisionTool_exposesPartialTradingActionsAndCloseRatioSchema() {
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        ).createServer()
+        val tool = requireNotNull(server.tools["submit_decision"]?.tool)
+        val actionEnum = requireNotNull(tool.inputSchema.properties?.get("action"))
+            .jsonObject
+            .getValue("enum")
+            .jsonArray
+            .map { action -> action.jsonPrimitive.contentOrNull }
+        val closeRatioSchema = requireNotNull(tool.inputSchema.properties?.get("close_ratio"))
+            .jsonObject
+
+        assertTrue(actionEnum.contains("REDUCE"))
+        assertTrue(actionEnum.contains("ADD_LONG"))
+        assertEquals("string", closeRatioSchema.getValue("type").jsonPrimitive.contentOrNull)
+    }
+
+    @Test
     fun submitDecisionTool_recordsNoTradeInMemoryRuntime() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
@@ -502,6 +523,79 @@ class FukurouMcpServerTest {
             structuredContent.getValue("message").jsonPrimitive.contentOrNull,
         )
         assertEquals(0, repository.snapshots.decisions().size)
+    }
+
+    @Test
+    fun submitDecisionTool_rejectsReduceWithoutCloseRatio() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = reduceDecisionArguments(closeRatio = null),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(result.isError == true)
+        assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals(
+            "REDUCE decision requires close_ratio.",
+            structuredContent.getValue("message").jsonPrimitive.contentOrNull,
+        )
+        assertEquals(0, repository.snapshots.decisions().size)
+    }
+
+    @Test
+    fun submitDecisionTool_rejectsCloseRatioForExit() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = exitDecisionArguments(closeRatio = "0.50"),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(result.isError == true)
+        assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals(
+            "close_ratio is only supported for REDUCE decisions.",
+            structuredContent.getValue("message").jsonPrimitive.contentOrNull,
+        )
+        assertEquals(0, repository.snapshots.decisions().size)
+    }
+
+    @Test
+    fun submitDecisionTool_recordsReduceCloseRatio() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = reduceDecisionArguments(closeRatio = "0.50"),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+        val submission = repository.snapshots.decisions().single().submission
+
+        assertTrue(result.isError != true)
+        assertEquals("REDUCE", structuredContent.getValue("action").jsonPrimitive.contentOrNull)
+        assertEquals("0.50", structuredContent.getValue("close_ratio").jsonPrimitive.contentOrNull)
+        assertEquals("0.50", submission.closeRatio?.toPlainString())
     }
 
     @Test
@@ -571,6 +665,70 @@ class FukurouMcpServerTest {
         assertEquals(1, repository.snapshots.falsifications().size)
         assertTrue(duplicateResult.isError == true)
         assertEquals("invalid_request", duplicateContent.getValue("type").jsonPrimitive.contentOrNull)
+    }
+
+    @Test
+    fun submitDecisionTool_recordsAddLongIntentWithTradePlanRevision() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val enterResult = callTool(server, "submit_decision", enterDecisionArguments())
+        val parentTradePlanId = assertNotNull(enterResult.structuredContent)
+            .getValue("trade_plan_id")
+            .jsonPrimitive
+            .contentOrNull
+            .let { value -> assertNotNull(value) }
+
+        val result = callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = addLongDecisionArguments(parentTradePlanId = parentTradePlanId),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(result.isError != true)
+        assertEquals("ADD_LONG", structuredContent.getValue("action").jsonPrimitive.contentOrNull)
+        assertNotNull(structuredContent.getValue("intent_id").jsonPrimitive.contentOrNull)
+        assertEquals("1", structuredContent.getValue("revision_count").jsonPrimitive.contentOrNull)
+        assertEquals(2, repository.snapshots.tradeIntents().size)
+        assertEquals(2, repository.snapshots.tradePlans().size)
+    }
+
+    @Test
+    fun submitDecisionTool_rejectsAddLongWithoutSetupTags() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+        val enterResult = callTool(server, "submit_decision", enterDecisionArguments())
+        val parentTradePlanId = assertNotNull(enterResult.structuredContent)
+            .getValue("trade_plan_id")
+            .jsonPrimitive
+            .contentOrNull
+            .let { value -> assertNotNull(value) }
+
+        val result = callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = addLongDecisionArguments(
+                parentTradePlanId = parentTradePlanId,
+                setupTags = stringArray(),
+            ),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(result.isError == true)
+        assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals(
+            "ADD_LONG decision requires setup_tags.",
+            structuredContent.getValue("message").jsonPrimitive.contentOrNull,
+        )
+        assertEquals(1, repository.snapshots.tradeIntents().size)
     }
 
     @Test
@@ -1358,6 +1516,74 @@ private fun enterDecisionArguments(invocationId: String? = null) = buildJsonObje
     put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ", "出来高急減"))
     put("trade_plan_target_price_jpy", "10500000")
     put("trade_plan_time_stop_at", "2026-07-02T01:00:00Z")
+}
+
+/**
+ * EXIT decision tool request の引数を作る。
+ *
+ * @param closeRatio close_ratio。null の場合は指定しない。
+ */
+private fun exitDecisionArguments(closeRatio: String? = null) = buildJsonObject {
+    put("action", "EXIT")
+    closeRatio?.let { value -> put("close_ratio", value) }
+    put("estimated_win_probability", "0.40")
+    put("expected_r_multiple", "0")
+    put("tool_evidence_ids", stringArray("tool-1", "tool-2"))
+    put("fact_check", """{"ticker":true}""")
+    put("self_review", """{"reasonsNotToTrade":["risk"]}""")
+    put("reason_ja", "否定条件に達したため全量退出します。")
+}
+
+/**
+ * REDUCE decision tool request の引数を作る。
+ *
+ * @param closeRatio close_ratio。null の場合は欠落ケースを作る。
+ */
+private fun reduceDecisionArguments(closeRatio: String? = "0.50") = buildJsonObject {
+    put("action", "REDUCE")
+    closeRatio?.let { value -> put("close_ratio", value) }
+    put("estimated_win_probability", "0.62")
+    put("expected_r_multiple", "0.80")
+    put("round_trip_cost_r", "0.05")
+    put("tool_evidence_ids", stringArray("tool-1", "tool-2"))
+    put("fact_check", """{"ticker":true}""")
+    put("self_review", """{"reasonsNotToTrade":[]}""")
+    put("reason_ja", "含み益の一部を確定し、残りは保護を維持します。")
+}
+
+/**
+ * ADD_LONG decision tool request の引数を作る。
+ */
+private fun addLongDecisionArguments(
+    parentTradePlanId: String,
+    setupTags: JsonArray = stringArray("breakout"),
+): JsonObject {
+    return buildJsonObject {
+        put("action", "ADD_LONG")
+        put("setup_tags", setupTags)
+        put("estimated_win_probability", "0.74")
+        put("expected_r_multiple", "1.60")
+        put("round_trip_cost_r", "0.05")
+        put("tool_evidence_ids", stringArray("tool-1", "tool-2"))
+        put("fact_check", """{"ticker":true}""")
+        put("self_review", """{"reasonsNotToTrade":[]}""")
+        put(
+            "reason_ja",
+            "含み益がピラミッディング条件を満たすため、既存 long に追加します。",
+        )
+        put("symbol", TradingSymbol.BTC.apiSymbol)
+        put("side", "BUY")
+        put("type", "MARKET")
+        put("size_btc", "0.0010")
+        put("protective_stop_price_jpy", "9900000")
+        put("take_profit_price_jpy", "10600000")
+        put("parent_trade_plan_id", parentTradePlanId)
+        put("trade_plan_revision_count", 1)
+        put("trade_plan_thesis_ja", "既存仮説の継続に追加します。")
+        put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ"))
+        put("trade_plan_target_price_jpy", "10600000")
+        put("trade_plan_time_stop_at", "2026-07-02T02:00:00Z")
+    }
 }
 
 private suspend fun submitApprovedEnterIntent(server: io.modelcontextprotocol.kotlin.sdk.server.Server): String {

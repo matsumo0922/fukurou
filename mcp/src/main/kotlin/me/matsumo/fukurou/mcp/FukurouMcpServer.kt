@@ -63,6 +63,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -173,6 +174,24 @@ private const val PLACE_ORDER_TOOL = "place_order"
  * LLM 判断提出 tool 名。
  */
 private const val SUBMIT_DECISION_TOOL = "submit_decision"
+
+/**
+ * LLM 判断提出 tool の説明。
+ */
+private const val SUBMIT_DECISION_DESCRIPTION = "Submit the structured LLM decision. " +
+    "ENTER and ADD_LONG create a trade intent and TradePlan; REDUCE requires close_ratio."
+
+/**
+ * submit_decision.close_ratio schema の説明。
+ */
+private const val SUBMIT_DECISION_CLOSE_RATIO_DESCRIPTION = "Position close ratio for REDUCE. " +
+    "Decimal string with 0 < close_ratio <= 1.00."
+
+/**
+ * submit_decision.expected_r_multiple schema の説明。
+ */
+private const val SUBMIT_DECISION_EXPECTED_R_DESCRIPTION = "Required expected R for every action. " +
+    "Submit 0 when no setup or managed-plan residual R is unavailable; negative values are valid."
 
 /**
  * Falsifier verdict 提出 tool 名。
@@ -661,17 +680,21 @@ private fun Server.registerSubmitDecisionTool(
     addLimitedTool(
         definition = LimitedToolDefinition(
             name = SUBMIT_DECISION_TOOL,
-            description = "Submit the structured LLM decision. ENTER creates a trade intent and TradePlan.",
+            description = SUBMIT_DECISION_DESCRIPTION,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("action") {
                         put("type", JSON_TYPE_STRING)
-                        put("description", "ENTER, EXIT, ADJUST_PROTECTION, or NO_TRADE.")
+                        put("description", "ENTER, EXIT, REDUCE, ADD_LONG, ADJUST_PROTECTION, or NO_TRADE.")
                         put("enum", ToolJson.encodeToJsonElement(DecisionAction.entries.map { action -> action.name }))
                     }
-                    putStringArraySchema("setup_tags", "Setup taxonomy tags.")
+                    putDecimalStringSchema(
+                        name = "close_ratio",
+                        description = SUBMIT_DECISION_CLOSE_RATIO_DESCRIPTION,
+                    )
+                    putStringArraySchema("setup_tags", "Setup taxonomy tags. Required for ENTER and ADD_LONG.")
                     putDecimalStringSchema("estimated_win_probability", "Estimated win probability from 0 to 1.")
-                    putDecimalStringSchema("expected_r_multiple", "Required expected R for every action. Submit 0 when no setup or managed-plan residual R is unavailable; negative values are valid.")
+                    putDecimalStringSchema("expected_r_multiple", SUBMIT_DECISION_EXPECTED_R_DESCRIPTION)
                     putDecimalStringSchema("round_trip_cost_r", "Round-trip cost expressed in R.")
                     putStringArraySchema("tool_evidence_ids", "Tool call IDs used as decision evidence.")
                     putJsonObject("fact_check") {
@@ -1548,18 +1571,18 @@ private fun JsonObjectBuilder.putEntryIntentDecisionSchemas() {
     putSymbolSchema()
     putJsonObject("side") {
         put("type", JSON_TYPE_STRING)
-        put("description", "BUY entry only for ENTER.")
+        put("description", "BUY entry only for ENTER and ADD_LONG.")
         put("enum", ToolJson.encodeToJsonElement(listOf(OrderSide.BUY.name)))
     }
     putJsonObject("type") {
         put("type", JSON_TYPE_STRING)
-        put("description", "MARKET, LIMIT, or STOP for ENTER.")
+        put("description", "MARKET, LIMIT, or STOP for ENTER and ADD_LONG.")
         put("enum", ToolJson.encodeToJsonElement(OrderType.entries.map { type -> type.name }))
     }
     putDecimalStringSchema("size_btc", "BTC intent size.")
     putDecimalStringSchema("price_jpy", "LIMIT or STOP intent price. Omit for MARKET.")
-    putDecimalStringSchema("protective_stop_price_jpy", "Protective STOP price for ENTER.")
-    putDecimalStringSchema("take_profit_price_jpy", "Virtual take-profit price for ENTER.")
+    putDecimalStringSchema("protective_stop_price_jpy", "Protective STOP price for ENTER and ADD_LONG.")
+    putDecimalStringSchema("take_profit_price_jpy", "Virtual take-profit price for ENTER and ADD_LONG.")
 }
 
 private fun JsonObjectBuilder.putTradePlanDecisionSchemas() {
@@ -1644,6 +1667,7 @@ private fun parseDecisionSubmission(
                 ?: decisionRunContext.systemPromptVersion,
             marketSnapshotId = request.stringArgument("market_snapshot_id") ?: decisionRunContext.marketSnapshotId,
             action = action,
+            closeRatio = parseDecisionCloseRatio(request, action).getOrThrow(),
             setupTags = request.stringListArgument("setup_tags"),
             estimatedWinProbability = parseBigDecimalArgument(request, "estimated_win_probability").getOrThrow(),
             expectedRMultiple = parseBigDecimalArgument(request, "expected_r_multiple").getOrThrow(),
@@ -1676,7 +1700,7 @@ private fun parseFalsificationSubmission(
 
 private fun parseEntryIntentDraft(request: CallToolRequest, action: DecisionAction): Result<EntryIntentDraft?> {
     return runCatching {
-        if (action != DecisionAction.ENTER) {
+        if (!action.requiresEntryIntent()) {
             return@runCatching null
         }
 
@@ -1694,7 +1718,7 @@ private fun parseEntryIntentDraft(request: CallToolRequest, action: DecisionActi
 
 private fun parseTradePlanDraft(request: CallToolRequest, action: DecisionAction): Result<TradePlanDraft?> {
     return runCatching {
-        val tradePlanRequired = action == DecisionAction.ENTER
+        val tradePlanRequired = action.requiresEntryIntent()
         val tradePlanSpecified = request.hasAnyArgument(
             "parent_trade_plan_id",
             "trade_plan_revision_count",
@@ -1718,6 +1742,24 @@ private fun parseTradePlanDraft(request: CallToolRequest, action: DecisionAction
             timeStopAt = request.stringArgument("trade_plan_time_stop_at")?.let { value -> Instant.parse(value) },
             setupTags = request.stringListArgument("setup_tags"),
         )
+    }
+}
+
+private fun parseDecisionCloseRatio(request: CallToolRequest, action: DecisionAction): Result<BigDecimal?> {
+    return runCatching {
+        val closeRatio = parseOptionalBigDecimalArgument(request, "close_ratio").getOrThrow()
+
+        require(closeRatio == null || action == DecisionAction.REDUCE) {
+            "close_ratio is only supported for REDUCE decisions."
+        }
+
+        if (action == DecisionAction.REDUCE) {
+            require(closeRatio != null) {
+                "REDUCE decision requires close_ratio."
+            }
+        }
+
+        closeRatio
     }
 }
 
@@ -2312,6 +2354,9 @@ private fun decisionSubmissionResult(result: DecisionSubmissionResult): CallTool
             put("accepted", true)
             put("decision_id", result.decision.decisionId.toString())
             put("action", result.decision.submission.action.name)
+            result.decision.submission.closeRatio?.let { closeRatio ->
+                put("close_ratio", closeRatio.toPlainString())
+            }
             result.tradeIntent?.let { intent ->
                 put("intent_id", intent.intentId.toString())
             }

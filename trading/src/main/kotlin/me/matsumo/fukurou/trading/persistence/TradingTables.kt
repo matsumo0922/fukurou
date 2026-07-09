@@ -918,6 +918,11 @@ object DecisionsTable : Table("decisions") {
     val action = varchar("action", length = 32)
 
     /**
+     * REDUCE の close ratio。
+     */
+    val closeRatio = decimal("close_ratio", precision = 20, scale = 10).nullable()
+
+    /**
      * setup tag 一覧 JSON。
      */
     val setupTags = text("setup_tags")
@@ -1038,7 +1043,7 @@ object TradePlansTable : Table("trade_plans") {
 }
 
 /**
- * ENTER decision から発行された intent を append-only で保存する Exposed table。
+ * entry 系 decision から発行された intent を append-only で保存する Exposed table。
  */
 object TradeIntentsTable : Table("trade_intents") {
     /**

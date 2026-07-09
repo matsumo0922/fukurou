@@ -1627,6 +1627,20 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun decision_repository_roundTripsReduceCloseRatioInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        repository.submitDecision(reduceDecisionSubmission()).getOrThrow()
+
+        val record = requireNotNull(repository.latestDecisionByInvocationId("run-reduce").getOrThrow())
+        val closeRatio = requireNotNull(record.decision.submission.closeRatio)
+
+        assertEquals(DecisionAction.REDUCE, record.decision.submission.action)
+        assertEquals(0, BigDecimal("0.50").compareTo(closeRatio))
+    }
+
+    @Test
     fun decision_repository_enforces_trade_plan_revision_lineage() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -2730,6 +2744,33 @@ private fun noTradeDecisionSubmission(): DecisionSubmission {
         reasonJa = "材料不足のため見送ります。",
         missingDataJa = listOf("orderbook"),
         noTradeConditionsJa = listOf("出来高が戻るまで待つ"),
+        entryIntent = null,
+        tradePlan = null,
+    )
+}
+
+/**
+ * repository test 用 REDUCE decision を作る。
+ */
+private fun reduceDecisionSubmission(): DecisionSubmission {
+    return DecisionSubmission(
+        invocationId = "run-reduce",
+        llmProvider = "claude",
+        promptHash = "prompt-hash",
+        systemPromptVersion = "system-prompt-v1",
+        marketSnapshotId = "snapshot-reduce",
+        action = DecisionAction.REDUCE,
+        closeRatio = BigDecimal("0.50"),
+        setupTags = emptyList(),
+        estimatedWinProbability = BigDecimal("0.55"),
+        expectedRMultiple = BigDecimal("0.80"),
+        roundTripCostR = BigDecimal("0.02"),
+        toolEvidenceIds = listOf("tool-reduce"),
+        factCheckJson = """{"positions":true}""",
+        selfReviewJson = """{"reasonsNotToTrade":[]}""",
+        reasonJa = "含み益の一部を確定します。",
+        missingDataJa = emptyList(),
+        noTradeConditionsJa = emptyList(),
         entryIntent = null,
         tradePlan = null,
     )

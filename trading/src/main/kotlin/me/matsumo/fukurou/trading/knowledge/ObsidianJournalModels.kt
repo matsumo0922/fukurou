@@ -29,7 +29,7 @@ data class ClosedPaperPosition(
  * decision と note 生成に必要な付随 record。
  *
  * @param decision 永続化済み decision
- * @param tradeIntent ENTER 時の intent
+ * @param tradeIntent entry 系 action の intent
  * @param tradePlan decision に紐づく TradePlan
  * @param falsification intent に紐づく最新 Falsifier verdict
  */

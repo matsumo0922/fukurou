@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -128,15 +129,18 @@ internal class DecisionExecutionLifecycle(
             ).getOrThrow()
             recordNoTrade(context, target.failure.reason, null).getOrThrow()
 
-            return DecisionLifecycleExecutionResult(
-                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
-                tradeResult = null,
-            )
+            return DecisionLifecycleExecutionResult(OneShotRunnerStatus.NO_TRADE_AUDITED, null)
         }
 
         val result = runCatching {
             when (target) {
-                is ExitExecutionTarget.ClosePosition -> closePosition(context, target.position, decision)
+                is ExitExecutionTarget.ClosePosition -> closePosition(
+                    context = context,
+                    position = target.position,
+                    decision = decision,
+                    closeRatio = BigDecimal.ONE,
+                    reason = "exit_decision_close_position",
+                )
                 is ExitExecutionTarget.CancelEntryOrder -> cancelOrder(
                     context = context,
                     order = target.order,
@@ -154,10 +158,7 @@ internal class DecisionExecutionLifecycle(
             ).getOrThrow()
             recordNoTrade(context, "exit_execution_failed", throwable).getOrThrow()
 
-            return DecisionLifecycleExecutionResult(
-                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
-                tradeResult = null,
-            )
+            return DecisionLifecycleExecutionResult(OneShotRunnerStatus.NO_TRADE_AUDITED, null)
         }
 
         appendExecutionPhase(
@@ -168,9 +169,104 @@ internal class DecisionExecutionLifecycle(
             startedAt = startedAt,
         ).getOrThrow()
 
+        return DecisionLifecycleExecutionResult(OneShotRunnerStatus.PAPER_EXIT_EXECUTED, result)
+    }
+
+    /**
+     * REDUCE decision を close_position に写像する。
+     */
+    suspend fun executeReduceDecision(
+        context: DecisionRunContext,
+        decision: DecisionSubmissionResult,
+    ): DecisionLifecycleExecutionResult {
+        val startedAt = Instant.now(clock)
+        val openPositions = tradingRuntime.broker.getPositions().getOrThrow()
+        val targetPosition = openPositions.singleOrNull()
+
+        if (targetPosition == null) {
+            val failure = reduceFailure(openPositions)
+
+            appendFailClosedPhase(
+                context = context,
+                phase = "reduce_execution",
+                failure = failure,
+                startedAt = startedAt,
+            ).getOrThrow()
+            recordNoTrade(context, failure.reason, null).getOrThrow()
+
+            return DecisionLifecycleExecutionResult(
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                tradeResult = null,
+            )
+        }
+
+        val closeRatio = requireNotNull(decision.decision.submission.closeRatio) {
+            "REDUCE decision requires close_ratio."
+        }
+        val result = runCatching {
+            closePosition(
+                context = context,
+                position = targetPosition,
+                decision = decision,
+                closeRatio = closeRatio,
+                reason = "reduce_decision_close_position",
+            )
+        }.getOrElse { throwable ->
+            appendFailClosedPhase(
+                context = context,
+                phase = "reduce_execution",
+                failure = DecisionLifecycleFailure("reduce_execution_failed"),
+                startedAt = startedAt,
+            ).getOrThrow()
+            recordNoTrade(context, "reduce_execution_failed", throwable).getOrThrow()
+
+            return DecisionLifecycleExecutionResult(
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                tradeResult = null,
+            )
+        }
+
+        appendExecutionPhase(
+            context = context,
+            phase = "reduce_execution",
+            operation = "close_position",
+            result = result,
+            startedAt = startedAt,
+        ).getOrThrow()
+
         return DecisionLifecycleExecutionResult(
-            status = OneShotRunnerStatus.PAPER_EXIT_EXECUTED,
+            status = OneShotRunnerStatus.PAPER_REDUCE_EXECUTED,
             tradeResult = result,
+        )
+    }
+
+    /**
+     * ADD_LONG decision の対象 position が一意に決まることを検証する。
+     */
+    suspend fun ensureAddLongTargetPosition(context: DecisionRunContext): DecisionLifecycleExecutionResult? {
+        val startedAt = Instant.now(clock)
+        val openPositions = tradingRuntime.broker.getPositions().getOrThrow()
+        val targetPosition = openPositions.singleOrNull()
+
+        if (targetPosition != null) return null
+
+        val failure = if (openPositions.isEmpty()) {
+            DecisionLifecycleFailure("add_long_target_position_missing")
+        } else {
+            DecisionLifecycleFailure("add_long_target_position_ambiguous")
+        }
+
+        appendFailClosedPhase(
+            context = context,
+            phase = "add_long_execution",
+            failure = failure,
+            startedAt = startedAt,
+        ).getOrThrow()
+        recordNoTrade(context, failure.reason, null).getOrThrow()
+
+        return DecisionLifecycleExecutionResult(
+            status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+            tradeResult = null,
         )
     }
 
@@ -355,6 +451,21 @@ internal class DecisionExecutionLifecycle(
         )
     }
 
+    private fun reduceFailure(openPositions: List<Position>): DecisionLifecycleFailure {
+        val reason = if (openPositions.isEmpty()) {
+            "reduce_target_not_found"
+        } else {
+            "reduce_target_ambiguous"
+        }
+
+        return DecisionLifecycleFailure(
+            reason = reason,
+            details = buildJsonObject {
+                put("positionCount", openPositions.size)
+            },
+        )
+    }
+
     private fun adjustProtectionPriceDetails(
         position: Position,
         stopPriceText: String,
@@ -372,23 +483,29 @@ internal class DecisionExecutionLifecycle(
         context: DecisionRunContext,
         position: Position,
         decision: DecisionSubmissionResult,
+        closeRatio: BigDecimal,
+        reason: String,
     ): PaperTradeResult {
+        val action = decision.decision.submission.action
         val call = guardedTradeCall(
             toolName = "close_position",
-            clientRequestId = "runner-exit-close-${position.positionId}",
+            clientRequestId = "runner-${action.runnerCloseClientRequestPrefix()}-${position.positionId}",
             context = context,
             payload = buildJsonObject {
                 put("decisionId", decision.decision.decisionId.toString())
+                put("action", action.name)
                 put("positionId", position.positionId)
+                put("close_ratio", closeRatio.toPlainString())
                 put("source", "one_shot_runner")
-                put("reason", "exit_decision_close_position")
+                put("reason", reason)
             }.toString(),
         )
         val command = ClosePositionCommand(
             commandId = idGenerator(),
             positionId = UUID.fromString(position.positionId),
             closeAll = false,
-            reasonJa = "EXIT decision による runner deterministic close。",
+            closeRatio = closeRatio,
+            reasonJa = "${action.name} decision による runner deterministic close。",
             auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
         )
 
@@ -554,6 +671,13 @@ internal class DecisionExecutionLifecycle(
             reason = reason,
             cause = cause,
         )
+    }
+}
+
+private fun DecisionAction.runnerCloseClientRequestPrefix(): String {
+    return when (this) {
+        DecisionAction.REDUCE -> "reduce-close"
+        else -> "exit-close"
     }
 }
 

@@ -35,6 +35,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
+import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
@@ -180,6 +181,11 @@ enum class OneShotRunnerStatus {
      * EXIT decision を runner が決定論的に実行した。
      */
     PAPER_EXIT_EXECUTED,
+
+    /**
+     * REDUCE decision を runner が決定論的に実行した。
+     */
+    PAPER_REDUCE_EXECUTED,
 
     /**
      * ADJUST_PROTECTION decision を runner が決定論的に実行した。
@@ -451,7 +457,7 @@ class OneShotLlmRunner(
             )
         }
 
-        if (decision.decision.submission.action != DecisionAction.ENTER) {
+        if (!decision.decision.submission.action.requiresEntryIntent()) {
             return handleNonEnterDecision(input, decision)
         }
 
@@ -493,12 +499,14 @@ class OneShotLlmRunner(
 
         val lifecycleResult = when (decision.decision.submission.action) {
             DecisionAction.EXIT -> decisionExecutionLifecycle.executeExitDecision(input.proposerContext, decision)
+            DecisionAction.REDUCE -> decisionExecutionLifecycle.executeReduceDecision(input.proposerContext, decision)
             DecisionAction.ADJUST_PROTECTION -> decisionExecutionLifecycle.executeAdjustProtectionDecision(
                 context = input.proposerContext,
                 decision = decision,
             )
             DecisionAction.NO_TRADE -> null
             DecisionAction.ENTER -> null
+            DecisionAction.ADD_LONG -> null
         }
 
         if (lifecycleResult != null) {
@@ -528,7 +536,7 @@ class OneShotLlmRunner(
         val invocationId = input.invocationId
         val proposerContext = input.proposerContext
         val intent = requireNotNull(decision.tradeIntent) {
-            "ENTER decision did not create trade intent."
+            "${decision.decision.submission.action.name} decision did not create trade intent."
         }
         val falsifierContext = requestFactory.decisionRunContext(
             invocationId = invocationId,
@@ -546,16 +554,16 @@ class OneShotLlmRunner(
                 cause = falsifierResult.failure,
             ).getOrThrow()
 
-            return OneShotRunnerResult(
-                invocationId = invocationId,
-                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
-                decision = decision,
-                intent = intent,
-                tradeResult = null,
-            )
+            return entryFlowResult(invocationId, decision, intent, OneShotRunnerStatus.NO_TRADE_AUDITED)
         }
 
         input.failureContextUpdated(proposerContext)
+        if (decision.decision.submission.action == DecisionAction.ADD_LONG) {
+            decisionExecutionLifecycle.ensureAddLongTargetPosition(proposerContext)?.let { lifecycleResult ->
+                return entryFlowResult(invocationId, decision, intent, lifecycleResult.status, lifecycleResult.tradeResult)
+            }
+        }
+
         val placeResult = placeApprovedEntry(proposerContext, intent)
         val placed = placeResult.getOrNull()
 
@@ -566,13 +574,7 @@ class OneShotLlmRunner(
                 cause = placeResult.exceptionOrNull(),
             ).getOrThrow()
 
-            return OneShotRunnerResult(
-                invocationId = invocationId,
-                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
-                decision = decision,
-                intent = intent,
-                tradeResult = null,
-            )
+            return entryFlowResult(invocationId, decision, intent, OneShotRunnerStatus.NO_TRADE_AUDITED)
         }
 
         val finalStatus = if (placed.accepted) {
@@ -581,12 +583,22 @@ class OneShotLlmRunner(
             OneShotRunnerStatus.NO_TRADE_AUDITED
         }
 
+        return entryFlowResult(invocationId, decision, intent, finalStatus, placed)
+    }
+
+    private fun entryFlowResult(
+        invocationId: String,
+        decision: DecisionSubmissionResult,
+        intent: TradeIntentRecord,
+        status: OneShotRunnerStatus,
+        tradeResult: PaperTradeResult? = null,
+    ): OneShotRunnerResult {
         return OneShotRunnerResult(
             invocationId = invocationId,
-            status = finalStatus,
+            status = status,
             decision = decision,
             intent = intent,
-            tradeResult = placed,
+            tradeResult = tradeResult,
         )
     }
 
