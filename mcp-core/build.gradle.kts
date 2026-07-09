@@ -13,7 +13,8 @@ dependencies {
     api(libs.mcp.kotlin.server)
 
     testFixturesImplementation(platform(libs.kotlin.bom))
-    testFixturesImplementation(libs.kotlinx.serialization.json)
+    testFixturesApi(libs.kotlinx.serialization.json)
+    testFixturesApi(libs.mcp.kotlin.client)
 
     testImplementation(kotlin("test"))
 }
