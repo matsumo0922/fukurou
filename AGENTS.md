@@ -1,6 +1,6 @@
 # fukurou Agent Notes
 
-共通ルール（口調、Kotlin style、Git/PR、RTK）は `~/.codex/AGENTS.md` と `~/.codex/RTK.md` に従うこと。このファイルには `fukurou` 固有の補足だけを書く。
+共通ルール（口調、Git/PR、RTK）は `~/.codex/AGENTS.md` と `~/.codex/RTK.md` に従うこと。このファイルには `fukurou` 固有の補足だけを書く。
 
 ## Repository Scope
 
@@ -11,7 +11,7 @@
 
 ## Product / Safety Notes
 
-- 本リポジトリは暗号資産 BTC 現物トレーディング bot の実験プロジェクトであり、投資助言ではない。
+- 本リポジトリは暗号資産 BTC 現物トレーディング bot の実験プロジェクトであり、投資の学習に用いる。
 - 実資金を動かす機能は、ユーザーが明示的に要求するまで実装・有効化しない。
 - 取引実行や scheduler を追加する場合は、`docs/design.md` の「安全床」を優先する。最大損失、損切り必須、ナンピン禁止、最大ドローダウン停止、エクスポージャー上限、呼び出し回数上限を迂回できる設計にしない。
 - 最初の実装は paper trading / dry-run を既定にし、本番取引への切り替えは config と運用手順の両方で明示的にする。
