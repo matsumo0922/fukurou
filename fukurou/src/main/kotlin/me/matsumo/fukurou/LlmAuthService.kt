@@ -601,7 +601,7 @@ class DefaultLlmAuthService(
         }
     }
 
-    private suspend fun collectProcessOutput(inputStream: InputStream, session: MutableLlmAuthLoginSession) {
+    private fun collectProcessOutput(inputStream: InputStream, session: MutableLlmAuthLoginSession) {
         BufferedReader(InputStreamReader(inputStream, StandardCharsets.UTF_8)).use { reader ->
             while (true) {
                 val line = reader.readLine() ?: break

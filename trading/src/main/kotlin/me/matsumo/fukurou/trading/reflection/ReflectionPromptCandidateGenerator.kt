@@ -471,7 +471,7 @@ class ReflectionPromptCandidateGenerator(
         )
     }
 
-    private suspend fun failedAttemptFile(
+    private fun failedAttemptFile(
         dataset: ReflectionDataset,
         attemptCount: Int,
         failure: Throwable,
