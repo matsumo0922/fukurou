@@ -150,8 +150,9 @@ class LlmInvocationAuditor(
         val outputContainsAuthFailure = LLM_CLI_AUTH_FAILURE_PATTERNS.any { pattern ->
             combinedOutput.contains(pattern, ignoreCase = true)
         }
+        val outputContainsCliError = LLM_CLI_ERROR_OUTPUT_PATTERN.containsMatchIn(combinedOutput)
 
-        return exitFailed && outputContainsAuthFailure
+        return outputContainsAuthFailure && (exitFailed || outputContainsCliError)
     }
 
     private fun ProcessRunResult.didFail(): Boolean {
@@ -203,3 +204,8 @@ private val LLM_CLI_AUTH_FAILURE_PATTERNS = listOf(
     "token expired",
     "please run /login",
 )
+
+/**
+ * Claude CLI の result JSON が error 終了を示す出力断片。
+ */
+private val LLM_CLI_ERROR_OUTPUT_PATTERN = Regex(""""is_error"\s*:\s*true""")
