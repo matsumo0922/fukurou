@@ -1,10 +1,15 @@
 package me.matsumo.fukurou.trading.daemon
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.FUKUROU_INVOCATION_ID_ENV
@@ -422,7 +427,8 @@ private fun List<Candle>.latestAtr14JpyOrNull(): BigDecimal? {
 }
 
 private fun parsePreFilterDecision(stdout: String): LlmDaemonPreFilterDecision {
-    val firstToken = stdout
+    val decisionText = stdout.extractPreFilterDecisionText()
+    val firstToken = decisionText
         .lineSequence()
         .firstOrNull { line -> line.isNotBlank() }
         ?.trim()
@@ -433,6 +439,30 @@ private fun parsePreFilterDecision(stdout: String): LlmDaemonPreFilterDecision {
         "NO" -> LlmDaemonPreFilterDecision.SKIP_NO_CHANGE
         else -> error("Pre-filter output must be exactly YES or NO.")
     }
+}
+
+private fun String.extractPreFilterDecisionText(): String {
+    return runCatching {
+        PreFilterStdoutJson.parseToJsonElement(this).preFilterDecisionTextOrNull()
+    }.getOrNull() ?: this
+}
+
+private fun JsonElement.preFilterDecisionTextOrNull(): String? {
+    return when (this) {
+        is JsonPrimitive -> contentOrNull
+        is JsonArray -> firstNotNullOfOrNull { element -> element.preFilterDecisionTextOrNull() }
+        is JsonObject -> preFilterDecisionTextOrNull()
+    }
+}
+
+private fun JsonObject.preFilterDecisionTextOrNull(): String? {
+    val value = this["result"]
+        ?: this["text"]
+        ?: this["content"]
+        ?: this["message"]
+        ?: return null
+
+    return value.preFilterDecisionTextOrNull()
 }
 
 private fun JsonObjectBuilder.putNullableString(name: String, value: String?) {
@@ -459,3 +489,7 @@ private const val PRE_FILTER_TEXT_LIMIT = 480
 private const val PRE_FILTER_DECIMAL_SCALE = 8
 private const val PRE_FILTER_FAILURE_LOG_KEY = "llm-daemon-pre-filter-failure"
 private val PRE_FILTER_DECISION_LOOKBACK: Duration = Duration.ofDays(7)
+
+private val PreFilterStdoutJson = Json {
+    ignoreUnknownKeys = true
+}
