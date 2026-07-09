@@ -124,10 +124,11 @@ class DefaultLlmCommandRenderer(
             suffix = ".json",
             content = request.mcpServer?.toClaudeMcpConfigJson() ?: EMPTY_CLAUDE_MCP_CONFIG_JSON,
         )
-        val allowedTools = if (request.mcpServer == null) {
-            ""
-        } else {
+        val hasMcpServer = request.mcpServer != null
+        val allowedTools = if (hasMcpServer) {
             request.allowedTools.joinToString(",")
+        } else {
+            ""
         }
         val baseArgs = listOf(
             "-p",
@@ -140,14 +141,19 @@ class DefaultLlmCommandRenderer(
             "--allowedTools",
             allowedTools,
         )
-        val noMcpIsolationArgs = if (request.mcpServer == null) {
+        val noMcpIsolationArgs = if (hasMcpServer) {
+            emptyList()
+        } else {
             listOf(
                 "--bare",
             )
-        } else {
-            emptyList()
         }
-        val args = baseArgs + noMcpIsolationArgs + mcpArgs + CLAUDE_BUILTIN_TOOL_DISABLE_ARGS +
+        val toolArgs = if (hasMcpServer) {
+            CLAUDE_MCP_ONLY_TOOL_ARGS
+        } else {
+            CLAUDE_NO_TOOL_ARGS
+        }
+        val args = baseArgs + noMcpIsolationArgs + mcpArgs + toolArgs +
             ENFORCED_CLAUDE_COMMON_ARGS
 
         return runCatching {
@@ -496,11 +502,20 @@ val ENFORCED_CLAUDE_COMMON_ARGS = listOf(
 )
 
 /**
- * Claude built-in tool を無効化する引数。
+ * MCP 経路の Claude built-in tool を `ToolSearch` だけに絞る引数。
  *
- * MCP tool は `--allowedTools` で別に明示する。
+ * Claude CLI は stdio MCP tools を deferred tools として渡すため、モデルが MCP tool schema に到達するには
+ * built-in `ToolSearch` が必要になる。`--allowedTools` は呼び出し許可の層であり、tool schema の供給・発見層ではない。
  */
-val CLAUDE_BUILTIN_TOOL_DISABLE_ARGS = listOf(
+val CLAUDE_MCP_ONLY_TOOL_ARGS = listOf(
+    "--tools",
+    "ToolSearch",
+)
+
+/**
+ * MCP を使わない Claude 経路で全 built-in tool を無効化する引数。
+ */
+val CLAUDE_NO_TOOL_ARGS = listOf(
     "--tools",
     "",
 )
