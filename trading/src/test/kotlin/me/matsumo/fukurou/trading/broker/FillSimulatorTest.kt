@@ -100,6 +100,30 @@ class FillSimulatorTest {
     }
 
     @Test
+    fun sell_crossing_limit_uses_executable_bid_depth_and_taker_fee() {
+        val simulator = FillSimulator(clock = fixedClock())
+
+        val fill = simulator.limitTakerFill(
+            side = OrderSide.SELL,
+            sizeBtc = BigDecimal("0.0100"),
+            limitPriceJpy = BigDecimal("9980000"),
+            context = paperSimulationContext(
+                orderbook = orderbook(
+                    bids = listOf(
+                        OrderbookLevel(price = "9990000", size = "0.0040"),
+                        OrderbookLevel(price = "9980000", size = "0.0060"),
+                        OrderbookLevel(price = "9970000", size = "0.0100"),
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals("9984000.00000000", fill.priceJpy.toPlainString())
+        assertEquals("49.92000000", fill.feeJpy.toPlainString())
+        assertEquals(ExecutionLiquidity.TAKER, fill.liquidity)
+    }
+
+    @Test
     fun resting_limit_records_fak_divergence_memo_when_board_depth_is_partial() {
         val simulator = FillSimulator(clock = fixedClock())
 
