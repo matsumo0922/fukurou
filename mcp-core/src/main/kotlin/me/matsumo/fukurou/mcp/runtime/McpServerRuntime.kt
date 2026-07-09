@@ -15,6 +15,8 @@ import kotlinx.io.asSource
 import kotlinx.io.buffered
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.io.FileDescriptor
+import java.io.FileOutputStream
 
 /**
  * MCP server を stdio transport で起動し、session close まで待機する。
@@ -23,7 +25,7 @@ fun Server.runStdioMcpServer(onClose: () -> Unit = {}) {
     val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val transport = StdioServerTransport(
         input = System.`in`.asSource().buffered(),
-        output = System.out.asSink().buffered(),
+        output = FileOutputStream(FileDescriptor.out).asSink().buffered(),
     ) {
         scope = transportScope
         handlerDispatcher = Dispatchers.Default
@@ -43,6 +45,16 @@ fun Server.runStdioMcpServer(onClose: () -> Unit = {}) {
             onClose()
         }
     }
+}
+
+/**
+ * MCP stdio server process の stdout を transport 専用 channel に固定する。
+ *
+ * 呼び出し後の `System.out` は stderr へ向く。
+ * library 初期化ログや `println` は JSON-RPC stdout に混ざらない。
+ */
+fun redirectProcessStdoutToStderrForMcpStdio() {
+    System.setOut(System.err)
 }
 
 /**

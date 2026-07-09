@@ -32,6 +32,7 @@ import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolErrorResponse
 import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolExecutor
 import me.matsumo.fukurou.mcp.gmo.registerGmoCoinMarketTools
 import me.matsumo.fukurou.mcp.runtime.mcpErrorResult
+import me.matsumo.fukurou.mcp.runtime.redirectProcessStdoutToStderrForMcpStdio
 import me.matsumo.fukurou.mcp.runtime.runStdioMcpServer
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
@@ -376,6 +377,8 @@ private data class LimitedToolContext(
  * fukurou MCP stdio server のエントリポイント。
  */
 fun main() {
+    redirectProcessStdoutToStderrForMcpStdio()
+
     FukurouMcpServer().run()
 }
 

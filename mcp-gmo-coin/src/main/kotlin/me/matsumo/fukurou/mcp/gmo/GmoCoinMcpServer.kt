@@ -4,6 +4,7 @@ import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
 import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
+import me.matsumo.fukurou.mcp.runtime.redirectProcessStdoutToStderrForMcpStdio
 import me.matsumo.fukurou.mcp.runtime.runStdioMcpServer
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
@@ -25,6 +26,8 @@ private const val GMO_COIN_MCP_SERVER_VERSION = "0.1.0"
  * GMO Coin market tools だけを公開する standalone MCP server のエントリポイント。
  */
 fun main() {
+    redirectProcessStdoutToStderrForMcpStdio()
+
     GmoCoinMcpServer().run()
 }
 
