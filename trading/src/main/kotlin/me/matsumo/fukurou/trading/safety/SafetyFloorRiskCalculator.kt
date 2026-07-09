@@ -2,14 +2,13 @@ package me.matsumo.fukurou.trading.safety
 
 import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.bestOppositeQuoteJpy
 import me.matsumo.fukurou.trading.broker.moneyScale
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
-import me.matsumo.fukurou.trading.domain.Orderbook
-import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.Ticker
@@ -177,6 +176,7 @@ internal class SafetyFloorRiskCalculator(
             entryPrice = entryPrice,
             stopPrice = command.protectiveStopPriceJpy,
             entryOrderType = command.orderType,
+            entryLiquidity = entryLiquidityFor(command, context),
             context = context,
         )
     }
@@ -383,6 +383,7 @@ internal class SafetyFloorRiskCalculator(
         entryPrice: BigDecimal,
         stopPrice: BigDecimal,
         entryOrderType: OrderType,
+        entryLiquidity: ExecutionLiquidity = defaultEntryLiquidityFor(entryOrderType),
         context: SafetyFloorContext,
     ): BigDecimal {
         val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(sizeBtc)
@@ -391,6 +392,7 @@ internal class SafetyFloorRiskCalculator(
             entryPrice = entryPrice,
             stopPrice = stopPrice,
             entryOrderType = entryOrderType,
+            entryLiquidity = entryLiquidity,
             context = context,
         )
 
@@ -569,21 +571,6 @@ internal data class ExpectedValueDetails(
     val probabilityUsed: BigDecimal,
     val probabilityCapApplied: Boolean,
 )
-
-private fun Orderbook.bestOppositeQuoteJpy(side: OrderSide): BigDecimal? {
-    return when (side) {
-        OrderSide.BUY -> asks.bestAskJpy()
-        OrderSide.SELL -> bids.bestBidJpy()
-    }
-}
-
-private fun List<OrderbookLevel>.bestAskJpy(): BigDecimal? {
-    return mapNotNull { level -> level.price.toBigDecimalOrNull() }.minOrNull()
-}
-
-private fun List<OrderbookLevel>.bestBidJpy(): BigDecimal? {
-    return mapNotNull { level -> level.price.toBigDecimalOrNull() }.maxOrNull()
-}
 
 private fun Ticker.bestOppositeQuoteJpy(side: OrderSide): BigDecimal? {
     return when (side) {

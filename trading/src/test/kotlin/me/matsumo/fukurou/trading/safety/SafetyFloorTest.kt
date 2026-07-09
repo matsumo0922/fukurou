@@ -444,6 +444,59 @@ class SafetyFloorTest {
     }
 
     @Test
+    fun place_order_usesTakerCostForCrossingLimitMaxRiskBoundary() {
+        val passingCommand = entryCommand(
+            orderType = OrderType.LIMIT,
+            sizeBtc = BigDecimal("0.01537"),
+            priceJpy = BigDecimal("10110000"),
+            protectiveStopPriceJpy = BigDecimal("10000000"),
+            takeProfitPriceJpy = BigDecimal("10500000"),
+            estimatedWinProbability = BigDecimal.ONE,
+        )
+        val failingCommand = passingCommand.copy(
+            commandId = UUID.randomUUID(),
+            sizeBtc = BigDecimal("0.01538"),
+        )
+        val floor = SafetyFloor(
+            config = SafetyFloorConfig(maxRiskPerTradeRatio = BigDecimal("0.01")),
+            clock = fixedClock(),
+        )
+        val context = safetyContext(
+            account = accountSnapshot(
+                cashJpy = "250000.00000000",
+                totalEquityJpy = "200000.00000000",
+            ),
+            positions = emptyList(),
+            atr14Jpy = null,
+            entryIntent = approvedIntentSnapshot(passingCommand),
+            marketDataObservedAt = fixedInstant(),
+            orderbook = orderbook(
+                bid = "10100000",
+                ask = "10110000",
+            ),
+        )
+
+        val passingVerdict = floor.evaluatePlaceOrder(
+            command = passingCommand,
+            context = context,
+        )
+        val failingVerdict = floor.evaluatePlaceOrder(
+            command = failingCommand,
+            context = context.copy(entryIntent = approvedIntentSnapshot(failingCommand)),
+        )
+        val failingDetails = floor.placeOrderRiskDetails(
+            command = failingCommand,
+            context = context.copy(entryIntent = approvedIntentSnapshot(failingCommand)),
+        )
+        val rejected = assertIs<SafetyFloorVerdict.Rejected>(failingVerdict)
+
+        assertIs<SafetyFloorVerdict.Accepted>(passingVerdict)
+        assertEquals(SafetyFloorRule.MAX_RISK_PER_TRADE, rejected.violation.rule)
+        assertEquals("2001.09180000", rejected.violation.measuredValue)
+        assertEquals("2001.09180000", failingDetails.orderRiskJpy)
+    }
+
+    @Test
     fun place_order_keepsTakerAndMarketSlippageCostForMoveToCostBoundary() {
         val passingCommand = entryCommand(
             orderType = OrderType.MARKET,

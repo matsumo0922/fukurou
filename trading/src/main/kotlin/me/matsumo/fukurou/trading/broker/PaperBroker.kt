@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
@@ -1334,6 +1335,7 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
             notional = notional,
             orderType = orderType,
             symbolRules = rules,
+            entryLiquidity = orderType.cashReservationLiquidity(),
         ).moneyScale()
     }
 
@@ -1345,9 +1347,44 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
         notional = estimatedNotional,
         orderType = orderType,
         symbolRules = rules,
+        entryLiquidity = entryLiquidityForCashReservation(executionContext),
     )
 
     return requiredCash.moneyScale()
+}
+
+private fun PlaceOrderCommand.entryLiquidityForCashReservation(
+    executionContext: PaperSimulationContext?,
+): ExecutionLiquidity {
+    if (orderType != OrderType.LIMIT) {
+        return orderType.cashReservationLiquidity()
+    }
+
+    val limitPrice = requireNotNull(priceJpy) {
+        "LIMIT order requires priceJpy."
+    }
+    val crossesBook = executionContext?.let { context ->
+        limitOrderCrossesBook(
+            side = side,
+            limitPriceJpy = limitPrice,
+            context = context,
+        )
+    } ?: false
+
+    return if (crossesBook) {
+        ExecutionLiquidity.TAKER
+    } else {
+        ExecutionLiquidity.MAKER
+    }
+}
+
+private fun OrderType.cashReservationLiquidity(): ExecutionLiquidity {
+    return when (this) {
+        OrderType.LIMIT -> ExecutionLiquidity.MAKER
+        OrderType.MARKET,
+        OrderType.STOP,
+        -> ExecutionLiquidity.TAKER
+    }
 }
 
 internal fun Order.estimatedBuyReservationJpy(
@@ -1375,6 +1412,7 @@ internal fun Order.estimatedBuyReservationJpy(
         notional = notional,
         orderType = orderType,
         symbolRules = rules,
+        entryLiquidity = orderType.cashReservationLiquidity(),
     )
 
     return requiredCash.moneyScale()
