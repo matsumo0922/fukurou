@@ -4,6 +4,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 
 class McpServerRuntimeTest {
@@ -24,5 +25,20 @@ class McpServerRuntimeTest {
         assertEquals(JsonPrimitive("unknown error"), structuredContent["message"])
         assertEquals(JsonPrimitive(false), structuredContent["executed"])
         assertEquals(JsonPrimitive("rate_limit"), structuredContent["failure_kind"])
+    }
+
+    @Test
+    fun mcpErrorResultOmitsOptionalStructuredFieldsWhenAbsent() {
+        val result = mcpErrorResult(
+            type = "validation",
+            message = "bad request",
+        )
+        val structuredContent = assertIs<JsonObject>(result.structuredContent)
+
+        assertEquals(JsonPrimitive(true), structuredContent["error"])
+        assertEquals(JsonPrimitive("validation"), structuredContent["type"])
+        assertEquals(JsonPrimitive("bad request"), structuredContent["message"])
+        assertFalse("executed" in structuredContent)
+        assertFalse("failure_kind" in structuredContent)
     }
 }

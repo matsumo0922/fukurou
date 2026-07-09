@@ -2160,6 +2160,7 @@ private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalo
         CommandEventType.CLI_AUTH_LOGIN_COMPLETED -> "cliAuthLoginCompleted"
         CommandEventType.CLI_AUTH_LOGIN_FAILED -> "cliAuthLoginFailed"
         CommandEventType.CLI_AUTH_LOGIN_TIMED_OUT -> "cliAuthLoginTimedOut"
+        CommandEventType.CLI_AUTH_CLOSE_WAIT_TIMED_OUT -> "cliAuthCloseWaitTimedOut"
     }
 
     return activityCatalogItem(name, "activity.catalog.audit.$keySuffix")

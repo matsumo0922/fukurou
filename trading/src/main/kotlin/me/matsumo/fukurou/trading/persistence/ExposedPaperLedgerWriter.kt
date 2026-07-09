@@ -25,7 +25,6 @@ import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.broker.btcScale
 import me.matsumo.fukurou.trading.broker.emptyReconcileProgress
-import me.matsumo.fukurou.trading.broker.floorToStep
 import me.matsumo.fukurou.trading.broker.hasTightenedStop
 import me.matsumo.fukurou.trading.broker.limitOrderReached
 import me.matsumo.fukurou.trading.broker.marketFill

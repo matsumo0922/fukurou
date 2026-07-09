@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_PERSISTENT_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.HOME_ENV
 import java.io.ByteArrayInputStream
+import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -281,7 +282,7 @@ class LlmAuthServiceTest {
             processStarter.release()
 
             assertIs<LlmAuthLoginStartResult.Rejected>(secondResult)
-            assertEquals("login already in progress", secondResult.reason)
+            assertEquals(LOGIN_ALREADY_IN_PROGRESS_REASON, secondResult.reason)
             assertIs<LlmAuthLoginStartResult.Accepted>(firstResult.await())
             assertEquals(1, processStarter.startCount())
         }
@@ -306,6 +307,29 @@ class LlmAuthServiceTest {
     }
 
     @Test
+    fun closeAuditsWhenProcessJobsDoNotFinishBeforeTimeout() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val processStarter = RecordingLlmAuthProcessStarter(blockingStdout = true)
+        createService(
+            processStarter = processStarter,
+            commandEventLog = eventLog,
+            closeAwaitTimeout = Duration.ofMillis(50),
+        ).use { service ->
+            service.startLogin(LlmAuthProvider.CLAUDE, "operator re-auth").getOrThrow()
+            service.close()
+            processStarter.processes.single().releaseStdout()
+
+            val timeoutEvent = eventLog.events().single { event ->
+                event.clientRequestId == CLOSE_AWAIT_AUDIT_REQUEST_ID &&
+                    event.eventType == CommandEventType.CLI_AUTH_CLOSE_WAIT_TIMED_OUT &&
+                    event.payload.contains("\"stage\":\"$CLOSE_AWAIT_STAGE_PROCESS_JOBS\"")
+            }
+
+            assertTrue(timeoutEvent.payload.contains("\"pendingJobCount\":"))
+        }
+    }
+
+    @Test
     fun startLoginRejectsAfterClose() = runBlocking {
         val processStarter = RecordingLlmAuthProcessStarter()
         createService(processStarter = processStarter).use { service ->
@@ -314,7 +338,7 @@ class LlmAuthServiceTest {
             val result = service.startLogin(LlmAuthProvider.CLAUDE, "operator re-auth").getOrThrow()
             val rejected = assertIs<LlmAuthLoginStartResult.Rejected>(result)
 
-            assertEquals("service is closing", rejected.reason)
+            assertEquals(SERVICE_CLOSING_REASON, rejected.reason)
             assertTrue(processStarter.processes.isEmpty())
         }
     }
@@ -324,6 +348,7 @@ class LlmAuthServiceTest {
         processStarter: LlmAuthProcessStarter,
         commandEventLog: InMemoryCommandEventLog? = null,
         startupCaptureTimeout: Duration = Duration.ZERO,
+        closeAwaitTimeout: Duration = Duration.ofSeconds(5),
         terminalSessionRetention: Duration = Duration.ofMinutes(30),
     ): DefaultLlmAuthService {
         return DefaultLlmAuthService(
@@ -337,6 +362,7 @@ class LlmAuthServiceTest {
                 terminalSessionRetention = terminalSessionRetention,
             ),
             commandEventLog = commandEventLog,
+            closeAwaitTimeout = closeAwaitTimeout,
             processStarter = processStarter,
             idGenerator = SequentialUuidGenerator(),
         )
@@ -346,6 +372,7 @@ class LlmAuthServiceTest {
 private class RecordingLlmAuthProcessStarter(
     private val stdout: String = "",
     private val completed: Boolean = false,
+    private val blockingStdout: Boolean = false,
 ) : LlmAuthProcessStarter {
 
     val commands = mutableListOf<List<String>>()
@@ -363,6 +390,7 @@ private class RecordingLlmAuthProcessStarter(
         val process = RunningLlmAuthProcess(
             stdout = stdout,
             completed = completed,
+            blockingStdout = blockingStdout,
         )
         processes += process
 
@@ -404,10 +432,16 @@ private class BlockingLlmAuthProcessStarter : LlmAuthProcessStarter {
 private class RunningLlmAuthProcess(
     private val stdout: String = "",
     completed: Boolean = false,
+    blockingStdout: Boolean = false,
 ) : Process() {
 
     private val destroyed = CountDownLatch(1)
     private val stdin = RecordingProcessInputStream()
+    private val stdoutStream = if (blockingStdout) {
+        BlockingProcessInputStream()
+    } else {
+        ByteArrayInputStream(stdout.toByteArray())
+    }
 
     @Volatile
     private var alive = !completed
@@ -416,8 +450,8 @@ private class RunningLlmAuthProcess(
         return stdin
     }
 
-    override fun getInputStream(): ByteArrayInputStream {
-        return ByteArrayInputStream(stdout.toByteArray())
+    override fun getInputStream(): InputStream {
+        return stdoutStream
     }
 
     override fun getErrorStream(): ByteArrayInputStream {
@@ -472,6 +506,25 @@ private class RunningLlmAuthProcess(
     fun stdinText(): String {
         return stdin.text()
     }
+
+    fun releaseStdout() {
+        (stdoutStream as? BlockingProcessInputStream)?.release()
+    }
+}
+
+private class BlockingProcessInputStream : InputStream() {
+
+    private val released = CountDownLatch(1)
+
+    override fun read(): Int {
+        released.await()
+
+        return -1
+    }
+
+    fun release() {
+        released.countDown()
+    }
 }
 
 private class RecordingProcessInputStream : OutputStream() {
@@ -516,3 +569,7 @@ private const val TEST_PATH_ENV = "PATH"
 private const val TEST_PATH_VALUE = "/opt/fukurou/bin:/usr/bin"
 private const val SECRET_ENV = "DB_PASSWORD"
 private const val DUMMY_AUTH_CODE = "DUMMY-CODE"
+private const val CLOSE_AWAIT_STAGE_PROCESS_JOBS = "process_jobs"
+private const val CLOSE_AWAIT_AUDIT_REQUEST_ID = "llm-auth-close"
+private const val LOGIN_ALREADY_IN_PROGRESS_REASON = "login already in progress"
+private const val SERVICE_CLOSING_REASON = "service is closing"

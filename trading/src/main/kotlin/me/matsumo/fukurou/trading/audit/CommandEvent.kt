@@ -117,6 +117,11 @@ enum class CommandEventType {
      * CLI auth login process が timeout した。
      */
     CLI_AUTH_LOGIN_TIMED_OUT,
+
+    /**
+     * CLI auth service close が process / scope の終了待ちを timeout した。
+     */
+    CLI_AUTH_CLOSE_WAIT_TIMED_OUT,
 }
 
 /**

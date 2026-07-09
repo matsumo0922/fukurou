@@ -358,6 +358,7 @@ data class LlmAuthServiceConfig(
  * @param config service 設定
  * @param commandEventLog login start / completion 監査 log。null の場合は監査だけ省略する
  * @param clock session と監査時刻に使う clock
+ * @param closeAwaitTimeout close 時に process job / scope job をそれぞれ待つ上限
  * @param scope process reader 用 scope
  * @param processStarter process 起動境界
  * @param idGenerator session ID generator
@@ -366,6 +367,7 @@ class DefaultLlmAuthService(
     private val config: LlmAuthServiceConfig = LlmAuthServiceConfig.fromEnvironment(),
     private val commandEventLog: CommandEventLog? = null,
     private val clock: Clock = Clock.systemUTC(),
+    private val closeAwaitTimeout: Duration = DEFAULT_LLM_AUTH_CLOSE_AWAIT_TIMEOUT,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val processStarter: LlmAuthProcessStarter = JvmLlmAuthProcessStarter,
     private val idGenerator: () -> UUID = { UUID.randomUUID() },
@@ -472,8 +474,30 @@ class DefaultLlmAuthService(
         }
     }
 
+    /**
+     * Login process を破棄し、process job を最大 closeAwaitTimeout だけ待つ。
+     *
+     * その後、service scope job と timeout 監査書き込みを合わせて最大 closeAwaitTimeout だけ待ち、
+     * timeout 後も shutdown を継続する。
+     */
     override fun close() {
-        val jobs = synchronized(lifecycleLock) {
+        val jobs = closeSessionsAndSnapshotProcessJobs()
+        val processJobsCompleted = awaitJobs(jobs)
+        val closeAuditJobs = mutableListOf<Job>()
+
+        if (!processJobsCompleted) {
+            launchCloseAwaitTimeoutAudit(
+                stage = CLOSE_AWAIT_STAGE_PROCESS_JOBS,
+                pendingJobCount = jobs.count { job -> !job.isCompleted },
+            )?.let { auditJob -> closeAuditJobs += auditJob }
+        }
+
+        scope.cancel()
+        awaitScopeAndCloseAuditJobs(closeAuditJobs)
+    }
+
+    private fun closeSessionsAndSnapshotProcessJobs(): List<Job> {
+        return synchronized(lifecycleLock) {
             closing.set(true)
             sessions.values.forEach { session ->
                 runCatching { session.destroyProcess() }
@@ -481,10 +505,30 @@ class DefaultLlmAuthService(
 
             processJobs.values.flatten()
         }
+    }
 
-        awaitJobs(jobs)
-        scope.cancel()
-        scope.coroutineContext[Job]?.let { scopeJob -> awaitJobs(listOf(scopeJob)) }
+    private fun awaitScopeAndCloseAuditJobs(closeAuditJobs: List<Job>) {
+        val scopeJob = scope.coroutineContext[Job] ?: return
+        val scopeJobCompleted = awaitJobs(closeAuditJobs + scopeJob)
+
+        if (scopeJobCompleted) return
+
+        cancelIncompleteJobs(closeAuditJobs)
+
+        if (!scopeJob.isCompleted) {
+            launchCloseAwaitTimeoutAudit(
+                stage = CLOSE_AWAIT_STAGE_SCOPE_JOB,
+                pendingJobCount = 1,
+            )
+        }
+    }
+
+    private fun cancelIncompleteJobs(jobs: Collection<Job>) {
+        jobs.forEach { job ->
+            if (!job.isCompleted) {
+                job.cancel()
+            }
+        }
     }
 
     private fun providerStatus(provider: LlmAuthProvider, checkedAt: Instant): LlmAuthProviderStatus {
@@ -540,14 +584,14 @@ class DefaultLlmAuthService(
 
     private suspend fun startLoginUnsafe(provider: LlmAuthProvider, reason: String): LlmAuthLoginStartResult {
         if (closing.get()) {
-            return LlmAuthLoginStartResult.Rejected("service is closing")
+            return LlmAuthLoginStartResult.Rejected(SERVICE_CLOSING_REASON)
         }
 
         val sessionId = idGenerator().toString()
         val sessionReserved = reserveLoginSession(provider, sessionId)
 
         if (!sessionReserved) {
-            return LlmAuthLoginStartResult.Rejected("login already in progress")
+            return LlmAuthLoginStartResult.Rejected(LOGIN_ALREADY_IN_PROGRESS_REASON)
         }
 
         var session: MutableLlmAuthLoginSession? = null
@@ -587,7 +631,7 @@ class DefaultLlmAuthService(
                 sessions.remove(sessionId, session)
                 session.destroyProcess()
 
-                return LlmAuthLoginStartResult.Rejected("service is closing")
+                return LlmAuthLoginStartResult.Rejected(SERVICE_CLOSING_REASON)
             }
 
             waitForStartupCapture(session)
@@ -633,6 +677,7 @@ class DefaultLlmAuthService(
             },
         )
         val completionHandles = mutableListOf<DisposableHandle>()
+        val completionDisposed = AtomicBoolean(false)
 
         synchronized(lifecycleLock) {
             if (closing.get()) {
@@ -646,7 +691,9 @@ class DefaultLlmAuthService(
                 val completionHandle = job.invokeOnCompletion {
                     if (jobs.all { processJob -> processJob.isCompleted }) {
                         processJobs.remove(session.sessionId, jobs)
-                        completionHandles.forEach { handle -> handle.dispose() }
+                        if (completionDisposed.compareAndSet(false, true)) {
+                            completionHandles.forEach { handle -> handle.dispose() }
+                        }
                     }
                 }
                 completionHandles += completionHandle
@@ -699,8 +746,8 @@ class DefaultLlmAuthService(
         scheduleTerminalSessionCleanup(session)
     }
 
-    private fun awaitJobs(jobs: Collection<Job>) {
-        if (jobs.isEmpty()) return
+    private fun awaitJobs(jobs: Collection<Job>): Boolean {
+        if (jobs.isEmpty()) return true
 
         val completed = CountDownLatch(jobs.size)
         val completionHandles = jobs.map { job ->
@@ -709,12 +756,37 @@ class DefaultLlmAuthService(
             }
         }
 
-        try {
-            completed.await(CLOSE_AWAIT_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+        return try {
+            completed.await(closeAwaitTimeout.toMillis(), TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
+            false
         } finally {
             completionHandles.forEach { handle -> handle.dispose() }
+        }
+    }
+
+    private fun launchCloseAwaitTimeoutAudit(stage: String, pendingJobCount: Int): Job? {
+        val eventLog = commandEventLog ?: return null
+        val payload = buildJsonObject {
+            put("stage", stage)
+            put("pendingJobCount", pendingJobCount)
+            put("timeoutMillis", closeAwaitTimeout.toMillis())
+            put("detail", "close wait timed out before all CLI auth jobs completed")
+        }.toString()
+
+        return CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            eventLog.append(
+                CommandEvent(
+                    decisionRunContext = DecisionRunContext.EMPTY,
+                    toolName = "cli-auth",
+                    toolCallId = null,
+                    clientRequestId = CLOSE_AWAIT_AUDIT_REQUEST_ID,
+                    eventType = CommandEventType.CLI_AUTH_CLOSE_WAIT_TIMED_OUT,
+                    payload = payload,
+                    occurredAt = Instant.now(clock),
+                ),
+            ).getOrThrow()
         }
     }
 
@@ -1094,10 +1166,15 @@ private const val CLAUDE_HOME_DIRECTORY = ".claude"
 private const val CODEX_AUTH_FILE_NAME = "auth.json"
 private const val STARTUP_CAPTURE_POLL_MILLIS = 100L
 private const val DESTROY_GRACE_MILLIS = 500L
-private const val CLOSE_AWAIT_TIMEOUT_MILLIS = 5_000L
 private const val PATH_ENV = "PATH"
+private const val CLOSE_AWAIT_STAGE_PROCESS_JOBS = "process_jobs"
+private const val CLOSE_AWAIT_STAGE_SCOPE_JOB = "scope_job"
+private const val CLOSE_AWAIT_AUDIT_REQUEST_ID = "llm-auth-close"
+private const val LOGIN_ALREADY_IN_PROGRESS_REASON = "login already in progress"
+private const val SERVICE_CLOSING_REASON = "service is closing"
 private val DEFAULT_LLM_AUTH_LOGIN_TIMEOUT: Duration = Duration.ofMinutes(10)
 private val DEFAULT_LLM_AUTH_STARTUP_CAPTURE_TIMEOUT: Duration = Duration.ofSeconds(2)
+private val DEFAULT_LLM_AUTH_CLOSE_AWAIT_TIMEOUT: Duration = Duration.ofSeconds(5)
 private val DEFAULT_LLM_AUTH_TERMINAL_SESSION_RETENTION: Duration = Duration.ofMinutes(30)
 private val CLAUDE_AUTH_MARKERS = listOf(
     "$CLAUDE_HOME_DIRECTORY/.credentials.json",
