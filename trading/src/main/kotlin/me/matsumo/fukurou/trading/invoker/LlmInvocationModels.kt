@@ -24,6 +24,11 @@ enum class LlmProvider {
  */
 enum class LlmInvocationPhase {
     /**
+     * heartbeat 系 trigger の full run 要否を判定する軽量 pre-filter phase。
+     */
+    PRE_FILTER,
+
+    /**
      * 取引判断を提出する Proposer phase。
      */
     PROPOSER,

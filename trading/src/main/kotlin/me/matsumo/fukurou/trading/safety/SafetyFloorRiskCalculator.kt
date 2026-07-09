@@ -2,13 +2,17 @@ package me.matsumo.fukurou.trading.safety
 
 import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.bestOppositeQuoteJpy
 import me.matsumo.fukurou.trading.broker.moneyScale
+import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
+import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.domain.defaultEntryLiquidity
 import me.matsumo.fukurou.trading.domain.requiredCashFor
 import me.matsumo.fukurou.trading.domain.roundTripCostReserveFor
 import java.math.BigDecimal
@@ -19,7 +23,7 @@ import java.time.Instant
 
 /**
  * SafetyFloor の金額、exposure、EV 計算を担当する。
- * pre-trade 見積もりは板深さを取得せず、ticker ask / bid と slippage reserve で保守的に近似する。
+ * crossing LIMIT 判定は板の best quote を優先し、板がない場合は ticker ask / bid で保守的に近似する。
  * volatility slippage は entry 価格の price risk と往復 cost reserve の両方に含め、
  * 急変時の価格不利と約定 cost を別々に安全方向へ見積もる。
  *
@@ -173,6 +177,7 @@ internal class SafetyFloorRiskCalculator(
             entryPrice = entryPrice,
             stopPrice = command.protectiveStopPriceJpy,
             entryOrderType = command.orderType,
+            entryLiquidity = entryLiquidityFor(command, context),
             context = context,
         )
     }
@@ -223,6 +228,7 @@ internal class SafetyFloorRiskCalculator(
             notional = notional,
             orderType = command.orderType,
             symbolRules = context.symbolRules,
+            entryLiquidity = entryLiquidityFor(command, context),
         )
 
         return requiredCash.safetyScale()
@@ -261,10 +267,9 @@ internal class SafetyFloorRiskCalculator(
         val riskAmount = entryRiskAmount(command.sizeBtc, entryPrice, command.protectiveStopPriceJpy)
         val expectedRMultiple = expectedRMultiple(command.sizeBtc, entryPrice, takeProfitPrice, riskAmount)
         val roundTripCostR = roundTripCost(
-            sizeBtc = command.sizeBtc,
+            command = command,
             entryPrice = entryPrice,
             stopPrice = command.protectiveStopPriceJpy,
-            entryOrderType = command.orderType,
             context = context,
         ).divideOrZero(riskAmount)
         val expectedValueR = probabilityForExpectedValue
@@ -288,10 +293,9 @@ internal class SafetyFloorRiskCalculator(
         val entryPrice = estimatedEntryPrice(command, context)
         val expectedMove = takeProfitPrice.subtract(entryPrice).maxZero().multiply(command.sizeBtc)
         val roundTripCost = roundTripCost(
-            sizeBtc = command.sizeBtc,
+            command = command,
             entryPrice = entryPrice,
             stopPrice = command.protectiveStopPriceJpy,
-            entryOrderType = command.orderType,
             context = context,
         )
 
@@ -380,6 +384,7 @@ internal class SafetyFloorRiskCalculator(
         entryPrice: BigDecimal,
         stopPrice: BigDecimal,
         entryOrderType: OrderType,
+        entryLiquidity: ExecutionLiquidity = entryOrderType.defaultEntryLiquidity(),
         context: SafetyFloorContext,
     ): BigDecimal {
         val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(sizeBtc)
@@ -388,6 +393,7 @@ internal class SafetyFloorRiskCalculator(
             entryPrice = entryPrice,
             stopPrice = stopPrice,
             entryOrderType = entryOrderType,
+            entryLiquidity = entryLiquidity,
             context = context,
         )
 
@@ -438,10 +444,27 @@ internal class SafetyFloorRiskCalculator(
     }
 
     private fun roundTripCost(
+        command: PlaceOrderCommand,
+        entryPrice: BigDecimal,
+        stopPrice: BigDecimal,
+        context: SafetyFloorContext,
+    ): BigDecimal {
+        return roundTripCost(
+            sizeBtc = command.sizeBtc,
+            entryPrice = entryPrice,
+            stopPrice = stopPrice,
+            entryOrderType = command.orderType,
+            entryLiquidity = entryLiquidityFor(command, context),
+            context = context,
+        )
+    }
+
+    private fun roundTripCost(
         sizeBtc: BigDecimal,
         entryPrice: BigDecimal,
         stopPrice: BigDecimal,
         entryOrderType: OrderType,
+        entryLiquidity: ExecutionLiquidity = entryOrderType.defaultEntryLiquidity(),
         context: SafetyFloorContext,
     ): BigDecimal {
         val entryNotional = entryPrice.multiply(sizeBtc)
@@ -452,12 +475,40 @@ internal class SafetyFloorRiskCalculator(
             entryOrderType = entryOrderType,
             symbolRules = context.symbolRules,
             slippageRatio = slippageRatio(),
+            entryLiquidity = entryLiquidity,
         )
         val volatilityReserve = volatilitySlippageJpy(context)
             .multiply(sizeBtc)
             .multiply(ROUND_TRIP_VOLATILITY_RESERVE_MULTIPLIER)
 
         return costReserve.add(volatilityReserve).safetyScale()
+    }
+
+    private fun entryLiquidityFor(command: PlaceOrderCommand, context: SafetyFloorContext): ExecutionLiquidity {
+        if (command.orderType != OrderType.LIMIT) {
+            return command.orderType.defaultEntryLiquidity()
+        }
+
+        return if (limitEntryCrossesOppositeQuote(command, context)) {
+            ExecutionLiquidity.TAKER
+        } else {
+            ExecutionLiquidity.MAKER
+        }
+    }
+
+    private fun limitEntryCrossesOppositeQuote(command: PlaceOrderCommand, context: SafetyFloorContext): Boolean {
+        val limitPrice = requireNotNull(command.priceJpy) {
+            "LIMIT order requires priceJpy."
+        }
+        val bestOppositeQuote = context.orderbook
+            ?.bestOppositeQuoteJpy(command.side)
+            ?: context.ticker.bestOppositeQuoteJpy(command.side)
+            ?: return true
+
+        return when (command.side) {
+            OrderSide.BUY -> limitPrice >= bestOppositeQuote
+            OrderSide.SELL -> limitPrice <= bestOppositeQuote
+        }
     }
 
     private fun applyPositiveSlippage(price: BigDecimal): BigDecimal {
@@ -512,6 +563,13 @@ internal data class ExpectedValueDetails(
     val probabilityUsed: BigDecimal,
     val probabilityCapApplied: Boolean,
 )
+
+private fun Ticker.bestOppositeQuoteJpy(side: OrderSide): BigDecimal? {
+    return when (side) {
+        OrderSide.BUY -> ask.toBigDecimalOrNull()
+        OrderSide.SELL -> bid.toBigDecimalOrNull()
+    }
+}
 
 /**
  * entry と protective exit の 2 leg 分の volatility slippage reserve。

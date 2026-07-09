@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
@@ -18,6 +19,7 @@ import me.matsumo.fukurou.trading.domain.ProtectionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.domain.defaultEntryLiquidity
 import me.matsumo.fukurou.trading.domain.requiredCashFor
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
@@ -544,6 +546,7 @@ private class PaperBrokerTradeDelegate(
         val safetyContext = marketContextFactory.safetyContext(
             ticker = ticker,
             symbolRules = symbolRules,
+            includeOrderbook = true,
             intentId = command.intentId,
             tradeGroupId = tradeGroupId,
         )
@@ -717,6 +720,7 @@ private class PaperBrokerMarketContextFactory(
         ticker: Ticker,
         symbolRules: SymbolRules,
         includeAtr: Boolean = false,
+        includeOrderbook: Boolean = false,
         intentId: UUID? = null,
         tradeGroupId: UUID? = null,
     ): SafetyFloorContext {
@@ -740,6 +744,11 @@ private class PaperBrokerMarketContextFactory(
             runtime.stores.ledgerRepository.getExecutions().getOrThrow()
                 .filter { execution -> execution.orderId in tradeGroupOrderIds }
         }
+        val orderbook = if (includeOrderbook) {
+            runtime.orderbookFor(TradingSymbol.BTC)
+        } else {
+            null
+        }
 
         return SafetyFloorContext(
             account = runtime.stores.ledgerRepository.getAccountSnapshot().getOrThrow(),
@@ -749,6 +758,8 @@ private class PaperBrokerMarketContextFactory(
             tradeGroupOrders = tradeGroupOrders,
             tradeGroupExecutions = tradeGroupExecutions,
             ticker = ticker,
+            orderbook = orderbook,
+            orderbookLookupAttempted = includeOrderbook,
             symbolRules = symbolRules,
             entryIntent = entryIntent,
             atr14Jpy = if (includeAtr) {
@@ -1325,6 +1336,7 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
             notional = notional,
             orderType = orderType,
             symbolRules = rules,
+            entryLiquidity = orderType.defaultEntryLiquidity(),
         ).moneyScale()
     }
 
@@ -1336,9 +1348,35 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
         notional = estimatedNotional,
         orderType = orderType,
         symbolRules = rules,
+        entryLiquidity = entryLiquidityForCashReservation(executionContext),
     )
 
     return requiredCash.moneyScale()
+}
+
+private fun PlaceOrderCommand.entryLiquidityForCashReservation(
+    executionContext: PaperSimulationContext?,
+): ExecutionLiquidity {
+    if (orderType != OrderType.LIMIT) {
+        return orderType.defaultEntryLiquidity()
+    }
+
+    val limitPrice = requireNotNull(priceJpy) {
+        "LIMIT order requires priceJpy."
+    }
+    val crossesBook = executionContext?.let { context ->
+        limitOrderCrossesBook(
+            side = side,
+            limitPriceJpy = limitPrice,
+            context = context,
+        )
+    } ?: false
+
+    return if (crossesBook) {
+        ExecutionLiquidity.TAKER
+    } else {
+        ExecutionLiquidity.MAKER
+    }
 }
 
 internal fun Order.estimatedBuyReservationJpy(
@@ -1366,6 +1404,7 @@ internal fun Order.estimatedBuyReservationJpy(
         notional = notional,
         orderType = orderType,
         symbolRules = rules,
+        entryLiquidity = orderType.defaultEntryLiquidity(),
     )
 
     return requiredCash.moneyScale()

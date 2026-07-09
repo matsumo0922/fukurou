@@ -369,6 +369,33 @@ object RuntimeConfigCatalog {
                     safetyTier = RuntimeConfigSafetyTier.GUARDED,
                 ),
                 runtimeItem(
+                    key = "daemon.entryFillTriggerEnabled",
+                    legacyEnvName = FUKUROU_LLM_TRIGGER_ENTRY_FILL_ENABLED_ENV,
+                    valueType = RuntimeConfigValueType.BOOLEAN,
+                    defaultValue = defaults.config.daemon.entryFillTriggerEnabled.toString(),
+                    effectiveValue = config.daemon.entryFillTriggerEnabled.toString(),
+                    unit = null,
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
+                    key = "daemon.entryFillCooldown",
+                    legacyEnvName = FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS_ENV,
+                    valueType = RuntimeConfigValueType.DURATION_SECONDS,
+                    defaultValue = defaults.config.daemon.entryFillCooldown.seconds.toString(),
+                    effectiveValue = config.daemon.entryFillCooldown.seconds.toString(),
+                    unit = "seconds",
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
+                    key = "daemon.preFilterEnabled",
+                    legacyEnvName = FUKUROU_LLM_PRE_FILTER_ENABLED_ENV,
+                    valueType = RuntimeConfigValueType.BOOLEAN,
+                    defaultValue = defaults.config.daemon.preFilterEnabled.toString(),
+                    effectiveValue = config.daemon.preFilterEnabled.toString(),
+                    unit = null,
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
                     key = "daemon.stopProximityTriggerEnabled",
                     legacyEnvName = FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED_ENV,
                     valueType = RuntimeConfigValueType.BOOLEAN,
@@ -1079,6 +1106,10 @@ private const val FUKUROU_LLM_TRIGGER_PRICE_MOVE_ENABLED_ENV = "FUKUROU_LLM_TRIG
 private const val FUKUROU_LLM_TRIGGER_PRICE_MOVE_WINDOW_SECONDS_ENV = "FUKUROU_LLM_TRIGGER_PRICE_MOVE_WINDOW_SECONDS"
 private const val FUKUROU_LLM_TRIGGER_PRICE_MOVE_THRESHOLD_RATIO_ENV = "FUKUROU_LLM_TRIGGER_PRICE_MOVE_THRESHOLD_RATIO"
 private const val FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS_ENV = "FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS"
+private const val FUKUROU_LLM_TRIGGER_ENTRY_FILL_ENABLED_ENV = "FUKUROU_LLM_TRIGGER_ENTRY_FILL_ENABLED"
+private const val FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS_ENV =
+    "FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS"
+private const val FUKUROU_LLM_PRE_FILTER_ENABLED_ENV = "FUKUROU_LLM_PRE_FILTER_ENABLED"
 private const val FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED_ENV = "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED"
 private const val FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_REMAINING_R_THRESHOLD_ENV =
     "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_REMAINING_R_THRESHOLD"

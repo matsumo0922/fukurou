@@ -57,7 +57,7 @@
 
 [確定事項の改訂: 2026-07-09] paper trading 1週目の週次反省会を受け、runtime catalog default と system prompt を調整する。`safety.minExpectedMoveToCostRatio` の既定値は 2.5、`runner.maxInvocationsPerHour` の既定値は 6、`runner.maxInvocationsPerDay` は 96、flat heartbeat は 15分とする。hourly cap には event trigger 用の余地が生まれるが、flat heartbeat 単独で daily cap 96 を消費できるため、同日内の event trigger は後続 heartbeat と日次予算を共有する。production の active runtime config に明示値が保存済みの場合、catalog default 変更では上書きされないため、`/ops/runtime-config` の draft / activate で active 値を更新する。
 
-system prompt v1.10 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
+system prompt v1.12 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。EV gate は resting LIMIT entry を maker fee(rebate) と保護 exit 側 taker fee / slippage reserve で評価し、板を跨ぐ LIMIT / MARKET / STOP entry を taker fee と entry / exit 両側の market slippage reserve で評価する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
 
 ### 1.3 本設計の方針
 
@@ -1329,7 +1329,7 @@ kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `K
 
 benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は期間開始時点の paper equity（paper 初期資金 + 期間開始前の累計 realized trade PnL）とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
 
-LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、保存済み `details.usage` がない過去行は redacted `details.stdout` から可能な範囲で fallback parse する。Codex phase や parse 不能 phase は usage 欠落として数える。取得は既定 20,000 行で bounded にし、超過時は `/evaluation/costs` の `truncated` で示す。
+LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`pre_filter` / `proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、保存済み `details.usage` がない過去行は redacted `details.stdout` から可能な範囲で fallback parse する。Codex phase や parse 不能 phase は usage 欠落として数える。取得は既定 20,000 行で bounded にし、超過時は `/evaluation/costs` の `truncated` で示す。
 
 ## 6. 発火エンジンと呼び出しモデル（A-7）
 
@@ -1339,17 +1339,18 @@ LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`
 
 [設計提案] v1の具体条件は次の通り。
 
-| 発火         | 条件                                   |                cooldown | 備考                                                              |
-|------------|--------------------------------------|------------------------:|-----------------------------------------------------------------|
-| flatハートビート | ポジションなしで15分ごと                        |                      適用 | 学習データ収集と地合い更新。token / サブスク枠は #28 で監視する                          |
-| 価格急変       | 5分前midから `abs(change) >= 1.0%`       | 適用。ただし保有中STOP接近は bypass | 急変時の確認                                                          |
-| 構造イベント     | 1時間足の新高値/新安値、主要レンジ抜けなど               |                      適用 | 静かなトレンド取り逃しの緩和。daemon設計時に条件を追加                                  |
-| 保有中check   | open position / open order があれば15分ごと |                      適用 | STOP/TP近接、1R到達、ATR床更新。保護・約定判定は `ProtectionReconciler` が短周期で継続する |
-| 起動時復旧      | プロセス起動直後                             |                  bypass | DB/取引所/ペーパー台帳の整合性確認                                             |
-| 安全バックストップ  | DD閾値、STOP到達、データ不整合                   |                  bypass | LLMを呼ばずコードで守る場合あり                                               |
-| 手動         | WebUI/CLIで明示発火                       |                bypass可能 | 理由必須                                                            |
+| 発火 | 条件 | cooldown | 備考 |
+|---|---|---:|---|
+| flatハートビート | ポジションなしで15分ごと | 適用 | 学習データ収集と地合い更新。token / サブスク枠は #28 で監視する |
+| 価格急変 | 5分前midから `abs(change) >= 1.0%` | 適用。ただし保有中STOP接近は bypass | 急変時の確認 |
+| 構造イベント | 1時間足の新高値/新安値、主要レンジ抜けなど | 適用 | 静かなトレンド取り逃しの緩和。daemon設計時に条件を追加 |
+| paper entry fill | paper entry の BUY execution を検出 | 適用 | 約定直後に thesis が有効なままか再評価する |
+| 保有中check | open position / open order があれば15分ごと | 適用 | STOP/TP近接、1R到達、ATR床更新。保護・約定判定は `ProtectionReconciler` が短周期で継続する |
+| 起動時復旧 | プロセス起動直後 | bypass | DB/取引所/ペーパー台帳の整合性確認 |
+| 安全バックストップ | DD閾値、STOP到達、データ不整合 | bypass | LLMを呼ばずコードで守る場合あり |
+| 手動 | WebUI/CLIで明示発火 | bypass可能 | 理由必須 |
 
-[実装済み: #55] `PRICE_MOVE` は GMO ticker の5分 window 変化率が1%以上のとき、`STOP_PROXIMITY` は保有中 LONG position の残り R が0.3以下のときに daemon reservation 経路で発火する。ticker が取得不能・stale・timestamp parse 不能な tick では市場系 trigger だけを見送り、flat heartbeat / holding dense check は従来通り fallback として残す。
+`PRICE_MOVE` は GMO ticker の5分 window 変化率が1%以上のとき、`STOP_PROXIMITY` は保有中 LONG position の残り R が0.3以下のとき、`ENTRY_FILL` は paper entry の BUY execution を検出したときに daemon reservation 経路で発火する。ticker が取得不能・stale・timestamp parse 不能な tick では市場系 trigger だけを見送り、flat heartbeat / holding dense check は fallback として残す。`ENTRY_FILL` は同じ fill と cooldown 内の fill burst を後追い発火せず、runner の hourly / daily cap を消費する。`daemon.preFilterEnabled` が true のとき、flat heartbeat / holding dense check は full LLM 起動前に `claude-haiku-4-5-20251001` で deterministic market snapshot の有意変化を判定し、NO の場合は `pre_filter_no_change` として full run を省略する。pre-filter は軽量でも LLM 呼び出しのため予約済み invocation と hourly / daily cap を消費し、価格急変、STOP 接近、entry fill、経済イベントには適用せず、失敗時は full run へ進む。
 
 ### 6.2 daemonの責務
 
@@ -2629,8 +2630,9 @@ roundedSizeBtc = floorToStep(rawSizeBtc, tradeRule.sizeStep)
 estimatedMaxLossJpy = roundedSizeBtc * perBtcRiskJpy + orderTypeAwareFeeEstimate + slippageBuffer
 ```
 
-`orderTypeAwareFeeEstimate` は、MARKET/STOP entry と protective exit を taker、resting LIMIT entry を maker fee / rebate として見積もる。
-発注時点で板を跨ぐLIMITは、brokerの実約定時cash検証でtaker feeを使う。
+`orderTypeAwareFeeEstimate` は、MARKET/STOP entry、発注時点で板を跨ぐ LIMIT、protective exit を taker、resting LIMIT entry を maker fee / rebate として見積もる。
+fixed market slippage reserve は MARKET/STOP entry、板を跨ぐ LIMIT entry、protective exit に乗せ、resting LIMIT entry 側には乗せない。
+発注時点で板を跨ぐ LIMIT は、SafetyFloor と broker の実約定時 cash 検証で taker fee を使う。
 
 `estimatedMaxLossJpy <= riskBudgetJpy` でなければ拒否する。
 
@@ -2639,10 +2641,10 @@ estimatedMaxLossJpy = roundedSizeBtc * perBtcRiskJpy + orderTypeAwareFeeEstimate
 [確定] MARKET entryの評価価格は `last` ではなく `ask + fixed slippage + ATR(5m,14) * volatilitySlippageMultiplier` として保守的に見積もる。SELL closeは `bid - fixed slippage - ATR(5m,14) * volatilitySlippageMultiplier` として保守的に見積もる。
 
 SafetyFloor の fixed slippage reserve は、SafetyFloor 側の `marketSlippageReserveBps` と paper 約定側の `marketSlippageBps` の大きい方を使い、pre-trade 見積もりが paper fill より小さい固定 slippage 前提にならないようにする。
-SafetyFloor の pre-trade 見積もりは板深さを取得せず、ticker ask / bid と slippage reserve で保守的に近似する。paper fill は約定時点の板を歩くため、大口注文では板深さ由来の差が残る。
+SafetyFloor の pre-trade 見積もりは crossing LIMIT 判定に板の best quote を優先し、板が取得できない場合は ticker ask / bid と slippage reserve で保守的に近似する。paper fill は約定時点の板を歩くため、大口注文では板深さ由来の差が残る。
 volatility slippage reserve は entry 価格見積もりの price risk と往復 cost reserve の両方に含める。急変時の価格不利と約定 cost を別々に見る安全方向の reserve とする。
 
-[確定事項の改訂: 2026-07-02] 安全床6「コスト上限」は、EVゲートと想定値幅/往復コスト比の下限で実体化する。往復コストはentry order typeに応じたtaker fee / maker rebate、保護exit側のtaker fee、spread、slippage reserveを含めてR換算し、`expectedMoveToCostRatio` が下限未満なら拒否する。
+安全床6「コスト上限」は、EVゲートと想定値幅/往復コスト比の下限で実体化する。往復コストはentry liquidityに応じたtaker fee / maker rebate、保護exit側のtaker fee、spread、slippage reserveを含めてR換算し、`expectedMoveToCostRatio` が下限未満なら拒否する。resting LIMIT entry は maker fee / rebate として評価し、entry 側の fixed market slippage reserve は含めない。板を跨ぐ LIMIT entry は taker fee と entry 側 fixed market slippage reserve を含める。
 
 ### 10.2 ATR損切り
 

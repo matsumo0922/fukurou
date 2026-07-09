@@ -172,9 +172,10 @@ class ManualLlmLaunchServiceTest {
                 riskStateRepository = riskStateRepository,
                 commandEventLog = eventLog,
                 launchReservationRepository = reservations,
-                openRiskReader = { Result.success(false) },
-                tickerReader = { error("ticker must not be read") },
-                positionsReader = { Result.success(emptyList()) },
+                openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
+                tickerReader = LlmDaemonTickerReader { error("ticker must not be read") },
+                positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
+                entryFillReader = LlmDaemonEntryFillReader { Result.success(null) },
             ),
             runtime = LlmDaemonSchedulerRuntime(
                 requestBase = defaultRequest(),

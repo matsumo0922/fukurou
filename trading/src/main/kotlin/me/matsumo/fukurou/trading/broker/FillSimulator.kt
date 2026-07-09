@@ -544,7 +544,7 @@ internal fun Orderbook.limitExecutableDepth(
     )
 }
 
-private fun Orderbook.bestOppositeQuoteJpy(side: OrderSide): BigDecimal? {
+internal fun Orderbook.bestOppositeQuoteJpy(side: OrderSide): BigDecimal? {
     return when (side) {
         OrderSide.BUY -> bestAskJpy()
         OrderSide.SELL -> bestBidJpy()

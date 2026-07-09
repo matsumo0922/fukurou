@@ -210,7 +210,7 @@ private const val SELECT_LLM_PHASE_USAGE_SQL = """
     WHERE event_type = 'RUNNER_PHASE_COMPLETED'
         AND ts >= ?
         AND ts < ?
-        AND payload::jsonb->>'phase' IN ('proposer', 'falsifier', 'reflection')
+        AND payload::jsonb->>'phase' IN ('pre_filter', 'proposer', 'falsifier', 'reflection')
     ORDER BY ts ASC
     LIMIT ?
 """

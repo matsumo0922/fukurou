@@ -30,6 +30,8 @@ import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
@@ -1634,7 +1636,8 @@ class OneShotLlmRunnerTest {
                         ),
                     )
                 },
-                positionsReader = { Result.success(emptyList()) },
+                positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
+                entryFillReader = LlmDaemonEntryFillReader { Result.success(null) },
             ),
             runtime = LlmDaemonSchedulerRuntime(
                 requestBase = defaultRequest(),
@@ -1989,6 +1992,7 @@ private class RequestCapturingLlmInvoker(
         requests += request
 
         when (request.phase) {
+            LlmInvocationPhase.PRE_FILTER -> Unit
             LlmInvocationPhase.PROPOSER -> submitDecisionFromRequest(repository, request, proposerAction).getOrThrow()
             LlmInvocationPhase.FALSIFIER -> {
                 submitFalsificationFromRequest(repository, request, FalsificationVerdict.APPROVED).getOrThrow()

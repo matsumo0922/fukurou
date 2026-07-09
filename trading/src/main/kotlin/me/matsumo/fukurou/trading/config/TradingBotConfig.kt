@@ -244,6 +244,9 @@ data class LlmRunnerConfig(
  * @param priceMoveWindow 価格急変判定に使う観測 window
  * @param priceMoveThresholdRatio 価格急変とみなす絶対変化率
  * @param priceMoveCooldown 価格急変 trigger の cooldown
+ * @param entryFillTriggerEnabled entry fill trigger を有効にするか
+ * @param entryFillCooldown entry fill trigger の cooldown
+ * @param preFilterEnabled heartbeat 系 trigger の軽量 pre-filter を有効にするか
  * @param stopProximityTriggerEnabled STOP 接近 trigger を有効にするか
  * @param stopProximityRemainingRThreshold STOP 接近とみなす残り R
  * @param stopProximityCooldown STOP 接近 trigger の cooldown
@@ -258,6 +261,9 @@ data class LlmDaemonConfig(
     val priceMoveWindow: Duration = DEFAULT_LLM_PRICE_MOVE_WINDOW,
     val priceMoveThresholdRatio: BigDecimal = DEFAULT_LLM_PRICE_MOVE_THRESHOLD_RATIO,
     val priceMoveCooldown: Duration = DEFAULT_LLM_PRICE_MOVE_COOLDOWN,
+    val entryFillTriggerEnabled: Boolean = DEFAULT_LLM_ENTRY_FILL_TRIGGER_ENABLED,
+    val entryFillCooldown: Duration = DEFAULT_LLM_ENTRY_FILL_COOLDOWN,
+    val preFilterEnabled: Boolean = DEFAULT_LLM_PRE_FILTER_ENABLED,
     val stopProximityTriggerEnabled: Boolean = DEFAULT_LLM_STOP_PROXIMITY_TRIGGER_ENABLED,
     val stopProximityRemainingRThreshold: BigDecimal = DEFAULT_LLM_STOP_PROXIMITY_REMAINING_R_THRESHOLD,
     val stopProximityCooldown: Duration = DEFAULT_LLM_STOP_PROXIMITY_COOLDOWN,
@@ -270,6 +276,7 @@ data class LlmDaemonConfig(
         val priceMoveThresholdIsPositive = priceMoveThresholdRatio > BigDecimal.ZERO
         val priceMoveWindowFitsPoll = priceMoveWindow >= pollInterval
         val priceMoveCooldownFitsPoll = priceMoveCooldown >= pollInterval
+        val entryFillCooldownFitsPoll = entryFillCooldown >= pollInterval
         val stopProximityThresholdIsPositive = stopProximityRemainingRThreshold > BigDecimal.ZERO
         val stopProximityCooldownFitsPoll = stopProximityCooldown >= pollInterval
 
@@ -293,6 +300,9 @@ data class LlmDaemonConfig(
         }
         require(priceMoveCooldownFitsPoll) {
             "priceMoveCooldown must be greater than or equal to pollInterval."
+        }
+        require(entryFillCooldownFitsPoll) {
+            "entryFillCooldown must be greater than or equal to pollInterval."
         }
         require(stopProximityThresholdIsPositive) {
             "stopProximityRemainingRThreshold must be greater than 0."
@@ -521,6 +531,22 @@ private const val FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS_ENV =
     "FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS"
 
 /**
+ * entry fill trigger 有効化の環境変数名。
+ */
+private const val FUKUROU_LLM_TRIGGER_ENTRY_FILL_ENABLED_ENV = "FUKUROU_LLM_TRIGGER_ENTRY_FILL_ENABLED"
+
+/**
+ * entry fill trigger の cooldown 秒数の環境変数名。
+ */
+private const val FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS_ENV =
+    "FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS"
+
+/**
+ * 軽量 pre-filter 有効化の環境変数名。
+ */
+private const val FUKUROU_LLM_PRE_FILTER_ENABLED_ENV = "FUKUROU_LLM_PRE_FILTER_ENABLED"
+
+/**
  * STOP 接近 trigger 有効化の環境変数名。
  */
 private const val FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED_ENV =
@@ -710,6 +736,21 @@ val DEFAULT_LLM_PRICE_MOVE_THRESHOLD_RATIO: BigDecimal = BigDecimal("0.01")
  * 価格急変 trigger の既定 cooldown。
  */
 val DEFAULT_LLM_PRICE_MOVE_COOLDOWN: Duration = Duration.ofSeconds(600)
+
+/**
+ * entry fill trigger 有効化の既定値。
+ */
+const val DEFAULT_LLM_ENTRY_FILL_TRIGGER_ENABLED = true
+
+/**
+ * entry fill trigger の既定 cooldown。
+ */
+val DEFAULT_LLM_ENTRY_FILL_COOLDOWN: Duration = Duration.ofSeconds(600)
+
+/**
+ * 軽量 pre-filter 有効化の既定値。
+ */
+const val DEFAULT_LLM_PRE_FILTER_ENABLED = false
 
 /**
  * STOP 接近 trigger 有効化の既定値。
@@ -947,6 +988,16 @@ private fun Map<String, String>.readLlmDaemonConfig(): LlmDaemonConfig {
                 ?.toLong()
                 ?: DEFAULT_LLM_PRICE_MOVE_COOLDOWN.seconds,
         ),
+        entryFillTriggerEnabled = readOptional(FUKUROU_LLM_TRIGGER_ENTRY_FILL_ENABLED_ENV)
+            ?.toBooleanStrictOrNull()
+            ?: DEFAULT_LLM_ENTRY_FILL_TRIGGER_ENABLED,
+        entryFillCooldown = Duration.ofSeconds(
+            readOptional(FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_LLM_ENTRY_FILL_COOLDOWN.seconds,
+        ),
+        preFilterEnabled = readOptional(FUKUROU_LLM_PRE_FILTER_ENABLED_ENV)?.toBooleanStrictOrNull()
+            ?: DEFAULT_LLM_PRE_FILTER_ENABLED,
         stopProximityTriggerEnabled = readOptional(FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED_ENV)
             ?.toBooleanStrictOrNull()
             ?: DEFAULT_LLM_STOP_PROXIMITY_TRIGGER_ENABLED,

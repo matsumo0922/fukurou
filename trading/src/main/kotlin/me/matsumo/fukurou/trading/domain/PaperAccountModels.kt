@@ -130,6 +130,18 @@ enum class ExecutionLiquidity {
 }
 
 /**
+ * 注文種別だけで entry liquidity を近似する既定値。
+ */
+internal fun OrderType.defaultEntryLiquidity(): ExecutionLiquidity {
+    return when (this) {
+        OrderType.LIMIT -> ExecutionLiquidity.MAKER
+        OrderType.MARKET,
+        OrderType.STOP,
+        -> ExecutionLiquidity.TAKER
+    }
+}
+
+/**
  * paper 口座の資産 snapshot。
  *
  * @param mode 取引 mode

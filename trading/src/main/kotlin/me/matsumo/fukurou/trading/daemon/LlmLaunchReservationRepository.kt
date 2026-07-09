@@ -33,6 +33,11 @@ enum class LlmDaemonTriggerKind {
     STOP_PROXIMITY,
 
     /**
+     * paper entry order の約定直後に thesis を再評価する発火。
+     */
+    ENTRY_FILL,
+
+    /**
      * 建玉または open order がある場合の密な確認。
      */
     HOLDING_DENSE_CHECK,

@@ -1978,6 +1978,10 @@ private class CapturingLogHandler : Handler() {
  * fee 予約検証用に数量 step を細かくした fake market data。
  */
 private object FineStepMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.success(orderbookWithAsk(price = "10000001"))
+    }
+
     override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
         return Result.success(
             SymbolRules(

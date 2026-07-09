@@ -262,6 +262,27 @@ class EvaluationMathTest {
             listOf(
                 llmUsageFact(phase = "preflight", provider = null, usage = null),
                 llmUsageFact(
+                    phase = "pre_filter",
+                    provider = "claude",
+                    usage = LlmUsageDetails(
+                        totalCostUsd = BigDecimal("0.01"),
+                        numTurns = 1,
+                        durationMs = 250,
+                        usage = null,
+                        modelUsages = listOf(
+                            LlmModelUsage(
+                                model = "claude-haiku-4-5-20251001",
+                                usage = LlmTokenUsage(
+                                    inputTokens = 3,
+                                    outputTokens = 1,
+                                    cacheCreationInputTokens = null,
+                                    cacheReadInputTokens = null,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+                llmUsageFact(
                     phase = "proposer",
                     provider = "claude",
                     usage = LlmUsageDetails(
@@ -297,11 +318,15 @@ class EvaluationMathTest {
             ),
         )
 
-        assertEquals(3, stats.phaseCount)
+        assertEquals(4, stats.phaseCount)
         assertEquals(1, stats.missingUsagePhaseCount)
-        assertEquals("0.3000000000", stats.totalCostUsd.toPlainString())
+        assertEquals("0.3100000000", stats.totalCostUsd.toPlainString())
         assertEquals(listOf("claude", "codex"), stats.byProvider.map { provider -> provider.provider })
-        assertEquals(10L, stats.byModel.single().inputTokens)
+        assertEquals(
+            listOf("claude-haiku-4-5-20251001", "claude-sonnet-5"),
+            stats.byModel.map { model -> model.model },
+        )
+        assertEquals(13L, stats.byModel.sumOf { model -> model.inputTokens })
     }
 }
 

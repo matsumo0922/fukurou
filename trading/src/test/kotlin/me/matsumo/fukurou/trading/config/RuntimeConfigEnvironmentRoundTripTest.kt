@@ -125,6 +125,9 @@ private fun nonDefaultRuntimeConfig(): TradingBotConfig {
             stopProximityTriggerEnabled = false,
             stopProximityRemainingRThreshold = BigDecimal("0.20"),
             stopProximityCooldown = Duration.ofSeconds(960),
+            entryFillTriggerEnabled = false,
+            entryFillCooldown = Duration.ofSeconds(1200),
+            preFilterEnabled = true,
         ),
         obsidian = config.obsidian.copy(
             enabled = true,
