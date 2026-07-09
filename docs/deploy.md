@@ -105,16 +105,12 @@ FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS=2
 # FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
 # Obsidian writer と Reflection Runner は FUKUROU_OBSIDIAN_ENABLED を共有する。
 
-# production container では image 内の MCP fat jar と handshake bridge snapshot を使う。
+# production container では image 内の MCP fat jar を使う。
 FUKUROU_MCP_JAR_PATH=/app/fukurou-mcp-all.jar
-FUKUROU_MCP_SERVER_COMMAND=node
-FUKUROU_MCP_SERVER_ARGS=/app/fukurou-mcp-bridge.mjs --snapshot /app/fukurou-mcp-tools.json $${mcpJarPath}
 
 # CLI auth を配置して smoke test が通るまでは false を維持する。
 FUKUROU_LLM_DAEMON_ENABLED=false
 ```
-
-JVM 直起動へ戻す場合は、同じ `.env` で `FUKUROU_MCP_SERVER_COMMAND=java` と `FUKUROU_MCP_SERVER_ARGS=-jar $${mcpJarPath}` を合わせて指定する。
 
 Cloudflare Access の `CF-Access-Client-Id` / `CF-Access-Client-Secret` は手元の検証環境で使う credential であり、NAS の `.env` には保存しない。
 
