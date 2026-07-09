@@ -59,6 +59,7 @@ internal fun requiredCashFor(
 
 /**
  * 往復 cost reserve を返す。maker rebate と taker fee の合算が負になる場合も reserve は 0 未満にしない。
+ * LIMIT entry は resting maker 前提で entry 側の fixed market slippage reserve を乗せず、保護 exit 側だけに残す。
  */
 internal fun roundTripCostReserveFor(
     entryNotional: BigDecimal,
@@ -70,9 +71,26 @@ internal fun roundTripCostReserveFor(
     val entryFee = entryNotional.multiply(entryFeeRateFor(entryOrderType, symbolRules))
     val exitFee = exitNotional.multiply(protectiveExitFeeRateFor(symbolRules))
     val feeReserve = entryFee.add(exitFee)
-    val slippageReserve = entryNotional.add(exitNotional).multiply(slippageRatio)
+    val slippageReserve = roundTripSlippageNotional(
+        entryNotional = entryNotional,
+        exitNotional = exitNotional,
+        entryOrderType = entryOrderType,
+    ).multiply(slippageRatio)
 
     return feeReserve.add(slippageReserve).max(BigDecimal.ZERO)
+}
+
+private fun roundTripSlippageNotional(
+    entryNotional: BigDecimal,
+    exitNotional: BigDecimal,
+    entryOrderType: OrderType,
+): BigDecimal {
+    return when (entryOrderType) {
+        OrderType.LIMIT -> exitNotional
+        OrderType.MARKET,
+        OrderType.STOP,
+        -> entryNotional.add(exitNotional)
+    }
 }
 
 /**

@@ -2628,6 +2628,7 @@ estimatedMaxLossJpy = roundedSizeBtc * perBtcRiskJpy + orderTypeAwareFeeEstimate
 ```
 
 `orderTypeAwareFeeEstimate` は、MARKET/STOP entry と protective exit を taker、resting LIMIT entry を maker fee / rebate として見積もる。
+fixed market slippage reserve は MARKET/STOP entry と protective exit に乗せ、resting LIMIT entry 側には乗せない。
 発注時点で板を跨ぐLIMITは、brokerの実約定時cash検証でtaker feeを使う。
 
 `estimatedMaxLossJpy <= riskBudgetJpy` でなければ拒否する。
@@ -2640,7 +2641,7 @@ SafetyFloor の fixed slippage reserve は、SafetyFloor 側の `marketSlippageR
 SafetyFloor の pre-trade 見積もりは板深さを取得せず、ticker ask / bid と slippage reserve で保守的に近似する。paper fill は約定時点の板を歩くため、大口注文では板深さ由来の差が残る。
 volatility slippage reserve は entry 価格見積もりの price risk と往復 cost reserve の両方に含める。急変時の価格不利と約定 cost を別々に見る安全方向の reserve とする。
 
-[確定事項の改訂: 2026-07-02] 安全床6「コスト上限」は、EVゲートと想定値幅/往復コスト比の下限で実体化する。往復コストはentry order typeに応じたtaker fee / maker rebate、保護exit側のtaker fee、spread、slippage reserveを含めてR換算し、`expectedMoveToCostRatio` が下限未満なら拒否する。
+安全床6「コスト上限」は、EVゲートと想定値幅/往復コスト比の下限で実体化する。往復コストはentry order typeに応じたtaker fee / maker rebate、保護exit側のtaker fee、spread、slippage reserveを含めてR換算し、`expectedMoveToCostRatio` が下限未満なら拒否する。resting LIMIT entry は maker fee / rebate として評価し、entry 側の fixed market slippage reserve は含めない。
 
 ### 10.2 ATR損切り
 

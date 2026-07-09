@@ -246,7 +246,7 @@ class SafetyFloorTest {
         )
 
         assertEquals("50000.00000000", limitDetails.requiredCashJpy)
-        assertEquals("1568.50000000", limitDetails.orderRiskJpy)
+        assertEquals("1543.50000000", limitDetails.orderRiskJpy)
         assertEquals("50600.56263750", marketDetails.requiredCashJpy)
         assertEquals("2174.35027500", marketDetails.orderRiskJpy)
         assertEquals("50050.01250000", stopDetails.requiredCashJpy)
@@ -356,8 +356,79 @@ class SafetyFloorTest {
         assertIs<SafetyFloorVerdict.Accepted>(verdict)
         assertEquals("50000.00000000", details.requiredCashJpy)
         // maker LIMIT cost:
-        // (-5.00000000 entry rebate + 24.25000000 exit taker) + 49.25000000 slippage = 68.50000000
-        assertEquals("3.64963504", details.expectedMoveToCostRatio)
+        // (-5.00000000 entry rebate + 24.25000000 exit taker) + 24.25000000 exit slippage = 43.50000000
+        assertEquals("5.74712644", details.expectedMoveToCostRatio)
+    }
+
+    @Test
+    fun place_order_usesMakerLimitCostForMoveToCostBoundary() {
+        val passingCommand = entryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("10000000"),
+            protectiveStopPriceJpy = BigDecimal("9850000"),
+            takeProfitPriceJpy = BigDecimal("10026550"),
+            estimatedWinProbability = BigDecimal.ONE,
+        )
+        val failingCommand = passingCommand.copy(
+            commandId = UUID.randomUUID(),
+            takeProfitPriceJpy = BigDecimal("10026549"),
+        )
+        val floor = SafetyFloor(clock = fixedClock())
+        val context = safetyContext(
+            positions = emptyList(),
+            atr14Jpy = null,
+            entryIntent = approvedIntentSnapshot(passingCommand),
+            marketDataObservedAt = fixedInstant(),
+        )
+
+        val passingVerdict = floor.evaluatePlaceOrder(
+            command = passingCommand,
+            context = context,
+        )
+        val failingVerdict = floor.evaluatePlaceOrder(
+            command = failingCommand,
+            context = context.copy(entryIntent = approvedIntentSnapshot(failingCommand)),
+        )
+        val rejected = assertIs<SafetyFloorVerdict.Rejected>(failingVerdict)
+
+        assertIs<SafetyFloorVerdict.Accepted>(passingVerdict)
+        assertEquals(SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO, rejected.violation.rule)
+        assertEquals("2.99988701", rejected.violation.measuredValue)
+    }
+
+    @Test
+    fun place_order_keepsTakerAndMarketSlippageCostForMoveToCostBoundary() {
+        val passingCommand = entryCommand(
+            orderType = OrderType.MARKET,
+            protectiveStopPriceJpy = BigDecimal("9950000"),
+            takeProfitPriceJpy = BigDecimal("10175251"),
+            estimatedWinProbability = BigDecimal.ONE,
+        )
+        val failingCommand = passingCommand.copy(
+            commandId = UUID.randomUUID(),
+            takeProfitPriceJpy = BigDecimal("10175250"),
+        )
+        val floor = SafetyFloor(clock = fixedClock())
+        val context = safetyContext(
+            positions = emptyList(),
+            atr14Jpy = null,
+            entryIntent = approvedIntentSnapshot(passingCommand),
+            marketDataObservedAt = fixedInstant(),
+        )
+
+        val passingVerdict = floor.evaluatePlaceOrder(
+            command = passingCommand,
+            context = context,
+        )
+        val failingVerdict = floor.evaluatePlaceOrder(
+            command = failingCommand,
+            context = context.copy(entryIntent = approvedIntentSnapshot(failingCommand)),
+        )
+        val rejected = assertIs<SafetyFloorVerdict.Rejected>(failingVerdict)
+
+        assertIs<SafetyFloorVerdict.Accepted>(passingVerdict)
+        assertEquals(SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO, rejected.violation.rule)
+        assertEquals("2.99999178", rejected.violation.measuredValue)
     }
 
     @Test
