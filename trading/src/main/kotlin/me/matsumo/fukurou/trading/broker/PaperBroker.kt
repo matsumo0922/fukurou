@@ -19,6 +19,7 @@ import me.matsumo.fukurou.trading.domain.ProtectionStatus
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.domain.defaultEntryLiquidity
 import me.matsumo.fukurou.trading.domain.requiredCashFor
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
@@ -1335,7 +1336,7 @@ private fun PlaceOrderCommand.estimatedRequiredCash(
             notional = notional,
             orderType = orderType,
             symbolRules = rules,
-            entryLiquidity = orderType.cashReservationLiquidity(),
+            entryLiquidity = orderType.defaultEntryLiquidity(),
         ).moneyScale()
     }
 
@@ -1357,7 +1358,7 @@ private fun PlaceOrderCommand.entryLiquidityForCashReservation(
     executionContext: PaperSimulationContext?,
 ): ExecutionLiquidity {
     if (orderType != OrderType.LIMIT) {
-        return orderType.cashReservationLiquidity()
+        return orderType.defaultEntryLiquidity()
     }
 
     val limitPrice = requireNotNull(priceJpy) {
@@ -1375,15 +1376,6 @@ private fun PlaceOrderCommand.entryLiquidityForCashReservation(
         ExecutionLiquidity.TAKER
     } else {
         ExecutionLiquidity.MAKER
-    }
-}
-
-private fun OrderType.cashReservationLiquidity(): ExecutionLiquidity {
-    return when (this) {
-        OrderType.LIMIT -> ExecutionLiquidity.MAKER
-        OrderType.MARKET,
-        OrderType.STOP,
-        -> ExecutionLiquidity.TAKER
     }
 }
 
@@ -1412,7 +1404,7 @@ internal fun Order.estimatedBuyReservationJpy(
         notional = notional,
         orderType = orderType,
         symbolRules = rules,
-        entryLiquidity = orderType.cashReservationLiquidity(),
+        entryLiquidity = orderType.defaultEntryLiquidity(),
     )
 
     return requiredCash.moneyScale()

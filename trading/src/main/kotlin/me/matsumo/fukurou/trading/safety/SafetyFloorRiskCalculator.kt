@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.domain.defaultEntryLiquidity
 import me.matsumo.fukurou.trading.domain.requiredCashFor
 import me.matsumo.fukurou.trading.domain.roundTripCostReserveFor
 import java.math.BigDecimal
@@ -383,7 +384,7 @@ internal class SafetyFloorRiskCalculator(
         entryPrice: BigDecimal,
         stopPrice: BigDecimal,
         entryOrderType: OrderType,
-        entryLiquidity: ExecutionLiquidity = defaultEntryLiquidityFor(entryOrderType),
+        entryLiquidity: ExecutionLiquidity = entryOrderType.defaultEntryLiquidity(),
         context: SafetyFloorContext,
     ): BigDecimal {
         val priceRisk = entryPrice.subtract(stopPrice).maxZero().multiply(sizeBtc)
@@ -463,7 +464,7 @@ internal class SafetyFloorRiskCalculator(
         entryPrice: BigDecimal,
         stopPrice: BigDecimal,
         entryOrderType: OrderType,
-        entryLiquidity: ExecutionLiquidity = defaultEntryLiquidityFor(entryOrderType),
+        entryLiquidity: ExecutionLiquidity = entryOrderType.defaultEntryLiquidity(),
         context: SafetyFloorContext,
     ): BigDecimal {
         val entryNotional = entryPrice.multiply(sizeBtc)
@@ -485,22 +486,13 @@ internal class SafetyFloorRiskCalculator(
 
     private fun entryLiquidityFor(command: PlaceOrderCommand, context: SafetyFloorContext): ExecutionLiquidity {
         if (command.orderType != OrderType.LIMIT) {
-            return defaultEntryLiquidityFor(command.orderType)
+            return command.orderType.defaultEntryLiquidity()
         }
 
         return if (limitEntryCrossesOppositeQuote(command, context)) {
             ExecutionLiquidity.TAKER
         } else {
             ExecutionLiquidity.MAKER
-        }
-    }
-
-    private fun defaultEntryLiquidityFor(orderType: OrderType): ExecutionLiquidity {
-        return when (orderType) {
-            OrderType.LIMIT -> ExecutionLiquidity.MAKER
-            OrderType.MARKET,
-            OrderType.STOP,
-            -> ExecutionLiquidity.TAKER
         }
     }
 
