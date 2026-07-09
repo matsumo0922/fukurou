@@ -22,9 +22,12 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp:buildFatJar
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp-gmo-coin:buildFatJar
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp:smokeStdio
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp:timeoutStdio
+JAVA_HOME=$(/usr/libexec/java_home -v 21) ./gradlew :mcp-gmo-coin:smokeStdio
 ```
 
 `:mcp:smokeStdio` と `:mcp:timeoutStdio` は、子プロセスに `-Dfukurou.mcp.testInMemoryRuntime=true` と `FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME=true` を渡して DB なしの no-trade smoke として実行する。両 task は MCP server process の raw stdout を SDK client へ渡す前に全行 JSON として parse し、stdio stdout が JSON-RPC 専用 channel であることを検証する。通常の MCP jar 起動ではこの二重 opt-in を付けず、DB env が欠けていれば fail closed する。
+
+`:mcp-gmo-coin:smokeStdio` は standalone GMO Coin MCP fat jar を stdio 子プロセスとして起動し、SDK client へ渡す前の raw stdout を全行 JSON として parse しながらネットワーク必須の Public `get_ticker` tool を呼び出す。stderr は診断出力として許容し、stdout は JSON-RPC 専用 channel として検証する。
 
 Docker image に MCP fat jar が入ることの確認:
 

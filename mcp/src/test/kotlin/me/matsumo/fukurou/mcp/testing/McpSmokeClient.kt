@@ -42,32 +42,13 @@ fun main(args: Array<String>) = runBlocking {
 
     try {
         client.connect(transport)
-        verifyTicker(client)
+        verifyBtcTickerTool(client)
         verifyDummyTradeReject(client)
         verifySimulatedTimeoutTool(client)
     } finally {
         client.close()
         process.destroy()
     }
-}
-
-private suspend fun verifyTicker(client: Client) {
-    val result = client.callTool(
-        name = "get_ticker",
-        arguments = mapOf("symbol" to "BTC"),
-    )
-    val text = result.content.joinToString(separator = "\n") { content ->
-        if (content is TextContent) content.text else content.toString()
-    }
-
-    check(result.isError != true) {
-        "get_ticker returned MCP error: $text"
-    }
-    check(text.contains("\"symbol\":\"BTC\"")) {
-        "get_ticker response did not include BTC ticker JSON: $text"
-    }
-
-    println("get_ticker ok: $text")
 }
 
 private suspend fun verifyDummyTradeReject(client: Client) {

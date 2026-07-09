@@ -19,6 +19,8 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.mcp.kotlin.server)
 
+    testImplementation(libs.mcp.kotlin.client)
+    testImplementation(testFixtures(project(":mcp-core")))
     testImplementation(kotlin("test"))
 }
 
@@ -44,4 +46,13 @@ val gmoCoinMcpFatJar = tasks.register<Jar>("buildFatJar") {
 
 tasks.named("build") {
     dependsOn(gmoCoinMcpFatJar)
+}
+
+tasks.register<JavaExec>("smokeStdio") {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Starts the standalone GMO Coin MCP fat jar over stdio and calls get_ticker."
+    dependsOn(gmoCoinMcpFatJar, tasks.named("testClasses"))
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("me.matsumo.fukurou.mcp.gmo.testing.GmoCoinMcpSmokeClientKt")
+    args(layout.buildDirectory.file("libs/gmo-coin-mcp-all.jar").get().asFile.absolutePath)
 }
