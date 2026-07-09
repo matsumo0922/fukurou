@@ -22,6 +22,8 @@ import java.io.FileOutputStream
  * MCP server を stdio transport で起動し、session close まで待機する。
  */
 fun Server.runStdioMcpServer(onClose: () -> Unit = {}) {
+    redirectProcessStdoutToStderrForMcpStdio()
+
     val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val transport = StdioServerTransport(
         input = System.`in`.asSource().buffered(),
