@@ -846,7 +846,7 @@ private class InMemoryPaperLedgerMutationWriter(
                 val fill = context.simulator.stopFill(
                     OrderSide.SELL,
                     position.sizeBtc.toBigDecimal(),
-                    requireNotNull(stopPrice),
+                    stopPrice,
                     context.simulationContext,
                 )
                 val result = closePositionLocked(

@@ -609,7 +609,7 @@ private fun JdbcTransaction.triggerPositionProtections(
         val takeProfitTriggered = takeProfitPrice != null && context.lastPrice >= takeProfitPrice
 
         if (stopTriggered) {
-            triggerStopProtection(position, requireNotNull(stopPrice), context, progress, clock)
+            triggerStopProtection(position, stopPrice, context, progress, clock)
 
             return@forEach
         }
