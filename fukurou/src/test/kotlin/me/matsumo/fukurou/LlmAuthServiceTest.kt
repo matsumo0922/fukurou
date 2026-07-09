@@ -291,12 +291,10 @@ class LlmAuthServiceTest {
     fun closeWaitsForProcessCompletionAudit() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
         val processStarter = RecordingLlmAuthProcessStarter()
-        val service = createService(
+        createService(
             processStarter = processStarter,
             commandEventLog = eventLog,
-        )
-
-        try {
+        ).use { service ->
             service.startLogin(LlmAuthProvider.CLAUDE, "operator re-auth").getOrThrow()
             service.close()
 
@@ -304,8 +302,20 @@ class LlmAuthServiceTest {
 
             assertFalse(processStarter.processes.single().isAlive())
             assertTrue(CommandEventType.CLI_AUTH_LOGIN_FAILED in eventTypes)
-        } finally {
+        }
+    }
+
+    @Test
+    fun startLoginRejectsAfterClose() = runBlocking {
+        val processStarter = RecordingLlmAuthProcessStarter()
+        createService(processStarter = processStarter).use { service ->
             service.close()
+
+            val result = service.startLogin(LlmAuthProvider.CLAUDE, "operator re-auth").getOrThrow()
+            val rejected = assertIs<LlmAuthLoginStartResult.Rejected>(result)
+
+            assertEquals("service is closing", rejected.reason)
+            assertTrue(processStarter.processes.isEmpty())
         }
     }
 

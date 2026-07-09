@@ -1,4 +1,5 @@
 plugins {
+    `java-library`
     id("matsumo.primitive.kotlin.jvm")
     id("matsumo.primitive.detekt")
 }
@@ -8,5 +9,7 @@ dependencies {
 
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
-    implementation(libs.mcp.kotlin.server)
+    api(libs.mcp.kotlin.server)
+
+    testImplementation(kotlin("test"))
 }

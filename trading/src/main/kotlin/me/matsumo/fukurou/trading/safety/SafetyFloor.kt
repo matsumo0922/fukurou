@@ -483,7 +483,7 @@ class SafetyFloor(
     /**
      * close_position は risk-reducing 操作なので HARD_HALT 中も許可する。
      */
-    @Suppress("unused")
+    @Suppress("UNUSED_PARAMETER")
     fun evaluateClosePosition(command: ClosePositionCommand, context: SafetyFloorContext): SafetyFloorVerdict {
         return SafetyFloorVerdict.Accepted
     }

@@ -3,6 +3,7 @@ package me.matsumo.fukurou
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.DisposableHandle
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -35,6 +36,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.DurationUnit
 import kotlin.time.toDuration
 
@@ -372,6 +374,8 @@ class DefaultLlmAuthService(
     private val sessions = ConcurrentHashMap<String, MutableLlmAuthLoginSession>()
     private val activeSessions = ConcurrentHashMap<LlmAuthProvider, String>()
     private val processJobs = ConcurrentHashMap<String, List<Job>>()
+    private val lifecycleLock = Any()
+    private val closing = AtomicBoolean(false)
 
     override suspend fun snapshot(): Result<LlmAuthSnapshot> {
         return runCatching {
@@ -469,9 +473,16 @@ class DefaultLlmAuthService(
     }
 
     override fun close() {
-        sessions.values.forEach { session -> session.destroyProcess() }
+        val jobs = synchronized(lifecycleLock) {
+            closing.set(true)
+            sessions.values.forEach { session ->
+                runCatching { session.destroyProcess() }
+            }
 
-        awaitJobs(processJobs.values.flatten())
+            processJobs.values.flatten()
+        }
+
+        awaitJobs(jobs)
         scope.cancel()
         scope.coroutineContext[Job]?.let { scopeJob -> awaitJobs(listOf(scopeJob)) }
     }
@@ -528,6 +539,10 @@ class DefaultLlmAuthService(
     }
 
     private suspend fun startLoginUnsafe(provider: LlmAuthProvider, reason: String): LlmAuthLoginStartResult {
+        if (closing.get()) {
+            return LlmAuthLoginStartResult.Rejected("service is closing")
+        }
+
         val sessionId = idGenerator().toString()
         val sessionReserved = reserveLoginSession(provider, sessionId)
 
@@ -565,7 +580,16 @@ class DefaultLlmAuthService(
                     detail = "login process started",
                 ),
             )
-            launchReaders(session, reason)
+            val readersLaunched = launchReaders(session, reason)
+
+            if (!readersLaunched) {
+                activeSessions.remove(provider, sessionId)
+                sessions.remove(sessionId, session)
+                session.destroyProcess()
+
+                return LlmAuthLoginStartResult.Rejected("service is closing")
+            }
+
             waitForStartupCapture(session)
 
             return LlmAuthLoginStartResult.Accepted(session.snapshot())
@@ -596,7 +620,7 @@ class DefaultLlmAuthService(
         return reserved
     }
 
-    private fun launchReaders(session: MutableLlmAuthLoginSession, reason: String) {
+    private fun launchReaders(session: MutableLlmAuthLoginSession, reason: String): Boolean {
         val jobs = listOf(
             scope.launch(start = CoroutineStart.LAZY) {
                 collectProcessOutput(session.process.inputStream, session)
@@ -608,15 +632,29 @@ class DefaultLlmAuthService(
                 waitForProcess(session, reason)
             },
         )
-        processJobs[session.sessionId] = jobs
-        jobs.forEach { job ->
-            job.invokeOnCompletion {
-                if (jobs.all { processJob -> processJob.isCompleted }) {
-                    processJobs.remove(session.sessionId, jobs)
-                }
+        val completionHandles = mutableListOf<DisposableHandle>()
+
+        synchronized(lifecycleLock) {
+            if (closing.get()) {
+                jobs.forEach { job -> job.cancel() }
+
+                return false
             }
+
+            processJobs[session.sessionId] = jobs
+            jobs.forEach { job ->
+                val completionHandle = job.invokeOnCompletion {
+                    if (jobs.all { processJob -> processJob.isCompleted }) {
+                        processJobs.remove(session.sessionId, jobs)
+                        completionHandles.forEach { handle -> handle.dispose() }
+                    }
+                }
+                completionHandles += completionHandle
+            }
+            jobs.forEach { job -> job.start() }
         }
-        jobs.forEach { job -> job.start() }
+
+        return true
     }
 
     private suspend fun collectProcessOutput(inputStream: InputStream, session: MutableLlmAuthLoginSession) {
@@ -665,12 +703,19 @@ class DefaultLlmAuthService(
         if (jobs.isEmpty()) return
 
         val completed = CountDownLatch(jobs.size)
-        jobs.forEach { job ->
+        val completionHandles = jobs.map { job ->
             job.invokeOnCompletion {
                 completed.countDown()
             }
         }
-        completed.await()
+
+        try {
+            completed.await(CLOSE_AWAIT_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            completionHandles.forEach { handle -> handle.dispose() }
+        }
     }
 
     private fun scheduleTerminalSessionCleanup(session: MutableLlmAuthLoginSession) {
@@ -1049,6 +1094,7 @@ private const val CLAUDE_HOME_DIRECTORY = ".claude"
 private const val CODEX_AUTH_FILE_NAME = "auth.json"
 private const val STARTUP_CAPTURE_POLL_MILLIS = 100L
 private const val DESTROY_GRACE_MILLIS = 500L
+private const val CLOSE_AWAIT_TIMEOUT_MILLIS = 5_000L
 private const val PATH_ENV = "PATH"
 private val DEFAULT_LLM_AUTH_LOGIN_TIMEOUT: Duration = Duration.ofMinutes(10)
 private val DEFAULT_LLM_AUTH_STARTUP_CAPTURE_TIMEOUT: Duration = Duration.ofSeconds(2)
