@@ -128,7 +128,8 @@ class FukurouMcpBridge {
   constructor(options, snapshot) {
     this.options = options;
     this.allowedToolNames = parseAllowedToolNames(process.env[ALLOWED_TOOLS_ENV]);
-    this.snapshot = filterSnapshotTools(snapshot, this.allowedToolNames);
+    this.rawSnapshot = snapshot;
+    this.clientSnapshot = filterSnapshotTools(snapshot, this.allowedToolNames);
     this.backend = null;
     this.ready = false;
     this.exiting = false;
@@ -200,7 +201,7 @@ class FukurouMcpBridge {
     if (!isObject(message)) return;
 
     if (message.method === INITIALIZE_METHOD && hasRequestId(message)) {
-      this.replyFromSnapshot(message.id, this.snapshot.initializeResult);
+      this.replyFromSnapshot(message.id, this.clientSnapshot.initializeResult);
       this.startHandshake(message.params ?? {});
       return;
     }
@@ -210,12 +211,7 @@ class FukurouMcpBridge {
     }
 
     if (message.method === TOOLS_LIST_METHOD && hasRequestId(message)) {
-      if (this.ready) {
-        this.forwardToolsListToBackend(message);
-        return;
-      }
-
-      this.replyFromSnapshot(message.id, this.snapshot.toolsListResult);
+      this.replyFromSnapshot(message.id, this.clientSnapshot.toolsListResult);
       return;
     }
 
@@ -286,33 +282,13 @@ class FukurouMcpBridge {
         return;
       }
 
-      warnIfToolSnapshotDiffers(
-        this.snapshot.toolsListResult,
-        filterToolsListResult(message.result, this.allowedToolNames),
-      );
+      warnIfToolSnapshotDiffers(this.rawSnapshot.toolsListResult, message.result);
     });
     this.forwardToBackend({
       jsonrpc: JSON_RPC_VERSION,
       id: requestId,
       method: TOOLS_LIST_METHOD,
       params: {},
-    });
-  }
-
-  forwardToolsListToBackend(clientMessage) {
-    const requestId = this.nextInternalId("client-tools-list");
-    this.internalHandlers.set(requestId, (message) => {
-      this.writeClientResponse({
-        ...message,
-        id: clientMessage.id,
-        result: message.result === undefined
-          ? undefined
-          : filterToolsListResult(message.result, this.allowedToolNames),
-      });
-    });
-    this.forwardToBackend({
-      ...clientMessage,
-      id: requestId,
     });
   }
 
@@ -661,21 +637,17 @@ function warnIfToolSnapshotDiffers(snapshotResult, backendResult) {
 function filterSnapshotTools(snapshot, allowedToolNames) {
   if (allowedToolNames === null) return snapshot;
 
+  const tools = filterTools(snapshot.toolsListResult.tools, allowedToolNames);
+  if (tools.length === 0) {
+    throw new Error("filtered MCP tools snapshot contained zero tools");
+  }
+
   return {
     ...snapshot,
     toolsListResult: {
       ...snapshot.toolsListResult,
-      tools: filterTools(snapshot.toolsListResult.tools, allowedToolNames),
+      tools,
     },
-  };
-}
-
-function filterToolsListResult(result, allowedToolNames) {
-  if (allowedToolNames === null || !isObject(result) || !Array.isArray(result.tools)) return result;
-
-  return {
-    ...result,
-    tools: filterTools(result.tools, allowedToolNames),
   };
 }
 

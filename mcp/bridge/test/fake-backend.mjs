@@ -5,7 +5,6 @@ import process from "node:process";
 const JSON_RPC_VERSION = "2.0";
 const eventsFile = process.env.FAKE_BACKEND_EVENTS_FILE;
 const tools = parseTools(process.env.FAKE_BACKEND_TOOLS);
-const allowedTools = parseAllowedTools(process.env.FUKUROU_MCP_ALLOWED_TOOLS);
 const initializeDelayMs = Number.parseInt(process.env.FAKE_BACKEND_INIT_DELAY_MS ?? "0", 10);
 const toolsListDelayMs = Number.parseInt(process.env.FAKE_BACKEND_TOOLS_LIST_DELAY_MS ?? "0", 10);
 
@@ -61,7 +60,7 @@ function handleLine(line) {
         jsonrpc: JSON_RPC_VERSION,
         id: message.id,
         result: {
-          tools: filteredTools().map((toolName) => ({
+          tools: tools.map((toolName) => ({
             name: toolName,
             description: `${toolName} description`,
             inputSchema: {
@@ -114,24 +113,6 @@ function parseTools(rawValue) {
     .split(",")
     .map((toolName) => toolName.trim())
     .filter((toolName) => toolName.length > 0);
-}
-
-function parseAllowedTools(rawValue) {
-  if (!rawValue) return null;
-
-  const toolNames = rawValue
-    .split(",")
-    .map((toolName) => toolName.trim())
-    .filter((toolName) => toolName.length > 0);
-  if (toolNames.length === 0) return null;
-
-  return new Set(toolNames);
-}
-
-function filteredTools() {
-  if (process.env.FAKE_BACKEND_IGNORE_ALLOWED_TOOLS === "true" || allowedTools === null) return tools;
-
-  return tools.filter((toolName) => allowedTools.has(toolName));
 }
 
 function recordMessage(message) {
