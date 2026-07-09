@@ -57,7 +57,7 @@
 
 [確定事項の改訂: 2026-07-09] paper trading 1週目の週次反省会を受け、runtime catalog default と system prompt を調整する。`safety.minExpectedMoveToCostRatio` の既定値は 2.5、`runner.maxInvocationsPerHour` の既定値は 6、`runner.maxInvocationsPerDay` は 96、flat heartbeat は 15分とする。hourly cap には event trigger 用の余地が生まれるが、flat heartbeat 単独で daily cap 96 を消費できるため、同日内の event trigger は後続 heartbeat と日次予算を共有する。production の active runtime config に明示値が保存済みの場合、catalog default 変更では上書きされないため、`/ops/runtime-config` の draft / activate で active 値を更新する。
 
-system prompt v1.10 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
+system prompt v1.11 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。EV gate は LIMIT entry を maker fee(rebate) と保護 exit 側 taker fee / slippage reserve で評価し、MARKET / STOP entry を taker fee と entry / exit 両側の market slippage reserve で評価する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
 
 ### 1.3 本設計の方針
 

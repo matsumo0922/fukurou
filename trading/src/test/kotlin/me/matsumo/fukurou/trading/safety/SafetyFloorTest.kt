@@ -365,13 +365,13 @@ class SafetyFloorTest {
         val passingCommand = entryCommand(
             orderType = OrderType.LIMIT,
             priceJpy = BigDecimal("10000000"),
-            protectiveStopPriceJpy = BigDecimal("9850000"),
-            takeProfitPriceJpy = BigDecimal("10026550"),
+            protectiveStopPriceJpy = BigDecimal("9870000"),
+            takeProfitPriceJpy = BigDecimal("10022175"),
             estimatedWinProbability = BigDecimal.ONE,
         )
         val failingCommand = passingCommand.copy(
             commandId = UUID.randomUUID(),
-            takeProfitPriceJpy = BigDecimal("10026549"),
+            takeProfitPriceJpy = BigDecimal("10022174"),
         )
         val floor = SafetyFloor(clock = fixedClock())
         val context = safetyContext(
@@ -393,7 +393,7 @@ class SafetyFloorTest {
 
         assertIs<SafetyFloorVerdict.Accepted>(passingVerdict)
         assertEquals(SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO, rejected.violation.rule)
-        assertEquals("2.99988701", rejected.violation.measuredValue)
+        assertEquals("2.49988726", rejected.violation.measuredValue)
     }
 
     @Test
@@ -401,12 +401,12 @@ class SafetyFloorTest {
         val passingCommand = entryCommand(
             orderType = OrderType.MARKET,
             protectiveStopPriceJpy = BigDecimal("9950000"),
-            takeProfitPriceJpy = BigDecimal("10175251"),
+            takeProfitPriceJpy = BigDecimal("10165218"),
             estimatedWinProbability = BigDecimal.ONE,
         )
         val failingCommand = passingCommand.copy(
             commandId = UUID.randomUUID(),
-            takeProfitPriceJpy = BigDecimal("10175250"),
+            takeProfitPriceJpy = BigDecimal("10165217"),
         )
         val floor = SafetyFloor(clock = fixedClock())
         val context = safetyContext(
@@ -428,7 +428,7 @@ class SafetyFloorTest {
 
         assertIs<SafetyFloorVerdict.Accepted>(passingVerdict)
         assertEquals(SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO, rejected.violation.rule)
-        assertEquals("2.99999178", rejected.violation.measuredValue)
+        assertEquals("2.49996823", rejected.violation.measuredValue)
     }
 
     @Test
