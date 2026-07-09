@@ -140,9 +140,9 @@ class DefaultLlmCommandRendererTest {
             "mcp__custom-mcp__get_ticker,mcp__custom-mcp__submit_decision",
             command.args[allowedToolsIndex + 1],
         )
+        assertEquals(1, command.args.count { argument -> argument == "--tools" })
         assertNotEquals(-1, toolsIndex)
         assertEquals("ToolSearch", command.args[toolsIndex + 1])
-        assertNotEquals("", command.args[toolsIndex + 1])
         assertFalse(command.args.contains("--bare"))
 
         command.deleteCleanupPaths()
@@ -167,6 +167,7 @@ class DefaultLlmCommandRendererTest {
         assertTrue(command.args.contains("--strict-mcp-config"))
         assertEquals("""{"mcpServers":{}}""", Files.readString(mcpConfigPath))
         assertEquals("", command.args[allowedToolsIndex + 1])
+        assertEquals(1, command.args.count { argument -> argument == "--tools" })
         assertNotEquals(-1, toolsIndex)
         assertEquals("", command.args[toolsIndex + 1])
         assertTrue(command.cleanupPaths.contains(mcpConfigPath))
