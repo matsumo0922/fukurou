@@ -407,8 +407,8 @@ class ReflectionPromptCandidateGenerator(
         val actionCounts = weekly.actionCounts.joinToString(", ") { actionCount ->
             "${actionCount.action}=${actionCount.count}"
         }
-        val setupTags = weekly.closedTrades
-            .flatMap { fact -> fact.setupTags }
+        val setupTags = weekly.closedTrades.asSequence()
+            .flatMap { fact -> fact.setupTags.asSequence() }
             .map { tag -> tag.trim() }
             .filter { tag -> tag.isNotBlank() }
             .distinct()

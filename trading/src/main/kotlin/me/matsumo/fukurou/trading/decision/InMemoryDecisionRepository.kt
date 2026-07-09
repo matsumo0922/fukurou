@@ -148,11 +148,13 @@ class InMemoryDecisionRepository(
 
             mutex.withLock {
                 decisions
+                    .asSequence()
                     .filter { decision -> decision.createdAt in from..<toExclusive }
                     .sortedByDescending { decision -> decision.createdAt }
                     .take(limit)
                     .sortedBy { decision -> decision.createdAt }
                     .map { decision -> decision.toJournalRecordLocked() }
+                    .toList()
             }
         }
     }

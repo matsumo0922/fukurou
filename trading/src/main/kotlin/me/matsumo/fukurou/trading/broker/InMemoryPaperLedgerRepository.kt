@@ -392,6 +392,7 @@ private class InMemoryPaperLedgerHistoryReader(
 
             state.read {
                 positions
+                    .asSequence()
                     .filter { position -> position.status == PositionStatus.CLOSED }
                     .mapNotNull { position -> position.toClosedPositionWithParsedInstantOrNull() }
                     .filter { closedPosition ->
@@ -413,6 +414,7 @@ private class InMemoryPaperLedgerHistoryReader(
                                 .sortedBy { execution -> Instant.parse(execution.executedAt) },
                         )
                     }
+                    .toList()
             }
         }
     }
