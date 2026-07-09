@@ -887,7 +887,7 @@ class OneShotLlmRunnerTest {
             logger = { message -> humanLogs += message },
         ) {
             nonZeroExit(
-                stdout = """{"type":"result","is_error":true,"result":"401"}""",
+                stdout = "API Error: 401 Invalid authentication credentials",
             )
         }
 
@@ -896,7 +896,7 @@ class OneShotLlmRunnerTest {
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertEquals("true", proposerDetails.stringValue("authFailureSuspected"))
-        assertEquals("true", proposerDetails.stringValue("cliErrorReported"))
+        assertFalse(proposerDetails.containsKey("cliErrorReported"))
         assertEquals("1", proposerDetails.stringValue("exitCode"))
         assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
         assertTrue(humanLogs.any { message -> message.isAuthFailureRunbookLog() })
