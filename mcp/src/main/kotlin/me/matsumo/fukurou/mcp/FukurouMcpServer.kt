@@ -2,7 +2,6 @@ package me.matsumo.fukurou.mcp
 
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
-import io.modelcontextprotocol.kotlin.sdk.server.StdioServerTransport
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
@@ -10,16 +9,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.types.ToolAnnotations
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.runBlocking
-import kotlinx.io.asSink
-import kotlinx.io.asSource
-import kotlinx.io.buffered
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
@@ -106,6 +96,7 @@ import me.matsumo.fukurou.trading.risk.AccountStatusService
 import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.NoTradeExitException
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
@@ -425,29 +416,8 @@ class FukurouMcpServer(
      * 標準入出力に MCP server を接続し、client から閉じられるまで待機する。
      */
     fun run() {
-        val server = createServer()
-        val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val transport = StdioServerTransport(
-            input = System.`in`.asSource().buffered(),
-            output = System.out.asSink().buffered(),
-        ) {
-            scope = transportScope
-            handlerDispatcher = Dispatchers.Default
-            ioDispatcher = Dispatchers.IO
-        }
-
-        runBlocking {
-            try {
-                val session = server.createSession(transport)
-                val done = Job()
-                session.onClose {
-                    done.complete()
-                }
-                done.join()
-            } finally {
-                transportScope.cancel()
-                tradingRuntime.close()
-            }
+        createServer().runStdioMcpServer {
+            tradingRuntime.close()
         }
     }
 
@@ -2279,6 +2249,19 @@ private fun KnowledgeDecisionOutcome.toJsonObject(): JsonObject {
     }
 }
 
+private fun JsonObjectBuilder.putSafetyViolation(violation: SafetyViolation?) {
+    violation ?: return
+
+    putJsonObject("safety_violation") {
+        put("id", violation.id.toString())
+        put("rule", violation.rule.name)
+        put("message", violation.messageJa)
+        put("measured_value", violation.measuredValue)
+        put("limit_value", violation.limitValue)
+        put("hard_halt_required", violation.hardHaltRequired)
+    }
+}
+
 private fun tradeResult(result: PaperTradeResult): CallToolResult {
     return jsonObjectResult(
         buildJsonObject {
@@ -2294,16 +2277,7 @@ private fun tradeResult(result: PaperTradeResult): CallToolResult {
                     JsonArray(result.divergenceMemos.map { memo -> memo.toJsonObject() }),
                 )
             }
-            result.safetyViolation?.let { violation ->
-                putJsonObject("safety_violation") {
-                    put("id", violation.id.toString())
-                    put("rule", violation.rule.name)
-                    put("message", violation.messageJa)
-                    put("measured_value", violation.measuredValue)
-                    put("limit_value", violation.limitValue)
-                    put("hard_halt_required", violation.hardHaltRequired)
-                }
-            }
+            putSafetyViolation(result.safetyViolation)
         },
     )
 }
@@ -2343,16 +2317,7 @@ private fun previewOrderResult(result: PreviewOrderResult): CallToolResult {
                 put("probability_used_for_expected_value", result.riskDetails.probabilityUsedForExpectedValue)
                 put("probability_cap_applied", result.riskDetails.probabilityCapApplied)
             }
-            result.safetyViolation?.let { violation ->
-                putJsonObject("safety_violation") {
-                    put("id", violation.id.toString())
-                    put("rule", violation.rule.name)
-                    put("message", violation.messageJa)
-                    put("measured_value", violation.measuredValue)
-                    put("limit_value", violation.limitValue)
-                    put("hard_halt_required", violation.hardHaltRequired)
-                }
-            }
+            putSafetyViolation(result.safetyViolation)
         },
     )
 }
@@ -2426,7 +2391,7 @@ private fun throwableResult(throwable: Throwable): CallToolResult {
 
     val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
 
-    return errorResult(type, throwable.message.orEmpty(), executed, failureKind)
+    return mcpErrorResult(type, throwable.message.orEmpty(), executed, failureKind)
 }
 
 private fun toolErrorType(throwable: Throwable): String {
@@ -2434,29 +2399,4 @@ private fun toolErrorType(throwable: Throwable): String {
         .firstOrNull { (errorClass, _) -> errorClass.isInstance(throwable) }
         ?.second
         ?: "tool_call_failed"
-}
-
-private fun errorResult(
-    type: String,
-    message: String,
-    executed: Boolean? = null,
-    failureKind: String? = null,
-): CallToolResult {
-    val resolvedMessage = message.ifBlank { "unknown error" }
-
-    return CallToolResult(
-        content = listOf(TextContent(resolvedMessage)),
-        structuredContent = buildJsonObject {
-            put("error", true)
-            put("type", type)
-            put("message", resolvedMessage)
-            if (executed != null) {
-                put("executed", executed)
-            }
-            if (failureKind != null) {
-                put("failure_kind", failureKind)
-            }
-        },
-        isError = true,
-    )
 }

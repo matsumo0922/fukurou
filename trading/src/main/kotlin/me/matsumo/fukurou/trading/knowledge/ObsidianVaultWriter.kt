@@ -16,11 +16,8 @@ import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.nio.charset.StandardCharsets
-import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.StandardCopyOption
-import java.nio.file.StandardOpenOption
 import java.time.Clock
 import java.time.Instant
 import java.time.LocalDate
@@ -157,52 +154,11 @@ class ObsidianVaultWriter(
 
     private fun writeIfChanged(relativePath: String, rawContent: String): VaultWriteState {
         val targetPath = vaultPath.resolve(relativePath)
-        val content = redactor.redact(rawContent)
 
-        Files.createDirectories(requireNotNull(targetPath.parent))
-
-        if (Files.exists(targetPath) && Files.readString(targetPath, StandardCharsets.UTF_8) == content) {
-            return VaultWriteState.UNCHANGED
-        }
-
-        atomicReplace(targetPath, content)
-
-        return VaultWriteState.WRITTEN
-    }
-
-    private fun atomicReplace(targetPath: Path, content: String) {
-        val parentPath = requireNotNull(targetPath.parent)
-        val tempPath = Files.createTempFile(parentPath, "${targetPath.fileName}.", ".tmp")
-
-        try {
-            Files.writeString(
-                tempPath,
-                content,
-                StandardCharsets.UTF_8,
-                StandardOpenOption.TRUNCATE_EXISTING,
-            )
-            moveReplacing(tempPath, targetPath)
-        } catch (throwable: Throwable) {
-            Files.deleteIfExists(tempPath)
-
-            throw throwable
-        }
-    }
-
-    private fun moveReplacing(tempPath: Path, targetPath: Path) {
-        try {
-            Files.move(
-                tempPath,
-                targetPath,
-                StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING,
-            )
-        } catch (_: AtomicMoveNotSupportedException) {
-            Files.move(
-                tempPath,
-                targetPath,
-                StandardCopyOption.REPLACE_EXISTING,
-            )
+        return if (writeRedactedVaultFileIfChanged(targetPath, rawContent, redactor)) {
+            VaultWriteState.WRITTEN
+        } else {
+            VaultWriteState.UNCHANGED
         }
     }
 
@@ -593,18 +549,6 @@ private class ObsidianWriteCounter {
     }
 }
 
-private fun StringBuilder.appendYamlList(key: String, values: List<String>) {
-    if (values.isEmpty()) {
-        appendLine("$key: []")
-        return
-    }
-
-    appendLine("$key:")
-    values.forEach { value ->
-        appendLine("  - ${value.yamlQuoted()}")
-    }
-}
-
 private fun StringBuilder.appendBodyLine(value: String) {
     if (value.isBlank()) {
         return
@@ -627,35 +571,6 @@ private fun String.shortId(): String {
 
 private fun Int.twoDigits(): String {
     return toString().padStart(length = 2, padChar = '0')
-}
-
-private fun String.yamlQuoted(): String {
-    val escaped = buildString {
-        this@yamlQuoted.forEach { character ->
-            when (character) {
-                '\\' -> append("\\\\")
-                '"' -> append("\\\"")
-                '\n' -> append("\\n")
-                '\r' -> append("\\r")
-                '\t' -> append("\\t")
-                else -> appendYamlCharacter(character)
-            }
-        }
-    }
-
-    return "\"$escaped\""
-}
-
-private fun StringBuilder.appendYamlCharacter(character: Char) {
-    if (character.code < YAML_CONTROL_CHARACTER_BOUNDARY) {
-        append(' ')
-    } else {
-        append(character)
-    }
-}
-
-private fun String?.yamlNullable(): String {
-    return this?.yamlQuoted() ?: "null"
 }
 
 private fun String.toJstText(): String {
@@ -738,11 +653,6 @@ private const val FRONTMATTER_START = "---\n"
  * frontmatter 終了 marker。
  */
 private const val FRONTMATTER_END = "\n---\n"
-
-/**
- * YAML double-quoted scalar にそのまま入れない制御文字の境界。
- */
-private const val YAML_CONTROL_CHARACTER_BOUNDARY = 0x20
 
 /**
  * Obsidian skeleton として必ず作る directory。

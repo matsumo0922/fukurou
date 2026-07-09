@@ -348,41 +348,33 @@ private class PaperBrokerTradeDelegate(
                 return@runCatching existingResult
             }
 
-            val ticker = runtime.tickerFor(command.symbol).getOrThrow()
-            val symbolRules = runtime.symbolRulesFor(command.symbol).getOrThrow()
-            val context = marketContextFactory.safetyContext(
-                ticker = ticker,
-                symbolRules = symbolRules,
-                includeAtr = true,
-                intentId = command.intentId,
-            )
-            val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
-            val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
-            val safetyContext = marketContextFactory.safetyContext(
-                ticker = ticker,
-                symbolRules = symbolRules,
-                intentId = command.intentId,
-                tradeGroupId = resolvedTradeGroupId,
-            )
+            val preparedOrder = preparePlaceOrder(command)
 
             safetyGate.enforceSafetyFloor(
-                verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(resolvedCommand, safetyContext),
-                command = resolvedCommand,
-                ticker = ticker,
-                symbolRules = symbolRules,
+                verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(
+                    preparedOrder.command,
+                    preparedOrder.safetyContext,
+                ),
+                command = preparedOrder.command,
+                ticker = preparedOrder.ticker,
+                symbolRules = preparedOrder.symbolRules,
             )?.let { rejectedResult -> return@runCatching rejectedResult }
 
-            validateSymbolRules(resolvedCommand, symbolRules)
-            validateEntryPriceContract(resolvedCommand, ticker)
-            val immediateUpdate = immediateEntryUpdateOrNull(resolvedCommand, ticker, symbolRules)
+            validateSymbolRules(preparedOrder.command, preparedOrder.symbolRules)
+            validateEntryPriceContract(preparedOrder.command, preparedOrder.ticker)
+            val immediateUpdate = immediateEntryUpdateOrNull(
+                preparedOrder.command,
+                preparedOrder.ticker,
+                preparedOrder.symbolRules,
+            )
 
             if (immediateUpdate != null) {
                 return@runCatching intentConsumer.fillMarketEntryAndConsumeIntent(
                     MarketEntryFillRequest(
-                        command = resolvedCommand,
+                        command = preparedOrder.command,
                         fill = immediateUpdate.fill,
                         positionId = UUID.randomUUID(),
-                        tradeGroupId = resolvedTradeGroupId,
+                        tradeGroupId = preparedOrder.tradeGroupId,
                         stopOrderId = UUID.randomUUID(),
                         divergenceMemo = immediateUpdate.divergenceMemo,
                     ),
@@ -390,16 +382,16 @@ private class PaperBrokerTradeDelegate(
             }
 
             runtime.validateCashAvailability(
-                command = resolvedCommand,
-                ticker = ticker,
-                rules = symbolRules,
+                command = preparedOrder.command,
+                ticker = preparedOrder.ticker,
+                rules = preparedOrder.symbolRules,
             )
 
             intentConsumer.createRestingEntryOrderAndConsumeIntent(
                 RestingEntryOrderRequest(
-                    command = resolvedCommand,
+                    command = preparedOrder.command,
                     orderId = UUID.randomUUID(),
-                    tradeGroupId = resolvedTradeGroupId,
+                    tradeGroupId = preparedOrder.tradeGroupId,
                 ),
             )
         }
@@ -497,26 +489,17 @@ private class PaperBrokerTradeDelegate(
         return runCatching {
             validatePlaceOrderCommand(command)
 
-            val ticker = runtime.tickerFor(command.symbol).getOrThrow()
-            val symbolRules = runtime.symbolRulesFor(command.symbol).getOrThrow()
-            val context = marketContextFactory.safetyContext(
-                ticker = ticker,
-                symbolRules = symbolRules,
-                includeAtr = true,
-                intentId = command.intentId,
+            val preparedOrder = preparePlaceOrder(command)
+            val riskDetails = runtime.safety.safetyFloor.placeOrderRiskDetails(
+                preparedOrder.command,
+                preparedOrder.safetyContext,
             )
-            val resolvedTradeGroupId = resolveTradeGroupId(command, context.positions)
-            val resolvedCommand = command.copy(tradeGroupId = resolvedTradeGroupId)
-            val safetyContext = marketContextFactory.safetyContext(
-                ticker = ticker,
-                symbolRules = symbolRules,
-                intentId = command.intentId,
-                tradeGroupId = resolvedTradeGroupId,
-            )
-            val riskDetails = runtime.safety.safetyFloor.placeOrderRiskDetails(resolvedCommand, safetyContext)
             val normalizedOrderContent = command.toPreviewOrderNormalizedContent()
             val previewHash = normalizedOrderContent.calculatePreviewHash()
-            val verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(resolvedCommand, safetyContext)
+            val verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(
+                preparedOrder.command,
+                preparedOrder.safetyContext,
+            )
 
             if (verdict is SafetyFloorVerdict.Rejected) {
                 return@runCatching PreviewOrderResult(
@@ -529,12 +512,12 @@ private class PaperBrokerTradeDelegate(
                 )
             }
 
-            validateSymbolRules(resolvedCommand, symbolRules)
-            validateEntryPriceContract(resolvedCommand, ticker)
+            validateSymbolRules(preparedOrder.command, preparedOrder.symbolRules)
+            validateEntryPriceContract(preparedOrder.command, preparedOrder.ticker)
             runtime.validateCashAvailability(
-                command = resolvedCommand,
-                ticker = ticker,
-                rules = symbolRules,
+                command = preparedOrder.command,
+                ticker = preparedOrder.ticker,
+                rules = preparedOrder.symbolRules,
             )
 
             PreviewOrderResult(
@@ -545,6 +528,33 @@ private class PaperBrokerTradeDelegate(
                 messageJa = "paper entry 注文 preview は SafetyFloor と broker 事前検証を通過しました。",
             )
         }
+    }
+
+    private suspend fun preparePlaceOrder(command: PlaceOrderCommand): PreparedPlaceOrder {
+        val ticker = runtime.tickerFor(command.symbol).getOrThrow()
+        val symbolRules = runtime.symbolRulesFor(command.symbol).getOrThrow()
+        val context = marketContextFactory.safetyContext(
+            ticker = ticker,
+            symbolRules = symbolRules,
+            includeAtr = true,
+            intentId = command.intentId,
+        )
+        val tradeGroupId = resolveTradeGroupId(command, context.positions)
+        val resolvedCommand = command.copy(tradeGroupId = tradeGroupId)
+        val safetyContext = marketContextFactory.safetyContext(
+            ticker = ticker,
+            symbolRules = symbolRules,
+            intentId = command.intentId,
+            tradeGroupId = tradeGroupId,
+        )
+
+        return PreparedPlaceOrder(
+            command = resolvedCommand,
+            ticker = ticker,
+            symbolRules = symbolRules,
+            safetyContext = safetyContext,
+            tradeGroupId = tradeGroupId,
+        )
     }
 
     override suspend fun closePosition(command: ClosePositionCommand): Result<PaperTradeResult> {
@@ -686,6 +696,14 @@ private class PaperBrokerReconcileDelegate(
         }
     }
 }
+
+private data class PreparedPlaceOrder(
+    val command: PlaceOrderCommand,
+    val ticker: Ticker,
+    val symbolRules: SymbolRules,
+    val safetyContext: SafetyFloorContext,
+    val tradeGroupId: UUID,
+)
 
 /**
  * SafetyFloor 評価に渡す market context を組み立てる helper。
