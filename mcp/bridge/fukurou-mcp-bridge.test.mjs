@@ -65,6 +65,48 @@ test("initialize and tools/list return snapshot results with client ids before b
   }
 });
 
+test("tools/list snapshot response is filtered by FUKUROU_MCP_ALLOWED_TOOLS", async () => {
+  const context = await createBridgeContext({
+    snapshotTools: ["read_tool", "trade_tool", "submit_decision"],
+    backendEnv: {
+      FAKE_BACKEND_INIT_DELAY_MS: "100",
+      FAKE_BACKEND_TOOLS: "read_tool,trade_tool,submit_decision",
+    },
+  });
+
+  try {
+    const bridge = context.spawnBridge({
+      env: {
+        FUKUROU_MCP_ALLOWED_TOOLS: "read_tool,submit_decision",
+      },
+    });
+    bridge.send(initializeRequest("init"));
+    bridge.send({
+      jsonrpc: "2.0",
+      id: "list-filtered",
+      method: "tools/list",
+      params: {},
+    });
+
+    await bridge.readJson();
+    const toolsListResponse = await bridge.readJson();
+
+    assert.deepEqual(
+      toolsListResponse.result.tools.map((tool) => tool.name),
+      ["read_tool", "submit_decision"],
+    );
+    await waitForBackendReady(context);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    assert.doesNotMatch(bridge.stderrText(), /tools\/list snapshot mismatch/);
+
+    await bridge.close();
+  } finally {
+    await context.cleanup();
+  }
+});
+
 test("tools/call requests wait for backend readiness and flush in order", async () => {
   const context = await createBridgeContext({
     backendEnv: {
@@ -232,6 +274,28 @@ test("backend stdout non-json lines go to bridge stderr without polluting client
   }
 });
 
+test("backend stderr is forwarded without redacting the diagnostic line", async () => {
+  const context = await createBridgeContext({
+    backendEnv: {
+      FAKE_BACKEND_STDERR_LINE: "backend startup diagnostic",
+      FAKE_BACKEND_TOOLS: "snapshot_tool",
+    },
+  });
+
+  try {
+    const bridge = context.spawnBridge();
+    bridge.send(initializeRequest("init"));
+
+    await bridge.readJson();
+    await waitForCondition(() => bridge.stderrText().includes("backend startup diagnostic"));
+    assert.doesNotMatch(bridge.stderrText(), /backend stderr line received/);
+
+    await bridge.close();
+  } finally {
+    await context.cleanup();
+  }
+});
+
 test("tools/list comparison warns with tool names only when snapshot drifts", async () => {
   const context = await createBridgeContext({
     snapshotTools: ["snapshot_only"],
@@ -321,6 +385,23 @@ test("stdin EOF closes backend and exits with backend status", async () => {
   try {
     const bridge = context.spawnBridge();
     const exitStatus = await bridge.close();
+
+    assert.equal(exitStatus.code, 0);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("SIGTERM closes backend and exits without waiting for stdin EOF", async () => {
+  const context = await createBridgeContext();
+
+  try {
+    const bridge = context.spawnBridge();
+    bridge.send(initializeRequest("init"));
+    await bridge.readJson();
+
+    bridge.child.kill("SIGTERM");
+    const exitStatus = await bridge.waitForExit();
 
     assert.equal(exitStatus.code, 0);
   } finally {

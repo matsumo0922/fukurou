@@ -11,6 +11,7 @@ const INITIALIZE_METHOD = "initialize";
 const INITIALIZED_NOTIFICATION_METHOD = "notifications/initialized";
 const TOOLS_LIST_METHOD = "tools/list";
 const PING_METHOD = "ping";
+const ALLOWED_TOOLS_ENV = "FUKUROU_MCP_ALLOWED_TOOLS";
 const TEST_RUNTIME_ENV = "FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME";
 const TEST_RUNTIME_PROPERTY = "-Dfukurou.mcp.testInMemoryRuntime=true";
 
@@ -126,7 +127,7 @@ function loadSnapshot(snapshotPath) {
 class FukurouMcpBridge {
   constructor(options, snapshot) {
     this.options = options;
-    this.snapshot = snapshot;
+    this.snapshot = filterSnapshotTools(snapshot, process.env[ALLOWED_TOOLS_ENV]);
     this.backend = null;
     this.ready = false;
     this.exiting = false;
@@ -149,7 +150,7 @@ class FukurouMcpBridge {
 
   startBackend() {
     this.backend = spawn("java", ["-jar", this.options.jarPath], {
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "inherit"],
     });
 
     this.backend.on("error", (error) => {
@@ -161,15 +162,6 @@ class FukurouMcpBridge {
     attachLineReader(
       this.backend.stdout,
       (line) => this.handleBackendStdoutLine(line),
-      () => {},
-    );
-    attachLineReader(
-      this.backend.stderr,
-      (line) => {
-        if (line.trim().length > 0) {
-          writeBridgeError("backend stderr line received");
-        }
-      },
       () => {},
     );
   }
@@ -379,7 +371,7 @@ class FukurouMcpBridge {
     if (this.exiting) return;
 
     this.exiting = true;
-    process.exitCode = signal ? 1 : (code ?? 1);
+    process.exit(signal ? 1 : (code ?? 1));
   }
 
   fail(message) {
@@ -429,7 +421,7 @@ async function generateSnapshot(options) {
     "java",
     [TEST_RUNTIME_PROPERTY, "-jar", options.jarPath],
     {
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "inherit"],
       env: {
         ...process.env,
         [TEST_RUNTIME_ENV]: "true",
@@ -497,15 +489,6 @@ class SnapshotBackendRpc {
     attachLineReader(
       backend.stdout,
       (line) => this.handleStdoutLine(line),
-      () => {},
-    );
-    attachLineReader(
-      backend.stderr,
-      (line) => {
-        if (line.trim().length > 0) {
-          writeBridgeError("backend stderr line received during snapshot generation");
-        }
-      },
       () => {},
     );
   }
@@ -652,6 +635,32 @@ function warnIfToolSnapshotDiffers(snapshotResult, backendResult) {
   const missing = missingFromBackend.length > 0 ? missingFromBackend.join(",") : "none";
   const extra = extraFromBackend.length > 0 ? extraFromBackend.join(",") : "none";
   writeBridgeError(`tools/list snapshot mismatch missing_from_backend=${missing} extra_from_backend=${extra}`);
+}
+
+function filterSnapshotTools(snapshot, rawAllowedTools) {
+  const allowedToolNames = parseAllowedToolNames(rawAllowedTools);
+  if (allowedToolNames === null) return snapshot;
+
+  return {
+    ...snapshot,
+    toolsListResult: {
+      ...snapshot.toolsListResult,
+      tools: snapshot.toolsListResult.tools.filter((tool) =>
+        isObject(tool) && allowedToolNames.has(tool.name)),
+    },
+  };
+}
+
+function parseAllowedToolNames(rawAllowedTools) {
+  if (typeof rawAllowedTools !== "string") return null;
+
+  const toolNames = rawAllowedTools
+    .split(",")
+    .map((toolName) => toolName.trim())
+    .filter((toolName) => toolName.length > 0);
+  if (toolNames.length === 0) return null;
+
+  return new Set(toolNames);
 }
 
 function toolNamesFromResult(result) {
