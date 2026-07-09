@@ -80,7 +80,7 @@ class ShellProcessRunnerTest {
 
         val tempDirectory = Files.createTempDirectory("fukurou-process-runner-test")
         val childPidFile = tempDirectory.resolve("child.pid")
-        val script = "(/bin/sleep 30) & child_pid=$!; echo \$child_pid > ${childPidFile.shellQuoted()}; wait \$child_pid"
+        val script = $$"(/bin/sleep 30) & child_pid=$!; echo $child_pid > $${childPidFile.shellQuoted()}; wait $child_pid"
         val command = RenderedLlmCommand(
             executable = shellPath.toString(),
             args = listOf("-c", script),
@@ -135,7 +135,7 @@ class ShellProcessRunnerTest {
         val tempDirectory = Files.createTempDirectory("fukurou-process-runner-cancel-test")
         val childPidFile = tempDirectory.resolve("child.pid")
         val cleanupFile = Files.createTempFile(tempDirectory, "secret-config", ".json")
-        val script = "(/bin/sleep 30) & child_pid=$!; echo \$child_pid > ${childPidFile.shellQuoted()}; wait \$child_pid"
+        val script = $$"(/bin/sleep 30) & child_pid=$!; echo $child_pid > $${childPidFile.shellQuoted()}; wait $child_pid"
         val command = RenderedLlmCommand(
             executable = shellPath.toString(),
             args = listOf("-c", script),

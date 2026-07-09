@@ -1220,7 +1220,7 @@ const val DEFAULT_RUNNER_MCP_SERVER_COMMAND = "java"
 /**
  * MCP jar path placeholder。
  */
-const val MCP_JAR_PATH_PLACEHOLDER = "\${mcpJarPath}"
+const val MCP_JAR_PATH_PLACEHOLDER = $$"${mcpJarPath}"
 
 /**
  * prompt 読み込み前の caller failure audit に使う placeholder。
