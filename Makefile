@@ -1,6 +1,6 @@
 #!/usr/bin/make -f
 
-.PHONY: detekt run build test dev-db dev-api dev-web
+.PHONY: detekt run build test bridge-test dev-db dev-api dev-web
 
 # 静的解析（テンプレ準拠: auto-correct + continue）
 detekt:
@@ -15,8 +15,12 @@ build:
 	./gradlew build
 
 # テスト
-test:
+test: bridge-test
 	./gradlew test
+
+# MCP handshake bridge テスト
+bridge-test:
+	node --test mcp/bridge/fukurou-mcp-bridge.test.mjs
 
 # ローカル開発用 PostgreSQL 起動
 dev-db:
