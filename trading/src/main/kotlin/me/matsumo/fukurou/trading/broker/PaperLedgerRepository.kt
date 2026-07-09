@@ -262,6 +262,7 @@ interface IntentConsumingPaperLedgerRepository : PaperLedgerRepository {
  * @param positionId 作成する position ID
  * @param tradeGroupId entry / stop / position を束ねる trade group ID
  * @param stopOrderId 作成する protective STOP order ID
+ * @param divergenceMemo paper/live 乖離を audit に渡す structured memo
  */
 data class MarketEntryFillRequest(
     val command: PlaceOrderCommand,
@@ -269,6 +270,7 @@ data class MarketEntryFillRequest(
     val positionId: UUID,
     val tradeGroupId: UUID,
     val stopOrderId: UUID,
+    val divergenceMemo: PaperExecutionDivergenceMemo? = null,
 )
 
 /**

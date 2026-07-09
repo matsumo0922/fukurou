@@ -1,5 +1,8 @@
 package me.matsumo.fukurou.trading.broker
 
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -194,6 +197,29 @@ data class PaperExecutionDivergenceMemo(
 )
 
 /**
+ * paper execution 乖離 memo を audit payload 用 JSON object に変換する。
+ */
+fun PaperExecutionDivergenceMemo.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        put("kind", kind)
+        orderId?.let { value -> put("orderId", value) }
+        intentId?.let { value -> put("intentId", value) }
+        tradeGroupId?.let { value -> put("tradeGroupId", value) }
+        clientRequestId?.let { value -> put("clientRequestId", value) }
+        symbol?.let { value -> put("symbol", value) }
+        put("side", side.name)
+        put("limitPriceJpy", limitPriceJpy.toPlainString())
+        put("requestedSizeBtc", requestedSizeBtc.toPlainString())
+        put("hypotheticalFilledSizeBtc", hypotheticalFilledSizeBtc.toPlainString())
+        put("hypotheticalRemainingSizeBtc", hypotheticalRemainingSizeBtc.toPlainString())
+        put("boardDepthBtc", boardDepthBtc.toPlainString())
+        put("queueFillRatio", queueFillRatio.toPlainString())
+        bestBidJpy?.let { value -> put("bestBidJpy", value.toPlainString()) }
+        bestAskJpy?.let { value -> put("bestAskJpy", value.toPlainString()) }
+    }
+}
+
+/**
  * paper command の戻り値。
  *
  * @param accepted command を受理したか
@@ -203,6 +229,7 @@ data class PaperExecutionDivergenceMemo(
  * @param executionIds command で作成した execution IDs
  * @param messageJa 呼び出し元へ返す日本語 message
  * @param safetyViolation SafetyFloor による拒否内容
+ * @param divergenceMemos paper/live 乖離を audit に渡す structured memo
  */
 data class PaperTradeResult(
     val accepted: Boolean,
@@ -212,6 +239,7 @@ data class PaperTradeResult(
     val executionIds: List<String>,
     val messageJa: String,
     val safetyViolation: SafetyViolation? = null,
+    val divergenceMemos: List<PaperExecutionDivergenceMemo> = emptyList(),
 )
 
 /**

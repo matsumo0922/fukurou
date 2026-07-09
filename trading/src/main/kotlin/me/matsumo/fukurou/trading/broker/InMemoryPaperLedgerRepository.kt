@@ -755,6 +755,10 @@ private class InMemoryPaperLedgerMutationWriter(
             status = OrderStatus.FILLED,
             recordedAt = recordedAt,
         )
+        val divergenceMemos = request.entry.divergenceMemo
+            ?.withOrderContext(entryOrder)
+            ?.let { memo -> listOf(memo) }
+            .orEmpty()
 
         if (request.insertEntryOrder) {
             orders += entryOrder
@@ -782,6 +786,7 @@ private class InMemoryPaperLedgerMutationWriter(
             } else {
                 "paper entry を既存 position に合算しました。"
             },
+            divergenceMemos = divergenceMemos,
         )
     }
 

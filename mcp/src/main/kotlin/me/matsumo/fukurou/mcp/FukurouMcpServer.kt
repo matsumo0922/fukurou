@@ -21,6 +21,7 @@ import kotlinx.io.asSink
 import kotlinx.io.asSource
 import kotlinx.io.buffered
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
@@ -53,6 +54,7 @@ import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.PreviewOrderResult
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
+import me.matsumo.fukurou.trading.broker.toJsonObject
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -2285,6 +2287,12 @@ private fun tradeResult(result: PaperTradeResult): CallToolResult {
             put("position_ids", ToolJson.encodeToJsonElement(result.positionIds))
             put("execution_ids", ToolJson.encodeToJsonElement(result.executionIds))
             put("message", result.messageJa)
+            if (result.divergenceMemos.isNotEmpty()) {
+                put(
+                    "paper_execution_divergence_memos",
+                    JsonArray(result.divergenceMemos.map { memo -> memo.toJsonObject() }),
+                )
+            }
             result.safetyViolation?.let { violation ->
                 putJsonObject("safety_violation") {
                     put("id", violation.id.toString())

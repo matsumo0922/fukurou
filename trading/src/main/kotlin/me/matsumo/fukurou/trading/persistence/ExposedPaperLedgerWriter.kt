@@ -33,6 +33,7 @@ import me.matsumo.fukurou.trading.broker.moneyScale
 import me.matsumo.fukurou.trading.broker.ratioScale
 import me.matsumo.fukurou.trading.broker.restingEntryUpdate
 import me.matsumo.fukurou.trading.broker.stopFill
+import me.matsumo.fukurou.trading.broker.withEntryCommandContext
 import me.matsumo.fukurou.trading.broker.withOrderContext
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
@@ -382,6 +383,14 @@ private fun JdbcTransaction.insertEntryFill(request: EntryFillWriteRequest, cloc
     val target = resolveEntryFillTarget(request)
 
     writeEntryOrderForFill(request, target.positionId, clock)
+    val divergenceMemos = request.entry.divergenceMemo
+        ?.withEntryCommandContext(
+            command = command,
+            orderId = request.entryOrderId,
+            tradeGroupId = request.entry.tradeGroupId,
+        )
+        ?.let { memo -> listOf(memo) }
+        .orEmpty()
     val stopOrderId = upsertPositionForEntryFill(request, target.existingPosition, clock)
     insertExecution(
         ExecutionInsertRequest(
@@ -406,6 +415,7 @@ private fun JdbcTransaction.insertEntryFill(request: EntryFillWriteRequest, cloc
         } else {
             "paper entry を既存 position に合算しました。"
         },
+        divergenceMemos = divergenceMemos,
     )
 }
 

@@ -1,7 +1,6 @@
 package me.matsumo.fukurou.trading.broker
 
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
-import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
@@ -158,7 +157,11 @@ class DefaultPaperExecutionSimulator(
             feeRate = context.rules.makerFee.toBigDecimal(),
             liquidity = ExecutionLiquidity.MAKER,
         )
-        val divergenceMemo = limitFillDivergenceMemo(request, context)
+        val divergenceMemo = limitFillDivergenceMemo(
+            request = request,
+            context = context,
+            warnLogger = warnLogger,
+        )
 
         return PaperOrderUpdate(
             fill = fill,
@@ -241,49 +244,6 @@ class DefaultPaperExecutionSimulator(
         }
 
         return walkResult.priceJpy
-    }
-
-    private fun limitFillDivergenceMemo(
-        request: PendingLimitExecutionRequest,
-        context: PaperSimulationContext,
-    ): PaperExecutionDivergenceMemo? {
-        val orderbook = context.orderbook ?: return null
-        val depth = orderbook.limitExecutableDepth(request.side, request.limitPriceJpy)
-
-        if (depth.invalidLevelFound) {
-            warnLogger.warn(
-                key = ORDERBOOK_INVALID_LEVEL_LOG_KEY,
-                message = "Paper execution ignored invalid orderbook levels.",
-            )
-        }
-
-        val requestedSize = request.sizeBtc.btcScale()
-        val queueFillRatio = context.queueFillRatio.max(BigDecimal.ZERO)
-        val hypotheticalFilledSize = depth.availableSizeBtc
-            .multiply(queueFillRatio)
-            .min(request.sizeBtc)
-            .btcScale()
-        val hypotheticalRemainingSize = request.sizeBtc
-            .subtract(hypotheticalFilledSize)
-            .max(BigDecimal.ZERO)
-            .btcScale()
-
-        if (hypotheticalRemainingSize <= BigDecimal.ZERO) {
-            return null
-        }
-
-        return PaperExecutionDivergenceMemo(
-            kind = LIMIT_PARTIAL_FAK_DIVERGENCE_KIND,
-            side = request.side,
-            limitPriceJpy = request.limitPriceJpy.moneyScale(),
-            requestedSizeBtc = requestedSize,
-            hypotheticalFilledSizeBtc = hypotheticalFilledSize,
-            hypotheticalRemainingSizeBtc = hypotheticalRemainingSize,
-            boardDepthBtc = depth.availableSizeBtc.btcScale(),
-            queueFillRatio = queueFillRatio.ratioScale(),
-            bestBidJpy = depth.bestBidJpy?.moneyScale(),
-            bestAskJpy = depth.bestAskJpy?.moneyScale(),
-        )
     }
 
     private fun fill(
@@ -555,16 +515,6 @@ internal fun limitOrderReached(
     }
 
     return limitOrderReachedByLastPrice(side, limitPriceJpy, lastPrice)
-}
-
-internal fun PaperExecutionDivergenceMemo.withOrderContext(order: Order): PaperExecutionDivergenceMemo {
-    return copy(
-        orderId = order.orderId,
-        intentId = order.intentId,
-        tradeGroupId = order.tradeGroupId,
-        clientRequestId = order.clientRequestId,
-        symbol = order.symbol,
-    )
 }
 
 internal fun Orderbook.limitExecutableDepth(

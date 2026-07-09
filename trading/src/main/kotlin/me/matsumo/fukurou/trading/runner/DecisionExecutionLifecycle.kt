@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.runner
 
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -11,6 +12,7 @@ import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
+import me.matsumo.fukurou.trading.broker.toJsonObject
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
@@ -606,6 +608,12 @@ internal class DecisionExecutionLifecycle(
                 put("status", result.status.name)
                 put("orderIds", result.orderIds.joinToString(","))
                 put("positionIds", result.positionIds.joinToString(","))
+                if (result.divergenceMemos.isNotEmpty()) {
+                    put(
+                        "paperExecutionDivergenceMemos",
+                        JsonArray(result.divergenceMemos.map { memo -> memo.toJsonObject() }),
+                    )
+                }
             },
         )
     }

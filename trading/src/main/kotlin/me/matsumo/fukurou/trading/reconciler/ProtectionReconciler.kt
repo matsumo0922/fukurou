@@ -5,7 +5,6 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
@@ -14,6 +13,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.broker.PaperExecutionDivergenceMemo
+import me.matsumo.fukurou.trading.broker.toJsonObject
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.lock.TradingLock
@@ -395,26 +395,6 @@ private fun buildPassCompletedPayload(
             put("paperExecutionDivergenceMemos", JsonArray(divergenceMemos.map { memo -> memo.toJsonObject() }))
         }
     }.toString()
-}
-
-private fun PaperExecutionDivergenceMemo.toJsonObject(): JsonObject {
-    return buildJsonObject {
-        put("kind", kind)
-        orderId?.let { value -> put("orderId", value) }
-        intentId?.let { value -> put("intentId", value) }
-        tradeGroupId?.let { value -> put("tradeGroupId", value) }
-        clientRequestId?.let { value -> put("clientRequestId", value) }
-        symbol?.let { value -> put("symbol", value) }
-        put("side", side.name)
-        put("limitPriceJpy", limitPriceJpy.toPlainString())
-        put("requestedSizeBtc", requestedSizeBtc.toPlainString())
-        put("hypotheticalFilledSizeBtc", hypotheticalFilledSizeBtc.toPlainString())
-        put("hypotheticalRemainingSizeBtc", hypotheticalRemainingSizeBtc.toPlainString())
-        put("boardDepthBtc", boardDepthBtc.toPlainString())
-        put("queueFillRatio", queueFillRatio.toPlainString())
-        bestBidJpy?.let { value -> put("bestBidJpy", value.toPlainString()) }
-        bestAskJpy?.let { value -> put("bestAskJpy", value.toPlainString()) }
-    }
 }
 
 /**

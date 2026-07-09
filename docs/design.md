@@ -2707,7 +2707,7 @@ risk:
 [設計提案] ペーパー時:
 
 - 成行: 即時taker。板歩き + スリッページ。
-- 指値: 発注時点で板を跨ぐ場合は即時taker。resting LIMITは板のbest bid/askで到達判定し、all-or-none約定する。FAK部分約定との差分は乖離メモに記録する。
+- 指値: 発注時点で板を跨ぐ場合は即時taker。resting LIMITは板のbest bid/askで到達判定し、all-or-none約定する。FAK部分約定との差分はcrossing / restingのどちらも乖離メモに記録する。
 - TimeInForce / post-only / SOK / FAS はpaper約定判定に含めない。
 - STOP: サーバーサイド保護ストップ。
 
@@ -3665,7 +3665,7 @@ DD -15% は `HARD_HALT`。発動時はDB上の `risk_state.hard_halt=true` をst
 - taker/maker fee
 - sizeStep/tickSize丸め
 - market orderの板歩き
-- limit orderの板ベース到達判定。resting LIMITはall-or-noneとし、FAK部分約定との差分は乖離メモに記録する
+- limit orderの板ベース到達判定。LIMITはall-or-noneとし、FAK部分約定との差分はcrossing / restingのどちらも乖離メモに記録する
 - TimeInForce / post-only 失効は約定判定に含めない
 - STOP / virtual TP 到達時のticker last price判定と不利約定
 
@@ -3712,13 +3712,13 @@ finalFillPrice = fillPrice - fixedSlippage - volatilitySlippage
 
 - `limitPrice >= bestAsk` ならtakerとして即時約定。
 - `limitPrice < bestAsk` ならmaker候補。未約定中は取得できた板の `bestAsk <= limitPrice` で到達判定し、板が取得できない場合だけWARNを出してticker由来のlast price比較へfallbackする。
-- 到達したresting LIMITはall-or-noneでfull fillし、LIMIT価格までのask深さに `queueFillRatio` を掛けたFAK推定数量が注文数量を下回る場合は、実約定とは別にcommand_event_logのreconcile pass payloadへ乖離メモを残す。
+- crossing / resting LIMITはall-or-noneでfull fillし、LIMIT価格までのask深さに `queueFillRatio` を掛けたFAK推定数量が注文数量を下回る場合は、実約定とは別にpaper execution乖離メモを残す。crossing は `PaperTradeResult` と runner lifecycle payload、resting は reconcile pass payload へ伝搬する。
 
 指値SELL:
 
 - `limitPrice <= bestBid` ならtakerとして即時約定。
 - `limitPrice > bestBid` ならmaker候補。未約定中は取得できた板の `bestBid >= limitPrice` で到達判定し、板が取得できない場合だけWARNを出してticker由来のlast price比較へfallbackする。
-- 到達したresting LIMITはall-or-noneでfull fillし、LIMIT価格までのbid深さに `queueFillRatio` を掛けたFAK推定数量が注文数量を下回る場合は、実約定とは別にcommand_event_logのreconcile pass payloadへ乖離メモを残す。
+- crossing / resting LIMITはall-or-noneでfull fillし、LIMIT価格までのbid深さに `queueFillRatio` を掛けたFAK推定数量が注文数量を下回る場合は、実約定とは別にpaper execution乖離メモを残す。crossing は `PaperTradeResult` と runner lifecycle payload、resting は reconcile pass payload へ伝搬する。
 
 TimeInForce / post-only / SOK / FAS はpaper約定判定に含めない。
 
@@ -3878,7 +3878,7 @@ maxDD = min((equity - equityPeak) / equityPeak)
 - 成行BUYがasksを正しく板歩きする。
 - LIMIT BUY / SELL がbest ask / best bidで到達判定される。
 - crossing LIMITがtaker feeで即時約定する。
-- resting LIMITの板深さがFAK部分約定相当なら、actual fillはfullのまま乖離メモが残る。
+- crossing / resting LIMITの板深さがFAK部分約定相当なら、actual fillはfullのまま乖離メモが残る。
 - maker/taker feeが正負含め計算される。
 - sizeStep/tickSize丸め後も2%リスクを超えない。
 - Clock注入と価格リプレイにより、同じDB初期状態・同じ価格系列なら同じorder/fill/position結果になる。

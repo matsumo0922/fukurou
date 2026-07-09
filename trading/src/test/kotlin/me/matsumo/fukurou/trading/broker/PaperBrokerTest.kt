@@ -295,6 +295,37 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun place_order_crossing_limit_records_fak_divergence_memo_when_depth_is_partial() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = MutableOrderbookMarketDataSource(
+                orderbook = orderbookWithAsk(price = "10000000", size = "0.0020"),
+            ),
+            clock = fixedClock(),
+        )
+        val command = restingLimitCommand(priceJpy = BigDecimal("10000000"))
+        val approved = approvedCommand(decisionRepository, command)
+
+        val result = broker.placeOrder(approved).getOrThrow()
+        val execution = repository.getExecutions().getOrThrow().single()
+        val memo = result.divergenceMemos.single()
+
+        assertEquals("0.005000000000", execution.sizeBtc)
+        assertEquals(LIMIT_PARTIAL_FAK_DIVERGENCE_KIND, memo.kind)
+        assertEquals(approved.commandId.toString(), memo.orderId)
+        assertEquals(approved.intentId.toString(), memo.intentId)
+        assertEquals(TradingSymbol.BTC.apiSymbol, memo.symbol)
+        assertEquals("0.005000000000", memo.requestedSizeBtc.toPlainString())
+        assertEquals("0.002000000000", memo.hypotheticalFilledSizeBtc.toPlainString())
+        assertEquals("0.003000000000", memo.hypotheticalRemainingSizeBtc.toPlainString())
+        assertEquals("0.002000000000", memo.boardDepthBtc.toPlainString())
+    }
+
+    @Test
     fun place_order_non_crossing_limit_entry_remains_resting() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val decisionRepository = InMemoryDecisionRepository(fixedClock())

@@ -223,6 +223,17 @@ private data class CloseExecutionPlan(
 )
 
 /**
+ * 即時 entry 約定と paper/live 乖離 memo。
+ *
+ * @param fill paper 約定
+ * @param divergenceMemo paper/live 乖離を audit に渡す structured memo
+ */
+private data class ImmediateEntryUpdate(
+    val fill: SimulatedFill,
+    val divergenceMemo: PaperExecutionDivergenceMemo? = null,
+)
+
+/**
  * PaperBroker の read boundary 実装。
  *
  * @param runtime PaperBroker runtime context
@@ -363,16 +374,17 @@ private class PaperBrokerTradeDelegate(
 
             validateSymbolRules(resolvedCommand, symbolRules)
             validateEntryPriceContract(resolvedCommand, ticker)
-            val immediateFill = immediateEntryFillOrNull(resolvedCommand, ticker, symbolRules)
+            val immediateUpdate = immediateEntryUpdateOrNull(resolvedCommand, ticker, symbolRules)
 
-            if (immediateFill != null) {
+            if (immediateUpdate != null) {
                 return@runCatching intentConsumer.fillMarketEntryAndConsumeIntent(
                     MarketEntryFillRequest(
                         command = resolvedCommand,
-                        fill = immediateFill,
+                        fill = immediateUpdate.fill,
                         positionId = UUID.randomUUID(),
                         tradeGroupId = resolvedTradeGroupId,
                         stopOrderId = UUID.randomUUID(),
+                        divergenceMemo = immediateUpdate.divergenceMemo,
                     ),
                 )
             }
@@ -393,14 +405,14 @@ private class PaperBrokerTradeDelegate(
         }
     }
 
-    private suspend fun immediateEntryFillOrNull(
+    private suspend fun immediateEntryUpdateOrNull(
         command: PlaceOrderCommand,
         ticker: Ticker,
         symbolRules: SymbolRules,
-    ): SimulatedFill? {
+    ): ImmediateEntryUpdate? {
         return when (command.orderType) {
-            OrderType.MARKET -> marketEntryFill(command, ticker, symbolRules)
-            OrderType.LIMIT -> crossingLimitEntryFillOrNull(command, ticker, symbolRules)
+            OrderType.MARKET -> ImmediateEntryUpdate(marketEntryFill(command, ticker, symbolRules))
+            OrderType.LIMIT -> crossingLimitEntryUpdateOrNull(command, ticker, symbolRules)
             OrderType.STOP -> null
         }
     }
@@ -432,11 +444,11 @@ private class PaperBrokerTradeDelegate(
         )
     }
 
-    private suspend fun crossingLimitEntryFillOrNull(
+    private suspend fun crossingLimitEntryUpdateOrNull(
         command: PlaceOrderCommand,
         ticker: Ticker,
         symbolRules: SymbolRules,
-    ): SimulatedFill? {
+    ): ImmediateEntryUpdate? {
         val limitPriceJpy = requireNotNull(command.priceJpy) {
             "LIMIT order requires priceJpy."
         }
@@ -458,6 +470,15 @@ private class PaperBrokerTradeDelegate(
             limitPriceJpy = limitPriceJpy,
             context = executionContext,
         )
+        val divergenceMemo = limitFillDivergenceMemo(
+            request = PendingLimitExecutionRequest(
+                side = command.side,
+                sizeBtc = command.sizeBtc,
+                limitPriceJpy = limitPriceJpy,
+            ),
+            context = executionContext,
+            warnLogger = runtime.market.warnLogger,
+        )
 
         runtime.validateCashAvailability(
             command = command,
@@ -466,7 +487,10 @@ private class PaperBrokerTradeDelegate(
             immediateFill = fill,
         )
 
-        return fill
+        return ImmediateEntryUpdate(
+            fill = fill,
+            divergenceMemo = divergenceMemo,
+        )
     }
 
     override suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult> {
@@ -1405,6 +1429,7 @@ private fun mergeTradeResults(results: List<PaperTradeResult>, messageJa: String
         positionIds = results.flatMap { result -> result.positionIds },
         executionIds = results.flatMap { result -> result.executionIds },
         messageJa = messageJa,
+        divergenceMemos = results.flatMap { result -> result.divergenceMemos },
     )
 }
 
@@ -1436,6 +1461,7 @@ private fun rejectedTradeResult(violation: SafetyViolation, sweepResult: PaperTr
         executionIds = sweepResult?.executionIds.orEmpty(),
         messageJa = violation.messageJa,
         safetyViolation = violation,
+        divergenceMemos = sweepResult?.divergenceMemos.orEmpty(),
     )
 }
 
