@@ -21,6 +21,7 @@ dependencies {
     implementation(libs.mcp.kotlin.server)
 
     testImplementation(libs.mcp.kotlin.client)
+    testImplementation(testFixtures(project(":mcp-core")))
     testImplementation(kotlin("test"))
 }
 

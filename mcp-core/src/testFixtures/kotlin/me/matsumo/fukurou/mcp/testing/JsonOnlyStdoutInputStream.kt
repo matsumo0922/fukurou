@@ -12,7 +12,7 @@ import java.io.InputStream
  * stdio transport の stdout は JSON-RPC 専用である。
  * 空行や logger 出力のような非 JSON 行を検出した時点で smoke を失敗させる。
  */
-internal class JsonOnlyStdoutInputStream(
+class JsonOnlyStdoutInputStream(
     private val delegate: InputStream,
     private val json: Json = Json,
 ) : InputStream() {
