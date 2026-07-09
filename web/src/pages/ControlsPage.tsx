@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient, type QueryClient, type UseQueryResult } from "@tanstack/react-query";
-import { useState, type ChangeEvent, type FormEvent } from "react";
+import { useState, type ChangeEvent, type SyntheticEvent } from "react";
 import Activity from "lucide-react/dist/esm/icons/activity.mjs";
 import AlertTriangle from "lucide-react/dist/esm/icons/alert-triangle.mjs";
 import KeyRound from "lucide-react/dist/esm/icons/key-round.mjs";
@@ -654,7 +654,7 @@ function LlmAuthTokenSubmitForm({
     setTokenCode(event.target.value);
     setValidationError(null);
   };
-  const tokenCodeFormSubmitted = (event: FormEvent<HTMLFormElement>) => {
+  const tokenCodeFormSubmitted = (event: SyntheticEvent<HTMLFormElement>) => {
     event.preventDefault();
 
     if (!canSubmit || isPending) {
@@ -747,7 +747,7 @@ function SafetyActionForm({
     setValidationError(null);
     setConfirmationReason(null);
   };
-  const reviewed = (event: FormEvent<HTMLFormElement>) => {
+  const reviewed = (event: SyntheticEvent<HTMLFormElement>) => {
     event.preventDefault();
 
     if (isDisabled) {
