@@ -392,20 +392,15 @@ internal class DecisionExecutionLifecycle(
 
         val position = requireNotNull(targetPosition)
         val stopPriceText = position.currentStopLossJpy
-
-        if (stopPriceText == null) {
-            return DecisionLifecycleFailure(
+            ?: return DecisionLifecycleFailure(
                 reason = "adjust_protection_unprotected_position",
                 details = buildJsonObject {
                     put("positionId", position.positionId)
                 },
             )
-        }
 
         val targetPrice = decision.tradePlan?.draft?.targetPriceJpy
-
-        if (targetPrice == null) {
-            return DecisionLifecycleFailure(
+            ?: return DecisionLifecycleFailure(
                 reason = "adjust_protection_missing_target_price",
                 details = buildJsonObject {
                     put("positionId", position.positionId)
@@ -413,7 +408,6 @@ internal class DecisionExecutionLifecycle(
                     put("currentStopLossJpy", stopPriceText)
                 },
             )
-        }
 
         val currentPrice = position.currentPriceJpy.toBigDecimalOrNull()
             ?: return DecisionLifecycleFailure(

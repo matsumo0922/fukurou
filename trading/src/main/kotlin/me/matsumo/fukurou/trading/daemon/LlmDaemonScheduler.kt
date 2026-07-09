@@ -214,10 +214,7 @@ class LlmDaemonScheduler(
         }
 
         val trigger = selectTrigger(hasOpenRisk, observedAt)
-
-        if (trigger == null) {
-            return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
-        }
+            ?: return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
 
         return reserveAndLaunch(trigger, observedAt)
     }

@@ -64,10 +64,7 @@ class GmoTokenBucketRateLimiter(
 
         while (true) {
             val waitDuration = acquirePermitOrWaitDuration()
-
-            if (waitDuration == null) {
-                return
-            }
+                ?: return
 
             sleeper.sleep(waitDuration)
         }

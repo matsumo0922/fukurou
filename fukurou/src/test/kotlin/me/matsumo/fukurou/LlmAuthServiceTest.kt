@@ -256,11 +256,8 @@ class LlmAuthServiceTest {
             val accepted = assertIs<LlmAuthLoginStartResult.Accepted>(result)
 
             repeat(20) {
-                val session = service.loginSession(LlmAuthProvider.CLAUDE, accepted.session.sessionId).getOrThrow()
-
-                if (session == null) {
-                    return@runBlocking
-                }
+                service.loginSession(LlmAuthProvider.CLAUDE, accepted.session.sessionId).getOrThrow()
+                    ?: return@runBlocking
 
                 delay(10.toDuration(DurationUnit.MILLISECONDS))
             }
