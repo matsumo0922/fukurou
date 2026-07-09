@@ -1993,6 +1993,7 @@ private class RequestCapturingLlmInvoker(
         requests += request
 
         when (request.phase) {
+            LlmInvocationPhase.PRE_FILTER -> Unit
             LlmInvocationPhase.PROPOSER -> submitDecisionFromRequest(repository, request, proposerAction).getOrThrow()
             LlmInvocationPhase.FALSIFIER -> {
                 submitFalsificationFromRequest(repository, request, FalsificationVerdict.APPROVED).getOrThrow()

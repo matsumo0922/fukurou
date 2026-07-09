@@ -2289,9 +2289,17 @@ class PostgresPersistenceIntegrationTest {
         eventLog.append(runnerPhaseEvent(phase = "preflight", provider = null, occurredAt = fixedInstant())).getOrThrow()
         eventLog.append(
             runnerPhaseEvent(
-                phase = "proposer",
+                phase = "pre_filter",
                 provider = "claude",
                 occurredAt = fixedInstant().plusMillis(1),
+                stdout = """{"total_cost_usd":0.01,"modelUsage":{"claude-haiku-4-5-20251001":{"input_tokens":3,"output_tokens":1}}}""",
+            ),
+        ).getOrThrow()
+        eventLog.append(
+            runnerPhaseEvent(
+                phase = "proposer",
+                provider = "claude",
+                occurredAt = fixedInstant().plusMillis(2),
                 stdout = """{"total_cost_usd":0.20,"modelUsage":{"claude-sonnet":{"input_tokens":10,"output_tokens":4}}}""",
             ),
         ).getOrThrow()
@@ -2299,7 +2307,7 @@ class PostgresPersistenceIntegrationTest {
             runnerPhaseEvent(
                 phase = "falsifier",
                 provider = "codex",
-                occurredAt = fixedInstant().plusMillis(2),
+                occurredAt = fixedInstant().plusMillis(3),
                 stdout = "codex text output",
             ),
         ).getOrThrow()
@@ -2307,7 +2315,7 @@ class PostgresPersistenceIntegrationTest {
             runnerPhaseEvent(
                 phase = "proposer",
                 provider = "claude",
-                occurredAt = fixedInstant().plusMillis(4),
+                occurredAt = fixedInstant().plusMillis(5),
                 stdout = """{"total_cost_usd":0.30}""",
             ),
         ).getOrThrow()
@@ -2315,7 +2323,7 @@ class PostgresPersistenceIntegrationTest {
             runnerPhaseEvent(
                 phase = "reflection",
                 provider = "claude",
-                occurredAt = fixedInstant().plusMillis(3),
+                occurredAt = fixedInstant().plusMillis(4),
                 stdout = """{"total_cost_usd":0.10}""",
             ),
         ).getOrThrow()
@@ -2326,14 +2334,18 @@ class PostgresPersistenceIntegrationTest {
                 from = fixedInstant().minusSeconds(1),
                 toExclusive = fixedInstant().plusSeconds(1),
             ),
-            limit = 3,
+            limit = 4,
         ).getOrThrow()
 
         assertTrue(usageResult.truncated)
-        assertEquals(listOf("proposer", "falsifier", "reflection"), usageResult.facts.map { fact -> fact.phase })
-        assertEquals("0.20", usageResult.facts.first().usage?.totalCostUsd?.toPlainString())
-        assertEquals(null, usageResult.facts[1].usage)
-        assertEquals("0.10", usageResult.facts[2].usage?.totalCostUsd?.toPlainString())
+        assertEquals(
+            listOf("pre_filter", "proposer", "falsifier", "reflection"),
+            usageResult.facts.map { fact -> fact.phase },
+        )
+        assertEquals("0.01", usageResult.facts.first().usage?.totalCostUsd?.toPlainString())
+        assertEquals("0.20", usageResult.facts[1].usage?.totalCostUsd?.toPlainString())
+        assertEquals(null, usageResult.facts[2].usage)
+        assertEquals("0.10", usageResult.facts[3].usage?.totalCostUsd?.toPlainString())
     }
 
     @Test

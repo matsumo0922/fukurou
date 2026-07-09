@@ -1327,7 +1327,7 @@ kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `K
 
 benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は期間開始時点の paper equity（paper 初期資金 + 期間開始前の累計 realized trade PnL）とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
 
-LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、保存済み `details.usage` がない過去行は redacted `details.stdout` から可能な範囲で fallback parse する。Codex phase や parse 不能 phase は usage 欠落として数える。取得は既定 20,000 行で bounded にし、超過時は `/evaluation/costs` の `truncated` で示す。
+LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`pre_filter` / `proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、保存済み `details.usage` がない過去行は redacted `details.stdout` から可能な範囲で fallback parse する。Codex phase や parse 不能 phase は usage 欠落として数える。取得は既定 20,000 行で bounded にし、超過時は `/evaluation/costs` の `truncated` で示す。
 
 ## 6. 発火エンジンと呼び出しモデル（A-7）
 
@@ -1348,7 +1348,7 @@ LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`
 | 安全バックストップ | DD閾値、STOP到達、データ不整合 | bypass | LLMを呼ばずコードで守る場合あり |
 | 手動 | WebUI/CLIで明示発火 | bypass可能 | 理由必須 |
 
-`PRICE_MOVE` は GMO ticker の5分 window 変化率が1%以上のとき、`STOP_PROXIMITY` は保有中 LONG position の残り R が0.3以下のとき、`ENTRY_FILL` は paper entry の BUY execution を検出したときに daemon reservation 経路で発火する。ticker が取得不能・stale・timestamp parse 不能な tick では市場系 trigger だけを見送り、flat heartbeat / holding dense check は fallback として残す。`ENTRY_FILL` は同じ fill と cooldown 内の fill burst を後追い発火せず、runner の hourly / daily cap を消費する。
+`PRICE_MOVE` は GMO ticker の5分 window 変化率が1%以上のとき、`STOP_PROXIMITY` は保有中 LONG position の残り R が0.3以下のとき、`ENTRY_FILL` は paper entry の BUY execution を検出したときに daemon reservation 経路で発火する。ticker が取得不能・stale・timestamp parse 不能な tick では市場系 trigger だけを見送り、flat heartbeat / holding dense check は fallback として残す。`ENTRY_FILL` は同じ fill と cooldown 内の fill burst を後追い発火せず、runner の hourly / daily cap を消費する。`daemon.preFilterEnabled` が true のとき、flat heartbeat / holding dense check は full LLM 起動前に `claude-haiku-4-5-20251001` で deterministic market snapshot の有意変化を判定し、NO の場合は `pre_filter_no_change` として full run を省略する。pre-filter は価格急変、STOP 接近、entry fill、経済イベントには適用せず、失敗時は full run へ進む。
 
 ### 6.2 daemonの責務
 

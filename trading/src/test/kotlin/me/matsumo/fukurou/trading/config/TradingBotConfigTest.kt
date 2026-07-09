@@ -42,6 +42,7 @@ class TradingBotConfigTest {
         assertEquals(Duration.ofSeconds(600), config.daemon.priceMoveCooldown)
         assertEquals(true, config.daemon.entryFillTriggerEnabled)
         assertEquals(Duration.ofSeconds(600), config.daemon.entryFillCooldown)
+        assertEquals(false, config.daemon.preFilterEnabled)
         assertEquals(true, config.daemon.stopProximityTriggerEnabled)
         assertEquals(BigDecimal("0.3"), config.daemon.stopProximityRemainingRThreshold)
         assertEquals(Duration.ofSeconds(900), config.daemon.stopProximityCooldown)
@@ -108,6 +109,7 @@ class TradingBotConfigTest {
                 "FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS" to "1200",
                 "FUKUROU_LLM_TRIGGER_ENTRY_FILL_ENABLED" to "false",
                 "FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS" to "1200",
+                "FUKUROU_LLM_PRE_FILTER_ENABLED" to "true",
                 "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED" to "false",
                 "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_REMAINING_R_THRESHOLD" to "0.4",
                 "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_COOLDOWN_SECONDS" to "1800",
@@ -172,6 +174,7 @@ class TradingBotConfigTest {
         assertEquals(Duration.ofSeconds(1200), config.daemon.priceMoveCooldown)
         assertEquals(false, config.daemon.entryFillTriggerEnabled)
         assertEquals(Duration.ofSeconds(1200), config.daemon.entryFillCooldown)
+        assertEquals(true, config.daemon.preFilterEnabled)
         assertEquals(false, config.daemon.stopProximityTriggerEnabled)
         assertEquals(BigDecimal("0.4"), config.daemon.stopProximityRemainingRThreshold)
         assertEquals(Duration.ofSeconds(1800), config.daemon.stopProximityCooldown)

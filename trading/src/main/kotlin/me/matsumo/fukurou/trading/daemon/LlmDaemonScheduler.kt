@@ -194,6 +194,18 @@ class LlmDaemonScheduler(
     private val idGenerator = runtime.idGenerator
     private val warnLogger = runtime.warnLogger
     private val daemonConfig: LlmDaemonConfig = tradingConfig.daemon
+    private val preFilterGate = LlmDaemonPreFilterGate(
+        daemonConfig = daemonConfig,
+        preFilter = runtime.preFilter,
+        requestBase = requestBase,
+        warnLogger = warnLogger,
+    )
+    private val entryFillTrigger = LlmDaemonEntryFillTrigger(
+        daemonConfig = daemonConfig,
+        entryFillReader = entryFillReader,
+        launchReservationRepository = launchReservationRepository,
+        warnLogger = warnLogger,
+    )
     private val priceSamples = mutableListOf<LlmDaemonPriceSample>()
 
     /**
@@ -298,6 +310,30 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped(reason, trigger.kind)
         }
 
+        val preFilterDecision = preFilterGate.decisionIfNeeded(
+            triggerKind = trigger.kind,
+            triggerKey = trigger.key,
+            invocationId = invocationId,
+            observedAt = observedAt,
+        )
+
+        if (preFilterDecision == LlmDaemonPreFilterDecision.SKIP_NO_CHANGE) {
+            appendSkip(
+                reason = DAEMON_SKIP_PRE_FILTER_NO_CHANGE,
+                trigger = trigger,
+                observedAt = observedAt,
+            ).getOrThrow()
+            finishReservedInvocation(
+                trigger = trigger,
+                invocationId = invocationId,
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = DAEMON_SKIP_PRE_FILTER_NO_CHANGE,
+                finishedAt = observedAt,
+            )
+
+            return LlmDaemonTickResult.Skipped(DAEMON_SKIP_PRE_FILTER_NO_CHANGE, trigger.kind)
+        }
+
         appendLaunched(trigger, invocationId, observedAt).getOrThrow()
 
         return runReservedInvocation(trigger, invocationId)
@@ -366,7 +402,7 @@ class LlmDaemonScheduler(
         if (hasOpenRisk) {
             val marketEvaluation = marketEvaluationIfNeeded(true, observedAt)
 
-            return entryFillTriggerIfDue(observedAt)
+            return entryFillTrigger.triggerIfDue(observedAt)
                 ?: stopProximityTriggerIfDue(marketEvaluation, observedAt)
                 ?: priceMoveTriggerIfDue(marketEvaluation, observedAt)
                 ?: holdingTriggerIfDue(observedAt)
@@ -526,48 +562,6 @@ class LlmDaemonScheduler(
         )
 
         return if (triggerDue(trigger.key, daemonConfig.stopProximityCooldown, observedAt)) trigger else null
-    }
-
-    private suspend fun entryFillTriggerIfDue(observedAt: Instant): LlmDaemonTrigger? {
-        if (!daemonConfig.entryFillTriggerEnabled) {
-            return null
-        }
-
-        val entryFill = latestEntryFillOrNull() ?: return null
-        val latestReservedAt = launchReservationRepository.latestReservedAt(ENTRY_FILL_TRIGGER_KEY).getOrThrow()
-        val entryFillCoveredByCooldown = latestReservedAt != null &&
-            !entryFill.executedAt.isAfter(latestReservedAt.plus(daemonConfig.entryFillCooldown))
-
-        if (entryFillCoveredByCooldown) {
-            return null
-        }
-
-        val trigger = LlmDaemonTrigger(
-            kind = LlmDaemonTriggerKind.ENTRY_FILL,
-            key = ENTRY_FILL_TRIGGER_KEY,
-            eventName = null,
-            details = entryFill.toTriggerDetails(),
-        )
-
-        return if (triggerDue(trigger.key, daemonConfig.entryFillCooldown, observedAt)) trigger else null
-    }
-
-    private suspend fun latestEntryFillOrNull(): LlmDaemonEntryFill? {
-        return runCatching {
-            entryFillReader.latestEntryFill().getOrThrow()
-        }.getOrElse { throwable ->
-            if (throwable is CancellationException) {
-                throw throwable
-            }
-
-            warnLogger.warn(
-                key = ENTRY_FILL_FETCH_FAILURE_LOG_KEY,
-                message = "LlmDaemonScheduler could not read entry fills for entry-fill trigger.",
-                throwable = throwable,
-            )
-
-            null
-        }
     }
 
     private suspend fun positionsForStopProximity(): List<Position>? {
@@ -888,6 +882,7 @@ data class LlmDaemonSchedulerDependencies(
  *
  * @param requestBase one-shot runner に渡す固定 request
  * @param launchOneShot one-shot runner 起動境界
+ * @param preFilter heartbeat 系 trigger の full run 要否を判定する pre-filter
  * @param clock cadence と監査時刻に使う clock
  * @param idGenerator invocation ID generator
  * @param warnLogger tick 失敗の rate-limited warning logger
@@ -895,6 +890,9 @@ data class LlmDaemonSchedulerDependencies(
 data class LlmDaemonSchedulerRuntime(
     val requestBase: OneShotRunnerRequest,
     val launchOneShot: suspend (OneShotRunnerRequest) -> Result<OneShotRunnerResult>,
+    val preFilter: LlmDaemonPreFilter = LlmDaemonPreFilter {
+        Result.success(LlmDaemonPreFilterDecision.RUN_FULL)
+    },
     val clock: Clock = Clock.systemUTC(),
     val idGenerator: () -> UUID = { UUID.randomUUID() },
     val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
@@ -977,6 +975,78 @@ private data class LlmDaemonMarketEvaluation(
 )
 
 /**
+ * ENTRY_FILL trigger の候補を選ぶ helper。
+ *
+ * @param daemonConfig daemon 設定
+ * @param entryFillReader entry fill 読み取り境界
+ * @param launchReservationRepository 起動予約 repository
+ * @param warnLogger warning logger
+ */
+private class LlmDaemonEntryFillTrigger(
+    private val daemonConfig: LlmDaemonConfig,
+    private val entryFillReader: LlmDaemonEntryFillReader,
+    private val launchReservationRepository: LlmLaunchReservationRepository,
+    private val warnLogger: RateLimitedWarnLogger,
+) {
+    /**
+     * ENTRY_FILL trigger が発火可能なら trigger を返す。
+     */
+    suspend fun triggerIfDue(observedAt: Instant): LlmDaemonTrigger? {
+        if (!daemonConfig.entryFillTriggerEnabled) {
+            return null
+        }
+
+        val entryFill = latestEntryFillOrNull() ?: return null
+        val latestReservedAt = launchReservationRepository.latestReservedAt(ENTRY_FILL_TRIGGER_KEY).getOrThrow()
+        val entryFillCoveredByCooldown = latestReservedAt != null &&
+            !entryFill.executedAt.isAfter(latestReservedAt.plus(daemonConfig.entryFillCooldown))
+
+        if (entryFillCoveredByCooldown) {
+            return null
+        }
+
+        val trigger = LlmDaemonTrigger(
+            kind = LlmDaemonTriggerKind.ENTRY_FILL,
+            key = ENTRY_FILL_TRIGGER_KEY,
+            eventName = null,
+            details = entryFill.toTriggerDetails(),
+        )
+
+        return if (triggerDue(trigger.key, daemonConfig.entryFillCooldown, observedAt)) trigger else null
+    }
+
+    private suspend fun latestEntryFillOrNull(): LlmDaemonEntryFill? {
+        return runCatching {
+            entryFillReader.latestEntryFill().getOrThrow()
+        }.getOrElse { throwable ->
+            if (throwable is CancellationException) {
+                throw throwable
+            }
+
+            warnLogger.warn(
+                key = ENTRY_FILL_FETCH_FAILURE_LOG_KEY,
+                message = "LlmDaemonScheduler could not read entry fills for entry-fill trigger.",
+                throwable = throwable,
+            )
+
+            null
+        }
+    }
+
+    private suspend fun triggerDue(
+        triggerKey: String,
+        interval: Duration,
+        observedAt: Instant,
+    ): Boolean {
+        val latestReservedAt = launchReservationRepository.latestReservedAt(triggerKey).getOrThrow()
+            ?: return true
+        val nextDueAt = latestReservedAt.plus(interval)
+
+        return !observedAt.isBefore(nextDueAt)
+    }
+}
+
+/**
  * STOP 接近 trigger の候補。
  *
  * @param positionId position ID
@@ -1050,6 +1120,11 @@ private const val DAEMON_SKIP_NO_TRIGGER = "no_trigger_due"
  * daemon tick 失敗で起動しなかった理由。
  */
 private const val DAEMON_SKIP_TICK_FAILED = "tick_failed"
+
+/**
+ * pre-filter が有意な変化なしと判定した skip 理由。
+ */
+private const val DAEMON_SKIP_PRE_FILTER_NO_CHANGE = "pre_filter_no_change"
 
 /**
  * daemon tick failure log の rate limit key。

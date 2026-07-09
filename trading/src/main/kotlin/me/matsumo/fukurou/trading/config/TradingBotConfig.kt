@@ -246,6 +246,7 @@ data class LlmRunnerConfig(
  * @param priceMoveCooldown 価格急変 trigger の cooldown
  * @param entryFillTriggerEnabled entry fill trigger を有効にするか
  * @param entryFillCooldown entry fill trigger の cooldown
+ * @param preFilterEnabled heartbeat 系 trigger の軽量 pre-filter を有効にするか
  * @param stopProximityTriggerEnabled STOP 接近 trigger を有効にするか
  * @param stopProximityRemainingRThreshold STOP 接近とみなす残り R
  * @param stopProximityCooldown STOP 接近 trigger の cooldown
@@ -262,6 +263,7 @@ data class LlmDaemonConfig(
     val priceMoveCooldown: Duration = DEFAULT_LLM_PRICE_MOVE_COOLDOWN,
     val entryFillTriggerEnabled: Boolean = DEFAULT_LLM_ENTRY_FILL_TRIGGER_ENABLED,
     val entryFillCooldown: Duration = DEFAULT_LLM_ENTRY_FILL_COOLDOWN,
+    val preFilterEnabled: Boolean = DEFAULT_LLM_PRE_FILTER_ENABLED,
     val stopProximityTriggerEnabled: Boolean = DEFAULT_LLM_STOP_PROXIMITY_TRIGGER_ENABLED,
     val stopProximityRemainingRThreshold: BigDecimal = DEFAULT_LLM_STOP_PROXIMITY_REMAINING_R_THRESHOLD,
     val stopProximityCooldown: Duration = DEFAULT_LLM_STOP_PROXIMITY_COOLDOWN,
@@ -540,6 +542,11 @@ private const val FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS_ENV =
     "FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS"
 
 /**
+ * 軽量 pre-filter 有効化の環境変数名。
+ */
+private const val FUKUROU_LLM_PRE_FILTER_ENABLED_ENV = "FUKUROU_LLM_PRE_FILTER_ENABLED"
+
+/**
  * STOP 接近 trigger 有効化の環境変数名。
  */
 private const val FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED_ENV =
@@ -739,6 +746,11 @@ const val DEFAULT_LLM_ENTRY_FILL_TRIGGER_ENABLED = true
  * entry fill trigger の既定 cooldown。
  */
 val DEFAULT_LLM_ENTRY_FILL_COOLDOWN: Duration = Duration.ofSeconds(600)
+
+/**
+ * 軽量 pre-filter 有効化の既定値。
+ */
+const val DEFAULT_LLM_PRE_FILTER_ENABLED = false
 
 /**
  * STOP 接近 trigger 有効化の既定値。
@@ -984,6 +996,8 @@ private fun Map<String, String>.readLlmDaemonConfig(): LlmDaemonConfig {
                 ?.toLong()
                 ?: DEFAULT_LLM_ENTRY_FILL_COOLDOWN.seconds,
         ),
+        preFilterEnabled = readOptional(FUKUROU_LLM_PRE_FILTER_ENABLED_ENV)?.toBooleanStrictOrNull()
+            ?: DEFAULT_LLM_PRE_FILTER_ENABLED,
         stopProximityTriggerEnabled = readOptional(FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED_ENV)
             ?.toBooleanStrictOrNull()
             ?: DEFAULT_LLM_STOP_PROXIMITY_TRIGGER_ENABLED,

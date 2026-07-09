@@ -1193,6 +1193,7 @@ private class OneShotLlmRequestFactory(
 
     private fun allowedToolsForPhase(phase: LlmInvocationPhase, cliConfig: OneShotRunnerCliConfig): List<String> {
         return when (phase) {
+            LlmInvocationPhase.PRE_FILTER -> emptyList()
             LlmInvocationPhase.PROPOSER -> cliConfig.proposerAllowedTools
             LlmInvocationPhase.FALSIFIER -> cliConfig.falsifierAllowedTools
             LlmInvocationPhase.REFLECTION -> emptyList()
@@ -1648,7 +1649,10 @@ private fun Map<String, String>.readToolAllowlist(name: String, defaultValue: Li
         ?: defaultValue
 }
 
-private fun isForbiddenSecretEnvKey(key: String): Boolean {
+/**
+ * LLM child process へ渡さない secret 風 env 名なら true を返す。
+ */
+fun isForbiddenSecretEnvKey(key: String): Boolean {
     val upperKey = key.uppercase()
     val databaseCredential = key in DB_ENV_KEYS
     val explicitlyForbidden = upperKey in SECRET_ENV_KEYS

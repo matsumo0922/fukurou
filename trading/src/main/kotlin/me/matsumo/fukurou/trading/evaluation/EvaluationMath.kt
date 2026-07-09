@@ -569,6 +569,11 @@ private const val UNCLASSIFIED_SETUP_TAG = "unclassified"
 private const val UNKNOWN_PROVIDER = "unknown"
 
 /**
+ * pre-filter phase 名。
+ */
+private const val PRE_FILTER_PHASE = "pre_filter"
+
+/**
  * proposer phase 名。
  */
 private const val PROPOSER_PHASE = "proposer"
@@ -614,5 +619,8 @@ private const val VOLATILITY_WINDOW = 14
 private val RANGE_THRESHOLD_RATIO = BigDecimal("0.005")
 
 private fun LlmPhaseUsageFact.isLlmInvocationPhase(): Boolean {
-    return phase == PROPOSER_PHASE || phase == FALSIFIER_PHASE || phase == REFLECTION_PHASE
+    return phase == PRE_FILTER_PHASE ||
+        phase == PROPOSER_PHASE ||
+        phase == FALSIFIER_PHASE ||
+        phase == REFLECTION_PHASE
 }

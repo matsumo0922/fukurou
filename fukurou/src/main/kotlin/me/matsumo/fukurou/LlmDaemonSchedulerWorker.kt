@@ -13,6 +13,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.DefaultLlmDaemonPreFilter
+import me.matsumo.fukurou.trading.daemon.DefaultLlmDaemonPreFilterDependencies
 import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
@@ -36,10 +38,13 @@ import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationReposit
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_JAR_PATH_ENV
+import me.matsumo.fukurou.trading.runner.LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE
+import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
 import me.matsumo.fukurou.trading.runner.OneShotRunnerCliConfig
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
 import me.matsumo.fukurou.trading.runner.OneShotRunnerResult
+import me.matsumo.fukurou.trading.runner.SecretRedactor
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import java.math.BigDecimal
@@ -201,6 +206,7 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
         runtime = LlmDaemonSchedulerRuntime(
             requestBase = components.requestBase,
             launchOneShot = components.launchOneShot,
+            preFilter = components.preFilter,
             clock = inputs.clock,
         ),
     )
@@ -259,6 +265,7 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         config = inputs.tradingConfig.gmoPublicClient,
         clock = inputs.clock,
     )
+    val commandRendererConfig = LlmCommandRendererConfig.fromEnvironment(inputs.environment)
     val tradingRuntime = TradingRuntimeFactory.connectedPostgres(
         dataSource = inputs.dataSource,
         database = inputs.database,
@@ -271,7 +278,7 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         tradingConfig = inputs.tradingConfig,
         llmInvoker = ShellLlmInvoker(
             commandRenderer = DefaultLlmCommandRenderer(
-                config = LlmCommandRendererConfig.fromEnvironment(inputs.environment),
+                config = commandRendererConfig,
             ),
             processRunner = ShellProcessRunner(),
         ),
@@ -283,6 +290,12 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         database = inputs.database,
         fallbackSymbolRules = inputs.tradingConfig.paperMarket.toSymbolRules(inputs.tradingConfig.symbol),
     )
+    val preFilter = createLlmDaemonPreFilter(
+        inputs = inputs,
+        marketDataSource = marketDataSource,
+        tradingRuntime = tradingRuntime,
+        commandRendererConfig = commandRendererConfig,
+    )
 
     return LlmLaunchRuntimeComponents(
         tradingRuntime = tradingRuntime,
@@ -291,6 +304,36 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         launchReservationRepository = ExposedLlmLaunchReservationRepository(inputs.database),
         requestBase = inputs.requestBase,
         launchOneShot = runner.asDaemonLauncher(),
+        preFilter = preFilter,
+    )
+}
+
+private fun createLlmDaemonPreFilter(
+    inputs: LlmLaunchRuntimeInputs,
+    marketDataSource: GmoPublicMarketDataSource,
+    tradingRuntime: TradingRuntime,
+    commandRendererConfig: LlmCommandRendererConfig,
+): DefaultLlmDaemonPreFilter {
+    return DefaultLlmDaemonPreFilter(
+        tradingConfig = inputs.tradingConfig,
+        runtimeConfigSnapshot = inputs.runtimeConfigSnapshot,
+        dependencies = DefaultLlmDaemonPreFilterDependencies(
+            marketDataSource = marketDataSource,
+            decisionRepository = tradingRuntime.decisionRepository,
+            llmInvoker = ShellLlmInvoker(
+                commandRenderer = DefaultLlmCommandRenderer(
+                    config = commandRendererConfig.copy(claudeModel = HAIKU_PRE_FILTER_MODEL),
+                ),
+                processRunner = ShellProcessRunner(),
+            ),
+            invocationAuditor = LlmInvocationAuditor(
+                commandEventLog = tradingRuntime.commandEventLog,
+                redactor = SecretRedactor.fromEnvironment(inputs.environment),
+                clock = inputs.clock,
+                authFailureMessage = LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE,
+            ),
+        ),
+        parentEnvironment = inputs.environment,
     )
 }
 
@@ -406,6 +449,7 @@ private data class LlmLaunchRuntimeInputs(
  * @param launchReservationRepository 起動予約 repository
  * @param requestBase one-shot runner の固定 request
  * @param launchOneShot one-shot runner 起動境界
+ * @param preFilter heartbeat 系 trigger の軽量 pre-filter
  */
 private data class LlmLaunchRuntimeComponents(
     val tradingRuntime: TradingRuntime,
@@ -414,9 +458,15 @@ private data class LlmLaunchRuntimeComponents(
     val launchReservationRepository: ExposedLlmLaunchReservationRepository,
     val requestBase: OneShotRunnerRequest,
     val launchOneShot: suspend (OneShotRunnerRequest) -> Result<OneShotRunnerResult>,
+    val preFilter: DefaultLlmDaemonPreFilter,
 )
 
 /**
  * ENTRY_FILL trigger が見る recent execution 件数。
  */
 private const val ENTRY_FILL_LOOKBACK_LIMIT = 20
+
+/**
+ * daemon pre-filter に使う Claude Haiku model。
+ */
+private const val HAIKU_PRE_FILTER_MODEL = "claude-haiku-4-5-20251001"

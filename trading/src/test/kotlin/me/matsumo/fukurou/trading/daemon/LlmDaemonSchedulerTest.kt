@@ -233,6 +233,140 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
+    fun preFilterYesRunsFullFlatHeartbeat() = runBlocking {
+        val preFilter = FakePreFilter()
+        preFilter.decision = LlmDaemonPreFilterDecision.RUN_FULL
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    priceMoveTriggerEnabled = false,
+                    preFilterEnabled = true,
+                    stopProximityTriggerEnabled = false,
+                ),
+            ),
+            preFilter = preFilter,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
+        assertEquals(1, fixture.launches.size)
+        assertEquals(1, preFilter.requests.size)
+    }
+
+    @Test
+    fun preFilterNoSkipsFlatHeartbeatWithAuditReason() = runBlocking {
+        val preFilter = FakePreFilter()
+        preFilter.decision = LlmDaemonPreFilterDecision.SKIP_NO_CHANGE
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    priceMoveTriggerEnabled = false,
+                    preFilterEnabled = true,
+                    stopProximityTriggerEnabled = false,
+                ),
+            ),
+            preFilter = preFilter,
+        )
+
+        val result = fixture.scheduler.tick()
+        val skipEvents = fixture.eventLog.events()
+            .filter { event -> event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED }
+
+        assertIs<LlmDaemonTickResult.Skipped>(result)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
+        assertEquals("pre_filter_no_change", result.reason)
+        assertEquals(0, fixture.launches.size)
+        assertEquals(1, preFilter.requests.size)
+        assertTrue(skipEvents.any { event -> event.payload.contains("pre_filter_no_change") })
+    }
+
+    @Test
+    fun preFilterFailureFailsOpenToFullHoldingCheck() = runBlocking {
+        val preFilter = FakePreFilter()
+        preFilter.forcedThrowable = IllegalStateException("haiku timeout")
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    priceMoveTriggerEnabled = false,
+                    preFilterEnabled = true,
+                    stopProximityTriggerEnabled = false,
+                ),
+            ),
+            hasOpenRisk = true,
+            preFilter = preFilter,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, result.triggerKind)
+        assertEquals(1, fixture.launches.size)
+        assertEquals(1, preFilter.requests.size)
+    }
+
+    @Test
+    fun preFilterDoesNotRunForEventTriggers() = runBlocking {
+        val preFilter = FakePreFilter()
+        preFilter.decision = LlmDaemonPreFilterDecision.SKIP_NO_CHANGE
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    priceMoveTriggerEnabled = false,
+                    preFilterEnabled = true,
+                    stopProximityTriggerEnabled = false,
+                ),
+                events = listOf(
+                    EconomicEventBlackout(
+                        eventId = "cpi-20260703",
+                        eventName = "CPI",
+                        eventAt = fixedInstant(),
+                        blackoutBefore = Duration.ZERO,
+                        blackoutAfter = Duration.ofMinutes(60),
+                    ),
+                ),
+            ),
+            preFilter = preFilter,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, result.triggerKind)
+        assertEquals(1, fixture.launches.size)
+        assertEquals(0, preFilter.requests.size)
+    }
+
+    @Test
+    fun disabledPreFilterKeepsHeartbeatBehavior() = runBlocking {
+        val preFilter = FakePreFilter()
+        preFilter.decision = LlmDaemonPreFilterDecision.SKIP_NO_CHANGE
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    priceMoveTriggerEnabled = false,
+                    preFilterEnabled = false,
+                    stopProximityTriggerEnabled = false,
+                ),
+            ),
+            preFilter = preFilter,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
+        assertEquals(1, fixture.launches.size)
+        assertEquals(0, preFilter.requests.size)
+    }
+
+    @Test
     fun hardHaltStopsLaunchAndResumeAllowsLaunchAgain() = runBlocking {
         val fixture = schedulerFixture()
 
@@ -920,6 +1054,7 @@ private fun schedulerFixture(
     tickerReader: FakeTickerReader = FakeTickerReader(clock),
     positionsReader: FakePositionsReader = FakePositionsReader(),
     entryFillReader: FakeEntryFillReader = FakeEntryFillReader(),
+    preFilter: FakePreFilter = FakePreFilter(),
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): SchedulerFixture {
@@ -945,6 +1080,7 @@ private fun schedulerFixture(
                 launches += request
                 Result.success(launchHandler(request))
             },
+            preFilter = preFilter,
             clock = clock,
             idGenerator = idGenerator,
         ),
@@ -961,6 +1097,7 @@ private fun schedulerFixture(
         tickerReader = tickerReader,
         positionsReader = positionsReader,
         entryFillReader = entryFillReader,
+        preFilter = preFilter,
     )
 }
 
@@ -1011,6 +1148,7 @@ private fun deterministicIds(): () -> UUID {
  * @param tickerReader fake ticker reader
  * @param positionsReader fake positions reader
  * @param entryFillReader fake entry fill reader
+ * @param preFilter fake pre-filter
  */
 private data class SchedulerFixture(
     val scheduler: LlmDaemonScheduler,
@@ -1023,6 +1161,7 @@ private data class SchedulerFixture(
     val tickerReader: FakeTickerReader,
     val positionsReader: FakePositionsReader,
     val entryFillReader: FakeEntryFillReader,
+    val preFilter: FakePreFilter,
 )
 
 /**
@@ -1084,6 +1223,23 @@ private class FakeEntryFillReader : LlmDaemonEntryFillReader {
         forcedThrowable?.let { throwable -> throw throwable }
 
         return Result.success(currentEntryFill)
+    }
+}
+
+/**
+ * scheduler test 用 fake pre-filter。
+ */
+private class FakePreFilter : LlmDaemonPreFilter {
+
+    val requests: MutableList<LlmDaemonPreFilterRequest> = mutableListOf()
+    var decision: LlmDaemonPreFilterDecision = LlmDaemonPreFilterDecision.RUN_FULL
+    var forcedThrowable: Throwable? = null
+
+    override suspend fun evaluate(request: LlmDaemonPreFilterRequest): Result<LlmDaemonPreFilterDecision> {
+        requests += request
+        forcedThrowable?.let { throwable -> return Result.failure(throwable) }
+
+        return Result.success(decision)
     }
 }
 
