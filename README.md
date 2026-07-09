@@ -129,4 +129,4 @@ Docker Compose と GitHub Actions による GHCR image pull 型の NAS deploy sc
 
 ## ライセンス
 
-未定
+[PolyForm Strict License 1.0.0](LICENSE)
