@@ -48,6 +48,12 @@ RUN apt-get update \
 COPY --from=build /src/fukurou/build/libs/*-all.jar app.jar
 # MCP fat JAR は CLI の stdio 子プロセスとして利用する。
 COPY --from=build /src/mcp/build/libs/fukurou-mcp-all.jar fukurou-mcp-all.jar
+# Claude Code headless の MCP handshake race を避ける bridge と tool snapshot。
+COPY mcp/bridge/fukurou-mcp-bridge.mjs fukurou-mcp-bridge.mjs
+RUN FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME=true \
+    node /app/fukurou-mcp-bridge.mjs \
+        --generate-snapshot /app/fukurou-mcp-all.jar \
+        --snapshot /app/fukurou-mcp-tools.json
 # standalone GMO Coin MCP fat JAR は分離検証や再利用用に同梱するが、entrypoint では起動しない。
 COPY --from=build /src/mcp-gmo-coin/build/libs/gmo-coin-mcp-all.jar gmo-coin-mcp-all.jar
 # one-shot runner が system prompt hash を計算するため、prompt 正本を同梱する。
