@@ -31,6 +31,7 @@ import me.matsumo.fukurou.mcp.gmo.DescribedGmoCoinKlineRequestBudgetHook
 import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolErrorResponse
 import me.matsumo.fukurou.mcp.gmo.GmoCoinMarketToolExecutor
 import me.matsumo.fukurou.mcp.gmo.registerGmoCoinMarketTools
+import me.matsumo.fukurou.mcp.runtime.runStdioMcpServer
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
@@ -2391,7 +2392,7 @@ private fun throwableResult(throwable: Throwable): CallToolResult {
 
     val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
 
-    return mcpErrorResult(type, throwable.message.orEmpty(), executed, failureKind)
+    return me.matsumo.fukurou.mcp.runtime.mcpErrorResult(type, throwable.message.orEmpty(), executed, failureKind)
 }
 
 private fun toolErrorType(throwable: Throwable): String {

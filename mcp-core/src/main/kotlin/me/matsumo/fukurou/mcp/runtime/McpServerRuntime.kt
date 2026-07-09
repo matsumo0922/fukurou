@@ -1,4 +1,4 @@
-package me.matsumo.fukurou.mcp
+package me.matsumo.fukurou.mcp.runtime
 
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.StdioServerTransport

@@ -18,7 +18,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
-import me.matsumo.fukurou.mcp.mcpErrorResult
+import me.matsumo.fukurou.mcp.runtime.mcpErrorResult
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.Orderbook

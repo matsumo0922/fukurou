@@ -287,6 +287,28 @@ class LlmAuthServiceTest {
         }
     }
 
+    @Test
+    fun closeWaitsForProcessCompletionAudit() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val processStarter = RecordingLlmAuthProcessStarter()
+        val service = createService(
+            processStarter = processStarter,
+            commandEventLog = eventLog,
+        )
+
+        try {
+            service.startLogin(LlmAuthProvider.CLAUDE, "operator re-auth").getOrThrow()
+            service.close()
+
+            val eventTypes = eventLog.events().map { event -> event.eventType }
+
+            assertFalse(processStarter.processes.single().isAlive())
+            assertTrue(CommandEventType.CLI_AUTH_LOGIN_FAILED in eventTypes)
+        } finally {
+            service.close()
+        }
+    }
+
     private fun createService(
         cliHome: Path = Files.createTempDirectory("fukurou-llm-auth-home"),
         processStarter: LlmAuthProcessStarter,
