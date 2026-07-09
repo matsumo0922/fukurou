@@ -915,6 +915,20 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun proposerSuccess_omitsAuthFailureSignalEvenWhenOutputMentionsAuthText() = runBlocking {
+        val fixture = runnerFixture {
+            cleanExit(stdout = """{"type":"result","is_error":false,"result":"Not logged in"}""")
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertFalse(proposerDetails.containsKey("authFailureSuspected"))
+        assertEquals("0", proposerDetails.stringValue("exitCode"))
+    }
+
+    @Test
     fun proposerFailedToStart_auditsRedactedErrorAndRecordsNoTradeExit() = runBlocking {
         val failure = IOException(
             "Cannot run program \"claude\" (in directory \"/tmp/fukurou-llm\"): " +
