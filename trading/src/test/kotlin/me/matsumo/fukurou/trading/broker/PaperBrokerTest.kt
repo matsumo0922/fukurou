@@ -270,6 +270,84 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun place_order_crossing_limit_entry_fills_immediately_as_taker() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = MutableOrderbookMarketDataSource(
+                orderbook = orderbookWithAsk("10000000"),
+            ),
+            clock = fixedClock(),
+        )
+        val command = restingLimitCommand(priceJpy = BigDecimal("10000000"))
+
+        val result = broker.placeOrder(approvedCommand(decisionRepository, command)).getOrThrow()
+        val openOrders = broker.getOpenOrders().getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertEquals(OrderStatus.FILLED, result.status)
+        assertEquals(listOf(OrderType.STOP), openOrders.map { order -> order.orderType })
+        assertEquals(ExecutionLiquidity.TAKER, executions.single().liquidity)
+        assertEquals("10000000.00000000", executions.single().priceJpy)
+        assertEquals("25.00000000", executions.single().feeJpy)
+    }
+
+    @Test
+    fun place_order_crossing_limit_records_fak_divergence_memo_when_depth_is_partial() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = MutableOrderbookMarketDataSource(
+                orderbook = orderbookWithAsk(price = "10000000", size = "0.0020"),
+            ),
+            clock = fixedClock(),
+        )
+        val command = restingLimitCommand(priceJpy = BigDecimal("10000000"))
+        val approved = approvedCommand(decisionRepository, command)
+
+        val result = broker.placeOrder(approved).getOrThrow()
+        val execution = repository.getExecutions().getOrThrow().single()
+        val memo = result.divergenceMemos.single()
+
+        assertEquals("0.005000000000", execution.sizeBtc)
+        assertEquals(LIMIT_PARTIAL_FAK_DIVERGENCE_KIND, memo.kind)
+        assertEquals(approved.commandId.toString(), memo.orderId)
+        assertEquals(approved.intentId.toString(), memo.intentId)
+        assertEquals(TradingSymbol.BTC.apiSymbol, memo.symbol)
+        assertEquals("0.005000000000", memo.requestedSizeBtc.toPlainString())
+        assertEquals("0.002000000000", memo.hypotheticalFilledSizeBtc.toPlainString())
+        assertEquals("0.003000000000", memo.hypotheticalRemainingSizeBtc.toPlainString())
+        assertEquals("0.002000000000", memo.boardDepthBtc.toPlainString())
+    }
+
+    @Test
+    fun place_order_non_crossing_limit_entry_remains_resting() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = MutableOrderbookMarketDataSource(
+                orderbook = orderbookWithAsk("10000000"),
+            ),
+            clock = fixedClock(),
+        )
+
+        val result = broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand())).getOrThrow()
+
+        assertEquals(OrderStatus.OPEN, result.status)
+        assertEquals(1, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(0, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
     fun place_order_capsProbabilityFromStaleTickerTimestamp() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
@@ -1427,6 +1505,85 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun reconcile_buy_limit_reaches_when_best_ask_is_at_limit_even_if_last_price_is_above_limit() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val marketDataSource = MutableOrderbookMarketDataSource(
+            orderbook = orderbookWithAsk("10000000"),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand())).getOrThrow()
+
+        marketDataSource.orderbook = orderbookWithAsk("9900000")
+        val result = broker.reconcile(watermarkTickSnapshot("10000000")).getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertEquals(1, result.triggeredOrderIds.size)
+        assertEquals(1, executions.size)
+        assertEquals(ExecutionLiquidity.MAKER, executions.single().liquidity)
+    }
+
+    @Test
+    fun reconcile_buy_limit_stays_pending_when_best_ask_is_above_limit_even_if_last_price_is_below_limit() {
+        runBlocking {
+            val repository = InMemoryPaperLedgerRepository()
+            val decisionRepository = InMemoryDecisionRepository(fixedClock())
+            val broker = PaperBroker(
+                ledgerRepository = repository,
+                riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                decisionRepository = decisionRepository,
+                marketDataSource = MutableOrderbookMarketDataSource(
+                    orderbook = orderbookWithAsk("10000000"),
+                ),
+                clock = fixedClock(),
+            )
+            broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand())).getOrThrow()
+
+            val result = broker.reconcile(watermarkTickSnapshot("9800000")).getOrThrow()
+
+            assertFalse(result.advanced)
+            assertEquals(1, broker.getOpenOrders().getOrThrow().size)
+            assertEquals(0, repository.getExecutions().getOrThrow().size)
+        }
+    }
+
+    @Test
+    fun reconcile_buy_limit_records_fak_divergence_memo_while_full_filling_paper_order() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val marketDataSource = MutableOrderbookMarketDataSource(
+            orderbook = orderbookWithAsk("10000000"),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand())).getOrThrow()
+
+        marketDataSource.orderbook = orderbookWithAsk(price = "9900000", size = "0.0020")
+        val result = broker.reconcile(watermarkTickSnapshot("10000000")).getOrThrow()
+        val execution = repository.getExecutions().getOrThrow().single()
+        val memo = result.divergenceMemos.single()
+
+        assertEquals("0.005000000000", execution.sizeBtc)
+        assertEquals("0.005000000000", memo.requestedSizeBtc.toPlainString())
+        assertEquals("0.002000000000", memo.hypotheticalFilledSizeBtc.toPlainString())
+        assertEquals("0.003000000000", memo.hypotheticalRemainingSizeBtc.toPlainString())
+        assertEquals("0.002000000000", memo.boardDepthBtc.toPlainString())
+        assertEquals(LIMIT_PARTIAL_FAK_DIVERGENCE_KIND, memo.kind)
+        assertEquals(TradingSymbol.BTC.apiSymbol, memo.symbol)
+    }
+
+    @Test
     fun reconcile_tracks_lowest_and_highest_watermarks_monotonically() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
@@ -1531,14 +1688,14 @@ private fun marketEntryCommand(
     )
 }
 
-private fun restingLimitCommand(): PlaceOrderCommand {
+private fun restingLimitCommand(priceJpy: BigDecimal = BigDecimal("9900000")): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
         symbol = TradingSymbol.BTC,
         side = OrderSide.BUY,
         orderType = OrderType.LIMIT,
         sizeBtc = BigDecimal("0.0050"),
-        priceJpy = BigDecimal("9900000"),
+        priceJpy = priceJpy,
         tradeGroupId = null,
         protectiveStopPriceJpy = BigDecimal("9700000"),
         takeProfitPriceJpy = BigDecimal("10500000"),
@@ -1642,6 +1799,14 @@ private fun watermarkTickSnapshot(
     )
 }
 
+private fun orderbookWithAsk(price: String, size: String = "0.0100"): Orderbook {
+    return Orderbook(
+        symbol = "BTC",
+        bids = listOf(OrderbookLevel(price = "9990000", size = "0.0100")),
+        asks = listOf(OrderbookLevel(price = price, size = size)),
+    )
+}
+
 private fun defaultSymbolRules(): SymbolRules {
     return SymbolRules(
         symbol = "BTC",
@@ -1738,6 +1903,19 @@ private object OrderbookAtrMarketDataSource : MarketDataSource by FakeMarketData
                 ),
             ),
         )
+    }
+}
+
+/**
+ * LIMIT entry の board relation を切り替える fake market data。
+ *
+ * @param orderbook 現在返す orderbook
+ */
+private class MutableOrderbookMarketDataSource(
+    var orderbook: Orderbook,
+) : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.success(orderbook)
     }
 }
 

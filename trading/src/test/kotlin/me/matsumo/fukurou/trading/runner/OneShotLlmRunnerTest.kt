@@ -7,6 +7,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.CommandEvent
@@ -58,6 +59,7 @@ import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
@@ -191,6 +193,51 @@ class OneShotLlmRunnerTest {
         assertEquals(1, positions.size)
         assertEquals(1, consumptions.size)
         assertEquals(result.intent?.intentId, consumptions.single().intentId)
+    }
+
+    @Test
+    fun enterApproved_recordsCrossingLimitDivergenceMemoInRunnerLifecycleAudit() = runBlocking {
+        val config = TradingBotConfig()
+        val fixture = runnerFixture(
+            config = config,
+            runtimeTransform = { runtime ->
+                runtime.withMarketDataSource(CrossingLimitPartialOrderbookMarketDataSource, config)
+            },
+        ) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(
+                    repository = fixtureRepository,
+                    command = command,
+                    action = DecisionAction.ENTER,
+                    entryIntent = entryIntentDraft(
+                        orderType = OrderType.LIMIT,
+                        priceJpy = BigDecimal("10000000"),
+                    ),
+                ).getOrThrow()
+
+                return@runnerFixture cleanExit()
+            }
+
+            submitFalsification(fixtureRepository, command, FalsificationVerdict.APPROVED).getOrThrow()
+
+            cleanExit()
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val placeOrderDetails = fixture.eventLog.events().singleRunnerPhaseDetails("decision_to_place_order")
+        val memo = placeOrderDetails
+            .getValue("paperExecutionDivergenceMemos")
+            .jsonArray
+            .single()
+            .jsonObject
+
+        assertEquals(OneShotRunnerStatus.PAPER_ENTRY_PLACED, result.status)
+        assertEquals("LIMIT_PARTIAL_FAK_DIVERGENCE", memo.stringValue("kind"))
+        assertEquals(result.intent?.intentId.toString(), memo.stringValue("intentId"))
+        assertEquals(TradingSymbol.BTC.apiSymbol, memo.stringValue("symbol"))
+        assertEquals("0.005000000000", memo.stringValue("requestedSizeBtc"))
+        assertEquals("0.002000000000", memo.stringValue("hypotheticalFilledSizeBtc"))
+        assertEquals("0.003000000000", memo.stringValue("hypotheticalRemainingSizeBtc"))
     }
 
     @Test
@@ -1703,6 +1750,28 @@ private fun TradingRuntime.withPaperLedger(
     )
 }
 
+private fun TradingRuntime.withMarketDataSource(
+    marketDataSource: MarketDataSource,
+    config: TradingBotConfig,
+    clock: Clock = fixedClock(),
+): TradingRuntime {
+    val baseBroker = broker as PaperBroker
+    val paperBroker = PaperBroker(
+        ledgerRepository = baseBroker.ledgerRepository,
+        riskStateRepository = riskStateRepository,
+        riskStateCommandService = riskStateCommandService,
+        decisionRepository = decisionRepository,
+        falsificationFreshnessWindow = config.decisionProtocol.falsificationFreshnessWindow,
+        safetyViolationRepository = safetyViolationRepository,
+        safetyFloor = SafetyFloor(config.safetyFloor, clock),
+        marketDataSource = marketDataSource,
+        fillSimulator = baseBroker.fillSimulator,
+        clock = clock,
+    )
+
+    return copy(broker = paperBroker)
+}
+
 private fun accountSnapshotWithBtc(): AccountSnapshot {
     return AccountSnapshot(
         mode = TradingMode.PAPER,
@@ -2420,6 +2489,21 @@ private object FakeMarketDataSource : MarketDataSource {
                 tickSize = "1",
                 takerFee = "0.0005",
                 makerFee = "-0.0001",
+            ),
+        )
+    }
+}
+
+/**
+ * crossing LIMIT が FAK 部分約定相当になる runner test 用 market data source。
+ */
+private object CrossingLimitPartialOrderbookMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.success(
+            Orderbook(
+                symbol = symbol.apiSymbol,
+                bids = listOf(OrderbookLevel(price = "9990000", size = "0.0100")),
+                asks = listOf(OrderbookLevel(price = "10000000", size = "0.0020")),
             ),
         )
     }

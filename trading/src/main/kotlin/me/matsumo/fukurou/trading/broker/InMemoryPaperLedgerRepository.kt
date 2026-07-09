@@ -616,6 +616,7 @@ private class InMemoryPaperLedgerMutationWriter(
                     triggeredOrderIds = triggeredOrderIds,
                     closedPositionIds = closedPositionIds,
                     executionIds = executionIds,
+                    divergenceMemos = progress.divergenceMemos.toList(),
                 )
             }
         }
@@ -689,15 +690,18 @@ private class InMemoryPaperLedgerMutationWriter(
     ) {
         val entryOrders = orders
             .filter { order -> order.status == OrderStatus.OPEN && order.side == OrderSide.BUY }
-            .filter { order -> order.isEntryTriggered(context.lastPrice) }
+            .filter { order -> order.isEntryTriggered(context) }
 
         entryOrders.forEach { order ->
-            val fill = order.createEntryFill(
+            val orderUpdate = order.createEntryUpdate(
                 ticker = context.ticker,
                 rules = context.rules,
                 simulator = context.simulator,
                 simulationContext = context.simulationContext,
             )
+            val fill = requireNotNull(orderUpdate.fill) {
+                "Triggered entry order must create a fill."
+            }
             val positionId = UUID.randomUUID()
             val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
             val stopOrderId = UUID.randomUUID()
@@ -726,6 +730,9 @@ private class InMemoryPaperLedgerMutationWriter(
             )
             progress.triggeredOrderIds += order.orderId
             progress.executionIds += fill.executionId.toString()
+            orderUpdate.divergenceMemo
+                ?.withOrderContext(order)
+                ?.let { memo -> progress.divergenceMemos += memo }
         }
     }
 
@@ -748,6 +755,10 @@ private class InMemoryPaperLedgerMutationWriter(
             status = OrderStatus.FILLED,
             recordedAt = recordedAt,
         )
+        val divergenceMemos = request.entry.divergenceMemo
+            ?.withOrderContext(entryOrder)
+            ?.let { memo -> listOf(memo) }
+            .orEmpty()
 
         if (request.insertEntryOrder) {
             orders += entryOrder
@@ -775,6 +786,7 @@ private class InMemoryPaperLedgerMutationWriter(
             } else {
                 "paper entry を既存 position に合算しました。"
             },
+            divergenceMemos = divergenceMemos,
         )
     }
 
@@ -1487,21 +1499,30 @@ private fun AccountSnapshot.isHardHaltDrawdownReached(): Boolean {
     return drawdownRatio.toBigDecimal() <= SafetyFloorDefaults.maxDrawdownRatio
 }
 
-private fun Order.isEntryTriggered(lastPrice: BigDecimal): Boolean {
+private fun Order.isEntryTriggered(context: ReconcileMarketContext): Boolean {
     return when (orderType) {
         OrderType.MARKET -> false
-        OrderType.LIMIT -> limitPriceJpy?.toBigDecimal()?.let { price -> lastPrice <= price } ?: false
-        OrderType.STOP -> triggerPriceJpy?.toBigDecimal()?.let { price -> lastPrice >= price } ?: false
+        OrderType.LIMIT -> {
+            val limitPrice = limitPriceJpy?.toBigDecimal()
+
+            limitPrice != null && limitOrderReached(
+                side = side,
+                limitPriceJpy = limitPrice,
+                context = context.simulationContext,
+                lastPrice = context.lastPrice,
+            )
+        }
+        OrderType.STOP -> triggerPriceJpy?.toBigDecimal()?.let { price -> context.lastPrice >= price } ?: false
     }
 }
 
-private fun Order.createEntryFill(
+private fun Order.createEntryUpdate(
     ticker: Ticker,
     rules: SymbolRules,
     simulator: PaperExecutionSimulator,
     simulationContext: PaperSimulationContext,
-): SimulatedFill {
-    return simulator.restingEntryFill(
+): PaperOrderUpdate {
+    return simulator.restingEntryUpdate(
         request = RestingEntryFillRequest(
             side = side,
             orderType = orderType,

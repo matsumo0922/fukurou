@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.runner
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -21,6 +22,7 @@ import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.PreviewOrderResult
 import me.matsumo.fukurou.trading.broker.calculatePreviewHash
+import me.matsumo.fukurou.trading.broker.toJsonObject
 import me.matsumo.fukurou.trading.broker.toPreviewOrderNormalizedContent
 import me.matsumo.fukurou.trading.config.FUKUROU_MCP_ACT_TOOL_CALL_LIMIT_ENV
 import me.matsumo.fukurou.trading.config.FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT_ENV
@@ -768,6 +770,7 @@ class OneShotLlmRunner(
                 placeOrderHash = placeOrderHash,
                 hashMismatchWarning = hashMismatchWarning,
                 accepted = result.getOrNull()?.accepted ?: false,
+                tradeResult = result.getOrNull(),
             ),
         ).getOrThrow()
         if (result.getOrNull()?.accepted == false) {
@@ -816,6 +819,12 @@ class OneShotLlmRunner(
                 }
                 if (input.hashMismatchWarning != null) {
                     put("previewHashMismatchWarning", input.hashMismatchWarning)
+                }
+                if (!input.tradeResult?.divergenceMemos.isNullOrEmpty()) {
+                    put(
+                        "paperExecutionDivergenceMemos",
+                        JsonArray(input.tradeResult.divergenceMemos.map { memo -> memo.toJsonObject() }),
+                    )
                 }
                 put("accepted", input.accepted)
             },
@@ -1279,6 +1288,7 @@ private data class OneShotAfterPreflightRequest(
  * @param placeOrderHash place_order normalized hash
  * @param hashMismatchWarning preview / place_order hash mismatch warning
  * @param accepted place_order が受理されたか
+ * @param tradeResult place_order 実行結果
  */
 private data class DecisionToPlaceOrderPhaseInput(
     val context: DecisionRunContext,
@@ -1290,6 +1300,7 @@ private data class DecisionToPlaceOrderPhaseInput(
     val placeOrderHash: String?,
     val hashMismatchWarning: String?,
     val accepted: Boolean,
+    val tradeResult: PaperTradeResult? = null,
 )
 
 /**

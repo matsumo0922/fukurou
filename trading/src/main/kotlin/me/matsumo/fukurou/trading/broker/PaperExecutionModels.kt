@@ -1,5 +1,8 @@
 package me.matsumo.fukurou.trading.broker
 
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -157,6 +160,66 @@ data class SimulatedFill(
 )
 
 /**
+ * paper LIMIT 約定と FAK 部分約定モデルの乖離を追跡する structured memo。
+ *
+ * @param kind memo 種別
+ * @param orderId 乖離が発生した paper order ID
+ * @param intentId entry intent ID
+ * @param tradeGroupId entry / stop / position を束ねる trade group ID
+ * @param clientRequestId 呼び出し元 request ID
+ * @param symbol 取引対象 symbol
+ * @param side 注文 side
+ * @param limitPriceJpy LIMIT 価格
+ * @param requestedSizeBtc 注文数量
+ * @param hypotheticalFilledSizeBtc FAK なら約定したと推定される数量
+ * @param hypotheticalRemainingSizeBtc FAK なら残ったと推定される数量
+ * @param boardDepthBtc LIMIT 価格までの反対側板数量
+ * @param queueFillRatio maker queue の約定率
+ * @param bestBidJpy memo 作成時点の best bid
+ * @param bestAskJpy memo 作成時点の best ask
+ */
+data class PaperExecutionDivergenceMemo(
+    val kind: String,
+    val orderId: String? = null,
+    val intentId: String? = null,
+    val tradeGroupId: String? = null,
+    val clientRequestId: String? = null,
+    val symbol: String? = null,
+    val side: OrderSide,
+    val limitPriceJpy: BigDecimal,
+    val requestedSizeBtc: BigDecimal,
+    val hypotheticalFilledSizeBtc: BigDecimal,
+    val hypotheticalRemainingSizeBtc: BigDecimal,
+    val boardDepthBtc: BigDecimal,
+    val queueFillRatio: BigDecimal,
+    val bestBidJpy: BigDecimal?,
+    val bestAskJpy: BigDecimal?,
+)
+
+/**
+ * paper execution 乖離 memo を audit payload 用 JSON object に変換する。
+ */
+fun PaperExecutionDivergenceMemo.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        put("kind", kind)
+        orderId?.let { value -> put("orderId", value) }
+        intentId?.let { value -> put("intentId", value) }
+        tradeGroupId?.let { value -> put("tradeGroupId", value) }
+        clientRequestId?.let { value -> put("clientRequestId", value) }
+        symbol?.let { value -> put("symbol", value) }
+        put("side", side.name)
+        put("limitPriceJpy", limitPriceJpy.toPlainString())
+        put("requestedSizeBtc", requestedSizeBtc.toPlainString())
+        put("hypotheticalFilledSizeBtc", hypotheticalFilledSizeBtc.toPlainString())
+        put("hypotheticalRemainingSizeBtc", hypotheticalRemainingSizeBtc.toPlainString())
+        put("boardDepthBtc", boardDepthBtc.toPlainString())
+        put("queueFillRatio", queueFillRatio.toPlainString())
+        bestBidJpy?.let { value -> put("bestBidJpy", value.toPlainString()) }
+        bestAskJpy?.let { value -> put("bestAskJpy", value.toPlainString()) }
+    }
+}
+
+/**
  * paper command の戻り値。
  *
  * @param accepted command を受理したか
@@ -166,6 +229,7 @@ data class SimulatedFill(
  * @param executionIds command で作成した execution IDs
  * @param messageJa 呼び出し元へ返す日本語 message
  * @param safetyViolation SafetyFloor による拒否内容
+ * @param divergenceMemos paper/live 乖離を audit に渡す structured memo
  */
 data class PaperTradeResult(
     val accepted: Boolean,
@@ -175,6 +239,7 @@ data class PaperTradeResult(
     val executionIds: List<String>,
     val messageJa: String,
     val safetyViolation: SafetyViolation? = null,
+    val divergenceMemos: List<PaperExecutionDivergenceMemo> = emptyList(),
 )
 
 /**
@@ -184,10 +249,12 @@ data class PaperTradeResult(
  * @param triggeredOrderIds trigger された order IDs
  * @param closedPositionIds close された position IDs
  * @param executionIds 作成された execution IDs
+ * @param divergenceMemos paper/live 乖離を command_event_log へ残すための structured memo
  */
 data class PaperReconcileResult(
     val advanced: Boolean,
     val triggeredOrderIds: List<String>,
     val closedPositionIds: List<String>,
     val executionIds: List<String>,
+    val divergenceMemos: List<PaperExecutionDivergenceMemo> = emptyList(),
 )

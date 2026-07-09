@@ -42,6 +42,7 @@ import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.OrderbookLevel
 import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
@@ -2025,6 +2026,41 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun paper_execution_reconcilesRestingLimitByBestAskInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val marketDataSource = MutablePostgresOrderbookMarketDataSource(
+            orderbook = postgresOrderbookWithAsk("10000000"),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+
+        val placeResult = broker.placeOrder(command).getOrThrow()
+        marketDataSource.orderbook = postgresOrderbookWithAsk("9900000")
+        val reconcileResult = broker.reconcile(watermarkTickSnapshot("10000000")).getOrThrow()
+        val executions = repository.getExecutions().getOrThrow()
+
+        assertEquals(1, placeResult.orderIds.size)
+        assertEquals(1, reconcileResult.triggeredOrderIds.size)
+        assertEquals(1, executions.size)
+    }
+
+    @Test
     fun paper_execution_appendsFillEquitySnapshotsAndSkipsMarkOnlyUpdates() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -3019,6 +3055,14 @@ private fun postgresSymbolRules(): SymbolRules {
     )
 }
 
+private fun postgresOrderbookWithAsk(price: String, size: String = "0.0100"): Orderbook {
+    return Orderbook(
+        symbol = "BTC",
+        bids = listOf(OrderbookLevel(price = "9990000", size = "0.0100")),
+        asks = listOf(OrderbookLevel(price = price, size = size)),
+    )
+}
+
 private fun trailingSymbolRules(): SymbolRules {
     return SymbolRules(
         symbol = "BTC",
@@ -3067,6 +3111,19 @@ private object PostgresFakeMarketDataSource : MarketDataSource {
 
     override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> {
         return Result.success(postgresSymbolRules())
+    }
+}
+
+/**
+ * Postgres paper execution test 用に orderbook だけ差し替える fake market data。
+ *
+ * @param orderbook 現在返す orderbook
+ */
+private class MutablePostgresOrderbookMarketDataSource(
+    var orderbook: Orderbook,
+) : MarketDataSource by PostgresFakeMarketDataSource {
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.success(orderbook)
     }
 }
 

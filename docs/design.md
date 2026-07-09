@@ -2628,6 +2628,7 @@ estimatedMaxLossJpy = roundedSizeBtc * perBtcRiskJpy + orderTypeAwareFeeEstimate
 ```
 
 `orderTypeAwareFeeEstimate` は、MARKET/STOP entry と protective exit を taker、resting LIMIT entry を maker fee / rebate として見積もる。
+発注時点で板を跨ぐLIMITは、brokerの実約定時cash検証でtaker feeを使う。
 
 `estimatedMaxLossJpy <= riskBudgetJpy` でなければ拒否する。
 
@@ -2716,8 +2717,8 @@ risk:
 [設計提案] ペーパー時:
 
 - 成行: 即時taker。板歩き + スリッページ。
-- 指値FAS: 価格到達でall-or-none約定。当面、部分約定は乖離メモに記録する。
-- SOK(Post-only): maker狙い。即takerになる価格なら失効。
+- 指値: 発注時点で板を跨ぐ場合は即時taker。resting LIMITは板のbest bid/askで到達判定し、all-or-none約定する。FAK部分約定との差分はcrossing / restingのどちらも乖離メモに記録する。
+- TimeInForce / post-only / SOK / FAS はpaper約定判定に含めない。
 - STOP: サーバーサイド保護ストップ。
 
 少額実弾時:
@@ -3678,10 +3679,9 @@ DD -15% は `HARD_HALT`。発動時はDB上の `risk_state.hard_halt=true` をst
 - taker/maker fee
 - sizeStep/tickSize丸め
 - market orderの板歩き
-- limit orderの到達判定。当面はall-or-noneとし、FAK部分約定との差分は乖離メモに記録する
-- post-only失効
-- stop到達時の不利約定
-- 同一ローソク内でTP/SL両方に触れた場合の悲観処理
+- limit orderの板ベース到達判定。LIMITはall-or-noneとし、FAK部分約定との差分はcrossing / restingのどちらも乖離メモに記録する
+- TimeInForce / post-only 失効は約定判定に含めない
+- STOP / virtual TP 到達時のticker last price判定と不利約定
 
 [確定] liveではnative STOPがbot停止中も取引所で作動する。一方、paperでは `ProtectionReconciler` 停止中はSTOPが作動しないため、paperの保護はliveより弱い。これは安全側の構造的乖離として文書化し、復旧テストで補う。
 
@@ -3698,7 +3698,7 @@ notionalJpy = executionPriceJpy * filledSizeBtc
 
 maker feeが負の場合はリベートとして `feeJpy < 0` を許容する。ただし合格判定では、リベート依存になりすぎていないか週次で確認する。
 
-GMO側では銘柄ごとにmaker/taker feeが異なるため、ハードコードしない。実測ではBTCのtaker feeは0.05%、maker feeは -0.01%（rebate）を想定値として扱い、`GET /public/v1/symbols` から取得した値を正本にする。paperではMARKET/STOPをtaker、resting LIMITをmaker rebateとして扱う。
+GMO側では銘柄ごとにmaker/taker feeが異なるため、ハードコードしない。実測ではBTCのtaker feeは0.05%、maker feeは -0.01%（rebate）を想定値として扱い、`GET /public/v1/symbols` から取得した値を正本にする。paperではMARKET/STOPと発注時点で板を跨ぐLIMITをtaker、resting LIMITをmaker rebateとして扱う。
 
 ### 15.3 スプレッド・スリッページモデル
 
@@ -3725,13 +3725,16 @@ finalFillPrice = fillPrice - fixedSlippage - volatilitySlippage
 指値BUY:
 
 - `limitPrice >= bestAsk` ならtakerとして即時約定。
-- `limitPrice < bestAsk` ならmaker候補。後続tradesで `trade.price <= limitPrice` が発生したら、当面はall-or-noneで約定または未約定にする。
-- `SOK` で即takerになる価格なら失効。
+- `limitPrice < bestAsk` ならmaker候補。未約定中は取得できた板の `bestAsk <= limitPrice` で到達判定し、板が取得できない場合だけWARNを出してticker由来のlast price比較へfallbackする。
+- crossing / resting LIMITはall-or-noneでfull fillし、LIMIT価格までのask深さに `queueFillRatio` を掛けたFAK推定数量が注文数量を下回る場合は、実約定とは別にpaper execution乖離メモを残す。crossing は `PaperTradeResult` と runner lifecycle payload、resting は reconcile pass payload へ伝搬する。
 
 指値SELL:
 
 - `limitPrice <= bestBid` ならtakerとして即時約定。
-- `limitPrice > bestBid` ならmaker候補。
+- `limitPrice > bestBid` ならmaker候補。未約定中は取得できた板の `bestBid >= limitPrice` で到達判定し、板が取得できない場合だけWARNを出してticker由来のlast price比較へfallbackする。
+- crossing / resting LIMITはall-or-noneでfull fillし、LIMIT価格までのbid深さに `queueFillRatio` を掛けたFAK推定数量が注文数量を下回る場合は、実約定とは別にpaper execution乖離メモを残す。crossing は `PaperTradeResult` と runner lifecycle payload、resting は reconcile pass payload へ伝搬する。
+
+TimeInForce / post-only / SOK / FAS はpaper約定判定に含めない。
 
 ### 15.4 STOP/TPシミュレーション
 
@@ -3740,11 +3743,10 @@ finalFillPrice = fillPrice - fixedSlippage - volatilitySlippage
 - `ProtectionReconciler` は REST polling で取得した ticker の `lastPrice` をもとにSTOP / virtual TP到達を検出する。
 - 到達時点で取得した板でSELL成行相当をシミュレートする。板取得に失敗した場合は ticker bid と slippage で保守的に約定価格を決める。
 
-ローソク補完時:
+ローソク高安:
 
-- long positionで `candle.low <= stopLoss` ならSTOP約定。
-- 同じ足で `high >= takeProfit` と `low <= stopLoss` の両方が成立した場合、悲観的にSTOPが先とみなす。
-- これはバックテストではなく、paper ledgerの欠損補正用。
+- paper reconcile は同一足の high / low をSTOP / virtual TPの到達判定に使わない。
+- STOP / virtual TP は `ProtectionReconciler` が取得したtickのlast priceで判定する。
 
 ### 15.5 約定シミュレータinterface
 
@@ -3778,6 +3780,7 @@ data class ImmediateExecutionRequest(
     val orderType: OrderType,
     val sizeBtc: BigDecimal,
     val triggerPriceJpy: BigDecimal? = null,
+    val limitPriceJpy: BigDecimal? = null,
 )
 
 data class PendingLimitExecutionRequest(
@@ -3805,6 +3808,25 @@ data class PaperOrderUpdate(
     val fill: SimulatedFill?,
     val remainingSizeBtc: BigDecimal,
     val expired: Boolean,
+    val divergenceMemo: PaperExecutionDivergenceMemo? = null,
+)
+
+data class PaperExecutionDivergenceMemo(
+    val kind: String,
+    val orderId: String?,
+    val intentId: String?,
+    val tradeGroupId: String?,
+    val clientRequestId: String?,
+    val symbol: String?,
+    val side: OrderSide,
+    val limitPriceJpy: BigDecimal,
+    val requestedSizeBtc: BigDecimal,
+    val hypotheticalFilledSizeBtc: BigDecimal,
+    val hypotheticalRemainingSizeBtc: BigDecimal,
+    val boardDepthBtc: BigDecimal,
+    val queueFillRatio: BigDecimal,
+    val bestBidJpy: BigDecimal?,
+    val bestAskJpy: BigDecimal?,
 )
 ```
 
@@ -3868,10 +3890,10 @@ maxDD = min((equity - equityPeak) / equityPeak)
 #### Paper simulatorテスト
 
 - 成行BUYがasksを正しく板歩きする。
-- 板数量不足時に拒否または未約定になる。
+- LIMIT BUY / SELL がbest ask / best bidで到達判定される。
+- crossing LIMITがtaker feeで即時約定する。
+- crossing / resting LIMITの板深さがFAK部分約定相当なら、actual fillはfullのまま乖離メモが残る。
 - maker/taker feeが正負含め計算される。
-- SOKがtaker化する価格で失効する。
-- 同一足TP/SL同時到達でSTOP優先になる。
 - sizeStep/tickSize丸め後も2%リスクを超えない。
 - Clock注入と価格リプレイにより、同じDB初期状態・同じ価格系列なら同じorder/fill/position結果になる。
 

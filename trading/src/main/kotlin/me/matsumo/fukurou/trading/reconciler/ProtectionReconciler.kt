@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
@@ -11,6 +12,8 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.Broker
+import me.matsumo.fukurou.trading.broker.PaperExecutionDivergenceMemo
+import me.matsumo.fukurou.trading.broker.toJsonObject
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.lock.TradingLock
@@ -177,12 +180,17 @@ class ProtectionReconciler(
             val reconciledAt = Instant.now(clock)
 
             val tickSnapshot = readTickSnapshot()
+            var divergenceMemos = emptyList<PaperExecutionDivergenceMemo>()
 
             if (tickSnapshot != null) {
                 val sweptBeforeReconcile = enforceHardHaltSweepIfNeeded(tickSnapshot)
 
                 if (!sweptBeforeReconcile) {
-                    broker?.reconcile(tickSnapshot)?.getOrThrow()
+                    divergenceMemos = broker
+                        ?.reconcile(tickSnapshot)
+                        ?.getOrThrow()
+                        ?.divergenceMemos
+                        .orEmpty()
                     val sweptAfterReconcile = enforceHardHaltSweepIfNeeded(tickSnapshot)
 
                     if (!sweptAfterReconcile) {
@@ -192,7 +200,7 @@ class ProtectionReconciler(
             }
 
             equitySnapshotRecorder?.recordDailyIfNeeded()
-            markSuccessfulPass(passKind, tickSnapshot, reconciledAt).getOrThrow()
+            markSuccessfulPass(passKind, tickSnapshot, reconciledAt, divergenceMemos).getOrThrow()
         }
 
         if (passResult.isSuccess) {
@@ -266,6 +274,7 @@ class ProtectionReconciler(
         passKind: ReconcilePassKind,
         tickSnapshot: TickSnapshot?,
         reconciledAt: Instant,
+        divergenceMemos: List<PaperExecutionDivergenceMemo>,
     ): Result<Unit> {
         val isStartupFullPass = passKind == ReconcilePassKind.STARTUP_FULL
         val lastMarketDataAt = tickSnapshot?.observedAt ?: status.snapshot().lastMarketDataAt
@@ -274,6 +283,7 @@ class ProtectionReconciler(
             reconciledAt = reconciledAt,
             startupFullReconcileCompleted = isStartupFullPass,
             lastMarketDataAt = lastMarketDataAt,
+            divergenceMemos = divergenceMemos,
         )
 
         if (auditResult.isFailure) {
@@ -294,6 +304,7 @@ class ProtectionReconciler(
         reconciledAt: Instant,
         startupFullReconcileCompleted: Boolean,
         lastMarketDataAt: Instant?,
+        divergenceMemos: List<PaperExecutionDivergenceMemo>,
     ): Result<Unit> {
         val completedResult = appendReconcilerEvent(
             eventType = CommandEventType.RECONCILER_PASS_COMPLETED,
@@ -302,6 +313,7 @@ class ProtectionReconciler(
                 reconciledAt = reconciledAt,
                 startupFullReconcileCompleted = startupFullReconcileCompleted,
                 lastMarketDataAt = lastMarketDataAt,
+                divergenceMemos = divergenceMemos,
             ),
             occurredAt = reconciledAt,
         )
@@ -369,6 +381,7 @@ private fun buildPassCompletedPayload(
     reconciledAt: Instant,
     startupFullReconcileCompleted: Boolean,
     lastMarketDataAt: Instant?,
+    divergenceMemos: List<PaperExecutionDivergenceMemo>,
 ): String {
     return buildJsonObject {
         put("pass", passKind.payloadName())
@@ -377,6 +390,9 @@ private fun buildPassCompletedPayload(
         put("startupFullReconcileCompleted", startupFullReconcileCompleted)
         lastMarketDataAt?.let { marketDataAt ->
             put("lastMarketDataAt", marketDataAt.toString())
+        }
+        if (divergenceMemos.isNotEmpty()) {
+            put("paperExecutionDivergenceMemos", JsonArray(divergenceMemos.map { memo -> memo.toJsonObject() }))
         }
     }.toString()
 }

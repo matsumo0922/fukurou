@@ -217,6 +217,7 @@ Cloudflare Access は `/app/*` と `/ops/*` を保護し、runtime config draft 
 ## paper / live の構造的乖離
 
 - paper STOP は `ProtectionReconciler` が動いている間だけ約定判定される。live の native STOP は bot 停止中も取引所側で作動するため、paper の方が保護が弱い。
-- paper は当面 all-or-none 約定で、GMO の FAK 部分約定は完全再現しない。
+- paper の LIMIT は all-or-none 約定で、GMO の FAK 部分約定は完全再現しない。LIMIT 価格までの板深さではFAK部分約定になるケースは、crossing / resting のどちらも乖離メモとして残す。crossing は tool response と runner lifecycle payload、resting は `command_event_log` の reconcile pass payload に伝搬する。
+- paper の LIMIT は板が取得できる場合、BUY は `bestAsk <= limitPrice`、SELL は `bestBid >= limitPrice` で到達判定する。発注時点で板を跨ぐ LIMIT は taker fee の即時約定として扱う。板が取得できない場合だけ、WARNを出してlast price比較へfallbackする。
 - paper の slippage / fallback spread / fallback fee は config で保守的に近似する。live 化前に実測で較正する。
 - `LIVE` mode は typed model の予約値であり、`LiveGmoBroker` と live 実発注は未実装。現時点では env 起動を fail closed し、ユーザーの明示要求なしに有効化しない。

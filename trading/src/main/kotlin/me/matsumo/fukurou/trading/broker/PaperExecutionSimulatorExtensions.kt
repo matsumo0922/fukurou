@@ -104,31 +104,63 @@ internal fun PaperExecutionSimulator.restingEntryFill(
     request: RestingEntryFillRequest,
     context: PaperSimulationContext,
 ): SimulatedFill {
+    return requireNotNull(restingEntryUpdate(request, context).fill) {
+        "Triggered resting entry order must create a fill."
+    }
+}
+
+/**
+ * resting entry order の更新を注文種別と市場 context に応じて計算する。
+ */
+internal fun PaperExecutionSimulator.restingEntryUpdate(
+    request: RestingEntryFillRequest,
+    context: PaperSimulationContext,
+): PaperOrderUpdate {
     return when (request.orderType) {
-        OrderType.LIMIT -> requireNotNull(
-            simulatePendingLimit(
-                request = PendingLimitExecutionRequest(
-                    side = request.side,
-                    sizeBtc = request.sizeBtc,
-                    limitPriceJpy = requireNotNull(request.limitPriceJpy) {
-                        "LIMIT entry order requires limitPriceJpy."
-                    },
-                ),
-                context = context,
-            ).fill,
-        ) {
-            "Triggered LIMIT order must create a fill."
-        }
-        OrderType.STOP -> stopFill(
-            side = request.side,
-            sizeBtc = request.sizeBtc,
-            triggerPriceJpy = requireNotNull(request.triggerPriceJpy) {
-                "STOP entry order requires triggerPriceJpy."
-            },
+        OrderType.LIMIT -> simulatePendingLimit(
+            request = PendingLimitExecutionRequest(
+                side = request.side,
+                sizeBtc = request.sizeBtc,
+                limitPriceJpy = requireNotNull(request.limitPriceJpy) {
+                    "LIMIT entry order requires limitPriceJpy."
+                },
+            ),
             context = context,
+        )
+        OrderType.STOP -> PaperOrderUpdate(
+            fill = stopFill(
+                side = request.side,
+                sizeBtc = request.sizeBtc,
+                triggerPriceJpy = requireNotNull(request.triggerPriceJpy) {
+                    "STOP entry order requires triggerPriceJpy."
+                },
+                context = context,
+            ),
+            remainingSizeBtc = BigDecimal.ZERO.btcScale(),
+            expired = false,
         )
         OrderType.MARKET -> error("MARKET entry is not a resting order.")
     }
+}
+
+/**
+ * crossing LIMIT の即時 taker 約定を計算する。
+ */
+internal fun PaperExecutionSimulator.limitTakerFill(
+    side: OrderSide,
+    sizeBtc: BigDecimal,
+    limitPriceJpy: BigDecimal,
+    context: PaperSimulationContext,
+): SimulatedFill {
+    return simulateImmediate(
+        request = ImmediateExecutionRequest(
+            side = side,
+            orderType = OrderType.LIMIT,
+            sizeBtc = sizeBtc,
+            limitPriceJpy = limitPriceJpy,
+        ),
+        context = context,
+    )
 }
 
 /**
