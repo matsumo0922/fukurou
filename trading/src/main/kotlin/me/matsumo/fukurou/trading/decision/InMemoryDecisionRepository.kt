@@ -405,6 +405,9 @@ fun validateDecisionSubmission(submission: DecisionSubmission, maxTradePlanRevis
     require(closeRatioIsInRange) {
         "close_ratio must be greater than zero and less than or equal to 1."
     }
+    require(closeRatio == null || submission.action == DecisionAction.REDUCE) {
+        "close_ratio is only supported for REDUCE decisions."
+    }
     require(submission.reasonJa.isNotBlank()) {
         "reason_ja is required."
     }

@@ -100,7 +100,7 @@ FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC=
 
 runner の成功判定は DB が唯一の正本であり、LLM の stdout や exit code から decision は parse しない。Proposer 終了後に `FUKUROU_INVOCATION_ID` に紐づく `decisions` 行を読み、行がなければ `CallerNoTradeGuard` で no-trade audit を残して fail closed する。
 
-`ENTER` / `ADD_LONG` decision は Falsifier を起動し、fresh な `APPROVED` が DB にあるときだけ persisted `trade_intents` の宣言値から `PlaceOrderCommand` を組み立て、`ToolCallGuard.runTradeTool -> PaperBroker -> SafetyFloor` の既存経路へ流す。`EXIT` / `REDUCE` / `ADJUST_PROTECTION` decision は Falsifier と EV gate を通さず、保存済み decision と paper ledger から対象を一意に決められる場合だけ runner が決定論的に close / reduce / protection update を実行する。`REDUCE` は `close_ratio` を必須にし、`EXIT` は `close_ratio` 省略時に full close として扱う。order placement 用の第三 LLM session は起動しない。
+`ENTER` / `ADD_LONG` decision は Falsifier を起動し、fresh な `APPROVED` が DB にあるときだけ persisted `trade_intents` の宣言値から `PlaceOrderCommand` を組み立て、`ToolCallGuard.runTradeTool -> PaperBroker -> SafetyFloor` の既存経路へ流す。`EXIT` / `REDUCE` / `ADJUST_PROTECTION` decision は Falsifier と EV gate を通さず、保存済み decision と paper ledger から対象を一意に決められる場合だけ runner が決定論的に close / reduce / protection update を実行する。`REDUCE` は `close_ratio` を必須にし、`EXIT` は常に full close として扱う。order placement 用の第三 LLM session は起動しない。
 
 runner が CLI に渡す MCP config は、MCP server env を親 process 継承任せにしない。DB credential を含むため、Claude では permission 0600 の一時 JSON file を作り、その path だけを `--mcp-config` に渡す。Codex では `CODEX_HOME/config.toml` に書き、`mcp_servers.*.env.*` を `-c` argv へ展開しない。production では `FUKUROU_CODEX_PERSISTENT_HOME=/tmp/fukurou-cli-home/.codex` を明示し、`llm-home` volume 内の Codex home に config だけを in-place 生成する。local など未設定時は従来どおり一時 `CODEX_HOME` を作り、親 `CODEX_HOME/auth.json`（未設定時は `HOME/.codex/auth.json`）が存在する場合だけ 0600 で copy する。概念的には少なくとも以下を MCP server env へ明示する。
 

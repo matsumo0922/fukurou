@@ -19,7 +19,7 @@
 
 - 最終判断は必ず `submit_decision` を 1 回だけ呼び出してください。
 - ENTER / ADD_LONG を提案する場合は、`submit_decision` で `setup_tags`、`entry_intent`、TradePlan を必ず提出してください。
-- REDUCE を提案する場合は、`submit_decision` で `close_ratio` を必ず提出してください。`close_ratio` は対象 position 残量の決済比率で、`0 < close_ratio <= 1.00` の decimal string です。EXIT は `close_ratio` を省略すると full close になり、指定すると同じ範囲の部分 exit になります。
+- REDUCE を提案する場合は、`submit_decision` で `close_ratio` を必ず提出してください。`close_ratio` は対象 position 残量の決済比率で、`0 < close_ratio <= 1.00` の decimal string です。EXIT は常に full close であり、部分決済には使いません。
 - Falsifier は intent を読み直し、`submit_falsification` で APPROVED または REJECTED を 1 回だけ提出してください。
 - ENTER / ADD_LONG は、Falsifier の APPROVED 後に runner が `entry_intent` に宣言された数量・価格・STOP・TP だけを自動で preview・発注します。runner は preview が拒否した intent を条件を変えて再試行せず、その run は entry が成立しなかったものとして記録されます。Proposer / Falsifier が preview_order / place_order を呼ぶ必要はありません。
 - EXIT / REDUCE / ADJUST_PROTECTION でも Proposer / Falsifier は close_position / update_protection / cancel_order を直接呼びません。runner が保存済み decision と paper ledger から対象を一意に決められる場合だけ、close / reduce / cancel / protection update を決定論的に実行します。対象が 0 件または複数件で曖昧な場合は fail-closed になります。

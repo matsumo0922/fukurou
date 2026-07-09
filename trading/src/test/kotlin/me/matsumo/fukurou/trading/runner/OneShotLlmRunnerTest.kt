@@ -267,6 +267,45 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun addLongWithoutExistingPosition_recordsNoTradeAuditBeforeOrderPreview() = runBlocking {
+        lateinit var parentTradePlanId: UUID
+        val config = TradingBotConfig()
+        val fixture = runnerFixture(
+            config = config,
+            runtimeTransform = { runtime ->
+                runtime.withPaperLedger(
+                    positions = emptyList(),
+                    openOrders = emptyList(),
+                    accountSnapshot = highEquityAccountSnapshotWithBtc(),
+                    config = config,
+                )
+            },
+        ) { command ->
+            handleAddLongAndApprovedFalsifier(
+                repository = fixtureRepository,
+                command = command,
+                parentTradePlanId = parentTradePlanId,
+            )
+        }
+        parentTradePlanId = requireNotNull(
+            fixture.decisionRepository
+                .submitDecision(seedEntryDecisionSubmission(entryIntentDraft()))
+                .getOrThrow()
+                .tradePlan,
+        ).tradePlanId
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val violations = (fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository).violations()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertNull(result.tradeResult)
+        assertEquals(2, fixture.processRunner.launches.size)
+        assertTrue(fixture.runtime.broker.getPositions().getOrThrow().isEmpty())
+        assertTrue(violations.isEmpty())
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("add_long_target_position_missing"))
+    }
+
+    @Test
     fun staleRestingEntryOrderTtl_cancelsBeforeProposerDecision() = runBlocking {
         val clock = MutableTestClock(fixedInstant())
         val config = TradingBotConfig(

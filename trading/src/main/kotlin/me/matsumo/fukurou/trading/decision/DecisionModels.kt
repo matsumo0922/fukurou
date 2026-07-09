@@ -74,7 +74,7 @@ enum class FalsificationVerdict {
  * @param systemPromptVersion system prompt version
  * @param marketSnapshotId 判断前 market snapshot ID
  * @param action 最終 action
- * @param closeRatio REDUCE / EXIT が対象 position 残量のうち決済する比率
+ * @param closeRatio REDUCE が対象 position 残量のうち決済する比率
  * @param setupTags setup taxonomy 用タグ
  * @param estimatedWinProbability LLM 申告の推定勝率
  * @param expectedRMultiple 期待 R 倍率

@@ -554,16 +554,16 @@ class OneShotLlmRunner(
                 cause = falsifierResult.failure,
             ).getOrThrow()
 
-            return OneShotRunnerResult(
-                invocationId = invocationId,
-                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
-                decision = decision,
-                intent = intent,
-                tradeResult = null,
-            )
+            return entryFlowResult(invocationId, decision, intent, OneShotRunnerStatus.NO_TRADE_AUDITED)
         }
 
         input.failureContextUpdated(proposerContext)
+        if (decision.decision.submission.action == DecisionAction.ADD_LONG) {
+            decisionExecutionLifecycle.ensureAddLongTargetPosition(proposerContext)?.let { lifecycleResult ->
+                return entryFlowResult(invocationId, decision, intent, lifecycleResult.status, lifecycleResult.tradeResult)
+            }
+        }
+
         val placeResult = placeApprovedEntry(proposerContext, intent)
         val placed = placeResult.getOrNull()
 
@@ -574,13 +574,7 @@ class OneShotLlmRunner(
                 cause = placeResult.exceptionOrNull(),
             ).getOrThrow()
 
-            return OneShotRunnerResult(
-                invocationId = invocationId,
-                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
-                decision = decision,
-                intent = intent,
-                tradeResult = null,
-            )
+            return entryFlowResult(invocationId, decision, intent, OneShotRunnerStatus.NO_TRADE_AUDITED)
         }
 
         val finalStatus = if (placed.accepted) {
@@ -589,12 +583,22 @@ class OneShotLlmRunner(
             OneShotRunnerStatus.NO_TRADE_AUDITED
         }
 
+        return entryFlowResult(invocationId, decision, intent, finalStatus, placed)
+    }
+
+    private fun entryFlowResult(
+        invocationId: String,
+        decision: DecisionSubmissionResult,
+        intent: TradeIntentRecord,
+        status: OneShotRunnerStatus,
+        tradeResult: PaperTradeResult? = null,
+    ): OneShotRunnerResult {
         return OneShotRunnerResult(
             invocationId = invocationId,
-            status = finalStatus,
+            status = status,
             decision = decision,
             intent = intent,
-            tradeResult = placed,
+            tradeResult = tradeResult,
         )
     }
 

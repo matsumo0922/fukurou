@@ -918,7 +918,7 @@ object DecisionsTable : Table("decisions") {
     val action = varchar("action", length = 32)
 
     /**
-     * REDUCE / EXIT の close ratio。
+     * REDUCE の close ratio。
      */
     val closeRatio = decimal("close_ratio", precision = 20, scale = 10).nullable()
 

@@ -33,6 +33,7 @@ class SystemPromptV1Test {
         assertTrue(content.contains("p < 0.5 でも ENTER / ADD_LONG"))
         assertTrue(content.contains("REDUCE を提案する場合は"))
         assertTrue(content.contains("`close_ratio` は対象 position 残量の決済比率"))
+        assertTrue(content.contains("EXIT は常に full close"))
         assertTrue(content.contains("ENTER / ADD_LONG は、Falsifier の APPROVED 後"))
         assertTrue(content.contains("STOP なしの ENTER / ADD_LONG"))
         assertTrue(content.contains("追加 risk が初回 risk budget の 50% 以下"))

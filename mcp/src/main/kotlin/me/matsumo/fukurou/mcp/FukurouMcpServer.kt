@@ -184,9 +184,8 @@ private const val SUBMIT_DECISION_DESCRIPTION = "Submit the structured LLM decis
 /**
  * submit_decision.close_ratio schema の説明。
  */
-private const val SUBMIT_DECISION_CLOSE_RATIO_DESCRIPTION = "Position close ratio for REDUCE, " +
-    "or optional partial EXIT. Decimal string with 0 < close_ratio <= 1.00. " +
-    "Omit EXIT close_ratio for full close."
+private const val SUBMIT_DECISION_CLOSE_RATIO_DESCRIPTION = "Position close ratio for REDUCE. " +
+    "Decimal string with 0 < close_ratio <= 1.00."
 
 /**
  * submit_decision.expected_r_multiple schema の説明。
@@ -1749,6 +1748,10 @@ private fun parseTradePlanDraft(request: CallToolRequest, action: DecisionAction
 private fun parseDecisionCloseRatio(request: CallToolRequest, action: DecisionAction): Result<BigDecimal?> {
     return runCatching {
         val closeRatio = parseOptionalBigDecimalArgument(request, "close_ratio").getOrThrow()
+
+        require(closeRatio == null || action == DecisionAction.REDUCE) {
+            "close_ratio is only supported for REDUCE decisions."
+        }
 
         if (action == DecisionAction.REDUCE) {
             require(closeRatio != null) {

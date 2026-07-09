@@ -138,7 +138,7 @@ internal class DecisionExecutionLifecycle(
                     context = context,
                     position = target.position,
                     decision = decision,
-                    closeRatio = decision.decision.submission.closeRatio ?: BigDecimal.ONE,
+                    closeRatio = BigDecimal.ONE,
                     reason = "exit_decision_close_position",
                 )
                 is ExitExecutionTarget.CancelEntryOrder -> cancelOrder(
@@ -237,6 +237,36 @@ internal class DecisionExecutionLifecycle(
         return DecisionLifecycleExecutionResult(
             status = OneShotRunnerStatus.PAPER_REDUCE_EXECUTED,
             tradeResult = result,
+        )
+    }
+
+    /**
+     * ADD_LONG decision の対象 position が一意に決まることを検証する。
+     */
+    suspend fun ensureAddLongTargetPosition(context: DecisionRunContext): DecisionLifecycleExecutionResult? {
+        val startedAt = Instant.now(clock)
+        val openPositions = tradingRuntime.broker.getPositions().getOrThrow()
+        val targetPosition = openPositions.singleOrNull()
+
+        if (targetPosition != null) return null
+
+        val failure = if (openPositions.isEmpty()) {
+            DecisionLifecycleFailure("add_long_target_position_missing")
+        } else {
+            DecisionLifecycleFailure("add_long_target_position_ambiguous")
+        }
+
+        appendFailClosedPhase(
+            context = context,
+            phase = "add_long_execution",
+            failure = failure,
+            startedAt = startedAt,
+        ).getOrThrow()
+        recordNoTrade(context, failure.reason, null).getOrThrow()
+
+        return DecisionLifecycleExecutionResult(
+            status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+            tradeResult = null,
         )
     }
 

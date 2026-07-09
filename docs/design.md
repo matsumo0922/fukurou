@@ -2279,6 +2279,7 @@ get_runtime_limits
 - `ENTER` / `ADD_LONG` で `entryPlan.stopLossJpy == null` は拒否。
 - `ENTER` / `ADD_LONG` で `entryPlan.targetPriceJpy == null` は拒否。
 - `REDUCE` では `close_ratio` を必須にし、`0 < close_ratio <= 1.0` の範囲だけ受け付ける。
+- `REDUCE` 以外の action に `close_ratio` が指定された場合は拒否する。`EXIT` は常に全量 close として扱う。
 - `entryPlan.sizeBtc` がある場合、`preview_order` のtoolEvidenceIdが必須。
 - `factCheck` の必須項目がfalseの場合、actionによって拒否またはwarning。
 - `overrideRequests` にSafety Floor関連が混入した場合は拒否。
@@ -2674,6 +2675,7 @@ newFloor = max(currentStopLoss, atrTrailingFloor)
 |---|---|
 | 追加回数 | `position.pyramidAddCount < 2` |
 | 含み益 | `position.unrealizedR >= position.pyramidAddCount + 1` |
+| 対象 | `ADD_LONG` は同一 trade group の既存 open position がある場合だけ許可 |
 | 方向 | 1h biasがUP、5mで押し/再ブレイク、板/歩み値が極端に悪くない |
 | リスク | 追加 risk が初回 risk budget の 50% 以内、かつ追加後の合算STOPリスクが equity の 2% 以内 |
 | 禁止 | `unrealizedPnlJpy < 0` の買い増しはSafety Floorで拒否 |

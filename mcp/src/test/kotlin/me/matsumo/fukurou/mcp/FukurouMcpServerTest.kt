@@ -551,6 +551,31 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun submitDecisionTool_rejectsCloseRatioForExit() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = runtime,
+        ).createServer()
+
+        val result = callTool(
+            server = server,
+            toolName = "submit_decision",
+            arguments = exitDecisionArguments(closeRatio = "0.50"),
+        )
+        val structuredContent = assertNotNull(result.structuredContent)
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(result.isError == true)
+        assertEquals("invalid_request", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals(
+            "close_ratio is only supported for REDUCE decisions.",
+            structuredContent.getValue("message").jsonPrimitive.contentOrNull,
+        )
+        assertEquals(0, repository.snapshots.decisions().size)
+    }
+
+    @Test
     fun submitDecisionTool_recordsReduceCloseRatio() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
@@ -1491,6 +1516,22 @@ private fun enterDecisionArguments(invocationId: String? = null) = buildJsonObje
     put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ", "出来高急減"))
     put("trade_plan_target_price_jpy", "10500000")
     put("trade_plan_time_stop_at", "2026-07-02T01:00:00Z")
+}
+
+/**
+ * EXIT decision tool request の引数を作る。
+ *
+ * @param closeRatio close_ratio。null の場合は指定しない。
+ */
+private fun exitDecisionArguments(closeRatio: String? = null) = buildJsonObject {
+    put("action", "EXIT")
+    closeRatio?.let { value -> put("close_ratio", value) }
+    put("estimated_win_probability", "0.40")
+    put("expected_r_multiple", "0")
+    put("tool_evidence_ids", stringArray("tool-1", "tool-2"))
+    put("fact_check", """{"ticker":true}""")
+    put("self_review", """{"reasonsNotToTrade":["risk"]}""")
+    put("reason_ja", "否定条件に達したため全量退出します。")
 }
 
 /**
