@@ -11,6 +11,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.FUKUROU_INVOCATION_ID_ENV
@@ -786,9 +787,8 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun proposerMissingDecisionForExitFailures_recordsCallerNoTrade() = runBlocking {
+    fun proposerMissingDecisionForProcessFailures_recordsCallerNoTrade() = runBlocking {
         val cases = listOf(
-            "normal_exit" to cleanExit(),
             "nonzero_exit" to nonZeroExit(),
             "timeout" to timeoutExit(),
         )
@@ -802,6 +802,58 @@ class OneShotLlmRunnerTest {
             assertNull(result.decision, failureCase.first)
             assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"), failureCase.first)
         }
+    }
+
+    @Test
+    fun proposerNormalExitWithoutToolCalls_recordsNoToolCallsReason() = runBlocking {
+        val fixture = runnerFixture { cleanExit() }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertNull(result.decision)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_no_tool_calls"))
+    }
+
+    @Test
+    fun proposerNormalExitWithToolCallAndNoDecision_recordsMissingDecisionReason() = runBlocking {
+        lateinit var eventLog: InMemoryCommandEventLog
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                eventLog = runtime.commandEventLog as InMemoryCommandEventLog
+
+                runtime
+            },
+        ) { command ->
+            if (command.isProposerLaunch()) {
+                eventLog.append(proposerToolCallCompletedEvent(command)).getOrThrow()
+            }
+
+            cleanExit()
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertNull(result.decision)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
+        assertFalse(fixture.eventLog.events().containsNoTradeReason("proposer_no_tool_calls"))
+    }
+
+    @Test
+    fun proposerToolCallCountFailure_recordsMissingDecisionReason() = runBlocking {
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                runtime.copy(commandEventLog = CountFailureCommandEventLog(runtime.commandEventLog))
+            },
+        ) { cleanExit() }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertNull(result.decision)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
+        assertFalse(fixture.eventLog.events().containsNoTradeReason("proposer_no_tool_calls"))
     }
 
     @Test
@@ -958,7 +1010,7 @@ class OneShotLlmRunnerTest {
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertEquals(1, fixture.processRunner.launches.size)
-        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_no_tool_calls"))
     }
 
     @Test
@@ -1615,15 +1667,14 @@ private fun runnerFixture(
     clock: Clock = fixedClock(),
     launchHandler: suspend (RenderedLlmCommand) -> ProcessRunResult,
 ): RunnerFixture {
-    val runtime = runtimeTransform(
-        TradingRuntimeFactory.inMemory(
-            clock = clock,
-            marketDataSource = FakeMarketDataSource,
-            tradingConfig = config,
-        ),
+    val baseRuntime = TradingRuntimeFactory.inMemory(
+        clock = clock,
+        marketDataSource = FakeMarketDataSource,
+        tradingConfig = config,
     )
+    val eventLog = baseRuntime.commandEventLog as InMemoryCommandEventLog
+    val runtime = runtimeTransform(baseRuntime)
     val decisionRepository = runtime.decisionRepository as InMemoryDecisionRepository
-    val eventLog = runtime.commandEventLog as InMemoryCommandEventLog
     val processRunner = FakeProcessRunner(launchHandler)
     val runner = OneShotLlmRunner(
         tradingRuntime = runtime,
@@ -1646,6 +1697,26 @@ private fun runnerFixture(
         processRunner = processRunner,
         runner = runner,
     )
+}
+
+/**
+ * tool call count だけ失敗させる command event log。
+ */
+private class CountFailureCommandEventLog(
+    private val delegate: CommandEventLog,
+) : CommandEventLog {
+
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        return delegate.append(event)
+    }
+
+    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+        return delegate.countDistinctDecisionRunsSince(since)
+    }
+
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {
+        return Result.failure(IllegalStateException("tool call count failed"))
+    }
 }
 
 private fun addLongRunnerFixture(
@@ -2295,6 +2366,24 @@ private fun RenderedLlmCommand.isProposerLaunch(): Boolean {
 
 private fun RenderedLlmCommand.isFalsifierLaunch(): Boolean {
     return environment[FUKUROU_FALSIFIER_INTENT_ID_ENV] != null
+}
+
+private fun proposerToolCallCompletedEvent(command: RenderedLlmCommand): CommandEvent {
+    return CommandEvent(
+        decisionRunContext = DecisionRunContext(
+            decisionRunId = command.environment.getValue(FUKUROU_INVOCATION_ID_ENV),
+            llmProvider = command.environment.getValue(FUKUROU_LLM_PROVIDER_ENV),
+            promptHash = command.environment.getValue(FUKUROU_PROMPT_HASH_ENV),
+            systemPromptVersion = command.environment.getValue(FUKUROU_SYSTEM_PROMPT_VERSION_ENV),
+            marketSnapshotId = command.environment.getValue(FUKUROU_MARKET_SNAPSHOT_ID_ENV),
+        ),
+        toolName = "get_ticker",
+        toolCallId = "tool-call-1",
+        clientRequestId = "client-request-1",
+        eventType = CommandEventType.TOOL_CALL_COMPLETED,
+        payload = "{}",
+        occurredAt = fixedInstant(),
+    )
 }
 
 private fun RenderedLlmCommand.claudeMcpConfigContent(): String {

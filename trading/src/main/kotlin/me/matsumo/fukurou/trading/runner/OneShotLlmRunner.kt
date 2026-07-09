@@ -8,6 +8,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.FUKUROU_INVOCATION_ID_ENV
@@ -443,9 +444,15 @@ class OneShotLlmRunner(
         val decision = proposerResult.decision
 
         if (decision == null) {
+            val noTradeReason = missingProposerDecisionReason(
+                input = input,
+                proposerResult = proposerResult,
+                commandEventLog = tradingRuntime.commandEventLog,
+            )
+
             runAuditRecorder.recordNoTrade(
                 context = proposerContext,
-                reason = "proposer_missing_decision",
+                reason = noTradeReason,
                 cause = proposerResult.failure,
             ).getOrThrow()
 
@@ -1227,6 +1234,10 @@ const val MCP_JAR_PATH_PLACEHOLDER = $$"${mcpJarPath}"
  */
 private const val PROMPT_HASH_UNAVAILABLE = "unavailable"
 
+private const val PROPOSER_MISSING_DECISION_REASON = "proposer_missing_decision"
+
+private const val PROPOSER_NO_TOOL_CALLS_REASON = "proposer_no_tool_calls"
+
 /**
  * max invocations/hour の集計 window。
  */
@@ -1333,6 +1344,35 @@ private data class ProposerDecisionResult(
     val decision: DecisionSubmissionResult?,
     val failure: Throwable?,
 )
+
+private suspend fun missingProposerDecisionReason(
+    input: OneShotAfterPreflightRequest,
+    proposerResult: ProposerDecisionResult,
+    commandEventLog: CommandEventLog,
+): String {
+    if (proposerResult.failure != null) {
+        return PROPOSER_MISSING_DECISION_REASON
+    }
+
+    val proposerToolNames = shortMcpToolNames(input.request.cliConfig.proposerAllowedTools).toSet()
+    if (proposerToolNames.isEmpty()) {
+        return PROPOSER_MISSING_DECISION_REASON
+    }
+
+    val toolCallCount = commandEventLog
+        .countToolCallEvents(
+            decisionRunId = input.invocationId,
+            toolNames = proposerToolNames,
+        ).getOrElse {
+            return PROPOSER_MISSING_DECISION_REASON
+        }
+
+    return if (toolCallCount == 0) {
+        PROPOSER_NO_TOOL_CALLS_REASON
+    } else {
+        PROPOSER_MISSING_DECISION_REASON
+    }
+}
 
 /**
  * falsifier phase 後の verdict 判定結果。
