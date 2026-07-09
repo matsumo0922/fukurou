@@ -14,6 +14,7 @@ import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
+import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
@@ -24,6 +25,7 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceDependencies
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceRuntime
 import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
+import me.matsumo.fukurou.trading.daemon.toLlmDaemonEntryFillOrNull
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
@@ -31,6 +33,7 @@ import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_JAR_PATH_ENV
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
@@ -193,6 +196,7 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
             openRiskReader = components.tradingRuntime.openRiskReader(),
             tickerReader = components.marketDataSource.tickerReader(inputs.tradingConfig),
             positionsReader = components.tradingRuntime.positionsReader(),
+            entryFillReader = components.paperLedgerRepository.entryFillReader(),
         ),
         runtime = LlmDaemonSchedulerRuntime(
             requestBase = components.requestBase,
@@ -275,10 +279,15 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         parentEnvironment = inputs.environment,
         clock = inputs.clock,
     )
+    val paperLedgerRepository = ExposedPaperLedgerRepository(
+        database = inputs.database,
+        fallbackSymbolRules = inputs.tradingConfig.paperMarket.toSymbolRules(inputs.tradingConfig.symbol),
+    )
 
     return LlmLaunchRuntimeComponents(
         tradingRuntime = tradingRuntime,
         marketDataSource = marketDataSource,
+        paperLedgerRepository = paperLedgerRepository,
         launchReservationRepository = ExposedLlmLaunchReservationRepository(inputs.database),
         requestBase = inputs.requestBase,
         launchOneShot = runner.asDaemonLauncher(),
@@ -312,6 +321,17 @@ private fun GmoPublicMarketDataSource.tickerReader(tradingConfig: TradingBotConf
 private fun TradingRuntime.positionsReader(): LlmDaemonPositionsReader {
     return LlmDaemonPositionsReader {
         broker.getPositions()
+    }
+}
+
+private fun ExposedPaperLedgerRepository.entryFillReader(): LlmDaemonEntryFillReader {
+    return LlmDaemonEntryFillReader {
+        getRecentExecutions(ENTRY_FILL_LOOKBACK_LIMIT).map { executions ->
+            executions
+                .asSequence()
+                .mapNotNull { execution -> execution.toLlmDaemonEntryFillOrNull() }
+                .maxByOrNull { entryFill -> entryFill.executedAt }
+        }
     }
 }
 
@@ -382,6 +402,7 @@ private data class LlmLaunchRuntimeInputs(
  *
  * @param tradingRuntime DB 接続済み trading runtime
  * @param marketDataSource GMO public market data source
+ * @param paperLedgerRepository paper ledger 読み書き repository
  * @param launchReservationRepository 起動予約 repository
  * @param requestBase one-shot runner の固定 request
  * @param launchOneShot one-shot runner 起動境界
@@ -389,7 +410,13 @@ private data class LlmLaunchRuntimeInputs(
 private data class LlmLaunchRuntimeComponents(
     val tradingRuntime: TradingRuntime,
     val marketDataSource: GmoPublicMarketDataSource,
+    val paperLedgerRepository: ExposedPaperLedgerRepository,
     val launchReservationRepository: ExposedLlmLaunchReservationRepository,
     val requestBase: OneShotRunnerRequest,
     val launchOneShot: suspend (OneShotRunnerRequest) -> Result<OneShotRunnerResult>,
 )
+
+/**
+ * ENTRY_FILL trigger が見る recent execution 件数。
+ */
+private const val ENTRY_FILL_LOOKBACK_LIMIT = 20

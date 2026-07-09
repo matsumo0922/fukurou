@@ -1337,17 +1337,18 @@ LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`
 
 [設計提案] v1の具体条件は次の通り。
 
-| 発火         | 条件                                   |                cooldown | 備考                                                              |
-|------------|--------------------------------------|------------------------:|-----------------------------------------------------------------|
-| flatハートビート | ポジションなしで15分ごと                        |                      適用 | 学習データ収集と地合い更新。token / サブスク枠は #28 で監視する                          |
-| 価格急変       | 5分前midから `abs(change) >= 1.0%`       | 適用。ただし保有中STOP接近は bypass | 急変時の確認                                                          |
-| 構造イベント     | 1時間足の新高値/新安値、主要レンジ抜けなど               |                      適用 | 静かなトレンド取り逃しの緩和。daemon設計時に条件を追加                                  |
-| 保有中check   | open position / open order があれば15分ごと |                      適用 | STOP/TP近接、1R到達、ATR床更新。保護・約定判定は `ProtectionReconciler` が短周期で継続する |
-| 起動時復旧      | プロセス起動直後                             |                  bypass | DB/取引所/ペーパー台帳の整合性確認                                             |
-| 安全バックストップ  | DD閾値、STOP到達、データ不整合                   |                  bypass | LLMを呼ばずコードで守る場合あり                                               |
-| 手動         | WebUI/CLIで明示発火                       |                bypass可能 | 理由必須                                                            |
+| 発火 | 条件 | cooldown | 備考 |
+|---|---|---:|---|
+| flatハートビート | ポジションなしで15分ごと | 適用 | 学習データ収集と地合い更新。token / サブスク枠は #28 で監視する |
+| 価格急変 | 5分前midから `abs(change) >= 1.0%` | 適用。ただし保有中STOP接近は bypass | 急変時の確認 |
+| 構造イベント | 1時間足の新高値/新安値、主要レンジ抜けなど | 適用 | 静かなトレンド取り逃しの緩和。daemon設計時に条件を追加 |
+| paper entry fill | paper entry の BUY execution を検出 | 適用 | 約定直後に thesis が有効なままか再評価する |
+| 保有中check | open position / open order があれば15分ごと | 適用 | STOP/TP近接、1R到達、ATR床更新。保護・約定判定は `ProtectionReconciler` が短周期で継続する |
+| 起動時復旧 | プロセス起動直後 | bypass | DB/取引所/ペーパー台帳の整合性確認 |
+| 安全バックストップ | DD閾値、STOP到達、データ不整合 | bypass | LLMを呼ばずコードで守る場合あり |
+| 手動 | WebUI/CLIで明示発火 | bypass可能 | 理由必須 |
 
-[実装済み: #55] `PRICE_MOVE` は GMO ticker の5分 window 変化率が1%以上のとき、`STOP_PROXIMITY` は保有中 LONG position の残り R が0.3以下のときに daemon reservation 経路で発火する。ticker が取得不能・stale・timestamp parse 不能な tick では市場系 trigger だけを見送り、flat heartbeat / holding dense check は従来通り fallback として残す。
+`PRICE_MOVE` は GMO ticker の5分 window 変化率が1%以上のとき、`STOP_PROXIMITY` は保有中 LONG position の残り R が0.3以下のとき、`ENTRY_FILL` は paper entry の BUY execution を検出したときに daemon reservation 経路で発火する。ticker が取得不能・stale・timestamp parse 不能な tick では市場系 trigger だけを見送り、flat heartbeat / holding dense check は fallback として残す。`ENTRY_FILL` は同じ fill と cooldown 内の fill burst を後追い発火せず、runner の hourly / daily cap を消費する。
 
 ### 6.2 daemonの責務
 

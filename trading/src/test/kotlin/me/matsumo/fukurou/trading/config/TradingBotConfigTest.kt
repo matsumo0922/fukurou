@@ -40,6 +40,8 @@ class TradingBotConfigTest {
         assertEquals(Duration.ofSeconds(300), config.daemon.priceMoveWindow)
         assertEquals(BigDecimal("0.01"), config.daemon.priceMoveThresholdRatio)
         assertEquals(Duration.ofSeconds(600), config.daemon.priceMoveCooldown)
+        assertEquals(true, config.daemon.entryFillTriggerEnabled)
+        assertEquals(Duration.ofSeconds(600), config.daemon.entryFillCooldown)
         assertEquals(true, config.daemon.stopProximityTriggerEnabled)
         assertEquals(BigDecimal("0.3"), config.daemon.stopProximityRemainingRThreshold)
         assertEquals(Duration.ofSeconds(900), config.daemon.stopProximityCooldown)
@@ -104,6 +106,8 @@ class TradingBotConfigTest {
                 "FUKUROU_LLM_TRIGGER_PRICE_MOVE_WINDOW_SECONDS" to "600",
                 "FUKUROU_LLM_TRIGGER_PRICE_MOVE_THRESHOLD_RATIO" to "0.02",
                 "FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS" to "1200",
+                "FUKUROU_LLM_TRIGGER_ENTRY_FILL_ENABLED" to "false",
+                "FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS" to "1200",
                 "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_ENABLED" to "false",
                 "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_REMAINING_R_THRESHOLD" to "0.4",
                 "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_COOLDOWN_SECONDS" to "1800",
@@ -166,6 +170,8 @@ class TradingBotConfigTest {
         assertEquals(Duration.ofSeconds(600), config.daemon.priceMoveWindow)
         assertEquals(BigDecimal("0.02"), config.daemon.priceMoveThresholdRatio)
         assertEquals(Duration.ofSeconds(1200), config.daemon.priceMoveCooldown)
+        assertEquals(false, config.daemon.entryFillTriggerEnabled)
+        assertEquals(Duration.ofSeconds(1200), config.daemon.entryFillCooldown)
         assertEquals(false, config.daemon.stopProximityTriggerEnabled)
         assertEquals(BigDecimal("0.4"), config.daemon.stopProximityRemainingRThreshold)
         assertEquals(Duration.ofSeconds(1800), config.daemon.stopProximityCooldown)
@@ -353,6 +359,11 @@ class TradingBotConfigTest {
         assertFailsWith<IllegalArgumentException> {
             TradingBotConfig.fromEnvironment(
                 mapOf("FUKUROU_LLM_TRIGGER_PRICE_MOVE_COOLDOWN_SECONDS" to "30"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            TradingBotConfig.fromEnvironment(
+                mapOf("FUKUROU_LLM_TRIGGER_ENTRY_FILL_COOLDOWN_SECONDS" to "30"),
             )
         }
         assertFailsWith<IllegalArgumentException> {

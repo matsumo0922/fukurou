@@ -407,6 +407,7 @@ private fun validateTypedConfigConstraints(
         requireDecimalGreaterThan(values, "daemon.priceMoveThresholdRatio", BigDecimal.ZERO)
         requireLongGreaterThanOrEqualKey(values, "daemon.priceMoveWindow", "daemon.pollInterval")
         requireLongGreaterThanOrEqualKey(values, "daemon.priceMoveCooldown", "daemon.pollInterval")
+        requireLongGreaterThanOrEqualKey(values, "daemon.entryFillCooldown", "daemon.pollInterval")
         requireDecimalGreaterThan(values, "daemon.stopProximityRemainingRThreshold", BigDecimal.ZERO)
         requireLongGreaterThanOrEqualKey(values, "daemon.stopProximityCooldown", "daemon.pollInterval")
         requireLongGreaterThanOrEqual(
