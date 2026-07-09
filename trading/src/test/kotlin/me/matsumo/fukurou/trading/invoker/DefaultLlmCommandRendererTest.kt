@@ -116,6 +116,39 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
+    fun renderClaude_withMcpKeepsToolSearchAndMcpPermissionArgs() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CLAUDE,
+            phase = LlmInvocationPhase.PROPOSER,
+            mcpServerName = "custom-mcp",
+            allowedTools = listOf(
+                "mcp__custom-mcp__get_ticker",
+                "mcp__custom-mcp__submit_decision",
+            ),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val mcpConfigIndex = command.args.indexOf("--mcp-config")
+        val allowedToolsIndex = command.args.indexOf("--allowedTools")
+        val toolsIndex = command.args.indexOf("--tools")
+
+        assertNotEquals(-1, mcpConfigIndex)
+        assertTrue(command.args.contains("--strict-mcp-config"))
+        assertNotEquals(-1, allowedToolsIndex)
+        assertEquals(
+            "mcp__custom-mcp__get_ticker,mcp__custom-mcp__submit_decision",
+            command.args[allowedToolsIndex + 1],
+        )
+        assertEquals(1, command.args.count { argument -> argument == "--tools" })
+        assertNotEquals(-1, toolsIndex)
+        assertEquals("ToolSearch", command.args[toolsIndex + 1])
+        assertFalse(command.args.contains("--bare"))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
     fun renderClaude_withoutMcpDisablesToolsAndMcpDiscovery() {
         val renderer = DefaultLlmCommandRenderer()
         val request = request(
@@ -134,6 +167,8 @@ class DefaultLlmCommandRendererTest {
         assertTrue(command.args.contains("--strict-mcp-config"))
         assertEquals("""{"mcpServers":{}}""", Files.readString(mcpConfigPath))
         assertEquals("", command.args[allowedToolsIndex + 1])
+        assertEquals(1, command.args.count { argument -> argument == "--tools" })
+        assertNotEquals(-1, toolsIndex)
         assertEquals("", command.args[toolsIndex + 1])
         assertTrue(command.cleanupPaths.contains(mcpConfigPath))
 
