@@ -35,6 +35,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
+import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
@@ -180,6 +181,11 @@ enum class OneShotRunnerStatus {
      * EXIT decision を runner が決定論的に実行した。
      */
     PAPER_EXIT_EXECUTED,
+
+    /**
+     * REDUCE decision を runner が決定論的に実行した。
+     */
+    PAPER_REDUCE_EXECUTED,
 
     /**
      * ADJUST_PROTECTION decision を runner が決定論的に実行した。
@@ -451,7 +457,7 @@ class OneShotLlmRunner(
             )
         }
 
-        if (decision.decision.submission.action != DecisionAction.ENTER) {
+        if (!decision.decision.submission.action.requiresEntryIntent()) {
             return handleNonEnterDecision(input, decision)
         }
 
@@ -493,12 +499,14 @@ class OneShotLlmRunner(
 
         val lifecycleResult = when (decision.decision.submission.action) {
             DecisionAction.EXIT -> decisionExecutionLifecycle.executeExitDecision(input.proposerContext, decision)
+            DecisionAction.REDUCE -> decisionExecutionLifecycle.executeReduceDecision(input.proposerContext, decision)
             DecisionAction.ADJUST_PROTECTION -> decisionExecutionLifecycle.executeAdjustProtectionDecision(
                 context = input.proposerContext,
                 decision = decision,
             )
             DecisionAction.NO_TRADE -> null
             DecisionAction.ENTER -> null
+            DecisionAction.ADD_LONG -> null
         }
 
         if (lifecycleResult != null) {
@@ -528,7 +536,7 @@ class OneShotLlmRunner(
         val invocationId = input.invocationId
         val proposerContext = input.proposerContext
         val intent = requireNotNull(decision.tradeIntent) {
-            "ENTER decision did not create trade intent."
+            "${decision.decision.submission.action.name} decision did not create trade intent."
         }
         val falsifierContext = requestFactory.decisionRunContext(
             invocationId = invocationId,

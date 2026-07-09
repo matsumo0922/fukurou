@@ -145,6 +145,16 @@
       "descriptionKey": "activity.catalog.decision.exit.description"
     },
     {
+      "value": "REDUCE",
+      "labelKey": "activity.catalog.decision.reduce.label",
+      "descriptionKey": "activity.catalog.decision.reduce.description"
+    },
+    {
+      "value": "ADD_LONG",
+      "labelKey": "activity.catalog.decision.addLong.label",
+      "descriptionKey": "activity.catalog.decision.addLong.description"
+    },
+    {
       "value": "ADJUST_PROTECTION",
       "labelKey": "activity.catalog.decision.adjustProtection.label",
       "descriptionKey": "activity.catalog.decision.adjustProtection.description"

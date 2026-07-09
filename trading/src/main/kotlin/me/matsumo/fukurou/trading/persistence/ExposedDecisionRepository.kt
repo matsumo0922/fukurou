@@ -49,6 +49,7 @@ private const val INSERT_DECISION_SQL = """
         system_prompt_version,
         market_snapshot_id,
         action,
+        close_ratio,
         setup_tags,
         estimated_win_probability,
         expected_r_multiple,
@@ -61,7 +62,7 @@ private const val INSERT_DECISION_SQL = """
         no_trade_conditions_ja,
         created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 /**
@@ -231,6 +232,7 @@ private const val SELECT_LATEST_DECISION_BY_INVOCATION_ID_SQL = """
         system_prompt_version,
         market_snapshot_id,
         action,
+        close_ratio,
         setup_tags,
         estimated_win_probability,
         expected_r_multiple,
@@ -260,6 +262,7 @@ private const val SELECT_DECISIONS_CREATED_BETWEEN_SQL = """
         latest_decisions.system_prompt_version,
         latest_decisions.market_snapshot_id,
         latest_decisions.action,
+        latest_decisions.close_ratio,
         latest_decisions.setup_tags,
         latest_decisions.estimated_win_probability,
         latest_decisions.expected_r_multiple,
@@ -280,6 +283,7 @@ private const val SELECT_DECISIONS_CREATED_BETWEEN_SQL = """
             system_prompt_version,
             market_snapshot_id,
             action,
+            close_ratio,
             setup_tags,
             estimated_win_probability,
             expected_r_multiple,
@@ -312,6 +316,7 @@ private const val SELECT_DECISIONS_FOR_STABLE_FEED_SQL_PREFIX = """
         system_prompt_version,
         market_snapshot_id,
         action,
+        close_ratio,
         setup_tags,
         estimated_win_probability,
         expected_r_multiple,
@@ -573,7 +578,7 @@ private fun JdbcTransaction.insertDecisionSubmission(
             intentId = UUID.randomUUID(),
             decisionId = decision.decisionId,
             tradePlanId = requireNotNull(tradePlan?.tradePlanId) {
-                "ENTER decision requires trade_plan."
+                "${submission.action.name} decision requires trade_plan."
             },
             draft = draft,
             estimatedWinProbability = submission.estimatedWinProbability,
@@ -638,17 +643,18 @@ private fun JdbcTransaction.insertDecision(record: DecisionRecord) {
         statement.setNullableString(5, submission.systemPromptVersion)
         statement.setNullableString(6, submission.marketSnapshotId)
         statement.setString(7, submission.action.name)
-        statement.setString(8, submission.setupTags.toJsonText())
-        statement.setBigDecimal(9, submission.estimatedWinProbability)
-        statement.setNullableBigDecimal(10, submission.expectedRMultiple)
-        statement.setNullableBigDecimal(11, submission.roundTripCostR)
-        statement.setString(12, submission.toolEvidenceIds.toJsonText())
-        statement.setString(13, submission.factCheckJson)
-        statement.setString(14, submission.selfReviewJson)
-        statement.setString(15, submission.reasonJa)
-        statement.setString(16, submission.missingDataJa.toJsonText())
-        statement.setString(17, submission.noTradeConditionsJa.toJsonText())
-        statement.setLong(18, record.createdAt.toEpochMilli())
+        statement.setNullableBigDecimal(8, submission.closeRatio)
+        statement.setString(9, submission.setupTags.toJsonText())
+        statement.setBigDecimal(10, submission.estimatedWinProbability)
+        statement.setNullableBigDecimal(11, submission.expectedRMultiple)
+        statement.setNullableBigDecimal(12, submission.roundTripCostR)
+        statement.setString(13, submission.toolEvidenceIds.toJsonText())
+        statement.setString(14, submission.factCheckJson)
+        statement.setString(15, submission.selfReviewJson)
+        statement.setString(16, submission.reasonJa)
+        statement.setString(17, submission.missingDataJa.toJsonText())
+        statement.setString(18, submission.noTradeConditionsJa.toJsonText())
+        statement.setLong(19, record.createdAt.toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -840,6 +846,7 @@ private fun ResultSet.toDecisionRecord(): DecisionRecord {
             systemPromptVersion = getString("system_prompt_version"),
             marketSnapshotId = getString("market_snapshot_id"),
             action = me.matsumo.fukurou.trading.decision.DecisionAction.valueOf(getString("action")),
+            closeRatio = getNullableBigDecimal("close_ratio"),
             setupTags = getString("setup_tags").toStringList(),
             estimatedWinProbability = getBigDecimal("estimated_win_probability"),
             expectedRMultiple = getNullableBigDecimal("expected_r_multiple"),

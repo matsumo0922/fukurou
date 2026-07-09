@@ -576,6 +576,7 @@ private const val VERIFY_DECISIONS_SCHEMA_SQL = """
         system_prompt_version,
         market_snapshot_id,
         action,
+        close_ratio,
         setup_tags,
         estimated_win_probability,
         expected_r_multiple,

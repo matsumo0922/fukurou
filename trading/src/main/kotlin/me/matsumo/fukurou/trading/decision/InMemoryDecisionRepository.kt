@@ -63,7 +63,7 @@ class InMemoryDecisionRepository(
                 val tradeIntent = submission.entryIntent?.toRecord(
                     decisionId = decision.decisionId,
                     tradePlanId = requireNotNull(tradePlan?.tradePlanId) {
-                        "ENTER decision requires trade_plan."
+                        "${submission.action.name} decision requires trade_plan."
                     },
                     estimatedWinProbability = submission.estimatedWinProbability,
                     createdAt = now,
@@ -394,9 +394,16 @@ private fun validateConsumableIntentLocked(
 fun validateDecisionSubmission(submission: DecisionSubmission, maxTradePlanRevisions: Int = MAX_TRADE_PLAN_REVISIONS) {
     val estimatedProbabilityIsInRange = submission.estimatedWinProbability >= BigDecimal.ZERO &&
         submission.estimatedWinProbability <= BigDecimal.ONE
+    val closeRatio = submission.closeRatio
+    val closeRatioIsInRange = closeRatio?.let { value ->
+        value > BigDecimal.ZERO && value <= BigDecimal.ONE
+    } ?: true
 
     require(estimatedProbabilityIsInRange) {
         "estimated_win_probability must be between 0 and 1."
+    }
+    require(closeRatioIsInRange) {
+        "close_ratio must be greater than zero and less than or equal to 1."
     }
     require(submission.reasonJa.isNotBlank()) {
         "reason_ja is required."
@@ -405,15 +412,21 @@ fun validateDecisionSubmission(submission: DecisionSubmission, maxTradePlanRevis
         "trade_plan revision_count must be less than or equal to $maxTradePlanRevisions."
     }
 
-    if (submission.action == DecisionAction.ENTER) {
+    if (submission.action.requiresEntryIntent()) {
         require(submission.entryIntent != null) {
-            "ENTER decision requires entry_intent."
+            "${submission.action.name} decision requires entry_intent."
         }
         require(submission.tradePlan != null) {
-            "ENTER decision requires trade_plan."
+            "${submission.action.name} decision requires trade_plan."
         }
         require(submission.setupTags.isNotEmpty()) {
-            "ENTER decision requires setup_tags."
+            "${submission.action.name} decision requires setup_tags."
+        }
+    }
+
+    if (submission.action == DecisionAction.REDUCE) {
+        require(closeRatio != null) {
+            "REDUCE decision requires close_ratio."
         }
     }
 }

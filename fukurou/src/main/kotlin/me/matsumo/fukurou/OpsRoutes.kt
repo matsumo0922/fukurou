@@ -2172,6 +2172,8 @@ private fun DecisionAction.toActivityDecisionActionDefinition(): OpsActivityCata
     val keySuffix = when (this) {
         DecisionAction.ENTER -> "enter"
         DecisionAction.EXIT -> "exit"
+        DecisionAction.REDUCE -> "reduce"
+        DecisionAction.ADD_LONG -> "addLong"
         DecisionAction.ADJUST_PROTECTION -> "adjustProtection"
         DecisionAction.NO_TRADE -> "noTrade"
     }

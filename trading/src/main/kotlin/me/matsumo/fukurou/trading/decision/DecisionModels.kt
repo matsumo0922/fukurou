@@ -23,6 +23,16 @@ enum class DecisionAction {
     EXIT,
 
     /**
+     * 既存 position の一部または全部の縮小を提案する。
+     */
+    REDUCE,
+
+    /**
+     * 既存 long position への買い増しを提案する。
+     */
+    ADD_LONG,
+
+    /**
      * 既存 position の保護更新を提案する。
      */
     ADJUST_PROTECTION,
@@ -31,6 +41,13 @@ enum class DecisionAction {
      * 今回は取引しない正式判断。
      */
     NO_TRADE,
+}
+
+/**
+ * entry intent と Falsifier gate を必要とする action かどうかを返す。
+ */
+fun DecisionAction.requiresEntryIntent(): Boolean {
+    return this == DecisionAction.ENTER || this == DecisionAction.ADD_LONG
 }
 
 /**
@@ -57,6 +74,7 @@ enum class FalsificationVerdict {
  * @param systemPromptVersion system prompt version
  * @param marketSnapshotId 判断前 market snapshot ID
  * @param action 最終 action
+ * @param closeRatio REDUCE / EXIT が対象 position 残量のうち決済する比率
  * @param setupTags setup taxonomy 用タグ
  * @param estimatedWinProbability LLM 申告の推定勝率
  * @param expectedRMultiple 期待 R 倍率
@@ -67,7 +85,7 @@ enum class FalsificationVerdict {
  * @param reasonJa 判断理由
  * @param missingDataJa NO_TRADE を含む不足データ
  * @param noTradeConditionsJa 見送り条件
- * @param entryIntent ENTER 時に作成する intent 宣言
+ * @param entryIntent entry 系 action で作成する intent 宣言
  * @param tradePlan ENTER または正式修正時に保存する TradePlan
  */
 data class DecisionSubmission(
@@ -77,6 +95,7 @@ data class DecisionSubmission(
     val systemPromptVersion: String?,
     val marketSnapshotId: String?,
     val action: DecisionAction,
+    val closeRatio: BigDecimal? = null,
     val setupTags: List<String>,
     val estimatedWinProbability: BigDecimal,
     val expectedRMultiple: BigDecimal?,
@@ -105,7 +124,7 @@ data class DecisionRecord(
 )
 
 /**
- * ENTER decision から発行する intent 宣言。
+ * entry 系 decision から発行する intent 宣言。
  *
  * @param symbol 取引対象 symbol
  * @param side 注文 side
@@ -186,7 +205,7 @@ data class TradePlanRecord(
  * decision.submit_decision の保存結果。
  *
  * @param decision 保存済み decision
- * @param tradeIntent ENTER 時に作成された intent
+ * @param tradeIntent entry 系 action で作成された intent
  * @param tradePlan 作成または改訂された TradePlan
  */
 data class DecisionSubmissionResult(
