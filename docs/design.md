@@ -48,9 +48,9 @@
 
 [確定事項の改訂: 2026-07-03] 2026-07-02 の「flat時15分定期発火廃止」は、サブスク枠の実数が未確定な段階で token 消費を抑えるための保守運用案だった。Claude Max / Codex Pro 20x の Usage UI と #28 の token / cost 集計で消費を別途監視する前提で、学習データ収集を優先し、daemon 学習期は flat / 保有中とも 15分 cadence を暫定採用する。
 
-- 既定値は flat heartbeat 15分、保有中 check 15分、max invocations per hour 4、daily cap 96 とする。
+- 既定値は flat heartbeat 15分、保有中 check 15分、max invocations per hour 6、daily cap 96 とする。
 - 経済イベント trigger も同じ hourly / daily 予算を消費し、heartbeat とは別枠にしない。
-- flat 15分運転では rolling 1時間予算が heartbeat で飽和しやすいため、経済イベント trigger は最大約15分遅延して heartbeat 枠を置き換える可能性がある。
+- flat 15分運転でも rolling 1時間予算に event trigger 用の headroom を残すため、経済イベント trigger は heartbeat と同じ 6/hour・96/day の予算内で起動する。
 - 96起動/日 x 実測 token は日次消費が大きいため、Usage UI と #28 の集計で過剰消費が見えた場合は cadence を再調整する。
 
 ### 1.3 本設計の方針
@@ -1418,7 +1418,7 @@ suspend fun handleTrigger(
 
 [確定] daemonはCLI起動時に `FUKUROU_INVOCATION_ID`（= `decisionRunId`）を環境変数へ注入する。MCPは全tool callへこのIDを自動付与し、`decision_run_id` / `tool_call_id` / `client_request_id` / `llm_provider` / `prompt_hash` / `system_prompt_version` / `market_snapshot_id` をauditとして保存する。
 
-[確定事項の改訂: 2026-07-03] 2026-07-02 の「flat時15分定期発火廃止」は保守運用案として扱い、学習期は flat時15分定期発火（96起動/日）を暫定採用する。既定上限は 4/hour、96/day とする。Step1スパイクと #19 の実測値を入力にしつつ、#28 で実運用 token・所要時間・tool call数・サブスク枠消費を集計して見直す。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
+[確定事項の改訂: 2026-07-03] 2026-07-02 の「flat時15分定期発火廃止」は保守運用案として扱い、学習期は flat時15分定期発火（96起動/日）を暫定採用する。既定上限は 6/hour、96/day とする。Step1スパイクと #19 の実測値を入力にしつつ、#28 で実運用 token・所要時間・tool call数・サブスク枠消費を集計して見直す。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
 
 ### 6.4 1起動内で許可すること/禁止すること
 
@@ -1434,7 +1434,7 @@ suspend fun handleTrigger(
 
 [設計提案] 既定値:
 
-- LLM最大呼び出し回数: 4回/時
+- LLM最大呼び出し回数: 6回/時
 - LLM最大呼び出し回数: 96回/日
 - LLM通常目標: 学習期は flat / 保有中とも15分 cadence + 経済イベント発火
 - 1起動の最大実行時間: 180秒
@@ -1504,7 +1504,7 @@ llm:
       argv:
         - "claude"
         - "{prompt}"
-  maxCallsPerHour: 12
+  maxCallsPerHour: 6
   maxToolCallsPerRun: 30
   maxActToolCallsPerRun: 3
 ```
@@ -3376,7 +3376,7 @@ trigger:
 
 llm:
   provider: "codex"
-  maxCallsPerHour: 12
+  maxCallsPerHour: 6
   perRunTimeoutSeconds: 180
   maxToolCallsPerRun: 30
   maxActToolCallsPerRun: 3
@@ -3610,7 +3610,7 @@ LLM CLI:
 | GMO WS subscribe | 1 req/s | 起動/再接続時 |
 | MCP tool calls | 30/run | LLM暴走防止 |
 | act tool calls | 3/run | 過剰売買防止 |
-| LLM calls (trading) | 4/hour, 96/day | サブスク/ToS/制限対策 |
+| LLM calls (trading) | 6/hour, 96/day | サブスク/ToS/制限対策 |
 | LLM calls (reflection) | 完了済み前週の PromptCandidates のみ | trading と同じ cap を消費し、1時間で1回分・24時間で4回分の headroom がない場合は起動しない |
 
 Private POSTは取引所上限より安全側に、bot内部の実効上限を `5 req/s` 程度へ下げてもよい。設定は上の既定を上限として、実運用で調整する。
