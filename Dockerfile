@@ -11,6 +11,7 @@ COPY gradle ./gradle
 COPY settings.gradle.kts build.gradle.kts gradle.properties ./
 COPY build-logic ./build-logic
 COPY fukurou ./fukurou
+COPY mcp-core ./mcp-core
 COPY mcp ./mcp
 COPY mcp-gmo-coin ./mcp-gmo-coin
 COPY trading ./trading
