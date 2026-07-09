@@ -13,6 +13,11 @@ object SafetyFloorDefaults {
     val maxDrawdownRatio: BigDecimal = BigDecimal("-0.15")
 
     /**
+     * 想定値幅 / 往復 cost の既定最小比率。
+     */
+    val minExpectedMoveToCostRatio: BigDecimal = BigDecimal("2.5")
+
+    /**
      * ATR trailing stop に使う既定倍率。
      */
     val trailingAtrMultiplier: BigDecimal = BigDecimal("2.0")

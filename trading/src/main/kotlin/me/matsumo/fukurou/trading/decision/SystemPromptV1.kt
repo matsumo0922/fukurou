@@ -10,7 +10,7 @@ object SystemPromptV1 {
     /**
      * decision protocol v1 の system prompt version。
      */
-    const val VERSION = "system-prompt-v1.9"
+    const val VERSION = "system-prompt-v1.10"
 
     /**
      * repository root から見た system prompt file path。

@@ -230,6 +230,31 @@ sudo docker ps --filter name=fukurou- --format 'table {{.Names}}\t{{.Image}}\t{{
 sudo git -C /srv/fukurou/repo rev-parse HEAD
 ```
 
+## runtime config default 変更の反映
+
+code-owned catalog default の変更は、active runtime config に同じ key が明示保存済みの場合は実効値を上書きしない。runtime config の runtime group は applyMode `NEXT_RESTART` のため、deploy 後に `/ops/runtime-config` または WebUI `/app/config` で現在の `effectiveValue` を確認し、必要な key を draft / validate / activate で active 化する。
+
+例: `safety.minExpectedMoveToCostRatio` と `runner.maxInvocationsPerHour` を active config に反映する。
+
+```sh
+draft_id="$(scripts/prod-curl \
+  /ops/runtime-config/drafts \
+  --json '{
+    "baseVersionId": null,
+    "values": {
+      "safety.minExpectedMoveToCostRatio": "2.5",
+      "runner.maxInvocationsPerHour": "6"
+    },
+    "note": "paper trading weekly review defaults"
+  }' | jq -r '.version.id')"
+
+scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/validate" \
+  --json '{"reason":"paper trading weekly review defaults"}'
+scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/activate" \
+  --json '{"reason":"paper trading weekly review defaults"}'
+scripts/prod-curl /ops/runtime-config
+```
+
 ## Rollback
 
 rollback は過去の commit SHA tag を指定して workflow_dispatch を再実行する。指定できるのは `origin/main` から到達可能で、かつ `docker-compose.prod.yml` を含む commit に限る。

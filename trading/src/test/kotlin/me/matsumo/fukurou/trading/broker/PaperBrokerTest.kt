@@ -40,6 +40,7 @@ import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
+import me.matsumo.fukurou.trading.safety.SafetyFloorContext
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import java.math.BigDecimal
 import java.time.Clock
@@ -1178,8 +1179,8 @@ class PaperBrokerTest {
         val command = approvedCommand(
             repository = decisionRepository,
             command = marketEntryCommand(
-                protectiveStopPriceJpy = BigDecimal("9700000"),
-                takeProfitPriceJpy = BigDecimal("10062000"),
+                protectiveStopPriceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10048000"),
                 estimatedWinProbability = BigDecimal.ONE,
             ),
         )
@@ -1188,6 +1189,41 @@ class PaperBrokerTest {
 
         assertFalse(result.accepted)
         assertEquals(SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO, result.safetyViolation?.rule)
+        assertEquals("2.16026124", result.safetyViolation?.measuredValue)
+        assertEquals("2.5", result.safetyViolation?.limitValue)
+    }
+
+    @Test
+    fun safety_floor_accepts_calculated_expected_move_to_cost_ratio_between_new_and_old_thresholds() = runBlocking {
+        val violationRepository = InMemorySafetyViolationRepository()
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = safetyBroker(repository, violationRepository, decisionRepository = decisionRepository)
+        val command = approvedCommand(
+            repository = decisionRepository,
+            command = marketEntryCommand(
+                protectiveStopPriceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10059000"),
+                estimatedWinProbability = BigDecimal.ONE,
+            ),
+        )
+        val riskDetails = SafetyFloor(clock = fixedClock()).placeOrderRiskDetails(
+            command = command,
+            context = SafetyFloorContext(
+                account = accountSnapshot(),
+                riskState = RiskState(updatedAt = fixedInstant()),
+                positions = emptyList(),
+                openOrders = emptyList(),
+                ticker = FakeMarketDataSource.getTicker(TradingSymbol.BTC).getOrThrow(),
+                symbolRules = FakeMarketDataSource.getSymbolRules(TradingSymbol.BTC).getOrThrow(),
+                marketDataObservedAt = fixedInstant(),
+            ),
+        )
+
+        val result = broker.placeOrder(command).getOrThrow()
+
+        assertEquals("2.71288621", riskDetails.expectedMoveToCostRatio)
+        assertTrue(result.accepted)
     }
 
     @Test

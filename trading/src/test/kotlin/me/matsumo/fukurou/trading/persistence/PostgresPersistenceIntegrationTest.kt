@@ -865,9 +865,12 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun runtimeConfigBootstrapBackfillsMissingCatalogKeyIntoNewActiveSnapshot() = runPostgresTest {
+    fun runtimeConfigBootstrapBackfillsMissingCatalogKeysIntoNewActiveSnapshot() = runPostgresTest {
         val defaultValues = RuntimeConfigCatalog.runtimeDefaultValues()
-        val missingKey = "paper.volatilitySlippageMultiplier"
+        val missingKeys = mapOf(
+            "safety.minExpectedMoveToCostRatio" to "FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO",
+            "runner.maxInvocationsPerHour" to "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR",
+        )
         val preservedKey = "runner.maxToolCallsPerRun"
         val preservedValue = "12"
 
@@ -879,7 +882,7 @@ class PostgresPersistenceIntegrationTest {
         )
         val originalSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
 
-        deleteRuntimeConfigValue(database, missingKey)
+        missingKeys.keys.forEach { key -> deleteRuntimeConfigValue(database, key) }
 
         RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -893,10 +896,9 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(expectedValues, backfilledSnapshot.values)
         assertEquals(calculateRuntimeConfigHash(expectedValues), backfilledSnapshot.hash)
         assertEquals(backfilledSnapshot.versionId, resolution.auditSnapshot.versionId)
-        assertEquals(
-            defaultValues.getValue(missingKey),
-            resolution.typedEnvironment.getValue("FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER"),
-        )
+        missingKeys.forEach { (configKey, envName) ->
+            assertEquals(defaultValues.getValue(configKey), resolution.typedEnvironment.getValue(envName))
+        }
         assertEquals(
             preservedValue,
             resolution.typedEnvironment.getValue("FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT"),

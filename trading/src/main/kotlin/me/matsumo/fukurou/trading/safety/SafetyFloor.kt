@@ -201,7 +201,7 @@ data class SafetyFloorConfig(
     val maxDrawdownRatio: BigDecimal = SafetyFloorDefaults.maxDrawdownRatio,
     val maxTotalExposureRatio: BigDecimal = DEFAULT_MAX_TOTAL_EXPOSURE_RATIO,
     val minExpectedValueR: BigDecimal = DEFAULT_MIN_EXPECTED_VALUE_R,
-    val minExpectedMoveToCostRatio: BigDecimal = DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO,
+    val minExpectedMoveToCostRatio: BigDecimal = SafetyFloorDefaults.minExpectedMoveToCostRatio,
     val dataQualityCap: DataQualityCapConfig = DataQualityCapConfig(),
     val maxTakerFeeRatio: BigDecimal = DEFAULT_MAX_TAKER_FEE_RATIO,
     val economicEventBlackouts: List<EconomicEventBlackout> = emptyList(),
@@ -233,8 +233,9 @@ data class SafetyFloorConfig(
         require(minExpectedValueR >= DEFAULT_MIN_EXPECTED_VALUE_R) {
             "minExpectedValueR must be greater than or equal to 0.10."
         }
-        require(minExpectedMoveToCostRatio >= DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO) {
-            "minExpectedMoveToCostRatio must be greater than or equal to 3.0."
+        require(minExpectedMoveToCostRatio >= SafetyFloorDefaults.minExpectedMoveToCostRatio) {
+            val defaultRatio = SafetyFloorDefaults.minExpectedMoveToCostRatio.toPlainString()
+            "minExpectedMoveToCostRatio must be greater than or equal to $defaultRatio."
         }
         require(maxOrderFeeIsConservative) {
             "maxTakerFeeRatio must stay between 0 and 0.0010 as the order fee / maker rebate cap."
@@ -1272,11 +1273,6 @@ private val DEFAULT_MAX_TOTAL_EXPOSURE_RATIO = BigDecimal("0.80")
  * entry plan の既定最小 EV。
  */
 private val DEFAULT_MIN_EXPECTED_VALUE_R = BigDecimal("0.10")
-
-/**
- * 想定値幅 / 往復 cost の既定最小比率。
- */
-private val DEFAULT_MIN_EXPECTED_MOVE_TO_COST_RATIO = BigDecimal("3.0")
 
 /**
  * 既定 order fee / maker rebate 絶対値上限。

@@ -84,7 +84,7 @@ enum class FalsificationVerdict {
  * @param selfReviewJson self review の JSON 文字列
  * @param reasonJa 判断理由
  * @param missingDataJa NO_TRADE を含む不足データ
- * @param noTradeConditionsJa 見送り条件
+ * @param noTradeConditionsJa NO_TRADE 時に次回評価へ残す entry trigger / invalidation 条件
  * @param entryIntent entry 系 action で作成する intent 宣言
  * @param tradePlan ENTER、ADD_LONG、または正式修正時に保存する TradePlan。
  * ADD_LONG では既存 TradePlan を親にした revision を保存する
