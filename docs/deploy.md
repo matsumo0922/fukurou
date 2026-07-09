@@ -31,7 +31,7 @@ docker compose pull && docker compose up -d
 ## 本番環境の想定値
 
 | 項目                       | 値                                          |
-|---|---|
+|--------------------------|--------------------------------------------|
 | 公開ドメイン                   | `fukurou.matsumo.me`                       |
 | deploy root              | `/srv/fukurou`                             |
 | root checkout            | `/srv/fukurou/repo`                        |

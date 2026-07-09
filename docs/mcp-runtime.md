@@ -155,7 +155,7 @@ Reflection Runner の PromptCandidates は完了済み前週を対象に `REFLEC
 runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB bootstrap が `runtime_config_versions` / `runtime_config_values` に初期 active version を作成する。active snapshot に不足する code-owned catalog key がある場合、bootstrap は既存値を保持した complete snapshot を新しい active version として作成する。key の削除は無効化手段ではなく、bootstrap が catalog default で復元する。unknown key、不正値、validation failure は fail closed する。DB-backed runtime では active DB config が `RUNTIME` key の正本で、legacy `FUKUROU_*` env より優先する。`.env` は secret / deployment / bootstrap 値に使う。主な legacy env 名:
 
 | env                                                   | 既定                                   | 用途                                                                                                       |
-|---|---|---|
+|-------------------------------------------------------|--------------------------------------|----------------------------------------------------------------------------------------------------------|
 | `FUKUROU_TRADING_SYMBOL`                              | `BTC`                                | 取引対象 symbol                                                                                              |
 | `FUKUROU_TRADING_MODE`                                | `PAPER`                              | `PAPER` のみ有効。`LIVE` は予約値で、現時点では起動時に拒否                                                                    |
 | `FUKUROU_PAPER_INITIAL_CASH_JPY`                      | `100000`                             | paper 初期 JPY 残高                                                                                          |
@@ -177,7 +177,7 @@ runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB 
 | `FUKUROU_LLM_DAEMON_POLL_SECONDS`                     | `60`                                 | daemon loop の確認間隔。60 秒以上だけ許可                                                                             |
 | `FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS`                  | `900`                                | flat heartbeat。15 分以上だけ許可                                                                                |
 | `FUKUROU_LLM_HOLDING_CHECK_SECONDS`                   | `900`                                | holding dense check。15 分以上だけ許可                                                                           |
-| `FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC`                | 未指定                                  | `id\|name\|eventAtUtc\|beforeMinutes\|afterMinutes` を `;` 区切りで列挙                                         |
+| `FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC`                | 未指定                                  | `id,name,eventAtUtc,beforeMinutes,afterMinutes` 形式を `;` 区切りで列挙                                           |
 | `FUKUROU_OBSIDIAN_ENABLED`                            | `false`                              | Obsidian Writer / Reflection Runner の有効化                                                                 |
 | `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS`             | `3600`                               | Reflection Runner loop の最小間隔                                                                             |
 | `FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER`        | `CLAUDE`                             | 完了済み前週の PromptCandidates に使う LLM provider                                                                |
@@ -186,7 +186,7 @@ runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB 
 | `FUKUROU_MCP_JAR_PATH`                                | `mcp/build/libs/fukurou-mcp-all.jar` | one-shot runner が stdio 子プロセスとして起動する MCP fat jar                                                         |
 | `FUKUROU_MCP_SERVER_NAME`                             | `fukurou-mcp`                        | Claude / Codex に登録する MCP server 名                                                                        |
 | `FUKUROU_MCP_SERVER_COMMAND`                          | `java`                               | MCP server 起動 command                                                                                    |
-| `FUKUROU_MCP_SERVER_ARGS`                             | 未指定                                  | MCP server 起動引数。未指定時は `-jar <FUKUROU_MCP_JAR_PATH>`                                                      |
+| `FUKUROU_MCP_SERVER_ARGS`                             | 未指定                                  | MCP server 起動引数。未指定時は `-jar FUKUROU_MCP_JAR_PATH`                                                        |
 | `FUKUROU_CLAUDE_COMMAND_TEMPLATE`                     | `claude`                             | Claude CLI 起動 command template                                                                           |
 | `FUKUROU_CODEX_COMMAND_TEMPLATE`                      | `codex`                              | Codex CLI 起動 command template。sandbox wrapper prefix を含められる                                              |
 | `FUKUROU_CLAUDE_MODEL`                                | 未指定                                  | Claude CLI に渡す model 名                                                                                   |
