@@ -43,6 +43,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRuntimeConfigRepository
 import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -113,6 +114,9 @@ fun Application.module(
             clock = clock,
             tradingConfig = tradingConfig,
             runtimeConfigEnvironment = runtimeConfigEnvironment,
+            onStaleLlmRunsRecovered = { count ->
+                log.warn("Recovered {} stale llm_runs rows at startup.", count)
+            },
         ),
     )
     val routeResources = createApplicationRouteResources(
@@ -311,6 +315,8 @@ private class ApplicationRuntimeConfigState(
                 database = database,
                 clock = inputs.clock,
                 paperAccountConfig = resolvedTradingConfig.paperAccount,
+                staleLlmRunRecoveryThreshold = resolvedTradingConfig.staleLlmRunRecoveryThreshold(),
+                onStaleLlmRunsRecovered = inputs.onStaleLlmRunsRecovered,
             ).ensureSchema()
 
             if (tradingBootstrapResult.isFailure) {
@@ -837,6 +843,7 @@ private fun sharedTradingPersistenceBootstrap(
                     database = database,
                     clock = clock,
                     paperAccountConfig = tradingConfig.paperAccount,
+                    staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
                 ).ensureSchema().also { result ->
                     if (result.isSuccess) {
                         completed = true
@@ -855,6 +862,7 @@ private fun sharedTradingPersistenceBootstrap(
  * @param clock worker と route に渡す clock
  * @param tradingConfig 取引 bot 全体の typed config
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
+ * @param onStaleLlmRunsRecovered stale llm_runs 回収件数の通知
  */
 private data class ApplicationRuntimeInputs(
     val readinessProbe: ReadinessProbe?,
@@ -862,6 +870,7 @@ private data class ApplicationRuntimeInputs(
     val clock: Clock,
     val tradingConfig: TradingBotConfig,
     val runtimeConfigEnvironment: Map<String, String>,
+    val onStaleLlmRunsRecovered: (Int) -> Unit,
 )
 
 /**

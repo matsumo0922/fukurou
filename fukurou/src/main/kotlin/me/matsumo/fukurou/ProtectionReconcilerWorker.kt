@@ -26,6 +26,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.ExposedSafetyViolationRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ProtectionReconciler
 import me.matsumo.fukurou.trading.reconciler.RestPollingTickStream
@@ -139,6 +140,7 @@ internal fun startProtectionReconcilerWorker(
                 database = database,
                 clock = clock,
                 paperAccountConfig = tradingConfig.paperAccount,
+                staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
             ).ensureSchema()
         },
         clock = clock,

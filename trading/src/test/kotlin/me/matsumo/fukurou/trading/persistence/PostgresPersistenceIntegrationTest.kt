@@ -53,6 +53,7 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
@@ -1089,6 +1090,71 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(startedAt, record.startedAt)
         assertEquals(finishedAt, record.finishedAt)
         assertEquals(finish.errorMessage, record.errorMessage)
+    }
+
+    @Test
+    fun bootstrap_recoversStaleRunningLlmRunsInPostgresPath() = runPostgresTest {
+        val recoveryThreshold = Duration.ofMinutes(9)
+        val recoveredCounts = mutableListOf<Int>()
+        val bootstrap = TradingPersistenceBootstrap(
+            database = database,
+            clock = fixedClock(),
+            staleLlmRunRecoveryThreshold = recoveryThreshold,
+            onStaleLlmRunsRecovered = { count -> recoveredCounts += count },
+        )
+
+        bootstrap.ensureSchema().getOrThrow()
+        val repository = ExposedLlmRunRepository(database)
+        val staleStartedAt = fixedInstant().minus(recoveryThreshold).minusSeconds(1)
+        val freshStartedAt = fixedInstant().minus(recoveryThreshold).plusSeconds(1)
+        val alreadyFinishedAt = fixedInstant().minusSeconds(1_200)
+        repository.insertRunning(
+            LlmRunStart(
+                invocationId = "stale-running-run",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                startedAt = staleStartedAt,
+            ),
+        ).getOrThrow()
+        repository.insertRunning(
+            LlmRunStart(
+                invocationId = "fresh-running-run",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                startedAt = freshStartedAt,
+            ),
+        ).getOrThrow()
+        repository.finish(
+            LlmRunFinish(
+                invocationId = "already-finished-run",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                status = LLM_RUN_STATUS_FAILED,
+                startedAt = staleStartedAt,
+                finishedAt = alreadyFinishedAt,
+                errorMessage = "already failed",
+            ),
+        ).getOrThrow()
+
+        bootstrap.ensureSchema().getOrThrow()
+
+        val staleRun = requireNotNull(repository.findByInvocationId("stale-running-run").getOrThrow())
+        val freshRun = requireNotNull(repository.findByInvocationId("fresh-running-run").getOrThrow())
+        val alreadyFinishedRun = requireNotNull(repository.findByInvocationId("already-finished-run").getOrThrow())
+
+        assertEquals(listOf(1), recoveredCounts)
+        assertEquals(LLM_RUN_STATUS_FAILED, staleRun.status)
+        assertEquals(fixedInstant(), staleRun.finishedAt)
+        assertEquals(STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE, staleRun.errorMessage)
+        assertEquals(LLM_RUN_STATUS_RUNNING, freshRun.status)
+        assertNull(freshRun.finishedAt)
+        assertNull(freshRun.errorMessage)
+        assertEquals(LLM_RUN_STATUS_FAILED, alreadyFinishedRun.status)
+        assertEquals(alreadyFinishedAt, alreadyFinishedRun.finishedAt)
+        assertEquals("already failed", alreadyFinishedRun.errorMessage)
     }
 
     @Test
