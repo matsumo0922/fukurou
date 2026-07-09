@@ -129,6 +129,4 @@ Docker Compose と GitHub Actions による GHCR image pull 型の NAS deploy sc
 
 ## ライセンス
 
-本リポジトリは [PolyForm Strict License 1.0.0](LICENSE) で提供されています。OSS ではなく、非商用・個人利用等に用途を限定した source-available ライセンスです。
-
-利用条件の正本は `LICENSE` を参照してください。
+[PolyForm Strict License 1.0.0](LICENSE)
