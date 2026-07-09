@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
@@ -56,31 +57,22 @@ class LlmInvocationAuditor(
         val usage = processResult?.let { completedProcess ->
             usageForAudit(request.provider, completedProcess.stdout)
         }
-        val authFailureSuspected = processResult?.authFailureSuspected() ?: false
+        val auditSignals = processResult?.auditSignals() ?: LlmPhaseAuditSignals()
 
         appendPhase(
             context = context,
             phaseName = phaseName,
             duration = duration,
-            details = buildJsonObject {
-                put("provider", request.provider.name.lowercase())
-                put("status", processResult?.status?.name ?: "FAILED_TO_START")
-                put("exitCode", processResult?.exitCode?.toString() ?: "null")
-                startFailureError?.let { error -> put("error", error) }
-                processResult?.let { completedProcess ->
-                    put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
-                    put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
-                }
-                if (authFailureSuspected) {
-                    put("authFailureSuspected", "true")
-                }
-                usage?.let { parsedUsage ->
-                    put("usage", LlmUsageParser.toJsonObject(parsedUsage))
-                }
-            },
+            details = phaseDetails(
+                provider = request.provider,
+                processResult = processResult,
+                startFailureError = startFailureError,
+                usage = usage,
+                auditSignals = auditSignals,
+            ),
         ).getOrThrow()
         humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
-        if (authFailureSuspected && authFailureMessage != null) {
+        if (auditSignals.authFailureSuspected && authFailureMessage != null) {
             humanLogger(authFailureMessage)
         }
 
@@ -96,7 +88,8 @@ class LlmInvocationAuditor(
                     LlmPhaseAuditResult(
                         invocationResult = invocation,
                         duration = duration,
-                        authFailureSuspected = authFailureSuspected,
+                        authFailureSuspected = auditSignals.authFailureSuspected,
+                        cliErrorReported = auditSignals.cliErrorReported,
                     ),
                 )
             },
@@ -144,15 +137,57 @@ class LlmInvocationAuditor(
         LlmProvider.CODEX -> null
     }
 
-    private fun ProcessRunResult.authFailureSuspected(): Boolean {
+    private fun phaseDetails(
+        provider: LlmProvider,
+        processResult: ProcessRunResult?,
+        startFailureError: String?,
+        usage: LlmUsageDetails?,
+        auditSignals: LlmPhaseAuditSignals,
+    ): JsonObject {
+        return buildJsonObject {
+            put("provider", provider.name.lowercase())
+            put("status", processResult?.status?.name ?: "FAILED_TO_START")
+            put("exitCode", processResult?.exitCode?.toString() ?: "null")
+            startFailureError?.let { error -> put("error", error) }
+            processResult?.let { completedProcess ->
+                put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
+                put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
+            }
+            if (auditSignals.authFailureSuspected) {
+                put("authFailureSuspected", "true")
+            }
+            if (auditSignals.cliErrorReported) {
+                put("cliErrorReported", "true")
+            }
+            usage?.let { parsedUsage ->
+                put("usage", LlmUsageParser.toJsonObject(parsedUsage))
+            }
+        }
+    }
+
+    private fun ProcessRunResult.auditSignals(): LlmPhaseAuditSignals {
+        val cliErrorReported = cliErrorReported()
+
+        return LlmPhaseAuditSignals(
+            authFailureSuspected = authFailureSuspected(cliErrorReported),
+            cliErrorReported = cliErrorReported,
+        )
+    }
+
+    private fun ProcessRunResult.authFailureSuspected(cliErrorReported: Boolean): Boolean {
         val exitFailed = exitCode?.let { completedExitCode -> completedExitCode != 0 } ?: false
         val combinedOutput = "$stdout\n$stderr"
         val outputContainsAuthFailure = LLM_CLI_AUTH_FAILURE_PATTERNS.any { pattern ->
             combinedOutput.contains(pattern, ignoreCase = true)
         }
-        val outputContainsCliError = LLM_CLI_ERROR_OUTPUT_PATTERN.containsMatchIn(combinedOutput)
 
-        return outputContainsAuthFailure && (exitFailed || outputContainsCliError)
+        return outputContainsAuthFailure && (exitFailed || cliErrorReported)
+    }
+
+    private fun ProcessRunResult.cliErrorReported(): Boolean {
+        val combinedOutput = "$stdout\n$stderr"
+
+        return LLM_CLI_ERROR_OUTPUT_PATTERN.containsMatchIn(combinedOutput)
     }
 
     private fun ProcessRunResult.didFail(): Boolean {
@@ -169,11 +204,24 @@ class LlmInvocationAuditor(
  * @param invocationResult process 実行結果を含む LLM 起動結果
  * @param duration phase 実行時間
  * @param authFailureSuspected CLI 認証失敗らしい出力を検出したか
+ * @param cliErrorReported CLI が error 終了を報告する出力を検出したか
  */
 data class LlmPhaseAuditResult(
     val invocationResult: LlmInvocationResult,
     val duration: Duration,
     val authFailureSuspected: Boolean,
+    val cliErrorReported: Boolean,
+)
+
+/**
+ * LLM phase audit へ載せる CLI 出力由来の検出シグナル。
+ *
+ * @param authFailureSuspected CLI 認証失敗らしい出力を検出したか
+ * @param cliErrorReported CLI が error 終了を報告する出力を検出したか
+ */
+private data class LlmPhaseAuditSignals(
+    val authFailureSuspected: Boolean = false,
+    val cliErrorReported: Boolean = false,
 )
 
 /**
