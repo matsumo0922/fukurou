@@ -10,6 +10,7 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -1134,11 +1135,19 @@ class OpsRouteTest {
         val response = client.get("/ops/activity/catalog")
         val responseText = response.bodyAsText()
         val expectedJson = Json.parseToJsonElement(readSharedTestdata("ops-activity-catalog.golden.json"))
-        val actualJson = Json.parseToJsonElement(responseText)
+        val actualJson = Json.parseToJsonElement(responseText).jsonObject
+        val auditEventTypes = actualJson.getValue("auditEventTypes").jsonArray
+        val recoveryEvent = auditEventTypes.single { element ->
+            element.jsonObject.getValue("value").jsonPrimitive.content == "LLM_INVOCATION_RECOVERED"
+        }
+        val normalizedActual = JsonObject(
+            actualJson + ("auditEventTypes" to JsonArray(auditEventTypes.filter { it != recoveryEvent })),
+        )
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertNoSecretLikeText(responseText)
-        assertEquals(expectedJson, actualJson)
+        assertEquals("activity.catalog.audit.llmInvocationRecovered.label", recoveryEvent.jsonObject.getValue("labelKey").jsonPrimitive.content)
+        assertEquals(expectedJson, normalizedActual)
     }
 
     @Test
