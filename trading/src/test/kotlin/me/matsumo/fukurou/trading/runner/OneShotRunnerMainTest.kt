@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.runner
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
@@ -7,6 +8,7 @@ import java.nio.file.FileSystemException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -83,5 +85,35 @@ class OneShotRunnerMainTest {
 
         assertEquals(failure, result.exceptionOrNull())
         assertTrue(stderr.isEmpty())
+    }
+
+    @Test
+    fun runOneShotRunnerMain_codexCancellationOmitsSuppressedCleanupPathAndReturnsFailureExitCode() = runBlocking {
+        val cancellation = CancellationException("cancellation path-message-marker")
+        val cleanupFailure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "cleanup path-message-marker",
+        )
+        cancellation.addSuppressed(cleanupFailure)
+        val classifiedCancellation = cancellation.classifyLlmFailure(LlmProvider.CODEX)
+        val stderr = mutableListOf<String>()
+
+        val exitCode = runOneShotRunnerMain(
+            environment = emptyMap(),
+            launch = { throw classifiedCancellation },
+            stdout = {},
+            stderr = stderr::add,
+        )
+        val output = stderr.single()
+
+        assertEquals(1, exitCode)
+        assertSame(cancellation, classifiedCancellation)
+        assertTrue(cancellation.suppressed.contains(cleanupFailure))
+        assertTrue(output.contains("category=INVOCATION_RESULT_UNAVAILABLE"))
+        assertTrue(output.contains("type=CancellationException"))
+        assertFalse(output.contains("auth-path-marker"))
+        assertFalse(output.contains("path-message-marker"))
+        assertFalse(output.contains("at me.matsumo"))
     }
 }

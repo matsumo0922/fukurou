@@ -13,6 +13,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -188,6 +189,34 @@ class ShellLlmInvokerTest {
         }
         assertTrue(processRunner.cleanupCalled)
         assertFalse(Files.exists(artifact))
+    }
+
+    @Test
+    fun invoke_codexCancellationPreservesOriginalAndSuppressedCleanupFailure() = runBlocking {
+        val artifact = Files.createTempFile("shell-llm-invoker-cancel-cleanup", ".jsonl")
+        val cancellation = CancellationException("cancellation path-message-marker")
+        val cleanupFailure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "cleanup path-message-marker",
+        )
+        val processRunner = RecordingProcessRunner(
+            result = Result.failure(cancellation),
+            cleanupAction = { throw cleanupFailure },
+        )
+        val invoker = ShellLlmInvoker(
+            commandRenderer = StaticCommandRenderer(renderedCommand(artifact)),
+            processRunner = processRunner,
+        )
+
+        val propagated = assertFailsWith<CancellationException> {
+            invoker.invoke(request())
+        }
+
+        assertSame(cancellation, propagated)
+        assertTrue(propagated.suppressed.contains(cleanupFailure))
+        assertEquals("CancellationException", propagated.safeCodexFailureOrNull()?.type)
+        assertTrue(processRunner.cleanupCalled)
     }
 }
 

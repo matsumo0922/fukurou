@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.runner
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -50,7 +51,13 @@ class LlmInvocationAuditor(
         llmInvoker: LlmInvoker,
     ): Result<LlmPhaseAuditResult> {
         val startedAt = System.nanoTime()
-        val result = llmInvoker.invoke(request)
+        val result = try {
+            llmInvoker.invoke(request)
+        } catch (throwable: CancellationException) {
+            throw throwable.classifyLlmFailure(request.provider)
+        } catch (throwable: Throwable) {
+            throw throwable.classifyLlmFailure(request.provider)
+        }
         val duration = Duration.ofNanos(System.nanoTime() - startedAt)
         val invocationResult = result.getOrNull()
         val processResult = invocationResult?.processResult

@@ -35,7 +35,7 @@ private class LlmProviderFailureMarker(
 /**
  * Codex の場合だけ、元の例外と cleanup failure を維持したまま provider 分類を付ける。
  */
-internal fun Throwable.classifyLlmFailure(provider: LlmProvider): Throwable {
+internal fun <T : Throwable> T.classifyLlmFailure(provider: LlmProvider): T {
     if (provider != LlmProvider.CODEX) {
         return this
     }
@@ -59,7 +59,7 @@ internal fun Throwable.classifyLlmFailure(provider: LlmProvider): Throwable {
 /**
  * provider 名が Codex の場合だけ元例外へ分類を付ける。
  */
-internal fun Throwable.classifyLlmFailure(providerName: String?): Throwable {
+internal fun <T : Throwable> T.classifyLlmFailure(providerName: String?): T {
     val provider = LlmProvider.entries
         .firstOrNull { candidate -> candidate.name.equals(providerName, ignoreCase = true) }
         ?: return this

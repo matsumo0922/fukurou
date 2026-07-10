@@ -118,6 +118,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -1619,6 +1620,48 @@ class OneShotLlmRunnerTest {
         assertTrue(result.isFailure)
         assertEquals(failure, result.exceptionOrNull())
         assertEquals("FileSystemException", failureDisclosure?.type)
+        assertEquals("Codex invocation failure details omitted.", record?.errorMessage)
+        assertFalse(noTradeEvent.payload.contains("auth-path-marker"))
+        assertFalse(noTradeEvent.payload.contains("path-message-marker"))
+        assertTrue(noTradeEvent.payload.contains("\"messageOmitted\":true"))
+    }
+
+    @Test
+    fun codexInvokerCancellation_preservesOriginalAndOmitsSuppressedCleanupPathFromAudit() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = FakeMarketDataSource,
+        )
+        val cancellation = CancellationException("cancellation path-message-marker")
+        val cleanupFailure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "cleanup path-message-marker",
+        )
+        cancellation.addSuppressed(cleanupFailure)
+        val runner = OneShotLlmRunner(
+            tradingRuntime = runtime,
+            tradingConfig = TradingBotConfig(),
+            llmInvoker = ThrowingLlmInvoker(cancellation),
+            parentEnvironment = defaultParentEnvironment(),
+            clock = fixedClock(),
+            logger = {},
+        )
+        val request = defaultRequest().copy(
+            invocationId = "codex-cancelled-run",
+            proposerProvider = LlmProvider.CODEX,
+        )
+
+        val propagated = assertFailsWith<CancellationException> {
+            runner.runOneShot(request)
+        }
+        val record = runtime.llmRunRepository.findByInvocationId("codex-cancelled-run").getOrThrow()
+        val noTradeEvent = (runtime.commandEventLog as InMemoryCommandEventLog).events()
+            .single { event -> event.eventType == CommandEventType.NO_TRADE_EXIT }
+
+        assertSame(cancellation, propagated)
+        assertTrue(propagated.suppressed.contains(cleanupFailure))
+        assertEquals("CancellationException", propagated.safeCodexFailureOrNull()?.type)
         assertEquals("Codex invocation failure details omitted.", record?.errorMessage)
         assertFalse(noTradeEvent.payload.contains("auth-path-marker"))
         assertFalse(noTradeEvent.payload.contains("path-message-marker"))

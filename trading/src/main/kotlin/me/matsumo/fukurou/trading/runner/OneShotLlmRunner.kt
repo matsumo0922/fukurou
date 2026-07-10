@@ -319,7 +319,7 @@ class OneShotLlmRunner(
             Result.success(result)
         } catch (throwable: CancellationException) {
             handleCancelledRun(failureContext, llmRunStart, throwable)
-            throw throwable
+            throw throwable.classifyLlmFailure(failureContext.llmProvider)
         } catch (throwable: Throwable) {
             Result.failure(handleFailedRun(failureContext, llmRunStart, throwable))
         }
@@ -1048,7 +1048,7 @@ private class OneShotPhaseInvoker(
                 llmInvoker = llmInvoker,
             )
         } catch (throwable: CancellationException) {
-            throw throwable
+            throw throwable.classifyLlmFailure(request.provider)
         } catch (throwable: Throwable) {
             throw throwable.classifyLlmFailure(request.provider)
         }
