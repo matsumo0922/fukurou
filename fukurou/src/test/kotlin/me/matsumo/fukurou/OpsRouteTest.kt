@@ -715,6 +715,36 @@ class OpsRouteTest {
     }
 
     @Test
+    fun desiredStateActivatorRetriesConflictWhenDraftDiscardFails() = runBlocking {
+        val config = TradingBotConfig()
+        val values = RuntimeConfigCatalog.runtimeValues(config)
+        val adminService = FakeRuntimeConfigAdminService(
+            activationConflictsRemaining = 1,
+            discardDraftFailure = IllegalStateException("draft cleanup unavailable"),
+        )
+        val snapshot = LlmDaemonRuntimeSnapshot(
+            tradingConfig = config,
+            configIdentity = RuntimeConfigAuditSnapshot(
+                versionId = "active-runtime-config",
+                hash = calculateRuntimeConfigHash(values),
+            ),
+            values = values,
+            available = true,
+        )
+        val activator = VersionedLlmDaemonDesiredStateActivator(
+            adminService = adminService,
+            snapshotProvider = LlmDaemonRuntimeSnapshotProvider { snapshot },
+            onActiveChanged = {},
+        )
+
+        val result = activator.activate(enabled = true, reason = "operator start")
+
+        assertTrue(result.isSuccess)
+        assertEquals(listOf("draft-1"), adminService.discardedDraftIds)
+        assertTrue(adminService.hasVersion("draft-2"))
+    }
+
+    @Test
     fun moduleKeepsRuntimeConfigRecoveryApiAvailableWhenActiveConfigIsInvalid() = testApplication {
         if (!isDockerAvailable()) {
             println("Skipping module runtime config recovery test because Docker is unavailable.")
@@ -1901,6 +1931,7 @@ private fun metadataValue(container: JsonObject, label: String): String {
 private class FakeRuntimeConfigAdminService(
     private val listVersionsFailure: Throwable? = null,
     private var activationConflictsRemaining: Int = 0,
+    private val discardDraftFailure: Throwable? = null,
 ) : RuntimeConfigAdminService, LlmDaemonRuntimeConfigActivationService {
     private val versions = mutableMapOf<String, RuntimeConfigVersionDetail>()
     private var activeVersionId: String = "active-runtime-config"
@@ -2002,6 +2033,7 @@ private class FakeRuntimeConfigAdminService(
 
     override fun discardDraft(versionId: String): Result<Unit> {
         discardedDraftIds += versionId
+        discardDraftFailure?.let { failure -> return Result.failure(failure) }
         versions.remove(versionId)
 
         return Result.success(Unit)

@@ -297,7 +297,7 @@ class LlmDaemonSupervisorTest {
         val pendingWorker = workers.single()
         snapshotState.markUnavailable()
         supervisor.notifyConfigChanged()
-        awaitReason(supervisor, LlmDaemonStatusReason.RUNTIME_CONFIG_UNAVAILABLE)
+        awaitWorkerStopResult(pendingWorker, LlmDaemonWorkerStopResult.TERMINATION_PENDING)
 
         assertEquals(LlmDaemonWorkerStopResult.TERMINATION_PENDING, pendingWorker.stopResult)
 
@@ -308,6 +308,49 @@ class LlmDaemonSupervisorTest {
 
         assertTrue(pendingWorker.stopRequested)
         assertEquals(enabledConfig.daemon, workers.last().request.tradingConfig.daemon)
+
+        supervisor.close()
+    }
+
+    @Test
+    fun unavailableRuntimeDoesNotRepeatTerminationPendingAudits() = runBlocking {
+        val processConfig = TradingBotConfig()
+        val enabledConfig = processConfig.copy(daemon = processConfig.daemon.copy(enabled = true))
+        val snapshotState = MutableRuntimeSnapshot(enabledConfig)
+        val eventLog = InMemoryCommandEventLog()
+        lateinit var worker: FakeWorker
+        val supervisor = createSupervisor(
+            processConfig = processConfig,
+            snapshotState = snapshotState,
+            eventLog = eventLog,
+            initialRetryDelay = Duration.ofMillis(5),
+            maxRetryDelay = Duration.ofMillis(20),
+        ) { request ->
+            FakeWorker(
+                request = request,
+                configuredStopResult = LlmDaemonWorkerStopResult.TERMINATION_PENDING,
+            ).also { created -> worker = created }
+        }.start()
+
+        awaitState(supervisor, LlmDaemonObservedState.RUNNING)
+        snapshotState.markUnavailable()
+        supervisor.notifyConfigChanged()
+        awaitWorkerStopResult(worker, LlmDaemonWorkerStopResult.TERMINATION_PENDING)
+        delay(80)
+
+        val events = eventLog.events()
+        val stoppingEvents = events.filter { event ->
+            event.eventType == CommandEventType.DAEMON_STATE_CHANGED &&
+                event.payload.contains("\"observedState\":\"STOPPING\"")
+        }
+        val timeoutEvents = events.filter { event ->
+            event.eventType == CommandEventType.DAEMON_DRAIN_TIMED_OUT
+        }
+
+        assertTrue(worker.stopCallCount >= 3)
+        assertEquals(1, stoppingEvents.size)
+        assertEquals(1, timeoutEvents.size)
+        assertEquals(LlmDaemonStatusReason.RUNTIME_CONFIG_UNAVAILABLE, supervisor.status().reason)
 
         supervisor.close()
     }
@@ -574,6 +617,18 @@ class LlmDaemonSupervisorTest {
 
         error("daemon did not reach reason $reason: ${supervisor.status()}")
     }
+
+    private suspend fun awaitWorkerStopResult(worker: FakeWorker, expected: LlmDaemonWorkerStopResult) {
+        repeat(200) {
+            if (worker.stopResult == expected) {
+                return
+            }
+
+            delay(5)
+        }
+
+        error("worker did not reach stop result $expected")
+    }
 }
 
 private class MutableRuntimeSnapshot(initialConfig: TradingBotConfig) {
@@ -637,6 +692,7 @@ private class FakeWorker(
     @Volatile
     private var configuredStopResult = configuredStopResult
 
+    @Volatile
     var stopResult: LlmDaemonWorkerStopResult? = null
         private set
     var stopRequested = false
@@ -694,7 +750,7 @@ private class FakeWorker(
         request.lifecycleListener.onStarted()
     }
 
-    override fun close() {
+    override suspend fun shutdown() {
         closeCount += 1
     }
 }

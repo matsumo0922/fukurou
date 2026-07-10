@@ -105,7 +105,7 @@ internal enum class LlmDaemonWorkerStopResult {
 /**
  * supervisor が所有する worker lifecycle 境界。
  */
-internal interface LlmDaemonWorkerHandle : AutoCloseable {
+internal interface LlmDaemonWorkerHandle {
     /** worker loop を開始する。 */
     fun start(): LlmDaemonWorkerHandle
 
@@ -114,6 +114,9 @@ internal interface LlmDaemonWorkerHandle : AutoCloseable {
 
     /** 新規 tick を止め、現在処理を bounded drain する。 */
     suspend fun stopGracefully(timeout: Duration): LlmDaemonWorkerStopResult
+
+    /** worker が所有する coroutine scope を停止する。 */
+    suspend fun shutdown()
 }
 
 /**
@@ -224,12 +227,12 @@ internal class LlmDaemonSchedulerWorker(
         return runningJob.awaitCancelledTermination()
     }
 
-    override fun close() {
-        runBlocking {
-            stopGracefully(Duration.ZERO)
-        }
+    override suspend fun shutdown() {
+        stopGracefully(Duration.ZERO)
         scope.cancel()
     }
+
+    override fun close() = runBlocking { shutdown() }
 
     private suspend fun Job.awaitCancelledTermination(): LlmDaemonWorkerStopResult {
         val completed = withTimeoutOrNull(cancellationJoinTimeout.toMillis().coerceAtLeast(1L)) {

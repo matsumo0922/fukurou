@@ -305,7 +305,13 @@ internal class VersionedLlmDaemonDesiredStateActivator(
                         return@runCatching result
                     } finally {
                         if (!activated) {
-                            adminService.discardDraft(draft.version.id).getOrThrow()
+                            adminService.discardDraft(draft.version.id).onFailure { error ->
+                                DAEMON_SUPERVISOR_LOGGER.log(
+                                    Level.WARNING,
+                                    "Discarding an inactive LLM daemon control draft failed.",
+                                    error,
+                                )
+                            }
                         }
                     }
                 }
@@ -511,9 +517,7 @@ internal class LlmDaemonSupervisor(
                     reason = LlmDaemonStatusReason.PROCESS_SHUTDOWN,
                 )
                 stopCurrentWorkerLocked(LlmDaemonStatusReason.PROCESS_SHUTDOWN)
-                currentWorker?.close()
-                currentWorker = null
-                currentWorkerDaemonValues = null
+                releaseCurrentWorkerLocked()
             }
         }
         scope.cancel()
@@ -527,22 +531,16 @@ internal class LlmDaemonSupervisor(
 
             val snapshot = currentSnapshotSafely()
 
+            if (!reapTerminationPendingWorkerLocked()) return
+
             if (!snapshot.available) {
-                stopCurrentWorkerLocked(LlmDaemonStatusReason.RUNTIME_CONFIG_UNAVAILABLE)
-                updateStatus(
-                    observedState = LlmDaemonObservedState.DEGRADED,
-                    reason = LlmDaemonStatusReason.RUNTIME_CONFIG_UNAVAILABLE,
-                    detail = "active runtime config is unavailable",
-                )
-                scheduleRuntimeRecoveryLocked()
+                handleUnavailableRuntimeSnapshotLocked()
 
                 return
             }
 
             runtimeRetryAttempt = 0
             updateActiveSnapshot(snapshot)
-
-            if (!reapTerminationPendingWorkerLocked()) return
 
             if (!snapshot.tradingConfig.daemon.enabled) {
                 retryJob?.cancel()
@@ -589,6 +587,19 @@ internal class LlmDaemonSupervisor(
         }
     }
 
+    private suspend fun handleUnavailableRuntimeSnapshotLocked() {
+        val stopResult = stopCurrentWorkerLocked(LlmDaemonStatusReason.RUNTIME_CONFIG_UNAVAILABLE)
+
+        updateStatus(
+            observedState = LlmDaemonObservedState.DEGRADED,
+            reason = LlmDaemonStatusReason.RUNTIME_CONFIG_UNAVAILABLE,
+            detail = "active runtime config is unavailable",
+        )
+        if (stopResult != LlmDaemonWorkerStopResult.TERMINATION_PENDING) {
+            scheduleRuntimeRecoveryLocked()
+        }
+    }
+
     private suspend fun reapTerminationPendingWorkerLocked(): Boolean {
         if (!workerTerminationPending) {
             return true
@@ -627,7 +638,7 @@ internal class LlmDaemonSupervisor(
         return lastCompletedDesiredChange?.takeUnless { change -> change.enabled }
     }
 
-    private fun startWorkerLocked(snapshot: LlmDaemonRuntimeSnapshot) {
+    private suspend fun startWorkerLocked(snapshot: LlmDaemonRuntimeSnapshot) {
         workerGeneration += 1
         val generation = workerGeneration
         val appliedTradingConfig = processSnapshot.tradingConfig.copy(daemon = snapshot.tradingConfig.daemon)
@@ -735,8 +746,8 @@ internal class LlmDaemonSupervisor(
         return stopResult
     }
 
-    private fun releaseCurrentWorkerLocked() {
-        currentWorker?.close()
+    private suspend fun releaseCurrentWorkerLocked() {
+        currentWorker?.shutdown()
         currentWorker = null
         workerTerminationPending = false
         currentWorkerDaemonValues = null
