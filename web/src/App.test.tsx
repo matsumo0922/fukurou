@@ -279,7 +279,7 @@ describe("App", () => {
 
     expect(screen.getByText("安全性、リスク、鮮度、paper 口座の状態。")).toBeInTheDocument();
     expect(document.documentElement).toHaveAttribute("lang", "ja");
-    expect(storageSetItemSpy).toHaveBeenCalled();
+    await waitFor(() => expect(storageSetItemSpy).toHaveBeenCalled());
   });
 
   it("formats Japanese date-times with a ja-JP leaning and the JST label", () => {
