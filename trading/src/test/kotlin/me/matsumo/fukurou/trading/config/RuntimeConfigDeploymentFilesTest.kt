@@ -48,7 +48,7 @@ class RuntimeConfigDeploymentFilesTest {
 
         val missingDeclarations = primaryDeploymentFiles.flatMap { deploymentFile ->
             requiredEnvNames
-                .filterNot { legacyEnvName -> deploymentFile.declaresEnvName(legacyEnvName) }
+                .filterNot { legacyEnvName -> deploymentFile.activelyDeclaresEnvName(legacyEnvName) }
                 .map { legacyEnvName -> "${repositoryRoot.relativize(deploymentFile)}: $legacyEnvName" }
         }
 
@@ -60,7 +60,7 @@ class RuntimeConfigDeploymentFilesTest {
 }
 
 private fun deploymentFiles(repositoryRoot: Path): List<Path> {
-    val composeFiles = Files.newDirectoryStream(repositoryRoot, "docker-compose*.yml").use { paths ->
+    val composeFiles = Files.newDirectoryStream(repositoryRoot, "docker-compose*.y*ml").use { paths ->
         paths.toList()
     }
 
@@ -68,9 +68,14 @@ private fun deploymentFiles(repositoryRoot: Path): List<Path> {
         .sortedBy { path -> path.fileName.toString() }
 }
 
-private fun Path.declaresEnvName(envName: String): Boolean {
+private fun Path.declaresEnvName(envName: String): Boolean = matchesEnvName(envName, allowComment = true)
+
+private fun Path.activelyDeclaresEnvName(envName: String): Boolean = matchesEnvName(envName, allowComment = false)
+
+private fun Path.matchesEnvName(envName: String, allowComment: Boolean): Boolean {
+    val optionalCommentPattern = if (allowComment) "#?\\s*" else ""
     val declarationPattern = Regex(
-        pattern = "(?m)^\\s*#?\\s*${Regex.escape(envName)}\\s*[=:]",
+        pattern = "(?m)^\\s*$optionalCommentPattern${Regex.escape(envName)}\\s*[=:]",
     )
 
     return declarationPattern.containsMatchIn(Files.readString(this))
