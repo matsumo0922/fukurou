@@ -1613,8 +1613,8 @@ export interface paths {
                     limit?: number;
                     /** @description 前回応答の nextBefore を指定する opaque cursor です。 */
                     before?: string;
-                    /** @description pagination より前に bounded scan で適用する outcome filter です。 */
-                    outcome?: "EXECUTED" | "DENIED" | "NO_TRADE" | "INTERRUPTED" | "RUNNING" | "FAILED";
+                    /** @description pagination より前に bounded scan で適用する目的別 filter です。 */
+                    filter?: "ACTION_REQUIRED" | "WAITING" | "FILLED" | "NO_ENTRY";
                 };
                 header?: never;
                 path?: never;
@@ -1631,7 +1631,7 @@ export interface paths {
                         "application/json": components["schemas"]["OpsDecisionRunsResponse"];
                     };
                 };
-                /** @description limit、before、または outcome が不正です。 */
+                /** @description limit、before、または filter が不正です。 */
                 400: {
                     headers: {
                         [name: string]: unknown;
@@ -2237,6 +2237,32 @@ export interface components {
             nextBefore?: string | null;
             limit: number;
         };
+        /** OpsDecisionRunOrderResponse */
+        OpsDecisionRunOrderResponse: {
+            orderId: string;
+            intentId?: string | null;
+            positionId?: string | null;
+            tradeGroupId?: string | null;
+            side: string;
+            orderType: string;
+            status: string;
+            sizeBtc: string;
+            limitPriceJpy?: string | null;
+            reasonJa?: string | null;
+            expiresAt?: string | null;
+            expirySource?: string | null;
+            effectiveTtlSeconds?: number | null;
+            expiredAt?: string | null;
+            canceledAt?: string | null;
+            cancelReason?: string | null;
+            createdAt: string;
+        };
+        /** OpsDecisionRunQuoteResponse */
+        OpsDecisionRunQuoteResponse: {
+            priceJpy: string;
+            observedAt: string;
+            stale: boolean;
+        };
         /** OpsDecisionRunSummaryResponse */
         OpsDecisionRunSummaryResponse: {
             invocationId: string;
@@ -2245,7 +2271,7 @@ export interface components {
             triggerKind?: string | null;
             status: string;
             /** @enum {string} */
-            outcome: "EXECUTED" | "DENIED" | "NO_TRADE" | "INTERRUPTED" | "RUNNING" | "FAILED";
+            outcome: "WAITING" | "FILLED" | "EXPIRED" | "NO_ENTRY" | "RUNNING" | "FAILED" | "ACTION_REQUIRED";
             startedAt: string;
             finishedAt?: string | null;
             durationMillis?: number | null;
@@ -2258,6 +2284,8 @@ export interface components {
             errorMessage?: string | null;
             orderCount: number;
             executionCount: number;
+            order?: components["schemas"]["OpsDecisionRunOrderResponse"] | null;
+            currentQuote?: components["schemas"]["OpsDecisionRunQuoteResponse"] | null;
         };
         /** OpsDecisionRunsResponse */
         OpsDecisionRunsResponse: {
@@ -2315,20 +2343,6 @@ export interface components {
             measuredValue: string;
             limitValue: string;
             messageJa: string;
-            createdAt: string;
-        };
-        /** OpsDecisionRunOrderResponse */
-        OpsDecisionRunOrderResponse: {
-            orderId: string;
-            intentId?: string | null;
-            positionId?: string | null;
-            tradeGroupId?: string | null;
-            side: string;
-            orderType: string;
-            status: string;
-            sizeBtc: string;
-            limitPriceJpy?: string | null;
-            reasonJa?: string | null;
             createdAt: string;
         };
         /** OpsDecisionRunExecutionResponse */
@@ -2409,6 +2423,13 @@ export interface components {
             estimatedWinProbability?: string | null;
             reasonJa?: string | null;
             clientRequestId?: string | null;
+            expiresAt?: string | null;
+            /** @enum {string|null} */
+            expirySource?: "SYSTEM_TTL" | "LLM_TIME_STOP" | null;
+            effectiveTtlSeconds?: number | null;
+            expiredAt?: string | null;
+            canceledAt?: string | null;
+            cancelReason?: string | null;
             createdAt: string;
             updatedAt: string;
         };

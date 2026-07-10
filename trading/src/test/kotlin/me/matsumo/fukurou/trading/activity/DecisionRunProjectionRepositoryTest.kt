@@ -21,11 +21,11 @@ class DecisionRunProjectionRepositoryTest {
             ),
         )
 
-        assertEquals(DecisionRunOutcome.DENIED, outcome)
+        assertEquals(DecisionRunOutcome.NO_ENTRY, outcome)
     }
 
     @Test
-    fun outcomeOnlyClassifiesExplicitBootstrapRecoveryAsInterrupted() {
+    fun bootstrapRecoveryRemainsAProcessFailureWithoutLifecycleEvidence() {
         val interrupted = classifyDecisionRunOutcome(
             DecisionRunOutcomeEvidence(
                 status = "FAILED",
@@ -51,7 +51,7 @@ class DecisionRunProjectionRepositoryTest {
             ),
         )
 
-        assertEquals(DecisionRunOutcome.INTERRUPTED, interrupted)
+        assertEquals(DecisionRunOutcome.FAILED, interrupted)
         assertEquals(DecisionRunOutcome.FAILED, ordinaryFailure)
     }
 
@@ -74,11 +74,11 @@ class DecisionRunProjectionRepositoryTest {
             classifyDecisionRunOutcome(outcomeEvidence(status = "RUNNING")),
         )
         assertEquals(
-            DecisionRunOutcome.NO_TRADE,
+            DecisionRunOutcome.NO_ENTRY,
             classifyDecisionRunOutcome(outcomeEvidence(action = "NO_TRADE", hasNoTradeExit = true)),
         )
         assertEquals(
-            DecisionRunOutcome.EXECUTED,
+            DecisionRunOutcome.FILLED,
             classifyDecisionRunOutcome(outcomeEvidence(action = "ENTER", orderCount = 1, filledOrderCount = 1)),
         )
     }
@@ -93,7 +93,7 @@ class DecisionRunProjectionRepositoryTest {
         )
 
         assertEquals(DecisionRunOutcome.FAILED, classifyDecisionRunOutcome(rejectedOnly))
-        assertEquals(DecisionRunOutcome.NO_TRADE, classifyDecisionRunOutcome(canceledWithNoTradeExit))
+        assertEquals(DecisionRunOutcome.NO_ENTRY, classifyDecisionRunOutcome(canceledWithNoTradeExit))
     }
 
     @Test
@@ -101,6 +101,22 @@ class DecisionRunProjectionRepositoryTest {
         val outcome = classifyDecisionRunOutcome(outcomeEvidence())
 
         assertEquals(DecisionRunOutcome.FAILED, outcome)
+    }
+
+    @Test
+    fun openOrderLifecycleOverridesLateProcessFailure() {
+        val waiting = outcomeEvidence(status = "FAILED", action = "ENTER", openOrderCount = 1)
+        val overdue = waiting.copy(overdueOpenOrderCount = 1)
+
+        assertEquals(DecisionRunOutcome.WAITING, classifyDecisionRunOutcome(waiting))
+        assertEquals(DecisionRunOutcome.ACTION_REQUIRED, classifyDecisionRunOutcome(overdue))
+    }
+
+    @Test
+    fun ttlCanceledOrderIsDistinctFromProcessFailure() {
+        val expired = outcomeEvidence(action = "ENTER", orderCount = 1, ttlCanceledOrderCount = 1)
+
+        assertEquals(DecisionRunOutcome.EXPIRED, classifyDecisionRunOutcome(expired))
     }
 }
 
@@ -111,6 +127,8 @@ private fun outcomeEvidence(
     orderCount: Int = 0,
     filledOrderCount: Int = 0,
     hasNoTradeExit: Boolean = false,
+    openOrderCount: Int = 0,
+    ttlCanceledOrderCount: Int = 0,
 ): DecisionRunOutcomeEvidence {
     return DecisionRunOutcomeEvidence(
         status = status,
@@ -121,5 +139,7 @@ private fun outcomeEvidence(
         filledOrderCount = filledOrderCount,
         executionCount = 0,
         hasNoTradeExit = hasNoTradeExit,
+        openOrderCount = openOrderCount,
+        ttlCanceledOrderCount = ttlCanceledOrderCount,
     )
 }

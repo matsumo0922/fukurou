@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunDetail
 import me.matsumo.fukurou.trading.activity.DecisionRunExecution
+import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
@@ -17,14 +18,17 @@ import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
 import me.matsumo.fukurou.trading.activity.classifyDecisionRunOutcome
+import me.matsumo.fukurou.trading.activity.matches
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.ResultSet
+import java.time.Clock
 import java.time.Instant
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
 private val SAFE_FINAL_REASON_PATTERN = Regex("[a-z][a-z0-9_]{0,79}")
+private const val RESTING_ENTRY_TTL_CANCEL_REASON = "resting_entry_order_ttl_expired"
 
 /** outcome filter が 1 query で走査する raw run 件数。 */
 internal const val FILTER_SCAN_BATCH_SIZE = 100
@@ -61,9 +65,29 @@ private val LIST_RUNS_SQL = """
         safety.message_ja,
         order_count.value AS order_count,
         order_count.filled_value AS filled_order_count,
+        order_count.open_value AS open_order_count,
+        order_count.overdue_value AS overdue_open_order_count,
+        order_count.ttl_canceled_value AS ttl_canceled_order_count,
         execution_count.value AS execution_count,
         no_trade.reason AS no_trade_reason,
-        no_trade.present AS has_no_trade_exit
+        no_trade.present AS has_no_trade_exit,
+        entry_order.id AS entry_order_id,
+        entry_order.intent_id AS entry_intent_id,
+        entry_order.position_id AS entry_position_id,
+        entry_order.trade_group_id AS entry_trade_group_id,
+        entry_order.side AS entry_side,
+        entry_order.order_type AS entry_order_type,
+        entry_order.status AS entry_status,
+        entry_order.size_btc AS entry_size_btc,
+        entry_order.limit_price_jpy AS entry_limit_price_jpy,
+        entry_order.reason_ja AS entry_reason_ja,
+        entry_order.expires_at AS entry_expires_at,
+        entry_order.expiry_source AS entry_expiry_source,
+        entry_order.effective_ttl_seconds AS entry_effective_ttl_seconds,
+        entry_order.expired_at AS entry_expired_at,
+        entry_order.canceled_at AS entry_canceled_at,
+        entry_order.cancel_reason AS entry_cancel_reason,
+        entry_order.created_at AS entry_created_at
     FROM candidate_runs run
     LEFT JOIN LATERAL (
         SELECT id, action, reason_ja
@@ -90,10 +114,21 @@ private val LIST_RUNS_SQL = """
     LEFT JOIN LATERAL (
         SELECT
             COUNT(*)::INT AS value,
-            COUNT(*) FILTER (WHERE status = ?)::INT AS filled_value
+            COUNT(*) FILTER (WHERE status = ?)::INT AS filled_value,
+            COUNT(*) FILTER (WHERE status = ?)::INT AS open_value,
+            COUNT(*) FILTER (WHERE status = ? AND expires_at IS NOT NULL AND expires_at <= ?)::INT AS overdue_value,
+            COUNT(*) FILTER (WHERE status = ? AND cancel_reason = ?)::INT AS ttl_canceled_value
         FROM orders
         WHERE decision_run_id = run.invocation_id
     ) order_count ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM orders
+        WHERE decision_run_id = run.invocation_id
+            AND side = 'BUY'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+    ) entry_order ON TRUE
     LEFT JOIN LATERAL (
         SELECT COUNT(*)::INT AS value
         FROM executions
@@ -163,6 +198,16 @@ private val FIND_RUN_SQL = """
                 AND status = ?
         ) AS filled_order_count,
         (SELECT COUNT(*) FROM executions WHERE decision_run_id = run.invocation_id) AS execution_count,
+        (SELECT COUNT(*) FROM orders WHERE decision_run_id = run.invocation_id AND status = ?) AS open_order_count,
+        (
+            SELECT COUNT(*) FROM orders
+            WHERE decision_run_id = run.invocation_id AND status = ?
+                AND expires_at IS NOT NULL AND expires_at <= ?
+        ) AS overdue_open_order_count,
+        (
+            SELECT COUNT(*) FROM orders
+            WHERE decision_run_id = run.invocation_id AND status = ? AND cancel_reason = ?
+        ) AS ttl_canceled_order_count,
         no_trade.reason AS no_trade_reason,
         no_trade.present AS has_no_trade_exit
     FROM llm_runs run
@@ -205,7 +250,8 @@ private val FIND_RUN_SQL = """
 
 private const val FIND_ORDERS_SQL = """
     SELECT id, intent_id, position_id, trade_group_id, side, order_type, status, size_btc,
-        limit_price_jpy, reason_ja, created_at
+        limit_price_jpy, reason_ja, expires_at, expiry_source, effective_ttl_seconds,
+        expired_at, canceled_at, cancel_reason, created_at
     FROM orders
     WHERE decision_run_id = ?
     ORDER BY created_at ASC, id ASC
@@ -233,17 +279,18 @@ private const val FIND_SAFE_AUDIT_SQL = """
  */
 class ExposedDecisionRunProjectionRepository(
     private val database: ExposedDatabase,
+    private val clock: Clock = Clock.systemUTC(),
 ) : DecisionRunProjectionRepository {
 
     override suspend fun listRuns(
         cursor: DecisionRunCursor?,
         limit: Int,
-        outcome: DecisionRunOutcome?,
+        filter: DecisionRunFilter?,
     ): Result<DecisionRunPage> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 require(limit > 0) { "limit must be greater than 0." }
-                exposedTransaction(database) { selectRuns(cursor, limit, outcome) }
+                exposedTransaction(database) { selectRuns(cursor, limit, filter, clock.instant()) }
             }
         }
     }
@@ -251,7 +298,7 @@ class ExposedDecisionRunProjectionRepository(
     override suspend fun findRun(invocationId: String): Result<DecisionRunDetail?> {
         return withContext(Dispatchers.IO) {
             runCatching {
-                exposedTransaction(database) { selectRunDetail(invocationId) }
+                exposedTransaction(database) { selectRunDetail(invocationId, clock.instant()) }
             }
         }
     }
@@ -260,11 +307,12 @@ class ExposedDecisionRunProjectionRepository(
 private fun JdbcTransaction.selectRuns(
     cursor: DecisionRunCursor?,
     limit: Int,
-    outcome: DecisionRunOutcome?,
+    filter: DecisionRunFilter?,
+    observedAt: Instant,
 ): DecisionRunPage {
-    if (outcome == null) {
+    if (filter == null) {
         return DecisionRunPage(
-            runs = selectRunBatch(cursor, limit),
+            runs = selectRunBatch(cursor, limit, observedAt),
             scanContinuation = null,
         )
     }
@@ -274,10 +322,10 @@ private fun JdbcTransaction.selectRuns(
 
     repeat(MAX_FILTER_SCAN_BATCHES) {
         val remaining = limit - selected.size
-        val batch = selectRunBatch(scanCursor, FILTER_SCAN_BATCH_SIZE)
+        val batch = selectRunBatch(scanCursor, FILTER_SCAN_BATCH_SIZE, observedAt)
         selected += batch
             .asSequence()
-            .filter { summary -> summary.outcome == outcome }
+            .filter { summary -> summary.outcome.matches(filter) }
             .take(remaining)
             .toList()
 
@@ -292,7 +340,11 @@ private fun JdbcTransaction.selectRuns(
     return DecisionRunPage(selected, scanContinuation = scanCursor)
 }
 
-private fun JdbcTransaction.selectRunBatch(cursor: DecisionRunCursor?, limit: Int): List<DecisionRunSummary> {
+private fun JdbcTransaction.selectRunBatch(
+    cursor: DecisionRunCursor?,
+    limit: Int,
+    observedAt: Instant,
+): List<DecisionRunSummary> {
     return jdbcConnection().prepareStatement(LIST_RUNS_SQL).use { statement ->
         val cursorMillis = cursor?.startedAt?.toEpochMilli()
         statement.setObject(1, cursorMillis)
@@ -301,6 +353,11 @@ private fun JdbcTransaction.selectRunBatch(cursor: DecisionRunCursor?, limit: In
         statement.setString(4, cursor?.invocationId)
         statement.setInt(5, limit)
         statement.setString(6, OrderStatus.FILLED.name)
+        statement.setString(7, OrderStatus.OPEN.name)
+        statement.setString(8, OrderStatus.OPEN.name)
+        statement.setLong(9, observedAt.toEpochMilli())
+        statement.setString(10, OrderStatus.CANCELED.name)
+        statement.setString(11, RESTING_ENTRY_TTL_CANCEL_REASON)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) add(resultSet.toSummary())
@@ -309,10 +366,15 @@ private fun JdbcTransaction.selectRunBatch(cursor: DecisionRunCursor?, limit: In
     }
 }
 
-private fun JdbcTransaction.selectRunDetail(invocationId: String): DecisionRunDetail? {
+private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: Instant): DecisionRunDetail? {
     val base = jdbcConnection().prepareStatement(FIND_RUN_SQL).use { statement ->
         statement.setString(1, OrderStatus.FILLED.name)
-        statement.setString(2, invocationId)
+        statement.setString(2, OrderStatus.OPEN.name)
+        statement.setString(3, OrderStatus.OPEN.name)
+        statement.setLong(4, observedAt.toEpochMilli())
+        statement.setString(5, OrderStatus.CANCELED.name)
+        statement.setString(6, RESTING_ENTRY_TTL_CANCEL_REASON)
+        statement.setString(7, invocationId)
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.toDetailBase() else null
         }
@@ -326,7 +388,12 @@ private fun JdbcTransaction.selectRunDetail(invocationId: String): DecisionRunDe
         addAll(executions.map { execution -> execution.toRawRecord() })
     }.sortedBy { record -> record.occurredAt }
 
-    return base.copy(orders = orders, executions = executions, raw = raw)
+    return base.copy(
+        summary = base.summary.copy(order = orders.lastOrNull { order -> order.side == "BUY" }),
+        orders = orders,
+        executions = executions,
+        raw = raw,
+    )
 }
 
 private fun JdbcTransaction.selectOrders(invocationId: String): List<DecisionRunOrder> {
@@ -347,6 +414,12 @@ private fun JdbcTransaction.selectOrders(invocationId: String): List<DecisionRun
                             sizeBtc = resultSet.getString("size_btc"),
                             limitPriceJpy = resultSet.getString("limit_price_jpy"),
                             reasonJa = resultSet.getString("reason_ja"),
+                            expiresAt = resultSet.nullableInstant("expires_at"),
+                            expirySource = resultSet.getString("expiry_source"),
+                            effectiveTtlSeconds = resultSet.nullableLong("effective_ttl_seconds"),
+                            expiredAt = resultSet.nullableInstant("expired_at"),
+                            canceledAt = resultSet.nullableInstant("canceled_at"),
+                            cancelReason = resultSet.getString("cancel_reason"),
                             createdAt = Instant.ofEpochMilli(resultSet.getLong("created_at")),
                         ),
                     )
@@ -402,7 +475,7 @@ private fun JdbcTransaction.selectSafeAudit(invocationId: String): List<Decision
     }
 }
 
-private fun ResultSet.toSummary(): DecisionRunSummary {
+private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummary {
     val action = getString("action")
     val safetyRule = getString("rule")
     val orderCount = getInt("order_count")
@@ -412,6 +485,9 @@ private fun ResultSet.toSummary(): DecisionRunSummary {
     val errorMessage = getString("error_message")
     val noTradeReason = getString("no_trade_reason")
     val hasNoTradeExit = getBoolean("has_no_trade_exit")
+    val openOrderCount = getInt("open_order_count")
+    val overdueOpenOrderCount = getInt("overdue_open_order_count")
+    val ttlCanceledOrderCount = getInt("ttl_canceled_order_count")
 
     return DecisionRunSummary(
         invocationId = getString("invocation_id"),
@@ -430,6 +506,7 @@ private fun ResultSet.toSummary(): DecisionRunSummary {
         finalReason = noTradeReason.safeNoTradeReason(),
         orderCount = orderCount,
         executionCount = executionCount,
+        order = if (includeOrder) toSummaryOrder() else null,
         outcome = classifyDecisionRunOutcome(
             DecisionRunOutcomeEvidence(
                 status = status,
@@ -440,13 +517,16 @@ private fun ResultSet.toSummary(): DecisionRunSummary {
                 filledOrderCount = filledOrderCount,
                 executionCount = executionCount,
                 hasNoTradeExit = hasNoTradeExit,
+                openOrderCount = openOrderCount,
+                overdueOpenOrderCount = overdueOpenOrderCount,
+                ttlCanceledOrderCount = ttlCanceledOrderCount,
             ),
         ),
     )
 }
 
 private fun ResultSet.toDetailBase(): DecisionRunDetail {
-    val summary = toSummary()
+    val summary = toSummary(includeOrder = false)
     val runRaw = DecisionRunRawRecord(
         source = "llm_run",
         occurredAt = summary.startedAt,
@@ -468,6 +548,30 @@ private fun ResultSet.toDetailBase(): DecisionRunDetail {
         orders = emptyList(),
         executions = emptyList(),
         raw = listOf(runRaw),
+    )
+}
+
+private fun ResultSet.toSummaryOrder(): DecisionRunOrder? {
+    val orderId = getString("entry_order_id") ?: return null
+
+    return DecisionRunOrder(
+        orderId = orderId,
+        intentId = getString("entry_intent_id"),
+        positionId = getString("entry_position_id"),
+        tradeGroupId = getString("entry_trade_group_id"),
+        side = getString("entry_side"),
+        orderType = getString("entry_order_type"),
+        status = getString("entry_status"),
+        sizeBtc = getString("entry_size_btc"),
+        limitPriceJpy = getString("entry_limit_price_jpy"),
+        reasonJa = getString("entry_reason_ja"),
+        expiresAt = nullableInstant("entry_expires_at"),
+        expirySource = getString("entry_expiry_source"),
+        effectiveTtlSeconds = nullableLong("entry_effective_ttl_seconds"),
+        expiredAt = nullableInstant("entry_expired_at"),
+        canceledAt = nullableInstant("entry_canceled_at"),
+        cancelReason = getString("entry_cancel_reason"),
+        createdAt = Instant.ofEpochMilli(getLong("entry_created_at")),
     )
 }
 
@@ -543,6 +647,11 @@ private fun ResultSet.nullableInstant(column: String): Instant? {
     return if (wasNull()) null else Instant.ofEpochMilli(millis)
 }
 
+private fun ResultSet.nullableLong(column: String): Long? {
+    val value = getLong(column)
+    return if (wasNull()) null else value
+}
+
 private fun String?.safeNoTradeReason(): String? {
     return this?.takeIf(SAFE_FINAL_REASON_PATTERN::matches)
 }
@@ -559,6 +668,11 @@ private fun DecisionRunOrder.toRawRecord(): DecisionRunRawRecord {
             "side" to side,
             "orderType" to orderType,
             "status" to status,
+            "expiresAt" to expiresAt?.toString(),
+            "expirySource" to expirySource,
+            "expiredAt" to expiredAt?.toString(),
+            "canceledAt" to canceledAt?.toString(),
+            "cancelReason" to cancelReason,
         ),
     )
 }

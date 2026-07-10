@@ -360,20 +360,20 @@ describe("App", () => {
     render(<App />);
 
     const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
-    const filters = screen.getByRole("group", { name: "Decision run outcome filters" });
-    expect(within(runList).getByText("EXPECTED_VALUE_GATE")).toBeInTheDocument();
-    expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "false");
+    const filters = screen.getByRole("group", { name: "Decision run purpose filters" });
+    expect(within(runList).getByText("preview_order_rejected")).toBeInTheDocument();
+    expect(within(filters).getByRole("button", { name: /No entry/ })).toHaveAttribute("aria-pressed", "false");
     expect(within(filters).getByRole("button", { name: /All/ })).toHaveTextContent("2 loaded");
     expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("limit") === "50")).toBe(true);
 
-    fireEvent.click(within(filters).getByRole("button", { name: /Denied/ }));
-    expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "true");
-    expect(window.localStorage.getItem("fukurou.web.activity.run-filter.v2")).toBe("DENIED");
+    fireEvent.click(within(filters).getByRole("button", { name: /No entry/ }));
+    expect(within(filters).getByRole("button", { name: /No entry/ })).toHaveAttribute("aria-pressed", "true");
+    expect(window.localStorage.getItem("fukurou.web.activity.run-filter.v2")).toBe("NO_ENTRY");
     await waitFor(() => {
-      expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("outcome") === "DENIED")).toBe(true);
+      expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("filter") === "NO_ENTRY")).toBe(true);
     });
     await waitFor(() => {
-      expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveTextContent("1 loaded");
+      expect(within(filters).getByRole("button", { name: /No entry/ })).toHaveTextContent("1 loaded");
     });
 
     const filteredRunList = await screen.findByRole("main", { name: "Decision runs, newest first" });
@@ -403,6 +403,70 @@ describe("App", () => {
     await waitFor(() => expect(selectedRun).toHaveFocus());
   });
 
+  it("shows resting order quote distance expiry and natural fill condition", async () => {
+    const order = {
+      orderId: "order-waiting",
+      intentId: "intent-1",
+      positionId: null,
+      tradeGroupId: "trade-group-waiting",
+      side: "BUY",
+      orderType: "LIMIT",
+      status: "OPEN",
+      sizeBtc: "0.005000000000",
+      limitPriceJpy: "9900000.00000000",
+      reasonJa: "paper resting entry",
+      expiresAt: "2099-07-10T01:00:00.000Z",
+      expirySource: "SYSTEM_TTL",
+      effectiveTtlSeconds: 1800,
+      expiredAt: null,
+      canceledAt: null,
+      cancelReason: null,
+      createdAt: "2099-07-10T00:30:00.000Z",
+    };
+    const summary = {
+      ...decisionRunsResponse().runs[0],
+      invocationId: "run-waiting",
+      outcome: "WAITING",
+      safetyRule: null,
+      safetyMessageJa: null,
+      finalReason: null,
+      orderCount: 1,
+      order,
+      currentQuote: {
+        priceJpy: "10000000.00000000",
+        observedAt: "2099-07-10T00:31:00.000Z",
+        stale: false,
+      },
+    };
+    stubSystemFetch({
+      decisionRunsResponse: { status: 200, body: { runs: [summary], nextBefore: null } },
+      decisionRunDetails: {
+        "run-waiting": {
+          ...decisionRunDetailResponse(),
+          summary,
+          safetyViolation: null,
+          orders: [order],
+          executions: [],
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    const waitingRow = within(runList).getByRole("button", { name: /BUY LIMIT/ });
+    expect(within(waitingRow).getByText("Waiting for fill")).toBeInTheDocument();
+    expect(within(waitingRow).getByText(/10000000\.00000000/)).toBeInTheDocument();
+    expect(within(waitingRow).getByText(/100,000 JPY/)).toBeInTheDocument();
+
+    fireEvent.click(waitingRow);
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(await within(detailPane).findByText(/best ask reaches 9900000\.00000000 JPY/)).toBeInTheDocument();
+    expect(within(detailPane).getAllByText("SYSTEM_TTL").length).toBeGreaterThan(0);
+    expect(within(detailPane).getByText("Reference display only. It is not paper fill evidence.")).toBeInTheDocument();
+  });
+
   it("loads older decision runs without duplicating the cursor boundary", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/activity");
@@ -414,7 +478,7 @@ describe("App", () => {
 
     expect(await within(runList).findByRole("button", { name: /EXIT/ })).toBeInTheDocument();
     expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("before") === "older-cursor")).toBe(true);
-    expect(within(runList).getAllByText("EXPECTED_VALUE_GATE")).toHaveLength(1);
+    expect(within(runList).getAllByText("preview_order_rejected")).toHaveLength(1);
     expect(within(runList).queryByRole("button", { name: "Load older runs" })).not.toBeInTheDocument();
 
     const activityRefresh = screen.getAllByRole("button", { name: "Refresh" })
@@ -422,7 +486,7 @@ describe("App", () => {
     expect(activityRefresh).toBeDefined();
     fireEvent.click(activityRefresh!);
     await waitFor(() => expect(activityRefresh).toBeEnabled());
-    expect(within(runList).getAllByText("EXPECTED_VALUE_GATE")).toHaveLength(1);
+    expect(within(runList).getAllByText("preview_order_rejected")).toHaveLength(1);
   });
 
   it("keeps generic terminal codes separate from redacted failure details", async () => {
@@ -494,7 +558,7 @@ describe("App", () => {
   });
 
   it("continues a bounded outcome scan after an empty window", async () => {
-    window.localStorage.setItem("fukurou.web.activity.run-filter.v2", "RUNNING");
+    window.localStorage.setItem("fukurou.web.activity.run-filter.v2", "WAITING");
     const fetchMock = stubSystemFetch({
       decisionRunsResponse: {
         status: 200,
@@ -987,11 +1051,11 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         }
         if (requestSearchParams(input).has("before")) {
           return fixture.decisionRunsOlderResponse ?? jsonResponse(
-            filterDecisionRunsResponse(olderDecisionRunsResponse(), requestSearchParams(input).get("outcome")),
+          filterDecisionRunsResponse(olderDecisionRunsResponse(), requestSearchParams(input).get("filter")),
           );
         }
         return jsonResponse(
-          filterDecisionRunsResponse(decisionRunsResponse(), requestSearchParams(input).get("outcome")),
+          filterDecisionRunsResponse(decisionRunsResponse(), requestSearchParams(input).get("filter")),
         );
       case "/ops/runs/run-denied":
         return jsonResponse(decisionRunDetailResponse());
@@ -1533,7 +1597,7 @@ function decisionRunsResponse() {
         symbol: "BTC_JPY",
         triggerKind: "SCHEDULED",
         status: "SUCCEEDED",
-        outcome: "DENIED",
+        outcome: "NO_ENTRY",
         startedAt: "2026-07-10T00:47:27.000Z",
         finishedAt: "2026-07-10T00:47:36.000Z",
         durationMillis: 9000,
@@ -1553,7 +1617,7 @@ function decisionRunsResponse() {
         symbol: "BTC_JPY",
         triggerKind: "SCHEDULED",
         status: "FAILED",
-        outcome: "INTERRUPTED",
+        outcome: "FAILED",
         startedAt: "2026-07-10T00:14:12.000Z",
         finishedAt: "2026-07-10T00:20:00.000Z",
         durationMillis: 348000,
@@ -1619,7 +1683,7 @@ function terminalDecisionRunsResponse() {
       {
         ...base,
         invocationId: "run-interrupted",
-        outcome: "INTERRUPTED",
+        outcome: "FAILED",
         startedAt: "2026-07-10T00:45:27.000Z",
         finalReason: null,
         errorMessage: "previous process/container shutdown recovery",
@@ -1628,7 +1692,7 @@ function terminalDecisionRunsResponse() {
         ...base,
         invocationId: "run-no-trade",
         status: "SUCCEEDED",
-        outcome: "NO_TRADE",
+        outcome: "NO_ENTRY",
         startedAt: "2026-07-10T00:44:27.000Z",
         finalReason: "market_conditions_not_met",
         errorMessage: null,
@@ -1675,7 +1739,7 @@ function olderDecisionRunsResponse() {
         symbol: "BTC_JPY",
         triggerKind: "ECONOMIC_EVENT",
         status: "SUCCEEDED",
-        outcome: "EXECUTED",
+        outcome: "FILLED",
         startedAt: "2026-07-09T23:40:00.000Z",
         finishedAt: "2026-07-09T23:40:12.000Z",
         durationMillis: 12000,

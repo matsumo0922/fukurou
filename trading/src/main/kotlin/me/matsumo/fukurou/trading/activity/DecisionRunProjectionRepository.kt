@@ -9,12 +9,21 @@ import java.time.Instant
 
 /** decision run の機械判定 outcome。 */
 enum class DecisionRunOutcome {
-    EXECUTED,
-    DENIED,
-    NO_TRADE,
-    INTERRUPTED,
+    WAITING,
+    FILLED,
+    EXPIRED,
+    NO_ENTRY,
     RUNNING,
     FAILED,
+    ACTION_REQUIRED,
+}
+
+/** Activity 一覧の目的別 filter。 */
+enum class DecisionRunFilter {
+    ACTION_REQUIRED,
+    WAITING,
+    FILLED,
+    NO_ENTRY,
 }
 
 /** outcome 判定に使う保存済み run 証跡。 */
@@ -27,21 +36,36 @@ data class DecisionRunOutcomeEvidence(
     val filledOrderCount: Int,
     val executionCount: Int,
     val hasNoTradeExit: Boolean,
+    val openOrderCount: Int = 0,
+    val overdueOpenOrderCount: Int = 0,
+    val ttlCanceledOrderCount: Int = 0,
 )
 
 /** 保存済み run 証跡から fail-closed な outcome を決定する。 */
 fun classifyDecisionRunOutcome(evidence: DecisionRunOutcomeEvidence): DecisionRunOutcome {
-    val recoveredAfterShutdown = evidence.errorMessage == STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE
     val hasExecutionEvidence = evidence.filledOrderCount > 0 || evidence.executionCount > 0
 
     return when {
+        evidence.overdueOpenOrderCount > 0 -> DecisionRunOutcome.ACTION_REQUIRED
+        evidence.openOrderCount > 0 -> DecisionRunOutcome.WAITING
+        hasExecutionEvidence -> DecisionRunOutcome.FILLED
+        evidence.ttlCanceledOrderCount > 0 -> DecisionRunOutcome.EXPIRED
         evidence.status == LLM_RUN_STATUS_RUNNING -> DecisionRunOutcome.RUNNING
-        recoveredAfterShutdown -> DecisionRunOutcome.INTERRUPTED
-        evidence.safetyRule != null -> DecisionRunOutcome.DENIED
+        evidence.safetyRule != null -> DecisionRunOutcome.NO_ENTRY
+        evidence.action == DecisionAction.NO_TRADE.name || evidence.hasNoTradeExit -> DecisionRunOutcome.NO_ENTRY
+        evidence.errorMessage == STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE -> DecisionRunOutcome.FAILED
         evidence.status == LLM_RUN_STATUS_FAILED || evidence.status == LLM_RUN_STATUS_CANCELLED -> DecisionRunOutcome.FAILED
-        evidence.action == DecisionAction.NO_TRADE.name || evidence.hasNoTradeExit -> DecisionRunOutcome.NO_TRADE
-        hasExecutionEvidence -> DecisionRunOutcome.EXECUTED
         else -> DecisionRunOutcome.FAILED
+    }
+}
+
+/** outcome が目的別 filter に一致するかを返す。 */
+fun DecisionRunOutcome.matches(filter: DecisionRunFilter): Boolean {
+    return when (filter) {
+        DecisionRunFilter.ACTION_REQUIRED -> this == DecisionRunOutcome.ACTION_REQUIRED || this == DecisionRunOutcome.FAILED
+        DecisionRunFilter.WAITING -> this == DecisionRunOutcome.WAITING
+        DecisionRunFilter.FILLED -> this == DecisionRunOutcome.FILLED
+        DecisionRunFilter.NO_ENTRY -> this == DecisionRunOutcome.NO_ENTRY || this == DecisionRunOutcome.EXPIRED
     }
 }
 
@@ -81,6 +105,7 @@ data class DecisionRunSummary(
     val orderCount: Int,
     val executionCount: Int,
     val outcome: DecisionRunOutcome,
+    val order: DecisionRunOrder? = null,
 )
 
 /** decision run の LLM 判断 projection。 */
@@ -146,6 +171,12 @@ data class DecisionRunOrder(
     val sizeBtc: String,
     val limitPriceJpy: String?,
     val reasonJa: String?,
+    val expiresAt: Instant? = null,
+    val expirySource: String? = null,
+    val effectiveTtlSeconds: Long? = null,
+    val expiredAt: Instant? = null,
+    val canceledAt: Instant? = null,
+    val cancelReason: String? = null,
     val createdAt: Instant,
 )
 
@@ -191,7 +222,7 @@ interface DecisionRunProjectionRepository {
     suspend fun listRuns(
         cursor: DecisionRunCursor?,
         limit: Int,
-        outcome: DecisionRunOutcome? = null,
+        filter: DecisionRunFilter? = null,
     ): Result<DecisionRunPage>
 
     /** invocation ID に対応する run 詳細を返す。 */

@@ -9,6 +9,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunDetail
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
+import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
@@ -47,19 +48,19 @@ class DecisionRunRouteTest {
         assertEquals(Instant.parse("2026-07-10T00:47:27Z"), repository.lastCursor?.startedAt)
         assertEquals("run-new", repository.lastCursor?.invocationId)
 
-        val filteredResponse = client.get("/ops/runs?outcome=INTERRUPTED")
+        val filteredResponse = client.get("/ops/runs?filter=ACTION_REQUIRED")
         assertEquals(HttpStatusCode.OK, filteredResponse.status)
         val filteredPage = Json.decodeFromString<OpsDecisionRunsResponse>(filteredResponse.body())
         assertEquals(listOf("run-old"), filteredPage.runs.map { run -> run.invocationId })
-        assertEquals(DecisionRunOutcome.INTERRUPTED, repository.lastOutcome)
+        assertEquals(DecisionRunFilter.ACTION_REQUIRED, repository.lastFilter)
 
-        val cappedResponse = client.get("/ops/runs?outcome=RUNNING")
+        val cappedResponse = client.get("/ops/runs?filter=WAITING")
         assertEquals(HttpStatusCode.OK, cappedResponse.status)
         val cappedPage = Json.decodeFromString<OpsDecisionRunsResponse>(cappedResponse.body())
         assertTrue(cappedPage.runs.isEmpty())
         assertNotNull(cappedPage.nextBefore)
 
-        val continuedResponse = client.get("/ops/runs?outcome=RUNNING&before=${cappedPage.nextBefore}")
+        val continuedResponse = client.get("/ops/runs?filter=WAITING&before=${cappedPage.nextBefore}")
         assertEquals(HttpStatusCode.OK, continuedResponse.status)
         val continuedPage = Json.decodeFromString<OpsDecisionRunsResponse>(continuedResponse.body())
         assertTrue(continuedPage.runs.isEmpty())
@@ -69,7 +70,7 @@ class DecisionRunRouteTest {
         val detailResponse = client.get("/ops/runs/run-new")
         assertEquals(HttpStatusCode.OK, detailResponse.status)
         val detail = Json.decodeFromString<OpsDecisionRunDetailResponse>(detailResponse.body())
-        assertEquals(OpsDecisionRunOutcome.DENIED, detail.summary.outcome)
+        assertEquals(OpsDecisionRunOutcome.NO_ENTRY, detail.summary.outcome)
         assertEquals("APPROVED", detail.falsification?.verdict)
         assertEquals("0.1100000000", detail.decision?.expectedRMultiple)
         assertEquals("0.03357778", detail.safetyViolation?.measuredValue)
@@ -83,7 +84,7 @@ class DecisionRunRouteTest {
         assertTrue(detail.raw.none { raw -> raw.values.keys.any { key -> key.contains("secret", ignoreCase = true) } })
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?limit=0").status)
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?before=invalid").status)
-        assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?outcome=UNKNOWN").status)
+        assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?filter=UNKNOWN").status)
     }
 
     @Test
@@ -121,7 +122,7 @@ class DecisionRunRouteTest {
 
 private class FakeDecisionRunProjectionRepository : DecisionRunProjectionRepository {
     var lastCursor: DecisionRunCursor? = null
-    var lastOutcome: DecisionRunOutcome? = null
+    var lastFilter: DecisionRunFilter? = null
 
     private val denied = deniedRunSummary()
     private val interrupted = denied.copy(
@@ -135,17 +136,17 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
         falsificationVerdict = null,
         safetyRule = null,
         safetyMessageJa = null,
-        outcome = DecisionRunOutcome.INTERRUPTED,
+        outcome = DecisionRunOutcome.FAILED,
     )
 
     override suspend fun listRuns(
         cursor: DecisionRunCursor?,
         limit: Int,
-        outcome: DecisionRunOutcome?,
+        filter: DecisionRunFilter?,
     ): Result<DecisionRunPage> {
         lastCursor = cursor
-        lastOutcome = outcome
-        if (outcome == DecisionRunOutcome.RUNNING) {
+        lastFilter = filter
+        if (filter == DecisionRunFilter.WAITING) {
             val continuation = if (cursor == null) {
                 DecisionRunCursor(Instant.parse("2026-07-09T23:00:00Z"), "scan-boundary")
             } else {
@@ -158,7 +159,9 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
 
         return Result.success(
             DecisionRunPage(
-                runs = runs.filter { run -> outcome == null || run.outcome == outcome }.take(limit),
+                runs = runs.filter { run ->
+                    filter == null || filter == DecisionRunFilter.ACTION_REQUIRED && run.outcome == DecisionRunOutcome.FAILED
+                }.take(limit),
                 scanContinuation = null,
             ),
         )
@@ -231,7 +234,7 @@ private class SafetyPassedDecisionRunProjectionRepository : DecisionRunProjectio
     override suspend fun listRuns(
         cursor: DecisionRunCursor?,
         limit: Int,
-        outcome: DecisionRunOutcome?,
+        filter: DecisionRunFilter?,
     ): Result<DecisionRunPage> {
         return Result.success(DecisionRunPage(emptyList(), scanContinuation = null))
     }
@@ -276,7 +279,7 @@ private fun deniedRunSummary(): DecisionRunSummary {
         finalReason = "preview_order_rejected",
         orderCount = 0,
         executionCount = 0,
-        outcome = DecisionRunOutcome.DENIED,
+        outcome = DecisionRunOutcome.NO_ENTRY,
     )
 }
 
@@ -291,7 +294,7 @@ private fun safetyPassedDetail(action: DecisionAction): DecisionRunDetail {
         safetyMessageJa = null,
         finalReason = null,
         orderCount = 1,
-        outcome = DecisionRunOutcome.EXECUTED,
+        outcome = DecisionRunOutcome.FILLED,
     )
 
     return DecisionRunDetail(

@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right.mjs";
+import CircleAlert from "lucide-react/dist/esm/icons/circle-alert.mjs";
+import CircleCheck from "lucide-react/dist/esm/icons/circle-check.mjs";
+import Clock3 from "lucide-react/dist/esm/icons/clock-3.mjs";
+import Ban from "lucide-react/dist/esm/icons/ban.mjs";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import X from "lucide-react/dist/esm/icons/x.mjs";
 import {
   DECISION_RUN_FILTER_STORAGE_KEY,
-  DECISION_RUN_OUTCOME_FILTERS,
+  DECISION_RUN_FILTERS,
   decisionRunRefetchInterval,
   fetchDecisionRuns,
   opsDecisionRunDetailQuery,
-  type DecisionRunOutcomeFilter,
+  type DecisionRunFilterOption,
   type OpsDecisionRunDetailResponse,
   type OpsDecisionRunSummaryResponse,
 } from "../api/ops";
@@ -19,14 +23,14 @@ import { SectionHeader } from "../ui/components/SectionHeader";
 import { describeError, formatDateTime } from "../ui/format";
 
 export function ActivityPage() {
-  const [filter, setFilter] = useState<DecisionRunOutcomeFilter>(loadRunFilter);
+  const [filter, setFilter] = useState<DecisionRunFilterOption>(loadRunFilter);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selectedRunButtonRef = useRef<HTMLButtonElement | null>(null);
   const runsQuery = useInfiniteQuery({
     queryKey: ["ops", "decision-runs", filter],
     queryFn: ({ pageParam }) => fetchDecisionRuns({
       before: pageParam,
-      outcome: filter === "ALL" ? null : filter,
+      filter: filter === "ALL" ? null : filter,
     }),
     initialPageParam: null as string | null,
     getNextPageParam: (lastPage) => lastPage.nextBefore ?? undefined,
@@ -69,7 +73,7 @@ export function ActivityPage() {
       />
 
       <div className="run-filterbar" role="group" aria-label={t("activity.runs.filters.aria")}>
-        {DECISION_RUN_OUTCOME_FILTERS.map((outcome) => (
+        {DECISION_RUN_FILTERS.map((outcome) => (
           <button
             className="run-filter"
             type="button"
@@ -80,7 +84,7 @@ export function ActivityPage() {
               setSelectedId(null);
             }}
           >
-            {outcomeLabel(outcome, t)}
+            {filterLabel(outcome, t)}
             {filter === outcome ? (
               <span className="run-filter__count">{runs.length} {t("activity.runs.filter.loaded")}</span>
             ) : null}
@@ -155,6 +159,7 @@ function RunRow({
 }) {
   const { locale, t } = useI18n();
   const primaryReason = runSummaryPrimaryReason(run);
+  const order = run.order;
 
   return (
     <button
@@ -170,13 +175,14 @@ function RunRow({
           <time>{formatDateTime(run.startedAt, locale)}</time>
           <span className="decision-run-card__duration">{formatDuration(run.durationMillis)}</span>
           <span className={`run-outcome run-outcome--${run.outcome.toLowerCase().replaceAll("_", "-")}`}>
-            {outcomeLabel(run.outcome as DecisionRunOutcomeFilter, t)}
+            <OutcomeIcon outcome={run.outcome} />
+            {runOutcomeLabel(run.outcome, t)}
           </span>
           <ChevronRight className="decision-run-card__arrow" size={17} aria-hidden="true" />
         </span>
         <span className="decision-run-card__headline">
-          <strong>{run.action ?? run.status}</strong>
-          <code>{run.triggerKind ?? "MANUAL"}</code>
+          <strong>{order ? `${order.side} ${order.orderType} · ${order.sizeBtc} BTC` : run.action ?? run.status}</strong>
+          <code>{run.mode}</code>
         </span>
         <span className="decision-run-card__reason">
           <span>{primaryReason ?? t("activity.runs.reason.none")}</span>
@@ -185,10 +191,10 @@ function RunRow({
           ) : null}
         </span>
         <span className="decision-run-card__facts">
-          <span>{t("activity.runs.fact.verifier")} <strong>{run.falsificationVerdict ?? "—"}</strong></span>
-          <span>{t("activity.runs.fact.gate")} <strong>{run.safetyRule ?? "—"}</strong></span>
-          <span>{t("activity.runs.fact.orders")} <strong>{run.orderCount}</strong></span>
-          <span>{t("activity.runs.fact.executions")} <strong>{run.executionCount}</strong></span>
+          <span>{t("activity.runs.label.price")} <strong>{order?.limitPriceJpy ?? "—"}</strong></span>
+          <span>{t("activity.runs.label.currentQuote")} <strong>{formatReferenceQuote(run, locale)}</strong></span>
+          <span>{t("activity.runs.label.distance")} <strong>{formatPriceDistance(run)}</strong></span>
+          <span>{t("activity.runs.label.effectiveExpiry")} <strong>{formatExpiry(order?.expiresAt, locale)}</strong></span>
         </span>
       </span>
     </button>
@@ -225,7 +231,8 @@ function RunDetailPane({
         <span className="decision-run-detail__eyebrow">Decision run</span>
         {detail ? (
           <span className={`run-outcome run-outcome--${detail.summary.outcome.toLowerCase().replaceAll("_", "-")}`}>
-            {outcomeLabel(detail.summary.outcome as DecisionRunOutcomeFilter, t)}
+            <OutcomeIcon outcome={detail.summary.outcome} />
+            {runOutcomeLabel(detail.summary.outcome, t)}
           </span>
         ) : null}
         <button
@@ -258,14 +265,61 @@ function RunDetailContent({
   rawOpen: boolean;
   rawToggled: () => void;
 }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const decision = detail.decision;
   const intent = detail.intent;
   const safety = detail.safetyViolation;
+  const order = detail.summary.order ?? detail.orders.find((candidate) => candidate.side === "BUY") ?? null;
 
   return (
     <>
-      <DetailSection index="01" title={t("activity.runs.section.timeline")}>
+      {order ? <p className="run-order-explanation">{orderExplanation(order, locale)}</p> : null}
+
+      <DetailSection index="01" title={t("activity.runs.section.orderConditions")}>
+        <FactGrid facts={[
+          [t("activity.runs.label.mode"), detail.summary.mode],
+          [t("activity.runs.label.order"), order ? `${order.side} ${order.orderType}` : null],
+          [t("activity.runs.label.size"), order ? `${order.sizeBtc} BTC` : intent ? `${intent.sizeBtc} BTC` : null],
+          [t("activity.runs.label.price"), order?.limitPriceJpy ?? intent?.priceJpy],
+          [t("activity.runs.label.currentQuote"), formatReferenceQuote(detail.summary, locale)],
+          [t("activity.runs.label.distance"), formatPriceDistance(detail.summary)],
+          [t("activity.runs.label.quoteNotice"), detail.summary.currentQuote?.stale ? t("activity.runs.quote.stale") : t("activity.runs.quote.reference"), true],
+        ]} />
+        <RunOrderRecords orders={detail.orders} />
+        <RunExecutionRecords executions={detail.executions} />
+      </DetailSection>
+
+      <DetailSection index="02" title={t("activity.runs.section.expiry")}>
+        <FactGrid facts={[
+          [t("activity.runs.label.effectiveExpiry"), order?.expiresAt ? formatDateTime(order.expiresAt, locale) : t("activity.runs.expiry.unrecorded")],
+          [t("activity.runs.label.remaining"), formatExpiry(order?.expiresAt, locale)],
+          [t("activity.runs.label.expirySource"), order?.expirySource],
+          [t("activity.runs.label.effectiveTtl"), order?.effectiveTtlSeconds == null ? null : `${order.effectiveTtlSeconds}s`],
+          [t("activity.runs.label.timeStop"), intent?.timeStopAt],
+          [t("activity.runs.label.expiredAt"), order?.expiredAt],
+          [t("activity.runs.label.canceledAt"), order?.canceledAt],
+          [t("activity.runs.label.cancelReason"), order?.cancelReason, true],
+        ]} />
+      </DetailSection>
+
+      <DetailSection index="03" title={t("activity.runs.section.safety")}>
+        <div className="run-value-comparison">
+          <div><small>{t("activity.runs.comparison.llm")}</small><strong>{decision?.expectedRMultiple ?? "—"}</strong><span>expectedR</span></div>
+          <span aria-hidden="true">→</span>
+          <div><small>{t("activity.runs.comparison.code")}</small><strong>{safety?.measuredValue ?? "—"}</strong><span>{safety ? `limit ${safety.limitValue}` : "—"}</span></div>
+        </div>
+        <FactGrid facts={[
+          [t("activity.runs.label.rule"), safety?.rule],
+          [t("activity.runs.label.verdict"), detail.falsification?.verdict],
+          [t("activity.runs.label.falsifierReason"), detail.falsification?.reasonJa, true],
+          [t("activity.runs.label.stop"), intent?.protectiveStopPriceJpy],
+          [t("activity.runs.label.takeProfit"), intent?.takeProfitPriceJpy],
+          [t("activity.runs.label.finalReason"), detail.summary.finalReason],
+          [t("activity.runs.label.message"), safety?.messageJa, true],
+        ]} />
+      </DetailSection>
+
+      <DetailSection index="04" title={t("activity.runs.section.processingPath")}>
         <ol className="run-phase-list">
           {detail.phases.map((phase) => (
             <li className="run-phase" data-state={phase.status.toLowerCase()} key={phase.key}>
@@ -274,68 +328,21 @@ function RunDetailContent({
             </li>
           ))}
         </ol>
-      </DetailSection>
-
-      <DetailSection index="02" title={t("activity.runs.section.decision")}>
+        {detail.summary.errorMessage && detail.summary.outcome !== "FAILED" ? (
+          <p className="run-detail-notice run-detail-notice--warning">
+            <CircleAlert size={16} aria-hidden="true" /> {detail.summary.errorMessage}
+          </p>
+        ) : null}
         <FactGrid facts={[
           [t("activity.runs.label.action"), decision?.action],
           [t("activity.runs.label.provider"), decision?.provider],
-          ["p", decision?.estimatedWinProbability],
-          ["roundTripCostR", decision?.roundTripCostR],
-          [t("activity.runs.label.reason"), decision?.reasonJa, true],
-        ]} />
-      </DetailSection>
-
-      <DetailSection index="03" title={t("activity.runs.section.intent")}>
-        <FactGrid facts={[
-          [t("activity.runs.label.intentId"), intent?.intentId],
-          [t("activity.runs.label.tradePlanId"), intent?.tradePlanId],
-          [t("activity.runs.label.revision"), intent ? String(intent.revisionCount) : null],
           [t("activity.runs.label.parentPlan"), intent?.parentTradePlanId],
-          [t("activity.runs.label.order"), intent ? `${intent.side} ${intent.orderType}` : null],
-          [t("activity.runs.label.size"), intent ? `${intent.sizeBtc} BTC` : null],
-          [t("activity.runs.label.price"), intent?.priceJpy],
-          [t("activity.runs.label.stop"), intent?.protectiveStopPriceJpy],
-          [t("activity.runs.label.takeProfit"), intent?.takeProfitPriceJpy],
-          [t("activity.runs.label.target"), intent?.targetPriceJpy],
-          [t("activity.runs.label.timeStop"), intent?.timeStopAt],
           [t("activity.runs.label.setupTags"), formatJsonList(intent?.setupTagsJson), true],
           [t("activity.runs.label.thesis"), intent?.thesisJa, true],
           [t("activity.runs.label.invalidation"), formatJsonList(intent?.invalidationConditionsJaJson), true],
-        ]} />
-      </DetailSection>
-
-      <DetailSection index="04" title={t("activity.runs.section.verification")}>
-        <FactGrid facts={[
-          [t("activity.runs.label.verdict"), detail.falsification?.verdict],
-          [t("activity.runs.label.reason"), detail.falsification?.reasonJa, true],
-        ]} />
-      </DetailSection>
-
-      <DetailSection index="05" title={t("activity.runs.section.safety")}>
-        <div className="run-value-comparison">
-          <div><small>{t("activity.runs.comparison.llm")}</small><strong>{decision?.expectedRMultiple ?? "—"}</strong><span>expectedR</span></div>
-          <span aria-hidden="true">→</span>
-          <div><small>{t("activity.runs.comparison.code")}</small><strong>{safety?.measuredValue ?? "—"}</strong><span>{safety ? `limit ${safety.limitValue}` : "—"}</span></div>
-        </div>
-        <FactGrid facts={[
-          [t("activity.runs.label.rule"), safety?.rule],
-          [t("activity.runs.label.finalReason"), detail.summary.finalReason],
           [t("activity.runs.label.runtimeError"), detail.summary.errorMessage, true],
-          [t("activity.runs.label.message"), safety?.messageJa, true],
+          [t("activity.runs.label.reason"), decision?.reasonJa, true],
         ]} />
-      </DetailSection>
-
-      <DetailSection index="06" title={t("activity.runs.section.execution")}>
-        <FactGrid facts={[
-          [t("activity.runs.fact.orders"), String(detail.orders.length)],
-          [t("activity.runs.fact.executions"), String(detail.executions.length)],
-        ]} />
-        <RunOrderRecords orders={detail.orders} />
-        <RunExecutionRecords executions={detail.executions} />
-      </DetailSection>
-
-      <DetailSection index="07" title={t("activity.runs.section.raw")}>
         <button
           className="run-raw-toggle"
           type="button"
@@ -391,6 +398,11 @@ function RunOrderRecords({ orders }: { orders: OpsDecisionRunDetailResponse["ord
             [t("activity.runs.label.status"), order.status],
             [t("activity.runs.label.size"), `${order.sizeBtc} BTC`],
             [t("activity.runs.label.price"), order.limitPriceJpy],
+            [t("activity.runs.label.effectiveExpiry"), order.expiresAt],
+            [t("activity.runs.label.expirySource"), order.expirySource],
+            [t("activity.runs.label.expiredAt"), order.expiredAt],
+            [t("activity.runs.label.canceledAt"), order.canceledAt],
+            [t("activity.runs.label.cancelReason"), order.cancelReason, true],
             [t("activity.runs.label.createdAt"), order.createdAt],
             [t("activity.runs.label.entryReason"), order.reasonJa, true],
           ]} />
@@ -432,9 +444,9 @@ function RunListNotice({ text, action }: { text: string; action?: () => void }) 
   );
 }
 
-function loadRunFilter(): DecisionRunOutcomeFilter {
+function loadRunFilter(): DecisionRunFilterOption {
   const saved = window.localStorage.getItem(DECISION_RUN_FILTER_STORAGE_KEY);
-  return DECISION_RUN_OUTCOME_FILTERS.find((filter) => filter === saved) ?? "ALL";
+  return DECISION_RUN_FILTERS.find((filter) => filter === saved) ?? "ALL";
 }
 
 function deduplicateRuns(runs: OpsDecisionRunSummaryResponse[]): OpsDecisionRunSummaryResponse[] {
@@ -447,14 +459,66 @@ function deduplicateRuns(runs: OpsDecisionRunSummaryResponse[]): OpsDecisionRunS
   });
 }
 
+type AppLocale = ReturnType<typeof useI18n>["locale"];
+
+function formatReferenceQuote(run: OpsDecisionRunSummaryResponse, locale: AppLocale): string {
+  const quote = run.currentQuote;
+  if (!quote) return "—";
+
+  const stale = quote.stale ? (locale === "ja" ? " · stale" : " · stale") : "";
+  return `${quote.priceJpy} @ ${formatDateTime(quote.observedAt, locale)}${stale}`;
+}
+
+function formatPriceDistance(run: OpsDecisionRunSummaryResponse): string {
+  const limit = Number(run.order?.limitPriceJpy);
+  const quote = Number(run.currentQuote?.priceJpy);
+  if (!Number.isFinite(limit) || !Number.isFinite(quote) || quote === 0) return "—";
+
+  const distance = run.order?.side === "SELL" ? limit - quote : quote - limit;
+  const ratio = distance / quote * 100;
+  return `${distance.toLocaleString()} JPY (${ratio.toFixed(2)}%)`;
+}
+
+function formatExpiry(expiresAt: string | null | undefined, locale: AppLocale): string {
+  if (!expiresAt) return locale === "ja" ? "期限記録なし" : "Expiry not recorded";
+
+  const remainingMillis = Date.parse(expiresAt) - Date.now();
+  const absoluteSeconds = Math.floor(Math.abs(remainingMillis) / 1_000);
+  const hours = Math.floor(absoluteSeconds / 3_600);
+  const minutes = Math.floor((absoluteSeconds % 3_600) / 60);
+  const duration = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+  const relation = remainingMillis > 0
+    ? (locale === "ja" ? `残り ${duration}` : `${duration} remaining`)
+    : (locale === "ja" ? `${duration} 超過` : `${duration} overdue`);
+
+  return `${formatDateTime(expiresAt, locale)} · ${relation}`;
+}
+
+function orderExplanation(
+  order: NonNullable<OpsDecisionRunSummaryResponse["order"]>,
+  locale: AppLocale,
+): string {
+  if (order.orderType === "LIMIT" && order.limitPriceJpy) {
+    const quoteName = order.side === "BUY"
+      ? (locale === "ja" ? "最良売気配" : "best ask")
+      : (locale === "ja" ? "最良買気配" : "best bid");
+    const comparison = order.side === "BUY" ? (locale === "ja" ? "以下" : "or lower") : (locale === "ja" ? "以上" : "or higher");
+
+    return locale === "ja"
+      ? `${quoteName}が ${order.limitPriceJpy} JPY ${comparison}になると、${order.sizeBtc} BTC の paper 約定を作成します。`
+      : `A paper fill for ${order.sizeBtc} BTC is created when the ${quoteName} reaches ${order.limitPriceJpy} JPY ${comparison}.`;
+  }
+
+  return locale === "ja"
+    ? `${order.orderType} 条件で ${order.sizeBtc} BTC の paper 約定を待っています。`
+    : `Waiting for a paper fill of ${order.sizeBtc} BTC under the ${order.orderType} condition.`;
+}
+
 function runSummaryPrimaryReason(run: OpsDecisionRunSummaryResponse): string | null {
-  if (run.outcome === "FAILED" || run.outcome === "INTERRUPTED") {
+  if (run.outcome === "FAILED" || run.outcome === "ACTION_REQUIRED") {
     return run.errorMessage ?? run.finalReason ?? run.safetyMessageJa ?? run.reasonJa ?? null;
   }
-  if (run.outcome === "DENIED") {
-    return run.safetyMessageJa ?? run.errorMessage ?? run.finalReason ?? run.reasonJa ?? null;
-  }
-  if (run.outcome === "NO_TRADE") {
+  if (run.outcome === "NO_ENTRY") {
     return run.finalReason ?? run.reasonJa ?? run.errorMessage ?? null;
   }
 
@@ -481,17 +545,40 @@ function formatDuration(value: number | null | undefined): string {
 
 type Translator = ReturnType<typeof useI18n>["t"];
 
-function outcomeLabel(outcome: DecisionRunOutcomeFilter, t: Translator): string {
+function filterLabel(filter: DecisionRunFilterOption, t: Translator): string {
   const keys = {
     ALL: "activity.runs.filter.all",
-    EXECUTED: "activity.runs.filter.executed",
-    DENIED: "activity.runs.filter.denied",
-    NO_TRADE: "activity.runs.filter.noTrade",
-    INTERRUPTED: "activity.runs.filter.interrupted",
-    RUNNING: "activity.runs.filter.running",
-    FAILED: "activity.runs.filter.failed",
+    ACTION_REQUIRED: "activity.runs.filter.actionRequired",
+    WAITING: "activity.runs.filter.waiting",
+    FILLED: "activity.runs.filter.filled",
+    NO_ENTRY: "activity.runs.filter.noEntry",
+  } as const;
+  return t(keys[filter]);
+}
+
+function runOutcomeLabel(outcome: OpsDecisionRunSummaryResponse["outcome"], t: Translator): string {
+  const keys = {
+    ACTION_REQUIRED: "activity.runs.outcome.overdue",
+    WAITING: "activity.runs.outcome.waiting",
+    FILLED: "activity.runs.outcome.filled",
+    EXPIRED: "activity.runs.outcome.expired",
+    NO_ENTRY: "activity.runs.outcome.noEntry",
+    RUNNING: "activity.runs.outcome.running",
+    FAILED: "activity.runs.outcome.failed",
   } as const;
   return t(keys[outcome]);
+}
+
+function OutcomeIcon({ outcome }: { outcome: OpsDecisionRunSummaryResponse["outcome"] }) {
+  const Icon = outcome === "WAITING" || outcome === "RUNNING"
+    ? Clock3
+    : outcome === "FILLED"
+      ? CircleCheck
+      : outcome === "EXPIRED" || outcome === "NO_ENTRY"
+        ? Ban
+        : CircleAlert;
+
+  return <Icon size={14} aria-hidden="true" />;
 }
 
 function phaseLabel(phase: string, t: Translator): string {

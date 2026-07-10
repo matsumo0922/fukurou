@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunDetail
 import me.matsumo.fukurou.trading.activity.DecisionRunExecution
+import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
@@ -47,12 +48,22 @@ data class OpsDecisionRunsResponse(
 /** decision run の API outcome。 */
 @Serializable
 enum class OpsDecisionRunOutcome {
-    EXECUTED,
-    DENIED,
-    NO_TRADE,
-    INTERRUPTED,
+    WAITING,
+    FILLED,
+    EXPIRED,
+    NO_ENTRY,
     RUNNING,
     FAILED,
+    ACTION_REQUIRED,
+}
+
+/** Activity の目的別 filter。 */
+@Serializable
+enum class OpsDecisionRunFilter {
+    ACTION_REQUIRED,
+    WAITING,
+    FILLED,
+    NO_ENTRY,
 }
 
 /** decision run 一覧要素。 */
@@ -76,6 +87,16 @@ data class OpsDecisionRunSummaryResponse(
     val errorMessage: String?,
     val orderCount: Int,
     val executionCount: Int,
+    val order: OpsDecisionRunOrderResponse?,
+    val currentQuote: OpsDecisionRunQuoteResponse?,
+)
+
+/** Activity に表示する参考価格。paper fill の根拠には使わない。 */
+@Serializable
+data class OpsDecisionRunQuoteResponse(
+    val priceJpy: String,
+    val observedAt: String,
+    val stale: Boolean,
 )
 
 /** decision run 詳細 response。 */
@@ -168,6 +189,12 @@ data class OpsDecisionRunOrderResponse(
     val sizeBtc: String,
     val limitPriceJpy: String?,
     val reasonJa: String?,
+    val expiresAt: String?,
+    val expirySource: String?,
+    val effectiveTtlSeconds: Long?,
+    val expiredAt: String?,
+    val canceledAt: String?,
+    val cancelReason: String?,
     val createdAt: String,
 )
 
@@ -216,14 +243,14 @@ private fun Route.registerOpsDecisionRunsListRoute(dependencies: OpsRouteDepende
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("before must be a valid opaque cursor"))
             return@get
         }
-        val outcomeParameter = call.request.queryParameters["outcome"]
-        val outcome = outcomeParameter?.let(::parseRunOutcome)
-        if (outcomeParameter != null && outcome == null) {
-            call.respond(HttpStatusCode.BadRequest, ErrorResponse("outcome must be a valid decision run outcome"))
+        val filterParameter = call.request.queryParameters["filter"]
+        val filter = filterParameter?.let(::parseRunFilter)
+        if (filterParameter != null && filter == null) {
+            call.respond(HttpStatusCode.BadRequest, ErrorResponse("filter must be a valid decision run filter"))
             return@get
         }
-        val page = repository.listRuns(cursor, limit + 1, outcome).getOrThrow()
-        call.respond(page.toResponse(limit))
+        val page = repository.listRuns(cursor, limit + 1, filter).getOrThrow()
+        call.respond(page.toResponse(limit, dependencies.referenceQuote()))
     }.describe {
         summary = "decision run 一覧を取得する"
         description = RUNS_DESCRIPTION
@@ -237,9 +264,9 @@ private fun Route.registerOpsDecisionRunsListRoute(dependencies: OpsRouteDepende
                 description = "前回応答の nextBefore を指定する opaque cursor です。"
                 schema = jsonSchema<String>()
             }
-            query("outcome") {
-                description = "pagination より前に bounded scan で適用する outcome filter です。"
-                schema = jsonSchema<OpsDecisionRunOutcome>()
+            query("filter") {
+                description = "pagination より前に bounded scan で適用する目的別 filter です。"
+                schema = jsonSchema<OpsDecisionRunFilter>()
             }
         }
         responses {
@@ -248,7 +275,7 @@ private fun Route.registerOpsDecisionRunsListRoute(dependencies: OpsRouteDepende
                 schema = jsonSchema<OpsDecisionRunsResponse>()
             }
             HttpStatusCode.BadRequest {
-                description = "limit、before、または outcome が不正です。"
+                description = "limit、before、または filter が不正です。"
                 schema = jsonSchema<ErrorResponse>()
             }
             HttpStatusCode.ServiceUnavailable {
@@ -274,7 +301,7 @@ private fun Route.registerOpsDecisionRunDetailRoute(dependencies: OpsRouteDepend
             return@get
         }
 
-        call.respond(detail.toResponse())
+        call.respond(detail.toResponse(dependencies.referenceQuote()))
     }.describe {
         summary = "decision run 詳細を取得する"
         description = "Trigger から Order / Execution までの段階、LLM 申告値、Falsifier、SafetyFloor、関連 ledger、secret を除外した raw/debug 情報を返します。"
@@ -302,7 +329,21 @@ private fun Route.registerOpsDecisionRunDetailRoute(dependencies: OpsRouteDepend
     }
 }
 
-private fun DecisionRunPage.toResponse(limit: Int): OpsDecisionRunsResponse {
+private suspend fun OpsRouteDependencies.referenceQuote(): OpsDecisionRunQuoteResponse? {
+    val snapshot = feed.paperLedgerRepository?.getAccountSnapshotWithUpdatedAt()?.getOrNull() ?: return null
+    val observedAt = snapshot.updatedAt
+
+    return OpsDecisionRunQuoteResponse(
+        priceJpy = snapshot.accountSnapshot.btcMarkPriceJpy,
+        observedAt = observedAt.toString(),
+        stale = Duration.between(observedAt, clock.instant()) > Duration.ofMinutes(2),
+    )
+}
+
+private fun DecisionRunPage.toResponse(
+    limit: Int,
+    quote: OpsDecisionRunQuoteResponse?,
+): OpsDecisionRunsResponse {
     val visible = runs.take(limit)
     val nextCursor = if (runs.size > limit) {
         visible.lastOrNull()?.toCursor()
@@ -311,12 +352,12 @@ private fun DecisionRunPage.toResponse(limit: Int): OpsDecisionRunsResponse {
     }
 
     return OpsDecisionRunsResponse(
-        runs = visible.map(DecisionRunSummary::toResponse),
+        runs = visible.map { summary -> summary.toResponse(quote) },
         nextBefore = nextCursor?.let(::encodeRunCursor),
     )
 }
 
-private fun DecisionRunSummary.toResponse(): OpsDecisionRunSummaryResponse {
+private fun DecisionRunSummary.toResponse(quote: OpsDecisionRunQuoteResponse?): OpsDecisionRunSummaryResponse {
     return OpsDecisionRunSummaryResponse(
         invocationId = invocationId,
         mode = mode,
@@ -336,12 +377,14 @@ private fun DecisionRunSummary.toResponse(): OpsDecisionRunSummaryResponse {
         errorMessage = errorMessage,
         orderCount = orderCount,
         executionCount = executionCount,
+        order = order?.toResponse(),
+        currentQuote = quote,
     )
 }
 
-private fun DecisionRunDetail.toResponse(): OpsDecisionRunDetailResponse {
+private fun DecisionRunDetail.toResponse(quote: OpsDecisionRunQuoteResponse?): OpsDecisionRunDetailResponse {
     return OpsDecisionRunDetailResponse(
-        summary = summary.toResponse(),
+        summary = summary.toResponse(quote),
         phases = phases(),
         decision = decision?.toResponse(),
         intent = intent?.toResponse(),
@@ -409,12 +452,13 @@ private fun DecisionRunDetail.decisionAction(): DecisionAction? {
 
 private fun DecisionRunOutcome.toResponse(): OpsDecisionRunOutcome {
     return when (this) {
-        DecisionRunOutcome.EXECUTED -> OpsDecisionRunOutcome.EXECUTED
-        DecisionRunOutcome.DENIED -> OpsDecisionRunOutcome.DENIED
-        DecisionRunOutcome.NO_TRADE -> OpsDecisionRunOutcome.NO_TRADE
-        DecisionRunOutcome.INTERRUPTED -> OpsDecisionRunOutcome.INTERRUPTED
+        DecisionRunOutcome.WAITING -> OpsDecisionRunOutcome.WAITING
+        DecisionRunOutcome.FILLED -> OpsDecisionRunOutcome.FILLED
+        DecisionRunOutcome.EXPIRED -> OpsDecisionRunOutcome.EXPIRED
+        DecisionRunOutcome.NO_ENTRY -> OpsDecisionRunOutcome.NO_ENTRY
         DecisionRunOutcome.RUNNING -> OpsDecisionRunOutcome.RUNNING
         DecisionRunOutcome.FAILED -> OpsDecisionRunOutcome.FAILED
+        DecisionRunOutcome.ACTION_REQUIRED -> OpsDecisionRunOutcome.ACTION_REQUIRED
     }
 }
 
@@ -476,6 +520,12 @@ private fun DecisionRunOrder.toResponse() = OpsDecisionRunOrderResponse(
     sizeBtc = sizeBtc,
     limitPriceJpy = limitPriceJpy,
     reasonJa = reasonJa,
+    expiresAt = expiresAt?.toString(),
+    expirySource = expirySource,
+    effectiveTtlSeconds = effectiveTtlSeconds,
+    expiredAt = expiredAt?.toString(),
+    canceledAt = canceledAt?.toString(),
+    cancelReason = cancelReason,
     createdAt = createdAt.toString(),
 )
 
@@ -517,6 +567,6 @@ private fun decodeRunCursor(value: String): DecisionRunCursor? {
     }.getOrNull()
 }
 
-private fun parseRunOutcome(value: String): DecisionRunOutcome? {
-    return DecisionRunOutcome.entries.find { outcome -> outcome.name == value }
+private fun parseRunFilter(value: String): DecisionRunFilter? {
+    return DecisionRunFilter.entries.find { filter -> filter.name == value }
 }
