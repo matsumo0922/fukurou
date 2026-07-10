@@ -313,6 +313,29 @@ private const val ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL = """
     ON llm_runs (started_at)
 """
 
+/** decision run Activity projection の bounded lookup index を作る SQL。 */
+private const val ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_llm_runs_decision_activity
+        ON llm_runs (started_at DESC, invocation_id DESC)
+        WHERE trigger_kind IS DISTINCT FROM 'REFLECTION';
+    CREATE INDEX IF NOT EXISTS idx_command_event_log_run_event_ts
+        ON command_event_log (decision_run_id, event_type, ts DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_orders_decision_run_created
+        ON orders (decision_run_id, created_at, id)
+        WHERE decision_run_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_executions_decision_run_executed
+        ON executions (decision_run_id, executed_at, id)
+        WHERE decision_run_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_safety_violations_decision_run_created
+        ON safety_violations (decision_run_id, created_at DESC, id DESC)
+        WHERE decision_run_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_trade_intents_decision_created
+        ON trade_intents (decision_id, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_decisions_run_projection
+        ON decisions (invocation_id, created_at DESC, id DESC)
+        WHERE invocation_id IS NOT NULL
+"""
+
 /**
  * equity_snapshots.captured_at index を作る SQL。
  */
@@ -419,6 +442,23 @@ private const val VERIFY_LLM_RUNS_INDEX_COUNT_SQL = """
     WHERE schemaname = current_schema()
         AND tablename = 'llm_runs'
         AND indexname = 'idx_llm_runs_started_at'
+"""
+
+/** decision run Activity projection index の存在を確認する SQL。 */
+private const val VERIFY_DECISION_RUN_ACTIVITY_INDEXES_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND indexname IN (
+            'idx_llm_runs_decision_activity',
+            'idx_command_event_log_run_event_ts',
+            'idx_orders_decision_run_created',
+            'idx_executions_decision_run_executed',
+            'idx_safety_violations_decision_run_created',
+            'idx_trade_intents_decision_created',
+            'idx_decisions_run_projection'
+        )
+    HAVING COUNT(*) = 7
 """
 
 /**
@@ -804,6 +844,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL)
+    executeUpdate(ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_CAPTURED_AT_INDEX_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_DAILY_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_BOOTSTRAP_UNIQUE_INDEX_SQL)
@@ -848,6 +889,10 @@ private fun JdbcTransaction.verifyAccountRuntimeSchemaObjects() {
     verifyExistsBySql(
         sql = VERIFY_LLM_RUNS_INDEX_COUNT_SQL,
         missingMessage = "llm_runs indexes were not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_DECISION_RUN_ACTIVITY_INDEXES_SQL,
+        missingMessage = "decision run Activity projection indexes were not initialized.",
     )
     verifySchemaBySql(
         sql = VERIFY_EQUITY_SNAPSHOTS_SCHEMA_SQL,

@@ -1595,6 +1595,130 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ops/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * decision run 一覧を取得する
+         * @description llm_runs を起点に decision、Falsifier、SafetyFloor、order、execution を正規化した run 一覧を新しい順で返します。outcome filter は bounded window を走査し、上限到達時は次の window 用 cursor を返します。
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description 取得件数です。既定 30、最大 100 です。 */
+                    limit?: number;
+                    /** @description 前回応答の nextBefore を指定する opaque cursor です。 */
+                    before?: string;
+                    /** @description pagination より前に bounded scan で適用する outcome filter です。 */
+                    outcome?: "EXECUTED" | "DENIED" | "NO_TRADE" | "INTERRUPTED" | "RUNNING" | "FAILED";
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description decision run 一覧です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsDecisionRunsResponse"];
+                    };
+                };
+                /** @description limit、before、または outcome が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description projection repository が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/runs/{invocationId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * decision run 詳細を取得する
+         * @description Trigger から Order / Execution までの段階、LLM 申告値、Falsifier、SafetyFloor、関連 ledger、secret を除外した raw/debug 情報を返します。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description runner の invocation ID です。 */
+                    invocationId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description decision run 詳細です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsDecisionRunDetailResponse"];
+                    };
+                };
+                /** @description run が存在しません。 */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description projection repository が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ops/positions": {
         parameters: {
             query?: never;
@@ -2107,6 +2231,131 @@ export interface components {
             events: components["schemas"]["OpsActivityEventResponse"][];
             nextBefore?: string | null;
             limit: number;
+        };
+        /** OpsDecisionRunSummaryResponse */
+        OpsDecisionRunSummaryResponse: {
+            invocationId: string;
+            mode: string;
+            symbol: string;
+            triggerKind?: string | null;
+            status: string;
+            /** @enum {string} */
+            outcome: "EXECUTED" | "DENIED" | "NO_TRADE" | "INTERRUPTED" | "RUNNING" | "FAILED";
+            startedAt: string;
+            finishedAt?: string | null;
+            durationMillis?: number | null;
+            action?: string | null;
+            reasonJa?: string | null;
+            falsificationVerdict?: string | null;
+            safetyRule?: string | null;
+            safetyMessageJa?: string | null;
+            finalReason?: string | null;
+            errorMessage?: string | null;
+            orderCount: number;
+            executionCount: number;
+        };
+        /** OpsDecisionRunsResponse */
+        OpsDecisionRunsResponse: {
+            runs: components["schemas"]["OpsDecisionRunSummaryResponse"][];
+            nextBefore?: string | null;
+        };
+        /** OpsDecisionRunPhaseResponse */
+        OpsDecisionRunPhaseResponse: {
+            key: string;
+            status: string;
+            detail?: string | null;
+        };
+        /** OpsDecisionRunDecisionResponse */
+        OpsDecisionRunDecisionResponse: {
+            decisionId: string;
+            action: string;
+            provider?: string | null;
+            estimatedWinProbability: string;
+            expectedRMultiple?: string | null;
+            roundTripCostR?: string | null;
+            reasonJa: string;
+            setupTagsJson: string;
+            missingDataJaJson: string;
+            noTradeConditionsJaJson: string;
+            createdAt: string;
+        };
+        /** OpsDecisionRunIntentResponse */
+        OpsDecisionRunIntentResponse: {
+            intentId: string;
+            tradePlanId: string;
+            parentTradePlanId?: string | null;
+            revisionCount: number;
+            side: string;
+            orderType: string;
+            sizeBtc: string;
+            priceJpy?: string | null;
+            protectiveStopPriceJpy: string;
+            takeProfitPriceJpy?: string | null;
+            thesisJa?: string | null;
+            invalidationConditionsJaJson?: string | null;
+            targetPriceJpy?: string | null;
+            timeStopAt?: string | null;
+            setupTagsJson?: string | null;
+        };
+        /** OpsDecisionRunFalsificationResponse */
+        OpsDecisionRunFalsificationResponse: {
+            verdict: string;
+            provider?: string | null;
+            reasonJa: string;
+            createdAt: string;
+        };
+        /** OpsDecisionRunSafetyViolationResponse */
+        OpsDecisionRunSafetyViolationResponse: {
+            rule: string;
+            measuredValue: string;
+            limitValue: string;
+            messageJa: string;
+            createdAt: string;
+        };
+        /** OpsDecisionRunOrderResponse */
+        OpsDecisionRunOrderResponse: {
+            orderId: string;
+            intentId?: string | null;
+            positionId?: string | null;
+            tradeGroupId?: string | null;
+            side: string;
+            orderType: string;
+            status: string;
+            sizeBtc: string;
+            limitPriceJpy?: string | null;
+            reasonJa?: string | null;
+            createdAt: string;
+        };
+        /** OpsDecisionRunExecutionResponse */
+        OpsDecisionRunExecutionResponse: {
+            executionId: string;
+            orderId?: string | null;
+            positionId?: string | null;
+            side: string;
+            priceJpy: string;
+            sizeBtc: string;
+            realizedPnlJpy: string;
+            executedAt: string;
+        };
+        /** OpsDecisionRunRawRecordResponse */
+        OpsDecisionRunRawRecordResponse: {
+            source: string;
+            occurredAt: string;
+            values: {
+                [key: string]: string | null;
+            };
+        };
+        /** OpsDecisionRunDetailResponse */
+        OpsDecisionRunDetailResponse: {
+            summary: components["schemas"]["OpsDecisionRunSummaryResponse"];
+            phases: components["schemas"]["OpsDecisionRunPhaseResponse"][];
+            decision?: components["schemas"]["OpsDecisionRunDecisionResponse"] | null;
+            intent?: components["schemas"]["OpsDecisionRunIntentResponse"] | null;
+            falsification?: components["schemas"]["OpsDecisionRunFalsificationResponse"] | null;
+            safetyViolation?: components["schemas"]["OpsDecisionRunSafetyViolationResponse"] | null;
+            orders: components["schemas"]["OpsDecisionRunOrderResponse"][];
+            executions: components["schemas"]["OpsDecisionRunExecutionResponse"][];
+            raw: components["schemas"]["OpsDecisionRunRawRecordResponse"][];
         };
         /** Position */
         Position: {

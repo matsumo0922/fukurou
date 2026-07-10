@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
-import { ACTIVITY_TIMELINE_FILTER_STORAGE_KEY } from "./api/ops";
 import { LOCALE_STORAGE_KEY } from "./i18n/messages";
 import { readActivityCatalogGolden } from "./test/activityCatalogGolden";
 import { formatDateTime } from "./ui/format";
@@ -265,9 +264,18 @@ describe("App", () => {
   });
 
   it("keeps the selected locale usable when browser storage writes fail", async () => {
-    const storageSetItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    const storageSetItemSpy = vi.fn(() => {
       throw new Error("storage disabled");
     });
+    const unavailableStorage: Storage = {
+      length: 0,
+      clear: vi.fn(),
+      getItem: vi.fn(() => null),
+      key: vi.fn(() => null),
+      removeItem: vi.fn(),
+      setItem: storageSetItemSpy,
+    };
+    vi.spyOn(window, "localStorage", "get").mockReturnValue(unavailableStorage);
 
     stubSystemFetch();
     window.history.pushState({}, "", "/app/overview");
@@ -280,7 +288,7 @@ describe("App", () => {
 
     expect(screen.getByText("安全性、リスク、鮮度、paper 口座の状態。")).toBeInTheDocument();
     expect(document.documentElement).toHaveAttribute("lang", "ja");
-    expect(storageSetItemSpy).toHaveBeenCalled();
+    await waitFor(() => expect(storageSetItemSpy).toHaveBeenCalled());
   });
 
   it("formats Japanese date-times with a ja-JP leaning and the JST label", () => {
@@ -340,205 +348,166 @@ describe("App", () => {
     );
   });
 
-  it("shows activity timeline filters and loads older cursor pages", async () => {
+  it("filters decision runs and opens the normalized detail pane", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/activity");
 
     render(<App />);
 
-    expect(await screen.findByText("BTC entry fill")).toBeInTheDocument();
-    expect(screen.getAllByText("No trade").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Manual resume requested").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("operator").length).toBeGreaterThan(0);
-    expect(screen.getByText(/newest first/)).toBeInTheDocument();
-    expect(screen.getByText(/3\/50 records/)).toBeInTheDocument();
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    const filters = screen.getByRole("group", { name: "Decision run outcome filters" });
+    expect(within(runList).getByText("EXPECTED_VALUE_GATE")).toBeInTheDocument();
+    expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "false");
+    expect(within(filters).getByRole("button", { name: /All/ })).toHaveTextContent("2 loaded");
+    expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("limit") === "50")).toBe(true);
 
-    const timeline = await screen.findByRole("list", { name: "Activity timeline" });
-    const timelineItems = within(timeline).getAllByRole("listitem");
+    fireEvent.click(within(filters).getByRole("button", { name: /Denied/ }));
+    expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "true");
+    expect(window.localStorage.getItem("fukurou.web.activity.run-filter.v2")).toBe("DENIED");
+    await waitFor(() => {
+      expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("outcome") === "DENIED")).toBe(true);
+    });
+    await waitFor(() => {
+      expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveTextContent("1 loaded");
+    });
 
-    expect(timelineItems.map((item) => within(item).getByRole("heading", { level: 2 }).textContent)).toEqual([
-      "BTC entry fill",
-      "Manual resume requested",
-      "No trade",
-    ]);
-    expect(within(timeline).queryByText("Entry reason stays in the detail dialog.")).not.toBeInTheDocument();
+    const filteredRunList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    const selectedRun = within(filteredRunList).getByRole("button", { name: /ENTER/ });
+    fireEvent.click(selectedRun);
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(await within(detailPane).findByText("0.1100000000")).toBeInTheDocument();
+    expect(within(detailPane).getByText("0.03357778")).toBeInTheDocument();
+    expect(within(detailPane).getAllByText("APPROVED").length).toBeGreaterThan(0);
+    expect(within(detailPane).getByText("REJECTED").closest(".run-phase")).toHaveAttribute("data-state", "rejected");
+    expect(within(detailPane).getAllByText("preview_order_rejected").length).toBeGreaterThan(0);
+    expect(within(detailPane).getByText("上昇トレンド継続")).toBeInTheDocument();
+    expect(within(detailPane).getByText("直近安値割れ / 出来高急減")).toBeInTheDocument();
+    expect(within(detailPane).getByText("trend-breakout / volume-confirmed")).toBeInTheDocument();
+    expect(within(detailPane).getByText("parent-plan-1")).toBeInTheDocument();
+    expect(within(detailPane).getAllByText("order-1").length).toBeGreaterThan(0);
+    expect(within(detailPane).getAllByText("order-2").length).toBeGreaterThan(0);
+    expect(within(detailPane).getByText("execution-1")).toBeInTheDocument();
+    expect(within(detailPane).getByText("execution-2")).toBeInTheDocument();
+    expect(within(detailPane).getAllByText("0").length).toBeGreaterThan(0);
 
-    fireEvent.click(
-      within(timelineItems[0]).getByRole("button", {
-        name: "Open execution details for BTC entry fill",
-      }),
-    );
-
-    const detailsDialog = screen.getByRole("dialog", { name: "BTC entry fill" });
-
-    expect(within(detailsDialog).getByText("Entry reason stays in the detail dialog.")).toBeInTheDocument();
-    expect(within(detailsDialog).getByText("order-1")).toBeInTheDocument();
+    fireEvent.click(within(detailPane).getByRole("button", { name: "Show raw projection" }));
+    expect(within(detailPane).getByText(/RUNNER_PHASE_COMPLETED/)).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: "Escape" });
-
-    await waitFor(() => {
-      expect(screen.queryByRole("dialog", { name: "BTC entry fill" })).not.toBeInTheDocument();
-    });
-    expect(hasGetCall(fetchMock, "/ops/activity", (params) => params.get("limit") === "50")).toBe(true);
-
-    fireEvent.click(screen.getByRole("button", { name: "Load older" }));
-
-    expect(await screen.findByText("HARD_HALT set")).toBeInTheDocument();
-    expect(
-      hasGetCall(
-        fetchMock,
-        "/ops/activity",
-        (params) => params.get("before") === "2026-07-05T12:02:00.000Z|decision|decision:decision-1",
-      ),
-    ).toBe(true);
-
-    fireEvent.click(screen.getByRole("button", { name: "Audit" }));
-    fireEvent.click(screen.getByLabelText("Manual resume requested"));
-
-    await waitFor(() => {
-      expect(
-        hasGetCall(
-          fetchMock,
-          "/ops/activity",
-          (params) => params.get("source") === "audit" && params.get("auditEventType") === "MANUAL_RESUME_REQUESTED",
-        ),
-      ).toBe(true);
-    });
-    expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
-      source: "audit",
-      auditEventTypes: ["MANUAL_RESUME_REQUESTED"],
-    });
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Decision run detail" })).not.toBeInTheDocument());
+    await waitFor(() => expect(selectedRun).toHaveFocus());
   });
 
-  it("restores valid activity filters and drops stale saved values", async () => {
-    window.localStorage.setItem(
-      ACTIVITY_TIMELINE_FILTER_STORAGE_KEY,
-      JSON.stringify({
-        source: "audit",
-        auditEventTypes: ["HARD_HALT_SET", "STALE_EVENT"],
-      }),
-    );
+  it("loads older decision runs without duplicating the cursor boundary", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/activity");
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Activity" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Audit" })).toHaveAttribute("aria-pressed", "true");
-    expect(await screen.findByLabelText("HARD_HALT set")).toBeChecked();
-    expect(screen.queryByText("STALE_EVENT")).not.toBeInTheDocument();
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    fireEvent.click(within(runList).getByRole("button", { name: "Load older runs" }));
 
-    await waitFor(() => {
-      expect(
-        hasGetCall(
-          fetchMock,
-          "/ops/activity",
-          (params) => params.get("source") === "audit" && params.get("auditEventType") === "HARD_HALT_SET",
-        ),
-      ).toBe(true);
-    });
-    expect(
-      hasGetCall(
-        fetchMock,
-        "/ops/activity",
-        (params) => params.getAll("auditEventType").includes("STALE_EVENT"),
-      ),
-    ).toBe(false);
-    await waitFor(() => {
-      expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
-        source: "audit",
-        auditEventTypes: ["HARD_HALT_SET"],
-      });
-    });
+    expect(await within(runList).findByRole("button", { name: /EXIT/ })).toBeInTheDocument();
+    expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("before") === "older-cursor")).toBe(true);
+    expect(within(runList).getAllByText("EXPECTED_VALUE_GATE")).toHaveLength(1);
+    expect(within(runList).queryByRole("button", { name: "Load older runs" })).not.toBeInTheDocument();
+
+    const activityRefresh = screen.getAllByRole("button", { name: "Refresh" })
+      .find((button) => button.classList.contains("icon-text-button--prominent"));
+    expect(activityRefresh).toBeDefined();
+    fireEvent.click(activityRefresh!);
+    await waitFor(() => expect(activityRefresh).toBeEnabled());
+    expect(within(runList).getAllByText("EXPECTED_VALUE_GATE")).toHaveLength(1);
   });
 
-  it("opens the activity glossary and explains default audit exclusions", async () => {
+  it("keeps generic terminal codes separate from redacted failure details", async () => {
+    const response = terminalDecisionRunsResponse();
+    stubSystemFetch({
+      decisionRunsResponse: { status: 200, body: response },
+      decisionRunDetails: Object.fromEntries(
+        response.runs.map((run) => [run.invocationId, terminalDecisionRunDetailResponse(run)]),
+      ),
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    const timeoutRow = within(runList).getByText("provider timed out after 120 seconds").closest("button");
+    const authRow = within(runList).getByText("provider authentication failed").closest("button");
+    const interruptedRow = within(runList).getByText("previous process/container shutdown recovery").closest("button");
+    expect(timeoutRow).not.toBeNull();
+    expect(authRow).not.toBeNull();
+    expect(interruptedRow).not.toBeNull();
+    expect(within(timeoutRow!).getByText(/caller_failed/)).toBeInTheDocument();
+    expect(within(authRow!).getByText(/caller_failed/)).toBeInTheDocument();
+    expect(within(runList).getByText("market_conditions_not_met")).toBeInTheDocument();
+
+    fireEvent.click(timeoutRow!);
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(await within(detailPane).findByText("provider timed out after 120 seconds")).toBeInTheDocument();
+    expect(within(detailPane).getAllByText("caller_failed").length).toBeGreaterThan(0);
+    expect(within(detailPane).getByText("runtime error")).toBeInTheDocument();
+    expect(within(detailPane).queryByText(/must-not-leak/)).not.toBeInTheDocument();
+  });
+
+  it("ignores stale decision run filter storage values", async () => {
+    window.localStorage.setItem("fukurou.web.activity.run-filter.v2", "STALE");
     stubSystemFetch();
     window.history.pushState({}, "", "/app/activity");
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Open activity glossary" }));
-
-    const dialog = screen.getByRole("dialog", { name: "Activity glossary" });
-
-    expect(within(dialog).getByText("Sources")).toBeInTheDocument();
-    expect(within(dialog).getByText("Audit event types")).toBeInTheDocument();
-    expect(within(dialog).getByText("Decision actions")).toBeInTheDocument();
-    expect(within(dialog).getByText("Decision lifecycle completed")).toBeInTheDocument();
-    expect(within(dialog).getByText(/RECONCILER_PASS_COMPLETED.*excluded by default/)).toBeInTheDocument();
-
-    fireEvent.keyDown(window, { key: "Escape" });
-
-    await waitFor(() => {
-      expect(screen.queryByRole("dialog", { name: "Activity glossary" })).not.toBeInTheDocument();
-    });
+    expect(await screen.findByRole("button", { name: /All/ })).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("keeps saved filters and falls back to raw labels when the activity catalog fails", async () => {
-    window.localStorage.setItem(
-      ACTIVITY_TIMELINE_FILTER_STORAGE_KEY,
-      JSON.stringify({
-        source: "all",
-        auditEventTypes: ["STALE_EVENT"],
-      }),
-    );
-    const fetchMock = stubSystemFetch({
-      activityCatalogResponse: {
+  it("shows decision run loading, error, and empty states", async () => {
+    let resolveRuns: (response: Response) => void = () => undefined;
+    const pendingRuns = new Promise<Response>((resolve) => {
+      resolveRuns = resolve;
+    });
+    stubSystemFetch({ decisionRunsResponse: pendingRuns });
+    window.history.pushState({}, "", "/app/activity");
+
+    const view = render(<App />);
+    expect(await screen.findByText("Loading decision runs")).toBeInTheDocument();
+
+    await resolveRuns(jsonResponse({ runs: [], nextBefore: null }));
+    expect(await screen.findByText("No matching runs")).toBeInTheDocument();
+
+    view.unmount();
+    cleanup();
+    stubSystemFetch({
+      decisionRunsResponse: {
         status: 500,
-        body: { message: "catalog unavailable" },
+        body: { message: "projection unavailable" },
       },
     });
-    window.history.pushState({}, "", "/app/activity");
-
     render(<App />);
 
-    expect(await screen.findByText("NO_TRADE decision")).toBeInTheDocument();
-    expect(screen.getByLabelText("STALE_EVENT")).toBeChecked();
-    expect(
-      hasGetCall(
-        fetchMock,
-        "/ops/activity",
-        (params) => params.getAll("auditEventType").includes("STALE_EVENT"),
-      ),
-    ).toBe(false);
-    expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
-      source: "all",
-      auditEventTypes: ["STALE_EVENT"],
-    });
+    expect(await screen.findByText(/Decision runs unavailable/)).toBeInTheDocument();
   });
 
-  it("ignores an older activity page response after filters change", async () => {
-    let resolveOlderResponse: (response: Response) => void = () => undefined;
-    const activityOlderResponse = new Promise<Response>((resolve) => {
-      resolveOlderResponse = resolve;
-    });
+  it("continues a bounded outcome scan after an empty window", async () => {
+    window.localStorage.setItem("fukurou.web.activity.run-filter.v2", "RUNNING");
     const fetchMock = stubSystemFetch({
-      activityOlderResponse,
+      decisionRunsResponse: {
+        status: 200,
+        body: { runs: [], nextBefore: "scan-cursor" },
+      },
+      decisionRunsOlderResponse: Promise.resolve(jsonResponse({ runs: [], nextBefore: null })),
     });
     window.history.pushState({}, "", "/app/activity");
 
     render(<App />);
 
-    expect(await screen.findByText("BTC entry fill")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Load older" }));
-    fireEvent.click(screen.getByRole("button", { name: "Audit" }));
+    expect(await screen.findByText("No matches in this scan window")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load older runs" }));
 
     await waitFor(() => {
-      expect(hasGetCall(fetchMock, "/ops/activity", (params) => params.get("source") === "audit")).toBe(true);
+      expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("before") === "scan-cursor")).toBe(true);
     });
-
-    await act(async () => {
-      resolveOlderResponse(jsonResponse(activityTimelineOlderPage()));
-      await activityOlderResponse;
-      await Promise.resolve();
-    });
-
-    const timeline = await screen.findByRole("list", { name: "Activity timeline" });
-
-    expect(within(timeline).queryByText("HARD_HALT set")).not.toBeInTheDocument();
-    expect(within(timeline).getAllByText("Manual resume requested").length).toBeGreaterThan(0);
+    expect(await screen.findByText("No matching runs")).toBeInTheDocument();
   });
 
   it("rejects blank control reasons before calling the API", async () => {
@@ -824,6 +793,12 @@ type SystemFetchFixture = {
     body: unknown;
   };
   activityOlderResponse?: Promise<Response>;
+  decisionRunsResponse?: Promise<Response> | {
+    status: number;
+    body: unknown;
+  };
+  decisionRunsOlderResponse?: Promise<Response>;
+  decisionRunDetails?: Record<string, unknown>;
 };
 
 function stubSystemFetch(fixture: SystemFetchFixture = {}) {
@@ -892,6 +867,12 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         previousActiveVersionId: "runtime-config-active",
         validation: { valid: true, errors: [] },
       });
+    }
+
+    if (path.startsWith("/ops/runs/") && fixture.decisionRunDetails) {
+      const invocationId = path.slice("/ops/runs/".length);
+      const detail = fixture.decisionRunDetails[invocationId];
+      if (detail) return jsonResponse(detail);
     }
 
     switch (path) {
@@ -989,6 +970,26 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         });
       case "/ops/runtime-config":
         return jsonResponse(fixture.runtimeConfigResponse ?? runtimeConfigResponse());
+      case "/ops/runs":
+        if (requestSearchParams(input).has("before") && fixture.decisionRunsOlderResponse) {
+          return fixture.decisionRunsOlderResponse;
+        }
+        if (fixture.decisionRunsResponse instanceof Promise) {
+          return fixture.decisionRunsResponse;
+        }
+        if (fixture.decisionRunsResponse) {
+          return jsonResponse(fixture.decisionRunsResponse.body, { status: fixture.decisionRunsResponse.status });
+        }
+        if (requestSearchParams(input).has("before")) {
+          return fixture.decisionRunsOlderResponse ?? jsonResponse(
+            filterDecisionRunsResponse(olderDecisionRunsResponse(), requestSearchParams(input).get("outcome")),
+          );
+        }
+        return jsonResponse(
+          filterDecisionRunsResponse(decisionRunsResponse(), requestSearchParams(input).get("outcome")),
+        );
+      case "/ops/runs/run-denied":
+        return jsonResponse(decisionRunDetailResponse());
       case "/ops/activity/catalog":
         if (fixture.activityCatalogResponse) {
           return jsonResponse(
@@ -1505,6 +1506,290 @@ function runtimeConfigItem({
   };
 }
 
+function decisionRunsResponse() {
+  return {
+    runs: [
+      {
+        invocationId: "run-denied",
+        mode: "PAPER",
+        symbol: "BTC_JPY",
+        triggerKind: "SCHEDULED",
+        status: "SUCCEEDED",
+        outcome: "DENIED",
+        startedAt: "2026-07-10T00:47:27.000Z",
+        finishedAt: "2026-07-10T00:47:36.000Z",
+        durationMillis: 9000,
+        action: "ENTER",
+        reasonJa: "上昇継続を想定します。",
+        falsificationVerdict: "APPROVED",
+        safetyRule: "EXPECTED_VALUE_GATE",
+        safetyMessageJa: "期待値が安全床を下回りました。",
+        finalReason: "preview_order_rejected",
+        errorMessage: null,
+        orderCount: 0,
+        executionCount: 0,
+      },
+      {
+        invocationId: "run-interrupted",
+        mode: "PAPER",
+        symbol: "BTC_JPY",
+        triggerKind: "SCHEDULED",
+        status: "FAILED",
+        outcome: "INTERRUPTED",
+        startedAt: "2026-07-10T00:14:12.000Z",
+        finishedAt: "2026-07-10T00:20:00.000Z",
+        durationMillis: 348000,
+        action: null,
+        reasonJa: null,
+        falsificationVerdict: null,
+        safetyRule: null,
+        safetyMessageJa: null,
+        finalReason: null,
+        errorMessage: "previous process/container shutdown recovery",
+        orderCount: 0,
+        executionCount: 0,
+      },
+    ],
+    nextBefore: "older-cursor",
+  };
+}
+
+function filterDecisionRunsResponse<T extends { runs: Array<{ outcome: string }> }>(response: T, outcome: string | null): T {
+  if (!outcome) return response;
+
+  return {
+    ...response,
+    runs: response.runs.filter((run) => run.outcome === outcome),
+  };
+}
+
+function terminalDecisionRunsResponse() {
+  const base = {
+    mode: "PAPER",
+    symbol: "BTC_JPY",
+    triggerKind: "SCHEDULED",
+    status: "FAILED",
+    finishedAt: "2026-07-10T00:47:36.000Z",
+    durationMillis: 9000,
+    action: null,
+    reasonJa: null,
+    falsificationVerdict: null,
+    safetyRule: null,
+    safetyMessageJa: null,
+    orderCount: 0,
+    executionCount: 0,
+  };
+
+  return {
+    runs: [
+      {
+        ...base,
+        invocationId: "run-timeout",
+        outcome: "FAILED",
+        startedAt: "2026-07-10T00:47:27.000Z",
+        finalReason: "caller_failed",
+        errorMessage: "provider timed out after 120 seconds",
+      },
+      {
+        ...base,
+        invocationId: "run-auth",
+        outcome: "FAILED",
+        startedAt: "2026-07-10T00:46:27.000Z",
+        finalReason: "caller_failed",
+        errorMessage: "provider authentication failed",
+      },
+      {
+        ...base,
+        invocationId: "run-interrupted",
+        outcome: "INTERRUPTED",
+        startedAt: "2026-07-10T00:45:27.000Z",
+        finalReason: null,
+        errorMessage: "previous process/container shutdown recovery",
+      },
+      {
+        ...base,
+        invocationId: "run-no-trade",
+        status: "SUCCEEDED",
+        outcome: "NO_TRADE",
+        startedAt: "2026-07-10T00:44:27.000Z",
+        finalReason: "market_conditions_not_met",
+        errorMessage: null,
+      },
+    ],
+    nextBefore: null,
+  };
+}
+
+function terminalDecisionRunDetailResponse(summary: ReturnType<typeof terminalDecisionRunsResponse>["runs"][number]) {
+  return {
+    summary,
+    phases: [
+      { key: "TRIGGER", status: "COMPLETED", detail: summary.triggerKind },
+      { key: "PROPOSER", status: "FAILED", detail: summary.finalReason },
+      { key: "INTENT", status: "NOT_REACHED", detail: null },
+      { key: "FALSIFIER", status: "NOT_REACHED", detail: null },
+      { key: "SAFETY", status: "NOT_REACHED", detail: null },
+      { key: "ORDER_EXECUTION", status: "NOT_REACHED", detail: "orders=0, executions=0" },
+    ],
+    decision: null,
+    intent: null,
+    falsification: null,
+    safetyViolation: null,
+    orders: [],
+    executions: [],
+    raw: [
+      {
+        source: "audit",
+        occurredAt: summary.finishedAt,
+        values: { eventType: "NO_TRADE_EXIT", toolName: "runner" },
+      },
+    ],
+  };
+}
+
+function olderDecisionRunsResponse() {
+  return {
+    runs: [
+      decisionRunsResponse().runs[0],
+      {
+        invocationId: "run-executed",
+        mode: "PAPER",
+        symbol: "BTC_JPY",
+        triggerKind: "ECONOMIC_EVENT",
+        status: "SUCCEEDED",
+        outcome: "EXECUTED",
+        startedAt: "2026-07-09T23:40:00.000Z",
+        finishedAt: "2026-07-09T23:40:12.000Z",
+        durationMillis: 12000,
+        action: "EXIT",
+        reasonJa: "利確条件に到達しました。",
+        falsificationVerdict: "APPROVED",
+        safetyRule: null,
+        safetyMessageJa: null,
+        finalReason: null,
+        errorMessage: null,
+        orderCount: 1,
+        executionCount: 1,
+      },
+    ],
+    nextBefore: null,
+  };
+}
+
+function decisionRunDetailResponse() {
+  return {
+    summary: decisionRunsResponse().runs[0],
+    phases: [
+      { key: "TRIGGER", status: "COMPLETED", detail: "SCHEDULED" },
+      { key: "PROPOSER", status: "COMPLETED", detail: "codex" },
+      { key: "INTENT", status: "COMPLETED", detail: "intent-1" },
+      { key: "FALSIFIER", status: "APPROVED", detail: "反証条件を確認しました。" },
+      { key: "SAFETY", status: "REJECTED", detail: "EXPECTED_VALUE_GATE" },
+      { key: "ORDER_EXECUTION", status: "NOT_REACHED", detail: "orders=0, executions=0" },
+    ],
+    decision: {
+      decisionId: "decision-1",
+      action: "ENTER",
+      provider: "codex",
+      estimatedWinProbability: "0.6100000000",
+      expectedRMultiple: "0.1100000000",
+      roundTripCostR: "0.0100000000",
+      reasonJa: "上昇継続を想定します。",
+      setupTagsJson: "[]",
+      missingDataJaJson: "[]",
+      noTradeConditionsJaJson: "[]",
+      createdAt: "2026-07-10T00:47:30.000Z",
+    },
+    intent: {
+      intentId: "intent-1",
+      tradePlanId: "plan-1",
+      parentTradePlanId: "parent-plan-1",
+      revisionCount: 2,
+      setupTagsJson: "[\"trend-breakout\",\"volume-confirmed\"]",
+      side: "BUY",
+      orderType: "LIMIT",
+      sizeBtc: "0.060000000000",
+      priceJpy: "17000000.00000000",
+      protectiveStopPriceJpy: "16500000.00000000",
+      takeProfitPriceJpy: "18000000.00000000",
+      thesisJa: "上昇トレンド継続",
+      invalidationConditionsJaJson: "[\"直近安値割れ\",\"出来高急減\"]",
+      targetPriceJpy: "18000000.00000000",
+      timeStopAt: null,
+    },
+    falsification: {
+      verdict: "APPROVED",
+      provider: "claude",
+      reasonJa: "反証条件を確認しました。",
+      createdAt: "2026-07-10T00:47:32.000Z",
+    },
+    safetyViolation: {
+      rule: "EXPECTED_VALUE_GATE",
+      measuredValue: "0.03357778",
+      limitValue: "0.10",
+      messageJa: "期待値が安全床を下回りました。",
+      createdAt: "2026-07-10T00:47:35.000Z",
+    },
+    orders: [
+      {
+        orderId: "order-1",
+        intentId: "intent-1",
+        positionId: "position-1",
+        tradeGroupId: "trade-group-1",
+        side: "BUY",
+        orderType: "LIMIT",
+        status: "FILLED",
+        sizeBtc: "0.030000000000",
+        limitPriceJpy: "17000000.00000000",
+        reasonJa: "分割エントリー 1",
+        createdAt: "2026-07-10T00:47:33.000Z",
+      },
+      {
+        orderId: "order-2",
+        intentId: "intent-1",
+        positionId: "position-1",
+        tradeGroupId: "trade-group-1",
+        side: "BUY",
+        orderType: "MARKET",
+        status: "FILLED",
+        sizeBtc: "0.030000000000",
+        limitPriceJpy: null,
+        reasonJa: "分割エントリー 2",
+        createdAt: "2026-07-10T00:47:34.000Z",
+      },
+    ],
+    executions: [
+      {
+        executionId: "execution-1",
+        orderId: "order-1",
+        positionId: "position-1",
+        side: "BUY",
+        priceJpy: "16990000.00000000",
+        sizeBtc: "0.030000000000",
+        realizedPnlJpy: "0",
+        executedAt: "2026-07-10T00:47:34.000Z",
+      },
+      {
+        executionId: "execution-2",
+        orderId: "order-2",
+        positionId: "position-1",
+        side: "BUY",
+        priceJpy: "17000000.00000000",
+        sizeBtc: "0.030000000000",
+        realizedPnlJpy: "0",
+        executedAt: "2026-07-10T00:47:35.000Z",
+      },
+    ],
+    raw: [
+      {
+        source: "audit",
+        occurredAt: "2026-07-10T00:47:34.000Z",
+        values: { eventType: "RUNNER_PHASE_COMPLETED", toolName: "runner" },
+      },
+    ],
+  };
+}
+
 function activityTimelineResponse(searchParams: URLSearchParams) {
   const source = searchParams.get("source");
   const auditEventTypes = searchParams.getAll("auditEventType");
@@ -1531,14 +1816,6 @@ function unknownAuditEventTypes(searchParams: URLSearchParams): string[] {
   const knownAuditEventTypes = new Set(activityCatalogGolden.auditEventTypes.map((item) => item.value));
 
   return searchParams.getAll("auditEventType").filter((eventType) => !knownAuditEventTypes.has(eventType));
-}
-
-function activityTimelineOlderPage() {
-  return {
-    events: olderActivityEvents(),
-    nextBefore: null,
-    limit: 50,
-  };
 }
 
 function latestActivityEvents(source: string | null, auditEventTypes: string[]) {

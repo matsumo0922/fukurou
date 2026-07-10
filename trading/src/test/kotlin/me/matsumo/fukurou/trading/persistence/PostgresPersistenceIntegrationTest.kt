@@ -7,6 +7,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.activity.DecisionRunCursor
+import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
@@ -40,6 +42,7 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
@@ -147,6 +150,30 @@ private const val DROP_COMMAND_EVENT_LOG_TABLE_SQL = "DROP TABLE command_event_l
  * llm_runs table を削除する SQL。
  */
 private const val DROP_LLM_RUNS_TABLE_SQL = "DROP TABLE llm_runs"
+
+/** bounded outcome scan 検証用 llm_runs を一括追加する SQL。 */
+private const val INSERT_DECISION_RUN_SCAN_FIXTURE_SQL = """
+    INSERT INTO llm_runs (
+        invocation_id,
+        mode,
+        symbol,
+        trigger_kind,
+        status,
+        started_at,
+        finished_at,
+        error_message
+    )
+    SELECT
+        'scan-run-' || LPAD(sequence::TEXT, 6, '0'),
+        'PAPER',
+        'BTC',
+        'ECONOMIC_EVENT',
+        CASE WHEN sequence = ? THEN ? ELSE 'SUCCEEDED' END,
+        ? - sequence,
+        CASE WHEN sequence = ? THEN NULL ELSE ? - sequence END,
+        NULL
+    FROM generate_series(0, ?) AS sequence
+"""
 
 /**
  * active runtime config version を無効化する SQL。
@@ -576,7 +603,7 @@ private const val INSERT_ACTIVITY_CONTEXT_ORDER_SQL = """
         'BTC',
         ?,
         ?,
-        'FILLED',
+        ?,
         0.010000000000,
         ?,
         ?,
@@ -1164,6 +1191,333 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(startedAt, record.startedAt)
         assertEquals(finishedAt, record.finishedAt)
         assertEquals(finish.errorMessage, record.errorMessage)
+    }
+
+    @Test
+    fun decisionRunProjectionJoinsDeniedRunWithoutExposingAuditPayload() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        bootstrap.verifySchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val decisionResult = decisionRepository.submitDecision(enterDecisionSubmission()).getOrThrow()
+        val intentId = requireNotNull(decisionResult.tradeIntent?.intentId)
+
+        llmRunRepository.insertRunning(
+            LlmRunStart(
+                invocationId = "run-1",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                startedAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+        llmRunRepository.finish(
+            LlmRunFinish(
+                invocationId = "run-1",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                status = "SUCCEEDED",
+                startedAt = fixedInstant(),
+                finishedAt = fixedInstant().plusSeconds(10),
+                errorMessage = null,
+            ),
+        ).getOrThrow()
+        decisionRepository.submitFalsification(
+            FalsificationSubmission(
+                intentId = intentId,
+                verdict = FalsificationVerdict.APPROVED,
+                llmProvider = "claude",
+                reasonJa = "反証条件なし",
+            ),
+        ).getOrThrow()
+        ExposedSafetyViolationRepository(database).append(
+            SafetyViolation(
+                rule = SafetyFloorRule.EXPECTED_VALUE_GATE,
+                messageJa = "期待値が安全床を下回りました。",
+                measuredValue = "0.03357778",
+                limitValue = "0.10",
+                commandName = "place_order",
+                commandId = UUID.randomUUID(),
+                orderId = null,
+                decisionRunId = "run-1",
+                toolCallId = "tool-1",
+                clientRequestId = "client-1",
+                hardHaltRequired = false,
+                payloadJson = """{"credential":"must-not-leak"}""",
+                createdAt = fixedInstant().plusSeconds(8),
+            ),
+        ).getOrThrow()
+        ExposedCommandEventLog(database).append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = "run-1",
+                    llmProvider = "claude",
+                    promptHash = "prompt-hash",
+                    systemPromptVersion = "system-prompt-v1",
+                    marketSnapshotId = "snapshot-1",
+                ),
+                toolName = "runner",
+                toolCallId = null,
+                clientRequestId = null,
+                eventType = CommandEventType.NO_TRADE_EXIT,
+                payload = """{"reason":"preview_order_rejected","credential":"must-not-leak"}""",
+                occurredAt = fixedInstant().plusSeconds(9),
+            ),
+        ).getOrThrow()
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
+        val detail = requireNotNull(repository.findRun("run-1").getOrThrow())
+
+        assertEquals(DecisionRunOutcome.DENIED, summary.outcome)
+        assertEquals("APPROVED", summary.falsificationVerdict)
+        assertEquals("EXPECTED_VALUE_GATE", detail.safetyViolation?.rule)
+        assertEquals("0.03357778", detail.safetyViolation?.measuredValue)
+        assertEquals("preview_order_rejected", summary.finalReason)
+        assertEquals("preview_order_rejected", detail.summary.finalReason)
+        assertEquals("[\"breakout\",\"trend-follow\"]", detail.intent?.setupTagsJson)
+        assertEquals("1時間足の上昇継続に乗る。", detail.intent?.thesisJa)
+        assertEquals(0, detail.intent?.revisionCount)
+        assertEquals(0, detail.orders.size)
+        assertEquals(0, detail.executions.size)
+        assertTrue(detail.raw.none { raw -> raw.values.values.any { value -> value?.contains("must-not-leak") == true } })
+    }
+
+    @Test
+    fun decisionRunProjectionExcludesReflectionAndFailsTerminalRunWithoutEvidence() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        listOf(
+            LlmDaemonTriggerKind.REFLECTION to "reflection-run",
+            LlmDaemonTriggerKind.ECONOMIC_EVENT to "empty-terminal-run",
+        ).forEach { (triggerKind, invocationId) ->
+            val start = LlmRunStart(
+                invocationId = invocationId,
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = triggerKind,
+                startedAt = fixedInstant(),
+            )
+            llmRunRepository.insertRunning(start).getOrThrow()
+            llmRunRepository.finish(
+                LlmRunFinish(
+                    invocationId = invocationId,
+                    mode = start.mode,
+                    symbol = start.symbol,
+                    triggerKind = triggerKind,
+                    status = "SUCCEEDED",
+                    startedAt = start.startedAt,
+                    finishedAt = fixedInstant().plusSeconds(10),
+                    errorMessage = null,
+                ),
+            ).getOrThrow()
+        }
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val summaries = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs
+
+        assertEquals(listOf("empty-terminal-run"), summaries.map { summary -> summary.invocationId })
+        assertEquals(DecisionRunOutcome.FAILED, summaries.single().outcome)
+        assertNull(repository.findRun("reflection-run").getOrThrow())
+    }
+
+    @Test
+    fun decisionRunProjectionFiltersExecutedByFilledOrderEvidence() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        listOf("filled-run", "rejected-run").forEach { invocationId ->
+            val start = LlmRunStart(
+                invocationId = invocationId,
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                startedAt = fixedInstant(),
+            )
+            llmRunRepository.insertRunning(start).getOrThrow()
+            llmRunRepository.finish(
+                LlmRunFinish(
+                    invocationId = invocationId,
+                    mode = start.mode,
+                    symbol = start.symbol,
+                    triggerKind = start.triggerKind,
+                    status = "SUCCEEDED",
+                    startedAt = start.startedAt,
+                    finishedAt = fixedInstant().plusSeconds(10),
+                    errorMessage = null,
+                ),
+            ).getOrThrow()
+        }
+        exposedTransaction(database) {
+            listOf(
+                "filled-run" to OrderStatus.FILLED,
+                "rejected-run" to OrderStatus.REJECTED,
+            ).forEach { (invocationId, status) ->
+                val positionId = UUID.randomUUID()
+                val tradeGroupId = UUID.randomUUID()
+                insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+                insertActivityContextOrder(
+                    orderId = UUID.randomUUID(),
+                    positionId = positionId,
+                    tradeGroupId = tradeGroupId,
+                    side = OrderSide.BUY,
+                    orderType = OrderType.LIMIT,
+                    status = status,
+                    limitPriceJpy = BigDecimal("9900000"),
+                    triggerPriceJpy = null,
+                    takeProfitPriceJpy = BigDecimal("10500000"),
+                    reasonJa = "decision run outcome fixture",
+                    decisionRunId = invocationId,
+                )
+            }
+        }
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val executed = repository.listRuns(
+            cursor = null,
+            limit = 10,
+            outcome = DecisionRunOutcome.EXECUTED,
+        ).getOrThrow().runs
+        val failed = repository.listRuns(
+            cursor = null,
+            limit = 10,
+            outcome = DecisionRunOutcome.FAILED,
+        ).getOrThrow().runs
+
+        assertEquals(listOf("filled-run"), executed.map { summary -> summary.invocationId })
+        assertEquals(listOf("rejected-run"), failed.map { summary -> summary.invocationId })
+    }
+
+    @Test
+    fun decisionRunProjectionKeepsInvalidNoTradePayloadFailSafe() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val start = LlmRunStart(
+            invocationId = "invalid-no-trade-payload",
+            mode = TradingMode.PAPER,
+            symbol = TradingSymbol.BTC,
+            triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+            startedAt = fixedInstant(),
+        )
+        llmRunRepository.insertRunning(start).getOrThrow()
+        llmRunRepository.finish(
+            LlmRunFinish(
+                invocationId = start.invocationId,
+                mode = start.mode,
+                symbol = start.symbol,
+                triggerKind = start.triggerKind,
+                status = "SUCCEEDED",
+                startedAt = start.startedAt,
+                finishedAt = fixedInstant().plusSeconds(10),
+                errorMessage = null,
+            ),
+        ).getOrThrow()
+        ExposedCommandEventLog(database).append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = start.invocationId,
+                    llmProvider = "codex",
+                    promptHash = "prompt-hash",
+                    systemPromptVersion = "system-prompt-v1",
+                    marketSnapshotId = "snapshot-1",
+                ),
+                toolName = "runner",
+                toolCallId = null,
+                clientRequestId = null,
+                eventType = CommandEventType.NO_TRADE_EXIT,
+                payload = "{invalid-json",
+                occurredAt = fixedInstant().plusSeconds(9),
+            ),
+        ).getOrThrow()
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val page = repository.listRuns(cursor = null, limit = 10).getOrThrow()
+        val summary = page.runs.single()
+        val detail = requireNotNull(repository.findRun(start.invocationId).getOrThrow())
+
+        assertEquals(DecisionRunOutcome.NO_TRADE, summary.outcome)
+        assertNull(summary.finalReason)
+        assertNull(detail.summary.finalReason)
+    }
+
+    @Test
+    fun decisionRunProjectionContinuesAfterBoundedFilterScan() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val scanCap = FILTER_SCAN_BATCH_SIZE * MAX_FILTER_SCAN_BATCHES
+        insertDecisionRunScanFixture(
+            database = database,
+            maxSequence = scanCap,
+            runningSequence = scanCap,
+        )
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val firstPage = repository.listRuns(
+            cursor = null,
+            limit = 10,
+            outcome = DecisionRunOutcome.RUNNING,
+        ).getOrThrow()
+        val continuation = requireNotNull(firstPage.scanContinuation)
+        val secondPage = repository.listRuns(
+            cursor = continuation,
+            limit = 10,
+            outcome = DecisionRunOutcome.RUNNING,
+        ).getOrThrow()
+
+        assertTrue(firstPage.runs.isEmpty())
+        assertEquals("scan-run-${(scanCap - 1).toString().padStart(6, '0')}", continuation.invocationId)
+        assertEquals(listOf("scan-run-${scanCap.toString().padStart(6, '0')}"), secondPage.runs.map { it.invocationId })
+        assertNull(secondPage.scanContinuation)
+    }
+
+    @Test
+    fun decisionRunProjectionPagesStableTimestampsWithoutDuplicatesOrSkips() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val invocationIds = listOf(
+            "cursor-run-a",
+            "cursor-run-b",
+            "cursor-run-c",
+            "cursor-run-d",
+            "cursor-run-e",
+        )
+        invocationIds.forEach { invocationId ->
+            val start = LlmRunStart(
+                invocationId = invocationId,
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                startedAt = fixedInstant(),
+            )
+            llmRunRepository.insertRunning(start).getOrThrow()
+            llmRunRepository.finish(
+                LlmRunFinish(
+                    invocationId = invocationId,
+                    mode = start.mode,
+                    symbol = start.symbol,
+                    triggerKind = start.triggerKind,
+                    status = "SUCCEEDED",
+                    startedAt = start.startedAt,
+                    finishedAt = fixedInstant().plusSeconds(10),
+                    errorMessage = null,
+                ),
+            ).getOrThrow()
+        }
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val firstPage = repository.listRuns(cursor = null, limit = 2).getOrThrow().runs
+        val secondPage = repository.listRuns(
+            cursor = DecisionRunCursor(firstPage.last().startedAt, firstPage.last().invocationId),
+            limit = 2,
+        ).getOrThrow().runs
+        val thirdPage = repository.listRuns(
+            cursor = DecisionRunCursor(secondPage.last().startedAt, secondPage.last().invocationId),
+            limit = 2,
+        ).getOrThrow().runs
+        val actualInvocationIds = (firstPage + secondPage + thirdPage).map { summary -> summary.invocationId }
+
+        assertEquals(invocationIds.sortedDescending(), actualInvocationIds)
+        assertEquals(invocationIds.size, actualInvocationIds.distinct().size)
     }
 
     @Test
@@ -3874,6 +4228,25 @@ private fun insertActivityContextRows(
     }
 }
 
+/** bounded outcome scan 検証用 run を新しい順の連番で追加する。 */
+private fun insertDecisionRunScanFixture(
+    database: ExposedDatabase,
+    maxSequence: Int,
+    runningSequence: Int,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(INSERT_DECISION_RUN_SCAN_FIXTURE_SQL).use { statement ->
+            statement.setInt(1, runningSequence)
+            statement.setString(2, LLM_RUN_STATUS_RUNNING)
+            statement.setLong(3, fixedInstant().toEpochMilli())
+            statement.setInt(4, runningSequence)
+            statement.setLong(5, fixedInstant().plusSeconds(10).toEpochMilli())
+            statement.setInt(6, maxSequence)
+            statement.executeUpdate()
+        }
+    }
+}
+
 /**
  * Obsidian range query 検証用 closed position と約定を追加する。
  */
@@ -4019,6 +4392,7 @@ private fun JdbcTransaction.insertActivityContextOrder(
     tradeGroupId: UUID,
     side: OrderSide,
     orderType: OrderType,
+    status: OrderStatus = OrderStatus.FILLED,
     limitPriceJpy: BigDecimal?,
     triggerPriceJpy: BigDecimal?,
     takeProfitPriceJpy: BigDecimal?,
@@ -4031,13 +4405,14 @@ private fun JdbcTransaction.insertActivityContextOrder(
         statement.setObject(3, tradeGroupId)
         statement.setString(4, side.name)
         statement.setString(5, orderType.name)
-        statement.setNullableBigDecimal(6, limitPriceJpy)
-        statement.setNullableBigDecimal(7, triggerPriceJpy)
-        statement.setNullableBigDecimal(8, takeProfitPriceJpy)
-        statement.setString(9, reasonJa)
-        statement.setString(10, decisionRunId)
-        statement.setLong(11, fixedInstant().toEpochMilli())
+        statement.setString(6, status.name)
+        statement.setNullableBigDecimal(7, limitPriceJpy)
+        statement.setNullableBigDecimal(8, triggerPriceJpy)
+        statement.setNullableBigDecimal(9, takeProfitPriceJpy)
+        statement.setString(10, reasonJa)
+        statement.setString(11, decisionRunId)
         statement.setLong(12, fixedInstant().toEpochMilli())
+        statement.setLong(13, fixedInstant().toEpochMilli())
         statement.executeUpdate()
     }
 }

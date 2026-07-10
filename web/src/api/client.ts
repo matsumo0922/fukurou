@@ -129,6 +129,12 @@ export async function getJson<Path extends JsonGetPath & string>(
   return (await getJsonResponse(path, [200], init)).data;
 }
 
+export async function getJsonByPath<Payload>(path: string, init: ApiRequestInit = {}): Promise<Payload> {
+  const response = await get(path, "application/json", [200], init);
+
+  return (await response.json()) as Payload;
+}
+
 export function fetchRevision(): Promise<TextResponse<"/revision">> {
   return getText("/revision");
 }

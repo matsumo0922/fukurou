@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.activity.DecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.ExecutionActivityOrderContext
 import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
@@ -674,6 +675,7 @@ internal data class OpsFeedRouteDependencies(
     val decisionRepository: DecisionRepository?,
     val paperLedgerRepository: PaperLedgerRepository?,
     val commandEventFeedReader: CommandEventFeedReader?,
+    val decisionRunProjectionRepository: DecisionRunProjectionRepository? = null,
 )
 
 /**
@@ -708,6 +710,7 @@ internal fun Route.opsRoutes(dependencies: OpsRouteDependencies) {
     registerOpsDecisionsRoute(dependencies)
     registerOpsExecutionsRoute(dependencies)
     registerOpsActivityRoute(dependencies)
+    registerOpsDecisionRunRoutes(dependencies)
     registerOpsPositionsRoute(dependencies)
     registerOpsAuditRoute(dependencies)
 }
