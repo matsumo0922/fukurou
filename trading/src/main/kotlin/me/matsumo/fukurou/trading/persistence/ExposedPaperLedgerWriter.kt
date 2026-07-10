@@ -555,7 +555,7 @@ private fun JdbcTransaction.applyEventToRestingEntries(
 
         if (!hasCashForBuyFill(fill)) {
             updateOrderStatus(order.orderId, OrderStatus.REJECTED, "market event entry rejected: insufficient paper cash", clock)
-            progress.triggeredOrderIds += order.orderId
+            progress.rejectedOrderIds += order.orderId
             return@forEach
         }
 
@@ -577,7 +577,7 @@ private fun JdbcTransaction.applyEventToRestingEntries(
             clock,
         )
         bindPositionToEvent(positionId, event)
-        progress.triggeredOrderIds += order.orderId
+        progress.filledOrderIds += order.orderId
         progress.executionIds += fill.executionId.toString()
     }
 }
@@ -692,7 +692,7 @@ private fun JdbcTransaction.triggerEventStop(
     insertExecution(eventExecutionRequest(stopOrder.orderId, position, realizedFill, event))
     closePositionRow(position, realizedFill)
     updateAccountAfterSell(realizedFill, context.clock)
-    context.progress.triggeredOrderIds += stopOrder.orderId
+    context.progress.filledOrderIds += stopOrder.orderId
     context.progress.closedPositionIds += position.positionId
     context.progress.executionIds += realizedFill.executionId.toString()
 }
@@ -720,7 +720,8 @@ private fun JdbcTransaction.triggerEventTakeProfit(position: Position, context: 
     insertExecution(eventExecutionRequest(closeOrderId.toString(), position, realizedFill, event))
     closePositionRow(position, realizedFill)
     updateAccountAfterSell(realizedFill, context.clock)
-    context.progress.triggeredOrderIds += stopOrder.orderId
+    context.progress.canceledOrderIds += stopOrder.orderId
+    context.progress.filledOrderIds += closeOrderId.toString()
     context.progress.closedPositionIds += position.positionId
     context.progress.executionIds += realizedFill.executionId.toString()
 }
