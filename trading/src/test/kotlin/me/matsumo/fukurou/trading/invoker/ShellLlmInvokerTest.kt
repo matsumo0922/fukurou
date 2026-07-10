@@ -88,6 +88,7 @@ class ShellLlmInvokerTest {
         val result = invoker.invoke(request())
 
         assertEquals(failure, result.exceptionOrNull())
+        assertEquals("FileSystemException", result.exceptionOrNull()?.safeCodexFailureOrNull()?.type)
         assertFalse(processRunner.runCalled)
         assertFalse(processRunner.cleanupCalled)
     }
@@ -112,7 +113,35 @@ class ShellLlmInvokerTest {
         val result = invoker.invoke(request())
 
         assertEquals(failure, result.exceptionOrNull())
+        assertEquals("FileSystemException", result.exceptionOrNull()?.safeCodexFailureOrNull()?.type)
         assertTrue(processRunner.runCalled)
+        assertTrue(processRunner.cleanupCalled)
+    }
+
+    @Test
+    fun invoke_preservesPrimaryAndSuppressedCleanupFailuresWithCodexClassification() = runBlocking {
+        val artifact = Files.createTempFile("shell-llm-invoker-suppressed-cleanup", ".jsonl")
+        val primaryFailure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "start path-message-marker",
+        )
+        val cleanupFailure = IllegalStateException("suppressed cleanup path-message-marker")
+        val processRunner = RecordingProcessRunner(
+            result = Result.failure(primaryFailure),
+            cleanupAction = { throw cleanupFailure },
+        )
+        val invoker = ShellLlmInvoker(
+            commandRenderer = StaticCommandRenderer(renderedCommand(artifact)),
+            processRunner = processRunner,
+        )
+
+        val result = invoker.invoke(request())
+        val propagatedFailure = requireNotNull(result.exceptionOrNull())
+
+        assertEquals(primaryFailure, propagatedFailure)
+        assertTrue(propagatedFailure.suppressed.contains(cleanupFailure))
+        assertEquals("FileSystemException", propagatedFailure.safeCodexFailureOrNull()?.type)
         assertTrue(processRunner.cleanupCalled)
     }
 

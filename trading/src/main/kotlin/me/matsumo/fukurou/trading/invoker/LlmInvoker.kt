@@ -78,7 +78,7 @@ class ShellLlmInvoker(
         } catch (throwable: CancellationException) {
             throw throwable
         } catch (throwable: Throwable) {
-            return Result.failure(throwable)
+            return Result.failure(throwable.classifyLlmFailure(request.provider))
         }
 
         return try {
@@ -100,8 +100,13 @@ class ShellLlmInvoker(
                 processResult = processResult,
             )
             val cleanupResult = cleanupNonCancellable(command)
+            val cleanupFailure = cleanupResult.exceptionOrNull()
 
-            cleanupResult.map { invocationResult }
+            if (cleanupFailure == null) {
+                Result.success(invocationResult)
+            } else {
+                Result.failure(cleanupFailure.classifyLlmFailure(request.provider))
+            }
         } catch (throwable: CancellationException) {
             val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
             cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }
@@ -111,7 +116,7 @@ class ShellLlmInvoker(
             val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
             cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }
 
-            Result.failure(throwable)
+            Result.failure(throwable.classifyLlmFailure(request.provider))
         }
     }
 

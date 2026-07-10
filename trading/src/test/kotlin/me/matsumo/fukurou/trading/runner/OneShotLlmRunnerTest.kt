@@ -88,6 +88,7 @@ import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ProcessRunner
 import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
+import me.matsumo.fukurou.trading.invoker.safeCodexFailureOrNull
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -1613,8 +1614,11 @@ class OneShotLlmRunnerTest {
         val eventLog = runtime.commandEventLog as InMemoryCommandEventLog
         val noTradeEvent = eventLog.events()
             .single { event -> event.eventType == CommandEventType.NO_TRADE_EXIT }
+        val failureDisclosure = requireNotNull(result.exceptionOrNull()).safeCodexFailureOrNull()
 
         assertTrue(result.isFailure)
+        assertEquals(failure, result.exceptionOrNull())
+        assertEquals("FileSystemException", failureDisclosure?.type)
         assertEquals("Codex invocation failure details omitted.", record?.errorMessage)
         assertFalse(noTradeEvent.payload.contains("auth-path-marker"))
         assertFalse(noTradeEvent.payload.contains("path-message-marker"))

@@ -48,6 +48,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.invoker.readOptionalEnv
 import me.matsumo.fukurou.trading.invoker.splitCommandTemplate
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
@@ -1039,12 +1040,18 @@ private class OneShotPhaseInvoker(
         context: DecisionRunContext,
         request: LlmInvocationRequest,
     ): Result<LlmPhaseAuditResult> {
-        return invocationAuditor.invokeAndAudit(
-            phaseName = phaseName,
-            context = context,
-            request = request,
-            llmInvoker = llmInvoker,
-        )
+        return try {
+            invocationAuditor.invokeAndAudit(
+                phaseName = phaseName,
+                context = context,
+                request = request,
+                llmInvoker = llmInvoker,
+            )
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            throw throwable.classifyLlmFailure(request.provider)
+        }
     }
 }
 

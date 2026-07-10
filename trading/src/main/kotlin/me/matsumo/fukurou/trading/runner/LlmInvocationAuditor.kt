@@ -9,12 +9,15 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
+import me.matsumo.fukurou.trading.invoker.CODEX_INVOCATION_RESULT_UNAVAILABLE
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
+import me.matsumo.fukurou.trading.invoker.safeExceptionType
 import java.time.Clock
 import java.time.Duration
 
@@ -56,7 +59,7 @@ class LlmInvocationAuditor(
         val usage = invocationResult?.usage
         val auditSignals = processResult?.auditSignals() ?: LlmPhaseAuditSignals()
 
-        appendPhase(
+        val appendFailure = appendPhase(
             context = context,
             phaseName = phaseName,
             duration = duration,
@@ -67,7 +70,8 @@ class LlmInvocationAuditor(
                 usage = usage,
                 auditSignals = auditSignals,
             ),
-        ).getOrThrow()
+        ).exceptionOrNull()
+        appendFailure?.let { failure -> throw failure.classifyLlmFailure(request.provider) }
         humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
         if (auditSignals.authFailureSuspected && authFailureMessage != null) {
             humanLogger(authFailureMessage)
@@ -76,7 +80,9 @@ class LlmInvocationAuditor(
         val processFailed = processResult?.didFail() ?: false
 
         if (processFailed) {
-            return Result.failure(IllegalStateException("$phaseName process did not exit cleanly."))
+            val failure = IllegalStateException("$phaseName process did not exit cleanly.")
+
+            return Result.failure(failure.classifyLlmFailure(request.provider))
         }
 
         return result.fold(
@@ -90,7 +96,7 @@ class LlmInvocationAuditor(
                     ),
                 )
             },
-            onFailure = { throwable -> Result.failure(throwable) },
+            onFailure = { throwable -> Result.failure(throwable.classifyLlmFailure(request.provider)) },
         )
     }
 
@@ -208,12 +214,6 @@ class LlmInvocationAuditor(
     }
 }
 
-private fun Throwable.safeExceptionType(): String {
-    val typeName = javaClass.simpleName
-
-    return typeName.takeIf { value -> SAFE_EXCEPTION_TYPE.matches(value) } ?: "Throwable"
-}
-
 /**
  * LLM phase audit の結果。
  *
@@ -273,7 +273,3 @@ private val LLM_CLI_AUTH_FAILURE_PATTERNS = listOf(
  * Claude CLI の result JSON が error 終了を示す出力断片。
  */
 private val LLM_CLI_ERROR_OUTPUT_PATTERN = Regex(""""is_error"\s*:\s*true""")
-
-private val SAFE_EXCEPTION_TYPE = Regex("[A-Za-z][A-Za-z0-9]*")
-
-private const val CODEX_INVOCATION_RESULT_UNAVAILABLE = "INVOCATION_RESULT_UNAVAILABLE"
