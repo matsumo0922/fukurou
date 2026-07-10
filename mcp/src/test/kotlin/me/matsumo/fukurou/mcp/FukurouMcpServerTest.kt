@@ -32,6 +32,11 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenial
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialPage
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialQuery
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialReader
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -70,6 +75,7 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.knowledge.KnowledgeService
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.runner.DEFAULT_RUNNER_MCP_SERVER_NAME
@@ -811,6 +817,7 @@ class FukurouMcpServerTest {
         val repository = runtime.decisionRepository as InMemoryDecisionRepository
 
         assertTrue(result.isError != true)
+        assertEquals("knowledge.recent_lessons.v2", structuredContent.getValue("schema_version").jsonPrimitive.contentOrNull)
         assertEquals("postgres", structuredContent.getValue("source").jsonPrimitive.contentOrNull)
         assertEquals(1L, structuredContent.getValue("item_count").jsonPrimitive.longOrNull)
         assertEquals("NO_TRADE", lesson.getValue("action").jsonPrimitive.contentOrNull)
@@ -829,6 +836,69 @@ class FukurouMcpServerTest {
         assertEquals(1, repository.snapshots.decisions().size)
         assertTrue(!structuredContent.toString().contains("fact_check"))
         assertTrue(!structuredContent.toString().contains("tool_evidence_ids"))
+        assertEquals(0L, structuredContent.getValue("safety_floor_denial_item_count").jsonPrimitive.longOrNull)
+        assertEquals(false, structuredContent.getValue("safety_floor_denials_truncated").jsonPrimitive.booleanOrNull)
+        assertTrue(structuredContent.getValue("safety_floor_denials").jsonArray.isEmpty())
+    }
+
+    @Test
+    fun knowledgeRecentLessonsTool_separatesLayers() = runBlocking {
+        val clock = fixedClock()
+        val runtime = TradingRuntimeFactory.inMemory(clock = clock)
+        val reader = object : DecisionRunSafetyDenialReader {
+            override suspend fun readSafetyDenials(
+                query: DecisionRunSafetyDenialQuery,
+            ): Result<DecisionRunSafetyDenialPage> {
+                return Result.success(
+                    DecisionRunSafetyDenialPage(
+                        denials = listOf(
+                            DecisionRunSafetyDenial(
+                                invocationId = "denied-run",
+                                deniedAt = Instant.now(clock),
+                                finalReason = "preview_order_rejected",
+                                decision = null,
+                                intent = null,
+                                falsification = null,
+                                safetyViolation = DecisionRunSafetyViolation(
+                                    rule = "EXPECTED_VALUE_GATE",
+                                    measuredValue = "0.03357778",
+                                    limitValue = "0.10",
+                                    messageJa = "EV が不足しています。",
+                                    createdAt = Instant.now(clock),
+                                ),
+                            ),
+                        ),
+                        truncated = false,
+                    ),
+                )
+            }
+        }
+        val knowledgeService = KnowledgeService(
+            decisionRepository = runtime.decisionRepository,
+            llmRunRepository = runtime.llmRunRepository,
+            evaluationRepository = runtime.evaluationRepository,
+            safetyDenialReader = reader,
+            clock = clock,
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = clock,
+            tradingRuntime = runtime,
+            knowledgeService = knowledgeService,
+        ).createServer()
+
+        val result = callTool(server, "knowledge_get_recent_lessons", buildJsonObject {})
+        val structuredContent = assertNotNull(result.structuredContent)
+        val denial = structuredContent.getValue("safety_floor_denials").jsonArray.single().jsonObject
+
+        assertEquals("knowledge.recent_lessons.v2", structuredContent.getValue("schema_version").jsonPrimitive.contentOrNull)
+        assertEquals("DENIED", denial.getValue("outcome").jsonPrimitive.contentOrNull)
+        assertEquals("SafetyFloor", denial.getValue("deny_layer").jsonPrimitive.contentOrNull)
+        assertEquals("preview_order_rejected", denial.getValue("final_reason").jsonPrimitive.contentOrNull)
+        assertEquals("EXPECTED_VALUE_GATE", denial.getValue("machine_outcome").jsonObject.getValue("rule").jsonPrimitive.contentOrNull)
+        assertEquals("0.03357778", denial.getValue("machine_outcome").jsonObject.getValue("measured_value").jsonPrimitive.contentOrNull)
+        assertEquals(null, denial.getValue("prior_proposal").jsonPrimitive.contentOrNull)
+        assertEquals(null, denial.getValue("falsifier").jsonPrimitive.contentOrNull)
     }
 
     @Test

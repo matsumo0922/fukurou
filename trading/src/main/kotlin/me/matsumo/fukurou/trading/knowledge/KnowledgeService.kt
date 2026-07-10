@@ -1,5 +1,12 @@
 package me.matsumo.fukurou.trading.knowledge
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonArray
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenial
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialQuery
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialReader
+import me.matsumo.fukurou.trading.activity.EmptyDecisionRunSafetyDenialReader
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.TradePlanRecord
@@ -97,6 +104,7 @@ class KnowledgeService(
     private val decisionRepository: DecisionRepository,
     private val llmRunRepository: LlmRunRepository,
     private val evaluationRepository: EvaluationRepository,
+    private val safetyDenialReader: DecisionRunSafetyDenialReader = EmptyDecisionRunSafetyDenialReader,
     private val clock: Clock = Clock.systemUTC(),
     private val redactor: SecretRedactor = SecretRedactor.fromEnvironment(System.getenv()),
 ) {
@@ -116,6 +124,14 @@ class KnowledgeService(
             val tradeResult = evaluationRepository.fetchClosedTrades(
                 period = period,
                 limit = MAX_KNOWLEDGE_EVALUATION_TRADE_FETCH_LIMIT,
+            ).getOrThrow()
+            val safetyDenialPage = safetyDenialReader.readSafetyDenials(
+                DecisionRunSafetyDenialQuery(
+                    symbol = query.symbol,
+                    from = period.from,
+                    toExclusive = period.toExclusive,
+                    limit = query.limit.coerceAtMost(KNOWLEDGE_LIST_MAX_ITEMS),
+                ),
             ).getOrThrow()
             val setupPerformance = setupPerformanceSummaries(
                 trades = tradeResult.trades,
@@ -143,6 +159,11 @@ class KnowledgeService(
                 runSummaries = runSummaries,
                 setupPerformance = setupPerformance.take(KNOWLEDGE_SETUP_PERFORMANCE_MAX_ITEMS),
                 evaluationTruncated = tradeResult.truncated,
+                safetyFloorDenials = safetyDenialPage.denials
+                    .take(KNOWLEDGE_LIST_MAX_ITEMS)
+                    .map { denial -> denial.toKnowledgeSafetyFloorDenial() },
+                safetyFloorDenialsTruncated = safetyDenialPage.truncated ||
+                    safetyDenialPage.denials.size > KNOWLEDGE_LIST_MAX_ITEMS,
             )
         }
     }
@@ -312,6 +333,47 @@ class KnowledgeService(
                     createdAt = record.createdAt,
                 )
             },
+        )
+    }
+
+    private fun DecisionRunSafetyDenial.toKnowledgeSafetyFloorDenial(): KnowledgeSafetyFloorDenial {
+        val proposal = decision?.let { declared ->
+            KnowledgePriorProposal(
+                action = declared.action.sanitize(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                setupTags = declared.setupTagsJson.toSanitizedSetupTags(),
+                tradePlanThesisJa = intent?.thesisJa.sanitizeOptional(KNOWLEDGE_TEXT_MAX_LENGTH),
+                estimatedWinProbability = declared.estimatedWinProbability.sanitizeOptional(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                expectedRMultiple = declared.expectedRMultiple.sanitizeOptional(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                roundTripCostR = declared.roundTripCostR.sanitizeOptional(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                intent = intent?.let { priorIntent ->
+                    KnowledgePriorIntent(
+                        orderType = priorIntent.orderType.sanitize(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                        sizeBtc = priorIntent.sizeBtc.sanitize(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                        priceJpy = priorIntent.priceJpy.sanitizeOptional(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                        protectiveStopPriceJpy = priorIntent.protectiveStopPriceJpy.sanitize(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                        takeProfitPriceJpy = priorIntent.takeProfitPriceJpy.sanitizeOptional(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                    )
+                },
+            )
+        }
+
+        return KnowledgeSafetyFloorDenial(
+            invocationId = invocationId.sanitizeIdentifier(),
+            deniedAt = deniedAt,
+            finalReason = finalReason.sanitizeOptional(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+            priorProposal = proposal,
+            falsifier = falsification?.let { value ->
+                KnowledgeFalsifierOutcome(
+                    verdict = value.verdict.sanitize(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                    createdAt = value.createdAt,
+                )
+            },
+            machineOutcome = KnowledgeMachineOutcome(
+                rule = safetyViolation.rule.sanitize(KNOWLEDGE_SHORT_TEXT_MAX_LENGTH),
+                measuredValue = safetyViolation.measuredValue.sanitize(KNOWLEDGE_TEXT_MAX_LENGTH),
+                limitValue = safetyViolation.limitValue.sanitize(KNOWLEDGE_TEXT_MAX_LENGTH),
+                messageJa = safetyViolation.messageJa.sanitize(KNOWLEDGE_TEXT_MAX_LENGTH),
+            ),
         )
     }
 
@@ -642,18 +704,26 @@ class KnowledgeService(
     }
 
     private fun String.sanitize(maxLength: Int): String {
-        val normalized = replace(KnowledgeWhitespaceRegex, " ").trim()
-        val redacted = redactor.redact(normalized)
+        val redacted = redactor.redact(this)
+        val normalized = redacted.replace(KnowledgeWhitespaceRegex, " ").trim()
 
-        if (redacted.length <= maxLength) {
-            return redacted
+        if (normalized.length <= maxLength) {
+            return normalized
         }
 
-        return redacted.take(maxLength) + KNOWLEDGE_TRUNCATED_SUFFIX
+        return normalized.take(maxLength) + KNOWLEDGE_TRUNCATED_SUFFIX
     }
 
     private fun String.sanitizeIdentifier(): String {
         return sanitize(KNOWLEDGE_IDENTIFIER_MAX_LENGTH)
+    }
+
+    private fun String.toSanitizedSetupTags(): List<String> {
+        val values = runCatching {
+            Json.parseToJsonElement(this).jsonArray.mapNotNull { value -> (value as? JsonPrimitive)?.content }
+        }.getOrDefault(emptyList())
+
+        return sanitizeList(values, KNOWLEDGE_SHORT_TEXT_MAX_LENGTH)
     }
 
     private fun String.normalizeTerm(): String {

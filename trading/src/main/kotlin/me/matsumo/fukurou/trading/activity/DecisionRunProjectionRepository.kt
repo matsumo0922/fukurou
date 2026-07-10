@@ -10,6 +10,13 @@ import me.matsumo.fukurou.trading.persistence.STALE_LLM_RUN_RECOVERY_ERROR_MESSA
 import java.time.Duration
 import java.time.Instant
 
+private val SafeDecisionRunFinalReasonPattern = Regex("[a-z][a-z0-9_]{0,79}")
+
+/** NO_TRADE_EXIT に保存する final reason を公開可能な識別子へ限定する。 */
+internal fun String?.safeDecisionRunFinalReason(): String? {
+    return this?.takeIf(SafeDecisionRunFinalReasonPattern::matches)
+}
+
 /** decision run の機械判定 outcome。 */
 enum class DecisionRunOutcome {
     WAITING,

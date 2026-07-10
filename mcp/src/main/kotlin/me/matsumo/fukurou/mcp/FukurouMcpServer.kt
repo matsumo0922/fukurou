@@ -71,9 +71,13 @@ import me.matsumo.fukurou.trading.knowledge.KnowledgeDecisionOutcome
 import me.matsumo.fukurou.trading.knowledge.KnowledgeFailurePattern
 import me.matsumo.fukurou.trading.knowledge.KnowledgeFalsificationSummary
 import me.matsumo.fukurou.trading.knowledge.KnowledgeLesson
+import me.matsumo.fukurou.trading.knowledge.KnowledgeMachineOutcome
+import me.matsumo.fukurou.trading.knowledge.KnowledgePriorIntent
+import me.matsumo.fukurou.trading.knowledge.KnowledgePriorProposal
 import me.matsumo.fukurou.trading.knowledge.KnowledgeRecentLessonsQuery
 import me.matsumo.fukurou.trading.knowledge.KnowledgeRecentLessonsResult
 import me.matsumo.fukurou.trading.knowledge.KnowledgeRunSummary
+import me.matsumo.fukurou.trading.knowledge.KnowledgeSafetyFloorDenial
 import me.matsumo.fukurou.trading.knowledge.KnowledgeService
 import me.matsumo.fukurou.trading.knowledge.KnowledgeSetupPerformanceSummary
 import me.matsumo.fukurou.trading.knowledge.KnowledgeSimilarSetupHit
@@ -308,6 +312,9 @@ private const val JSON_TYPE_NULL = "null"
  */
 private const val DEFAULT_SIMULATED_TIMEOUT_DELAY_MS = 30_000L
 
+/** recent lessons の SafetyFloor denial section に許可する UTF-8 byte 数。 */
+private const val KNOWLEDGE_SAFETY_DENIALS_MAX_BYTES = 16 * 1024
+
 /**
  * timeout 再現 tool に指定できる最小 delay。
  */
@@ -405,6 +412,7 @@ class FukurouMcpServer(
         decisionRepository = tradingRuntime.decisionRepository,
         llmRunRepository = tradingRuntime.llmRunRepository,
         evaluationRepository = tradingRuntime.evaluationRepository,
+        safetyDenialReader = tradingRuntime.safetyDenialReader,
         clock = clock,
     ),
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
@@ -1030,7 +1038,7 @@ private fun Server.registerKnowledgeRecentLessonsTool(
     addLimitedTool(
         definition = LimitedToolDefinition(
             name = KNOWLEDGE_GET_RECENT_LESSONS_TOOL,
-            description = "Return bounded DB-backed recent lessons, failure patterns, and reflection summaries.",
+            description = "Return bounded DB-backed recent lessons, SafetyFloor denials, failure patterns, and reflection summaries.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putSymbolSchema()
@@ -2106,15 +2114,19 @@ private fun tradeIntentResult(snapshot: TradeIntentReviewSnapshot): CallToolResu
 }
 
 private fun knowledgeRecentLessonsResult(result: KnowledgeRecentLessonsResult): CallToolResult {
+    val boundedDenials = boundedSafetyDenials(result.safetyFloorDenials)
+
     return jsonObjectResult(
         buildJsonObject {
-            put("schema_version", "knowledge.recent_lessons.v1")
+            put("schema_version", "knowledge.recent_lessons.v2")
             put("source", "postgres")
             put("symbol", result.symbol.apiSymbol)
             put("lookback_days", result.lookbackDays)
             put("limit", result.limit)
             put("item_count", result.lessons.size)
             put("evaluation_truncated", result.evaluationTruncated)
+            put("safety_floor_denial_item_count", boundedDenials.items.size)
+            put("safety_floor_denials_truncated", result.safetyFloorDenialsTruncated || boundedDenials.truncated)
             putJsonArray("lessons") {
                 result.lessons.forEach { lesson -> add(lesson.toJsonObject()) }
             }
@@ -2127,8 +2139,31 @@ private fun knowledgeRecentLessonsResult(result: KnowledgeRecentLessonsResult): 
             putJsonArray("setup_performance") {
                 result.setupPerformance.forEach { performance -> add(performance.toJsonObject()) }
             }
+            put("safety_floor_denials", boundedDenials.items)
         },
     )
+}
+
+private data class BoundedSafetyDenials(
+    val items: JsonArray,
+    val truncated: Boolean,
+)
+
+private fun boundedSafetyDenials(denials: List<KnowledgeSafetyFloorDenial>): BoundedSafetyDenials {
+    val accepted = mutableListOf<JsonObject>()
+
+    for (denial in denials) {
+        val candidate = denial.toJsonObject()
+        val section = JsonArray(accepted + candidate)
+
+        if (section.toString().toByteArray(Charsets.UTF_8).size > KNOWLEDGE_SAFETY_DENIALS_MAX_BYTES) {
+            return BoundedSafetyDenials(JsonArray(accepted), truncated = true)
+        }
+
+        accepted += candidate
+    }
+
+    return BoundedSafetyDenials(JsonArray(accepted), truncated = false)
 }
 
 private fun knowledgeSimilarSetupsResult(result: KnowledgeSimilarSetupsResult): CallToolResult {
@@ -2189,6 +2224,62 @@ private fun KnowledgeLesson.toJsonObject(): JsonObject {
         } else {
             put("falsification", falsification.toJsonObject())
         }
+    }
+}
+
+private fun KnowledgeSafetyFloorDenial.toJsonObject(): JsonObject {
+    val proposal = priorProposal
+    val falsifierOutcome = falsifier
+
+    return buildJsonObject {
+        put("invocation_id", invocationId)
+        put("denied_at", deniedAt.toString())
+        put("outcome", "DENIED")
+        put("deny_layer", "SafetyFloor")
+        putNullableString("final_reason", finalReason)
+        if (proposal == null) put("prior_proposal", JsonNull) else put("prior_proposal", proposal.toJsonObject())
+        if (falsifierOutcome == null) {
+            put("falsifier", JsonNull)
+        } else {
+            putJsonObject("falsifier") {
+                put("verdict", falsifierOutcome.verdict)
+                put("created_at", falsifierOutcome.createdAt.toString())
+            }
+        }
+        put("machine_outcome", machineOutcome.toJsonObject())
+    }
+}
+
+private fun KnowledgePriorProposal.toJsonObject(): JsonObject {
+    val priorIntent = intent
+
+    return buildJsonObject {
+        put("action", action)
+        put("setup_tags", ToolJson.encodeToJsonElement(setupTags))
+        putNullableString("trade_plan_thesis_ja", tradePlanThesisJa)
+        putNullableString("estimated_win_probability", estimatedWinProbability)
+        putNullableString("expected_r_multiple", expectedRMultiple)
+        putNullableString("round_trip_cost_r", roundTripCostR)
+        if (priorIntent == null) put("intent", JsonNull) else put("intent", priorIntent.toJsonObject())
+    }
+}
+
+private fun KnowledgePriorIntent.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        put("order_type", orderType)
+        put("size_btc", sizeBtc)
+        putNullableString("price_jpy", priceJpy)
+        put("protective_stop_price_jpy", protectiveStopPriceJpy)
+        putNullableString("take_profit_price_jpy", takeProfitPriceJpy)
+    }
+}
+
+private fun KnowledgeMachineOutcome.toJsonObject(): JsonObject {
+    return buildJsonObject {
+        put("rule", rule)
+        put("measured_value", measuredValue)
+        put("limit_value", limitValue)
+        put("message_ja", messageJa)
     }
 }
 
