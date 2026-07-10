@@ -24,6 +24,7 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.runner.CHILD_ENV_ALLOWLIST
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.MAX_DAILY_INVOCATION_COUNT_WINDOW
@@ -338,7 +339,11 @@ class ReflectionPromptCandidateGenerator(
     ) {
         val finishedAt = clock.instant()
         val redactedMessage = cause?.let { throwable ->
-            redactor.redactAndTruncate("${throwable.javaClass.simpleName}: ${throwable.message.orEmpty()}")
+            if (tradingConfig.reflection.promptCandidateProvider == LlmProvider.CODEX) {
+                CODEX_FAILURE_DETAILS_OMITTED
+            } else {
+                redactor.redactAndTruncate("${throwable.javaClass.simpleName}: ${throwable.message.orEmpty()}")
+            }
         }
 
         llmRunRepository.finish(
@@ -938,3 +943,4 @@ private val SUSPICIOUS_SECRET_PATTERNS = listOf(
 private const val REFLECTION_PHASE_NAME = "reflection"
 private const val REFLECTION_PROMPT_VERSION = "reflection-prompt-candidates-v1"
 private const val REFLECTION_LLM_RUN_STATUS_SUCCEEDED = "SUCCEEDED"
+private const val CODEX_FAILURE_DETAILS_OMITTED = "Codex invocation failure details omitted."

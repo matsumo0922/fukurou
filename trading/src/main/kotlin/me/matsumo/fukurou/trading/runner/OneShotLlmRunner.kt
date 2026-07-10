@@ -341,6 +341,7 @@ class OneShotLlmRunner(
                 start = llmRunStart,
                 status = LLM_RUN_STATUS_CANCELLED,
                 cause = throwable,
+                llmProvider = failureContext.llmProvider,
             )
         }
         throwable.withSuppressedFailure(auditResult)
@@ -361,6 +362,7 @@ class OneShotLlmRunner(
             start = llmRunStart,
             status = LLM_RUN_STATUS_FAILED,
             cause = throwable,
+            llmProvider = failureContext.llmProvider,
         )
 
         return throwable
@@ -928,6 +930,7 @@ private class OneShotRunAuditRecorder(
         start: LlmRunStart,
         status: String,
         cause: Throwable?,
+        llmProvider: String? = null,
     ): Result<Unit> {
         val finish = LlmRunFinish(
             invocationId = start.invocationId,
@@ -937,7 +940,7 @@ private class OneShotRunAuditRecorder(
             status = status,
             startedAt = start.startedAt,
             finishedAt = clock.instant(),
-            errorMessage = cause?.redactedErrorMessage(),
+            errorMessage = cause?.persistedErrorMessage(llmProvider),
             runtimeConfigVersionId = start.runtimeConfigVersionId,
             runtimeConfigHash = start.runtimeConfigHash,
         )
@@ -995,7 +998,11 @@ private class OneShotRunAuditRecorder(
         )
     }
 
-    private fun Throwable.redactedErrorMessage(): String {
+    private fun Throwable.persistedErrorMessage(llmProvider: String?): String {
+        if (llmProvider.equals(CODEX_PROVIDER_NAME, ignoreCase = true)) {
+            return CODEX_FAILURE_DETAILS_OMITTED
+        }
+
         val typeName = javaClass.simpleName
         val detail = message.orEmpty()
         val message = if (detail.isBlank()) typeName else "$typeName: $detail"
@@ -1013,6 +1020,9 @@ private class OneShotRunAuditRecorder(
         )
     }
 }
+
+private const val CODEX_PROVIDER_NAME = "codex"
+private const val CODEX_FAILURE_DETAILS_OMITTED = "Codex invocation failure details omitted."
 
 /**
  * OneShot runner の LLM phase 実行を共通 auditor へ委譲する helper。

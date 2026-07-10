@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.invoker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import java.nio.file.FileSystemException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
@@ -62,6 +63,57 @@ class ShellLlmInvokerTest {
         assertTrue(result.isFailure)
         assertTrue(processRunner.cleanupCalled)
         assertFalse(Files.exists(artifact))
+    }
+
+    @Test
+    fun invoke_propagatesCommandRenderFailure() = runBlocking {
+        val failure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "render path-message-marker",
+        )
+        val processRunner = RecordingProcessRunner(
+            result = Result.success(cleanProcess()),
+            cleanupAction = {},
+        )
+        val invoker = ShellLlmInvoker(
+            commandRenderer = object : LlmCommandRenderer {
+                override fun render(request: LlmInvocationRequest): Result<RenderedLlmCommand> {
+                    return Result.failure(failure)
+                }
+            },
+            processRunner = processRunner,
+        )
+
+        val result = invoker.invoke(request())
+
+        assertEquals(failure, result.exceptionOrNull())
+        assertFalse(processRunner.runCalled)
+        assertFalse(processRunner.cleanupCalled)
+    }
+
+    @Test
+    fun invoke_propagatesCleanupFailureAfterSuccessfulProcess() = runBlocking {
+        val artifact = Files.createTempFile("shell-llm-invoker-cleanup-failure", ".jsonl")
+        val failure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "cleanup path-message-marker",
+        )
+        val processRunner = RecordingProcessRunner(
+            result = Result.success(cleanProcess()),
+            cleanupAction = { throw failure },
+        )
+        val invoker = ShellLlmInvoker(
+            commandRenderer = StaticCommandRenderer(renderedCommand(artifact)),
+            processRunner = processRunner,
+        )
+
+        val result = invoker.invoke(request())
+
+        assertEquals(failure, result.exceptionOrNull())
+        assertTrue(processRunner.runCalled)
+        assertTrue(processRunner.cleanupCalled)
     }
 
     @Test
@@ -144,10 +196,15 @@ private class RecordingProcessRunner(
     private val result: Result<ProcessRunResult>,
     private val cleanupAction: () -> Unit,
 ) : ProcessRunner {
+    var runCalled: Boolean = false
+        private set
+
     var cleanupCalled: Boolean = false
         private set
 
     override suspend fun run(command: RenderedLlmCommand): Result<ProcessRunResult> {
+        runCalled = true
+
         return result
     }
 

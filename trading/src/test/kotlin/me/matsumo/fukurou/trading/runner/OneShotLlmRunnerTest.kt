@@ -101,6 +101,7 @@ import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import java.io.IOException
 import java.math.BigDecimal
+import java.nio.file.FileSystemException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Clock
@@ -1584,6 +1585,43 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun codexInvokerFailure_omitsExceptionPathFromLlmRunAndNoTradeAudit() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = FakeMarketDataSource,
+        )
+        val failure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "cleanup path-message-marker",
+        )
+        val runner = OneShotLlmRunner(
+            tradingRuntime = runtime,
+            tradingConfig = TradingBotConfig(),
+            llmInvoker = ThrowingLlmInvoker(failure),
+            parentEnvironment = defaultParentEnvironment(),
+            clock = fixedClock(),
+            logger = {},
+        )
+        val request = defaultRequest().copy(
+            invocationId = "codex-failed-run",
+            proposerProvider = LlmProvider.CODEX,
+        )
+
+        val result = runner.runOneShot(request)
+        val record = runtime.llmRunRepository.findByInvocationId("codex-failed-run").getOrThrow()
+        val eventLog = runtime.commandEventLog as InMemoryCommandEventLog
+        val noTradeEvent = eventLog.events()
+            .single { event -> event.eventType == CommandEventType.NO_TRADE_EXIT }
+
+        assertTrue(result.isFailure)
+        assertEquals("Codex invocation failure details omitted.", record?.errorMessage)
+        assertFalse(noTradeEvent.payload.contains("auth-path-marker"))
+        assertFalse(noTradeEvent.payload.contains("path-message-marker"))
+        assertTrue(noTradeEvent.payload.contains("\"messageOmitted\":true"))
+    }
+
+    @Test
     fun llmRunRecordFailure_doesNotPreventRunnerCompletion() = runBlocking {
         val fixture = runnerFixture(
             runtimeTransform = { runtime ->
@@ -1952,17 +1990,20 @@ private fun requestCapturingRunnerFixture(
 /**
  * LLM 起動時に例外を投げる test double。
  *
- * @param message 例外 message
+ * @param failure LLM 起動時に投げる例外
  */
 private class ThrowingLlmInvoker(
-    private val message: String,
+    private val failure: Throwable,
 ) : LlmInvoker {
+
+    constructor(message: String) : this(IllegalStateException(message))
+
     override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
         require(request.invocationId.isNotBlank()) {
             "invocationId must not be blank."
         }
 
-        throw IllegalStateException(message)
+        throw failure
     }
 }
 

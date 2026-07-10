@@ -128,6 +128,32 @@ class LlmInvocationAuditorTest {
         assertFalse(commandEventLog.events().single().payload.contains("submit_decision"))
         assertFalse(commandEventLog.events().single().payload.contains("private/session/path"))
     }
+
+    @Test
+    fun invokeAndAudit_preservesClaudeStartFailureDetail() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CLAUDE)
+
+        val result = auditor.invokeAndAudit(
+            phaseName = "proposer",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = FailingAuditLlmInvoker(IllegalStateException("synthetic claude failure")),
+        )
+
+        val payload = Json.parseToJsonElement(commandEventLog.events().single().payload).jsonObject
+        val details = requireNotNull(payload["details"]).jsonObject
+
+        assertTrue(result.isFailure)
+        assertEquals("FAILED_TO_START", details["status"]?.jsonPrimitive?.content)
+        assertTrue(details["error"]?.jsonPrimitive?.content.orEmpty().contains("synthetic claude failure"))
+        assertFalse(details.containsKey("failureCategory"))
+    }
 }
 
 private fun auditRequest(provider: LlmProvider): LlmInvocationRequest {
@@ -165,6 +191,17 @@ private class StaticStructuredAuditLlmInvoker(
                 usage = usage,
             ),
         )
+    }
+}
+
+/**
+ * auditor test 用の失敗する LLM invoker。
+ */
+private class FailingAuditLlmInvoker(
+    private val failure: Throwable,
+) : LlmInvoker {
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        return Result.failure(failure)
     }
 }
 

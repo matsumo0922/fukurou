@@ -1,8 +1,11 @@
 package me.matsumo.fukurou.trading.reflection
 
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.LlmProvider
+import java.nio.file.FileSystemException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -137,5 +140,28 @@ class ReflectionPromptCandidateGeneratorTest {
         assertEquals(ReflectionPromptCandidateGenerationStatus.LLM_FAILED, secondGeneration.generatedStatus())
         assertEquals(2, fixture.invoker.requests.size)
         assertEquals(listOf("FAILED", "FAILED"), fixture.llmRunRepository.records().map { record -> record.status })
+    }
+
+    @Test
+    fun generate_codexFailureOmitsExceptionPathFromLlmRun() = runBlocking {
+        val fixture = reflectionPromptCandidateGeneratorFixture(
+            tradingConfig = TradingBotConfig(
+                reflection = ReflectionConfig(promptCandidateProvider = LlmProvider.CODEX),
+            ),
+            thrownFailure = FileSystemException(
+                "/temporary/codex-home/auth-path-marker.json",
+                null,
+                "cleanup path-message-marker",
+            ),
+        )
+
+        val generation = fixture.generator.generate(reflectionDataset(), existingState = null).getOrThrow()
+        val llmRun = fixture.llmRunRepository.records().single()
+        val errorMessage = requireNotNull(llmRun.errorMessage)
+
+        assertEquals(ReflectionPromptCandidateGenerationStatus.LLM_FAILED, generation.generatedStatus())
+        assertEquals("Codex invocation failure details omitted.", errorMessage)
+        assertFalse(errorMessage.contains("auth-path-marker"))
+        assertFalse(errorMessage.contains("path-message-marker"))
     }
 }

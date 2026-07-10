@@ -51,9 +51,8 @@ class LlmInvocationAuditor(
         val duration = Duration.ofNanos(System.nanoTime() - startedAt)
         val invocationResult = result.getOrNull()
         val processResult = invocationResult?.processResult
-        val startFailureError = result.exceptionOrNull()
+        val startFailure = result.exceptionOrNull()
             ?.takeIf { processResult == null }
-            ?.redactedQualifiedErrorMessage()
         val usage = invocationResult?.usage
         val auditSignals = processResult?.auditSignals() ?: LlmPhaseAuditSignals()
 
@@ -64,7 +63,7 @@ class LlmInvocationAuditor(
             details = phaseDetails(
                 provider = request.provider,
                 processResult = processResult,
-                startFailureError = startFailureError,
+                startFailure = startFailure,
                 usage = usage,
                 auditSignals = auditSignals,
             ),
@@ -133,7 +132,7 @@ class LlmInvocationAuditor(
     private fun phaseDetails(
         provider: LlmProvider,
         processResult: ProcessRunResult?,
-        startFailureError: String?,
+        startFailure: Throwable?,
         usage: LlmUsageDetails?,
         auditSignals: LlmPhaseAuditSignals,
     ): JsonObject {
@@ -141,7 +140,15 @@ class LlmInvocationAuditor(
             put("provider", provider.name.lowercase())
             put("status", processResult?.status?.name ?: "FAILED_TO_START")
             put("exitCode", processResult?.exitCode?.toString() ?: "null")
-            startFailureError?.let { error -> put("error", error) }
+            startFailure?.let { throwable ->
+                when (provider) {
+                    LlmProvider.CLAUDE -> put("error", throwable.redactedQualifiedErrorMessage())
+                    LlmProvider.CODEX -> {
+                        put("failureCategory", CODEX_INVOCATION_RESULT_UNAVAILABLE)
+                        put("failureType", throwable.safeExceptionType())
+                    }
+                }
+            }
             when (provider) {
                 LlmProvider.CLAUDE -> processResult?.let { completedProcess ->
                     put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
@@ -199,6 +206,12 @@ class LlmInvocationAuditor(
 
         return timedOut || nonZeroExit
     }
+}
+
+private fun Throwable.safeExceptionType(): String {
+    val typeName = javaClass.simpleName
+
+    return typeName.takeIf { value -> SAFE_EXCEPTION_TYPE.matches(value) } ?: "Throwable"
 }
 
 /**
@@ -260,3 +273,7 @@ private val LLM_CLI_AUTH_FAILURE_PATTERNS = listOf(
  * Claude CLI の result JSON が error 終了を示す出力断片。
  */
 private val LLM_CLI_ERROR_OUTPUT_PATTERN = Regex(""""is_error"\s*:\s*true""")
+
+private val SAFE_EXCEPTION_TYPE = Regex("[A-Za-z][A-Za-z0-9]*")
+
+private const val CODEX_INVOCATION_RESULT_UNAVAILABLE = "INVOCATION_RESULT_UNAVAILABLE"

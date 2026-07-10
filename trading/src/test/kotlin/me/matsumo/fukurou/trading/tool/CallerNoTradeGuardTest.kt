@@ -15,11 +15,13 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import java.nio.file.FileSystemException
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.DurationUnit
 import kotlin.time.toDuration
@@ -53,19 +55,42 @@ class CallerNoTradeGuardTest {
     }
 
     @Test
-    fun startup_failure_is_logged_as_no_trade_exit() = runBlocking {
+    fun codexStartupFailure_omitsExceptionMessageFromNoTradeExit() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
         val guard = CallerNoTradeGuard(eventLog, fixedClock())
+        val failure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "startup path-message-marker",
+        )
 
         val result = guard.run(createInvocation()) {
-            error("MCP process failed before connect")
+            throw failure
         }
         val event = eventLog.events().single()
 
         assertTrue(result.isFailure)
         assertEquals(CommandEventType.NO_TRADE_EXIT, event.eventType)
         assertTrue(event.payload.contains("caller_failed"))
+        assertTrue(event.payload.contains("\"cause\":\"FileSystemException\""))
+        assertTrue(event.payload.contains("\"messageOmitted\":true"))
+        assertFalse(event.payload.contains("auth-path-marker"))
+        assertFalse(event.payload.contains("path-message-marker"))
+    }
+
+    @Test
+    fun claudeStartupFailure_keepsExceptionMessageInNoTradeExit() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val guard = CallerNoTradeGuard(eventLog, fixedClock())
+
+        val result = guard.run(createInvocation(llmProvider = "claude")) {
+            error("MCP process failed before connect")
+        }
+        val event = eventLog.events().single()
+
+        assertTrue(result.isFailure)
         assertTrue(event.payload.contains("MCP process failed before connect"))
+        assertFalse(event.payload.contains("messageOmitted"))
     }
 
     @Test
@@ -95,13 +120,13 @@ class CallerNoTradeGuardTest {
 /**
  * CallerNoTradeGuard test 用の caller invocation を作る。
  */
-private fun createInvocation(): CallerInvocation {
+private fun createInvocation(llmProvider: String = "codex"): CallerInvocation {
     return CallerInvocation(
         operationName = "mcp.process",
         clientRequestId = "client-request",
         decisionRunContext = DecisionRunContext(
             decisionRunId = "run-789",
-            llmProvider = "codex",
+            llmProvider = llmProvider,
             promptHash = "prompt-hash",
             systemPromptVersion = "v1",
             marketSnapshotId = "snapshot-1",

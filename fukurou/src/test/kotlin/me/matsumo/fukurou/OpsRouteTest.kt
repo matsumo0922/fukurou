@@ -72,6 +72,7 @@ import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
 import java.io.File
 import java.math.BigDecimal
+import java.nio.file.FileSystemException
 import java.nio.file.Path
 import java.sql.Connection
 import java.time.Clock
@@ -1310,6 +1311,58 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_auditClassifiesCodexFailureWithoutExposingExceptionPath() = testApplication {
+        val eventLog = InMemoryCommandEventLog()
+        val request = codexAuditRequest()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = eventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = fixedClock(),
+        )
+        val failure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "cleanup path-message-marker",
+        )
+
+        val invocation = auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = FailingOpsAuditLlmInvoker(failure),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsCommandEventFeedReader = eventLog,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/audit?eventType=RUNNER_PHASE_COMPLETED")
+        val responseText = response.bodyAsText()
+        val responseBody = Json.parseToJsonElement(responseText).jsonObject
+        val event = responseBody.getValue("events").jsonArray.single().jsonObject
+        val payload = Json.parseToJsonElement(event.getValue("payload").jsonPrimitive.content).jsonObject
+        val details = payload.getValue("details").jsonObject
+
+        assertTrue(invocation.isFailure)
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertEquals("FAILED_TO_START", details.getValue("status").jsonPrimitive.content)
+        assertEquals("null", details.getValue("exitCode").jsonPrimitive.content)
+        assertEquals(
+            "INVOCATION_RESULT_UNAVAILABLE",
+            details.getValue("failureCategory").jsonPrimitive.content,
+        )
+        assertEquals("FileSystemException", details.getValue("failureType").jsonPrimitive.content)
+        assertFalse(details.containsKey("error"))
+        assertFalse(responseText.contains("auth-path-marker"))
+        assertFalse(responseText.contains("path-message-marker"))
+        assertFalse(responseText.contains("temporary/codex-home"))
+    }
+
+    @Test
     fun opsRoutes_returnServiceUnavailableWhenDbServicesAreNotConfigured() = testApplication {
         application {
             module(
@@ -1545,6 +1598,17 @@ private class StaticOpsAuditLlmInvoker(
 ) : LlmInvoker {
     override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
         return Result.success(invocationResult)
+    }
+}
+
+/**
+ * ops audit route test 用の失敗する LLM invoker。
+ */
+private class FailingOpsAuditLlmInvoker(
+    private val failure: Throwable,
+) : LlmInvoker {
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        return Result.failure(failure)
     }
 }
 
