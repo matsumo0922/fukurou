@@ -11,6 +11,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
+import me.matsumo.fukurou.trading.evaluation.EvaluationExclusionSummary
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
@@ -47,6 +48,10 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
             )
             AND p.closed_at >= ?
             AND p.closed_at < ?
+            AND NOT EXISTS (
+                SELECT 1 FROM evaluation_exclusions x
+                WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
+            )
         ORDER BY p.closed_at ASC
         LIMIT ?
     ),
@@ -115,6 +120,10 @@ private const val COUNT_EVALUATION_DECISION_RUNS_SQL = """
         AND event_type IN ('RUNNER_PHASE_COMPLETED', 'NO_TRADE_EXIT')
         AND ts >= ?
         AND ts < ?
+        AND NOT EXISTS (
+            SELECT 1 FROM evaluation_exclusions x
+            WHERE x.entity_type = 'DECISION_RUN' AND x.entity_id = command_event_log.decision_run_id
+        )
 """
 
 /**
@@ -125,6 +134,10 @@ private const val COUNT_DECISIONS_BY_ACTION_SQL = """
     FROM decisions
     WHERE created_at >= ?
         AND created_at < ?
+        AND NOT EXISTS (
+            SELECT 1 FROM evaluation_exclusions x
+            WHERE x.entity_type = 'DECISION_RUN' AND x.entity_id = decisions.invocation_id
+        )
     GROUP BY action
     ORDER BY action ASC
 """
@@ -144,6 +157,10 @@ private const val SELECT_DAILY_TRADE_PNL_SQL = """
             )
             AND closed_at >= ?
             AND closed_at < ?
+            AND NOT EXISTS (
+                SELECT 1 FROM evaluation_exclusions x
+                WHERE x.entity_type = 'POSITION' AND x.entity_id = positions.id::text
+            )
     ),
     position_pnl AS (
         SELECT
@@ -174,6 +191,10 @@ private const val SUM_TRADE_PNL_BEFORE_SQL = """
                 WHERE id = ?
             )
             AND closed_at < ?
+            AND NOT EXISTS (
+                SELECT 1 FROM evaluation_exclusions x
+                WHERE x.entity_type = 'POSITION' AND x.entity_id = positions.id::text
+            )
     ),
     position_pnl AS (
         SELECT
@@ -228,6 +249,10 @@ private const val SELECT_KILL_CRITERION_STATS_SQL = """
                 FROM paper_account
                 WHERE id = ?
             )
+            AND NOT EXISTS (
+                SELECT 1 FROM evaluation_exclusions x
+                WHERE x.entity_type = 'POSITION' AND x.entity_id = positions.id::text
+            )
     ),
     position_pnl AS (
         SELECT
@@ -253,6 +278,14 @@ private const val SELECT_KILL_CRITERION_STATS_SQL = """
 class ExposedEvaluationRepository(
     private val database: ExposedDatabase,
 ) : EvaluationRepository {
+
+    override suspend fun fetchExclusionSummary(period: EvaluationPeriod): Result<EvaluationExclusionSummary> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) { selectEvaluationExclusionSummary(period) }
+            }
+        }
+    }
 
     override suspend fun fetchClosedTrades(period: EvaluationPeriod, limit: Int): Result<EvaluationTradeQueryResult> {
         return withContext(Dispatchers.IO) {
@@ -336,6 +369,41 @@ class ExposedEvaluationRepository(
             }
         }
     }
+}
+
+private fun JdbcTransaction.selectEvaluationExclusionSummary(period: EvaluationPeriod): EvaluationExclusionSummary {
+    return prepare(
+        """
+            SELECT entity_type, reason, COUNT(DISTINCT entity_id) AS entity_count
+            FROM evaluation_exclusions
+            WHERE created_at >= ? AND created_at < ?
+            GROUP BY entity_type, reason
+        """,
+    ).use { statement ->
+        statement.setLong(1, period.from.toEpochMilli())
+        statement.setLong(2, period.toExclusive.toEpochMilli())
+        statement.executeQuery().use(ResultSet::toEvaluationExclusionSummary)
+    }
+}
+
+private fun ResultSet.toEvaluationExclusionSummary(): EvaluationExclusionSummary {
+    val counts = mutableMapOf<String, Int>()
+    val reasons = mutableMapOf<String, Int>()
+
+    while (next()) {
+        val count = getInt("entity_count")
+        val entityType = getString("entity_type")
+        counts[entityType] = counts.getOrDefault(entityType, 0) + count
+        val reason = getString("reason")
+        reasons[reason] = reasons.getOrDefault(reason, 0) + count
+    }
+
+    return EvaluationExclusionSummary(
+        orderCount = counts.getOrDefault("ORDER", 0),
+        decisionRunCount = counts.getOrDefault("DECISION_RUN", 0),
+        positionCount = counts.getOrDefault("POSITION", 0),
+        reasons = reasons,
+    )
 }
 
 private fun JdbcTransaction.selectClosedTrades(period: EvaluationPeriod, limit: Int): EvaluationTradeQueryResult {

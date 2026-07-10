@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
@@ -124,6 +125,19 @@ data class ExecutionActivityRecord(
     val order: ExecutionActivityOrderContext?,
     val position: ExecutionActivityPositionContext?,
     val entryDecision: ExecutionActivityDecisionContext?,
+    val sourceEvidence: ExecutionActivitySourceEvidence? = null,
+    val evaluationExclusionReason: String? = null,
+)
+
+/** Activity に表示する realtime execution source evidence。 */
+data class ExecutionActivitySourceEvidence(
+    val sessionId: String,
+    val sequence: Long,
+    val exchangeAt: String,
+    val receivedAt: String,
+    val side: String,
+    val priceJpy: String,
+    val sizeBtc: String,
 )
 
 /**
@@ -230,6 +244,14 @@ interface PaperLedgerMutationRepository {
         simulator: PaperExecutionSimulator,
         simulationContext: PaperSimulationContext? = null,
     ): Result<PaperReconcileResult>
+
+    /**
+     * realtime market event と session cursor を同一 transaction で ledger に適用する。
+     */
+    suspend fun applyMarketEvent(
+        event: PaperMarketTradeEvent,
+        simulator: PaperExecutionSimulator,
+    ): Result<PaperReconcileResult>
 }
 
 /**
@@ -278,6 +300,7 @@ data class MarketEntryFillRequest(
     val tradeGroupId: UUID,
     val stopOrderId: UUID,
     val divergenceMemo: PaperExecutionDivergenceMemo? = null,
+    val source: PaperMarketTradeEvent? = null,
 )
 
 /**
@@ -299,6 +322,24 @@ data class RestingEntryOrderRequest(
     val expiresAt: Instant,
     val expirySource: OrderExpirySource,
     val effectiveTtlSeconds: Long,
+    val marketEligibility: RestingOrderMarketEligibility? = null,
+)
+
+/**
+ * resting order が realtime event を受理するための永続境界。
+ *
+ * @param sessionId 作成時の WebSocket session
+ * @param eligibleAfterSequence 作成時点の処理済み sequence
+ * @param eligibleFrom 作成時刻。同一時刻 event は不適格
+ * @param queueAheadBtc LIMIT の先行 queue 数量。STOP は null
+ * @param queueSnapshotAt LIMIT queue snapshot 時刻。STOP は null
+ */
+data class RestingOrderMarketEligibility(
+    val sessionId: UUID,
+    val eligibleAfterSequence: Long,
+    val eligibleFrom: Instant,
+    val queueAheadBtc: BigDecimal? = null,
+    val queueSnapshotAt: Instant? = null,
 )
 
 /**

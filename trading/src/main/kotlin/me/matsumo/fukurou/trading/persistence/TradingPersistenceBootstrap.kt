@@ -543,6 +543,8 @@ private const val VERIFY_POSITIONS_SCHEMA_SQL = """
         prompt_hash,
         system_prompt_version,
         market_snapshot_id
+        ,market_data_session_id
+        ,market_eligible_after_sequence
     FROM positions
     LIMIT 0
 """
@@ -582,6 +584,12 @@ private const val VERIFY_ORDERS_SCHEMA_SQL = """
         canceled_at,
         cancel_reason,
         canceled_by_decision_run_id,
+        queue_ahead_btc,
+        queue_consumed_btc,
+        queue_snapshot_at,
+        market_data_session_id,
+        market_eligible_after_sequence,
+        market_eligible_from,
         created_at,
         updated_at
     FROM orders
@@ -629,7 +637,41 @@ private const val VERIFY_EXECUTIONS_SCHEMA_SQL = """
         prompt_hash,
         system_prompt_version,
         market_snapshot_id
+        ,source_session_id
+        ,source_sequence
+        ,source_exchange_at
+        ,source_received_at
+        ,source_side
+        ,source_price_jpy
+        ,source_size_btc
     FROM executions
+    LIMIT 0
+"""
+
+/** market-data integrity schema の存在を確認する SQL。 */
+private const val VERIFY_MARKET_DATA_INTEGRITY_SCHEMA_SQL = """
+    SELECT
+        s.id,
+        s.state,
+        s.connected_at,
+        s.disconnected_at,
+        s.last_processed_sequence,
+        s.last_received_at,
+        g.id,
+        g.session_id,
+        g.reason,
+        g.started_at,
+        g.impact_applied_at,
+        g.recovered_at,
+        e.id,
+        e.gap_id,
+        e.entity_type,
+        e.entity_id,
+        e.reason,
+        e.created_at
+    FROM market_data_sessions s
+    LEFT JOIN market_data_gaps g ON g.session_id = s.id
+    LEFT JOIN evaluation_exclusions e ON e.gap_id = g.id
     LIMIT 0
 """
 
@@ -797,6 +839,9 @@ class TradingPersistenceBootstrap(
                     PositionsTable,
                     OrdersTable,
                     ExecutionsTable,
+                    MarketDataSessionsTable,
+                    MarketDataGapsTable,
+                    EvaluationExclusionsTable,
                     CommandEventLogTable,
                     LlmLaunchReservationsTable,
                     SafetyViolationsTable,
@@ -967,6 +1012,10 @@ private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
     verifySchemaBySql(
         sql = VERIFY_EXECUTIONS_SCHEMA_SQL,
         missingMessage = "executions schema was not initialized.",
+    )
+    verifySchemaBySql(
+        sql = VERIFY_MARKET_DATA_INTEGRITY_SCHEMA_SQL,
+        missingMessage = "market-data integrity schema was not initialized.",
     )
     verifySchemaBySql(
         sql = VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL,

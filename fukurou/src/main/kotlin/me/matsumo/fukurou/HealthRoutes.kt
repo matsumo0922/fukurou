@@ -94,6 +94,10 @@ internal suspend fun respondReadiness(
         status = if (ready) "ready" else "not_ready",
         lastReconciledAt = reconcilerStatus.lastReconciledAt?.toString(),
         lastMarketDataAt = reconcilerStatus.lastMarketDataAt?.toString(),
+        marketDataState = reconcilerStatus.marketDataState.name,
+        gapStartedAt = reconcilerStatus.gapStartedAt?.toString(),
+        recoveredAt = reconcilerStatus.recoveredAt?.toString(),
+        gapReason = reconcilerStatus.gapReason?.name,
     )
 
     if (ready) {

@@ -482,6 +482,7 @@ private fun createPostgresBroker(
         paperExecutionConfig = context.tradingConfig.paperExecution,
         fillSimulator = DefaultPaperExecutionSimulator(context.tradingConfig.paperExecution, context.clock),
         reconcilerStatusProvider = resolvedReconcilerStatusProvider,
+        requireRealtimeIntegrityForRestingOrders = true,
         clock = context.clock,
     )
 }

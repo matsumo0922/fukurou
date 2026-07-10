@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.evaluation.InMemoryEquitySnapshotRepository
 import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.math.BigDecimal
@@ -193,6 +194,9 @@ private class InMemoryPaperLedgerState(
     val equitySnapshotRepository: InMemoryEquitySnapshotRepository = runtime.equitySnapshotRepository
     val fallbackSymbolRules: SymbolRules = runtime.fallbackSymbolRules
     val clock: Clock = runtime.clock
+    val orderMarketEligibility: MutableMap<String, RestingOrderMarketEligibility> = mutableMapOf()
+    var marketSessionId: UUID? = null
+    var lastMarketSequence: Long = 0
 
     fun <T> read(block: InMemoryPaperLedgerState.() -> T): T {
         return synchronized(lock) { block() }
@@ -466,6 +470,7 @@ private class InMemoryPaperLedgerMutationWriter(
                 )
 
                 orders += order
+                request.marketEligibility?.let { eligibility -> orderMarketEligibility[order.orderId] = eligibility }
 
                 PaperTradeResult(
                     accepted = true,
@@ -631,6 +636,45 @@ private class InMemoryPaperLedgerMutationWriter(
                 updatedAt = processedAt.toString(),
             )
             progress.canceledOrderIds += order.orderId
+        }
+    }
+
+    override suspend fun applyMarketEvent(
+        event: PaperMarketTradeEvent,
+        simulator: PaperExecutionSimulator,
+    ): Result<PaperReconcileResult> {
+        return runCatching {
+            state.write {
+                if (marketSessionId != event.connectionSessionId) {
+                    marketSessionId = event.connectionSessionId
+                    lastMarketSequence = 0
+                }
+                if (event.sequence <= lastMarketSequence) {
+                    return@write emptyReconcileProgress().toPaperReconcileResult()
+                }
+                require(event.sequence == lastMarketSequence + 1) { "market-data sequence gap." }
+
+                val tick = TickSnapshot(
+                    symbol = event.symbol.apiSymbol,
+                    observedAt = event.receivedAt,
+                    lastPrice = event.priceJpy.toPlainString(),
+                    bidPrice = event.priceJpy.toPlainString(),
+                    askPrice = event.priceJpy.toPlainString(),
+                    symbolRules = fallbackSymbolRules,
+                )
+                val context = tick.toReconcileMarketContext(fallbackSymbolRules, simulator, null)
+                val progress = emptyReconcileProgress()
+
+                updateMarksLocked(event.priceJpy, null, fallbackSymbolRules, event.receivedAt)
+                expireRestingEntryOrdersLocked(event.receivedAt, progress)
+                if (!accountSnapshot.isHardHaltDrawdownReached()) {
+                    fillTriggeredEntryOrdersLocked(context, progress)
+                    triggerPositionProtectionsLocked(context, progress)
+                }
+                lastMarketSequence = event.sequence
+
+                progress.toPaperReconcileResult()
+            }
         }
     }
 

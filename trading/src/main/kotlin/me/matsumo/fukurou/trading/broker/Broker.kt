@@ -4,6 +4,7 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import java.time.Instant
 
@@ -130,6 +131,11 @@ interface BrokerTradeBoundary {
  * paper broker の reconcile / halt sweep 境界。
  */
 interface BrokerReconcileBoundary {
+    /** realtime trade event を paper ledger に適用する。 */
+    suspend fun applyMarketEvent(event: PaperMarketTradeEvent): Result<PaperReconcileResult> {
+        return Result.failure(UnsupportedOperationException("realtime market events are not supported by this broker."))
+    }
+
     /**
      * tick をもとに paper ledger を決定的に前進させる。
      */

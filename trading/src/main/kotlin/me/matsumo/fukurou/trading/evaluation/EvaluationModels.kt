@@ -44,6 +44,21 @@ data class EvaluationLlmUsageQueryResult(
 )
 
 /**
+ * market-data gap により評価から外れた entity の summary。
+ *
+ * @param orderCount 除外 order 数
+ * @param decisionRunCount 除外 decision run 数
+ * @param positionCount 除外 position/trade 数
+ * @param reasons reason 別 entity 件数
+ */
+data class EvaluationExclusionSummary(
+    val orderCount: Int = 0,
+    val decisionRunCount: Int = 0,
+    val positionCount: Int = 0,
+    val reasons: Map<String, Int> = emptyMap(),
+)
+
+/**
  * DB から読み出した closed trade の評価用 fact。
  *
  * setup tag が複数ある trade は setup 別集計で各 tag へ重複計上する。

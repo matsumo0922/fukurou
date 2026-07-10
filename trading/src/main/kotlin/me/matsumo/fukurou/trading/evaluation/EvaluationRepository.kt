@@ -7,6 +7,11 @@ import java.time.Instant
  * 評価系が参照する DB 読み取り repository。
  */
 interface EvaluationRepository {
+    /** market-data gap による評価除外 summary を返す。 */
+    suspend fun fetchExclusionSummary(period: EvaluationPeriod): Result<EvaluationExclusionSummary> {
+        return Result.success(EvaluationExclusionSummary())
+    }
+
     /**
      * closed trade fact を取得する。
      */
@@ -58,6 +63,9 @@ interface EvaluationRepository {
  * unit test と in-memory runtime 用の空の評価 repository。
  */
 class InMemoryEvaluationRepository : EvaluationRepository {
+    override suspend fun fetchExclusionSummary(period: EvaluationPeriod): Result<EvaluationExclusionSummary> {
+        return Result.success(EvaluationExclusionSummary())
+    }
     override suspend fun fetchClosedTrades(period: EvaluationPeriod, limit: Int): Result<EvaluationTradeQueryResult> {
         return runCatching {
             require(limit > 0) {

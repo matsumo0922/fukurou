@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.config
 
 import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicWebSocketConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRateLimitConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
@@ -181,6 +182,12 @@ private fun nonDefaultRuntimeConfig(): TradingBotConfig {
                 maxBackoff = Duration.ofMillis(2500),
                 backoffMultiplier = 3,
             ),
+        ),
+        gmoPublicWebSocket = GmoPublicWebSocketConfig(
+            endpoint = "wss://example.invalid/fukurou-test",
+            connectTimeout = Duration.ofMillis(6100),
+            messageStaleTimeout = Duration.ofSeconds(31),
+            reconnectBackoff = Duration.ofMillis(2100),
         ),
     )
 }

@@ -18,6 +18,11 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
+import me.matsumo.fukurou.trading.market.MarketDataGapReason
+import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
+import me.matsumo.fukurou.trading.market.MarketEventStream
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
+import me.matsumo.fukurou.trading.market.UnavailableMarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -25,6 +30,7 @@ import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.util.UUID
 import java.util.logging.Logger
 import kotlin.time.DurationUnit
 import kotlin.time.toDuration
@@ -33,6 +39,9 @@ import kotlin.time.toDuration
  * ProtectionReconciler の lock owner 名。
  */
 private const val RECONCILER_LOCK_OWNER = "protection-reconciler"
+
+/** market event 適用時の global lock owner 名。 */
+private const val MARKET_EVENT_LOCK_OWNER = "paper-market-event"
 
 /**
  * worker 起動 audit の payload。
@@ -105,6 +114,9 @@ class ProtectionReconciler(
     private val commandEventLog: CommandEventLog,
     private val tradingLock: TradingLock,
     private val tickStream: TickStream = EmptyTickStream,
+    private val marketEventStream: MarketEventStream? = null,
+    private val marketDataIntegrityRepository: MarketDataIntegrityRepository =
+        UnavailableMarketDataIntegrityRepository,
     private val broker: Broker? = null,
     private val killCriterionEvaluator: KillCriterionEvaluator? = null,
     private val equitySnapshotRecorder: EquitySnapshotRecorder? = null,
@@ -130,6 +142,11 @@ class ProtectionReconciler(
             )
         }
 
+        if (marketEventStream != null) {
+            runMarketEventLoop(interval)
+            return
+        }
+
         while (currentCoroutineContext().isActive) {
             val startupResult = reconcileOnce(ReconcilePassKind.STARTUP_FULL)
 
@@ -153,6 +170,104 @@ class ProtectionReconciler(
                 logPassFailure(ReconcilePassKind.LOOP, throwable)
             }
         }
+    }
+
+    private suspend fun runMarketEventLoop(reconnectBackoff: Duration) {
+        while (currentCoroutineContext().isActive) {
+            val session = marketEventStream?.connect()?.getOrElse { throwable ->
+                logPassFailure(ReconcilePassKind.LOOP, throwable)
+                delay(reconnectBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
+                continue
+            } ?: return
+
+            val beginResult = marketDataIntegrityRepository.beginSession(session.sessionId, session.connectedAt)
+            if (beginResult.isFailure) {
+                session.close()
+                beginResult.exceptionOrNull()?.let { throwable -> logPassFailure(ReconcilePassKind.LOOP, throwable) }
+                delay(reconnectBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
+                continue
+            }
+            refreshMarketDataStatus()
+
+            try {
+                consumeMarketEventSession(session)
+            } finally {
+                session.close()
+            }
+
+            delay(reconnectBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
+        }
+    }
+
+    private suspend fun consumeMarketEventSession(session: me.matsumo.fukurou.trading.market.MarketEventSession) {
+        while (currentCoroutineContext().isActive) {
+            val eventResult = session.receive()
+            val event = eventResult.getOrNull()
+
+            if (event == null) {
+                recordMarketDataGap(
+                    sessionId = session.sessionId,
+                    throwable = eventResult.exceptionOrNull(),
+                )
+                refreshMarketDataStatus()
+                return
+            }
+
+            val applied = applyMarketEvent(event)
+            if (applied.isFailure) {
+                recordMarketDataGap(
+                    sessionId = session.sessionId,
+                    throwable = applied.exceptionOrNull(),
+                )
+                refreshMarketDataStatus()
+                return
+            }
+        }
+    }
+
+    private suspend fun recordMarketDataGap(sessionId: UUID, throwable: Throwable?) {
+        tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
+            marketDataIntegrityRepository.recordGap(
+                sessionId = sessionId,
+                reason = throwable.toGapReason(),
+                detectedAt = Instant.now(clock),
+                detail = throwable?.javaClass?.simpleName,
+            ).getOrThrow()
+        }
+    }
+
+    private suspend fun applyMarketEvent(event: PaperMarketTradeEvent): Result<Unit> {
+        return try {
+            tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
+                broker?.applyMarketEvent(event)?.getOrThrow()
+                equitySnapshotRecorder?.recordDailyIfNeeded()
+            }
+            refreshMarketDataStatus()
+            Result.success(Unit)
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            Result.failure(throwable)
+        }
+    }
+
+    private suspend fun refreshMarketDataStatus() {
+        val integrity = marketDataIntegrityRepository.snapshot().getOrThrow()
+        val reconciledAt = integrity.lastReceivedAt ?: status.snapshot().lastReconciledAt
+        status.updateMarketData(
+            ReconcilerStatus(
+                lastReconciledAt = reconciledAt,
+                startupFullReconcileCompleted = integrity.startupRecoveryCompleted,
+                lastMarketDataAt = integrity.lastReceivedAt,
+                marketDataState = integrity.state,
+                marketDataSessionId = integrity.sessionId,
+                lastProcessedSequence = integrity.lastProcessedSequence,
+                gapStartedAt = integrity.gapStartedAt,
+                recoveredAt = integrity.recoveredAt,
+                gapReason = integrity.gapReason,
+                startupRecoveryCompleted = integrity.startupRecoveryCompleted,
+            ),
+        )
     }
 
     /**
@@ -418,5 +533,21 @@ private fun ReconcilePassKind.payloadName(): String {
     return when (this) {
         ReconcilePassKind.STARTUP_FULL -> "startup_full"
         ReconcilePassKind.LOOP -> "loop"
+    }
+}
+
+private fun Throwable?.toGapReason(): MarketDataGapReason {
+    val message = this?.message.orEmpty()
+
+    return when {
+        this is kotlinx.coroutines.TimeoutCancellationException -> MarketDataGapReason.MESSAGE_STALE
+        message.contains("sequence gap", ignoreCase = true) -> MarketDataGapReason.SEQUENCE_GAP
+        message.contains("JSON", ignoreCase = true) || message.contains("WebSocket trade", ignoreCase = true) -> {
+            MarketDataGapReason.INVALID_MESSAGE
+        }
+        message.contains("database", ignoreCase = true) || this is java.sql.SQLException -> {
+            MarketDataGapReason.DATABASE_FAILURE
+        }
+        else -> MarketDataGapReason.DISCONNECTED
     }
 }

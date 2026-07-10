@@ -17,10 +17,12 @@ import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicWebSocketMarketEventStream
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedEquitySnapshotRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedMarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
@@ -68,7 +70,7 @@ private val WORKER_LOGGER = Logger.getLogger(ProtectionReconcilerWorker::class.j
 class ProtectionReconcilerWorker(
     private val reconciler: ProtectionReconciler,
     private val interval: Duration = DEFAULT_RECONCILER_INTERVAL,
-    private val bootstrap: () -> Result<Unit> = { Result.success(Unit) },
+    private val bootstrap: suspend () -> Result<Unit> = { Result.success(Unit) },
     clock: Clock = Clock.systemUTC(),
     private val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
         logger = WORKER_LOGGER,
@@ -141,13 +143,19 @@ internal fun startProtectionReconcilerWorker(
     return ProtectionReconcilerWorker(
         reconciler = reconciler,
         bootstrap = {
-            TradingPersistenceBootstrap(
+            val schemaResult = TradingPersistenceBootstrap(
                 database = database,
                 clock = clock,
                 paperAccountConfig = tradingConfig.paperAccount,
                 staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
                 onStaleLlmRunsRecovered = onStaleLlmRunsRecovered,
             ).ensureSchema()
+            if (schemaResult.isFailure) {
+                schemaResult
+            } else {
+                runtimeComponents.repositories.marketDataIntegrityRepository
+                    .recoverStaleSession(clock.instant())
+            }
         },
         clock = clock,
     ).start()
@@ -170,6 +178,11 @@ private fun ProtectionReconcilerWorkerInputs.createRuntimeComponents(): Protecti
         tradingLock = PostgresGlobalTradingLock(dataSource, clock),
         marketDataSource = marketDataSource,
         broker = broker,
+        marketEventStream = GmoPublicWebSocketMarketEventStream(
+            config = tradingConfig.gmoPublicWebSocket,
+            symbol = tradingConfig.symbol,
+            clock = clock,
+        ),
     )
 }
 
@@ -181,6 +194,7 @@ private fun ProtectionReconcilerWorkerInputs.createRepositories(): ProtectionRec
         riskStateCommandService = ExposedRiskStateCommandService(database, clock),
         safetyViolationRepository = ExposedSafetyViolationRepository(database),
         ledgerRepository = ExposedPaperLedgerRepository(database),
+        marketDataIntegrityRepository = ExposedMarketDataIntegrityRepository(database),
     )
 }
 
@@ -198,6 +212,7 @@ private fun ProtectionReconcilerWorkerInputs.createBroker(
         marketDataSource = marketDataSource,
         fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
         reconcilerStatusProvider = status,
+        requireRealtimeIntegrityForRestingOrders = true,
         clock = clock,
     )
 }
@@ -213,6 +228,8 @@ private fun ProtectionReconcilerRuntimeComponents.createReconciler(): Protection
             latestMarketQuoteStore = inputs.latestMarketQuoteStore,
             clock = inputs.clock,
         ),
+        marketEventStream = marketEventStream,
+        marketDataIntegrityRepository = repositories.marketDataIntegrityRepository,
         broker = broker,
         killCriterionEvaluator = KillCriterionEvaluator(
             config = inputs.tradingConfig.killCriterion,
@@ -269,6 +286,7 @@ private data class ProtectionReconcilerRepositories(
     val riskStateCommandService: ExposedRiskStateCommandService,
     val safetyViolationRepository: ExposedSafetyViolationRepository,
     val ledgerRepository: ExposedPaperLedgerRepository,
+    val marketDataIntegrityRepository: ExposedMarketDataIntegrityRepository,
 )
 
 /**
@@ -286,4 +304,5 @@ private data class ProtectionReconcilerRuntimeComponents(
     val tradingLock: PostgresGlobalTradingLock,
     val marketDataSource: GmoPublicMarketDataSource,
     val broker: PaperBroker,
+    val marketEventStream: GmoPublicWebSocketMarketEventStream,
 )

@@ -443,6 +443,12 @@ object PositionsTable : Table("positions") {
      */
     val marketSnapshotId = varchar("market_snapshot_id", length = 128).nullable()
 
+    /** position 管理 event の接続 session ID。 */
+    val marketDataSessionId = uuid("market_data_session_id").nullable()
+
+    /** position 管理に使える最小 event sequence の直前値。 */
+    val marketEligibleAfterSequence = long("market_eligible_after_sequence").nullable()
+
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -586,6 +592,25 @@ object OrdersTable : Table("orders") {
     /** 取消を実行した decision run ID。 */
     val canceledByDecisionRunId = varchar("canceled_by_decision_run_id", length = 128).nullable()
 
+    /** LIMIT 作成時点で先行する queue 数量。 */
+    val queueAheadBtc = decimal("queue_ahead_btc", precision = 24, scale = 12).nullable()
+
+    /** realtime SELL event で消化した queue 数量。 */
+    val queueConsumedBtc = decimal("queue_consumed_btc", precision = 24, scale = 12).nullable()
+
+    /** queue snapshot の取得時刻。 */
+    val queueSnapshotAt = long("queue_snapshot_at").nullable()
+
+    /** 注文を作成した market-data session ID。 */
+    val marketDataSessionId = uuid("market_data_session_id").nullable()
+
+    /** 注文作成時点の処理済み sequence。 */
+    val marketEligibleAfterSequence = long("market_eligible_after_sequence").nullable()
+
+    /** 注文が realtime event を受理できる時刻境界。 */
+    val marketEligibleFrom = long("market_eligible_from").nullable()
+
+
     /**
      * 作成時刻。epoch millis で保存する。
      */
@@ -697,6 +722,65 @@ object ExecutionsTable : Table("executions") {
      * market snapshot ID。
      */
     val marketSnapshotId = varchar("market_snapshot_id", length = 128).nullable()
+
+    /** 約定根拠の market-data session ID。 */
+    val sourceSessionId = uuid("source_session_id").nullable()
+
+    /** 約定根拠の local sequence。 */
+    val sourceSequence = long("source_sequence").nullable()
+
+    /** 約定根拠の取引所時刻。 */
+    val sourceExchangeAt = long("source_exchange_at").nullable()
+
+    /** 約定根拠の受信時刻。 */
+    val sourceReceivedAt = long("source_received_at").nullable()
+
+    /** 約定根拠の trade side。 */
+    val sourceSide = varchar("source_side", length = 8).nullable()
+
+    /** 約定根拠の trade price。 */
+    val sourcePriceJpy = decimal("source_price_jpy", precision = 24, scale = 8).nullable()
+
+    /** 約定根拠の trade size。 */
+    val sourceSizeBtc = decimal("source_size_btc", precision = 24, scale = 12).nullable()
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** paper execution 用 WebSocket 接続 session。 */
+object MarketDataSessionsTable : Table("market_data_sessions") {
+    val id = uuid("id")
+    val state = varchar("state", length = 32)
+    val connectedAt = long("connected_at")
+    val disconnectedAt = long("disconnected_at").nullable()
+    val lastProcessedSequence = long("last_processed_sequence").default(0)
+    val lastReceivedAt = long("last_received_at").nullable()
+    val disconnectReason = varchar("disconnect_reason", length = 64).nullable()
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** market-data gap の監査記録。 */
+object MarketDataGapsTable : Table("market_data_gaps") {
+    val id = uuid("id")
+    val sessionId = uuid("session_id").references(MarketDataSessionsTable.id)
+    val reason = varchar("reason", length = 64)
+    val detail = text("detail").nullable()
+    val startedAt = long("started_at")
+    val impactAppliedAt = long("impact_applied_at").nullable()
+    val recoveredAt = long("recovered_at").nullable()
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** infrastructure failure により戦略評価から外す entity。 */
+object EvaluationExclusionsTable : Table("evaluation_exclusions") {
+    val id = uuid("id")
+    val gapId = uuid("gap_id").references(MarketDataGapsTable.id)
+    val entityType = varchar("entity_type", length = 32)
+    val entityId = varchar("entity_id", length = 128)
+    val reason = varchar("reason", length = 64)
+    val createdAt = long("created_at")
 
     override val primaryKey = PrimaryKey(id)
 }

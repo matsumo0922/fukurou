@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.evaluation.BenchmarkResult
 import me.matsumo.fukurou.trading.evaluation.CalibrationBinStats
 import me.matsumo.fukurou.trading.evaluation.CalibrationGroupStats
 import me.matsumo.fukurou.trading.evaluation.DecisionRunRateStats
+import me.matsumo.fukurou.trading.evaluation.EvaluationExclusionSummary
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
@@ -100,6 +101,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         val tradeResult = evaluationRepository.fetchClosedTrades(period).getOrThrow()
         val runCount = evaluationRepository.countDecisionRuns(period).getOrThrow()
         val actionCounts = evaluationRepository.countDecisionsByAction(period).getOrThrow()
+        val exclusionSummary = evaluationRepository.fetchExclusionSummary(period).getOrThrow()
         val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
         val riskState = evaluationRiskStateRepository.current().getOrThrow()
         val candles = call.fetchDailyCandlesOrEmpty(
@@ -121,6 +123,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
                     hardHalt = riskState.state == RiskHaltState.HARD_HALT,
                 ),
                 runRates = EvaluationRunRatesResponse.fromStats(EvaluationMath.decisionRunRates(runCount, actionCounts)),
+                exclusions = exclusionSummary.toResponse(),
                 marketRegimes = EvaluationMath.summarizeByMarketRegime(
                     trades = tradeResult.trades,
                     regimes = regimes,
@@ -130,7 +133,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         )
     }.describe {
         summary = "評価サマリーを取得する"
-        description = "closed trade の PF、勝率、期待 R、MAE/MFE、行動率、entry rate、相場局面別成績を返します。"
+        description = "market-data gap の評価除外を適用した PF、勝率、期待 R、行動率、相場局面別成績と除外理由を返します。"
         tag(EVALUATION_TAG)
         responses {
             HttpStatusCode.OK {
@@ -507,8 +510,27 @@ data class EvaluationSummaryResponse(
     val performance: EvaluationPerformanceResponse,
     val killCriterion: EvaluationKillCriterionResponse,
     val runRates: EvaluationRunRatesResponse,
+    val exclusions: EvaluationExclusionSummaryResponse = EvaluationExclusionSummaryResponse(),
     val marketRegimes: List<EvaluationMarketRegimeResponse>,
 )
+
+/** market-data gap による評価除外 summary。 */
+@Serializable
+data class EvaluationExclusionSummaryResponse(
+    val orderCount: Int = 0,
+    val decisionRunCount: Int = 0,
+    val tradeCount: Int = 0,
+    val reasons: Map<String, Int> = emptyMap(),
+)
+
+private fun EvaluationExclusionSummary.toResponse(): EvaluationExclusionSummaryResponse {
+    return EvaluationExclusionSummaryResponse(
+        orderCount = orderCount,
+        decisionRunCount = decisionRunCount,
+        tradeCount = positionCount,
+        reasons = reasons,
+    )
+}
 
 /**
  * kill 基準への近接度レスポンス。
