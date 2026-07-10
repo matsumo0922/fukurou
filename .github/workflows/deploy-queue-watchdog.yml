@@ -54,6 +54,9 @@ jobs:
               continue
             fi
 
+            # label が未登録だと issue create が失敗するため、既存でも失敗しない形で用意する。
+            gh label create ops-alert --color B60205 --description "デプロイ pipeline の運用アラート" 2>/dev/null || true
+
             body="$(printf 'run_id:%s\nrun URL: https://github.com/%s/actions/runs/%s\n\nDeploy on NAS job が %s 分経過しても開始していません。self-hosted runner (dxp4800plus-fukurou-prod / label fukurou-prod) の稼働状況と https://www.githubstatus.com/ を確認してください。' \
               "${run_id}" "${REPOSITORY}" "${run_id}" "${age_minutes}")"
 
