@@ -307,14 +307,16 @@ private fun Route.registerEvaluationCostsRoute(dependencies: EvaluationRouteDepe
                 truncated = usageResult.truncated,
                 phaseCount = costs.phaseCount,
                 missingUsagePhaseCount = costs.missingUsagePhaseCount,
-                totalCostUsd = costs.totalCostUsd.toDecimalString(),
+                unpricedPhaseCount = costs.unpricedPhaseCount,
+                unattributedTokenPhaseCount = costs.unattributedTokenPhaseCount,
+                knownCostUsd = costs.knownCostUsd?.toDecimalString(),
                 byProvider = costs.byProvider.map { stats -> EvaluationProviderCostResponse.fromStats(stats) },
                 byModel = costs.byModel.map { stats -> EvaluationModelTokenResponse.fromStats(stats) },
             ),
         )
     }.describe {
         summary = "LLM cost と usage を取得する"
-        description = "runner phase audit に保存された Claude usage を集計し、usage 欠落 phase 数も返します。"
+        description = "runner phase audit に保存された provider usage と取得済み cost を集計し、usage・cost・model attribution の coverage を返します。"
         tag(EVALUATION_TAG)
         responses {
             HttpStatusCode.OK {
@@ -850,7 +852,9 @@ data class EvaluationBenchmarkReturnResponse(
  * @param truncated phase usage fact が取得上限で切り詰められたか
  * @param phaseCount phase 数
  * @param missingUsagePhaseCount usage 欠落 phase 数
- * @param totalCostUsd 合計 cost USD
+ * @param unpricedPhaseCount monetary cost 未取得 phase 数
+ * @param unattributedTokenPhaseCount model attribution 欠落 phase 数
+ * @param knownCostUsd 取得済み cost の合計 USD。全 phase で未取得なら null
  * @param byProvider provider 別 cost
  * @param byModel model 別 token
  */
@@ -860,7 +864,9 @@ data class EvaluationCostsResponse(
     val truncated: Boolean,
     val phaseCount: Int,
     val missingUsagePhaseCount: Int,
-    val totalCostUsd: String,
+    val unpricedPhaseCount: Int,
+    val unattributedTokenPhaseCount: Int,
+    val knownCostUsd: String?,
     val byProvider: List<EvaluationProviderCostResponse>,
     val byModel: List<EvaluationModelTokenResponse>,
 )
@@ -869,24 +875,30 @@ data class EvaluationCostsResponse(
  * provider 別 cost レスポンス。
  *
  * @param provider provider 名
- * @param totalCostUsd 合計 cost USD
+ * @param knownCostUsd 取得済み cost の合計 USD。全 phase で未取得なら null
  * @param phaseCount phase 数
  * @param missingUsagePhaseCount usage 欠落 phase 数
+ * @param unpricedPhaseCount monetary cost 未取得 phase 数
+ * @param unattributedTokenPhaseCount model attribution 欠落 phase 数
  */
 @Serializable
 data class EvaluationProviderCostResponse(
     val provider: String,
-    val totalCostUsd: String,
+    val knownCostUsd: String?,
     val phaseCount: Int,
     val missingUsagePhaseCount: Int,
+    val unpricedPhaseCount: Int,
+    val unattributedTokenPhaseCount: Int,
 ) {
     companion object {
         fun fromStats(stats: LlmProviderCostStats): EvaluationProviderCostResponse {
             return EvaluationProviderCostResponse(
                 provider = stats.provider,
-                totalCostUsd = stats.totalCostUsd.toDecimalString(),
+                knownCostUsd = stats.knownCostUsd?.toDecimalString(),
                 phaseCount = stats.phaseCount,
                 missingUsagePhaseCount = stats.missingUsagePhaseCount,
+                unpricedPhaseCount = stats.unpricedPhaseCount,
+                unattributedTokenPhaseCount = stats.unattributedTokenPhaseCount,
             )
         }
     }
@@ -898,6 +910,7 @@ data class EvaluationProviderCostResponse(
  * @param model model 名
  * @param inputTokens input token 数
  * @param outputTokens output token 数
+ * @param reasoningOutputTokens output token のうち reasoning token 数
  * @param cacheCreationInputTokens cache 作成 input token 数
  * @param cacheReadInputTokens cache read input token 数
  */
@@ -906,6 +919,7 @@ data class EvaluationModelTokenResponse(
     val model: String,
     val inputTokens: Long,
     val outputTokens: Long,
+    val reasoningOutputTokens: Long,
     val cacheCreationInputTokens: Long,
     val cacheReadInputTokens: Long,
 ) {
@@ -915,6 +929,7 @@ data class EvaluationModelTokenResponse(
                 model = stats.model,
                 inputTokens = stats.inputTokens,
                 outputTokens = stats.outputTokens,
+                reasoningOutputTokens = stats.reasoningOutputTokens,
                 cacheCreationInputTokens = stats.cacheCreationInputTokens,
                 cacheReadInputTokens = stats.cacheReadInputTokens,
             )

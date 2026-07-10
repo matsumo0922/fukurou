@@ -1329,7 +1329,9 @@ kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `K
 
 benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は期間開始時点の paper equity（paper 初期資金 + 期間開始前の累計 realized trade PnL）とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
 
-LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`pre_filter` / `proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、保存済み `details.usage` がない過去行は redacted `details.stdout` から可能な範囲で fallback parse する。Codex phase や parse 不能 phase は usage 欠落として数える。取得は既定 20,000 行で bounded にし、超過時は `/evaluation/costs` の `truncated` で示す。
+LLM cost / usage は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`pre_filter` / `proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON では `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage`、Codex JSONL では invocation 単位の `turn.completed.usage` を best-effort で抽出する。Codex の `reasoning_output_tokens` は `output_tokens` の内数として別に保持し、token 合計へ二重加算しない。Codex の model は同じ thread ID を持つ invocation 日の session JSONL だけから解決し、session がない場合も semantic response と token usage は維持する。保存済み `details.usage` がない過去の Claude 行は redacted `details.stdout` から可能な範囲で fallback parse する。
+
+`/evaluation/costs` は usage 欠落の `missingUsagePhaseCount`、monetary cost 未取得の `unpricedPhaseCount`、token を model に帰属できない `unattributedTokenPhaseCount` を分けて返す。取得済み金額だけを nullable な `knownCostUsd` として合計し、全 phase で cost 未取得なら null とする。Web UI と Reflection report は未知の cost を `$0` や完全な total として表示しない。取得は既定 20,000 行で bounded にし、超過時は `truncated` で示す。
 
 ## 6. 発火エンジンと呼び出しモデル（A-7）
 
