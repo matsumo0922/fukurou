@@ -191,6 +191,8 @@ Access policy は `/app/*` と `/ops/*` を対象にし、runtime config draft /
 
 ## Runtime source kind 移行 deploy
 
+削除条件: production の source kind 移行完了後にこの節を削除する。
+
 LLM model override と Reflection Runner 設定を NAS `.env` から Runtime group へ移す code を deploy する場合、既存値は catalog default へ自動移行されない。移行中に CLI 既定 model で daemon が動かないよう、deploy 前に WebUI `/app/config` で現在の `daemon.enabled` を控え、`daemon.enabled=false` の draft を active 化する。
 
 続けて、NAS `.env` に設定されている次の値を deploy 作業用の記録へ控える。未設定の項目は catalog default を採用するか、Runtime group へ明示値を設定するかを deploy 前に決める。
