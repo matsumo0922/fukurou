@@ -50,6 +50,7 @@ export const DECISION_RUN_OUTCOME_FILTERS = [
   "RUNNING",
   "FAILED",
 ] as const satisfies readonly DecisionRunOutcomeFilter[];
+export const DECISION_RUN_PAGE_LIMIT = 50;
 
 export type LlmAuthProvider = "claude" | "codex";
 export type ActivityTimelineSource = "audit" | "decision" | "execution";
@@ -135,12 +136,12 @@ export const opsActivityCatalogQuery = queryOptions({
   staleTime: 300_000,
 });
 
-export const opsDecisionRunsQuery = queryOptions({
-  queryKey: ["ops", "decision-runs"],
-  queryFn: () => getJson("/ops/runs?limit=100"),
-  staleTime: 15_000,
-  refetchInterval: 30_000,
-});
+export async function fetchDecisionRuns(before?: string | null): Promise<OpsDecisionRunsResponse> {
+  const searchParams = new URLSearchParams({ limit: String(DECISION_RUN_PAGE_LIMIT) });
+  if (before) searchParams.set("before", before);
+
+  return getJson(`/ops/runs?${searchParams.toString()}`);
+}
 
 export function opsDecisionRunDetailQuery(invocationId: string | null) {
   return queryOptions({

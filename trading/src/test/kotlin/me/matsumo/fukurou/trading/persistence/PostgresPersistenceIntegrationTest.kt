@@ -1095,7 +1095,9 @@ class PostgresPersistenceIntegrationTest {
 
     @Test
     fun decisionRunProjectionJoinsDeniedRunWithoutExposingAuditPayload() = runPostgresTest {
-        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        bootstrap.verifySchema().getOrThrow()
         val llmRunRepository = ExposedLlmRunRepository(database)
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val decisionResult = decisionRepository.submitDecision(enterDecisionSubmission()).getOrThrow()
@@ -1147,6 +1149,23 @@ class PostgresPersistenceIntegrationTest {
                 createdAt = fixedInstant().plusSeconds(8),
             ),
         ).getOrThrow()
+        ExposedCommandEventLog(database).append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = "run-1",
+                    llmProvider = "claude",
+                    promptHash = "prompt-hash",
+                    systemPromptVersion = "system-prompt-v1",
+                    marketSnapshotId = "snapshot-1",
+                ),
+                toolName = "runner",
+                toolCallId = null,
+                clientRequestId = null,
+                eventType = CommandEventType.NO_TRADE_EXIT,
+                payload = """{"reason":"preview_order_rejected","credential":"must-not-leak"}""",
+                occurredAt = fixedInstant().plusSeconds(9),
+            ),
+        ).getOrThrow()
 
         val repository = ExposedDecisionRunProjectionRepository(database)
         val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().single()
@@ -1156,9 +1175,52 @@ class PostgresPersistenceIntegrationTest {
         assertEquals("APPROVED", summary.falsificationVerdict)
         assertEquals("EXPECTED_VALUE_GATE", detail.safetyViolation?.rule)
         assertEquals("0.03357778", detail.safetyViolation?.measuredValue)
+        assertEquals("preview_order_rejected", summary.finalReason)
+        assertEquals("preview_order_rejected", detail.summary.finalReason)
+        assertEquals("[\"breakout\",\"trend-follow\"]", detail.intent?.setupTagsJson)
+        assertEquals("1時間足の上昇継続に乗る。", detail.intent?.thesisJa)
+        assertEquals(0, detail.intent?.revisionCount)
         assertEquals(0, detail.orders.size)
         assertEquals(0, detail.executions.size)
         assertTrue(detail.raw.none { raw -> raw.values.values.any { value -> value?.contains("must-not-leak") == true } })
+    }
+
+    @Test
+    fun decisionRunProjectionExcludesReflectionAndFailsTerminalRunWithoutEvidence() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        listOf(
+            LlmDaemonTriggerKind.REFLECTION to "reflection-run",
+            LlmDaemonTriggerKind.ECONOMIC_EVENT to "empty-terminal-run",
+        ).forEach { (triggerKind, invocationId) ->
+            val start = LlmRunStart(
+                invocationId = invocationId,
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = triggerKind,
+                startedAt = fixedInstant(),
+            )
+            llmRunRepository.insertRunning(start).getOrThrow()
+            llmRunRepository.finish(
+                LlmRunFinish(
+                    invocationId = invocationId,
+                    mode = start.mode,
+                    symbol = start.symbol,
+                    triggerKind = triggerKind,
+                    status = "SUCCEEDED",
+                    startedAt = start.startedAt,
+                    finishedAt = fixedInstant().plusSeconds(10),
+                    errorMessage = null,
+                ),
+            ).getOrThrow()
+        }
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val summaries = repository.listRuns(cursor = null, limit = 10).getOrThrow()
+
+        assertEquals(listOf("empty-terminal-run"), summaries.map { summary -> summary.invocationId })
+        assertEquals(DecisionRunOutcome.FAILED, summaries.single().outcome)
+        assertNull(repository.findRun("reflection-run").getOrThrow())
     }
 
     @Test

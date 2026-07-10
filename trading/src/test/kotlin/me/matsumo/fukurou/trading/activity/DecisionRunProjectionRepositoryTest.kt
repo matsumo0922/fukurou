@@ -66,6 +66,13 @@ class DecisionRunProjectionRepositoryTest {
             classifyDecisionRunOutcome(outcomeEvidence(action = "ENTER", orderCount = 1)),
         )
     }
+
+    @Test
+    fun terminalRunWithoutDecisionOrExecutionEvidenceIsFailed() {
+        val outcome = classifyDecisionRunOutcome(outcomeEvidence())
+
+        assertEquals(DecisionRunOutcome.FAILED, outcome)
+    }
 }
 
 private fun outcomeEvidence(

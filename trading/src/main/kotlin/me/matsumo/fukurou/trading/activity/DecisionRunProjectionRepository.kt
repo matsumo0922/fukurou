@@ -36,7 +36,7 @@ fun classifyDecisionRunOutcome(evidence: DecisionRunOutcomeEvidence): DecisionRu
         evidence.status == "FAILED" || evidence.status == "CANCELLED" -> DecisionRunOutcome.FAILED
         evidence.action == "NO_TRADE" || evidence.hasNoTradeExit -> DecisionRunOutcome.NO_TRADE
         evidence.orderCount > 0 || evidence.executionCount > 0 -> DecisionRunOutcome.EXECUTED
-        else -> DecisionRunOutcome.NO_TRADE
+        else -> DecisionRunOutcome.FAILED
     }
 }
 
@@ -61,6 +61,7 @@ data class DecisionRunSummary(
     val falsificationVerdict: String?,
     val safetyRule: String?,
     val safetyMessageJa: String?,
+    val finalReason: String?,
     val orderCount: Int,
     val executionCount: Int,
     val outcome: DecisionRunOutcome,
@@ -85,6 +86,8 @@ data class DecisionRunDecision(
 data class DecisionRunIntent(
     val intentId: String,
     val tradePlanId: String,
+    val parentTradePlanId: String?,
+    val revisionCount: Int,
     val side: String,
     val orderType: String,
     val sizeBtc: String,
@@ -95,6 +98,7 @@ data class DecisionRunIntent(
     val invalidationConditionsJaJson: String?,
     val targetPriceJpy: String?,
     val timeStopAt: Instant?,
+    val setupTagsJson: String?,
 )
 
 /** decision run の Falsifier projection。 */

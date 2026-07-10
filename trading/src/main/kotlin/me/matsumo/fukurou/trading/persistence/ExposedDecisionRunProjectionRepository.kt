@@ -2,6 +2,10 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunDetail
@@ -21,7 +25,17 @@ import java.time.Instant
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
+private val SAFE_FINAL_REASON_PATTERN = Regex("[a-z][a-z0-9_]{0,79}")
+
 private const val LIST_RUNS_SQL = """
+    WITH candidate_runs AS (
+        SELECT invocation_id, mode, symbol, trigger_kind, status, started_at, finished_at, error_message
+        FROM llm_runs
+        WHERE trigger_kind IS DISTINCT FROM 'REFLECTION'
+            AND (CAST(? AS BIGINT) IS NULL OR started_at < ? OR (started_at = ? AND invocation_id < ?))
+        ORDER BY started_at DESC, invocation_id DESC
+        LIMIT ?
+    )
     SELECT
         run.invocation_id,
         run.mode,
@@ -36,13 +50,10 @@ private const val LIST_RUNS_SQL = """
         falsification.verdict,
         safety.rule,
         safety.message_ja,
-        (SELECT COUNT(*) FROM orders WHERE decision_run_id = run.invocation_id) AS order_count,
-        (SELECT COUNT(*) FROM executions WHERE decision_run_id = run.invocation_id) AS execution_count,
-        EXISTS (
-            SELECT 1 FROM command_event_log
-            WHERE decision_run_id = run.invocation_id AND event_type = 'NO_TRADE_EXIT'
-        ) AS has_no_trade_exit
-    FROM llm_runs run
+        order_count.value AS order_count,
+        execution_count.value AS execution_count,
+        no_trade.payload AS no_trade_payload
+    FROM candidate_runs run
     LEFT JOIN LATERAL (
         SELECT id, action, reason_ja
         FROM decisions
@@ -65,9 +76,25 @@ private const val LIST_RUNS_SQL = """
         ORDER BY created_at DESC, id DESC
         LIMIT 1
     ) safety ON TRUE
-    WHERE (CAST(? AS BIGINT) IS NULL OR run.started_at < ? OR (run.started_at = ? AND run.invocation_id < ?))
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*)::INT AS value
+        FROM orders
+        WHERE decision_run_id = run.invocation_id
+    ) order_count ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*)::INT AS value
+        FROM executions
+        WHERE decision_run_id = run.invocation_id
+    ) execution_count ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT payload
+        FROM command_event_log
+        WHERE decision_run_id = run.invocation_id
+            AND event_type = 'NO_TRADE_EXIT'
+        ORDER BY ts DESC, id DESC
+        LIMIT 1
+    ) no_trade ON TRUE
     ORDER BY run.started_at DESC, run.invocation_id DESC
-    LIMIT ?
 """
 
 private const val FIND_RUN_SQL = """
@@ -99,10 +126,13 @@ private const val FIND_RUN_SQL = """
         intent.price_jpy AS intent_price_jpy,
         intent.protective_stop_price_jpy,
         intent.take_profit_price_jpy,
+        plan.parent_trade_plan_id,
+        plan.revision_count,
         plan.thesis_ja,
         plan.invalidation_conditions_ja,
         plan.target_price_jpy,
         plan.time_stop_at,
+        plan.setup_tags AS plan_setup_tags,
         falsification.verdict,
         falsification.llm_provider AS falsification_provider,
         falsification.reason_ja AS falsification_reason_ja,
@@ -114,10 +144,7 @@ private const val FIND_RUN_SQL = """
         safety.created_at AS safety_created_at,
         (SELECT COUNT(*) FROM orders WHERE decision_run_id = run.invocation_id) AS order_count,
         (SELECT COUNT(*) FROM executions WHERE decision_run_id = run.invocation_id) AS execution_count,
-        EXISTS (
-            SELECT 1 FROM command_event_log
-            WHERE decision_run_id = run.invocation_id AND event_type = 'NO_TRADE_EXIT'
-        ) AS has_no_trade_exit
+        no_trade.payload AS no_trade_payload
     FROM llm_runs run
     LEFT JOIN LATERAL (
         SELECT * FROM decisions
@@ -144,7 +171,16 @@ private const val FIND_RUN_SQL = """
         ORDER BY created_at DESC, id DESC
         LIMIT 1
     ) safety ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT payload
+        FROM command_event_log
+        WHERE decision_run_id = run.invocation_id
+            AND event_type = 'NO_TRADE_EXIT'
+        ORDER BY ts DESC, id DESC
+        LIMIT 1
+    ) no_trade ON TRUE
     WHERE run.invocation_id = ?
+        AND run.trigger_kind IS DISTINCT FROM 'REFLECTION'
 """
 
 private const val FIND_ORDERS_SQL = """
@@ -307,7 +343,7 @@ private fun ResultSet.toSummary(): DecisionRunSummary {
     val executionCount = getInt("execution_count")
     val status = getString("status")
     val errorMessage = getString("error_message")
-    val hasNoTradeExit = getBoolean("has_no_trade_exit")
+    val noTradePayload = getString("no_trade_payload")
 
     return DecisionRunSummary(
         invocationId = getString("invocation_id"),
@@ -323,6 +359,7 @@ private fun ResultSet.toSummary(): DecisionRunSummary {
         falsificationVerdict = getString("verdict"),
         safetyRule = safetyRule,
         safetyMessageJa = getString("message_ja"),
+        finalReason = noTradePayload.safeNoTradeReason(),
         orderCount = orderCount,
         executionCount = executionCount,
         outcome = classifyDecisionRunOutcome(
@@ -333,7 +370,7 @@ private fun ResultSet.toSummary(): DecisionRunSummary {
                 safetyRule = safetyRule,
                 orderCount = orderCount,
                 executionCount = executionCount,
-                hasNoTradeExit = hasNoTradeExit,
+                hasNoTradeExit = noTradePayload != null,
             ),
         ),
     )
@@ -390,6 +427,8 @@ private fun ResultSet.toIntent(): DecisionRunIntent? {
         DecisionRunIntent(
             intentId = it,
             tradePlanId = getString("trade_plan_id"),
+            parentTradePlanId = getString("parent_trade_plan_id"),
+            revisionCount = getInt("revision_count"),
             side = getString("intent_side"),
             orderType = getString("intent_order_type"),
             sizeBtc = getString("intent_size_btc"),
@@ -400,6 +439,7 @@ private fun ResultSet.toIntent(): DecisionRunIntent? {
             invalidationConditionsJaJson = getString("invalidation_conditions_ja"),
             targetPriceJpy = getString("target_price_jpy"),
             timeStopAt = nullableInstant("time_stop_at"),
+            setupTagsJson = getString("plan_setup_tags"),
         )
     }
 }
@@ -432,6 +472,15 @@ private fun ResultSet.toSafetyViolation(): DecisionRunSafetyViolation? {
 private fun ResultSet.nullableInstant(column: String): Instant? {
     val millis = getLong(column)
     return if (wasNull()) null else Instant.ofEpochMilli(millis)
+}
+
+private fun String?.safeNoTradeReason(): String? {
+    if (this == null) return null
+
+    return runCatching {
+        Json.parseToJsonElement(this).jsonObject["reason"]?.jsonPrimitive?.contentOrNull
+            ?.takeIf(SAFE_FINAL_REASON_PATTERN::matches)
+    }.getOrNull()
 }
 
 private fun DecisionRunOrder.toRawRecord(): DecisionRunRawRecord {

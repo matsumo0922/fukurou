@@ -1,13 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right.mjs";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import X from "lucide-react/dist/esm/icons/x.mjs";
 import {
   DECISION_RUN_FILTER_STORAGE_KEY,
   DECISION_RUN_OUTCOME_FILTERS,
+  fetchDecisionRuns,
   opsDecisionRunDetailQuery,
-  opsDecisionRunsQuery,
   type DecisionRunOutcomeFilter,
   type OpsDecisionRunDetailResponse,
   type OpsDecisionRunSummaryResponse,
@@ -20,15 +20,30 @@ import { describeError, formatDateTime } from "../ui/format";
 export function ActivityPage() {
   const [filter, setFilter] = useState<DecisionRunOutcomeFilter>(loadRunFilter);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const runsQuery = useQuery(opsDecisionRunsQuery);
+  const selectedRunButtonRef = useRef<HTMLButtonElement | null>(null);
+  const runsQuery = useInfiniteQuery({
+    queryKey: ["ops", "decision-runs"],
+    queryFn: ({ pageParam }) => fetchDecisionRuns(pageParam),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.nextBefore ?? undefined,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  });
   const { locale, t } = useI18n();
-  const runs = useMemo(() => runsQuery.data?.runs ?? [], [runsQuery.data?.runs]);
+  const runs = useMemo(
+    () => deduplicateRuns(runsQuery.data?.pages.flatMap((page) => page.runs) ?? []),
+    [runsQuery.data?.pages],
+  );
   const visibleRuns = useMemo(
     () => runs.filter((run) => filter === "ALL" || run.outcome === filter),
     [filter, runs],
   );
   const activeSelectedId = selectedId && visibleRuns.some((run) => run.invocationId === selectedId) ? selectedId : null;
   const detailQuery = useQuery(opsDecisionRunDetailQuery(activeSelectedId));
+  const closeDetail = useCallback(() => {
+    setSelectedId(null);
+    window.setTimeout(() => selectedRunButtonRef.current?.focus(), 0);
+  }, []);
 
   useEffect(() => {
     window.localStorage.setItem(DECISION_RUN_FILTER_STORAGE_KEY, filter);
@@ -88,18 +103,32 @@ export function ActivityPage() {
                 <RunRow
                   run={run}
                   selected={run.invocationId === activeSelectedId}
-                  selectedChanged={() => setSelectedId(run.invocationId)}
+                  selectedChanged={(button) => {
+                    selectedRunButtonRef.current = button;
+                    setSelectedId(run.invocationId);
+                  }}
                   key={run.invocationId}
                 />
               ))
             )}
+            {runsQuery.hasNextPage ? (
+              <button
+                className="run-load-more"
+                type="button"
+                disabled={runsQuery.isFetchingNextPage}
+                onClick={() => void runsQuery.fetchNextPage()}
+              >
+                {runsQuery.isFetchingNextPage ? t("activity.runs.loadingOlder") : t("activity.runs.loadOlder")}
+              </button>
+            ) : null}
+            {runsQuery.isFetchNextPageError ? <p className="run-detail-notice--error">{t("activity.runs.errorOlder")}</p> : null}
           </main>
           {activeSelectedId ? (
             <RunDetailPane
               detail={detailQuery.data ?? null}
               isPending={detailQuery.isPending}
               error={detailQuery.error}
-              closed={() => setSelectedId(null)}
+              closed={closeDetail}
             />
           ) : null}
         </div>
@@ -115,7 +144,7 @@ function RunRow({
 }: {
   run: OpsDecisionRunSummaryResponse;
   selected: boolean;
-  selectedChanged: () => void;
+  selectedChanged: (button: HTMLButtonElement) => void;
 }) {
   const { locale, t } = useI18n();
 
@@ -125,7 +154,7 @@ function RunRow({
       type="button"
       aria-selected={selected}
       data-outcome={run.outcome}
-      onClick={selectedChanged}
+      onClick={(event) => selectedChanged(event.currentTarget)}
     >
       <span className="decision-run-row__rail"><span className="decision-run-row__dot" /></span>
       <span className="decision-run-card">
@@ -142,7 +171,7 @@ function RunRow({
           <code>{run.triggerKind ?? "MANUAL"}</code>
         </span>
         <span className="decision-run-card__reason">
-          {run.safetyMessageJa ?? run.errorMessage ?? run.reasonJa ?? t("activity.runs.reason.none")}
+          {runSummaryReason(run) ?? t("activity.runs.reason.none")}
         </span>
         <span className="decision-run-card__facts">
           <span>{t("activity.runs.fact.verifier")} <strong>{run.falsificationVerdict ?? "—"}</strong></span>
@@ -180,7 +209,7 @@ function RunDetailPane({
   }, [closed]);
 
   return (
-    <aside className="decision-run-detail" role="dialog" aria-modal="false" aria-label={t("activity.runs.detail.aria")}>
+    <aside className="decision-run-detail" aria-label={t("activity.runs.detail.aria")}>
       <header className="decision-run-detail__header">
         <span className="decision-run-detail__eyebrow">Decision run</span>
         {detail ? (
@@ -246,17 +275,24 @@ function RunDetailContent({
         ]} />
       </DetailSection>
 
-      {intent ? (
-        <DetailSection index="03" title={t("activity.runs.section.intent")}>
-          <FactGrid facts={[
-            [t("activity.runs.label.order"), `${intent.side} ${intent.orderType}`],
-            [t("activity.runs.label.size"), `${intent.sizeBtc} BTC`],
-            [t("activity.runs.label.price"), intent.priceJpy],
-            [t("activity.runs.label.stop"), intent.protectiveStopPriceJpy],
-            [t("activity.runs.label.thesis"), intent.thesisJa, true],
-          ]} />
-        </DetailSection>
-      ) : null}
+      <DetailSection index="03" title={t("activity.runs.section.intent")}>
+        <FactGrid facts={[
+          [t("activity.runs.label.intentId"), intent?.intentId],
+          [t("activity.runs.label.tradePlanId"), intent?.tradePlanId],
+          [t("activity.runs.label.revision"), intent ? String(intent.revisionCount) : null],
+          [t("activity.runs.label.parentPlan"), intent?.parentTradePlanId],
+          [t("activity.runs.label.order"), intent ? `${intent.side} ${intent.orderType}` : null],
+          [t("activity.runs.label.size"), intent ? `${intent.sizeBtc} BTC` : null],
+          [t("activity.runs.label.price"), intent?.priceJpy],
+          [t("activity.runs.label.stop"), intent?.protectiveStopPriceJpy],
+          [t("activity.runs.label.takeProfit"), intent?.takeProfitPriceJpy],
+          [t("activity.runs.label.target"), intent?.targetPriceJpy],
+          [t("activity.runs.label.timeStop"), intent?.timeStopAt],
+          [t("activity.runs.label.setupTags"), formatJsonList(intent?.setupTagsJson), true],
+          [t("activity.runs.label.thesis"), intent?.thesisJa, true],
+          [t("activity.runs.label.invalidation"), formatJsonList(intent?.invalidationConditionsJaJson), true],
+        ]} />
+      </DetailSection>
 
       <DetailSection index="04" title={t("activity.runs.section.verification")}>
         <FactGrid facts={[
@@ -273,6 +309,7 @@ function RunDetailContent({
         </div>
         <FactGrid facts={[
           [t("activity.runs.label.rule"), safety?.rule],
+          [t("activity.runs.label.finalReason"), detail.summary.finalReason],
           [t("activity.runs.label.message"), safety?.messageJa, true],
         ]} />
       </DetailSection>
@@ -281,10 +318,9 @@ function RunDetailContent({
         <FactGrid facts={[
           [t("activity.runs.fact.orders"), String(detail.orders.length)],
           [t("activity.runs.fact.executions"), String(detail.executions.length)],
-          [t("activity.runs.label.position"), detail.orders.map((order) => order.positionId).find(Boolean)],
-          [t("activity.runs.label.tradeGroup"), detail.orders.map((order) => order.tradeGroupId).find(Boolean)],
-          [t("activity.runs.label.entryReason"), detail.orders.map((order) => order.reasonJa).find(Boolean), true],
         ]} />
+        <RunOrderRecords orders={detail.orders} />
+        <RunExecutionRecords executions={detail.executions} />
       </DetailSection>
 
       <DetailSection index="07" title={t("activity.runs.section.raw")}>
@@ -325,6 +361,58 @@ function FactGrid({ facts }: { facts: Array<[string, string | null | undefined, 
   );
 }
 
+function RunOrderRecords({ orders }: { orders: OpsDecisionRunDetailResponse["orders"] }) {
+  const { t } = useI18n();
+
+  return (
+    <div className="run-records">
+      <h4>{t("activity.runs.records.orders")}</h4>
+      {orders.length === 0 ? <p>{t("activity.runs.records.noOrders")}</p> : orders.map((order, index) => (
+        <article className="run-record" key={order.orderId}>
+          <h5>{t("activity.runs.records.orderNumber")} {index + 1}</h5>
+          <FactGrid facts={[
+            ["order ID", order.orderId],
+            [t("activity.runs.label.intentId"), order.intentId],
+            [t("activity.runs.label.position"), order.positionId],
+            [t("activity.runs.label.tradeGroup"), order.tradeGroupId],
+            [t("activity.runs.label.order"), `${order.side} ${order.orderType}`],
+            [t("activity.runs.label.status"), order.status],
+            [t("activity.runs.label.size"), `${order.sizeBtc} BTC`],
+            [t("activity.runs.label.price"), order.limitPriceJpy],
+            [t("activity.runs.label.createdAt"), order.createdAt],
+            [t("activity.runs.label.entryReason"), order.reasonJa, true],
+          ]} />
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function RunExecutionRecords({ executions }: { executions: OpsDecisionRunDetailResponse["executions"] }) {
+  const { t } = useI18n();
+
+  return (
+    <div className="run-records">
+      <h4>{t("activity.runs.records.executions")}</h4>
+      {executions.length === 0 ? <p>{t("activity.runs.records.noExecutions")}</p> : executions.map((execution, index) => (
+        <article className="run-record" key={execution.executionId}>
+          <h5>{t("activity.runs.records.executionNumber")} {index + 1}</h5>
+          <FactGrid facts={[
+            ["execution ID", execution.executionId],
+            ["order ID", execution.orderId],
+            [t("activity.runs.label.position"), execution.positionId],
+            [t("activity.runs.label.side"), execution.side],
+            [t("activity.runs.label.price"), execution.priceJpy],
+            [t("activity.runs.label.size"), `${execution.sizeBtc} BTC`],
+            [t("activity.runs.label.realizedPnl"), execution.realizedPnlJpy],
+            [t("activity.runs.label.executedAt"), execution.executedAt],
+          ]} />
+        </article>
+      ))}
+    </div>
+  );
+}
+
 function RunListNotice({ text, action }: { text: string; action?: () => void }) {
   const { t } = useI18n();
   return (
@@ -339,6 +427,34 @@ function loadRunFilter(): DecisionRunOutcomeFilter {
 
 function outcomeCount(outcome: DecisionRunOutcomeFilter, runs: OpsDecisionRunSummaryResponse[]): number {
   return outcome === "ALL" ? runs.length : runs.filter((run) => run.outcome === outcome).length;
+}
+
+function deduplicateRuns(runs: OpsDecisionRunSummaryResponse[]): OpsDecisionRunSummaryResponse[] {
+  const uniqueRuns = new Map<string, OpsDecisionRunSummaryResponse>();
+  runs.forEach((run) => uniqueRuns.set(run.invocationId, run));
+
+  return [...uniqueRuns.values()].sort((first, second) => {
+    const startedAtComparison = Date.parse(second.startedAt) - Date.parse(first.startedAt);
+    return startedAtComparison || second.invocationId.localeCompare(first.invocationId);
+  });
+}
+
+function runSummaryReason(run: OpsDecisionRunSummaryResponse): string | null {
+  const terminalReason = run.finalReason ?? run.errorMessage;
+  if (terminalReason && run.safetyMessageJa) return `${terminalReason} — ${run.safetyMessageJa}`;
+
+  return terminalReason ?? run.safetyMessageJa ?? run.reasonJa ?? null;
+}
+
+function formatJsonList(value: string | null | undefined): string | null {
+  if (!value) return null;
+
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String).join(" / ") : value;
+  } catch {
+    return value;
+  }
 }
 
 function formatDuration(value: number | null | undefined): string {

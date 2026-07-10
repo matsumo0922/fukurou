@@ -2265,6 +2265,7 @@ a:focus-visible {
 .run-phase:last-child .run-phase__rail::before { display: none; }
 .run-phase__rail span { position: absolute; top: 6px; left: 4px; z-index: 1; width: 9px; height: 9px; border: 2px solid var(--surface-raised); border-radius: 50%; background: var(--green); box-shadow: 0 0 0 1px var(--green); }
 .run-phase[data-state="denied"] .run-phase__rail span { background: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
+.run-phase[data-state="rejected"] .run-phase__rail span { background: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
 .run-phase[data-state="failed"] .run-phase__rail span { background: var(--red); box-shadow: 0 0 0 1px var(--red); }
 .run-phase[data-state="not_reached"] .run-phase__rail span,
 .run-phase[data-state="not_required"] .run-phase__rail span { background: var(--surface-raised); box-shadow: 0 0 0 1px var(--line-strong); }
@@ -2289,6 +2290,14 @@ a:focus-visible {
 .run-value-comparison > span { color: var(--ink-faint); }
 
 .run-raw-toggle { display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 40px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-raised); color: var(--ink); cursor: pointer; padding: 0 12px; font-weight: 700; }
+.run-load-more { display: block; min-height: 40px; margin: 16px auto 0; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface-raised); color: var(--ink); cursor: pointer; padding: 0 18px; font-weight: 700; }
+.run-load-more:hover { border-color: var(--blue); color: var(--blue); }
+.run-load-more:disabled { cursor: wait; opacity: 0.65; }
+.run-records { display: grid; gap: 10px; margin-top: 18px; }
+.run-records h4 { margin: 0; font-size: 0.82rem; }
+.run-records > p { margin: 0; color: var(--ink-muted); font-size: 0.78rem; }
+.run-record { display: grid; gap: 8px; }
+.run-record h5 { margin: 0; color: var(--ink-muted); font-family: var(--mono), monospace; font-size: 0.7rem; text-transform: uppercase; }
 .run-raw-block { max-height: 360px; margin: 10px 0 0; border: 1px solid var(--line); border-radius: 9px; background: #f7f8f5; color: #2e382f; padding: 13px; font-family: var(--mono), monospace; font-size: 0.68rem; line-height: 1.55; overflow: auto; white-space: pre; }
 .run-list-notice { border: 1px dashed var(--line-strong); border-radius: 10px; background: rgb(251 252 248 / 70%); color: var(--ink-muted); padding: 48px 24px; text-align: center; }
 .run-list-notice button { min-height: 34px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-raised); cursor: pointer; padding: 0 12px; }

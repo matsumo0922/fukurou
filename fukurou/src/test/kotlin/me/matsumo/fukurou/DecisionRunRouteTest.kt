@@ -52,6 +52,10 @@ class DecisionRunRouteTest {
         assertEquals("0.1100000000", detail.decision?.expectedRMultiple)
         assertEquals("0.03357778", detail.safetyViolation?.measuredValue)
         assertEquals("0.10", detail.safetyViolation?.limitValue)
+        assertEquals("preview_order_rejected", detail.summary.finalReason)
+        assertEquals("parent-plan-1", detail.intent?.parentTradePlanId)
+        assertEquals(2, detail.intent?.revisionCount)
+        assertEquals("[\"trend-breakout\"]", detail.intent?.setupTagsJson)
         assertEquals(0, detail.orders.size)
         assertEquals(0, detail.executions.size)
         assertTrue(detail.raw.none { raw -> raw.values.keys.any { key -> key.contains("secret", ignoreCase = true) } })
@@ -112,6 +116,9 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
                 intent = DecisionRunIntent(
                     intentId = "intent-1",
                     tradePlanId = "plan-1",
+                    parentTradePlanId = "parent-plan-1",
+                    revisionCount = 2,
+                    setupTagsJson = "[\"trend-breakout\"]",
                     side = "BUY",
                     orderType = "LIMIT",
                     sizeBtc = "0.06",
@@ -165,6 +172,7 @@ private fun deniedRunSummary(): DecisionRunSummary {
         falsificationVerdict = "APPROVED",
         safetyRule = "EXPECTED_VALUE_GATE",
         safetyMessageJa = "期待値が安全床を下回りました。",
+        finalReason = "preview_order_rejected",
         orderCount = 0,
         executionCount = 0,
         outcome = DecisionRunOutcome.DENIED,

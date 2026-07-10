@@ -349,23 +349,58 @@ describe("App", () => {
     const filters = screen.getByRole("group", { name: "Decision run outcome filters" });
     expect(within(runList).getByText("EXPECTED_VALUE_GATE")).toBeInTheDocument();
     expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "false");
-    expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("limit") === "100")).toBe(true);
+    expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("limit") === "50")).toBe(true);
 
     fireEvent.click(within(filters).getByRole("button", { name: /Denied/ }));
     expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "true");
     expect(window.localStorage.getItem("fukurou.web.activity.run-filter.v2")).toBe("DENIED");
 
-    fireEvent.click(within(runList).getByRole("button", { name: /ENTER/ }));
-    const dialog = await screen.findByRole("dialog", { name: "Decision run detail" });
-    expect(await within(dialog).findByText("0.1100000000")).toBeInTheDocument();
-    expect(within(dialog).getByText("0.03357778")).toBeInTheDocument();
-    expect(within(dialog).getAllByText("APPROVED").length).toBeGreaterThan(0);
+    const selectedRun = within(runList).getByRole("button", { name: /ENTER/ });
+    fireEvent.click(selectedRun);
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(await within(detailPane).findByText("0.1100000000")).toBeInTheDocument();
+    expect(within(detailPane).getByText("0.03357778")).toBeInTheDocument();
+    expect(within(detailPane).getAllByText("APPROVED").length).toBeGreaterThan(0);
+    expect(within(detailPane).getByText("REJECTED").closest(".run-phase")).toHaveAttribute("data-state", "rejected");
+    expect(within(detailPane).getAllByText("preview_order_rejected").length).toBeGreaterThan(0);
+    expect(within(detailPane).getByText("上昇トレンド継続")).toBeInTheDocument();
+    expect(within(detailPane).getByText("直近安値割れ / 出来高急減")).toBeInTheDocument();
+    expect(within(detailPane).getByText("trend-breakout / volume-confirmed")).toBeInTheDocument();
+    expect(within(detailPane).getByText("parent-plan-1")).toBeInTheDocument();
+    expect(within(detailPane).getAllByText("order-1").length).toBeGreaterThan(0);
+    expect(within(detailPane).getAllByText("order-2").length).toBeGreaterThan(0);
+    expect(within(detailPane).getByText("execution-1")).toBeInTheDocument();
+    expect(within(detailPane).getByText("execution-2")).toBeInTheDocument();
+    expect(within(detailPane).getAllByText("0").length).toBeGreaterThan(0);
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "Show raw projection" }));
-    expect(within(dialog).getByText(/RUNNER_PHASE_COMPLETED/)).toBeInTheDocument();
+    fireEvent.click(within(detailPane).getByRole("button", { name: "Show raw projection" }));
+    expect(within(detailPane).getByText(/RUNNER_PHASE_COMPLETED/)).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: "Escape" });
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Decision run detail" })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Decision run detail" })).not.toBeInTheDocument());
+    await waitFor(() => expect(selectedRun).toHaveFocus());
+  });
+
+  it("loads older decision runs without duplicating the cursor boundary", async () => {
+    const fetchMock = stubSystemFetch();
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    fireEvent.click(within(runList).getByRole("button", { name: "Load older runs" }));
+
+    expect(await within(runList).findByRole("button", { name: /EXIT/ })).toBeInTheDocument();
+    expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("before") === "older-cursor")).toBe(true);
+    expect(within(runList).getAllByText("EXPECTED_VALUE_GATE")).toHaveLength(1);
+    expect(within(runList).queryByRole("button", { name: "Load older runs" })).not.toBeInTheDocument();
+
+    const activityRefresh = screen.getAllByRole("button", { name: "Refresh" })
+      .find((button) => button.classList.contains("icon-text-button--prominent"));
+    expect(activityRefresh).toBeDefined();
+    fireEvent.click(activityRefresh!);
+    await waitFor(() => expect(activityRefresh).toBeEnabled());
+    expect(within(runList).getAllByText("EXPECTED_VALUE_GATE")).toHaveLength(1);
   });
 
   it("ignores stale decision run filter storage values", async () => {
@@ -692,6 +727,7 @@ type SystemFetchFixture = {
     status: number;
     body: unknown;
   };
+  decisionRunsOlderResponse?: Promise<Response>;
 };
 
 function stubSystemFetch(fixture: SystemFetchFixture = {}) {
@@ -863,6 +899,9 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         }
         if (fixture.decisionRunsResponse) {
           return jsonResponse(fixture.decisionRunsResponse.body, { status: fixture.decisionRunsResponse.status });
+        }
+        if (requestSearchParams(input).has("before")) {
+          return fixture.decisionRunsOlderResponse ?? jsonResponse(olderDecisionRunsResponse());
         }
         return jsonResponse(decisionRunsResponse());
       case "/ops/runs/run-denied":
@@ -1401,6 +1440,7 @@ function decisionRunsResponse() {
         falsificationVerdict: "APPROVED",
         safetyRule: "EXPECTED_VALUE_GATE",
         safetyMessageJa: "期待値が安全床を下回りました。",
+        finalReason: "preview_order_rejected",
         errorMessage: null,
         orderCount: 0,
         executionCount: 0,
@@ -1420,9 +1460,39 @@ function decisionRunsResponse() {
         falsificationVerdict: null,
         safetyRule: null,
         safetyMessageJa: null,
+        finalReason: null,
         errorMessage: "previous process/container shutdown recovery",
         orderCount: 0,
         executionCount: 0,
+      },
+    ],
+    nextBefore: "older-cursor",
+  };
+}
+
+function olderDecisionRunsResponse() {
+  return {
+    runs: [
+      decisionRunsResponse().runs[0],
+      {
+        invocationId: "run-executed",
+        mode: "PAPER",
+        symbol: "BTC_JPY",
+        triggerKind: "ECONOMIC_EVENT",
+        status: "SUCCEEDED",
+        outcome: "EXECUTED",
+        startedAt: "2026-07-09T23:40:00.000Z",
+        finishedAt: "2026-07-09T23:40:12.000Z",
+        durationMillis: 12000,
+        action: "EXIT",
+        reasonJa: "利確条件に到達しました。",
+        falsificationVerdict: "APPROVED",
+        safetyRule: null,
+        safetyMessageJa: null,
+        finalReason: null,
+        errorMessage: null,
+        orderCount: 1,
+        executionCount: 1,
       },
     ],
     nextBefore: null,
@@ -1437,7 +1507,7 @@ function decisionRunDetailResponse() {
       { key: "PROPOSER", status: "COMPLETED", detail: "codex" },
       { key: "INTENT", status: "COMPLETED", detail: "intent-1" },
       { key: "FALSIFIER", status: "APPROVED", detail: "反証条件を確認しました。" },
-      { key: "SAFETY", status: "DENIED", detail: "EXPECTED_VALUE_GATE" },
+      { key: "SAFETY", status: "REJECTED", detail: "EXPECTED_VALUE_GATE" },
       { key: "ORDER_EXECUTION", status: "NOT_REACHED", detail: "orders=0, executions=0" },
     ],
     decision: {
@@ -1456,6 +1526,9 @@ function decisionRunDetailResponse() {
     intent: {
       intentId: "intent-1",
       tradePlanId: "plan-1",
+      parentTradePlanId: "parent-plan-1",
+      revisionCount: 2,
+      setupTagsJson: "[\"trend-breakout\",\"volume-confirmed\"]",
       side: "BUY",
       orderType: "LIMIT",
       sizeBtc: "0.060000000000",
@@ -1463,7 +1536,7 @@ function decisionRunDetailResponse() {
       protectiveStopPriceJpy: "16500000.00000000",
       takeProfitPriceJpy: "18000000.00000000",
       thesisJa: "上昇トレンド継続",
-      invalidationConditionsJaJson: "[]",
+      invalidationConditionsJaJson: "[\"直近安値割れ\",\"出来高急減\"]",
       targetPriceJpy: "18000000.00000000",
       timeStopAt: null,
     },
@@ -1480,8 +1553,56 @@ function decisionRunDetailResponse() {
       messageJa: "期待値が安全床を下回りました。",
       createdAt: "2026-07-10T00:47:35.000Z",
     },
-    orders: [],
-    executions: [],
+    orders: [
+      {
+        orderId: "order-1",
+        intentId: "intent-1",
+        positionId: "position-1",
+        tradeGroupId: "trade-group-1",
+        side: "BUY",
+        orderType: "LIMIT",
+        status: "FILLED",
+        sizeBtc: "0.030000000000",
+        limitPriceJpy: "17000000.00000000",
+        reasonJa: "分割エントリー 1",
+        createdAt: "2026-07-10T00:47:33.000Z",
+      },
+      {
+        orderId: "order-2",
+        intentId: "intent-1",
+        positionId: "position-1",
+        tradeGroupId: "trade-group-1",
+        side: "BUY",
+        orderType: "MARKET",
+        status: "FILLED",
+        sizeBtc: "0.030000000000",
+        limitPriceJpy: null,
+        reasonJa: "分割エントリー 2",
+        createdAt: "2026-07-10T00:47:34.000Z",
+      },
+    ],
+    executions: [
+      {
+        executionId: "execution-1",
+        orderId: "order-1",
+        positionId: "position-1",
+        side: "BUY",
+        priceJpy: "16990000.00000000",
+        sizeBtc: "0.030000000000",
+        realizedPnlJpy: "0",
+        executedAt: "2026-07-10T00:47:34.000Z",
+      },
+      {
+        executionId: "execution-2",
+        orderId: "order-2",
+        positionId: "position-1",
+        side: "BUY",
+        priceJpy: "17000000.00000000",
+        sizeBtc: "0.030000000000",
+        realizedPnlJpy: "0",
+        executedAt: "2026-07-10T00:47:35.000Z",
+      },
+    ],
     raw: [
       {
         source: "audit",

@@ -2247,6 +2247,7 @@ export interface components {
             falsificationVerdict?: string | null;
             safetyRule?: string | null;
             safetyMessageJa?: string | null;
+            finalReason?: string | null;
             errorMessage?: string | null;
             orderCount: number;
             executionCount: number;
@@ -2280,6 +2281,8 @@ export interface components {
         OpsDecisionRunIntentResponse: {
             intentId: string;
             tradePlanId: string;
+            parentTradePlanId?: string | null;
+            revisionCount: number;
             side: string;
             orderType: string;
             sizeBtc: string;
@@ -2290,6 +2293,7 @@ export interface components {
             invalidationConditionsJaJson?: string | null;
             targetPriceJpy?: string | null;
             timeStopAt?: string | null;
+            setupTagsJson?: string | null;
         };
         /** OpsDecisionRunFalsificationResponse */
         OpsDecisionRunFalsificationResponse: {

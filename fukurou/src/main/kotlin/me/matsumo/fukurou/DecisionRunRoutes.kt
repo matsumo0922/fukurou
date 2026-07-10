@@ -62,6 +62,7 @@ data class OpsDecisionRunSummaryResponse(
     val falsificationVerdict: String?,
     val safetyRule: String?,
     val safetyMessageJa: String?,
+    val finalReason: String?,
     val errorMessage: String?,
     val orderCount: Int,
     val executionCount: Int,
@@ -110,6 +111,8 @@ data class OpsDecisionRunDecisionResponse(
 data class OpsDecisionRunIntentResponse(
     val intentId: String,
     val tradePlanId: String,
+    val parentTradePlanId: String?,
+    val revisionCount: Int,
     val side: String,
     val orderType: String,
     val sizeBtc: String,
@@ -120,6 +123,7 @@ data class OpsDecisionRunIntentResponse(
     val invalidationConditionsJaJson: String?,
     val targetPriceJpy: String?,
     val timeStopAt: String?,
+    val setupTagsJson: String?,
 )
 
 /** Falsifier section。 */
@@ -303,6 +307,7 @@ private fun DecisionRunSummary.toResponse(): OpsDecisionRunSummaryResponse {
         falsificationVerdict = falsificationVerdict,
         safetyRule = safetyRule,
         safetyMessageJa = safetyMessageJa,
+        finalReason = finalReason,
         errorMessage = errorMessage,
         orderCount = orderCount,
         executionCount = executionCount,
@@ -392,6 +397,8 @@ private fun DecisionRunDecision.toResponse() = OpsDecisionRunDecisionResponse(
 private fun DecisionRunIntent.toResponse() = OpsDecisionRunIntentResponse(
     intentId = intentId,
     tradePlanId = tradePlanId,
+    parentTradePlanId = parentTradePlanId,
+    revisionCount = revisionCount,
     side = side,
     orderType = orderType,
     sizeBtc = sizeBtc,
@@ -402,6 +409,7 @@ private fun DecisionRunIntent.toResponse() = OpsDecisionRunIntentResponse(
     invalidationConditionsJaJson = invalidationConditionsJaJson,
     targetPriceJpy = targetPriceJpy,
     timeStopAt = timeStopAt?.toString(),
+    setupTagsJson = setupTagsJson,
 )
 
 private fun DecisionRunFalsification.toResponse() = OpsDecisionRunFalsificationResponse(
