@@ -11,20 +11,12 @@ import kotlin.test.assertTrue
 class RuntimeConfigDeploymentFilesTest {
 
     @Test
-    fun deploymentFiles_doNotContainRuntimeLegacyEnvNames() {
+    fun deploymentFiles_doNotDeclareRuntimeLegacyEnvNames() {
         val repositoryRoot = repositoryRoot()
-        val deploymentFiles = listOf(
-            ".env.example",
-            "docker-compose.yml",
-            "docker-compose.dev.yml",
-            "docker-compose.prod.yml",
-        )
-        val violations = deploymentFiles.flatMap { relativePath ->
-            val content = Files.readString(repositoryRoot.resolve(relativePath))
-
+        val violations = deploymentFiles(repositoryRoot).flatMap { deploymentFile ->
             RuntimeConfigCatalog.runtimeLegacyEnvNames()
-                .filter { legacyEnvName -> content.contains(legacyEnvName) }
-                .map { legacyEnvName -> "$relativePath: $legacyEnvName" }
+                .filter { legacyEnvName -> deploymentFile.declaresEnvName(legacyEnvName) }
+                .map { legacyEnvName -> "${repositoryRoot.relativize(deploymentFile)}: $legacyEnvName" }
         }
 
         assertTrue(
@@ -32,6 +24,56 @@ class RuntimeConfigDeploymentFilesTest {
             "deployment files must not declare runtime legacy env names: $violations",
         )
     }
+
+    @Test
+    fun primaryDeploymentFiles_keepRequiredDeploymentLegacyEnvNames() {
+        val repositoryRoot = repositoryRoot()
+        val requiredEnvNames = setOf(
+            "FUKUROU_MCP_JAR_PATH",
+            "FUKUROU_TRADING_MODE",
+            "FUKUROU_GMO_PUBLIC_BASE_URL",
+            "FUKUROU_OBSIDIAN_VAULT_PATH",
+        )
+        val primaryDeploymentFiles = listOf(
+            repositoryRoot.resolve(".env.example"),
+            repositoryRoot.resolve("docker-compose.yml"),
+            repositoryRoot.resolve("docker-compose.prod.yml"),
+        )
+        val catalogEnvNames = RuntimeConfigCatalog.deploymentLegacyEnvNames()
+
+        assertTrue(
+            catalogEnvNames.containsAll(requiredEnvNames),
+            "required deployment env names must belong to the deployment catalog: $requiredEnvNames",
+        )
+
+        val missingDeclarations = primaryDeploymentFiles.flatMap { deploymentFile ->
+            requiredEnvNames
+                .filterNot { legacyEnvName -> deploymentFile.declaresEnvName(legacyEnvName) }
+                .map { legacyEnvName -> "${repositoryRoot.relativize(deploymentFile)}: $legacyEnvName" }
+        }
+
+        assertTrue(
+            missingDeclarations.isEmpty(),
+            "primary deployment files must keep required deployment env names: $missingDeclarations",
+        )
+    }
+}
+
+private fun deploymentFiles(repositoryRoot: Path): List<Path> {
+    val composeFiles = Files.newDirectoryStream(repositoryRoot, "docker-compose*.yml").use { paths ->
+        paths.toList()
+    }
+
+    return (listOf(repositoryRoot.resolve(".env.example")) + composeFiles)
+        .sortedBy { path -> path.fileName.toString() }
+}
+
+private fun Path.declaresEnvName(envName: String): Boolean {
+    val declarationPattern = Regex(
+        pattern = "(?m)^\\s*#?\\s*${Regex.escape(envName)}\\s*[=:]",
+    )
+
+    return declarationPattern.containsMatchIn(Files.readString(this))
 }
 
 private fun repositoryRoot(): Path {

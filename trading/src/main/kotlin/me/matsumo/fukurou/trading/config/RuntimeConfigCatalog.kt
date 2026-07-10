@@ -51,6 +51,21 @@ object RuntimeConfigCatalog {
     }
 
     /**
+     * deployment group の legacy env 名一覧を返す。
+     */
+    fun deploymentLegacyEnvNames(): Set<String> {
+        val config = TradingBotConfig()
+        val environment = emptyMap<String, String>()
+        val defaults = RuntimeConfigDefaults()
+        val deploymentValues = RuntimeConfigDeploymentValues.fromEnvironment(environment)
+
+        return deploymentGroup(config, environment, defaults, deploymentValues)
+            .items
+            .map { item -> item.legacyEnvName }
+            .toSet()
+    }
+
+    /**
      * code catalog default を runtime config key ごとに返す。
      */
     fun runtimeDefaultValues(): Map<String, String> {
