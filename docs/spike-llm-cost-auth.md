@@ -222,7 +222,7 @@ Claude / Codex のプラン枠:
 - Proposer model を軽量 model に変えて再計測する。
 - Proposer prompt / tool policy を縮小し、毎回 1h/100 indicator を複数取らない。
 - Codex Falsifier は ENTER 時のみ維持し、NO_TRADE では起動しない現行方針を守る。
-- `codex exec --json` 相当の structured usage capture、Claude stdout の永続化、tool duration audit を product code 側で追加してから再計測する。
+- 再計測では product code が保存する Claude / Codex の structured usage を使い、必要なら tool duration audit を追加する。
 - サブスク枠ではなく API key billing で使う場合は、API pricing と上限 budget を明示した別設計に分ける。
 
 ## 7. 発見した問題
@@ -230,7 +230,7 @@ Claude / Codex のプラン枠:
 1. runner の token 計測性が低い。
    - `ShellProcessRunner` は stdout/stderr を `ProcessRunResult` に持つが、DB や file に永続化しない。
    - `DefaultLlmCommandRenderer` は Claude に `--output-format json` を付けるが、その JSON は通常 runner 実行後に捨てられる。
-   - Codex は runner では `--json` を付けないため、Falsifier に到達しても token の input/output breakdown は標準設定では取りにくい。
+   - この計測時点の runner は Codex に `--json` を付けないため、Falsifier に到達しても token の input/output breakdown は標準設定では取りにくかった。現在の runner は `--json` と invocation 単位の structured usage audit を使う。
 
 2. `command_event_log` では tool latency と response size が取れない。
    - `TOOL_CALL_COMPLETED.payload` は tool arguments であり、tool 開始時刻、終了時刻、duration、response count を含まない。
