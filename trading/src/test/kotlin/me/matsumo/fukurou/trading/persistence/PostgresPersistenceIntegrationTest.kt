@@ -6612,10 +6612,7 @@ private fun updateOrderDecisionRun(
 }
 
 /** current position と先行 filled entry の decision run が異なる group を再現する。 */
-private fun updateOpenPositionDecisionRun(
-    database: ExposedDatabase,
-    decisionRunId: String,
-) {
+private fun updateOpenPositionDecisionRun(database: ExposedDatabase, decisionRunId: String) {
     exposedTransaction(database) {
         prepare("UPDATE positions SET decision_run_id = ? WHERE status = 'OPEN'").use { statement ->
             statement.setString(1, decisionRunId)

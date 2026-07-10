@@ -610,7 +610,6 @@ object OrdersTable : Table("orders") {
     /** 注文が realtime event を受理できる時刻境界。 */
     val marketEligibleFrom = long("market_eligible_from").nullable()
 
-
     /**
      * 作成時刻。epoch millis で保存する。
      */

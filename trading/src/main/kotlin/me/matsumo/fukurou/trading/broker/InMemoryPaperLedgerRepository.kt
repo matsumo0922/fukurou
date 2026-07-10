@@ -438,6 +438,7 @@ private class InMemoryPaperLedgerHistoryReader(
  *
  * @param state 共有 mutable state
  */
+@Suppress("LargeClass")
 private class InMemoryPaperLedgerMutationWriter(
     private val state: InMemoryPaperLedgerState,
 ) : PaperLedgerMutationRepository {
