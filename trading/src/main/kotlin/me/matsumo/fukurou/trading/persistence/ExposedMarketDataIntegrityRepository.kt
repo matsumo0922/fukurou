@@ -1,12 +1,14 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.market.MarketDataIntegritySnapshot
-import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Instant
 import java.util.UUID

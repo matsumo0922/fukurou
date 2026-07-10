@@ -907,8 +907,10 @@ private class InMemoryPaperLedgerMutationWriter(
     ) {
         val openPositions = positions.filter { position ->
             val eligibility = positionMarketEligibility[position.positionId]
-            position.status == PositionStatus.OPEN && (event == null || eligibility == null ||
-                (eligibility.sessionId == event.connectionSessionId && eligibility.eligibleAfterSequence < event.sequence))
+            val isEligibleForEvent = event == null || eligibility == null ||
+                eligibility.sessionId == event.connectionSessionId && eligibility.eligibleAfterSequence < event.sequence
+
+            position.status == PositionStatus.OPEN && isEligibleForEvent
         }
 
         openPositions.forEach { position ->
