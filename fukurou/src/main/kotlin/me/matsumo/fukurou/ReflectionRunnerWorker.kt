@@ -217,7 +217,7 @@ private fun createReflectionRunner(
                 llm = ReflectionPromptCandidateLlmRuntime(
                     llmInvoker = ShellLlmInvoker(
                         commandRenderer = DefaultLlmCommandRenderer(
-                            config = LlmCommandRendererConfig.fromEnvironment(environment),
+                            config = LlmCommandRendererConfig.fromEnvironment(environment, tradingConfig.llmModels),
                         ),
                         processRunner = ShellProcessRunner(),
                     ),

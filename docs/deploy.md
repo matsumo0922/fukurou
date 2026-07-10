@@ -91,26 +91,15 @@ POSTGRES_DB=fukurou
 POSTGRES_USER=fukurou
 POSTGRES_PASSWORD=
 
-FUKUROU_OBSIDIAN_ENABLED=false
+# container mount と対応する deployment path。
 FUKUROU_OBSIDIAN_VAULT_PATH=/vault
-FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS=300
-FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS=3600
-FUKUROU_REFLECTION_QUERY_LIMIT=1000
-FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS=180
-FUKUROU_REFLECTION_RECENT_DECISION_LIMIT=50
-FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT=30
-FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER=CLAUDE
-FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS=60
-FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS=2
 # FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
-# Obsidian writer と Reflection Runner は FUKUROU_OBSIDIAN_ENABLED を共有する。
 
 # production container では image 内の MCP fat jar を使う。
 FUKUROU_MCP_JAR_PATH=/app/fukurou-mcp-all.jar
-
-# CLI auth を配置して smoke test が通るまでは false を維持する。
-FUKUROU_LLM_DAEMON_ENABLED=false
 ```
+
+Obsidian Writer / Reflection Runner の有効化、Reflection の interval / query / PromptCandidates 設定、LLM model override、LLM daemon の有効化は WebUI `/app/config` の Runtime group で管理する。CLI auth と MCP path の smoke test が通るまでは `daemon.enabled=false` を active config として維持する。Runtime group の変更は process restart 後に適用する。
 
 Cloudflare Access の `CF-Access-Client-Id` / `CF-Access-Client-Secret` は手元の検証環境で使う credential であり、NAS の `.env` には保存しない。
 

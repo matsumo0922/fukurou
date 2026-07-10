@@ -1,6 +1,6 @@
 # LLM daemon / Obsidian Writer / Reflection Runner production setup
 
-Fukurou production で Claude Code / Codex CLI auth と Obsidian vault を準備し、`FUKUROU_OBSIDIAN_ENABLED` / `FUKUROU_LLM_DAEMON_ENABLED` を有効化する前に確認する手順。
+Fukurou production で Claude Code / Codex CLI auth と Obsidian vault を準備し、runtime config の `obsidian.enabled` / `daemon.enabled` を有効化する前に確認する手順。
 
 Obsidian Writer / Reflection Runner と LLM daemon は独立した worker であり、同時に有効化する必要はない。Obsidian Writer / Reflection Runner は DB 由来の deterministic Markdown を生成し、完了済み前週の `Knowledge/PromptCandidates/` だけ低優先の LLM CLI を使う。CLI auth がない場合でも deterministic note は生成され、PromptCandidates は fail-closed status note と backoff に留まる。LLM daemon は Claude / Codex CLI auth と MCP runtime の疎通確認後に有効化する。
 
@@ -28,12 +28,9 @@ NAS の `/srv/fukurou/.env` は `.env.example` の形を正とし、値だけ環
 FUKUROU_MCP_JAR_PATH=/app/fukurou-mcp-all.jar
 
 FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
-
-FUKUROU_OBSIDIAN_ENABLED=false
-FUKUROU_LLM_DAEMON_ENABLED=false
 ```
 
-`FUKUROU_CLAUDE_MODEL` / `FUKUROU_CODEX_MODEL` は未指定なら CLI 側の既定 model になる。低コスト運用を優先する場合は、まず smoke test でその account が受け付ける model 名を確認してから指定する。
+`llm.claudeModel` / `llm.codexModel` は WebUI `/app/config` の Runtime group で管理し、空なら CLI 側の既定 model を使う。低コスト運用を優先する場合は、まず smoke test でその account が受け付ける model 名を確認してから active 化する。
 
 ## WebUI CLI login
 
@@ -112,20 +109,22 @@ ssh dxp4800plus \
 
 ## Enable Obsidian Writer / Reflection Runner
 
-Obsidian Writer / Reflection Runner は LLM daemon と独立している。先にこれだけ有効化してよい。`FUKUROU_OBSIDIAN_ENABLED=true` では、Trade / Daily note の機械再生成と、`Knowledge/DailyReflections/`、`Knowledge/WeeklyReviews/`、`Knowledge/Calibration/`、`Knowledge/Setups/` への deterministic reflection report 生成、`Knowledge/PromptCandidates/` への週次 prompt candidate note 生成が同じ Ktor process 内で動く。
+Obsidian Writer / Reflection Runner は LLM daemon と独立している。先にこれだけ有効化してよい。`obsidian.enabled=true` では、Trade / Daily note の機械再生成と、`Knowledge/DailyReflections/`、`Knowledge/WeeklyReviews/`、`Knowledge/Calibration/`、`Knowledge/Setups/` への deterministic reflection report 生成、`Knowledge/PromptCandidates/` への週次 prompt candidate note 生成が同じ Ktor process 内で動く。
 
-```dotenv
-FUKUROU_OBSIDIAN_ENABLED=true
-FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS=3600
-FUKUROU_REFLECTION_QUERY_LIMIT=1000
-FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS=180
-FUKUROU_REFLECTION_RECENT_DECISION_LIMIT=50
-FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT=30
-FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER=CLAUDE
-FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS=60
-FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS=2
-FUKUROU_LLM_DAEMON_ENABLED=false
-```
+WebUI `/app/config` で draft を作成し、次の Runtime key を確認して active 化する。
+
+- `obsidian.enabled=true`
+- `reflection.minInterval=3600`
+- `reflection.queryLimit=1000`
+- `reflection.calibrationLookbackDays=180`
+- `reflection.recentDecisionLimit=50`
+- `reflection.sampleWarningTradeCount=30`
+- `reflection.promptCandidateProvider=CLAUDE`
+- `reflection.promptCandidateTimeout=60`
+- `reflection.promptCandidateMaxAttempts=2`
+- `daemon.enabled=false`
+
+Obsidian vault の container 内 path は Deployment key `obsidian.vaultPath` で確認する。この値は compose の mount target と一致させ、WebUI からは編集しない。Runtime draft を active 化した後に Ktor process を再起動する。
 
 deploy 後に vault を確認する。
 
@@ -141,7 +140,7 @@ Reflection Runner は DB を正本として、日次・週次・confidence calib
 
 PromptCandidates は `generated` / `invalid_output` / `input_truncated` / `budget_deferred` / `llm_failed` / `failed_backoff` の status を frontmatter に保存する。`budget_deferred` は試行回数を増やさず、`llm_failed` は 24 時間 backoff 後に同じ週で最大 2 回まで再試行する。trading の RUNNING 予約、HARD_HALT、または LLM hour/day cap の headroom 不足がある場合は LLM を呼ばず deterministic report だけを生成する。
 
-Reflection Runner の loop は `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` と `FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS` の大きい方を使う。Markdown 本文には生成時刻だけで変わる field を書かず、対象 period の DB データが変わらない tick は unchanged として扱う。日付または週の境界直前に保存された decision / trade を確定ノートへ反映するため、current period と previous period の Daily / Weekly / TagTaxonomy report を同じ tick で再生成する。
+Reflection Runner の loop は `reflection.minInterval` と `obsidian.writeInterval` の大きい方を使う。Markdown 本文には生成時刻だけで変わる field を書かず、対象 period の DB データが変わらない tick は unchanged として扱う。日付または週の境界直前に保存された decision / trade を確定ノートへ反映するため、current period と previous period の Daily / Weekly / TagTaxonomy report を同じ tick で再生成する。
 
 ## Enable LLM daemon
 
@@ -173,7 +172,7 @@ ssh dxp4800plus 'docker logs --since 10m fukurou-ktor | tail -200'
 
 - Claude / Codex CLI は access token を自動 refresh する。refresh token 自体が失効または revoke された場合だけ、WebUI または fallback で再ログインする。
 - Runner は stdout / stderr に `is_error: true` を含む CLI 出力を検出した場合、`RUNNER_PHASE_COMPLETED.details.cliErrorReported = "true"` を残す。認証失敗らしい stdout / stderr を検出し、かつ CLI process が非 0 exit または `is_error: true` を含む CLI 出力を返した場合、`RUNNER_PHASE_COMPLETED.details.authFailureSuspected = "true"` と login runbook の warn log も残す。どちらも運用上の発見シグナルであり、runner は `proposer_missing_decision` の no-trade に fail closed する。`proposer_no_tool_calls` は process failure、CLI error 報告、認証失敗疑いのいずれもなく、判断未保存かつ許可済み tool call 0 件の場合だけ記録する。
-- Codex の低コスト model 名は account / CLI の対応に依存する。未確認の model を `FUKUROU_CODEX_MODEL` に入れると Falsifier phase が fail-closed する。
+- Codex の低コスト model 名は account / CLI の対応に依存する。未確認の model を `llm.codexModel` で active 化すると Falsifier phase が fail-closed する。
 - 既定の Codex Falsifier は `--skip-git-repo-check`、`--sandbox read-only`、`approval_policy="never"` で起動し、`CODEX_HOME/config.toml` に `submit_falsification` だけを tool 単位で `approval_mode = "approve"` として書く。これにより shell sandbox は保ったまま、ENTER 時の Falsifier verdict 保存まで進める。
 - `FUKUROU_CODEX_FALSIFIER_ARGS="--yolo"` や `--dangerously-bypass-approvals-and-sandbox` は通常運用には不要である。外部 sandbox で filesystem / network / secret mount を閉じた command template を明示 opt-in する場合の防御的 validation としてのみ残す。
 - live 実発注は未実装であり、production でも `PAPER` mode を維持する。

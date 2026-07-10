@@ -100,6 +100,8 @@ class TradingBotConfigTest {
                 "FUKUROU_LLM_RUN_TIMEOUT_SECONDS" to "120",
                 "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "1",
                 "FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY" to "3",
+                "FUKUROU_CLAUDE_MODEL" to "claude-runtime-test",
+                "FUKUROU_CODEX_MODEL" to "codex-runtime-test",
                 "FUKUROU_LLM_DAEMON_ENABLED" to "true",
                 "FUKUROU_LLM_DAEMON_POLL_SECONDS" to "120",
                 "FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS" to "28800",
@@ -165,6 +167,8 @@ class TradingBotConfigTest {
         assertEquals(Duration.ofSeconds(120), config.runner.perRunTimeout)
         assertEquals(1, config.runner.maxInvocationsPerHour)
         assertEquals(3, config.runner.maxInvocationsPerDay)
+        assertEquals("claude-runtime-test", config.llmModels.claudeModel)
+        assertEquals("codex-runtime-test", config.llmModels.codexModel)
         assertEquals(true, config.daemon.enabled)
         assertEquals(Duration.ofSeconds(120), config.daemon.pollInterval)
         assertEquals(Duration.ofHours(8), config.daemon.flatHeartbeatInterval)

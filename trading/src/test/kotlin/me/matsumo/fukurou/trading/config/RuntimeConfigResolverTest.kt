@@ -17,6 +17,8 @@ class RuntimeConfigResolverTest {
     fun resolve_usesActiveRuntimeConfigAheadOfLegacyRuntimeEnv() {
         val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
             "runner.maxToolCallsPerRun" to "12",
+            "llm.claudeModel" to "claude-db-model",
+            "llm.codexModel" to "codex-db-model",
             "safety.economicEventBlackouts" to economicEventBlackoutsJson(),
         )
         val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
@@ -24,12 +26,21 @@ class RuntimeConfigResolverTest {
         val result = resolver.resolve(
             environment = mapOf(
                 "FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT" to "48",
+                "FUKUROU_CLAUDE_MODEL" to "claude-legacy-env-model",
+                "FUKUROU_CODEX_MODEL" to "codex-legacy-env-model",
+                "FUKUROU_OBSIDIAN_VAULT_PATH" to "/deployment-vault",
                 "FUKUROU_TRADING_SYMBOL" to "BTC",
             ),
         ).getOrThrow()
 
         assertEquals(12, result.tradingConfig.runner.maxToolCallsPerRun)
+        assertEquals("claude-db-model", result.tradingConfig.llmModels.claudeModel)
+        assertEquals("codex-db-model", result.tradingConfig.llmModels.codexModel)
+        assertEquals("/deployment-vault", result.tradingConfig.obsidian.vaultPath)
         assertEquals("12", result.typedEnvironment.getValue("FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT"))
+        assertEquals("claude-db-model", result.typedEnvironment.getValue("FUKUROU_CLAUDE_MODEL"))
+        assertEquals("codex-db-model", result.typedEnvironment.getValue("FUKUROU_CODEX_MODEL"))
+        assertEquals("/deployment-vault", result.typedEnvironment.getValue("FUKUROU_OBSIDIAN_VAULT_PATH"))
         assertEquals("12", result.catalogEnvironment.getValue("FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT"))
         assertEquals("runtime-config-version", result.auditSnapshot.versionId)
         assertEquals(calculateRuntimeConfigHash(values), result.auditSnapshot.hash)
@@ -59,12 +70,22 @@ class RuntimeConfigResolverTest {
     fun resolve_acceptsStandardRuntimeConfigAboveAbsoluteMinimumBelowDefault() {
         val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
             "obsidian.writeInterval" to "60",
+            "reflection.minInterval" to "60",
+            "reflection.queryLimit" to "500",
+            "reflection.promptCandidateProvider" to "CODEX",
+            "reflection.promptCandidateTimeout" to "120",
+            "reflection.promptCandidateMaxAttempts" to "3",
         )
         val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
 
         val result = resolver.resolve(emptyMap()).getOrThrow()
 
         assertEquals(Duration.ofSeconds(60), result.tradingConfig.obsidian.writeInterval)
+        assertEquals(Duration.ofSeconds(60), result.tradingConfig.reflection.minInterval)
+        assertEquals(500, result.tradingConfig.reflection.queryLimit)
+        assertEquals("CODEX", result.tradingConfig.reflection.promptCandidateProvider.name)
+        assertEquals(Duration.ofSeconds(120), result.tradingConfig.reflection.promptCandidateTimeout)
+        assertEquals(3, result.tradingConfig.reflection.promptCandidateMaxAttemptsPerPeriod)
         assertEquals("60", result.catalogEnvironment.getValue("FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS"))
     }
 
@@ -151,6 +172,22 @@ class RuntimeConfigResolverTest {
         assertEquals("runtimeConfig.validation.typedGreaterThanOrEqual", validationError.code)
         assertEquals("obsidian.writeInterval", validationError.key)
         assertEquals("60", validationError.params.getValue("min"))
+    }
+
+    @Test
+    fun resolve_failsClosedWhenReflectionProviderIsUnknown() {
+        val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
+            "reflection.promptCandidateProvider" to "UNKNOWN",
+        )
+        val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
+        val result = resolver.resolve(emptyMap())
+        val exception = result.exceptionOrNull() as RuntimeConfigValidationRejectedException
+        val validationError = exception.validation.errors.single()
+
+        assertTrue(result.isFailure)
+        assertEquals("runtimeConfig.validation.typedOneOf", validationError.code)
+        assertEquals("reflection.promptCandidateProvider", validationError.key)
+        assertEquals("CLAUDE, CODEX", validationError.params.getValue("values"))
     }
 }
 

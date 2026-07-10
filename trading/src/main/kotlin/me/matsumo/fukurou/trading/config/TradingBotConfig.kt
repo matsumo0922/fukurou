@@ -8,6 +8,8 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
+import me.matsumo.fukurou.trading.invoker.FUKUROU_CLAUDE_MODEL_ENV
+import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_MODEL_ENV
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.reflection.ReflectionConfig
 import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
@@ -30,6 +32,7 @@ import java.time.Instant
  * @param decisionProtocol decision / Falsifier protocol 設定
  * @param runner LLM one-shot runner の保守的な上限設定
  * @param daemon Ktor 常駐 daemon scheduler 設定
+ * @param llmModels LLM provider ごとの model override
  * @param obsidian Obsidian vault への機械生成 note writer 設定
  * @param reflection deterministic reflection runner 設定
  * @param killCriterion 評価成績による HARD_HALT 基準
@@ -45,6 +48,7 @@ data class TradingBotConfig(
     val decisionProtocol: DecisionProtocolConfig = DecisionProtocolConfig(),
     val runner: LlmRunnerConfig = LlmRunnerConfig(),
     val daemon: LlmDaemonConfig = LlmDaemonConfig(),
+    val llmModels: LlmModelConfig = LlmModelConfig(),
     val obsidian: ObsidianConfig = ObsidianConfig(),
     val reflection: ReflectionConfig = ReflectionConfig(),
     val killCriterion: KillCriterionConfig = KillCriterionConfig(),
@@ -100,6 +104,7 @@ data class TradingBotConfig(
                 decisionProtocol = environment.readDecisionProtocolConfig(),
                 runner = environment.readLlmRunnerConfig(),
                 daemon = environment.readLlmDaemonConfig(),
+                llmModels = environment.readLlmModelConfig(),
                 obsidian = environment.readObsidianConfig(),
                 reflection = environment.readReflectionConfig(),
                 killCriterion = environment.readKillCriterionConfig(),
@@ -108,6 +113,17 @@ data class TradingBotConfig(
         }
     }
 }
+
+/**
+ * LLM provider ごとの model override。
+ *
+ * @param claudeModel Claude Code に渡す model。null の場合は CLI の既定値を使う
+ * @param codexModel Codex に渡す model。null の場合は CLI の既定値を使う
+ */
+data class LlmModelConfig(
+    val claudeModel: String? = null,
+    val codexModel: String? = null,
+)
 
 /**
  * Obsidian vault へ DB 由来の Markdown note を再生成する writer 設定。
@@ -582,47 +598,47 @@ private const val FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS_ENV = "FUKUROU_OBSIDIA
 /**
  * deterministic Reflection Runner 最小間隔秒数の環境変数名。
  */
-private const val FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS_ENV = "FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS"
+internal const val FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS_ENV = "FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS"
 
 /**
  * deterministic Reflection Runner の 1 tick 読み取り上限の環境変数名。
  */
-private const val FUKUROU_REFLECTION_QUERY_LIMIT_ENV = "FUKUROU_REFLECTION_QUERY_LIMIT"
+internal const val FUKUROU_REFLECTION_QUERY_LIMIT_ENV = "FUKUROU_REFLECTION_QUERY_LIMIT"
 
 /**
  * confidence calibration lookback 日数の環境変数名。
  */
-private const val FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS_ENV =
+internal const val FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS_ENV =
     "FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS"
 
 /**
  * Recent Decisions 表示上限の環境変数名。
  */
-private const val FUKUROU_REFLECTION_RECENT_DECISION_LIMIT_ENV =
+internal const val FUKUROU_REFLECTION_RECENT_DECISION_LIMIT_ENV =
     "FUKUROU_REFLECTION_RECENT_DECISION_LIMIT"
 
 /**
  * sample size warning の closed trade 件数しきい値の環境変数名。
  */
-private const val FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT_ENV =
+internal const val FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT_ENV =
     "FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT"
 
 /**
  * PromptCandidates 生成 LLM provider の環境変数名。
  */
-private const val FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER_ENV =
+internal const val FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER_ENV =
     "FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER"
 
 /**
  * PromptCandidates 生成 LLM timeout 秒数の環境変数名。
  */
-private const val FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS_ENV =
+internal const val FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS_ENV =
     "FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS"
 
 /**
  * 週ごとの PromptCandidates 生成最大試行回数の環境変数名。
  */
-private const val FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS_ENV =
+internal const val FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS_ENV =
     "FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS"
 
 /**
@@ -1024,6 +1040,13 @@ private fun Map<String, String>.readObsidianConfig(): ObsidianConfig {
                 ?.toLong()
                 ?: DEFAULT_OBSIDIAN_WRITE_INTERVAL.seconds,
         ),
+    )
+}
+
+private fun Map<String, String>.readLlmModelConfig(): LlmModelConfig {
+    return LlmModelConfig(
+        claudeModel = readOptional(FUKUROU_CLAUDE_MODEL_ENV),
+        codexModel = readOptional(FUKUROU_CODEX_MODEL_ENV),
     )
 }
 

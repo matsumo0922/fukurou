@@ -14,6 +14,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.config.requireValid
+import me.matsumo.fukurou.trading.config.retiredRuntimeConfigKeys
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import java.sql.ResultSet
@@ -54,9 +55,9 @@ private const val RUNTIME_CONFIG_WEBUI_CREATED_BY = "webui"
 private const val RUNTIME_CONFIG_BOOTSTRAP_NOTE = "code catalog defaults"
 
 /**
- * catalog backfill 由来の runtime config note prefix。
+ * catalog reconciliation 由来の runtime config note prefix。
  */
-private const val RUNTIME_CONFIG_CATALOG_BACKFILL_NOTE_PREFIX = "code catalog default backfill"
+private const val RUNTIME_CONFIG_CATALOG_RECONCILIATION_NOTE_PREFIX = "code catalog reconciliation"
 
 /**
  * active runtime config version を読む SQL。
@@ -294,8 +295,8 @@ class RuntimeConfigPersistenceBootstrap(
      * runtime config schema と active version を用意する。
      *
      * active snapshot に code-owned catalog key が不足している場合は、既存値を保持した
-     * complete snapshot を新しい active version として作成する。key の削除は無効化手段ではなく、
-     * bootstrap が catalog default で復元する。
+     * complete snapshot を新しい active version として作成する。明示的に退役した key は
+     * 新しい active version から除去し、それ以外の unknown key は拒否する。
      */
     fun ensureSchema(): Result<Unit> {
         return runCatching {
@@ -585,15 +586,18 @@ private fun JdbcTransaction.ensureActiveRuntimeConfigVersionValues(now: Instant)
     val defaultValues = RuntimeConfigCatalog.runtimeDefaultValues()
     val catalogKeyDiff = computeRuntimeConfigCatalogKeyDiff(values, defaultValues.keys)
 
-    require(catalogKeyDiff.unknownKeys.isEmpty()) {
-        "Active runtime config contains catalog-incompatible keys: ${catalogKeyDiff.unknownKeys.sorted()}"
+    val unexpectedKeys = catalogKeyDiff.unknownKeys - retiredRuntimeConfigKeys
+    val retiredKeys = catalogKeyDiff.unknownKeys intersect retiredRuntimeConfigKeys
+
+    require(unexpectedKeys.isEmpty()) {
+        "Active runtime config contains catalog-incompatible keys: ${unexpectedKeys.sorted()}"
     }
-    if (catalogKeyDiff.missingKeys.isNotEmpty()) {
-        backfillActiveRuntimeConfigVersionValues(
+    if (catalogKeyDiff.missingKeys.isNotEmpty() || retiredKeys.isNotEmpty()) {
+        reconcileActiveRuntimeConfigVersionValues(
             activeVersion = activeVersion,
             values = values,
             defaultValues = defaultValues,
-            missingKeys = catalogKeyDiff.missingKeys,
+            catalogKeyDiff = catalogKeyDiff,
             now = now,
         )
     }
@@ -632,21 +636,24 @@ private fun computeRuntimeConfigCatalogKeyDiff(
     )
 }
 
-private fun JdbcTransaction.backfillActiveRuntimeConfigVersionValues(
+private fun JdbcTransaction.reconcileActiveRuntimeConfigVersionValues(
     activeVersion: RuntimeConfigVersionRow,
     values: Map<String, String>,
     defaultValues: Map<String, String>,
-    missingKeys: Set<String>,
+    catalogKeyDiff: RuntimeConfigCatalogKeyDiff,
     now: Instant,
 ) {
     val versionId = UUID.randomUUID()
-    val completeValues = defaultValues + values
+    val completeValues = (defaultValues + values) - catalogKeyDiff.unknownKeys
 
     deactivateRuntimeConfigVersion(activeVersion.versionId)
     insertRuntimeConfigVersion(
         versionId = versionId,
         now = now,
-        note = runtimeConfigCatalogBackfillNote(missingKeys),
+        note = runtimeConfigCatalogReconciliationNote(
+            missingKeys = catalogKeyDiff.missingKeys,
+            retiredKeys = catalogKeyDiff.unknownKeys,
+        ),
     )
     insertRuntimeConfigValues(
         versionId = versionId,
@@ -779,8 +786,13 @@ private fun JdbcTransaction.insertRuntimeConfigValues(versionId: UUID, values: M
     }
 }
 
-private fun runtimeConfigCatalogBackfillNote(missingKeys: Set<String>): String {
-    return "$RUNTIME_CONFIG_CATALOG_BACKFILL_NOTE_PREFIX: ${missingKeys.sorted().joinToString(",")}"
+private fun runtimeConfigCatalogReconciliationNote(missingKeys: Set<String>, retiredKeys: Set<String>): String {
+    val changes = buildList {
+        if (missingKeys.isNotEmpty()) add("added=${missingKeys.sorted().joinToString(",")}")
+        if (retiredKeys.isNotEmpty()) add("removed=${retiredKeys.sorted().joinToString(",")}")
+    }
+
+    return "$RUNTIME_CONFIG_CATALOG_RECONCILIATION_NOTE_PREFIX: ${changes.joinToString(";")}"
 }
 
 private fun JdbcTransaction.deactivateActiveRuntimeConfigVersion() {

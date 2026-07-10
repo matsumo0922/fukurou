@@ -925,6 +925,35 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun runtimeConfigBootstrapRemovesExplicitlyRetiredCatalogKeys() = runPostgresTest {
+        val defaultValues = RuntimeConfigCatalog.runtimeDefaultValues()
+        val retiredKey = "obsidian.vaultPath"
+        val newlyAddedKey = "llm.claudeModel"
+        val deploymentVaultPath = "/deployment-vault"
+
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val originalSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+        upsertActiveRuntimeConfigValue(
+            database = database,
+            configKey = retiredKey,
+            configValue = "/legacy-runtime-vault",
+        )
+        deleteRuntimeConfigValue(database, newlyAddedKey)
+
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val migratedSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+        val resolution = RuntimeConfigResolver(ExposedRuntimeConfigRepository(database))
+            .resolve(mapOf("FUKUROU_OBSIDIAN_VAULT_PATH" to deploymentVaultPath))
+            .getOrThrow()
+
+        assertTrue(originalSnapshot.versionId != migratedSnapshot.versionId)
+        assertEquals(defaultValues, migratedSnapshot.values)
+        assertTrue(retiredKey !in migratedSnapshot.values)
+        assertEquals(deploymentVaultPath, resolution.tradingConfig.obsidian.vaultPath)
+    }
+
+    @Test
     fun runtimeConfigBootstrapFailsClosedWhenActiveValueHasUnknownKey() = runPostgresTest {
         RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         upsertActiveRuntimeConfigValue(

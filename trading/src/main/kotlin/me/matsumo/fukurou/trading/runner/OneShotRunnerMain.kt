@@ -26,7 +26,10 @@ fun main() = runBlocking {
             tradingConfig = tradingConfig,
             llmInvoker = ShellLlmInvoker(
                 commandRenderer = DefaultLlmCommandRenderer(
-                    config = LlmCommandRendererConfig.fromEnvironment(environment),
+                    config = LlmCommandRendererConfig.fromEnvironment(
+                        environment = environment,
+                        runtimeModels = tradingConfig.llmModels,
+                    ),
                 ),
                 processRunner = ShellProcessRunner(),
             ),

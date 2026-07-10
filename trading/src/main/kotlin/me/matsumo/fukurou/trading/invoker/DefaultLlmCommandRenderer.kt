@@ -5,6 +5,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+import me.matsumo.fukurou.trading.config.LlmModelConfig
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -71,8 +72,25 @@ data class LlmCommandRendererConfig(
     companion object {
         /**
          * 環境変数から renderer 設定を構築する。
+         *
+         * @param environment deployment boundary の設定を読む環境変数
+         * @param runtimeModels DB runtime config から解決した model override。指定時は legacy env より優先する
          */
-        fun fromEnvironment(environment: Map<String, String> = System.getenv()): LlmCommandRendererConfig {
+        fun fromEnvironment(
+            environment: Map<String, String> = System.getenv(),
+            runtimeModels: LlmModelConfig? = null,
+        ): LlmCommandRendererConfig {
+            val claudeModel = if (runtimeModels == null) {
+                environment.readOptionalEnv(FUKUROU_CLAUDE_MODEL_ENV)
+            } else {
+                runtimeModels.claudeModel
+            }
+            val codexModel = if (runtimeModels == null) {
+                environment.readOptionalEnv(FUKUROU_CODEX_MODEL_ENV)
+            } else {
+                runtimeModels.codexModel
+            }
+
             return LlmCommandRendererConfig(
                 claudeCommandTemplate = environment.readCommandTemplateEnv(
                     name = FUKUROU_CLAUDE_COMMAND_TEMPLATE_ENV,
@@ -82,8 +100,8 @@ data class LlmCommandRendererConfig(
                     name = FUKUROU_CODEX_COMMAND_TEMPLATE_ENV,
                     defaultValue = DEFAULT_CODEX_COMMAND_TEMPLATE,
                 ),
-                claudeModel = environment.readOptionalEnv(FUKUROU_CLAUDE_MODEL_ENV),
-                codexModel = environment.readOptionalEnv(FUKUROU_CODEX_MODEL_ENV),
+                claudeModel = claudeModel,
+                codexModel = codexModel,
                 claudeCommonArgs = environment.readOptionalEnv(FUKUROU_CLAUDE_COMMON_ARGS_ENV)
                     ?.splitCommandTemplate()
                     ?: DEFAULT_CLAUDE_COMMON_ARGS,
