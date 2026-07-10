@@ -264,9 +264,18 @@ describe("App", () => {
   });
 
   it("keeps the selected locale usable when browser storage writes fail", async () => {
-    const storageSetItemSpy = vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
+    const storageSetItemSpy = vi.fn(() => {
       throw new Error("storage disabled");
     });
+    const unavailableStorage: Storage = {
+      length: 0,
+      clear: vi.fn(),
+      getItem: vi.fn(() => null),
+      key: vi.fn(() => null),
+      removeItem: vi.fn(),
+      setItem: storageSetItemSpy,
+    };
+    vi.spyOn(window, "localStorage", "get").mockReturnValue(unavailableStorage);
 
     stubSystemFetch();
     window.history.pushState({}, "", "/app/overview");
