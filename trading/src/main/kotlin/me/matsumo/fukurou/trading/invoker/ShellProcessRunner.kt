@@ -128,10 +128,11 @@ class ShellProcessRunner : ProcessRunner {
             paths.forEach { path ->
                 runCatching { deleteCleanupPath(path) }
                     .onFailure { throwable ->
-                        if (firstFailure == null) {
+                        val existingFailure = firstFailure
+                        if (existingFailure == null) {
                             firstFailure = throwable
                         } else {
-                            firstFailure?.addSuppressed(throwable)
+                            existingFailure.addSuppressed(throwable)
                         }
                     }
             }
