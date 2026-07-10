@@ -107,11 +107,19 @@ class ExposedMarketDataIntegrityRepository(
                             detail = "previous process ended before the WebSocket session was closed",
                         )
                     }
+                    selectUnappliedMarketDataGaps().forEach { gap ->
+                        applyGapImpact(gap.id, gap.reason, recoveredAt)
+                    }
                 }
             }
         }
     }
 }
+
+private data class UnappliedMarketDataGap(
+    val id: UUID,
+    val reason: MarketDataGapReason,
+)
 
 internal fun JdbcTransaction.selectMarketDataIntegritySnapshot(): MarketDataIntegritySnapshot {
     return prepare(
@@ -171,6 +179,25 @@ private fun JdbcTransaction.selectConnectedMarketDataSessionIds(): List<UUID> {
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) add(resultSet.getObject("id", UUID::class.java))
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectUnappliedMarketDataGaps(): List<UnappliedMarketDataGap> {
+    return prepare(
+        "SELECT id, reason FROM market_data_gaps WHERE impact_applied_at IS NULL FOR UPDATE",
+    ).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(
+                        UnappliedMarketDataGap(
+                            id = resultSet.getObject("id", UUID::class.java),
+                            reason = MarketDataGapReason.valueOf(resultSet.getString("reason")),
+                        ),
+                    )
+                }
             }
         }
     }
@@ -311,6 +338,21 @@ private fun JdbcTransaction.insertPositionAndRunExclusions(
         at,
         "DECISION_RUN",
         "SELECT DISTINCT decision_run_id FROM positions WHERE status = 'OPEN' AND decision_run_id IS NOT NULL",
+    )
+    insertExclusionsFromQuery(
+        gapId,
+        reason,
+        at,
+        "DECISION_RUN",
+        """
+            SELECT DISTINCT entry.decision_run_id
+            FROM orders entry
+            INNER JOIN positions affected ON affected.trade_group_id = entry.trade_group_id
+            WHERE affected.status = 'OPEN'
+                AND entry.status = 'FILLED'
+                AND entry.side = 'BUY'
+                AND entry.decision_run_id IS NOT NULL
+        """,
     )
 }
 

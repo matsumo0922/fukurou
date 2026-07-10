@@ -78,6 +78,9 @@ private val RECONCILER_LOGGER = Logger.getLogger(ProtectionReconciler::class.jav
  */
 private const val HARD_HALT_SWEEP_REASON = "ProtectionReconciler HARD_HALT sweep"
 
+/** gap 永続化失敗時に fail-closed のまま再試行する間隔。 */
+private val DEFAULT_GAP_RETRY_BACKOFF = Duration.ofSeconds(2)
+
 /**
  * ProtectionReconciler の pass 種別。
  */
@@ -172,13 +175,14 @@ class ProtectionReconciler(
         }
     }
 
-    private suspend fun runMarketEventLoop(reconnectBackoff: Duration) {
+    private suspend fun runMarketEventLoop(maintenanceInterval: Duration) {
+        val reconnectBackoff = requireNotNull(marketEventStream).reconnectBackoff
         while (currentCoroutineContext().isActive) {
-            val session = marketEventStream?.connect()?.getOrElse { throwable ->
+            val session = marketEventStream.connect().getOrElse { throwable ->
                 logPassFailure(ReconcilePassKind.LOOP, throwable)
                 delay(reconnectBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
                 continue
-            } ?: return
+            }
 
             val beginResult = marketDataIntegrityRepository.beginSession(session.sessionId, session.connectedAt)
             if (beginResult.isFailure) {
@@ -190,7 +194,7 @@ class ProtectionReconciler(
             refreshMarketDataStatus()
 
             try {
-                consumeMarketEventSession(session)
+                consumeMarketEventSession(session, maintenanceInterval)
             } finally {
                 session.close()
             }
@@ -199,9 +203,18 @@ class ProtectionReconciler(
         }
     }
 
-    private suspend fun consumeMarketEventSession(session: me.matsumo.fukurou.trading.market.MarketEventSession) {
+    private suspend fun consumeMarketEventSession(
+        session: me.matsumo.fukurou.trading.market.MarketEventSession,
+        maintenanceInterval: Duration,
+    ) {
         while (currentCoroutineContext().isActive) {
-            val eventResult = session.receive()
+            val eventResult = kotlinx.coroutines.withTimeoutOrNull(maintenanceInterval.toMillis()) {
+                session.receive()
+            }
+            if (eventResult == null) {
+                runPeriodicSafetyMaintenance()
+                continue
+            }
             val event = eventResult.getOrNull()
 
             if (event == null) {
@@ -228,19 +241,33 @@ class ProtectionReconciler(
     private suspend fun recordMarketDataGap(sessionId: UUID, throwable: Throwable?) {
         val reason = throwable.toGapReason()
         val detectedAt = Instant.now(clock)
-        marketDataIntegrityRepository.markDisconnected(
-            sessionId = sessionId,
-            reason = reason,
-            detectedAt = detectedAt,
-            detail = throwable?.javaClass?.simpleName,
-        ).getOrThrow()
 
-        tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
-            marketDataIntegrityRepository.applyGapImpact(
-                sessionId = sessionId,
-                reason = reason,
-                detectedAt = detectedAt,
-            ).getOrThrow()
+        markMarketDataUnavailable(sessionId, reason, detectedAt)
+        while (currentCoroutineContext().isActive) {
+            val result = runCatching {
+                marketDataIntegrityRepository.markDisconnected(
+                    sessionId = sessionId,
+                    reason = reason,
+                    detectedAt = detectedAt,
+                    detail = throwable?.javaClass?.simpleName,
+                ).getOrThrow()
+
+                tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
+                    marketDataIntegrityRepository.applyGapImpact(
+                        sessionId = sessionId,
+                        reason = reason,
+                        detectedAt = detectedAt,
+                    ).getOrThrow()
+                }
+            }
+            if (result.isSuccess) {
+                refreshMarketDataStatus()
+                return
+            }
+
+            result.exceptionOrNull()?.let { failure -> logPassFailure(ReconcilePassKind.LOOP, failure) }
+            val retryBackoff = marketEventStream?.reconnectBackoff ?: DEFAULT_GAP_RETRY_BACKOFF
+            delay(retryBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
         }
     }
 
@@ -248,7 +275,7 @@ class ProtectionReconciler(
         return try {
             tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
                 broker?.applyMarketEvent(event)?.getOrThrow()
-                equitySnapshotRecorder?.recordDailyIfNeeded()
+                runPeriodicSafetyMaintenanceLocked()
             }
             refreshMarketDataStatus()
             Result.success(Unit)
@@ -257,6 +284,41 @@ class ProtectionReconciler(
         } catch (throwable: Throwable) {
             Result.failure(throwable)
         }
+    }
+
+    /** REST は約定根拠にせず、定期的な safety / evaluation 保守だけに使う。 */
+    private suspend fun runPeriodicSafetyMaintenance() {
+        tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
+            runPeriodicSafetyMaintenanceLocked()
+        }
+    }
+
+    private suspend fun runPeriodicSafetyMaintenanceLocked() {
+        val tickSnapshot = readTickSnapshot()
+        if (tickSnapshot != null) {
+            broker?.maintainProtections(tickSnapshot)?.getOrThrow()
+            val swept = enforceHardHaltSweepIfNeeded(tickSnapshot)
+            if (!swept) {
+                killCriterionEvaluator?.evaluate(tickSnapshot)?.getOrThrow()
+            }
+        }
+        equitySnapshotRecorder?.recordDailyIfNeeded()
+    }
+
+    private fun markMarketDataUnavailable(
+        sessionId: UUID,
+        reason: MarketDataGapReason,
+        detectedAt: Instant,
+    ) {
+        val current = status.snapshot()
+        status.updateMarketData(
+            current.copy(
+                marketDataState = me.matsumo.fukurou.trading.market.MarketDataConnectionState.DISCONNECTED,
+                marketDataSessionId = sessionId,
+                gapStartedAt = detectedAt,
+                gapReason = reason,
+            ),
+        )
     }
 
     private suspend fun refreshMarketDataStatus() {

@@ -213,6 +213,7 @@ private fun ProtectionReconcilerWorkerInputs.createBroker(
         fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
         reconcilerStatusProvider = status,
         requireRealtimeIntegrityForRestingOrders = true,
+        restingEntryOrderTtl = tradingConfig.decisionProtocol.restingEntryOrderTtl,
         clock = clock,
     )
 }

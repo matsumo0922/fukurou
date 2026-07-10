@@ -243,6 +243,7 @@ interface PaperLedgerMutationRepository {
         tickSnapshot: TickSnapshot,
         simulator: PaperExecutionSimulator,
         simulationContext: PaperSimulationContext? = null,
+        allowRestingEntryFills: Boolean = true,
     ): Result<PaperReconcileResult>
 
     /**

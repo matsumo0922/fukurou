@@ -187,5 +187,6 @@ Cloudflare Access は `/app/*` と `/ops/*` を保護し、runtime config draft 
 - paper STOP は `ProtectionReconciler` が動いている間だけ約定判定される。live の native STOP は bot 停止中も取引所側で作動するため、paper の方が保護が弱い。
 - paper の resting BUY LIMIT は発注時に exact-price bid と先行する同価格の自 paper order を `queueAheadBtc` として保存する。WebSocket の eligible SELL 数量が `queueAheadBtc + order.sizeBtc` に達した event でだけ、LIMIT 価格の maker 全量約定にする。partial fill と先行 exchange order cancellation は再現しない。
 - queue snapshot 取得不能、板 depth 外、取得中の session 変更は 0 とみなさず注文を fail-closed にする。REST history/candle/ticker や再接続後の履歴を resting fill、STOP、TP の根拠にしない。同期 MARKET、手動 close、crossing LIMIT は既存の即時 command contract を使う。
+- WebSocket 待機中も `ProtectionReconciler` は有効な `gmoPublic.websocketReconnectBackoff` で再接続し、REST tick は HARD_HALT、kill criterion、ATR trailing の保守だけに使う。REST tick は resting entry を約定させない。
 - paper の slippage / fallback spread / fallback fee は config で保守的に近似する。live 化前に実測で較正する。
 - `LIVE` mode は typed model の予約値であり、`LiveGmoBroker` と live 実発注は未実装。現時点では env 起動を fail closed し、ユーザーの明示要求なしに有効化しない。

@@ -37,12 +37,19 @@ class GmoPublicWebSocketMarketEventStream(
         .build(),
 ) : MarketEventStream {
 
+    override val reconnectBackoff: java.time.Duration
+        get() = config.reconnectBackoff
+
     override suspend fun connect(): Result<MarketEventSession> {
         return runCatching {
             val sessionId = UUID.randomUUID()
             val connectedAt = clock.instant()
-            val messages = Channel<Result<String>>(capacity = Channel.UNLIMITED)
-            val listener = GmoWebSocketListener(messages)
+            val messages = Channel<Result<PaperMarketTradeEvent>>(capacity = Channel.UNLIMITED)
+            val listener = GmoWebSocketListener(
+                messages = messages,
+                decoder = GmoTradeMessageDecoder(symbol, sessionId),
+                clock = clock,
+            )
             val socket = httpClient.newWebSocketBuilder()
                 .connectTimeout(config.connectTimeout)
                 .buildAsync(URI.create(config.endpoint), listener)
@@ -52,10 +59,8 @@ class GmoPublicWebSocketMarketEventStream(
 
             GmoMarketEventSession(
                 metadata = MarketEventSessionMetadata(sessionId, connectedAt),
-                symbol = symbol,
                 socket = socket,
                 messages = messages,
-                clock = clock,
                 messageStaleTimeoutMillis = config.messageStaleTimeout.toMillis(),
             )
         }
@@ -94,27 +99,17 @@ data class GmoPublicWebSocketConfig(
 
 private class GmoMarketEventSession(
     private val metadata: MarketEventSessionMetadata,
-    private val symbol: TradingSymbol,
     private val socket: WebSocket,
-    private val messages: Channel<Result<String>>,
-    private val clock: Clock,
+    private val messages: Channel<Result<PaperMarketTradeEvent>>,
     private val messageStaleTimeoutMillis: Long,
 ) : MarketEventSession {
     override val sessionId: UUID = metadata.sessionId
     override val connectedAt: Instant = metadata.connectedAt
-    private val decoder = GmoTradeMessageDecoder(symbol, sessionId)
-
     override suspend fun receive(): Result<PaperMarketTradeEvent> {
         return runCatching {
-            while (true) {
-                val payload = withTimeout(messageStaleTimeoutMillis) {
-                    messages.receive().getOrThrow()
-                }
-                val receivedAt = clock.instant()
-                decoder.decode(payload, receivedAt)?.let { event -> return@runCatching event }
+            withTimeout(messageStaleTimeoutMillis) {
+                messages.receive().getOrThrow()
             }
-
-            error("unreachable")
         }
     }
 
@@ -162,8 +157,10 @@ internal class GmoTradeMessageDecoder(
     }
 }
 
-private class GmoWebSocketListener(
-    private val messages: Channel<Result<String>>,
+internal class GmoWebSocketListener(
+    private val messages: Channel<Result<PaperMarketTradeEvent>>,
+    private val decoder: GmoTradeMessageDecoder,
+    private val clock: Clock,
 ) : WebSocket.Listener {
     private val fragments = StringBuilder()
 
@@ -180,7 +177,16 @@ private class GmoWebSocketListener(
             fragments.append(data)
 
             if (last) {
-                messages.trySend(Result.success(fragments.toString()))
+                val receivedAt = clock.instant()
+                val decoded = runCatching {
+                    decoder.decode(fragments.toString(), receivedAt)
+                }
+                decoded.exceptionOrNull()?.let { throwable ->
+                    messages.trySend(Result.failure(throwable))
+                }
+                decoded.getOrNull()?.let { event ->
+                    messages.trySend(Result.success(event))
+                }
                 fragments.setLength(0)
             }
         }

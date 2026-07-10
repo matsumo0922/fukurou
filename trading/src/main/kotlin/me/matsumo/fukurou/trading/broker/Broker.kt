@@ -142,6 +142,20 @@ interface BrokerReconcileBoundary {
     suspend fun reconcile(tickSnapshot: TickSnapshot): Result<PaperReconcileResult>
 
     /**
+     * REST tick を使い、resting entry を約定させず position mark / ATR trailing だけを保守する。
+     */
+    suspend fun maintainProtections(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
+        return Result.success(
+            PaperReconcileResult(
+                advanced = false,
+                triggeredOrderIds = emptyList(),
+                closedPositionIds = emptyList(),
+                executionIds = emptyList(),
+            ),
+        )
+    }
+
+    /**
      * HARD_HALT 到達時の内部掃引を実行する。
      */
     suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult>

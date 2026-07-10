@@ -358,6 +358,7 @@ internal class ExposedPaperLedgerWriter(
         tickSnapshot: TickSnapshot,
         simulator: PaperExecutionSimulator,
         simulationContext: PaperSimulationContext?,
+        allowRestingEntryFills: Boolean,
     ): Result<PaperReconcileResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -379,7 +380,9 @@ internal class ExposedPaperLedgerWriter(
                     expireRestingEntryOrders(clock.instant(), progress)
 
                     if (!paperAccountHardHaltReached()) {
-                        fillTriggeredEntryOrders(reconcileContext, progress, clock)
+                        if (allowRestingEntryFills) {
+                            fillTriggeredEntryOrders(reconcileContext, progress, clock)
+                        }
                         triggerPositionProtections(reconcileContext, progress, clock)
                     }
 
@@ -467,7 +470,7 @@ private fun JdbcTransaction.applyPaperMarketEvent(
 
     updateMarks(event.priceJpy, null, rules, clock)
     expireRestingEntryOrders(event.receivedAt, progress)
-    bindUnmanagedPositionsToSession(event)
+    bindExistingPositionsToSession(event)
 
     if (!paperAccountHardHaltReached()) {
         applyEventToRestingEntries(event, simulator, simulationContext, progress, clock)
@@ -496,7 +499,10 @@ private fun JdbcTransaction.lockMarketDataCursor(sessionId: UUID): Long {
     }
 }
 
-private fun JdbcTransaction.bindUnmanagedPositionsToSession(event: PaperMarketTradeEvent) {
+private fun JdbcTransaction.bindExistingPositionsToSession(event: PaperMarketTradeEvent) {
+    val isFirstEventAfterRecoveredGap = hasUnrecoveredGapBefore(event.connectionSessionId)
+    val eligibleAfterSequence = if (isFirstEventAfterRecoveredGap) event.sequence - 1 else event.sequence
+
     prepare(
         """
             UPDATE positions
@@ -506,9 +512,20 @@ private fun JdbcTransaction.bindUnmanagedPositionsToSession(event: PaperMarketTr
         """,
     ).use { statement ->
         statement.setObject(1, event.connectionSessionId)
-        statement.setLong(2, event.sequence)
+        // gap 復旧後はこの event より前に存在した position を直ちに保護する。
+        // 通常接続で同期待ちの position と event 内で新規作成した position は同一 sequence を拒否する。
+        statement.setLong(2, eligibleAfterSequence)
         statement.setObject(3, event.connectionSessionId)
         statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.hasUnrecoveredGapBefore(sessionId: UUID): Boolean {
+    return prepare(
+        "SELECT 1 FROM market_data_gaps WHERE recovered_at IS NULL AND session_id <> ? LIMIT 1",
+    ).use { statement ->
+        statement.setObject(1, sessionId)
+        statement.executeQuery().use { resultSet -> resultSet.next() }
     }
 }
 

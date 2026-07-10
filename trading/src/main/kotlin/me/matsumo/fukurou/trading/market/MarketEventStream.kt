@@ -7,6 +7,10 @@ import java.util.UUID
  * realtime market event 接続を作る transport-neutral 境界。
  */
 interface MarketEventStream {
+    /** 接続失敗または切断後に次の接続を試行するまでの待機時間。 */
+    val reconnectBackoff: java.time.Duration
+        get() = java.time.Duration.ofSeconds(5)
+
     /**
      * 新しい接続 session を開く。
      */

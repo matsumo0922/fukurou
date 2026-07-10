@@ -446,7 +446,7 @@ private class PaperBrokerTradeDelegate(
             sessionId = sessionId,
             eligibleAfterSequence = after.lastProcessedSequence,
             eligibleFrom = eligibleFrom,
-            expiresAt = eligibleFrom.plus(DEFAULT_RESTING_ORDER_TTL),
+            expiresAt = eligibleFrom.plus(runtime.time.restingEntryOrderTtl),
             queueAheadBtc = queueAhead,
             queueSnapshotAt = queueSnapshotAt.takeIf { command.orderType == OrderType.LIMIT },
         )
@@ -779,6 +779,24 @@ private class PaperBrokerReconcileDelegate(
                     tickSnapshot = tickSnapshot,
                     simulator = runtime.market.fillSimulator,
                     simulationContext = simulationContext,
+                )
+                .getOrThrow()
+
+            safetyGate.activateHardHaltIfAccountDrawdownReached()
+
+            result
+        }
+    }
+
+    override suspend fun maintainProtections(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
+        return runCatching {
+            val simulationContext = runtime.reconcileSimulationContext(tickSnapshot)
+            val result = runtime.stores.ledgerRepository
+                .reconcile(
+                    tickSnapshot = tickSnapshot,
+                    simulator = runtime.market.fillSimulator,
+                    simulationContext = simulationContext,
+                    allowRestingEntryFills = false,
                 )
                 .getOrThrow()
 
@@ -1678,9 +1696,6 @@ private val TRADING_DATE_ZONE = ZoneId.of("Asia/Tokyo")
  * ATR 算出に取得する 5分足本数。
  */
 private const val ATR_CANDLE_LIMIT = 64
-
-/** resting entry の既定有効期限。 */
-private val DEFAULT_RESTING_ORDER_TTL: Duration = Duration.ofHours(1)
 
 /** resting order 作成を許す market-data freshness window。 */
 private val MARKET_DATA_FRESHNESS_WINDOW: Duration = Duration.ofSeconds(30)

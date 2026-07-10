@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
+import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -41,7 +42,14 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.lock.TradingLockLease
+import me.matsumo.fukurou.trading.market.MarketDataConnectionState
+import me.matsumo.fukurou.trading.market.MarketDataGapReason
+import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
+import me.matsumo.fukurou.trading.market.MarketDataIntegritySnapshot
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.market.MarketEventSession
+import me.matsumo.fukurou.trading.market.MarketEventStream
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
@@ -638,6 +646,72 @@ class ProtectionReconcilerTest {
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertEquals(2, repository.getExecutions().getOrThrow().size)
     }
+
+    @Test
+    fun market_event_loop_applies_event_and_retries_gap_impact_under_global_lock() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000163")
+        val event = PaperMarketTradeEvent(
+            symbol = TradingSymbol.BTC,
+            side = OrderSide.SELL,
+            priceJpy = BigDecimal("10000000"),
+            sizeBtc = BigDecimal("0.0010"),
+            exchangeAt = fixedInstant(),
+            receivedAt = fixedInstant(),
+            connectionSessionId = sessionId,
+            sequence = 1,
+        )
+        val stream = SingleSessionMarketEventStream(
+            session = ScriptedMarketEventSession(
+                sessionId = sessionId,
+                connectedAt = fixedInstant(),
+                results = listOf(
+                    Result.success(event),
+                    Result.failure(IllegalStateException("socket closed")),
+                ),
+            ),
+        )
+        val integrity = RetryableMarketDataIntegrityRepository(failMarkDisconnectedTimes = 1)
+        val lock = CountingTradingLock(fixedClock())
+        val broker = RecordingBroker(
+            PaperBroker(
+                ledgerRepository = InMemoryPaperLedgerRepository(),
+                riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                decisionRepository = InMemoryDecisionRepository(fixedClock()),
+                marketDataSource = ReconcilerFakeMarketDataSource,
+                clock = fixedClock(),
+            ),
+        )
+        val status = MutableReconcilerStatus()
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = lock,
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            marketEventStream = stream,
+            marketDataIntegrityRepository = integrity,
+            broker = broker,
+            status = status,
+            clock = fixedClock(),
+        )
+
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(1))
+        }
+
+        withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
+            while (integrity.applyGapImpactCount == 0) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertEquals(listOf(event), broker.appliedEvents)
+        assertTrue(broker.maintenanceCount >= 1)
+        assertEquals(2, integrity.markDisconnectedCount)
+        assertEquals(1, integrity.applyGapImpactCount)
+        assertTrue(lock.owners.count { owner -> owner == "paper-market-event" } >= 2)
+        assertEquals(MarketDataConnectionState.DISCONNECTED, status.snapshot().marketDataState)
+    }
 }
 
 private suspend fun InMemoryPaperLedgerRepository.fillEquitySnapshotCount(): Int {
@@ -677,13 +751,136 @@ private class CountingTradingLock(
     var acquisitionCount: Int = 0
         private set
 
+    val owners = mutableListOf<String>()
+
     override suspend fun <T> withLock(owner: String, block: suspend (TradingLockLease) -> T): T {
         return delegate.withLock(owner) { lease ->
             acquisitionCount += 1
+            owners += owner
 
             block(lease)
         }
     }
+}
+
+/** realtime event を実 broker に渡した回数を記録する test adapter。 */
+private class RecordingBroker(
+    private val delegate: Broker,
+) : Broker by delegate {
+    val appliedEvents = mutableListOf<PaperMarketTradeEvent>()
+    var maintenanceCount = 0
+        private set
+
+    override suspend fun applyMarketEvent(event: PaperMarketTradeEvent): Result<PaperReconcileResult> {
+        return delegate.applyMarketEvent(event).also {
+            appliedEvents += event
+        }
+    }
+
+    override suspend fun maintainProtections(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
+        return delegate.maintainProtections(tickSnapshot).also {
+            maintenanceCount += 1
+        }
+    }
+}
+
+/** 1 session の event と切断を返し、その後の reconnect を失敗させる stream。 */
+private class SingleSessionMarketEventStream(
+    private val session: MarketEventSession,
+) : MarketEventStream {
+    override val reconnectBackoff: Duration = Duration.ofMillis(1)
+    private var connectCount = 0
+
+    override suspend fun connect(): Result<MarketEventSession> {
+        connectCount += 1
+
+        return if (connectCount == 1) Result.success(session) else Result.failure(IllegalStateException("reconnect unavailable"))
+    }
+}
+
+/** 指定した順に event 結果を返す session。 */
+private class ScriptedMarketEventSession(
+    override val sessionId: UUID,
+    override val connectedAt: Instant,
+    private val results: List<Result<PaperMarketTradeEvent>>,
+) : MarketEventSession {
+    private var nextIndex = 0
+
+    override suspend fun receive(): Result<PaperMarketTradeEvent> {
+        val result = results.getOrElse(nextIndex) {
+            Result.failure(IllegalStateException("scripted session exhausted"))
+        }
+        nextIndex += 1
+
+        return result
+    }
+
+    override fun close() = Unit
+}
+
+/** 切断永続化の一時失敗を再現する integrity repository。 */
+private class RetryableMarketDataIntegrityRepository(
+    private var failMarkDisconnectedTimes: Int,
+) : MarketDataIntegrityRepository {
+    private var snapshot = MarketDataIntegritySnapshot()
+
+    var markDisconnectedCount = 0
+        private set
+    var applyGapImpactCount = 0
+        private set
+
+    override suspend fun snapshot(): Result<MarketDataIntegritySnapshot> = Result.success(snapshot)
+
+    override suspend fun beginSession(sessionId: UUID, connectedAt: Instant): Result<Unit> {
+        snapshot = MarketDataIntegritySnapshot(
+            state = MarketDataConnectionState.CONNECTED,
+            sessionId = sessionId,
+            startupRecoveryCompleted = true,
+        )
+
+        return Result.success(Unit)
+    }
+
+    override suspend fun markDisconnected(
+        sessionId: UUID,
+        reason: MarketDataGapReason,
+        detectedAt: Instant,
+        detail: String?,
+    ): Result<Unit> {
+        markDisconnectedCount += 1
+        if (failMarkDisconnectedTimes > 0) {
+            failMarkDisconnectedTimes -= 1
+            return Result.failure(IllegalStateException("transient persistence failure"))
+        }
+
+        snapshot = snapshot.copy(
+            state = MarketDataConnectionState.DISCONNECTED,
+            sessionId = sessionId,
+            gapStartedAt = detectedAt,
+            gapReason = reason,
+        )
+
+        return Result.success(Unit)
+    }
+
+    override suspend fun applyGapImpact(
+        sessionId: UUID,
+        reason: MarketDataGapReason,
+        detectedAt: Instant,
+    ): Result<Unit> {
+        applyGapImpactCount += 1
+
+        return Result.success(Unit)
+    }
+
+    override suspend fun recordGap(
+        sessionId: UUID,
+        reason: MarketDataGapReason,
+        detectedAt: Instant,
+        detail: String?,
+    ): Result<Unit> = Result.failure(UnsupportedOperationException("not used"))
+
+    override suspend fun recoverStaleSession(recoveredAt: Instant): Result<Unit> = Result.success(Unit)
 }
 
 /**
