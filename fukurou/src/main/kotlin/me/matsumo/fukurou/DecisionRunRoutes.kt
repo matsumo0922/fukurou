@@ -12,8 +12,8 @@ import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunDetail
 import me.matsumo.fukurou.trading.activity.DecisionRunExecution
-import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
+import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
@@ -340,10 +340,7 @@ private suspend fun OpsRouteDependencies.referenceQuote(): OpsDecisionRunQuoteRe
     )
 }
 
-private fun DecisionRunPage.toResponse(
-    limit: Int,
-    quote: OpsDecisionRunQuoteResponse?,
-): OpsDecisionRunsResponse {
+private fun DecisionRunPage.toResponse(limit: Int, quote: OpsDecisionRunQuoteResponse?): OpsDecisionRunsResponse {
     val visible = runs.take(limit)
     val nextCursor = if (runs.size > limit) {
         visible.lastOrNull()?.toCursor()
