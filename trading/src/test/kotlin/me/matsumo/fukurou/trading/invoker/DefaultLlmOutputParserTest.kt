@@ -180,6 +180,37 @@ class DefaultLlmOutputParserTest {
     }
 
     @Test
+    fun parseCodex_doesNotWarnWhenModelIsResolvedBeforeSessionLineLimit() {
+        val codexHome = Files.createTempDirectory("codex-output-parser-resolved-line-limit-test")
+        val sessionDirectory = codexHome.resolve("sessions/2026/07/10")
+        Files.createDirectories(sessionDirectory)
+        val threadId = "019f0f13-d14f-71c1-a517-f71bb01767b5"
+        val sessionContent = buildString {
+            appendLine("""{"type":"session_meta","payload":{"id":"$threadId"}}""")
+            appendLine("""{"type":"turn_context","payload":{"model":"gpt-5.4"}}""")
+            repeat(9_999) { appendLine("malformed") }
+        }
+        Files.writeString(
+            sessionDirectory.resolve("rollout-$threadId.jsonl"),
+            sessionContent,
+        )
+        val warnings = mutableListOf<String>()
+
+        val output = DefaultLlmOutputParser(warnings::add).parse(
+            request = request(LlmProvider.CODEX),
+            command = command(codexHome),
+            processResult = processResult(codexStdout(threadId)),
+            startedAt = Instant.parse("2026-07-10T00:00:00Z"),
+            completedAt = Instant.parse("2026-07-10T00:00:01Z"),
+        )
+
+        assertEquals("gpt-5.4", output.usage?.modelUsages?.single()?.model)
+        assertEquals(emptyList(), warnings)
+
+        codexHome.toFile().deleteRecursively()
+    }
+
+    @Test
     fun parseClaude_preservesExistingSemanticResponseAndUsage() {
         val stdout = """
             {

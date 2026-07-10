@@ -163,7 +163,9 @@ class DefaultLlmOutputParser(
                 )
             }
 
-            candidates.take(MAX_SESSION_FILES_PER_DAY)
+            candidates
+                .sortedByLastModifiedDescending()
+                .take(MAX_SESSION_FILES_PER_DAY)
         }
 
         return fallbackCandidates.firstNotNullOfOrNull { path -> resolveModelFromSession(path, threadId) }
@@ -191,13 +193,16 @@ class DefaultLlmOutputParser(
                 paths
                     .filter { path -> Files.isRegularFile(path) }
                     .toList()
-                    .map { path ->
-                        path to runCatching { Files.getLastModifiedTime(path).toMillis() }.getOrDefault(0L)
-                    }
-                    .sortedByDescending { (_, lastModifiedMillis) -> lastModifiedMillis }
-                    .map { (path, _) -> path }
             }
         }.getOrDefault(emptyList())
+    }
+
+    private fun List<Path>.sortedByLastModifiedDescending(): List<Path> {
+        return map { path ->
+            path to runCatching { Files.getLastModifiedTime(path).toMillis() }.getOrDefault(0L)
+        }
+            .sortedByDescending { (_, lastModifiedMillis) -> lastModifiedMillis }
+            .map { (path, _) -> path }
     }
 
     private fun resolveModelFromSession(path: Path, threadId: String): String? {
@@ -217,7 +222,7 @@ class DefaultLlmOutputParser(
                     }
                 }
 
-                if (reader.readLine() != null) {
+                if (reader.readLine() != null && scanState.model == null) {
                     warningLogger(
                         "Codex model attribution truncated session content " +
                             "limit=$MAX_SESSION_LINES.",
