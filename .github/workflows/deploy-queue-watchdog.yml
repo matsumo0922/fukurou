@@ -25,8 +25,9 @@ jobs:
             --jq '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued") | .id]')"
 
           for run_id in $(echo "${runs}" | jq -r '.[]'); do
+            # re-run 等で同名 job が複数存在する場合があるため、最新の 1 件だけに絞る。
             job="$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/jobs" \
-              --jq '.jobs[] | select(.name=="Deploy on NAS")')"
+              --jq '[.jobs[] | select(.name=="Deploy on NAS")] | sort_by(.created_at) | last // empty')"
 
             if [[ -z "${job}" ]]; then
               continue
