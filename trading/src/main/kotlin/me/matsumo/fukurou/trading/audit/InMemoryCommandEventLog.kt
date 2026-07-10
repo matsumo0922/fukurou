@@ -21,13 +21,14 @@ class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
         return Result.success(Unit)
     }
 
-    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+    override suspend fun countDistinctLlmLaunchesSince(since: Instant, excludedInvocationId: String?): Result<Int> {
         return runCatching {
             mutex.withLock {
                 storedEvents
                     .filter { event -> !event.occurredAt.isBefore(since) }
                     .filter { event -> event.eventType in DECISION_RUN_COUNTED_EVENT_TYPES }
                     .mapNotNull { event -> event.decisionRunContext.decisionRunId }
+                    .filter { decisionRunId -> decisionRunId != excludedInvocationId }
                     .distinct()
                     .size
             }

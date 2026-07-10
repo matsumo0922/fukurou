@@ -172,7 +172,8 @@ enum class LlmLaunchReservationRejectionReason {
 /**
  * daemon scheduler の起動予約 repository。
  *
- * daemon 経路の起動予算と同時起動の正本であり、DB 実装では予約行と runner 完了 audit を合算して数える。
+ * daemon 経路の起動予算と同時起動の正本であり、DB 実装では予約時刻を起動時刻の正本とする。
+ * 予約のない legacy run だけ runner 完了 audit の時刻へ fallback する。
  * runner preflight は手動 one-shot も含む最後の防衛線として残す。
  */
 interface LlmLaunchReservationRepository {

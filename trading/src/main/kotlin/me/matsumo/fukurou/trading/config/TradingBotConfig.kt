@@ -701,12 +701,12 @@ val MAX_LLM_PER_RUN_TIMEOUT: Duration = Duration.ofSeconds(600)
 /**
  * 直近 1 時間の既定 runner 起動上限。
  */
-const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 6
+const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 7
 
 /**
  * 直近 24 時間の既定 runner 起動上限。
  */
-const val DEFAULT_MAX_INVOCATIONS_PER_DAY = 96
+const val DEFAULT_MAX_INVOCATIONS_PER_DAY = 120
 
 /**
  * LLM daemon scheduler 有効化の既定値。

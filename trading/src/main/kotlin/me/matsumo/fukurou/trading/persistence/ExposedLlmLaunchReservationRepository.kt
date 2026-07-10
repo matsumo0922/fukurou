@@ -46,24 +46,6 @@ private const val COUNT_ACTIVE_LLM_LAUNCH_RESERVATIONS_SQL = """
 """
 
 /**
- * LLM 起動数を reservation と command_event_log の union で数える SQL。
- */
-private const val COUNT_DISTINCT_LLM_LAUNCHES_SINCE_SQL = """
-    SELECT COUNT(DISTINCT launch_id)
-    FROM (
-        SELECT invocation_id AS launch_id
-        FROM llm_launch_reservations
-        WHERE reserved_at >= ?
-        UNION
-        SELECT decision_run_id AS launch_id
-        FROM command_event_log
-        WHERE decision_run_id IS NOT NULL
-            AND event_type IN ('RUNNER_PHASE_COMPLETED', 'NO_TRADE_EXIT')
-            AND ts >= ?
-    ) AS launch_ids
-"""
-
-/**
  * LLM 起動予約を完了する SQL。
  */
 private const val FINISH_LLM_LAUNCH_RESERVATION_SQL = """
@@ -170,8 +152,8 @@ private fun JdbcTransaction.tryReserveInTransaction(
         return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION)
     }
 
-    val hourlyCount = countDistinctLaunchesSince(request.reservedAt.minus(request.hourlyWindow))
-    val dailyCount = countDistinctLaunchesSince(request.reservedAt.minus(request.dailyWindow))
+    val hourlyCount = countDistinctLlmLaunchesSince(request.reservedAt.minus(request.hourlyWindow))
+    val dailyCount = countDistinctLlmLaunchesSince(request.reservedAt.minus(request.dailyWindow))
 
     launchBudgetRejection(request, hourlyCount, dailyCount)?.let { rejectionReason ->
         return LlmLaunchReservationOutcome.Rejected(rejectionReason)
@@ -207,16 +189,6 @@ private fun JdbcTransaction.countActiveReservations(activeSince: Instant, includ
         statement.setLong(2, activeSince.toEpochMilli())
         statement.setBoolean(3, includeReflection)
         statement.setString(4, LlmDaemonTriggerKind.REFLECTION.name)
-        statement.executeQuery().use { resultSet ->
-            if (resultSet.next()) resultSet.getInt(1) else 0
-        }
-    }
-}
-
-private fun JdbcTransaction.countDistinctLaunchesSince(since: Instant): Int {
-    return jdbcConnection().prepareStatement(COUNT_DISTINCT_LLM_LAUNCHES_SINCE_SQL).use { statement ->
-        statement.setLong(1, since.toEpochMilli())
-        statement.setLong(2, since.toEpochMilli())
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.getInt(1) else 0
         }

@@ -157,9 +157,13 @@ interface CommandEventLog {
     suspend fun append(event: CommandEvent): Result<Unit>
 
     /**
-     * 指定時刻以降に audit へ現れた distinct decision run ID 数を返す。
+     * 指定時刻以降の distinct LLM 起動数を返す。
+     *
+     * DB 実装は reservation を正本とし、reservation のない legacy run だけ audit 時刻へ fallback する。
+     *
+     * @param excludedInvocationId 集計から除外する invocation ID
      */
-    suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int>
+    suspend fun countDistinctLlmLaunchesSince(since: Instant, excludedInvocationId: String? = null): Result<Int>
 
     /**
      * 指定 decision run ID に紐づく tool call 監査イベント数を返す。

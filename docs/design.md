@@ -48,14 +48,14 @@
 
 [確定事項の改訂: 2026-07-03] 2026-07-02 の「flat時15分定期発火廃止」は、サブスク枠の実数が未確定な段階で token 消費を抑えるための保守運用案だった。Claude Max / Codex Pro 20x の Usage UI と #28 の token / cost 集計で消費を別途監視する前提で、学習データ収集を優先し、daemon 学習期は flat / 保有中とも 15分 cadence を暫定採用する。
 
-- 既定値は flat heartbeat 15分、保有中 check 15分、max invocations per hour 4、daily cap 96 とする（2026-07-09 の改訂値は §1.2.2 を参照）。
+- 既定値は flat heartbeat 15分、保有中 check 15分、hard cap 7/hour・120/day とする。routine cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。
 - 経済イベント trigger も同じ hourly / daily 予算を消費し、heartbeat とは別枠にしない。
 - flat 15分運転では rolling 1時間予算が heartbeat で飽和しやすいため、経済イベント trigger は最大約15分遅延して heartbeat 枠を置き換える可能性がある。
-- 96起動/日 x 実測 token は日次消費が大きいため、Usage UI と #28 の集計で過剰消費が見えた場合は cadence を再調整する。
+- 最大120起動/日 x 実測 token は日次消費が大きいため、Usage UI と #28 の集計で過剰消費が見えた場合は cadence を再調整する。
 
 ### 1.2.2 paper trading 週次反省会による runtime / prompt 改訂
 
-[確定事項の改訂: 2026-07-09] paper trading 1週目の週次反省会を受け、runtime catalog default と system prompt を調整する。`safety.minExpectedMoveToCostRatio` の既定値は 2.5、`runner.maxInvocationsPerHour` の既定値は 6、`runner.maxInvocationsPerDay` は 96、flat heartbeat は 15分とする。hourly cap には event trigger 用の余地が生まれるが、flat heartbeat 単独で daily cap 96 を消費できるため、同日内の event trigger は後続 heartbeat と日次予算を共有する。production の active runtime config に明示値が保存済みの場合、catalog default 変更では上書きされないため、`/ops/runtime-config` の draft / activate で active 値を更新する。
+[確定] `safety.minExpectedMoveToCostRatio` の既定値は 2.5、`runner.maxInvocationsPerHour` の既定値は 7、`runner.maxInvocationsPerDay` は 120、flat / holding cadence は 15分とする。routine cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。production の active runtime config に明示値が保存済みの場合、catalog default 変更では上書きされないため、`/ops/runtime-config` の draft / activate で active 値を更新する。
 
 system prompt v1.12 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。EV gate は resting LIMIT entry を maker fee(rebate) と保護 exit 側 taker fee / slippage reserve で評価し、板を跨ぐ LIMIT / MARKET / STOP entry を taker fee と entry / exit 両側の market slippage reserve で評価する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
 
@@ -1427,9 +1427,9 @@ suspend fun handleTrigger(
 
 [確定] daemonはCLI起動時に `FUKUROU_INVOCATION_ID`（= `decisionRunId`）を環境変数へ注入する。MCPは全tool callへこのIDを自動付与し、`decision_run_id` / `tool_call_id` / `client_request_id` / `llm_provider` / `prompt_hash` / `system_prompt_version` / `market_snapshot_id` をauditとして保存する。
 
-[確定事項の改訂: 2026-07-03] 2026-07-02 の「flat時15分定期発火廃止」は保守運用案として扱い、学習期は flat時15分定期発火（96起動/日）を暫定採用する。既定上限は 4/hour、96/day とする。Step1スパイクと #19 の実測値を入力にしつつ、#28 で実運用 token・所要時間・tool call数・サブスク枠消費を集計して見直す。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
+[確定] 学習期は flat / 保有中とも15分 cadence を採用する。routine cadence は最大 4/hour・96/day を使い、hard cap は 7/hour・120/day とする。Step1スパイクと #19 の実測値を入力にしつつ、#28 で実運用 token・所要時間・tool call数・サブスク枠消費を集計する。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
 
-[確定事項の改訂: 2026-07-09] 週次反省会 follow-up として、runtime catalog default の `runner.maxInvocationsPerHour` は 6/hour、`runner.maxInvocationsPerDay` は 96/day とする。flat 15分 heartbeat は daily cap 96 を単独で消費できるため、event trigger は同じ日次予算内で後続 heartbeat と入れ替わる。既存 production active config の明示値は catalog default 変更で上書きされないため、deploy 後に `/ops/runtime-config` の draft / activate で active 値を更新する。
+[確定] runtime catalog default の `runner.maxInvocationsPerHour` は 7/hour、`runner.maxInvocationsPerDay` は 120/day とする。flat / holding の15分 cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。既存 production active config の明示値は catalog default 変更で上書きされないため、deploy 後に `/ops/runtime-config` の draft / activate で active 値を更新する。
 
 ### 6.4 1起動内で許可すること/禁止すること
 
@@ -1445,8 +1445,8 @@ suspend fun handleTrigger(
 
 [設計提案] 既定値:
 
-- LLM最大呼び出し回数: 6回/時
-- LLM最大呼び出し回数: 96回/日
+- LLM最大呼び出し回数: 7回/時
+- LLM最大呼び出し回数: 120回/日
 - LLM通常目標: 学習期は flat / 保有中とも15分 cadence + 経済イベント発火
 - 1起動の最大実行時間: 180秒
 - 1起動のMCP tool call上限: 48回
@@ -3627,10 +3627,10 @@ LLM CLI:
 | GMO WS subscribe       |                     1 req/s | 起動/再接続時                                                     |
 | MCP tool calls         |                      30/run | LLM暴走防止                                                     |
 | act tool calls         |                       3/run | 過剰売買防止                                                      |
-| LLM calls (trading)    |              6/hour, 96/day | サブスク/ToS/制限対策                                               |
+| LLM calls (trading)    |             7/hour, 120/day | サブスク/ToS/制限対策                                               |
 | LLM calls (reflection) | 完了済み前週の PromptCandidates のみ | trading と同じ cap を消費し、1時間で1回分・24時間で4回分の headroom がない場合は起動しない |
 
-flat 15分 heartbeat は daily cap 96 を単独で消費できる。event trigger が追加で起動した日は後続 heartbeat が日次予算で skip されうるため、総 run 数の上限は daily cap で変わらない。
+flat / holding の15分 cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。hard cap 到達後は後続 heartbeat が skip されうる。
 
 Private POSTは取引所上限より安全側に、bot内部の実効上限を `5 req/s` 程度へ下げてもよい。設定は上の既定を上限として、実運用で調整する。
 
