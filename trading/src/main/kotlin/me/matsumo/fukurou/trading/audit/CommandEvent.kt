@@ -94,6 +94,31 @@ enum class CommandEventType {
     DAEMON_INVOCATION_COMPLETED,
 
     /**
+     * WebUI または operator が daemon start を要求した。
+     */
+    DAEMON_START_REQUESTED,
+
+    /**
+     * WebUI または operator が daemon stop を要求した。
+     */
+    DAEMON_STOP_REQUESTED,
+
+    /**
+     * daemon supervisor の observed state が遷移した。
+     */
+    DAEMON_STATE_CHANGED,
+
+    /**
+     * daemon desired state 操作または worker 起動が失敗した。
+     */
+    DAEMON_OPERATION_FAILED,
+
+    /**
+     * daemon graceful drain が上限を超え、in-flight run を cancel した。
+     */
+    DAEMON_DRAIN_TIMED_OUT,
+
+    /**
      * CLI auth login process を開始した。
      */
     CLI_AUTH_LOGIN_STARTED,

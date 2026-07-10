@@ -108,6 +108,36 @@ data class LlmDaemonEntryFill(
 )
 
 /**
+ * daemon が実行中の one-shot invocation。
+ *
+ * @param invocationId 起動 ID
+ * @param triggerKind 起動 trigger 種別
+ * @param startedAt 起動開始時刻
+ */
+data class LlmDaemonInvocationMetadata(
+    val invocationId: String,
+    val triggerKind: LlmDaemonTriggerKind,
+    val startedAt: Instant,
+)
+
+/**
+ * daemon scheduler の実行状況を process supervisor へ通知する observer。
+ */
+interface LlmDaemonSchedulerObserver {
+    /** scheduler tick の開始を通知する。 */
+    fun onSchedulerSignal(observedAt: Instant) = Unit
+
+    /** one-shot invocation の開始を通知する。 */
+    fun onInvocationStarted(metadata: LlmDaemonInvocationMetadata) = Unit
+
+    /** one-shot invocation の終端を通知する。 */
+    fun onInvocationFinished(invocationId: String, finishedAt: Instant) = Unit
+
+    /** scheduler tick の結果を通知する。 */
+    fun onTickCompleted(result: LlmDaemonTickResult, completedAt: Instant) = Unit
+}
+
+/**
  * execution が paper entry fill なら daemon trigger 用 model へ変換する。
  */
 fun Execution.toLlmDaemonEntryFillOrNull(): LlmDaemonEntryFill? {
@@ -193,6 +223,7 @@ class LlmDaemonScheduler(
     private val clock = runtime.clock
     private val idGenerator = runtime.idGenerator
     private val warnLogger = runtime.warnLogger
+    private val observer = runtime.observer
     private val daemonConfig: LlmDaemonConfig = tradingConfig.daemon
     private val preFilterGate = LlmDaemonPreFilterGate(
         daemonConfig = daemonConfig,
@@ -212,7 +243,7 @@ class LlmDaemonScheduler(
      * daemon scheduler loop を開始する。
      */
     suspend fun runLoop(interval: Duration = daemonConfig.pollInterval) {
-        appendDaemonStarted().getOrThrow()
+        startSession()
 
         while (currentCoroutineContext().isActive) {
             tick()
@@ -225,9 +256,10 @@ class LlmDaemonScheduler(
      */
     suspend fun tick(): LlmDaemonTickResult {
         val observedAt = Instant.now(clock)
+        observer.onSchedulerSignal(observedAt)
         val result = runCatching { tickUnsafe(observedAt) }
 
-        return result.getOrElse { throwable ->
+        val tickResult = result.getOrElse { throwable ->
             if (throwable is CancellationException) {
                 throw throwable
             }
@@ -241,6 +273,17 @@ class LlmDaemonScheduler(
 
             LlmDaemonTickResult.Skipped(DAEMON_SKIP_TICK_FAILED, null)
         }
+
+        observer.onTickCompleted(tickResult, Instant.now(clock))
+
+        return tickResult
+    }
+
+    /**
+     * scheduler session の開始を監査する。
+     */
+    suspend fun startSession() {
+        appendDaemonStarted().getOrThrow()
     }
 
     private suspend fun tickUnsafe(observedAt: Instant): LlmDaemonTickResult {
@@ -335,6 +378,13 @@ class LlmDaemonScheduler(
         }
 
         appendLaunched(trigger, invocationId, observedAt).getOrThrow()
+        observer.onInvocationStarted(
+            LlmDaemonInvocationMetadata(
+                invocationId = invocationId,
+                triggerKind = trigger.kind,
+                startedAt = observedAt,
+            ),
+        )
 
         return runReservedInvocation(trigger, invocationId)
     }
@@ -370,6 +420,8 @@ class LlmDaemonScheduler(
                 }
             }
 
+            observer.onInvocationFinished(invocationId, Instant.now(clock))
+
             throw failure
         }
 
@@ -382,6 +434,7 @@ class LlmDaemonScheduler(
         val reason = runnerResult?.status?.name ?: failure?.javaClass?.simpleName
 
         finishReservedInvocation(trigger, invocationId, status, reason, finishedAt)
+        observer.onInvocationFinished(invocationId, finishedAt)
 
         if (failure != null) {
             return LlmDaemonTickResult.Failed(
@@ -886,6 +939,7 @@ data class LlmDaemonSchedulerDependencies(
  * @param clock cadence と監査時刻に使う clock
  * @param idGenerator invocation ID generator
  * @param warnLogger tick 失敗の rate-limited warning logger
+ * @param observer scheduler の signal と invocation lifecycle observer
  */
 data class LlmDaemonSchedulerRuntime(
     val requestBase: OneShotRunnerRequest,
@@ -899,6 +953,7 @@ data class LlmDaemonSchedulerRuntime(
         logger = Logger.getLogger(LlmDaemonScheduler::class.java.name),
         clock = clock,
     ),
+    val observer: LlmDaemonSchedulerObserver = object : LlmDaemonSchedulerObserver {},
 )
 
 private fun daemonDecisionRunContext(

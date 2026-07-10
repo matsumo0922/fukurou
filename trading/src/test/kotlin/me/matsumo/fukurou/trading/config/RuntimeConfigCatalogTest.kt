@@ -67,6 +67,7 @@ class RuntimeConfigCatalogTest {
         assertEquals("codex-runtime-test", runtimeItems.getValue("llm.codexModel").effectiveValue)
         assertTrue(runtimeItems.getValue("safety.maxRiskPerTradeRatio").editable)
         assertEquals(RuntimeConfigApplyMode.NEXT_RESTART, runtimeItems.getValue("safety.maxRiskPerTradeRatio").applyMode)
+        assertEquals(RuntimeConfigApplyMode.HOT, runtimeItems.getValue("daemon.enabled").applyMode)
         assertEquals(
             "FUKUROU_VOLATILITY_SLIPPAGE_MULTIPLIER",
             runtimeItems.getValue("paper.volatilitySlippageMultiplier").legacyEnvName,

@@ -79,6 +79,19 @@ object RuntimeConfigCatalog {
     }
 
     /**
+     * typed config と等価な runtime config 値を key ごとに返す。
+     */
+    fun runtimeValues(tradingConfig: TradingBotConfig): Map<String, String> {
+        return runtimeItems(tradingConfig).associate { item ->
+            val effectiveValue = requireNotNull(item.effectiveValue) {
+                "Runtime config effective value must not be null: ${item.key}"
+            }
+
+            item.key to effectiveValue
+        }
+    }
+
+    /**
      * typed config と等価な runtime env map を返す。
      */
     fun runtimeEnvironment(tradingConfig: TradingBotConfig): Map<String, String> {
@@ -863,7 +876,11 @@ object RuntimeConfigCatalog {
             legacyEnvName = legacyEnvName,
             safetyTier = safetyTier,
             editable = true,
-            applyMode = RuntimeConfigApplyMode.NEXT_RESTART,
+            applyMode = if (key.startsWith("daemon.")) {
+                RuntimeConfigApplyMode.HOT
+            } else {
+                RuntimeConfigApplyMode.NEXT_RESTART
+            },
             blankAllowed = blankAllowed,
         )
     }
@@ -1083,6 +1100,9 @@ enum class RuntimeConfigValueType {
  */
 @Serializable
 enum class RuntimeConfigApplyMode {
+    /** supervisor が process restart なしで反映する。 */
+    HOT,
+
     /** 次回 runtime 起動で反映する。 */
     NEXT_RESTART,
 

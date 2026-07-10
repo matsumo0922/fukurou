@@ -50,6 +50,7 @@ import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.risk.SoftHaltDowngradeRejectedException
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 
 /**
@@ -115,6 +116,66 @@ data class OpsTriggerRequest(
 data class OpsTriggerResponse(
     val invocationId: String,
     val triggerKind: String,
+)
+
+/**
+ * daemon desired state 操作 API の request body。
+ */
+@Serializable
+data class OpsDaemonControlRequest(
+    val reason: String,
+)
+
+/**
+ * daemon status の config identity。
+ */
+@Serializable
+data class OpsDaemonConfigIdentityResponse(
+    val versionId: String?,
+    val hash: String?,
+)
+
+/**
+ * daemon status の launch metadata。
+ */
+@Serializable
+data class OpsDaemonLaunchResponse(
+    val invocationId: String,
+    val triggerKind: String,
+    val startedAt: String,
+    val elapsedSeconds: Long,
+)
+
+/**
+ * daemon status の skip metadata。
+ */
+@Serializable
+data class OpsDaemonSkipResponse(
+    val reason: String,
+    val triggerKind: String?,
+    val occurredAt: String,
+)
+
+/**
+ * daemon lifecycle / config apply status。
+ */
+@Serializable
+data class OpsDaemonStatusResponse(
+    val desiredEnabled: Boolean,
+    val observedState: String,
+    val reason: String,
+    val detail: String?,
+    val activeConfig: OpsDaemonConfigIdentityResponse,
+    val appliedConfig: OpsDaemonConfigIdentityResponse,
+    val daemonAppliedConfig: OpsDaemonConfigIdentityResponse,
+    val restartRequired: Boolean,
+    val lastSchedulerSignalAt: String?,
+    val lastLaunch: OpsDaemonLaunchResponse?,
+    val lastSkip: OpsDaemonSkipResponse?,
+    val nextHeartbeatAt: String?,
+    val inFlightRun: OpsDaemonLaunchResponse?,
+    val silenceWarning: Boolean,
+    val nextRetryAt: String?,
 )
 
 /**
@@ -649,6 +710,13 @@ internal data class OpsRiskRouteDependencies(
 )
 
 /**
+ * daemon status / desired state route の依存関係。
+ */
+internal data class OpsDaemonRouteDependencies(
+    val operations: LlmDaemonOperations?,
+)
+
+/**
  * 取引 runtime が利用可能かを読む境界。
  */
 internal fun interface OpsRuntimeAvailabilityProvider {
@@ -683,6 +751,7 @@ internal data class OpsFeedRouteDependencies(
  *
  * @param runtimeConfig runtime config catalog route の依存関係
  * @param risk risk 操作用 route の依存関係
+ * @param daemon daemon status / desired state route の依存関係
  * @param auth CLI auth route の依存関係
  * @param feed feed 取得 route の依存関係
  * @param clock 既定時刻と cursor 検証に使う clock
@@ -690,6 +759,7 @@ internal data class OpsFeedRouteDependencies(
 internal data class OpsRouteDependencies(
     val runtimeConfig: OpsRuntimeConfigRouteDependencies,
     val risk: OpsRiskRouteDependencies,
+    val daemon: OpsDaemonRouteDependencies = OpsDaemonRouteDependencies(null),
     val auth: OpsAuthRouteDependencies,
     val feed: OpsFeedRouteDependencies,
     val clock: Clock = Clock.systemUTC(),
@@ -701,6 +771,7 @@ internal data class OpsRouteDependencies(
 @OptIn(ExperimentalKtorApi::class)
 internal fun Route.opsRoutes(dependencies: OpsRouteDependencies) {
     registerOpsRuntimeConfigRoute(dependencies)
+    registerOpsDaemonRoutes(dependencies)
     registerOpsHaltRoute(dependencies)
     registerOpsResumeRoute(dependencies)
     registerOpsRiskStateRoute(dependencies)
@@ -713,6 +784,125 @@ internal fun Route.opsRoutes(dependencies: OpsRouteDependencies) {
     registerOpsDecisionRunRoutes(dependencies)
     registerOpsPositionsRoute(dependencies)
     registerOpsAuditRoute(dependencies)
+}
+
+@OptIn(ExperimentalKtorApi::class)
+@Suppress("LongMethod")
+private fun Route.registerOpsDaemonRoutes(dependencies: OpsRouteDependencies) {
+    val operations = dependencies.daemon.operations
+
+    get("/ops/daemon") {
+        val service = call.requireLlmDaemonOperations(operations) ?: return@get
+
+        call.respond(service.status().toOpsDaemonStatusResponse(dependencies.clock))
+    }.describe {
+        summary = "LLM daemon status を取得する"
+        description = "desired state、observed worker state、停止理由、active / process applied / daemon applied config、scheduler signal、in-flight run、無音警告を返します。readiness の意味は変更しません。"
+        tag(OPS_TAG)
+        responses {
+            HttpStatusCode.OK {
+                description = "現在の daemon status です。"
+                schema = jsonSchema<OpsDaemonStatusResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "daemon supervisor が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    post("/ops/daemon/start") {
+        call.respondDaemonDesiredState(operations, enabled = true, dependencies.clock)
+    }.describe {
+        summary = "LLM daemon を起動する"
+        description = "HARD_HALT を先に確認し、daemon.enabled=true の versioned draft を validation / active 化して supervisor を起動します。HARD_HALT 中は config を変更しません。"
+        tag(OPS_TAG)
+        requestBody {
+            description = "監査と runtime config version note に残す理由です。"
+            required = true
+            schema = jsonSchema<OpsDaemonControlRequest>()
+        }
+        responses {
+            HttpStatusCode.OK {
+                description = "desired state 変更後の daemon status です。"
+                schema = jsonSchema<OpsDaemonStatusResponse>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "request body または reason が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.Conflict {
+                description = "HARD_HALT、STOPPING、または runtime config validation により拒否されました。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "daemon supervisor が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+
+    post("/ops/daemon/stop") {
+        call.respondDaemonDesiredState(operations, enabled = false, dependencies.clock)
+    }.describe {
+        summary = "LLM daemon を停止する"
+        description = "daemon.enabled=false の versioned draft を validation / active 化し、新規 tick を止めます。in-flight run は bounded drain で通常終端を待ちます。"
+        tag(OPS_TAG)
+        requestBody {
+            description = "監査と runtime config version note に残す理由です。"
+            required = true
+            schema = jsonSchema<OpsDaemonControlRequest>()
+        }
+        responses {
+            HttpStatusCode.OK {
+                description = "desired state 変更後の daemon status です。"
+                schema = jsonSchema<OpsDaemonStatusResponse>()
+            }
+            HttpStatusCode.BadRequest {
+                description = "request body または reason が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.Conflict {
+                description = "STOPPING または runtime config validation により拒否されました。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.ServiceUnavailable {
+                description = "daemon supervisor が利用できません。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+        }
+    }
+}
+
+private suspend fun ApplicationCall.respondDaemonDesiredState(
+    operations: LlmDaemonOperations?,
+    enabled: Boolean,
+    clock: Clock,
+) {
+    val request = receiveBodyOrBadRequest<OpsDaemonControlRequest>() ?: return
+    val reason = requireReason(request.reason) ?: return
+    val service = requireLlmDaemonOperations(operations) ?: return
+    val result = service.setDesiredEnabled(enabled, reason)
+    val status = result.getOrElse { error ->
+        when (error) {
+            is LlmDaemonHardHaltRejectedException,
+            is LlmDaemonStoppingRejectedException,
+            is RuntimeConfigValidationRejectedException,
+            -> {
+                respond(HttpStatusCode.Conflict, ErrorResponse(error.message ?: "daemon operation was rejected"))
+
+                return
+            }
+            is IllegalArgumentException -> {
+                respond(HttpStatusCode.BadRequest, ErrorResponse(error.message ?: "daemon request is invalid"))
+
+                return
+            }
+            else -> throw error
+        }
+    }
+
+    respond(status.toOpsDaemonStatusResponse(clock))
 }
 
 @OptIn(ExperimentalKtorApi::class)
@@ -1781,6 +1971,18 @@ private suspend fun ApplicationCall.requireRuntimeConfigAdminService(
     return null
 }
 
+private suspend fun ApplicationCall.requireLlmDaemonOperations(
+    operations: LlmDaemonOperations?,
+): LlmDaemonOperations? {
+    if (operations != null) {
+        return operations
+    }
+
+    respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("daemon supervisor is not configured"))
+
+    return null
+}
+
 private suspend fun ApplicationCall.requireLlmAuthProvider(rawProvider: String?): LlmAuthProvider? {
     val provider = rawProvider
         ?.trim()
@@ -2158,6 +2360,11 @@ private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalo
         CommandEventType.DAEMON_TRIGGER_SKIPPED -> "daemonTriggerSkipped"
         CommandEventType.DAEMON_TRIGGER_LAUNCHED -> "daemonTriggerLaunched"
         CommandEventType.DAEMON_INVOCATION_COMPLETED -> "daemonInvocationCompleted"
+        CommandEventType.DAEMON_START_REQUESTED -> "daemonStartRequested"
+        CommandEventType.DAEMON_STOP_REQUESTED -> "daemonStopRequested"
+        CommandEventType.DAEMON_STATE_CHANGED -> "daemonStateChanged"
+        CommandEventType.DAEMON_OPERATION_FAILED -> "daemonOperationFailed"
+        CommandEventType.DAEMON_DRAIN_TIMED_OUT -> "daemonDrainTimedOut"
         CommandEventType.CLI_AUTH_LOGIN_STARTED -> "cliAuthLoginStarted"
         CommandEventType.CLI_AUTH_LOGIN_TOKEN_SUBMITTED -> "cliAuthLoginTokenSubmitted"
         CommandEventType.CLI_AUTH_LOGIN_COMPLETED -> "cliAuthLoginCompleted"
@@ -2198,6 +2405,50 @@ private fun RiskState.toOpsRiskStateResponse(): OpsRiskStateResponse {
         resumedAt = resumedAt?.toString(),
         resumedReason = resumedReason,
         drawdownRatio = drawdownRatio.toPlainString(),
+    )
+}
+
+private fun LlmDaemonSupervisorStatus.toOpsDaemonStatusResponse(clock: Clock): OpsDaemonStatusResponse {
+    return OpsDaemonStatusResponse(
+        desiredEnabled = desiredEnabled,
+        observedState = observedState.name,
+        reason = reason.name,
+        detail = detail,
+        activeConfig = activeConfig.toOpsDaemonConfigIdentityResponse(),
+        appliedConfig = appliedConfig.toOpsDaemonConfigIdentityResponse(),
+        daemonAppliedConfig = daemonAppliedConfig.toOpsDaemonConfigIdentityResponse(),
+        restartRequired = restartRequired,
+        lastSchedulerSignalAt = lastSchedulerSignalAt?.toString(),
+        lastLaunch = lastLaunch?.toOpsDaemonLaunchResponse(clock),
+        lastSkip = lastSkip?.let { skip ->
+            OpsDaemonSkipResponse(
+                reason = skip.reason,
+                triggerKind = skip.triggerKind,
+                occurredAt = skip.occurredAt.toString(),
+            )
+        },
+        nextHeartbeatAt = nextHeartbeatAt?.toString(),
+        inFlightRun = inFlightRun?.toOpsDaemonLaunchResponse(clock),
+        silenceWarning = silenceWarning,
+        nextRetryAt = nextRetryAt?.toString(),
+    )
+}
+
+private fun LlmDaemonConfigIdentity.toOpsDaemonConfigIdentityResponse(): OpsDaemonConfigIdentityResponse {
+    return OpsDaemonConfigIdentityResponse(
+        versionId = versionId,
+        hash = hash,
+    )
+}
+
+private fun LlmDaemonLaunchStatus.toOpsDaemonLaunchResponse(clock: Clock): OpsDaemonLaunchResponse {
+    val elapsedSeconds = Duration.between(startedAt, Instant.now(clock)).seconds.coerceAtLeast(0L)
+
+    return OpsDaemonLaunchResponse(
+        invocationId = invocationId,
+        triggerKind = triggerKind,
+        startedAt = startedAt.toString(),
+        elapsedSeconds = elapsedSeconds,
     )
 }
 

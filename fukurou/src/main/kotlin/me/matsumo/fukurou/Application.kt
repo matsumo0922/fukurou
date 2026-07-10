@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
@@ -79,6 +80,7 @@ fun interface ReadinessProbe {
  * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
  * @param opsDecisionRunProjectionRepository ops decision run projection。null なら DB 設定から構築する
  * @param opsRuntimeConfigAdminService ops API 用 runtime config admin service。null なら DB 設定から構築する
+ * @param opsLlmDaemonOperations ops API 用 daemon operations。null なら DB 設定から supervisor を構築する
  * @param tradingConfig trading runtime config
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  * @param databaseConfig DB 接続設定。null なら DB 未構成として扱う
@@ -101,6 +103,7 @@ fun Application.module(
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
     opsDecisionRunProjectionRepository: DecisionRunProjectionRepository? = null,
     opsRuntimeConfigAdminService: RuntimeConfigAdminService? = null,
+    opsLlmDaemonOperations: LlmDaemonOperations? = null,
     tradingConfig: TradingBotConfig = TradingBotConfig(),
     runtimeConfigEnvironment: Map<String, String> = System.getenv(),
     databaseConfig: DatabaseConfig? = DatabaseConfig.fromEnv(),
@@ -123,6 +126,11 @@ fun Application.module(
             },
         ),
     )
+    val daemonResources = createApplicationDaemonResources(
+        databaseResources = databaseResources,
+        runtime = runtime,
+        operationsOverride = opsLlmDaemonOperations,
+    )
     val routeResources = createApplicationRouteResources(
         databaseResources = databaseResources,
         evaluationOverrides = ApplicationEvaluationOverrides(
@@ -140,8 +148,10 @@ fun Application.module(
             commandEventFeedReader = opsCommandEventFeedReader,
             decisionRunProjectionRepository = opsDecisionRunProjectionRepository,
             runtimeConfigAdminService = opsRuntimeConfigAdminService,
+            llmDaemonOperations = opsLlmDaemonOperations,
         ),
         runtime = runtime,
+        daemonResources = daemonResources,
     )
 
     installApplicationPlugins(webRoot)
@@ -154,7 +164,7 @@ fun Application.module(
         apiDocumentationRoutes()
     }
 
-    val backgroundWorkers = startApplicationBackgroundWorkers(databaseResources, runtime)
+    val backgroundWorkers = startApplicationBackgroundWorkers(databaseResources, runtime, daemonResources)
     subscribeApplicationShutdown(databaseResources, routeResources.ops, backgroundWorkers)
 }
 
@@ -253,6 +263,7 @@ private class ApplicationRuntimeConfigState(
                     tradingRuntimeAvailable = false,
                     runtimeConfigEnvironment = inputs.runtimeConfigEnvironment,
                     runtimeConfigSnapshot = null,
+                    runtimeConfigValues = RuntimeConfigCatalog.runtimeValues(inputs.tradingConfig),
                     runtimeConfigWarnings = listOf(runtimeConfigResolveWarning(error)),
                 )
 
@@ -294,6 +305,7 @@ private class ApplicationRuntimeConfigState(
                 tradingRuntimeAvailable = true,
                 runtimeConfigEnvironment = inputs.runtimeConfigEnvironment,
                 runtimeConfigSnapshot = null,
+                runtimeConfigValues = RuntimeConfigCatalog.runtimeValues(inputs.tradingConfig),
                 runtimeConfigWarnings = emptyList(),
             )
         }
@@ -336,6 +348,7 @@ private class ApplicationRuntimeConfigState(
             tradingRuntimeAvailable = tradingRuntimeAvailable,
             runtimeConfigEnvironment = runtimeConfigResolution?.catalogEnvironment ?: inputs.runtimeConfigEnvironment,
             runtimeConfigSnapshot = runtimeConfigResolution?.auditSnapshot,
+            runtimeConfigValues = RuntimeConfigCatalog.runtimeValues(resolvedTradingConfig),
             runtimeConfigWarnings = runtimeConfigWarnings,
         )
     }
@@ -362,6 +375,15 @@ private fun ApplicationRuntimeConfigSnapshot.toOpsRuntimeConfigRouteSnapshot(): 
     )
 }
 
+private fun ApplicationRuntimeConfigSnapshot.toLlmDaemonRuntimeSnapshot(): LlmDaemonRuntimeSnapshot {
+    return LlmDaemonRuntimeSnapshot(
+        tradingConfig = tradingConfig,
+        configIdentity = runtimeConfigSnapshot,
+        values = runtimeConfigValues,
+        available = tradingRuntimeAvailable,
+    )
+}
+
 private fun ApplicationRuntimeConfigSnapshot.delegateKey(): String {
     val snapshot = runtimeConfigSnapshot ?: return "env:${tradingConfig.hashCode()}"
 
@@ -373,6 +395,7 @@ private fun createApplicationRouteResources(
     evaluationOverrides: ApplicationEvaluationOverrides,
     opsOverrides: ApplicationOpsOverrides,
     runtime: ApplicationRuntimeResources,
+    daemonResources: ApplicationDaemonResources,
 ): ApplicationRouteResources {
     val riskStateRepository = evaluationOverrides.riskStateRepository ?: databaseResources.database?.let { database ->
         ExposedRiskStateRepository(database)
@@ -391,6 +414,7 @@ private fun createApplicationRouteResources(
             opsOverrides = opsOverrides,
             riskStateRepository = riskStateRepository,
             runtime = runtime,
+            daemonResources = daemonResources,
         ),
     )
 }
@@ -423,11 +447,13 @@ private fun createEvaluationRouteDependencies(
     )
 }
 
+@Suppress("LongMethod")
 private fun createOpsRouteResources(
     databaseResources: ApplicationDatabaseResources,
     opsOverrides: ApplicationOpsOverrides,
     riskStateRepository: RiskStateRepository?,
     runtime: ApplicationRuntimeResources,
+    daemonResources: ApplicationDaemonResources,
 ): ApplicationOpsRouteResources {
     val database = databaseResources.database
     val createdManualLlmLaunchService = createDefaultManualLlmLaunchService(
@@ -450,7 +476,10 @@ private fun createOpsRouteResources(
     val invalidatingRuntimeConfigAdminService = runtimeConfigAdminService?.let { service ->
         InvalidatingRuntimeConfigAdminService(
             delegate = service,
-            onActiveChanged = runtime.runtimeConfigState::invalidate,
+            onActiveChanged = {
+                runtime.runtimeConfigState.invalidate()
+                daemonResources.supervisor?.notifyConfigChanged()
+            },
         )
     }
 
@@ -469,6 +498,9 @@ private fun createOpsRouteResources(
                 createdManualLlmLaunchService = createdManualLlmLaunchService,
                 runtime = runtime,
             ),
+            daemon = OpsDaemonRouteDependencies(
+                operations = opsOverrides.llmDaemonOperations ?: daemonResources.operations,
+            ),
             auth = OpsAuthRouteDependencies(
                 llmAuthService = opsOverrides.llmAuthService ?: createdLlmAuthService,
             ),
@@ -482,6 +514,56 @@ private fun createOpsRouteResources(
         ),
         createdManualLlmLaunchService = createdManualLlmLaunchService,
         createdLlmAuthService = createdLlmAuthService,
+    )
+}
+
+private fun createApplicationDaemonResources(
+    databaseResources: ApplicationDatabaseResources,
+    runtime: ApplicationRuntimeResources,
+    operationsOverride: LlmDaemonOperations?,
+): ApplicationDaemonResources {
+    if (operationsOverride != null) {
+        return ApplicationDaemonResources(operations = operationsOverride)
+    }
+
+    val dataSource = databaseResources.dataSource ?: return ApplicationDaemonResources()
+    val database = databaseResources.database ?: return ApplicationDaemonResources()
+    val commandEventLog = ExposedCommandEventLog(database)
+    val runtimeConfigAdminService = ExposedRuntimeConfigRepository(
+        database = database,
+        clock = runtime.clock,
+        environment = databaseResources.environment,
+    )
+    val processSnapshot = runtime.runtimeConfigState.snapshot().toLlmDaemonRuntimeSnapshot()
+    val supervisor = LlmDaemonSupervisor(
+        processSnapshot = processSnapshot,
+        snapshotProvider = LlmDaemonRuntimeSnapshotProvider {
+            runtime.runtimeConfigState.snapshot().toLlmDaemonRuntimeSnapshot()
+        },
+        desiredStateActivator = VersionedLlmDaemonDesiredStateActivator(
+            adminService = runtimeConfigAdminService,
+            onActiveChanged = runtime.runtimeConfigState::invalidate,
+        ),
+        riskStateRepository = ExposedRiskStateRepository(database),
+        commandEventLog = commandEventLog,
+        workerFactory = LlmDaemonWorkerFactory { request ->
+            createLlmDaemonSchedulerWorker(
+                dataSource = dataSource,
+                database = database,
+                tradingConfig = request.tradingConfig,
+                runtimeConfigSnapshot = request.runtimeConfigSnapshot,
+                clock = runtime.clock,
+                onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
+                observer = request.observer,
+                lifecycleListener = request.lifecycleListener,
+            )
+        },
+        clock = runtime.clock,
+    )
+
+    return ApplicationDaemonResources(
+        operations = supervisor,
+        supervisor = supervisor,
     )
 }
 
@@ -761,16 +843,19 @@ private fun Application.installApplicationPlugins(webRoot: File?) {
 private fun startApplicationBackgroundWorkers(
     databaseResources: ApplicationDatabaseResources,
     runtime: ApplicationRuntimeResources,
+    daemonResources: ApplicationDaemonResources,
 ): ApplicationBackgroundWorkers {
     val dataSource = databaseResources.dataSource
     val database = databaseResources.database
 
-    if (!runtime.tradingRuntimeAvailable) {
+    if (dataSource == null || database == null) {
         return ApplicationBackgroundWorkers()
     }
 
-    if (dataSource == null || database == null) {
-        return ApplicationBackgroundWorkers()
+    val daemonSupervisor = daemonResources.supervisor?.start()
+
+    if (!runtime.tradingRuntimeAvailable) {
+        return ApplicationBackgroundWorkers(llmDaemonSupervisor = daemonSupervisor)
     }
 
     val sharedPersistenceBootstrap = sharedTradingPersistenceBootstrap(
@@ -789,14 +874,7 @@ private fun startApplicationBackgroundWorkers(
             clock = runtime.clock,
             onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
         ),
-        llmDaemonWorker = startLlmDaemonSchedulerWorker(
-            dataSource = dataSource,
-            database = database,
-            tradingConfig = runtime.tradingConfig,
-            runtimeConfigSnapshot = runtime.runtimeConfigSnapshot,
-            clock = runtime.clock,
-            onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
-        ),
+        llmDaemonSupervisor = daemonSupervisor,
         obsidianWriterWorker = startObsidianWriterWorker(
             database = database,
             tradingConfig = runtime.tradingConfig,
@@ -829,7 +907,7 @@ private fun Application.subscribeApplicationShutdown(
     monitor.subscribe(ApplicationStopped) {
         backgroundWorkers.reflectionRunnerWorker?.close()
         backgroundWorkers.obsidianWriterWorker?.close()
-        backgroundWorkers.llmDaemonWorker?.close()
+        backgroundWorkers.llmDaemonSupervisor?.close()
         opsResources.createdLlmAuthService?.close()
         opsResources.createdManualLlmLaunchService?.close?.invoke()
         backgroundWorkers.reconcilerWorker?.close()
@@ -893,6 +971,7 @@ private data class ApplicationRuntimeInputs(
  * @param tradingRuntimeAvailable 取引 runtime / manual trigger / daemon を起動できるか
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  * @param runtimeConfigSnapshot active runtime config の監査 snapshot
+ * @param runtimeConfigValues active runtime config の typed key/value
  * @param runtimeConfigWarnings runtime config catalog API で返す運用者向け warning
  */
 private data class ApplicationRuntimeConfigSnapshot(
@@ -900,6 +979,7 @@ private data class ApplicationRuntimeConfigSnapshot(
     val tradingRuntimeAvailable: Boolean,
     val runtimeConfigEnvironment: Map<String, String>,
     val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
+    val runtimeConfigValues: Map<String, String>,
     val runtimeConfigWarnings: List<RuntimeConfigSnapshotWarning>,
 )
 
@@ -963,6 +1043,7 @@ private data class ApplicationEvaluationOverrides(
  * @param commandEventLog command_event_log writer
  * @param commandEventFeedReader command_event_log feed reader
  * @param runtimeConfigAdminService runtime config admin service
+ * @param llmDaemonOperations daemon status / desired state operations
  */
 private data class ApplicationOpsOverrides(
     val riskStateCommandService: RiskStateCommandService?,
@@ -974,6 +1055,15 @@ private data class ApplicationOpsOverrides(
     val commandEventFeedReader: CommandEventFeedReader?,
     val decisionRunProjectionRepository: DecisionRunProjectionRepository?,
     val runtimeConfigAdminService: RuntimeConfigAdminService?,
+    val llmDaemonOperations: LlmDaemonOperations?,
+)
+
+/**
+ * Application が構築した daemon supervisor resource。
+ */
+private data class ApplicationDaemonResources(
+    val operations: LlmDaemonOperations? = null,
+    val supervisor: LlmDaemonSupervisor? = null,
 )
 
 /**
@@ -1017,18 +1107,18 @@ private data class ApplicationOpsRouteResources(
  * Application lifecycle に紐づく background worker。
  *
  * @param reconcilerWorker protection reconciler worker
- * @param llmDaemonWorker LLM daemon scheduler worker
+ * @param llmDaemonSupervisor LLM daemon supervisor
  * @param obsidianWriterWorker Obsidian writer worker
  * @param reflectionRunnerWorker reflection report worker
  */
 private data class ApplicationBackgroundWorkers(
     val reconcilerWorker: ProtectionReconcilerWorker? = null,
-    val llmDaemonWorker: LlmDaemonSchedulerWorker? = null,
+    val llmDaemonSupervisor: LlmDaemonSupervisor? = null,
     val obsidianWriterWorker: ObsidianWriterWorker? = null,
     val reflectionRunnerWorker: ReflectionRunnerWorker? = null,
 ) {
     val hasWorker: Boolean = reconcilerWorker != null ||
-        llmDaemonWorker != null ||
+        llmDaemonSupervisor != null ||
         obsidianWriterWorker != null ||
         reflectionRunnerWorker != null
 }

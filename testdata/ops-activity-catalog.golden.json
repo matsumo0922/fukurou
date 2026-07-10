@@ -108,6 +108,31 @@
       "descriptionKey": "activity.catalog.audit.daemonInvocationCompleted.description"
     },
     {
+      "value": "DAEMON_START_REQUESTED",
+      "labelKey": "activity.catalog.audit.daemonStartRequested.label",
+      "descriptionKey": "activity.catalog.audit.daemonStartRequested.description"
+    },
+    {
+      "value": "DAEMON_STOP_REQUESTED",
+      "labelKey": "activity.catalog.audit.daemonStopRequested.label",
+      "descriptionKey": "activity.catalog.audit.daemonStopRequested.description"
+    },
+    {
+      "value": "DAEMON_STATE_CHANGED",
+      "labelKey": "activity.catalog.audit.daemonStateChanged.label",
+      "descriptionKey": "activity.catalog.audit.daemonStateChanged.description"
+    },
+    {
+      "value": "DAEMON_OPERATION_FAILED",
+      "labelKey": "activity.catalog.audit.daemonOperationFailed.label",
+      "descriptionKey": "activity.catalog.audit.daemonOperationFailed.description"
+    },
+    {
+      "value": "DAEMON_DRAIN_TIMED_OUT",
+      "labelKey": "activity.catalog.audit.daemonDrainTimedOut.label",
+      "descriptionKey": "activity.catalog.audit.daemonDrainTimedOut.description"
+    },
+    {
       "value": "CLI_AUTH_LOGIN_STARTED",
       "labelKey": "activity.catalog.audit.cliAuthLoginStarted.label",
       "descriptionKey": "activity.catalog.audit.cliAuthLoginStarted.description"

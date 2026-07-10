@@ -2,15 +2,18 @@ package me.matsumo.fukurou
 
 import com.zaxxer.hikari.HikariDataSource
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.DefaultLlmDaemonPreFilter
@@ -21,6 +24,7 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerObserver
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
@@ -54,8 +58,6 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.logging.Logger
-import kotlin.time.DurationUnit
-import kotlin.time.toDuration
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
@@ -79,6 +81,50 @@ private const val FUKUROU_LLM_WORKING_DIRECTORY_ENV = "FUKUROU_LLM_WORKING_DIREC
 private val DAEMON_WORKER_LOGGER = Logger.getLogger(LlmDaemonSchedulerWorker::class.java.name)
 
 /**
+ * daemon worker process lifecycle の通知先。
+ */
+internal interface LlmDaemonWorkerLifecycleListener {
+    /** scheduler session が開始したことを通知する。 */
+    fun onStarted() = Unit
+
+    /** worker が失敗終了したことを通知する。 */
+    fun onFailed(error: Throwable) = Unit
+}
+
+/**
+ * daemon worker の graceful stop 結果。
+ */
+internal enum class LlmDaemonWorkerStopResult {
+    /** in-flight invocation を含めて通常終了した。 */
+    DRAINED,
+
+    /** drain 上限を超えたため worker job を cancel した。 */
+    TIMED_OUT,
+}
+
+/**
+ * supervisor が所有する worker lifecycle 境界。
+ */
+internal interface LlmDaemonWorkerHandle {
+    /** worker loop を開始する。 */
+    fun start(): LlmDaemonWorkerHandle
+
+    /** 新規 tick を止め、現在処理を bounded drain する。 */
+    suspend fun stopGracefully(timeout: Duration): LlmDaemonWorkerStopResult
+}
+
+/**
+ * worker が駆動する scheduler loop の最小境界。
+ */
+internal interface LlmDaemonWorkerLoop {
+    /** session start を監査して初期化する。 */
+    suspend fun startSession()
+
+    /** scheduler tick を1回実行する。 */
+    suspend fun tick()
+}
+
+/**
  * Ktor backend 上で LLM daemon scheduler を常駐起動する worker。
  *
  * @param schedulerFactory scheduler 構築処理
@@ -86,10 +132,11 @@ private val DAEMON_WORKER_LOGGER = Logger.getLogger(LlmDaemonSchedulerWorker::cl
  * @param bootstrap scheduler loop 開始前に必要な DB schema 初期化
  * @param clock warning log の rate limit 判定に使う clock
  * @param warnLogger rate-limited warning logger
+ * @param lifecycleListener worker lifecycle の通知先
  * @param scope worker coroutine scope
  */
-class LlmDaemonSchedulerWorker(
-    private val schedulerFactory: () -> Result<LlmDaemonScheduler>,
+internal class LlmDaemonSchedulerWorker(
+    private val schedulerFactory: () -> Result<LlmDaemonWorkerLoop>,
     private val interval: Duration,
     private val bootstrap: () -> Result<Unit> = { Result.success(Unit) },
     clock: Clock = Clock.systemUTC(),
@@ -97,68 +144,92 @@ class LlmDaemonSchedulerWorker(
         logger = DAEMON_WORKER_LOGGER,
         clock = clock,
     ),
+    private val lifecycleListener: LlmDaemonWorkerLifecycleListener = object : LlmDaemonWorkerLifecycleListener {},
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-) : AutoCloseable {
+) : LlmDaemonWorkerHandle, AutoCloseable {
 
     private var job: Job? = null
+    private val stopRequested = CompletableDeferred<Unit>()
 
     /**
      * worker loop を開始する。
      */
-    fun start(): LlmDaemonSchedulerWorker {
+    override fun start(): LlmDaemonSchedulerWorker {
         require(job == null) { "LlmDaemonSchedulerWorker is already started." }
 
         job = scope.launch {
-            while (currentCoroutineContext().isActive) {
-                val loopResult = bootstrap().mapCatching {
-                    schedulerFactory().getOrThrow().runLoop(interval)
+            bootstrap().getOrThrow()
+            val scheduler = schedulerFactory().getOrThrow()
+
+            scheduler.startSession()
+            lifecycleListener.onStarted()
+
+            while (currentCoroutineContext().isActive && !stopRequested.isCompleted) {
+                scheduler.tick()
+
+                if (!stopRequested.isCompleted) {
+                    withTimeoutOrNull(interval.toMillis()) {
+                        stopRequested.await()
+                    }
                 }
-
-                if (loopResult.isSuccess) {
-                    continue
-                }
-
-                val throwable = requireNotNull(loopResult.exceptionOrNull())
-
-                if (throwable is CancellationException) {
-                    throw throwable
-                }
-
+            }
+        }
+        job?.invokeOnCompletion { error ->
+            if (error != null && error !is CancellationException) {
                 warnLogger.warn(
                     key = DAEMON_BOOTSTRAP_FAILURE_LOG_KEY,
                     message = "LlmDaemonSchedulerWorker bootstrap or scheduler loop failed.",
-                    throwable = throwable,
+                    throwable = error,
                 )
-
-                delay(interval.toMillis().toDuration(DurationUnit.MILLISECONDS))
+                lifecycleListener.onFailed(error)
             }
         }
 
         return this
     }
 
+    /**
+     * 新規 tick を止め、現在の tick を timeout まで drain する。
+     */
+    override suspend fun stopGracefully(timeout: Duration): LlmDaemonWorkerStopResult {
+        stopRequested.complete(Unit)
+        val runningJob = job ?: return LlmDaemonWorkerStopResult.DRAINED
+        val completed = withTimeoutOrNull(timeout.toMillis().coerceAtLeast(1L)) {
+            runningJob.join()
+            true
+        } ?: false
+
+        if (completed) {
+            return LlmDaemonWorkerStopResult.DRAINED
+        }
+
+        runningJob.cancelAndJoin()
+
+        return LlmDaemonWorkerStopResult.TIMED_OUT
+    }
+
     override fun close() {
-        job?.cancel()
+        runBlocking {
+            stopGracefully(Duration.ZERO)
+        }
         scope.cancel()
     }
 }
 
 /**
- * DB runtime から LlmDaemonSchedulerWorker を構築して起動する。
+ * DB runtime から未起動の LlmDaemonSchedulerWorker を構築する。
  */
-internal fun startLlmDaemonSchedulerWorker(
+internal fun createLlmDaemonSchedulerWorker(
     dataSource: HikariDataSource,
     database: ExposedDatabase,
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     clock: Clock = Clock.systemUTC(),
     onStaleLlmRunsRecovered: (Int) -> Unit = {},
-): LlmDaemonSchedulerWorker? {
+    observer: LlmDaemonSchedulerObserver = object : LlmDaemonSchedulerObserver {},
+    lifecycleListener: LlmDaemonWorkerLifecycleListener = object : LlmDaemonWorkerLifecycleListener {},
+): LlmDaemonSchedulerWorker {
     val environment = System.getenv()
-
-    if (!tradingConfig.daemon.enabled) {
-        return null
-    }
 
     return LlmDaemonSchedulerWorker(
         schedulerFactory = {
@@ -172,8 +243,9 @@ internal fun startLlmDaemonSchedulerWorker(
                         tradingConfig = tradingConfig,
                         runtimeConfigSnapshot = runtimeConfigSnapshot,
                         requestBase = oneShotRequestFromEnvironment(environment),
+                        observer = observer,
                     ),
-                )
+                ).asWorkerLoop()
             }
         },
         interval = tradingConfig.daemon.pollInterval,
@@ -187,7 +259,8 @@ internal fun startLlmDaemonSchedulerWorker(
             ).ensureSchema()
         },
         clock = clock,
-    ).start()
+        lifecycleListener = lifecycleListener,
+    )
 }
 
 private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonScheduler {
@@ -212,8 +285,21 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
             launchOneShot = components.launchOneShot,
             preFilter = components.preFilter,
             clock = inputs.clock,
+            observer = inputs.observer,
         ),
     )
+}
+
+private fun LlmDaemonScheduler.asWorkerLoop(): LlmDaemonWorkerLoop {
+    return object : LlmDaemonWorkerLoop {
+        override suspend fun startSession() {
+            this@asWorkerLoop.startSession()
+        }
+
+        override suspend fun tick() {
+            this@asWorkerLoop.tick()
+        }
+    }
 }
 
 /**
@@ -436,6 +522,7 @@ private fun Map<String, String>.requiredString(name: String): String? {
  * @param tradingConfig 取引 bot 全体の typed config
  * @param runtimeConfigSnapshot 起動開始時に固定する runtime config snapshot
  * @param requestBase one-shot runner の固定 request
+ * @param observer scheduler の実行状況 observer
  */
 private data class LlmLaunchRuntimeInputs(
     val dataSource: HikariDataSource,
@@ -445,6 +532,7 @@ private data class LlmLaunchRuntimeInputs(
     val tradingConfig: TradingBotConfig,
     val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
     val requestBase: OneShotRunnerRequest,
+    val observer: LlmDaemonSchedulerObserver = object : LlmDaemonSchedulerObserver {},
 )
 
 /**

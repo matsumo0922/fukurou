@@ -112,6 +112,22 @@ class ApiDocumentationRouteTest {
             summary = "runtime config catalog を取得する",
             tag = "ops",
         )
+        assertOperation(
+            paths = paths,
+            path = "/ops/daemon",
+            summary = "LLM daemon status を取得する",
+            tag = "ops",
+        )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/daemon/start",
+            schemaRef = "#/components/schemas/OpsDaemonControlRequest",
+        )
+        assertPostRequestBodySchema(
+            paths = paths,
+            path = "/ops/daemon/stop",
+            schemaRef = "#/components/schemas/OpsDaemonControlRequest",
+        )
         assertPostRequestBodySchema(
             paths = paths,
             path = "/ops/runtime-config/drafts",

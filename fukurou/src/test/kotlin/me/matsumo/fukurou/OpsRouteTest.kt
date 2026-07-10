@@ -9,6 +9,7 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
+import kotlinx.coroutines.delay
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
@@ -250,6 +251,68 @@ class OpsRouteTest {
 
         assertEquals(HttpStatusCode.Conflict, response.status)
         assertTrue(response.bodyAsText().contains("concurrent_invocation"))
+    }
+
+    @Test
+    fun opsRoutes_daemonStatusAndVersionedControlExposeObservedState() = testApplication {
+        val clock = fixedClock()
+        val operations = CapturingLlmDaemonOperations(daemonStatus(desiredEnabled = false))
+
+        application {
+            module(
+                readinessProbe = { true },
+                clock = clock,
+                opsLlmDaemonOperations = operations,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val initialResponse = client.get("/ops/daemon")
+        val startResponse = client.post("/ops/daemon/start") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"reason":"operator start"}""")
+        }
+        val stopResponse = client.post("/ops/daemon/stop") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"reason":"operator stop"}""")
+        }
+        val startBody = Json.parseToJsonElement(startResponse.bodyAsText()).jsonObject
+
+        assertEquals(HttpStatusCode.OK, initialResponse.status)
+        assertTrue(initialResponse.bodyAsText().contains("\"observedState\":\"STOPPED\""))
+        assertEquals(HttpStatusCode.OK, startResponse.status)
+        assertEquals("RUNNING", startBody.getValue("observedState").jsonPrimitive.content)
+        assertEquals("invocation-1", startBody.getValue("inFlightRun").jsonObject.getValue("invocationId").jsonPrimitive.content)
+        assertEquals(HttpStatusCode.OK, stopResponse.status)
+        assertEquals(listOf(true to "operator start", false to "operator stop"), operations.requests)
+    }
+
+    @Test
+    fun opsRoutes_daemonStartRejectsHardHaltAndBlankReason() = testApplication {
+        val operations = CapturingLlmDaemonOperations(
+            status = daemonStatus(desiredEnabled = false),
+            failure = LlmDaemonHardHaltRejectedException(),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsLlmDaemonOperations = operations,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val hardHaltResponse = client.post("/ops/daemon/start") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"reason":"operator start"}""")
+        }
+        val blankResponse = client.post("/ops/daemon/start") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"reason":"   "}""")
+        }
+
+        assertEquals(HttpStatusCode.Conflict, hardHaltResponse.status)
+        assertEquals(HttpStatusCode.BadRequest, blankResponse.status)
     }
 
     @Test
@@ -668,6 +731,7 @@ class OpsRouteTest {
             }
 
             val configResponse = client.get("/ops/runtime-config")
+            val daemonUnavailableResponse = client.get("/ops/daemon")
             val triggerResponse = client.post("/ops/trigger") {
                 contentType(ContentType.Application.Json)
                 setBody("""{"reason":"operator recovery check"}""")
@@ -684,6 +748,9 @@ class OpsRouteTest {
                 .jsonObject
 
             assertEquals(HttpStatusCode.OK, configResponse.status)
+            assertEquals(HttpStatusCode.OK, daemonUnavailableResponse.status)
+            assertTrue(daemonUnavailableResponse.bodyAsText().contains("\"observedState\":\"DEGRADED\""))
+            assertTrue(daemonUnavailableResponse.bodyAsText().contains("\"reason\":\"RUNTIME_CONFIG_UNAVAILABLE\""))
             assertEquals("runtimeConfig.warning.activeValidationFailed", warning.getValue("code").jsonPrimitive.content)
             assertEquals("runtimeConfig.validation.typedBetweenInclusive", validationError.getValue("code").jsonPrimitive.content)
             assertEquals(HttpStatusCode.ServiceUnavailable, triggerResponse.status)
@@ -706,6 +773,20 @@ class OpsRouteTest {
                 setBody("""{"reason":"operator restored runtime config"}""")
             }
             val recoveredReadyResponse = client.get("/health/ready")
+            var recoveredDaemonResponse = JsonObject(emptyMap())
+            var remainingDaemonStatusAttempts = 100
+            while (remainingDaemonStatusAttempts > 0) {
+                val candidate = Json.parseToJsonElement(client.get("/ops/daemon").bodyAsText()).jsonObject
+
+                if (candidate.getValue("observedState").jsonPrimitive.content == "STOPPED") {
+                    recoveredDaemonResponse = candidate
+
+                    break
+                }
+
+                remainingDaemonStatusAttempts -= 1
+                delay(10)
+            }
             val recoveredBody = Json.parseToJsonElement(recoveredConfigResponse.bodyAsText()).jsonObject
             val recoveredWarnings = recoveredBody.getValue("warnings").jsonArray.map { element ->
                 element.jsonObject.getValue("code").jsonPrimitive.content
@@ -717,6 +798,7 @@ class OpsRouteTest {
             assertFalse(recoveredWarnings.contains("runtimeConfig.warning.activeValidationFailed"))
             assertEquals(HttpStatusCode.Accepted, recoveredTriggerResponse.status)
             assertEquals(HttpStatusCode.OK, recoveredReadyResponse.status)
+            assertEquals("ACTIVE_CONFIG_DISABLED", recoveredDaemonResponse.getValue("reason").jsonPrimitive.content)
             assertEquals(listOf("operator restored runtime config"), manualService.reasons)
         } finally {
             container.stop()
@@ -1833,6 +1915,54 @@ private class CapturingManualLlmLaunchService(
 
         return Result.success(result)
     }
+}
+
+private class CapturingLlmDaemonOperations(
+    private var status: LlmDaemonSupervisorStatus,
+    private val failure: Throwable? = null,
+) : LlmDaemonOperations {
+    val requests = mutableListOf<Pair<Boolean, String>>()
+
+    override fun status(): LlmDaemonSupervisorStatus = status
+
+    override suspend fun setDesiredEnabled(enabled: Boolean, reason: String): Result<LlmDaemonSupervisorStatus> {
+        requests += enabled to reason
+        failure?.let { error -> return Result.failure(error) }
+        status = status.copy(
+            desiredEnabled = enabled,
+            observedState = if (enabled) LlmDaemonObservedState.RUNNING else LlmDaemonObservedState.STOPPED,
+            reason = if (enabled) LlmDaemonStatusReason.RUNNING else LlmDaemonStatusReason.ACTIVE_CONFIG_DISABLED,
+        )
+
+        return Result.success(status)
+    }
+}
+
+private fun daemonStatus(desiredEnabled: Boolean): LlmDaemonSupervisorStatus {
+    val identity = LlmDaemonConfigIdentity("version-1", "hash-1")
+    val launch = LlmDaemonLaunchStatus(
+        invocationId = "invocation-1",
+        triggerKind = "FLAT_HEARTBEAT",
+        startedAt = fixedInstant(),
+    )
+
+    return LlmDaemonSupervisorStatus(
+        desiredEnabled = desiredEnabled,
+        observedState = if (desiredEnabled) LlmDaemonObservedState.RUNNING else LlmDaemonObservedState.STOPPED,
+        reason = if (desiredEnabled) LlmDaemonStatusReason.RUNNING else LlmDaemonStatusReason.ACTIVE_CONFIG_DISABLED,
+        detail = null,
+        activeConfig = identity,
+        appliedConfig = identity,
+        daemonAppliedConfig = identity,
+        restartRequired = false,
+        lastSchedulerSignalAt = fixedInstant(),
+        lastLaunch = launch,
+        lastSkip = LlmDaemonSkipStatus("no_trigger_due", null, fixedInstant()),
+        nextHeartbeatAt = fixedInstant().plusSeconds(300),
+        inFlightRun = launch,
+        silenceWarning = false,
+        nextRetryAt = null,
+    )
 }
 
 /**
