@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
-import { ACTIVITY_TIMELINE_FILTER_STORAGE_KEY } from "./api/ops";
 import { LOCALE_STORAGE_KEY } from "./i18n/messages";
 import { readActivityCatalogGolden } from "./test/activityCatalogGolden";
 import { formatDateTime } from "./ui/format";
@@ -265,7 +264,7 @@ describe("App", () => {
   });
 
   it("keeps the selected locale usable when browser storage writes fail", async () => {
-    const storageSetItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    const storageSetItemSpy = vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
       throw new Error("storage disabled");
     });
 
@@ -340,205 +339,43 @@ describe("App", () => {
     );
   });
 
-  it("shows activity timeline filters and loads older cursor pages", async () => {
+  it("filters decision runs and opens the normalized detail pane", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/activity");
 
     render(<App />);
 
-    expect(await screen.findByText("BTC entry fill")).toBeInTheDocument();
-    expect(screen.getAllByText("No trade").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Manual resume requested").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("operator").length).toBeGreaterThan(0);
-    expect(screen.getByText(/newest first/)).toBeInTheDocument();
-    expect(screen.getByText(/3\/50 records/)).toBeInTheDocument();
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    const filters = screen.getByRole("group", { name: "Decision run outcome filters" });
+    expect(within(runList).getByText("EXPECTED_VALUE_GATE")).toBeInTheDocument();
+    expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "false");
+    expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("limit") === "100")).toBe(true);
 
-    const timeline = await screen.findByRole("list", { name: "Activity timeline" });
-    const timelineItems = within(timeline).getAllByRole("listitem");
+    fireEvent.click(within(filters).getByRole("button", { name: /Denied/ }));
+    expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "true");
+    expect(window.localStorage.getItem("fukurou.web.activity.run-filter.v2")).toBe("DENIED");
 
-    expect(timelineItems.map((item) => within(item).getByRole("heading", { level: 2 }).textContent)).toEqual([
-      "BTC entry fill",
-      "Manual resume requested",
-      "No trade",
-    ]);
-    expect(within(timeline).queryByText("Entry reason stays in the detail dialog.")).not.toBeInTheDocument();
+    fireEvent.click(within(runList).getByRole("button", { name: /ENTER/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Decision run detail" });
+    expect(await within(dialog).findByText("0.1100000000")).toBeInTheDocument();
+    expect(within(dialog).getByText("0.03357778")).toBeInTheDocument();
+    expect(within(dialog).getAllByText("APPROVED").length).toBeGreaterThan(0);
 
-    fireEvent.click(
-      within(timelineItems[0]).getByRole("button", {
-        name: "Open execution details for BTC entry fill",
-      }),
-    );
-
-    const detailsDialog = screen.getByRole("dialog", { name: "BTC entry fill" });
-
-    expect(within(detailsDialog).getByText("Entry reason stays in the detail dialog.")).toBeInTheDocument();
-    expect(within(detailsDialog).getByText("order-1")).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Show raw projection" }));
+    expect(within(dialog).getByText(/RUNNER_PHASE_COMPLETED/)).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: "Escape" });
-
-    await waitFor(() => {
-      expect(screen.queryByRole("dialog", { name: "BTC entry fill" })).not.toBeInTheDocument();
-    });
-    expect(hasGetCall(fetchMock, "/ops/activity", (params) => params.get("limit") === "50")).toBe(true);
-
-    fireEvent.click(screen.getByRole("button", { name: "Load older" }));
-
-    expect(await screen.findByText("HARD_HALT set")).toBeInTheDocument();
-    expect(
-      hasGetCall(
-        fetchMock,
-        "/ops/activity",
-        (params) => params.get("before") === "2026-07-05T12:02:00.000Z|decision|decision:decision-1",
-      ),
-    ).toBe(true);
-
-    fireEvent.click(screen.getByRole("button", { name: "Audit" }));
-    fireEvent.click(screen.getByLabelText("Manual resume requested"));
-
-    await waitFor(() => {
-      expect(
-        hasGetCall(
-          fetchMock,
-          "/ops/activity",
-          (params) => params.get("source") === "audit" && params.get("auditEventType") === "MANUAL_RESUME_REQUESTED",
-        ),
-      ).toBe(true);
-    });
-    expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
-      source: "audit",
-      auditEventTypes: ["MANUAL_RESUME_REQUESTED"],
-    });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Decision run detail" })).not.toBeInTheDocument());
   });
 
-  it("restores valid activity filters and drops stale saved values", async () => {
-    window.localStorage.setItem(
-      ACTIVITY_TIMELINE_FILTER_STORAGE_KEY,
-      JSON.stringify({
-        source: "audit",
-        auditEventTypes: ["HARD_HALT_SET", "STALE_EVENT"],
-      }),
-    );
-    const fetchMock = stubSystemFetch();
-    window.history.pushState({}, "", "/app/activity");
-
-    render(<App />);
-
-    expect(await screen.findByRole("heading", { name: "Activity" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Audit" })).toHaveAttribute("aria-pressed", "true");
-    expect(await screen.findByLabelText("HARD_HALT set")).toBeChecked();
-    expect(screen.queryByText("STALE_EVENT")).not.toBeInTheDocument();
-
-    await waitFor(() => {
-      expect(
-        hasGetCall(
-          fetchMock,
-          "/ops/activity",
-          (params) => params.get("source") === "audit" && params.get("auditEventType") === "HARD_HALT_SET",
-        ),
-      ).toBe(true);
-    });
-    expect(
-      hasGetCall(
-        fetchMock,
-        "/ops/activity",
-        (params) => params.getAll("auditEventType").includes("STALE_EVENT"),
-      ),
-    ).toBe(false);
-    await waitFor(() => {
-      expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
-        source: "audit",
-        auditEventTypes: ["HARD_HALT_SET"],
-      });
-    });
-  });
-
-  it("opens the activity glossary and explains default audit exclusions", async () => {
+  it("ignores stale decision run filter storage values", async () => {
+    window.localStorage.setItem("fukurou.web.activity.run-filter.v2", "STALE");
     stubSystemFetch();
     window.history.pushState({}, "", "/app/activity");
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Open activity glossary" }));
-
-    const dialog = screen.getByRole("dialog", { name: "Activity glossary" });
-
-    expect(within(dialog).getByText("Sources")).toBeInTheDocument();
-    expect(within(dialog).getByText("Audit event types")).toBeInTheDocument();
-    expect(within(dialog).getByText("Decision actions")).toBeInTheDocument();
-    expect(within(dialog).getByText("Decision lifecycle completed")).toBeInTheDocument();
-    expect(within(dialog).getByText(/RECONCILER_PASS_COMPLETED.*excluded by default/)).toBeInTheDocument();
-
-    fireEvent.keyDown(window, { key: "Escape" });
-
-    await waitFor(() => {
-      expect(screen.queryByRole("dialog", { name: "Activity glossary" })).not.toBeInTheDocument();
-    });
-  });
-
-  it("keeps saved filters and falls back to raw labels when the activity catalog fails", async () => {
-    window.localStorage.setItem(
-      ACTIVITY_TIMELINE_FILTER_STORAGE_KEY,
-      JSON.stringify({
-        source: "all",
-        auditEventTypes: ["STALE_EVENT"],
-      }),
-    );
-    const fetchMock = stubSystemFetch({
-      activityCatalogResponse: {
-        status: 500,
-        body: { message: "catalog unavailable" },
-      },
-    });
-    window.history.pushState({}, "", "/app/activity");
-
-    render(<App />);
-
-    expect(await screen.findByText("NO_TRADE decision")).toBeInTheDocument();
-    expect(screen.getByLabelText("STALE_EVENT")).toBeChecked();
-    expect(
-      hasGetCall(
-        fetchMock,
-        "/ops/activity",
-        (params) => params.getAll("auditEventType").includes("STALE_EVENT"),
-      ),
-    ).toBe(false);
-    expect(JSON.parse(window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY) ?? "{}")).toEqual({
-      source: "all",
-      auditEventTypes: ["STALE_EVENT"],
-    });
-  });
-
-  it("ignores an older activity page response after filters change", async () => {
-    let resolveOlderResponse: (response: Response) => void = () => undefined;
-    const activityOlderResponse = new Promise<Response>((resolve) => {
-      resolveOlderResponse = resolve;
-    });
-    const fetchMock = stubSystemFetch({
-      activityOlderResponse,
-    });
-    window.history.pushState({}, "", "/app/activity");
-
-    render(<App />);
-
-    expect(await screen.findByText("BTC entry fill")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Load older" }));
-    fireEvent.click(screen.getByRole("button", { name: "Audit" }));
-
-    await waitFor(() => {
-      expect(hasGetCall(fetchMock, "/ops/activity", (params) => params.get("source") === "audit")).toBe(true);
-    });
-
-    await act(async () => {
-      resolveOlderResponse(jsonResponse(activityTimelineOlderPage()));
-      await activityOlderResponse;
-      await Promise.resolve();
-    });
-
-    const timeline = await screen.findByRole("list", { name: "Activity timeline" });
-
-    expect(within(timeline).queryByText("HARD_HALT set")).not.toBeInTheDocument();
-    expect(within(timeline).getAllByText("Manual resume requested").length).toBeGreaterThan(0);
+    expect(await screen.findByRole("button", { name: /All/ })).toHaveAttribute("aria-pressed", "true");
   });
 
   it("rejects blank control reasons before calling the API", async () => {
@@ -989,6 +826,10 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         });
       case "/ops/runtime-config":
         return jsonResponse(fixture.runtimeConfigResponse ?? runtimeConfigResponse());
+      case "/ops/runs":
+        return jsonResponse(decisionRunsResponse());
+      case "/ops/runs/run-denied":
+        return jsonResponse(decisionRunDetailResponse());
       case "/ops/activity/catalog":
         if (fixture.activityCatalogResponse) {
           return jsonResponse(
@@ -1505,6 +1346,115 @@ function runtimeConfigItem({
   };
 }
 
+function decisionRunsResponse() {
+  return {
+    runs: [
+      {
+        invocationId: "run-denied",
+        mode: "PAPER",
+        symbol: "BTC_JPY",
+        triggerKind: "SCHEDULED",
+        status: "SUCCEEDED",
+        outcome: "DENIED",
+        startedAt: "2026-07-10T00:47:27.000Z",
+        finishedAt: "2026-07-10T00:47:36.000Z",
+        durationMillis: 9000,
+        action: "ENTER",
+        reasonJa: "上昇継続を想定します。",
+        falsificationVerdict: "APPROVED",
+        safetyRule: "EXPECTED_VALUE_GATE",
+        safetyMessageJa: "期待値が安全床を下回りました。",
+        errorMessage: null,
+        orderCount: 0,
+        executionCount: 0,
+      },
+      {
+        invocationId: "run-interrupted",
+        mode: "PAPER",
+        symbol: "BTC_JPY",
+        triggerKind: "SCHEDULED",
+        status: "FAILED",
+        outcome: "INTERRUPTED",
+        startedAt: "2026-07-10T00:14:12.000Z",
+        finishedAt: "2026-07-10T00:20:00.000Z",
+        durationMillis: 348000,
+        action: null,
+        reasonJa: null,
+        falsificationVerdict: null,
+        safetyRule: null,
+        safetyMessageJa: null,
+        errorMessage: "previous process/container shutdown recovery",
+        orderCount: 0,
+        executionCount: 0,
+      },
+    ],
+    nextBefore: null,
+  };
+}
+
+function decisionRunDetailResponse() {
+  return {
+    summary: decisionRunsResponse().runs[0],
+    phases: [
+      { key: "TRIGGER", status: "COMPLETED", detail: "SCHEDULED" },
+      { key: "PROPOSER", status: "COMPLETED", detail: "codex" },
+      { key: "INTENT", status: "COMPLETED", detail: "intent-1" },
+      { key: "FALSIFIER", status: "APPROVED", detail: "反証条件を確認しました。" },
+      { key: "SAFETY", status: "DENIED", detail: "EXPECTED_VALUE_GATE" },
+      { key: "ORDER_EXECUTION", status: "NOT_REACHED", detail: "orders=0, executions=0" },
+    ],
+    decision: {
+      decisionId: "decision-1",
+      action: "ENTER",
+      provider: "codex",
+      estimatedWinProbability: "0.6100000000",
+      expectedRMultiple: "0.1100000000",
+      roundTripCostR: "0.0100000000",
+      reasonJa: "上昇継続を想定します。",
+      setupTagsJson: "[]",
+      missingDataJaJson: "[]",
+      noTradeConditionsJaJson: "[]",
+      createdAt: "2026-07-10T00:47:30.000Z",
+    },
+    intent: {
+      intentId: "intent-1",
+      tradePlanId: "plan-1",
+      side: "BUY",
+      orderType: "LIMIT",
+      sizeBtc: "0.060000000000",
+      priceJpy: "17000000.00000000",
+      protectiveStopPriceJpy: "16500000.00000000",
+      takeProfitPriceJpy: "18000000.00000000",
+      thesisJa: "上昇トレンド継続",
+      invalidationConditionsJaJson: "[]",
+      targetPriceJpy: "18000000.00000000",
+      timeStopAt: null,
+    },
+    falsification: {
+      verdict: "APPROVED",
+      provider: "claude",
+      reasonJa: "反証条件を確認しました。",
+      createdAt: "2026-07-10T00:47:32.000Z",
+    },
+    safetyViolation: {
+      rule: "EXPECTED_VALUE_GATE",
+      measuredValue: "0.03357778",
+      limitValue: "0.10",
+      messageJa: "期待値が安全床を下回りました。",
+      createdAt: "2026-07-10T00:47:35.000Z",
+    },
+    orders: [],
+    executions: [],
+    raw: [
+      {
+        source: "audit",
+        occurredAt: "2026-07-10T00:47:34.000Z",
+        values: { eventType: "RUNNER_PHASE_COMPLETED", toolName: "runner" },
+      },
+    ],
+  };
+}
+
 function activityTimelineResponse(searchParams: URLSearchParams) {
   const source = searchParams.get("source");
   const auditEventTypes = searchParams.getAll("auditEventType");
@@ -1531,14 +1481,6 @@ function unknownAuditEventTypes(searchParams: URLSearchParams): string[] {
   const knownAuditEventTypes = new Set(activityCatalogGolden.auditEventTypes.map((item) => item.value));
 
   return searchParams.getAll("auditEventType").filter((eventType) => !knownAuditEventTypes.has(eventType));
-}
-
-function activityTimelineOlderPage() {
-  return {
-    events: olderActivityEvents(),
-    nextBefore: null,
-    limit: 50,
-  };
 }
 
 function latestActivityEvents(source: string | null, auditEventTypes: string[]) {

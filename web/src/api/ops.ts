@@ -1,5 +1,5 @@
 import { queryOptions } from "@tanstack/react-query";
-import { getJson, postJsonResponse } from "./client";
+import { getJson, getJsonByPath, postJsonResponse } from "./client";
 import type { components } from "./openapi-types";
 
 export type EvaluationSummaryResponse = components["schemas"]["EvaluationSummaryResponse"];
@@ -34,6 +34,22 @@ export type RuntimeConfigValidationResult = components["schemas"]["RuntimeConfig
 export type RuntimeConfigVersionDetail = components["schemas"]["RuntimeConfigVersionDetail"];
 export type RuntimeConfigVersionSummary = components["schemas"]["RuntimeConfigVersionSummary"];
 export type OpsTriggerResponse = components["schemas"]["OpsTriggerResponse"];
+export type OpsDecisionRunsResponse = components["schemas"]["OpsDecisionRunsResponse"];
+export type OpsDecisionRunSummaryResponse = components["schemas"]["OpsDecisionRunSummaryResponse"];
+export type OpsDecisionRunDetailResponse = components["schemas"]["OpsDecisionRunDetailResponse"];
+export type DecisionRunOutcome = "EXECUTED" | "DENIED" | "NO_TRADE" | "INTERRUPTED" | "RUNNING" | "FAILED";
+export type DecisionRunOutcomeFilter = DecisionRunOutcome | "ALL";
+
+export const DECISION_RUN_FILTER_STORAGE_KEY = "fukurou.web.activity.run-filter.v2";
+export const DECISION_RUN_OUTCOME_FILTERS = [
+  "ALL",
+  "EXECUTED",
+  "DENIED",
+  "NO_TRADE",
+  "INTERRUPTED",
+  "RUNNING",
+  "FAILED",
+] as const satisfies readonly DecisionRunOutcomeFilter[];
 
 export type LlmAuthProvider = "claude" | "codex";
 export type ActivityTimelineSource = "audit" | "decision" | "execution";
@@ -118,6 +134,22 @@ export const opsActivityCatalogQuery = queryOptions({
   queryFn: () => getJson("/ops/activity/catalog"),
   staleTime: 300_000,
 });
+
+export const opsDecisionRunsQuery = queryOptions({
+  queryKey: ["ops", "decision-runs"],
+  queryFn: () => getJson("/ops/runs?limit=100"),
+  staleTime: 15_000,
+  refetchInterval: 30_000,
+});
+
+export function opsDecisionRunDetailQuery(invocationId: string | null) {
+  return queryOptions({
+    queryKey: ["ops", "decision-run", invocationId],
+    queryFn: () => getJsonByPath<OpsDecisionRunDetailResponse>(`/ops/runs/${encodeURIComponent(invocationId ?? "")}`),
+    enabled: invocationId !== null,
+    staleTime: 15_000,
+  });
+}
 
 export const evaluationSummaryQuery = queryOptions({
   queryKey: ["evaluation", "summary"],

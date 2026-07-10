@@ -1,907 +1,376 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import Activity from "lucide-react/dist/esm/icons/activity.mjs";
-import ChevronDown from "lucide-react/dist/esm/icons/chevron-down.mjs";
-import Filter from "lucide-react/dist/esm/icons/filter.mjs";
-import Info from "lucide-react/dist/esm/icons/info.mjs";
+import ChevronRight from "lucide-react/dist/esm/icons/chevron-right.mjs";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import X from "lucide-react/dist/esm/icons/x.mjs";
 import {
-  ACTIVITY_TIMELINE_FILTER_STORAGE_KEY,
-  ACTIVITY_TIMELINE_SOURCE_FILTERS,
-  DEFAULT_ACTIVITY_TIMELINE_FILTERS,
-  activityTimelineRequestFilters,
-  activityTimelineQuery,
-  fetchActivityTimeline,
-  newestFirstActivityTimelineEvents,
-  normalizeActivityTimelineFilters,
-  opsActivityCatalogQuery,
-  pruneActivityTimelineFilters,
-  type ActivityTimelineEvent,
-  type ActivityTimelineFilters,
-  type ActivityTimelineSnapshot,
-  type ActivityTimelineSource,
-  type ActivityTimelineSourceFilter,
-  type OpsActivityCatalogItemResponse,
-  type OpsActivityCatalogResponse,
+  DECISION_RUN_FILTER_STORAGE_KEY,
+  DECISION_RUN_OUTCOME_FILTERS,
+  opsDecisionRunDetailQuery,
+  opsDecisionRunsQuery,
+  type DecisionRunOutcomeFilter,
+  type OpsDecisionRunDetailResponse,
+  type OpsDecisionRunSummaryResponse,
 } from "../api/ops";
-import type { MessageKey } from "../i18n/messages";
 import { useI18n } from "../i18n/useI18n";
 import { EmptyState } from "../ui/components/EmptyState";
-import { Panel } from "../ui/components/Panel";
 import { SectionHeader } from "../ui/components/SectionHeader";
-import { StatusPill, type StatusTone } from "../ui/components/StatusPill";
 import { describeError, formatDateTime } from "../ui/format";
-import { formatJpy, formatRatioAsPercent, formatSignedJpy } from "../ui/numberFormat";
 
 export function ActivityPage() {
-  const [filters, setFilters] = useState(loadStoredActivityTimelineFilters);
-  const [olderPages, setOlderPages] = useState<ActivityTimelineSnapshot[]>([]);
-  const [olderError, setOlderError] = useState<unknown>(null);
-  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
-  const [isCatalogDialogOpen, setIsCatalogDialogOpen] = useState(false);
-  const timelineVersionRef = useRef(0);
-  const hasLoadedOlderPages = olderPages.length > 0;
-  const catalogQuery = useQuery(opsActivityCatalogQuery);
-  const catalog = catalogQuery.data ?? null;
-  const requestFilters = useMemo(
-    () => activityTimelineRequestFilters(filters, catalog),
-    [catalog, filters],
+  const [filter, setFilter] = useState<DecisionRunOutcomeFilter>(loadRunFilter);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const runsQuery = useQuery(opsDecisionRunsQuery);
+  const { locale, t } = useI18n();
+  const runs = useMemo(() => runsQuery.data?.runs ?? [], [runsQuery.data?.runs]);
+  const visibleRuns = useMemo(
+    () => runs.filter((run) => filter === "ALL" || run.outcome === filter),
+    [filter, runs],
   );
-  const timelineQuery = useQuery(activityTimelineQuery(requestFilters, undefined, !hasLoadedOlderPages));
-  const visibleTimeline = useMemo(
-    () => mergeActivityTimelinePages(timelineQuery.data ?? null, olderPages),
-    [olderPages, timelineQuery.data],
-  );
-  const { t } = useI18n();
+  const activeSelectedId = selectedId && visibleRuns.some((run) => run.invocationId === selectedId) ? selectedId : null;
+  const detailQuery = useQuery(opsDecisionRunDetailQuery(activeSelectedId));
 
   useEffect(() => {
-    persistActivityTimelineFilters(filters);
-  }, [filters]);
-
-  useEffect(() => {
-    if (!catalogQuery.isSuccess) {
-      return;
-    }
-
-    // Defer UI/storage normalization until catalog-backed request filters have rendered.
-    const timeoutId = window.setTimeout(() => {
-      setFilters((currentFilters) => {
-        const prunedFilters = pruneActivityTimelineFilters(currentFilters, catalogQuery.data);
-
-        return activityTimelineFiltersEqual(currentFilters, prunedFilters) ? currentFilters : prunedFilters;
-      });
-    }, 0);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [catalogQuery.data, catalogQuery.isSuccess]);
-
-  const refreshed = () => {
-    timelineVersionRef.current += 1;
-    setOlderPages([]);
-    setOlderError(null);
-    setIsLoadingOlder(false);
-    void timelineQuery.refetch();
-  };
-  const filtersChanged = (changedFilters: ActivityTimelineFilters) => {
-    timelineVersionRef.current += 1;
-    setFilters(changedFilters);
-    setOlderPages([]);
-    setOlderError(null);
-    setIsLoadingOlder(false);
-  };
-  const olderLoaded = () => {
-    const requestVersion = timelineVersionRef.current;
-
-    void loadOlderActivityPage({
-      filters: requestFilters,
-      latestPage: timelineQuery.data ?? null,
-      olderPages,
-      setOlderPages,
-      setOlderError,
-      setIsLoadingOlder,
-      requestIsCurrent: () => timelineVersionRef.current === requestVersion,
-    });
-  };
+    window.localStorage.setItem(DECISION_RUN_FILTER_STORAGE_KEY, filter);
+  }, [filter]);
 
   return (
-    <div className="page-stack">
+    <div className="decision-runs-page page-stack">
       <SectionHeader
-        eyebrow="App"
+        eyebrow="Operations"
         title="Activity"
-        description={t("activity.description")}
+        description={t("activity.runs.description")}
         action={
           <button
             className="icon-text-button icon-text-button--prominent"
             type="button"
-            onClick={refreshed}
-            disabled={timelineQuery.isFetching}
+            onClick={() => void runsQuery.refetch()}
+            disabled={runsQuery.isFetching}
           >
             <RefreshCw size={16} aria-hidden="true" />
-            {timelineQuery.isFetching ? t("common.refreshing") : t("common.refresh")}
+            {runsQuery.isFetching ? t("common.refreshing") : t("common.refresh")}
           </button>
         }
       />
 
-      <Panel>
-        <ActivityFilters
-          catalog={catalog}
-          catalogFailed={catalogQuery.isError}
-          filters={filters}
-          filtersChanged={filtersChanged}
-        />
-      </Panel>
+      <div className="run-filterbar" role="group" aria-label={t("activity.runs.filters.aria")}>
+        {DECISION_RUN_OUTCOME_FILTERS.map((outcome) => (
+          <button
+            className="run-filter"
+            type="button"
+            aria-pressed={filter === outcome}
+            key={outcome}
+            onClick={() => {
+              setFilter(outcome);
+              setSelectedId(null);
+            }}
+          >
+            {outcomeLabel(outcome, t)}
+            <span className="run-filter__count">{outcomeCount(outcome, runs)}</span>
+          </button>
+        ))}
+      </div>
 
-      <Panel>
-        <div className="panel-heading">
-          <Activity size={18} aria-hidden="true" />
-          <h2>{t("activity.panel.timeline")}</h2>
-          {visibleTimeline ? (
-            <StatusPill
-              label={timelineQuery.isStale ? t("common.stale") : t("common.fresh")}
-              tone={timelineQuery.isStale ? "warning" : "positive"}
+      {runsQuery.isPending ? <RunListNotice text={t("activity.runs.loading")} /> : null}
+      {runsQuery.isError ? (
+        <RunListNotice
+          text={`${t("activity.runs.error")}: ${describeError(runsQuery.error, locale)}`}
+          action={() => void runsQuery.refetch()}
+        />
+      ) : null}
+      {runsQuery.isSuccess ? (
+        <div className={activeSelectedId ? "decision-runs-layout decision-runs-layout--detail" : "decision-runs-layout"}>
+          <main className="decision-run-list" aria-label={t("activity.runs.list.aria")}>
+            {visibleRuns.length === 0 ? (
+              <EmptyState title={t("activity.runs.empty.title")} description={t("activity.runs.empty.description")} />
+            ) : (
+              visibleRuns.map((run) => (
+                <RunRow
+                  run={run}
+                  selected={run.invocationId === activeSelectedId}
+                  selectedChanged={() => setSelectedId(run.invocationId)}
+                  key={run.invocationId}
+                />
+              ))
+            )}
+          </main>
+          {activeSelectedId ? (
+            <RunDetailPane
+              detail={detailQuery.data ?? null}
+              isPending={detailQuery.isPending}
+              error={detailQuery.error}
+              closed={() => setSelectedId(null)}
             />
           ) : null}
-          <span className="panel-heading__spacer" />
-          <button
-            className="icon-only-button"
-            type="button"
-            aria-label={t("activity.catalog.open")}
-            title={t("activity.catalog.open")}
-            onClick={() => setIsCatalogDialogOpen(true)}
-          >
-            <Info size={17} aria-hidden="true" />
-          </button>
         </div>
-        {timelineQuery.isPending && !visibleTimeline ? <ActivityLoading /> : null}
-        {timelineQuery.isError && !visibleTimeline ? (
-          <ActivityError error={timelineQuery.error} retried={() => void timelineQuery.refetch()} />
-        ) : null}
-        {visibleTimeline ? (
-          <ActivityTimeline
-            timeline={visibleTimeline}
-            loadedPageCount={1 + olderPages.length}
-            olderError={olderError}
-            isLoadingOlder={isLoadingOlder}
-            olderLoaded={olderLoaded}
-            catalog={catalog}
-          />
-        ) : null}
-        {isCatalogDialogOpen ? (
-          <ActivityCatalogDialog
-            catalog={catalog}
-            catalogFailed={catalogQuery.isError}
-            closed={() => setIsCatalogDialogOpen(false)}
-          />
-        ) : null}
-      </Panel>
+      ) : null}
     </div>
   );
 }
 
-function ActivityFilters({
-  catalog,
-  catalogFailed,
-  filters,
-  filtersChanged,
+function RunRow({
+  run,
+  selected,
+  selectedChanged,
 }: {
-  catalog: OpsActivityCatalogResponse | null;
-  catalogFailed: boolean;
-  filters: ActivityTimelineFilters;
-  filtersChanged: (filters: ActivityTimelineFilters) => void;
+  run: OpsDecisionRunSummaryResponse;
+  selected: boolean;
+  selectedChanged: () => void;
 }) {
-  const { t } = useI18n();
-  const sourceFilters = catalog?.sourceFilters ?? fallbackSourceFilters();
-  const auditEventTypes = catalog?.auditEventTypes ?? fallbackSelectedAuditEventTypes(filters);
-
-  return (
-    <div className="activity-filters" aria-label={t("activity.filters.aria")}>
-      <div className="activity-filters__heading">
-        <Filter size={18} aria-hidden="true" />
-        <h2>{t("activity.filters.title")}</h2>
-      </div>
-      <div className="activity-filters__section">
-        <span className="activity-filters__label">{t("activity.filters.source")}</span>
-        <div className="segmented-control" role="group" aria-label={t("activity.filters.source")}>
-          {sourceFilters.map((source) => (
-            <button
-              className={
-                source.value === filters.source
-                  ? "segmented-control__button segmented-control__button--active"
-                  : "segmented-control__button"
-              }
-              type="button"
-              aria-pressed={source.value === filters.source}
-              key={source.value}
-              onClick={() => filtersChanged({ ...filters, source: source.value as ActivityTimelineSourceFilter })}
-            >
-              {catalogMessage(source.labelKey, source.value, t)}
-            </button>
-          ))}
-        </div>
-      </div>
-      <fieldset className="activity-event-filter">
-        <legend>{t("activity.filters.auditEventTypes")}</legend>
-        <div className="activity-event-filter__options">
-          {auditEventTypes.map((eventType) => (
-            <label className="checkbox-chip" key={eventType.value}>
-              <input
-                type="checkbox"
-                checked={filters.auditEventTypes.includes(eventType.value)}
-                onChange={() => filtersChanged(toggleAuditEventType(filters, eventType.value, auditEventTypes))}
-              />
-              <span>{catalogMessage(eventType.labelKey, eventType.value, t)}</span>
-            </label>
-          ))}
-        </div>
-        {auditEventTypes.length === 0 ? (
-          <p className="activity-filters__hint">
-            {catalogFailed ? t("activity.filters.catalogUnavailable") : t("activity.filters.catalogLoading")}
-          </p>
-        ) : null}
-      </fieldset>
-    </div>
-  );
-}
-
-function ActivityLoading() {
-  const { t } = useI18n();
-
-  return (
-    <div className="loading-row" role="status">
-      <span className="loading-dot" aria-hidden="true" />
-      <span>{t("activity.loading.timeline")}</span>
-    </div>
-  );
-}
-
-function ActivityError({ error, retried }: { error: unknown; retried: () => void }) {
   const { locale, t } = useI18n();
 
   return (
-    <EmptyState
-      title={t("activity.error.timeline")}
-      description={describeError(error, locale)}
-      action={
-        <button className="icon-text-button" type="button" onClick={retried}>
-          <RefreshCw size={16} aria-hidden="true" />
-          {t("common.retry")}
-        </button>
-      }
-    />
+    <button
+      className="decision-run-row"
+      type="button"
+      aria-selected={selected}
+      data-outcome={run.outcome}
+      onClick={selectedChanged}
+    >
+      <span className="decision-run-row__rail"><span className="decision-run-row__dot" /></span>
+      <span className="decision-run-card">
+        <span className="decision-run-card__top">
+          <time>{formatDateTime(run.startedAt, locale)}</time>
+          <span className="decision-run-card__duration">{formatDuration(run.durationMillis)}</span>
+          <span className={`run-outcome run-outcome--${run.outcome.toLowerCase().replace("_", "-")}`}>
+            {outcomeLabel(run.outcome as DecisionRunOutcomeFilter, t)}
+          </span>
+          <ChevronRight className="decision-run-card__arrow" size={17} aria-hidden="true" />
+        </span>
+        <span className="decision-run-card__headline">
+          <strong>{run.action ?? run.status}</strong>
+          <code>{run.triggerKind ?? "MANUAL"}</code>
+        </span>
+        <span className="decision-run-card__reason">
+          {run.safetyMessageJa ?? run.errorMessage ?? run.reasonJa ?? t("activity.runs.reason.none")}
+        </span>
+        <span className="decision-run-card__facts">
+          <span>{t("activity.runs.fact.verifier")} <strong>{run.falsificationVerdict ?? "—"}</strong></span>
+          <span>{t("activity.runs.fact.gate")} <strong>{run.safetyRule ?? "—"}</strong></span>
+          <span>{t("activity.runs.fact.orders")} <strong>{run.orderCount}</strong></span>
+          <span>{t("activity.runs.fact.executions")} <strong>{run.executionCount}</strong></span>
+        </span>
+      </span>
+    </button>
   );
 }
 
-function ActivityDetailsDialog({
-  event,
-  catalog,
+function RunDetailPane({
+  detail,
+  isPending,
+  error,
   closed,
 }: {
-  event: ActivityTimelineEvent;
-  catalog: OpsActivityCatalogResponse | null;
+  detail: OpsDecisionRunDetailResponse | null;
+  isPending: boolean;
+  error: unknown;
   closed: () => void;
 }) {
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const [rawOpen, setRawOpen] = useState(false);
   const { locale, t } = useI18n();
-  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
-  const dialogTitle = event.details?.title ?? activityEventTitle(event, catalog, t);
 
   useEffect(() => {
     closeButtonRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    const keyDownHandled = (keyboardEvent: KeyboardEvent) => {
-      if (keyboardEvent.key === "Escape") {
-        closed();
-      }
+    const keyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closed();
     };
-
-    window.addEventListener("keydown", keyDownHandled);
-
-    return () => window.removeEventListener("keydown", keyDownHandled);
+    window.addEventListener("keydown", keyDown);
+    return () => window.removeEventListener("keydown", keyDown);
   }, [closed]);
 
-  if (!event.details) {
-    return null;
-  }
-
   return (
-    <div
-      className="activity-catalog-dialog__backdrop"
-      onClick={(clickEvent) => {
-        if (clickEvent.target === clickEvent.currentTarget) {
-          closed();
-        }
-      }}
-    >
-      <div
-        className="activity-detail-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="activity-detail-dialog-title"
-      >
-        <div className="activity-detail-dialog__heading">
-          <h2 id="activity-detail-dialog-title">{dialogTitle}</h2>
-          <button
-            ref={closeButtonRef}
-            className="icon-only-button"
-            type="button"
-            aria-label={t("activity.details.close")}
-            title={t("activity.details.close")}
-            onClick={closed}
-          >
-            <X size={17} aria-hidden="true" />
-          </button>
-        </div>
-        <p className="activity-detail-dialog__summary">
-          {sourceLabel(event.source, t)} · {activityEventKindLabel(event, catalog, t)} · {formatDateTime(event.occurredAt, locale)}
-        </p>
-        <dl className="activity-detail-list">
-          {event.details.metadata.map((item) => (
-            <div className="activity-detail-list__item" key={item.label}>
-              <dt>{metadataLabel(item.label, t)}</dt>
-              <dd>{formatMetadataValue(item.label, item.value, t)}</dd>
-            </div>
-          ))}
-        </dl>
+    <aside className="decision-run-detail" role="dialog" aria-modal="false" aria-label={t("activity.runs.detail.aria")}>
+      <header className="decision-run-detail__header">
+        <span className="decision-run-detail__eyebrow">Decision run</span>
+        {detail ? (
+          <span className={`run-outcome run-outcome--${detail.summary.outcome.toLowerCase().replace("_", "-")}`}>
+            {outcomeLabel(detail.summary.outcome as DecisionRunOutcomeFilter, t)}
+          </span>
+        ) : null}
+        <button
+          ref={closeButtonRef}
+          className="icon-only-button decision-run-detail__close"
+          type="button"
+          aria-label={t("activity.runs.detail.close")}
+          onClick={closed}
+        >
+          <X size={18} aria-hidden="true" />
+        </button>
+        <h2>{detail?.decision?.action ?? detail?.summary.status ?? t("activity.runs.detail.loading")}</h2>
+        <code>{detail?.summary.invocationId ?? "—"}</code>
+      </header>
+      <div className="decision-run-detail__scroll">
+        {isPending ? <p className="run-detail-notice">{t("activity.runs.detail.loading")}</p> : null}
+        {error ? <p className="run-detail-notice run-detail-notice--error">{describeError(error, locale)}</p> : null}
+        {detail ? <RunDetailContent detail={detail} rawOpen={rawOpen} rawToggled={() => setRawOpen((open) => !open)} /> : null}
       </div>
-    </div>
+    </aside>
   );
 }
 
-function ActivityTimeline({
-  timeline,
-  loadedPageCount,
-  olderError,
-  isLoadingOlder,
-  olderLoaded,
-  catalog,
+function RunDetailContent({
+  detail,
+  rawOpen,
+  rawToggled,
 }: {
-  timeline: ActivityTimelineSnapshot;
-  loadedPageCount: number;
-  olderError: unknown;
-  isLoadingOlder: boolean;
-  olderLoaded: () => void;
-  catalog: OpsActivityCatalogResponse | null;
+  detail: OpsDecisionRunDetailResponse;
+  rawOpen: boolean;
+  rawToggled: () => void;
 }) {
-  const { locale, t } = useI18n();
-  const [selectedDetailsEvent, setSelectedDetailsEvent] = useState<ActivityTimelineEvent | null>(null);
-  const events = newestFirstActivityTimelineEvents(timeline.events);
-  const canLoadOlder = timeline.nextBefore !== null;
-
-  if (events.length === 0) {
-    return <EmptyState title={t("activity.empty.title")} description={t("activity.empty.description")} />;
-  }
+  const { t } = useI18n();
+  const decision = detail.decision;
+  const intent = detail.intent;
+  const safety = detail.safetyViolation;
 
   return (
     <>
-      <p className="timeline__freshness">
-        {t("activity.updated")} {formatDateTime(timeline.fetchedAt, locale)} · {t("activity.newestFirst")} · {events.length}/
-        {timeline.limit} {t("activity.records")} · {t("activity.loadedPages")} {loadedPageCount}
-      </p>
-      <ol className="timeline" aria-label={t("activity.timelineAria")}>
-        {events.map((event) => (
-          <li className="timeline__item" key={event.id}>
-            <div className="timeline__rail" aria-hidden="true" />
-            <div className="timeline__body">
-              <div className="timeline__header">
-                <StatusPill label={sourceLabel(event.source, t)} tone={sourceTone(event.source)} />
-                <StatusPill label={activityEventKindLabel(event, catalog, t)} tone={eventTone(event)} />
-                <time dateTime={event.occurredAt}>{formatDateTime(event.occurredAt, locale)}</time>
-                {event.details ? (
-                  <button
-                    className="icon-only-button"
-                    type="button"
-                    aria-label={formatMessage(t("activity.details.open"), {
-                      title: activityEventTitle(event, catalog, t),
-                    })}
-                    title={formatMessage(t("activity.details.open"), {
-                      title: activityEventTitle(event, catalog, t),
-                    })}
-                    onClick={() => setSelectedDetailsEvent(event)}
-                  >
-                    <Info size={16} aria-hidden="true" />
-                  </button>
-                ) : null}
-              </div>
-              <h2>{activityEventTitle(event, catalog, t)}</h2>
-              <p>{formatTimelineDetail(event, t)}</p>
-              <dl className="timeline__metadata">
-                {event.metadata.map((item) => (
-                  <div key={item.label}>
-                    <dt>{metadataLabel(item.label, t)}</dt>
-                    <dd>{formatMetadataValue(item.label, item.value, t)}</dd>
-                  </div>
-                ))}
-              </dl>
-            </div>
-          </li>
-        ))}
-      </ol>
-      <div className="timeline__paging">
-        <button className="icon-text-button" type="button" onClick={olderLoaded} disabled={!canLoadOlder || isLoadingOlder}>
-          <ChevronDown size={16} aria-hidden="true" />
-          {isLoadingOlder ? t("activity.loadingOlder") : t("activity.loadOlder")}
-        </button>
-        {!canLoadOlder ? <span>{t("activity.noOlderRecords")}</span> : null}
-      </div>
-      {olderError ? <p className="timeline__paging-error">{describeError(olderError, locale)}</p> : null}
-      {selectedDetailsEvent?.details ? (
-        <ActivityDetailsDialog
-          event={selectedDetailsEvent}
-          catalog={catalog}
-          closed={() => setSelectedDetailsEvent(null)}
-        />
+      <DetailSection index="01" title={t("activity.runs.section.timeline")}>
+        <ol className="run-phase-list">
+          {detail.phases.map((phase) => (
+            <li className="run-phase" data-state={phase.status.toLowerCase()} key={phase.key}>
+              <span className="run-phase__rail"><span /></span>
+              <span><strong>{phaseLabel(phase.key, t)}</strong><code>{phase.status}</code><small>{phase.detail ?? "—"}</small></span>
+            </li>
+          ))}
+        </ol>
+      </DetailSection>
+
+      <DetailSection index="02" title={t("activity.runs.section.decision")}>
+        <FactGrid facts={[
+          [t("activity.runs.label.action"), decision?.action],
+          [t("activity.runs.label.provider"), decision?.provider],
+          ["p", decision?.estimatedWinProbability],
+          ["roundTripCostR", decision?.roundTripCostR],
+          [t("activity.runs.label.reason"), decision?.reasonJa, true],
+        ]} />
+      </DetailSection>
+
+      {intent ? (
+        <DetailSection index="03" title={t("activity.runs.section.intent")}>
+          <FactGrid facts={[
+            [t("activity.runs.label.order"), `${intent.side} ${intent.orderType}`],
+            [t("activity.runs.label.size"), `${intent.sizeBtc} BTC`],
+            [t("activity.runs.label.price"), intent.priceJpy],
+            [t("activity.runs.label.stop"), intent.protectiveStopPriceJpy],
+            [t("activity.runs.label.thesis"), intent.thesisJa, true],
+          ]} />
+        </DetailSection>
       ) : null}
+
+      <DetailSection index="04" title={t("activity.runs.section.verification")}>
+        <FactGrid facts={[
+          [t("activity.runs.label.verdict"), detail.falsification?.verdict],
+          [t("activity.runs.label.reason"), detail.falsification?.reasonJa, true],
+        ]} />
+      </DetailSection>
+
+      <DetailSection index="05" title={t("activity.runs.section.safety")}>
+        <div className="run-value-comparison">
+          <div><small>{t("activity.runs.comparison.llm")}</small><strong>{decision?.expectedRMultiple ?? "—"}</strong><span>expectedR</span></div>
+          <span aria-hidden="true">→</span>
+          <div><small>{t("activity.runs.comparison.code")}</small><strong>{safety?.measuredValue ?? "—"}</strong><span>{safety ? `limit ${safety.limitValue}` : "—"}</span></div>
+        </div>
+        <FactGrid facts={[
+          [t("activity.runs.label.rule"), safety?.rule],
+          [t("activity.runs.label.message"), safety?.messageJa, true],
+        ]} />
+      </DetailSection>
+
+      <DetailSection index="06" title={t("activity.runs.section.execution")}>
+        <FactGrid facts={[
+          [t("activity.runs.fact.orders"), String(detail.orders.length)],
+          [t("activity.runs.fact.executions"), String(detail.executions.length)],
+          [t("activity.runs.label.position"), detail.orders.map((order) => order.positionId).find(Boolean)],
+          [t("activity.runs.label.tradeGroup"), detail.orders.map((order) => order.tradeGroupId).find(Boolean)],
+          [t("activity.runs.label.entryReason"), detail.orders.map((order) => order.reasonJa).find(Boolean), true],
+        ]} />
+      </DetailSection>
+
+      <DetailSection index="07" title={t("activity.runs.section.raw")}>
+        <button
+          className="run-raw-toggle"
+          type="button"
+          aria-expanded={rawOpen}
+          aria-label={rawOpen ? t("activity.runs.raw.hide") : t("activity.runs.raw.show")}
+          onClick={rawToggled}
+        >
+          {rawOpen ? t("activity.runs.raw.hide") : t("activity.runs.raw.show")}
+          <span>{detail.raw.length}</span>
+        </button>
+        {rawOpen ? <pre className="run-raw-block">{JSON.stringify(detail.raw, null, 2)}</pre> : null}
+      </DetailSection>
     </>
   );
 }
 
-function ActivityCatalogDialog({
-  catalog,
-  catalogFailed,
-  closed,
-}: {
-  catalog: OpsActivityCatalogResponse | null;
-  catalogFailed: boolean;
-  closed: () => void;
-}) {
-  const { t } = useI18n();
-  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
-  const defaultExcludedAuditEventTypes = catalog
-    ? defaultExcludedAuditEventSummary(catalog, t)
-    : "RECONCILER_PASS_COMPLETED";
-
-  useEffect(() => {
-    closeButtonRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    const keyDownHandled = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        closed();
-      }
-    };
-
-    window.addEventListener("keydown", keyDownHandled);
-
-    return () => window.removeEventListener("keydown", keyDownHandled);
-  }, [closed]);
-
+function DetailSection({ index, title, children }: { index: string; title: string; children: React.ReactNode }) {
   return (
-    <div
-      className="activity-catalog-dialog__backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) {
-          closed();
-        }
-      }}
-    >
-      <div
-        className="activity-catalog-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="activity-catalog-dialog-title"
-      >
-        <div className="activity-catalog-dialog__heading">
-          <h2 id="activity-catalog-dialog-title">{t("activity.catalog.title")}</h2>
-          <button
-            ref={closeButtonRef}
-            className="icon-only-button"
-            type="button"
-            aria-label={t("activity.catalog.close")}
-            title={t("activity.catalog.close")}
-            onClick={closed}
-          >
-            <X size={17} aria-hidden="true" />
-          </button>
-        </div>
-        <p className="activity-catalog-dialog__note">
-          {formatMessage(t("activity.catalog.defaultExcluded"), {
-            eventTypes: defaultExcludedAuditEventTypes,
-          })}
-        </p>
-        {catalog ? (
-          <div className="activity-catalog-dialog__groups">
-            <ActivityCatalogGroup title={t("activity.catalog.group.sources")} items={catalog.sourceFilters} />
-            <ActivityCatalogGroup title={t("activity.catalog.group.audit")} items={catalog.auditEventTypes} />
-            <ActivityCatalogGroup title={t("activity.catalog.group.decisions")} items={catalog.decisionActions} />
-          </div>
-        ) : (
-          <p className="activity-catalog-dialog__empty">
-            {catalogFailed ? t("activity.catalog.unavailable") : t("activity.catalog.loading")}
-          </p>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ActivityCatalogGroup({
-  title,
-  items,
-}: {
-  title: string;
-  items: OpsActivityCatalogItemResponse[];
-}) {
-  const { t } = useI18n();
-
-  return (
-    <section className="activity-catalog-dialog__group">
-      <h3>{title}</h3>
-      <dl className="activity-catalog-list">
-        {items.map((item) => (
-          <div className="activity-catalog-list__item" key={item.value}>
-            <dt>
-              <span>{catalogMessage(item.labelKey, item.value, t)}</span>
-              <code>{item.value}</code>
-            </dt>
-            <dd>{catalogMessage(item.descriptionKey, item.value, t)}</dd>
-          </div>
-        ))}
-      </dl>
+    <section className="run-detail-section">
+      <div className="run-detail-section__heading"><span>{index}</span><h3>{title}</h3></div>
+      {children}
     </section>
   );
 }
 
-function activityEventTitle(
-  event: ActivityTimelineEvent,
-  catalog: OpsActivityCatalogResponse | null,
-  t: (key: MessageKey) => string,
-): string {
-  const definition = activityEventDefinition(event, catalog);
-
-  return definition ? catalogMessage(definition.labelKey, event.title, t) : event.title;
-}
-
-function activityEventKindLabel(
-  event: ActivityTimelineEvent,
-  catalog: OpsActivityCatalogResponse | null,
-  t: (key: MessageKey) => string,
-): string {
-  if (event.source === "execution") {
-    return executionKindLabel(event.kind, t);
-  }
-
-  const definition = activityEventDefinition(event, catalog);
-
-  return definition ? catalogMessage(definition.labelKey, event.kind, t) : event.kind;
-}
-
-function executionKindLabel(kind: string, t: (key: MessageKey) => string): string {
-  switch (kind) {
-    case "ENTRY_FILL":
-      return t("activity.executionKind.entryFill");
-    case "STOP_TRIGGER":
-      return t("activity.executionKind.stopTrigger");
-    case "TAKE_PROFIT_CLOSE":
-      return t("activity.executionKind.takeProfitClose");
-    case "LIMIT_CLOSE":
-      return t("activity.executionKind.limitClose");
-    case "MARKET_CLOSE":
-      return t("activity.executionKind.marketClose");
-    default:
-      return kind;
-  }
-}
-
-function activityEventDefinition(
-  event: ActivityTimelineEvent,
-  catalog: OpsActivityCatalogResponse | null,
-): OpsActivityCatalogItemResponse | null {
-  if (!catalog) {
-    return null;
-  }
-
-  switch (event.source) {
-    case "audit":
-      return catalog.auditEventTypes.find((item) => item.value === event.kind) ?? null;
-    case "decision":
-      return catalog.decisionActions.find((item) => item.value === event.kind) ?? null;
-    case "execution":
-      return null;
-  }
-}
-
-function defaultExcludedAuditEventSummary(
-  catalog: OpsActivityCatalogResponse,
-  t: (key: MessageKey) => string,
-): string {
-  const defaultExcludedAuditEventTypes = catalog.defaultExcludedAuditEventTypes.map((eventType) => {
-    const definition = catalog.auditEventTypes.find((item) => item.value === eventType);
-    const label = definition ? catalogMessage(definition.labelKey, eventType, t) : eventType;
-
-    return `${label} (${eventType})`;
-  });
-
-  return defaultExcludedAuditEventTypes.length > 0 ? defaultExcludedAuditEventTypes.join(", ") : t("common.none");
-}
-
-function fallbackSourceFilters(): OpsActivityCatalogItemResponse[] {
-  return ACTIVITY_TIMELINE_SOURCE_FILTERS.map((source) => ({
-    value: source,
-    labelKey: `activity.catalog.source.${source}.label`,
-    descriptionKey: `activity.catalog.source.${source}.description`,
-  }));
-}
-
-function fallbackSelectedAuditEventTypes(filters: ActivityTimelineFilters): OpsActivityCatalogItemResponse[] {
-  return filters.auditEventTypes.map((eventType) => ({
-    value: eventType,
-    labelKey: eventType,
-    descriptionKey: eventType,
-  }));
-}
-
-function catalogMessage(key: string, fallback: string, t: (key: MessageKey) => string): string {
-  const message = t(key as MessageKey);
-
-  return message === key ? fallback : message;
-}
-
-function formatMessage(template: string, replacements: Record<string, string>): string {
-  return Object.entries(replacements).reduce(
-    (message, [key, value]) => message.replace(`{${key}}`, value),
-    template,
+function FactGrid({ facts }: { facts: Array<[string, string | null | undefined, boolean?]> }) {
+  return (
+    <dl className="run-fact-grid">
+      {facts.map(([label, value, wide]) => (
+        <div className={wide ? "run-fact run-fact--wide" : "run-fact"} key={label}>
+          <dt>{label}</dt><dd>{value || "—"}</dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 
-function sourceLabel(source: ActivityTimelineSource, t: (key: MessageKey) => string): string {
-  switch (source) {
-    case "audit":
-      return t("activity.source.audit");
-    case "decision":
-      return t("activity.source.decision");
-    case "execution":
-      return t("activity.source.execution");
-  }
-}
-
-function sourceTone(source: ActivityTimelineSource): StatusTone {
-  switch (source) {
-    case "audit":
-      return "neutral";
-    case "decision":
-      return "warning";
-    case "execution":
-      return "positive";
-  }
-}
-
-function eventTone(event: ActivityTimelineEvent): StatusTone {
-  if (event.source === "audit" && event.kind.includes("HARD_HALT")) {
-    return "critical";
-  }
-
-  if (event.source === "audit" && event.kind.includes("SOFT_HALT")) {
-    return "warning";
-  }
-
-  if (event.source === "decision" && event.kind === "NO_TRADE") {
-    return "neutral";
-  }
-
-  return event.source === "execution" ? "positive" : "warning";
-}
-
-function formatTimelineDetail(event: ActivityTimelineEvent, t: (key: MessageKey) => string): string {
-  if (event.source !== "execution") {
-    return event.detail;
-  }
-
-  const [sizeBtc, priceJpy] = event.detail.split(" BTC at ");
-
-  if (!priceJpy) {
-    return event.detail;
-  }
-
-  return `${sizeBtc} BTC ${t("activity.executionPriceJoin")} ${formatJpy(priceJpy.replace(" JPY", ""))}`;
-}
-
-function metadataLabel(label: string, t: (key: MessageKey) => string): string {
-  switch (label) {
-    case "execution":
-      return t("activity.label.execution");
-    case "side":
-      return t("activity.label.side");
-    case "size":
-      return t("activity.label.size");
-    case "price":
-      return t("activity.label.price");
-    case "estimated p":
-      return t("activity.label.estimatedP");
-    case "setup tags":
-      return t("activity.label.setupTags");
-    case "no-trade conditions":
-      return t("activity.label.noTradeConditions");
-    case "tool":
-      return t("activity.label.tool");
-    case "realized pnl":
-      return t("activity.label.realizedPnl");
-    case "fee":
-      return t("activity.label.fee");
-    case "liquidity":
-      return t("activity.label.liquidity");
-    case "order":
-      return t("activity.label.order");
-    case "order type":
-      return t("activity.label.orderType");
-    case "trigger price":
-      return t("activity.label.triggerPrice");
-    case "take-profit price":
-      return t("activity.label.takeProfitPrice");
-    case "order reason":
-      return t("activity.label.orderReason");
-    case "position":
-      return t("activity.label.position");
-    case "trade group":
-      return t("activity.label.tradeGroup");
-    case "decision action":
-      return t("activity.label.decisionAction");
-    case "decision":
-      return t("activity.label.decision");
-    case "decision run":
-      return t("activity.label.decisionRun");
-    case "decision reason":
-      return t("activity.label.decisionReason");
-    default:
-      return label;
-  }
-}
-
-function formatMetadataValue(label: string, value: string, t: (key: MessageKey) => string): string {
-  if (value === ACTIVITY_METADATA_NOT_LINKED_VALUE) {
-    return t("activity.notLinked");
-  }
-
-  if (value === ACTIVITY_METADATA_NONE_VALUE) {
-    return t("common.none");
-  }
-
-  if (label === "estimated p") {
-    return formatRatioAsPercent(value);
-  }
-
-  if (label === "size") {
-    return `${value} BTC`;
-  }
-
-  if (label === "price" || label === "trigger price" || label === "take-profit price") {
-    return formatJpy(value);
-  }
-
-  if (label === "realized pnl") {
-    return formatSignedJpy(value);
-  }
-
-  if (label === "fee") {
-    return formatJpy(value);
-  }
-
-  return value;
-}
-
-// Wire sentinels emitted by OpsRoutes activity metadata.
-const ACTIVITY_METADATA_NOT_LINKED_VALUE = "not linked";
-const ACTIVITY_METADATA_NONE_VALUE = "none";
-
-function mergeActivityTimelinePages(
-  latestPage: ActivityTimelineSnapshot | null,
-  olderPages: ActivityTimelineSnapshot[],
-): ActivityTimelineSnapshot | null {
-  const lastOlderPage = olderPages[olderPages.length - 1];
-  const lastPage = lastOlderPage ?? latestPage;
-
-  if (!latestPage || !lastPage) {
-    return null;
-  }
-
-  return {
-    ...latestPage,
-    events: newestFirstActivityTimelineEvents([latestPage, ...olderPages].flatMap((page) => page.events)),
-    nextBefore: lastPage.nextBefore,
-  };
-}
-
-async function loadOlderActivityPage({
-  filters,
-  latestPage,
-  olderPages,
-  setOlderPages,
-  setOlderError,
-  setIsLoadingOlder,
-  requestIsCurrent,
-}: {
-  filters: ActivityTimelineFilters;
-  latestPage: ActivityTimelineSnapshot | null;
-  olderPages: ActivityTimelineSnapshot[];
-  setOlderPages: (pages: ActivityTimelineSnapshot[]) => void;
-  setOlderError: (error: unknown) => void;
-  setIsLoadingOlder: (isLoading: boolean) => void;
-  requestIsCurrent: () => boolean;
-}) {
-  const lastOlderPage = olderPages[olderPages.length - 1];
-  const lastPage = lastOlderPage ?? latestPage;
-  const before = lastPage?.nextBefore;
-
-  if (!before) {
-    return;
-  }
-
-  setOlderError(null);
-  setIsLoadingOlder(true);
-
-  try {
-    const olderPage = await fetchActivityTimeline({ filters, before });
-
-    if (!requestIsCurrent()) {
-      return;
-    }
-
-    setOlderPages([...olderPages, olderPage]);
-  } catch (error) {
-    if (!requestIsCurrent()) {
-      return;
-    }
-
-    setOlderError(error);
-  } finally {
-    if (requestIsCurrent()) {
-      setIsLoadingOlder(false);
-    }
-  }
-}
-
-function toggleAuditEventType(
-  filters: ActivityTimelineFilters,
-  eventType: string,
-  candidates: OpsActivityCatalogItemResponse[],
-): ActivityTimelineFilters {
-  const selectedEventTypes = new Set(filters.auditEventTypes);
-
-  if (selectedEventTypes.has(eventType)) {
-    selectedEventTypes.delete(eventType);
-  } else {
-    selectedEventTypes.add(eventType);
-  }
-
-  return {
-    ...filters,
-    auditEventTypes: candidates
-      .map((candidate) => candidate.value)
-      .filter((candidate) => selectedEventTypes.has(candidate)),
-  };
-}
-
-function activityTimelineFiltersEqual(firstFilters: ActivityTimelineFilters, secondFilters: ActivityTimelineFilters): boolean {
-  if (firstFilters.source !== secondFilters.source) {
-    return false;
-  }
-
-  if (firstFilters.auditEventTypes.length !== secondFilters.auditEventTypes.length) {
-    return false;
-  }
-
-  return firstFilters.auditEventTypes.every(
-    (eventType, index) => eventType === secondFilters.auditEventTypes[index],
+function RunListNotice({ text, action }: { text: string; action?: () => void }) {
+  const { t } = useI18n();
+  return (
+    <div className="run-list-notice"><p>{text}</p>{action ? <button type="button" onClick={action}>{t("common.retry")}</button> : null}</div>
   );
 }
 
-function loadStoredActivityTimelineFilters(): ActivityTimelineFilters {
-  try {
-    const storedValue = window.localStorage.getItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY);
-    const parsedValue = storedValue ? JSON.parse(storedValue) : null;
-
-    return normalizeActivityTimelineFilters(parsedValue);
-  } catch {
-    return DEFAULT_ACTIVITY_TIMELINE_FILTERS;
-  }
+function loadRunFilter(): DecisionRunOutcomeFilter {
+  const saved = window.localStorage.getItem(DECISION_RUN_FILTER_STORAGE_KEY);
+  return DECISION_RUN_OUTCOME_FILTERS.find((filter) => filter === saved) ?? "ALL";
 }
 
-function persistActivityTimelineFilters(filters: ActivityTimelineFilters) {
-  try {
-    window.localStorage.setItem(ACTIVITY_TIMELINE_FILTER_STORAGE_KEY, JSON.stringify(filters));
-  } catch {
-    return;
-  }
+function outcomeCount(outcome: DecisionRunOutcomeFilter, runs: OpsDecisionRunSummaryResponse[]): number {
+  return outcome === "ALL" ? runs.length : runs.filter((run) => run.outcome === outcome).length;
+}
+
+function formatDuration(value: number | null | undefined): string {
+  if (value == null) return "running";
+  if (value < 1_000) return `${value}ms`;
+  if (value < 60_000) return `${(value / 1_000).toFixed(1)}s`;
+  return `${Math.floor(value / 60_000)}m ${Math.floor((value % 60_000) / 1_000)}s`;
+}
+
+type Translator = ReturnType<typeof useI18n>["t"];
+
+function outcomeLabel(outcome: DecisionRunOutcomeFilter, t: Translator): string {
+  const keys = {
+    ALL: "activity.runs.filter.all",
+    EXECUTED: "activity.runs.filter.executed",
+    DENIED: "activity.runs.filter.denied",
+    NO_TRADE: "activity.runs.filter.noTrade",
+    INTERRUPTED: "activity.runs.filter.interrupted",
+    RUNNING: "activity.runs.filter.running",
+    FAILED: "activity.runs.filter.failed",
+  } as const;
+  return t(keys[outcome]);
+}
+
+function phaseLabel(phase: string, t: Translator): string {
+  const keys = {
+    TRIGGER: "activity.runs.phase.trigger",
+    PROPOSER: "activity.runs.phase.proposer",
+    INTENT: "activity.runs.phase.intent",
+    FALSIFIER: "activity.runs.phase.falsifier",
+    SAFETY: "activity.runs.phase.safety",
+    ORDER_EXECUTION: "activity.runs.phase.execution",
+  } as const;
+  return t(keys[phase as keyof typeof keys] ?? "activity.runs.phase.unknown");
 }
