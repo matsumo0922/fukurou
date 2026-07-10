@@ -1,11 +1,13 @@
+@file:Suppress("TooManyFunctions")
+
 package me.matsumo.fukurou.trading.persistence
 
-import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
@@ -833,11 +835,13 @@ class TradingPersistenceBootstrap(
                 ensurePaperAccountRow(now, paperAccountConfig)
                 ensureRiskStateEquityPeak(now, paperAccountConfig.initialCashJpy)
                 ensureBootstrapEquitySnapshot(now)
-                jdbcConnection().prepareStatement("""
+                jdbcConnection().prepareStatement(
+                    """
                     UPDATE llm_runs
                     SET terminal_cause = ?
                     WHERE status <> ? AND terminal_cause IS NULL
-                """).use { statement ->
+                """,
+                ).use { statement ->
                     statement.setString(1, LlmRunTerminalCause.LEGACY_UNCLASSIFIED.name)
                     statement.setString(2, LLM_RUN_STATUS_RUNNING)
                     statement.executeUpdate()
@@ -1119,11 +1123,13 @@ internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(now: Instant, threshold
     val cutoff = now.minus(threshold)
     val recoveries = selectStaleLlmInvocationRecoveries(cutoff)
 
-    jdbcConnection().prepareStatement("""
+    jdbcConnection().prepareStatement(
+        """
         UPDATE llm_launch_reservations
         SET status = ?, finished_at = ?, reason = ?
         WHERE status = ? AND reserved_at < ?
-    """).use { statement ->
+    """,
+    ).use { statement ->
         statement.setString(1, "FAILED")
         statement.setLong(2, now.toEpochMilli())
         statement.setString(3, LlmRunTerminalCause.RESTART_INTERRUPTED.name)
@@ -1199,7 +1205,10 @@ private fun JdbcTransaction.selectStaleLlmInvocationRecoveries(cutoff: Instant):
     }
 }
 
-private fun JdbcTransaction.insertLlmInvocationRecoveryEvent(recovery: StaleLlmInvocationRecovery, recoveredAt: Instant) {
+private fun JdbcTransaction.insertLlmInvocationRecoveryEvent(
+    recovery: StaleLlmInvocationRecovery,
+    recoveredAt: Instant,
+) {
     insertEvent(
         CommandEvent(
             decisionRunContext = DecisionRunContext(

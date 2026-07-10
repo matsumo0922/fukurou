@@ -468,11 +468,13 @@ class LlmDaemonSchedulerTest {
         assertIs<LlmDaemonTickResult.Skipped>(secondResult)
         assertEquals("concurrent_invocation", secondResult.reason)
         assertEquals(1, fixture.launches.size)
-        assertTrue(skipEvents.any { event ->
-            event.payload.contains("concurrent_invocation") &&
-                event.payload.contains("activeInvocationId") &&
-                event.decisionRunContext.decisionRunId != null
-        })
+        assertTrue(
+            skipEvents.any { event ->
+                event.payload.contains("concurrent_invocation") &&
+                    event.payload.contains("activeInvocationId") &&
+                    event.decisionRunContext.decisionRunId != null
+            },
+        )
     }
 
     @Test

@@ -1,9 +1,9 @@
 package me.matsumo.fukurou.trading.activity
 
-import kotlin.test.Test
-import kotlin.test.assertEquals
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
+import kotlin.test.Test
+import kotlin.test.assertEquals
 
 class LlmTerminalCauseOutcomeTest {
 

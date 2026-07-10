@@ -18,11 +18,11 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
-import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmInvocationTimedOutException
-import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
+import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -246,7 +246,7 @@ class ReflectionPromptCandidateGenerator(
     ): ReflectionPromptCandidateGeneration {
         return when (validation) {
             is PromptCandidateValidation.Valid -> {
-                finishSucceededRun(start, ReflectionPromptCandidateGenerationStatus.GENERATED.wireValue)
+                finishSucceededRun(start)
 
                 generatedFile(dataset, attemptCount, validation.candidates)
             }
@@ -257,7 +257,7 @@ class ReflectionPromptCandidateGenerator(
                 nextRetryAfter = null,
                 rejectionReason = validation.reason,
             ).also {
-                finishSucceededRun(start, ReflectionPromptCandidateGenerationStatus.INVALID_OUTPUT.wireValue)
+                finishSucceededRun(start)
             }
         }
     }
@@ -311,7 +311,7 @@ class ReflectionPromptCandidateGenerator(
             }
     }
 
-    private suspend fun finishSucceededRun(start: LlmRunStart, status: String) {
+    private suspend fun finishSucceededRun(start: LlmRunStart) {
         finishRun(
             start = start,
             status = REFLECTION_LLM_RUN_STATUS_SUCCEEDED,

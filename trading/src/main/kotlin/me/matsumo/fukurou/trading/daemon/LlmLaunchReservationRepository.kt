@@ -387,7 +387,9 @@ private data class LlmLaunchReservationRecord(
     val finishedAt: Instant?,
     val reason: String?,
 ) {
-    fun toActive(): LlmActiveLaunchReservation = LlmActiveLaunchReservation(invocationId, triggerKind, triggerKey, reservedAt)
+    fun toActive(): LlmActiveLaunchReservation =
+        LlmActiveLaunchReservation(invocationId, triggerKind, triggerKey, reservedAt)
+
     /**
      * stale 判定込みで RUNNING か返す。
      */

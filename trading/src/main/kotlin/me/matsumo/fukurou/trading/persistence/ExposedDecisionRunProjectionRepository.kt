@@ -757,6 +757,7 @@ private fun JdbcTransaction.selectSafeAudit(invocationId: String): List<Decision
     }
 }
 
+@Suppress("LongMethod")
 private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummary {
     val action = getString("action")
     val safetyRule = getString("rule")

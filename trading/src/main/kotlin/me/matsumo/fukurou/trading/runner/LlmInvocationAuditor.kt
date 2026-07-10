@@ -8,9 +8,9 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.evaluation.LlmInvocationTimedOutException
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
-import me.matsumo.fukurou.trading.evaluation.LlmInvocationTimedOutException
 import me.matsumo.fukurou.trading.invoker.CODEX_INVOCATION_RESULT_UNAVAILABLE
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
@@ -45,6 +45,7 @@ class LlmInvocationAuditor(
     /**
      * LLM phase を起動し、完了または起動失敗を audit へ保存する。
      */
+    @Suppress("LongMethod")
     suspend fun invokeAndAudit(
         phaseName: String,
         context: DecisionRunContext,
