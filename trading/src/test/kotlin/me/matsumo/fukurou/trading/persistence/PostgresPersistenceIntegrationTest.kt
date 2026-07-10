@@ -1823,21 +1823,24 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun llm_launch_reservation_enforcesDailyCapInPostgresPath() = runPostgresTest {
+    fun llm_launch_reservation_usesInWindowReservationWhenPhaseIsOutsideWindow() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedLlmLaunchReservationRepository(database)
         val config = LlmRunnerConfig(maxInvocationsPerDay = 1)
 
-        repository.tryReserve(llmLaunchReservationRequest("daemon-run-1", config)).getOrThrow()
-        repository.finish(
-            LlmLaunchReservationFinish(
-                invocationId = "daemon-run-1",
-                status = LlmLaunchReservationStatus.FINISHED,
-                reason = "NO_TRADE_DECISION",
-                finishedAt = fixedInstant().plusSeconds(1),
-            ),
-        ).getOrThrow()
+        reserveAndFinishLlmLaunch(
+            repository = repository,
+            invocationId = "daemon-run-1",
+            config = config,
+            reservedAt = fixedInstant(),
+        )
+        appendLlmLaunchAudit(
+            database = database,
+            invocationId = "daemon-run-1",
+            eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+            occurredAt = fixedInstant().minus(Duration.ofHours(25)),
+        )
         val secondOutcome = repository.tryReserve(
             llmLaunchReservationRequest(
                 invocationId = "daemon-run-2",
@@ -1849,6 +1852,121 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(
             LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY),
             secondOutcome,
+        )
+    }
+
+    @Test
+    fun llm_launch_reservation_doesNotFallbackToInWindowPhaseWhenReservationIsOutsideWindows() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1)
+        val nextReservedAt = fixedInstant().plus(Duration.ofHours(25))
+
+        reserveAndFinishLlmLaunch(
+            repository = repository,
+            invocationId = "daemon-run-old",
+            config = config,
+            reservedAt = fixedInstant(),
+        )
+        appendLlmLaunchAudit(
+            database = database,
+            invocationId = "daemon-run-old",
+            eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+            occurredAt = nextReservedAt.minusSeconds(1),
+        )
+        val outcome = repository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "daemon-run-new",
+                config = config,
+                reservedAt = nextReservedAt,
+            ),
+        ).getOrThrow()
+
+        assertEquals(LlmLaunchReservationOutcome.Reserved("daemon-run-new"), outcome)
+    }
+
+    @Test
+    fun llm_launch_reservation_countsLegacyPhaseFallbackOncePerInvocation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig(maxInvocationsPerHour = 2, maxInvocationsPerDay = 2)
+
+        appendLlmLaunchAudit(
+            database = database,
+            invocationId = "legacy-run",
+            eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+            occurredAt = fixedInstant(),
+        )
+        appendLlmLaunchAudit(
+            database = database,
+            invocationId = "legacy-run",
+            eventType = CommandEventType.NO_TRADE_EXIT,
+            occurredAt = fixedInstant().plusSeconds(1),
+        )
+        reserveAndFinishLlmLaunch(
+            repository = repository,
+            invocationId = "daemon-run-1",
+            config = config,
+            reservedAt = fixedInstant().plusSeconds(2),
+        )
+        val cappedOutcome = repository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "daemon-run-2",
+                config = config,
+                reservedAt = fixedInstant().plusSeconds(3),
+            ),
+        ).getOrThrow()
+
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR),
+            cappedOutcome,
+        )
+    }
+
+    @Test
+    fun llm_launch_reservation_countsInWindowReservationAndPhasesAsOneInvocation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig(maxInvocationsPerHour = 2, maxInvocationsPerDay = 2)
+
+        reserveAndFinishLlmLaunch(
+            repository = repository,
+            invocationId = "daemon-run-1",
+            config = config,
+            reservedAt = fixedInstant(),
+        )
+        appendLlmLaunchAudit(
+            database = database,
+            invocationId = "daemon-run-1",
+            eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+            occurredAt = fixedInstant().plusSeconds(1),
+        )
+        appendLlmLaunchAudit(
+            database = database,
+            invocationId = "daemon-run-1",
+            eventType = CommandEventType.NO_TRADE_EXIT,
+            occurredAt = fixedInstant().plusSeconds(2),
+        )
+        reserveAndFinishLlmLaunch(
+            repository = repository,
+            invocationId = "daemon-run-2",
+            config = config,
+            reservedAt = fixedInstant().plusSeconds(3),
+        )
+        val cappedOutcome = repository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "daemon-run-3",
+                config = config,
+                reservedAt = fixedInstant().plusSeconds(4),
+            ),
+        ).getOrThrow()
+
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR),
+            cappedOutcome,
         )
     }
 
@@ -3474,6 +3592,56 @@ private suspend fun runWatermarkScenario(
         highestPriceSinceEntryJpy = position.highestPriceSinceEntryJpy,
         lowestPriceSinceEntryJpy = position.lowestPriceSinceEntryJpy,
     )
+}
+
+private suspend fun reserveAndFinishLlmLaunch(
+    repository: ExposedLlmLaunchReservationRepository,
+    invocationId: String,
+    config: LlmRunnerConfig,
+    reservedAt: Instant,
+) {
+    val outcome = repository.tryReserve(
+        llmLaunchReservationRequest(
+            invocationId = invocationId,
+            config = config,
+            reservedAt = reservedAt,
+        ),
+    ).getOrThrow()
+
+    assertEquals(LlmLaunchReservationOutcome.Reserved(invocationId), outcome)
+    repository.finish(
+        LlmLaunchReservationFinish(
+            invocationId = invocationId,
+            status = LlmLaunchReservationStatus.FINISHED,
+            reason = "NO_TRADE_DECISION",
+            finishedAt = reservedAt.plusSeconds(1),
+        ),
+    ).getOrThrow()
+}
+
+private suspend fun appendLlmLaunchAudit(
+    database: ExposedDatabase,
+    invocationId: String,
+    eventType: CommandEventType,
+    occurredAt: Instant,
+) {
+    ExposedCommandEventLog(database).append(
+        CommandEvent(
+            decisionRunContext = DecisionRunContext(
+                decisionRunId = invocationId,
+                llmProvider = "claude",
+                promptHash = "hash",
+                systemPromptVersion = "system-prompt-v1",
+                marketSnapshotId = "snapshot",
+            ),
+            toolName = "one-shot-runner",
+            toolCallId = null,
+            clientRequestId = null,
+            eventType = eventType,
+            payload = "{}",
+            occurredAt = occurredAt,
+        ),
+    ).getOrThrow()
 }
 
 private fun llmLaunchReservationRequest(

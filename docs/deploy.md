@@ -252,7 +252,7 @@ sudo git -C /srv/fukurou/repo rev-parse HEAD
 
 code-owned catalog default の変更は、active runtime config に同じ key が明示保存済みの場合は実効値を上書きしない。runtime config の runtime group は applyMode `NEXT_RESTART` のため、deploy 後に `/ops/runtime-config` または WebUI `/app/config` で現在の `effectiveValue` を確認し、必要な key を draft / validate / activate で active 化する。
 
-例: `safety.minExpectedMoveToCostRatio` と `runner.maxInvocationsPerHour` を active config に反映する。
+例: `safety.minExpectedMoveToCostRatio` と runner の hourly / daily cap を active config に反映する。
 
 ```sh
 draft_id="$(scripts/prod-curl \
@@ -261,7 +261,8 @@ draft_id="$(scripts/prod-curl \
     "baseVersionId": null,
     "values": {
       "safety.minExpectedMoveToCostRatio": "2.5",
-      "runner.maxInvocationsPerHour": "6"
+      "runner.maxInvocationsPerHour": "7",
+      "runner.maxInvocationsPerDay": "120"
     },
     "note": "paper trading weekly review defaults"
   }' | jq -r '.version.id')"

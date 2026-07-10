@@ -1,0 +1,122 @@
+package me.matsumo.fukurou.trading.daemon
+
+import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import java.time.Duration
+import java.time.Instant
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertIs
+
+/**
+ * LLM 起動予約の既定 hourly / daily 境界を検証するテスト。
+ */
+class LlmLaunchReservationRepositoryTest {
+
+    @Test
+    fun defaultHourlyCap_allowsSeventhAndRejectsEighthReservation() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val config = LlmRunnerConfig()
+
+        repeat(7) { index ->
+            val reservedAt = launchBudgetFixedInstant().plus(Duration.ofMinutes(index.toLong()))
+
+            reserveAndFinishLaunchBudget(
+                repository = repository,
+                invocationId = "hourly-$index",
+                config = config,
+                reservedAt = reservedAt,
+            )
+        }
+
+        val eighthOutcome = repository.tryReserve(
+            launchBudgetRequest(
+                invocationId = "hourly-7",
+                config = config,
+                reservedAt = launchBudgetFixedInstant().plus(Duration.ofMinutes(7)),
+            ),
+        ).getOrThrow()
+
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR),
+            eighthOutcome,
+        )
+    }
+
+    @Test
+    fun defaultDailyCap_allowsHundredTwentiethAndRejectsHundredTwentyFirstReservation() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val config = LlmRunnerConfig()
+
+        repeat(120) { index ->
+            val reservedAt = launchBudgetFixedInstant().plus(Duration.ofMinutes(index * 12L))
+
+            reserveAndFinishLaunchBudget(
+                repository = repository,
+                invocationId = "daily-$index",
+                config = config,
+                reservedAt = reservedAt,
+            )
+        }
+
+        val hundredTwentyFirstOutcome = repository.tryReserve(
+            launchBudgetRequest(
+                invocationId = "daily-120",
+                config = config,
+                reservedAt = launchBudgetFixedInstant().plus(Duration.ofHours(24)),
+            ),
+        ).getOrThrow()
+
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY),
+            hundredTwentyFirstOutcome,
+        )
+    }
+}
+
+private suspend fun reserveAndFinishLaunchBudget(
+    repository: InMemoryLlmLaunchReservationRepository,
+    invocationId: String,
+    config: LlmRunnerConfig,
+    reservedAt: Instant,
+) {
+    val outcome = repository.tryReserve(
+        launchBudgetRequest(
+            invocationId = invocationId,
+            config = config,
+            reservedAt = reservedAt,
+        ),
+    ).getOrThrow()
+
+    assertIs<LlmLaunchReservationOutcome.Reserved>(outcome)
+    repository.finish(
+        LlmLaunchReservationFinish(
+            invocationId = invocationId,
+            status = LlmLaunchReservationStatus.FINISHED,
+            reason = "NO_TRADE_DECISION",
+            finishedAt = reservedAt.plusSeconds(1),
+        ),
+    ).getOrThrow()
+}
+
+private fun launchBudgetRequest(
+    invocationId: String,
+    config: LlmRunnerConfig,
+    reservedAt: Instant,
+): LlmLaunchReservationRequest {
+    return LlmLaunchReservationRequest(
+        invocationId = invocationId,
+        triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+        triggerKey = "test:$invocationId",
+        reservedAt = reservedAt,
+        runnerConfig = config,
+        hourlyWindow = Duration.ofHours(1),
+        dailyWindow = Duration.ofHours(24),
+        activeReservationStaleAfter = Duration.ofMinutes(30),
+    )
+}
+
+private fun launchBudgetFixedInstant(): Instant {
+    return Instant.parse("2026-07-10T00:00:00Z")
+}

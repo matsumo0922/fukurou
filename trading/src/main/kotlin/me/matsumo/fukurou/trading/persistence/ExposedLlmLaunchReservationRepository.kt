@@ -46,7 +46,7 @@ private const val COUNT_ACTIVE_LLM_LAUNCH_RESERVATIONS_SQL = """
 """
 
 /**
- * LLM 起動数を reservation と command_event_log の union で数える SQL。
+ * LLM 起動数を reservation 優先、legacy audit fallback で数える SQL。
  */
 private const val COUNT_DISTINCT_LLM_LAUNCHES_SINCE_SQL = """
     SELECT COUNT(DISTINCT launch_id)
@@ -60,6 +60,11 @@ private const val COUNT_DISTINCT_LLM_LAUNCHES_SINCE_SQL = """
         WHERE decision_run_id IS NOT NULL
             AND event_type IN ('RUNNER_PHASE_COMPLETED', 'NO_TRADE_EXIT')
             AND ts >= ?
+            AND NOT EXISTS (
+                SELECT 1
+                FROM llm_launch_reservations
+                WHERE invocation_id = command_event_log.decision_run_id
+            )
     ) AS launch_ids
 """
 

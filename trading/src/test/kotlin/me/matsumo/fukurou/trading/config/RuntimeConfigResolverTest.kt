@@ -104,19 +104,19 @@ class RuntimeConfigResolverTest {
     }
 
     @Test
-    fun resolve_preservesExplicitOperatorOverridesForPaperReviewDefaults() {
+    fun resolve_preservesExplicitOperatorInvocationCapsBelowCatalogDefaults() {
         val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
-            "safety.minExpectedMoveToCostRatio" to "3.0",
-            "runner.maxInvocationsPerHour" to "4",
+            "runner.maxInvocationsPerHour" to "6",
+            "runner.maxInvocationsPerDay" to "96",
         )
         val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
 
         val result = resolver.resolve(emptyMap()).getOrThrow()
 
-        assertEquals(BigDecimal("3.0"), result.tradingConfig.safetyFloor.minExpectedMoveToCostRatio)
-        assertEquals(4, result.tradingConfig.runner.maxInvocationsPerHour)
-        assertEquals("3.0", result.typedEnvironment.getValue("FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO"))
-        assertEquals("4", result.typedEnvironment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"))
+        assertEquals(6, result.tradingConfig.runner.maxInvocationsPerHour)
+        assertEquals(96, result.tradingConfig.runner.maxInvocationsPerDay)
+        assertEquals("6", result.typedEnvironment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"))
+        assertEquals("96", result.typedEnvironment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY"))
     }
 
     @Test
