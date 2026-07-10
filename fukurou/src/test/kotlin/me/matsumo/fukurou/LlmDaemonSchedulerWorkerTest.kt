@@ -77,6 +77,32 @@ class LlmDaemonSchedulerWorkerTest {
     }
 
     @Test
+    fun cancellationWaitRemainsBoundedWhenTickDoesNotCooperate() = runBlocking {
+        val tickStarted = CompletableDeferred<Unit>()
+        val worker = LlmDaemonSchedulerWorker(
+            schedulerFactory = {
+                Result.success(
+                    workerLoop {
+                        tickStarted.complete(Unit)
+                        Thread.sleep(200)
+                    },
+                )
+            },
+            interval = Duration.ofMillis(10),
+            cancellationJoinTimeout = Duration.ofMillis(10),
+        ).start()
+        tickStarted.await()
+
+        val result = worker.stopGracefully(Duration.ofMillis(10))
+
+        assertEquals(LlmDaemonWorkerStopResult.TERMINATION_PENDING, result)
+
+        delay(250)
+        assertEquals(LlmDaemonWorkerStopResult.TIMED_OUT, worker.stopGracefully(Duration.ofMillis(10)))
+        worker.close()
+    }
+
+    @Test
     fun bootstrapFailureIsReportedToSupervisorWithoutInternalRetryStorm() = runBlocking {
         val failure = CompletableDeferred<Throwable>()
         val attempts = AtomicInteger()

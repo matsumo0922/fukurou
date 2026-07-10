@@ -136,6 +136,16 @@ data class OpsDaemonConfigIdentityResponse(
 )
 
 /**
+ * daemon component に適用した config identity。
+ */
+@Serializable
+data class OpsDaemonComponentConfigIdentityResponse(
+    val component: String,
+    val sourceVersionId: String?,
+    val hash: String?,
+)
+
+/**
  * daemon status の launch metadata。
  */
 @Serializable
@@ -167,7 +177,7 @@ data class OpsDaemonStatusResponse(
     val detail: String?,
     val activeConfig: OpsDaemonConfigIdentityResponse,
     val appliedConfig: OpsDaemonConfigIdentityResponse,
-    val daemonAppliedConfig: OpsDaemonConfigIdentityResponse,
+    val daemonAppliedConfig: OpsDaemonComponentConfigIdentityResponse,
     val restartRequired: Boolean,
     val lastSchedulerSignalAt: String?,
     val lastLaunch: OpsDaemonLaunchResponse?,
@@ -644,10 +654,12 @@ data class OpsActivityCatalogItemResponse(
  *
  * @param snapshotProvider active runtime config の現在状態 provider
  * @param adminService runtime config の draft / validate / activate 操作用 service
+ * @param activationService daemon lifecycle contract を適用する activate / rollback service
  */
 internal data class OpsRuntimeConfigRouteDependencies(
     val snapshotProvider: OpsRuntimeConfigSnapshotProvider,
     val adminService: RuntimeConfigAdminService? = null,
+    val activationService: LlmDaemonRuntimeConfigActivationService? = null,
 )
 
 /**
@@ -1017,16 +1029,16 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
     }
 
     post("/ops/runtime-config/drafts/{versionId}/activate") {
-        call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
+        val request = call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
         val versionId = call.requirePathValue(call.parameters["versionId"], "versionId is required") ?: return@post
-        val service = call.requireRuntimeConfigAdminService(adminService) ?: return@post
-        val result = service.activateDraft(versionId)
+        val service = call.requireRuntimeConfigActivationService(runtimeConfig.activationService) ?: return@post
+        val result = service.activateDraft(versionId, request.reason)
         val response = call.respondRuntimeConfigResult(result) ?: return@post
 
         call.respond(response)
     }.describe {
         summary = "runtime config draft を active 化する"
-        description = "保存済み draft を現在の catalog / typed config で再検証してから active 化します。"
+        description = "保存済み draft を現在の catalog / typed config で再検証してから active 化します。daemon.* の変更は Controls と同じ HARD_HALT / STOPPING / 監査 / lifecycle contract を通ります。"
         tag(OPS_TAG)
         parameters {
             path("versionId") {
@@ -1049,7 +1061,7 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
                 schema = jsonSchema<ErrorResponse>()
             }
             HttpStatusCode.Conflict {
-                description = "現在の catalog / typed config validation に失敗しました。"
+                description = "validation、HARD_HALT、または daemon STOPPING により拒否されました。"
                 schema = jsonSchema<RuntimeConfigValidationResult>()
             }
             HttpStatusCode.ServiceUnavailable {
@@ -1060,16 +1072,16 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
     }
 
     post("/ops/runtime-config/versions/{versionId}/rollback") {
-        call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
+        val request = call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
         val versionId = call.requirePathValue(call.parameters["versionId"], "versionId is required") ?: return@post
-        val service = call.requireRuntimeConfigAdminService(adminService) ?: return@post
-        val result = service.rollbackToVersion(versionId)
+        val service = call.requireRuntimeConfigActivationService(runtimeConfig.activationService) ?: return@post
+        val result = service.rollbackToVersion(versionId, request.reason)
         val response = call.respondRuntimeConfigResult(result) ?: return@post
 
         call.respond(response)
     }.describe {
         summary = "runtime config version へ rollback する"
-        description = "保存済み inactive version を現在の catalog / typed config で再検証してから active 化します。"
+        description = "保存済み inactive version を現在の catalog / typed config で再検証してから active 化します。daemon.* の変更は Controls と同じ HARD_HALT / STOPPING / 監査 / lifecycle contract を通ります。"
         tag(OPS_TAG)
         parameters {
             path("versionId") {
@@ -1092,7 +1104,7 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
                 schema = jsonSchema<ErrorResponse>()
             }
             HttpStatusCode.Conflict {
-                description = "現在の catalog / typed config validation に失敗しました。"
+                description = "validation、HARD_HALT、または daemon STOPPING により拒否されました。"
                 schema = jsonSchema<RuntimeConfigValidationResult>()
             }
             HttpStatusCode.ServiceUnavailable {
@@ -1971,6 +1983,18 @@ private suspend fun ApplicationCall.requireRuntimeConfigAdminService(
     return null
 }
 
+private suspend fun ApplicationCall.requireRuntimeConfigActivationService(
+    service: LlmDaemonRuntimeConfigActivationService?,
+): LlmDaemonRuntimeConfigActivationService? {
+    if (service != null) {
+        return service
+    }
+
+    respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("runtime config activation service is not configured"))
+
+    return null
+}
+
 private suspend fun ApplicationCall.requireLlmDaemonOperations(
     operations: LlmDaemonOperations?,
 ): LlmDaemonOperations? {
@@ -2258,6 +2282,14 @@ private suspend fun <T : Any> ApplicationCall.respondRuntimeConfigResult(result:
         return null
     }
 
+    if (throwable is LlmDaemonHardHaltRejectedException ||
+        throwable is LlmDaemonStoppingRejectedException
+    ) {
+        respond(HttpStatusCode.Conflict, ErrorResponse(throwable.message ?: "daemon config activation was rejected"))
+
+        return null
+    }
+
     if (throwable is IllegalArgumentException) {
         respond(HttpStatusCode.BadRequest, ErrorResponse(throwable.message ?: "runtime config request is invalid"))
 
@@ -2437,6 +2469,15 @@ private fun LlmDaemonSupervisorStatus.toOpsDaemonStatusResponse(clock: Clock): O
 private fun LlmDaemonConfigIdentity.toOpsDaemonConfigIdentityResponse(): OpsDaemonConfigIdentityResponse {
     return OpsDaemonConfigIdentityResponse(
         versionId = versionId,
+        hash = hash,
+    )
+}
+
+private fun LlmDaemonComponentConfigIdentity.toOpsDaemonConfigIdentityResponse():
+    OpsDaemonComponentConfigIdentityResponse {
+    return OpsDaemonComponentConfigIdentityResponse(
+        component = component,
+        sourceVersionId = sourceVersionId,
         hash = hash,
     )
 }

@@ -386,7 +386,13 @@ class LlmDaemonScheduler(
             ),
         )
 
-        return runReservedInvocation(trigger, invocationId)
+        return try {
+            runReservedInvocation(trigger, invocationId)
+        } finally {
+            withContext(NonCancellable) {
+                observer.onInvocationFinished(invocationId, Instant.now(clock))
+            }
+        }
     }
 
     private suspend fun runReservedInvocation(trigger: LlmDaemonTrigger, invocationId: String): LlmDaemonTickResult {
@@ -420,8 +426,6 @@ class LlmDaemonScheduler(
                 }
             }
 
-            observer.onInvocationFinished(invocationId, Instant.now(clock))
-
             throw failure
         }
 
@@ -434,7 +438,6 @@ class LlmDaemonScheduler(
         val reason = runnerResult?.status?.name ?: failure?.javaClass?.simpleName
 
         finishReservedInvocation(trigger, invocationId, status, reason, finishedAt)
-        observer.onInvocationFinished(invocationId, finishedAt)
 
         if (failure != null) {
             return LlmDaemonTickResult.Failed(

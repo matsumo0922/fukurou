@@ -29,7 +29,7 @@ fun interface ActiveRuntimeConfigSource {
 /**
  * DB から読んだ active runtime config snapshot。
  *
- * @param versionId runtime_config_versions の ID
+ * @param versionId runtime_config_versions の ID。複数 component を合成した snapshot は null
  * @param activatedAt active 化された時刻
  * @param values runtime config key ごとの保存値
  * @param hash values から算出した content hash
@@ -48,7 +48,7 @@ data class ActiveRuntimeConfigSnapshot(
  * @param hash values から算出した content hash
  */
 data class RuntimeConfigAuditSnapshot(
-    val versionId: String,
+    val versionId: String?,
     val hash: String,
 )
 
@@ -140,6 +140,11 @@ class RuntimeConfigValidationRejectedException(
 ) : IllegalArgumentException("runtime config validation failed")
 
 /**
+ * runtime config draft の基準 active version が activate 前に変わったことを表す。
+ */
+class RuntimeConfigActiveVersionChangedException : IllegalStateException("active runtime config version changed")
+
+/**
  * 保存済み runtime config version の詳細。
  *
  * @param version version 概要
@@ -190,6 +195,19 @@ interface RuntimeConfigAdminService {
      * draft version を active 化する。
      */
     fun activateDraft(versionId: String): Result<RuntimeConfigActivationResult>
+
+    /**
+     * 指定した active version が現在も正本である場合だけ draft version を active 化する。
+     *
+     * 単一 key patch を full snapshot として保存する間に別の activate が入った場合、古い full snapshot で
+     * 新しい設定を上書きしないために使う。
+     */
+    fun activateDraftIfActive(
+        versionId: String,
+        expectedActiveVersionId: String,
+    ): Result<RuntimeConfigActivationResult> {
+        return activateDraft(versionId)
+    }
 
     /**
      * 保存済み inactive version へ rollback する。

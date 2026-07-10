@@ -220,6 +220,7 @@ private class ApplicationRuntimeConfigState(
 
     @Volatile
     private var cachedSnapshot: ApplicationRuntimeConfigSnapshot? = null
+    private var tradingPersistenceBootstrapped = false
 
     private val runtimeConfigRepository = databaseResources.database?.let { database ->
         ExposedRuntimeConfigRepository(
@@ -244,6 +245,29 @@ private class ApplicationRuntimeConfigState(
     fun invalidate() {
         synchronized(lock) {
             cachedSnapshot = null
+        }
+    }
+
+    fun ensureTradingPersistence(tradingConfig: TradingBotConfig): Result<Unit> {
+        return synchronized(lock) {
+            if (tradingPersistenceBootstrapped) {
+                return@synchronized Result.success(Unit)
+            }
+
+            val database = databaseResources.database
+                ?: return@synchronized Result.success(Unit)
+
+            TradingPersistenceBootstrap(
+                database = database,
+                clock = inputs.clock,
+                paperAccountConfig = tradingConfig.paperAccount,
+                staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
+                onStaleLlmRunsRecovered = inputs.onStaleLlmRunsRecovered,
+            ).ensureSchema().also { result ->
+                if (result.isSuccess) {
+                    tradingPersistenceBootstrapped = true
+                }
+            }
         }
     }
 
@@ -329,13 +353,7 @@ private class ApplicationRuntimeConfigState(
         var tradingRuntimeAvailable = runtimeConfigBootstrapResult.isSuccess && runtimeConfigResolution != null
 
         if (tradingRuntimeAvailable) {
-            val tradingBootstrapResult = TradingPersistenceBootstrap(
-                database = database,
-                clock = inputs.clock,
-                paperAccountConfig = resolvedTradingConfig.paperAccount,
-                staleLlmRunRecoveryThreshold = resolvedTradingConfig.staleLlmRunRecoveryThreshold(),
-                onStaleLlmRunsRecovered = inputs.onStaleLlmRunsRecovered,
-            ).ensureSchema()
+            val tradingBootstrapResult = ensureTradingPersistence(resolvedTradingConfig)
 
             if (tradingBootstrapResult.isFailure) {
                 tradingRuntimeAvailable = false
@@ -490,6 +508,8 @@ private fun createOpsRouteResources(
                     runtime.runtimeConfigState.snapshot().toOpsRuntimeConfigRouteSnapshot()
                 },
                 adminService = invalidatingRuntimeConfigAdminService,
+                activationService = daemonResources.activationService
+                    ?: (opsOverrides.runtimeConfigAdminService as? LlmDaemonRuntimeConfigActivationService),
             ),
             risk = createOpsRiskRouteDependencies(
                 database = database,
@@ -542,10 +562,16 @@ private fun createApplicationDaemonResources(
         },
         desiredStateActivator = VersionedLlmDaemonDesiredStateActivator(
             adminService = runtimeConfigAdminService,
+            snapshotProvider = LlmDaemonRuntimeSnapshotProvider {
+                runtime.runtimeConfigState.snapshot().toLlmDaemonRuntimeSnapshot()
+            },
             onActiveChanged = runtime.runtimeConfigState::invalidate,
         ),
+        runtimeConfigAdminService = runtimeConfigAdminService,
+        onActiveConfigChanged = runtime.runtimeConfigState::invalidate,
         riskStateRepository = ExposedRiskStateRepository(database),
         commandEventLog = commandEventLog,
+        desiredStateReasonProvider = commandEventDesiredStateReasonProvider(commandEventLog),
         workerFactory = LlmDaemonWorkerFactory { request ->
             createLlmDaemonSchedulerWorker(
                 dataSource = dataSource,
@@ -553,7 +579,6 @@ private fun createApplicationDaemonResources(
                 tradingConfig = request.tradingConfig,
                 runtimeConfigSnapshot = request.runtimeConfigSnapshot,
                 clock = runtime.clock,
-                onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
                 observer = request.observer,
                 lifecycleListener = request.lifecycleListener,
             )
@@ -563,6 +588,7 @@ private fun createApplicationDaemonResources(
 
     return ApplicationDaemonResources(
         operations = supervisor,
+        activationService = supervisor,
         supervisor = supervisor,
     )
 }
@@ -858,12 +884,9 @@ private fun startApplicationBackgroundWorkers(
         return ApplicationBackgroundWorkers(llmDaemonSupervisor = daemonSupervisor)
     }
 
-    val sharedPersistenceBootstrap = sharedTradingPersistenceBootstrap(
-        database = database,
-        tradingConfig = runtime.tradingConfig,
-        clock = runtime.clock,
-        onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
-    )
+    val sharedPersistenceBootstrap = {
+        runtime.runtimeConfigState.ensureTradingPersistence(runtime.tradingConfig)
+    }
 
     return ApplicationBackgroundWorkers(
         reconcilerWorker = startProtectionReconcilerWorker(
@@ -873,6 +896,7 @@ private fun startApplicationBackgroundWorkers(
             status = runtime.reconcilerStatus,
             clock = runtime.clock,
             onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
+            bootstrap = sharedPersistenceBootstrap,
         ),
         llmDaemonSupervisor = daemonSupervisor,
         obsidianWriterWorker = startObsidianWriterWorker(
@@ -912,36 +936,6 @@ private fun Application.subscribeApplicationShutdown(
         opsResources.createdManualLlmLaunchService?.close?.invoke()
         backgroundWorkers.reconcilerWorker?.close()
         databaseResources.dataSource?.close()
-    }
-}
-
-private fun sharedTradingPersistenceBootstrap(
-    database: ExposedDatabase,
-    tradingConfig: TradingBotConfig,
-    clock: Clock,
-    onStaleLlmRunsRecovered: (Int) -> Unit,
-): () -> Result<Unit> {
-    val lock = Any()
-    var completed = false
-
-    return {
-        synchronized(lock) {
-            if (completed) {
-                Result.success(Unit)
-            } else {
-                TradingPersistenceBootstrap(
-                    database = database,
-                    clock = clock,
-                    paperAccountConfig = tradingConfig.paperAccount,
-                    staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
-                    onStaleLlmRunsRecovered = onStaleLlmRunsRecovered,
-                ).ensureSchema().also { result ->
-                    if (result.isSuccess) {
-                        completed = true
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1063,6 +1057,7 @@ private data class ApplicationOpsOverrides(
  */
 private data class ApplicationDaemonResources(
     val operations: LlmDaemonOperations? = null,
+    val activationService: LlmDaemonRuntimeConfigActivationService? = null,
     val supervisor: LlmDaemonSupervisor? = null,
 )
 

@@ -1460,7 +1460,8 @@ function defaultDaemonStatus(): OpsDaemonStatusResponse {
       hash: "process-hash-1234567890",
     },
     daemonAppliedConfig: {
-      versionId: "active-version-1",
+      component: "daemon",
+      sourceVersionId: "active-version-1",
       hash: "active-hash-1234567890",
     },
     restartRequired: true,

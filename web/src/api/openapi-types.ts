@@ -658,7 +658,7 @@ export interface paths {
         put?: never;
         /**
          * runtime config draft を active 化する
-         * @description 保存済み draft を現在の catalog / typed config で再検証してから active 化します。
+         * @description 保存済み draft を現在の catalog / typed config で再検証してから active 化します。daemon.* の変更は Controls と同じ HARD_HALT / STOPPING / 監査 / lifecycle contract を通ります。
          */
         post: {
             parameters: {
@@ -695,7 +695,7 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
-                /** @description 現在の catalog / typed config validation に失敗しました。 */
+                /** @description validation、HARD_HALT、または daemon STOPPING により拒否されました。 */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -732,7 +732,7 @@ export interface paths {
         put?: never;
         /**
          * runtime config version へ rollback する
-         * @description 保存済み inactive version を現在の catalog / typed config で再検証してから active 化します。
+         * @description 保存済み inactive version を現在の catalog / typed config で再検証してから active 化します。daemon.* の変更は Controls と同じ HARD_HALT / STOPPING / 監査 / lifecycle contract を通ります。
          */
         post: {
             parameters: {
@@ -769,7 +769,7 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
-                /** @description 現在の catalog / typed config validation に失敗しました。 */
+                /** @description validation、HARD_HALT、または daemon STOPPING により拒否されました。 */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -2274,6 +2274,12 @@ export interface components {
             versionId?: string | null;
             hash?: string | null;
         };
+        /** OpsDaemonComponentConfigIdentityResponse */
+        OpsDaemonComponentConfigIdentityResponse: {
+            component: string;
+            sourceVersionId?: string | null;
+            hash?: string | null;
+        };
         /** OpsDaemonLaunchResponse */
         OpsDaemonLaunchResponse: {
             invocationId: string;
@@ -2295,7 +2301,7 @@ export interface components {
             detail?: string | null;
             activeConfig: components["schemas"]["OpsDaemonConfigIdentityResponse"];
             appliedConfig: components["schemas"]["OpsDaemonConfigIdentityResponse"];
-            daemonAppliedConfig: components["schemas"]["OpsDaemonConfigIdentityResponse"];
+            daemonAppliedConfig: components["schemas"]["OpsDaemonComponentConfigIdentityResponse"];
             restartRequired: boolean;
             lastSchedulerSignalAt?: string | null;
             lastLaunch?: components["schemas"]["OpsDaemonLaunchResponse"] | null;

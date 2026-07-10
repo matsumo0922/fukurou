@@ -223,7 +223,7 @@ sudo git -C /srv/fukurou/repo rev-parse HEAD
 
 ## runtime config default 変更の反映
 
-code-owned catalog default の変更は、active runtime config に同じ key が明示保存済みの場合は実効値を上書きしない。runtime config の `daemon.*` は `HOT`、それ以外は applyMode `NEXT_RESTART` として扱う。deploy 後に `/ops/runtime-config` または WebUI `/app/config` で現在の `effectiveValue` を確認し、必要な key を draft / validate / activate で active 化する。`GET /ops/daemon` は active / process applied / daemon applied config identity と restart 要否を返す。
+code-owned catalog default の変更は、active runtime config に同じ key が明示保存済みの場合は実効値を上書きしない。runtime config の `daemon.*` は `HOT`、それ以外は applyMode `NEXT_RESTART` として扱う。deploy 後に `/ops/runtime-config` または WebUI `/app/config` で現在の `effectiveValue` を確認し、必要な key を draft / validate / activate で active 化する。daemon section を含む activate / rollback は Controls と同じ lifecycle guard を通る。`GET /ops/daemon` は active full config、process applied full config、daemon applied component の source version / hash と restart 要否を返す。
 
 例: `safety.minExpectedMoveToCostRatio` と runner の hourly / daily cap を active config に反映する。
 

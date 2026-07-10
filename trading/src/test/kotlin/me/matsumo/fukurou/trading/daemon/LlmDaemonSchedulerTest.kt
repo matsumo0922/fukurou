@@ -46,6 +46,32 @@ import kotlin.test.assertTrue
 class LlmDaemonSchedulerTest {
 
     @Test
+    fun invocationObserverFinishesWhenReservationPersistenceFails() = runBlocking {
+        val baseReservations = InMemoryLlmLaunchReservationRepository(
+            InMemoryRiskStateRepository(MutableClock(fixedInstant())),
+        )
+        val failingReservations = object : LlmLaunchReservationRepository by baseReservations {
+            override suspend fun finish(finish: LlmLaunchReservationFinish): Result<Unit> {
+                return Result.failure(IllegalStateException("reservation finish failed"))
+            }
+        }
+        val finishedInvocations = mutableListOf<String>()
+        val fixture = schedulerFixture(
+            reservations = failingReservations,
+            observer = object : LlmDaemonSchedulerObserver {
+                override fun onInvocationFinished(invocationId: String, finishedAt: Instant) {
+                    finishedInvocations += invocationId
+                }
+            },
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Skipped>(result)
+        assertEquals(listOf("00000000-0000-0000-0000-000000000001"), finishedInvocations)
+    }
+
+    @Test
     fun flatState_launchesOnlyOnFifteenMinuteHeartbeatWhenNoEventExists() = runBlocking {
         val fixture = schedulerFixture()
 
@@ -1046,7 +1072,7 @@ private fun schedulerFixture(
     clock: MutableClock = MutableClock(fixedInstant()),
     riskStateRepository: InMemoryRiskStateRepository = InMemoryRiskStateRepository(clock),
     eventLog: InMemoryCommandEventLog = InMemoryCommandEventLog(),
-    reservations: InMemoryLlmLaunchReservationRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository),
+    reservations: LlmLaunchReservationRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository),
     launches: MutableList<OneShotRunnerRequest> = mutableListOf(),
     idGenerator: () -> UUID = deterministicIds(),
     hasOpenRisk: Boolean = false,
@@ -1056,6 +1082,7 @@ private fun schedulerFixture(
     entryFillReader: FakeEntryFillReader = FakeEntryFillReader(),
     preFilter: FakePreFilter = FakePreFilter(),
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
+    observer: LlmDaemonSchedulerObserver = object : LlmDaemonSchedulerObserver {},
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): SchedulerFixture {
     val scheduler = LlmDaemonScheduler(
@@ -1083,6 +1110,7 @@ private fun schedulerFixture(
             preFilter = preFilter,
             clock = clock,
             idGenerator = idGenerator,
+            observer = observer,
         ),
     )
 
@@ -1155,7 +1183,7 @@ private data class SchedulerFixture(
     val clock: MutableClock,
     val riskStateRepository: InMemoryRiskStateRepository,
     val eventLog: InMemoryCommandEventLog,
-    val reservations: InMemoryLlmLaunchReservationRepository,
+    val reservations: LlmLaunchReservationRepository,
     val launches: MutableList<OneShotRunnerRequest>,
     val idGenerator: () -> UUID,
     val tickerReader: FakeTickerReader,

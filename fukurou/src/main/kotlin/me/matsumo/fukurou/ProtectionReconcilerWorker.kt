@@ -123,6 +123,7 @@ internal fun startProtectionReconcilerWorker(
     status: MutableReconcilerStatus,
     clock: Clock = Clock.systemUTC(),
     onStaleLlmRunsRecovered: (Int) -> Unit = {},
+    bootstrap: (() -> Result<Unit>)? = null,
 ): ProtectionReconcilerWorker {
     val inputs = ProtectionReconcilerWorkerInputs(
         dataSource = dataSource,
@@ -136,7 +137,7 @@ internal fun startProtectionReconcilerWorker(
 
     return ProtectionReconcilerWorker(
         reconciler = reconciler,
-        bootstrap = {
+        bootstrap = bootstrap ?: {
             TradingPersistenceBootstrap(
                 database = database,
                 clock = clock,

@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.config.ActiveRuntimeConfigSnapshot
 import me.matsumo.fukurou.trading.config.ActiveRuntimeConfigSource
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
 import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
+import me.matsumo.fukurou.trading.config.RuntimeConfigActiveVersionChangedException
 import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigCandidateValidator
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
@@ -419,6 +420,18 @@ class ExposedRuntimeConfigRepository(
         return activateVersion(
             versionId = versionId,
             allowedStatuses = setOf(RUNTIME_CONFIG_STATUS_DRAFT),
+            expectedActiveVersionId = null,
+        )
+    }
+
+    override fun activateDraftIfActive(
+        versionId: String,
+        expectedActiveVersionId: String,
+    ): Result<RuntimeConfigActivationResult> {
+        return activateVersion(
+            versionId = versionId,
+            allowedStatuses = setOf(RUNTIME_CONFIG_STATUS_DRAFT),
+            expectedActiveVersionId = expectedActiveVersionId,
         )
     }
 
@@ -426,15 +439,18 @@ class ExposedRuntimeConfigRepository(
         return activateVersion(
             versionId = versionId,
             allowedStatuses = setOf(RUNTIME_CONFIG_STATUS_INACTIVE),
+            expectedActiveVersionId = null,
         )
     }
 
     private fun activateVersion(
         versionId: String,
         allowedStatuses: Set<String>,
+        expectedActiveVersionId: String?,
     ): Result<RuntimeConfigActivationResult> {
         return runCatching {
             exposedTransaction(database) {
+                lockRuntimeConfigVersionWriters()
                 val targetVersion = requireRuntimeConfigVersion(versionId)
 
                 require(targetVersion.status in allowedStatuses) {
@@ -446,6 +462,11 @@ class ExposedRuntimeConfigRepository(
                 validation.requireValid()
 
                 val previousActiveVersionId = requireSingleActiveRuntimeConfigVersion().versionId.toString()
+
+                if (expectedActiveVersionId != null && previousActiveVersionId != expectedActiveVersionId) {
+                    throw RuntimeConfigActiveVersionChangedException()
+                }
+
                 val now = Instant.now(clock)
                 deactivateActiveRuntimeConfigVersion()
                 activateRuntimeConfigVersion(targetVersion.versionId, now)

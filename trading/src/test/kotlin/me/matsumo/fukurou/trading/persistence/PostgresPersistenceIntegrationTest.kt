@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.config.RuntimeConfigActiveVersionChangedException
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
@@ -822,6 +823,41 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(previousActiveVersionId, rollback.activeVersion.id)
         assertEquals(defaultValues, repository.activeSnapshot().getOrThrow().values)
+    }
+
+    @Test
+    fun runtimeConfigConditionalActivationRejectsStaleFullSnapshot() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedRuntimeConfigRepository(
+            database = database,
+            clock = fixedClock(),
+            environment = emptyMap(),
+        )
+        val originalVersionId = repository.activeSnapshot().getOrThrow().versionId
+        val staleDaemonDraft = repository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = originalVersionId,
+                values = mapOf("daemon.enabled" to "true"),
+                note = "stale daemon start",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+        val newerSafetyDraft = repository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = originalVersionId,
+                values = mapOf("runner.maxInvocationsPerHour" to "1"),
+                note = "lower invocation cap",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+        repository.activateDraft(newerSafetyDraft.version.id).getOrThrow()
+
+        val staleActivation = repository.activateDraftIfActive(staleDaemonDraft.version.id, originalVersionId)
+        val activeValues = repository.activeSnapshot().getOrThrow().values
+
+        assertTrue(staleActivation.exceptionOrNull() is RuntimeConfigActiveVersionChangedException)
+        assertEquals("1", activeValues.getValue("runner.maxInvocationsPerHour"))
+        assertEquals("false", activeValues.getValue("daemon.enabled"))
     }
 
     @Test

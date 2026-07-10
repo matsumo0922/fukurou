@@ -8,7 +8,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -40,8 +39,6 @@ import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
-import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
-import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
 import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_JAR_PATH_ENV
 import me.matsumo.fukurou.trading.runner.LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
@@ -100,6 +97,9 @@ internal enum class LlmDaemonWorkerStopResult {
 
     /** drain 上限を超えたため worker job を cancel した。 */
     TIMED_OUT,
+
+    /** cancel 後も bounded termination wait 内に worker job が終了しなかった。 */
+    TERMINATION_PENDING,
 }
 
 /**
@@ -108,6 +108,9 @@ internal enum class LlmDaemonWorkerStopResult {
 internal interface LlmDaemonWorkerHandle {
     /** worker loop を開始する。 */
     fun start(): LlmDaemonWorkerHandle
+
+    /** 新規 tick を同期的に禁止する。 */
+    fun requestStop()
 
     /** 新規 tick を止め、現在処理を bounded drain する。 */
     suspend fun stopGracefully(timeout: Duration): LlmDaemonWorkerStopResult
@@ -145,11 +148,15 @@ internal class LlmDaemonSchedulerWorker(
         clock = clock,
     ),
     private val lifecycleListener: LlmDaemonWorkerLifecycleListener = object : LlmDaemonWorkerLifecycleListener {},
+    private val cancellationJoinTimeout: Duration = DEFAULT_WORKER_CANCELLATION_JOIN_TIMEOUT,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
 ) : LlmDaemonWorkerHandle, AutoCloseable {
 
     private var job: Job? = null
     private val stopRequested = CompletableDeferred<Unit>()
+
+    @Volatile
+    private var cancellationRequested = false
 
     /**
      * worker loop を開始する。
@@ -189,12 +196,19 @@ internal class LlmDaemonSchedulerWorker(
         return this
     }
 
+    override fun requestStop() {
+        stopRequested.complete(Unit)
+    }
+
     /**
      * 新規 tick を止め、現在の tick を timeout まで drain する。
      */
     override suspend fun stopGracefully(timeout: Duration): LlmDaemonWorkerStopResult {
-        stopRequested.complete(Unit)
+        requestStop()
         val runningJob = job ?: return LlmDaemonWorkerStopResult.DRAINED
+        if (cancellationRequested) {
+            return runningJob.awaitCancelledTermination()
+        }
         val completed = withTimeoutOrNull(timeout.toMillis().coerceAtLeast(1L)) {
             runningJob.join()
             true
@@ -204,9 +218,10 @@ internal class LlmDaemonSchedulerWorker(
             return LlmDaemonWorkerStopResult.DRAINED
         }
 
-        runningJob.cancelAndJoin()
+        cancellationRequested = true
+        runningJob.cancel()
 
-        return LlmDaemonWorkerStopResult.TIMED_OUT
+        return runningJob.awaitCancelledTermination()
     }
 
     override fun close() {
@@ -214,6 +229,15 @@ internal class LlmDaemonSchedulerWorker(
             stopGracefully(Duration.ZERO)
         }
         scope.cancel()
+    }
+
+    private suspend fun Job.awaitCancelledTermination(): LlmDaemonWorkerStopResult {
+        val completed = withTimeoutOrNull(cancellationJoinTimeout.toMillis().coerceAtLeast(1L)) {
+            join()
+            true
+        } ?: false
+
+        return if (completed) LlmDaemonWorkerStopResult.TIMED_OUT else LlmDaemonWorkerStopResult.TERMINATION_PENDING
     }
 }
 
@@ -226,7 +250,6 @@ internal fun createLlmDaemonSchedulerWorker(
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     clock: Clock = Clock.systemUTC(),
-    onStaleLlmRunsRecovered: (Int) -> Unit = {},
     observer: LlmDaemonSchedulerObserver = object : LlmDaemonSchedulerObserver {},
     lifecycleListener: LlmDaemonWorkerLifecycleListener = object : LlmDaemonWorkerLifecycleListener {},
 ): LlmDaemonSchedulerWorker {
@@ -250,19 +273,12 @@ internal fun createLlmDaemonSchedulerWorker(
             }
         },
         interval = tradingConfig.daemon.pollInterval,
-        bootstrap = {
-            TradingPersistenceBootstrap(
-                database = database,
-                clock = clock,
-                paperAccountConfig = tradingConfig.paperAccount,
-                staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
-                onStaleLlmRunsRecovered = onStaleLlmRunsRecovered,
-            ).ensureSchema()
-        },
         clock = clock,
         lifecycleListener = lifecycleListener,
     )
 }
+
+private val DEFAULT_WORKER_CANCELLATION_JOIN_TIMEOUT: Duration = Duration.ofSeconds(5)
 
 private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonScheduler {
     val components = createLlmLaunchRuntimeComponents(

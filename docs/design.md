@@ -1368,11 +1368,13 @@ desired=false, in-flightなし -> STOPPED
 desired=false, in-flightあり -> STOPPING -> STOPPED
 daemon.*変更, in-flightあり -> STOPPING -> STARTING -> RUNNING
 start/loop失敗 -> DEGRADED -> bounded retry -> STARTING
+runtime config解決失敗 -> DEGRADED -> bounded retry -> desired state再評価
+cancel後もworker終了待ち超過 -> DEGRADED -> bounded再確認
 ```
 
-通常 stop と daemon config hot apply は新規 tick を止め、in-flight run の通常終端を待つ。drain 上限は `runner.perRunTimeout + 30秒` で、超過時だけ cancel して reservation / run を fail-closed で終端する。`STOPPING` 中は start / stop 操作を受け付けない。HARD_HALT 中の start は versioned config を変更する前に拒否する。
+通常 stop と daemon config hot apply は監査などの副作用待ちより先に新規 tick を止め、in-flight run の通常終端を待つ。drain 上限は process 起動時の `runner.perRunTimeout + 30秒` で、超過時だけ cancel して reservation / run を fail-closed で終端する。cancel 後の終了待ちも固定上限とし、非協調 worker が残る間は新 worker を起動しない。`STOPPING` 中は start / stop と daemon section を変更する generic activate / rollback を受け付けない。HARD_HALT 中の start は Controls と generic activation のどちらも versioned config を変更する前に拒否する。Controls の単一 key 更新は最新 active version を基準に draft を作り、DB transaction 内の expected active version 照合に失敗した場合は最新 snapshot から再試行する。
 
-hot apply は `daemon.*` に限定する。worker 再構築では process 起動時の runner / safety / paper config を維持し、active snapshot の daemon section だけを差し替える。active / process applied / daemon applied の identity と非 daemon 差分による restart 要否は ops API で別々に公開する。scheduler signal の無音判定は `daemon.flatHeartbeatInterval + daemon.pollInterval` を上限とし、desired=false と意図的停止は異常に含めない。
+hot apply は `daemon.*` に限定する。worker 再構築では drain timeout を含めて process 起動時の runner / safety / paper config を維持し、active snapshot の daemon section だけを差し替える。active full / process applied full / daemon applied component の identity と非 daemon 差分による restart 要否は ops API で別々に公開する。daemon applied component は source version と component hash を持ち、合成 worker config を単一 runtime config version として監査しない。scheduler signal の無音判定は `daemon.flatHeartbeatInterval + daemon.pollInterval` を上限とし、desired=false と完了済み監査から復元した意図的停止は異常に含めない。process-start persistence bootstrap が stale `RUNNING` run を回収し、daemon worker rebuild は回収を再実行しない。
 
 ### 6.3 発火処理の擬似コード
 

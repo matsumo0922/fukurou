@@ -872,6 +872,121 @@ class OpsRouteTest {
     }
 
     @Test
+    fun moduleRoutesGenericActivationRollbackAndControlsThroughDaemonSupervisor() = testApplication {
+        if (!isDockerAvailable()) {
+            println("Skipping module daemon activation wiring test because Docker is unavailable.")
+            return@testApplication
+        }
+
+        val container = FukurouPostgresContainer()
+        container.start()
+
+        try {
+            val databaseConfig = DatabaseConfig(
+                url = container.jdbcUrl,
+                user = container.username,
+                password = container.password,
+            )
+            val database = ExposedDatabase.connect(
+                url = databaseConfig.url,
+                driver = "org.postgresql.Driver",
+                user = databaseConfig.user,
+                password = databaseConfig.password,
+            )
+            RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+            application {
+                module(
+                    clock = fixedClock(),
+                    databaseConfig = databaseConfig,
+                )
+            }
+
+            val originalStatus = Json.parseToJsonElement(client.get("/ops/daemon").bodyAsText()).jsonObject
+            val originalVersionId = originalStatus.getValue("activeConfig")
+                .jsonObject
+                .getValue("versionId")
+                .jsonPrimitive
+                .content
+            val draftResponse = client.post("/ops/runtime-config/drafts") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"values":{"daemon.pollInterval":"120"},"note":"adjust daemon poll"}""")
+            }
+            val draftVersionId = Json.parseToJsonElement(draftResponse.bodyAsText())
+                .jsonObject
+                .getValue("version")
+                .jsonObject
+                .getValue("id")
+                .jsonPrimitive
+                .content
+            val activateResponse = client.post("/ops/runtime-config/drafts/$draftVersionId/activate") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"apply daemon cadence"}""")
+            }
+            val activatedStatus = Json.parseToJsonElement(client.get("/ops/daemon").bodyAsText()).jsonObject
+            val rollbackResponse = client.post("/ops/runtime-config/versions/$originalVersionId/rollback") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"restore daemon cadence"}""")
+            }
+            val enabledDraftResponse = client.post("/ops/runtime-config/drafts") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"values":{"daemon.enabled":"true"},"note":"generic daemon start"}""")
+            }
+            val enabledDraftVersionId = Json.parseToJsonElement(enabledDraftResponse.bodyAsText())
+                .jsonObject
+                .getValue("version")
+                .jsonObject
+                .getValue("id")
+                .jsonPrimitive
+                .content
+            val haltResponse = client.post("/ops/halt") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"level":"HARD","reason":"activation guard test"}""")
+            }
+            val rejectedGenericStart = client.post("/ops/runtime-config/drafts/$enabledDraftVersionId/activate") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"must remain disabled"}""")
+            }
+            val rejectedStatus = Json.parseToJsonElement(client.get("/ops/daemon").bodyAsText()).jsonObject
+            val resumeResponse = client.post("/ops/resume") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"activation guard verified"}""")
+            }
+            val startResponse = client.post("/ops/daemon/start") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"application wiring start"}""")
+            }
+            val stopResponse = client.post("/ops/daemon/stop") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"application wiring stop"}""")
+            }
+            val stoppedStatus = Json.parseToJsonElement(stopResponse.bodyAsText()).jsonObject
+
+            assertEquals(HttpStatusCode.Created, draftResponse.status)
+            assertEquals(HttpStatusCode.OK, activateResponse.status)
+            assertFalse(activatedStatus.getValue("desiredEnabled").jsonPrimitive.content.toBoolean())
+            assertEquals(
+                draftVersionId,
+                activatedStatus.getValue("activeConfig").jsonObject.getValue("versionId").jsonPrimitive.content,
+            )
+            assertEquals(HttpStatusCode.OK, rollbackResponse.status)
+            assertEquals(HttpStatusCode.Created, enabledDraftResponse.status)
+            assertEquals(HttpStatusCode.OK, haltResponse.status)
+            assertEquals(HttpStatusCode.Conflict, rejectedGenericStart.status)
+            assertFalse(rejectedStatus.getValue("desiredEnabled").jsonPrimitive.content.toBoolean())
+            assertEquals(originalVersionId, rejectedStatus.getValue("activeConfig").jsonObject.getValue("versionId").jsonPrimitive.content)
+            assertEquals(HttpStatusCode.OK, resumeResponse.status)
+            assertEquals(HttpStatusCode.OK, startResponse.status)
+            assertEquals(HttpStatusCode.OK, stopResponse.status)
+            assertFalse(stoppedStatus.getValue("desiredEnabled").jsonPrimitive.content.toBoolean())
+            assertEquals("INTENTIONAL_STOP", stoppedStatus.getValue("reason").jsonPrimitive.content)
+            assertEquals("application wiring stop", stoppedStatus.getValue("detail").jsonPrimitive.content)
+        } finally {
+            container.stop()
+        }
+    }
+
+    @Test
     fun opsRoutes_accountReturnsCurrentSnapshotWithUpdatedAt() = testApplication {
         val ledgerRepository = InMemoryPaperLedgerRepository(
             accountSnapshot = accountSnapshot(),
@@ -1754,7 +1869,7 @@ private fun metadataValue(container: JsonObject, label: String): String {
 
 private class FakeRuntimeConfigAdminService(
     private val listVersionsFailure: Throwable? = null,
-) : RuntimeConfigAdminService {
+) : RuntimeConfigAdminService, LlmDaemonRuntimeConfigActivationService {
     private val versions = mutableMapOf<String, RuntimeConfigVersionDetail>()
     private var activeVersionId: String = "active-runtime-config"
     private var nextDraftId = 1
@@ -1837,6 +1952,14 @@ private class FakeRuntimeConfigAdminService(
 
     override fun rollbackToVersion(versionId: String): Result<RuntimeConfigActivationResult> {
         return activateDraft(versionId)
+    }
+
+    override suspend fun activateDraft(versionId: String, reason: String?): Result<RuntimeConfigActivationResult> {
+        return activateDraft(versionId)
+    }
+
+    override suspend fun rollbackToVersion(versionId: String, reason: String?): Result<RuntimeConfigActivationResult> {
+        return rollbackToVersion(versionId)
     }
 
     private fun versionSummary(
@@ -1953,7 +2076,11 @@ private fun daemonStatus(desiredEnabled: Boolean): LlmDaemonSupervisorStatus {
         detail = null,
         activeConfig = identity,
         appliedConfig = identity,
-        daemonAppliedConfig = identity,
+        daemonAppliedConfig = LlmDaemonComponentConfigIdentity(
+            component = "daemon",
+            sourceVersionId = "version-1",
+            hash = "hash-1",
+        ),
         restartRequired = false,
         lastSchedulerSignalAt = fixedInstant(),
         lastLaunch = launch,

@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou
 
 import kotlinx.coroutines.CoroutineScope
@@ -10,13 +12,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
+import me.matsumo.fukurou.trading.config.RuntimeConfigActiveVersionChangedException
 import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
@@ -99,6 +106,19 @@ data class LlmDaemonConfigIdentity(
 )
 
 /**
+ * full runtime config ではなく daemon component に適用した config identity。
+ *
+ * @param component component 名
+ * @param sourceVersionId daemon section を取得した active runtime config version ID
+ * @param hash daemon section だけの content hash
+ */
+data class LlmDaemonComponentConfigIdentity(
+    val component: String,
+    val sourceVersionId: String?,
+    val hash: String?,
+)
+
+/**
  * daemon の直近 launch 情報。
  *
  * @param invocationId 起動 ID
@@ -134,7 +154,7 @@ data class LlmDaemonSupervisorStatus(
     val detail: String?,
     val activeConfig: LlmDaemonConfigIdentity,
     val appliedConfig: LlmDaemonConfigIdentity,
-    val daemonAppliedConfig: LlmDaemonConfigIdentity,
+    val daemonAppliedConfig: LlmDaemonComponentConfigIdentity,
     val restartRequired: Boolean,
     val lastSchedulerSignalAt: Instant?,
     val lastLaunch: LlmDaemonLaunchStatus?,
@@ -154,6 +174,17 @@ interface LlmDaemonOperations {
 
     /** versioned runtime config を介して desired state を変更する。 */
     suspend fun setDesiredEnabled(enabled: Boolean, reason: String): Result<LlmDaemonSupervisorStatus>
+}
+
+/**
+ * generic runtime config activate / rollback を daemon lifecycle contract と一体で扱う境界。
+ */
+internal interface LlmDaemonRuntimeConfigActivationService {
+    /** 保存済み draft を active 化する。 */
+    suspend fun activateDraft(versionId: String, reason: String?): Result<RuntimeConfigActivationResult>
+
+    /** 保存済み inactive version へ rollback する。 */
+    suspend fun rollbackToVersion(versionId: String, reason: String?): Result<RuntimeConfigActivationResult>
 }
 
 /**
@@ -184,6 +215,22 @@ internal fun interface LlmDaemonRuntimeSnapshotProvider {
 }
 
 /**
+ * 直近に完了した daemon desired state 操作を監査ログから読む境界。
+ */
+internal fun interface LlmDaemonDesiredStateReasonProvider {
+    suspend fun latestCompletedChange(): Result<LlmDaemonDesiredStateChange?>
+}
+
+/**
+ * daemon desired state 操作の正本となる監査情報。
+ */
+internal data class LlmDaemonDesiredStateChange(
+    val enabled: Boolean,
+    val reason: String,
+    val occurredAt: Instant,
+)
+
+/**
  * worker 構築境界。
  */
 internal fun interface LlmDaemonWorkerFactory {
@@ -212,27 +259,43 @@ internal fun interface LlmDaemonDesiredStateActivator {
  */
 internal class VersionedLlmDaemonDesiredStateActivator(
     private val adminService: RuntimeConfigAdminService,
+    private val snapshotProvider: LlmDaemonRuntimeSnapshotProvider,
     private val onActiveChanged: () -> Unit,
 ) : LlmDaemonDesiredStateActivator {
     override fun activate(enabled: Boolean, reason: String): Result<RuntimeConfigActivationResult> {
         return runCatching {
-            val draft = adminService.createDraft(
-                RuntimeConfigDraftCreation(
-                    baseVersionId = null,
-                    values = mapOf(DAEMON_ENABLED_CONFIG_KEY to enabled.toString()),
-                    note = reason,
-                    createdBy = DAEMON_CONTROL_CREATED_BY,
-                ),
-            ).getOrThrow()
+            repeat(MAX_DESIRED_ACTIVATION_ATTEMPTS) {
+                val activeSnapshot = snapshotProvider.snapshot()
+                val activeVersionId = activeSnapshot.configIdentity?.versionId
+                    ?: error("active runtime config version is unavailable")
+                val draft = adminService.createDraft(
+                    RuntimeConfigDraftCreation(
+                        baseVersionId = activeVersionId,
+                        values = mapOf(DAEMON_ENABLED_CONFIG_KEY to enabled.toString()),
+                        note = reason,
+                        createdBy = DAEMON_CONTROL_CREATED_BY,
+                    ),
+                ).getOrThrow()
 
-            if (!draft.validation.valid) {
-                throw RuntimeConfigValidationRejectedException(draft.validation)
+                if (!draft.validation.valid) {
+                    throw RuntimeConfigValidationRejectedException(draft.validation)
+                }
+
+                adminService.validateVersion(draft.version.id).getOrThrow()
+                val activation = adminService.activateDraftIfActive(draft.version.id, activeVersionId)
+
+                if (activation.exceptionOrNull() is RuntimeConfigActiveVersionChangedException) {
+                    onActiveChanged()
+
+                    return@repeat
+                }
+
+                return@runCatching activation.getOrThrow().also {
+                    onActiveChanged()
+                }
             }
 
-            adminService.validateVersion(draft.version.id).getOrThrow()
-            adminService.activateDraft(draft.version.id).getOrThrow().also {
-                onActiveChanged()
-            }
+            throw RuntimeConfigActiveVersionChangedException()
         }
     }
 }
@@ -244,26 +307,32 @@ internal class LlmDaemonSupervisor(
     private val processSnapshot: LlmDaemonRuntimeSnapshot,
     private val snapshotProvider: LlmDaemonRuntimeSnapshotProvider,
     private val desiredStateActivator: LlmDaemonDesiredStateActivator,
+    private val runtimeConfigAdminService: RuntimeConfigAdminService? = null,
+    private val onActiveConfigChanged: () -> Unit = {},
     private val riskStateRepository: RiskStateRepository,
     private val commandEventLog: CommandEventLog,
+    private val desiredStateReasonProvider: LlmDaemonDesiredStateReasonProvider =
+        LlmDaemonDesiredStateReasonProvider { Result.success(null) },
     private val workerFactory: LlmDaemonWorkerFactory,
     private val clock: Clock = Clock.systemUTC(),
     private val drainGrace: Duration = DEFAULT_DAEMON_DRAIN_GRACE,
     private val initialRetryDelay: Duration = DEFAULT_DAEMON_RETRY_DELAY,
     private val maxRetryDelay: Duration = MAX_DAEMON_RETRY_DELAY,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-) : LlmDaemonOperations, AutoCloseable {
+) : LlmDaemonOperations, LlmDaemonRuntimeConfigActivationService, AutoCloseable {
     private val reconciliationMutex = Mutex()
     private val controlMutex = Mutex()
     private val stateLock = Any()
     private var currentWorker: LlmDaemonWorkerHandle? = null
     private var workerGeneration = 0L
     private var daemonAppliedValues: Map<String, String>? = null
-    private var daemonAppliedIdentity = LlmDaemonConfigIdentity(null, null)
+    private var daemonAppliedIdentity = emptyDaemonComponentIdentity()
     private var retryAttempt = 0
+    private var runtimeRetryAttempt = 0
     private var retryJob: Job? = null
     private var shuttingDown = false
-    private var intentionalStopRequested = false
+    private var lastCompletedDesiredChange: LlmDaemonDesiredStateChange? = null
+    private var desiredStateReasonLoaded = false
     private var mutableStatus = initialStatus(processSnapshot)
 
     /** Application lifecycle とともに desired state への収束を開始する。 */
@@ -287,33 +356,112 @@ internal class LlmDaemonSupervisor(
     override suspend fun setDesiredEnabled(enabled: Boolean, reason: String): Result<LlmDaemonSupervisorStatus> {
         return runCatching {
             controlMutex.withLock {
-                if (status().observedState == LlmDaemonObservedState.STOPPING) {
-                    throw LlmDaemonStoppingRejectedException()
-                }
-
-                if (enabled) {
-                    val riskState = riskStateRepository.current().getOrThrow()
-
-                    if (riskState.state == RiskHaltState.HARD_HALT) {
-                        throw LlmDaemonHardHaltRejectedException()
-                    }
-                }
-
+                validateDaemonTransition(enabled)
                 appendOperationRequested(enabled, reason).getOrThrow()
-                intentionalStopRequested = !enabled
-                try {
-                    desiredStateActivator.activate(enabled, reason).getOrThrow()
-                    reconcile()
-                    appendOperationCompleted(enabled, reason).getOrThrow()
-                } finally {
-                    intentionalStopRequested = false
-                }
+                desiredStateActivator.activate(enabled, reason).getOrThrow()
+                recordCompletedDesiredChange(enabled, reason)
+                reconcile()
+                appendOperationCompleted(enabled, reason).getOrThrow()
 
                 status()
             }
         }.onFailure { error ->
             appendOperationFailed(enabled, reason, error)
         }
+    }
+
+    override suspend fun activateDraft(versionId: String, reason: String?): Result<RuntimeConfigActivationResult> {
+        return activateRuntimeConfigVersion(versionId, reason) { service, targetVersionId ->
+            service.activateDraft(targetVersionId)
+        }
+    }
+
+    override suspend fun rollbackToVersion(versionId: String, reason: String?): Result<RuntimeConfigActivationResult> {
+        return activateRuntimeConfigVersion(versionId, reason) { service, targetVersionId ->
+            service.rollbackToVersion(targetVersionId)
+        }
+    }
+
+    private suspend fun activateRuntimeConfigVersion(
+        versionId: String,
+        requestedReason: String?,
+        activate: (RuntimeConfigAdminService, String) -> Result<RuntimeConfigActivationResult>,
+    ): Result<RuntimeConfigActivationResult> {
+        return runCatching {
+            controlMutex.withLock {
+                val service = checkNotNull(runtimeConfigAdminService) {
+                    "runtime config activation service is unavailable"
+                }
+                val target = service.validateVersion(versionId).getOrThrow()
+
+                if (!target.validation.valid) {
+                    throw RuntimeConfigValidationRejectedException(target.validation)
+                }
+
+                val currentSnapshot = currentSnapshotSafely()
+                val daemonChanged = !currentSnapshot.available ||
+                    target.values.daemonValues() != currentSnapshot.values.daemonValues()
+                val targetEnabled = target.values.getValue(DAEMON_ENABLED_CONFIG_KEY).toBooleanStrict()
+                val desiredChanged = targetEnabled != status().desiredEnabled
+                val reason = requestedReason?.trim()?.takeIf { value -> value.isNotEmpty() }
+                    ?: target.version.note
+                    ?: DEFAULT_RUNTIME_CONFIG_ACTIVATION_REASON
+
+                if (daemonChanged) {
+                    validateDaemonTransition(targetEnabled)
+                }
+                if (desiredChanged) {
+                    appendOperationRequested(targetEnabled, reason).getOrThrow()
+                }
+
+                val result = activate(service, versionId).getOrThrow()
+                onActiveConfigChanged()
+                if (desiredChanged) {
+                    recordCompletedDesiredChange(targetEnabled, reason)
+                }
+                reconcile()
+                if (desiredChanged) {
+                    appendOperationCompleted(targetEnabled, reason).getOrThrow()
+                }
+
+                result
+            }
+        }.onFailure { error ->
+            val targetEnabled = runtimeConfigAdminService
+                ?.validateVersion(versionId)
+                ?.getOrNull()
+                ?.values
+                ?.get(DAEMON_ENABLED_CONFIG_KEY)
+                ?.toBooleanStrictOrNull()
+            if (targetEnabled != null && targetEnabled != status().desiredEnabled) {
+                appendOperationFailed(targetEnabled, requestedReason ?: DEFAULT_RUNTIME_CONFIG_ACTIVATION_REASON, error)
+            }
+        }
+    }
+
+    private suspend fun validateDaemonTransition(enabled: Boolean) {
+        if (status().observedState == LlmDaemonObservedState.STOPPING) {
+            throw LlmDaemonStoppingRejectedException()
+        }
+
+        if (!enabled) {
+            return
+        }
+
+        val riskState = riskStateRepository.current().getOrThrow()
+
+        if (riskState.state == RiskHaltState.HARD_HALT) {
+            throw LlmDaemonHardHaltRejectedException()
+        }
+    }
+
+    private fun recordCompletedDesiredChange(enabled: Boolean, reason: String) {
+        lastCompletedDesiredChange = LlmDaemonDesiredStateChange(
+            enabled = enabled,
+            reason = reason,
+            occurredAt = Instant.now(clock),
+        )
+        desiredStateReasonLoaded = true
     }
 
     override fun close() {
@@ -338,8 +486,9 @@ internal class LlmDaemonSupervisor(
                 return
             }
 
-            val snapshot = snapshotProvider.snapshot()
-            updateActiveSnapshot(snapshot)
+            val snapshot = runCatching { snapshotProvider.snapshot() }.getOrElse {
+                unavailableRuntimeSnapshot()
+            }
 
             if (!snapshot.available) {
                 stopCurrentWorkerLocked(LlmDaemonStatusReason.RUNTIME_CONFIG_UNAVAILABLE)
@@ -348,20 +497,27 @@ internal class LlmDaemonSupervisor(
                     reason = LlmDaemonStatusReason.RUNTIME_CONFIG_UNAVAILABLE,
                     detail = "active runtime config is unavailable",
                 )
+                scheduleRuntimeRecoveryLocked()
 
                 return
             }
+
+            runtimeRetryAttempt = 0
+            updateActiveSnapshot(snapshot)
 
             if (!snapshot.tradingConfig.daemon.enabled) {
                 retryJob?.cancel()
                 retryJob = null
                 retryAttempt = 0
-                val disabledReason = if (intentionalStopRequested) {
-                    LlmDaemonStatusReason.INTENTIONAL_STOP
-                } else {
-                    LlmDaemonStatusReason.ACTIVE_CONFIG_DISABLED
-                }
+                val completedStop = completedStopReason()
+                val disabledReason = completedStop?.let { LlmDaemonStatusReason.INTENTIONAL_STOP }
+                    ?: LlmDaemonStatusReason.ACTIVE_CONFIG_DISABLED
                 val stopResult = stopCurrentWorkerLocked(disabledReason)
+
+                if (stopResult == LlmDaemonWorkerStopResult.TERMINATION_PENDING) {
+                    return
+                }
+
                 val stopReason = if (stopResult == LlmDaemonWorkerStopResult.TIMED_OUT) {
                     LlmDaemonStatusReason.DRAIN_TIMED_OUT
                 } else {
@@ -373,7 +529,7 @@ internal class LlmDaemonSupervisor(
                     detail = if (stopResult == LlmDaemonWorkerStopResult.TIMED_OUT) {
                         "in-flight run was cancelled after bounded drain"
                     } else {
-                        null
+                        completedStop?.reason
                     },
                     nextRetryAt = null,
                 )
@@ -394,14 +550,24 @@ internal class LlmDaemonSupervisor(
         }
     }
 
+    private suspend fun completedStopReason(): LlmDaemonDesiredStateChange? {
+        if (!desiredStateReasonLoaded) {
+            lastCompletedDesiredChange = desiredStateReasonProvider.latestCompletedChange().getOrNull()
+            desiredStateReasonLoaded = true
+        }
+
+        return lastCompletedDesiredChange?.takeUnless { change -> change.enabled }
+    }
+
     private fun startWorkerLocked(snapshot: LlmDaemonRuntimeSnapshot) {
         workerGeneration += 1
         val generation = workerGeneration
         val appliedTradingConfig = processSnapshot.tradingConfig.copy(daemon = snapshot.tradingConfig.daemon)
         val appliedValues = processSnapshot.values + snapshot.values.daemonValues()
         val appliedHash = calculateRuntimeConfigHash(appliedValues)
-        val nextDaemonAppliedIdentity = LlmDaemonConfigIdentity(
-            versionId = snapshot.configIdentity?.versionId,
+        val nextDaemonAppliedIdentity = LlmDaemonComponentConfigIdentity(
+            component = DAEMON_COMPONENT_NAME,
+            sourceVersionId = snapshot.configIdentity?.versionId,
             hash = calculateRuntimeConfigHash(snapshot.values.daemonValues()),
         )
 
@@ -418,7 +584,7 @@ internal class LlmDaemonSupervisor(
                 LlmDaemonWorkerRequest(
                     tradingConfig = appliedTradingConfig,
                     runtimeConfigSnapshot = RuntimeConfigAuditSnapshot(
-                        versionId = snapshot.configIdentity?.versionId ?: "process-default",
+                        versionId = null,
                         hash = appliedHash,
                     ),
                     observer = supervisorObserver(generation),
@@ -441,7 +607,9 @@ internal class LlmDaemonSupervisor(
 
     private suspend fun stopCurrentWorkerLocked(reason: LlmDaemonStatusReason): LlmDaemonWorkerStopResult? {
         val worker = currentWorker ?: return null
-        val currentSnapshot = currentSnapshotSafely()
+
+        worker.requestStop()
+        workerGeneration += 1
 
         updateStatus(
             observedState = LlmDaemonObservedState.STOPPING,
@@ -450,11 +618,25 @@ internal class LlmDaemonSupervisor(
         )
         appendStateChanged(LlmDaemonObservedState.STOPPING, reason)
 
-        val drainTimeout = currentSnapshot.tradingConfig.runner.perRunTimeout.plus(drainGrace)
+        val drainTimeout = processSnapshot.tradingConfig.runner.perRunTimeout.plus(drainGrace)
         val stopResult = worker.stopGracefully(drainTimeout)
+
+        if (stopResult == LlmDaemonWorkerStopResult.TERMINATION_PENDING) {
+            val nextRetryAt = Instant.now(clock).plus(initialRetryDelay)
+            updateStatus(
+                observedState = LlmDaemonObservedState.DEGRADED,
+                reason = LlmDaemonStatusReason.DRAIN_TIMED_OUT,
+                detail = "worker cancellation did not terminate within the bounded wait",
+                nextRetryAt = nextRetryAt,
+            )
+            appendDrainTimedOut(drainTimeout, terminationPending = true)
+            scheduleRetryLocked(initialRetryDelay)
+
+            return stopResult
+        }
+
         currentWorker = null
         daemonAppliedValues = null
-        workerGeneration += 1
 
         if (stopResult == LlmDaemonWorkerStopResult.TIMED_OUT) {
             updateStatus(
@@ -463,7 +645,7 @@ internal class LlmDaemonSupervisor(
                 detail = "daemon drain timed out and the in-flight run was cancelled",
                 inFlightRun = null,
             )
-            appendDrainTimedOut(drainTimeout)
+            appendDrainTimedOut(drainTimeout, terminationPending = false)
         } else {
             updateStatus(
                 observedState = LlmDaemonObservedState.STOPPED,
@@ -529,7 +711,7 @@ internal class LlmDaemonSupervisor(
     private fun supervisorLifecycleListener(
         generation: Long,
         appliedValues: Map<String, String>,
-        appliedIdentity: LlmDaemonConfigIdentity,
+        appliedIdentity: LlmDaemonComponentConfigIdentity,
     ): LlmDaemonWorkerLifecycleListener {
         return object : LlmDaemonWorkerLifecycleListener {
             override fun onStarted() {
@@ -589,6 +771,14 @@ internal class LlmDaemonSupervisor(
         }
     }
 
+    private fun scheduleRuntimeRecoveryLocked() {
+        runtimeRetryAttempt = (runtimeRetryAttempt + 1).coerceAtMost(MAX_RETRY_EXPONENT)
+        val recoveryDelay = retryDelay(runtimeRetryAttempt, initialRetryDelay, maxRetryDelay)
+
+        updateStatus(nextRetryAt = Instant.now(clock).plus(recoveryDelay))
+        scheduleRetryLocked(recoveryDelay)
+    }
+
     private fun updateActiveSnapshot(snapshot: LlmDaemonRuntimeSnapshot) {
         val activeIdentity = LlmDaemonConfigIdentity(
             versionId = snapshot.configIdentity?.versionId,
@@ -616,7 +806,7 @@ internal class LlmDaemonSupervisor(
         detail: String? = KEEP_DETAIL,
         activeConfig: LlmDaemonConfigIdentity? = null,
         appliedConfig: LlmDaemonConfigIdentity? = null,
-        daemonAppliedConfig: LlmDaemonConfigIdentity? = null,
+        daemonAppliedConfig: LlmDaemonComponentConfigIdentity? = null,
         restartRequired: Boolean? = null,
         inFlightRun: LlmDaemonLaunchStatus? = KEEP_IN_FLIGHT,
         nextRetryAt: Instant? = KEEP_RETRY_AT,
@@ -649,7 +839,14 @@ internal class LlmDaemonSupervisor(
     }
 
     private fun currentSnapshotSafely(): LlmDaemonRuntimeSnapshot {
-        return runCatching { snapshotProvider.snapshot() }.getOrDefault(processSnapshot)
+        return runCatching { snapshotProvider.snapshot() }.getOrElse { unavailableRuntimeSnapshot() }
+    }
+
+    private fun unavailableRuntimeSnapshot(): LlmDaemonRuntimeSnapshot {
+        return processSnapshot.copy(
+            configIdentity = null,
+            available = false,
+        )
     }
 
     private fun LlmDaemonSupervisorStatus.withDerivedTiming(
@@ -685,6 +882,7 @@ internal class LlmDaemonSupervisor(
         return appendOperationEvent(
             eventType = CommandEventType.DAEMON_STATE_CHANGED,
             payload = buildJsonObject {
+                put("operation", DESIRED_STATE_CHANGE_OPERATION)
                 put("desiredEnabled", enabled)
                 put("observedState", status().observedState.name)
                 put("reason", reason)
@@ -720,12 +918,20 @@ internal class LlmDaemonSupervisor(
         )
     }
 
-    private suspend fun appendDrainTimedOut(timeout: Duration) {
+    private suspend fun appendDrainTimedOut(timeout: Duration, terminationPending: Boolean) {
         appendOperationEvent(
             eventType = CommandEventType.DAEMON_DRAIN_TIMED_OUT,
             payload = buildJsonObject {
                 put("timeoutSeconds", timeout.seconds)
-                put("detail", "in-flight run cancelled after bounded drain")
+                put("terminationPending", terminationPending)
+                put(
+                    "detail",
+                    if (terminationPending) {
+                        "worker cancellation did not terminate within the bounded wait"
+                    } else {
+                        "in-flight run cancelled after bounded drain"
+                    },
+                )
             }.toString(),
         )
     }
@@ -756,6 +962,34 @@ internal class LlmDaemonSupervisor(
     }
 }
 
+/** command_event_log の完了監査から直近 desired state 操作を復元する。 */
+internal fun commandEventDesiredStateReasonProvider(
+    reader: CommandEventFeedReader,
+): LlmDaemonDesiredStateReasonProvider {
+    return LlmDaemonDesiredStateReasonProvider {
+        reader.findEvents(
+            limit = DESIRED_STATE_AUDIT_LOOKBACK,
+            eventType = CommandEventType.DAEMON_STATE_CHANGED,
+        ).map { events ->
+            events.firstNotNullOfOrNull { event ->
+                runCatching {
+                    val payload = Json.parseToJsonElement(event.payload).jsonObject
+
+                    if (payload["operation"]?.jsonPrimitive?.content != DESIRED_STATE_CHANGE_OPERATION) {
+                        return@runCatching null
+                    }
+
+                    LlmDaemonDesiredStateChange(
+                        enabled = payload.getValue("desiredEnabled").jsonPrimitive.content.toBooleanStrict(),
+                        reason = payload.getValue("reason").jsonPrimitive.content,
+                        occurredAt = event.occurredAt,
+                    )
+                }.getOrNull()
+            }
+        }
+    }
+}
+
 private fun initialStatus(snapshot: LlmDaemonRuntimeSnapshot): LlmDaemonSupervisorStatus {
     val identity = LlmDaemonConfigIdentity(
         versionId = snapshot.configIdentity?.versionId,
@@ -769,7 +1003,7 @@ private fun initialStatus(snapshot: LlmDaemonRuntimeSnapshot): LlmDaemonSupervis
         detail = null,
         activeConfig = identity,
         appliedConfig = identity,
-        daemonAppliedConfig = LlmDaemonConfigIdentity(null, null),
+        daemonAppliedConfig = emptyDaemonComponentIdentity(),
         restartRequired = false,
         lastSchedulerSignalAt = null,
         lastLaunch = null,
@@ -778,6 +1012,14 @@ private fun initialStatus(snapshot: LlmDaemonRuntimeSnapshot): LlmDaemonSupervis
         inFlightRun = null,
         silenceWarning = false,
         nextRetryAt = null,
+    )
+}
+
+private fun emptyDaemonComponentIdentity(): LlmDaemonComponentConfigIdentity {
+    return LlmDaemonComponentConfigIdentity(
+        component = DAEMON_COMPONENT_NAME,
+        sourceVersionId = null,
+        hash = null,
     )
 }
 
@@ -813,9 +1055,14 @@ private fun Duration.coerceAtMost(maximum: Duration): Duration {
 
 private const val DAEMON_ENABLED_CONFIG_KEY = "daemon.enabled"
 private const val DAEMON_CONFIG_PREFIX = "daemon."
+private const val DAEMON_COMPONENT_NAME = "daemon"
 private const val DAEMON_CONTROL_CREATED_BY = "webui-daemon-control"
 private const val DAEMON_SUPERVISOR_TOOL_NAME = "llm-daemon-supervisor"
+private const val DESIRED_STATE_CHANGE_OPERATION = "desired_state_change"
+private const val DESIRED_STATE_AUDIT_LOOKBACK = 50
+private const val MAX_DESIRED_ACTIVATION_ATTEMPTS = 3
 private const val MAX_RETRY_EXPONENT = 7
+private const val DEFAULT_RUNTIME_CONFIG_ACTIVATION_REASON = "runtime config activation"
 private val DEFAULT_DAEMON_DRAIN_GRACE: Duration = Duration.ofSeconds(30)
 private val DEFAULT_DAEMON_RETRY_DELAY: Duration = Duration.ofSeconds(5)
 private val MAX_DAEMON_RETRY_DELAY: Duration = Duration.ofMinutes(5)

@@ -533,7 +533,7 @@ function ControlsDaemonPanel({
   const operationsDisabled = operationInFlight || isStopping;
   const activeIdentity = configIdentityLabel(status.activeConfig);
   const appliedIdentity = configIdentityLabel(status.appliedConfig);
-  const daemonAppliedIdentity = configIdentityLabel(status.daemonAppliedConfig);
+  const daemonAppliedIdentity = daemonComponentIdentityLabel(status.daemonAppliedConfig);
 
   return (
     <Panel className="panel--wide">
@@ -629,6 +629,13 @@ function configIdentityLabel(identity: OpsDaemonStatusResponse["activeConfig"]):
   const hash = identity.hash?.slice(0, 12) ?? "none";
 
   return `${version} / ${hash}`;
+}
+
+function daemonComponentIdentityLabel(identity: OpsDaemonStatusResponse["daemonAppliedConfig"]): string {
+  const sourceVersion = identity.sourceVersionId ?? "none";
+  const hash = identity.hash?.slice(0, 12) ?? "none";
+
+  return `${identity.component}@${sourceVersion} / ${hash}`;
 }
 
 async function refreshControlsData(queryClient: QueryClient): Promise<void> {
