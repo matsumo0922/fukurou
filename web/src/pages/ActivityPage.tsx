@@ -99,7 +99,12 @@ export function ActivityPage() {
         <div className={activeSelectedId ? "decision-runs-layout decision-runs-layout--detail" : "decision-runs-layout"}>
           <main className="decision-run-list" aria-label={t("activity.runs.list.aria")}>
             {runs.length === 0 ? (
-              <EmptyState title={t("activity.runs.empty.title")} description={t("activity.runs.empty.description")} />
+              <EmptyState
+                title={t(runsQuery.hasNextPage ? "activity.runs.empty.scanTitle" : "activity.runs.empty.title")}
+                description={t(
+                  runsQuery.hasNextPage ? "activity.runs.empty.scanDescription" : "activity.runs.empty.description",
+                )}
+              />
             ) : (
               runs.map((run) => (
                 <RunRow

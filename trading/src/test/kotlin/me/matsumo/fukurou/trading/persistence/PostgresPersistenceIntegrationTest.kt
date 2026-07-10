@@ -151,6 +151,30 @@ private const val DROP_COMMAND_EVENT_LOG_TABLE_SQL = "DROP TABLE command_event_l
  */
 private const val DROP_LLM_RUNS_TABLE_SQL = "DROP TABLE llm_runs"
 
+/** bounded outcome scan 検証用 llm_runs を一括追加する SQL。 */
+private const val INSERT_DECISION_RUN_SCAN_FIXTURE_SQL = """
+    INSERT INTO llm_runs (
+        invocation_id,
+        mode,
+        symbol,
+        trigger_kind,
+        status,
+        started_at,
+        finished_at,
+        error_message
+    )
+    SELECT
+        'scan-run-' || LPAD(sequence::TEXT, 6, '0'),
+        'PAPER',
+        'BTC',
+        'ECONOMIC_EVENT',
+        CASE WHEN sequence = ? THEN ? ELSE 'SUCCEEDED' END,
+        ? - sequence,
+        CASE WHEN sequence = ? THEN NULL ELSE ? - sequence END,
+        NULL
+    FROM generate_series(0, ?) AS sequence
+"""
+
 /**
  * active runtime config version を無効化する SQL。
  */
@@ -1170,7 +1194,7 @@ class PostgresPersistenceIntegrationTest {
         ).getOrThrow()
 
         val repository = ExposedDecisionRunProjectionRepository(database)
-        val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().single()
+        val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
         val detail = requireNotNull(repository.findRun("run-1").getOrThrow())
 
         assertEquals(DecisionRunOutcome.DENIED, summary.outcome)
@@ -1218,7 +1242,7 @@ class PostgresPersistenceIntegrationTest {
         }
 
         val repository = ExposedDecisionRunProjectionRepository(database)
-        val summaries = repository.listRuns(cursor = null, limit = 10).getOrThrow()
+        val summaries = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs
 
         assertEquals(listOf("empty-terminal-run"), summaries.map { summary -> summary.invocationId })
         assertEquals(DecisionRunOutcome.FAILED, summaries.single().outcome)
@@ -1276,11 +1300,100 @@ class PostgresPersistenceIntegrationTest {
         }
 
         val repository = ExposedDecisionRunProjectionRepository(database)
-        val executed = repository.listRuns(cursor = null, limit = 10, outcome = DecisionRunOutcome.EXECUTED).getOrThrow()
-        val failed = repository.listRuns(cursor = null, limit = 10, outcome = DecisionRunOutcome.FAILED).getOrThrow()
+        val executed = repository.listRuns(
+            cursor = null,
+            limit = 10,
+            outcome = DecisionRunOutcome.EXECUTED,
+        ).getOrThrow().runs
+        val failed = repository.listRuns(
+            cursor = null,
+            limit = 10,
+            outcome = DecisionRunOutcome.FAILED,
+        ).getOrThrow().runs
 
         assertEquals(listOf("filled-run"), executed.map { summary -> summary.invocationId })
         assertEquals(listOf("rejected-run"), failed.map { summary -> summary.invocationId })
+    }
+
+    @Test
+    fun decisionRunProjectionKeepsInvalidNoTradePayloadFailSafe() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val start = LlmRunStart(
+            invocationId = "invalid-no-trade-payload",
+            mode = TradingMode.PAPER,
+            symbol = TradingSymbol.BTC,
+            triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+            startedAt = fixedInstant(),
+        )
+        llmRunRepository.insertRunning(start).getOrThrow()
+        llmRunRepository.finish(
+            LlmRunFinish(
+                invocationId = start.invocationId,
+                mode = start.mode,
+                symbol = start.symbol,
+                triggerKind = start.triggerKind,
+                status = "SUCCEEDED",
+                startedAt = start.startedAt,
+                finishedAt = fixedInstant().plusSeconds(10),
+                errorMessage = null,
+            ),
+        ).getOrThrow()
+        ExposedCommandEventLog(database).append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = start.invocationId,
+                    llmProvider = "codex",
+                    promptHash = "prompt-hash",
+                    systemPromptVersion = "system-prompt-v1",
+                    marketSnapshotId = "snapshot-1",
+                ),
+                toolName = "runner",
+                toolCallId = null,
+                clientRequestId = null,
+                eventType = CommandEventType.NO_TRADE_EXIT,
+                payload = "{invalid-json",
+                occurredAt = fixedInstant().plusSeconds(9),
+            ),
+        ).getOrThrow()
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val page = repository.listRuns(cursor = null, limit = 10).getOrThrow()
+        val summary = page.runs.single()
+        val detail = requireNotNull(repository.findRun(start.invocationId).getOrThrow())
+
+        assertEquals(DecisionRunOutcome.NO_TRADE, summary.outcome)
+        assertNull(summary.finalReason)
+        assertNull(detail.summary.finalReason)
+    }
+
+    @Test
+    fun decisionRunProjectionContinuesAfterBoundedFilterScan() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val scanCap = FILTER_SCAN_BATCH_SIZE * MAX_FILTER_SCAN_BATCHES
+        insertDecisionRunScanFixture(
+            database = database,
+            maxSequence = scanCap,
+            runningSequence = scanCap,
+        )
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val firstPage = repository.listRuns(
+            cursor = null,
+            limit = 10,
+            outcome = DecisionRunOutcome.RUNNING,
+        ).getOrThrow()
+        val continuation = requireNotNull(firstPage.scanContinuation)
+        val secondPage = repository.listRuns(
+            cursor = continuation,
+            limit = 10,
+            outcome = DecisionRunOutcome.RUNNING,
+        ).getOrThrow()
+
+        assertTrue(firstPage.runs.isEmpty())
+        assertEquals("scan-run-${(scanCap - 1).toString().padStart(6, '0')}", continuation.invocationId)
+        assertEquals(listOf("scan-run-${scanCap.toString().padStart(6, '0')}"), secondPage.runs.map { it.invocationId })
+        assertNull(secondPage.scanContinuation)
     }
 
     @Test
@@ -1318,15 +1431,15 @@ class PostgresPersistenceIntegrationTest {
         }
 
         val repository = ExposedDecisionRunProjectionRepository(database)
-        val firstPage = repository.listRuns(cursor = null, limit = 2).getOrThrow()
+        val firstPage = repository.listRuns(cursor = null, limit = 2).getOrThrow().runs
         val secondPage = repository.listRuns(
             cursor = DecisionRunCursor(firstPage.last().startedAt, firstPage.last().invocationId),
             limit = 2,
-        ).getOrThrow()
+        ).getOrThrow().runs
         val thirdPage = repository.listRuns(
             cursor = DecisionRunCursor(secondPage.last().startedAt, secondPage.last().invocationId),
             limit = 2,
-        ).getOrThrow()
+        ).getOrThrow().runs
         val actualInvocationIds = (firstPage + secondPage + thirdPage).map { summary -> summary.invocationId }
 
         assertEquals(invocationIds.sortedDescending(), actualInvocationIds)
@@ -4038,6 +4151,25 @@ private fun insertActivityContextRows(
             priceJpy = BigDecimal("9800000"),
             realizedPnlJpy = BigDecimal("1200"),
         )
+    }
+}
+
+/** bounded outcome scan 検証用 run を新しい順の連番で追加する。 */
+private fun insertDecisionRunScanFixture(
+    database: ExposedDatabase,
+    maxSequence: Int,
+    runningSequence: Int,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(INSERT_DECISION_RUN_SCAN_FIXTURE_SQL).use { statement ->
+            statement.setInt(1, runningSequence)
+            statement.setString(2, LLM_RUN_STATUS_RUNNING)
+            statement.setLong(3, fixedInstant().toEpochMilli())
+            statement.setInt(4, runningSequence)
+            statement.setLong(5, fixedInstant().plusSeconds(10).toEpochMilli())
+            statement.setInt(6, maxSequence)
+            statement.executeUpdate()
+        }
     }
 }
 

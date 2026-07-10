@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunIntent
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcomeEvidence
+import me.matsumo.fukurou.trading.activity.DecisionRunPage
 import me.matsumo.fukurou.trading.activity.DecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
@@ -24,9 +25,18 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
 private val SAFE_FINAL_REASON_PATTERN = Regex("[a-z][a-z0-9_]{0,79}")
-private const val FILTER_SCAN_BATCH_SIZE = 100
 
-private const val LIST_RUNS_SQL = """
+/** outcome filter が 1 query で走査する raw run 件数。 */
+internal const val FILTER_SCAN_BATCH_SIZE = 100
+
+/** outcome filter が 1 request で走査する最大 batch 数。 */
+internal const val MAX_FILTER_SCAN_BATCHES = 10
+
+/** TEXT payload が valid JSON の場合だけ reason を抽出する PostgreSQL 式。 */
+private const val SAFE_NO_TRADE_REASON_EXPRESSION =
+    "CASE WHEN pg_input_is_valid(payload, 'jsonb') THEN payload::jsonb ->> 'reason' ELSE NULL END"
+
+private val LIST_RUNS_SQL = """
     WITH candidate_runs AS (
         SELECT invocation_id, mode, symbol, trigger_kind, status, started_at, finished_at, error_message
         FROM llm_runs
@@ -90,7 +100,7 @@ private const val LIST_RUNS_SQL = """
         WHERE decision_run_id = run.invocation_id
     ) execution_count ON TRUE
     LEFT JOIN LATERAL (
-        SELECT payload::jsonb ->> 'reason' AS reason, TRUE AS present
+        SELECT $SAFE_NO_TRADE_REASON_EXPRESSION AS reason, TRUE AS present
         FROM command_event_log
         WHERE decision_run_id = run.invocation_id
             AND event_type = 'NO_TRADE_EXIT'
@@ -100,7 +110,7 @@ private const val LIST_RUNS_SQL = """
     ORDER BY run.started_at DESC, run.invocation_id DESC
 """
 
-private const val FIND_RUN_SQL = """
+private val FIND_RUN_SQL = """
     SELECT
         run.invocation_id,
         run.mode,
@@ -182,7 +192,7 @@ private const val FIND_RUN_SQL = """
         LIMIT 1
     ) safety ON TRUE
     LEFT JOIN LATERAL (
-        SELECT payload::jsonb ->> 'reason' AS reason, TRUE AS present
+        SELECT $SAFE_NO_TRADE_REASON_EXPRESSION AS reason, TRUE AS present
         FROM command_event_log
         WHERE decision_run_id = run.invocation_id
             AND event_type = 'NO_TRADE_EXIT'
@@ -229,7 +239,7 @@ class ExposedDecisionRunProjectionRepository(
         cursor: DecisionRunCursor?,
         limit: Int,
         outcome: DecisionRunOutcome?,
-    ): Result<List<DecisionRunSummary>> {
+    ): Result<DecisionRunPage> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 require(limit > 0) { "limit must be greater than 0." }
@@ -251,28 +261,35 @@ private fun JdbcTransaction.selectRuns(
     cursor: DecisionRunCursor?,
     limit: Int,
     outcome: DecisionRunOutcome?,
-): List<DecisionRunSummary> {
+): DecisionRunPage {
+    if (outcome == null) {
+        return DecisionRunPage(
+            runs = selectRunBatch(cursor, limit),
+            scanContinuation = null,
+        )
+    }
+
     val selected = mutableListOf<DecisionRunSummary>()
     var scanCursor = cursor
 
-    while (selected.size < limit) {
+    repeat(MAX_FILTER_SCAN_BATCHES) {
         val remaining = limit - selected.size
-        val batchLimit = if (outcome == null) remaining else maxOf(remaining, FILTER_SCAN_BATCH_SIZE)
-        val batch = selectRunBatch(scanCursor, batchLimit)
+        val batch = selectRunBatch(scanCursor, FILTER_SCAN_BATCH_SIZE)
         selected += batch
             .asSequence()
-            .filter { summary -> outcome == null || summary.outcome == outcome }
+            .filter { summary -> summary.outcome == outcome }
             .take(remaining)
             .toList()
 
-        val reachedEnd = batch.size < batchLimit
-        if (selected.size >= limit || reachedEnd) break
+        if (selected.size >= limit || batch.size < FILTER_SCAN_BATCH_SIZE) {
+            return DecisionRunPage(selected, scanContinuation = null)
+        }
 
-        val last = batch.lastOrNull() ?: break
+        val last = batch.last()
         scanCursor = DecisionRunCursor(last.startedAt, last.invocationId)
     }
 
-    return selected
+    return DecisionRunPage(selected, scanContinuation = scanCursor)
 }
 
 private fun JdbcTransaction.selectRunBatch(cursor: DecisionRunCursor?, limit: Int): List<DecisionRunSummary> {

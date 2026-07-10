@@ -16,6 +16,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
+import me.matsumo.fukurou.trading.activity.DecisionRunPage
 import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
@@ -30,6 +31,11 @@ import java.util.Base64
 private const val RUNS_TAG = "ops"
 private const val DEFAULT_RUN_LIMIT = 30
 private const val MAX_RUN_LIMIT = 100
+
+/** decision run 一覧 endpoint の OpenAPI description。 */
+private const val RUNS_DESCRIPTION =
+    "llm_runs を起点に decision、Falsifier、SafetyFloor、order、execution を正規化した run 一覧を新しい順で返します。" +
+        "outcome filter は bounded window を走査し、上限到達時は次の window 用 cursor を返します。"
 
 /** decision run 一覧 response。 */
 @Serializable
@@ -216,11 +222,11 @@ private fun Route.registerOpsDecisionRunsListRoute(dependencies: OpsRouteDepende
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("outcome must be a valid decision run outcome"))
             return@get
         }
-        val records = repository.listRuns(cursor, limit + 1, outcome).getOrThrow()
-        call.respond(records.toPageResponse(limit))
+        val page = repository.listRuns(cursor, limit + 1, outcome).getOrThrow()
+        call.respond(page.toResponse(limit))
     }.describe {
         summary = "decision run 一覧を取得する"
-        description = "llm_runs を起点に decision、Falsifier、SafetyFloor、order、execution を正規化した run 一覧を新しい順で返します。"
+        description = RUNS_DESCRIPTION
         tag(RUNS_TAG)
         parameters {
             query("limit") {
@@ -232,7 +238,7 @@ private fun Route.registerOpsDecisionRunsListRoute(dependencies: OpsRouteDepende
                 schema = jsonSchema<String>()
             }
             query("outcome") {
-                description = "pagination より前に適用する outcome filter です。"
+                description = "pagination より前に bounded scan で適用する outcome filter です。"
                 schema = jsonSchema<OpsDecisionRunOutcome>()
             }
         }
@@ -296,13 +302,17 @@ private fun Route.registerOpsDecisionRunDetailRoute(dependencies: OpsRouteDepend
     }
 }
 
-private fun List<DecisionRunSummary>.toPageResponse(limit: Int): OpsDecisionRunsResponse {
-    val visible = take(limit)
-    val nextBefore = if (size > limit) visible.lastOrNull()?.let(::encodeRunCursor) else null
+private fun DecisionRunPage.toResponse(limit: Int): OpsDecisionRunsResponse {
+    val visible = runs.take(limit)
+    val nextCursor = if (runs.size > limit) {
+        visible.lastOrNull()?.toCursor()
+    } else {
+        scanContinuation
+    }
 
     return OpsDecisionRunsResponse(
         runs = visible.map(DecisionRunSummary::toResponse),
-        nextBefore = nextBefore,
+        nextBefore = nextCursor?.let(::encodeRunCursor),
     )
 }
 
@@ -392,7 +402,9 @@ private fun DecisionRunDetail.orderExecutionPhaseStatus(stoppedStatus: String): 
 }
 
 private fun DecisionRunDetail.decisionAction(): DecisionAction? {
-    return decision?.action?.let(DecisionAction::valueOf)
+    val action = decision?.action ?: return null
+
+    return DecisionAction.entries.find { candidate -> candidate.name == action }
 }
 
 private fun DecisionRunOutcome.toResponse(): OpsDecisionRunOutcome {
@@ -484,8 +496,12 @@ private fun DecisionRunRawRecord.toResponse() = OpsDecisionRunRawRecordResponse(
     values = values,
 )
 
-private fun encodeRunCursor(summary: DecisionRunSummary): String {
-    val value = "${summary.startedAt.toEpochMilli()}:${summary.invocationId}"
+private fun DecisionRunSummary.toCursor(): DecisionRunCursor {
+    return DecisionRunCursor(startedAt, invocationId)
+}
+
+private fun encodeRunCursor(cursor: DecisionRunCursor): String {
+    val value = "${cursor.startedAt.toEpochMilli()}:${cursor.invocationId}"
     return Base64.getUrlEncoder().withoutPadding().encodeToString(value.toByteArray(StandardCharsets.UTF_8))
 }
 

@@ -51,6 +51,17 @@ data class DecisionRunCursor(
     val invocationId: String,
 )
 
+/**
+ * bounded scan で構築した decision run page。
+ *
+ * @param runs outcome filter 適用後の run
+ * @param scanContinuation scan 上限で打ち切った場合に最後に確認した raw run の cursor
+ */
+data class DecisionRunPage(
+    val runs: List<DecisionRunSummary>,
+    val scanContinuation: DecisionRunCursor?,
+)
+
 /** decision run 一覧の表示用 projection。 */
 data class DecisionRunSummary(
     val invocationId: String,
@@ -181,7 +192,7 @@ interface DecisionRunProjectionRepository {
         cursor: DecisionRunCursor?,
         limit: Int,
         outcome: DecisionRunOutcome? = null,
-    ): Result<List<DecisionRunSummary>>
+    ): Result<DecisionRunPage>
 
     /** invocation ID に対応する run 詳細を返す。 */
     suspend fun findRun(invocationId: String): Result<DecisionRunDetail?>

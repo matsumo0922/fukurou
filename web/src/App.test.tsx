@@ -488,6 +488,28 @@ describe("App", () => {
     expect(await screen.findByText(/Decision runs unavailable/)).toBeInTheDocument();
   });
 
+  it("continues a bounded outcome scan after an empty window", async () => {
+    window.localStorage.setItem("fukurou.web.activity.run-filter.v2", "RUNNING");
+    const fetchMock = stubSystemFetch({
+      decisionRunsResponse: {
+        status: 200,
+        body: { runs: [], nextBefore: "scan-cursor" },
+      },
+      decisionRunsOlderResponse: Promise.resolve(jsonResponse({ runs: [], nextBefore: null })),
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    expect(await screen.findByText("No matches in this scan window")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load older runs" }));
+
+    await waitFor(() => {
+      expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("before") === "scan-cursor")).toBe(true);
+    });
+    expect(await screen.findByText("No matching runs")).toBeInTheDocument();
+  });
+
   it("rejects blank control reasons before calling the API", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/controls");
@@ -949,6 +971,9 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
       case "/ops/runtime-config":
         return jsonResponse(fixture.runtimeConfigResponse ?? runtimeConfigResponse());
       case "/ops/runs":
+        if (requestSearchParams(input).has("before") && fixture.decisionRunsOlderResponse) {
+          return fixture.decisionRunsOlderResponse;
+        }
         if (fixture.decisionRunsResponse instanceof Promise) {
           return fixture.decisionRunsResponse;
         }

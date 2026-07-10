@@ -1604,7 +1604,7 @@ export interface paths {
         };
         /**
          * decision run 一覧を取得する
-         * @description llm_runs を起点に decision、Falsifier、SafetyFloor、order、execution を正規化した run 一覧を新しい順で返します。
+         * @description llm_runs を起点に decision、Falsifier、SafetyFloor、order、execution を正規化した run 一覧を新しい順で返します。outcome filter は bounded window を走査し、上限到達時は次の window 用 cursor を返します。
          */
         get: {
             parameters: {
@@ -1613,7 +1613,7 @@ export interface paths {
                     limit?: number;
                     /** @description 前回応答の nextBefore を指定する opaque cursor です。 */
                     before?: string;
-                    /** @description pagination より前に適用する outcome filter です。 */
+                    /** @description pagination より前に bounded scan で適用する outcome filter です。 */
                     outcome?: "EXECUTED" | "DENIED" | "NO_TRADE" | "INTERRUPTED" | "RUNNING" | "FAILED";
                 };
                 header?: never;

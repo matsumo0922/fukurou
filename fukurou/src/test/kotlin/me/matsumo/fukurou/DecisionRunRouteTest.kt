@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
+import me.matsumo.fukurou.trading.activity.DecisionRunPage
 import me.matsumo.fukurou.trading.activity.DecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
@@ -52,6 +53,19 @@ class DecisionRunRouteTest {
         assertEquals(listOf("run-old"), filteredPage.runs.map { run -> run.invocationId })
         assertEquals(DecisionRunOutcome.INTERRUPTED, repository.lastOutcome)
 
+        val cappedResponse = client.get("/ops/runs?outcome=RUNNING")
+        assertEquals(HttpStatusCode.OK, cappedResponse.status)
+        val cappedPage = Json.decodeFromString<OpsDecisionRunsResponse>(cappedResponse.body())
+        assertTrue(cappedPage.runs.isEmpty())
+        assertNotNull(cappedPage.nextBefore)
+
+        val continuedResponse = client.get("/ops/runs?outcome=RUNNING&before=${cappedPage.nextBefore}")
+        assertEquals(HttpStatusCode.OK, continuedResponse.status)
+        val continuedPage = Json.decodeFromString<OpsDecisionRunsResponse>(continuedResponse.body())
+        assertTrue(continuedPage.runs.isEmpty())
+        assertEquals(null, continuedPage.nextBefore)
+        assertEquals("scan-boundary", repository.lastCursor?.invocationId)
+
         val detailResponse = client.get("/ops/runs/run-new")
         assertEquals(HttpStatusCode.OK, detailResponse.status)
         val detail = Json.decodeFromString<OpsDecisionRunDetailResponse>(detailResponse.body())
@@ -89,6 +103,12 @@ class DecisionRunRouteTest {
             assertEquals("PASSED", detail.phases.single { phase -> phase.key == "SAFETY" }.status)
             assertEquals("COMPLETED", detail.phases.single { phase -> phase.key == "ORDER_EXECUTION" }.status)
         }
+
+        val unknownResponse = client.get("/ops/runs/safety-unknown")
+        assertEquals(HttpStatusCode.OK, unknownResponse.status)
+        val unknownDetail = Json.decodeFromString<OpsDecisionRunDetailResponse>(unknownResponse.body())
+        assertEquals("NOT_REQUIRED", unknownDetail.phases.single { phase -> phase.key == "INTENT" }.status)
+        assertEquals("NOT_REQUIRED", unknownDetail.phases.single { phase -> phase.key == "SAFETY" }.status)
     }
 
     @Test
@@ -122,12 +142,26 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
         cursor: DecisionRunCursor?,
         limit: Int,
         outcome: DecisionRunOutcome?,
-    ): Result<List<DecisionRunSummary>> {
+    ): Result<DecisionRunPage> {
         lastCursor = cursor
         lastOutcome = outcome
+        if (outcome == DecisionRunOutcome.RUNNING) {
+            val continuation = if (cursor == null) {
+                DecisionRunCursor(Instant.parse("2026-07-09T23:00:00Z"), "scan-boundary")
+            } else {
+                null
+            }
+
+            return Result.success(DecisionRunPage(emptyList(), continuation))
+        }
         val runs = if (cursor == null) listOf(denied, interrupted) else listOf(interrupted)
 
-        return Result.success(runs.filter { run -> outcome == null || run.outcome == outcome }.take(limit))
+        return Result.success(
+            DecisionRunPage(
+                runs = runs.filter { run -> outcome == null || run.outcome == outcome }.take(limit),
+                scanContinuation = null,
+            ),
+        )
     }
 
     override suspend fun findRun(invocationId: String): Result<DecisionRunDetail?> {
@@ -198,11 +232,26 @@ private class SafetyPassedDecisionRunProjectionRepository : DecisionRunProjectio
         cursor: DecisionRunCursor?,
         limit: Int,
         outcome: DecisionRunOutcome?,
-    ): Result<List<DecisionRunSummary>> {
-        return Result.success(emptyList())
+    ): Result<DecisionRunPage> {
+        return Result.success(DecisionRunPage(emptyList(), scanContinuation = null))
     }
 
     override suspend fun findRun(invocationId: String): Result<DecisionRunDetail?> {
+        if (invocationId == "safety-unknown") {
+            val detail = safetyPassedDetail(DecisionAction.EXIT)
+            return Result.success(
+                detail.copy(
+                    summary = detail.summary.copy(
+                        invocationId = invocationId,
+                        action = "REMOVED_ACTION",
+                        orderCount = 0,
+                        outcome = DecisionRunOutcome.FAILED,
+                    ),
+                    decision = detail.decision?.copy(action = "REMOVED_ACTION"),
+                    orders = emptyList(),
+                ),
+            )
+        }
         val action = DecisionAction.entries.find { candidate -> invocationId == "safety-${candidate.name.lowercase()}" }
 
         return Result.success(action?.let(::safetyPassedDetail))
