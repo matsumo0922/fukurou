@@ -378,6 +378,33 @@ describe("App", () => {
     expect(await screen.findByRole("button", { name: /All/ })).toHaveAttribute("aria-pressed", "true");
   });
 
+  it("shows decision run loading, error, and empty states", async () => {
+    let resolveRuns: (response: Response) => void = () => undefined;
+    const pendingRuns = new Promise<Response>((resolve) => {
+      resolveRuns = resolve;
+    });
+    stubSystemFetch({ decisionRunsResponse: pendingRuns });
+    window.history.pushState({}, "", "/app/activity");
+
+    const view = render(<App />);
+    expect(await screen.findByText("Loading decision runs")).toBeInTheDocument();
+
+    await resolveRuns(jsonResponse({ runs: [], nextBefore: null }));
+    expect(await screen.findByText("No matching runs")).toBeInTheDocument();
+
+    view.unmount();
+    cleanup();
+    stubSystemFetch({
+      decisionRunsResponse: {
+        status: 500,
+        body: { message: "projection unavailable" },
+      },
+    });
+    render(<App />);
+
+    expect(await screen.findByText(/Decision runs unavailable/)).toBeInTheDocument();
+  });
+
   it("rejects blank control reasons before calling the API", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/controls");
@@ -661,6 +688,10 @@ type SystemFetchFixture = {
     body: unknown;
   };
   activityOlderResponse?: Promise<Response>;
+  decisionRunsResponse?: Promise<Response> | {
+    status: number;
+    body: unknown;
+  };
 };
 
 function stubSystemFetch(fixture: SystemFetchFixture = {}) {
@@ -827,6 +858,12 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
       case "/ops/runtime-config":
         return jsonResponse(fixture.runtimeConfigResponse ?? runtimeConfigResponse());
       case "/ops/runs":
+        if (fixture.decisionRunsResponse instanceof Promise) {
+          return fixture.decisionRunsResponse;
+        }
+        if (fixture.decisionRunsResponse) {
+          return jsonResponse(fixture.decisionRunsResponse.body, { status: fixture.decisionRunsResponse.status });
+        }
         return jsonResponse(decisionRunsResponse());
       case "/ops/runs/run-denied":
         return jsonResponse(decisionRunDetailResponse());
