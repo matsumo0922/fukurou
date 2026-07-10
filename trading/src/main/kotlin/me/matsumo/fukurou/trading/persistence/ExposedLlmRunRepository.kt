@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunRecord
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.ResultSet
 import java.time.Instant
@@ -29,10 +30,11 @@ private const val INSERT_LLM_RUN_RUNNING_SQL = """
         started_at,
         finished_at,
         error_message,
+        terminal_cause,
         runtime_config_version_id,
         runtime_config_hash
     )
-    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
     ON CONFLICT (invocation_id) DO NOTHING
 """
 
@@ -49,15 +51,17 @@ private const val UPSERT_LLM_RUN_FINISH_SQL = """
         started_at,
         finished_at,
         error_message,
+        terminal_cause,
         runtime_config_version_id,
         runtime_config_hash
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (invocation_id) DO UPDATE
     SET
         status = EXCLUDED.status,
         finished_at = EXCLUDED.finished_at,
         error_message = EXCLUDED.error_message,
+        terminal_cause = EXCLUDED.terminal_cause,
         runtime_config_version_id = EXCLUDED.runtime_config_version_id,
         runtime_config_hash = EXCLUDED.runtime_config_hash
 """
@@ -75,6 +79,7 @@ private const val SELECT_LLM_RUN_BY_INVOCATION_ID_SQL = """
         started_at,
         finished_at,
         error_message,
+        terminal_cause,
         runtime_config_version_id,
         runtime_config_hash
     FROM llm_runs
@@ -104,9 +109,10 @@ private const val SELECT_LLM_RUNS_STARTED_BETWEEN_SQL = """
             trigger_kind,
             status,
             started_at,
-            finished_at,
-            error_message,
-            runtime_config_version_id,
+        finished_at,
+        error_message,
+        terminal_cause,
+        runtime_config_version_id,
             runtime_config_hash
         FROM llm_runs
         WHERE started_at >= ?
@@ -203,8 +209,9 @@ private fun JdbcTransaction.finishLlmRun(finish: LlmRunFinish) {
         statement.setLong(6, finish.startedAt.toEpochMilli())
         statement.setLong(7, finish.finishedAt.toEpochMilli())
         statement.setString(8, finish.errorMessage)
-        statement.setString(9, finish.runtimeConfigVersionId)
-        statement.setString(10, finish.runtimeConfigHash)
+        statement.setString(9, finish.terminalCause.name)
+        statement.setString(10, finish.runtimeConfigVersionId)
+        statement.setString(11, finish.runtimeConfigHash)
         statement.executeUpdate()
     }
 }
@@ -254,6 +261,7 @@ private fun ResultSet.toLlmRunRecord(): LlmRunRecord {
         startedAt = Instant.ofEpochMilli(getLong("started_at")),
         finishedAt = finishedAt,
         errorMessage = getString("error_message"),
+        terminalCause = getString("terminal_cause")?.let(LlmRunTerminalCause::valueOf),
         runtimeConfigVersionId = getString("runtime_config_version_id"),
         runtimeConfigHash = getString("runtime_config_hash"),
     )

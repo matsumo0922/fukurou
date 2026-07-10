@@ -6,7 +6,7 @@ import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
-import me.matsumo.fukurou.trading.persistence.STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import java.time.Duration
 import java.time.Instant
 
@@ -48,6 +48,7 @@ enum class DecisionRunFilter {
 data class DecisionRunOutcomeEvidence(
     val status: String,
     val errorMessage: String?,
+    val terminalCause: LlmRunTerminalCause?,
     val action: String?,
     val safetyRule: String?,
     val orderCount: Int,
@@ -83,9 +84,16 @@ private fun DecisionRunOutcomeEvidence.lifecycleOutcome(): DecisionRunOutcome? {
 private fun DecisionRunOutcomeEvidence.processOutcome(): DecisionRunOutcome {
     return when {
         status == LLM_RUN_STATUS_RUNNING -> DecisionRunOutcome.RUNNING
+        terminalCause == LlmRunTerminalCause.SAFETY_DENIED -> DecisionRunOutcome.DENIED
+        terminalCause == LlmRunTerminalCause.NO_TRADE -> DecisionRunOutcome.NO_ENTRY
+        terminalCause in setOf(
+            LlmRunTerminalCause.RESTART_INTERRUPTED,
+            LlmRunTerminalCause.CALLER_CANCELLED,
+            LlmRunTerminalCause.TIMED_OUT,
+            LlmRunTerminalCause.RUNNER_FAILED,
+        ) -> DecisionRunOutcome.FAILED
         safetyRule != null -> DecisionRunOutcome.DENIED
         hasNoEntryEvidence() -> DecisionRunOutcome.NO_ENTRY
-        errorMessage == STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE -> DecisionRunOutcome.FAILED
         status == LLM_RUN_STATUS_FAILED || status == LLM_RUN_STATUS_CANCELLED -> DecisionRunOutcome.FAILED
         else -> DecisionRunOutcome.FAILED
     }
@@ -148,6 +156,7 @@ data class DecisionRunSummary(
     val startedAt: Instant,
     val finishedAt: Instant?,
     val errorMessage: String?,
+    val terminalCause: LlmRunTerminalCause?,
     val action: String?,
     val reasonJa: String?,
     val falsificationVerdict: String?,

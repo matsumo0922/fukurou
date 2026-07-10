@@ -42,6 +42,7 @@ import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
@@ -225,6 +226,12 @@ data class OneShotRunnerResult(
     val decision: DecisionSubmissionResult?,
     val intent: TradeIntentRecord?,
     val tradeResult: PaperTradeResult?,
+    val terminalCause: LlmRunTerminalCause = when (status) {
+        OneShotRunnerStatus.NO_TRADE_AUDITED,
+        OneShotRunnerStatus.LAUNCH_REJECTED,
+        -> LlmRunTerminalCause.NO_TRADE
+        else -> LlmRunTerminalCause.NORMAL_COMPLETION
+    },
 )
 
 /**
@@ -965,6 +972,12 @@ private class OneShotRunAuditRecorder(
             startedAt = start.startedAt,
             finishedAt = clock.instant(),
             errorMessage = cause?.persistedErrorMessage(llmProvider),
+            terminalCause = when {
+                cause is CancellationException -> LlmRunTerminalCause.CALLER_CANCELLED
+                cause != null -> LlmRunTerminalCause.RUNNER_FAILED
+                status == LLM_RUN_STATUS_FAILED -> LlmRunTerminalCause.RUNNER_FAILED
+                else -> LlmRunTerminalCause.NORMAL_COMPLETION
+            },
             runtimeConfigVersionId = start.runtimeConfigVersionId,
             runtimeConfigHash = start.runtimeConfigHash,
         )

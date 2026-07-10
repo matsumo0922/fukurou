@@ -2161,6 +2161,7 @@ private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalo
         CommandEventType.DAEMON_TRIGGER_SKIPPED -> "daemonTriggerSkipped"
         CommandEventType.DAEMON_TRIGGER_LAUNCHED -> "daemonTriggerLaunched"
         CommandEventType.DAEMON_INVOCATION_COMPLETED -> "daemonInvocationCompleted"
+        CommandEventType.LLM_INVOCATION_RECOVERED -> "llmInvocationRecovered"
         CommandEventType.CLI_AUTH_LOGIN_STARTED -> "cliAuthLoginStarted"
         CommandEventType.CLI_AUTH_LOGIN_TOKEN_SUBMITTED -> "cliAuthLoginTokenSubmitted"
         CommandEventType.CLI_AUTH_LOGIN_COMPLETED -> "cliAuthLoginCompleted"

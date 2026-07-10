@@ -237,7 +237,7 @@ class DefaultManualLlmLaunchService(
         } else {
             LlmLaunchReservationStatus.FAILED
         }
-        val finishReason = runnerResult?.status?.name ?: failure?.javaClass?.simpleName
+        val finishReason = runnerResult?.terminalCause?.name ?: failure?.javaClass?.simpleName
 
         finishReservedInvocation(
             invocationId = invocationId,

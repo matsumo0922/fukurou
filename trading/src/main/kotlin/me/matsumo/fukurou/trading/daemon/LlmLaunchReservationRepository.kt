@@ -111,6 +111,14 @@ data class LlmLaunchReservationFinish(
     val finishedAt: Instant,
 )
 
+/** 同時起動を阻止している RUNNING reservation の監査用 identity。 */
+data class LlmActiveLaunchReservation(
+    val invocationId: String,
+    val triggerKind: LlmDaemonTriggerKind,
+    val triggerKey: String,
+    val reservedAt: Instant,
+)
+
 /**
  * 起動予約の試行結果。
  */
@@ -131,6 +139,7 @@ sealed interface LlmLaunchReservationOutcome {
      */
     data class Rejected(
         val reason: LlmLaunchReservationRejectionReason,
+        val activeReservation: LlmActiveLaunchReservation? = null,
     ) : LlmLaunchReservationOutcome
 }
 
@@ -200,7 +209,10 @@ interface LlmLaunchReservationRepository {
     /**
      * stale ではない trading RUNNING 予約が存在するか返す。
      */
-    suspend fun hasFreshRunningReservation(activeSince: Instant): Result<Boolean>
+    suspend fun findBlockingRunningReservation(
+        requestTriggerKind: LlmDaemonTriggerKind,
+        activeSince: Instant,
+    ): Result<LlmActiveLaunchReservation?>
 }
 
 /**
@@ -263,10 +275,18 @@ class InMemoryLlmLaunchReservationRepository(
         }
     }
 
-    override suspend fun hasFreshRunningReservation(activeSince: Instant): Result<Boolean> {
+    override suspend fun findBlockingRunningReservation(
+        requestTriggerKind: LlmDaemonTriggerKind,
+        activeSince: Instant,
+    ): Result<LlmActiveLaunchReservation?> {
         return runCatching {
             mutex.withLock {
-                reservations.any { reservation -> reservation.isFreshTradingRunning(activeSince) }
+                reservations.asSequence()
+                    .filter { reservation -> reservation.isFreshRunning(activeSince) }
+                    .filter { reservation -> requestTriggerKind == LlmDaemonTriggerKind.REFLECTION || reservation.triggerKind != LlmDaemonTriggerKind.REFLECTION }
+                    .sortedWith(compareBy<LlmLaunchReservationRecord> { it.reservedAt }.thenBy { it.invocationId })
+                    .firstOrNull()
+                    ?.toActive()
             }
         }
     }
@@ -292,8 +312,11 @@ class InMemoryLlmLaunchReservationRepository(
             return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.HARD_HALT)
         }
 
-        activeReservation(request)?.let {
-            return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION)
+        activeReservation(request)?.let { active ->
+            return LlmLaunchReservationOutcome.Rejected(
+                LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION,
+                active.toActive(),
+            )
         }
 
         val hourlyCount = countReservationsSince(request.reservedAt.minus(request.hourlyWindow))
@@ -345,6 +368,7 @@ private data class LlmLaunchReservationRecord(
     val finishedAt: Instant?,
     val reason: String?,
 ) {
+    fun toActive(): LlmActiveLaunchReservation = LlmActiveLaunchReservation(invocationId, triggerKind, triggerKey, reservedAt)
     /**
      * stale 判定込みで RUNNING か返す。
      */
