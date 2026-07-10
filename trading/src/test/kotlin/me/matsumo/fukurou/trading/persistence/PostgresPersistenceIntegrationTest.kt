@@ -4672,7 +4672,7 @@ class PostgresPersistenceIntegrationTest {
             ),
         ).getOrThrow()
         assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
-        assertEquals(1, broker.getOpenOrders().getOrThrow().size)
+        assertTrue(broker.getOpenOrders().getOrThrow().isEmpty())
 
         integrityRepository.markDisconnected(
             sessionId,

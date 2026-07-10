@@ -705,6 +705,7 @@ private fun JdbcTransaction.triggerEventTakeProfit(position: Position, context: 
         OrderStatus.CANCELED,
         "market event virtual take profit trigger",
         context.clock,
+        PaperOrderCancelReason.POSITION_CLOSE,
     )
     val fill = context.simulator.marketFill(OrderSide.SELL, position.sizeBtc.toBigDecimal(), context.simulationContext)
         .copy(executedAt = event.receivedAt)
