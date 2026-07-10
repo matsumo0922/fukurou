@@ -269,7 +269,10 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         config = inputs.tradingConfig.gmoPublicClient,
         clock = inputs.clock,
     )
-    val commandRendererConfig = LlmCommandRendererConfig.fromEnvironment(inputs.environment)
+    val commandRendererConfig = LlmCommandRendererConfig.fromEnvironment(
+        environment = inputs.environment,
+        runtimeModels = inputs.tradingConfig.llmModels,
+    )
     val tradingRuntime = TradingRuntimeFactory.connectedPostgres(
         dataSource = inputs.dataSource,
         database = inputs.database,

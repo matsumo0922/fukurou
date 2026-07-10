@@ -8,6 +8,9 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
+import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.reflection.MAX_REFLECTION_LLM_TIMEOUT
+import me.matsumo.fukurou.trading.reflection.MIN_REFLECTION_MIN_INTERVAL
 import java.math.BigDecimal
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -415,6 +418,27 @@ private fun validateTypedConfigConstraints(
             key = "obsidian.writeInterval",
             min = MIN_OBSIDIAN_WRITE_INTERVAL.seconds,
         )
+        requireLongGreaterThanOrEqual(
+            values = values,
+            key = "reflection.minInterval",
+            min = MIN_REFLECTION_MIN_INTERVAL.seconds,
+        )
+        requireIntGreaterThan(values, "reflection.queryLimit", 0)
+        requireIntGreaterThan(values, "reflection.calibrationLookbackDays", 0)
+        requireIntGreaterThan(values, "reflection.recentDecisionLimit", 0)
+        requireIntGreaterThan(values, "reflection.sampleWarningTradeCount", 0)
+        requireStringOneOf(
+            values = values,
+            key = "reflection.promptCandidateProvider",
+            allowedValues = LlmProvider.entries.map { provider -> provider.name }.toSet(),
+        )
+        requireLongBetweenInclusive(
+            values = values,
+            key = "reflection.promptCandidateTimeout",
+            min = 1,
+            max = MAX_REFLECTION_LLM_TIMEOUT.seconds,
+        )
+        requireIntGreaterThan(values, "reflection.promptCandidateMaxAttempts", 0)
         requireIntBetweenInclusive(
             values = values,
             key = "killCriterion.minClosedTrades",
@@ -635,6 +659,22 @@ private fun MutableList<RuntimeConfigValidationError>.requireLongGreaterThanOrEq
     }
 }
 
+private fun MutableList<RuntimeConfigValidationError>.requireStringOneOf(
+    values: Map<String, String>,
+    key: String,
+    allowedValues: Set<String>,
+) {
+    val value = values.getValue(key)
+
+    if (value !in allowedValues) {
+        addTypedConfigError(
+            key = key,
+            code = "runtimeConfig.validation.typedOneOf",
+            params = mapOf("values" to allowedValues.sorted().joinToString(", ")),
+        )
+    }
+}
+
 private fun MutableList<RuntimeConfigValidationError>.addTypedConfigError(
     key: String,
     code: String,
@@ -726,20 +766,21 @@ private fun MutableList<RuntimeConfigValidationError>.addKeySetErrors(
 private fun validateRuntimeValue(item: RuntimeConfigItem, value: String): Result<String> {
     return try {
         val trimmedValue = value.trim()
+        val canonicalValue = canonicalizeRuntimeConfigValue(item, trimmedValue)
 
-        if (trimmedValue.isEmpty()) {
+        if (canonicalValue.isEmpty() && !item.blankAllowed) {
             throw RuntimeConfigValidationException("runtimeConfig.validation.blank")
         }
 
         when (item.valueType) {
-            RuntimeConfigValueType.BOOLEAN -> validateBooleanValue(trimmedValue)
-            RuntimeConfigValueType.INT -> validateIntValue(trimmedValue)
+            RuntimeConfigValueType.BOOLEAN -> validateBooleanValue(canonicalValue)
+            RuntimeConfigValueType.INT -> validateIntValue(canonicalValue)
             RuntimeConfigValueType.DURATION_SECONDS -> validateLongValue(
                 code = "runtimeConfig.validation.invalidDurationSeconds",
-                value = trimmedValue,
+                value = canonicalValue,
             )
-            RuntimeConfigValueType.DECIMAL_STRING -> validateDecimalValue(trimmedValue)
-            RuntimeConfigValueType.STRUCTURED_JSON_LIST -> validateJsonListValue(trimmedValue)
+            RuntimeConfigValueType.DECIMAL_STRING -> validateDecimalValue(canonicalValue)
+            RuntimeConfigValueType.STRUCTURED_JSON_LIST -> validateJsonListValue(canonicalValue)
             RuntimeConfigValueType.ENUM,
             RuntimeConfigValueType.STRING,
             RuntimeConfigValueType.URL,
@@ -748,7 +789,7 @@ private fun validateRuntimeValue(item: RuntimeConfigItem, value: String): Result
             -> Unit
         }
 
-        Result.success(trimmedValue)
+        Result.success(canonicalValue)
     } catch (throwable: Exception) {
         Result.failure(
             RuntimeConfigValueValidationFailure(
@@ -765,6 +806,16 @@ private fun validateRuntimeValue(item: RuntimeConfigItem, value: String): Result
                 ),
             ),
         )
+    }
+}
+
+/**
+ * runtime config 値を value type ごとの保存形式へ正規化する。
+ */
+internal fun canonicalizeRuntimeConfigValue(item: RuntimeConfigItem, value: String): String {
+    return when (item.valueType) {
+        RuntimeConfigValueType.ENUM -> value.uppercase()
+        else -> value
     }
 }
 

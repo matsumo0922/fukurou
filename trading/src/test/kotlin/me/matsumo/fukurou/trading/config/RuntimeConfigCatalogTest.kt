@@ -18,6 +18,9 @@ class RuntimeConfigCatalogTest {
             "FUKUROU_TRADING_SYMBOL" to "BTC",
             "FUKUROU_GMO_PUBLIC_BASE_URL" to "https://example.test/public",
             "FUKUROU_CLAUDE_COMMAND_TEMPLATE" to "docker run claude",
+            "FUKUROU_CLAUDE_MODEL" to "claude-runtime-test",
+            "FUKUROU_CODEX_MODEL" to "codex-runtime-test",
+            "FUKUROU_OBSIDIAN_VAULT_PATH" to "/vault",
             "FUKUROU_PROPOSER_ALLOWED_TOOLS" to "mcp__fukurou-mcp__get_ticker",
             "DB_PASSWORD" to "super-secret-password",
         )
@@ -33,9 +36,35 @@ class RuntimeConfigCatalogTest {
         assertEquals(RuntimeConfigSourceKind.RUNTIME, runtimeItems.getValue("runner.maxToolCallsPerRun").sourceKind)
         assertEquals(RuntimeConfigSourceKind.DEPLOYMENT, deploymentItems.getValue("gmoPublic.baseUrl").sourceKind)
         assertEquals(RuntimeConfigSourceKind.DEPLOYMENT, deploymentItems.getValue("llm.claudeCommandTemplate").sourceKind)
+        assertEquals(RuntimeConfigSourceKind.DEPLOYMENT, deploymentItems.getValue("obsidian.vaultPath").sourceKind)
         assertEquals(RuntimeConfigSourceKind.DEPLOYMENT, deploymentItems.getValue("runner.proposerAllowedTools").sourceKind)
+        assertEquals(RuntimeConfigSourceKind.RUNTIME, runtimeItems.getValue("llm.claudeModel").sourceKind)
+        assertEquals(RuntimeConfigSourceKind.RUNTIME, runtimeItems.getValue("llm.codexModel").sourceKind)
+        assertEquals(RuntimeConfigSourceKind.RUNTIME, runtimeItems.getValue("reflection.minInterval").sourceKind)
+        assertEquals(RuntimeConfigSourceKind.RUNTIME, runtimeItems.getValue("reflection.promptCandidateProvider").sourceKind)
+        assertTrue(
+            runtimeItems.keys.containsAll(
+                setOf(
+                    "reflection.minInterval",
+                    "reflection.queryLimit",
+                    "reflection.calibrationLookbackDays",
+                    "reflection.recentDecisionLimit",
+                    "reflection.sampleWarningTradeCount",
+                    "reflection.promptCandidateProvider",
+                    "reflection.promptCandidateTimeout",
+                    "reflection.promptCandidateMaxAttempts",
+                ),
+            ),
+        )
         assertEquals("https://example.test/public", deploymentItems.getValue("gmoPublic.baseUrl").effectiveValue)
         assertFalse(deploymentItems.getValue("trading.mode").editable)
+        assertFalse(deploymentItems.getValue("obsidian.vaultPath").editable)
+        assertTrue(runtimeItems.getValue("llm.claudeModel").editable)
+        assertTrue(runtimeItems.getValue("llm.claudeModel").blankAllowed)
+        assertTrue(runtimeItems.getValue("llm.codexModel").blankAllowed)
+        assertFalse(runtimeItems.getValue("reflection.promptCandidateProvider").blankAllowed)
+        assertEquals("claude-runtime-test", runtimeItems.getValue("llm.claudeModel").effectiveValue)
+        assertEquals("codex-runtime-test", runtimeItems.getValue("llm.codexModel").effectiveValue)
         assertTrue(runtimeItems.getValue("safety.maxRiskPerTradeRatio").editable)
         assertEquals(RuntimeConfigApplyMode.NEXT_RESTART, runtimeItems.getValue("safety.maxRiskPerTradeRatio").applyMode)
         assertEquals(

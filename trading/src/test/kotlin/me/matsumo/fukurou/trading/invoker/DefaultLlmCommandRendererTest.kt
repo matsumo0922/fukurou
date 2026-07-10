@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.invoker
 
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.config.LlmModelConfig
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
@@ -45,6 +46,31 @@ class DefaultLlmCommandRendererTest {
         assertNull(unsetConfig.codexPersistentHome)
 
         Files.deleteIfExists(persistentCodexHome)
+    }
+
+    @Test
+    fun configFromEnvironment_usesRuntimeModelsAheadOfLegacyEnvironment() {
+        val environment = mapOf(
+            FUKUROU_CLAUDE_MODEL_ENV to "claude-legacy-env-model",
+            FUKUROU_CODEX_MODEL_ENV to "codex-legacy-env-model",
+        )
+
+        val runtimeConfig = LlmCommandRendererConfig.fromEnvironment(
+            environment = environment,
+            runtimeModels = LlmModelConfig(
+                claudeModel = "claude-runtime-model",
+                codexModel = "codex-runtime-model",
+            ),
+        )
+        val unsetRuntimeConfig = LlmCommandRendererConfig.fromEnvironment(
+            environment = environment,
+            runtimeModels = LlmModelConfig(),
+        )
+
+        assertEquals("claude-runtime-model", runtimeConfig.claudeModel)
+        assertEquals("codex-runtime-model", runtimeConfig.codexModel)
+        assertNull(unsetRuntimeConfig.claudeModel)
+        assertNull(unsetRuntimeConfig.codexModel)
     }
 
     @Test

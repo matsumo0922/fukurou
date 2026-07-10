@@ -3,10 +3,13 @@
 package me.matsumo.fukurou.trading.config
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.invoker.FUKUROU_CLAUDE_MODEL_ENV
+import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_MODEL_ENV
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.runner.FUKUROU_FALSIFIER_ALLOWED_TOOLS_ENV
 import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_JAR_PATH_ENV
@@ -16,6 +19,13 @@ import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_SERVER_NAME_ENV
 import me.matsumo.fukurou.trading.runner.FUKUROU_PROPOSER_ALLOWED_TOOLS_ENV
 import me.matsumo.fukurou.trading.runner.OneShotRunnerCliConfig
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
+
+/**
+ * catalog から明示的に退役し、bootstrap 時に旧 active snapshot から除去する runtime key。
+ */
+internal val retiredRuntimeConfigKeys = setOf(
+    "obsidian.vaultPath",
+)
 
 /**
  * runtime config の code-owned catalog を提供する。
@@ -297,6 +307,24 @@ object RuntimeConfigCatalog {
                     safetyTier = RuntimeConfigSafetyTier.GUARDED,
                 ),
                 runtimeItem(
+                    key = "llm.claudeModel",
+                    legacyEnvName = FUKUROU_CLAUDE_MODEL_ENV,
+                    valueType = RuntimeConfigValueType.STRING,
+                    defaultValue = defaults.config.llmModels.claudeModel.orEmpty(),
+                    effectiveValue = config.llmModels.claudeModel.orEmpty(),
+                    unit = null,
+                    blankAllowed = true,
+                ),
+                runtimeItem(
+                    key = "llm.codexModel",
+                    legacyEnvName = FUKUROU_CODEX_MODEL_ENV,
+                    valueType = RuntimeConfigValueType.STRING,
+                    defaultValue = defaults.config.llmModels.codexModel.orEmpty(),
+                    effectiveValue = config.llmModels.codexModel.orEmpty(),
+                    unit = null,
+                    blankAllowed = true,
+                ),
+                runtimeItem(
                     key = "daemon.enabled",
                     legacyEnvName = FUKUROU_LLM_DAEMON_ENABLED_ENV,
                     valueType = RuntimeConfigValueType.BOOLEAN,
@@ -431,20 +459,76 @@ object RuntimeConfigCatalog {
                     unit = null,
                 ),
                 runtimeItem(
-                    key = "obsidian.vaultPath",
-                    legacyEnvName = FUKUROU_OBSIDIAN_VAULT_PATH_ENV,
-                    valueType = RuntimeConfigValueType.STRING,
-                    defaultValue = defaults.config.obsidian.vaultPath,
-                    effectiveValue = config.obsidian.vaultPath,
-                    unit = null,
-                ),
-                runtimeItem(
                     key = "obsidian.writeInterval",
                     legacyEnvName = FUKUROU_OBSIDIAN_WRITE_INTERVAL_SECONDS_ENV,
                     valueType = RuntimeConfigValueType.DURATION_SECONDS,
                     defaultValue = defaults.config.obsidian.writeInterval.seconds.toString(),
                     effectiveValue = config.obsidian.writeInterval.seconds.toString(),
                     unit = "seconds",
+                ),
+                runtimeItem(
+                    key = "reflection.minInterval",
+                    legacyEnvName = FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS_ENV,
+                    valueType = RuntimeConfigValueType.DURATION_SECONDS,
+                    defaultValue = defaults.config.reflection.minInterval.seconds.toString(),
+                    effectiveValue = config.reflection.minInterval.seconds.toString(),
+                    unit = "seconds",
+                ),
+                runtimeItem(
+                    key = "reflection.queryLimit",
+                    legacyEnvName = FUKUROU_REFLECTION_QUERY_LIMIT_ENV,
+                    valueType = RuntimeConfigValueType.INT,
+                    defaultValue = defaults.config.reflection.queryLimit.toString(),
+                    effectiveValue = config.reflection.queryLimit.toString(),
+                    unit = "rows",
+                ),
+                runtimeItem(
+                    key = "reflection.calibrationLookbackDays",
+                    legacyEnvName = FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS_ENV,
+                    valueType = RuntimeConfigValueType.INT,
+                    defaultValue = defaults.config.reflection.calibrationLookbackDays.toString(),
+                    effectiveValue = config.reflection.calibrationLookbackDays.toString(),
+                    unit = "days",
+                ),
+                runtimeItem(
+                    key = "reflection.recentDecisionLimit",
+                    legacyEnvName = FUKUROU_REFLECTION_RECENT_DECISION_LIMIT_ENV,
+                    valueType = RuntimeConfigValueType.INT,
+                    defaultValue = defaults.config.reflection.recentDecisionLimit.toString(),
+                    effectiveValue = config.reflection.recentDecisionLimit.toString(),
+                    unit = "decisions",
+                ),
+                runtimeItem(
+                    key = "reflection.sampleWarningTradeCount",
+                    legacyEnvName = FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT_ENV,
+                    valueType = RuntimeConfigValueType.INT,
+                    defaultValue = defaults.config.reflection.sampleWarningTradeCount.toString(),
+                    effectiveValue = config.reflection.sampleWarningTradeCount.toString(),
+                    unit = "trades",
+                ),
+                runtimeItem(
+                    key = "reflection.promptCandidateProvider",
+                    legacyEnvName = FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER_ENV,
+                    valueType = RuntimeConfigValueType.ENUM,
+                    defaultValue = defaults.config.reflection.promptCandidateProvider.name,
+                    effectiveValue = config.reflection.promptCandidateProvider.name,
+                    unit = null,
+                ),
+                runtimeItem(
+                    key = "reflection.promptCandidateTimeout",
+                    legacyEnvName = FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS_ENV,
+                    valueType = RuntimeConfigValueType.DURATION_SECONDS,
+                    defaultValue = defaults.config.reflection.promptCandidateTimeout.seconds.toString(),
+                    effectiveValue = config.reflection.promptCandidateTimeout.seconds.toString(),
+                    unit = "seconds",
+                ),
+                runtimeItem(
+                    key = "reflection.promptCandidateMaxAttempts",
+                    legacyEnvName = FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS_ENV,
+                    valueType = RuntimeConfigValueType.INT,
+                    defaultValue = defaults.config.reflection.promptCandidateMaxAttemptsPerPeriod.toString(),
+                    effectiveValue = config.reflection.promptCandidateMaxAttemptsPerPeriod.toString(),
+                    unit = "attempts",
                 ),
                 runtimeItem(
                     key = "killCriterion.minClosedTrades",
@@ -579,6 +663,14 @@ object RuntimeConfigCatalog {
                     unit = null,
                 ),
                 deploymentItem(
+                    key = "obsidian.vaultPath",
+                    legacyEnvName = FUKUROU_OBSIDIAN_VAULT_PATH_ENV,
+                    valueType = RuntimeConfigValueType.STRING,
+                    defaultValue = defaults.config.obsidian.vaultPath,
+                    effectiveValue = config.obsidian.vaultPath,
+                    unit = null,
+                ),
+                deploymentItem(
                     key = "runner.repositoryRoot",
                     legacyEnvName = FUKUROU_REPOSITORY_ROOT_ENV,
                     valueType = RuntimeConfigValueType.STRING,
@@ -658,22 +750,6 @@ object RuntimeConfigCatalog {
                     valueType = RuntimeConfigValueType.STRING_LIST,
                     defaultValue = defaults.rendererConfig.codexCommandTemplate.joinToString(" "),
                     effectiveValue = deploymentValues.rendererConfig.codexCommandTemplate.joinToString(" "),
-                    unit = null,
-                ),
-                deploymentItem(
-                    key = "llm.claudeModel",
-                    legacyEnvName = FUKUROU_CLAUDE_MODEL_ENV,
-                    valueType = RuntimeConfigValueType.STRING,
-                    defaultValue = null,
-                    effectiveValue = deploymentValues.rendererConfig.claudeModel,
-                    unit = null,
-                ),
-                deploymentItem(
-                    key = "llm.codexModel",
-                    legacyEnvName = FUKUROU_CODEX_MODEL_ENV,
-                    valueType = RuntimeConfigValueType.STRING,
-                    defaultValue = null,
-                    effectiveValue = deploymentValues.rendererConfig.codexModel,
                     unit = null,
                 ),
                 deploymentItem(
@@ -760,6 +836,7 @@ object RuntimeConfigCatalog {
         effectiveValue: String?,
         unit: String?,
         safetyTier: RuntimeConfigSafetyTier = RuntimeConfigSafetyTier.STANDARD,
+        blankAllowed: Boolean = false,
     ): RuntimeConfigItem {
         return configItem(
             key = key,
@@ -772,6 +849,7 @@ object RuntimeConfigCatalog {
             safetyTier = safetyTier,
             editable = true,
             applyMode = RuntimeConfigApplyMode.NEXT_RESTART,
+            blankAllowed = blankAllowed,
         )
     }
 
@@ -795,6 +873,7 @@ object RuntimeConfigCatalog {
             safetyTier = safetyTier,
             editable = false,
             applyMode = RuntimeConfigApplyMode.PROCESS_RESTART,
+            blankAllowed = false,
         )
     }
 
@@ -828,6 +907,7 @@ object RuntimeConfigCatalog {
         safetyTier: RuntimeConfigSafetyTier,
         editable: Boolean,
         applyMode: RuntimeConfigApplyMode,
+        blankAllowed: Boolean,
     ): RuntimeConfigItem {
         return RuntimeConfigItem(
             key = key,
@@ -844,6 +924,7 @@ object RuntimeConfigCatalog {
             safetyTier = safetyTier,
             labelKey = "config.item.$key.label",
             descriptionKey = "config.item.$key.description",
+            blankAllowed = blankAllowed,
         )
     }
 }
@@ -909,6 +990,7 @@ data class RuntimeConfigGroup(
  * @param safetyTier 安全上の分類
  * @param labelKey UI label の i18n key
  * @param descriptionKey UI description の i18n key
+ * @param blankAllowed runtime candidate に空文字を保存できるか
  */
 @Serializable
 data class RuntimeConfigItem(
@@ -926,6 +1008,8 @@ data class RuntimeConfigItem(
     val safetyTier: RuntimeConfigSafetyTier,
     val labelKey: String,
     val descriptionKey: String,
+    @Transient
+    val blankAllowed: Boolean = false,
 )
 
 /**
@@ -1134,8 +1218,6 @@ private const val FUKUROU_REPOSITORY_ROOT_ENV = "FUKUROU_REPOSITORY_ROOT"
 private const val FUKUROU_LLM_WORKING_DIRECTORY_ENV = "FUKUROU_LLM_WORKING_DIRECTORY"
 private const val FUKUROU_CLAUDE_COMMAND_TEMPLATE_ENV = "FUKUROU_CLAUDE_COMMAND_TEMPLATE"
 private const val FUKUROU_CODEX_COMMAND_TEMPLATE_ENV = "FUKUROU_CODEX_COMMAND_TEMPLATE"
-private const val FUKUROU_CLAUDE_MODEL_ENV = "FUKUROU_CLAUDE_MODEL"
-private const val FUKUROU_CODEX_MODEL_ENV = "FUKUROU_CODEX_MODEL"
 private const val FUKUROU_CLAUDE_COMMON_ARGS_ENV = "FUKUROU_CLAUDE_COMMON_ARGS"
 private const val FUKUROU_CODEX_COMMON_ARGS_ENV = "FUKUROU_CODEX_COMMON_ARGS"
 private const val FUKUROU_CODEX_FALSIFIER_ARGS_ENV = "FUKUROU_CODEX_FALSIFIER_ARGS"

@@ -76,7 +76,7 @@ FUKUROU_LLM_WORKING_DIRECTORY=/tmp/fukurou-llm \
 java -cp /app/app.jar me.matsumo.fukurou.trading.runner.OneShotRunnerMainKt
 ```
 
-LLM CLI / MCP 登録は env から差し替えられる。server 名、tool allowlist、model 名、sandbox wrapper は renderer に直書きせず、次の設定で渡す。
+LLM CLI / MCP 登録の deployment boundary は env から差し替えられる。server 名、tool allowlist、sandbox wrapper は renderer に直書きせず、次の設定で渡す。model override と daemon cadence は WebUI `/app/config` の Runtime group で管理する。
 
 ```sh
 FUKUROU_MCP_SERVER_NAME=fukurou-mcp
@@ -84,16 +84,11 @@ FUKUROU_MCP_SERVER_COMMAND=java
 FUKUROU_MCP_SERVER_ARGS='-jar ${mcpJarPath}'
 FUKUROU_CLAUDE_COMMAND_TEMPLATE=claude
 FUKUROU_CODEX_COMMAND_TEMPLATE=codex
-FUKUROU_CLAUDE_MODEL=
-FUKUROU_CODEX_MODEL=
 FUKUROU_PROPOSER_ALLOWED_TOOLS=
 FUKUROU_FALSIFIER_ALLOWED_TOOLS=
 FUKUROU_CLAUDE_COMMON_ARGS=
 FUKUROU_CODEX_COMMON_ARGS=
 FUKUROU_CODEX_FALSIFIER_ARGS=
-FUKUROU_LLM_DAEMON_ENABLED=false
-FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS=900
-FUKUROU_LLM_HOLDING_CHECK_SECONDS=900
 FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR=6
 FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY=96
 FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC=
@@ -156,7 +151,7 @@ Reflection Runner の PromptCandidates は完了済み前週を対象に `REFLEC
 
 ## config
 
-runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB bootstrap が `runtime_config_versions` / `runtime_config_values` に初期 active version を作成する。active snapshot に不足する code-owned catalog key がある場合、bootstrap は既存値を保持した complete snapshot を新しい active version として作成する。key の削除は無効化手段ではなく、bootstrap が catalog default で復元する。unknown key、不正値、validation failure は fail closed する。DB-backed runtime では active DB config が `RUNTIME` key の正本で、legacy `FUKUROU_*` env より優先する。`.env` は secret / deployment / bootstrap 値に使う。主な legacy env 名:
+runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB bootstrap が `runtime_config_versions` / `runtime_config_values` に初期 active version を作成する。active snapshot に不足する code-owned catalog key がある場合、bootstrap は既存値を保持した complete snapshot を新しい active version として作成する。明示的に退役した key は新しい active version から除去し、それ以外の unknown key、不正値、validation failure は fail closed する。DB-backed runtime では active DB config が `RUNTIME` key の正本で、legacy `FUKUROU_*` env より優先する。`.env` は secret / deployment / bootstrap 値に使う。Reflection Runner 設定と LLM model override は `RUNTIME`、Obsidian vault path は container mount と対応する `DEPLOYMENT` である。主な legacy env 名:
 
 | env | 既定 | 用途 |
 | --- | --- | --- |
@@ -186,7 +181,12 @@ runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB 
 | `FUKUROU_LLM_PRE_FILTER_ENABLED` | `false` | flat heartbeat / holding dense check の full LLM 起動前に Claude Haiku pre-filter を使うかどうか |
 | `FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC` | 未指定 | `id\|name\|eventAtUtc\|beforeMinutes\|afterMinutes` を `;` 区切りで列挙 |
 | `FUKUROU_OBSIDIAN_ENABLED` | `false` | Obsidian Writer / Reflection Runner の有効化 |
+| `FUKUROU_OBSIDIAN_VAULT_PATH` | `/vault` | Obsidian vault の container 内 mount path。`DEPLOYMENT` read-only |
 | `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` | `3600` | Reflection Runner loop の最小間隔 |
+| `FUKUROU_REFLECTION_QUERY_LIMIT` | `1000` | 1 tick で読む最大行数 |
+| `FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS` | `180` | confidence calibration の参照日数 |
+| `FUKUROU_REFLECTION_RECENT_DECISION_LIMIT` | `50` | Recent Decisions の最大件数 |
+| `FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT` | `30` | sample size warning の closed trade 件数 |
 | `FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER` | `CLAUDE` | 完了済み前週の PromptCandidates に使う LLM provider |
 | `FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS` | `60` | PromptCandidates の LLM timeout。120 秒以下だけ許可 |
 | `FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS` | `2` | 同じ対象週の PromptCandidates LLM 最大試行回数 |
@@ -196,15 +196,15 @@ runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB 
 | `FUKUROU_MCP_SERVER_ARGS` | 未指定 | MCP server 起動引数。未指定時は `-jar <FUKUROU_MCP_JAR_PATH>` |
 | `FUKUROU_CLAUDE_COMMAND_TEMPLATE` | `claude` | Claude CLI 起動 command template |
 | `FUKUROU_CODEX_COMMAND_TEMPLATE` | `codex` | Codex CLI 起動 command template。sandbox wrapper prefix を含められる |
-| `FUKUROU_CLAUDE_MODEL` | 未指定 | Claude CLI に渡す model 名 |
-| `FUKUROU_CODEX_MODEL` | 未指定 | Codex CLI に渡す model 名 |
+| `FUKUROU_CLAUDE_MODEL` | 未指定 | Claude CLI に渡す runtime model override |
+| `FUKUROU_CODEX_MODEL` | 未指定 | Codex CLI に渡す runtime model override |
 | `FUKUROU_MCP_ALLOWED_TOOLS` | runner が設定 | MCP server instance 内で許可する short tool 名。通常は手動設定しない |
 
 SafetyFloor 系値と fallback fee / spread は、既定値と同等またはより保守的な値だけ許可する。GMO Public REST の rate-limit も既定 10 req/s / burst 10 以下だけ許可する。GMO Public REST の timeout / retry backoff も runtime config で管理する。GMO `/public/v1/symbols` が取得できる場合、paper 手数料は取引所 rule を優先する。
 
 runner 上限も保守側の override だけを許可する。総 tool call は 48 以下、trade 系 tool call は 3 以下、timeout は 180 秒以下、起動数は 6 回/時・96 回/日以下だけを受け入れる。tool call 上限は同じ `decision_run_id` の `command_event_log` と MCP server instance 内 counter を合算して、Proposer / Falsifier の phase をまたいで強制する。上限超過時は tool error を返し、no-trade audit を残す。
 
-`GET /ops/runtime-config` は code-owned `RuntimeConfigCatalog` から Runtime / Deployment / Secrets の実効設定、version 履歴、warning を返す。Runtime group は active DB snapshot から解決した typed config、Deployment group は `FUKUROU_GMO_PUBLIC_BASE_URL`、LLM command template、MCP server command / args / tool allowlist などの deploy 境界、Secrets group は DB password や Cloudflare token などの設定有無を表す。active DB snapshot が不正または一時的に読めない場合、Ktor、WebUI、runtime config admin API は起動し、取引 runtime、manual trigger、daemon worker は fail closed する。valid な active version へ戻ると、runtime config warning、`/health/ready`、manual trigger gate は現在の active snapshot に基づいて再評価される。version 履歴が一時的に読めない場合、API は empty versions と warning を返し、catalog 表示を継続する。`/ops/runtime-config/drafts` は active または指定 version を基準に draft を作成し、`/ops/runtime-config/drafts/{versionId}/validate` は保存済み draft を現在の catalog / typed config で検証する。`/ops/runtime-config/drafts/{versionId}/activate` と `/ops/runtime-config/versions/{versionId}/rollback` は保存済み候補を再検証してから active version を切り替える。draft と inactive version は active version と newest 20 draft / newest 20 inactive version を残す。保守側へ境界を締める code を deploy する場合、active runtime config は deploy 前に新しい境界内の値へ更新する。`/app/config` は Runtime group の draft 編集、diff preview、validation、activate、rollback を扱い、Deployment group を read-only で表示する。secret 値は API response と画面のどちらにも出さない。
+`GET /ops/runtime-config` は code-owned `RuntimeConfigCatalog` から Runtime / Deployment / Secrets の実効設定、version 履歴、warning を返す。Runtime group は active DB snapshot から解決した typed config で、Reflection Runner 設定と Claude / Codex model override も含む。Deployment group は `FUKUROU_GMO_PUBLIC_BASE_URL`、Obsidian vault path、LLM command template、MCP server command / args / tool allowlist などの deploy 境界、Secrets group は DB password や Cloudflare token などの設定有無を表す。active DB snapshot が不正または一時的に読めない場合、Ktor、WebUI、runtime config admin API は起動し、取引 runtime、manual trigger、daemon worker は fail closed する。valid な active version へ戻ると、runtime config warning、`/health/ready`、manual trigger gate は現在の active snapshot に基づいて再評価される。version 履歴が一時的に読めない場合、API は empty versions と warning を返し、catalog 表示を継続する。`/ops/runtime-config/drafts` は active または指定 version を基準に draft を作成し、`/ops/runtime-config/drafts/{versionId}/validate` は保存済み draft を現在の catalog / typed config で検証する。`/ops/runtime-config/drafts/{versionId}/activate` と `/ops/runtime-config/versions/{versionId}/rollback` は保存済み候補を再検証してから active version を切り替える。draft と inactive version は active version と newest 20 draft / newest 20 inactive version を残す。保守側へ境界を締める code を deploy する場合、active runtime config は deploy 前に新しい境界内の値へ更新する。`/app/config` は Runtime group の draft 編集、diff preview、validation、activate、rollback を扱い、Deployment group を read-only で表示する。Runtime group の変更は process restart 後に適用する。secret 値は API response と画面のどちらにも出さない。
 
 Deployment group の env は `/ops/runtime-config` と `/app/config` に raw value として表示されるため、command template、common args、working directory、repository root、tool allowlist には secret を入れない。
 

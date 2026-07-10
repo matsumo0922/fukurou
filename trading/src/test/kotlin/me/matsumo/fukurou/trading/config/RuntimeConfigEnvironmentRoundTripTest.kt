@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.config
 import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRateLimitConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
+import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
 import java.math.BigDecimal
@@ -31,6 +32,8 @@ class RuntimeConfigEnvironmentRoundTripTest {
         assertEquals("123456.7800", environment.getValue("FUKUROU_PAPER_INITIAL_CASH_JPY"))
         assertEquals("0.0010", environment.getValue("FUKUROU_FALLBACK_TAKER_FEE_RATE"))
         assertEquals("240", environment.getValue("FUKUROU_LLM_RUN_TIMEOUT_SECONDS"))
+        assertEquals("claude-runtime-test", environment.getValue("FUKUROU_CLAUDE_MODEL"))
+        assertEquals("codex-runtime-test", environment.getValue("FUKUROU_CODEX_MODEL"))
         assertEquals(
             """[{"eventId":"cpi-20260703","eventName":"CPI","eventAt":"2026-07-03T12:30:00Z","blackoutBeforeSeconds":30,"blackoutAfterSeconds":90}]""",
             environment.getValue("FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC"),
@@ -129,10 +132,24 @@ private fun nonDefaultRuntimeConfig(): TradingBotConfig {
             entryFillCooldown = Duration.ofSeconds(1200),
             preFilterEnabled = true,
         ),
+        llmModels = LlmModelConfig(
+            claudeModel = "claude-runtime-test",
+            codexModel = "codex-runtime-test",
+        ),
         obsidian = config.obsidian.copy(
             enabled = true,
             vaultPath = "/tmp/fukurou-roundtrip-vault",
             writeInterval = Duration.ofMinutes(6),
+        ),
+        reflection = config.reflection.copy(
+            minInterval = Duration.ofHours(2),
+            queryLimit = 500,
+            calibrationLookbackDays = 90,
+            recentDecisionLimit = 25,
+            sampleWarningTradeCount = 20,
+            promptCandidateProvider = LlmProvider.CODEX,
+            promptCandidateTimeout = Duration.ofSeconds(90),
+            promptCandidateMaxAttemptsPerPeriod = 3,
         ),
         killCriterion = config.killCriterion.copy(
             minClosedTrades = 80,
