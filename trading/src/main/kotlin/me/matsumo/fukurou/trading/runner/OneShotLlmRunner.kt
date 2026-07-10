@@ -247,6 +247,7 @@ data class OneShotRunnerResult(
  * @param idGenerator invocation / tool call ID generator
  * @param logger 人間向け runner log 出力
  */
+@Suppress("LargeClass")
 class OneShotLlmRunner(
     private val tradingRuntime: TradingRuntime,
     private val tradingConfig: TradingBotConfig,
@@ -324,6 +325,7 @@ class OneShotLlmRunner(
                 start = llmRunStart,
                 status = result.status.name,
                 cause = null,
+                terminalCause = result.terminalCause,
             )
 
             Result.success(result)
@@ -626,6 +628,7 @@ class OneShotLlmRunner(
             decision = decision,
             intent = intent,
             tradeResult = tradeResult,
+            terminalCause = classifyOneShotTerminalCause(status, tradeResult),
         )
     }
 
@@ -962,6 +965,7 @@ private class OneShotRunAuditRecorder(
         start: LlmRunStart,
         status: String,
         cause: Throwable?,
+        terminalCause: LlmRunTerminalCause? = null,
         llmProvider: String? = null,
     ): Result<Unit> {
         val finish = LlmRunFinish(
@@ -973,7 +977,7 @@ private class OneShotRunAuditRecorder(
             startedAt = start.startedAt,
             finishedAt = clock.instant(),
             errorMessage = cause?.persistedErrorMessage(llmProvider),
-            terminalCause = when {
+            terminalCause = terminalCause ?: when {
                 cause is CancellationException -> LlmRunTerminalCause.CALLER_CANCELLED
                 cause is LlmInvocationTimedOutException -> LlmRunTerminalCause.TIMED_OUT
                 cause != null -> LlmRunTerminalCause.RUNNER_FAILED
@@ -1681,6 +1685,21 @@ private val FALSIFIER_FORBIDDEN_TOOL_NAMES = setOf(
 
 private fun mcpToolName(serverName: String, toolName: String): String {
     return "mcp__${serverName}__$toolName"
+}
+
+private fun classifyOneShotTerminalCause(
+    status: OneShotRunnerStatus,
+    tradeResult: PaperTradeResult?,
+): LlmRunTerminalCause {
+    if (tradeResult?.safetyViolation != null) return LlmRunTerminalCause.SAFETY_DENIED
+
+    return when (status) {
+        OneShotRunnerStatus.NO_TRADE_DECISION,
+        OneShotRunnerStatus.NO_TRADE_AUDITED,
+        OneShotRunnerStatus.LAUNCH_REJECTED,
+        -> LlmRunTerminalCause.NO_TRADE
+        else -> LlmRunTerminalCause.NORMAL_COMPLETION
+    }
 }
 
 private fun String.isMcpToolNameFor(serverName: String): Boolean {

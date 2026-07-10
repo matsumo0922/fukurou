@@ -2280,6 +2280,7 @@ export interface components {
             safetyMessageJa?: string | null;
             finalReason?: string | null;
             errorMessage?: string | null;
+            terminalCause?: string | null;
             orderCount: number;
             executionCount: number;
             hasProcessFailure: boolean;

@@ -749,16 +749,16 @@ describe("App", () => {
     render(<App />);
 
     const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
-    const timeoutRow = within(runList).getByText("provider timed out after 120 seconds").closest("article");
-    const authRow = within(runList).getByText("provider authentication failed").closest("article");
-    const interruptedRow = within(runList).getByText("previous process/container shutdown recovery").closest("article");
+    const timeoutRow = within(runList).getByText("timed out").closest("article");
+    const authRow = within(runList).getByText("runner failed").closest("article");
+    const interruptedRow = within(runList).getByText("interrupted by restart").closest("article");
     expect(timeoutRow).not.toBeNull();
     expect(authRow).not.toBeNull();
     expect(interruptedRow).not.toBeNull();
-    expect(within(timeoutRow!).getByText(/caller_failed/)).toBeInTheDocument();
+    expect(within(timeoutRow!).getByText("timed out")).toBeInTheDocument();
     expect(within(timeoutRow!).getByLabelText("This run also has a process failure")).toBeInTheDocument();
-    expect(within(authRow!).getByText(/caller_failed/)).toBeInTheDocument();
-    expect(within(runList).getByText("market_conditions_not_met")).toBeInTheDocument();
+    expect(within(authRow!).getByText("runner failed")).toBeInTheDocument();
+    expect(within(runList).getByText("no trade")).toBeInTheDocument();
 
     fireEvent.click(within(timeoutRow!).getByRole("button", { name: /run-timeout/ }));
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
@@ -1931,6 +1931,7 @@ function terminalDecisionRunsResponse() {
         startedAt: "2026-07-10T00:47:27.000Z",
         finalReason: "caller_failed",
         errorMessage: "provider timed out after 120 seconds",
+        terminalCause: "TIMED_OUT",
       },
       {
         ...base,
@@ -1939,6 +1940,7 @@ function terminalDecisionRunsResponse() {
         startedAt: "2026-07-10T00:46:27.000Z",
         finalReason: "caller_failed",
         errorMessage: "provider authentication failed",
+        terminalCause: "RUNNER_FAILED",
       },
       {
         ...base,
@@ -1947,6 +1949,7 @@ function terminalDecisionRunsResponse() {
         startedAt: "2026-07-10T00:45:27.000Z",
         finalReason: null,
         errorMessage: "previous process/container shutdown recovery",
+        terminalCause: "RESTART_INTERRUPTED",
       },
       {
         ...base,
@@ -1956,6 +1959,7 @@ function terminalDecisionRunsResponse() {
         startedAt: "2026-07-10T00:44:27.000Z",
         finalReason: "market_conditions_not_met",
         errorMessage: null,
+        terminalCause: "NO_TRADE",
         hasProcessFailure: false,
       },
     ],

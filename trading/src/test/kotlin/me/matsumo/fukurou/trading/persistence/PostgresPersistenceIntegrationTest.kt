@@ -66,6 +66,7 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -2498,6 +2499,7 @@ class PostgresPersistenceIntegrationTest {
 
         bootstrap.ensureSchema().getOrThrow()
         val repository = ExposedLlmRunRepository(database)
+        val reservationRepository = ExposedLlmLaunchReservationRepository(database)
         val staleStartedAt = fixedInstant().minus(recoveryThreshold).minusSeconds(1)
         val freshStartedAt = fixedInstant().minus(recoveryThreshold).plusSeconds(1)
         val alreadyFinishedAt = fixedInstant().minusSeconds(1_200)
@@ -2508,6 +2510,13 @@ class PostgresPersistenceIntegrationTest {
                 symbol = TradingSymbol.BTC,
                 triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
                 startedAt = staleStartedAt,
+            ),
+        ).getOrThrow()
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "stale-running-run",
+                config = TradingBotConfig.fromEnvironment(emptyMap()).runner,
+                reservedAt = staleStartedAt,
             ),
         ).getOrThrow()
         repository.insertRunning(
@@ -2537,11 +2546,18 @@ class PostgresPersistenceIntegrationTest {
         val staleRun = requireNotNull(repository.findByInvocationId("stale-running-run").getOrThrow())
         val freshRun = requireNotNull(repository.findByInvocationId("fresh-running-run").getOrThrow())
         val alreadyFinishedRun = requireNotNull(repository.findByInvocationId("already-finished-run").getOrThrow())
+        val recoveredEvent = ExposedCommandEventLog(database)
+            .findEvents(limit = 20, eventType = CommandEventType.LLM_INVOCATION_RECOVERED)
+            .getOrThrow()
+            .single()
 
         assertEquals(listOf(1), recoveredCounts)
         assertEquals(LLM_RUN_STATUS_FAILED, staleRun.status)
         assertEquals(fixedInstant(), staleRun.finishedAt)
         assertEquals(STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE, staleRun.errorMessage)
+        assertEquals(LlmRunTerminalCause.RESTART_INTERRUPTED, staleRun.terminalCause)
+        assertEquals("stale-running-run", recoveredEvent.decisionRunContext.decisionRunId)
+        assertTrue(recoveredEvent.payload.contains("reservationRecovered"))
         assertEquals(LLM_RUN_STATUS_RUNNING, freshRun.status)
         assertNull(freshRun.finishedAt)
         assertNull(freshRun.errorMessage)

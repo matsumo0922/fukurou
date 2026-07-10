@@ -75,6 +75,7 @@ class DecisionRunRouteTest {
         assertEquals(HttpStatusCode.OK, filteredResponse.status)
         val filteredPage = Json.decodeFromString<OpsDecisionRunsResponse>(filteredResponse.body())
         assertEquals(listOf("run-old"), filteredPage.runs.map { run -> run.invocationId })
+        assertEquals("RESTART_INTERRUPTED", filteredPage.runs.single().terminalCause)
         assertEquals(DecisionRunFilter.ACTION_REQUIRED, repository.lastFilter)
 
         val cappedResponse = client.get("/ops/runs?filter=WAITING")
@@ -169,6 +170,7 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
         startedAt = Instant.parse("2026-07-10T00:47:27Z"),
         finishedAt = Instant.parse("2026-07-10T00:20:00Z"),
         errorMessage = "previous process/container shutdown recovery",
+        terminalCause = me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RESTART_INTERRUPTED,
         action = null,
         reasonJa = null,
         falsificationVerdict = null,

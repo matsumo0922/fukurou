@@ -198,6 +198,7 @@ function RunRow({
   selectedChanged: (button: HTMLButtonElement) => void;
 }) {
   const { locale, t } = useI18n();
+  const primaryReason = runSummaryPrimaryReason(run, t);
   const order = run.order;
   const detailTitle = order ? `${order.side} ${order.orderType}` : run.action ?? run.status;
 
@@ -424,6 +425,7 @@ function RunDetailContent({
           </p>
         ) : null}
         <FactGrid facts={[
+          [t("activity.runs.label.terminalCause"), terminalCauseLabel(detail.summary.terminalCause, t)],
           [t("activity.runs.label.action"), decision?.action],
           [t("activity.runs.label.provider"), decision?.provider],
           [t("activity.runs.label.parentPlan"), intent?.parentTradePlanId],
@@ -711,6 +713,26 @@ function orderExplanation(
   return locale === "ja"
     ? `${order.orderType} 条件で ${order.sizeBtc} BTC の paper 約定を待っています。`
     : `Waiting for a paper fill of ${order.sizeBtc} BTC under the ${order.orderType} condition.`;
+}
+
+function runSummaryPrimaryReason(run: OpsDecisionRunSummaryResponse, t: Translator): string | null {
+  const terminalCause = terminalCauseLabel(run.terminalCause, t);
+  if (terminalCause) return terminalCause;
+
+  if (run.outcome === "FAILED" || run.outcome === "ACTION_REQUIRED") {
+    return run.errorMessage ?? run.finalReason ?? run.safetyMessageJa ?? run.reasonJa ?? null;
+  }
+  if (run.outcome === "NO_ENTRY") {
+    return run.finalReason ?? run.reasonJa ?? run.errorMessage ?? null;
+  }
+
+  return run.errorMessage ?? run.safetyMessageJa ?? run.reasonJa ?? run.finalReason ?? null;
+}
+
+function terminalCauseLabel(cause: string | null | undefined, t: Translator): string | null {
+  if (!cause) return null;
+
+  return t(`activity.runs.terminalCause.${cause}` as Parameters<Translator>[0]);
 }
 
 function formatJsonList(value: string | null | undefined): string | null {

@@ -42,9 +42,15 @@ class ApiDocumentationRouteTest {
         val openApiDocument = Json.parseToJsonElement(responseBody).jsonObject
         val info = openApiDocument.getValue("info").jsonObject
         val paths = openApiDocument.getValue("paths").jsonObject
+        val schemas = openApiDocument.getValue("components").jsonObject.getValue("schemas").jsonObject
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertEquals("Fukurou API", info.getValue("title").jsonPrimitive.content)
+        assertTrue(
+            schemas.getValue("OpsDecisionRunSummaryResponse").jsonObject
+                .getValue("properties").jsonObject
+                .containsKey("terminalCause"),
+        )
         assertOperation(
             paths = paths,
             path = "/health/live",
