@@ -7,6 +7,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -1221,6 +1222,56 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf("empty-terminal-run"), summaries.map { summary -> summary.invocationId })
         assertEquals(DecisionRunOutcome.FAILED, summaries.single().outcome)
         assertNull(repository.findRun("reflection-run").getOrThrow())
+    }
+
+    @Test
+    fun decisionRunProjectionPagesStableTimestampsWithoutDuplicatesOrSkips() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val invocationIds = listOf(
+            "cursor-run-a",
+            "cursor-run-b",
+            "cursor-run-c",
+            "cursor-run-d",
+            "cursor-run-e",
+        )
+        invocationIds.forEach { invocationId ->
+            val start = LlmRunStart(
+                invocationId = invocationId,
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                startedAt = fixedInstant(),
+            )
+            llmRunRepository.insertRunning(start).getOrThrow()
+            llmRunRepository.finish(
+                LlmRunFinish(
+                    invocationId = invocationId,
+                    mode = start.mode,
+                    symbol = start.symbol,
+                    triggerKind = start.triggerKind,
+                    status = "SUCCEEDED",
+                    startedAt = start.startedAt,
+                    finishedAt = fixedInstant().plusSeconds(10),
+                    errorMessage = null,
+                ),
+            ).getOrThrow()
+        }
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val firstPage = repository.listRuns(cursor = null, limit = 2).getOrThrow()
+        val secondPage = repository.listRuns(
+            cursor = DecisionRunCursor(firstPage.last().startedAt, firstPage.last().invocationId),
+            limit = 2,
+        ).getOrThrow()
+        val thirdPage = repository.listRuns(
+            cursor = DecisionRunCursor(secondPage.last().startedAt, secondPage.last().invocationId),
+            limit = 2,
+        ).getOrThrow()
+        val actualInvocationIds = (firstPage + secondPage + thirdPage).map { summary -> summary.invocationId }
+
+        assertEquals(invocationIds.sortedDescending(), actualInvocationIds)
+        assertEquals(invocationIds.size, actualInvocationIds.distinct().size)
     }
 
     @Test

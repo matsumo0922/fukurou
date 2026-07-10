@@ -147,6 +147,7 @@ function RunRow({
   selectedChanged: (button: HTMLButtonElement) => void;
 }) {
   const { locale, t } = useI18n();
+  const primaryReason = runSummaryPrimaryReason(run);
 
   return (
     <button
@@ -171,7 +172,10 @@ function RunRow({
           <code>{run.triggerKind ?? "MANUAL"}</code>
         </span>
         <span className="decision-run-card__reason">
-          {runSummaryReason(run) ?? t("activity.runs.reason.none")}
+          <span>{primaryReason ?? t("activity.runs.reason.none")}</span>
+          {run.finalReason && run.finalReason !== primaryReason ? (
+            <small><strong>{t("activity.runs.label.finalReason")}</strong> {run.finalReason}</small>
+          ) : null}
         </span>
         <span className="decision-run-card__facts">
           <span>{t("activity.runs.fact.verifier")} <strong>{run.falsificationVerdict ?? "—"}</strong></span>
@@ -310,6 +314,7 @@ function RunDetailContent({
         <FactGrid facts={[
           [t("activity.runs.label.rule"), safety?.rule],
           [t("activity.runs.label.finalReason"), detail.summary.finalReason],
+          [t("activity.runs.label.runtimeError"), detail.summary.errorMessage, true],
           [t("activity.runs.label.message"), safety?.messageJa, true],
         ]} />
       </DetailSection>
@@ -439,11 +444,18 @@ function deduplicateRuns(runs: OpsDecisionRunSummaryResponse[]): OpsDecisionRunS
   });
 }
 
-function runSummaryReason(run: OpsDecisionRunSummaryResponse): string | null {
-  const terminalReason = run.finalReason ?? run.errorMessage;
-  if (terminalReason && run.safetyMessageJa) return `${terminalReason} — ${run.safetyMessageJa}`;
+function runSummaryPrimaryReason(run: OpsDecisionRunSummaryResponse): string | null {
+  if (run.outcome === "FAILED" || run.outcome === "INTERRUPTED") {
+    return run.errorMessage ?? run.finalReason ?? run.safetyMessageJa ?? run.reasonJa ?? null;
+  }
+  if (run.outcome === "DENIED") {
+    return run.safetyMessageJa ?? run.errorMessage ?? run.finalReason ?? run.reasonJa ?? null;
+  }
+  if (run.outcome === "NO_TRADE") {
+    return run.finalReason ?? run.reasonJa ?? run.errorMessage ?? null;
+  }
 
-  return terminalReason ?? run.safetyMessageJa ?? run.reasonJa ?? null;
+  return run.errorMessage ?? run.safetyMessageJa ?? run.reasonJa ?? run.finalReason ?? null;
 }
 
 function formatJsonList(value: string | null | undefined): string | null {

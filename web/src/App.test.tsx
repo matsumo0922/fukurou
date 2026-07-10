@@ -412,6 +412,37 @@ describe("App", () => {
     expect(within(runList).getAllByText("EXPECTED_VALUE_GATE")).toHaveLength(1);
   });
 
+  it("keeps generic terminal codes separate from redacted failure details", async () => {
+    const response = terminalDecisionRunsResponse();
+    stubSystemFetch({
+      decisionRunsResponse: { status: 200, body: response },
+      decisionRunDetails: Object.fromEntries(
+        response.runs.map((run) => [run.invocationId, terminalDecisionRunDetailResponse(run)]),
+      ),
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    const timeoutRow = within(runList).getByText("provider timed out after 120 seconds").closest("button");
+    const authRow = within(runList).getByText("provider authentication failed").closest("button");
+    const interruptedRow = within(runList).getByText("previous process/container shutdown recovery").closest("button");
+    expect(timeoutRow).not.toBeNull();
+    expect(authRow).not.toBeNull();
+    expect(interruptedRow).not.toBeNull();
+    expect(within(timeoutRow!).getByText(/caller_failed/)).toBeInTheDocument();
+    expect(within(authRow!).getByText(/caller_failed/)).toBeInTheDocument();
+    expect(within(runList).getByText("market_conditions_not_met")).toBeInTheDocument();
+
+    fireEvent.click(timeoutRow!);
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(await within(detailPane).findByText("provider timed out after 120 seconds")).toBeInTheDocument();
+    expect(within(detailPane).getAllByText("caller_failed").length).toBeGreaterThan(0);
+    expect(within(detailPane).getByText("runtime error")).toBeInTheDocument();
+    expect(within(detailPane).queryByText(/must-not-leak/)).not.toBeInTheDocument();
+  });
+
   it("ignores stale decision run filter storage values", async () => {
     window.localStorage.setItem("fukurou.web.activity.run-filter.v2", "STALE");
     stubSystemFetch();
@@ -737,6 +768,7 @@ type SystemFetchFixture = {
     body: unknown;
   };
   decisionRunsOlderResponse?: Promise<Response>;
+  decisionRunDetails?: Record<string, unknown>;
 };
 
 function stubSystemFetch(fixture: SystemFetchFixture = {}) {
@@ -805,6 +837,12 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         previousActiveVersionId: "runtime-config-active",
         validation: { valid: true, errors: [] },
       });
+    }
+
+    if (path.startsWith("/ops/runs/") && fixture.decisionRunDetails) {
+      const invocationId = path.slice("/ops/runs/".length);
+      const detail = fixture.decisionRunDetails[invocationId];
+      if (detail) return jsonResponse(detail);
     }
 
     switch (path) {
@@ -1476,6 +1514,90 @@ function decisionRunsResponse() {
       },
     ],
     nextBefore: "older-cursor",
+  };
+}
+
+function terminalDecisionRunsResponse() {
+  const base = {
+    mode: "PAPER",
+    symbol: "BTC_JPY",
+    triggerKind: "SCHEDULED",
+    status: "FAILED",
+    finishedAt: "2026-07-10T00:47:36.000Z",
+    durationMillis: 9000,
+    action: null,
+    reasonJa: null,
+    falsificationVerdict: null,
+    safetyRule: null,
+    safetyMessageJa: null,
+    orderCount: 0,
+    executionCount: 0,
+  };
+
+  return {
+    runs: [
+      {
+        ...base,
+        invocationId: "run-timeout",
+        outcome: "FAILED",
+        startedAt: "2026-07-10T00:47:27.000Z",
+        finalReason: "caller_failed",
+        errorMessage: "provider timed out after 120 seconds",
+      },
+      {
+        ...base,
+        invocationId: "run-auth",
+        outcome: "FAILED",
+        startedAt: "2026-07-10T00:46:27.000Z",
+        finalReason: "caller_failed",
+        errorMessage: "provider authentication failed",
+      },
+      {
+        ...base,
+        invocationId: "run-interrupted",
+        outcome: "INTERRUPTED",
+        startedAt: "2026-07-10T00:45:27.000Z",
+        finalReason: null,
+        errorMessage: "previous process/container shutdown recovery",
+      },
+      {
+        ...base,
+        invocationId: "run-no-trade",
+        status: "SUCCEEDED",
+        outcome: "NO_TRADE",
+        startedAt: "2026-07-10T00:44:27.000Z",
+        finalReason: "market_conditions_not_met",
+        errorMessage: null,
+      },
+    ],
+    nextBefore: null,
+  };
+}
+
+function terminalDecisionRunDetailResponse(summary: ReturnType<typeof terminalDecisionRunsResponse>["runs"][number]) {
+  return {
+    summary,
+    phases: [
+      { key: "TRIGGER", status: "COMPLETED", detail: summary.triggerKind },
+      { key: "PROPOSER", status: "FAILED", detail: summary.finalReason },
+      { key: "INTENT", status: "NOT_REACHED", detail: null },
+      { key: "FALSIFIER", status: "NOT_REACHED", detail: null },
+      { key: "SAFETY", status: "NOT_REACHED", detail: null },
+      { key: "ORDER_EXECUTION", status: "NOT_REACHED", detail: "orders=0, executions=0" },
+    ],
+    decision: null,
+    intent: null,
+    falsification: null,
+    safetyViolation: null,
+    orders: [],
+    executions: [],
+    raw: [
+      {
+        source: "audit",
+        occurredAt: summary.finishedAt,
+        values: { eventType: "NO_TRADE_EXIT", toolName: "runner" },
+      },
+    ],
   };
 }
 
