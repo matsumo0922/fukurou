@@ -1895,15 +1895,6 @@ export interface components {
             entryRate?: string | null;
             noTradeRate?: string | null;
         };
-        /** EvaluationExclusionSummaryResponse */
-        EvaluationExclusionSummaryResponse: {
-            orderCount?: number;
-            decisionRunCount?: number;
-            tradeCount?: number;
-            reasons?: {
-                [key: string]: number;
-            };
-        };
         /** EvaluationMarketRegimeResponse */
         EvaluationMarketRegimeResponse: {
             trend: string;
@@ -1917,8 +1908,8 @@ export interface components {
             performance: components["schemas"]["EvaluationPerformanceResponse"];
             killCriterion: components["schemas"]["EvaluationKillCriterionResponse"];
             runRates: components["schemas"]["EvaluationRunRatesResponse"];
-            exclusions?: components["schemas"]["EvaluationExclusionSummaryResponse"];
             marketRegimes: components["schemas"]["EvaluationMarketRegimeResponse"][];
+            exclusions?: components["schemas"]["EvaluationExclusionSummaryResponse"];
         };
         /** EvaluationSetupResponse */
         EvaluationSetupResponse: {
@@ -2486,6 +2477,15 @@ export interface components {
         /** OpsAuditResponse */
         OpsAuditResponse: {
             events: components["schemas"]["OpsAuditEventResponse"][];
+        };
+        /** EvaluationExclusionSummaryResponse */
+        EvaluationExclusionSummaryResponse: {
+            orderCount?: number;
+            decisionRunCount?: number;
+            tradeCount?: number;
+            reasons?: {
+                [key: string]: number;
+            };
         };
     };
     responses: never;

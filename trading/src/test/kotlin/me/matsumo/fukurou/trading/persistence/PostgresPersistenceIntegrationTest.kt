@@ -4565,6 +4565,10 @@ class PostgresPersistenceIntegrationTest {
             orderId = requireNotNull(ledgerRepository.getExecutions().getOrThrow().single().orderId),
             decisionRunId = "run-entry-related-filled-buy",
         )
+        updateOpenPositionDecisionRun(
+            database = database,
+            decisionRunId = "run-current-position",
+        )
 
         integrityRepository.recordGap(
             sessionId,
@@ -6603,6 +6607,19 @@ private fun updateOrderDecisionRun(
             statement.setString(1, decisionRunId)
             statement.setObject(2, UUID.fromString(orderId))
             require(statement.executeUpdate() == 1) { "filled entry order was not found." }
+        }
+    }
+}
+
+/** current position と先行 filled entry の decision run が異なる group を再現する。 */
+private fun updateOpenPositionDecisionRun(
+    database: ExposedDatabase,
+    decisionRunId: String,
+) {
+    exposedTransaction(database) {
+        prepare("UPDATE positions SET decision_run_id = ? WHERE status = 'OPEN'").use { statement ->
+            statement.setString(1, decisionRunId)
+            require(statement.executeUpdate() == 1) { "open position was not found." }
         }
     }
 }
