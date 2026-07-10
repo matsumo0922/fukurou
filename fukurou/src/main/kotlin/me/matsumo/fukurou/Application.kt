@@ -16,6 +16,7 @@ import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
+import me.matsumo.fukurou.trading.activity.DecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
@@ -36,6 +37,7 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
+import me.matsumo.fukurou.trading.persistence.ExposedDecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
@@ -75,6 +77,7 @@ fun interface ReadinessProbe {
  * @param opsPaperLedgerRepository ops API 用 paper ledger repository。null なら DB 設定から構築する
  * @param opsCommandEventLog ops API 用 command_event_log writer。null なら DB 設定から構築する
  * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
+ * @param opsDecisionRunProjectionRepository ops decision run projection。null なら DB 設定から構築する
  * @param opsRuntimeConfigAdminService ops API 用 runtime config admin service。null なら DB 設定から構築する
  * @param tradingConfig trading runtime config
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
@@ -96,6 +99,7 @@ fun Application.module(
     opsPaperLedgerRepository: PaperLedgerRepository? = null,
     opsCommandEventLog: CommandEventLog? = null,
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
+    opsDecisionRunProjectionRepository: DecisionRunProjectionRepository? = null,
     opsRuntimeConfigAdminService: RuntimeConfigAdminService? = null,
     tradingConfig: TradingBotConfig = TradingBotConfig(),
     runtimeConfigEnvironment: Map<String, String> = System.getenv(),
@@ -134,6 +138,7 @@ fun Application.module(
             paperLedgerRepository = opsPaperLedgerRepository,
             commandEventLog = opsCommandEventLog,
             commandEventFeedReader = opsCommandEventFeedReader,
+            decisionRunProjectionRepository = opsDecisionRunProjectionRepository,
             runtimeConfigAdminService = opsRuntimeConfigAdminService,
         ),
         runtime = runtime,
@@ -559,6 +564,8 @@ private fun createOpsFeedRouteDependencies(
             ExposedPaperLedgerRepository(connectedDatabase)
         },
         commandEventFeedReader = opsOverrides.commandEventFeedReader ?: createdCommandEventLog,
+        decisionRunProjectionRepository = opsOverrides.decisionRunProjectionRepository
+            ?: database?.let(::ExposedDecisionRunProjectionRepository),
     )
 }
 
@@ -965,6 +972,7 @@ private data class ApplicationOpsOverrides(
     val paperLedgerRepository: PaperLedgerRepository?,
     val commandEventLog: CommandEventLog?,
     val commandEventFeedReader: CommandEventFeedReader?,
+    val decisionRunProjectionRepository: DecisionRunProjectionRepository?,
     val runtimeConfigAdminService: RuntimeConfigAdminService?,
 )
 

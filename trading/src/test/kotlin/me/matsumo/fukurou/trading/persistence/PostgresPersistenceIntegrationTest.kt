@@ -7,6 +7,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
@@ -1090,6 +1091,74 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(startedAt, record.startedAt)
         assertEquals(finishedAt, record.finishedAt)
         assertEquals(finish.errorMessage, record.errorMessage)
+    }
+
+    @Test
+    fun decisionRunProjectionJoinsDeniedRunWithoutExposingAuditPayload() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val decisionResult = decisionRepository.submitDecision(enterDecisionSubmission()).getOrThrow()
+        val intentId = requireNotNull(decisionResult.tradeIntent?.intentId)
+
+        llmRunRepository.insertRunning(
+            LlmRunStart(
+                invocationId = "run-1",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                startedAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+        llmRunRepository.finish(
+            LlmRunFinish(
+                invocationId = "run-1",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                status = "SUCCEEDED",
+                startedAt = fixedInstant(),
+                finishedAt = fixedInstant().plusSeconds(10),
+                errorMessage = null,
+            ),
+        ).getOrThrow()
+        decisionRepository.submitFalsification(
+            FalsificationSubmission(
+                intentId = intentId,
+                verdict = FalsificationVerdict.APPROVED,
+                llmProvider = "claude",
+                reasonJa = "反証条件なし",
+            ),
+        ).getOrThrow()
+        ExposedSafetyViolationRepository(database).append(
+            SafetyViolation(
+                rule = SafetyFloorRule.EXPECTED_VALUE_GATE,
+                messageJa = "期待値が安全床を下回りました。",
+                measuredValue = "0.03357778",
+                limitValue = "0.10",
+                commandName = "place_order",
+                commandId = UUID.randomUUID(),
+                orderId = null,
+                decisionRunId = "run-1",
+                toolCallId = "tool-1",
+                clientRequestId = "client-1",
+                hardHaltRequired = false,
+                payloadJson = """{"credential":"must-not-leak"}""",
+                createdAt = fixedInstant().plusSeconds(8),
+            ),
+        ).getOrThrow()
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().single()
+        val detail = requireNotNull(repository.findRun("run-1").getOrThrow())
+
+        assertEquals(DecisionRunOutcome.DENIED, summary.outcome)
+        assertEquals("APPROVED", summary.falsificationVerdict)
+        assertEquals("EXPECTED_VALUE_GATE", detail.safetyViolation?.rule)
+        assertEquals("0.03357778", detail.safetyViolation?.measuredValue)
+        assertEquals(0, detail.orders.size)
+        assertEquals(0, detail.executions.size)
+        assertTrue(detail.raw.none { raw -> raw.values.values.any { value -> value?.contains("must-not-leak") == true } })
     }
 
     @Test
