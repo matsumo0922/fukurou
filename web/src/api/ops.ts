@@ -16,6 +16,7 @@ export type OpsActivityMetadataResponse = components["schemas"]["OpsActivityMeta
 export type OpsActivityResponse = components["schemas"]["OpsActivityResponse"];
 export type OpsAuditEventResponse = components["schemas"]["OpsAuditEventResponse"];
 export type OpsDecisionResponse = components["schemas"]["OpsDecisionResponse"];
+export type OpsDaemonStatusResponse = components["schemas"]["OpsDaemonStatusResponse"];
 export type OpsExecutionResponse = components["schemas"]["OpsExecutionResponse"];
 export type OpsHaltLevel = components["schemas"]["OpsHaltRequest"]["level"];
 export type OpsLlmAuthLoginResponse = components["schemas"]["OpsLlmAuthLoginResponse"];
@@ -94,6 +95,13 @@ export const opsRiskStateQuery = queryOptions({
   queryFn: () => getJson("/ops/risk-state"),
   staleTime: 15_000,
   refetchInterval: 30_000,
+});
+
+export const opsDaemonStatusQuery = queryOptions({
+  queryKey: ["ops", "daemon"],
+  queryFn: () => getJson("/ops/daemon"),
+  staleTime: 5_000,
+  refetchInterval: 10_000,
 });
 
 export const opsAccountQuery = queryOptions({
@@ -222,6 +230,18 @@ export async function requestOpsResume(reason: string): Promise<OpsRiskStateResp
 
 export async function requestOpsTrigger(reason: string): Promise<OpsTriggerResponse> {
   const response = await postJsonResponse("/ops/trigger", { reason }, [202] as const);
+
+  return response.data;
+}
+
+export async function requestOpsDaemonStart(reason: string): Promise<OpsDaemonStatusResponse> {
+  const response = await postJsonResponse("/ops/daemon/start", { reason }, [200] as const);
+
+  return response.data;
+}
+
+export async function requestOpsDaemonStop(reason: string): Promise<OpsDaemonStatusResponse> {
+  const response = await postJsonResponse("/ops/daemon/stop", { reason }, [200] as const);
 
   return response.data;
 }

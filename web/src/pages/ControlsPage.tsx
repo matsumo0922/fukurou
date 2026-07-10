@@ -8,16 +8,20 @@ import ShieldAlert from "lucide-react/dist/esm/icons/shield-alert.mjs";
 import { ApiClientError } from "../api/client";
 import {
   LLM_AUTH_PROVIDERS,
+  opsDaemonStatusQuery,
   opsLlmAuthLoginSessionQuery,
   opsPositionsQuery,
   opsRiskStateQuery,
   requestOpsLlmAuthLogin,
   requestOpsLlmAuthTokenCodeSubmit,
   requestOpsHalt,
+  requestOpsDaemonStart,
+  requestOpsDaemonStop,
   requestOpsResume,
   requestOpsTrigger,
   type LlmAuthProvider,
   type OpsLlmAuthLoginResponse,
+  type OpsDaemonStatusResponse,
   type OpsPositionsResponse,
   type OpsRiskStateResponse,
 } from "../api/ops";
@@ -78,6 +82,7 @@ export function ControlsPage() {
   const { t } = useI18n();
   const queryClient = useQueryClient();
   const riskStateQuery = useQuery(opsRiskStateQuery);
+  const daemonStatusQuery = useQuery(opsDaemonStatusQuery);
   const positionsQuery = useQuery(opsPositionsQuery);
   const [notice, setNotice] = useState<ControlNotice | null>(null);
   const [activeLlmAuthLogin, setActiveLlmAuthLogin] = useState<ActiveLlmAuthLogin | null>(null);
@@ -173,6 +178,46 @@ export function ControlsPage() {
       });
     },
   });
+  const daemonStartMutation = useMutation({
+    mutationFn: requestOpsDaemonStart,
+    onSuccess: (status) => {
+      setNotice({
+        tone: status.observedState === "DEGRADED" ? "warning" : "positive",
+        title: t("controls.notice.daemonStartRequested"),
+        detail: formatMessage(t("controls.notice.daemonState"), {
+          state: status.observedState,
+        }),
+      });
+      refreshAfterSuccess();
+    },
+    onError: (error) => {
+      setNotice({
+        tone: "critical",
+        title: t("controls.notice.daemonStartFailed"),
+        detail: describeControlError(error, t),
+      });
+    },
+  });
+  const daemonStopMutation = useMutation({
+    mutationFn: requestOpsDaemonStop,
+    onSuccess: (status) => {
+      setNotice({
+        tone: "neutral",
+        title: t("controls.notice.daemonStopRequested"),
+        detail: formatMessage(t("controls.notice.daemonState"), {
+          state: status.observedState,
+        }),
+      });
+      refreshAfterSuccess();
+    },
+    onError: (error) => {
+      setNotice({
+        tone: "critical",
+        title: t("controls.notice.daemonStopFailed"),
+        detail: describeControlError(error, t),
+      });
+    },
+  });
   const llmAuthLoginMutation = useMutation({
     mutationFn: requestOpsLlmAuthLogin,
     onSuccess: (session, variables) => {
@@ -253,17 +298,20 @@ export function ControlsPage() {
       });
     },
   });
-  const isRefreshing = riskStateQuery.isFetching || positionsQuery.isFetching || llmAuthLoginSessionQuery.isFetching;
+  const isRefreshing = daemonStatusQuery.isFetching || riskStateQuery.isFetching || positionsQuery.isFetching || llmAuthLoginSessionQuery.isFetching;
   const isOperationInFlight =
     softHaltMutation.isPending ||
     hardHaltMutation.isPending ||
     resumeMutation.isPending ||
     triggerMutation.isPending ||
+    daemonStartMutation.isPending ||
+    daemonStopMutation.isPending ||
     llmAuthLoginMutation.isPending ||
     llmAuthTokenSubmitMutation.isPending;
   const refreshed = () => {
     void riskStateQuery.refetch();
     void positionsQuery.refetch();
+    void daemonStatusQuery.refetch();
   };
 
   return (
@@ -286,6 +334,15 @@ export function ControlsPage() {
       />
 
       {notice ? <ControlNoticePanel notice={notice} /> : null}
+
+      <ControlsDaemonPanel
+        daemonStatusQuery={daemonStatusQuery}
+        startPending={daemonStartMutation.isPending}
+        stopPending={daemonStopMutation.isPending}
+        operationInFlight={isOperationInFlight}
+        startRequested={(reason) => daemonStartMutation.mutate(reason)}
+        stopRequested={(reason) => daemonStopMutation.mutate(reason)}
+      />
 
       <div className="page-grid page-grid--two">
         <ControlsRiskStatePanel riskStateQuery={riskStateQuery} />
@@ -439,6 +496,139 @@ export function ControlsPage() {
       </Panel>
     </div>
   );
+}
+
+type ControlsDaemonPanelProps = {
+  daemonStatusQuery: UseQueryResult<OpsDaemonStatusResponse, Error>;
+  startPending: boolean;
+  stopPending: boolean;
+  operationInFlight: boolean;
+  startRequested: (reason: string) => void;
+  stopRequested: (reason: string) => void;
+};
+
+function ControlsDaemonPanel({
+  daemonStatusQuery,
+  startPending,
+  stopPending,
+  operationInFlight,
+  startRequested,
+  stopRequested,
+}: ControlsDaemonPanelProps) {
+  const { t, locale } = useI18n();
+
+  if (daemonStatusQuery.isPending) {
+    return <PanelLoading label={t("controls.loading.daemonState")} />;
+  }
+
+  if (daemonStatusQuery.isError) {
+    return <PanelError title={t("controls.error.daemonState")} error={daemonStatusQuery.error} retried={() => void daemonStatusQuery.refetch()} />;
+  }
+
+  const status = daemonStatusQuery.data;
+  const isStopping = status.observedState === "STOPPING";
+  const stateLabel = isStopping && status.inFlightRun
+    ? t("controls.daemon.stoppingInFlight")
+    : status.observedState;
+  const operationsDisabled = operationInFlight || isStopping;
+  const activeIdentity = configIdentityLabel(status.activeConfig);
+  const appliedIdentity = configIdentityLabel(status.appliedConfig);
+  const daemonAppliedIdentity = configIdentityLabel(status.daemonAppliedConfig);
+
+  return (
+    <Panel className="panel--wide">
+      <div className="panel-heading">
+        <Activity size={18} aria-hidden="true" />
+        <h2>{t("controls.panel.daemon")}</h2>
+        <StatusPill label={stateLabel} tone={daemonStateTone(status.observedState, status.silenceWarning)} />
+        {status.silenceWarning ? <StatusPill label={t("controls.daemon.silenceWarning")} tone="critical" /> : null}
+      </div>
+      <DataStrip
+        items={[
+          {
+            label: t("controls.label.daemonDesired"),
+            value: status.desiredEnabled ? t("common.yes") : t("common.no"),
+            detail: status.reason,
+          },
+          {
+            label: t("controls.label.schedulerSignal"),
+            value: formatDateTime(status.lastSchedulerSignalAt, locale),
+            detail: status.nextHeartbeatAt
+              ? formatMessage(t("controls.daemon.nextHeartbeat"), { at: formatDateTime(status.nextHeartbeatAt, locale) })
+              : t("common.notReported"),
+          },
+          {
+            label: t("controls.label.activeConfig"),
+            value: activeIdentity,
+            detail: status.restartRequired ? t("controls.daemon.restartRequired") : t("controls.daemon.configApplied"),
+          },
+          {
+            label: t("controls.label.processAppliedConfig"),
+            value: appliedIdentity,
+            detail: formatMessage(t("controls.daemon.daemonAppliedConfig"), { identity: daemonAppliedIdentity }),
+          },
+          {
+            label: t("controls.label.inFlightRun"),
+            value: status.inFlightRun?.invocationId ?? t("common.none"),
+            detail: status.inFlightRun
+              ? formatMessage(t("controls.daemon.inFlightDetail"), {
+                  trigger: status.inFlightRun.triggerKind,
+                  startedAt: formatDateTime(status.inFlightRun.startedAt, locale),
+                  elapsed: String(status.inFlightRun.elapsedSeconds),
+                })
+              : t("controls.daemon.noInFlight"),
+          },
+          {
+            label: t("controls.label.lastSkip"),
+            value: status.lastSkip?.reason ?? t("common.none"),
+            detail: status.lastSkip ? formatDateTime(status.lastSkip.occurredAt, locale) : undefined,
+          },
+        ]}
+      />
+      {status.detail ? <p className="control-panel-note">{status.detail}</p> : null}
+      <div className="control-action-grid control-action-grid--two">
+        <SafetyActionForm
+          id="daemon-start"
+          title={t("controls.action.daemonStart.title")}
+          description={t("controls.action.daemonStart.description")}
+          badgeLabel="START"
+          badgeTone="positive"
+          reasonLabel={t("controls.action.daemonStart.reason")}
+          reasonPlaceholder={t("controls.action.daemonStart.placeholder")}
+          reviewLabel={t("controls.action.daemonStart.review")}
+          confirmLabel={t("controls.action.daemonStart.confirm")}
+          pendingLabel={t("controls.action.daemonStart.pending")}
+          buttonTone="neutral"
+          isPending={startPending}
+          isDisabled={operationsDisabled || status.desiredEnabled}
+          submitted={startRequested}
+        />
+        <SafetyActionForm
+          id="daemon-stop"
+          title={t("controls.action.daemonStop.title")}
+          description={t("controls.action.daemonStop.description")}
+          badgeLabel="STOP"
+          badgeTone="warning"
+          reasonLabel={t("controls.action.daemonStop.reason")}
+          reasonPlaceholder={t("controls.action.daemonStop.placeholder")}
+          reviewLabel={t("controls.action.daemonStop.review")}
+          confirmLabel={t("controls.action.daemonStop.confirm")}
+          pendingLabel={t("controls.action.daemonStop.pending")}
+          buttonTone="warning"
+          isPending={stopPending}
+          isDisabled={operationsDisabled || !status.desiredEnabled}
+          submitted={stopRequested}
+        />
+      </div>
+    </Panel>
+  );
+}
+
+function configIdentityLabel(identity: OpsDaemonStatusResponse["activeConfig"]): string {
+  const version = identity.versionId ?? "env";
+  const hash = identity.hash?.slice(0, 12) ?? "none";
+
+  return `${version} / ${hash}`;
 }
 
 async function refreshControlsData(queryClient: QueryClient): Promise<void> {
@@ -883,6 +1073,22 @@ function riskStateTone(state: string): StatusTone {
 
   if (state === "HARD_HALT") {
     return "critical";
+  }
+
+  return "neutral";
+}
+
+function daemonStateTone(state: string, silenceWarning: boolean): StatusTone {
+  if (silenceWarning || state === "DEGRADED") {
+    return "critical";
+  }
+
+  if (state === "RUNNING") {
+    return "positive";
+  }
+
+  if (state === "STARTING" || state === "STOPPING") {
+    return "warning";
   }
 
   return "neutral";

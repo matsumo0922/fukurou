@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
+import type { OpsDaemonStatusResponse } from "./api/ops";
 import { LOCALE_STORAGE_KEY } from "./i18n/messages";
 import { readActivityCatalogGolden } from "./test/activityCatalogGolden";
 import { formatDateTime } from "./ui/format";
@@ -638,6 +639,75 @@ describe("App", () => {
     expect(screen.getByText(/hourly LLM invocation cap has already been reached/)).toBeInTheDocument();
   });
 
+  it("shows daemon STOPPING metadata and disables start and stop actions", async () => {
+    stubSystemFetch({
+      daemonStatus: {
+        ...defaultDaemonStatus(),
+        desiredEnabled: false,
+        observedState: "STOPPING",
+        reason: "INTENTIONAL_STOP",
+        inFlightRun: {
+          invocationId: "daemon-run-1",
+          triggerKind: "FLAT_HEARTBEAT",
+          startedAt: "2026-07-05T12:00:00.000Z",
+          elapsedSeconds: 42,
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    expect(await screen.findByText("Stopping… (waiting for the active run to finish)")).toBeInTheDocument();
+    expect(screen.getByText("daemon-run-1")).toBeInTheDocument();
+    expect(screen.getByLabelText("Daemon start reason")).toBeDisabled();
+    expect(screen.getByLabelText("Daemon stop reason")).toBeDisabled();
+  });
+
+  it("shows the exact Japanese STOPPING drain message", async () => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, "ja");
+    stubSystemFetch({
+      daemonStatus: {
+        ...defaultDaemonStatus(),
+        desiredEnabled: false,
+        observedState: "STOPPING",
+        reason: "CONFIG_APPLY",
+        inFlightRun: {
+          invocationId: "daemon-run-ja",
+          triggerKind: "PRICE_MOVE",
+          startedAt: "2026-07-05T12:00:00.000Z",
+          elapsedSeconds: 18,
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    expect(await screen.findByText("停止中…（実行中の run 完了待ち）")).toBeInTheDocument();
+    expect(screen.getByText("daemon-run-ja")).toBeInTheDocument();
+  });
+
+  it("submits daemon stop through the dedicated versioned control endpoint", async () => {
+    const fetchMock = stubSystemFetch();
+    window.history.pushState({}, "", "/app/controls");
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("Daemon stop reason"), {
+      target: {
+        value: "planned scheduler maintenance",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review daemon stop" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm daemon stop" }));
+
+    expect(await screen.findByText("Daemon stop requested")).toBeInTheDocument();
+    expect(postBody(fetchMock, "/ops/daemon/stop")).toEqual({
+      reason: "planned scheduler maintenance",
+    });
+  });
+
   it("starts confirmed CLI auth login and displays the authorization challenge", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/controls");
@@ -785,6 +855,11 @@ type SystemFetchFixture = {
   };
   resumeResponse?: Promise<Response>;
   triggerResponse?: {
+    status: number;
+    body: unknown;
+  };
+  daemonStatus?: ReturnType<typeof defaultDaemonStatus>;
+  daemonControlResponse?: {
     status: number;
     body: unknown;
   };
@@ -960,6 +1035,24 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
           },
           { status: 202 },
         );
+      }
+      case "/ops/daemon":
+        return jsonResponse(fixture.daemonStatus ?? defaultDaemonStatus());
+      case "/ops/daemon/start":
+      case "/ops/daemon/stop": {
+        if (method !== "POST") {
+          return jsonResponse({ message: "method not allowed" }, { status: 405 });
+        }
+
+        if (fixture.daemonControlResponse) {
+          return jsonResponse(fixture.daemonControlResponse.body, { status: fixture.daemonControlResponse.status });
+        }
+
+        return jsonResponse({
+          ...(fixture.daemonStatus ?? defaultDaemonStatus()),
+          desiredEnabled: path.endsWith("/start"),
+          observedState: path.endsWith("/start") ? "RUNNING" : "STOPPED",
+        });
       }
       case "/ops/account":
         return jsonResponse({
@@ -1349,6 +1442,44 @@ function defaultLlmAuthResponse() {
       },
     ],
     checkedAt: "2026-07-05T12:00:00.000Z",
+  };
+}
+
+function defaultDaemonStatus(): OpsDaemonStatusResponse {
+  return {
+    desiredEnabled: true,
+    observedState: "RUNNING",
+    reason: "RUNNING",
+    detail: null,
+    activeConfig: {
+      versionId: "active-version-1",
+      hash: "active-hash-1234567890",
+    },
+    appliedConfig: {
+      versionId: "process-version-1",
+      hash: "process-hash-1234567890",
+    },
+    daemonAppliedConfig: {
+      versionId: "active-version-1",
+      hash: "active-hash-1234567890",
+    },
+    restartRequired: true,
+    lastSchedulerSignalAt: "2026-07-05T12:04:00.000Z",
+    lastLaunch: {
+      invocationId: "daemon-run-0",
+      triggerKind: "FLAT_HEARTBEAT",
+      startedAt: "2026-07-05T12:00:00.000Z",
+      elapsedSeconds: 240,
+    },
+    lastSkip: {
+      reason: "no_trigger_due",
+      triggerKind: null,
+      occurredAt: "2026-07-05T12:04:00.000Z",
+    },
+    nextHeartbeatAt: "2026-07-05T12:30:00.000Z",
+    inFlightRun: null,
+    silenceWarning: false,
+    nextRetryAt: null,
   };
 }
 

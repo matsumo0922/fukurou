@@ -795,6 +795,196 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ops/daemon": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * LLM daemon status を取得する
+         * @description desired state、observed worker state、停止理由、active / process applied / daemon applied config、scheduler signal、in-flight run、無音警告を返します。readiness の意味は変更しません。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description 現在の daemon status です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsDaemonStatusResponse"];
+                    };
+                };
+                /** @description daemon supervisor が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/daemon/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * LLM daemon を起動する
+         * @description HARD_HALT を先に確認し、daemon.enabled=true の versioned draft を validation / active 化して supervisor を起動します。HARD_HALT 中は config を変更しません。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            /** @description 監査と runtime config version note に残す理由です。 */
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["OpsDaemonControlRequest"];
+                };
+            };
+            responses: {
+                /** @description desired state 変更後の daemon status です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsDaemonStatusResponse"];
+                    };
+                };
+                /** @description request body または reason が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description HARD_HALT、STOPPING、または runtime config validation により拒否されました。 */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description daemon supervisor が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/daemon/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * LLM daemon を停止する
+         * @description daemon.enabled=false の versioned draft を validation / active 化し、新規 tick を止めます。in-flight run は bounded drain で通常終端を待ちます。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            /** @description 監査と runtime config version note に残す理由です。 */
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["OpsDaemonControlRequest"];
+                };
+            };
+            responses: {
+                /** @description desired state 変更後の daemon status です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsDaemonStatusResponse"];
+                    };
+                };
+                /** @description request body または reason が不正です。 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description STOPPING または runtime config validation により拒否されました。 */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description daemon supervisor が利用できません。 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ops/halt": {
         parameters: {
             query?: never;
@@ -2005,7 +2195,7 @@ export interface components {
             legacyEnvName: string;
             editable: boolean;
             /** @enum {string} */
-            applyMode: "NEXT_RESTART" | "PROCESS_RESTART";
+            applyMode: "HOT" | "NEXT_RESTART" | "PROCESS_RESTART";
             /** @enum {string} */
             safetyTier: "STANDARD" | "GUARDED" | "SAFETY_CRITICAL" | "DEPLOYMENT_BOUNDARY" | "SECRET";
             labelKey: string;
@@ -2078,6 +2268,46 @@ export interface components {
             activeVersion: components["schemas"]["RuntimeConfigVersionSummary"];
             previousActiveVersionId?: string | null;
             validation: components["schemas"]["RuntimeConfigValidationResult"];
+        };
+        /** OpsDaemonConfigIdentityResponse */
+        OpsDaemonConfigIdentityResponse: {
+            versionId?: string | null;
+            hash?: string | null;
+        };
+        /** OpsDaemonLaunchResponse */
+        OpsDaemonLaunchResponse: {
+            invocationId: string;
+            triggerKind: string;
+            startedAt: string;
+            elapsedSeconds: number;
+        };
+        /** OpsDaemonSkipResponse */
+        OpsDaemonSkipResponse: {
+            reason: string;
+            triggerKind?: string | null;
+            occurredAt: string;
+        };
+        /** OpsDaemonStatusResponse */
+        OpsDaemonStatusResponse: {
+            desiredEnabled: boolean;
+            observedState: string;
+            reason: string;
+            detail?: string | null;
+            activeConfig: components["schemas"]["OpsDaemonConfigIdentityResponse"];
+            appliedConfig: components["schemas"]["OpsDaemonConfigIdentityResponse"];
+            daemonAppliedConfig: components["schemas"]["OpsDaemonConfigIdentityResponse"];
+            restartRequired: boolean;
+            lastSchedulerSignalAt?: string | null;
+            lastLaunch?: components["schemas"]["OpsDaemonLaunchResponse"] | null;
+            lastSkip?: components["schemas"]["OpsDaemonSkipResponse"] | null;
+            nextHeartbeatAt?: string | null;
+            inFlightRun?: components["schemas"]["OpsDaemonLaunchResponse"] | null;
+            silenceWarning: boolean;
+            nextRetryAt?: string | null;
+        };
+        /** OpsDaemonControlRequest */
+        OpsDaemonControlRequest: {
+            reason: string;
         };
         /** OpsHaltRequest */
         OpsHaltRequest: {
