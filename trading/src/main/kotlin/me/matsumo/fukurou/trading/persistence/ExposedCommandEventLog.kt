@@ -40,17 +40,6 @@ private const val INSERT_COMMAND_EVENT_SQL = """
 """
 
 /**
- * audit log に現れた distinct decision run ID 数を数える SQL。
- */
-private const val COUNT_DISTINCT_DECISION_RUNS_SINCE_SQL = """
-    SELECT COUNT(DISTINCT decision_run_id)
-    FROM command_event_log
-    WHERE decision_run_id IS NOT NULL
-        AND event_type IN ('RUNNER_PHASE_COMPLETED', 'NO_TRADE_EXIT')
-        AND ts >= ?
-"""
-
-/**
  * tool call 監査イベントを数える SQL の前半。
  */
 private const val COUNT_TOOL_CALL_EVENTS_SQL_PREFIX = """
@@ -130,16 +119,11 @@ class ExposedCommandEventLog(
         }
     }
 
-    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+    override suspend fun countDistinctLlmLaunchesSince(since: Instant, excludedInvocationId: String?): Result<Int> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    jdbcConnection().prepareStatement(COUNT_DISTINCT_DECISION_RUNS_SINCE_SQL).use { statement ->
-                        statement.setLong(1, since.toEpochMilli())
-                        statement.executeQuery().use { resultSet ->
-                            if (resultSet.next()) resultSet.getInt(1) else 0
-                        }
-                    }
+                    countDistinctLlmLaunchesSince(since, excludedInvocationId)
                 }
             }
         }

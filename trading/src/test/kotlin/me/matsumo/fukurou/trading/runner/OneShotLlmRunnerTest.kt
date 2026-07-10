@@ -1763,8 +1763,8 @@ private class CountFailureCommandEventLog(
         return delegate.append(event)
     }
 
-    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
-        return delegate.countDistinctDecisionRunsSince(since)
+    override suspend fun countDistinctLlmLaunchesSince(since: Instant, excludedInvocationId: String?): Result<Int> {
+        return delegate.countDistinctLlmLaunchesSince(since, excludedInvocationId)
     }
 
     override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {

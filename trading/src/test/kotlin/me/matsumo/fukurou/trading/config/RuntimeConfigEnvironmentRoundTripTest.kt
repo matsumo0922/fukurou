@@ -22,6 +22,8 @@ class RuntimeConfigEnvironmentRoundTripTest {
         val environment = assertRuntimeEnvironmentRoundTrips(TradingBotConfig())
 
         assertEquals("false", environment.getValue("FUKUROU_LLM_DAEMON_ENABLED"))
+        assertEquals("7", environment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"))
+        assertEquals("120", environment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY"))
     }
 
     @Test

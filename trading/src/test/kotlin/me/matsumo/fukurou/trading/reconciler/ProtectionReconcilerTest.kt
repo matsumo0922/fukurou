@@ -767,7 +767,7 @@ private object FailingCommandEventLog : CommandEventLog {
         return Result.failure(IllegalStateException("audit append failed"))
     }
 
-    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+    override suspend fun countDistinctLlmLaunchesSince(since: Instant, excludedInvocationId: String?): Result<Int> {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 

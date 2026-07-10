@@ -137,12 +137,14 @@ Ktor process 内の daemon scheduler は active runtime config の `daemon.enabl
 - event 条件: `safety.economicEventBlackouts` の active window、価格急変、STOP 接近、paper entry fill を既存 reservation / cap 経路で評価する。経済イベントは同じ active window で 1 回だけ起動する。
 - holding 状態: open position / open order が DB にある場合も 15 分 cadence。paper entry fill は最新 execution を起点に `ENTRY_FILL` として 1 回だけ起動し、cooldown 内の fill burst は後追い発火しない。
 - pre-filter: `daemon.preFilterEnabled=true` のとき、flat heartbeat / holding dense check は full LLM 起動前に Claude Haiku で market snapshot の有意変化を判定する。NO の場合は `pre_filter_no_change` として full run を省略し、pre-filter 失敗時は full run へ進む。pre-filter 自体も LLM 呼び出しなので予約済み invocation と hourly / daily cap を消費し、full run だけを省略する。価格急変、STOP 接近、paper entry fill、経済イベントには適用しない。
-- 起動予算: 6/hour、96/day。event も heartbeat も同じ予算を消費する。サブスク枠 / token 消費は Usage UI と別途集計で監視する前提で、学習に必要な 15 分間隔を初期値にする。flat 15分 heartbeat は daily cap 96 を単独で消費できるため、event trigger が追加で起動した日は後続 heartbeat が日次予算で skip されうる。
+- 起動予算: hard cap は 7/hour、120/day。flat / holding の 15 分 cadence は通常 4/hour、96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を routine cadence より追加で最大 3/hour、24/day まで使う。hard cap 到達後は後続 heartbeat が skip されうる。
 - HARD_HALT 中: LLM は起動せず、daemon skip 監査だけを残す。手動再開は `risk_state` の resume 操作で hard_halt を解除してから次 cycle を待つ。
 
 起動可否は `llm_launch_reservations` と `risk_state` を同一 DB transaction で確認し、同時起動、hour/day cap、HARD_HALT の TOCTOU を避ける。LLM には次回起動時刻を決める tool を渡さない。
 
-手動 `OneShotRunnerMain` は daemon の `llm_launch_reservations` を通らないため、daemon の `CONCURRENT_INVOCATION` guard からは見えない。手動実行は daemon を停止してから行うこと。rolling cap は `command_event_log` 側で相互に数える。手動実行も開始時に active runtime config snapshot を解決し、その version id / hash を decision run audit へ残す。
+hourly / daily cap の起動時刻は、対象 invocation に reservation が存在する場合は `reserved_at` を正本とする。reservation のない legacy run だけ `RUNNER_PHASE_COMPLETED` / `NO_TRADE_EXIT` の `ts` へ fallback し、複数 phase は invocation 単位で 1 起動にまとめる。
+
+手動 `OneShotRunnerMain` は daemon の `llm_launch_reservations` を通らないため、daemon の `CONCURRENT_INVOCATION` guard からは見えない。手動実行は daemon を停止してから行うこと。runner preflight の rolling cap は reservation 優先規則を使い、手動実行は reservation のない audit fallback として daemon 起動と相互に数える。preflight で拒否された手動実行も phase / NO_TRADE audit を残し、window 外へ出るまで 1 起動として数える。手動実行も開始時に active runtime config snapshot を解決し、その version id / hash を decision run audit へ残す。
 
 Reflection Runner の PromptCandidates は完了済み前週を対象に `REFLECTION` trigger として同じ reservation / cap を使う。reflection の RUNNING 予約は trading trigger を `CONCURRENT_INVOCATION` で塞がない。fresh な trading RUNNING 予約、HARD_HALT、1時間 cap の残り 1 回以下、24時間 cap の残り 4 回以下では PromptCandidates の LLM を呼ばず、status note だけを残す。
 
@@ -154,7 +156,7 @@ paper 約定、SafetyFloor、GMO Public REST の rate-limit / retry / timeout、
 
 SafetyFloor 系値と fallback fee / spread は、既定値と同等またはより保守的な値だけ許可する。GMO Public REST の rate-limit も既定 10 req/s / burst 10 以下だけ許可する。GMO Public REST の timeout / retry backoff も runtime config で管理する。GMO `/public/v1/symbols` が取得できる場合、paper 手数料は取引所 rule を優先する。
 
-runner 上限も保守側の override だけを許可する。総 tool call は 48 以下、trade 系 tool call は 3 以下、timeout は 180 秒以下、起動数は 6 回/時・96 回/日以下だけを受け入れる。tool call 上限は同じ `decision_run_id` の `command_event_log` と MCP server instance 内 counter を合算して、Proposer / Falsifier の phase をまたいで強制する。上限超過時は tool error を返し、no-trade audit を残す。
+runner 上限も保守側の override だけを許可する。総 tool call は 48 以下、trade 系 tool call は 3 以下、timeout は 180 秒以下、起動数は 7 回/時・120 回/日以下だけを受け入れる。tool call 上限は同じ `decision_run_id` の `command_event_log` と MCP server instance 内 counter を合算して、Proposer / Falsifier の phase をまたいで強制する。上限超過時は tool error を返し、no-trade audit を残す。
 
 `GET /ops/runtime-config` は code-owned `RuntimeConfigCatalog` から Runtime / Deployment / Secrets の実効設定、version 履歴、warning を返す。Runtime group は active DB snapshot から解決した typed config で、Reflection Runner 設定と Claude / Codex model override も含む。Deployment group は `FUKUROU_GMO_PUBLIC_BASE_URL`、Obsidian vault path、LLM command template、MCP server command / args / tool allowlist などの deploy 境界、Secrets group は DB password や Cloudflare token などの設定有無を表す。active DB snapshot が不正または一時的に読めない場合、Ktor、WebUI、runtime config admin API は起動し、取引 runtime、manual trigger、daemon worker は fail closed する。valid な active version へ戻ると、runtime config warning、`/health/ready`、manual trigger gate は現在の active snapshot に基づいて再評価される。version 履歴が一時的に読めない場合、API は empty versions と warning を返し、catalog 表示を継続する。`/ops/runtime-config/drafts` は active または指定 version を基準に draft を作成し、`/ops/runtime-config/drafts/{versionId}/validate` は保存済み draft を現在の catalog / typed config で検証する。`/ops/runtime-config/drafts/{versionId}/activate` と `/ops/runtime-config/versions/{versionId}/rollback` は保存済み候補を再検証してから active version を切り替える。draft と inactive version は active version と newest 20 draft / newest 20 inactive version を残す。保守側へ境界を締める code を deploy する場合、active runtime config は deploy 前に新しい境界内の値へ更新する。`/app/config` は Runtime group の draft 編集、diff preview、validation、activate、rollback を扱い、Deployment group を read-only で表示する。Runtime group の変更は process restart 後に適用する。secret 値は API response と画面のどちらにも出さない。
 
