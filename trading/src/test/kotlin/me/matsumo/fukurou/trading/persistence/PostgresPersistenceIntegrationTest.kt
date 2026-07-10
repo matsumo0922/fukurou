@@ -10,6 +10,7 @@ import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialQuery
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
@@ -326,6 +327,15 @@ private const val SELECT_LLM_RUN_INDEX_COUNT_SQL = """
     WHERE schemaname = current_schema()
         AND tablename = 'llm_runs'
         AND indexname = 'idx_llm_runs_started_at'
+"""
+
+/** recent SafetyFloor denial scan 用 partial index 件数を読む SQL。 */
+private const val SELECT_RECENT_SAFETY_DENIAL_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'safety_violations'
+        AND indexname = 'idx_safety_violations_recent_denials'
 """
 
 /**
@@ -771,6 +781,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, selectDecisionsInvocationIdIndexCount(database))
         assertEquals(3, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))
+        assertEquals(1, selectRecentSafetyDenialIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
         assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
     }
@@ -1308,6 +1319,76 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(0, detail.orders.size)
         assertEquals(0, detail.executions.size)
         assertTrue(detail.raw.none { raw -> raw.values.values.any { value -> value?.contains("must-not-leak") == true } })
+    }
+
+    @Test
+    fun safetyDenialReader_usesActivityOutcomeAndBoundedDenialProjection() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        repeat(2) { bootstrap.ensureSchema().getOrThrow() }
+        bootstrap.verifySchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val decisionResult = decisionRepository.submitDecision(enterDecisionSubmission()).getOrThrow()
+        val intentId = requireNotNull(decisionResult.tradeIntent?.intentId)
+
+        insertFinishedDecisionRun(llmRunRepository, "run-1", status = "SUCCEEDED", errorMessage = null)
+        insertFinishedDecisionRun(llmRunRepository, "run-malformed", status = "SUCCEEDED", errorMessage = null)
+        insertFinishedDecisionRun(llmRunRepository, "run-filled", status = "SUCCEEDED", errorMessage = null)
+        insertFinishedDecisionRun(llmRunRepository, "run-old", status = "SUCCEEDED", errorMessage = null)
+        decisionRepository.submitFalsification(
+            FalsificationSubmission(
+                intentId = intentId,
+                verdict = FalsificationVerdict.APPROVED,
+                llmProvider = "codex",
+                reasonJa = "反証条件なし",
+            ),
+        ).getOrThrow()
+        val safetyRepository = ExposedSafetyViolationRepository(database)
+
+        safetyRepository.append(testSafetyViolation("run-1", SafetyFloorRule.MAX_RISK_PER_TRADE, fixedInstant().minusSeconds(20))).getOrThrow()
+        safetyRepository.append(testSafetyViolation("run-1", SafetyFloorRule.EXPECTED_VALUE_GATE, fixedInstant().minusSeconds(10))).getOrThrow()
+        safetyRepository.append(testSafetyViolation("run-malformed", SafetyFloorRule.EXPECTED_VALUE_GATE, fixedInstant().minusSeconds(15))).getOrThrow()
+        safetyRepository.append(testSafetyViolation("run-filled", SafetyFloorRule.EXPECTED_VALUE_GATE, fixedInstant().minusSeconds(12))).getOrThrow()
+        safetyRepository.append(testSafetyViolation("run-old", SafetyFloorRule.EXPECTED_VALUE_GATE, fixedInstant().minus(Duration.ofDays(31)))).getOrThrow()
+        appendNoTradeExit(database, "run-1", "{\"reason\":\"preview_order_rejected\"}", fixedInstant().minusSeconds(5))
+        appendNoTradeExit(database, "run-malformed", "{", fixedInstant().minusSeconds(4))
+        exposedTransaction(database) {
+            insertActivityContextOrder(
+                orderId = UUID.randomUUID(),
+                positionId = null,
+                tradeGroupId = UUID.randomUUID(),
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.FILLED,
+                limitPriceJpy = BigDecimal("10000000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = BigDecimal("10500000"),
+                reasonJa = "lifecycle precedence",
+                decisionRunId = "run-filled",
+            )
+        }
+        val repository = ExposedDecisionRunProjectionRepository(database, fixedClock())
+        val denials = repository.readSafetyDenials(
+            DecisionRunSafetyDenialQuery(
+                symbol = TradingSymbol.BTC,
+                from = fixedInstant().minus(Duration.ofDays(30)),
+                toExclusive = fixedInstant().plusMillis(1),
+                limit = 5,
+            ),
+        ).getOrThrow()
+        val detail = requireNotNull(repository.findRun("run-1").getOrThrow())
+
+        assertEquals(1, selectRecentSafetyDenialIndexCount(database))
+        assertEquals(listOf("run-1", "run-malformed"), denials.denials.map { denial -> denial.invocationId })
+        assertFalse(denials.truncated)
+        assertEquals("EXPECTED_VALUE_GATE", denials.denials.first().safetyViolation.rule)
+        assertEquals("preview_order_rejected", denials.denials.first().finalReason)
+        assertEquals("APPROVED", denials.denials.first().falsification?.verdict)
+        assertEquals(DecisionRunOutcome.DENIED, detail.summary.outcome)
+        assertEquals(detail.safetyViolation?.rule, denials.denials.first().safetyViolation.rule)
+        assertEquals(detail.summary.finalReason, denials.denials.first().finalReason)
+        assertEquals(null, denials.denials.last().finalReason)
+        assertTrue(denials.denials.none { denial -> denial.invocationId == "run-filled" || denial.invocationId == "run-old" })
     }
 
     @Test
@@ -4773,6 +4854,19 @@ private fun selectLlmRunIndexCount(database: ExposedDatabase): Int {
     }
 }
 
+/** recent SafetyFloor denial scan index 件数を読む。 */
+private fun selectRecentSafetyDenialIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_RECENT_SAFETY_DENIAL_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "recent safety denial index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
 /**
  * equity_snapshots index 件数を読む。
  */
@@ -5331,6 +5425,53 @@ private fun JdbcTransaction.insertCancellationActorExecution(decisionRunId: Stri
         statement.setString(3, decisionRunId)
         statement.executeUpdate()
     }
+}
+
+private fun testSafetyViolation(
+    decisionRunId: String,
+    rule: SafetyFloorRule,
+    createdAt: Instant,
+): SafetyViolation {
+    return SafetyViolation(
+        rule = rule,
+        messageJa = "SafetyFloor denial",
+        measuredValue = "0.03357778",
+        limitValue = "0.10",
+        commandName = "preview_order",
+        commandId = UUID.randomUUID(),
+        orderId = null,
+        decisionRunId = decisionRunId,
+        toolCallId = "tool-$decisionRunId",
+        clientRequestId = "request-$decisionRunId",
+        hardHaltRequired = false,
+        payloadJson = "{\"credential\":\"must-not-leak\"}",
+        createdAt = createdAt,
+    )
+}
+
+private suspend fun appendNoTradeExit(
+    database: ExposedDatabase,
+    decisionRunId: String,
+    payload: String,
+    occurredAt: Instant,
+) {
+    ExposedCommandEventLog(database).append(
+        CommandEvent(
+            decisionRunContext = DecisionRunContext(
+                decisionRunId = decisionRunId,
+                llmProvider = "claude",
+                promptHash = "prompt-hash",
+                systemPromptVersion = "system-prompt-v1",
+                marketSnapshotId = "snapshot-1",
+            ),
+            toolName = "runner",
+            toolCallId = null,
+            clientRequestId = null,
+            eventType = CommandEventType.NO_TRADE_EXIT,
+            payload = payload,
+            occurredAt = occurredAt,
+        ),
+    ).getOrThrow()
 }
 
 private fun runtimeConfigDraftCreation(note: String): RuntimeConfigDraftCreation {
