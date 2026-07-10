@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.activity
 
+import me.matsumo.fukurou.trading.persistence.STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
@@ -14,6 +15,7 @@ class DecisionRunProjectionRepositoryTest {
                 action = "ENTER",
                 safetyRule = "EXPECTED_VALUE_GATE",
                 orderCount = 0,
+                filledOrderCount = 0,
                 executionCount = 0,
                 hasNoTradeExit = false,
             ),
@@ -27,10 +29,11 @@ class DecisionRunProjectionRepositoryTest {
         val interrupted = classifyDecisionRunOutcome(
             DecisionRunOutcomeEvidence(
                 status = "FAILED",
-                errorMessage = "previous process/container shutdown recovery",
+                errorMessage = STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE,
                 action = null,
                 safetyRule = null,
                 orderCount = 0,
+                filledOrderCount = 0,
                 executionCount = 0,
                 hasNoTradeExit = false,
             ),
@@ -42,6 +45,7 @@ class DecisionRunProjectionRepositoryTest {
                 action = null,
                 safetyRule = null,
                 orderCount = 0,
+                filledOrderCount = 0,
                 executionCount = 0,
                 hasNoTradeExit = false,
             ),
@@ -49,6 +53,18 @@ class DecisionRunProjectionRepositoryTest {
 
         assertEquals(DecisionRunOutcome.INTERRUPTED, interrupted)
         assertEquals(DecisionRunOutcome.FAILED, ordinaryFailure)
+    }
+
+    @Test
+    fun outcomeDoesNotTreatSimilarFailureTextAsBootstrapRecovery() {
+        val outcome = classifyDecisionRunOutcome(
+            outcomeEvidence(
+                status = "FAILED",
+                errorMessage = "provider failed after previous process container shutdown",
+            ),
+        )
+
+        assertEquals(DecisionRunOutcome.FAILED, outcome)
     }
 
     @Test
@@ -63,8 +79,21 @@ class DecisionRunProjectionRepositoryTest {
         )
         assertEquals(
             DecisionRunOutcome.EXECUTED,
-            classifyDecisionRunOutcome(outcomeEvidence(action = "ENTER", orderCount = 1)),
+            classifyDecisionRunOutcome(outcomeEvidence(action = "ENTER", orderCount = 1, filledOrderCount = 1)),
         )
+    }
+
+    @Test
+    fun outcomeRequiresFilledOrderOrExecutionEvidenceForExecuted() {
+        val rejectedOnly = outcomeEvidence(action = "ENTER", orderCount = 1)
+        val canceledWithNoTradeExit = outcomeEvidence(
+            action = "EXIT",
+            orderCount = 1,
+            hasNoTradeExit = true,
+        )
+
+        assertEquals(DecisionRunOutcome.FAILED, classifyDecisionRunOutcome(rejectedOnly))
+        assertEquals(DecisionRunOutcome.NO_TRADE, classifyDecisionRunOutcome(canceledWithNoTradeExit))
     }
 
     @Test
@@ -77,16 +106,19 @@ class DecisionRunProjectionRepositoryTest {
 
 private fun outcomeEvidence(
     status: String = "SUCCEEDED",
+    errorMessage: String? = null,
     action: String? = null,
     orderCount: Int = 0,
+    filledOrderCount: Int = 0,
     hasNoTradeExit: Boolean = false,
 ): DecisionRunOutcomeEvidence {
     return DecisionRunOutcomeEvidence(
         status = status,
-        errorMessage = null,
+        errorMessage = errorMessage,
         action = action,
         safetyRule = null,
         orderCount = orderCount,
+        filledOrderCount = filledOrderCount,
         executionCount = 0,
         hasNoTradeExit = hasNoTradeExit,
     )

@@ -2,10 +2,6 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunDetail
@@ -13,12 +9,14 @@ import me.matsumo.fukurou.trading.activity.DecisionRunExecution
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
+import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcomeEvidence
 import me.matsumo.fukurou.trading.activity.DecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
 import me.matsumo.fukurou.trading.activity.classifyDecisionRunOutcome
+import me.matsumo.fukurou.trading.domain.OrderStatus
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.ResultSet
 import java.time.Instant
@@ -26,6 +24,7 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
 private val SAFE_FINAL_REASON_PATTERN = Regex("[a-z][a-z0-9_]{0,79}")
+private const val FILTER_SCAN_BATCH_SIZE = 100
 
 private const val LIST_RUNS_SQL = """
     WITH candidate_runs AS (
@@ -51,8 +50,10 @@ private const val LIST_RUNS_SQL = """
         safety.rule,
         safety.message_ja,
         order_count.value AS order_count,
+        order_count.filled_value AS filled_order_count,
         execution_count.value AS execution_count,
-        no_trade.payload AS no_trade_payload
+        no_trade.reason AS no_trade_reason,
+        no_trade.present AS has_no_trade_exit
     FROM candidate_runs run
     LEFT JOIN LATERAL (
         SELECT id, action, reason_ja
@@ -77,7 +78,9 @@ private const val LIST_RUNS_SQL = """
         LIMIT 1
     ) safety ON TRUE
     LEFT JOIN LATERAL (
-        SELECT COUNT(*)::INT AS value
+        SELECT
+            COUNT(*)::INT AS value,
+            COUNT(*) FILTER (WHERE status = ?)::INT AS filled_value
         FROM orders
         WHERE decision_run_id = run.invocation_id
     ) order_count ON TRUE
@@ -87,7 +90,7 @@ private const val LIST_RUNS_SQL = """
         WHERE decision_run_id = run.invocation_id
     ) execution_count ON TRUE
     LEFT JOIN LATERAL (
-        SELECT payload
+        SELECT payload::jsonb ->> 'reason' AS reason, TRUE AS present
         FROM command_event_log
         WHERE decision_run_id = run.invocation_id
             AND event_type = 'NO_TRADE_EXIT'
@@ -143,8 +146,15 @@ private const val FIND_RUN_SQL = """
         safety.message_ja,
         safety.created_at AS safety_created_at,
         (SELECT COUNT(*) FROM orders WHERE decision_run_id = run.invocation_id) AS order_count,
+        (
+            SELECT COUNT(*)
+            FROM orders
+            WHERE decision_run_id = run.invocation_id
+                AND status = ?
+        ) AS filled_order_count,
         (SELECT COUNT(*) FROM executions WHERE decision_run_id = run.invocation_id) AS execution_count,
-        no_trade.payload AS no_trade_payload
+        no_trade.reason AS no_trade_reason,
+        no_trade.present AS has_no_trade_exit
     FROM llm_runs run
     LEFT JOIN LATERAL (
         SELECT * FROM decisions
@@ -172,7 +182,7 @@ private const val FIND_RUN_SQL = """
         LIMIT 1
     ) safety ON TRUE
     LEFT JOIN LATERAL (
-        SELECT payload
+        SELECT payload::jsonb ->> 'reason' AS reason, TRUE AS present
         FROM command_event_log
         WHERE decision_run_id = run.invocation_id
             AND event_type = 'NO_TRADE_EXIT'
@@ -205,16 +215,25 @@ private const val FIND_SAFE_AUDIT_SQL = """
     ORDER BY ts ASC, id ASC
 """
 
-/** PostgreSQL の append-only 台帳から decision run projection を構築する repository。 */
+/**
+ * PostgreSQL の append-only 台帳から decision run projection を構築する repository。
+ *
+ * runner の 1 run = 1 decision = 最大 1 entry intent という保存 invariant に従い最新 intent を選び、
+ * order / execution は decision_run_id に紐づく全件を監査 projection として返す。
+ */
 class ExposedDecisionRunProjectionRepository(
     private val database: ExposedDatabase,
 ) : DecisionRunProjectionRepository {
 
-    override suspend fun listRuns(cursor: DecisionRunCursor?, limit: Int): Result<List<DecisionRunSummary>> {
+    override suspend fun listRuns(
+        cursor: DecisionRunCursor?,
+        limit: Int,
+        outcome: DecisionRunOutcome?,
+    ): Result<List<DecisionRunSummary>> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 require(limit > 0) { "limit must be greater than 0." }
-                exposedTransaction(database) { selectRuns(cursor, limit) }
+                exposedTransaction(database) { selectRuns(cursor, limit, outcome) }
             }
         }
     }
@@ -228,7 +247,35 @@ class ExposedDecisionRunProjectionRepository(
     }
 }
 
-private fun JdbcTransaction.selectRuns(cursor: DecisionRunCursor?, limit: Int): List<DecisionRunSummary> {
+private fun JdbcTransaction.selectRuns(
+    cursor: DecisionRunCursor?,
+    limit: Int,
+    outcome: DecisionRunOutcome?,
+): List<DecisionRunSummary> {
+    val selected = mutableListOf<DecisionRunSummary>()
+    var scanCursor = cursor
+
+    while (selected.size < limit) {
+        val remaining = limit - selected.size
+        val batchLimit = if (outcome == null) remaining else maxOf(remaining, FILTER_SCAN_BATCH_SIZE)
+        val batch = selectRunBatch(scanCursor, batchLimit)
+        selected += batch
+            .asSequence()
+            .filter { summary -> outcome == null || summary.outcome == outcome }
+            .take(remaining)
+            .toList()
+
+        val reachedEnd = batch.size < batchLimit
+        if (selected.size >= limit || reachedEnd) break
+
+        val last = batch.lastOrNull() ?: break
+        scanCursor = DecisionRunCursor(last.startedAt, last.invocationId)
+    }
+
+    return selected
+}
+
+private fun JdbcTransaction.selectRunBatch(cursor: DecisionRunCursor?, limit: Int): List<DecisionRunSummary> {
     return jdbcConnection().prepareStatement(LIST_RUNS_SQL).use { statement ->
         val cursorMillis = cursor?.startedAt?.toEpochMilli()
         statement.setObject(1, cursorMillis)
@@ -236,6 +283,7 @@ private fun JdbcTransaction.selectRuns(cursor: DecisionRunCursor?, limit: Int): 
         statement.setObject(3, cursorMillis)
         statement.setString(4, cursor?.invocationId)
         statement.setInt(5, limit)
+        statement.setString(6, OrderStatus.FILLED.name)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) add(resultSet.toSummary())
@@ -246,7 +294,8 @@ private fun JdbcTransaction.selectRuns(cursor: DecisionRunCursor?, limit: Int): 
 
 private fun JdbcTransaction.selectRunDetail(invocationId: String): DecisionRunDetail? {
     val base = jdbcConnection().prepareStatement(FIND_RUN_SQL).use { statement ->
-        statement.setString(1, invocationId)
+        statement.setString(1, OrderStatus.FILLED.name)
+        statement.setString(2, invocationId)
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.toDetailBase() else null
         }
@@ -340,10 +389,12 @@ private fun ResultSet.toSummary(): DecisionRunSummary {
     val action = getString("action")
     val safetyRule = getString("rule")
     val orderCount = getInt("order_count")
+    val filledOrderCount = getInt("filled_order_count")
     val executionCount = getInt("execution_count")
     val status = getString("status")
     val errorMessage = getString("error_message")
-    val noTradePayload = getString("no_trade_payload")
+    val noTradeReason = getString("no_trade_reason")
+    val hasNoTradeExit = getBoolean("has_no_trade_exit")
 
     return DecisionRunSummary(
         invocationId = getString("invocation_id"),
@@ -359,7 +410,7 @@ private fun ResultSet.toSummary(): DecisionRunSummary {
         falsificationVerdict = getString("verdict"),
         safetyRule = safetyRule,
         safetyMessageJa = getString("message_ja"),
-        finalReason = noTradePayload.safeNoTradeReason(),
+        finalReason = noTradeReason.safeNoTradeReason(),
         orderCount = orderCount,
         executionCount = executionCount,
         outcome = classifyDecisionRunOutcome(
@@ -369,8 +420,9 @@ private fun ResultSet.toSummary(): DecisionRunSummary {
                 action = action,
                 safetyRule = safetyRule,
                 orderCount = orderCount,
+                filledOrderCount = filledOrderCount,
                 executionCount = executionCount,
-                hasNoTradeExit = noTradePayload != null,
+                hasNoTradeExit = hasNoTradeExit,
             ),
         ),
     )
@@ -475,12 +527,7 @@ private fun ResultSet.nullableInstant(column: String): Instant? {
 }
 
 private fun String?.safeNoTradeReason(): String? {
-    if (this == null) return null
-
-    return runCatching {
-        Json.parseToJsonElement(this).jsonObject["reason"]?.jsonPrimitive?.contentOrNull
-            ?.takeIf(SAFE_FINAL_REASON_PATTERN::matches)
-    }.getOrNull()
+    return this?.takeIf(SAFE_FINAL_REASON_PATTERN::matches)
 }
 
 private fun DecisionRunOrder.toRawRecord(): DecisionRunRawRecord {

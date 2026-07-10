@@ -3,6 +3,8 @@ import { messages } from "../i18n/messages";
 import { readActivityCatalogGolden } from "../test/activityCatalogGolden";
 import {
   activityTimelineRequestFilters,
+  DECISION_RUN_REFETCH_INTERVAL_MILLIS,
+  decisionRunRefetchInterval,
   newestFirstActivityTimelineEvents,
   type ActivityTimelineFilters,
   type ActivityTimelineEvent,
@@ -81,6 +83,14 @@ describe("ops activity timeline helpers", () => {
       source: "audit",
       auditEventTypes: ["HARD_HALT_SET"],
     });
+  });
+});
+
+describe("decision run query helpers", () => {
+  it("polls only while the infinite query contains its first page", () => {
+    expect(decisionRunRefetchInterval(0)).toBe(DECISION_RUN_REFETCH_INTERVAL_MILLIS);
+    expect(decisionRunRefetchInterval(1)).toBe(DECISION_RUN_REFETCH_INTERVAL_MILLIS);
+    expect(decisionRunRefetchInterval(2)).toBe(false);
   });
 });
 

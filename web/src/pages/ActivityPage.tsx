@@ -6,6 +6,7 @@ import X from "lucide-react/dist/esm/icons/x.mjs";
 import {
   DECISION_RUN_FILTER_STORAGE_KEY,
   DECISION_RUN_OUTCOME_FILTERS,
+  decisionRunRefetchInterval,
   fetchDecisionRuns,
   opsDecisionRunDetailQuery,
   type DecisionRunOutcomeFilter,
@@ -22,23 +23,22 @@ export function ActivityPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selectedRunButtonRef = useRef<HTMLButtonElement | null>(null);
   const runsQuery = useInfiniteQuery({
-    queryKey: ["ops", "decision-runs"],
-    queryFn: ({ pageParam }) => fetchDecisionRuns(pageParam),
+    queryKey: ["ops", "decision-runs", filter],
+    queryFn: ({ pageParam }) => fetchDecisionRuns({
+      before: pageParam,
+      outcome: filter === "ALL" ? null : filter,
+    }),
     initialPageParam: null as string | null,
     getNextPageParam: (lastPage) => lastPage.nextBefore ?? undefined,
     staleTime: 15_000,
-    refetchInterval: 30_000,
+    refetchInterval: (query) => decisionRunRefetchInterval(query.state.data?.pages.length ?? 0),
   });
   const { locale, t } = useI18n();
   const runs = useMemo(
     () => deduplicateRuns(runsQuery.data?.pages.flatMap((page) => page.runs) ?? []),
     [runsQuery.data?.pages],
   );
-  const visibleRuns = useMemo(
-    () => runs.filter((run) => filter === "ALL" || run.outcome === filter),
-    [filter, runs],
-  );
-  const activeSelectedId = selectedId && visibleRuns.some((run) => run.invocationId === selectedId) ? selectedId : null;
+  const activeSelectedId = selectedId && runs.some((run) => run.invocationId === selectedId) ? selectedId : null;
   const detailQuery = useQuery(opsDecisionRunDetailQuery(activeSelectedId));
   const closeDetail = useCallback(() => {
     setSelectedId(null);
@@ -81,7 +81,9 @@ export function ActivityPage() {
             }}
           >
             {outcomeLabel(outcome, t)}
-            <span className="run-filter__count">{outcomeCount(outcome, runs)}</span>
+            {filter === outcome ? (
+              <span className="run-filter__count">{runs.length} {t("activity.runs.filter.loaded")}</span>
+            ) : null}
           </button>
         ))}
       </div>
@@ -96,10 +98,10 @@ export function ActivityPage() {
       {runsQuery.isSuccess ? (
         <div className={activeSelectedId ? "decision-runs-layout decision-runs-layout--detail" : "decision-runs-layout"}>
           <main className="decision-run-list" aria-label={t("activity.runs.list.aria")}>
-            {visibleRuns.length === 0 ? (
+            {runs.length === 0 ? (
               <EmptyState title={t("activity.runs.empty.title")} description={t("activity.runs.empty.description")} />
             ) : (
-              visibleRuns.map((run) => (
+              runs.map((run) => (
                 <RunRow
                   run={run}
                   selected={run.invocationId === activeSelectedId}
@@ -162,7 +164,7 @@ function RunRow({
         <span className="decision-run-card__top">
           <time>{formatDateTime(run.startedAt, locale)}</time>
           <span className="decision-run-card__duration">{formatDuration(run.durationMillis)}</span>
-          <span className={`run-outcome run-outcome--${run.outcome.toLowerCase().replace("_", "-")}`}>
+          <span className={`run-outcome run-outcome--${run.outcome.toLowerCase().replaceAll("_", "-")}`}>
             {outcomeLabel(run.outcome as DecisionRunOutcomeFilter, t)}
           </span>
           <ChevronRight className="decision-run-card__arrow" size={17} aria-hidden="true" />
@@ -217,7 +219,7 @@ function RunDetailPane({
       <header className="decision-run-detail__header">
         <span className="decision-run-detail__eyebrow">Decision run</span>
         {detail ? (
-          <span className={`run-outcome run-outcome--${detail.summary.outcome.toLowerCase().replace("_", "-")}`}>
+          <span className={`run-outcome run-outcome--${detail.summary.outcome.toLowerCase().replaceAll("_", "-")}`}>
             {outcomeLabel(detail.summary.outcome as DecisionRunOutcomeFilter, t)}
           </span>
         ) : null}
@@ -428,10 +430,6 @@ function RunListNotice({ text, action }: { text: string; action?: () => void }) 
 function loadRunFilter(): DecisionRunOutcomeFilter {
   const saved = window.localStorage.getItem(DECISION_RUN_FILTER_STORAGE_KEY);
   return DECISION_RUN_OUTCOME_FILTERS.find((filter) => filter === saved) ?? "ALL";
-}
-
-function outcomeCount(outcome: DecisionRunOutcomeFilter, runs: OpsDecisionRunSummaryResponse[]): number {
-  return outcome === "ALL" ? runs.length : runs.filter((run) => run.outcome === outcome).length;
 }
 
 function deduplicateRuns(runs: OpsDecisionRunSummaryResponse[]): OpsDecisionRunSummaryResponse[] {

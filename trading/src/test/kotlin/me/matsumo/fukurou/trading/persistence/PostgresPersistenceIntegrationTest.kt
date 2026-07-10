@@ -42,6 +42,7 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
@@ -578,7 +579,7 @@ private const val INSERT_ACTIVITY_CONTEXT_ORDER_SQL = """
         'BTC',
         ?,
         ?,
-        'FILLED',
+        ?,
         0.010000000000,
         ?,
         ?,
@@ -1222,6 +1223,64 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf("empty-terminal-run"), summaries.map { summary -> summary.invocationId })
         assertEquals(DecisionRunOutcome.FAILED, summaries.single().outcome)
         assertNull(repository.findRun("reflection-run").getOrThrow())
+    }
+
+    @Test
+    fun decisionRunProjectionFiltersExecutedByFilledOrderEvidence() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        listOf("filled-run", "rejected-run").forEach { invocationId ->
+            val start = LlmRunStart(
+                invocationId = invocationId,
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                startedAt = fixedInstant(),
+            )
+            llmRunRepository.insertRunning(start).getOrThrow()
+            llmRunRepository.finish(
+                LlmRunFinish(
+                    invocationId = invocationId,
+                    mode = start.mode,
+                    symbol = start.symbol,
+                    triggerKind = start.triggerKind,
+                    status = "SUCCEEDED",
+                    startedAt = start.startedAt,
+                    finishedAt = fixedInstant().plusSeconds(10),
+                    errorMessage = null,
+                ),
+            ).getOrThrow()
+        }
+        exposedTransaction(database) {
+            listOf(
+                "filled-run" to OrderStatus.FILLED,
+                "rejected-run" to OrderStatus.REJECTED,
+            ).forEach { (invocationId, status) ->
+                val positionId = UUID.randomUUID()
+                val tradeGroupId = UUID.randomUUID()
+                insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+                insertActivityContextOrder(
+                    orderId = UUID.randomUUID(),
+                    positionId = positionId,
+                    tradeGroupId = tradeGroupId,
+                    side = OrderSide.BUY,
+                    orderType = OrderType.LIMIT,
+                    status = status,
+                    limitPriceJpy = BigDecimal("9900000"),
+                    triggerPriceJpy = null,
+                    takeProfitPriceJpy = BigDecimal("10500000"),
+                    reasonJa = "decision run outcome fixture",
+                    decisionRunId = invocationId,
+                )
+            }
+        }
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val executed = repository.listRuns(cursor = null, limit = 10, outcome = DecisionRunOutcome.EXECUTED).getOrThrow()
+        val failed = repository.listRuns(cursor = null, limit = 10, outcome = DecisionRunOutcome.FAILED).getOrThrow()
+
+        assertEquals(listOf("filled-run"), executed.map { summary -> summary.invocationId })
+        assertEquals(listOf("rejected-run"), failed.map { summary -> summary.invocationId })
     }
 
     @Test
@@ -4127,6 +4186,7 @@ private fun JdbcTransaction.insertActivityContextOrder(
     tradeGroupId: UUID,
     side: OrderSide,
     orderType: OrderType,
+    status: OrderStatus = OrderStatus.FILLED,
     limitPriceJpy: BigDecimal?,
     triggerPriceJpy: BigDecimal?,
     takeProfitPriceJpy: BigDecimal?,
@@ -4139,13 +4199,14 @@ private fun JdbcTransaction.insertActivityContextOrder(
         statement.setObject(3, tradeGroupId)
         statement.setString(4, side.name)
         statement.setString(5, orderType.name)
-        statement.setNullableBigDecimal(6, limitPriceJpy)
-        statement.setNullableBigDecimal(7, triggerPriceJpy)
-        statement.setNullableBigDecimal(8, takeProfitPriceJpy)
-        statement.setString(9, reasonJa)
-        statement.setString(10, decisionRunId)
-        statement.setLong(11, fixedInstant().toEpochMilli())
+        statement.setString(6, status.name)
+        statement.setNullableBigDecimal(7, limitPriceJpy)
+        statement.setNullableBigDecimal(8, triggerPriceJpy)
+        statement.setNullableBigDecimal(9, takeProfitPriceJpy)
+        statement.setString(10, reasonJa)
+        statement.setString(11, decisionRunId)
         statement.setLong(12, fixedInstant().toEpochMilli())
+        statement.setLong(13, fixedInstant().toEpochMilli())
         statement.executeUpdate()
     }
 }

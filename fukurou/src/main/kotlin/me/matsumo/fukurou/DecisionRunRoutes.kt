@@ -15,9 +15,13 @@ import me.matsumo.fukurou.trading.activity.DecisionRunExecution
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
+import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
+import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.decision.requiresEntryIntent
+import me.matsumo.fukurou.trading.decision.requiresSafetyFloor
 import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.time.Instant
@@ -206,17 +210,14 @@ private fun Route.registerOpsDecisionRunsListRoute(dependencies: OpsRouteDepende
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("before must be a valid opaque cursor"))
             return@get
         }
-        val records = repository.listRuns(cursor, limit + 1).getOrThrow()
-        val hasNext = records.size > limit
-        val visible = records.take(limit)
-        val nextBefore = if (hasNext) visible.lastOrNull()?.let(::encodeRunCursor) else null
-
-        call.respond(
-            OpsDecisionRunsResponse(
-                runs = visible.map(DecisionRunSummary::toResponse),
-                nextBefore = nextBefore,
-            ),
-        )
+        val outcomeParameter = call.request.queryParameters["outcome"]
+        val outcome = outcomeParameter?.let(::parseRunOutcome)
+        if (outcomeParameter != null && outcome == null) {
+            call.respond(HttpStatusCode.BadRequest, ErrorResponse("outcome must be a valid decision run outcome"))
+            return@get
+        }
+        val records = repository.listRuns(cursor, limit + 1, outcome).getOrThrow()
+        call.respond(records.toPageResponse(limit))
     }.describe {
         summary = "decision run 一覧を取得する"
         description = "llm_runs を起点に decision、Falsifier、SafetyFloor、order、execution を正規化した run 一覧を新しい順で返します。"
@@ -230,6 +231,10 @@ private fun Route.registerOpsDecisionRunsListRoute(dependencies: OpsRouteDepende
                 description = "前回応答の nextBefore を指定する opaque cursor です。"
                 schema = jsonSchema<String>()
             }
+            query("outcome") {
+                description = "pagination より前に適用する outcome filter です。"
+                schema = jsonSchema<OpsDecisionRunOutcome>()
+            }
         }
         responses {
             HttpStatusCode.OK {
@@ -237,7 +242,7 @@ private fun Route.registerOpsDecisionRunsListRoute(dependencies: OpsRouteDepende
                 schema = jsonSchema<OpsDecisionRunsResponse>()
             }
             HttpStatusCode.BadRequest {
-                description = "limit または before が不正です。"
+                description = "limit、before、または outcome が不正です。"
                 schema = jsonSchema<ErrorResponse>()
             }
             HttpStatusCode.ServiceUnavailable {
@@ -291,6 +296,16 @@ private fun Route.registerOpsDecisionRunDetailRoute(dependencies: OpsRouteDepend
     }
 }
 
+private fun List<DecisionRunSummary>.toPageResponse(limit: Int): OpsDecisionRunsResponse {
+    val visible = take(limit)
+    val nextBefore = if (size > limit) visible.lastOrNull()?.let(::encodeRunCursor) else null
+
+    return OpsDecisionRunsResponse(
+        runs = visible.map(DecisionRunSummary::toResponse),
+        nextBefore = nextBefore,
+    )
+}
+
 private fun DecisionRunSummary.toResponse(): OpsDecisionRunSummaryResponse {
     return OpsDecisionRunSummaryResponse(
         invocationId = invocationId,
@@ -298,7 +313,7 @@ private fun DecisionRunSummary.toResponse(): OpsDecisionRunSummaryResponse {
         symbol = symbol,
         triggerKind = triggerKind,
         status = status,
-        outcome = OpsDecisionRunOutcome.valueOf(outcome.name),
+        outcome = outcome.toResponse(),
         startedAt = startedAt.toString(),
         finishedAt = finishedAt?.toString(),
         durationMillis = finishedAt?.let { end -> Duration.between(startedAt, end).toMillis() },
@@ -329,7 +344,7 @@ private fun DecisionRunDetail.toResponse(): OpsDecisionRunDetailResponse {
 }
 
 private fun DecisionRunDetail.phases(): List<OpsDecisionRunPhaseResponse> {
-    val isRunning = summary.outcome.name == "RUNNING"
+    val isRunning = summary.outcome == DecisionRunOutcome.RUNNING
     val stoppedStatus = if (isRunning) "RUNNING" else "NOT_REACHED"
     return listOf(
         OpsDecisionRunPhaseResponse("TRIGGER", "COMPLETED", summary.triggerKind ?: "MANUAL"),
@@ -355,7 +370,7 @@ private fun DecisionRunDetail.phases(): List<OpsDecisionRunPhaseResponse> {
 
 private fun DecisionRunDetail.intentPhaseStatus(stoppedStatus: String): String {
     if (intent != null) return "COMPLETED"
-    return if (requiresIntent()) stoppedStatus else "NOT_REQUIRED"
+    return if (decisionAction()?.requiresEntryIntent() == true) stoppedStatus else "NOT_REQUIRED"
 }
 
 private fun DecisionRunDetail.falsificationPhaseStatus(stoppedStatus: String): String {
@@ -365,7 +380,7 @@ private fun DecisionRunDetail.falsificationPhaseStatus(stoppedStatus: String): S
 private fun DecisionRunDetail.safetyPhaseStatus(stoppedStatus: String): String {
     return when {
         safetyViolation != null -> "DENIED"
-        !requiresIntent() -> "NOT_REQUIRED"
+        decisionAction()?.requiresSafetyFloor() != true -> "NOT_REQUIRED"
         orders.isNotEmpty() -> "PASSED"
         executions.isNotEmpty() -> "PASSED"
         else -> stoppedStatus
@@ -376,8 +391,19 @@ private fun DecisionRunDetail.orderExecutionPhaseStatus(stoppedStatus: String): 
     return if (orders.isNotEmpty() || executions.isNotEmpty()) "COMPLETED" else stoppedStatus
 }
 
-private fun DecisionRunDetail.requiresIntent(): Boolean {
-    return decision?.action == "ENTER" || decision?.action == "ADD_LONG"
+private fun DecisionRunDetail.decisionAction(): DecisionAction? {
+    return decision?.action?.let(DecisionAction::valueOf)
+}
+
+private fun DecisionRunOutcome.toResponse(): OpsDecisionRunOutcome {
+    return when (this) {
+        DecisionRunOutcome.EXECUTED -> OpsDecisionRunOutcome.EXECUTED
+        DecisionRunOutcome.DENIED -> OpsDecisionRunOutcome.DENIED
+        DecisionRunOutcome.NO_TRADE -> OpsDecisionRunOutcome.NO_TRADE
+        DecisionRunOutcome.INTERRUPTED -> OpsDecisionRunOutcome.INTERRUPTED
+        DecisionRunOutcome.RUNNING -> OpsDecisionRunOutcome.RUNNING
+        DecisionRunOutcome.FAILED -> OpsDecisionRunOutcome.FAILED
+    }
 }
 
 private fun DecisionRunDecision.toResponse() = OpsDecisionRunDecisionResponse(
@@ -473,4 +499,8 @@ private fun decodeRunCursor(value: String): DecisionRunCursor? {
             invocationId = decoded.substring(separator + 1).also { require(it.isNotBlank()) },
         )
     }.getOrNull()
+}
+
+private fun parseRunOutcome(value: String): DecisionRunOutcome? {
+    return DecisionRunOutcome.entries.find { outcome -> outcome.name == value }
 }

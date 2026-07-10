@@ -1,5 +1,10 @@
 package me.matsumo.fukurou.trading.activity
 
+import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
+import me.matsumo.fukurou.trading.persistence.STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE
 import java.time.Instant
 
 /** decision run の機械判定 outcome。 */
@@ -19,23 +24,23 @@ data class DecisionRunOutcomeEvidence(
     val action: String?,
     val safetyRule: String?,
     val orderCount: Int,
+    val filledOrderCount: Int,
     val executionCount: Int,
     val hasNoTradeExit: Boolean,
 )
 
 /** 保存済み run 証跡から fail-closed な outcome を決定する。 */
 fun classifyDecisionRunOutcome(evidence: DecisionRunOutcomeEvidence): DecisionRunOutcome {
-    val normalizedError = evidence.errorMessage.orEmpty().lowercase()
-    val recoveredAfterShutdown = normalizedError.contains("previous process") &&
-        (normalizedError.contains("shutdown") || normalizedError.contains("container"))
+    val recoveredAfterShutdown = evidence.errorMessage == STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE
+    val hasExecutionEvidence = evidence.filledOrderCount > 0 || evidence.executionCount > 0
 
     return when {
-        evidence.status == "RUNNING" -> DecisionRunOutcome.RUNNING
+        evidence.status == LLM_RUN_STATUS_RUNNING -> DecisionRunOutcome.RUNNING
         recoveredAfterShutdown -> DecisionRunOutcome.INTERRUPTED
         evidence.safetyRule != null -> DecisionRunOutcome.DENIED
-        evidence.status == "FAILED" || evidence.status == "CANCELLED" -> DecisionRunOutcome.FAILED
-        evidence.action == "NO_TRADE" || evidence.hasNoTradeExit -> DecisionRunOutcome.NO_TRADE
-        evidence.orderCount > 0 || evidence.executionCount > 0 -> DecisionRunOutcome.EXECUTED
+        evidence.status == LLM_RUN_STATUS_FAILED || evidence.status == LLM_RUN_STATUS_CANCELLED -> DecisionRunOutcome.FAILED
+        evidence.action == DecisionAction.NO_TRADE.name || evidence.hasNoTradeExit -> DecisionRunOutcome.NO_TRADE
+        hasExecutionEvidence -> DecisionRunOutcome.EXECUTED
         else -> DecisionRunOutcome.FAILED
     }
 }
@@ -152,7 +157,12 @@ data class DecisionRunRawRecord(
     val values: Map<String, String?>,
 )
 
-/** decision run 詳細の正規化 projection。 */
+/**
+ * decision run 詳細の正規化 projection。
+ *
+ * runner は 1 run に 1 decision と最大 1 entry intent を保存する。projection はその invariant を前提に
+ * 最新 intent を表示し、run に紐づく order / execution は監査のため全件を保持する。
+ */
 data class DecisionRunDetail(
     val summary: DecisionRunSummary,
     val decision: DecisionRunDecision?,
@@ -166,8 +176,12 @@ data class DecisionRunDetail(
 
 /** Activity の decision run read model repository。 */
 interface DecisionRunProjectionRepository {
-    /** run を新しい順で返す。 */
-    suspend fun listRuns(cursor: DecisionRunCursor?, limit: Int): Result<List<DecisionRunSummary>>
+    /** outcome filter を pagination より前に適用し、run を新しい順で返す。 */
+    suspend fun listRuns(
+        cursor: DecisionRunCursor?,
+        limit: Int,
+        outcome: DecisionRunOutcome? = null,
+    ): Result<List<DecisionRunSummary>>
 
     /** invocation ID に対応する run 詳細を返す。 */
     suspend fun findRun(invocationId: String): Result<DecisionRunDetail?>

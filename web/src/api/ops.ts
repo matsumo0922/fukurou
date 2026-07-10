@@ -51,6 +51,7 @@ export const DECISION_RUN_OUTCOME_FILTERS = [
   "FAILED",
 ] as const satisfies readonly DecisionRunOutcomeFilter[];
 export const DECISION_RUN_PAGE_LIMIT = 50;
+export const DECISION_RUN_REFETCH_INTERVAL_MILLIS = 30_000;
 
 export type LlmAuthProvider = "claude" | "codex";
 export type ActivityTimelineSource = "audit" | "decision" | "execution";
@@ -136,11 +137,22 @@ export const opsActivityCatalogQuery = queryOptions({
   staleTime: 300_000,
 });
 
-export async function fetchDecisionRuns(before?: string | null): Promise<OpsDecisionRunsResponse> {
+export async function fetchDecisionRuns({
+  before,
+  outcome,
+}: {
+  before?: string | null;
+  outcome?: DecisionRunOutcome | null;
+} = {}): Promise<OpsDecisionRunsResponse> {
   const searchParams = new URLSearchParams({ limit: String(DECISION_RUN_PAGE_LIMIT) });
   if (before) searchParams.set("before", before);
+  if (outcome) searchParams.set("outcome", outcome);
 
   return getJson(`/ops/runs?${searchParams.toString()}`);
+}
+
+export function decisionRunRefetchInterval(pageCount: number): number | false {
+  return pageCount <= 1 ? DECISION_RUN_REFETCH_INTERVAL_MILLIS : false;
 }
 
 export function opsDecisionRunDetailQuery(invocationId: string | null) {

@@ -51,6 +51,13 @@ fun DecisionAction.requiresEntryIntent(): Boolean {
 }
 
 /**
+ * SafetyFloor を通過してから取引副作用を実行する action かどうかを返す。
+ */
+fun DecisionAction.requiresSafetyFloor(): Boolean {
+    return this != DecisionAction.NO_TRADE
+}
+
+/**
  * Falsifier が entry intent に対して返す verdict。
  */
 enum class FalsificationVerdict {

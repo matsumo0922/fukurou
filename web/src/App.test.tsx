@@ -358,13 +358,21 @@ describe("App", () => {
     const filters = screen.getByRole("group", { name: "Decision run outcome filters" });
     expect(within(runList).getByText("EXPECTED_VALUE_GATE")).toBeInTheDocument();
     expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "false");
+    expect(within(filters).getByRole("button", { name: /All/ })).toHaveTextContent("2 loaded");
     expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("limit") === "50")).toBe(true);
 
     fireEvent.click(within(filters).getByRole("button", { name: /Denied/ }));
     expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "true");
     expect(window.localStorage.getItem("fukurou.web.activity.run-filter.v2")).toBe("DENIED");
+    await waitFor(() => {
+      expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("outcome") === "DENIED")).toBe(true);
+    });
+    await waitFor(() => {
+      expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveTextContent("1 loaded");
+    });
 
-    const selectedRun = within(runList).getByRole("button", { name: /ENTER/ });
+    const filteredRunList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    const selectedRun = within(filteredRunList).getByRole("button", { name: /ENTER/ });
     fireEvent.click(selectedRun);
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
     expect(await within(detailPane).findByText("0.1100000000")).toBeInTheDocument();
@@ -948,9 +956,13 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
           return jsonResponse(fixture.decisionRunsResponse.body, { status: fixture.decisionRunsResponse.status });
         }
         if (requestSearchParams(input).has("before")) {
-          return fixture.decisionRunsOlderResponse ?? jsonResponse(olderDecisionRunsResponse());
+          return fixture.decisionRunsOlderResponse ?? jsonResponse(
+            filterDecisionRunsResponse(olderDecisionRunsResponse(), requestSearchParams(input).get("outcome")),
+          );
         }
-        return jsonResponse(decisionRunsResponse());
+        return jsonResponse(
+          filterDecisionRunsResponse(decisionRunsResponse(), requestSearchParams(input).get("outcome")),
+        );
       case "/ops/runs/run-denied":
         return jsonResponse(decisionRunDetailResponse());
       case "/ops/activity/catalog":
@@ -1514,6 +1526,15 @@ function decisionRunsResponse() {
       },
     ],
     nextBefore: "older-cursor",
+  };
+}
+
+function filterDecisionRunsResponse<T extends { runs: Array<{ outcome: string }> }>(response: T, outcome: string | null): T {
+  if (!outcome) return response;
+
+  return {
+    ...response,
+    runs: response.runs.filter((run) => run.outcome === outcome),
   };
 }
 

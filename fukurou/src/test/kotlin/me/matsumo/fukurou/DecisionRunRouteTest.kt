@@ -10,11 +10,13 @@ import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunDetail
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
+import me.matsumo.fukurou.trading.activity.DecisionRunOrder
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.activity.DecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
+import me.matsumo.fukurou.trading.decision.DecisionAction
 import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -44,6 +46,12 @@ class DecisionRunRouteTest {
         assertEquals(Instant.parse("2026-07-10T00:47:27Z"), repository.lastCursor?.startedAt)
         assertEquals("run-new", repository.lastCursor?.invocationId)
 
+        val filteredResponse = client.get("/ops/runs?outcome=INTERRUPTED")
+        assertEquals(HttpStatusCode.OK, filteredResponse.status)
+        val filteredPage = Json.decodeFromString<OpsDecisionRunsResponse>(filteredResponse.body())
+        assertEquals(listOf("run-old"), filteredPage.runs.map { run -> run.invocationId })
+        assertEquals(DecisionRunOutcome.INTERRUPTED, repository.lastOutcome)
+
         val detailResponse = client.get("/ops/runs/run-new")
         assertEquals(HttpStatusCode.OK, detailResponse.status)
         val detail = Json.decodeFromString<OpsDecisionRunDetailResponse>(detailResponse.body())
@@ -61,6 +69,26 @@ class DecisionRunRouteTest {
         assertTrue(detail.raw.none { raw -> raw.values.keys.any { key -> key.contains("secret", ignoreCase = true) } })
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?limit=0").status)
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?before=invalid").status)
+        assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?outcome=UNKNOWN").status)
+    }
+
+    @Test
+    fun nonEntryTradeActionsShowSafetyFloorAsPassed() = testApplication {
+        application {
+            module(
+                opsDecisionRunProjectionRepository = SafetyPassedDecisionRunProjectionRepository(),
+                databaseConfig = null,
+            )
+        }
+
+        listOf(DecisionAction.EXIT, DecisionAction.REDUCE, DecisionAction.ADJUST_PROTECTION).forEach { action ->
+            val response = client.get("/ops/runs/safety-${action.name.lowercase()}")
+            assertEquals(HttpStatusCode.OK, response.status)
+            val detail = Json.decodeFromString<OpsDecisionRunDetailResponse>(response.body())
+            assertEquals("NOT_REQUIRED", detail.phases.single { phase -> phase.key == "INTENT" }.status)
+            assertEquals("PASSED", detail.phases.single { phase -> phase.key == "SAFETY" }.status)
+            assertEquals("COMPLETED", detail.phases.single { phase -> phase.key == "ORDER_EXECUTION" }.status)
+        }
     }
 
     @Test
@@ -73,6 +101,7 @@ class DecisionRunRouteTest {
 
 private class FakeDecisionRunProjectionRepository : DecisionRunProjectionRepository {
     var lastCursor: DecisionRunCursor? = null
+    var lastOutcome: DecisionRunOutcome? = null
 
     private val denied = deniedRunSummary()
     private val interrupted = denied.copy(
@@ -89,9 +118,16 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
         outcome = DecisionRunOutcome.INTERRUPTED,
     )
 
-    override suspend fun listRuns(cursor: DecisionRunCursor?, limit: Int): Result<List<DecisionRunSummary>> {
+    override suspend fun listRuns(
+        cursor: DecisionRunCursor?,
+        limit: Int,
+        outcome: DecisionRunOutcome?,
+    ): Result<List<DecisionRunSummary>> {
         lastCursor = cursor
-        return Result.success(if (cursor == null) listOf(denied, interrupted).take(limit) else listOf(interrupted).take(limit))
+        lastOutcome = outcome
+        val runs = if (cursor == null) listOf(denied, interrupted) else listOf(interrupted)
+
+        return Result.success(runs.filter { run -> outcome == null || run.outcome == outcome }.take(limit))
     }
 
     override suspend fun findRun(invocationId: String): Result<DecisionRunDetail?> {
@@ -157,6 +193,22 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
     }
 }
 
+private class SafetyPassedDecisionRunProjectionRepository : DecisionRunProjectionRepository {
+    override suspend fun listRuns(
+        cursor: DecisionRunCursor?,
+        limit: Int,
+        outcome: DecisionRunOutcome?,
+    ): Result<List<DecisionRunSummary>> {
+        return Result.success(emptyList())
+    }
+
+    override suspend fun findRun(invocationId: String): Result<DecisionRunDetail?> {
+        val action = DecisionAction.entries.find { candidate -> invocationId == "safety-${candidate.name.lowercase()}" }
+
+        return Result.success(action?.let(::safetyPassedDetail))
+    }
+}
+
 private fun deniedRunSummary(): DecisionRunSummary {
     return DecisionRunSummary(
         invocationId = "run-new",
@@ -176,5 +228,57 @@ private fun deniedRunSummary(): DecisionRunSummary {
         orderCount = 0,
         executionCount = 0,
         outcome = DecisionRunOutcome.DENIED,
+    )
+}
+
+private fun safetyPassedDetail(action: DecisionAction): DecisionRunDetail {
+    val invocationId = "safety-${action.name.lowercase()}"
+    val summary = deniedRunSummary().copy(
+        invocationId = invocationId,
+        action = action.name,
+        reasonJa = "既存 position を更新します。",
+        falsificationVerdict = null,
+        safetyRule = null,
+        safetyMessageJa = null,
+        finalReason = null,
+        orderCount = 1,
+        outcome = DecisionRunOutcome.EXECUTED,
+    )
+
+    return DecisionRunDetail(
+        summary = summary,
+        decision = DecisionRunDecision(
+            decisionId = "decision-${action.name.lowercase()}",
+            action = action.name,
+            provider = "codex",
+            estimatedWinProbability = "0.61",
+            expectedRMultiple = null,
+            roundTripCostR = null,
+            reasonJa = "既存 position を更新します。",
+            setupTagsJson = "[]",
+            missingDataJaJson = "[]",
+            noTradeConditionsJaJson = "[]",
+            createdAt = Instant.parse("2026-07-10T00:47:30Z"),
+        ),
+        intent = null,
+        falsification = null,
+        safetyViolation = null,
+        orders = listOf(
+            DecisionRunOrder(
+                orderId = "order-${action.name.lowercase()}",
+                intentId = null,
+                positionId = "position-1",
+                tradeGroupId = "trade-group-1",
+                side = "SELL",
+                orderType = "MARKET",
+                status = "FILLED",
+                sizeBtc = "0.01",
+                limitPriceJpy = null,
+                reasonJa = null,
+                createdAt = Instant.parse("2026-07-10T00:47:34Z"),
+            ),
+        ),
+        executions = emptyList(),
+        raw = emptyList(),
     )
 }

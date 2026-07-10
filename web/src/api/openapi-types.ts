@@ -1613,6 +1613,8 @@ export interface paths {
                     limit?: number;
                     /** @description 前回応答の nextBefore を指定する opaque cursor です。 */
                     before?: string;
+                    /** @description pagination より前に適用する outcome filter です。 */
+                    outcome?: "EXECUTED" | "DENIED" | "NO_TRADE" | "INTERRUPTED" | "RUNNING" | "FAILED";
                 };
                 header?: never;
                 path?: never;
@@ -1629,7 +1631,7 @@ export interface paths {
                         "application/json": components["schemas"]["OpsDecisionRunsResponse"];
                     };
                 };
-                /** @description limit または before が不正です。 */
+                /** @description limit、before、または outcome が不正です。 */
                 400: {
                     headers: {
                         [name: string]: unknown;
