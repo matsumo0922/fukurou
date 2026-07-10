@@ -1,6 +1,8 @@
 package me.matsumo.fukurou.trading.activity
 
 import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
+import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
@@ -10,10 +12,12 @@ import java.time.Instant
 /** decision run の機械判定 outcome。 */
 enum class DecisionRunOutcome {
     WAITING,
+    EXPIRING,
     FILLED,
     EXPIRED,
     CANCELED,
     NO_ENTRY,
+    DENIED,
     RUNNING,
     FAILED,
     ACTION_REQUIRED,
@@ -23,7 +27,12 @@ enum class DecisionRunOutcome {
 enum class DecisionRunFilter {
     ACTION_REQUIRED,
     WAITING,
+    EXPIRING,
     FILLED,
+    DENIED,
+    RUNNING,
+    EXPIRED,
+    CANCELED,
     NO_ENTRY,
 }
 
@@ -38,6 +47,7 @@ data class DecisionRunOutcomeEvidence(
     val executionCount: Int,
     val hasNoTradeExit: Boolean,
     val openOrderCount: Int = 0,
+    val expiringOpenOrderCount: Int = 0,
     val overdueOpenOrderCount: Int = 0,
     val ttlCanceledOrderCount: Int = 0,
     val canceledEntryOrderCount: Int = 0,
@@ -46,18 +56,29 @@ data class DecisionRunOutcomeEvidence(
 
 /** 保存済み run 証跡から fail-closed な outcome を決定する。 */
 fun classifyDecisionRunOutcome(evidence: DecisionRunOutcomeEvidence): DecisionRunOutcome {
-    val hasExecutionEvidence = evidence.filledOrderCount > 0 || evidence.executionCount > 0
+    return evidence.lifecycleOutcome() ?: evidence.processOutcome()
+}
 
+private fun DecisionRunOutcomeEvidence.lifecycleOutcome(): DecisionRunOutcome? {
+    val hasExecutionEvidence = filledOrderCount > 0 || executionCount > 0
     return when {
-        evidence.overdueOpenOrderCount > 0 -> DecisionRunOutcome.ACTION_REQUIRED
-        evidence.openOrderCount > 0 -> DecisionRunOutcome.WAITING
+        overdueOpenOrderCount > 0 -> DecisionRunOutcome.ACTION_REQUIRED
+        expiringOpenOrderCount > 0 -> DecisionRunOutcome.EXPIRING
+        openOrderCount > 0 -> DecisionRunOutcome.WAITING
         hasExecutionEvidence -> DecisionRunOutcome.FILLED
-        evidence.ttlCanceledOrderCount > 0 -> DecisionRunOutcome.EXPIRED
-        evidence.hasNormalCancellationEvidence() -> DecisionRunOutcome.CANCELED
-        evidence.status == LLM_RUN_STATUS_RUNNING -> DecisionRunOutcome.RUNNING
-        evidence.hasNoEntryEvidence() -> DecisionRunOutcome.NO_ENTRY
-        evidence.errorMessage == STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE -> DecisionRunOutcome.FAILED
-        evidence.status == LLM_RUN_STATUS_FAILED || evidence.status == LLM_RUN_STATUS_CANCELLED -> DecisionRunOutcome.FAILED
+        ttlCanceledOrderCount > 0 -> DecisionRunOutcome.EXPIRED
+        hasNormalCancellationEvidence() -> DecisionRunOutcome.CANCELED
+        else -> null
+    }
+}
+
+private fun DecisionRunOutcomeEvidence.processOutcome(): DecisionRunOutcome {
+    return when {
+        status == LLM_RUN_STATUS_RUNNING -> DecisionRunOutcome.RUNNING
+        safetyRule != null -> DecisionRunOutcome.DENIED
+        hasNoEntryEvidence() -> DecisionRunOutcome.NO_ENTRY
+        errorMessage == STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE -> DecisionRunOutcome.FAILED
+        status == LLM_RUN_STATUS_FAILED || status == LLM_RUN_STATUS_CANCELLED -> DecisionRunOutcome.FAILED
         else -> DecisionRunOutcome.FAILED
     }
 }
@@ -67,7 +88,7 @@ private fun DecisionRunOutcomeEvidence.hasNormalCancellationEvidence(): Boolean 
 }
 
 private fun DecisionRunOutcomeEvidence.hasNoEntryEvidence(): Boolean {
-    return safetyRule != null || action == DecisionAction.NO_TRADE.name || hasNoTradeExit
+    return action == DecisionAction.NO_TRADE.name || hasNoTradeExit
 }
 
 /** outcome が目的別 filter に一致するかを返す。 */
@@ -75,12 +96,21 @@ fun DecisionRunOutcome.matches(filter: DecisionRunFilter): Boolean {
     return when (filter) {
         DecisionRunFilter.ACTION_REQUIRED -> this == DecisionRunOutcome.ACTION_REQUIRED || this == DecisionRunOutcome.FAILED
         DecisionRunFilter.WAITING -> this == DecisionRunOutcome.WAITING
+        DecisionRunFilter.EXPIRING -> this == DecisionRunOutcome.EXPIRING
         DecisionRunFilter.FILLED -> this == DecisionRunOutcome.FILLED
-        DecisionRunFilter.NO_ENTRY ->
-            this == DecisionRunOutcome.NO_ENTRY ||
-                this == DecisionRunOutcome.EXPIRED ||
-                this == DecisionRunOutcome.CANCELED
+        DecisionRunFilter.DENIED -> this == DecisionRunOutcome.DENIED
+        DecisionRunFilter.RUNNING -> this == DecisionRunOutcome.RUNNING
+        DecisionRunFilter.EXPIRED -> this == DecisionRunOutcome.EXPIRED
+        DecisionRunFilter.CANCELED -> this == DecisionRunOutcome.CANCELED
+        DecisionRunFilter.NO_ENTRY -> this == DecisionRunOutcome.NO_ENTRY
     }
+}
+
+/** summary が filter に一致するかを process failure marker も含めて返す。 */
+fun DecisionRunSummary.matches(filter: DecisionRunFilter): Boolean {
+    if (filter == DecisionRunFilter.ACTION_REQUIRED && hasProcessFailure) return true
+
+    return outcome.matches(filter)
 }
 
 /** decision run 一覧の安定 cursor。 */
@@ -119,6 +149,7 @@ data class DecisionRunSummary(
     val orderCount: Int,
     val executionCount: Int,
     val outcome: DecisionRunOutcome,
+    val hasProcessFailure: Boolean = false,
     val order: DecisionRunOrder? = null,
 )
 
@@ -190,10 +221,47 @@ data class DecisionRunOrder(
     val effectiveTtlSeconds: Long? = null,
     val expiredAt: Instant? = null,
     val canceledAt: Instant? = null,
-    val cancelReason: String? = null,
+    val cancelReason: PaperOrderCancelReason? = null,
     val canceledByDecisionRunId: String? = null,
     val createdAt: Instant,
+    val strategyEvaluationEligible: Boolean = true,
+    val strategyEvaluationExclusionReason: StrategyEvaluationExclusionReason? = null,
+    val lifecycleDelaySeconds: Long? = null,
 )
+
+/** strategy 評価から除外する理由。 */
+enum class StrategyEvaluationExclusionReason {
+    LIFECYCLE_MONITORING_DELAY,
+    EXPIRY_EVIDENCE_MISSING,
+}
+
+/** TTL取消の証跡から strategy 評価可否を付与する。 */
+fun DecisionRunOrder.withStrategyEvaluation(): DecisionRunOrder {
+    if (cancelReason != PaperOrderCancelReason.TTL_EXPIRY) return this
+    val logicalExpiry = expiredAt ?: expiresAt
+    val processingTime = canceledAt
+
+    if (logicalExpiry == null || processingTime == null) {
+        return copy(
+            strategyEvaluationEligible = false,
+            strategyEvaluationExclusionReason = StrategyEvaluationExclusionReason.EXPIRY_EVIDENCE_MISSING,
+        )
+    }
+
+    val delay = java.time.Duration.between(logicalExpiry, processingTime)
+        .coerceAtLeast(java.time.Duration.ZERO)
+    val delayed = delay > PaperOrderLifecyclePolicy.cancellationGrace
+
+    return copy(
+        strategyEvaluationEligible = !delayed,
+        strategyEvaluationExclusionReason = if (delayed) {
+            StrategyEvaluationExclusionReason.LIFECYCLE_MONITORING_DELAY
+        } else {
+            null
+        },
+        lifecycleDelaySeconds = delay.seconds,
+    )
+}
 
 /** decision run に紐づく execution projection。 */
 data class DecisionRunExecution(

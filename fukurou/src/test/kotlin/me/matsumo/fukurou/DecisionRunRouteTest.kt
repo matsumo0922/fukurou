@@ -19,14 +19,9 @@ import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
 import me.matsumo.fukurou.trading.decision.DecisionAction
-import me.matsumo.fukurou.trading.domain.Candle
-import me.matsumo.fukurou.trading.domain.CandleInterval
-import me.matsumo.fukurou.trading.domain.Orderbook
-import me.matsumo.fukurou.trading.domain.RecentTrade
-import me.matsumo.fukurou.trading.domain.SymbolRules
-import me.matsumo.fukurou.trading.domain.Ticker
-import me.matsumo.fukurou.trading.domain.TradingSymbol
-import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
+import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
+import java.math.BigDecimal
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
@@ -40,10 +35,19 @@ class DecisionRunRouteTest {
     @Test
     fun runsRouteReturnsStableCursorAndNormalizedDeniedDetail() = testApplication {
         val repository = FakeDecisionRunProjectionRepository()
+        val latestMarketQuoteStore = LatestMarketQuoteStore().apply {
+            update(
+                LatestMarketQuote(
+                    bidPriceJpy = BigDecimal("16990000"),
+                    askPriceJpy = BigDecimal("17000000"),
+                    observedAt = Instant.parse("2026-07-10T00:47:30Z"),
+                ),
+            )
+        }
         application {
             module(
                 opsDecisionRunProjectionRepository = repository,
-                opsMarketDataSource = DecisionRunRouteMarketDataSource,
+                latestMarketQuoteStore = latestMarketQuoteStore,
                 clock = Clock.fixed(Instant.parse("2026-07-10T00:48:00Z"), ZoneOffset.UTC),
                 databaseConfig = null,
             )
@@ -54,7 +58,7 @@ class DecisionRunRouteTest {
         val firstPage = Json.decodeFromString<OpsDecisionRunsResponse>(firstResponse.body())
         assertEquals(listOf("run-new"), firstPage.runs.map { run -> run.invocationId })
         assertNotNull(firstPage.nextBefore)
-        val currentQuote = assertNotNull(firstPage.runs.single().currentQuote)
+        val currentQuote = assertNotNull(firstPage.latestMarketQuote)
         assertEquals("16990000", currentQuote.bidPriceJpy)
         assertEquals("17000000", currentQuote.askPriceJpy)
         assertEquals("2026-07-10T00:47:30Z", currentQuote.observedAt)
@@ -134,39 +138,6 @@ class DecisionRunRouteTest {
         application { module(databaseConfig = null) }
 
         assertEquals(HttpStatusCode.ServiceUnavailable, client.get("/ops/runs").status)
-    }
-}
-
-private object DecisionRunRouteMarketDataSource : MarketDataSource {
-    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
-        return Result.success(
-            Ticker(
-                symbol = symbol.apiSymbol,
-                last = "16995000",
-                bid = "16990000",
-                ask = "17000000",
-                high = "17100000",
-                low = "16800000",
-                volume = "12.5",
-                timestamp = "2026-07-10T00:47:30Z",
-            ),
-        )
-    }
-
-    override suspend fun getCandles(
-        symbol: TradingSymbol,
-        interval: CandleInterval,
-        limit: Int,
-    ): Result<List<Candle>> = unusedMarketData()
-
-    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> = unusedMarketData()
-
-    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> = unusedMarketData()
-
-    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> = unusedMarketData()
-
-    private fun <T> unusedMarketData(): Result<T> {
-        return Result.failure(UnsupportedOperationException("not used"))
     }
 }
 

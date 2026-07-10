@@ -18,7 +18,12 @@ import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
 import me.matsumo.fukurou.trading.activity.classifyDecisionRunOutcome
 import me.matsumo.fukurou.trading.activity.matches
+import me.matsumo.fukurou.trading.activity.withStrategyEvaluation
 import me.matsumo.fukurou.trading.domain.OrderStatus
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
+import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.ResultSet
 import java.time.Clock
@@ -27,7 +32,19 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
 private val SAFE_FINAL_REASON_PATTERN = Regex("[a-z][a-z0-9_]{0,79}")
-private const val RESTING_ENTRY_TTL_CANCEL_REASON = "resting_entry_order_ttl_expired"
+
+/** domain policy から生成する resting entry role SQL。 */
+private val RESTING_ENTRY_ROLE_SQL = buildString {
+    append("side = '")
+    append(PaperOrderLifecyclePolicy.restingEntrySide.name)
+    append("' AND position_id IS NULL AND order_type IN (")
+    append(PaperOrderLifecyclePolicy.restingEntryTypes.joinToString { type -> "'${type.name}'" })
+    append(")")
+}
+
+/** domain policy から生成する resting entry lifecycle status SQL。 */
+private val RESTING_ENTRY_LIFECYCLE_STATUS_SQL = PaperOrderLifecyclePolicy.lifecycleStatuses
+    .joinToString(prefix = "status IN (", postfix = ")") { status -> "'${status.name}'" }
 
 /** outcome filter が 1 query で走査する raw run 件数。 */
 internal const val FILTER_SCAN_BATCH_SIZE = 100
@@ -65,6 +82,7 @@ private val LIST_RUNS_SQL = """
         order_count.value AS order_count,
         order_count.filled_value AS filled_order_count,
         order_count.open_value AS open_order_count,
+        order_count.expiring_value AS expiring_open_order_count,
         order_count.overdue_value AS overdue_open_order_count,
         order_count.ttl_canceled_value AS ttl_canceled_order_count,
         order_count.canceled_value AS canceled_entry_order_count,
@@ -117,19 +135,21 @@ private val LIST_RUNS_SQL = """
         SELECT
             COUNT(*)::INT AS value,
             COUNT(*) FILTER (WHERE status = ?)::INT AS filled_value,
+            COUNT(*) FILTER (WHERE $RESTING_ENTRY_ROLE_SQL AND status = ?)::INT AS open_value,
             COUNT(*) FILTER (
-                WHERE side = 'BUY' AND order_type IN ('LIMIT', 'STOP') AND status = ?
-            )::INT AS open_value,
+                WHERE $RESTING_ENTRY_ROLE_SQL AND $RESTING_ENTRY_LIFECYCLE_STATUS_SQL
+                    AND expires_at IS NOT NULL AND expires_at <= ?
+            )::INT AS expiring_value,
             COUNT(*) FILTER (
-                WHERE side = 'BUY' AND order_type IN ('LIMIT', 'STOP')
-                    AND status = ? AND expires_at IS NOT NULL AND expires_at <= ?
+                WHERE $RESTING_ENTRY_ROLE_SQL
+                    AND status = ? AND expires_at IS NOT NULL AND expires_at < ?
             )::INT AS overdue_value,
             COUNT(*) FILTER (
-                WHERE side = 'BUY' AND order_type IN ('LIMIT', 'STOP')
+                WHERE $RESTING_ENTRY_ROLE_SQL
                     AND status = ? AND cancel_reason = ?
             )::INT AS ttl_canceled_value,
             COUNT(*) FILTER (
-                WHERE side = 'BUY' AND order_type IN ('LIMIT', 'STOP')
+                WHERE $RESTING_ENTRY_ROLE_SQL
                     AND status = ? AND cancel_reason IS DISTINCT FROM ?
             )::INT AS canceled_value
         FROM orders
@@ -222,24 +242,30 @@ private val FIND_RUN_SQL = """
         (
             SELECT COUNT(*) FROM orders
             WHERE decision_run_id = run.invocation_id
-                AND side = 'BUY' AND order_type IN ('LIMIT', 'STOP') AND status = ?
+                AND $RESTING_ENTRY_ROLE_SQL AND status = ?
         ) AS open_order_count,
         (
             SELECT COUNT(*) FROM orders
             WHERE decision_run_id = run.invocation_id
-                AND side = 'BUY' AND order_type IN ('LIMIT', 'STOP') AND status = ?
+                AND $RESTING_ENTRY_ROLE_SQL AND $RESTING_ENTRY_LIFECYCLE_STATUS_SQL
                 AND expires_at IS NOT NULL AND expires_at <= ?
+        ) AS expiring_open_order_count,
+        (
+            SELECT COUNT(*) FROM orders
+            WHERE decision_run_id = run.invocation_id
+                AND $RESTING_ENTRY_ROLE_SQL AND status = ?
+                AND expires_at IS NOT NULL AND expires_at < ?
         ) AS overdue_open_order_count,
         (
             SELECT COUNT(*) FROM orders
             WHERE decision_run_id = run.invocation_id
-                AND side = 'BUY' AND order_type IN ('LIMIT', 'STOP')
+                AND $RESTING_ENTRY_ROLE_SQL
                 AND status = ? AND cancel_reason = ?
         ) AS ttl_canceled_order_count,
         (
             SELECT COUNT(*) FROM orders
             WHERE decision_run_id = run.invocation_id
-                AND side = 'BUY' AND order_type IN ('LIMIT', 'STOP')
+                AND $RESTING_ENTRY_ROLE_SQL
                 AND status = ? AND cancel_reason IS DISTINCT FROM ?
         ) AS canceled_entry_order_count,
         (
@@ -364,7 +390,7 @@ private fun JdbcTransaction.selectRuns(
         val batch = selectRunBatch(scanCursor, FILTER_SCAN_BATCH_SIZE, observedAt)
         selected += batch
             .asSequence()
-            .filter { summary -> summary.outcome.matches(filter) }
+            .filter { summary -> summary.matches(filter) }
             .take(remaining)
             .toList()
 
@@ -386,21 +412,24 @@ private fun JdbcTransaction.selectRunBatch(
 ): List<DecisionRunSummary> {
     return jdbcConnection().prepareStatement(LIST_RUNS_SQL).use { statement ->
         val cursorMillis = cursor?.startedAt?.toEpochMilli()
+        val overdueCutoff = observedAt.minus(PaperOrderLifecyclePolicy.cancellationGrace).toEpochMilli()
+        val waitingStatus = PaperOrderLifecyclePolicy.waitingStatuses.single().name
         statement.setObject(1, cursorMillis)
         statement.setObject(2, cursorMillis)
         statement.setObject(3, cursorMillis)
         statement.setString(4, cursor?.invocationId)
         statement.setInt(5, limit)
         statement.setString(6, OrderStatus.FILLED.name)
-        statement.setString(7, OrderStatus.OPEN.name)
-        statement.setString(8, OrderStatus.OPEN.name)
-        statement.setLong(9, observedAt.toEpochMilli())
-        statement.setString(10, OrderStatus.CANCELED.name)
-        statement.setString(11, RESTING_ENTRY_TTL_CANCEL_REASON)
-        statement.setString(12, OrderStatus.CANCELED.name)
-        statement.setString(13, RESTING_ENTRY_TTL_CANCEL_REASON)
-        statement.setString(14, OrderStatus.CANCELED.name)
-        statement.setString(15, RESTING_ENTRY_TTL_CANCEL_REASON)
+        statement.setString(7, waitingStatus)
+        statement.setLong(8, observedAt.toEpochMilli())
+        statement.setString(9, waitingStatus)
+        statement.setLong(10, overdueCutoff)
+        statement.setString(11, OrderStatus.CANCELED.name)
+        statement.setString(12, PaperOrderCancelReason.TTL_EXPIRY.wireCode)
+        statement.setString(13, OrderStatus.CANCELED.name)
+        statement.setString(14, PaperOrderCancelReason.TTL_EXPIRY.wireCode)
+        statement.setString(15, OrderStatus.CANCELED.name)
+        statement.setString(16, PaperOrderCancelReason.TTL_EXPIRY.wireCode)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) add(resultSet.toSummary())
@@ -411,17 +440,20 @@ private fun JdbcTransaction.selectRunBatch(
 
 private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: Instant): DecisionRunDetail? {
     val base = jdbcConnection().prepareStatement(FIND_RUN_SQL).use { statement ->
+        val overdueCutoff = observedAt.minus(PaperOrderLifecyclePolicy.cancellationGrace).toEpochMilli()
+        val waitingStatus = PaperOrderLifecyclePolicy.waitingStatuses.single().name
         statement.setString(1, OrderStatus.FILLED.name)
-        statement.setString(2, OrderStatus.OPEN.name)
-        statement.setString(3, OrderStatus.OPEN.name)
-        statement.setLong(4, observedAt.toEpochMilli())
-        statement.setString(5, OrderStatus.CANCELED.name)
-        statement.setString(6, RESTING_ENTRY_TTL_CANCEL_REASON)
-        statement.setString(7, OrderStatus.CANCELED.name)
-        statement.setString(8, RESTING_ENTRY_TTL_CANCEL_REASON)
-        statement.setString(9, OrderStatus.CANCELED.name)
-        statement.setString(10, RESTING_ENTRY_TTL_CANCEL_REASON)
-        statement.setString(11, invocationId)
+        statement.setString(2, waitingStatus)
+        statement.setLong(3, observedAt.toEpochMilli())
+        statement.setString(4, waitingStatus)
+        statement.setLong(5, overdueCutoff)
+        statement.setString(6, OrderStatus.CANCELED.name)
+        statement.setString(7, PaperOrderCancelReason.TTL_EXPIRY.wireCode)
+        statement.setString(8, OrderStatus.CANCELED.name)
+        statement.setString(9, PaperOrderCancelReason.TTL_EXPIRY.wireCode)
+        statement.setString(10, OrderStatus.CANCELED.name)
+        statement.setString(11, PaperOrderCancelReason.TTL_EXPIRY.wireCode)
+        statement.setString(12, invocationId)
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.toDetailBase() else null
         }
@@ -466,10 +498,10 @@ private fun JdbcTransaction.selectOrders(invocationId: String): List<DecisionRun
                             effectiveTtlSeconds = resultSet.nullableLong("effective_ttl_seconds"),
                             expiredAt = resultSet.nullableInstant("expired_at"),
                             canceledAt = resultSet.nullableInstant("canceled_at"),
-                            cancelReason = resultSet.getString("cancel_reason"),
+                            cancelReason = resultSet.getString("cancel_reason")?.let(PaperOrderCancelReason::fromWireCode),
                             canceledByDecisionRunId = resultSet.getString("canceled_by_decision_run_id"),
                             createdAt = Instant.ofEpochMilli(resultSet.getLong("created_at")),
-                        ),
+                        ).withStrategyEvaluation(),
                     )
                 }
             }
@@ -534,6 +566,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
     val noTradeReason = getString("no_trade_reason")
     val hasNoTradeExit = getBoolean("has_no_trade_exit")
     val openOrderCount = getInt("open_order_count")
+    val expiringOpenOrderCount = getInt("expiring_open_order_count")
     val overdueOpenOrderCount = getInt("overdue_open_order_count")
     val ttlCanceledOrderCount = getInt("ttl_canceled_order_count")
     val canceledEntryOrderCount = getInt("canceled_entry_order_count")
@@ -556,6 +589,9 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
         finalReason = noTradeReason.safeNoTradeReason(),
         orderCount = orderCount,
         executionCount = executionCount,
+        hasProcessFailure = errorMessage != null ||
+            status == LLM_RUN_STATUS_FAILED ||
+            status == LLM_RUN_STATUS_CANCELLED,
         order = if (includeOrder) toSummaryOrder() else null,
         outcome = classifyDecisionRunOutcome(
             DecisionRunOutcomeEvidence(
@@ -568,6 +604,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
                 executionCount = executionCount,
                 hasNoTradeExit = hasNoTradeExit,
                 openOrderCount = openOrderCount,
+                expiringOpenOrderCount = expiringOpenOrderCount,
                 overdueOpenOrderCount = overdueOpenOrderCount,
                 ttlCanceledOrderCount = ttlCanceledOrderCount,
                 canceledEntryOrderCount = canceledEntryOrderCount,
@@ -622,10 +659,10 @@ private fun ResultSet.toSummaryOrder(): DecisionRunOrder? {
         effectiveTtlSeconds = nullableLong("entry_effective_ttl_seconds"),
         expiredAt = nullableInstant("entry_expired_at"),
         canceledAt = nullableInstant("entry_canceled_at"),
-        cancelReason = getString("entry_cancel_reason"),
+        cancelReason = getString("entry_cancel_reason")?.let(PaperOrderCancelReason::fromWireCode),
         canceledByDecisionRunId = getString("entry_canceled_by_decision_run_id"),
         createdAt = Instant.ofEpochMilli(getLong("entry_created_at")),
-    )
+    ).withStrategyEvaluation()
 }
 
 private fun ResultSet.toDecision(): DecisionRunDecision? {
@@ -725,7 +762,7 @@ private fun DecisionRunOrder.toRawRecord(): DecisionRunRawRecord {
             "expirySource" to expirySource,
             "expiredAt" to expiredAt?.toString(),
             "canceledAt" to canceledAt?.toString(),
-            "cancelReason" to cancelReason,
+            "cancelReason" to cancelReason?.wireCode,
             "canceledByDecisionRunId" to canceledByDecisionRunId,
         ),
     )

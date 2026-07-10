@@ -43,9 +43,9 @@ import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
-import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -671,14 +671,14 @@ internal data class OpsAuthRouteDependencies(
  * @param decisionRepository decision repository
  * @param paperLedgerRepository paper ledger repository
  * @param commandEventFeedReader command_event_log feed reader
- * @param marketDataSource Activity 表示用の公開市場データ取得元
+ * @param latestMarketQuoteStore reconciler が更新する最新気配値 store
  */
 internal data class OpsFeedRouteDependencies(
     val decisionRepository: DecisionRepository?,
     val paperLedgerRepository: PaperLedgerRepository?,
     val commandEventFeedReader: CommandEventFeedReader?,
     val decisionRunProjectionRepository: DecisionRunProjectionRepository? = null,
-    val marketDataSource: MarketDataSource? = null,
+    val latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
 )
 
 /**

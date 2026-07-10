@@ -22,6 +22,7 @@ import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
@@ -382,8 +383,33 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun restingEntryKeepsPastLlmTimeStopAndClampsEffectiveTtlToZero() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(60),
+            marketDataSource = MutableOrderbookMarketDataSource(orderbook = orderbookWithAsk("10000000")),
+            clock = fixedClock(),
+        )
+        val pastTimeStop = fixedInstant().minusSeconds(5)
+
+        broker.placeOrder(
+            approvedCommand(decisionRepository, restingLimitCommand().copy(timeStopAt = pastTimeStop)),
+        ).getOrThrow()
+        val order = broker.getOpenOrders().getOrThrow().single()
+
+        assertEquals(pastTimeStop.toString(), order.expiresAt)
+        assertEquals(OrderExpirySource.LLM_TIME_STOP, order.expirySource)
+        assertEquals(0, order.effectiveTtlSeconds)
+    }
+
+    @Test
     fun reconcileExpiresAtBoundaryBeforePotentialFillAndRemainsTerminalAfterward() = runBlocking {
-        val repository = InMemoryPaperLedgerRepository()
+        val ledgerClock = MutablePaperTestClock(fixedInstant())
+        val repository = InMemoryPaperLedgerRepository(clock = ledgerClock)
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val marketDataSource = MutableOrderbookMarketDataSource(orderbook = orderbookWithAsk("10000000"))
         val broker = PaperBroker(
@@ -402,13 +428,15 @@ class PaperBrokerTest {
         assertEquals(OrderStatus.OPEN, broker.getOpenOrders().getOrThrow().single().status)
 
         marketDataSource.orderbook = orderbookWithAsk("9800000")
-        broker.reconcile(watermarkTickSnapshot("9800000").copy(observedAt = fixedInstant().plusSeconds(60))).getOrThrow()
+        ledgerClock.currentInstant = fixedInstant().plusSeconds(60)
+        broker.reconcile(watermarkTickSnapshot("9800000").copy(observedAt = fixedInstant().plusSeconds(600))).getOrThrow()
         broker.reconcile(watermarkTickSnapshot("9800000").copy(observedAt = fixedInstant().plusSeconds(61))).getOrThrow()
         val expiredOrder = repository.findOrdersByTradeGroupId(tradeGroupId).getOrThrow().single()
 
         assertEquals(OrderStatus.CANCELED, expiredOrder.status)
         assertEquals(fixedInstant().plusSeconds(60).toString(), expiredOrder.expiredAt)
-        assertEquals("resting_entry_order_ttl_expired", expiredOrder.cancelReason)
+        assertEquals(fixedInstant().plusSeconds(60).toString(), expiredOrder.canceledAt)
+        assertEquals(PaperOrderCancelReason.TTL_EXPIRY, expiredOrder.cancelReason)
         assertEquals(0, repository.getExecutions().getOrThrow().size)
     }
 
@@ -1571,7 +1599,7 @@ class PaperBrokerTest {
 
     @Test
     fun reconcile_buy_limit_reaches_when_best_ask_is_at_limit_even_if_last_price_is_above_limit() = runBlocking {
-        val repository = InMemoryPaperLedgerRepository()
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val marketDataSource = MutableOrderbookMarketDataSource(
             orderbook = orderbookWithAsk("10000000"),
@@ -1589,7 +1617,7 @@ class PaperBrokerTest {
         val result = broker.reconcile(watermarkTickSnapshot("10000000")).getOrThrow()
         val executions = repository.getExecutions().getOrThrow()
 
-        assertEquals(1, result.triggeredOrderIds.size)
+        assertEquals(1, result.filledOrderIds.size)
         assertEquals(1, executions.size)
         assertEquals(ExecutionLiquidity.MAKER, executions.single().liquidity)
     }
@@ -1597,7 +1625,7 @@ class PaperBrokerTest {
     @Test
     fun reconcile_buy_limit_stays_pending_when_best_ask_is_above_limit_even_if_last_price_is_below_limit() {
         runBlocking {
-            val repository = InMemoryPaperLedgerRepository()
+            val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
             val decisionRepository = InMemoryDecisionRepository(fixedClock())
             val broker = PaperBroker(
                 ledgerRepository = repository,
@@ -1620,7 +1648,7 @@ class PaperBrokerTest {
 
     @Test
     fun reconcile_buy_limit_records_fak_divergence_memo_while_full_filling_paper_order() = runBlocking {
-        val repository = InMemoryPaperLedgerRepository()
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val marketDataSource = MutableOrderbookMarketDataSource(
             orderbook = orderbookWithAsk("10000000"),
@@ -2393,4 +2421,12 @@ private fun fixedInstant(): Instant {
  */
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+private class MutablePaperTestClock(var currentInstant: Instant) : Clock() {
+    override fun getZone() = ZoneOffset.UTC
+
+    override fun withZone(zone: java.time.ZoneId): Clock = Clock.fixed(currentInstant, zone)
+
+    override fun instant(): Instant = currentInstant
 }

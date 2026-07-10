@@ -49,11 +49,13 @@ interface TickStream {
  * REST polling で ticker と recent trades を確認する TickStream。
  *
  * @param marketDataSource 市場データ取得元
+ * @param latestMarketQuoteStore API と共有する最新気配値 store
  * @param symbol polling 対象 symbol
  * @param clock observedAt に使う clock
  */
 class RestPollingTickStream(
     private val marketDataSource: MarketDataSource,
+    private val latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
     private val symbol: TradingSymbol = TradingSymbol.BTC,
     private val clock: Clock = Clock.systemUTC(),
 ) : TickStream {
@@ -61,6 +63,21 @@ class RestPollingTickStream(
     override suspend fun latestTick(): Result<TickSnapshot?> {
         return runCatching {
             val ticker = marketDataSource.getTicker(symbol).getOrThrow()
+            val bidPrice = ticker.bid.toBigDecimalOrNull()
+            val askPrice = ticker.ask.toBigDecimalOrNull()
+            val tickerObservedAt = runCatching { Instant.parse(ticker.timestamp) }.getOrNull()
+            val quoteIsValid = bidPrice != null && askPrice != null && tickerObservedAt != null
+
+            if (quoteIsValid) {
+                latestMarketQuoteStore.update(
+                    LatestMarketQuote(
+                        bidPriceJpy = checkNotNull(bidPrice),
+                        askPriceJpy = checkNotNull(askPrice),
+                        observedAt = checkNotNull(tickerObservedAt),
+                    ),
+                )
+            }
+
             val recentTrades = marketDataSource.getTrades(symbol, RECENT_TRADES_LIMIT).getOrThrow()
             val symbolRules = marketDataSource.getSymbolRules(symbol).getOrThrow()
             val atr14Jpy = fetchAtr14Jpy()

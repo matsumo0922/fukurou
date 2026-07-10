@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.persistence
 
 import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
@@ -29,6 +30,29 @@ private const val STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER = 3L
  */
 internal const val STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE =
     "LLM run was interrupted by a previous process or container shutdown and recovered during persistence bootstrap."
+
+/** cancel_reason を domain wire code だけへ制限する bootstrap SQL。 */
+private val ENSURE_ORDER_CANCEL_REASON_DOMAIN_SQL = run {
+    val wireCodes = PaperOrderCancelReason.entries.joinToString { reason -> "'${reason.wireCode}'" }
+    """
+        UPDATE orders
+        SET cancel_reason = '${PaperOrderCancelReason.LEGACY_UNCLASSIFIED.wireCode}'
+        WHERE cancel_reason IS NOT NULL AND cancel_reason NOT IN ($wireCodes);
+        DO ${'$'}${'$'}
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = 'orders_cancel_reason_domain'
+                    AND conrelid = 'orders'::regclass
+            ) THEN
+                ALTER TABLE orders ADD CONSTRAINT orders_cancel_reason_domain
+                    CHECK (cancel_reason IS NULL OR cancel_reason IN ($wireCodes));
+            END IF;
+        END
+        ${'$'}${'$'};
+    """.trimIndent()
+}
 
 /**
  * risk_state 初期行を作る SQL。
@@ -855,6 +879,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL)
     executeUpdate(ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL)
+    executeUpdate(ENSURE_ORDER_CANCEL_REASON_DOMAIN_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_CAPTURED_AT_INDEX_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_DAILY_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_BOOTSTRAP_UNIQUE_INDEX_SQL)

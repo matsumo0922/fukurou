@@ -17,10 +17,9 @@ import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
 import me.matsumo.fukurou.trading.domain.Order
-import me.matsumo.fukurou.trading.domain.OrderSide
-import me.matsumo.fukurou.trading.domain.OrderStatus
-import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.domain.isRestingEntryLifecycleCandidate
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.tool.CallerInvocation
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
@@ -71,6 +70,7 @@ internal class DecisionExecutionLifecycle(
                         context = context,
                         order = order,
                         clientRequestId = "runner-ttl-cancel-${order.orderId}",
+                        cancelReason = PaperOrderCancelReason.LEGACY_TTL_SWEEP,
                         reason = "resting_entry_order_ttl_exceeded",
                     )
                 }.onSuccess { result ->
@@ -338,7 +338,7 @@ internal class DecisionExecutionLifecycle(
     private suspend fun openRestingEntryOrders(): List<Order> {
         return tradingRuntime.broker.getOpenOrders()
             .getOrThrow()
-            .filter { order -> order.isRestingEntryOrder() }
+            .filter(Order::isRestingEntryLifecycleCandidate)
     }
 
     private fun resolveExitTarget(openPositions: List<Position>, openEntryOrders: List<Order>): ExitExecutionTarget {
@@ -513,6 +513,7 @@ internal class DecisionExecutionLifecycle(
         context: DecisionRunContext,
         order: Order,
         clientRequestId: String,
+        cancelReason: PaperOrderCancelReason = PaperOrderCancelReason.EXPLICIT_CANCEL,
         reason: String,
     ): PaperTradeResult {
         val call = guardedTradeCall(
@@ -528,6 +529,7 @@ internal class DecisionExecutionLifecycle(
         val command = CancelOrderCommand(
             commandId = idGenerator(),
             orderId = UUID.fromString(order.orderId),
+            cancelReason = cancelReason,
             reasonJa = "$reason: runner deterministic cancel。",
             auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
         )
@@ -747,16 +749,8 @@ private sealed interface ExitExecutionTarget {
     }
 }
 
-private fun Order.isRestingEntryOrder(): Boolean {
-    val statusIsOpenRisk = status == OrderStatus.OPEN || status == OrderStatus.PENDING_CANCEL
-    val isBuyEntry = side == OrderSide.BUY && positionId == null
-    val isRestingType = orderType == OrderType.LIMIT || orderType == OrderType.STOP
-
-    return statusIsOpenRisk && isBuyEntry && isRestingType
-}
-
 private fun Order.isExpiredRestingEntryOrder(observedAt: Instant, ttl: Duration): Boolean {
-    if (!isRestingEntryOrder() || expiresAt != null) {
+    if (!isRestingEntryLifecycleCandidate() || expiresAt != null) {
         return false
     }
 

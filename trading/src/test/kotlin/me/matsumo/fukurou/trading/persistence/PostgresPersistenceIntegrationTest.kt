@@ -50,6 +50,7 @@ import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
@@ -1284,7 +1285,7 @@ class PostgresPersistenceIntegrationTest {
         val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
         val detail = requireNotNull(repository.findRun("run-1").getOrThrow())
 
-        assertEquals(DecisionRunOutcome.NO_ENTRY, summary.outcome)
+        assertEquals(DecisionRunOutcome.DENIED, summary.outcome)
         assertEquals("APPROVED", summary.falsificationVerdict)
         assertEquals("EXPECTED_VALUE_GATE", detail.safetyViolation?.rule)
         assertEquals("0.03357778", detail.safetyViolation?.measuredValue)
@@ -1460,7 +1461,7 @@ class PostgresPersistenceIntegrationTest {
                 insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
                 insertActivityContextOrder(
                     orderId = orderId,
-                    positionId = positionId,
+                    positionId = null,
                     tradeGroupId = tradeGroupId,
                     side = OrderSide.BUY,
                     orderType = OrderType.LIMIT,
@@ -1521,7 +1522,7 @@ class PostgresPersistenceIntegrationTest {
             insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
             insertActivityContextOrder(
                 orderId = orderId,
-                positionId = positionId,
+                positionId = null,
                 tradeGroupId = tradeGroupId,
                 side = OrderSide.BUY,
                 orderType = OrderType.LIMIT,
@@ -1552,6 +1553,54 @@ class PostgresPersistenceIntegrationTest {
         val summaries = projection.listRuns(cursor = null, limit = 10).getOrThrow().runs.associateBy { it.invocationId }
         assertEquals(DecisionRunOutcome.WAITING, summaries.getValue("entry-persistence-failure-run").outcome)
         assertEquals(DecisionRunOutcome.FAILED, summaries.getValue("cancel-persistence-failure-actor-run").outcome)
+    }
+
+    @Test
+    fun persistenceBootstrapNormalizesLegacyCancelReasonAndEnforcesDomainCodes() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val orderId = UUID.randomUUID()
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        exposedTransaction(database) {
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = orderId,
+                positionId = null,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.CANCELED,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "legacy cancel",
+                decisionRunId = null,
+            )
+            executeUpdate("ALTER TABLE orders DROP CONSTRAINT orders_cancel_reason_domain")
+            jdbcConnection().prepareStatement("UPDATE orders SET cancel_reason = ? WHERE id = ?").use { statement ->
+                statement.setString(1, "legacy free text reason")
+                statement.setObject(2, orderId)
+                statement.executeUpdate()
+            }
+        }
+
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val normalizedOrder = ExposedPaperLedgerRepository(database)
+            .findOrdersByTradeGroupId(tradeGroupId)
+            .getOrThrow()
+            .single { order -> order.orderId == orderId.toString() }
+
+        assertEquals(PaperOrderCancelReason.LEGACY_UNCLASSIFIED, normalizedOrder.cancelReason)
+        val invalidWrite = runCatching {
+            exposedTransaction(database) {
+                jdbcConnection().prepareStatement("UPDATE orders SET cancel_reason = ? WHERE id = ?").use { statement ->
+                    statement.setString(1, "another free text reason")
+                    statement.setObject(2, orderId)
+                    statement.executeUpdate()
+                }
+            }
+        }
+        assertTrue(invalidWrite.isFailure)
     }
 
     @Test
@@ -1621,7 +1670,7 @@ class PostgresPersistenceIntegrationTest {
             insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
             insertActivityContextOrder(
                 orderId = UUID.randomUUID(),
-                positionId = positionId,
+                positionId = null,
                 tradeGroupId = tradeGroupId,
                 side = OrderSide.BUY,
                 orderType = OrderType.LIMIT,
@@ -1651,6 +1700,52 @@ class PostgresPersistenceIntegrationTest {
         assertEquals("scan-run-${(scanCap - 1).toString().padStart(6, '0')}", continuation.invocationId)
         assertEquals(listOf("scan-run-${scanCap.toString().padStart(6, '0')}"), secondPage.runs.map { it.invocationId })
         assertNull(secondPage.scanContinuation)
+    }
+
+    @Test
+    fun decisionRunProjectionKeepsPendingCancelExpiredOrderInExpiringState() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val invocationId = "pending-cancel-expiring-run"
+        insertFinishedDecisionRun(
+            repository = ExposedLlmRunRepository(database),
+            invocationId = invocationId,
+            status = "SUCCEEDED",
+            errorMessage = null,
+        )
+        exposedTransaction(database) {
+            val orderId = UUID.randomUUID()
+            insertActivityContextOrder(
+                orderId = orderId,
+                positionId = null,
+                tradeGroupId = UUID.randomUUID(),
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.PENDING_CANCEL,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "cancel processing",
+                decisionRunId = invocationId,
+            )
+            jdbcConnection().prepareStatement("UPDATE orders SET expires_at = ? WHERE id = ?").use { statement ->
+                statement.setLong(1, fixedInstant().minusSeconds(60).toEpochMilli())
+                statement.setObject(2, orderId)
+                statement.executeUpdate()
+            }
+        }
+
+        val repository = ExposedDecisionRunProjectionRepository(database, fixedClock())
+        val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
+
+        assertEquals(DecisionRunOutcome.EXPIRING, summary.outcome)
+        assertEquals(
+            listOf(invocationId),
+            repository.listRuns(
+                cursor = null,
+                limit = 10,
+                filter = DecisionRunFilter.EXPIRING,
+            ).getOrThrow().runs.map { run -> run.invocationId },
+        )
     }
 
     @Test
@@ -2847,7 +2942,7 @@ class PostgresPersistenceIntegrationTest {
     fun paper_execution_linksRestingLimitEntryOrderToClosedTradeEvaluation() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
-        val repository = ExposedPaperLedgerRepository(database)
+        val repository = ExposedPaperLedgerRepository(database, clock = fixedClock())
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
@@ -2915,7 +3010,7 @@ class PostgresPersistenceIntegrationTest {
     fun paper_execution_reconcilesRestingLimitByBestAskInPostgresPath() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
-        val repository = ExposedPaperLedgerRepository(database)
+        val repository = ExposedPaperLedgerRepository(database, clock = fixedClock())
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val marketDataSource = MutablePostgresOrderbookMarketDataSource(
             orderbook = postgresOrderbookWithAsk("10000000"),
@@ -2942,7 +3037,7 @@ class PostgresPersistenceIntegrationTest {
         val executions = repository.getExecutions().getOrThrow()
 
         assertEquals(1, placeResult.orderIds.size)
-        assertEquals(1, reconcileResult.triggeredOrderIds.size)
+        assertEquals(1, reconcileResult.filledOrderIds.size)
         assertEquals(1, executions.size)
     }
 
@@ -3334,7 +3429,10 @@ class PostgresPersistenceIntegrationTest {
     fun paper_execution_persists_and_expires_resting_entry_metadataAtomically() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
-        val repository = ExposedPaperLedgerRepository(database)
+        val repository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
+        )
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
@@ -3378,8 +3476,18 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(OrderStatus.CANCELED, expiredOrder.status)
         assertEquals(fixedInstant().plusSeconds(60).toString(), expiredOrder.expiredAt)
         assertEquals(fixedInstant().plusSeconds(60).toString(), expiredOrder.canceledAt)
-        assertEquals("resting_entry_order_ttl_expired", expiredOrder.cancelReason)
+        assertEquals(PaperOrderCancelReason.TTL_EXPIRY, expiredOrder.cancelReason)
         assertTrue(repository.getExecutions().getOrThrow().isEmpty())
+
+        val evaluationRepository = ExposedEvaluationRepository(database)
+        val evaluationTrades = evaluationRepository.fetchClosedTrades(
+            EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(61),
+            ),
+        ).getOrThrow()
+        assertTrue(evaluationTrades.trades.isEmpty())
+        assertEquals(0, evaluationRepository.fetchKillCriterionStats().getOrThrow().closedTrades)
     }
 
     @Test
@@ -4915,7 +5023,7 @@ private fun JdbcTransaction.insertTestExecution(
  */
 private fun JdbcTransaction.insertActivityContextOrder(
     orderId: UUID,
-    positionId: UUID,
+    positionId: UUID?,
     tradeGroupId: UUID,
     side: OrderSide,
     orderType: OrderType,

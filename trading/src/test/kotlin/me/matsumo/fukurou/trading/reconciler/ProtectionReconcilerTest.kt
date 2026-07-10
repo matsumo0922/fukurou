@@ -30,6 +30,7 @@ import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
@@ -418,7 +419,7 @@ class ProtectionReconcilerTest {
 
     @Test
     fun reconcile_pass_records_limit_fak_divergence_memo_in_completed_audit_payload() = runBlocking {
-        val repository = InMemoryPaperLedgerRepository()
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
         val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val eventLog = InMemoryCommandEventLog()
@@ -459,8 +460,9 @@ class ProtectionReconcilerTest {
 
     @Test
     fun residentReconcilerExpiresRestingEntryWithoutLlmRunnerAndBeforeFill() = runBlocking {
-        val repository = InMemoryPaperLedgerRepository()
-        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val clock = MutableTestClock(fixedInstant())
+        val repository = InMemoryPaperLedgerRepository(clock = clock)
+        val riskStateRepository = InMemoryRiskStateRepository(clock = clock)
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val marketDataSource = MutableReconcilerOrderbookMarketDataSource(
             orderbook = reconcilerOrderbookWithAsk("10010000"),
@@ -480,7 +482,9 @@ class ProtectionReconcilerTest {
         val tradeGroupId = UUID.fromString(requireNotNull(openOrder.tradeGroupId))
         marketDataSource.orderbook = reconcilerOrderbookWithAsk("9990000")
         val expiryTick = limitReachTickSnapshot().copy(observedAt = fixedInstant().plusSeconds(30))
+        clock.currentInstant = fixedInstant().plusSeconds(30)
         val reconciler = createReconciler(
+            clock = clock,
             riskStateRepository = riskStateRepository,
             broker = broker,
             tickStream = SwitchableTickStream(Result.success(expiryTick)),
@@ -490,7 +494,7 @@ class ProtectionReconcilerTest {
         val expiredOrder = repository.findOrdersByTradeGroupId(tradeGroupId).getOrThrow().single()
 
         assertEquals(OrderStatus.CANCELED, expiredOrder.status)
-        assertEquals("resting_entry_order_ttl_expired", expiredOrder.cancelReason)
+        assertEquals(PaperOrderCancelReason.TTL_EXPIRY, expiredOrder.cancelReason)
         assertTrue(repository.getExecutions().getOrThrow().isEmpty())
     }
 

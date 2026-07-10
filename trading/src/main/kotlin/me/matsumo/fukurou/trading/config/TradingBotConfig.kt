@@ -356,7 +356,7 @@ data class KillCriterionConfig(
  * decision / Falsifier protocol の保守的な設定。
  *
  * @param falsificationFreshnessWindow fresh APPROVED とみなす時間窓
- * @param restingEntryOrderTtl runner が stale resting entry order を cancel するまでの TTL
+ * @param restingEntryOrderTtl ProtectionReconciler が resting entry order を cancel するまでの TTL
  */
 data class DecisionProtocolConfig(
     val falsificationFreshnessWindow: Duration = DEFAULT_FALSIFICATION_FRESHNESS_WINDOW,

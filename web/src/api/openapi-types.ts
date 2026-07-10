@@ -1614,7 +1614,7 @@ export interface paths {
                     /** @description 前回応答の nextBefore を指定する opaque cursor です。 */
                     before?: string;
                     /** @description pagination より前に bounded scan で適用する目的別 filter です。 */
-                    filter?: "ACTION_REQUIRED" | "WAITING" | "FILLED" | "NO_ENTRY";
+                    filter?: "ACTION_REQUIRED" | "WAITING" | "EXPIRING" | "FILLED" | "DENIED" | "RUNNING" | "EXPIRED" | "CANCELED" | "NO_ENTRY";
                 };
                 header?: never;
                 path?: never;
@@ -2257,13 +2257,9 @@ export interface components {
             cancelReason?: string | null;
             canceledByDecisionRunId?: string | null;
             createdAt: string;
-        };
-        /** OpsDecisionRunQuoteResponse */
-        OpsDecisionRunQuoteResponse: {
-            bidPriceJpy: string;
-            askPriceJpy: string;
-            observedAt: string;
-            stale: boolean;
+            strategyEvaluationEligible: boolean;
+            strategyEvaluationExclusionReason?: string | null;
+            lifecycleDelaySeconds?: number | null;
         };
         /** OpsDecisionRunSummaryResponse */
         OpsDecisionRunSummaryResponse: {
@@ -2273,7 +2269,7 @@ export interface components {
             triggerKind?: string | null;
             status: string;
             /** @enum {string} */
-            outcome: "WAITING" | "FILLED" | "EXPIRED" | "CANCELED" | "NO_ENTRY" | "RUNNING" | "FAILED" | "ACTION_REQUIRED";
+            outcome: "WAITING" | "EXPIRING" | "FILLED" | "EXPIRED" | "CANCELED" | "NO_ENTRY" | "DENIED" | "RUNNING" | "FAILED" | "ACTION_REQUIRED";
             startedAt: string;
             finishedAt?: string | null;
             durationMillis?: number | null;
@@ -2286,13 +2282,21 @@ export interface components {
             errorMessage?: string | null;
             orderCount: number;
             executionCount: number;
+            hasProcessFailure: boolean;
             order?: components["schemas"]["OpsDecisionRunOrderResponse"] | null;
-            currentQuote?: components["schemas"]["OpsDecisionRunQuoteResponse"] | null;
+        };
+        /** OpsDecisionRunQuoteResponse */
+        OpsDecisionRunQuoteResponse: {
+            bidPriceJpy: string;
+            askPriceJpy: string;
+            observedAt: string;
+            stale: boolean;
         };
         /** OpsDecisionRunsResponse */
         OpsDecisionRunsResponse: {
             runs: components["schemas"]["OpsDecisionRunSummaryResponse"][];
             nextBefore?: string | null;
+            latestMarketQuote?: components["schemas"]["OpsDecisionRunQuoteResponse"] | null;
         };
         /** OpsDecisionRunPhaseResponse */
         OpsDecisionRunPhaseResponse: {
@@ -2369,6 +2373,7 @@ export interface components {
         /** OpsDecisionRunDetailResponse */
         OpsDecisionRunDetailResponse: {
             summary: components["schemas"]["OpsDecisionRunSummaryResponse"];
+            latestMarketQuote?: components["schemas"]["OpsDecisionRunQuoteResponse"] | null;
             phases: components["schemas"]["OpsDecisionRunPhaseResponse"][];
             decision?: components["schemas"]["OpsDecisionRunDecisionResponse"] | null;
             intent?: components["schemas"]["OpsDecisionRunIntentResponse"] | null;
@@ -2431,7 +2436,8 @@ export interface components {
             effectiveTtlSeconds?: number | null;
             expiredAt?: string | null;
             canceledAt?: string | null;
-            cancelReason?: string | null;
+            /** @enum {string|null} */
+            cancelReason?: "TTL_EXPIRY" | "EXPLICIT_CANCEL" | "LEGACY_TTL_SWEEP" | "POSITION_CLOSE" | "HARD_HALT" | "LEGACY_UNCLASSIFIED" | null;
             canceledByDecisionRunId?: string | null;
             createdAt: string;
             updatedAt: string;

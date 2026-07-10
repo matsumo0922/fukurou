@@ -14,6 +14,7 @@ import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.ProtectionStatus
@@ -667,7 +668,7 @@ private fun PaperBrokerRuntime.restingEntryOrderRequest(preparedOrder: PreparedP
         createdAt = createdAt,
         expiresAt = expiresAt,
         expirySource = if (usesLlmTimeStop) OrderExpirySource.LLM_TIME_STOP else OrderExpirySource.SYSTEM_TTL,
-        effectiveTtlSeconds = Duration.between(createdAt, expiresAt).seconds,
+        effectiveTtlSeconds = Duration.between(createdAt, expiresAt).seconds.coerceAtLeast(0),
     )
 }
 
@@ -927,6 +928,7 @@ private class PaperBrokerSafetyGate(
                     CancelOrderCommand(
                         commandId = UUID.randomUUID(),
                         orderId = UUID.fromString(order.orderId),
+                        cancelReason = PaperOrderCancelReason.HARD_HALT,
                         reasonJa = reason,
                         auditContext = auditContext,
                     ),

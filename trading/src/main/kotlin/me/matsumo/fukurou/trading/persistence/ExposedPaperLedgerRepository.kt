@@ -24,9 +24,11 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
@@ -38,6 +40,7 @@ import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
+import java.time.Clock
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -883,8 +886,9 @@ class ExposedPaperLedgerRepository private constructor(
     constructor(
         database: ExposedDatabase,
         fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
+        clock: Clock = Clock.systemUTC(),
     ) : this(
-        writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules),
+        writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules, clock = clock),
         accountRepository = ExposedPaperLedgerAccountReader(database),
         executionRepository = ExposedPaperLedgerExecutionReader(database),
         orderRepository = ExposedPaperLedgerOrderReader(database),
@@ -1353,11 +1357,11 @@ private fun ResultSet.toOrder(): Order {
         reasonJa = getString("reason_ja"),
         clientRequestId = getString("client_request_id"),
         expiresAt = getNullableInstant("expires_at")?.toString(),
-        expirySource = getString("expiry_source")?.let(me.matsumo.fukurou.trading.domain.OrderExpirySource::valueOf),
+        expirySource = getString("expiry_source")?.let(OrderExpirySource::valueOf),
         effectiveTtlSeconds = getNullableLong("effective_ttl_seconds"),
         expiredAt = getNullableInstant("expired_at")?.toString(),
         canceledAt = getNullableInstant("canceled_at")?.toString(),
-        cancelReason = getString("cancel_reason"),
+        cancelReason = getString("cancel_reason")?.let(PaperOrderCancelReason::fromWireCode),
         canceledByDecisionRunId = getString("canceled_by_decision_run_id"),
         createdAt = getInstant("created_at").toString(),
         updatedAt = getInstant("updated_at").toString(),

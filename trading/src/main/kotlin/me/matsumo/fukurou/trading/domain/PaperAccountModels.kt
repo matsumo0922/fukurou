@@ -242,8 +242,8 @@ data class Position(
  * @param expiresAt resting entry order の作成時に固定した実効期限
  * @param expirySource 実効期限を決めた入力
  * @param effectiveTtlSeconds 作成時刻から実効期限までの秒数
- * @param expiredAt lifecycle が期限到達を確定した時刻
- * @param canceledAt 取消を確定した時刻
+ * @param expiredAt 論理的な期限到達時刻。TTL取消では expiresAt と一致する
+ * @param canceledAt 取消処理を永続化した server 時刻
  * @param cancelReason 取消理由 code
  * @param canceledByDecisionRunId 取消を実行した decision run ID
  * @param createdAt 作成時刻
@@ -273,7 +273,7 @@ data class Order(
     val effectiveTtlSeconds: Long? = null,
     val expiredAt: String? = null,
     val canceledAt: String? = null,
-    val cancelReason: String? = null,
+    val cancelReason: PaperOrderCancelReason? = null,
     val canceledByDecisionRunId: String? = null,
     val createdAt: String,
     val updatedAt: String,

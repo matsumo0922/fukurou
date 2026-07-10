@@ -42,9 +42,11 @@ import me.matsumo.fukurou.trading.broker.withEntryCommandContext
 import me.matsumo.fukurou.trading.broker.withOrderContext
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
@@ -52,6 +54,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.domain.isRestingEntryLifecycleCandidate
 import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
@@ -326,6 +329,7 @@ internal class ExposedPaperLedgerWriter(
                         status = OrderStatus.CANCELED,
                         reasonJa = command.reasonJa,
                         clock = clock,
+                        cancelReason = command.cancelReason,
                         canceledByDecisionRunId = command.auditContext.decisionRunContext.decisionRunId,
                     )
 
@@ -367,7 +371,7 @@ internal class ExposedPaperLedgerWriter(
                         clock = clock,
                     )
 
-                    expireRestingEntryOrders(tickSnapshot.observedAt, progress)
+                    expireRestingEntryOrders(clock.instant(), progress)
 
                     if (!paperAccountHardHaltReached()) {
                         fillTriggeredEntryOrders(reconcileContext, progress, clock)
@@ -381,13 +385,13 @@ internal class ExposedPaperLedgerWriter(
     }
 }
 
-private fun JdbcTransaction.expireRestingEntryOrders(observedAt: Instant, progress: ReconcileProgress) {
+private fun JdbcTransaction.expireRestingEntryOrders(processedAt: Instant, progress: ReconcileProgress) {
     selectOpenOrders()
         .asSequence()
-        .filter { order -> order.side == OrderSide.BUY }
-        .filter { order -> order.orderType == OrderType.LIMIT || order.orderType == OrderType.STOP }
-        .filter { order -> order.expiresAt?.let(Instant::parse)?.let { expiresAt -> !observedAt.isBefore(expiresAt) } == true }
-        .forEach { order ->
+        .filter(Order::isRestingEntryLifecycleCandidate)
+        .mapNotNull { order -> order.expiresAt?.let(Instant::parse)?.let { expiresAt -> order to expiresAt } }
+        .filter { (_, expiresAt) -> !processedAt.isBefore(expiresAt) }
+        .forEach { (order, expiresAt) ->
             prepare(
                 """
                     UPDATE orders
@@ -402,20 +406,18 @@ private fun JdbcTransaction.expireRestingEntryOrders(observedAt: Instant, progre
                 """,
             ).use { statement ->
                 statement.setString(1, OrderStatus.CANCELED.name)
-                statement.setLong(2, observedAt.toEpochMilli())
-                statement.setLong(3, observedAt.toEpochMilli())
-                statement.setString(4, RESTING_ENTRY_TTL_CANCEL_REASON)
+                statement.setLong(2, expiresAt.toEpochMilli())
+                statement.setLong(3, processedAt.toEpochMilli())
+                statement.setString(4, PaperOrderCancelReason.TTL_EXPIRY.wireCode)
                 statement.setString(5, "resting entry order expired")
-                statement.setLong(6, observedAt.toEpochMilli())
+                statement.setLong(6, processedAt.toEpochMilli())
                 statement.setObject(7, UUID.fromString(order.orderId))
-                statement.setString(8, OrderStatus.OPEN.name)
+                statement.setString(8, order.status.name)
 
-                if (statement.executeUpdate() == 1) progress.triggeredOrderIds += order.orderId
+                if (statement.executeUpdate() == 1) progress.canceledOrderIds += order.orderId
             }
         }
 }
-
-private const val RESTING_ENTRY_TTL_CANCEL_REASON = "resting_entry_order_ttl_expired"
 
 private fun JdbcTransaction.insertEntryFill(request: EntryFillWriteRequest, clock: Clock): PaperTradeResult {
     val command = request.entry.command
@@ -609,7 +611,7 @@ private fun JdbcTransaction.fillTriggeredEntryOrders(
 
         if (!hasCashForBuyFill(fill)) {
             updateOrderStatus(order.orderId, OrderStatus.REJECTED, "reconciler entry rejected: insufficient paper cash", clock)
-            progress.triggeredOrderIds += order.orderId
+            progress.rejectedOrderIds += order.orderId
 
             return@forEach
         }
@@ -629,7 +631,7 @@ private fun JdbcTransaction.fillTriggeredEntryOrders(
             clock,
         )
 
-        progress.triggeredOrderIds += order.orderId
+        progress.filledOrderIds += order.orderId
         progress.executionIds += fill.executionId.toString()
         orderUpdate.divergenceMemo
             ?.withOrderContext(order)
@@ -690,7 +692,7 @@ private fun JdbcTransaction.triggerStopProtection(
     closePositionRow(position, realizedFill)
     updateAccountAfterSell(realizedFill, clock)
 
-    progress.triggeredOrderIds += stopOrder.orderId
+    progress.filledOrderIds += stopOrder.orderId
     progress.closedPositionIds += position.positionId
     progress.executionIds += realizedFill.executionId.toString()
 }
@@ -702,8 +704,14 @@ private fun JdbcTransaction.triggerTakeProfitProtection(
     clock: Clock,
 ) {
     requireLinkedStopOrder(position.positionId).let { stopOrder ->
-        updateOrderStatus(stopOrder.orderId, OrderStatus.CANCELED, "reconciler virtual take profit trigger", clock)
-        progress.triggeredOrderIds += stopOrder.orderId
+        updateOrderStatus(
+            orderId = stopOrder.orderId,
+            status = OrderStatus.CANCELED,
+            reasonJa = "reconciler virtual take profit trigger",
+            clock = clock,
+            cancelReason = PaperOrderCancelReason.POSITION_CLOSE,
+        )
+        progress.canceledOrderIds += stopOrder.orderId
     }
 
     val fill = context.simulator.marketFill(
@@ -1203,33 +1211,35 @@ private fun JdbcTransaction.updateOrderStatus(
     status: OrderStatus,
     reasonJa: String,
     clock: Clock,
+    cancelReason: PaperOrderCancelReason? = null,
     canceledByDecisionRunId: String? = null,
 ) {
+    val canceledAt = if (status == OrderStatus.CANCELED) clock.instant() else null
+    val cancelReasonCode = if (status == OrderStatus.CANCELED) {
+        requireNotNull(cancelReason) { "cancelReason is required for CANCELED order status." }.wireCode
+    } else {
+        null
+    }
+
     prepare(
         """
             UPDATE orders
             SET status = ?,
                 reason_ja = ?,
-                canceled_at = CASE WHEN ? = ? THEN ? ELSE canceled_at END,
-                cancel_reason = CASE WHEN ? = ? THEN ? ELSE cancel_reason END,
-                canceled_by_decision_run_id = CASE WHEN ? = ? THEN ? ELSE canceled_by_decision_run_id END,
+                canceled_at = COALESCE(?, canceled_at),
+                cancel_reason = COALESCE(?, cancel_reason),
+                canceled_by_decision_run_id = COALESCE(?, canceled_by_decision_run_id),
                 updated_at = ?
             WHERE id = ?
         """,
     ).use { statement ->
         statement.setString(1, status.name)
         statement.setString(2, reasonJa)
-        statement.setString(3, status.name)
-        statement.setString(4, OrderStatus.CANCELED.name)
-        statement.setLong(5, nowMillis(clock))
-        statement.setString(6, status.name)
-        statement.setString(7, OrderStatus.CANCELED.name)
-        statement.setString(8, reasonJa)
-        statement.setString(9, status.name)
-        statement.setString(10, OrderStatus.CANCELED.name)
-        statement.setString(11, canceledByDecisionRunId)
-        statement.setLong(12, nowMillis(clock))
-        statement.setObject(13, UUID.fromString(orderId))
+        statement.setNullableLong(3, canceledAt?.toEpochMilli())
+        statement.setString(4, cancelReasonCode)
+        statement.setString(5, canceledByDecisionRunId)
+        statement.setLong(6, nowMillis(clock))
+        statement.setObject(7, UUID.fromString(orderId))
         statement.executeUpdate()
     }
 }
@@ -1291,7 +1301,7 @@ private fun JdbcTransaction.cancelOpenStopOrders(
         statement.setString(1, OrderStatus.CANCELED.name)
         statement.setString(2, reasonJa)
         statement.setLong(3, nowMillis(clock))
-        statement.setString(4, reasonJa)
+        statement.setString(4, PaperOrderCancelReason.POSITION_CLOSE.wireCode)
         statement.setLong(5, nowMillis(clock))
         statement.bindOpenStopOrderFilter(startIndex = 6, positionId = positionId)
         statement.executeUpdate()
@@ -1511,7 +1521,7 @@ private data class EntryOrderInsertRequest(
     val status: OrderStatus,
     val createdAt: Instant? = null,
     val expiresAt: Instant? = null,
-    val expirySource: me.matsumo.fukurou.trading.domain.OrderExpirySource? = null,
+    val expirySource: OrderExpirySource? = null,
     val effectiveTtlSeconds: Long? = null,
 )
 

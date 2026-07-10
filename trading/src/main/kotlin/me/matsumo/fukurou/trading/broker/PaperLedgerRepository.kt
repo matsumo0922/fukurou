@@ -364,13 +364,17 @@ data class ReconcileMarketContext(
 /**
  * reconcile 中に蓄積する更新結果。
  *
- * @param triggeredOrderIds trigger した order ID
+ * @param filledOrderIds 約定した order ID
+ * @param canceledOrderIds 取消した order ID
+ * @param rejectedOrderIds 拒否した order ID
  * @param closedPositionIds close した position ID
  * @param executionIds 作成した execution ID
  * @param divergenceMemos paper/live 乖離を audit に渡す structured memo
  */
 data class ReconcileProgress(
-    val triggeredOrderIds: MutableList<String>,
+    val filledOrderIds: MutableList<String>,
+    val canceledOrderIds: MutableList<String>,
+    val rejectedOrderIds: MutableList<String>,
     val closedPositionIds: MutableList<String>,
     val executionIds: MutableList<String>,
     val divergenceMemos: MutableList<PaperExecutionDivergenceMemo> = mutableListOf(),
@@ -420,7 +424,9 @@ internal fun TickSnapshot.toReconcileMarketContext(
 
 internal fun emptyReconcileProgress(): ReconcileProgress {
     return ReconcileProgress(
-        triggeredOrderIds = mutableListOf(),
+        filledOrderIds = mutableListOf(),
+        canceledOrderIds = mutableListOf(),
+        rejectedOrderIds = mutableListOf(),
         closedPositionIds = mutableListOf(),
         executionIds = mutableListOf(),
     )
@@ -428,8 +434,13 @@ internal fun emptyReconcileProgress(): ReconcileProgress {
 
 internal fun ReconcileProgress.toPaperReconcileResult(): PaperReconcileResult {
     return PaperReconcileResult(
-        advanced = triggeredOrderIds.isNotEmpty() || closedPositionIds.isNotEmpty(),
-        triggeredOrderIds = triggeredOrderIds,
+        advanced = filledOrderIds.isNotEmpty() ||
+            canceledOrderIds.isNotEmpty() ||
+            rejectedOrderIds.isNotEmpty() ||
+            closedPositionIds.isNotEmpty(),
+        filledOrderIds = filledOrderIds,
+        canceledOrderIds = canceledOrderIds,
+        rejectedOrderIds = rejectedOrderIds,
         closedPositionIds = closedPositionIds,
         executionIds = executionIds,
         divergenceMemos = divergenceMemos.toList(),

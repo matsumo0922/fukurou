@@ -24,7 +24,6 @@ import me.matsumo.fukurou.trading.activity.DecisionRunSummary
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.decision.requiresSafetyFloor
-import me.matsumo.fukurou.trading.domain.TradingSymbol
 import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.time.Instant
@@ -44,16 +43,19 @@ private const val RUNS_DESCRIPTION =
 data class OpsDecisionRunsResponse(
     val runs: List<OpsDecisionRunSummaryResponse>,
     val nextBefore: String?,
+    val latestMarketQuote: OpsDecisionRunQuoteResponse?,
 )
 
 /** decision run の API outcome。 */
 @Serializable
 enum class OpsDecisionRunOutcome {
     WAITING,
+    EXPIRING,
     FILLED,
     EXPIRED,
     CANCELED,
     NO_ENTRY,
+    DENIED,
     RUNNING,
     FAILED,
     ACTION_REQUIRED,
@@ -64,7 +66,12 @@ enum class OpsDecisionRunOutcome {
 enum class OpsDecisionRunFilter {
     ACTION_REQUIRED,
     WAITING,
+    EXPIRING,
     FILLED,
+    DENIED,
+    RUNNING,
+    EXPIRED,
+    CANCELED,
     NO_ENTRY,
 }
 
@@ -89,8 +96,8 @@ data class OpsDecisionRunSummaryResponse(
     val errorMessage: String?,
     val orderCount: Int,
     val executionCount: Int,
+    val hasProcessFailure: Boolean,
     val order: OpsDecisionRunOrderResponse?,
-    val currentQuote: OpsDecisionRunQuoteResponse?,
 )
 
 /** Activity に表示する参考価格。paper fill の根拠には使わない。 */
@@ -106,6 +113,7 @@ data class OpsDecisionRunQuoteResponse(
 @Serializable
 data class OpsDecisionRunDetailResponse(
     val summary: OpsDecisionRunSummaryResponse,
+    val latestMarketQuote: OpsDecisionRunQuoteResponse?,
     val phases: List<OpsDecisionRunPhaseResponse>,
     val decision: OpsDecisionRunDecisionResponse?,
     val intent: OpsDecisionRunIntentResponse?,
@@ -200,6 +208,9 @@ data class OpsDecisionRunOrderResponse(
     val cancelReason: String?,
     val canceledByDecisionRunId: String?,
     val createdAt: String,
+    val strategyEvaluationEligible: Boolean,
+    val strategyEvaluationExclusionReason: String?,
+    val lifecycleDelaySeconds: Long?,
 )
 
 /** execution section。 */
@@ -333,16 +344,14 @@ private fun Route.registerOpsDecisionRunDetailRoute(dependencies: OpsRouteDepend
     }
 }
 
-private suspend fun OpsRouteDependencies.referenceQuote(): OpsDecisionRunQuoteResponse? {
-    val ticker = feed.marketDataSource?.getTicker(TradingSymbol.BTC)?.getOrNull() ?: return null
-    val validBid = ticker.bid.toBigDecimalOrNull() ?: return null
-    val validAsk = ticker.ask.toBigDecimalOrNull() ?: return null
-    val observedAt = runCatching { Instant.parse(ticker.timestamp) }.getOrNull() ?: return null
+private fun OpsRouteDependencies.referenceQuote(): OpsDecisionRunQuoteResponse? {
+    val quote = feed.latestMarketQuoteStore.snapshot() ?: return null
+    val observedAt = quote.observedAt
     val age = Duration.between(observedAt, clock.instant())
 
     return OpsDecisionRunQuoteResponse(
-        bidPriceJpy = validBid.toPlainString(),
-        askPriceJpy = validAsk.toPlainString(),
+        bidPriceJpy = quote.bidPriceJpy.toPlainString(),
+        askPriceJpy = quote.askPriceJpy.toPlainString(),
         observedAt = observedAt.toString(),
         stale = age.isNegative || age > Duration.ofMinutes(2),
     )
@@ -357,12 +366,13 @@ private fun DecisionRunPage.toResponse(limit: Int, quote: OpsDecisionRunQuoteRes
     }
 
     return OpsDecisionRunsResponse(
-        runs = visible.map { summary -> summary.toResponse(quote) },
+        runs = visible.map(DecisionRunSummary::toResponse),
         nextBefore = nextCursor?.let(::encodeRunCursor),
+        latestMarketQuote = quote,
     )
 }
 
-private fun DecisionRunSummary.toResponse(quote: OpsDecisionRunQuoteResponse?): OpsDecisionRunSummaryResponse {
+private fun DecisionRunSummary.toResponse(): OpsDecisionRunSummaryResponse {
     return OpsDecisionRunSummaryResponse(
         invocationId = invocationId,
         mode = mode,
@@ -382,14 +392,15 @@ private fun DecisionRunSummary.toResponse(quote: OpsDecisionRunQuoteResponse?): 
         errorMessage = errorMessage,
         orderCount = orderCount,
         executionCount = executionCount,
+        hasProcessFailure = hasProcessFailure,
         order = order?.toResponse(),
-        currentQuote = quote,
     )
 }
 
 private fun DecisionRunDetail.toResponse(quote: OpsDecisionRunQuoteResponse?): OpsDecisionRunDetailResponse {
     return OpsDecisionRunDetailResponse(
-        summary = summary.toResponse(quote),
+        summary = summary.toResponse(),
+        latestMarketQuote = quote,
         phases = phases(),
         decision = decision?.toResponse(),
         intent = intent?.toResponse(),
@@ -458,10 +469,12 @@ private fun DecisionRunDetail.decisionAction(): DecisionAction? {
 private fun DecisionRunOutcome.toResponse(): OpsDecisionRunOutcome {
     return when (this) {
         DecisionRunOutcome.WAITING -> OpsDecisionRunOutcome.WAITING
+        DecisionRunOutcome.EXPIRING -> OpsDecisionRunOutcome.EXPIRING
         DecisionRunOutcome.FILLED -> OpsDecisionRunOutcome.FILLED
         DecisionRunOutcome.EXPIRED -> OpsDecisionRunOutcome.EXPIRED
         DecisionRunOutcome.CANCELED -> OpsDecisionRunOutcome.CANCELED
         DecisionRunOutcome.NO_ENTRY -> OpsDecisionRunOutcome.NO_ENTRY
+        DecisionRunOutcome.DENIED -> OpsDecisionRunOutcome.DENIED
         DecisionRunOutcome.RUNNING -> OpsDecisionRunOutcome.RUNNING
         DecisionRunOutcome.FAILED -> OpsDecisionRunOutcome.FAILED
         DecisionRunOutcome.ACTION_REQUIRED -> OpsDecisionRunOutcome.ACTION_REQUIRED
@@ -531,9 +544,12 @@ private fun DecisionRunOrder.toResponse() = OpsDecisionRunOrderResponse(
     effectiveTtlSeconds = effectiveTtlSeconds,
     expiredAt = expiredAt?.toString(),
     canceledAt = canceledAt?.toString(),
-    cancelReason = cancelReason,
+    cancelReason = cancelReason?.wireCode,
     canceledByDecisionRunId = canceledByDecisionRunId,
     createdAt = createdAt.toString(),
+    strategyEvaluationEligible = strategyEvaluationEligible,
+    strategyEvaluationExclusionReason = strategyEvaluationExclusionReason?.name,
+    lifecycleDelaySeconds = lifecycleDelaySeconds,
 )
 
 private fun DecisionRunExecution.toResponse() = OpsDecisionRunExecutionResponse(
