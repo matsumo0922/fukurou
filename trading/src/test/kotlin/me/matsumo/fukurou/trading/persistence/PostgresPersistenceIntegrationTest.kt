@@ -66,7 +66,6 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
-import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -103,7 +102,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import javax.sql.DataSource
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -2555,7 +2556,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(LLM_RUN_STATUS_FAILED, staleRun.status)
         assertEquals(fixedInstant(), staleRun.finishedAt)
         assertEquals(STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE, staleRun.errorMessage)
-        assertEquals(LlmRunTerminalCause.RESTART_INTERRUPTED, staleRun.terminalCause)
+        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RESTART_INTERRUPTED, staleRun.terminalCause)
         assertEquals("stale-running-run", recoveredEvent.decisionRunContext.decisionRunId)
         assertTrue(recoveredEvent.payload.contains("reservationRecovered"))
         assertEquals(LLM_RUN_STATUS_RUNNING, freshRun.status)
@@ -2564,6 +2565,45 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(LLM_RUN_STATUS_FAILED, alreadyFinishedRun.status)
         assertEquals(alreadyFinishedAt, alreadyFinishedRun.finishedAt)
         assertEquals("already failed", alreadyFinishedRun.errorMessage)
+    }
+
+    @Test
+    fun lifecycleRecoveryRollsBackRunAndReservationTogether() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val staleAt = fixedInstant().minus(Duration.ofHours(1))
+        val runRepository = ExposedLlmRunRepository(database)
+        val reservationRepository = ExposedLlmLaunchReservationRepository(database)
+        val runnerConfig = TradingBotConfig.fromEnvironment(emptyMap()).runner
+
+        runRepository.insertRunning(
+            LlmRunStart(
+                invocationId = "rollback-run",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                startedAt = staleAt,
+            ),
+        ).getOrThrow()
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest("rollback-run", runnerConfig, staleAt),
+        ).getOrThrow()
+
+        assertFailsWith<IllegalStateException> {
+            exposedTransaction(database) {
+                recoverStaleLlmRunLifecycle(fixedInstant(), Duration.ofMinutes(9))
+                error("force rollback")
+            }
+        }
+
+        val run = requireNotNull(runRepository.findByInvocationId("rollback-run").getOrThrow())
+        assertEquals(LLM_RUN_STATUS_RUNNING, run.status)
+        assertNull(run.terminalCause)
+        assertNotNull(
+            reservationRepository.findBlockingRunningReservation(
+                LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                fixedInstant().minus(Duration.ofHours(2)),
+            ).getOrThrow(),
+        )
     }
 
     @Test
