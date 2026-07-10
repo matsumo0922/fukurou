@@ -38,7 +38,16 @@ export type OpsDecisionRunsResponse = components["schemas"]["OpsDecisionRunsResp
 export type OpsDecisionRunSummaryResponse = components["schemas"]["OpsDecisionRunSummaryResponse"];
 export type OpsDecisionRunDetailResponse = components["schemas"]["OpsDecisionRunDetailResponse"];
 export type DecisionRunOutcome = OpsDecisionRunSummaryResponse["outcome"];
-export type DecisionRunFilter = "ACTION_REQUIRED" | "WAITING" | "FILLED" | "NO_ENTRY";
+export type DecisionRunFilter =
+  | "ACTION_REQUIRED"
+  | "WAITING"
+  | "EXPIRING"
+  | "FILLED"
+  | "DENIED"
+  | "RUNNING"
+  | "EXPIRED"
+  | "CANCELED"
+  | "NO_ENTRY";
 export type DecisionRunFilterOption = DecisionRunFilter | "ALL";
 
 export const DECISION_RUN_FILTER_STORAGE_KEY = "fukurou.web.activity.run-filter.v2";
@@ -46,7 +55,12 @@ export const DECISION_RUN_FILTERS = [
   "ALL",
   "ACTION_REQUIRED",
   "WAITING",
+  "EXPIRING",
   "FILLED",
+  "DENIED",
+  "RUNNING",
+  "EXPIRED",
+  "CANCELED",
   "NO_ENTRY",
 ] as const satisfies readonly DecisionRunFilterOption[];
 export const DECISION_RUN_PAGE_LIMIT = 50;

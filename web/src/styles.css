@@ -2216,12 +2216,19 @@ a:focus-visible {
 
 .run-outcome--filled { color: var(--green); background: var(--green-soft); }
 .run-outcome--waiting { color: var(--blue); background: var(--blue-soft); }
+.run-outcome--expiring { color: var(--amber); background: var(--amber-soft); }
 .run-outcome--expired { color: var(--ink-muted); background: var(--surface-muted); }
 .run-outcome--canceled { color: var(--ink-muted); background: var(--surface-muted); }
 .run-outcome--no-entry { color: var(--ink-muted); background: var(--surface-muted); }
+.run-outcome--denied { color: var(--ink-muted); background: var(--surface-muted); }
 .run-outcome--action-required { color: var(--red); background: var(--red-soft); }
 .run-outcome--failed { color: var(--red); background: var(--red-soft); }
 .run-outcome--running { color: var(--blue); background: var(--blue-soft); }
+
+.run-process-failure {
+  display: inline-flex;
+  color: var(--red);
+}
 
 .decision-run-detail {
   position: sticky;

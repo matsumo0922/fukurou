@@ -42,6 +42,7 @@ export function ActivityPage() {
     () => deduplicateRuns(runsQuery.data?.pages.flatMap((page) => page.runs) ?? []),
     [runsQuery.data?.pages],
   );
+  const latestMarketQuote = runsQuery.data?.pages[0]?.latestMarketQuote ?? null;
   const activeSelectedId = selectedId && runs.some((run) => run.invocationId === selectedId) ? selectedId : null;
   const detailQuery = useQuery(opsDecisionRunDetailQuery(activeSelectedId));
   const closeDetail = useCallback(() => {
@@ -113,6 +114,7 @@ export function ActivityPage() {
               runs.map((run) => (
                 <RunRow
                   run={run}
+                  latestMarketQuote={latestMarketQuote}
                   selected={run.invocationId === activeSelectedId}
                   selectedChanged={(button) => {
                     selectedRunButtonRef.current = button;
@@ -150,10 +152,12 @@ export function ActivityPage() {
 
 function RunRow({
   run,
+  latestMarketQuote,
   selected,
   selectedChanged,
 }: {
   run: OpsDecisionRunSummaryResponse;
+  latestMarketQuote: OpsDecisionRunDetailResponse["latestMarketQuote"];
   selected: boolean;
   selectedChanged: (button: HTMLButtonElement) => void;
 }) {
@@ -178,6 +182,11 @@ function RunRow({
             <OutcomeIcon outcome={run.outcome} />
             {runOutcomeLabel(run.outcome, t)}
           </span>
+          {run.hasProcessFailure ? (
+            <span className="run-process-failure" title={t("activity.runs.processFailure")}>
+              <CircleAlert size={15} aria-label={t("activity.runs.processFailure")} />
+            </span>
+          ) : null}
           <ChevronRight className="decision-run-card__arrow" size={17} aria-hidden="true" />
         </span>
         <span className="decision-run-card__headline">
@@ -192,8 +201,8 @@ function RunRow({
         </span>
         <span className="decision-run-card__facts">
           <span>{t("activity.runs.label.price")} <strong>{order?.limitPriceJpy ?? "—"}</strong></span>
-          <span>{t("activity.runs.label.currentQuote")} <strong>{formatReferenceQuote(run, locale)}</strong></span>
-          <span>{t("activity.runs.label.distance")} <strong>{formatPriceDistance(run)}</strong></span>
+          <span>{t("activity.runs.label.currentQuote")} <strong>{formatReferenceQuote(run, latestMarketQuote, locale)}</strong></span>
+          <span>{t("activity.runs.label.distance")} <strong>{formatPriceDistance(run, latestMarketQuote)}</strong></span>
           <span>{t("activity.runs.label.effectiveExpiry")} <strong>{formatExpiry(order?.expiresAt, locale)}</strong></span>
         </span>
       </span>
@@ -281,9 +290,9 @@ function RunDetailContent({
           [t("activity.runs.label.order"), order ? `${order.side} ${order.orderType}` : null],
           [t("activity.runs.label.size"), order ? `${order.sizeBtc} BTC` : intent ? `${intent.sizeBtc} BTC` : null],
           [t("activity.runs.label.price"), order?.limitPriceJpy ?? intent?.priceJpy],
-          [t("activity.runs.label.currentQuote"), formatReferenceQuote(detail.summary, locale)],
-          [t("activity.runs.label.distance"), formatPriceDistance(detail.summary)],
-          [t("activity.runs.label.quoteNotice"), detail.summary.currentQuote?.stale ? t("activity.runs.quote.stale") : t("activity.runs.quote.reference"), true],
+          [t("activity.runs.label.currentQuote"), formatReferenceQuote(detail.summary, detail.latestMarketQuote, locale)],
+          [t("activity.runs.label.distance"), formatPriceDistance(detail.summary, detail.latestMarketQuote)],
+          [t("activity.runs.label.quoteNotice"), detail.latestMarketQuote?.stale ? t("activity.runs.quote.stale") : t("activity.runs.quote.reference"), true],
         ]} />
         <RunOrderRecords orders={detail.orders} />
         <RunExecutionRecords executions={detail.executions} />
@@ -300,6 +309,7 @@ function RunDetailContent({
           [t("activity.runs.label.canceledAt"), order?.canceledAt],
           [t("activity.runs.label.cancelReason"), order?.cancelReason, true],
           [t("activity.runs.label.canceledByRun"), order?.canceledByDecisionRunId, true],
+          [t("activity.runs.label.strategyEvaluation"), formatStrategyEvaluation(order, t), true],
         ]} />
       </DetailSection>
 
@@ -329,7 +339,7 @@ function RunDetailContent({
             </li>
           ))}
         </ol>
-        {detail.summary.errorMessage && detail.summary.outcome !== "FAILED" ? (
+        {detail.summary.hasProcessFailure && detail.summary.errorMessage ? (
           <p className="run-detail-notice run-detail-notice--warning">
             <CircleAlert size={16} aria-hidden="true" /> {detail.summary.errorMessage}
           </p>
@@ -405,6 +415,7 @@ function RunOrderRecords({ orders }: { orders: OpsDecisionRunDetailResponse["ord
             [t("activity.runs.label.canceledAt"), order.canceledAt],
             [t("activity.runs.label.cancelReason"), order.cancelReason, true],
             [t("activity.runs.label.canceledByRun"), order.canceledByDecisionRunId, true],
+            [t("activity.runs.label.strategyEvaluation"), formatStrategyEvaluation(order, t), true],
             [t("activity.runs.label.createdAt"), order.createdAt],
             [t("activity.runs.label.entryReason"), order.reasonJa, true],
           ]} />
@@ -463,32 +474,54 @@ function deduplicateRuns(runs: OpsDecisionRunSummaryResponse[]): OpsDecisionRunS
 
 type AppLocale = ReturnType<typeof useI18n>["locale"];
 
-function formatReferenceQuote(run: OpsDecisionRunSummaryResponse, locale: AppLocale): string {
-  const quote = run.currentQuote;
+function formatReferenceQuote(
+  run: OpsDecisionRunSummaryResponse,
+  quote: OpsDecisionRunDetailResponse["latestMarketQuote"],
+  locale: AppLocale,
+): string {
   if (!quote) return "—";
 
   const stale = quote.stale ? (locale === "ja" ? " · stale" : " · stale") : "";
-  const price = referenceQuotePrice(run);
+  const price = referenceQuotePrice(run, quote);
   const quoteName = run.order?.side === "SELL"
     ? (locale === "ja" ? "買" : "bid")
     : (locale === "ja" ? "売" : "ask");
   return `${quoteName} ${price} @ ${formatDateTime(quote.observedAt, locale)}${stale}`;
 }
 
-function formatPriceDistance(run: OpsDecisionRunSummaryResponse): string {
+function formatPriceDistance(
+  run: OpsDecisionRunSummaryResponse,
+  quote: OpsDecisionRunDetailResponse["latestMarketQuote"],
+): string {
   const limit = Number(run.order?.limitPriceJpy);
-  const quote = Number(referenceQuotePrice(run));
-  if (!Number.isFinite(limit) || !Number.isFinite(quote) || quote === 0) return "—";
+  const quotePrice = Number(referenceQuotePrice(run, quote));
+  if (!Number.isFinite(limit) || !Number.isFinite(quotePrice) || quotePrice === 0) return "—";
 
-  const distance = run.order?.side === "SELL" ? limit - quote : quote - limit;
-  const ratio = distance / quote * 100;
+  const distance = run.order?.side === "SELL" ? limit - quotePrice : quotePrice - limit;
+  const ratio = distance / quotePrice * 100;
   return `${distance.toLocaleString()} JPY (${ratio.toFixed(2)}%)`;
 }
 
-function referenceQuotePrice(run: OpsDecisionRunSummaryResponse): string | undefined {
-  if (run.order?.side === "SELL") return run.currentQuote?.bidPriceJpy;
+function referenceQuotePrice(
+  run: OpsDecisionRunSummaryResponse,
+  quote: OpsDecisionRunDetailResponse["latestMarketQuote"],
+): string | undefined {
+  if (run.order?.side === "SELL") return quote?.bidPriceJpy;
 
-  return run.currentQuote?.askPriceJpy;
+  return quote?.askPriceJpy;
+}
+
+function formatStrategyEvaluation(
+  order: OpsDecisionRunDetailResponse["orders"][number] | null,
+  t: Translator,
+): string | null {
+  if (!order) return null;
+  if (order.strategyEvaluationEligible) return t("activity.runs.evaluation.eligible");
+  if (order.strategyEvaluationExclusionReason === "LIFECYCLE_MONITORING_DELAY") {
+    return `${t("activity.runs.evaluation.monitoringDelay")} (${order.lifecycleDelaySeconds ?? "—"}s)`;
+  }
+
+  return t("activity.runs.evaluation.missingEvidence");
 }
 
 function formatExpiry(expiresAt: string | null | undefined, locale: AppLocale): string {
@@ -562,7 +595,12 @@ function filterLabel(filter: DecisionRunFilterOption, t: Translator): string {
     ALL: "activity.runs.filter.all",
     ACTION_REQUIRED: "activity.runs.filter.actionRequired",
     WAITING: "activity.runs.filter.waiting",
+    EXPIRING: "activity.runs.filter.expiring",
     FILLED: "activity.runs.filter.filled",
+    DENIED: "activity.runs.filter.denied",
+    RUNNING: "activity.runs.filter.running",
+    EXPIRED: "activity.runs.filter.expired",
+    CANCELED: "activity.runs.filter.canceled",
     NO_ENTRY: "activity.runs.filter.noEntry",
   } as const;
   return t(keys[filter]);
@@ -572,10 +610,12 @@ function runOutcomeLabel(outcome: OpsDecisionRunSummaryResponse["outcome"], t: T
   const keys = {
     ACTION_REQUIRED: "activity.runs.outcome.overdue",
     WAITING: "activity.runs.outcome.waiting",
+    EXPIRING: "activity.runs.outcome.expiring",
     FILLED: "activity.runs.outcome.filled",
     EXPIRED: "activity.runs.outcome.expired",
     CANCELED: "activity.runs.outcome.canceled",
     NO_ENTRY: "activity.runs.outcome.noEntry",
+    DENIED: "activity.runs.outcome.denied",
     RUNNING: "activity.runs.outcome.running",
     FAILED: "activity.runs.outcome.failed",
   } as const;
@@ -583,11 +623,11 @@ function runOutcomeLabel(outcome: OpsDecisionRunSummaryResponse["outcome"], t: T
 }
 
 function OutcomeIcon({ outcome }: { outcome: OpsDecisionRunSummaryResponse["outcome"] }) {
-  const Icon = outcome === "WAITING" || outcome === "RUNNING"
+  const Icon = outcome === "WAITING" || outcome === "EXPIRING" || outcome === "RUNNING"
     ? Clock3
     : outcome === "FILLED"
       ? CircleCheck
-      : outcome === "EXPIRED" || outcome === "CANCELED" || outcome === "NO_ENTRY"
+      : outcome === "EXPIRED" || outcome === "CANCELED" || outcome === "NO_ENTRY" || outcome === "DENIED"
         ? Ban
         : CircleAlert;
 
