@@ -77,8 +77,9 @@ prune_old_images() {
 
   local -a image_ids
   # CreatedAt 降順で列挙し、同一 digest（:main と :<sha> が同じ image を指す行）を除去する。
+  # --no-trunc でフル ID にし、docker inspect の {{.Image}} と同じ形式（sha256:<64hex>）に揃える。
   mapfile -t image_ids < <(
-    docker images "${IMAGE_REPOSITORY}" --format '{{.CreatedAt}}|{{.ID}}' \
+    docker images "${IMAGE_REPOSITORY}" --no-trunc --format '{{.CreatedAt}}|{{.ID}}' \
       | sort -r \
       | awk -F'|' '!seen[$2]++ { print $2 }'
   )
