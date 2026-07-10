@@ -108,7 +108,7 @@ flowchart LR
 
     subgraph External[External Systems]
         GmoRest[GMO Coin REST\nPublic / Private]
-        GmoWs[GMO Coin WebSocket\nFuture TickStream]
+        GmoWs[GMO Coin WebSocket\ntrades/BTC execution stream]
         OptionalData[Optional Data Sources\nFunding / News / Sentiment / Cross Market]
         Human[Human Operator]
     end
@@ -151,8 +151,8 @@ flowchart LR
 
 #### 2.3.1 市場データの流れ
 
-1. `ProtectionReconciler` が `TickStream` 抽象から ticker/trades を短周期で受け取り、保護・約定判定に使う。
-2. Step1.5時点の `TickStream` はREST polling（2〜5秒、ticker + trades）で開始し、live化前にWebSocketへ差し替え可能にする。
+1. `ProtectionReconciler` は GMO Public WebSocket `trades/BTC` を接続単位で直列消費し、受信 event で resting entry と保護を前進させる。
+2. connection session と local sequence、exchange/received time、gap、recovery、約定 source evidence を PostgreSQL に保存し、event と ledger cursor を同一 transaction で確定する。
 3. RESTで5分・1時間・日足のOHLCVを補完する。
 4. `MarketDataSource` 実装が、ローソク足、板、約定、指標、マイクロストラクチャ要約を統一モデルへ変換する。
 5. 必要なスナップショットのみPostgreSQLへ保存する。高頻度の板フル履歴はv1では保存せず、要約特徴量を保存する。
@@ -1198,9 +1198,9 @@ data class PositionViewState(
 
 | domain操作      | GMO API候補                        | 備考                                                                           |
 |---------------|----------------------------------|------------------------------------------------------------------------------|
-| ticker        | `GET /public/v1/ticker`          | symbol変換を通す。`TickStream` の初期実装はREST polling                                  |
+| ticker        | `GET /public/v1/ticker`          | LLM read、SafetyFloor、同期注文の symbol 変換を通す。resting execution には使わない                 |
 | orderbook     | `GET /public/v1/orderbooks`      | snapshotとして扱い、鮮度を記録                                                          |
-| trades        | `GET /public/v1/trades`          | 直近約定と出来高デルタに使用。`TickStream` の初期実装はREST polling                               |
+| trades        | `GET /public/v1/trades`          | LLM read と分析用。paper resting execution の遡及根拠には使わない                            |
 | candles       | `GET /public/v1/klines`          | 5min/1hour/1dayを取得。`date` は1min〜1hourが `YYYYMMDD`、4hour以上が `YYYY`            |
 | trade rules   | `GET /public/v1/symbols`         | 最小数量・tick・maker/taker fee                                                    |
 | balances      | `GET /private/v1/account/assets` | Paperではledgerから返す                                                            |
@@ -3634,7 +3634,7 @@ DD -15% は `HARD_HALT`。発動時はDB上の `risk_state.hard_halt=true` をst
 
 [確定] liveではnative STOPがbot停止中も取引所で作動する。一方、paperでは `ProtectionReconciler` 停止中はSTOPが作動しないため、paperの保護はliveより弱い。これは安全側の構造的乖離として文書化し、復旧テストで補う。
 
-[確定] Step4時点のpaper `ProtectionReconciler` はREST pollingで取得したtickerの `lastPrice` をもとにSTOP / virtual TP到達を判定する。polling間のintrabar高安は見ないため、5秒程度のpolling間隔内でSTOP/TPに触れて戻ったケースはlive native STOPや取引所約定履歴と乖離し得る。この制約は #9 のpaper divergence一覧に残し、WebSocket TickStreamまたはtradesベース判定へ差し替えるまで既知のpaper/live乖離として扱う。
+[確定] paper `ProtectionReconciler` は WebSocket で受信した trade event の price をもとに STOP / virtual TP 到達を判定する。受信していない期間、注文作成前、期限外、retry event は約定根拠にしない。接続断や sequence gap は未監査の欠損にせず、影響 entity を評価除外して復旧後最初の realtime event から管理を再開する。
 
 ### 15.2 手数料モデル
 
@@ -3674,14 +3674,13 @@ finalFillPrice = fillPrice - fixedSlippage - volatilitySlippage
 指値BUY:
 
 - `limitPrice >= bestAsk` ならtakerとして即時約定。
-- `limitPrice < bestAsk` ならmaker候補。未約定中は取得できた板の `bestAsk <= limitPrice` で到達判定し、板が取得できない場合だけWARNを出してticker由来のlast price比較へfallbackする。
-- crossing / resting LIMITはall-or-noneでfull fillし、LIMIT価格までのask深さに `queueFillRatio` を掛けたFAK推定数量が注文数量を下回る場合は、実約定とは別にpaper execution乖離メモを残す。crossing は `PaperTradeResult` と runner lifecycle payload、resting は reconcile pass payload へ伝搬する。
+- `limitPrice < bestAsk` なら maker 候補。resting BUY LIMIT は exact-price bid と先行する同価格の自 paper order を queue snapshot に含める。
+- eligible SELL volume が queue ahead と注文数量の合計に達した event で all-or-none の maker fill にする。partial fill と先行 exchange order cancellation は再現しない。
 
 指値SELL:
 
 - `limitPrice <= bestBid` ならtakerとして即時約定。
-- `limitPrice > bestBid` ならmaker候補。未約定中は取得できた板の `bestBid >= limitPrice` で到達判定し、板が取得できない場合だけWARNを出してticker由来のlast price比較へfallbackする。
-- crossing / resting LIMITはall-or-noneでfull fillし、LIMIT価格までのbid深さに `queueFillRatio` を掛けたFAK推定数量が注文数量を下回る場合は、実約定とは別にpaper execution乖離メモを残す。crossing は `PaperTradeResult` と runner lifecycle payload、resting は reconcile pass payload へ伝搬する。
+- SELL LIMIT は現物 entry scope 外であり、同期 close と protective exit の contract を使う。
 
 TimeInForce / post-only / SOK / FAS はpaper約定判定に含めない。
 
@@ -3689,8 +3688,8 @@ TimeInForce / post-only / SOK / FAS はpaper約定判定に含めない。
 
 リアルタイム時:
 
-- `ProtectionReconciler` は REST polling で取得した ticker の `lastPrice` をもとにSTOP / virtual TP到達を検出する。
-- 到達時点で取得した板でSELL成行相当をシミュレートする。板取得に失敗した場合は ticker bid と slippage で保守的に約定価格を決める。
+- `ProtectionReconciler` は共通 WebSocket trade event の price で STOP / virtual TP 到達を検出する。
+- STOP / TP は trigger event price に fixed adverse slippage を適用し、event transaction 中に REST ticker/orderbook/ATR fallback を使わない。
 
 ローソク高安:
 
@@ -3850,7 +3849,7 @@ maxDD = min((equity - equityPeak) / equityPeak)
 
 - GMO APIレスポンスfixtureからdomain型へ変換。
 - stale判定。
-- TickStream REST pollingの鮮度維持。WebSocket差し替え時は再接続と再購読のレート遵守。
+- WebSocket session / sequence / freshness、gap impact、再接続と再購読のレートを監査する。
 - `/public/v1/symbols` の手数料/最小数量変更に追従。
 
 #### LLM/MCP統合テスト

@@ -102,6 +102,10 @@ function renderSystemStatus(
     <>
       <StatusPill label={`health ${statusQuery.data.health.status}`} tone="positive" />
       <StatusPill label={`ready ${statusQuery.data.readiness.status}`} tone={readinessTone} />
+      <StatusPill
+        label={`market ${statusQuery.data.readiness.marketDataState ?? "DISCONNECTED"}`}
+        tone={statusQuery.data.readiness.marketDataState === "CONNECTED" ? "positive" : "critical"}
+      />
       <StatusPill label={freshnessLabel} tone={freshnessTone} />
       <span className="top-status-bar__text">
         {t("topStatus.revisionPrefix")} {statusQuery.data.revision}

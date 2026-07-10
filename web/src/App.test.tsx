@@ -85,7 +85,11 @@ describe("App", () => {
       readiness: {
         status: "ready",
         lastReconciledAt: "2026-07-05T12:00:00.000Z",
-        lastMarketDataAt: null,
+        lastMarketDataAt: "2026-07-05T12:00:01.000Z",
+        marketDataState: "CONNECTED",
+        gapStartedAt: "2026-07-05T11:59:00.000Z",
+        recoveredAt: "2026-07-05T12:00:01.000Z",
+        gapReason: "DISCONNECTED",
       },
       revision: "local-sha",
     });
@@ -99,6 +103,8 @@ describe("App", () => {
     expect(screen.getByText("GET /ops/llm-auth")).toBeInTheDocument();
     expect(screen.getByText("status=ok")).toBeInTheDocument();
     expect(screen.getByText("status=ready")).toBeInTheDocument();
+    expect(screen.getAllByText("CONNECTED").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("DISCONNECTED").length).toBeGreaterThan(0);
     expect(screen.getByText("claude=logged_in, codex=logged_out")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "CLI auth status" })).toBeInTheDocument();
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
@@ -330,6 +336,7 @@ describe("App", () => {
     expect(screen.getByText("known provider total · partially unavailable")).toBeInTheDocument();
     expect(screen.getByText("2 cost unavailable (incl. missing usage 1) · 1 model unavailable")).toBeInTheDocument();
     expect(screen.getByText("unavailable")).toBeInTheDocument();
+    expect(screen.getByText("DISCONNECTED 2 / SEQUENCE_GAP 1")).toBeInTheDocument();
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/evaluation/summary",
@@ -1082,6 +1089,10 @@ type SystemFetchFixture = {
     status: string;
     lastReconciledAt?: string | null;
     lastMarketDataAt?: string | null;
+    marketDataState?: string;
+    gapStartedAt?: string | null;
+    recoveredAt?: string | null;
+    gapReason?: string | null;
   };
   revision?: string;
   readinessStatus?: number;
@@ -1434,6 +1445,15 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
             ],
             entryRate: "0.2",
             noTradeRate: "0.8",
+          },
+          exclusions: {
+            orderCount: 1,
+            decisionRunCount: 1,
+            tradeCount: 1,
+            reasons: {
+              DISCONNECTED: 2,
+              SEQUENCE_GAP: 1,
+            },
           },
           marketRegimes: [],
         });

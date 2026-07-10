@@ -154,7 +154,7 @@ function EvaluationSummaryPanel({
     return <PanelError title={t("evaluation.error.summary")} error={summaryQuery.error} retried={() => void summaryQuery.refetch()} />;
   }
 
-  const { performance, runRates, period } = summaryQuery.data;
+  const { performance, runRates, period, exclusions } = summaryQuery.data;
 
   return (
     <Panel>
@@ -193,6 +193,13 @@ function EvaluationSummaryPanel({
             label: t("evaluation.label.decisionRuns"),
             value: formatInteger(runRates.decisionRunCount),
             detail: `${t("evaluation.detail.entry")} ${formatRatioAsPercent(runRates.entryRate)} / ${t("evaluation.label.noTrade")} ${formatRatioAsPercent(runRates.noTradeRate)}`,
+          },
+          {
+            label: t("evaluation.label.excluded"),
+            value: formatInteger((exclusions?.orderCount ?? 0) + (exclusions?.decisionRunCount ?? 0) + (exclusions?.tradeCount ?? 0)),
+            detail: Object.entries(exclusions?.reasons ?? {})
+              .map(([reason, count]) => `${reason} ${formatInteger(count)}`)
+              .join(" / ") || t("evaluation.detail.noExclusions"),
           },
         ]}
       />
