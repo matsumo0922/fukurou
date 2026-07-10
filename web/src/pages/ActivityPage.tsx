@@ -17,6 +17,7 @@ import {
   type OpsDecisionRunDetailResponse,
   type OpsDecisionRunSummaryResponse,
 } from "../api/ops";
+import { ApiClientError } from "../api/client";
 import { useI18n } from "../i18n/useI18n";
 import { EmptyState } from "../ui/components/EmptyState";
 import { SectionHeader } from "../ui/components/SectionHeader";
@@ -25,6 +26,7 @@ import { describeError, formatDateTime } from "../ui/format";
 export function ActivityPage() {
   const [filter, setFilter] = useState<DecisionRunFilterOption>(loadRunFilter);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [searchedRunId, setSearchedRunId] = useState<string | null>(null);
   const [runIdQuery, setRunIdQuery] = useState("");
   const selectedRunButtonRef = useRef<HTMLButtonElement | null>(null);
   const runsQuery = useInfiniteQuery({
@@ -46,8 +48,17 @@ export function ActivityPage() {
   const latestMarketQuote = runsQuery.data?.pages[0]?.latestMarketQuote ?? null;
   const activeSelectedId = selectedId;
   const detailQuery = useQuery(opsDecisionRunDetailQuery(activeSelectedId));
+  const exactSearchResult = searchedRunId && detailQuery.data?.summary.invocationId === searchedRunId
+    ? detailQuery.data
+    : null;
+  const displayedRuns = exactSearchResult ? [exactSearchResult.summary] : runs;
+  const displayedLatestMarketQuote = exactSearchResult?.latestMarketQuote ?? latestMarketQuote;
+  const exactSearchNotFound = searchedRunId != null
+    && detailQuery.error instanceof ApiClientError
+    && detailQuery.error.status === 404;
   const closeDetail = useCallback(() => {
     setSelectedId(null);
+    setSearchedRunId(null);
     window.setTimeout(() => selectedRunButtonRef.current?.focus(), 0);
   }, []);
 
@@ -72,13 +83,19 @@ export function ActivityPage() {
                 if (event.key === "Escape") {
                   setRunIdQuery("");
                   setSelectedId(null);
+                  setSearchedRunId(null);
                 }
-                if (event.key === "Enter" && runIdQuery.trim()) setSelectedId(runIdQuery.trim());
+                if (event.key === "Enter" && runIdQuery.trim()) {
+                  const runId = runIdQuery.trim();
+                  setSearchedRunId(runId);
+                  setSelectedId(runId);
+                }
               }}
             />
             {runIdQuery ? <button type="button" aria-label={t("activity.runs.search.clear")} onClick={() => {
               setRunIdQuery("");
               setSelectedId(null);
+              setSearchedRunId(null);
             }}><X size={14} aria-hidden="true" /></button> : null}
           </label>
           <button
@@ -103,6 +120,7 @@ export function ActivityPage() {
             onClick={() => {
               setFilter(outcome);
               setSelectedId(null);
+              setSearchedRunId(null);
             }}
           >
             {filterLabel(outcome, t)}
@@ -120,7 +138,8 @@ export function ActivityPage() {
       {runsQuery.isSuccess ? (
         <div className={activeSelectedId ? "decision-runs-layout decision-runs-layout--detail" : "decision-runs-layout"}>
           <main className="decision-run-list" aria-label={t("activity.runs.list.aria")}>
-            {runs.length === 0 ? (
+            {exactSearchNotFound ? <RunListNotice text={t("activity.runs.search.notFound")} /> : null}
+            {displayedRuns.length === 0 ? (
               <EmptyState
                 title={t(runsQuery.hasNextPage ? "activity.runs.empty.scanTitle" : "activity.runs.empty.title")}
                 description={t(
@@ -128,22 +147,20 @@ export function ActivityPage() {
                 )}
               />
             ) : (
-              runs.map((run) => (
+              displayedRuns.map((run) => (
                 <RunRow
                   run={run}
-                  latestMarketQuote={latestMarketQuote}
+                  latestMarketQuote={displayedLatestMarketQuote}
                   selected={run.invocationId === activeSelectedId}
                   selectedChanged={(button) => {
                     selectedRunButtonRef.current = button;
+                    setSearchedRunId(null);
                     setSelectedId(run.invocationId);
                   }}
                   key={run.invocationId}
                 />
               ))
             )}
-            {selectedId && !runs.some((run) => run.invocationId === selectedId) ? (
-              <p className="run-search-result">{t("activity.runs.search.result")}: <code>{selectedId}</code></p>
-            ) : null}
             {runsQuery.hasNextPage ? (
               <button
                 className="run-load-more"
@@ -314,13 +331,19 @@ function RunDetailContent({
   const safety = detail.safetyViolation;
   const order = detail.summary.order ?? detail.orders.find((candidate) => candidate.side === "BUY") ?? null;
   const isFilled = detail.summary.outcome === "FILLED";
+  const isPendingOrder = ["WAITING", "EXPIRING", "ACTION_REQUIRED"].includes(detail.summary.outcome);
+  const isCanceledOrExpired = ["CANCELED", "EXPIRED"].includes(detail.summary.outcome);
+  const isDecisionOutcome = !isFilled && !isPendingOrder && !isCanceledOrExpired;
+  const detailIndex = isFilled || isCanceledOrExpired || isDecisionOutcome ? "02" : "01";
 
   return (
     <>
       {isFilled ? <TradeLifecycleSection lifecycles={detail.tradeLifecycles ?? []} /> : null}
+      {isCanceledOrExpired ? <CancellationSection detail={detail} order={order} /> : null}
+      {isDecisionOutcome ? <DecisionOutcomeSection detail={detail} /> : null}
 
-      <DetailSection index={isFilled ? "02" : "01"} title={t("activity.runs.section.orderConditions")}>
-        {!isFilled && order ? <p className="run-order-conditions">{orderExplanation(order, locale)}</p> : null}
+      <DetailSection index={detailIndex} title={t("activity.runs.section.orderConditions")}>
+        {isPendingOrder && order ? <p className="run-order-conditions">{orderExplanation(order, locale)}</p> : null}
         <FactGrid facts={[
           [t("activity.runs.label.mode"), detail.summary.mode],
           [t("activity.runs.label.order"), order ? `${order.side} ${order.orderType}` : null],
@@ -334,7 +357,7 @@ function RunDetailContent({
         {!isFilled ? <RunExecutionRecords executions={detail.executions} /> : null}
       </DetailSection>
 
-      <DetailSection index={isFilled ? "03" : "02"} title={t("activity.runs.section.expiry")}>
+      <DetailSection index={String(Number(detailIndex) + 1).padStart(2, "0")} title={t("activity.runs.section.expiry")}>
         <FactGrid facts={[
           [t("activity.runs.label.effectiveExpiry"), order?.expiresAt ? formatDateTime(order.expiresAt, locale) : t("activity.runs.expiry.unrecorded")],
           [t("activity.runs.label.remaining"), formatExpiry(order?.expiresAt, locale)],
@@ -349,7 +372,7 @@ function RunDetailContent({
         ]} />
       </DetailSection>
 
-      <DetailSection index={isFilled ? "04" : "03"} title={t("activity.runs.section.safety")}>
+      <DetailSection index={String(Number(detailIndex) + 2).padStart(2, "0")} title={t("activity.runs.section.safety")}>
         <div className="run-value-comparison">
           <div><small>{t("activity.runs.comparison.llm")}</small><strong>{decision?.expectedRMultiple ?? "—"}</strong><span>expectedR</span></div>
           <span aria-hidden="true">→</span>
@@ -366,7 +389,7 @@ function RunDetailContent({
         ]} />
       </DetailSection>
 
-      <DetailSection index={isFilled ? "05" : "04"} title={t("activity.runs.section.processingPath")}>
+      <DetailSection index={String(Number(detailIndex) + 3).padStart(2, "0")} title={t("activity.runs.section.processingPath")}>
         <ol className="run-phase-list">
           {detail.phases.map((phase) => (
             <li className="run-phase" data-state={phase.status.toLowerCase()} key={phase.key}>
@@ -407,6 +430,44 @@ function RunDetailContent({
       </DetailSection>
     </>
   );
+}
+
+function CancellationSection({
+  detail,
+  order,
+}: {
+  detail: OpsDecisionRunDetailResponse;
+  order: OpsDecisionRunDetailResponse["orders"][number] | null;
+}) {
+  const { locale, t } = useI18n();
+  const canceledOrExpiredAt = order?.canceledAt ?? order?.expiredAt ?? null;
+
+  return <DetailSection index="01" title={t("activity.runs.section.cancellation")}>
+    <FactGrid facts={[
+      [t("activity.runs.label.status"), order?.status ?? detail.summary.outcome],
+      [t("activity.runs.label.canceledAt"), canceledOrExpiredAt ? formatDateTime(canceledOrExpiredAt, locale) : null],
+      [t("activity.runs.label.cancelReason"), order?.cancelReason, true],
+      [t("activity.runs.label.canceledByRun"), order?.canceledByDecisionRunId, true],
+      [t("activity.runs.label.finalReason"), detail.summary.finalReason, true],
+    ]} />
+  </DetailSection>;
+}
+
+function DecisionOutcomeSection({ detail }: { detail: OpsDecisionRunDetailResponse }) {
+  const { t } = useI18n();
+
+  return <DetailSection index="01" title={t("activity.runs.section.decision")}>
+    <FactGrid facts={[
+      [t("activity.runs.label.action"), detail.decision?.action],
+      [t("activity.runs.label.status"), detail.summary.status],
+      [t("activity.runs.label.finalReason"), detail.summary.finalReason, true],
+      [t("activity.runs.label.message"), detail.safetyViolation?.messageJa, true],
+    ]} />
+    <div className="run-narratives">
+      <Narrative label={t("activity.runs.label.reason")} value={detail.decision?.reasonJa} />
+      <Narrative label={t("activity.runs.label.falsifierReason")} value={detail.falsification?.reasonJa} />
+    </div>
+  </DetailSection>;
 }
 
 function Narrative({ label, value }: { label: string; value: string | null | undefined }) {

@@ -527,6 +527,7 @@ private const val INSERT_TEST_POSITION_SQL = """
 private const val INSERT_TEST_ORDER_SQL = """
     INSERT INTO orders (
         id,
+        intent_id,
         position_id,
         trade_group_id,
         mode,
@@ -605,6 +606,7 @@ private const val INSERT_TEST_EXECUTION_SQL = """
 private const val INSERT_ACTIVITY_CONTEXT_ORDER_SQL = """
     INSERT INTO orders (
         id,
+        intent_id,
         position_id,
         trade_group_id,
         mode,
@@ -624,6 +626,7 @@ private const val INSERT_ACTIVITY_CONTEXT_ORDER_SQL = """
         updated_at
     )
     VALUES (
+        ?,
         ?,
         ?,
         ?,
@@ -661,7 +664,8 @@ private const val INSERT_ACTIVITY_CONTEXT_EXECUTION_SQL = """
         fee_jpy,
         realized_pnl_jpy,
         liquidity,
-        executed_at
+        executed_at,
+        decision_run_id
     )
     VALUES (
         ?,
@@ -673,6 +677,7 @@ private const val INSERT_ACTIVITY_CONTEXT_EXECUTION_SQL = """
         ?,
         0.010000000000,
         10.00000000,
+        ?,
         ?,
         ?,
         ?
@@ -1460,6 +1465,9 @@ class PostgresPersistenceIntegrationTest {
         val tradeGroupId = UUID.randomUUID()
         val entryOrderId = UUID.randomUUID()
         val stopOrderId = UUID.randomUUID()
+        val unrelatedStopOrderId = UUID.randomUUID()
+        val unrelatedPositionId = UUID.randomUUID()
+        val unrelatedTradeGroupId = UUID.randomUUID()
         val llmRunRepository = ExposedLlmRunRepository(database)
         insertFinishedDecisionRun(llmRunRepository, runId, "SUCCEEDED", errorMessage = null)
 
@@ -1467,6 +1475,7 @@ class PostgresPersistenceIntegrationTest {
             insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
             insertActivityContextOrder(
                 orderId = entryOrderId,
+                intentId = UUID.randomUUID(),
                 positionId = null,
                 tradeGroupId = tradeGroupId,
                 side = OrderSide.BUY,
@@ -1489,6 +1498,19 @@ class PostgresPersistenceIntegrationTest {
                 reasonJa = "protective stop",
                 decisionRunId = null,
             )
+            insertTestPosition(unrelatedPositionId, unrelatedTradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = unrelatedStopOrderId,
+                positionId = unrelatedPositionId,
+                tradeGroupId = unrelatedTradeGroupId,
+                side = OrderSide.SELL,
+                orderType = OrderType.STOP,
+                limitPriceJpy = null,
+                triggerPriceJpy = BigDecimal("9700000"),
+                takeProfitPriceJpy = null,
+                reasonJa = "unrelated protective stop",
+                decisionRunId = runId,
+            )
             insertActivityContextExecution(
                 entryOrderId,
                 positionId,
@@ -1496,8 +1518,16 @@ class PostgresPersistenceIntegrationTest {
                 BigDecimal("9900000"),
                 BigDecimal.ZERO,
                 liquidity = "MAKER",
+                decisionRunId = runId,
             )
             insertActivityContextExecution(stopOrderId, positionId, OrderSide.SELL, BigDecimal("9800000"), BigDecimal("-1000"))
+            insertActivityContextExecution(
+                unrelatedStopOrderId,
+                unrelatedPositionId,
+                OrderSide.SELL,
+                BigDecimal("9700000"),
+                BigDecimal("-2000"),
+            )
             jdbcConnection().prepareStatement("UPDATE positions SET status = 'CLOSED' WHERE id = ?").use { statement ->
                 statement.setObject(1, positionId)
                 statement.executeUpdate()
@@ -1506,12 +1536,15 @@ class PostgresPersistenceIntegrationTest {
 
         val detail = requireNotNull(ExposedDecisionRunProjectionRepository(database).findRun(runId).getOrThrow())
         val lifecycle = detail.tradeLifecycles.single()
+        val executionsByKind = lifecycle.executions.associateBy { execution -> execution.kind }
 
         assertEquals(positionId.toString(), lifecycle.positionId)
         assertEquals("CLOSED", lifecycle.status)
-        assertEquals(listOf("ENTRY", "STOP"), lifecycle.executions.map { execution -> execution.kind })
-        assertEquals(listOf(entryOrderId.toString(), stopOrderId.toString()), lifecycle.executions.map { execution -> execution.orderId })
-        assertEquals(listOf("MAKER", "TAKER"), lifecycle.executions.map { execution -> execution.liquidity })
+        assertEquals(setOf("ENTRY", "STOP"), executionsByKind.keys)
+        assertEquals(entryOrderId.toString(), executionsByKind.getValue("ENTRY").orderId)
+        assertEquals(stopOrderId.toString(), executionsByKind.getValue("STOP").orderId)
+        assertEquals("MAKER", executionsByKind.getValue("ENTRY").liquidity)
+        assertEquals("TAKER", executionsByKind.getValue("STOP").liquidity)
     }
 
     @Test
@@ -5399,6 +5432,7 @@ private fun JdbcTransaction.insertTestExecution(
  */
 private fun JdbcTransaction.insertActivityContextOrder(
     orderId: UUID,
+    intentId: UUID? = null,
     positionId: UUID?,
     tradeGroupId: UUID,
     side: OrderSide,
@@ -5412,18 +5446,19 @@ private fun JdbcTransaction.insertActivityContextOrder(
 ) {
     jdbcConnection().prepareStatement(INSERT_ACTIVITY_CONTEXT_ORDER_SQL).use { statement ->
         statement.setObject(1, orderId)
-        statement.setObject(2, positionId)
-        statement.setObject(3, tradeGroupId)
-        statement.setString(4, side.name)
-        statement.setString(5, orderType.name)
-        statement.setString(6, status.name)
-        statement.setNullableBigDecimal(7, limitPriceJpy)
-        statement.setNullableBigDecimal(8, triggerPriceJpy)
-        statement.setNullableBigDecimal(9, takeProfitPriceJpy)
-        statement.setString(10, reasonJa)
-        statement.setString(11, decisionRunId)
-        statement.setLong(12, fixedInstant().toEpochMilli())
+        statement.setObject(2, intentId)
+        statement.setObject(3, positionId)
+        statement.setObject(4, tradeGroupId)
+        statement.setString(5, side.name)
+        statement.setString(6, orderType.name)
+        statement.setString(7, status.name)
+        statement.setNullableBigDecimal(8, limitPriceJpy)
+        statement.setNullableBigDecimal(9, triggerPriceJpy)
+        statement.setNullableBigDecimal(10, takeProfitPriceJpy)
+        statement.setString(11, reasonJa)
+        statement.setString(12, decisionRunId)
         statement.setLong(13, fixedInstant().toEpochMilli())
+        statement.setLong(14, fixedInstant().toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -5438,6 +5473,7 @@ private fun JdbcTransaction.insertActivityContextExecution(
     priceJpy: BigDecimal,
     realizedPnlJpy: BigDecimal,
     liquidity: String = "TAKER",
+    decisionRunId: String? = null,
 ) {
     jdbcConnection().prepareStatement(INSERT_ACTIVITY_CONTEXT_EXECUTION_SQL).use { statement ->
         statement.setObject(1, UUID.randomUUID())
@@ -5448,6 +5484,7 @@ private fun JdbcTransaction.insertActivityContextExecution(
         statement.setBigDecimal(6, realizedPnlJpy)
         statement.setString(7, liquidity)
         statement.setLong(8, fixedInstant().toEpochMilli())
+        statement.setString(9, decisionRunId)
         statement.executeUpdate()
     }
 }

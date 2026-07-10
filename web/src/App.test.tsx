@@ -513,6 +513,8 @@ describe("App", () => {
 
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
     expect((await within(detailPane).findAllByText("exit-actor-run")).length).toBeGreaterThan(0);
+    expect(within(detailPane).getByRole("heading", { name: "Cancellation result" })).toBeInTheDocument();
+    expect(within(detailPane).queryByText(/best ask reaches/)).not.toBeInTheDocument();
   });
 
   it("opens an exact run ID outside the current filter and shows only saved trade lifecycle evidence", async () => {
@@ -571,6 +573,9 @@ describe("App", () => {
     fireEvent.change(input, { target: { value: "run-archived-filled" } });
     fireEvent.keyDown(input, { key: "Enter" });
 
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    expect(await within(runList).findByRole("button", { name: /run-archived-filled/ })).toBeInTheDocument();
+    expect(within(runList).queryByText(/Exact run result/)).not.toBeInTheDocument();
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
     expect(await within(detailPane).findByText("position-archived")).toBeInTheDocument();
     expect(within(detailPane).getByText(/ENTRY · BUY LIMIT/)).toBeInTheDocument();
@@ -578,6 +583,23 @@ describe("App", () => {
     expect(within(detailPane).getByText(/MAKER/)).toBeInTheDocument();
     expect(within(detailPane).getAllByText(/fee 10 JPY/)).toHaveLength(2);
     expect(within(detailPane).queryByText(/best ask reaches/)).not.toBeInTheDocument();
+  });
+
+  it("shows an explicit error without rendering a fake row for an exact run ID that is not found", async () => {
+    stubSystemFetch({
+      decisionRunsResponse: { status: 200, body: { runs: [], nextBefore: null } },
+      decisionRunDetails: {},
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const input = await screen.findByLabelText("Find an exact run ID");
+    fireEvent.change(input, { target: { value: "missing-run" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(await screen.findByText("The requested run ID was not found.")).toBeInTheDocument();
+    expect(screen.queryByText("missing-run")).not.toBeInTheDocument();
   });
 
   it("loads older decision runs without duplicating the cursor boundary", async () => {
@@ -638,6 +660,7 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(within(detailPane).getAllByText("caller_failed").length).toBeGreaterThan(0);
     expect(within(detailPane).getByText("runtime error")).toBeInTheDocument();
+    expect(detailPane.querySelector(".run-detail-section h3")).toHaveTextContent("Proposer decision");
     expect(within(detailPane).queryByText(/must-not-leak/)).not.toBeInTheDocument();
   });
 

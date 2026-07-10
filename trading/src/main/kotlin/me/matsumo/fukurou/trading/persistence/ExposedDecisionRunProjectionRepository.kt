@@ -338,21 +338,32 @@ private const val FIND_EXECUTIONS_SQL = """
 """
 
 private const val FIND_TRADE_LIFECYCLES_SQL = """
-    WITH run_orders AS (
+    -- intent_id is persisted only for ENTER / ADD_LONG orders; run-owned STOP and EXIT orders are not lifecycle anchors.
+    WITH entry_orders AS (
         SELECT id
         FROM orders
         WHERE decision_run_id = ?
-    ), entry_positions AS (
-        SELECT DISTINCT execution.position_id
+            AND intent_id IS NOT NULL
+    ), entry_executions AS (
+        SELECT execution.id, execution.position_id
         FROM executions execution
-        JOIN run_orders ON run_orders.id = execution.order_id
+        JOIN entry_orders ON entry_orders.id = execution.order_id
         WHERE execution.position_id IS NOT NULL
+        UNION
+        SELECT execution.id, execution.position_id
+        FROM executions execution
+        WHERE execution.decision_run_id = ?
+            AND execution.position_id IS NOT NULL
+    ), entry_positions AS (
+        SELECT DISTINCT position_id
+        FROM entry_executions
     )
     SELECT execution.id, execution.order_id, execution.position_id, execution.side, execution.price_jpy,
         execution.size_btc, execution.fee_jpy, execution.realized_pnl_jpy, execution.liquidity,
         execution.executed_at, "order".order_type, position.status AS position_status,
         CASE
-            WHEN run_orders.id IS NOT NULL THEN 'ENTRY'
+            WHEN entry_orders.id IS NOT NULL THEN 'ENTRY'
+            WHEN entry_executions.id IS NOT NULL THEN 'DIRECT_RUN'
             WHEN "order".order_type = 'STOP' THEN 'STOP'
             WHEN "order".order_type = 'LIMIT' THEN 'TAKE_PROFIT'
             WHEN "order".order_type = 'MARKET' THEN 'MANUAL_CLOSE'
@@ -360,7 +371,8 @@ private const val FIND_TRADE_LIFECYCLES_SQL = """
         END AS execution_kind
     FROM executions execution
     JOIN entry_positions entry ON entry.position_id = execution.position_id
-    LEFT JOIN run_orders ON run_orders.id = execution.order_id
+    LEFT JOIN entry_orders ON entry_orders.id = execution.order_id
+    LEFT JOIN entry_executions ON entry_executions.id = execution.id
     LEFT JOIN orders "order" ON "order".id = execution.order_id
     LEFT JOIN positions position ON position.id = execution.position_id
     ORDER BY execution.executed_at ASC, execution.id ASC
@@ -682,6 +694,7 @@ private fun JdbcTransaction.selectExecutions(invocationId: String): List<Decisio
 private fun JdbcTransaction.selectTradeLifecycles(invocationId: String): List<DecisionRunTradeLifecycle> {
     return jdbcConnection().prepareStatement(FIND_TRADE_LIFECYCLES_SQL).use { statement ->
         statement.setString(1, invocationId)
+        statement.setString(2, invocationId)
         statement.executeQuery().use { resultSet ->
             val lifecycleRows = buildList {
                 while (resultSet.next()) {
