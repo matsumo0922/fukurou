@@ -13,10 +13,6 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: fukurou-production-deploy
-  cancel-in-progress: false
-
 env:
   IMAGE_REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/matsumo0922/fukurou
@@ -25,6 +21,9 @@ jobs:
   build:
     name: Build image
     runs-on: ubuntu-latest
+    concurrency:
+      group: fukurou-build-${{ github.event.inputs.image_sha || github.sha }}
+      cancel-in-progress: true
     permissions:
       contents: read
       packages: write
@@ -103,6 +102,10 @@ jobs:
   deploy:
     name: Deploy on NAS
     needs: build
+    concurrency:
+      group: fukurou-production-deploy
+      cancel-in-progress: false
+    timeout-minutes: 15
     runs-on:
       - self-hosted
       - fukurou-prod
