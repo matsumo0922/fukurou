@@ -446,7 +446,6 @@ private class PaperBrokerTradeDelegate(
             sessionId = sessionId,
             eligibleAfterSequence = after.lastProcessedSequence,
             eligibleFrom = eligibleFrom,
-            expiresAt = eligibleFrom.plus(runtime.time.restingEntryOrderTtl),
             queueAheadBtc = queueAhead,
             queueSnapshotAt = queueSnapshotAt.takeIf { command.orderType == OrderType.LIMIT },
         )
