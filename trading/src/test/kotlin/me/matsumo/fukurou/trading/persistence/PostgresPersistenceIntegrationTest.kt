@@ -1518,8 +1518,16 @@ class PostgresPersistenceIntegrationTest {
                 BigDecimal.ZERO,
                 liquidity = "MAKER",
                 decisionRunId = runId,
+                executedAt = fixedInstant(),
             )
-            insertActivityContextExecution(stopOrderId, positionId, OrderSide.SELL, BigDecimal("9800000"), BigDecimal("-1000"))
+            insertActivityContextExecution(
+                stopOrderId,
+                positionId,
+                OrderSide.SELL,
+                BigDecimal("9800000"),
+                BigDecimal("-1000"),
+                executedAt = fixedInstant().plusSeconds(1),
+            )
             insertActivityContextExecution(
                 unrelatedStopOrderId,
                 unrelatedPositionId,
@@ -1544,6 +1552,250 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(stopOrderId.toString(), executionsByKind.getValue("STOP").orderId)
         assertEquals("MAKER", executionsByKind.getValue("ENTRY").liquidity)
         assertEquals("TAKER", executionsByKind.getValue("STOP").liquidity)
+    }
+
+    @Test
+    fun decisionRunProjectionKeepsDirectExitAndReduceExecutionsOutOfPastPositionLifecycles() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        val historicalEntryOrderId = UUID.randomUUID()
+        val exitOrderId = UUID.randomUUID()
+        val reduceOrderId = UUID.randomUUID()
+        val exitRunId = "exit-lifecycle-run"
+        val reduceRunId = "reduce-lifecycle-run"
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        insertFinishedDecisionRun(llmRunRepository, exitRunId, "SUCCEEDED", errorMessage = null)
+        insertFinishedDecisionRun(llmRunRepository, reduceRunId, "SUCCEEDED", errorMessage = null)
+
+        exposedTransaction(database) {
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = historicalEntryOrderId,
+                intentId = UUID.randomUUID(),
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "historical entry",
+                decisionRunId = "historical-entry-run",
+            )
+            insertActivityContextExecution(
+                historicalEntryOrderId,
+                positionId,
+                OrderSide.BUY,
+                BigDecimal("9900000"),
+                BigDecimal.ZERO,
+                executedAt = fixedInstant(),
+            )
+            listOf(exitOrderId to exitRunId, reduceOrderId to reduceRunId).forEach { (orderId, runId) ->
+                insertActivityContextOrder(
+                    orderId = orderId,
+                    positionId = positionId,
+                    tradeGroupId = tradeGroupId,
+                    side = OrderSide.SELL,
+                    orderType = OrderType.MARKET,
+                    limitPriceJpy = null,
+                    triggerPriceJpy = null,
+                    takeProfitPriceJpy = null,
+                    reasonJa = "operator close",
+                    decisionRunId = runId,
+                )
+                insertActivityContextExecution(
+                    orderId,
+                    positionId,
+                    OrderSide.SELL,
+                    BigDecimal("10000000"),
+                    BigDecimal("100"),
+                    decisionRunId = runId,
+                    executedAt = fixedInstant().plusSeconds(1),
+                )
+            }
+        }
+
+        listOf(exitRunId, reduceRunId).forEach { runId ->
+            val detail = requireNotNull(ExposedDecisionRunProjectionRepository(database).findRun(runId).getOrThrow())
+
+            assertEquals(1, detail.executions.size)
+            assertTrue(detail.tradeLifecycles.isEmpty())
+        }
+    }
+
+    @Test
+    fun decisionRunProjectionStartsAdditionalEntryLifecycleAtItsOwnAnchor() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runId = "additional-entry-lifecycle-run"
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        val historicalEntryOrderId = UUID.randomUUID()
+        val historicalCloseOrderId = UUID.randomUUID()
+        val additionalEntryOrderId = UUID.randomUUID()
+        val stopOrderId = UUID.randomUUID()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        insertFinishedDecisionRun(llmRunRepository, runId, "SUCCEEDED", errorMessage = null)
+
+        exposedTransaction(database) {
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = historicalEntryOrderId,
+                intentId = UUID.randomUUID(),
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                limitPriceJpy = BigDecimal("9800000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "historical entry",
+                decisionRunId = "historical-entry-run",
+            )
+            insertActivityContextOrder(
+                orderId = historicalCloseOrderId,
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.SELL,
+                orderType = OrderType.MARKET,
+                limitPriceJpy = null,
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "historical close",
+                decisionRunId = null,
+            )
+            insertActivityContextOrder(
+                orderId = additionalEntryOrderId,
+                intentId = UUID.randomUUID(),
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.MARKET,
+                limitPriceJpy = null,
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "additional entry",
+                decisionRunId = runId,
+            )
+            insertActivityContextOrder(
+                orderId = stopOrderId,
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.SELL,
+                orderType = OrderType.STOP,
+                limitPriceJpy = null,
+                triggerPriceJpy = BigDecimal("9700000"),
+                takeProfitPriceJpy = null,
+                reasonJa = "protective stop",
+                decisionRunId = null,
+            )
+            insertActivityContextExecution(
+                historicalEntryOrderId,
+                positionId,
+                OrderSide.BUY,
+                BigDecimal("9800000"),
+                BigDecimal.ZERO,
+                executedAt = fixedInstant(),
+            )
+            insertActivityContextExecution(
+                historicalCloseOrderId,
+                positionId,
+                OrderSide.SELL,
+                BigDecimal("9900000"),
+                BigDecimal("100"),
+                executedAt = fixedInstant().plusSeconds(1),
+            )
+            insertActivityContextExecution(
+                additionalEntryOrderId,
+                positionId,
+                OrderSide.BUY,
+                BigDecimal("9950000"),
+                BigDecimal.ZERO,
+                decisionRunId = runId,
+                executedAt = fixedInstant().plusSeconds(2),
+            )
+            insertActivityContextExecution(
+                stopOrderId,
+                positionId,
+                OrderSide.SELL,
+                BigDecimal("9700000"),
+                BigDecimal("-100"),
+                executedAt = fixedInstant().plusSeconds(3),
+            )
+        }
+
+        val detail = requireNotNull(ExposedDecisionRunProjectionRepository(database).findRun(runId).getOrThrow())
+        val lifecycle = detail.tradeLifecycles.single()
+
+        assertEquals(
+            listOf(additionalEntryOrderId.toString(), stopOrderId.toString()),
+            lifecycle.executions.map { execution -> execution.orderId },
+        )
+        assertEquals(listOf("ENTRY", "STOP"), lifecycle.executions.map { execution -> execution.kind })
+        assertEquals(1, detail.executions.size)
+    }
+
+    @Test
+    fun decisionRunProjectionClassifiesVirtualTakeProfitFromSavedOrderReason() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runId = "virtual-take-profit-lifecycle-run"
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        val entryOrderId = UUID.randomUUID()
+        val takeProfitOrderId = UUID.randomUUID()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        insertFinishedDecisionRun(llmRunRepository, runId, "SUCCEEDED", errorMessage = null)
+
+        exposedTransaction(database) {
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = entryOrderId,
+                intentId = UUID.randomUUID(),
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.MARKET,
+                limitPriceJpy = null,
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = BigDecimal("10500000"),
+                reasonJa = "entry with virtual take profit",
+                decisionRunId = runId,
+            )
+            insertActivityContextOrder(
+                orderId = takeProfitOrderId,
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.SELL,
+                orderType = OrderType.MARKET,
+                limitPriceJpy = null,
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "reconciler virtual take profit trigger",
+                decisionRunId = null,
+            )
+            insertActivityContextExecution(
+                entryOrderId,
+                positionId,
+                OrderSide.BUY,
+                BigDecimal("9900000"),
+                BigDecimal.ZERO,
+                decisionRunId = runId,
+                executedAt = fixedInstant(),
+            )
+            insertActivityContextExecution(
+                takeProfitOrderId,
+                positionId,
+                OrderSide.SELL,
+                BigDecimal("10500000"),
+                BigDecimal("500"),
+                executedAt = fixedInstant().plusSeconds(1),
+            )
+        }
+
+        val detail = requireNotNull(ExposedDecisionRunProjectionRepository(database).findRun(runId).getOrThrow())
+
+        assertEquals(listOf("ENTRY", "TAKE_PROFIT"), detail.tradeLifecycles.single().executions.map { execution -> execution.kind })
+        assertEquals(1, detail.executions.size)
     }
 
     @Test
@@ -5473,6 +5725,7 @@ private fun JdbcTransaction.insertActivityContextExecution(
     realizedPnlJpy: BigDecimal,
     liquidity: String = "TAKER",
     decisionRunId: String? = null,
+    executedAt: Instant = fixedInstant(),
 ) {
     jdbcConnection().prepareStatement(INSERT_ACTIVITY_CONTEXT_EXECUTION_SQL).use { statement ->
         statement.setObject(1, UUID.randomUUID())
@@ -5482,7 +5735,7 @@ private fun JdbcTransaction.insertActivityContextExecution(
         statement.setBigDecimal(5, priceJpy)
         statement.setBigDecimal(6, realizedPnlJpy)
         statement.setString(7, liquidity)
-        statement.setLong(8, fixedInstant().toEpochMilli())
+        statement.setLong(8, executedAt.toEpochMilli())
         statement.setString(9, decisionRunId)
         statement.executeUpdate()
     }

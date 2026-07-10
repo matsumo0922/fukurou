@@ -47,7 +47,7 @@ export function ActivityPage() {
   );
   const latestMarketQuote = runsQuery.data?.pages[0]?.latestMarketQuote ?? null;
   const activeSelectedId = selectedId;
-  const detailQuery = useQuery(opsDecisionRunDetailQuery(activeSelectedId));
+  const detailQuery = useQuery(opsDecisionRunDetailQuery(activeSelectedId ?? searchedRunId));
   const exactSearchResult = searchedRunId && detailQuery.data?.summary.invocationId === searchedRunId
     ? detailQuery.data
     : null;
@@ -58,7 +58,6 @@ export function ActivityPage() {
     && detailQuery.error.status === 404;
   const closeDetail = useCallback(() => {
     setSelectedId(null);
-    setSearchedRunId(null);
     window.setTimeout(() => selectedRunButtonRef.current?.focus(), 0);
   }, []);
 
@@ -154,7 +153,7 @@ export function ActivityPage() {
                   selected={run.invocationId === activeSelectedId}
                   selectedChanged={(button) => {
                     selectedRunButtonRef.current = button;
-                    setSearchedRunId(null);
+                    if (!exactSearchResult) setSearchedRunId(null);
                     setSelectedId(run.invocationId);
                   }}
                   key={run.invocationId}

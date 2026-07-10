@@ -583,6 +583,18 @@ describe("App", () => {
     expect(within(detailPane).getByText(/MAKER/)).toBeInTheDocument();
     expect(within(detailPane).getAllByText(/fee 10 JPY/)).toHaveLength(2);
     expect(within(detailPane).queryByText(/best ask reaches/)).not.toBeInTheDocument();
+
+    fireEvent.click(within(detailPane).getByRole("button", { name: "Close decision run detail" }));
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Decision run detail" })).not.toBeInTheDocument());
+    const exactResultButton = within(runList).getByRole("button", { name: /run-archived-filled/ });
+    expect(exactResultButton).toBeInTheDocument();
+    expect(input).toHaveValue("run-archived-filled");
+
+    fireEvent.click(exactResultButton);
+    const reopenedDetailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    fireEvent.click(within(reopenedDetailPane).getByRole("button", { name: "Close decision run detail" }));
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Decision run detail" })).not.toBeInTheDocument());
+    expect(within(runList).getByRole("button", { name: /run-archived-filled/ })).toBeInTheDocument();
   });
 
   it("shows an explicit error without rendering a fake row for an exact run ID that is not found", async () => {

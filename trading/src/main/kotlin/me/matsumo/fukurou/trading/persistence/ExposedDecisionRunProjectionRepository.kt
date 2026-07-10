@@ -338,40 +338,37 @@ private const val FIND_EXECUTIONS_SQL = """
 """
 
 private const val FIND_TRADE_LIFECYCLES_SQL = """
-    -- intent_id is persisted only for ENTER / ADD_LONG orders; run-owned STOP and EXIT orders are not lifecycle anchors.
-    WITH entry_orders AS (
-        SELECT id
-        FROM orders
-        WHERE decision_run_id = ?
-            AND intent_id IS NOT NULL
-    ), entry_executions AS (
-        SELECT execution.id, execution.position_id
+    -- intent_id is persisted only for ENTER / ADD_LONG orders; STOP, EXIT, and direct executions do not anchor a lifecycle.
+    WITH entry_executions AS (
+        SELECT execution.id, execution.position_id, execution.executed_at
         FROM executions execution
-        JOIN entry_orders ON entry_orders.id = execution.order_id
-        WHERE execution.position_id IS NOT NULL
-        UNION
-        SELECT execution.id, execution.position_id
-        FROM executions execution
-        WHERE execution.decision_run_id = ?
+        JOIN orders entry_order ON entry_order.id = execution.order_id
+        WHERE entry_order.decision_run_id = ?
+            AND entry_order.intent_id IS NOT NULL
             AND execution.position_id IS NOT NULL
-    ), entry_positions AS (
-        SELECT DISTINCT position_id
+    ), entry_anchors AS (
+        SELECT DISTINCT ON (position_id) id, position_id, executed_at
         FROM entry_executions
+        ORDER BY position_id, executed_at ASC, id ASC
     )
     SELECT execution.id, execution.order_id, execution.position_id, execution.side, execution.price_jpy,
         execution.size_btc, execution.fee_jpy, execution.realized_pnl_jpy, execution.liquidity,
         execution.executed_at, "order".order_type, position.status AS position_status,
         CASE
-            WHEN entry_orders.id IS NOT NULL THEN 'ENTRY'
-            WHEN entry_executions.id IS NOT NULL THEN 'DIRECT_RUN'
+            WHEN entry_executions.id IS NOT NULL THEN 'ENTRY'
             WHEN "order".order_type = 'STOP' THEN 'STOP'
             WHEN "order".order_type = 'LIMIT' THEN 'TAKE_PROFIT'
+            WHEN "order".order_type = 'MARKET'
+                AND "order".reason_ja = 'reconciler virtual take profit trigger' THEN 'TAKE_PROFIT'
             WHEN "order".order_type = 'MARKET' THEN 'MANUAL_CLOSE'
             ELSE 'POSITION_EXECUTION'
         END AS execution_kind
     FROM executions execution
-    JOIN entry_positions entry ON entry.position_id = execution.position_id
-    LEFT JOIN entry_orders ON entry_orders.id = execution.order_id
+    JOIN entry_anchors anchor ON anchor.position_id = execution.position_id
+        AND (
+            execution.executed_at > anchor.executed_at
+            OR (execution.executed_at = anchor.executed_at AND execution.id >= anchor.id)
+        )
     LEFT JOIN entry_executions ON entry_executions.id = execution.id
     LEFT JOIN orders "order" ON "order".id = execution.order_id
     LEFT JOIN positions position ON position.id = execution.position_id
@@ -694,7 +691,6 @@ private fun JdbcTransaction.selectExecutions(invocationId: String): List<Decisio
 private fun JdbcTransaction.selectTradeLifecycles(invocationId: String): List<DecisionRunTradeLifecycle> {
     return jdbcConnection().prepareStatement(FIND_TRADE_LIFECYCLES_SQL).use { statement ->
         statement.setString(1, invocationId)
-        statement.setString(2, invocationId)
         statement.executeQuery().use { resultSet ->
             val lifecycleRows = buildList {
                 while (resultSet.next()) {
