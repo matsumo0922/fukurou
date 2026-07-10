@@ -13,6 +13,7 @@ import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
@@ -27,6 +28,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedSafetyViolationRepository
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
+import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ProtectionReconciler
 import me.matsumo.fukurou.trading.reconciler.RestPollingTickStream
@@ -41,7 +43,7 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 /**
  * ProtectionReconciler loop の既定実行間隔。
  */
-private val DEFAULT_RECONCILER_INTERVAL = Duration.ofSeconds(5)
+private val DEFAULT_RECONCILER_INTERVAL = PaperOrderLifecyclePolicy.reconcilerInterval
 
 /**
  * bootstrap failure log の rate limit key。
@@ -123,6 +125,7 @@ internal fun startProtectionReconcilerWorker(
     status: MutableReconcilerStatus,
     clock: Clock = Clock.systemUTC(),
     onStaleLlmRunsRecovered: (Int) -> Unit = {},
+    latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
 ): ProtectionReconcilerWorker {
     val inputs = ProtectionReconcilerWorkerInputs(
         dataSource = dataSource,
@@ -130,6 +133,7 @@ internal fun startProtectionReconcilerWorker(
         status = status,
         clock = clock,
         tradingConfig = tradingConfig,
+        latestMarketQuoteStore = latestMarketQuoteStore,
     )
     val runtimeComponents = inputs.createRuntimeComponents()
     val reconciler = runtimeComponents.createReconciler()
@@ -189,6 +193,7 @@ private fun ProtectionReconcilerWorkerInputs.createBroker(
         riskStateRepository = repositories.riskStateRepository,
         riskStateCommandService = repositories.riskStateCommandService,
         safetyViolationRepository = repositories.safetyViolationRepository,
+        restingEntryOrderTtl = tradingConfig.decisionProtocol.restingEntryOrderTtl,
         safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
         marketDataSource = marketDataSource,
         fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
@@ -205,6 +210,7 @@ private fun ProtectionReconcilerRuntimeComponents.createReconciler(): Protection
         tradingLock = tradingLock,
         tickStream = RestPollingTickStream(
             marketDataSource = marketDataSource,
+            latestMarketQuoteStore = inputs.latestMarketQuoteStore,
             clock = inputs.clock,
         ),
         broker = broker,
@@ -235,6 +241,7 @@ private fun ProtectionReconcilerRuntimeComponents.createReconciler(): Protection
  * @param status reconciler status holder
  * @param clock worker と repository に渡す clock
  * @param tradingConfig 取引 bot 全体の typed config
+ * @param latestMarketQuoteStore Activity API と共有する最新気配値 store
  */
 private data class ProtectionReconcilerWorkerInputs(
     val dataSource: HikariDataSource,
@@ -242,6 +249,7 @@ private data class ProtectionReconcilerWorkerInputs(
     val status: MutableReconcilerStatus,
     val clock: Clock,
     val tradingConfig: TradingBotConfig,
+    val latestMarketQuoteStore: LatestMarketQuoteStore,
 )
 
 /**

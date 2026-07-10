@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.persistence
 
 import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
@@ -29,6 +30,20 @@ private const val STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER = 3L
  */
 internal const val STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE =
     "LLM run was interrupted by a previous process or container shutdown and recovered during persistence bootstrap."
+
+/** cancel_reason を domain wire code だけへ制限する bootstrap SQL。 */
+private val ENSURE_ORDER_CANCEL_REASON_DOMAIN_SQL = run {
+    val wireCodes = PaperOrderCancelReason.entries.joinToString { reason -> "'${reason.wireCode}'" }
+    """
+        LOCK TABLE orders IN ACCESS EXCLUSIVE MODE;
+        UPDATE orders
+        SET cancel_reason = '${PaperOrderCancelReason.LEGACY_UNCLASSIFIED.wireCode}'
+        WHERE cancel_reason IS NOT NULL AND cancel_reason NOT IN ($wireCodes);
+        ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_cancel_reason_domain;
+        ALTER TABLE orders ADD CONSTRAINT orders_cancel_reason_domain
+            CHECK (cancel_reason IS NULL OR cancel_reason IN ($wireCodes));
+    """.trimIndent()
+}
 
 /**
  * risk_state 初期行を作る SQL。
@@ -323,6 +338,9 @@ private const val ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL = """
     CREATE INDEX IF NOT EXISTS idx_orders_decision_run_created
         ON orders (decision_run_id, created_at, id)
         WHERE decision_run_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_orders_canceled_by_decision_run
+        ON orders (canceled_by_decision_run_id, canceled_at, id)
+        WHERE canceled_by_decision_run_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_executions_decision_run_executed
         ON executions (decision_run_id, executed_at, id)
         WHERE decision_run_id IS NOT NULL;
@@ -559,6 +577,13 @@ private const val VERIFY_ORDERS_SCHEMA_SQL = """
         prompt_hash,
         system_prompt_version,
         market_snapshot_id,
+        expires_at,
+        expiry_source,
+        effective_ttl_seconds,
+        expired_at,
+        canceled_at,
+        cancel_reason,
+        canceled_by_decision_run_id,
         created_at,
         updated_at
     FROM orders
@@ -845,6 +870,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL)
     executeUpdate(ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL)
+    executeUpdate(ENSURE_ORDER_CANCEL_REASON_DOMAIN_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_CAPTURED_AT_INDEX_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_DAILY_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_BOOTSTRAP_UNIQUE_INDEX_SQL)

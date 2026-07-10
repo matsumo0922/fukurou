@@ -25,8 +25,10 @@ class TickStreamTest {
     @Test
     fun rest_polling_tick_stream_reads_ticker_and_recent_trades() = runBlocking {
         val marketDataSource = RecordingMarketDataSource()
+        val latestMarketQuoteStore = LatestMarketQuoteStore()
         val tickStream = RestPollingTickStream(
             marketDataSource = marketDataSource,
+            latestMarketQuoteStore = latestMarketQuoteStore,
             clock = fixedClock(),
         )
 
@@ -39,6 +41,10 @@ class TickStreamTest {
         assertEquals("100", tickSnapshot.lastPrice)
         assertEquals(2, tickSnapshot.recentTradeCount)
         assertEquals(fixedInstant(), tickSnapshot.observedAt)
+        val latestQuote = requireNotNull(latestMarketQuoteStore.snapshot())
+        assertEquals("99", latestQuote.bidPriceJpy.toPlainString())
+        assertEquals("101", latestQuote.askPriceJpy.toPlainString())
+        assertEquals(fixedInstant(), latestQuote.observedAt)
     }
 }
 

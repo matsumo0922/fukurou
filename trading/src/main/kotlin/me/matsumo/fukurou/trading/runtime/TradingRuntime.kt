@@ -373,6 +373,7 @@ private fun TradingBotConfig.createInMemoryBroker(
         riskStateCommandService = repositories.riskStateCommandService,
         decisionRepository = repositories.decisionRepository,
         falsificationFreshnessWindow = decisionProtocol.falsificationFreshnessWindow,
+        restingEntryOrderTtl = decisionProtocol.restingEntryOrderTtl,
         safetyViolationRepository = repositories.safetyViolationRepository,
         safetyFloor = SafetyFloor(
             config = safetyFloor,
@@ -462,6 +463,7 @@ private fun createPostgresBroker(
         riskStateCommandService = riskStateCommandService,
         decisionRepository = repositories.decisionRepository,
         falsificationFreshnessWindow = context.tradingConfig.decisionProtocol.falsificationFreshnessWindow,
+        restingEntryOrderTtl = context.tradingConfig.decisionProtocol.restingEntryOrderTtl,
         safetyViolationRepository = safetyViolationRepository,
         safetyFloor = SafetyFloor(
             config = context.tradingConfig.safetyFloor,

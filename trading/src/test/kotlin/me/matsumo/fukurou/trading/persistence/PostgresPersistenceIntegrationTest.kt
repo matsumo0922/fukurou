@@ -8,10 +8,12 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
+import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
@@ -42,11 +44,13 @@ import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
@@ -93,6 +97,7 @@ import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -1280,8 +1285,18 @@ class PostgresPersistenceIntegrationTest {
         val repository = ExposedDecisionRunProjectionRepository(database)
         val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
         val detail = requireNotNull(repository.findRun("run-1").getOrThrow())
+        val actionRequiredRuns = repository
+            .listRuns(
+                cursor = null,
+                limit = 10,
+                filter = DecisionRunFilter.ACTION_REQUIRED,
+            )
+            .getOrThrow()
+            .runs
 
         assertEquals(DecisionRunOutcome.DENIED, summary.outcome)
+        assertFalse(summary.hasProcessFailure)
+        assertTrue(actionRequiredRuns.isEmpty())
         assertEquals("APPROVED", summary.falsificationVerdict)
         assertEquals("EXPECTED_VALUE_GATE", detail.safetyViolation?.rule)
         assertEquals("0.03357778", detail.safetyViolation?.measuredValue)
@@ -1380,6 +1395,21 @@ class PostgresPersistenceIntegrationTest {
                     reasonJa = "decision run outcome fixture",
                     decisionRunId = invocationId,
                 )
+                if (invocationId == "filled-run") {
+                    insertActivityContextOrder(
+                        orderId = UUID.randomUUID(),
+                        positionId = positionId,
+                        tradeGroupId = tradeGroupId,
+                        side = OrderSide.SELL,
+                        orderType = OrderType.STOP,
+                        status = OrderStatus.OPEN,
+                        limitPriceJpy = null,
+                        triggerPriceJpy = BigDecimal("9700000"),
+                        takeProfitPriceJpy = null,
+                        reasonJa = "protective stop remains open",
+                        decisionRunId = invocationId,
+                    )
+                }
             }
         }
 
@@ -1387,16 +1417,272 @@ class PostgresPersistenceIntegrationTest {
         val executed = repository.listRuns(
             cursor = null,
             limit = 10,
-            outcome = DecisionRunOutcome.EXECUTED,
+            filter = DecisionRunFilter.FILLED,
         ).getOrThrow().runs
         val failed = repository.listRuns(
             cursor = null,
             limit = 10,
-            outcome = DecisionRunOutcome.FAILED,
+            filter = DecisionRunFilter.ACTION_REQUIRED,
         ).getOrThrow().runs
 
         assertEquals(listOf("filled-run"), executed.map { summary -> summary.invocationId })
         assertEquals(listOf("rejected-run"), failed.map { summary -> summary.invocationId })
+    }
+
+    @Test
+    fun decisionRunProjectionTracksNormalCancellationForTargetAndActorRuns() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val runIds = listOf(
+            "entry-exit-run",
+            "exit-actor-run",
+            "entry-hard-halt-run",
+            "hard-halt-actor-run",
+            "entry-executed-exit-run",
+            "executed-exit-actor-run",
+        )
+        runIds.forEach { invocationId ->
+            insertFinishedDecisionRun(
+                repository = llmRunRepository,
+                invocationId = invocationId,
+                status = if (invocationId.contains("actor")) LLM_RUN_STATUS_FAILED else "SUCCEEDED",
+                errorMessage = if (invocationId.contains("actor")) "runner ended after cancellation" else null,
+            )
+        }
+        val cancellationCases = listOf(
+            CancellationProjectionCase("entry-exit-run", "exit-actor-run", "EXIT canceled pending entry"),
+            CancellationProjectionCase(
+                "entry-hard-halt-run",
+                "hard-halt-actor-run",
+                "HARD_HALT canceled pending entry",
+            ),
+            CancellationProjectionCase(
+                "entry-executed-exit-run",
+                "executed-exit-actor-run",
+                "EXIT canceled pending entry before another execution",
+            ),
+        )
+        val repository = ExposedPaperLedgerRepository(database)
+
+        cancellationCases.forEach { cancellationCase ->
+            val orderId = UUID.randomUUID()
+            val positionId = UUID.randomUUID()
+            val tradeGroupId = UUID.randomUUID()
+            exposedTransaction(database) {
+                insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+                insertActivityContextOrder(
+                    orderId = orderId,
+                    positionId = null,
+                    tradeGroupId = tradeGroupId,
+                    side = OrderSide.BUY,
+                    orderType = OrderType.LIMIT,
+                    status = OrderStatus.OPEN,
+                    limitPriceJpy = BigDecimal("9900000"),
+                    triggerPriceJpy = null,
+                    takeProfitPriceJpy = null,
+                    reasonJa = "pending entry",
+                    decisionRunId = cancellationCase.targetRunId,
+                )
+            }
+            repository.cancelOrder(
+                CancelOrderCommand(
+                    commandId = UUID.randomUUID(),
+                    orderId = orderId,
+                    reasonJa = cancellationCase.reason,
+                    auditContext = cancellationAuditContext(cancellationCase.actorRunId),
+                ),
+            ).getOrThrow()
+        }
+        exposedTransaction(database) {
+            insertCancellationActorExecution("executed-exit-actor-run")
+        }
+
+        val projection = ExposedDecisionRunProjectionRepository(database, fixedClock())
+        val summaries = projection.listRuns(cursor = null, limit = 20).getOrThrow().runs.associateBy { it.invocationId }
+
+        assertEquals(DecisionRunOutcome.CANCELED, summaries.getValue("entry-exit-run").outcome)
+        assertEquals(DecisionRunOutcome.CANCELED, summaries.getValue("exit-actor-run").outcome)
+        assertEquals(DecisionRunOutcome.CANCELED, summaries.getValue("entry-hard-halt-run").outcome)
+        assertEquals(DecisionRunOutcome.CANCELED, summaries.getValue("hard-halt-actor-run").outcome)
+        assertEquals(DecisionRunOutcome.CANCELED, summaries.getValue("entry-executed-exit-run").outcome)
+        assertEquals(DecisionRunOutcome.FILLED, summaries.getValue("executed-exit-actor-run").outcome)
+        val exitTarget = requireNotNull(projection.findRun("entry-exit-run").getOrThrow())
+        assertEquals("exit-actor-run", exitTarget.orders.single().canceledByDecisionRunId)
+    }
+
+    @Test
+    fun decisionRunProjectionKeepsPersistenceCancellationFailureAsFailed() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        insertFinishedDecisionRun(
+            repository = llmRunRepository,
+            invocationId = "entry-persistence-failure-run",
+            status = "SUCCEEDED",
+            errorMessage = null,
+        )
+        insertFinishedDecisionRun(
+            repository = llmRunRepository,
+            invocationId = "cancel-persistence-failure-actor-run",
+            status = LLM_RUN_STATUS_FAILED,
+            errorMessage = "cancel persistence failed",
+        )
+        val orderId = UUID.randomUUID()
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        exposedTransaction(database) {
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = orderId,
+                positionId = null,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.OPEN,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "pending entry before failed cancel",
+                decisionRunId = "entry-persistence-failure-run",
+            )
+            jdbcConnection().prepareStatement("ALTER TABLE orders DROP COLUMN canceled_by_decision_run_id").use {
+                it.executeUpdate()
+            }
+        }
+
+        val cancelResult = ExposedPaperLedgerRepository(database).cancelOrder(
+            CancelOrderCommand(
+                commandId = UUID.randomUUID(),
+                orderId = orderId,
+                reasonJa = "cancel write must fail",
+                auditContext = cancellationAuditContext("cancel-persistence-failure-actor-run"),
+            ),
+        )
+        assertTrue(cancelResult.isFailure)
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val projection = ExposedDecisionRunProjectionRepository(database, fixedClock())
+        val summaries = projection.listRuns(cursor = null, limit = 10).getOrThrow().runs.associateBy { it.invocationId }
+        assertEquals(DecisionRunOutcome.WAITING, summaries.getValue("entry-persistence-failure-run").outcome)
+        assertEquals(DecisionRunOutcome.FAILED, summaries.getValue("cancel-persistence-failure-actor-run").outcome)
+    }
+
+    @Test
+    fun persistenceBootstrapNormalizesLegacyCancelReasonAndEnforcesDomainCodes() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val orderId = UUID.randomUUID()
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        exposedTransaction(database) {
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = orderId,
+                positionId = null,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.CANCELED,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "legacy cancel",
+                decisionRunId = null,
+            )
+            executeUpdate("ALTER TABLE orders DROP CONSTRAINT orders_cancel_reason_domain")
+            jdbcConnection().prepareStatement("UPDATE orders SET cancel_reason = ? WHERE id = ?").use { statement ->
+                statement.setString(1, "legacy free text reason")
+                statement.setObject(2, orderId)
+                statement.executeUpdate()
+            }
+        }
+
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val normalizedOrder = ExposedPaperLedgerRepository(database)
+            .findOrdersByTradeGroupId(tradeGroupId)
+            .getOrThrow()
+            .single { order -> order.orderId == orderId.toString() }
+
+        assertEquals(PaperOrderCancelReason.LEGACY_UNCLASSIFIED, normalizedOrder.cancelReason)
+        val invalidWrite = runCatching {
+            exposedTransaction(database) {
+                jdbcConnection().prepareStatement("UPDATE orders SET cancel_reason = ? WHERE id = ?").use { statement ->
+                    statement.setString(1, "another free text reason")
+                    statement.setObject(2, orderId)
+                    statement.executeUpdate()
+                }
+            }
+        }
+        assertTrue(invalidWrite.isFailure)
+    }
+
+    @Test
+    fun persistenceBootstrapRefreshesCancelReasonDomainFromCurrentWireCodes() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val orderId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        val addedReason = PaperOrderCancelReason.entries.last()
+        val legacyWireCodes = PaperOrderCancelReason.entries
+            .dropLast(1)
+            .joinToString { reason -> "'${reason.wireCode}'" }
+
+        exposedTransaction(database) {
+            insertActivityContextOrder(
+                orderId = orderId,
+                positionId = null,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.CANCELED,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "legacy subset constraint",
+                decisionRunId = null,
+            )
+            executeUpdate("ALTER TABLE orders DROP CONSTRAINT orders_cancel_reason_domain")
+            executeUpdate(
+                """
+                    ALTER TABLE orders ADD CONSTRAINT orders_cancel_reason_domain
+                    CHECK (cancel_reason IS NULL OR cancel_reason IN ($legacyWireCodes))
+                """.trimIndent(),
+            )
+        }
+
+        val rejectedByLegacyConstraint = runCatching {
+            updateOrderCancelReason(
+                database = database,
+                orderId = orderId,
+                cancelReason = addedReason.wireCode,
+            )
+        }
+        assertTrue(rejectedByLegacyConstraint.isFailure)
+
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        val refreshedDefinition = selectOrderCancelReasonConstraintDefinition(database)
+        PaperOrderCancelReason.entries.forEach { reason ->
+            assertTrue(refreshedDefinition.contains(reason.wireCode))
+        }
+        updateOrderCancelReason(
+            database = database,
+            orderId = orderId,
+            cancelReason = addedReason.wireCode,
+        )
+        val storedOrder = ExposedPaperLedgerRepository(database)
+            .findOrdersByTradeGroupId(tradeGroupId)
+            .getOrThrow()
+            .single { order -> order.orderId == orderId.toString() }
+        assertEquals(addedReason, storedOrder.cancelReason)
+
+        bootstrap.ensureSchema().getOrThrow()
+        assertEquals(refreshedDefinition, selectOrderCancelReasonConstraintDefinition(database))
+        val unknownWrite = runCatching {
+            updateOrderCancelReason(
+                database = database,
+                orderId = orderId,
+                cancelReason = "unknown_cancel_reason",
+            )
+        }
+        assertTrue(unknownWrite.isFailure)
     }
 
     @Test
@@ -1446,7 +1732,7 @@ class PostgresPersistenceIntegrationTest {
         val summary = page.runs.single()
         val detail = requireNotNull(repository.findRun(start.invocationId).getOrThrow())
 
-        assertEquals(DecisionRunOutcome.NO_TRADE, summary.outcome)
+        assertEquals(DecisionRunOutcome.NO_ENTRY, summary.outcome)
         assertNull(summary.finalReason)
         assertNull(detail.summary.finalReason)
     }
@@ -1460,24 +1746,88 @@ class PostgresPersistenceIntegrationTest {
             maxSequence = scanCap,
             runningSequence = scanCap,
         )
+        exposedTransaction(database) {
+            val positionId = UUID.randomUUID()
+            val tradeGroupId = UUID.randomUUID()
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = UUID.randomUUID(),
+                positionId = null,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.OPEN,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "waiting scan fixture",
+                decisionRunId = "scan-run-${scanCap.toString().padStart(6, '0')}",
+            )
+        }
 
         val repository = ExposedDecisionRunProjectionRepository(database)
         val firstPage = repository.listRuns(
             cursor = null,
             limit = 10,
-            outcome = DecisionRunOutcome.RUNNING,
+            filter = DecisionRunFilter.WAITING,
         ).getOrThrow()
         val continuation = requireNotNull(firstPage.scanContinuation)
         val secondPage = repository.listRuns(
             cursor = continuation,
             limit = 10,
-            outcome = DecisionRunOutcome.RUNNING,
+            filter = DecisionRunFilter.WAITING,
         ).getOrThrow()
 
         assertTrue(firstPage.runs.isEmpty())
         assertEquals("scan-run-${(scanCap - 1).toString().padStart(6, '0')}", continuation.invocationId)
         assertEquals(listOf("scan-run-${scanCap.toString().padStart(6, '0')}"), secondPage.runs.map { it.invocationId })
         assertNull(secondPage.scanContinuation)
+    }
+
+    @Test
+    fun decisionRunProjectionKeepsPendingCancelExpiredOrderInExpiringState() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val invocationId = "pending-cancel-expiring-run"
+        insertFinishedDecisionRun(
+            repository = ExposedLlmRunRepository(database),
+            invocationId = invocationId,
+            status = "SUCCEEDED",
+            errorMessage = null,
+        )
+        exposedTransaction(database) {
+            val orderId = UUID.randomUUID()
+            insertActivityContextOrder(
+                orderId = orderId,
+                positionId = null,
+                tradeGroupId = UUID.randomUUID(),
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.PENDING_CANCEL,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "cancel processing",
+                decisionRunId = invocationId,
+            )
+            jdbcConnection().prepareStatement("UPDATE orders SET expires_at = ? WHERE id = ?").use { statement ->
+                statement.setLong(1, fixedInstant().minusSeconds(60).toEpochMilli())
+                statement.setObject(2, orderId)
+                statement.executeUpdate()
+            }
+        }
+
+        val repository = ExposedDecisionRunProjectionRepository(database, fixedClock())
+        val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
+
+        assertEquals(DecisionRunOutcome.EXPIRING, summary.outcome)
+        assertEquals(
+            listOf(invocationId),
+            repository.listRuns(
+                cursor = null,
+                limit = 10,
+                filter = DecisionRunFilter.EXPIRING,
+            ).getOrThrow().runs.map { run -> run.invocationId },
+        )
     }
 
     @Test
@@ -2674,7 +3024,7 @@ class PostgresPersistenceIntegrationTest {
     fun paper_execution_linksRestingLimitEntryOrderToClosedTradeEvaluation() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
-        val repository = ExposedPaperLedgerRepository(database)
+        val repository = ExposedPaperLedgerRepository(database, clock = fixedClock())
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
@@ -2742,7 +3092,7 @@ class PostgresPersistenceIntegrationTest {
     fun paper_execution_reconcilesRestingLimitByBestAskInPostgresPath() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
-        val repository = ExposedPaperLedgerRepository(database)
+        val repository = ExposedPaperLedgerRepository(database, clock = fixedClock())
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val marketDataSource = MutablePostgresOrderbookMarketDataSource(
             orderbook = postgresOrderbookWithAsk("10000000"),
@@ -2769,7 +3119,7 @@ class PostgresPersistenceIntegrationTest {
         val executions = repository.getExecutions().getOrThrow()
 
         assertEquals(1, placeResult.orderIds.size)
-        assertEquals(1, reconcileResult.triggeredOrderIds.size)
+        assertEquals(1, reconcileResult.filledOrderIds.size)
         assertEquals(1, executions.size)
     }
 
@@ -3158,15 +3508,19 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun paper_execution_persists_estimated_win_probability_for_resting_entry() = runPostgresTest {
+    fun paper_execution_persists_and_expires_resting_entry_metadataAtomically() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
-        val repository = ExposedPaperLedgerRepository(database)
+        val repository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
+        )
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
             decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(60),
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
@@ -3183,8 +3537,39 @@ class PostgresPersistenceIntegrationTest {
         broker.placeOrder(command).getOrThrow()
 
         val openOrder = repository.getOpenOrders().getOrThrow().single()
+        val tradeGroupId = UUID.fromString(requireNotNull(openOrder.tradeGroupId))
 
         assertEquals("0.7300000000", openOrder.estimatedWinProbability)
+        assertEquals(fixedInstant().plusSeconds(60).toString(), openOrder.expiresAt)
+        assertEquals(OrderExpirySource.SYSTEM_TTL, openOrder.expirySource)
+        assertEquals(60, openOrder.effectiveTtlSeconds)
+
+        repository.reconcile(
+            tickSnapshot = stopTickSnapshot().copy(
+                observedAt = fixedInstant().plusSeconds(60),
+                lastPrice = "9800000",
+                bidPrice = "9790000",
+                askPrice = "9800000",
+            ),
+            simulator = FillSimulator(),
+        ).getOrThrow()
+        val expiredOrder = repository.findOrdersByTradeGroupId(tradeGroupId).getOrThrow().single()
+
+        assertEquals(OrderStatus.CANCELED, expiredOrder.status)
+        assertEquals(fixedInstant().plusSeconds(60).toString(), expiredOrder.expiredAt)
+        assertEquals(fixedInstant().plusSeconds(60).toString(), expiredOrder.canceledAt)
+        assertEquals(PaperOrderCancelReason.TTL_EXPIRY, expiredOrder.cancelReason)
+        assertTrue(repository.getExecutions().getOrThrow().isEmpty())
+
+        val evaluationRepository = ExposedEvaluationRepository(database)
+        val evaluationTrades = evaluationRepository.fetchClosedTrades(
+            EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(61),
+            ),
+        ).getOrThrow()
+        assertTrue(evaluationTrades.trades.isEmpty())
+        assertEquals(0, evaluationRepository.fetchKillCriterionStats().getOrThrow().closedTrades)
     }
 
     @Test
@@ -4009,6 +4394,45 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
 }
 
 /**
+ * order の cancel reason を直接更新する。
+ */
+private fun updateOrderCancelReason(
+    database: ExposedDatabase,
+    orderId: UUID,
+    cancelReason: String,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement("UPDATE orders SET cancel_reason = ? WHERE id = ?").use { statement ->
+            statement.setString(1, cancelReason)
+            statement.setObject(2, orderId)
+            check(statement.executeUpdate() == 1) { "Expected one order cancel reason to be updated." }
+        }
+    }
+}
+
+/**
+ * order cancel reason domain constraint の定義を返す。
+ */
+private fun selectOrderCancelReasonConstraintDefinition(database: ExposedDatabase): String {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                SELECT pg_get_constraintdef(oid) AS definition
+                FROM pg_constraint
+                WHERE conname = 'orders_cancel_reason_domain'
+                    AND conrelid = 'orders'::regclass
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "orders_cancel_reason_domain constraint was not found." }
+
+                resultSet.getString("definition")
+            }
+        }
+    }
+}
+
+/**
  * Docker daemon が利用可能かを返す。
  */
 private fun isDockerAvailable(): Boolean {
@@ -4720,7 +5144,7 @@ private fun JdbcTransaction.insertTestExecution(
  */
 private fun JdbcTransaction.insertActivityContextOrder(
     orderId: UUID,
-    positionId: UUID,
+    positionId: UUID?,
     tradeGroupId: UUID,
     side: OrderSide,
     orderType: OrderType,
@@ -4835,6 +5259,78 @@ private fun runnerPhaseEvent(
         payload = """{"phase":"$phase","details":$details}""",
         occurredAt = occurredAt,
     )
+}
+
+/**
+ * cancellation projection integration test の target / actor run 組。
+ *
+ * @param targetRunId 取消対象 order を作成した run ID
+ * @param actorRunId 取消を実行した run ID
+ * @param reason 取消理由
+ */
+private data class CancellationProjectionCase(
+    val targetRunId: String,
+    val actorRunId: String,
+    val reason: String,
+)
+
+private suspend fun insertFinishedDecisionRun(
+    repository: ExposedLlmRunRepository,
+    invocationId: String,
+    status: String,
+    errorMessage: String?,
+) {
+    val start = LlmRunStart(
+        invocationId = invocationId,
+        mode = TradingMode.PAPER,
+        symbol = TradingSymbol.BTC,
+        triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+        startedAt = fixedInstant(),
+    )
+    repository.insertRunning(start).getOrThrow()
+    repository.finish(
+        LlmRunFinish(
+            invocationId = invocationId,
+            mode = start.mode,
+            symbol = start.symbol,
+            triggerKind = start.triggerKind,
+            status = status,
+            startedAt = start.startedAt,
+            finishedAt = fixedInstant().plusSeconds(10),
+            errorMessage = errorMessage,
+        ),
+    ).getOrThrow()
+}
+
+private fun cancellationAuditContext(actorRunId: String): PaperTradeAuditContext {
+    return PaperTradeAuditContext(
+        decisionRunContext = DecisionRunContext(
+            decisionRunId = actorRunId,
+            llmProvider = "codex",
+            promptHash = "cancel-prompt-hash",
+            systemPromptVersion = "cancel-system-prompt",
+            marketSnapshotId = "cancel-market-snapshot",
+        ),
+        toolCallId = "cancel-tool-$actorRunId",
+        clientRequestId = "cancel-request-$actorRunId",
+    )
+}
+
+private fun JdbcTransaction.insertCancellationActorExecution(decisionRunId: String) {
+    jdbcConnection().prepareStatement(
+        """
+            INSERT INTO executions (
+                id, order_id, position_id, mode, symbol, side, price_jpy, size_btc,
+                fee_jpy, realized_pnl_jpy, liquidity, executed_at, decision_run_id
+            )
+            VALUES (?, NULL, NULL, 'PAPER', 'BTC', 'SELL', 10000000, 0.001, 0, 1000, 'TAKER', ?, ?)
+        """,
+    ).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setLong(2, fixedInstant().toEpochMilli())
+        statement.setString(3, decisionRunId)
+        statement.executeUpdate()
+    }
 }
 
 private fun runtimeConfigDraftCreation(note: String): RuntimeConfigDraftCreation {

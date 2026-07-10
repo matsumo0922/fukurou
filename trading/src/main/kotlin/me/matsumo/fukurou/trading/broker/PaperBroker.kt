@@ -9,10 +9,12 @@ import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.ProtectionStatus
@@ -60,6 +62,7 @@ import java.util.logging.Logger
  * @param riskStateCommandService risk_state 更新と audit をまとめる service
  * @param decisionRepository decision / intent / falsification repository
  * @param falsificationFreshnessWindow fresh APPROVED falsification とみなす時間窓
+ * @param restingEntryOrderTtl resting entry order の system TTL
  * @param safetyViolationRepository SafetyFloor violation repository
  * @param safetyFloor Broker 副作用前に実行する SafetyFloor
  * @param marketDataSource paper 約定に使う市場データ source
@@ -96,6 +99,7 @@ class PaperBroker private constructor(
         riskStateCommandService: RiskStateCommandService? = null,
         decisionRepository: DecisionRepository = InMemoryDecisionRepository(),
         falsificationFreshnessWindow: Duration = DecisionProtocolConfig().falsificationFreshnessWindow,
+        restingEntryOrderTtl: Duration = DecisionProtocolConfig().restingEntryOrderTtl,
         safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
         safetyFloor: SafetyFloor? = null,
         marketDataSource: MarketDataSource? = null,
@@ -136,6 +140,7 @@ class PaperBroker private constructor(
                 clock = clock,
                 tradingDateZone = tradingDateZone,
                 falsificationFreshnessWindow = falsificationFreshnessWindow,
+                restingEntryOrderTtl = restingEntryOrderTtl,
             ),
             reconcilerStatusProvider = reconcilerStatusProvider,
         ),
@@ -191,11 +196,13 @@ private data class PaperBrokerMarketServices(
  * @param clock audit / 約定時刻用 clock
  * @param tradingDateZone 当日判定に使う timezone
  * @param falsificationFreshnessWindow fresh APPROVED falsification とみなす時間窓
+ * @param restingEntryOrderTtl resting entry order の system TTL
  */
 private data class PaperBrokerTimeConfig(
     val clock: Clock,
     val tradingDateZone: ZoneId,
     val falsificationFreshnessWindow: Duration,
+    val restingEntryOrderTtl: Duration,
 )
 
 /**
@@ -390,11 +397,7 @@ private class PaperBrokerTradeDelegate(
             )
 
             intentConsumer.createRestingEntryOrderAndConsumeIntent(
-                RestingEntryOrderRequest(
-                    command = preparedOrder.command,
-                    orderId = UUID.randomUUID(),
-                    tradeGroupId = preparedOrder.tradeGroupId,
-                ),
+                runtime.restingEntryOrderRequest(preparedOrder),
             )
         }
     }
@@ -649,6 +652,24 @@ private class PaperBrokerTradeDelegate(
             runtime.stores.ledgerRepository.cancelOrder(command).getOrThrow()
         }
     }
+}
+
+private fun PaperBrokerRuntime.restingEntryOrderRequest(preparedOrder: PreparedPlaceOrder): RestingEntryOrderRequest {
+    val createdAt = Instant.now(time.clock)
+    val systemExpiresAt = createdAt.plus(time.restingEntryOrderTtl)
+    val llmExpiresAt = preparedOrder.command.timeStopAt
+    val usesLlmTimeStop = llmExpiresAt != null && llmExpiresAt.isBefore(systemExpiresAt)
+    val expiresAt = if (usesLlmTimeStop) checkNotNull(llmExpiresAt) else systemExpiresAt
+
+    return RestingEntryOrderRequest(
+        command = preparedOrder.command,
+        orderId = UUID.randomUUID(),
+        tradeGroupId = preparedOrder.tradeGroupId,
+        createdAt = createdAt,
+        expiresAt = expiresAt,
+        expirySource = if (usesLlmTimeStop) OrderExpirySource.LLM_TIME_STOP else OrderExpirySource.SYSTEM_TTL,
+        effectiveTtlSeconds = Duration.between(createdAt, expiresAt).seconds.coerceAtLeast(0),
+    )
 }
 
 /**
@@ -907,6 +928,7 @@ private class PaperBrokerSafetyGate(
                     CancelOrderCommand(
                         commandId = UUID.randomUUID(),
                         orderId = UUID.fromString(order.orderId),
+                        cancelReason = PaperOrderCancelReason.HARD_HALT,
                         reasonJa = reason,
                         auditContext = auditContext,
                     ),

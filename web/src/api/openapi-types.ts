@@ -1613,8 +1613,8 @@ export interface paths {
                     limit?: number;
                     /** @description 前回応答の nextBefore を指定する opaque cursor です。 */
                     before?: string;
-                    /** @description pagination より前に bounded scan で適用する outcome filter です。 */
-                    outcome?: "EXECUTED" | "DENIED" | "NO_TRADE" | "INTERRUPTED" | "RUNNING" | "FAILED";
+                    /** @description pagination より前に bounded scan で適用する目的別 filter です。 */
+                    filter?: "ACTION_REQUIRED" | "WAITING" | "EXPIRING" | "FILLED" | "DENIED" | "RUNNING" | "EXPIRED" | "CANCELED" | "NO_ENTRY";
                 };
                 header?: never;
                 path?: never;
@@ -1631,7 +1631,7 @@ export interface paths {
                         "application/json": components["schemas"]["OpsDecisionRunsResponse"];
                     };
                 };
-                /** @description limit、before、または outcome が不正です。 */
+                /** @description limit、before、または filter が不正です。 */
                 400: {
                     headers: {
                         [name: string]: unknown;
@@ -2237,6 +2237,30 @@ export interface components {
             nextBefore?: string | null;
             limit: number;
         };
+        /** OpsDecisionRunOrderResponse */
+        OpsDecisionRunOrderResponse: {
+            orderId: string;
+            intentId?: string | null;
+            positionId?: string | null;
+            tradeGroupId?: string | null;
+            side: string;
+            orderType: string;
+            status: string;
+            sizeBtc: string;
+            limitPriceJpy?: string | null;
+            reasonJa?: string | null;
+            expiresAt?: string | null;
+            expirySource?: string | null;
+            effectiveTtlSeconds?: number | null;
+            expiredAt?: string | null;
+            canceledAt?: string | null;
+            cancelReason?: string | null;
+            canceledByDecisionRunId?: string | null;
+            createdAt: string;
+            strategyEvaluationEligible: boolean;
+            strategyEvaluationExclusionReason?: string | null;
+            lifecycleDelaySeconds?: number | null;
+        };
         /** OpsDecisionRunSummaryResponse */
         OpsDecisionRunSummaryResponse: {
             invocationId: string;
@@ -2245,7 +2269,7 @@ export interface components {
             triggerKind?: string | null;
             status: string;
             /** @enum {string} */
-            outcome: "EXECUTED" | "DENIED" | "NO_TRADE" | "INTERRUPTED" | "RUNNING" | "FAILED";
+            outcome: "WAITING" | "EXPIRING" | "FILLED" | "EXPIRED" | "CANCELED" | "NO_ENTRY" | "DENIED" | "RUNNING" | "FAILED" | "ACTION_REQUIRED";
             startedAt: string;
             finishedAt?: string | null;
             durationMillis?: number | null;
@@ -2258,11 +2282,21 @@ export interface components {
             errorMessage?: string | null;
             orderCount: number;
             executionCount: number;
+            hasProcessFailure: boolean;
+            order?: components["schemas"]["OpsDecisionRunOrderResponse"] | null;
+        };
+        /** OpsDecisionRunQuoteResponse */
+        OpsDecisionRunQuoteResponse: {
+            bidPriceJpy: string;
+            askPriceJpy: string;
+            observedAt: string;
+            stale: boolean;
         };
         /** OpsDecisionRunsResponse */
         OpsDecisionRunsResponse: {
             runs: components["schemas"]["OpsDecisionRunSummaryResponse"][];
             nextBefore?: string | null;
+            latestMarketQuote?: components["schemas"]["OpsDecisionRunQuoteResponse"] | null;
         };
         /** OpsDecisionRunPhaseResponse */
         OpsDecisionRunPhaseResponse: {
@@ -2317,20 +2351,6 @@ export interface components {
             messageJa: string;
             createdAt: string;
         };
-        /** OpsDecisionRunOrderResponse */
-        OpsDecisionRunOrderResponse: {
-            orderId: string;
-            intentId?: string | null;
-            positionId?: string | null;
-            tradeGroupId?: string | null;
-            side: string;
-            orderType: string;
-            status: string;
-            sizeBtc: string;
-            limitPriceJpy?: string | null;
-            reasonJa?: string | null;
-            createdAt: string;
-        };
         /** OpsDecisionRunExecutionResponse */
         OpsDecisionRunExecutionResponse: {
             executionId: string;
@@ -2353,6 +2373,7 @@ export interface components {
         /** OpsDecisionRunDetailResponse */
         OpsDecisionRunDetailResponse: {
             summary: components["schemas"]["OpsDecisionRunSummaryResponse"];
+            latestMarketQuote?: components["schemas"]["OpsDecisionRunQuoteResponse"] | null;
             phases: components["schemas"]["OpsDecisionRunPhaseResponse"][];
             decision?: components["schemas"]["OpsDecisionRunDecisionResponse"] | null;
             intent?: components["schemas"]["OpsDecisionRunIntentResponse"] | null;
@@ -2409,6 +2430,15 @@ export interface components {
             estimatedWinProbability?: string | null;
             reasonJa?: string | null;
             clientRequestId?: string | null;
+            expiresAt?: string | null;
+            /** @enum {string|null} */
+            expirySource?: "SYSTEM_TTL" | "LLM_TIME_STOP" | null;
+            effectiveTtlSeconds?: number | null;
+            expiredAt?: string | null;
+            canceledAt?: string | null;
+            /** @enum {string|null} */
+            cancelReason?: "TTL_EXPIRY" | "EXPLICIT_CANCEL" | "LEGACY_TTL_SWEEP" | "POSITION_CLOSE" | "HARD_HALT" | "LEGACY_UNCLASSIFIED" | null;
+            canceledByDecisionRunId?: string | null;
             createdAt: string;
             updatedAt: string;
         };

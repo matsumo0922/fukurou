@@ -24,9 +24,11 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
@@ -38,6 +40,7 @@ import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
+import java.time.Clock
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -210,6 +213,13 @@ private const val SELECT_OPEN_ORDERS_SQL = """
         estimated_win_probability,
         reason_ja,
         client_request_id,
+        expires_at,
+        expiry_source,
+        effective_ttl_seconds,
+        expired_at,
+        canceled_at,
+        cancel_reason,
+        canceled_by_decision_run_id,
         created_at,
         updated_at
     FROM orders
@@ -245,6 +255,13 @@ private const val SELECT_OPEN_ORDERS_WITH_ACCOUNT_UPDATED_AT_SQL = """
         orders.estimated_win_probability,
         orders.reason_ja,
         orders.client_request_id,
+        orders.expires_at,
+        orders.expiry_source,
+        orders.effective_ttl_seconds,
+        orders.expired_at,
+        orders.canceled_at,
+        orders.cancel_reason,
+        orders.canceled_by_decision_run_id,
         orders.created_at,
         orders.updated_at
     FROM paper_account
@@ -277,6 +294,13 @@ private const val SELECT_ORDERS_BY_CLIENT_REQUEST_ID_SQL = """
         estimated_win_probability,
         reason_ja,
         client_request_id,
+        expires_at,
+        expiry_source,
+        effective_ttl_seconds,
+        expired_at,
+        canceled_at,
+        cancel_reason,
+        canceled_by_decision_run_id,
         created_at,
         updated_at
     FROM orders
@@ -311,6 +335,13 @@ private const val SELECT_ORDERS_BY_TRADE_GROUP_ID_SQL = """
         estimated_win_probability,
         reason_ja,
         client_request_id,
+        expires_at,
+        expiry_source,
+        effective_ttl_seconds,
+        expired_at,
+        canceled_at,
+        cancel_reason,
+        canceled_by_decision_run_id,
         created_at,
         updated_at
     FROM orders
@@ -855,8 +886,9 @@ class ExposedPaperLedgerRepository private constructor(
     constructor(
         database: ExposedDatabase,
         fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
+        clock: Clock = Clock.systemUTC(),
     ) : this(
-        writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules),
+        writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules, clock = clock),
         accountRepository = ExposedPaperLedgerAccountReader(database),
         executionRepository = ExposedPaperLedgerExecutionReader(database),
         orderRepository = ExposedPaperLedgerOrderReader(database),
@@ -1324,6 +1356,13 @@ private fun ResultSet.toOrder(): Order {
         estimatedWinProbability = getNullableBigDecimal("estimated_win_probability")?.toPlainString(),
         reasonJa = getString("reason_ja"),
         clientRequestId = getString("client_request_id"),
+        expiresAt = getNullableInstant("expires_at")?.toString(),
+        expirySource = getString("expiry_source")?.let(OrderExpirySource::valueOf),
+        effectiveTtlSeconds = getNullableLong("effective_ttl_seconds"),
+        expiredAt = getNullableInstant("expired_at")?.toString(),
+        canceledAt = getNullableInstant("canceled_at")?.toString(),
+        cancelReason = getString("cancel_reason")?.let(PaperOrderCancelReason::fromWireCode),
+        canceledByDecisionRunId = getString("canceled_by_decision_run_id"),
         createdAt = getInstant("created_at").toString(),
         updatedAt = getInstant("updated_at").toString(),
     )

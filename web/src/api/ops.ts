@@ -37,19 +37,32 @@ export type OpsTriggerResponse = components["schemas"]["OpsTriggerResponse"];
 export type OpsDecisionRunsResponse = components["schemas"]["OpsDecisionRunsResponse"];
 export type OpsDecisionRunSummaryResponse = components["schemas"]["OpsDecisionRunSummaryResponse"];
 export type OpsDecisionRunDetailResponse = components["schemas"]["OpsDecisionRunDetailResponse"];
-export type DecisionRunOutcome = "EXECUTED" | "DENIED" | "NO_TRADE" | "INTERRUPTED" | "RUNNING" | "FAILED";
-export type DecisionRunOutcomeFilter = DecisionRunOutcome | "ALL";
+export type DecisionRunOutcome = OpsDecisionRunSummaryResponse["outcome"];
+export type DecisionRunFilter =
+  | "ACTION_REQUIRED"
+  | "WAITING"
+  | "EXPIRING"
+  | "FILLED"
+  | "DENIED"
+  | "RUNNING"
+  | "EXPIRED"
+  | "CANCELED"
+  | "NO_ENTRY";
+export type DecisionRunFilterOption = DecisionRunFilter | "ALL";
 
 export const DECISION_RUN_FILTER_STORAGE_KEY = "fukurou.web.activity.run-filter.v2";
-export const DECISION_RUN_OUTCOME_FILTERS = [
+export const DECISION_RUN_FILTERS = [
   "ALL",
-  "EXECUTED",
+  "ACTION_REQUIRED",
+  "WAITING",
+  "EXPIRING",
+  "FILLED",
   "DENIED",
-  "NO_TRADE",
-  "INTERRUPTED",
   "RUNNING",
-  "FAILED",
-] as const satisfies readonly DecisionRunOutcomeFilter[];
+  "EXPIRED",
+  "CANCELED",
+  "NO_ENTRY",
+] as const satisfies readonly DecisionRunFilterOption[];
 export const DECISION_RUN_PAGE_LIMIT = 50;
 export const DECISION_RUN_REFETCH_INTERVAL_MILLIS = 30_000;
 
@@ -139,14 +152,14 @@ export const opsActivityCatalogQuery = queryOptions({
 
 export async function fetchDecisionRuns({
   before,
-  outcome,
+  filter,
 }: {
   before?: string | null;
-  outcome?: DecisionRunOutcome | null;
+  filter?: DecisionRunFilter | null;
 } = {}): Promise<OpsDecisionRunsResponse> {
   const searchParams = new URLSearchParams({ limit: String(DECISION_RUN_PAGE_LIMIT) });
   if (before) searchParams.set("before", before);
-  if (outcome) searchParams.set("outcome", outcome);
+  if (filter) searchParams.set("filter", filter);
 
   return getJson(`/ops/runs?${searchParams.toString()}`);
 }

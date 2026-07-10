@@ -179,6 +179,9 @@ Cloudflare Access は `/app/*` と `/ops/*` を保護し、runtime config draft 
 
 ## paper / live の構造的乖離
 
+- 新規 paper resting entry は作成時に `expiresAt` を固定し、常駐 `ProtectionReconciler` が LLM runner を待たずに server clock で期限到達を fill より先に処理する。作成時の system TTL と TradePlan `timeStopAt` の早い方を採用し、過去の `timeStopAt` も保持したまま `effectiveTtlSeconds=0` とする。TTL 取消では `expiredAt=expiresAt`、`canceledAt=server processing time` を保存し、runtime config 変更で既存 order の期限を再計算しない。`expiresAt` がない legacy order は推定期限を表示せず、runner の互換 sweep に任せる。
+- Activity は position 未紐付けの BUY LIMIT/STOP だけを resting entry とし、`OPEN` だけを約定待ちへ含める。期限到達から 2 polling 間隔（10 秒）までは取消処理中、それを超えた `OPEN` は要対応とする。通常取消は対象 order と、`canceledByDecisionRunId` に保存した取消 actor run の双方を取消済みとして追跡する。表示用気配は `ProtectionReconciler` が取得した GMO REST ticker の best bid/ask と取引所時刻を process 内の共有 store から読み、Activity request 自体は GMO REST を呼ばない。気配は現在の参考値であり、run 時点の価格や paper fill の根拠には使わない。
+- TTL 取消の `canceledAt - expiredAt` が 10 秒を超える場合は infrastructure / monitoring delay として `strategyEvaluationEligible=false` と `LIFECYCLE_MONITORING_DELAY` を返す。この order は勝率、EV、profit factor などの strategy outcome 集計へ含めない。現行集計は closed position と execution を正本とするため、未約定の取消 order は集計入力にならない。
 - paper STOP は `ProtectionReconciler` が動いている間だけ約定判定される。live の native STOP は bot 停止中も取引所側で作動するため、paper の方が保護が弱い。
 - paper の LIMIT は all-or-none 約定で、GMO の FAK 部分約定は完全再現しない。LIMIT 価格までの板深さではFAK部分約定になるケースは、crossing / resting のどちらも乖離メモとして残す。crossing は tool response と runner lifecycle payload、resting は `command_event_log` の reconcile pass payload に伝搬する。
 - paper の LIMIT は板が取得できる場合、BUY は `bestAsk <= limitPrice`、SELL は `bestBid >= limitPrice` で到達判定する。発注時点で板を跨ぐ LIMIT は SafetyFloor と paper 約定の両方で taker cost として扱う。板が取得できない場合だけ、WARNを出してlast price比較へfallbackする。

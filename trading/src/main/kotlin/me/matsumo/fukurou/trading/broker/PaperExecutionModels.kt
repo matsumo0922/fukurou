@@ -8,6 +8,7 @@ import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
@@ -64,6 +65,7 @@ data class PaperTradeAuditContext(
  * @param protectiveStopPriceJpy entry 後に必ず置く保護 STOP 価格
  * @param takeProfitPriceJpy virtual TP 価格
  * @param estimatedWinProbability LLM が申告した推定勝率。EV は SafetyFloor がこの値から計算する
+ * @param timeStopAt LLM TradePlan が指定した entry の期限
  * @param reasonJa 判断理由
  * @param auditContext audit context
  */
@@ -79,6 +81,7 @@ data class PlaceOrderCommand(
     val protectiveStopPriceJpy: BigDecimal,
     val takeProfitPriceJpy: BigDecimal?,
     val estimatedWinProbability: BigDecimal,
+    val timeStopAt: Instant? = null,
     val reasonJa: String,
     val auditContext: PaperTradeAuditContext,
 )
@@ -128,12 +131,14 @@ data class UpdateProtectionCommand(
  *
  * @param commandId command ID
  * @param orderId 取消対象 order ID
+ * @param cancelReason 永続化する取消理由 code
  * @param reasonJa 判断理由
  * @param auditContext audit context
  */
 data class CancelOrderCommand(
     val commandId: UUID,
     val orderId: UUID,
+    val cancelReason: PaperOrderCancelReason = PaperOrderCancelReason.EXPLICIT_CANCEL,
     val reasonJa: String,
     val auditContext: PaperTradeAuditContext,
 )
@@ -246,14 +251,18 @@ data class PaperTradeResult(
  * Reconciler が進めた paper ledger の結果。
  *
  * @param advanced 状態が前進したか
- * @param triggeredOrderIds trigger された order IDs
+ * @param filledOrderIds 約定した order IDs
+ * @param canceledOrderIds 取消した order IDs
+ * @param rejectedOrderIds 拒否した order IDs
  * @param closedPositionIds close された position IDs
  * @param executionIds 作成された execution IDs
  * @param divergenceMemos paper/live 乖離を command_event_log へ残すための structured memo
  */
 data class PaperReconcileResult(
     val advanced: Boolean,
-    val triggeredOrderIds: List<String>,
+    val filledOrderIds: List<String>,
+    val canceledOrderIds: List<String>,
+    val rejectedOrderIds: List<String>,
     val closedPositionIds: List<String>,
     val executionIds: List<String>,
     val divergenceMemos: List<PaperExecutionDivergenceMemo> = emptyList(),

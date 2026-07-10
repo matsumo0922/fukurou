@@ -47,6 +47,7 @@ import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
+import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.io.File
@@ -75,6 +76,7 @@ fun interface ReadinessProbe {
  * @param opsLlmAuthService ops API 用 CLI auth service。null なら環境変数から構築する
  * @param opsDecisionRepository ops API 用 decision repository。null なら DB 設定から構築する
  * @param opsPaperLedgerRepository ops API 用 paper ledger repository。null なら DB 設定から構築する
+ * @param latestMarketQuoteStore ProtectionReconciler と Activity API が共有する最新気配値 store
  * @param opsCommandEventLog ops API 用 command_event_log writer。null なら DB 設定から構築する
  * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
  * @param opsDecisionRunProjectionRepository ops decision run projection。null なら DB 設定から構築する
@@ -97,6 +99,7 @@ fun Application.module(
     opsLlmAuthService: LlmAuthService? = null,
     opsDecisionRepository: DecisionRepository? = null,
     opsPaperLedgerRepository: PaperLedgerRepository? = null,
+    latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
     opsCommandEventLog: CommandEventLog? = null,
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
     opsDecisionRunProjectionRepository: DecisionRunProjectionRepository? = null,
@@ -118,6 +121,7 @@ fun Application.module(
             clock = clock,
             tradingConfig = tradingConfig,
             runtimeConfigEnvironment = runtimeConfigEnvironment,
+            latestMarketQuoteStore = latestMarketQuoteStore,
             onStaleLlmRunsRecovered = { count ->
                 log.warn("Recovered {} stale llm_runs rows during persistence bootstrap.", count)
             },
@@ -193,6 +197,7 @@ private fun createApplicationRuntimeResources(
         runtimeConfigSnapshot = runtimeConfigSnapshot.runtimeConfigSnapshot,
         runtimeConfigState = runtimeConfigState,
         onStaleLlmRunsRecovered = inputs.onStaleLlmRunsRecovered,
+        latestMarketQuoteStore = inputs.latestMarketQuoteStore,
     )
 }
 
@@ -566,6 +571,7 @@ private fun createOpsFeedRouteDependencies(
         commandEventFeedReader = opsOverrides.commandEventFeedReader ?: createdCommandEventLog,
         decisionRunProjectionRepository = opsOverrides.decisionRunProjectionRepository
             ?: database?.let(::ExposedDecisionRunProjectionRepository),
+        latestMarketQuoteStore = runtime.latestMarketQuoteStore,
     )
 }
 
@@ -788,6 +794,7 @@ private fun startApplicationBackgroundWorkers(
             status = runtime.reconcilerStatus,
             clock = runtime.clock,
             onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
+            latestMarketQuoteStore = runtime.latestMarketQuoteStore,
         ),
         llmDaemonWorker = startLlmDaemonSchedulerWorker(
             dataSource = dataSource,
@@ -884,6 +891,7 @@ private data class ApplicationRuntimeInputs(
     val tradingConfig: TradingBotConfig,
     val runtimeConfigEnvironment: Map<String, String>,
     val onStaleLlmRunsRecovered: (Int) -> Unit,
+    val latestMarketQuoteStore: LatestMarketQuoteStore,
 )
 
 /**
@@ -914,6 +922,7 @@ private data class ApplicationRuntimeConfigSnapshot(
  * @param runtimeConfigSnapshot 起動時に解決した runtime config snapshot
  * @param runtimeConfigState active runtime config の現在状態 holder
  * @param onStaleLlmRunsRecovered stale llm_runs 回収件数の通知
+ * @param latestMarketQuoteStore reconciler と Activity API が共有する最新気配値 store
  */
 private data class ApplicationRuntimeResources(
     val readinessProbe: ReadinessProbe?,
@@ -924,6 +933,7 @@ private data class ApplicationRuntimeResources(
     val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
     val runtimeConfigState: ApplicationRuntimeConfigState,
     val onStaleLlmRunsRecovered: (Int) -> Unit,
+    val latestMarketQuoteStore: LatestMarketQuoteStore,
 )
 
 /**

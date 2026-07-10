@@ -562,6 +562,27 @@ object OrdersTable : Table("orders") {
      */
     val marketSnapshotId = varchar("market_snapshot_id", length = 128).nullable()
 
+    /** resting entry order の作成時に固定した実効期限。 */
+    val expiresAt = long("expires_at").nullable()
+
+    /** 実効期限を決めた入力。 */
+    val expirySource = varchar("expiry_source", length = 32).nullable()
+
+    /** 作成時刻から実効期限までの秒数。 */
+    val effectiveTtlSeconds = long("effective_ttl_seconds").nullable()
+
+    /** lifecycle が期限到達を確定した時刻。 */
+    val expiredAt = long("expired_at").nullable()
+
+    /** 取消を確定した時刻。 */
+    val canceledAt = long("canceled_at").nullable()
+
+    /** 取消理由 code。 */
+    val cancelReason = varchar("cancel_reason", length = 128).nullable()
+
+    /** 取消を実行した decision run ID。 */
+    val canceledByDecisionRunId = varchar("canceled_by_decision_run_id", length = 128).nullable()
+
     /**
      * 作成時刻。epoch millis で保存する。
      */

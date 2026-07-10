@@ -361,20 +361,24 @@ class OneShotLlmRunnerTest {
         val config = TradingBotConfig(
             decisionProtocol = DecisionProtocolConfig(restingEntryOrderTtl = Duration.ofMinutes(30)),
         )
-        val fixture = runnerFixture(config = config, clock = clock) { command ->
+        val fixture = runnerFixture(
+            config = config,
+            clock = clock,
+            runtimeTransform = { runtime ->
+                runtime.withPaperLedger(
+                    positions = emptyList(),
+                    openOrders = listOf(legacyRestingEntryOrder()),
+                    config = config,
+                    clock = clock,
+                )
+            },
+        ) { command ->
             if (command.isProposerLaunch()) {
                 submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
             }
 
             cleanExit()
         }
-        seedApprovedEntry(
-            fixture = fixture,
-            entryIntent = entryIntentDraft(
-                orderType = OrderType.LIMIT,
-                priceJpy = BigDecimal("9900000"),
-            ),
-        )
         clock.advance(Duration.ofMinutes(31))
 
         val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
@@ -1907,6 +1911,7 @@ private fun TradingRuntime.withHardHaltDrawdown(config: TradingBotConfig): Tradi
         riskStateCommandService = drawdownRiskStateCommandService,
         decisionRepository = decisionRepository,
         falsificationFreshnessWindow = config.decisionProtocol.falsificationFreshnessWindow,
+        restingEntryOrderTtl = config.decisionProtocol.restingEntryOrderTtl,
         safetyViolationRepository = safetyViolationRepository,
         safetyFloor = SafetyFloor(config.safetyFloor, fixedClock()),
         marketDataSource = baseBroker.marketDataSource,
@@ -1950,6 +1955,7 @@ private fun TradingRuntime.withPaperLedger(
         riskStateCommandService = riskStateCommandService,
         decisionRepository = decisionRepository,
         falsificationFreshnessWindow = config.decisionProtocol.falsificationFreshnessWindow,
+        restingEntryOrderTtl = config.decisionProtocol.restingEntryOrderTtl,
         safetyViolationRepository = safetyViolationRepository,
         safetyFloor = SafetyFloor(config.safetyFloor, clock),
         marketDataSource = baseBroker.marketDataSource,
@@ -1975,6 +1981,7 @@ private fun TradingRuntime.withMarketDataSource(
         riskStateCommandService = riskStateCommandService,
         decisionRepository = decisionRepository,
         falsificationFreshnessWindow = config.decisionProtocol.falsificationFreshnessWindow,
+        restingEntryOrderTtl = config.decisionProtocol.restingEntryOrderTtl,
         safetyViolationRepository = safetyViolationRepository,
         safetyFloor = SafetyFloor(config.safetyFloor, clock),
         marketDataSource = marketDataSource,
@@ -2440,6 +2447,29 @@ private fun linkedStopOrderFor(position: Position): Order {
         protectiveStopPriceJpy = null,
         takeProfitPriceJpy = null,
         reasonJa = "runner add long test stop",
+        clientRequestId = null,
+        createdAt = fixedInstant().toString(),
+        updatedAt = fixedInstant().toString(),
+    )
+}
+
+private fun legacyRestingEntryOrder(): Order {
+    return Order(
+        orderId = UUID.randomUUID().toString(),
+        positionId = null,
+        tradeGroupId = UUID.randomUUID().toString(),
+        symbol = TradingSymbol.BTC.apiSymbol,
+        mode = TradingMode.PAPER,
+        side = OrderSide.BUY,
+        orderType = OrderType.LIMIT,
+        status = OrderStatus.OPEN,
+        sizeBtc = "0.005000000000",
+        limitPriceJpy = "9900000.00000000",
+        triggerPriceJpy = null,
+        protectiveStopPriceJpy = "9700000.00000000",
+        takeProfitPriceJpy = "10500000.00000000",
+        estimatedWinProbability = "0.6000000000",
+        reasonJa = "legacy resting entry",
         clientRequestId = null,
         createdAt = fixedInstant().toString(),
         updatedAt = fixedInstant().toString(),

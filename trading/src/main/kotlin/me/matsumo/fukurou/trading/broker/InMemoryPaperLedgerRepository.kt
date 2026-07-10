@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
@@ -14,6 +15,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.domain.isRestingEntryLifecycleCandidate
 import me.matsumo.fukurou.trading.evaluation.InMemoryEquitySnapshotRepository
 import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
@@ -452,13 +454,15 @@ private class InMemoryPaperLedgerMutationWriter(
     override suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
         return runCatching {
             state.write {
-                val recordedAt = Instant.now(clock)
                 val order = request.command.toEntryOrder(
                     orderId = request.orderId,
                     positionId = null,
                     tradeGroupId = request.tradeGroupId,
                     status = OrderStatus.OPEN,
-                    recordedAt = recordedAt,
+                    recordedAt = request.createdAt,
+                    expiresAt = request.expiresAt,
+                    expirySource = request.expirySource,
+                    effectiveTtlSeconds = request.effectiveTtlSeconds,
                 )
 
                 orders += order
@@ -554,9 +558,14 @@ private class InMemoryPaperLedgerMutationWriter(
                     "order is not cancelable."
                 }
 
+                val canceledAt = Instant.now(clock)
                 orders[orderIndex] = order.copy(
                     status = OrderStatus.CANCELED,
                     reasonJa = command.reasonJa,
+                    canceledAt = canceledAt.toString(),
+                    cancelReason = command.cancelReason,
+                    canceledByDecisionRunId = command.auditContext.decisionRunContext.decisionRunId,
+                    updatedAt = canceledAt.toString(),
                 )
 
                 PaperTradeResult(
@@ -592,6 +601,8 @@ private class InMemoryPaperLedgerMutationWriter(
                     updatedAt = tickSnapshot.observedAt,
                 )
 
+                expireRestingEntryOrdersLocked(clock.instant(), progress)
+
                 if (!accountSnapshot.isHardHaltDrawdownReached()) {
                     fillTriggeredEntryOrdersLocked(reconcileContext, progress)
                     triggerPositionProtectionsLocked(reconcileContext, progress)
@@ -599,6 +610,27 @@ private class InMemoryPaperLedgerMutationWriter(
 
                 progress.toPaperReconcileResult()
             }
+        }
+    }
+
+    private fun InMemoryPaperLedgerState.expireRestingEntryOrdersLocked(
+        processedAt: Instant,
+        progress: ReconcileProgress,
+    ) {
+        orders.indices.forEach { index ->
+            val order = orders[index]
+            val expiresAt = order.expiresAt?.let(Instant::parse) ?: return@forEach
+            if (!order.isRestingEntryLifecycleCandidate() || processedAt.isBefore(expiresAt)) return@forEach
+
+            orders[index] = order.copy(
+                status = OrderStatus.CANCELED,
+                reasonJa = "resting entry order expired",
+                expiredAt = expiresAt.toString(),
+                canceledAt = processedAt.toString(),
+                cancelReason = PaperOrderCancelReason.TTL_EXPIRY,
+                updatedAt = processedAt.toString(),
+            )
+            progress.canceledOrderIds += order.orderId
         }
     }
 
@@ -691,7 +723,7 @@ private class InMemoryPaperLedgerMutationWriter(
 
             if (!accountSnapshot.hasCashForBuyFill(fill)) {
                 markOrderStatusLocked(order.orderId, OrderStatus.REJECTED, "reconciler entry rejected: insufficient paper cash")
-                progress.triggeredOrderIds += order.orderId
+                progress.rejectedOrderIds += order.orderId
 
                 return@forEach
             }
@@ -710,7 +742,7 @@ private class InMemoryPaperLedgerMutationWriter(
                     insertEntryOrder = false,
                 ),
             )
-            progress.triggeredOrderIds += order.orderId
+            progress.filledOrderIds += order.orderId
             progress.executionIds += fill.executionId.toString()
             orderUpdate.divergenceMemo
                 ?.withOrderContext(order)
@@ -835,7 +867,7 @@ private class InMemoryPaperLedgerMutationWriter(
                 )
 
                 markOrderStatusLocked(stopOrder.orderId, OrderStatus.FILLED)
-                progress.triggeredOrderIds += stopOrder.orderId
+                progress.filledOrderIds += stopOrder.orderId
                 progress.closedPositionIds += position.positionId
                 progress.executionIds += result.executionIds
 
@@ -844,8 +876,12 @@ private class InMemoryPaperLedgerMutationWriter(
 
             if (takeProfitTriggered) {
                 linkedStopOrder(position.positionId)?.let { stopOrder ->
-                    markOrderStatusLocked(stopOrder.orderId, OrderStatus.CANCELED)
-                    progress.triggeredOrderIds += stopOrder.orderId
+                    markOrderStatusLocked(
+                        orderId = stopOrder.orderId,
+                        status = OrderStatus.CANCELED,
+                        cancelReason = PaperOrderCancelReason.POSITION_CLOSE,
+                    )
+                    progress.canceledOrderIds += stopOrder.orderId
                 }
 
                 val fill = context.simulator.marketFill(
@@ -996,6 +1032,8 @@ private class InMemoryPaperLedgerMutationWriter(
             order.copy(
                 status = OrderStatus.CANCELED,
                 reasonJa = reasonJa,
+                canceledAt = Instant.now(clock).toString(),
+                cancelReason = PaperOrderCancelReason.POSITION_CLOSE,
             )
         }
     }
@@ -1004,13 +1042,22 @@ private class InMemoryPaperLedgerMutationWriter(
         orderId: String,
         status: OrderStatus,
         reasonJa: String? = null,
+        cancelReason: PaperOrderCancelReason? = null,
     ) {
         val orderIndex = orders.indexOfFirst { order -> order.orderId == orderId }
 
         if (orderIndex >= 0) {
+            val canceledAt = if (status == OrderStatus.CANCELED) Instant.now(clock).toString() else null
+            val resolvedCancelReason = if (status == OrderStatus.CANCELED) {
+                requireNotNull(cancelReason) { "cancelReason is required for CANCELED order status." }
+            } else {
+                orders[orderIndex].cancelReason
+            }
             orders[orderIndex] = orders[orderIndex].copy(
                 status = status,
                 reasonJa = reasonJa ?: orders[orderIndex].reasonJa,
+                canceledAt = canceledAt ?: orders[orderIndex].canceledAt,
+                cancelReason = resolvedCancelReason,
             )
         }
     }
@@ -1150,6 +1197,9 @@ private fun PlaceOrderCommand.toEntryOrder(
     tradeGroupId: UUID,
     status: OrderStatus,
     recordedAt: Instant,
+    expiresAt: Instant? = null,
+    expirySource: me.matsumo.fukurou.trading.domain.OrderExpirySource? = null,
+    effectiveTtlSeconds: Long? = null,
 ): Order {
     return Order(
         orderId = orderId.toString(),
@@ -1169,6 +1219,9 @@ private fun PlaceOrderCommand.toEntryOrder(
         estimatedWinProbability = estimatedWinProbability.ratioScale().toPlainString(),
         reasonJa = reasonJa,
         clientRequestId = auditContext.clientRequestId,
+        expiresAt = expiresAt?.toString(),
+        expirySource = expirySource,
+        effectiveTtlSeconds = effectiveTtlSeconds,
         createdAt = recordedAt.toString(),
         updatedAt = recordedAt.toString(),
     )

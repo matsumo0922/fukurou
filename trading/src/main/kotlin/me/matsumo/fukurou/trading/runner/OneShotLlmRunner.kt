@@ -579,7 +579,11 @@ class OneShotLlmRunner(
             }
         }
 
-        val placeResult = placeApprovedEntry(proposerContext, intent)
+        val placeResult = placeApprovedEntry(
+            context = proposerContext,
+            intent = intent,
+            timeStopAt = decision.tradePlan?.draft?.timeStopAt,
+        )
         val placed = placeResult.getOrNull()
 
         if (placed == null) {
@@ -689,10 +693,11 @@ class OneShotLlmRunner(
     private suspend fun placeApprovedEntry(
         context: DecisionRunContext,
         intent: TradeIntentRecord,
+        timeStopAt: Instant?,
     ): Result<PaperTradeResult> {
         val arrivedAtPlaceOrder = clock.instant()
         val decisionToPlaceOrderDuration = Duration.between(intent.createdAt, arrivedAtPlaceOrder)
-        val previewResult = previewApprovedEntry(context, intent)
+        val previewResult = previewApprovedEntry(context, intent, timeStopAt)
         val preview = previewResult.preview
 
         if (preview == null) {
@@ -716,6 +721,7 @@ class OneShotLlmRunner(
         return executeApprovedEntry(
             context = context,
             intent = intent,
+            timeStopAt = timeStopAt,
             decisionToPlaceOrderDuration = decisionToPlaceOrderDuration,
             previewResult = previewResult,
         )
@@ -724,6 +730,7 @@ class OneShotLlmRunner(
     private suspend fun previewApprovedEntry(
         context: DecisionRunContext,
         intent: TradeIntentRecord,
+        timeStopAt: Instant?,
     ): EntryPreviewResult {
         val previewStartedAt = System.nanoTime()
         val previewCall = GuardedToolCall(
@@ -733,7 +740,11 @@ class OneShotLlmRunner(
             decisionRunContext = context,
             payload = runnerIntentPayload(intent),
         )
-        val previewCommand = intent.toPlaceOrderCommand(previewCall)
+        val previewCommand = intent.toPlaceOrderCommand(
+            call = previewCall,
+            timeStopAt = timeStopAt,
+            commandId = idGenerator(),
+        )
         val previewResult = tradingRuntime.toolCallGuard.runReadOnlyTool(previewCall) {
             tradingRuntime.broker.previewOrder(previewCommand).getOrThrow()
         }
@@ -748,6 +759,7 @@ class OneShotLlmRunner(
     private suspend fun executeApprovedEntry(
         context: DecisionRunContext,
         intent: TradeIntentRecord,
+        timeStopAt: Instant?,
         decisionToPlaceOrderDuration: Duration,
         previewResult: EntryPreviewResult,
     ): Result<PaperTradeResult> {
@@ -760,7 +772,11 @@ class OneShotLlmRunner(
             decisionRunContext = context,
             payload = runnerIntentPayload(intent),
         )
-        val command = intent.toPlaceOrderCommand(call)
+        val command = intent.toPlaceOrderCommand(
+            call = call,
+            timeStopAt = timeStopAt,
+            commandId = idGenerator(),
+        )
         val placeOrderHash = command.toPreviewOrderNormalizedContent().calculatePreviewHash()
         val hashMismatchWarning = if (preview.previewHash == placeOrderHash) {
             null
@@ -844,24 +860,6 @@ class OneShotLlmRunner(
         )
     }
 
-    private fun TradeIntentRecord.toPlaceOrderCommand(call: GuardedToolCall): PlaceOrderCommand {
-        return PlaceOrderCommand(
-            commandId = idGenerator(),
-            intentId = intentId,
-            symbol = draft.symbol,
-            side = draft.side,
-            orderType = draft.orderType,
-            sizeBtc = draft.sizeBtc,
-            priceJpy = draft.priceJpy,
-            tradeGroupId = null,
-            protectiveStopPriceJpy = draft.protectiveStopPriceJpy,
-            takeProfitPriceJpy = draft.takeProfitPriceJpy,
-            estimatedWinProbability = estimatedWinProbability,
-            reasonJa = "Falsifier APPROVED 後の runner deterministic paper entry。",
-            auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
-        )
-    }
-
     private suspend fun recordFalsificationNoTrade(
         context: DecisionRunContext,
         falsification: FalsificationRecord?,
@@ -898,6 +896,29 @@ class OneShotLlmRunner(
     private fun logHuman(message: String) {
         logger("[fukurou-runner] $message")
     }
+}
+
+private fun TradeIntentRecord.toPlaceOrderCommand(
+    call: GuardedToolCall,
+    timeStopAt: Instant?,
+    commandId: UUID,
+): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = commandId,
+        intentId = intentId,
+        symbol = draft.symbol,
+        side = draft.side,
+        orderType = draft.orderType,
+        sizeBtc = draft.sizeBtc,
+        priceJpy = draft.priceJpy,
+        tradeGroupId = null,
+        protectiveStopPriceJpy = draft.protectiveStopPriceJpy,
+        takeProfitPriceJpy = draft.takeProfitPriceJpy,
+        estimatedWinProbability = estimatedWinProbability,
+        timeStopAt = timeStopAt,
+        reasonJa = "Falsifier APPROVED 後の runner deterministic paper entry。",
+        auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
+    )
 }
 
 private suspend fun CommandEventLog.countLlmLaunchesSince(since: Instant, excludedInvocationId: String): Int {
