@@ -450,6 +450,7 @@ class OneShotLlmRunner(
             decision = null,
             intent = null,
             tradeResult = null,
+            terminalCause = terminalCauseForNoTrade(cause),
         )
     }
 
@@ -478,6 +479,7 @@ class OneShotLlmRunner(
                 decision = null,
                 intent = null,
                 tradeResult = null,
+                terminalCause = terminalCauseForNoTrade(proposerResult.failure),
             )
         }
 
@@ -553,6 +555,7 @@ class OneShotLlmRunner(
         )
     }
 
+    @Suppress("LongMethod")
     private suspend fun runApprovedEntryFlow(
         input: OneShotAfterPreflightRequest,
         decision: DecisionSubmissionResult,
@@ -579,7 +582,13 @@ class OneShotLlmRunner(
                 cause = falsifierResult.failure,
             ).getOrThrow()
 
-            return entryFlowResult(invocationId, decision, intent, OneShotRunnerStatus.NO_TRADE_AUDITED)
+            return entryFlowResult(
+                invocationId = invocationId,
+                decision = decision,
+                intent = intent,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                terminalCause = terminalCauseForNoTrade(falsifierResult.failure),
+            )
         }
 
         input.failureContextUpdated(proposerContext)
@@ -603,7 +612,13 @@ class OneShotLlmRunner(
                 cause = placeResult.exceptionOrNull(),
             ).getOrThrow()
 
-            return entryFlowResult(invocationId, decision, intent, OneShotRunnerStatus.NO_TRADE_AUDITED)
+            return entryFlowResult(
+                invocationId = invocationId,
+                decision = decision,
+                intent = intent,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                terminalCause = terminalCauseForNoTrade(placeResult.exceptionOrNull()),
+            )
         }
 
         val finalStatus = if (placed.accepted) {
@@ -621,6 +636,7 @@ class OneShotLlmRunner(
         intent: TradeIntentRecord,
         status: OneShotRunnerStatus,
         tradeResult: PaperTradeResult? = null,
+        terminalCause: LlmRunTerminalCause? = null,
     ): OneShotRunnerResult {
         return OneShotRunnerResult(
             invocationId = invocationId,
@@ -628,7 +644,7 @@ class OneShotLlmRunner(
             decision = decision,
             intent = intent,
             tradeResult = tradeResult,
-            terminalCause = classifyOneShotTerminalCause(status, tradeResult),
+            terminalCause = terminalCause ?: classifyOneShotTerminalCause(status, tradeResult),
         )
     }
 
@@ -1699,6 +1715,15 @@ private fun classifyOneShotTerminalCause(
         OneShotRunnerStatus.LAUNCH_REJECTED,
         -> LlmRunTerminalCause.NO_TRADE
         else -> LlmRunTerminalCause.NORMAL_COMPLETION
+    }
+}
+
+private fun terminalCauseForNoTrade(cause: Throwable?): LlmRunTerminalCause {
+    return when (cause) {
+        null -> LlmRunTerminalCause.NO_TRADE
+        is LlmInvocationTimedOutException -> LlmRunTerminalCause.TIMED_OUT
+        is CancellationException -> LlmRunTerminalCause.CALLER_CANCELLED
+        else -> LlmRunTerminalCause.RUNNER_FAILED
     }
 }
 
