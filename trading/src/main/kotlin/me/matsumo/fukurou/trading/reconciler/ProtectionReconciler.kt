@@ -226,12 +226,20 @@ class ProtectionReconciler(
     }
 
     private suspend fun recordMarketDataGap(sessionId: UUID, throwable: Throwable?) {
+        val reason = throwable.toGapReason()
+        val detectedAt = Instant.now(clock)
+        marketDataIntegrityRepository.markDisconnected(
+            sessionId = sessionId,
+            reason = reason,
+            detectedAt = detectedAt,
+            detail = throwable?.javaClass?.simpleName,
+        ).getOrThrow()
+
         tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
-            marketDataIntegrityRepository.recordGap(
+            marketDataIntegrityRepository.applyGapImpact(
                 sessionId = sessionId,
-                reason = throwable.toGapReason(),
-                detectedAt = Instant.now(clock),
-                detail = throwable?.javaClass?.simpleName,
+                reason = reason,
+                detectedAt = detectedAt,
             ).getOrThrow()
         }
     }

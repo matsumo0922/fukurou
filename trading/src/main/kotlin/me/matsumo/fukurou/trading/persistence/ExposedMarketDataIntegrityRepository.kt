@@ -64,6 +64,37 @@ class ExposedMarketDataIntegrityRepository(
         }
     }
 
+    override suspend fun markDisconnected(
+        sessionId: UUID,
+        reason: MarketDataGapReason,
+        detectedAt: Instant,
+        detail: String?,
+    ): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    markMarketDataGap(sessionId, reason, detectedAt, detail)
+                    Unit
+                }
+            }
+        }
+    }
+
+    override suspend fun applyGapImpact(
+        sessionId: UUID,
+        reason: MarketDataGapReason,
+        detectedAt: Instant,
+    ): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    val gapId = requireNotNull(selectGapId(sessionId)) { "market-data gap was not found." }
+                    applyGapImpact(gapId, reason, detectedAt)
+                }
+            }
+        }
+    }
+
     override suspend fun recoverStaleSession(recoveredAt: Instant): Result<Unit> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -151,12 +182,17 @@ private fun JdbcTransaction.applyMarketDataGap(
     detectedAt: Instant,
     detail: String?,
 ) {
-    val existingGapId = selectGapId(sessionId)
+    val gapId = markMarketDataGap(sessionId, reason, detectedAt, detail)
+    applyGapImpact(gapId, reason, detectedAt)
+}
 
-    if (existingGapId != null) {
-        applyGapImpact(existingGapId, reason, detectedAt)
-        return
-    }
+private fun JdbcTransaction.markMarketDataGap(
+    sessionId: UUID,
+    reason: MarketDataGapReason,
+    detectedAt: Instant,
+    detail: String?,
+): UUID {
+    selectGapId(sessionId)?.let { gapId -> return gapId }
 
     val sessionUpdated = prepare(
         """
@@ -186,7 +222,7 @@ private fun JdbcTransaction.applyMarketDataGap(
         statement.setLong(5, detectedAt.toEpochMilli())
         statement.executeUpdate()
     }
-    applyGapImpact(gapId, reason, detectedAt)
+    return gapId
 }
 
 private fun JdbcTransaction.selectGapId(sessionId: UUID): UUID? {
