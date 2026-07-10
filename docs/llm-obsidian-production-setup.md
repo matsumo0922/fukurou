@@ -150,16 +150,10 @@ LLM daemon を有効化する前に、少なくとも次を満たすこと。
 - `codex login status` と `codex exec ...` の smoke test が成功している。
 - `FUKUROU_MCP_JAR_PATH=/app/fukurou-mcp-all.jar` が running container に反映されている。
 - `FUKUROU_TRADING_MODE=PAPER` のままになっている。
-- `FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR` / `FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY` が意図した上限になっている。
+- WebUI `/app/config` で `runner.maxInvocationsPerHour` / `runner.maxInvocationsPerDay` が意図した上限になっている。
 - Codex の model / cost 方針を確認している。
 
-有効化する。
-
-```dotenv
-FUKUROU_LLM_DAEMON_ENABLED=true
-```
-
-その後 deploy し、revision と container log を確認する。
+WebUI `/app/config` で `daemon.enabled=true` の Runtime draft を validate / activate し、Ktor process を再起動する。その後、revision と container log を確認する。
 
 ```sh
 scripts/prod-curl "/revision" -fsS

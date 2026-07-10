@@ -27,6 +27,16 @@ class RuntimeConfigEnvironmentRoundTripTest {
     }
 
     @Test
+    fun emptyEnvironment_usesEveryCodeOwnedRuntimeDefault() {
+        val defaultEnvironment = RuntimeConfigCatalog.runtimeEnvironment(TradingBotConfig())
+        val emptyEnvironmentConfig = TradingBotConfig.fromEnvironment(emptyMap())
+
+        assertEquals(RuntimeConfigCatalog.runtimeLegacyEnvNames(), defaultEnvironment.keys)
+        assertEquals(TradingBotConfig(), emptyEnvironmentConfig)
+        assertEquals(defaultEnvironment, RuntimeConfigCatalog.runtimeEnvironment(emptyEnvironmentConfig))
+    }
+
+    @Test
     fun runtimeEnvironment_roundTripsNonDefaultConfig() {
         val environment = assertRuntimeEnvironmentRoundTrips(nonDefaultRuntimeConfig())
 

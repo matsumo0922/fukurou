@@ -2,6 +2,8 @@
 
 Issue #19「計測: LLM token・コストと CLI auth 運用を検証する」の実施メモ。
 
+> この文書は Issue #19 実施時点の計測記録であり、現在の設定名・既定値・運用仕様の正本ではない。現在仕様は `docs/mcp-runtime.md` を参照する。
+
 このメモは実装ではなく計測結果である。product code と test code は変更していない。CLI stdout/stderr の token 情報を失わないため、計測時だけ `/tmp` の wrapper を `FUKUROU_CLAUDE_COMMAND_TEMPLATE` / `FUKUROU_CODEX_COMMAND_TEMPLATE` に指定した。prompt、model、runner の Kotlin 実装、MCP tool allowlist は変更していない。
 
 ## 0. 再計測追記: 実運用想定 model
