@@ -4515,7 +4515,7 @@ class PostgresPersistenceIntegrationTest {
         val integrityRepository = ExposedMarketDataIntegrityRepository(database)
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000163")
         integrityRepository.beginSession(sessionId, fixedInstant()).getOrThrow()
-        val ledgerRepository = ExposedPaperLedgerRepository(database)
+        val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val marketDataSource = MutablePostgresOrderbookMarketDataSource(
             Orderbook(
@@ -4589,7 +4589,7 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000164")
         ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
-        val ledgerRepository = ExposedPaperLedgerRepository(database)
+        val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
             ledgerRepository = ledgerRepository,

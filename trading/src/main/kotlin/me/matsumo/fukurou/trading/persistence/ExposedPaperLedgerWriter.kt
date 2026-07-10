@@ -542,7 +542,7 @@ private fun JdbcTransaction.applyEventToRestingEntries(
     progress: ReconcileProgress,
     clock: Clock,
 ) {
-    selectMarketEligibleEntryOrders(event).forEach { marketOrder ->
+    selectMarketEligibleEntryOrders(event, clock.instant()).forEach { marketOrder ->
         val order = marketOrder.order
         val shouldTrigger = when (order.orderType) {
             OrderType.LIMIT -> consumeLimitQueue(event, marketOrder)
@@ -588,7 +588,10 @@ private fun JdbcTransaction.applyEventToRestingEntries(
     }
 }
 
-private fun JdbcTransaction.selectMarketEligibleEntryOrders(event: PaperMarketTradeEvent): List<MarketEligibleOrder> {
+private fun JdbcTransaction.selectMarketEligibleEntryOrders(
+    event: PaperMarketTradeEvent,
+    processedAt: Instant,
+): List<MarketEligibleOrder> {
     return prepare(
         """
             SELECT id, queue_ahead_btc, queue_consumed_btc
@@ -606,7 +609,7 @@ private fun JdbcTransaction.selectMarketEligibleEntryOrders(event: PaperMarketTr
         statement.setObject(1, event.connectionSessionId)
         statement.setLong(2, event.sequence)
         statement.setLong(3, event.receivedAt.toEpochMilli())
-        statement.setLong(4, event.receivedAt.toEpochMilli())
+        statement.setLong(4, processedAt.toEpochMilli())
         statement.executeQuery().use { resultSet ->
             buildList {
                 val ordersById = selectOpenOrders().associateBy(Order::orderId)
