@@ -756,7 +756,7 @@ private fun Order.isRestingEntryOrder(): Boolean {
 }
 
 private fun Order.isExpiredRestingEntryOrder(observedAt: Instant, ttl: Duration): Boolean {
-    if (!isRestingEntryOrder()) {
+    if (!isRestingEntryOrder() || expiresAt != null) {
         return false
     }
 
@@ -766,5 +766,5 @@ private fun Order.isExpiredRestingEntryOrder(observedAt: Instant, ttl: Duration)
         }
     val expiresAt = createdInstant.plus(ttl)
 
-    return expiresAt.isBefore(observedAt)
+    return !observedAt.isBefore(expiresAt)
 }

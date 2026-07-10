@@ -4,6 +4,7 @@ import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.SymbolRules
@@ -282,11 +283,19 @@ data class MarketEntryFillRequest(
  * @param command place_order command
  * @param orderId 作成する order ID
  * @param tradeGroupId entry order を束ねる trade group ID
+ * @param createdAt order 作成時刻
+ * @param expiresAt 作成時に固定した実効期限
+ * @param expirySource 実効期限を決めた入力
+ * @param effectiveTtlSeconds 作成時刻から実効期限までの秒数
  */
 data class RestingEntryOrderRequest(
     val command: PlaceOrderCommand,
     val orderId: UUID,
     val tradeGroupId: UUID,
+    val createdAt: Instant,
+    val expiresAt: Instant,
+    val expirySource: OrderExpirySource,
+    val effectiveTtlSeconds: Long,
 )
 
 /**

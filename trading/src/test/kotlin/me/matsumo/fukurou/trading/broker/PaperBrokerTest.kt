@@ -16,6 +16,7 @@ import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
@@ -344,6 +345,70 @@ class PaperBrokerTest {
 
         assertEquals(OrderStatus.OPEN, result.status)
         assertEquals(1, broker.getOpenOrders().getOrThrow().size)
+        assertEquals(0, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun restingEntryPersistsEarlierLlmTimeStopWithoutFollowingLaterConfigChanges() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val marketDataSource = MutableOrderbookMarketDataSource(orderbook = orderbookWithAsk("10000000"))
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(60),
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+        )
+        val command = restingLimitCommand().copy(timeStopAt = fixedInstant().plusSeconds(30))
+
+        broker.placeOrder(approvedCommand(decisionRepository, command)).getOrThrow()
+        val original = broker.getOpenOrders().getOrThrow().single()
+        PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(10),
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+        )
+        val unchanged = broker.getOpenOrders().getOrThrow().single()
+
+        assertEquals(fixedInstant().plusSeconds(30).toString(), original.expiresAt)
+        assertEquals(OrderExpirySource.LLM_TIME_STOP, original.expirySource)
+        assertEquals(30, original.effectiveTtlSeconds)
+        assertEquals(original.expiresAt, unchanged.expiresAt)
+    }
+
+    @Test
+    fun reconcileExpiresAtBoundaryBeforePotentialFillAndRemainsTerminalAfterward() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val marketDataSource = MutableOrderbookMarketDataSource(orderbook = orderbookWithAsk("10000000"))
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(60),
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand())).getOrThrow()
+        val openOrder = broker.getOpenOrders().getOrThrow().single()
+        val tradeGroupId = UUID.fromString(requireNotNull(openOrder.tradeGroupId))
+
+        broker.reconcile(watermarkTickSnapshot("10000000").copy(observedAt = fixedInstant().plusSeconds(59))).getOrThrow()
+        assertEquals(OrderStatus.OPEN, broker.getOpenOrders().getOrThrow().single().status)
+
+        marketDataSource.orderbook = orderbookWithAsk("9800000")
+        broker.reconcile(watermarkTickSnapshot("9800000").copy(observedAt = fixedInstant().plusSeconds(60))).getOrThrow()
+        broker.reconcile(watermarkTickSnapshot("9800000").copy(observedAt = fixedInstant().plusSeconds(61))).getOrThrow()
+        val expiredOrder = repository.findOrdersByTradeGroupId(tradeGroupId).getOrThrow().single()
+
+        assertEquals(OrderStatus.CANCELED, expiredOrder.status)
+        assertEquals(fixedInstant().plusSeconds(60).toString(), expiredOrder.expiredAt)
+        assertEquals("resting_entry_order_ttl_expired", expiredOrder.cancelReason)
         assertEquals(0, repository.getExecutions().getOrThrow().size)
     }
 

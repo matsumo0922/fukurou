@@ -113,6 +113,16 @@ enum class OrderStatus {
     REJECTED,
 }
 
+/** resting entry order の実効期限を決めた入力。 */
+@Serializable
+enum class OrderExpirySource {
+    /** system の resting entry order TTL。 */
+    SYSTEM_TTL,
+
+    /** LLM TradePlan の timeStopAt。 */
+    LLM_TIME_STOP,
+}
+
 /**
  * 約定時の流動性区分。
  */
@@ -229,6 +239,12 @@ data class Position(
  * @param estimatedWinProbability entry intent で LLM が申告した推定勝率
  * @param reasonJa LLM / system の判断理由
  * @param clientRequestId 呼び出し元が渡した冪等化・追跡用 ID
+ * @param expiresAt resting entry order の作成時に固定した実効期限
+ * @param expirySource 実効期限を決めた入力
+ * @param effectiveTtlSeconds 作成時刻から実効期限までの秒数
+ * @param expiredAt lifecycle が期限到達を確定した時刻
+ * @param canceledAt 取消を確定した時刻
+ * @param cancelReason 取消理由 code
  * @param createdAt 作成時刻
  * @param updatedAt 更新時刻
  */
@@ -251,6 +267,12 @@ data class Order(
     val estimatedWinProbability: String? = null,
     val reasonJa: String?,
     val clientRequestId: String?,
+    val expiresAt: String? = null,
+    val expirySource: OrderExpirySource? = null,
+    val effectiveTtlSeconds: Long? = null,
+    val expiredAt: String? = null,
+    val canceledAt: String? = null,
+    val cancelReason: String? = null,
     val createdAt: String,
     val updatedAt: String,
 )

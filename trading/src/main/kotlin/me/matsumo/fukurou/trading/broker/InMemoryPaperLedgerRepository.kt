@@ -452,13 +452,15 @@ private class InMemoryPaperLedgerMutationWriter(
     override suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
         return runCatching {
             state.write {
-                val recordedAt = Instant.now(clock)
                 val order = request.command.toEntryOrder(
                     orderId = request.orderId,
                     positionId = null,
                     tradeGroupId = request.tradeGroupId,
                     status = OrderStatus.OPEN,
-                    recordedAt = recordedAt,
+                    recordedAt = request.createdAt,
+                    expiresAt = request.expiresAt,
+                    expirySource = request.expirySource,
+                    effectiveTtlSeconds = request.effectiveTtlSeconds,
                 )
 
                 orders += order
@@ -554,9 +556,13 @@ private class InMemoryPaperLedgerMutationWriter(
                     "order is not cancelable."
                 }
 
+                val canceledAt = Instant.now(clock)
                 orders[orderIndex] = order.copy(
                     status = OrderStatus.CANCELED,
                     reasonJa = command.reasonJa,
+                    canceledAt = canceledAt.toString(),
+                    cancelReason = command.reasonJa,
+                    updatedAt = canceledAt.toString(),
                 )
 
                 PaperTradeResult(
@@ -592,6 +598,8 @@ private class InMemoryPaperLedgerMutationWriter(
                     updatedAt = tickSnapshot.observedAt,
                 )
 
+                expireRestingEntryOrdersLocked(tickSnapshot.observedAt, progress)
+
                 if (!accountSnapshot.isHardHaltDrawdownReached()) {
                     fillTriggeredEntryOrdersLocked(reconcileContext, progress)
                     triggerPositionProtectionsLocked(reconcileContext, progress)
@@ -599,6 +607,31 @@ private class InMemoryPaperLedgerMutationWriter(
 
                 progress.toPaperReconcileResult()
             }
+        }
+    }
+
+    private fun InMemoryPaperLedgerState.expireRestingEntryOrdersLocked(
+        observedAt: Instant,
+        progress: ReconcileProgress,
+    ) {
+        orders.indices.forEach { index ->
+            val order = orders[index]
+            val expiresAt = order.expiresAt?.let(Instant::parse) ?: return@forEach
+            val isRestingEntry = order.status == OrderStatus.OPEN &&
+                order.side == OrderSide.BUY &&
+                (order.orderType == OrderType.LIMIT || order.orderType == OrderType.STOP)
+
+            if (!isRestingEntry || observedAt.isBefore(expiresAt)) return@forEach
+
+            orders[index] = order.copy(
+                status = OrderStatus.CANCELED,
+                reasonJa = "resting entry order expired",
+                expiredAt = observedAt.toString(),
+                canceledAt = observedAt.toString(),
+                cancelReason = "resting_entry_order_ttl_expired",
+                updatedAt = observedAt.toString(),
+            )
+            progress.triggeredOrderIds += order.orderId
         }
     }
 
@@ -996,6 +1029,8 @@ private class InMemoryPaperLedgerMutationWriter(
             order.copy(
                 status = OrderStatus.CANCELED,
                 reasonJa = reasonJa,
+                canceledAt = Instant.now(clock).toString(),
+                cancelReason = reasonJa,
             )
         }
     }
@@ -1008,9 +1043,12 @@ private class InMemoryPaperLedgerMutationWriter(
         val orderIndex = orders.indexOfFirst { order -> order.orderId == orderId }
 
         if (orderIndex >= 0) {
+            val canceledAt = if (status == OrderStatus.CANCELED) Instant.now(clock).toString() else null
             orders[orderIndex] = orders[orderIndex].copy(
                 status = status,
                 reasonJa = reasonJa ?: orders[orderIndex].reasonJa,
+                canceledAt = canceledAt ?: orders[orderIndex].canceledAt,
+                cancelReason = if (status == OrderStatus.CANCELED) reasonJa else orders[orderIndex].cancelReason,
             )
         }
     }
@@ -1150,6 +1188,9 @@ private fun PlaceOrderCommand.toEntryOrder(
     tradeGroupId: UUID,
     status: OrderStatus,
     recordedAt: Instant,
+    expiresAt: Instant? = null,
+    expirySource: me.matsumo.fukurou.trading.domain.OrderExpirySource? = null,
+    effectiveTtlSeconds: Long? = null,
 ): Order {
     return Order(
         orderId = orderId.toString(),
@@ -1169,6 +1210,9 @@ private fun PlaceOrderCommand.toEntryOrder(
         estimatedWinProbability = estimatedWinProbability.ratioScale().toPlainString(),
         reasonJa = reasonJa,
         clientRequestId = auditContext.clientRequestId,
+        expiresAt = expiresAt?.toString(),
+        expirySource = expirySource,
+        effectiveTtlSeconds = effectiveTtlSeconds,
         createdAt = recordedAt.toString(),
         updatedAt = recordedAt.toString(),
     )

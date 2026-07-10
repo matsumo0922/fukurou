@@ -189,6 +189,7 @@ private fun ProtectionReconcilerWorkerInputs.createBroker(
         riskStateRepository = repositories.riskStateRepository,
         riskStateCommandService = repositories.riskStateCommandService,
         safetyViolationRepository = repositories.safetyViolationRepository,
+        restingEntryOrderTtl = tradingConfig.decisionProtocol.restingEntryOrderTtl,
         safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
         marketDataSource = marketDataSource,
         fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),

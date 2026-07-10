@@ -26,6 +26,7 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.OrderbookLevel
@@ -454,6 +455,43 @@ class ProtectionReconcilerTest {
         assertTrue(payload.contains(""""paperExecutionDivergenceMemos""""))
         assertTrue(payload.contains(""""hypotheticalRemainingSizeBtc":"0.003000000000""""))
         assertTrue(payload.contains(""""orderId""""))
+    }
+
+    @Test
+    fun residentReconcilerExpiresRestingEntryWithoutLlmRunnerAndBeforeFill() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val marketDataSource = MutableReconcilerOrderbookMarketDataSource(
+            orderbook = reconcilerOrderbookWithAsk("10010000"),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(30),
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(
+            approvedReconcilerEntryCommand(decisionRepository, restingReconcilerEntryCommand()),
+        ).getOrThrow()
+        val openOrder = broker.getOpenOrders().getOrThrow().single()
+        val tradeGroupId = UUID.fromString(requireNotNull(openOrder.tradeGroupId))
+        marketDataSource.orderbook = reconcilerOrderbookWithAsk("9990000")
+        val expiryTick = limitReachTickSnapshot().copy(observedAt = fixedInstant().plusSeconds(30))
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(expiryTick)),
+        )
+
+        reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
+        val expiredOrder = repository.findOrdersByTradeGroupId(tradeGroupId).getOrThrow().single()
+
+        assertEquals(OrderStatus.CANCELED, expiredOrder.status)
+        assertEquals("resting_entry_order_ttl_expired", expiredOrder.cancelReason)
+        assertTrue(repository.getExecutions().getOrThrow().isEmpty())
     }
 
     @Test

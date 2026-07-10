@@ -110,8 +110,12 @@ internal class ExposedPaperLedgerWriter(
                             command = request.command,
                             orderId = request.orderId,
                             positionId = null,
-                            tradeGroupId = request.tradeGroupId,
-                            status = OrderStatus.OPEN,
+                        tradeGroupId = request.tradeGroupId,
+                        status = OrderStatus.OPEN,
+                        createdAt = request.createdAt,
+                        expiresAt = request.expiresAt,
+                        expirySource = request.expirySource,
+                        effectiveTtlSeconds = request.effectiveTtlSeconds,
                         ),
                         clock,
                     )
@@ -177,6 +181,10 @@ internal class ExposedPaperLedgerWriter(
                             positionId = null,
                             tradeGroupId = request.order.tradeGroupId,
                             status = OrderStatus.OPEN,
+                            createdAt = request.order.createdAt,
+                            expiresAt = request.order.expiresAt,
+                            expirySource = request.order.expirySource,
+                            effectiveTtlSeconds = request.order.effectiveTtlSeconds,
                         ),
                         clock,
                     )
@@ -353,6 +361,8 @@ internal class ExposedPaperLedgerWriter(
                         clock = clock,
                     )
 
+                    expireRestingEntryOrders(tickSnapshot.observedAt, progress)
+
                     if (!paperAccountHardHaltReached()) {
                         fillTriggeredEntryOrders(reconcileContext, progress, clock)
                         triggerPositionProtections(reconcileContext, progress, clock)
@@ -364,6 +374,42 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 }
+
+private fun JdbcTransaction.expireRestingEntryOrders(observedAt: Instant, progress: ReconcileProgress) {
+    selectOpenOrders()
+        .asSequence()
+        .filter { order -> order.side == OrderSide.BUY }
+        .filter { order -> order.orderType == OrderType.LIMIT || order.orderType == OrderType.STOP }
+        .filter { order -> order.expiresAt?.let(Instant::parse)?.let { expiresAt -> !observedAt.isBefore(expiresAt) } == true }
+        .forEach { order ->
+            prepare(
+                """
+                    UPDATE orders
+                    SET status = ?,
+                        expired_at = ?,
+                        canceled_at = ?,
+                        cancel_reason = ?,
+                        reason_ja = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                        AND status = ?
+                """,
+            ).use { statement ->
+                statement.setString(1, OrderStatus.CANCELED.name)
+                statement.setLong(2, observedAt.toEpochMilli())
+                statement.setLong(3, observedAt.toEpochMilli())
+                statement.setString(4, RESTING_ENTRY_TTL_CANCEL_REASON)
+                statement.setString(5, "resting entry order expired")
+                statement.setLong(6, observedAt.toEpochMilli())
+                statement.setObject(7, UUID.fromString(order.orderId))
+                statement.setString(8, OrderStatus.OPEN.name)
+
+                if (statement.executeUpdate() == 1) progress.triggeredOrderIds += order.orderId
+            }
+        }
+}
+
+private const val RESTING_ENTRY_TTL_CANCEL_REASON = "resting_entry_order_ttl_expired"
 
 private fun JdbcTransaction.insertEntryFill(request: EntryFillWriteRequest, clock: Clock): PaperTradeResult {
     val command = request.entry.command
@@ -725,9 +771,10 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
                 size_btc, limit_price_jpy, trigger_price_jpy, protective_stop_price_jpy,
                 take_profit_price_jpy, estimated_win_probability, reason_ja,
                 decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
-                system_prompt_version, market_snapshot_id, created_at, updated_at
+                system_prompt_version, market_snapshot_id, expires_at, expiry_source,
+                effective_ttl_seconds, expired_at, canceled_at, cancel_reason, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         val command = request.command
@@ -749,8 +796,15 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
         statement.setBigDecimal(15, command.estimatedWinProbability.ratioScale())
         statement.setString(16, command.reasonJa)
         statement.bindAudit(17, command.auditContext)
-        statement.setLong(24, nowMillis(clock))
-        statement.setLong(25, nowMillis(clock))
+        statement.setNullableLong(24, request.expiresAt?.toEpochMilli())
+        statement.setString(25, request.expirySource?.name)
+        statement.setNullableLong(26, request.effectiveTtlSeconds)
+        statement.setObject(27, null)
+        statement.setObject(28, null)
+        statement.setString(29, null)
+        val createdAt = request.createdAt?.toEpochMilli() ?: nowMillis(clock)
+        statement.setLong(30, createdAt)
+        statement.setLong(31, createdAt)
         statement.executeUpdate()
     }
 }
@@ -1149,14 +1203,22 @@ private fun JdbcTransaction.updateOrderStatus(
             UPDATE orders
             SET status = ?,
                 reason_ja = ?,
+                canceled_at = CASE WHEN ? = ? THEN ? ELSE canceled_at END,
+                cancel_reason = CASE WHEN ? = ? THEN ? ELSE cancel_reason END,
                 updated_at = ?
             WHERE id = ?
         """,
     ).use { statement ->
         statement.setString(1, status.name)
         statement.setString(2, reasonJa)
-        statement.setLong(3, nowMillis(clock))
-        statement.setObject(4, UUID.fromString(orderId))
+        statement.setString(3, status.name)
+        statement.setString(4, OrderStatus.CANCELED.name)
+        statement.setLong(5, nowMillis(clock))
+        statement.setString(6, status.name)
+        statement.setString(7, OrderStatus.CANCELED.name)
+        statement.setString(8, reasonJa)
+        statement.setLong(9, nowMillis(clock))
+        statement.setObject(10, UUID.fromString(orderId))
         statement.executeUpdate()
     }
 }
@@ -1206,6 +1268,8 @@ private fun JdbcTransaction.cancelOpenStopOrders(
             UPDATE orders
             SET status = ?,
                 reason_ja = ?,
+                canceled_at = ?,
+                cancel_reason = ?,
                 updated_at = ?
             WHERE position_id = ?
                 AND side = ?
@@ -1216,7 +1280,9 @@ private fun JdbcTransaction.cancelOpenStopOrders(
         statement.setString(1, OrderStatus.CANCELED.name)
         statement.setString(2, reasonJa)
         statement.setLong(3, nowMillis(clock))
-        statement.bindOpenStopOrderFilter(startIndex = 4, positionId = positionId)
+        statement.setString(4, reasonJa)
+        statement.setLong(5, nowMillis(clock))
+        statement.bindOpenStopOrderFilter(startIndex = 6, positionId = positionId)
         statement.executeUpdate()
     }
 }
@@ -1432,6 +1498,10 @@ private data class EntryOrderInsertRequest(
     val positionId: UUID?,
     val tradeGroupId: UUID,
     val status: OrderStatus,
+    val createdAt: Instant? = null,
+    val expiresAt: Instant? = null,
+    val expirySource: me.matsumo.fukurou.trading.domain.OrderExpirySource? = null,
+    val effectiveTtlSeconds: Long? = null,
 )
 
 /**

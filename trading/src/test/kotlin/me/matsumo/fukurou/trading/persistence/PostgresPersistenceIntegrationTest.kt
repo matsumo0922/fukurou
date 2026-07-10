@@ -9,6 +9,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
+import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
@@ -43,6 +44,7 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
@@ -1281,7 +1283,7 @@ class PostgresPersistenceIntegrationTest {
         val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
         val detail = requireNotNull(repository.findRun("run-1").getOrThrow())
 
-        assertEquals(DecisionRunOutcome.DENIED, summary.outcome)
+        assertEquals(DecisionRunOutcome.NO_ENTRY, summary.outcome)
         assertEquals("APPROVED", summary.falsificationVerdict)
         assertEquals("EXPECTED_VALUE_GATE", detail.safetyViolation?.rule)
         assertEquals("0.03357778", detail.safetyViolation?.measuredValue)
@@ -1387,12 +1389,12 @@ class PostgresPersistenceIntegrationTest {
         val executed = repository.listRuns(
             cursor = null,
             limit = 10,
-            outcome = DecisionRunOutcome.EXECUTED,
+            filter = DecisionRunFilter.FILLED,
         ).getOrThrow().runs
         val failed = repository.listRuns(
             cursor = null,
             limit = 10,
-            outcome = DecisionRunOutcome.FAILED,
+            filter = DecisionRunFilter.ACTION_REQUIRED,
         ).getOrThrow().runs
 
         assertEquals(listOf("filled-run"), executed.map { summary -> summary.invocationId })
@@ -1446,7 +1448,7 @@ class PostgresPersistenceIntegrationTest {
         val summary = page.runs.single()
         val detail = requireNotNull(repository.findRun(start.invocationId).getOrThrow())
 
-        assertEquals(DecisionRunOutcome.NO_TRADE, summary.outcome)
+        assertEquals(DecisionRunOutcome.NO_ENTRY, summary.outcome)
         assertNull(summary.finalReason)
         assertNull(detail.summary.finalReason)
     }
@@ -1460,18 +1462,36 @@ class PostgresPersistenceIntegrationTest {
             maxSequence = scanCap,
             runningSequence = scanCap,
         )
+        exposedTransaction(database) {
+            val positionId = UUID.randomUUID()
+            val tradeGroupId = UUID.randomUUID()
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = UUID.randomUUID(),
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.OPEN,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "waiting scan fixture",
+                decisionRunId = "scan-run-${scanCap.toString().padStart(6, '0')}",
+            )
+        }
 
         val repository = ExposedDecisionRunProjectionRepository(database)
         val firstPage = repository.listRuns(
             cursor = null,
             limit = 10,
-            outcome = DecisionRunOutcome.RUNNING,
+            filter = DecisionRunFilter.WAITING,
         ).getOrThrow()
         val continuation = requireNotNull(firstPage.scanContinuation)
         val secondPage = repository.listRuns(
             cursor = continuation,
             limit = 10,
-            outcome = DecisionRunOutcome.RUNNING,
+            filter = DecisionRunFilter.WAITING,
         ).getOrThrow()
 
         assertTrue(firstPage.runs.isEmpty())
@@ -3158,7 +3178,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun paper_execution_persists_estimated_win_probability_for_resting_entry() = runPostgresTest {
+    fun paper_execution_persists_and_expires_resting_entry_metadataAtomically() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedPaperLedgerRepository(database)
@@ -3167,6 +3187,7 @@ class PostgresPersistenceIntegrationTest {
             ledgerRepository = repository,
             riskStateRepository = ExposedRiskStateRepository(database),
             decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(60),
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
@@ -3183,8 +3204,29 @@ class PostgresPersistenceIntegrationTest {
         broker.placeOrder(command).getOrThrow()
 
         val openOrder = repository.getOpenOrders().getOrThrow().single()
+        val tradeGroupId = UUID.fromString(requireNotNull(openOrder.tradeGroupId))
 
         assertEquals("0.7300000000", openOrder.estimatedWinProbability)
+        assertEquals(fixedInstant().plusSeconds(60).toString(), openOrder.expiresAt)
+        assertEquals(OrderExpirySource.SYSTEM_TTL, openOrder.expirySource)
+        assertEquals(60, openOrder.effectiveTtlSeconds)
+
+        repository.reconcile(
+            tickSnapshot = stopTickSnapshot().copy(
+                observedAt = fixedInstant().plusSeconds(60),
+                lastPrice = "9800000",
+                bidPrice = "9790000",
+                askPrice = "9800000",
+            ),
+            simulator = FillSimulator(),
+        ).getOrThrow()
+        val expiredOrder = repository.findOrdersByTradeGroupId(tradeGroupId).getOrThrow().single()
+
+        assertEquals(OrderStatus.CANCELED, expiredOrder.status)
+        assertEquals(fixedInstant().plusSeconds(60).toString(), expiredOrder.expiredAt)
+        assertEquals(fixedInstant().plusSeconds(60).toString(), expiredOrder.canceledAt)
+        assertEquals("resting_entry_order_ttl_expired", expiredOrder.cancelReason)
+        assertTrue(repository.getExecutions().getOrThrow().isEmpty())
     }
 
     @Test

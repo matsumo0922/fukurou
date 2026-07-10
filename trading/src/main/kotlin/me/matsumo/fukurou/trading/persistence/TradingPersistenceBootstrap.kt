@@ -559,6 +559,12 @@ private const val VERIFY_ORDERS_SCHEMA_SQL = """
         prompt_hash,
         system_prompt_version,
         market_snapshot_id,
+        expires_at,
+        expiry_source,
+        effective_ttl_seconds,
+        expired_at,
+        canceled_at,
+        cancel_reason,
         created_at,
         updated_at
     FROM orders

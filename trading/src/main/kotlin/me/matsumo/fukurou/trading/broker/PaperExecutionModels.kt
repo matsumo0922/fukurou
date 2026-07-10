@@ -64,6 +64,7 @@ data class PaperTradeAuditContext(
  * @param protectiveStopPriceJpy entry 後に必ず置く保護 STOP 価格
  * @param takeProfitPriceJpy virtual TP 価格
  * @param estimatedWinProbability LLM が申告した推定勝率。EV は SafetyFloor がこの値から計算する
+ * @param timeStopAt LLM TradePlan が指定した entry の期限
  * @param reasonJa 判断理由
  * @param auditContext audit context
  */
@@ -79,6 +80,7 @@ data class PlaceOrderCommand(
     val protectiveStopPriceJpy: BigDecimal,
     val takeProfitPriceJpy: BigDecimal?,
     val estimatedWinProbability: BigDecimal,
+    val timeStopAt: Instant? = null,
     val reasonJa: String,
     val auditContext: PaperTradeAuditContext,
 )
