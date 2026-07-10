@@ -158,9 +158,11 @@ class ReflectionReportBuilder(
         appendLine("profit_factor: ${stats.tradeStats.profitFactor.yamlNumberOrNull()}")
         appendLine("win_rate: ${stats.tradeStats.winRate.yamlNumberOrNull()}")
         appendLine("expected_r: ${stats.tradeStats.expectedR.yamlNumberOrNull()}")
-        appendLine("llm_cost_usd: ${stats.costStats.totalCostUsd.toPlainString()}")
+        appendLine("llm_known_cost_usd: ${stats.costStats.knownCostUsd.yamlNumberOrNull()}")
         appendLine("llm_phase_count: ${stats.costStats.phaseCount}")
         appendLine("llm_missing_usage_phases: ${stats.costStats.missingUsagePhaseCount}")
+        appendLine("llm_unpriced_phases: ${stats.costStats.unpricedPhaseCount}")
+        appendLine("llm_unattributed_token_phases: ${stats.costStats.unattributedTokenPhaseCount}")
         appendLine("sample_size_warning: ${stats.sampleSizeWarning}")
         appendTruncationFrontmatter(data)
         appendYamlList("tags", context.reportTags)
@@ -190,7 +192,9 @@ class ReflectionReportBuilder(
         appendMetric("profit_factor", tradeStats.profitFactor?.toPlainString() ?: "null")
         appendMetric("win_rate", tradeStats.winRate?.toPlainString() ?: "null")
         appendMetric("expected_r", tradeStats.expectedR?.toPlainString() ?: "null")
-        appendMetric("llm_cost_usd", costStats.totalCostUsd.toPlainString())
+        appendMetric("llm_known_cost_usd", costStats.knownCostUsd?.toPlainString() ?: "取得不可")
+        appendMetric("llm_unpriced_phases", costStats.unpricedPhaseCount)
+        appendMetric("llm_unattributed_token_phases", costStats.unattributedTokenPhaseCount)
         appendLine()
     }
 

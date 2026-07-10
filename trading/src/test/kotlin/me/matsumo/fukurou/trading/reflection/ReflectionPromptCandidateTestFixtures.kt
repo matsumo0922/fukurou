@@ -36,6 +36,7 @@ internal data class ReflectionPromptCandidateGeneratorFixture(
 internal class RecordingReflectionLlmInvoker(
     private val result: Result<ProcessRunResult>,
     private val thrownFailure: Throwable? = null,
+    private val responseText: String? = null,
 ) : LlmInvoker {
 
     private val mutableRequests = mutableListOf<LlmInvocationRequest>()
@@ -51,6 +52,7 @@ internal class RecordingReflectionLlmInvoker(
             LlmInvocationResult(
                 request = request,
                 processResult = processResult,
+                responseText = responseText ?: processResult.stdout,
             )
         }
     }
@@ -81,6 +83,7 @@ internal fun reflectionPromptCandidateGeneratorFixture(
     tradingConfig: TradingBotConfig = promptCandidateTradingConfig(),
     clock: MutableReflectionClock = MutableReflectionClock(REFLECTION_TEST_INSTANT),
     thrownFailure: Throwable? = null,
+    responseText: String? = null,
 ): ReflectionPromptCandidateGeneratorFixture {
     val riskStateRepository = InMemoryRiskStateRepository(clock)
     val reservationRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository)
@@ -89,6 +92,7 @@ internal fun reflectionPromptCandidateGeneratorFixture(
     val invoker = RecordingReflectionLlmInvoker(
         result = processResult,
         thrownFailure = thrownFailure,
+        responseText = responseText,
     )
 
     return ReflectionPromptCandidateGeneratorFixture(

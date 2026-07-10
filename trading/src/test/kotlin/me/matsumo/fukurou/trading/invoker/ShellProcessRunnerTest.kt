@@ -98,7 +98,7 @@ class ShellProcessRunnerTest {
     }
 
     @Test
-    fun run_deletesCleanupPathsAfterProcessExit() = runBlocking {
+    fun cleanup_deletesPathsAfterCallerFinishesParsing() = runBlocking {
         val shellPath = Path.of("/bin/sh")
         if (!Files.isExecutable(shellPath)) {
             return@runBlocking
@@ -117,16 +117,22 @@ class ShellProcessRunnerTest {
             cleanupPaths = listOf(cleanupFile, tempDirectory),
         )
 
-        val result = ShellProcessRunner().run(command).getOrThrow()
+        val processRunner = ShellProcessRunner()
+        val result = processRunner.run(command).getOrThrow()
 
         assertEquals(ProcessRunStatus.EXITED, result.status)
+        assertTrue(Files.exists(cleanupFile))
+        assertTrue(Files.exists(cacheFile))
+
+        processRunner.cleanup(command).getOrThrow()
+
         assertFalse(Files.exists(cleanupFile))
         assertFalse(Files.exists(cacheFile))
         assertFalse(Files.exists(tempDirectory))
     }
 
     @Test
-    fun run_cancellationKillsDescendantProcessAndDeletesCleanupPaths() = runBlocking {
+    fun run_cancellationKillsDescendantProcessAndCleanupRemainsExplicit() = runBlocking {
         val shellPath = Path.of("/bin/sh")
         if (!Files.isExecutable(shellPath)) {
             return@runBlocking
@@ -157,6 +163,10 @@ class ShellProcessRunnerTest {
             runnerDeferred.await()
         }
         assertFalse(ProcessHandle.of(childPid).map { processHandle -> processHandle.isAlive }.orElse(false))
+        assertTrue(Files.exists(cleanupFile))
+
+        processRunner.cleanup(command).getOrThrow()
+
         assertFalse(Files.exists(cleanupFile))
         assertFalse(Files.exists(tempDirectory))
     }

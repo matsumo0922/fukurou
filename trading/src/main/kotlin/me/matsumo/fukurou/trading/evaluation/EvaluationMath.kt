@@ -208,15 +208,21 @@ object EvaluationMath {
     fun summarizeLlmCosts(facts: List<LlmPhaseUsageFact>): LlmCostStats {
         val llmFacts = facts.filter { fact -> fact.isLlmInvocationPhase() }
         val missingUsageCount = llmFacts.count { fact -> fact.usage == null }
-        val totalCost = llmFacts.sumOfBigDecimal { fact -> fact.usage?.totalCostUsd ?: BigDecimal.ZERO }
+        val unpricedCount = llmFacts.count { fact -> fact.usage?.totalCostUsd == null }
+        val unattributedTokenCount = llmFacts.count { fact -> fact.hasUnattributedTokens() }
+        val knownCost = llmFacts.mapNotNull { fact -> fact.usage?.totalCostUsd }.knownCostSumOrNull()
         val byProvider = llmFacts
             .groupBy { fact -> fact.provider ?: UNKNOWN_PROVIDER }
             .map { (provider, providerFacts) ->
                 LlmProviderCostStats(
                     provider = provider,
-                    totalCostUsd = providerFacts.sumOfBigDecimal { fact -> fact.usage?.totalCostUsd ?: BigDecimal.ZERO },
+                    knownCostUsd = providerFacts
+                        .mapNotNull { fact -> fact.usage?.totalCostUsd }
+                        .knownCostSumOrNull(),
                     phaseCount = providerFacts.size,
                     missingUsagePhaseCount = providerFacts.count { fact -> fact.usage == null },
+                    unpricedPhaseCount = providerFacts.count { fact -> fact.usage?.totalCostUsd == null },
+                    unattributedTokenPhaseCount = providerFacts.count { fact -> fact.hasUnattributedTokens() },
                 )
             }
             .sortedBy { stats -> stats.provider }
@@ -229,7 +235,9 @@ object EvaluationMath {
         return LlmCostStats(
             phaseCount = llmFacts.size,
             missingUsagePhaseCount = missingUsageCount,
-            totalCostUsd = totalCost.evaluationScale(),
+            unpricedPhaseCount = unpricedCount,
+            unattributedTokenPhaseCount = unattributedTokenCount,
+            knownCostUsd = knownCost,
             byProvider = byProvider,
             byModel = byModel,
         )
@@ -515,9 +523,22 @@ private fun List<LlmModelUsage>.toModelTokenStats(model: String): LlmModelTokenS
         model = model,
         inputTokens = sumOf { usage -> usage.usage.inputTokens ?: 0L },
         outputTokens = sumOf { usage -> usage.usage.outputTokens ?: 0L },
+        reasoningOutputTokens = sumOf { usage -> usage.usage.reasoningOutputTokens ?: 0L },
         cacheCreationInputTokens = sumOf { usage -> usage.usage.cacheCreationInputTokens ?: 0L },
         cacheReadInputTokens = sumOf { usage -> usage.usage.cacheReadInputTokens ?: 0L },
     )
+}
+
+private fun LlmPhaseUsageFact.hasUnattributedTokens(): Boolean {
+    val parsedUsage = usage ?: return false
+
+    return parsedUsage.usage != null && parsedUsage.modelUsages.isEmpty()
+}
+
+private fun List<BigDecimal>.knownCostSumOrNull(): BigDecimal? {
+    if (isEmpty()) return null
+
+    return sumOfBigDecimal { value -> value }.evaluationScale()
 }
 
 private fun rateOrNull(numerator: Int, denominator: Int): BigDecimal? {

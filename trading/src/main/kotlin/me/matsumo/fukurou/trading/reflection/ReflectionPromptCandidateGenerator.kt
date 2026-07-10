@@ -214,8 +214,8 @@ class ReflectionPromptCandidateGenerator(
                 return failedAttemptFile(dataset, attemptCount, failure)
             }
 
-            val stdout = auditResult.getOrThrow().invocationResult.processResult.stdout
-            val validation = validateOutput(stdout, dataset)
+            val responseText = auditResult.getOrThrow().invocationResult.responseText
+            val validation = validateOutput(responseText, dataset)
 
             promptCandidateFileForValidation(
                 dataset = dataset,
@@ -429,7 +429,7 @@ class ReflectionPromptCandidateGenerator(
             |      "title": "short Japanese title",
             |      "target": "SystemPromptV1",
             |      "problem": "observed issue",
-            |      "evidence": ["decision_runs / decisions / closed_trades / llm_cost_usd / setup tag evidence"],
+            |      "evidence": ["decision_runs / decisions / closed_trades / llm_known_cost_usd / cost coverage / setup tag evidence"],
             |      "proposedChangeJa": "候補文",
             |      "expectedImpact": "expected impact",
             |      "risk": "risk",
@@ -835,7 +835,7 @@ private fun ReflectionWindowData.evidenceTerms(): Set<String> {
             "decisions",
             "closed_trades",
             "llm_runs",
-            "llm_cost_usd",
+            "llm_known_cost_usd",
             "setup",
             "truncated",
         ) + actionNames + setupTags

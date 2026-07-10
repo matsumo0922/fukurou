@@ -42,6 +42,22 @@ class ReflectionPromptCandidateGeneratorTest {
     }
 
     @Test
+    fun generate_consumesSemanticResponseInsteadOfCodexJsonl() = runBlocking {
+        val fixture = reflectionPromptCandidateGeneratorFixture(
+            processResult = Result.success(
+                cleanReflectionProcess(
+                    """{"type":"item.completed","item":{"type":"agent_message","text":"normalized"}}""",
+                ),
+            ),
+            responseText = validPromptCandidateJson(),
+        )
+
+        val generation = fixture.generator.generate(reflectionDataset(), existingState = null).getOrThrow()
+
+        assertEquals(ReflectionPromptCandidateGenerationStatus.GENERATED, generation.generatedStatus())
+    }
+
+    @Test
     fun generate_rejectsInvalidJsonAndRequiredFieldViolations() = runBlocking {
         val outputs = listOf(
             """{"candidates": [""",

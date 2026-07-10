@@ -1495,8 +1495,8 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun claudePhaseAuditStoresUsageButCodexPhaseDoesNot() = runBlocking {
-        val usageStdout = """
+    fun phaseAuditStoresClaudeAndCodexStructuredUsage() = runBlocking {
+        val claudeUsageStdout = """
             {
               "total_cost_usd": 0.02,
               "num_turns": 2,
@@ -1507,16 +1507,21 @@ class OneShotLlmRunnerTest {
               }
             }
         """.trimIndent()
+        val codexUsageStdout = """
+            {"type":"thread.started","thread_id":"synthetic-thread"}
+            {"type":"item.completed","item":{"type":"agent_message","text":"approved"}}
+            {"type":"turn.completed","usage":{"input_tokens":80,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10}}
+        """.trimIndent()
         val fixture = runnerFixture { command ->
             if (command.isProposerLaunch()) {
                 submitDecision(fixtureRepository, command, DecisionAction.ENTER).getOrThrow()
 
-                return@runnerFixture cleanExit(stdout = usageStdout)
+                return@runnerFixture cleanExit(stdout = claudeUsageStdout)
             }
 
             submitFalsification(fixtureRepository, command, FalsificationVerdict.APPROVED).getOrThrow()
 
-            cleanExit(stdout = usageStdout)
+            cleanExit(stdout = codexUsageStdout)
         }
 
         fixture.runner.runOneShot(defaultRequest()).getOrThrow()
@@ -1528,7 +1533,9 @@ class OneShotLlmRunnerTest {
 
         assertTrue(proposerPhase.payload.contains("\"usage\""))
         assertTrue(proposerPhase.payload.contains("\"totalCostUsd\":\"0.02\""))
-        assertFalse(falsifierPhase.payload.contains("\"usage\""))
+        assertTrue(falsifierPhase.payload.contains("\"usage\""))
+        assertTrue(falsifierPhase.payload.contains("\"reasoningOutputTokens\":10"))
+        assertFalse(falsifierPhase.payload.contains("\"totalCostUsd\""))
     }
 
     @Test

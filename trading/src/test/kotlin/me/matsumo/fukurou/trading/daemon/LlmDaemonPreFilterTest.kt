@@ -98,6 +98,20 @@ class LlmDaemonPreFilterTest {
     }
 
     @Test
+    fun defaultPreFilterConsumesSemanticResponseInsteadOfCodexJsonl() = runBlocking {
+        val invoker = StaticPreFilterLlmInvoker(
+            stdout = """{"type":"item.completed","item":{"type":"agent_message","text":"YES"}}""",
+            responseText = "YES",
+        )
+
+        val decision = preFilter(invoker)
+            .evaluate(preFilterRequest())
+            .getOrThrow()
+
+        assertEquals(LlmDaemonPreFilterDecision.RUN_FULL, decision)
+    }
+
+    @Test
     fun defaultPreFilterFailureIncludesOnlyOutputMetadata() = runBlocking {
         val invoker = StaticPreFilterLlmInvoker(
             stdout = """
@@ -160,6 +174,7 @@ private fun preFilterRequest(): LlmDaemonPreFilterRequest {
  */
 private class StaticPreFilterLlmInvoker(
     private val stdout: String,
+    private val responseText: String = stdout,
 ) : LlmInvoker {
 
     val requests: MutableList<LlmInvocationRequest> = mutableListOf()
@@ -176,6 +191,7 @@ private class StaticPreFilterLlmInvoker(
                     stdout = stdout,
                     stderr = "",
                 ),
+                responseText = responseText,
             ),
         )
     }

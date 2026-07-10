@@ -54,9 +54,7 @@ class LlmInvocationAuditor(
         val startFailureError = result.exceptionOrNull()
             ?.takeIf { processResult == null }
             ?.redactedQualifiedErrorMessage()
-        val usage = processResult?.let { completedProcess ->
-            usageForAudit(request.provider, completedProcess.stdout)
-        }
+        val usage = invocationResult?.usage
         val auditSignals = processResult?.auditSignals() ?: LlmPhaseAuditSignals()
 
         appendPhase(
@@ -130,11 +128,6 @@ class LlmInvocationAuditor(
         val auditMessage = "${javaClass.name}: $detail"
 
         return redactor.redactAndTruncate(auditMessage)
-    }
-
-    private fun usageForAudit(provider: LlmProvider, stdout: String) = when (provider) {
-        LlmProvider.CLAUDE -> LlmUsageParser.parseClaudeStdout(stdout)
-        LlmProvider.CODEX -> null
     }
 
     private fun phaseDetails(

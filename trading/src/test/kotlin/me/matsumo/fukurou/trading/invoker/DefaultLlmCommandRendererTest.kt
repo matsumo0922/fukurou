@@ -215,6 +215,7 @@ class DefaultLlmCommandRendererTest {
         val configContent = Files.readString(codexHome.resolve(CODEX_CONFIG_FILE_NAME))
 
         assertEquals("", configContent)
+        assertTrue(command.args.contains("--json"))
         assertTrue(command.args.contains("--skip-git-repo-check"))
 
         command.deleteCleanupPaths()
@@ -281,10 +282,10 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
-    fun renderCodex_deduplicatesSkipGitRepoCheckFromConfiguredCommonArgs() {
+    fun renderCodex_deduplicatesStructuredAndRepositoryFlagsFromConfiguredCommonArgs() {
         val renderer = DefaultLlmCommandRenderer(
             config = LlmCommandRendererConfig(
-                codexCommonArgs = listOf("--skip-git-repo-check", "--headless-test"),
+                codexCommonArgs = listOf("--json", "--skip-git-repo-check", "--headless-test"),
             ),
         )
         val request = request(
@@ -297,8 +298,10 @@ class DefaultLlmCommandRendererTest {
         val skipGitRepoCheckCount = command.args.count { argument ->
             argument == "--skip-git-repo-check"
         }
+        val jsonCount = command.args.count { argument -> argument == "--json" }
 
         assertEquals(1, skipGitRepoCheckCount)
+        assertEquals(1, jsonCount)
         assertTrue(command.args.contains("--headless-test"))
 
         command.deleteCleanupPaths()
@@ -524,6 +527,11 @@ class DefaultLlmCommandRendererTest {
         assertFailsWith<IllegalArgumentException> {
             LlmCommandRendererConfig(
                 codexCommonArgs = listOf("--dangerously-bypass-approvals-and-sandbox"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmCommandRendererConfig(
+                codexCommonArgs = listOf("--ephemeral"),
             )
         }
     }

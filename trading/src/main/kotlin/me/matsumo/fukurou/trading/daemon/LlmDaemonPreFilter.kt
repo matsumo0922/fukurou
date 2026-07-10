@@ -140,7 +140,7 @@ class DefaultLlmDaemonPreFilter(
             llmInvoker = dependencies.llmInvoker,
         ).getOrThrow()
 
-        return parsePreFilterDecision(auditResult.invocationResult.processResult.stdout)
+        return parsePreFilterDecision(auditResult.invocationResult.responseText)
     }
 
     private suspend fun readSnapshot(observedAt: Instant): LlmDaemonPreFilterSnapshot {

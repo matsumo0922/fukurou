@@ -21,19 +21,16 @@ class ShellProcessRunner : ProcessRunner {
 
     override suspend fun run(command: RenderedLlmCommand): Result<ProcessRunResult> {
         return try {
-            val result = runProcess(command)
-            deleteCleanupPathsNonCancellable(command.cleanupPaths).map { result }
+            Result.success(runProcess(command))
         } catch (throwable: CancellationException) {
-            val cleanupResult = deleteCleanupPathsNonCancellable(command.cleanupPaths)
-            cleanupResult.exceptionOrNull()?.let { cleanupFailure -> throwable.addSuppressed(cleanupFailure) }
-
             throw throwable
         } catch (throwable: Throwable) {
-            val cleanupResult = deleteCleanupPathsNonCancellable(command.cleanupPaths)
-            cleanupResult.exceptionOrNull()?.let { cleanupFailure -> throwable.addSuppressed(cleanupFailure) }
-
             Result.failure(throwable)
         }
+    }
+
+    override suspend fun cleanup(command: RenderedLlmCommand): Result<Unit> {
+        return deleteCleanupPathsNonCancellable(command.cleanupPaths)
     }
 
     private suspend fun runProcess(command: RenderedLlmCommand): ProcessRunResult {
@@ -126,9 +123,20 @@ class ShellProcessRunner : ProcessRunner {
 
     private suspend fun deleteCleanupPaths(paths: List<Path>): Result<Unit> {
         return withContext(Dispatchers.IO) {
-            runCatching {
-                paths.forEach { path -> deleteCleanupPath(path) }
+            var firstFailure: Throwable? = null
+
+            paths.forEach { path ->
+                runCatching { deleteCleanupPath(path) }
+                    .onFailure { throwable ->
+                        if (firstFailure == null) {
+                            firstFailure = throwable
+                        } else {
+                            firstFailure?.addSuppressed(throwable)
+                        }
+                    }
             }
+
+            firstFailure?.let { throwable -> Result.failure(throwable) } ?: Result.success(Unit)
         }
     }
 

@@ -91,9 +91,11 @@ FUKUROU_CODEX_COMMON_ARGS=
 FUKUROU_CODEX_FALSIFIER_ARGS=
 ```
 
-`FUKUROU_MCP_SERVER_ARGS` では `${mcpJarPath}` を `FUKUROU_MCP_JAR_PATH` / request の jar path に置き換える。Codex を外部 sandbox で包む場合は、例えば `FUKUROU_CODEX_COMMAND_TEMPLATE='docker run --rm ... codex'` のように command template 側へ prefix を持たせる。local 開発では既定どおり素の `codex` 起動にできるが、この状態で `FUKUROU_CODEX_FALSIFIER_ARGS="--yolo"` を指定すると起動時に拒否する。`--yolo` の許可判定は command 名と危険 flag の deny-list による起動時チェックであり、sandbox の完全性そのものは運用設定の責務として確認する。`--privileged`、host network、root bind mount は拒否し、`--network none` は許可する。`FUKUROU_CLAUDE_COMMON_ARGS` / `FUKUROU_CODEX_COMMON_ARGS` は補助的な安全側引数だけに使い、MCP config、allowed tools、permission、sandbox、approval、Codex `-c` を上書きする flag は起動時に拒否する。
+`FUKUROU_MCP_SERVER_ARGS` では `${mcpJarPath}` を `FUKUROU_MCP_JAR_PATH` / request の jar path に置き換える。Codex を外部 sandbox で包む場合は、例えば `FUKUROU_CODEX_COMMAND_TEMPLATE='docker run --rm ... codex'` のように command template 側へ prefix を持たせる。local 開発では既定どおり素の `codex` 起動にできるが、この状態で `FUKUROU_CODEX_FALSIFIER_ARGS="--yolo"` を指定すると起動時に拒否する。`--yolo` の許可判定は command 名と危険 flag の deny-list による起動時チェックであり、sandbox の完全性そのものは運用設定の責務として確認する。`--privileged`、host network、root bind mount は拒否し、`--network none` は許可する。`FUKUROU_CLAUDE_COMMON_ARGS` / `FUKUROU_CODEX_COMMON_ARGS` は補助的な安全側引数だけに使い、MCP config、allowed tools、permission、sandbox、approval、Codex `-c` を上書きする flag と session 保存を止める `--ephemeral` は起動時に拒否する。Codex には structured output の `--json` を常に付け、common args 側の重複指定は除く。
 
 runner の成功判定は DB が唯一の正本であり、LLM の stdout や exit code から decision は parse しない。Proposer 終了後に `FUKUROU_INVOCATION_ID` に紐づく `decisions` 行を読み、行がなければ `CallerNoTradeGuard` で no-trade audit を残して fail closed する。
+
+CLI process 終了後は provider output を semantic response、structured usage、raw process result に分離する。pre-filter と Reflection は semantic response だけを読み、Codex JSONL 全文を応答本文として扱わない。raw stdout / stderr は redaction と truncate 後の audit だけに保存する。runner 生成の一時 config、session、auth copy は Codex session から model を解決した後、成功、timeout、非 0 exit、起動失敗、cancellation の各経路で削除する。timeout や非 0 exit でも取得済み usage は audit へ残すが、phase は成功へ昇格させない。
 
 `ENTER` / `ADD_LONG` decision は Falsifier を起動し、fresh な `APPROVED` が DB にあるときだけ persisted `trade_intents` の宣言値から `PlaceOrderCommand` を組み立て、`ToolCallGuard.runTradeTool -> PaperBroker -> SafetyFloor` の既存経路へ流す。`EXIT` / `REDUCE` / `ADJUST_PROTECTION` decision は Falsifier と EV gate を通さず、保存済み decision と paper ledger から対象を一意に決められる場合だけ runner が決定論的に close / reduce / protection update を実行する。`REDUCE` は `close_ratio` を必須にし、`EXIT` は常に full close として扱う。order placement 用の第三 LLM session は起動しない。
 
