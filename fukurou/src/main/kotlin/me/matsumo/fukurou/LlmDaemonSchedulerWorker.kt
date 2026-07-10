@@ -158,24 +158,25 @@ internal class LlmDaemonSchedulerWorker(
         require(job == null) { "LlmDaemonSchedulerWorker is already started." }
 
         job = scope.launch {
-            bootstrap().getOrThrow()
-            val scheduler = schedulerFactory().getOrThrow()
+            try {
+                bootstrap().getOrThrow()
+                val scheduler = schedulerFactory().getOrThrow()
 
-            scheduler.startSession()
-            lifecycleListener.onStarted()
+                scheduler.startSession()
+                lifecycleListener.onStarted()
 
-            while (currentCoroutineContext().isActive && !stopRequested.isCompleted) {
-                scheduler.tick()
+                while (currentCoroutineContext().isActive && !stopRequested.isCompleted) {
+                    scheduler.tick()
 
-                if (!stopRequested.isCompleted) {
-                    withTimeoutOrNull(interval.toMillis()) {
-                        stopRequested.await()
+                    if (!stopRequested.isCompleted) {
+                        withTimeoutOrNull(interval.toMillis()) {
+                            stopRequested.await()
+                        }
                     }
                 }
-            }
-        }
-        job?.invokeOnCompletion { error ->
-            if (error != null && error !is CancellationException) {
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
                 warnLogger.warn(
                     key = DAEMON_BOOTSTRAP_FAILURE_LOG_KEY,
                     message = "LlmDaemonSchedulerWorker bootstrap or scheduler loop failed.",
