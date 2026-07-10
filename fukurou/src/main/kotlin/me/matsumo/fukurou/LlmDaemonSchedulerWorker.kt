@@ -105,7 +105,7 @@ internal enum class LlmDaemonWorkerStopResult {
 /**
  * supervisor が所有する worker lifecycle 境界。
  */
-internal interface LlmDaemonWorkerHandle {
+internal interface LlmDaemonWorkerHandle : AutoCloseable {
     /** worker loop を開始する。 */
     fun start(): LlmDaemonWorkerHandle
 

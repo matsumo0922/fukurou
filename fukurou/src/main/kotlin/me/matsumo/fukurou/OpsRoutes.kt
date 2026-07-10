@@ -2395,6 +2395,7 @@ private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalo
         CommandEventType.DAEMON_START_REQUESTED -> "daemonStartRequested"
         CommandEventType.DAEMON_STOP_REQUESTED -> "daemonStopRequested"
         CommandEventType.DAEMON_STATE_CHANGED -> "daemonStateChanged"
+        CommandEventType.DAEMON_DESIRED_STATE_CHANGED -> "daemonDesiredStateChanged"
         CommandEventType.DAEMON_OPERATION_FAILED -> "daemonOperationFailed"
         CommandEventType.DAEMON_DRAIN_TIMED_OUT -> "daemonDrainTimedOut"
         CommandEventType.CLI_AUTH_LOGIN_STARTED -> "cliAuthLoginStarted"

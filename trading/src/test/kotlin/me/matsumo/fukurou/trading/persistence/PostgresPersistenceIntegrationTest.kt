@@ -94,6 +94,7 @@ import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -853,11 +854,14 @@ class PostgresPersistenceIntegrationTest {
         repository.activateDraft(newerSafetyDraft.version.id).getOrThrow()
 
         val staleActivation = repository.activateDraftIfActive(staleDaemonDraft.version.id, originalVersionId)
+        repository.discardDraft(staleDaemonDraft.version.id).getOrThrow()
         val activeValues = repository.activeSnapshot().getOrThrow().values
+        val versions = repository.listVersions(limit = 100).getOrThrow()
 
         assertTrue(staleActivation.exceptionOrNull() is RuntimeConfigActiveVersionChangedException)
         assertEquals("1", activeValues.getValue("runner.maxInvocationsPerHour"))
         assertEquals("false", activeValues.getValue("daemon.enabled"))
+        assertFalse(versions.any { version -> version.id == staleDaemonDraft.version.id })
     }
 
     @Test

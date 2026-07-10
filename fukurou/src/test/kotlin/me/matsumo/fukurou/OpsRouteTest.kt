@@ -10,6 +10,7 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
@@ -26,7 +27,9 @@ import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
+import me.matsumo.fukurou.trading.config.RuntimeConfigActiveVersionChangedException
 import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
+import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.RuntimeConfigCandidateValidator
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
@@ -681,6 +684,34 @@ class OpsRouteTest {
         assertEquals("runtimeConfig.validation.typedBetweenInclusive", validationError.getValue("code").jsonPrimitive.content)
         assertEquals("runner.maxToolCallsPerRun", validationError.getValue("key").jsonPrimitive.content)
         assertEquals("48", validationError.getValue("params").jsonObject.getValue("max").jsonPrimitive.content)
+    }
+
+    @Test
+    fun desiredStateActivatorDiscardsDraftAfterActivationConflict() = runBlocking {
+        val config = TradingBotConfig()
+        val values = RuntimeConfigCatalog.runtimeValues(config)
+        val adminService = FakeRuntimeConfigAdminService(activationConflictsRemaining = 1)
+        val snapshot = LlmDaemonRuntimeSnapshot(
+            tradingConfig = config,
+            configIdentity = RuntimeConfigAuditSnapshot(
+                versionId = "active-runtime-config",
+                hash = calculateRuntimeConfigHash(values),
+            ),
+            values = values,
+            available = true,
+        )
+        val activator = VersionedLlmDaemonDesiredStateActivator(
+            adminService = adminService,
+            snapshotProvider = LlmDaemonRuntimeSnapshotProvider { snapshot },
+            onActiveChanged = {},
+        )
+
+        val result = activator.activate(enabled = true, reason = "operator start")
+
+        assertTrue(result.isSuccess)
+        assertEquals(listOf("draft-1"), adminService.discardedDraftIds)
+        assertFalse(adminService.hasVersion("draft-1"))
+        assertTrue(adminService.hasVersion("draft-2"))
     }
 
     @Test
@@ -1869,10 +1900,12 @@ private fun metadataValue(container: JsonObject, label: String): String {
 
 private class FakeRuntimeConfigAdminService(
     private val listVersionsFailure: Throwable? = null,
+    private var activationConflictsRemaining: Int = 0,
 ) : RuntimeConfigAdminService, LlmDaemonRuntimeConfigActivationService {
     private val versions = mutableMapOf<String, RuntimeConfigVersionDetail>()
     private var activeVersionId: String = "active-runtime-config"
     private var nextDraftId = 1
+    val discardedDraftIds = mutableListOf<String>()
 
     init {
         val values = RuntimeConfigCatalog.runtimeDefaultValues()
@@ -1950,6 +1983,30 @@ private class FakeRuntimeConfigAdminService(
         )
     }
 
+    override fun activateDraftIfActive(
+        versionId: String,
+        expectedActiveVersionId: String,
+    ): Result<RuntimeConfigActivationResult> {
+        if (activationConflictsRemaining > 0) {
+            activationConflictsRemaining -= 1
+
+            return Result.failure(RuntimeConfigActiveVersionChangedException())
+        }
+
+        if (activeVersionId != expectedActiveVersionId) {
+            return Result.failure(RuntimeConfigActiveVersionChangedException())
+        }
+
+        return activateDraft(versionId)
+    }
+
+    override fun discardDraft(versionId: String): Result<Unit> {
+        discardedDraftIds += versionId
+        versions.remove(versionId)
+
+        return Result.success(Unit)
+    }
+
     override fun rollbackToVersion(versionId: String): Result<RuntimeConfigActivationResult> {
         return activateDraft(versionId)
     }
@@ -1961,6 +2018,8 @@ private class FakeRuntimeConfigAdminService(
     override suspend fun rollbackToVersion(versionId: String, reason: String?): Result<RuntimeConfigActivationResult> {
         return rollbackToVersion(versionId)
     }
+
+    fun hasVersion(versionId: String): Boolean = versions.containsKey(versionId)
 
     private fun versionSummary(
         id: String,
@@ -2046,7 +2105,7 @@ private class CapturingLlmDaemonOperations(
 ) : LlmDaemonOperations {
     val requests = mutableListOf<Pair<Boolean, String>>()
 
-    override fun status(): LlmDaemonSupervisorStatus = status
+    override suspend fun status(): LlmDaemonSupervisorStatus = status
 
     override suspend fun setDesiredEnabled(enabled: Boolean, reason: String): Result<LlmDaemonSupervisorStatus> {
         requests += enabled to reason

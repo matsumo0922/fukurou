@@ -624,6 +624,21 @@ private class InvalidatingRuntimeConfigAdminService(
         }
     }
 
+    override fun activateDraftIfActive(
+        versionId: String,
+        expectedActiveVersionId: String,
+    ): Result<RuntimeConfigActivationResult> {
+        return delegate.activateDraftIfActive(versionId, expectedActiveVersionId).also { result ->
+            if (result.isSuccess) {
+                onActiveChanged()
+            }
+        }
+    }
+
+    override fun discardDraft(versionId: String): Result<Unit> {
+        return delegate.discardDraft(versionId)
+    }
+
     override fun rollbackToVersion(versionId: String): Result<RuntimeConfigActivationResult> {
         return delegate.rollbackToVersion(versionId).also { result ->
             if (result.isSuccess) {

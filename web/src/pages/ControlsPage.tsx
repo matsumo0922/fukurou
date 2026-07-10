@@ -529,7 +529,7 @@ function ControlsDaemonPanel({
   const isStopping = status.observedState === "STOPPING";
   const stateLabel = isStopping && status.inFlightRun
     ? t("controls.daemon.stoppingInFlight")
-    : status.observedState;
+    : daemonObservedStateLabel(status.observedState, t);
   const operationsDisabled = operationInFlight || isStopping;
   const activeIdentity = configIdentityLabel(status.activeConfig);
   const appliedIdentity = configIdentityLabel(status.appliedConfig);
@@ -548,7 +548,12 @@ function ControlsDaemonPanel({
           {
             label: t("controls.label.daemonDesired"),
             value: status.desiredEnabled ? t("common.yes") : t("common.no"),
-            detail: status.reason,
+            detail: daemonStatusReasonLabel(status.reason, t),
+          },
+          {
+            label: t("controls.label.nextRetry"),
+            value: status.nextRetryAt ? formatDateTime(status.nextRetryAt, locale) : t("common.none"),
+            detail: status.nextRetryAt ? t("controls.daemon.retryScheduled") : t("controls.daemon.noRetryScheduled"),
           },
           {
             label: t("controls.label.schedulerSignal"),
@@ -1099,6 +1104,50 @@ function daemonStateTone(state: string, silenceWarning: boolean): StatusTone {
   }
 
   return "neutral";
+}
+
+function daemonObservedStateLabel(state: OpsDaemonStatusResponse["observedState"], t: Translate): string {
+  switch (state) {
+    case "STARTING":
+      return t("controls.daemon.state.starting");
+    case "RUNNING":
+      return t("controls.daemon.state.running");
+    case "STOPPING":
+      return t("controls.daemon.state.stopping");
+    case "STOPPED":
+      return t("controls.daemon.state.stopped");
+    case "DEGRADED":
+      return t("controls.daemon.state.degraded");
+    default:
+      return t("controls.daemon.state.unknown");
+  }
+}
+
+function daemonStatusReasonLabel(reason: OpsDaemonStatusResponse["reason"], t: Translate): string {
+  switch (reason) {
+    case "ACTIVE_CONFIG_DISABLED":
+      return t("controls.daemon.reason.activeConfigDisabled");
+    case "INTENTIONAL_STOP":
+      return t("controls.daemon.reason.intentionalStop");
+    case "CONFIG_APPLY":
+      return t("controls.daemon.reason.configApply");
+    case "RUNNING":
+      return t("controls.daemon.reason.running");
+    case "STARTING":
+      return t("controls.daemon.reason.starting");
+    case "START_FAILED":
+      return t("controls.daemon.reason.startFailed");
+    case "SILENCE_DETECTED":
+      return t("controls.daemon.reason.silenceDetected");
+    case "DRAIN_TIMED_OUT":
+      return t("controls.daemon.reason.drainTimedOut");
+    case "RUNTIME_CONFIG_UNAVAILABLE":
+      return t("controls.daemon.reason.runtimeConfigUnavailable");
+    case "PROCESS_SHUTDOWN":
+      return t("controls.daemon.reason.processShutdown");
+    default:
+      return t("controls.daemon.reason.unknown");
+  }
 }
 
 function llmAuthLoginStatusTone(status: string): StatusTone {

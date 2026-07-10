@@ -225,6 +225,8 @@ sudo git -C /srv/fukurou/repo rev-parse HEAD
 
 code-owned catalog default の変更は、active runtime config に同じ key が明示保存済みの場合は実効値を上書きしない。runtime config の `daemon.*` は `HOT`、それ以外は applyMode `NEXT_RESTART` として扱う。deploy 後に `/ops/runtime-config` または WebUI `/app/config` で現在の `effectiveValue` を確認し、必要な key を draft / validate / activate で active 化する。daemon section を含む activate / rollback は Controls と同じ lifecycle guard を通る。`GET /ops/daemon` は active full config、process applied full config、daemon applied component の source version / hash と restart 要否を返す。
 
+Ktor container の `stop_grace_period` は 11 分である。daemon supervisor は process shutdown 時も in-flight run を `runner.perRunTimeout + 30秒` まで graceful drain し、timeout 後は最大5秒の cancel 終端待ちを行う。11分は `runner.perRunTimeout` の code 上限10分を含む Application shutdown hook を完了できる猶予である。猶予を超えた場合は container runtime が process を強制終了し、残った stale `RUNNING` run は次回 process 起動時の recovery で `FAILED` へ確定する。
+
 例: `safety.minExpectedMoveToCostRatio` と runner の hourly / daily cap を active config に反映する。
 
 ```sh

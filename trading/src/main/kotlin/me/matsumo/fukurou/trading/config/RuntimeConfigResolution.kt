@@ -205,9 +205,12 @@ interface RuntimeConfigAdminService {
     fun activateDraftIfActive(
         versionId: String,
         expectedActiveVersionId: String,
-    ): Result<RuntimeConfigActivationResult> {
-        return activateDraft(versionId)
-    }
+    ): Result<RuntimeConfigActivationResult>
+
+    /**
+     * active 化されなかった draft version を破棄する。
+     */
+    fun discardDraft(versionId: String): Result<Unit>
 
     /**
      * 保存済み inactive version へ rollback する。

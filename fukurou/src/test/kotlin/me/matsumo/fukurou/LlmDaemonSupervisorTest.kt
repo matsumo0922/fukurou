@@ -1,12 +1,15 @@
 package me.matsumo.fukurou
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
+import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
@@ -24,6 +27,9 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -61,6 +67,7 @@ class LlmDaemonSupervisorTest {
         assertEquals(processConfig.runner, workers.last().request.tradingConfig.runner)
         assertEquals(nextConfig.daemon, workers.last().request.tradingConfig.daemon)
         assertEquals(LlmDaemonWorkerStopResult.DRAINED, workers.first().stopResult)
+        assertEquals(1, workers.first().closeCount)
         assertTrue(supervisor.status().restartRequired)
         assertNotEquals(supervisor.status().activeConfig.hash, supervisor.status().appliedConfig.hash)
         assertEquals(
@@ -102,6 +109,7 @@ class LlmDaemonSupervisorTest {
         assertEquals(LlmDaemonObservedState.STOPPED, supervisor.status().observedState)
         assertEquals(LlmDaemonStatusReason.INTENTIONAL_STOP, supervisor.status().reason)
         assertEquals(null, supervisor.status().inFlightRun)
+        assertEquals(1, worker.closeCount)
 
         supervisor.close()
     }
@@ -305,6 +313,140 @@ class LlmDaemonSupervisorTest {
     }
 
     @Test
+    fun terminationPendingUsesBackoffWithoutRepeatingTransitionAudits() = runBlocking {
+        val clock = SupervisorMutableClock(Instant.parse("2026-07-10T00:00:00Z"))
+        val processConfig = TradingBotConfig()
+        val enabledConfig = processConfig.copy(daemon = processConfig.daemon.copy(enabled = true))
+        val snapshotState = MutableRuntimeSnapshot(enabledConfig)
+        val eventLog = InMemoryCommandEventLog()
+        lateinit var worker: FakeWorker
+        val supervisor = createSupervisor(
+            processConfig = processConfig,
+            snapshotState = snapshotState,
+            eventLog = eventLog,
+            clock = clock,
+            initialRetryDelay = Duration.ofMillis(5),
+            maxRetryDelay = Duration.ofMillis(20),
+        ) { request ->
+            FakeWorker(
+                request = request,
+                configuredStopResult = LlmDaemonWorkerStopResult.TERMINATION_PENDING,
+            ).also { created -> worker = created }
+        }.start()
+
+        awaitState(supervisor, LlmDaemonObservedState.RUNNING)
+        supervisor.setDesiredEnabled(false, "operator stop").getOrThrow()
+        delay(80)
+
+        val events = eventLog.events()
+        val stoppingEvents = events.filter { event ->
+            event.eventType == CommandEventType.DAEMON_STATE_CHANGED &&
+                event.payload.contains("\"observedState\":\"STOPPING\"")
+        }
+        val timeoutEvents = events.filter { event ->
+            event.eventType == CommandEventType.DAEMON_DRAIN_TIMED_OUT
+        }
+
+        assertTrue(worker.stopCallCount >= 3)
+        assertEquals(1, stoppingEvents.size)
+        assertEquals(1, timeoutEvents.size)
+        assertEquals(clock.instant().plusMillis(20), supervisor.status().nextRetryAt)
+
+        supervisor.close()
+    }
+
+    @Test
+    fun configNotificationDuringStartingDoesNotRebuildHealthyWorker() = runBlocking {
+        val processConfig = TradingBotConfig()
+        val enabledConfig = processConfig.copy(daemon = processConfig.daemon.copy(enabled = true))
+        val snapshotState = MutableRuntimeSnapshot(enabledConfig)
+        val workers = CopyOnWriteArrayList<FakeWorker>()
+        val supervisor = createSupervisor(processConfig, snapshotState) { request ->
+            FakeWorker(request, deferStarted = true).also(workers::add)
+        }.start()
+
+        awaitState(supervisor, LlmDaemonObservedState.STARTING)
+        snapshotState.update(
+            enabledConfig.copy(
+                runner = enabledConfig.runner.copy(
+                    maxInvocationsPerHour = enabledConfig.runner.maxInvocationsPerHour - 1,
+                ),
+            ),
+        )
+        supervisor.notifyConfigChanged()
+        delay(30)
+
+        assertEquals(1, workers.size)
+
+        workers.single().completeStart()
+        awaitState(supervisor, LlmDaemonObservedState.RUNNING)
+        assertEquals(1, workers.size)
+
+        supervisor.close()
+    }
+
+    @Test
+    fun completedAuditFailureDoesNotTurnSuccessfulStartIntoOperationFailure() = runBlocking {
+        val processConfig = TradingBotConfig()
+        val snapshotState = MutableRuntimeSnapshot(processConfig)
+        val eventLog = CompletionAuditFailingEventLog()
+        val supervisor = createSupervisor(
+            processConfig = processConfig,
+            snapshotState = snapshotState,
+            eventLog = eventLog,
+        ) { request -> FakeWorker(request) }.start()
+
+        val result = supervisor.setDesiredEnabled(true, "operator start")
+
+        assertTrue(result.isSuccess)
+        assertEquals(LlmDaemonObservedState.RUNNING, result.getOrThrow().observedState)
+        assertFalse(
+            eventLog.events().any { event -> event.eventType == CommandEventType.DAEMON_OPERATION_FAILED },
+        )
+
+        supervisor.close()
+    }
+
+    @Test
+    fun statusSnapshotReadDoesNotBlockSchedulerObserverStateUpdates() = runBlocking {
+        val processConfig = TradingBotConfig()
+        val enabledConfig = processConfig.copy(daemon = processConfig.daemon.copy(enabled = true))
+        val snapshotState = MutableRuntimeSnapshot(enabledConfig)
+        val blockSnapshot = AtomicBoolean(false)
+        val snapshotEntered = CountDownLatch(1)
+        val releaseSnapshot = CountDownLatch(1)
+        lateinit var worker: FakeWorker
+        val supervisor = createSupervisor(
+            processConfig = processConfig,
+            snapshotState = snapshotState,
+            snapshotProvider = LlmDaemonRuntimeSnapshotProvider {
+                if (blockSnapshot.get()) {
+                    snapshotEntered.countDown()
+                    releaseSnapshot.await(1, TimeUnit.SECONDS)
+                }
+
+                snapshotState.snapshot
+            },
+        ) { request -> FakeWorker(request).also { created -> worker = created } }.start()
+        awaitState(supervisor, LlmDaemonObservedState.RUNNING)
+        blockSnapshot.set(true)
+        val statusJob = launch(Dispatchers.Default) { supervisor.status() }
+        assertTrue(withContext(Dispatchers.IO) { snapshotEntered.await(1, TimeUnit.SECONDS) })
+        val observerCompleted = CompletableDeferred<Unit>()
+        launch(Dispatchers.Default) {
+            worker.emitSignal(Instant.parse("2026-07-10T00:01:00Z"))
+            observerCompleted.complete(Unit)
+        }
+        delay(30)
+
+        assertTrue(observerCompleted.isCompleted)
+
+        releaseSnapshot.countDown()
+        statusJob.join()
+        supervisor.close()
+    }
+
+    @Test
     fun intentionalStopReasonIsRestoredFromCompletedAuditAfterRestart() = runBlocking {
         val processConfig = TradingBotConfig()
         val snapshotState = MutableRuntimeSnapshot(processConfig)
@@ -329,6 +471,42 @@ class LlmDaemonSupervisorTest {
         supervisor.close()
     }
 
+    @Test
+    fun desiredStateReasonUsesDedicatedAuditEventWithoutLookbackLoss() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val stoppedAt = Instant.parse("2026-07-10T00:00:00Z")
+        eventLog.append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext.EMPTY,
+                toolName = "llm-daemon-supervisor",
+                toolCallId = null,
+                clientRequestId = null,
+                eventType = CommandEventType.DAEMON_DESIRED_STATE_CHANGED,
+                payload = """{"desiredEnabled":false,"observedState":"STOPPED","reason":"maintenance"}""",
+                occurredAt = stoppedAt,
+            ),
+        ).getOrThrow()
+        repeat(100) { index ->
+            eventLog.append(
+                CommandEvent(
+                    decisionRunContext = DecisionRunContext.EMPTY,
+                    toolName = "llm-daemon-supervisor",
+                    toolCallId = null,
+                    clientRequestId = null,
+                    eventType = CommandEventType.DAEMON_STATE_CHANGED,
+                    payload = """{"observedState":"RUNNING","reason":"RUNNING"}""",
+                    occurredAt = stoppedAt.plusSeconds(index.toLong() + 1),
+                ),
+            ).getOrThrow()
+        }
+
+        val change = commandEventDesiredStateReasonProvider(eventLog).latestCompletedChange().getOrThrow()
+
+        assertEquals(false, change?.enabled)
+        assertEquals("maintenance", change?.reason)
+        assertEquals(stoppedAt, change?.occurredAt)
+    }
+
     private fun createSupervisor(
         processConfig: TradingBotConfig,
         snapshotState: MutableRuntimeSnapshot,
@@ -340,13 +518,15 @@ class LlmDaemonSupervisorTest {
         clock: Clock = Clock.systemUTC(),
         initialRetryDelay: Duration = Duration.ofMillis(10),
         maxRetryDelay: Duration = Duration.ofMillis(40),
+        snapshotProvider: LlmDaemonRuntimeSnapshotProvider =
+            LlmDaemonRuntimeSnapshotProvider { snapshotState.snapshot },
         workerFactory: (LlmDaemonWorkerRequest) -> LlmDaemonWorkerHandle,
     ): LlmDaemonSupervisor {
         val processSnapshot = MutableRuntimeSnapshot.snapshotFor(processConfig, version = 1)
 
         return LlmDaemonSupervisor(
             processSnapshot = processSnapshot,
-            snapshotProvider = LlmDaemonRuntimeSnapshotProvider { snapshotState.snapshot },
+            snapshotProvider = snapshotProvider,
             desiredStateActivator = activator,
             riskStateRepository = riskStateRepository,
             commandEventLog = eventLog,
@@ -452,6 +632,7 @@ private class FakeWorker(
     private val stopGate: CompletableDeferred<Unit>? = null,
     configuredStopResult: LlmDaemonWorkerStopResult = LlmDaemonWorkerStopResult.DRAINED,
     private val failOnStart: Boolean = false,
+    private val deferStarted: Boolean = false,
 ) : LlmDaemonWorkerHandle {
     @Volatile
     private var configuredStopResult = configuredStopResult
@@ -462,11 +643,15 @@ private class FakeWorker(
         private set
     var stopTimeout: Duration? = null
         private set
+    var stopCallCount = 0
+        private set
+    var closeCount = 0
+        private set
 
     override fun start(): LlmDaemonWorkerHandle {
         if (failOnStart) {
             request.lifecycleListener.onFailed(IllegalStateException("start failed"))
-        } else {
+        } else if (!deferStarted) {
             request.lifecycleListener.onStarted()
         }
 
@@ -479,6 +664,7 @@ private class FakeWorker(
 
     override suspend fun stopGracefully(timeout: Duration): LlmDaemonWorkerStopResult {
         requestStop()
+        stopCallCount += 1
         stopTimeout = timeout
         stopGate?.await()
         stopResult = configuredStopResult
@@ -503,6 +689,28 @@ private class FakeWorker(
     fun emitSignal(at: Instant) {
         request.observer.onSchedulerSignal(at)
     }
+
+    fun completeStart() {
+        request.lifecycleListener.onStarted()
+    }
+
+    override fun close() {
+        closeCount += 1
+    }
+}
+
+private class CompletionAuditFailingEventLog(
+    private val delegate: InMemoryCommandEventLog = InMemoryCommandEventLog(),
+) : CommandEventLog by delegate {
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        if (event.eventType == CommandEventType.DAEMON_DESIRED_STATE_CHANGED) {
+            return Result.failure(IllegalStateException("completion audit unavailable"))
+        }
+
+        return delegate.append(event)
+    }
+
+    suspend fun events(): List<CommandEvent> = delegate.events()
 }
 
 private class BlockingStoppingEventLog(

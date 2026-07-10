@@ -135,6 +135,23 @@ private const val SELECT_RUNTIME_CONFIG_VALUES_SQL = """
 """
 
 /**
+ * draft version の値を削除する SQL。
+ */
+private const val DELETE_RUNTIME_CONFIG_VALUES_SQL = """
+    DELETE FROM runtime_config_values
+    WHERE version_id = ?
+"""
+
+/**
+ * draft version を削除する SQL。
+ */
+private const val DELETE_RUNTIME_CONFIG_DRAFT_SQL = """
+    DELETE FROM runtime_config_versions
+    WHERE id = ?
+        AND status = ?
+"""
+
+/**
  * retention 対象の runtime config version ID を読む SQL。
  */
 private const val SELECT_PRUNABLE_RUNTIME_CONFIG_VERSION_IDS_SQL = """
@@ -433,6 +450,32 @@ class ExposedRuntimeConfigRepository(
             allowedStatuses = setOf(RUNTIME_CONFIG_STATUS_DRAFT),
             expectedActiveVersionId = expectedActiveVersionId,
         )
+    }
+
+    override fun discardDraft(versionId: String): Result<Unit> {
+        return runCatching {
+            exposedTransaction(database) {
+                lockRuntimeConfigVersionWriters()
+                val draft = requireRuntimeConfigVersion(versionId)
+
+                require(draft.status == RUNTIME_CONFIG_STATUS_DRAFT) {
+                    "runtime config version ${draft.versionId} status ${draft.status} cannot be discarded"
+                }
+
+                jdbcConnection().prepareStatement(DELETE_RUNTIME_CONFIG_VALUES_SQL).use { statement ->
+                    statement.setObject(1, draft.versionId)
+                    statement.executeUpdate()
+                }
+                jdbcConnection().prepareStatement(DELETE_RUNTIME_CONFIG_DRAFT_SQL).use { statement ->
+                    statement.setObject(1, draft.versionId)
+                    statement.setString(2, RUNTIME_CONFIG_STATUS_DRAFT)
+
+                    require(statement.executeUpdate() == 1) {
+                        "Expected to discard one runtime config draft, but the draft changed concurrently."
+                    }
+                }
+            }
+        }
     }
 
     override fun rollbackToVersion(versionId: String): Result<RuntimeConfigActivationResult> {

@@ -123,6 +123,11 @@
       "descriptionKey": "activity.catalog.audit.daemonStateChanged.description"
     },
     {
+      "value": "DAEMON_DESIRED_STATE_CHANGED",
+      "labelKey": "activity.catalog.audit.daemonDesiredStateChanged.label",
+      "descriptionKey": "activity.catalog.audit.daemonDesiredStateChanged.description"
+    },
+    {
       "value": "DAEMON_OPERATION_FAILED",
       "labelKey": "activity.catalog.audit.daemonOperationFailed.label",
       "descriptionKey": "activity.catalog.audit.daemonOperationFailed.description"

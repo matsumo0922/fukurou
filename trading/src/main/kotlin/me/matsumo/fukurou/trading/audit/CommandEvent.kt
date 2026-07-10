@@ -109,6 +109,11 @@ enum class CommandEventType {
     DAEMON_STATE_CHANGED,
 
     /**
+     * LLM daemon desired state の versioned config 変更が完了した。
+     */
+    DAEMON_DESIRED_STATE_CHANGED,
+
+    /**
      * daemon desired state 操作または worker 起動が失敗した。
      */
     DAEMON_OPERATION_FAILED,

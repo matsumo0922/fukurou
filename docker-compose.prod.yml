@@ -9,6 +9,7 @@ services:
     image: ghcr.io/matsumo0922/fukurou:${FUKUROU_IMAGE_TAG:?FUKUROU_IMAGE_TAG is required}
     container_name: fukurou-ktor
     restart: unless-stopped
+    stop_grace_period: 11m
     environment:
       DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
       DB_USER: ${POSTGRES_USER}
