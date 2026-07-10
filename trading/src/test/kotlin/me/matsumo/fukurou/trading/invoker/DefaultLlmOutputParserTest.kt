@@ -3,11 +3,13 @@ package me.matsumo.fukurou.trading.invoker
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.FileTime
 import java.time.Duration
 import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * Codex CLI 0.142.5 JSONL と session model attribution を検証するテスト。
@@ -83,6 +85,100 @@ class DefaultLlmOutputParserTest {
     }
 
     @Test
+    fun parseCodex_prioritizesThreadIdFilenameBeyondFallbackLimit() {
+        val codexHome = Files.createTempDirectory("codex-output-parser-filename-test")
+        val sessionDirectory = codexHome.resolve("sessions/2026/07/10")
+        Files.createDirectories(sessionDirectory)
+        repeat(300) { index ->
+            Files.writeString(
+                sessionDirectory.resolve("unrelated-$index.jsonl"),
+                sessionJsonl(threadId = "other-thread-$index", model = "wrong-model"),
+            )
+        }
+        val threadId = "019f0f13-d14f-71c1-a517-f71bb01767b5"
+        Files.writeString(
+            sessionDirectory.resolve("rollout-2026-07-10T00-00-00-$threadId.jsonl"),
+            sessionJsonl(threadId = threadId, model = "gpt-5.4"),
+        )
+        val warnings = mutableListOf<String>()
+
+        val output = DefaultLlmOutputParser(warnings::add).parse(
+            request = request(LlmProvider.CODEX),
+            command = command(codexHome),
+            processResult = processResult(codexStdout(threadId)),
+            startedAt = Instant.parse("2026-07-10T00:00:00Z"),
+            completedAt = Instant.parse("2026-07-10T00:00:01Z"),
+        )
+
+        assertEquals("gpt-5.4", output.usage?.modelUsages?.single()?.model)
+        assertEquals(emptyList(), warnings)
+
+        codexHome.toFile().deleteRecursively()
+    }
+
+    @Test
+    fun parseCodex_sortsFallbackByLastModifiedAndWarnsWhenFileScanIsTruncated() {
+        val codexHome = Files.createTempDirectory("codex-output-parser-fallback-test")
+        val sessionDirectory = codexHome.resolve("sessions/2026/07/10")
+        Files.createDirectories(sessionDirectory)
+        repeat(256) { index ->
+            Files.writeString(
+                sessionDirectory.resolve("unrelated-$index.jsonl"),
+                sessionJsonl(threadId = "other-thread-$index", model = "wrong-model"),
+            )
+        }
+        val threadId = "019f0f13-d14f-71c1-a517-f71bb01767b5"
+        val target = sessionDirectory.resolve("legacy-name.jsonl")
+        Files.writeString(target, sessionJsonl(threadId = threadId, model = "gpt-5.4"))
+        Files.setLastModifiedTime(target, FileTime.from(Instant.parse("2100-01-01T00:00:00Z")))
+        val warnings = mutableListOf<String>()
+
+        val output = DefaultLlmOutputParser(warnings::add).parse(
+            request = request(LlmProvider.CODEX),
+            command = command(codexHome),
+            processResult = processResult(codexStdout(threadId)),
+            startedAt = Instant.parse("2026-07-10T00:00:00Z"),
+            completedAt = Instant.parse("2026-07-10T00:00:01Z"),
+        )
+
+        assertEquals("gpt-5.4", output.usage?.modelUsages?.single()?.model)
+        assertTrue(warnings.single().contains("fallback truncated session files"))
+
+        codexHome.toFile().deleteRecursively()
+    }
+
+    @Test
+    fun parseCodex_warnsWhenMatchingSessionContentExceedsLineLimit() {
+        val codexHome = Files.createTempDirectory("codex-output-parser-line-limit-test")
+        val sessionDirectory = codexHome.resolve("sessions/2026/07/10")
+        Files.createDirectories(sessionDirectory)
+        val threadId = "019f0f13-d14f-71c1-a517-f71bb01767b5"
+        val sessionContent = buildString {
+            appendLine("""{"type":"session_meta","payload":{"id":"$threadId"}}""")
+            repeat(9_999) { appendLine("malformed") }
+            appendLine("""{"type":"turn_context","payload":{"model":"gpt-5.4"}}""")
+        }
+        Files.writeString(
+            sessionDirectory.resolve("rollout-$threadId.jsonl"),
+            sessionContent,
+        )
+        val warnings = mutableListOf<String>()
+
+        val output = DefaultLlmOutputParser(warnings::add).parse(
+            request = request(LlmProvider.CODEX),
+            command = command(codexHome),
+            processResult = processResult(codexStdout(threadId)),
+            startedAt = Instant.parse("2026-07-10T00:00:00Z"),
+            completedAt = Instant.parse("2026-07-10T00:00:01Z"),
+        )
+
+        assertEquals(emptyList(), output.usage?.modelUsages)
+        assertTrue(warnings.single().contains("truncated session content"))
+
+        codexHome.toFile().deleteRecursively()
+    }
+
+    @Test
     fun parseClaude_preservesExistingSemanticResponseAndUsage() {
         val stdout = """
             {
@@ -111,6 +207,14 @@ private fun sessionJsonl(threadId: String, model: String): String {
     return """
         {"timestamp":"2026-07-10T23:59:59Z","type":"session_meta","payload":{"id":"$threadId"}}
         {"timestamp":"2026-07-10T23:59:59Z","type":"turn_context","payload":{"model":"$model"}}
+    """.trimIndent()
+}
+
+private fun codexStdout(threadId: String): String {
+    return """
+        {"type":"thread.started","thread_id":"$threadId"}
+        {"type":"item.completed","item":{"type":"agent_message","text":"response"}}
+        {"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":4}}
     """.trimIndent()
 }
 

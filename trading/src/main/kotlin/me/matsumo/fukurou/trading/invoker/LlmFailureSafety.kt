@@ -1,25 +1,8 @@
 package me.matsumo.fukurou.trading.invoker
 
-import java.util.Collections
-import java.util.IdentityHashMap
-
-/**
- * 人間向け sink に出せる LLM failure の固定分類。
- *
- * @param category failure category
- * @param type path や message を含まない例外型
- */
-internal data class SafeLlmFailure(
-    val category: String,
-    val type: String,
-) {
-    /**
-     * human-facing log に埋め込む固定 field 文字列を返す。
-     */
-    fun toLogFields(): String {
-        return "category=$category type=$type"
-    }
-}
+import me.matsumo.fukurou.trading.logging.SafeLogFields
+import me.matsumo.fukurou.trading.logging.SafeLoggableFailure
+import me.matsumo.fukurou.trading.logging.safeLogFieldsOrNull
 
 /**
  * 元の例外を置き換えず provider 情報を内部伝播する marker。
@@ -30,7 +13,15 @@ internal data class SafeLlmFailure(
 private class LlmProviderFailureMarker(
     val provider: LlmProvider,
     val failureType: String,
-) : Throwable("LLM invocation failure classified.", null, false, false)
+) : Throwable("LLM invocation failure classified.", null, false, false), SafeLoggableFailure {
+
+    override fun safeLogFields(): SafeLogFields {
+        return SafeLogFields(
+            category = CODEX_INVOCATION_RESULT_UNAVAILABLE,
+            type = failureType,
+        )
+    }
+}
 
 /**
  * Codex の場合だけ、元の例外と cleanup failure を維持したまま provider 分類を付ける。
@@ -60,8 +51,7 @@ internal fun <T : Throwable> T.classifyLlmFailure(provider: LlmProvider): T {
  * provider 名が Codex の場合だけ元例外へ分類を付ける。
  */
 internal fun <T : Throwable> T.classifyLlmFailure(providerName: String?): T {
-    val provider = LlmProvider.entries
-        .firstOrNull { candidate -> candidate.name.equals(providerName, ignoreCase = true) }
+    val provider = providerName.toLlmProviderOrNull()
         ?: return this
 
     return classifyLlmFailure(provider)
@@ -70,14 +60,9 @@ internal fun <T : Throwable> T.classifyLlmFailure(providerName: String?): T {
 /**
  * Codex failure の場合だけ人間向けの固定分類を返す。
  */
-internal fun Throwable.safeCodexFailureOrNull(): SafeLlmFailure? {
-    val visited = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
-    val marker = findProviderFailureMarker(LlmProvider.CODEX, visited) ?: return null
-
-    return SafeLlmFailure(
-        category = CODEX_INVOCATION_RESULT_UNAVAILABLE,
-        type = marker.failureType,
-    )
+internal fun Throwable.safeCodexFailureOrNull(): SafeLogFields? {
+    return safeLogFieldsOrNull()
+        ?.takeIf { fields -> fields.category == CODEX_INVOCATION_RESULT_UNAVAILABLE }
 }
 
 /**
@@ -89,32 +74,25 @@ internal fun Throwable.safeExceptionType(): String {
     return typeName.takeIf { value -> SAFE_EXCEPTION_TYPE.matches(value) } ?: "Throwable"
 }
 
-private fun Throwable.findProviderFailureMarker(
-    provider: LlmProvider,
-    visited: MutableSet<Throwable>,
-): LlmProviderFailureMarker? {
-    if (!visited.add(this)) {
-        return null
-    }
+/**
+ * provider 名が Codex を表すか判定する。
+ */
+internal fun isCodexProvider(providerName: String?): Boolean {
+    return providerName.toLlmProviderOrNull() == LlmProvider.CODEX
+}
 
-    val directMarker = suppressed
-        .filterIsInstance<LlmProviderFailureMarker>()
-        .firstOrNull { marker -> marker.provider == provider }
-
-    if (directMarker != null) {
-        return directMarker
-    }
-
-    cause?.findProviderFailureMarker(provider, visited)?.let { marker -> return marker }
-
-    return suppressed.firstNotNullOfOrNull { failure ->
-        failure.findProviderFailureMarker(provider, visited)
-    }
+private fun String?.toLlmProviderOrNull(): LlmProvider? {
+    return LlmProvider.entries.firstOrNull { provider -> provider.name.equals(this, ignoreCase = true) }
 }
 
 /**
  * Codex invocation failure の固定 category。
  */
 internal const val CODEX_INVOCATION_RESULT_UNAVAILABLE = "INVOCATION_RESULT_UNAVAILABLE"
+
+/**
+ * Codex failure の永続化面へ保存する固定文言。
+ */
+internal const val CODEX_FAILURE_DETAILS_OMITTED = "Codex invocation failure details omitted."
 
 private val SAFE_EXCEPTION_TYPE = Regex("[A-Za-z][A-Za-z0-9]*")

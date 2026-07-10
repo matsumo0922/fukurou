@@ -1,6 +1,5 @@
 package me.matsumo.fukurou.trading.logging
 
-import me.matsumo.fukurou.trading.invoker.safeCodexFailureOrNull
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -49,10 +48,10 @@ class RateLimitedWarnLogger(
             return
         }
 
-        val codexFailure = throwable.safeCodexFailureOrNull()
+        val safeFields = throwable.safeLogFieldsOrNull()
 
-        if (codexFailure != null) {
-            logger.warning("$message ${codexFailure.toLogFields()}.")
+        if (safeFields != null) {
+            logger.warning("$message ${safeFields.format()}.")
             return
         }
 

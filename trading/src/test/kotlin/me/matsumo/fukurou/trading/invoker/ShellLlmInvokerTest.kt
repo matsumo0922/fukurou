@@ -95,7 +95,7 @@ class ShellLlmInvokerTest {
     }
 
     @Test
-    fun invoke_propagatesCleanupFailureAfterSuccessfulProcess() = runBlocking {
+    fun invoke_retainsCleanupFailureWithSuccessfulProcessResult() = runBlocking {
         val artifact = Files.createTempFile("shell-llm-invoker-cleanup-failure", ".jsonl")
         val failure = FileSystemException(
             "/temporary/codex-home/auth-path-marker.json",
@@ -112,9 +112,12 @@ class ShellLlmInvokerTest {
         )
 
         val result = invoker.invoke(request())
+        val invocationResult = result.getOrThrow()
 
-        assertEquals(failure, result.exceptionOrNull())
-        assertEquals("FileSystemException", result.exceptionOrNull()?.safeCodexFailureOrNull()?.type)
+        assertSame(failure, invocationResult.cleanupFailure)
+        assertEquals("FileSystemException", invocationResult.cleanupFailure?.safeCodexFailureOrNull()?.type)
+        assertEquals(ProcessRunStatus.EXITED, invocationResult.processResult.status)
+        assertEquals(0, invocationResult.processResult.exitCode)
         assertTrue(processRunner.runCalled)
         assertTrue(processRunner.cleanupCalled)
     }

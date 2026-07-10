@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.tool
 
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.invoker.isCodexProvider
 
 /**
  * no-trade 系 failure payload を JSON 文字列として組み立てる。
@@ -13,7 +14,7 @@ internal fun buildNoTradeFailurePayload(
 ): String {
     val causeName = cause?.javaClass?.simpleName ?: "none"
     val message = cause?.message ?: ""
-    val omitMessage = llmProvider.equals(CODEX_PROVIDER_NAME, ignoreCase = true)
+    val omitMessage = isCodexProvider(llmProvider)
 
     return buildJsonObject {
         put("reason", reason)
@@ -35,5 +36,3 @@ internal fun Throwable.withSuppressedFailure(result: Result<Unit>): Throwable {
 
     return this
 }
-
-private const val CODEX_PROVIDER_NAME = "codex"

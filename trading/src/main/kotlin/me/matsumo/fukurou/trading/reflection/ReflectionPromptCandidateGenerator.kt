@@ -21,6 +21,7 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
@@ -943,4 +944,3 @@ private val SUSPICIOUS_SECRET_PATTERNS = listOf(
 private const val REFLECTION_PHASE_NAME = "reflection"
 private const val REFLECTION_PROMPT_VERSION = "reflection-prompt-candidates-v1"
 private const val REFLECTION_LLM_RUN_STATUS_SUCCEEDED = "SUCCEEDED"
-private const val CODEX_FAILURE_DETAILS_OMITTED = "Codex invocation failure details omitted."

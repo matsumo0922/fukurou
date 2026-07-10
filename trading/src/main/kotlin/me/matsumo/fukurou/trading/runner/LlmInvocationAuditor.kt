@@ -61,10 +61,13 @@ class LlmInvocationAuditor(
         val duration = Duration.ofNanos(System.nanoTime() - startedAt)
         val invocationResult = result.getOrNull()
         val processResult = invocationResult?.processResult
+        val cleanupFailure = invocationResult?.cleanupFailure
         val startFailure = result.exceptionOrNull()
             ?.takeIf { processResult == null }
         val usage = invocationResult?.usage
-        val auditSignals = processResult?.auditSignals() ?: LlmPhaseAuditSignals()
+        val auditSignals = (processResult?.auditSignals() ?: LlmPhaseAuditSignals()).copy(
+            cleanupFailed = cleanupFailure != null,
+        )
 
         val appendFailure = appendPhase(
             context = context,
@@ -88,8 +91,13 @@ class LlmInvocationAuditor(
 
         if (processFailed) {
             val failure = IllegalStateException("$phaseName process did not exit cleanly.")
+            cleanupFailure?.let { cleanup -> failure.addSuppressed(cleanup) }
 
             return Result.failure(failure.classifyLlmFailure(request.provider))
+        }
+
+        if (cleanupFailure != null) {
+            return Result.failure(cleanupFailure.classifyLlmFailure(request.provider))
         }
 
         return result.fold(
@@ -153,6 +161,9 @@ class LlmInvocationAuditor(
             put("provider", provider.name.lowercase())
             put("status", processResult?.status?.name ?: "FAILED_TO_START")
             put("exitCode", processResult?.exitCode?.toString() ?: "null")
+            if (auditSignals.cleanupFailed) {
+                put("cleanupFailed", true)
+            }
             startFailure?.let { throwable ->
                 when (provider) {
                     LlmProvider.CLAUDE -> put("error", throwable.redactedQualifiedErrorMessage())
@@ -241,10 +252,12 @@ data class LlmPhaseAuditResult(
  *
  * @param authFailureSuspected CLI 認証失敗らしい出力を検出したか
  * @param cliErrorReported CLI が error 終了を報告する出力を検出したか
+ * @param cleanupFailed 一時 artifact の cleanup に失敗したか
  */
 private data class LlmPhaseAuditSignals(
     val authFailureSuspected: Boolean = false,
     val cliErrorReported: Boolean = false,
+    val cleanupFailed: Boolean = false,
 )
 
 /**

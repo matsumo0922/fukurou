@@ -31,7 +31,8 @@ interface LlmCommandRenderer {
  */
 interface ProcessRunner {
     /**
-     * command を実行する。
+     * command を実行する。renderer が生成した一時 artifact は削除しないため、
+     * 呼び出し側は output の解析後に [cleanup] を必ず呼ぶ。
      */
     suspend fun run(command: RenderedLlmCommand): Result<ProcessRunResult>
 
@@ -98,15 +99,12 @@ class ShellLlmInvoker(
                 responseText = parsedOutput.responseText,
                 usage = parsedOutput.usage,
                 processResult = processResult,
+                cleanupFailure = cleanupNonCancellable(command)
+                    .exceptionOrNull()
+                    ?.classifyLlmFailure(request.provider),
             )
-            val cleanupResult = cleanupNonCancellable(command)
-            val cleanupFailure = cleanupResult.exceptionOrNull()
 
-            if (cleanupFailure == null) {
-                Result.success(invocationResult)
-            } else {
-                Result.failure(cleanupFailure.classifyLlmFailure(request.provider))
-            }
+            Result.success(invocationResult)
         } catch (throwable: CancellationException) {
             val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
             cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }

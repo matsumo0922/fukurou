@@ -46,7 +46,7 @@ internal suspend fun runOneShotRunnerMain(
                 throw failure
             }
 
-            stderr("one-shot runner failed ${disclosure.toLogFields()}.")
+            stderr("one-shot runner failed ${disclosure.format()}.")
             ONE_SHOT_RUNNER_FAILURE_EXIT_CODE
         },
     )

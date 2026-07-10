@@ -148,10 +148,12 @@ data class ProcessRunResult(
  * @param responseText provider output から抽出した最終応答本文
  * @param usage provider output から抽出した structured usage
  * @param processResult process 実行結果
+ * @param cleanupFailure process output の解析後に一時 artifact を削除できなかった failure
  */
 data class LlmInvocationResult(
     val request: LlmInvocationRequest,
     val processResult: ProcessRunResult,
-    val responseText: String = processResult.stdout,
+    val responseText: String,
     val usage: LlmUsageDetails? = null,
+    val cleanupFailure: Throwable? = null,
 )

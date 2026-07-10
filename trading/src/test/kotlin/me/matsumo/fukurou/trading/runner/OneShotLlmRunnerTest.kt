@@ -2099,6 +2099,7 @@ private class RequestCapturingLlmInvoker(
             LlmInvocationResult(
                 request = request,
                 processResult = cleanExit(),
+                responseText = "",
             ),
         )
     }

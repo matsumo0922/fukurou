@@ -328,6 +328,7 @@ describe("App", () => {
     expect(screen.getAllByText("2.88%").length).toBeGreaterThan(0);
     expect(screen.getAllByText("$0.1234").length).toBeGreaterThan(0);
     expect(screen.getByText("known provider total · partially unavailable")).toBeInTheDocument();
+    expect(screen.getByText("2 cost unavailable (incl. missing usage 1) · 1 model unavailable")).toBeInTheDocument();
     expect(screen.getByText("unavailable")).toBeInTheDocument();
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -1285,7 +1286,7 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
           truncated: false,
           phaseCount: 4,
           missingUsagePhaseCount: 1,
-          unpricedPhaseCount: 1,
+          unpricedPhaseCount: 2,
           unattributedTokenPhaseCount: 1,
           knownCostUsd: "0.1234",
           byProvider: [
@@ -1294,7 +1295,7 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
               knownCostUsd: "0.1234",
               phaseCount: 3,
               missingUsagePhaseCount: 1,
-              unpricedPhaseCount: 0,
+              unpricedPhaseCount: 1,
               unattributedTokenPhaseCount: 0,
             },
             {

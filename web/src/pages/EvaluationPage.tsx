@@ -602,8 +602,8 @@ function CostsPanel({
             label: t("evaluation.label.phases"),
             value: formatInteger(costsQuery.data.phaseCount),
             detail: [
-              `${formatInteger(costsQuery.data.missingUsagePhaseCount)} ${t("evaluation.detail.missingUsage")}`,
-              `${formatInteger(costsQuery.data.unpricedPhaseCount)} ${t("evaluation.detail.unpriced")}`,
+              `${formatInteger(costsQuery.data.unpricedPhaseCount)} ${t("evaluation.detail.unpriced")} `
+                + `(${t("evaluation.detail.includingMissingUsage")} ${formatInteger(costsQuery.data.missingUsagePhaseCount)})`,
               `${formatInteger(costsQuery.data.unattributedTokenPhaseCount)} ${t("evaluation.detail.unattributedTokens")}`,
             ].join(" · "),
           },
@@ -630,8 +630,8 @@ function ProviderCostTable({ costs }: { costs: EvaluationCostsResponse["byProvid
           <span role="columnheader">{t("evaluation.table.provider")}</span>
           <span role="columnheader">{t("evaluation.table.cost")}</span>
           <span role="columnheader">{t("evaluation.label.phases")}</span>
-          <span role="columnheader">{t("evaluation.detail.missingUsage")}</span>
           <span role="columnheader">{t("evaluation.detail.unpriced")}</span>
+          <span role="columnheader">{t("evaluation.detail.includingMissingUsage")}</span>
           <span role="columnheader">{t("evaluation.detail.unattributedTokens")}</span>
         </div>
         {costs.map((cost) => (
@@ -646,8 +646,8 @@ function ProviderCostTable({ costs }: { costs: EvaluationCostsResponse["byProvid
                 : ""}
             </span>
             <span role="cell">{formatInteger(cost.phaseCount)}</span>
-            <span role="cell">{formatInteger(cost.missingUsagePhaseCount)}</span>
             <span role="cell">{formatInteger(cost.unpricedPhaseCount)}</span>
+            <span role="cell">{formatInteger(cost.missingUsagePhaseCount)}</span>
             <span role="cell">{formatInteger(cost.unattributedTokenPhaseCount)}</span>
           </div>
         ))}

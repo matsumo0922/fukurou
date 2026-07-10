@@ -16,6 +16,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import java.nio.file.FileSystemException
 import java.nio.file.Path
 import java.time.Clock
 import java.time.Duration
@@ -130,6 +131,55 @@ class LlmInvocationAuditorTest {
     }
 
     @Test
+    fun invokeAndAudit_recordsCompletedUsageBeforeFailingOnCleanup() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        val usage = LlmUsageDetails(
+            totalCostUsd = null,
+            numTurns = null,
+            durationMs = null,
+            usage = LlmTokenUsage(
+                inputTokens = 12,
+                outputTokens = 3,
+                reasoningOutputTokens = 1,
+                cacheCreationInputTokens = null,
+                cacheReadInputTokens = 2,
+            ),
+            modelUsages = emptyList(),
+        )
+        val cleanupFailure = FileSystemException(
+            "/private/codex-home/path-marker",
+            null,
+            "cleanup path-message-marker",
+        )
+        val invoker = CleanupFailingAuditLlmInvoker(usage, cleanupFailure)
+
+        val result = auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = invoker,
+        )
+
+        val payload = Json.parseToJsonElement(commandEventLog.events().single().payload).jsonObject
+        val details = requireNotNull(payload["details"]).jsonObject
+        val auditUsage = requireNotNull(details["usage"]).jsonObject
+
+        assertTrue(result.isFailure)
+        assertEquals("EXITED", details["status"]?.jsonPrimitive?.content)
+        assertEquals("0", details["exitCode"]?.jsonPrimitive?.content)
+        assertEquals("true", details["cleanupFailed"]?.jsonPrimitive?.content)
+        assertEquals("12", auditUsage["usage"]?.jsonObject?.get("inputTokens")?.jsonPrimitive?.content)
+        assertFalse(commandEventLog.events().single().payload.contains("path-marker"))
+        assertFalse(commandEventLog.events().single().payload.contains("path-message-marker"))
+    }
+
+    @Test
     fun invokeAndAudit_preservesClaudeStartFailureDetail() = runBlocking {
         val commandEventLog = InMemoryCommandEventLog()
         val auditor = LlmInvocationAuditor(
@@ -194,6 +244,28 @@ private class StaticStructuredAuditLlmInvoker(
     }
 }
 
+private class CleanupFailingAuditLlmInvoker(
+    private val usage: LlmUsageDetails,
+    private val cleanupFailure: Throwable,
+) : LlmInvoker {
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        return Result.success(
+            LlmInvocationResult(
+                request = request,
+                processResult = ProcessRunResult(
+                    status = ProcessRunStatus.EXITED,
+                    exitCode = 0,
+                    stdout = "private raw output",
+                    stderr = "",
+                ),
+                responseText = "semantic response",
+                usage = usage,
+                cleanupFailure = cleanupFailure,
+            ),
+        )
+    }
+}
+
 /**
  * auditor test 用の失敗する LLM invoker。
  */
@@ -219,6 +291,7 @@ private class StaticAuditLlmInvoker(
                     stdout = stdout,
                     stderr = "",
                 ),
+                responseText = stdout,
                 usage = LlmUsageParser.parseClaudeStdout(stdout),
             ),
         )

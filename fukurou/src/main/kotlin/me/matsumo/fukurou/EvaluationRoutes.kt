@@ -852,7 +852,7 @@ data class EvaluationBenchmarkReturnResponse(
  * @param truncated phase usage fact が取得上限で切り詰められたか
  * @param phaseCount phase 数
  * @param missingUsagePhaseCount usage 欠落 phase 数
- * @param unpricedPhaseCount monetary cost 未取得 phase 数
+ * @param unpricedPhaseCount monetary cost 未取得 phase 数。usage 欠落 phase を含む
  * @param unattributedTokenPhaseCount model attribution 欠落 phase 数
  * @param knownCostUsd 取得済み cost の合計 USD。全 phase で未取得なら null
  * @param byProvider provider 別 cost
@@ -878,7 +878,7 @@ data class EvaluationCostsResponse(
  * @param knownCostUsd 取得済み cost の合計 USD。全 phase で未取得なら null
  * @param phaseCount phase 数
  * @param missingUsagePhaseCount usage 欠落 phase 数
- * @param unpricedPhaseCount monetary cost 未取得 phase 数
+ * @param unpricedPhaseCount monetary cost 未取得 phase 数。usage 欠落 phase を含む
  * @param unattributedTokenPhaseCount model attribution 欠落 phase 数
  */
 @Serializable

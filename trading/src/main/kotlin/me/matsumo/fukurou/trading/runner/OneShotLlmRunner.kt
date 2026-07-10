@@ -43,12 +43,14 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
+import me.matsumo.fukurou.trading.invoker.isCodexProvider
 import me.matsumo.fukurou.trading.invoker.readOptionalEnv
 import me.matsumo.fukurou.trading.invoker.splitCommandTemplate
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
@@ -1000,7 +1002,7 @@ private class OneShotRunAuditRecorder(
     }
 
     private fun Throwable.persistedErrorMessage(llmProvider: String?): String {
-        if (llmProvider.equals(CODEX_PROVIDER_NAME, ignoreCase = true)) {
+        if (isCodexProvider(llmProvider)) {
             return CODEX_FAILURE_DETAILS_OMITTED
         }
 
@@ -1021,9 +1023,6 @@ private class OneShotRunAuditRecorder(
         )
     }
 }
-
-private const val CODEX_PROVIDER_NAME = "codex"
-private const val CODEX_FAILURE_DETAILS_OMITTED = "Codex invocation failure details omitted."
 
 /**
  * OneShot runner の LLM phase 実行を共通 auditor へ委譲する helper。

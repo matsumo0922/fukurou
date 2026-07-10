@@ -16,6 +16,7 @@ import java.nio.file.Path
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
+import java.util.logging.Logger
 
 /**
  * provider output を正規化した結果。
@@ -30,8 +31,14 @@ data class ParsedLlmOutput(
 
 /**
  * Claude JSON と Codex JSONL を解析する既定 output parser。
+ *
+ * @param warningLogger model attribution の bounded scan を打ち切った場合の warning 出力
  */
-class DefaultLlmOutputParser : LlmOutputParser {
+class DefaultLlmOutputParser(
+    private val warningLogger: (String) -> Unit = { message ->
+        Logger.getLogger(DefaultLlmOutputParser::class.java.name).warning(message)
+    },
+) : LlmOutputParser {
 
     override fun parse(
         request: LlmInvocationRequest,
@@ -93,6 +100,8 @@ class DefaultLlmOutputParser : LlmOutputParser {
         var responseText: String? = null
         var usage: LlmTokenUsage? = null
 
+        // renderer が強制する `codex exec` は invocation ごとに単一 turn を生成する。
+        // 将来の event 追加や重複に対しては、同じ invocation の最後の完了値を採用する。
         stdout.lineSequence().forEach { line ->
             val event = runCatching { OutputJson.parseToJsonElement(line).jsonObject }.getOrNull()
                 ?: return@forEach
@@ -131,10 +140,33 @@ class DefaultLlmOutputParser : LlmOutputParser {
         val codexHomeValue = command.environment[CODEX_HOME_ENV] ?: return null
         val codexHome = runCatching { Path.of(codexHomeValue) }.getOrNull() ?: return null
         val sessionRoot = codexHome.resolve(CODEX_SESSIONS_DIRECTORY)
-        val candidateFiles = invocationDates(startedAt, completedAt)
-            .flatMap { date -> sessionFiles(sessionRoot, date) }
+        val filesByDate = invocationDates(startedAt, completedAt)
+            .associateWith { date -> sessionFiles(sessionRoot, date) }
+        val filenameCandidates = filesByDate.values
+            .flatten()
+            .filter { path -> path.fileName.toString().contains(threadId) }
+        val filenameModel = filenameCandidates
+            .firstNotNullOfOrNull { path -> resolveModelFromSession(path, threadId) }
 
-        return candidateFiles.firstNotNullOfOrNull { path -> resolveModelFromSession(path, threadId) }
+        if (filenameModel != null) {
+            return filenameModel
+        }
+
+        val filenameCandidateSet = filenameCandidates.toSet()
+        val fallbackCandidates = filesByDate.flatMap { (date, files) ->
+            val candidates = files.filterNot { path -> path in filenameCandidateSet }
+
+            if (candidates.size > MAX_SESSION_FILES_PER_DAY) {
+                warningLogger(
+                    "Codex model attribution fallback truncated session files " +
+                        "date=$date candidates=${candidates.size} limit=$MAX_SESSION_FILES_PER_DAY.",
+                )
+            }
+
+            candidates.take(MAX_SESSION_FILES_PER_DAY)
+        }
+
+        return fallbackCandidates.firstNotNullOfOrNull { path -> resolveModelFromSession(path, threadId) }
     }
 
     private fun invocationDates(startedAt: Instant, completedAt: Instant): Set<LocalDate> {
@@ -158,39 +190,76 @@ class DefaultLlmOutputParser : LlmOutputParser {
             Files.list(directory).use { paths ->
                 paths
                     .filter { path -> Files.isRegularFile(path) }
-                    .limit(MAX_SESSION_FILES_PER_DAY)
                     .toList()
+                    .sortedByDescending { path ->
+                        runCatching { Files.getLastModifiedTime(path).toMillis() }.getOrDefault(0L)
+                    }
             }
         }.getOrDefault(emptyList())
     }
 
     private fun resolveModelFromSession(path: Path, threadId: String): String? {
         return runCatching {
-            var sessionMatches = false
-            var model: String? = null
+            val scanState = CodexSessionScanState()
+            var lineCount = 0
 
-            Files.newBufferedReader(path).useLines { lines ->
-                lines.take(MAX_SESSION_LINES).forEach { line ->
-                    val event = runCatching { OutputJson.parseToJsonElement(line).jsonObject }.getOrNull()
-                        ?: return@forEach
-                    val payload = event.objectOrNull("payload") ?: return@forEach
-
-                    when (event.stringOrNull("type")) {
-                        CODEX_SESSION_META_EVENT -> {
-                            sessionMatches = payload.stringOrNull("id") == threadId
-                        }
-
-                        CODEX_TURN_CONTEXT_EVENT -> {
-                            if (sessionMatches) {
-                                model = payload.stringOrNull("model") ?: model
-                            }
-                        }
+            Files.newBufferedReader(path).use { reader ->
+                while (lineCount < MAX_SESSION_LINES) {
+                    val line = reader.readLine() ?: break
+                    lineCount += 1
+                    if (!scanState.sessionMatches && lineCount > MAX_SESSION_META_LINES) {
+                        return@runCatching null
                     }
+                    if (scanState.update(line, threadId)) {
+                        return@runCatching null
+                    }
+                }
+
+                if (reader.readLine() != null) {
+                    warningLogger(
+                        "Codex model attribution truncated session content " +
+                            "limit=$MAX_SESSION_LINES matched=${scanState.sessionMatches}.",
+                    )
                 }
             }
 
-            model.takeIf { sessionMatches }
+            scanState.model.takeIf { scanState.sessionMatches }
         }.getOrNull()
+    }
+}
+
+/**
+ * Codex session JSONL の model attribution scan 状態。
+ */
+private data class CodexSessionScanState(
+    var sessionMatches: Boolean = false,
+    var model: String? = null,
+) {
+    /**
+     * 1 event を反映し、別 thread の session と確定した場合に true を返す。
+     */
+    fun update(line: String, threadId: String): Boolean {
+        val event = runCatching { OutputJson.parseToJsonElement(line).jsonObject }.getOrNull()
+            ?: return false
+        val payload = event.objectOrNull("payload") ?: return false
+
+        return when (event.stringOrNull("type")) {
+            CODEX_SESSION_META_EVENT -> {
+                sessionMatches = payload.stringOrNull("id") == threadId
+
+                !sessionMatches
+            }
+
+            CODEX_TURN_CONTEXT_EVENT -> {
+                if (sessionMatches) {
+                    model = payload.stringOrNull("model") ?: model
+                }
+
+                false
+            }
+
+            else -> false
+        }
     }
 }
 
@@ -238,7 +307,8 @@ private const val CODEX_AGENT_MESSAGE_ITEM = "agent_message"
 private const val CODEX_SESSION_META_EVENT = "session_meta"
 private const val CODEX_TURN_CONTEXT_EVENT = "turn_context"
 private const val CODEX_SESSIONS_DIRECTORY = "sessions"
-private const val MAX_SESSION_FILES_PER_DAY = 256L
+private const val MAX_SESSION_FILES_PER_DAY = 256
+private const val MAX_SESSION_META_LINES = 32
 private const val MAX_SESSION_LINES = 10_000
 
 private val OutputJson = Json {
