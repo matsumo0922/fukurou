@@ -133,10 +133,12 @@ class LlmInvocationAuditorTest {
     @Test
     fun invokeAndAudit_recordsCompletedUsageBeforeFailingOnCleanup() = runBlocking {
         val commandEventLog = InMemoryCommandEventLog()
+        val humanLogs = mutableListOf<String>()
         val auditor = LlmInvocationAuditor(
             commandEventLog = commandEventLog,
             redactor = SecretRedactor(emptySet()),
             clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+            humanLogger = humanLogs::add,
         )
         val request = auditRequest(LlmProvider.CODEX)
         val usage = LlmUsageDetails(
@@ -174,9 +176,11 @@ class LlmInvocationAuditorTest {
         assertEquals("EXITED", details["status"]?.jsonPrimitive?.content)
         assertEquals("0", details["exitCode"]?.jsonPrimitive?.content)
         assertEquals("true", details["cleanupFailed"]?.jsonPrimitive?.content)
+        assertTrue(details["cleanupFailed"]?.jsonPrimitive?.isString == true)
         assertEquals("12", auditUsage["usage"]?.jsonObject?.get("inputTokens")?.jsonPrimitive?.content)
         assertFalse(commandEventLog.events().single().payload.contains("path-marker"))
         assertFalse(commandEventLog.events().single().payload.contains("path-message-marker"))
+        assertEquals(emptyList(), humanLogs)
     }
 
     @Test

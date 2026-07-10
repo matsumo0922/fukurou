@@ -191,9 +191,11 @@ class DefaultLlmOutputParser(
                 paths
                     .filter { path -> Files.isRegularFile(path) }
                     .toList()
-                    .sortedByDescending { path ->
-                        runCatching { Files.getLastModifiedTime(path).toMillis() }.getOrDefault(0L)
+                    .map { path ->
+                        path to runCatching { Files.getLastModifiedTime(path).toMillis() }.getOrDefault(0L)
                     }
+                    .sortedByDescending { (_, lastModifiedMillis) -> lastModifiedMillis }
+                    .map { (path, _) -> path }
             }
         }.getOrDefault(emptyList())
     }
@@ -218,7 +220,7 @@ class DefaultLlmOutputParser(
                 if (reader.readLine() != null) {
                     warningLogger(
                         "Codex model attribution truncated session content " +
-                            "limit=$MAX_SESSION_LINES matched=${scanState.sessionMatches}.",
+                            "limit=$MAX_SESSION_LINES.",
                     )
                 }
             }
@@ -230,8 +232,11 @@ class DefaultLlmOutputParser(
 
 /**
  * Codex session JSONL の model attribution scan 状態。
+ *
+ * @param sessionMatches session metadata の thread ID が invocation と一致したか
+ * @param model matching session の turn context から最後に取得した model
  */
-private data class CodexSessionScanState(
+private class CodexSessionScanState(
     var sessionMatches: Boolean = false,
     var model: String? = null,
 ) {

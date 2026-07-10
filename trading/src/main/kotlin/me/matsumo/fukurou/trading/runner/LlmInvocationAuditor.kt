@@ -82,7 +82,6 @@ class LlmInvocationAuditor(
             ),
         ).exceptionOrNull()
         appendFailure?.let { failure -> throw failure.classifyLlmFailure(request.provider) }
-        humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
         if (auditSignals.authFailureSuspected && authFailureMessage != null) {
             humanLogger(authFailureMessage)
         }
@@ -102,6 +101,8 @@ class LlmInvocationAuditor(
 
         return result.fold(
             onSuccess = { invocation ->
+                humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
+
                 Result.success(
                     LlmPhaseAuditResult(
                         invocationResult = invocation,
@@ -162,7 +163,7 @@ class LlmInvocationAuditor(
             put("status", processResult?.status?.name ?: "FAILED_TO_START")
             put("exitCode", processResult?.exitCode?.toString() ?: "null")
             if (auditSignals.cleanupFailed) {
-                put("cleanupFailed", true)
+                put("cleanupFailed", "true")
             }
             startFailure?.let { throwable ->
                 when (provider) {

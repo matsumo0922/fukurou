@@ -174,6 +174,7 @@ class DefaultLlmOutputParserTest {
 
         assertEquals(emptyList(), output.usage?.modelUsages)
         assertTrue(warnings.single().contains("truncated session content"))
+        assertTrue(!warnings.single().contains("matched="))
 
         codexHome.toFile().deleteRecursively()
     }
