@@ -179,6 +179,7 @@ Cloudflare Access は `/app/*` と `/ops/*` を保護し、runtime config draft 
 
 ## paper / live の構造的乖離
 
+- 新規 paper resting entry は作成時に `expiresAt` を固定し、常駐 `ProtectionReconciler` が LLM runner を待たずに期限到達を fill より先に処理する。作成時の system TTL と TradePlan `timeStopAt` の早い方を採用し、runtime config 変更で既存 order の期限を再計算しない。`expiresAt` がない legacy order は推定期限を表示せず、runner の互換 sweep に任せる。
 - paper STOP は `ProtectionReconciler` が動いている間だけ約定判定される。live の native STOP は bot 停止中も取引所側で作動するため、paper の方が保護が弱い。
 - paper の LIMIT は all-or-none 約定で、GMO の FAK 部分約定は完全再現しない。LIMIT 価格までの板深さではFAK部分約定になるケースは、crossing / resting のどちらも乖離メモとして残す。crossing は tool response と runner lifecycle payload、resting は `command_event_log` の reconcile pass payload に伝搬する。
 - paper の LIMIT は板が取得できる場合、BUY は `bestAsk <= limitPrice`、SELL は `bestBid >= limitPrice` で到達判定する。発注時点で板を跨ぐ LIMIT は SafetyFloor と paper 約定の両方で taker cost として扱う。板が取得できない場合だけ、WARNを出してlast price比較へfallbackする。
