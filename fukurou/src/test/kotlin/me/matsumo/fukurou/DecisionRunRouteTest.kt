@@ -75,7 +75,10 @@ class DecisionRunRouteTest {
         assertEquals(HttpStatusCode.OK, filteredResponse.status)
         val filteredPage = Json.decodeFromString<OpsDecisionRunsResponse>(filteredResponse.body())
         assertEquals(listOf("run-old"), filteredPage.runs.map { run -> run.invocationId })
-        assertEquals("RESTART_INTERRUPTED", filteredPage.runs.single().terminalCause)
+        assertEquals(
+            me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RESTART_INTERRUPTED,
+            filteredPage.runs.single().terminalCause,
+        )
         assertEquals(DecisionRunFilter.ACTION_REQUIRED, repository.lastFilter)
 
         val cappedResponse = client.get("/ops/runs?filter=WAITING")

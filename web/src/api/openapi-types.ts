@@ -2280,7 +2280,8 @@ export interface components {
             safetyMessageJa?: string | null;
             finalReason?: string | null;
             errorMessage?: string | null;
-            terminalCause?: string | null;
+            /** @enum {string|null} */
+            terminalCause?: "NORMAL_COMPLETION" | "NO_TRADE" | "SAFETY_DENIED" | "TIMED_OUT" | "RUNNER_FAILED" | "CALLER_CANCELLED" | "RESTART_INTERRUPTED" | "LEGACY_UNCLASSIFIED" | null;
             orderCount: number;
             executionCount: number;
             hasProcessFailure: boolean;

@@ -25,6 +25,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunTradeLifecycle
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.decision.requiresSafetyFloor
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.time.Instant
@@ -95,7 +96,7 @@ data class OpsDecisionRunSummaryResponse(
     val safetyMessageJa: String?,
     val finalReason: String?,
     val errorMessage: String?,
-    val terminalCause: String? = null,
+    val terminalCause: LlmRunTerminalCause? = null,
     val orderCount: Int,
     val executionCount: Int,
     val hasProcessFailure: Boolean,
@@ -405,7 +406,7 @@ private fun DecisionRunSummary.toResponse(): OpsDecisionRunSummaryResponse {
         safetyMessageJa = safetyMessageJa,
         finalReason = finalReason,
         errorMessage = errorMessage,
-        terminalCause = terminalCause?.name,
+        terminalCause = terminalCause,
         orderCount = orderCount,
         executionCount = executionCount,
         hasProcessFailure = hasProcessFailure,

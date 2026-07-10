@@ -46,10 +46,22 @@ class ApiDocumentationRouteTest {
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertEquals("Fukurou API", info.getValue("title").jsonPrimitive.content)
-        assertTrue(
-            schemas.getValue("OpsDecisionRunSummaryResponse").jsonObject
-                .getValue("properties").jsonObject
-                .containsKey("terminalCause"),
+        val terminalCause = schemas.getValue("OpsDecisionRunSummaryResponse").jsonObject
+            .getValue("properties").jsonObject
+            .getValue("terminalCause").jsonObject
+
+        assertEquals(
+            listOf(
+                "NORMAL_COMPLETION",
+                "NO_TRADE",
+                "SAFETY_DENIED",
+                "TIMED_OUT",
+                "RUNNER_FAILED",
+                "CALLER_CANCELLED",
+                "RESTART_INTERRUPTED",
+                "LEGACY_UNCLASSIFIED",
+            ),
+            terminalCause.getValue("enum").jsonArray.map { value -> value.jsonPrimitive.content },
         )
         assertOperation(
             paths = paths,
