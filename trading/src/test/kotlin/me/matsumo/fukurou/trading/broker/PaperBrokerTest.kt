@@ -31,9 +31,11 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
+import me.matsumo.fukurou.trading.reconciler.ReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -1634,6 +1636,54 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun market_event_limit_entry_consumes_sell_queue_once_before_fill() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000178")
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val reconcilerStatus = MutableReconcilerStatus()
+        val marketDataSource = MutableOrderbookMarketDataSource(
+            orderbook = Orderbook(
+                symbol = "BTC",
+                bids = listOf(OrderbookLevel(price = "9900000", size = "0.0020")),
+                asks = listOf(OrderbookLevel(price = "10000000", size = "1.0000")),
+            ),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            reconcilerStatusProvider = reconcilerStatus,
+            requireRealtimeIntegrityForRestingOrders = true,
+            clock = fixedClock(),
+        )
+        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 1, OrderSide.SELL, "0.0010")).getOrThrow()
+        reconcilerStatus.updateMarketData(
+            ReconcilerStatus(
+                lastReconciledAt = fixedInstant(),
+                startupFullReconcileCompleted = true,
+                lastMarketDataAt = fixedInstant(),
+                marketDataState = MarketDataConnectionState.CONNECTED,
+                marketDataSessionId = sessionId,
+                lastProcessedSequence = 1,
+                startupRecoveryCompleted = true,
+            ),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand())).getOrThrow()
+
+        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 2, OrderSide.BUY, "1.0000")).getOrThrow()
+        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 3, OrderSide.SELL, "0.0040")).getOrThrow()
+        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 3, OrderSide.SELL, "0.0040")).getOrThrow()
+
+        assertTrue(repository.getExecutions().getOrThrow().isEmpty())
+
+        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 4, OrderSide.SELL, "0.0030")).getOrThrow()
+
+        assertEquals(1, repository.getExecutions().getOrThrow().size)
+        assertEquals(OrderType.STOP, broker.getOpenOrders().getOrThrow().single().orderType)
+    }
+
+    @Test
     fun periodic_rest_maintenance_does_not_execute_virtual_take_profit_but_market_event_does() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
@@ -2571,6 +2621,26 @@ private fun atrCandles(
  */
 private fun fixedInstant(): Instant {
     return Instant.parse("2026-07-02T00:00:00Z")
+}
+
+private fun inMemoryPaperTradeEvent(
+    sessionId: UUID,
+    sequence: Long,
+    side: OrderSide,
+    sizeBtc: String,
+): PaperMarketTradeEvent {
+    val receivedAt = fixedInstant().plusSeconds(sequence)
+
+    return PaperMarketTradeEvent(
+        symbol = TradingSymbol.BTC,
+        side = side,
+        priceJpy = BigDecimal("9900000"),
+        sizeBtc = BigDecimal(sizeBtc),
+        exchangeAt = receivedAt,
+        receivedAt = receivedAt,
+        connectionSessionId = sessionId,
+        sequence = sequence,
+    )
 }
 
 /**

@@ -281,6 +281,13 @@ private const val ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL = """
         AND trade_group_id IS NOT NULL
 """
 
+/** CONNECTED market-data session を一意にする partial unique index を作る SQL。 */
+private const val ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_market_data_sessions_connected_unique
+    ON market_data_sessions (state)
+    WHERE state = 'CONNECTED'
+"""
+
 /**
  * Activity execution context join 用の decision lookup index を作る SQL。
  */
@@ -419,6 +426,15 @@ private const val VERIFY_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL = """
     WHERE schemaname = current_schema()
         AND tablename = 'orders'
         AND indexname = 'idx_orders_activity_context_entry'
+"""
+
+/** CONNECTED market-data session の partial unique index 存在を確認する SQL。 */
+private const val VERIFY_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'market_data_sessions'
+        AND indexname = 'idx_market_data_sessions_connected_unique'
 """
 
 /**
@@ -657,6 +673,7 @@ private const val VERIFY_MARKET_DATA_INTEGRITY_SCHEMA_SQL = """
         s.disconnected_at,
         s.last_processed_sequence,
         s.last_received_at,
+        s.last_maintenance_at,
         g.id,
         g.session_id,
         g.reason,
@@ -918,6 +935,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL)
+    executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_DECISIONS_INVOCATION_ID_CREATED_AT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
@@ -1016,6 +1034,10 @@ private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
     verifySchemaBySql(
         sql = VERIFY_MARKET_DATA_INTEGRITY_SCHEMA_SQL,
         missingMessage = "market-data integrity schema was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL,
+        missingMessage = "market-data connected session unique index was not initialized.",
     )
     verifySchemaBySql(
         sql = VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL,

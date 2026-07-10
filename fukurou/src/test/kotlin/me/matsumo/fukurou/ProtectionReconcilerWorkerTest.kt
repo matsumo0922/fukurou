@@ -297,6 +297,12 @@ private class WorkerTestMarketDataIntegrityRepository : MarketDataIntegrityRepos
         return Result.success(Unit)
     }
 
+    override suspend fun markMaintenanceSucceeded(sessionId: UUID, succeededAt: Instant): Result<Unit> {
+        current = current.copy(lastMaintenanceAt = succeededAt)
+
+        return Result.success(Unit)
+    }
+
     override suspend fun markDisconnected(
         sessionId: UUID,
         reason: MarketDataGapReason,

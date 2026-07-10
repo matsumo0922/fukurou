@@ -51,7 +51,7 @@ class ExposedReconcilerStatusProvider(
             }
 
             ReconcilerStatus(
-                lastReconciledAt = integrity.lastReceivedAt,
+                lastReconciledAt = integrity.lastMaintenanceAt,
                 startupFullReconcileCompleted = integrity.startupRecoveryCompleted,
                 lastMarketDataAt = integrity.lastReceivedAt,
                 marketDataState = integrity.state,

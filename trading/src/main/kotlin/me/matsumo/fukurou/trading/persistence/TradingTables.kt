@@ -754,6 +754,7 @@ object MarketDataSessionsTable : Table("market_data_sessions") {
     val disconnectedAt = long("disconnected_at").nullable()
     val lastProcessedSequence = long("last_processed_sequence").default(0)
     val lastReceivedAt = long("last_received_at").nullable()
+    val lastMaintenanceAt = long("last_maintenance_at").nullable()
     val disconnectReason = varchar("disconnect_reason", length = 64).nullable()
 
     override val primaryKey = PrimaryKey(id)

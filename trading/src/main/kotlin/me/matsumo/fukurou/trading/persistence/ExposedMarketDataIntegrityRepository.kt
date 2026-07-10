@@ -52,6 +52,27 @@ class ExposedMarketDataIntegrityRepository(
         }
     }
 
+    override suspend fun markMaintenanceSucceeded(sessionId: UUID, succeededAt: Instant): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    val updated = prepare(
+                        """
+                            UPDATE market_data_sessions
+                            SET last_maintenance_at = ?
+                            WHERE id = ? AND state = 'CONNECTED'
+                        """,
+                    ).use { statement ->
+                        statement.setLong(1, succeededAt.toEpochMilli())
+                        statement.setObject(2, sessionId)
+                        statement.executeUpdate()
+                    }
+                    require(updated == 1) { "Connected market-data session was not found." }
+                }
+            }
+        }
+    }
+
     override suspend fun recordGap(
         sessionId: UUID,
         reason: MarketDataGapReason,
@@ -132,11 +153,13 @@ internal fun JdbcTransaction.selectMarketDataIntegritySnapshot(): MarketDataInte
                 s.state,
                 s.last_processed_sequence,
                 s.last_received_at,
+                s.last_maintenance_at,
                 g.started_at,
                 g.recovered_at,
                 g.reason
             FROM market_data_sessions s
             LEFT JOIN LATERAL (
+                -- readiness と API は session 単位ではなく、全体で最後に観測した gap を表示する。
                 SELECT started_at, recovered_at, reason
                 FROM market_data_gaps
                 ORDER BY started_at DESC
@@ -156,6 +179,9 @@ internal fun JdbcTransaction.selectMarketDataIntegritySnapshot(): MarketDataInte
                 sessionId = resultSet.getObject("id", UUID::class.java),
                 lastProcessedSequence = resultSet.getLong("last_processed_sequence"),
                 lastReceivedAt = resultSet.getLong("last_received_at")
+                    .takeUnless { resultSet.wasNull() }
+                    ?.let(Instant::ofEpochMilli),
+                lastMaintenanceAt = resultSet.getLong("last_maintenance_at")
                     .takeUnless { resultSet.wasNull() }
                     ?.let(Instant::ofEpochMilli),
                 gapStartedAt = resultSet.getLong("started_at")

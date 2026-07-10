@@ -953,6 +953,12 @@ private class RetryableMarketDataIntegrityRepository(
         return Result.success(Unit)
     }
 
+    override suspend fun markMaintenanceSucceeded(sessionId: UUID, succeededAt: Instant): Result<Unit> {
+        snapshot = snapshot.copy(lastMaintenanceAt = succeededAt)
+
+        return Result.success(Unit)
+    }
+
     override suspend fun markDisconnected(
         sessionId: UUID,
         reason: MarketDataGapReason,

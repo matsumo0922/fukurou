@@ -27,6 +27,7 @@ data class MarketDataIntegritySnapshot(
     val sessionId: UUID? = null,
     val lastProcessedSequence: Long = 0,
     val lastReceivedAt: Instant? = null,
+    val lastMaintenanceAt: Instant? = null,
     val gapStartedAt: Instant? = null,
     val recoveredAt: Instant? = null,
     val gapReason: MarketDataGapReason? = null,
@@ -42,6 +43,9 @@ interface MarketDataIntegrityRepository {
 
     /** 新しい接続 session を開始する。 */
     suspend fun beginSession(sessionId: UUID, connectedAt: Instant): Result<Unit>
+
+    /** periodic safety maintenance の最終成功時刻を保存する。 */
+    suspend fun markMaintenanceSucceeded(sessionId: UUID, succeededAt: Instant): Result<Unit>
 
     /** session を先に DISCONNECTED として永続化し、新規 resting order を fail-closed にする。 */
     suspend fun markDisconnected(
@@ -77,6 +81,10 @@ object UnavailableMarketDataIntegrityRepository : MarketDataIntegrityRepository 
     }
 
     override suspend fun beginSession(sessionId: UUID, connectedAt: Instant): Result<Unit> {
+        return Result.failure(IllegalStateException("market-data integrity repository is unavailable."))
+    }
+
+    override suspend fun markMaintenanceSucceeded(sessionId: UUID, succeededAt: Instant): Result<Unit> {
         return Result.failure(IllegalStateException("market-data integrity repository is unavailable."))
     }
 

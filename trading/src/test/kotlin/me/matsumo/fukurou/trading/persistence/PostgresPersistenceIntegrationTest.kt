@@ -305,6 +305,14 @@ private const val SELECT_ORDERS_CLIENT_REQUEST_ID_INDEX_COUNT_SQL = """
         AND indexname = 'idx_orders_client_request_id_unique'
 """
 
+private const val SELECT_MARKET_DATA_CONNECTED_SESSION_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'market_data_sessions'
+        AND indexname = 'idx_market_data_sessions_connected_unique'
+"""
+
 /**
  * orders activity context entry index 件数を読む SQL。
  */
@@ -806,12 +814,55 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(2, selectCommandEventLogIndexCount(database))
         assertEquals(1, selectOrdersClientRequestIdIndexCount(database))
         assertEquals(1, selectOrdersActivityContextIndexCount(database))
+        assertEquals(1, selectMarketDataConnectedSessionIndexCount(database))
         assertEquals(1, selectDecisionsInvocationIdIndexCount(database))
         assertEquals(3, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))
         assertEquals(1, selectRecentSafetyDenialIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
         assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
+    }
+
+    @Test
+    fun market_data_connected_session_is_unique_at_database_boundary() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        repository.beginSession(UUID.randomUUID(), fixedInstant()).getOrThrow()
+
+        val duplicateInsert = runCatching {
+            exposedTransaction(database) {
+                prepare(
+                    "INSERT INTO market_data_sessions (id, state, connected_at) VALUES (?, 'CONNECTED', ?)",
+                ).use { statement ->
+                    statement.setObject(1, UUID.randomUUID())
+                    statement.setLong(2, fixedInstant().plusSeconds(1).toEpochMilli())
+                    statement.executeUpdate()
+                }
+            }
+        }
+
+        assertTrue(duplicateInsert.isFailure)
+    }
+
+    @Test
+    fun reconciler_status_keeps_market_freshness_separate_from_maintenance_success() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        updateMarketDataSessionReceivedAt(database, sessionId, fixedInstant())
+
+        val beforeMaintenance = ExposedReconcilerStatusProvider(database).snapshot()
+
+        assertEquals(fixedInstant(), beforeMaintenance.lastMarketDataAt)
+        assertEquals(null, beforeMaintenance.lastReconciledAt)
+
+        val maintenanceAt = fixedInstant().plusSeconds(5)
+        repository.markMaintenanceSucceeded(sessionId, maintenanceAt).getOrThrow()
+        val afterMaintenance = ExposedReconcilerStatusProvider(database).snapshot()
+
+        assertEquals(fixedInstant(), afterMaintenance.lastMarketDataAt)
+        assertEquals(maintenanceAt, afterMaintenance.lastReconciledAt)
     }
 
     @Test
@@ -5896,6 +5947,34 @@ private fun selectOrdersActivityContextIndexCount(database: ExposedDatabase): In
 
                 resultSet.getInt(1)
             }
+        }
+    }
+}
+
+/** CONNECTED market-data session unique index 件数を読む。 */
+private fun selectMarketDataConnectedSessionIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_MARKET_DATA_CONNECTED_SESSION_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "market-data connected session index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/** market-data event 受信時刻だけを更新する。 */
+private fun updateMarketDataSessionReceivedAt(
+    database: ExposedDatabase,
+    sessionId: UUID,
+    receivedAt: Instant,
+) {
+    exposedTransaction(database) {
+        prepare("UPDATE market_data_sessions SET last_received_at = ? WHERE id = ?").use { statement ->
+            statement.setLong(1, receivedAt.toEpochMilli())
+            statement.setObject(2, sessionId)
+            require(statement.executeUpdate() == 1) { "market-data session was not found." }
         }
     }
 }

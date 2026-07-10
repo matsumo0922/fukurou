@@ -216,7 +216,7 @@ class ProtectionReconciler(
                 session.receive()
             }
             if (eventResult == null) {
-                runPeriodicSafetyMaintenance()
+                runPeriodicSafetyMaintenance(session.sessionId)
                 nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
                 continue
             }
@@ -242,7 +242,7 @@ class ProtectionReconciler(
             }
 
             if (System.nanoTime() >= nextMaintenanceAtNanos) {
-                runPeriodicSafetyMaintenance()
+                runPeriodicSafetyMaintenance(session.sessionId)
                 nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
             }
         }
@@ -312,12 +312,13 @@ class ProtectionReconciler(
     }
 
     /** REST は約定根拠にせず、定期的な safety / evaluation 保守だけに使う。 */
-    private suspend fun runPeriodicSafetyMaintenance(): Result<Unit> {
+    private suspend fun runPeriodicSafetyMaintenance(sessionId: UUID): Result<Unit> {
         return try {
             tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
                 runPeriodicSafetyMaintenanceLocked()
             }
             recordPeriodicMaintenanceRecovery().getOrThrow()
+            marketDataIntegrityRepository.markMaintenanceSucceeded(sessionId, Instant.now(clock)).getOrThrow()
 
             Result.success(Unit)
         } catch (throwable: CancellationException) {
@@ -376,10 +377,9 @@ class ProtectionReconciler(
 
     private suspend fun refreshMarketDataStatus() {
         val integrity = marketDataIntegrityRepository.snapshot().getOrThrow()
-        val reconciledAt = integrity.lastReceivedAt ?: status.snapshot().lastReconciledAt
         status.updateMarketData(
             ReconcilerStatus(
-                lastReconciledAt = reconciledAt,
+                lastReconciledAt = integrity.lastMaintenanceAt,
                 startupFullReconcileCompleted = integrity.startupRecoveryCompleted,
                 lastMarketDataAt = integrity.lastReceivedAt,
                 marketDataState = integrity.state,
