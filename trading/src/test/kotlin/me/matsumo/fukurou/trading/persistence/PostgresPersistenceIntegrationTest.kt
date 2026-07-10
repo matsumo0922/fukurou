@@ -4720,6 +4720,54 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun postgres_periodic_rest_maintenance_does_not_execute_virtual_take_profit_but_market_event_does() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000175")
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(
+            approvedPostgresEntryCommand(
+                decisionRepository,
+                postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+            ),
+        ).getOrThrow()
+
+        broker.maintainProtections(watermarkTickSnapshot("10600000")).getOrThrow()
+
+        assertEquals(1, broker.getPositions().getOrThrow().size)
+        assertEquals(1, ledgerRepository.getExecutions().getOrThrow().size)
+
+        broker.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 1,
+                sizeBtc = "0.0010",
+                priceJpy = "10400000",
+            ),
+        ).getOrThrow()
+
+        broker.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 2,
+                sizeBtc = "0.0010",
+                priceJpy = "10600000",
+            ),
+        ).getOrThrow()
+
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(2, ledgerRepository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
     fun paper_market_event_protects_existing_position_on_first_event_after_recovered_gap() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val firstSessionId = UUID.fromString("00000000-0000-0000-0000-000000000166")

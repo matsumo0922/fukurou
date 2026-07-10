@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.MarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.PaperExecutionSimulator
 import me.matsumo.fukurou.trading.broker.PaperLedgerMutationRepository
+import me.matsumo.fukurou.trading.broker.PaperLedgerReconcileScope
 import me.matsumo.fukurou.trading.broker.PaperOrderUpdate
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperSimulationContext
@@ -352,13 +353,13 @@ internal class ExposedPaperLedgerWriter(
     }
 
     /**
-     * tick に応じて resting order / protection を前進させる。
+     * tick に応じて [PaperLedgerReconcileScope] の範囲で ledger を保守する。
      */
     override suspend fun reconcile(
         tickSnapshot: TickSnapshot,
         simulator: PaperExecutionSimulator,
         simulationContext: PaperSimulationContext?,
-        allowRestingEntryFills: Boolean,
+        reconcileScope: PaperLedgerReconcileScope,
     ): Result<PaperReconcileResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -380,10 +381,10 @@ internal class ExposedPaperLedgerWriter(
                     expireRestingEntryOrders(clock.instant(), progress)
 
                     if (!paperAccountHardHaltReached()) {
-                        if (allowRestingEntryFills) {
+                        if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
                             fillTriggeredEntryOrders(reconcileContext, progress, clock)
+                            triggerPositionProtections(reconcileContext, progress, clock)
                         }
-                        triggerPositionProtections(reconcileContext, progress, clock)
                     }
 
                     progress.toPaperReconcileResult()

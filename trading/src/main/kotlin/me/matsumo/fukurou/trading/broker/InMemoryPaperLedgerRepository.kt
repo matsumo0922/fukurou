@@ -590,7 +590,7 @@ private class InMemoryPaperLedgerMutationWriter(
         tickSnapshot: TickSnapshot,
         simulator: PaperExecutionSimulator,
         simulationContext: PaperSimulationContext?,
-        allowRestingEntryFills: Boolean,
+        reconcileScope: PaperLedgerReconcileScope,
     ): Result<PaperReconcileResult> {
         return runCatching {
             state.write {
@@ -611,10 +611,10 @@ private class InMemoryPaperLedgerMutationWriter(
                 expireRestingEntryOrdersLocked(clock.instant(), progress)
 
                 if (!accountSnapshot.isHardHaltDrawdownReached()) {
-                    if (allowRestingEntryFills) {
+                    if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
                         fillTriggeredEntryOrdersLocked(reconcileContext, progress)
+                        triggerPositionProtectionsLocked(reconcileContext, progress)
                     }
-                    triggerPositionProtectionsLocked(reconcileContext, progress)
                 }
 
                 progress.toPaperReconcileResult()

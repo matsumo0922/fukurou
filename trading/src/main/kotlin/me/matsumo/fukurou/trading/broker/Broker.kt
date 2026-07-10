@@ -142,7 +142,8 @@ interface BrokerReconcileBoundary {
     suspend fun reconcile(tickSnapshot: TickSnapshot): Result<PaperReconcileResult>
 
     /**
-     * REST tick を使い、resting entry を約定させず position mark / ATR trailing だけを保守する。
+     * REST tick を使い、position mark / ATR trailing と resting entry の期限だけを保守する。
+     * protective STOP と virtual TP を含む market execution は realtime trade event だけが発生させる。
      */
     suspend fun maintainProtections(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
         return Result.success(

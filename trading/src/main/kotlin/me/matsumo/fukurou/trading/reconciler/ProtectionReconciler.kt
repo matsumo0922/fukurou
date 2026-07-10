@@ -207,12 +207,17 @@ class ProtectionReconciler(
         session: me.matsumo.fukurou.trading.market.MarketEventSession,
         maintenanceInterval: Duration,
     ) {
+        var nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
+
         while (currentCoroutineContext().isActive) {
-            val eventResult = kotlinx.coroutines.withTimeoutOrNull(maintenanceInterval.toMillis()) {
+            val eventResult = kotlinx.coroutines.withTimeoutOrNull(
+                remainingMaintenanceWaitMillis(nextMaintenanceAtNanos),
+            ) {
                 session.receive()
             }
             if (eventResult == null) {
                 runPeriodicSafetyMaintenance()
+                nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
                 continue
             }
             val event = eventResult.getOrNull()
@@ -235,7 +240,28 @@ class ProtectionReconciler(
                 refreshMarketDataStatus()
                 return
             }
+
+            if (System.nanoTime() >= nextMaintenanceAtNanos) {
+                runPeriodicSafetyMaintenance()
+                nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
+            }
         }
+    }
+
+    /** realtime event の量によらず periodic maintenance を rate limit する次回期限を返す。 */
+    private fun nextMaintenanceAtNanos(maintenanceInterval: Duration): Long {
+        require(!maintenanceInterval.isNegative && !maintenanceInterval.isZero) {
+            "maintenanceInterval must be positive."
+        }
+
+        return System.nanoTime() + maintenanceInterval.toNanos()
+    }
+
+    /** 次の maintenance 期限まで event を待機できるミリ秒を返す。 */
+    private fun remainingMaintenanceWaitMillis(nextMaintenanceAtNanos: Long): Long {
+        val remainingNanos = (nextMaintenanceAtNanos - System.nanoTime()).coerceAtLeast(0)
+
+        return ((remainingNanos + 999_999) / 1_000_000).coerceAtLeast(1)
     }
 
     private suspend fun recordMarketDataGap(sessionId: UUID, throwable: Throwable?) {
@@ -275,7 +301,6 @@ class ProtectionReconciler(
         return try {
             tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
                 broker?.applyMarketEvent(event)?.getOrThrow()
-                runPeriodicSafetyMaintenanceLocked()
             }
             refreshMarketDataStatus()
             Result.success(Unit)

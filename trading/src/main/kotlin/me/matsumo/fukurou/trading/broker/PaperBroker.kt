@@ -778,6 +778,7 @@ private class PaperBrokerReconcileDelegate(
                     tickSnapshot = tickSnapshot,
                     simulator = runtime.market.fillSimulator,
                     simulationContext = simulationContext,
+                    reconcileScope = PaperLedgerReconcileScope.FULL_TICK_EXECUTION,
                 )
                 .getOrThrow()
 
@@ -795,7 +796,7 @@ private class PaperBrokerReconcileDelegate(
                     tickSnapshot = tickSnapshot,
                     simulator = runtime.market.fillSimulator,
                     simulationContext = simulationContext,
-                    allowRestingEntryFills = false,
+                    reconcileScope = PaperLedgerReconcileScope.PERIODIC_MAINTENANCE,
                 )
                 .getOrThrow()
 

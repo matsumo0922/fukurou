@@ -237,13 +237,17 @@ interface PaperLedgerMutationRepository {
     suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult>
 
     /**
-     * tick をもとに resting order / protection を決定的に前進させる。
+     * tick をもとに paper ledger を保守する。
+     *
+     * [reconcileScope] が [PaperLedgerReconcileScope.PERIODIC_MAINTENANCE] の場合、REST tick は
+     * mark、ATR trailing、resting entry の期限処理だけに使う。resting entry、protective STOP、
+     * virtual TP の execution は realtime market event からのみ発生する。
      */
     suspend fun reconcile(
         tickSnapshot: TickSnapshot,
         simulator: PaperExecutionSimulator,
         simulationContext: PaperSimulationContext? = null,
-        allowRestingEntryFills: Boolean = true,
+        reconcileScope: PaperLedgerReconcileScope = PaperLedgerReconcileScope.FULL_TICK_EXECUTION,
     ): Result<PaperReconcileResult>
 
     /**
@@ -253,6 +257,17 @@ interface PaperLedgerMutationRepository {
         event: PaperMarketTradeEvent,
         simulator: PaperExecutionSimulator,
     ): Result<PaperReconcileResult>
+}
+
+/**
+ * tick による paper ledger 保守で許可する execution の範囲。
+ */
+enum class PaperLedgerReconcileScope {
+    /** 既存の同期 tick reconcile。entry と protection execution を許可する。 */
+    FULL_TICK_EXECUTION,
+
+    /** REST periodic maintenance。市場 execution は一切許可しない。 */
+    PERIODIC_MAINTENANCE,
 }
 
 /**

@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
@@ -1595,6 +1596,76 @@ class PaperBrokerTest {
         assertEquals("10099750.00000000", stopOrder.triggerPriceJpy)
         assertEquals("10100000.00000000", position.highestPriceSinceEntryJpy)
         assertEquals("10005000.00000000", position.lowestPriceSinceEntryJpy)
+    }
+
+    @Test
+    fun periodic_rest_maintenance_does_not_execute_protective_stop_but_market_event_does() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        broker.maintainProtections(stopGapTickSnapshot()).getOrThrow()
+
+        assertEquals(1, broker.getPositions().getOrThrow().size)
+        assertEquals(1, repository.getExecutions().getOrThrow().size)
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.SELL,
+                priceJpy = BigDecimal("9600000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(1),
+                receivedAt = fixedInstant().plusSeconds(1),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000171"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun periodic_rest_maintenance_does_not_execute_virtual_take_profit_but_market_event_does() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        broker.maintainProtections(watermarkTickSnapshot("10600000")).getOrThrow()
+
+        assertEquals(1, broker.getPositions().getOrThrow().size)
+        assertEquals(1, repository.getExecutions().getOrThrow().size)
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.BUY,
+                priceJpy = BigDecimal("10600000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(1),
+                receivedAt = fixedInstant().plusSeconds(1),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000172"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
     }
 
     @Test

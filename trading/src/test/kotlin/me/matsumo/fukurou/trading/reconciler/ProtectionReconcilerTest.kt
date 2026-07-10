@@ -706,11 +706,100 @@ class ProtectionReconcilerTest {
         job.cancelAndJoin()
 
         assertEquals(listOf(event), broker.appliedEvents)
-        assertTrue(broker.maintenanceCount >= 1)
         assertEquals(2, integrity.markDisconnectedCount)
         assertEquals(1, integrity.applyGapImpactCount)
         assertTrue(lock.owners.count { owner -> owner == "paper-market-event" } >= 2)
         assertEquals(MarketDataConnectionState.DISCONNECTED, status.snapshot().marketDataState)
+    }
+
+    @Test
+    fun market_event_burst_rate_limits_periodic_rest_maintenance() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000173")
+        val events = (1..100).map { sequence ->
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.SELL,
+                priceJpy = BigDecimal("10000000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant(),
+                receivedAt = fixedInstant(),
+                connectionSessionId = sessionId,
+                sequence = sequence.toLong(),
+            )
+        }
+        val broker = RecordingBroker(
+            PaperBroker(
+                ledgerRepository = InMemoryPaperLedgerRepository(),
+                riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                decisionRepository = InMemoryDecisionRepository(fixedClock()),
+                marketDataSource = ReconcilerFakeMarketDataSource,
+                clock = fixedClock(),
+            ),
+        )
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = CountingTradingLock(fixedClock()),
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            marketEventStream = SingleSessionMarketEventStream(
+                BurstThenIdleMarketEventSession(sessionId, fixedInstant(), events),
+            ),
+            marketDataIntegrityRepository = RetryableMarketDataIntegrityRepository(0),
+            broker = broker,
+            clock = fixedClock(),
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(50))
+        }
+
+        withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
+            while (broker.appliedEvents.size < events.size || broker.maintenanceCount == 0) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertEquals(events.size, broker.appliedEvents.size)
+        assertEquals(1, broker.maintenanceCount)
+    }
+
+    @Test
+    fun market_event_idle_session_continues_periodic_rest_maintenance() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000174")
+        val broker = RecordingBroker(
+            PaperBroker(
+                ledgerRepository = InMemoryPaperLedgerRepository(),
+                riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                decisionRepository = InMemoryDecisionRepository(fixedClock()),
+                marketDataSource = ReconcilerFakeMarketDataSource,
+                clock = fixedClock(),
+            ),
+        )
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = CountingTradingLock(fixedClock()),
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            marketEventStream = SingleSessionMarketEventStream(
+                BurstThenIdleMarketEventSession(sessionId, fixedInstant(), emptyList()),
+            ),
+            marketDataIntegrityRepository = RetryableMarketDataIntegrityRepository(0),
+            broker = broker,
+            clock = fixedClock(),
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(10))
+        }
+
+        withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
+            while (broker.maintenanceCount < 2) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertTrue(broker.appliedEvents.isEmpty())
+        assertTrue(broker.maintenanceCount >= 2)
     }
 }
 
@@ -813,6 +902,29 @@ private class ScriptedMarketEventSession(
         nextIndex += 1
 
         return result
+    }
+
+    override fun close() = Unit
+}
+
+/** 即時 event burst の後、timeout まで待機し続ける session。 */
+private class BurstThenIdleMarketEventSession(
+    override val sessionId: UUID,
+    override val connectedAt: Instant,
+    private val events: List<PaperMarketTradeEvent>,
+) : MarketEventSession {
+    private var nextIndex = 0
+
+    override suspend fun receive(): Result<PaperMarketTradeEvent> {
+        val event = events.getOrNull(nextIndex)
+        if (event != null) {
+            nextIndex += 1
+
+            return Result.success(event)
+        }
+
+        delay(Long.MAX_VALUE)
+        error("idle market event session was resumed without cancellation")
     }
 
     override fun close() = Unit
