@@ -651,6 +651,14 @@ private class InMemoryPaperLedgerMutationWriter(
         return runCatching {
             state.write {
                 if (marketSessionId != event.connectionSessionId) {
+                    positions
+                        .filter { position -> position.status == PositionStatus.OPEN }
+                        .forEach { position ->
+                            positionMarketEligibility[position.positionId] = PositionMarketEligibility(
+                                sessionId = event.connectionSessionId,
+                                eligibleAfterSequence = event.sequence - 1,
+                            )
+                        }
                     marketSessionId = event.connectionSessionId
                     lastMarketSequence = 0
                 }

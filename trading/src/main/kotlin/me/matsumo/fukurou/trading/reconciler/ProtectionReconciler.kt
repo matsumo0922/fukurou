@@ -312,10 +312,32 @@ class ProtectionReconciler(
     }
 
     /** REST は約定根拠にせず、定期的な safety / evaluation 保守だけに使う。 */
-    private suspend fun runPeriodicSafetyMaintenance() {
-        tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
-            runPeriodicSafetyMaintenanceLocked()
+    private suspend fun runPeriodicSafetyMaintenance(): Result<Unit> {
+        return try {
+            tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
+                runPeriodicSafetyMaintenanceLocked()
+            }
+
+            Result.success(Unit)
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            recordPeriodicMaintenanceFailure(throwable)
+
+            Result.failure(throwable)
         }
+    }
+
+    /** periodic maintenance の失敗を loop failure と同じ監査・ログ規約で残す。 */
+    private suspend fun recordPeriodicMaintenanceFailure(throwable: Throwable) {
+        val auditResult = recordFailureTransition(ReconcilePassKind.LOOP, throwable)
+        if (auditResult.isSuccess) {
+            previousPassFailed = true
+        } else {
+            auditResult.exceptionOrNull()?.let(throwable::addSuppressed)
+        }
+
+        logPassFailure(ReconcilePassKind.LOOP, throwable)
     }
 
     private suspend fun runPeriodicSafetyMaintenanceLocked() {

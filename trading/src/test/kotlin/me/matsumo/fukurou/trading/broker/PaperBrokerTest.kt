@@ -1669,6 +1669,92 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun market_event_session_switch_rebinds_existing_position_for_first_recovered_event() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.SELL,
+                priceJpy = BigDecimal("10000000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(1),
+                receivedAt = fixedInstant().plusSeconds(1),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000176"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.SELL,
+                priceJpy = BigDecimal("9600000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(2),
+                receivedAt = fixedInstant().plusSeconds(2),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000177"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun market_event_session_switch_rebinds_existing_position_for_first_recovered_take_profit() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.SELL,
+                priceJpy = BigDecimal("10000000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(1),
+                receivedAt = fixedInstant().plusSeconds(1),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000176"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.BUY,
+                priceJpy = BigDecimal("10600000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(2),
+                receivedAt = fixedInstant().plusSeconds(2),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000177"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
     fun reconcile_buy_limit_reaches_when_best_ask_is_at_limit_even_if_last_price_is_above_limit() = runBlocking {
         val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
