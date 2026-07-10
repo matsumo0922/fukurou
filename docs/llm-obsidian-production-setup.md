@@ -153,7 +153,7 @@ LLM daemon を有効化する前に、少なくとも次を満たすこと。
 - WebUI `/app/config` で `runner.maxInvocationsPerHour` / `runner.maxInvocationsPerDay` が意図した上限になっている。
 - Codex の model / cost 方針を確認している。
 
-WebUI `/app/config` で `daemon.enabled=true` の Runtime draft を validate / activate し、Ktor process を再起動する。その後、revision と container log を確認する。
+WebUI `/app/controls` で理由付き start を実行するか、`/app/config` で `daemon.enabled=true` の Runtime draft を validate / activate する。supervisor は process restart なしで worker を起動する。その後、`GET /ops/daemon` の desired / observed state、active / applied config identity、scheduler signal と container log を確認する。
 
 ```sh
 scripts/prod-curl "/revision" -fsS

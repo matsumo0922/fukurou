@@ -99,7 +99,7 @@ FUKUROU_OBSIDIAN_VAULT_PATH=/vault
 FUKUROU_MCP_JAR_PATH=/app/fukurou-mcp-all.jar
 ```
 
-Obsidian Writer / Reflection Runner の有効化、Reflection の interval / query / PromptCandidates 設定、LLM model override、LLM daemon の有効化は WebUI `/app/config` の Runtime group で管理する。CLI auth と MCP path の smoke test が通るまでは `daemon.enabled=false` を active config として維持する。Runtime group の変更は process restart 後に適用する。
+Obsidian Writer / Reflection Runner の有効化、Reflection の interval / query / PromptCandidates 設定、LLM model override、LLM daemon の有効化は WebUI `/app/config` の Runtime group で管理する。CLI auth と MCP path の smoke test が通るまでは `daemon.enabled=false` を active config として維持する。`daemon.*` は supervisor が graceful drain 後に hot apply し、それ以外の Runtime group は process restart 後に適用する。
 
 Cloudflare Access の `CF-Access-Client-Id` / `CF-Access-Client-Secret` は手元の検証環境で使う credential であり、NAS の `.env` には保存しない。
 
@@ -219,9 +219,11 @@ sudo docker ps --filter name=fukurou- --format 'table {{.Names}}\t{{.Image}}\t{{
 sudo git -C /srv/fukurou/repo rev-parse HEAD
 ```
 
+同一 commit SHA をもう一度 deploy しても、image tag と compose 定義が変わらなければ `docker compose up -d` は Ktor container を再作成しない。daemon 以外の active / process applied config の乖離を解消する運用では、同一 SHA deploy を restart 操作として扱わず、明示的な container restart と、その後の `/ops/daemon` identity 確認を行う。
+
 ## runtime config default 変更の反映
 
-code-owned catalog default の変更は、active runtime config に同じ key が明示保存済みの場合は実効値を上書きしない。runtime config の runtime group は applyMode `NEXT_RESTART` のため、deploy 後に `/ops/runtime-config` または WebUI `/app/config` で現在の `effectiveValue` を確認し、必要な key を draft / validate / activate で active 化する。
+code-owned catalog default の変更は、active runtime config に同じ key が明示保存済みの場合は実効値を上書きしない。runtime config の `daemon.*` は `HOT`、それ以外は applyMode `NEXT_RESTART` として扱う。deploy 後に `/ops/runtime-config` または WebUI `/app/config` で現在の `effectiveValue` を確認し、必要な key を draft / validate / activate で active 化する。`GET /ops/daemon` は active / process applied / daemon applied config identity と restart 要否を返す。
 
 例: `safety.minExpectedMoveToCostRatio` と runner の hourly / daily cap を active config に反映する。
 

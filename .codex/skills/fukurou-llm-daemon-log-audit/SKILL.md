@@ -26,6 +26,7 @@ Fukurou production の LLM daemon と paper trading 状態を、API と PostgreS
    ```bash
    scripts/prod-curl "/revision" -fsS
    scripts/prod-curl "/health/ready" -fsS
+   scripts/prod-curl "/ops/daemon" -fsS
    scripts/prod-curl "/evaluation/summary?from=<JST-date>&to=<JST-date>" -fsS
    scripts/prod-curl "/evaluation/costs?from=<JST-date>&to=<JST-date>" -fsS
    ```
@@ -50,6 +51,10 @@ Fukurou production の LLM daemon と paper trading 状態を、API と PostgreS
 - `PAPER_EXIT_EXECUTED`: runner が EXIT decision を `close_position` または `cancel_order` に写像した。`LIFECYCLE|...|exit_execution|...` と paper ledger の positions / orders / executions を確認し、position close と resting entry cancel を分けて説明する。
 - `PAPER_PROTECTION_UPDATED`: runner が ADJUST_PROTECTION decision を `update_protection` に写像した。`LIFECYCLE|...|adjust_protection_execution|...` と position の STOP / virtual TP を確認し、STOP が維持され TP だけ更新されたことを説明する。
 - `RUNNING`: run がまだ終わっていない。少し待って再確認してから断定する。
+- process 起動時の persistence bootstrap は、`runner.perRunTimeout` と Reflection timeout 上限の大きい方の3倍より古い `RUNNING` / `finished_at IS NULL` を `FAILED` に回収し、固定の process/container interruption message と回収時刻を保存する。回収済み行を daemon の正常完走や `NO_TRADE` と解釈しない。
+- `/ops/daemon` の `desiredEnabled` は versioned active config の正本、`observedState` は process 内 worker の観測状態。`STOPPING` は新規 tick 停止後の in-flight run drain、`DEGRADED` は desired=true のまま start/loop retry 待ちを表す。`reason`、`inFlightRun`、`nextRetryAt` を併記する。
+- `/ops/daemon` の `activeConfig`、`appliedConfig`、`daemonAppliedConfig` はそれぞれ active full config、process 起動時の full config、worker が採用した `daemon.*` section の identity。`daemonAppliedConfig.hash` は daemon section だけの hash。`restartRequired=true` は daemon 以外の active 値が process restart 待ちであることを示す。
+- `silenceWarning=true` は desired=true / observed=RUNNING で `flatHeartbeatInterval + pollInterval` を超えて scheduler signal がない異常。desired=false、`STOPPED`、意図的 stop は無音異常に含めない。
 - `LIFECYCLE|...`: `DECISION_LIFECYCLE_COMPLETED` の監査行。`phase` が `stale_resting_entry_ttl_sweep` なら `expiredOrderCount`、`cancelSuccessCount`、`cancelFailureCount`、`canceledOrderIds`、`failedOrderIds`、`failureSummaries` で TTL cancel の部分成功・失敗を確認する。`exit_execution` なら close / cancel / fail-closed、`adjust_protection_execution` なら protection update / fail-closed を読む。fail-closed は `reason` と `evidence` を根拠にする。
 - `max_invocations_per_hour_exceeded`: scheduler が起動上限で skip した。障害ではなく cap による抑制として扱う。
 - `RISK|...` の `state`: `RUNNING` 以外（soft halt / hard halt）なら停止中。`hard_halt=true` は全取引停止、soft halt は縮小運用。`halt_reason` を添えて説明する。
@@ -60,7 +65,7 @@ Fukurou production の LLM daemon と paper trading 状態を、API と PostgreS
 最終報告はこの順にする。
 
 1. 確認時刻、対象期間、revision / readiness。
-2. 全体結論: daemon が回っているか、fail-closed があるか、paper entry があったか。
+2. 全体結論: daemon の desired / observed state、無音警告、active / applied config 乖離、fail-closed、paper entry の有無。
 3. 時系列表: JST 時刻、trigger、status、p / expectedR、判断要約。
 4. skip 一覧: reason と時間帯。大量なら連続区間にまとめる。
 5. risk / paper ledger: hard_halt、state（soft/hard halt）、halt_reason、cash、BTC、equity、drawdown、orders / positions / executions / intents / falsifications / safety_violations（累計）。

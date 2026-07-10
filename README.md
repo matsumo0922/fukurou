@@ -40,6 +40,9 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `/evaluation/*`
 - `/ops/*`
 - `GET /ops/runtime-config`
+- `GET /ops/daemon`
+- `POST /ops/daemon/start`
+- `POST /ops/daemon/stop`
 - `GET /ops/runs`
 - `GET /ops/runs/{invocationId}`
 - `GET /ops/activity/catalog`
@@ -77,6 +80,8 @@ make build
 
 runtime config は DB 上の active version を code-owned catalog default に重ねて typed config として検証します。DB bootstrap は `runtime_config_versions` / `runtime_config_values` に初期 active version を作成し、active snapshot に不足する code-owned catalog key がある場合は既存値を保持した complete snapshot を新しい active version として作成します。明示的に退役した key は新しい active version から除去し、それ以外の unknown key は fail closed します。`RUNTIME` key は active DB config が正本で、`.env.example` と compose は runtime default を列挙せず、`.env` は secret / deployment / bootstrap 値に使います。LLM model override と Reflection Runner の interval / query / PromptCandidates 設定は `RUNTIME`、Obsidian vault path は container mount と対応する read-only の `DEPLOYMENT` として扱います。`GET /ops/runtime-config` は code-owned catalog から実効設定、version 履歴、warning を返し、secret は設定済み / 未設定だけを返します。active config が不正または一時的に読めない場合も WebUI と runtime config admin API は起動し、取引 runtime、manual trigger、daemon worker は fail closed します。draft / validate / activate / rollback は `/ops/runtime-config/drafts` と `/ops/runtime-config/versions/{versionId}/rollback` で行い、active 化と rollback は保存済み候補を現在の catalog / typed config で再検証します。valid な active version へ戻ると、runtime config warning、`/health/ready`、manual trigger gate は現在の active snapshot に基づいて再評価されます。
 
+`daemon.enabled` は versioned active runtime config 上の desired state です。WebUI Controls の start / stop も draft、typed validation、activate を通り、Ktor process を再起動せず supervisor が scheduler worker を起動、graceful stop、`daemon.*` hot apply へ収束させます。daemon 以外の active runtime config は process restart まで applied config と一致しない場合があり、`GET /ops/daemon` と Controls は active / process applied / daemon applied の identity と restart 要否を分けて表示します。daemon 無音警告は ops 表示だけに使い、`/health/ready` の意味を変えません。
+
 ## Web development
 
 `web/` は Vite + React + TypeScript のローカル Web 基盤です。Ktor API を `make dev-api` で起動した状態で Vite dev server を使います。
@@ -97,6 +102,8 @@ make dev-web
 Vite dev server は既定で `http://localhost:8080` の Ktor API へ proxy します。接続先は `VITE_FUKUROU_API_TARGET` で上書きできます。
 
 WebUI の `Config` 画面（`/app/config`）は `/ops/runtime-config` を表示します。Runtime group は draft 編集、diff preview、validation、activate、rollback を扱います。Deployment group は read-only で表示し、Secrets group は設定有無だけを表示します。warning がある場合は validation error を i18n 表示し、復旧操作の入口を維持します。secret 値は API response と画面のどちらにも出しません。
+
+WebUI の `Controls` 画面（`/app/controls`）は daemon の desired / observed state、停止・失敗理由、scheduler signal、in-flight run、config identity、無音警告を表示します。`STOPPING` 中は start / stop を無効化し、実行中 run の invocation ID、trigger、開始時刻、経過時間を表示します。
 
 WebUI の `Activity` 画面（`/app/activity`）は `/ops/runs` の decision run 一覧を新しい順に cursor pagination で表示し、server-side の `outcome` query で `Executed / Denied / No Trade / Interrupted / Running / Failed` を絞り込みます。filter 指定時の API は 1 request あたり最大 1,000 raw run を走査し、上限到達時は最後に走査した raw run の `nextBefore` を返します。一致する run が走査範囲になくても、WebUI から次の bounded window を読み込めます。自動更新は先頭ページの閲覧中だけ行い、過去ページを読み込んだ後は全ページを定期再取得しません。run を選択すると `/ops/runs/{invocationId}` から Trigger、Proposer、Intent / TradePlan、Falsifier、Runner / SafetyFloor、全 Order / Execution の各段階と raw/debug projection を右ペインへ表示します。Falsifier の verdict、LLM 申告値、SafetyFloor の再計算値と拒否 rule は別レイヤーとして扱います。terminal reason は形式検証済みの理由 code、runtime error は redacted error message として意味を混ぜずに表示します。raw/debug projection も保存済み JSON payload をそのまま公開せず、公開可能な識別子・event type・状態だけを返します。既存の `/ops/activity` と `/ops/activity/catalog` は互換 API として残ります。
 

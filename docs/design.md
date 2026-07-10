@@ -1360,24 +1360,19 @@ LLM cost / usage は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し p
 
 [確定] daemonの定義は「マクロ発火スケジューラ + 常駐ProtectionReconciler」である。前者はLLMをいつ起動するかを決め、後者はLLM起動中かどうかに依存せず、保護STOP、virtual TP、paper約定、HARD_HALT掃引を短い周期で決定的に進める。
 
-[設計提案] daemonは次の状態機械で動く。
+[確定] daemon supervisor は active runtime config の `daemon.enabled` を desired state の唯一の正本とし、次の observed state へ収束させる。
 
 ```text
-BOOT
-  -> RECOVER_STATE
-  -> RUNNING
-RUNNING
-  -> RECEIVE_TRIGGER
-  -> CHECK_COOLDOWN_AND_BUDGET
-  -> APPLY_CODE_BACKSTOP
-  -> INVOKE_LLM_ONESHOT
-  -> WAIT_CLI_EXIT_OR_TIMEOUT
-  -> RECONCILE_AFTER_RUN
-  -> RUNNING
-RUNNING
-  -> HALTED_BY_DRAWDOWN
-  -> ONLY_CLOSE_ALLOWED
+desired=true, workerなし -> STARTING -> RUNNING
+desired=false, in-flightなし -> STOPPED
+desired=false, in-flightあり -> STOPPING -> STOPPED
+daemon.*変更, in-flightあり -> STOPPING -> STARTING -> RUNNING
+start/loop失敗 -> DEGRADED -> bounded retry -> STARTING
 ```
+
+通常 stop と daemon config hot apply は新規 tick を止め、in-flight run の通常終端を待つ。drain 上限は `runner.perRunTimeout + 30秒` で、超過時だけ cancel して reservation / run を fail-closed で終端する。`STOPPING` 中は start / stop 操作を受け付けない。HARD_HALT 中の start は versioned config を変更する前に拒否する。
+
+hot apply は `daemon.*` に限定する。worker 再構築では process 起動時の runner / safety / paper config を維持し、active snapshot の daemon section だけを差し替える。active / process applied / daemon applied の identity と非 daemon 差分による restart 要否は ops API で別々に公開する。scheduler signal の無音判定は `daemon.flatHeartbeatInterval + daemon.pollInterval` を上限とし、desired=false と意図的停止は異常に含めない。
 
 ### 6.3 発火処理の擬似コード
 
