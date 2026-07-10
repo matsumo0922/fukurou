@@ -13,6 +13,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
+import me.matsumo.fukurou.trading.config.canonicalizeRuntimeConfigValue
 import me.matsumo.fukurou.trading.config.requireValid
 import me.matsumo.fukurou.trading.config.retiredRuntimeConfigKeys
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
@@ -597,7 +598,10 @@ private fun JdbcTransaction.ensureActiveRuntimeConfigVersionValues(now: Instant)
             activeVersion = activeVersion,
             values = values,
             defaultValues = defaultValues,
-            catalogKeyDiff = catalogKeyDiff,
+            reconciliation = RuntimeConfigCatalogReconciliation(
+                missingKeys = catalogKeyDiff.missingKeys,
+                retiredKeys = retiredKeys,
+            ),
             now = now,
         )
     }
@@ -640,19 +644,19 @@ private fun JdbcTransaction.reconcileActiveRuntimeConfigVersionValues(
     activeVersion: RuntimeConfigVersionRow,
     values: Map<String, String>,
     defaultValues: Map<String, String>,
-    catalogKeyDiff: RuntimeConfigCatalogKeyDiff,
+    reconciliation: RuntimeConfigCatalogReconciliation,
     now: Instant,
 ) {
     val versionId = UUID.randomUUID()
-    val completeValues = (defaultValues + values) - catalogKeyDiff.unknownKeys
+    val completeValues = (defaultValues + values) - reconciliation.retiredKeys
 
     deactivateRuntimeConfigVersion(activeVersion.versionId)
     insertRuntimeConfigVersion(
         versionId = versionId,
         now = now,
         note = runtimeConfigCatalogReconciliationNote(
-            missingKeys = catalogKeyDiff.missingKeys,
-            retiredKeys = catalogKeyDiff.unknownKeys,
+            missingKeys = reconciliation.missingKeys,
+            retiredKeys = reconciliation.retiredKeys,
         ),
     )
     insertRuntimeConfigValues(
@@ -826,7 +830,12 @@ private fun validateDraftPatchValues(values: Map<String, String>): Map<String, S
         }
     }
 
-    return values.mapValues { (_, value) -> value.trim() }
+    return values.mapValues { (key, value) ->
+        canonicalizeRuntimeConfigValue(
+            item = requireNotNull(runtimeItems[key]),
+            value = value.trim(),
+        )
+    }
 }
 
 private fun ResultSet.toRuntimeConfigVersionRow(): RuntimeConfigVersionRow {
@@ -867,4 +876,15 @@ private data class RuntimeConfigVersionRow(
 private data class RuntimeConfigCatalogKeyDiff(
     val unknownKeys: Set<String>,
     val missingKeys: Set<String>,
+)
+
+/**
+ * active runtime config の catalog reconciliation 対象。
+ *
+ * @param missingKeys catalog default から追加する key
+ * @param retiredKeys active snapshot から除去する明示的な退役 key
+ */
+private data class RuntimeConfigCatalogReconciliation(
+    val missingKeys: Set<String>,
+    val retiredKeys: Set<String>,
 )

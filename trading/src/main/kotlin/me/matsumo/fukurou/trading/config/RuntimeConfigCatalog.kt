@@ -3,6 +3,7 @@
 package me.matsumo.fukurou.trading.config
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -312,6 +313,7 @@ object RuntimeConfigCatalog {
                     defaultValue = defaults.config.llmModels.claudeModel.orEmpty(),
                     effectiveValue = config.llmModels.claudeModel.orEmpty(),
                     unit = null,
+                    blankAllowed = true,
                 ),
                 runtimeItem(
                     key = "llm.codexModel",
@@ -320,6 +322,7 @@ object RuntimeConfigCatalog {
                     defaultValue = defaults.config.llmModels.codexModel.orEmpty(),
                     effectiveValue = config.llmModels.codexModel.orEmpty(),
                     unit = null,
+                    blankAllowed = true,
                 ),
                 runtimeItem(
                     key = "daemon.enabled",
@@ -833,6 +836,7 @@ object RuntimeConfigCatalog {
         effectiveValue: String?,
         unit: String?,
         safetyTier: RuntimeConfigSafetyTier = RuntimeConfigSafetyTier.STANDARD,
+        blankAllowed: Boolean = false,
     ): RuntimeConfigItem {
         return configItem(
             key = key,
@@ -845,6 +849,7 @@ object RuntimeConfigCatalog {
             safetyTier = safetyTier,
             editable = true,
             applyMode = RuntimeConfigApplyMode.NEXT_RESTART,
+            blankAllowed = blankAllowed,
         )
     }
 
@@ -868,6 +873,7 @@ object RuntimeConfigCatalog {
             safetyTier = safetyTier,
             editable = false,
             applyMode = RuntimeConfigApplyMode.PROCESS_RESTART,
+            blankAllowed = false,
         )
     }
 
@@ -901,6 +907,7 @@ object RuntimeConfigCatalog {
         safetyTier: RuntimeConfigSafetyTier,
         editable: Boolean,
         applyMode: RuntimeConfigApplyMode,
+        blankAllowed: Boolean,
     ): RuntimeConfigItem {
         return RuntimeConfigItem(
             key = key,
@@ -917,6 +924,7 @@ object RuntimeConfigCatalog {
             safetyTier = safetyTier,
             labelKey = "config.item.$key.label",
             descriptionKey = "config.item.$key.description",
+            blankAllowed = blankAllowed,
         )
     }
 }
@@ -982,6 +990,7 @@ data class RuntimeConfigGroup(
  * @param safetyTier 安全上の分類
  * @param labelKey UI label の i18n key
  * @param descriptionKey UI description の i18n key
+ * @param blankAllowed runtime candidate に空文字を保存できるか
  */
 @Serializable
 data class RuntimeConfigItem(
@@ -999,6 +1008,8 @@ data class RuntimeConfigItem(
     val safetyTier: RuntimeConfigSafetyTier,
     val labelKey: String,
     val descriptionKey: String,
+    @Transient
+    val blankAllowed: Boolean = false,
 )
 
 /**

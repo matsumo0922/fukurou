@@ -788,6 +788,29 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun runtimeConfigDraftCanonicalizesEnumBeforePersistenceAndHashing() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedRuntimeConfigRepository(
+            database = database,
+            clock = fixedClock(),
+            environment = emptyMap(),
+        )
+
+        val draft = repository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = null,
+                values = mapOf("reflection.promptCandidateProvider" to "codex"),
+                note = "canonical enum",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+
+        assertTrue(draft.validation.valid)
+        assertEquals("CODEX", draft.values.getValue("reflection.promptCandidateProvider"))
+        assertEquals(calculateRuntimeConfigHash(draft.values), draft.version.hash)
+    }
+
+    @Test
     fun runtimeConfigDraftRejectsDeploymentAndSecretKeys() = runPostgresTest {
         RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedRuntimeConfigRepository(
@@ -969,6 +992,28 @@ class PostgresPersistenceIntegrationTest {
                 .resolve(emptyMap())
                 .isFailure,
         )
+    }
+
+    @Test
+    fun runtimeConfigBootstrapFailsClosedWhenRetiredAndUnknownKeysCoexist() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        upsertActiveRuntimeConfigValue(
+            database = database,
+            configKey = "obsidian.vaultPath",
+            configValue = "/legacy-runtime-vault",
+        )
+        upsertActiveRuntimeConfigValue(
+            database = database,
+            configKey = "runtime.unknown",
+            configValue = "1",
+        )
+
+        assertTrue(RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().isFailure)
+
+        val activeValues = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow().values
+
+        assertEquals("/legacy-runtime-vault", activeValues.getValue("obsidian.vaultPath"))
+        assertEquals("1", activeValues.getValue("runtime.unknown"))
     }
 
     @Test

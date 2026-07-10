@@ -90,6 +90,20 @@ class RuntimeConfigResolverTest {
     }
 
     @Test
+    fun resolve_canonicalizesReflectionProviderBeforeTypedConfigAndCatalogProjection() {
+        val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
+            "reflection.promptCandidateProvider" to "codex",
+        )
+        val resolver = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values))
+
+        val result = resolver.resolve(emptyMap()).getOrThrow()
+
+        assertEquals("CODEX", result.tradingConfig.reflection.promptCandidateProvider.name)
+        assertEquals("CODEX", result.typedEnvironment.getValue("FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER"))
+        assertEquals("CODEX", result.catalogEnvironment.getValue("FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER"))
+    }
+
+    @Test
     fun resolve_preservesExplicitOperatorOverridesForPaperReviewDefaults() {
         val values = RuntimeConfigCatalog.runtimeDefaultValues() + mapOf(
             "safety.minExpectedMoveToCostRatio" to "3.0",

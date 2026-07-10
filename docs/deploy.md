@@ -189,6 +189,33 @@ Public Hostname は次のように設定する。
 Cloudflare Access で Service Auth policy を作成し、手元の検証環境には Service Token を保存する。NAS `.env` には Service Token を置かない。
 Access policy は `/app/*` と `/ops/*` を対象にし、runtime config draft / validate / activate / rollback を含む state-changing ops endpoints を Access なしで公開しない。
 
+## Runtime source kind 移行 deploy
+
+LLM model override と Reflection Runner 設定を NAS `.env` から Runtime group へ移す code を deploy する場合、既存値は catalog default へ自動移行されない。移行中に CLI 既定 model で daemon が動かないよう、deploy 前に WebUI `/app/config` で現在の `daemon.enabled` を控え、`daemon.enabled=false` の draft を active 化する。
+
+続けて、NAS `.env` に設定されている次の値を deploy 作業用の記録へ控える。未設定の項目は catalog default を採用するか、Runtime group へ明示値を設定するかを deploy 前に決める。
+
+| NAS `.env` | Runtime key |
+|---|---|
+| `FUKUROU_CLAUDE_MODEL` | `llm.claudeModel` |
+| `FUKUROU_CODEX_MODEL` | `llm.codexModel` |
+| `FUKUROU_REFLECTION_MIN_INTERVAL_SECONDS` | `reflection.minInterval` |
+| `FUKUROU_REFLECTION_QUERY_LIMIT` | `reflection.queryLimit` |
+| `FUKUROU_REFLECTION_CALIBRATION_LOOKBACK_DAYS` | `reflection.calibrationLookbackDays` |
+| `FUKUROU_REFLECTION_RECENT_DECISION_LIMIT` | `reflection.recentDecisionLimit` |
+| `FUKUROU_REFLECTION_SAMPLE_WARNING_TRADE_COUNT` | `reflection.sampleWarningTradeCount` |
+| `FUKUROU_REFLECTION_PROMPT_CANDIDATE_PROVIDER` | `reflection.promptCandidateProvider` |
+| `FUKUROU_REFLECTION_PROMPT_CANDIDATE_TIMEOUT_SECONDS` | `reflection.promptCandidateTimeout` |
+| `FUKUROU_REFLECTION_PROMPT_CANDIDATE_MAX_ATTEMPTS` | `reflection.promptCandidateMaxAttempts` |
+
+source kind 移行を含む image を deploy すると、bootstrap は新しい Runtime key を catalog default で補完する。deploy 後、WebUI `/app/config` で控えた値と元の `daemon.enabled` を同じ draft に設定し、validate / activate する。active 化後、同じ commit SHA を指定して deploy script を再実行し、process restart 後の Runtime group と daemon 状態を確認する。
+
+```sh
+sudo /usr/local/sbin/deploy-fukurou <commit-sha>
+```
+
+この source kind 移行を含む code では、移行前に作成した draft / inactive version は現在の catalog に対して `obsidian.vaultPath` が unknown で、新しい Runtime key が missing になるため、activate / rollback できない。rollback 先には、移行後の catalog で作成・検証した version を使う。
+
 ## 初回デプロイ確認
 
 `main` push により `.github/workflows/deploy.yml` が実行される。build job が image を push し、deploy job が NAS runner 上で次を実行する。
