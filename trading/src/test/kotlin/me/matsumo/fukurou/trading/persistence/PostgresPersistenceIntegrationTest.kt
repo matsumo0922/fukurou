@@ -85,6 +85,7 @@ import me.matsumo.fukurou.trading.safety.SafetyViolation
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
+import java.lang.reflect.Proxy
 import java.math.BigDecimal
 import java.nio.file.Files
 import java.nio.file.Path
@@ -96,6 +97,8 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
+import javax.sql.DataSource
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -1402,6 +1405,43 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(detail.summary.finalReason, denials.denials.first().finalReason)
         assertEquals(null, denials.denials.last().finalReason)
         assertTrue(denials.denials.none { denial -> denial.invocationId in filledRunIds || denial.invocationId == "run-old" })
+    }
+
+    @Test
+    fun safetyDenialReader_stopsDetailLookupsAfterEligibleLimitPlusOne() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val invocationIds = (1..7).map { index -> "early-stop-denial-$index" }
+
+        invocationIds.forEach { invocationId ->
+            insertFinishedDecisionRun(llmRunRepository, invocationId, status = "SUCCEEDED", errorMessage = null)
+        }
+        val safetyRepository = ExposedSafetyViolationRepository(database)
+        invocationIds.forEachIndexed { index, invocationId ->
+            safetyRepository.append(
+                testSafetyViolation(
+                    decisionRunId = invocationId,
+                    rule = SafetyFloorRule.EXPECTED_VALUE_GATE,
+                    createdAt = fixedInstant().minusSeconds((index + 1).toLong()),
+                ),
+            ).getOrThrow()
+        }
+        val detailLookupCount = AtomicInteger()
+        val countingDatabase = ExposedDatabase.connect(countingDataSource(dataSource, detailLookupCount))
+        val repository = ExposedDecisionRunProjectionRepository(countingDatabase, fixedClock())
+
+        val denials = repository.readSafetyDenials(
+            DecisionRunSafetyDenialQuery(
+                symbol = TradingSymbol.BTC,
+                from = fixedInstant().minus(Duration.ofDays(30)),
+                toExclusive = fixedInstant().plusMillis(1),
+                limit = 5,
+            ),
+        ).getOrThrow()
+
+        assertEquals(5, denials.denials.size)
+        assertTrue(denials.truncated)
+        assertEquals(6, detailLookupCount.get())
     }
 
     @Test
@@ -4485,6 +4525,30 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
     } finally {
         container.stop()
     }
+}
+
+private fun countingDataSource(dataSource: DataSource, detailLookupCount: AtomicInteger): DataSource {
+    return Proxy.newProxyInstance(
+        DataSource::class.java.classLoader,
+        arrayOf(DataSource::class.java),
+    ) { _, method, arguments ->
+        val result = method.invoke(dataSource, *(arguments ?: emptyArray()))
+
+        if (method.name != "getConnection") return@newProxyInstance result
+
+        Proxy.newProxyInstance(
+            java.sql.Connection::class.java.classLoader,
+            arrayOf(java.sql.Connection::class.java),
+        ) { _, connectionMethod, connectionArguments ->
+            val sql = connectionArguments?.firstOrNull() as? String
+
+            if (connectionMethod.name == "prepareStatement" && sql?.contains("WHERE run.invocation_id = ?") == true) {
+                detailLookupCount.incrementAndGet()
+            }
+
+            connectionMethod.invoke(result, *(connectionArguments ?: emptyArray()))
+        }
+    } as DataSource
 }
 
 /**

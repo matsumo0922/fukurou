@@ -418,13 +418,16 @@ private fun JdbcTransaction.selectSafetyDenials(
 
     repeat(MAX_SAFETY_DENIAL_SCAN_BATCHES) { batchIndex ->
         val candidates = selectSafetyDenialCandidates(query, batchIndex)
-        selected += candidates.mapNotNull { invocationId ->
-            selectRunDetail(invocationId, observedAt).toSafetyDenialOrNull()
+
+        for (invocationId in candidates) {
+            val denial = selectRunDetail(invocationId, observedAt).toSafetyDenialOrNull() ?: continue
+            selected += denial
+
+            if (selected.size > query.limit) {
+                return DecisionRunSafetyDenialPage(selected.take(query.limit), truncated = true)
+            }
         }
 
-        if (selected.size > query.limit) {
-            return DecisionRunSafetyDenialPage(selected.take(query.limit), truncated = true)
-        }
         if (candidates.size < SAFETY_DENIAL_SCAN_BATCH_SIZE) {
             return DecisionRunSafetyDenialPage(selected, truncated = false)
         }
