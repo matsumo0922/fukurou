@@ -265,6 +265,46 @@ class LlmDaemonSupervisorTest {
     }
 
     @Test
+    fun recoveredRuntimeReapsPendingWorkerBeforeSameDaemonConfigShortCircuit() = runBlocking {
+        val processConfig = TradingBotConfig()
+        val enabledConfig = processConfig.copy(daemon = processConfig.daemon.copy(enabled = true))
+        val snapshotState = MutableRuntimeSnapshot(enabledConfig)
+        val workers = CopyOnWriteArrayList<FakeWorker>()
+        val supervisor = createSupervisor(
+            processConfig = processConfig,
+            snapshotState = snapshotState,
+            initialRetryDelay = Duration.ofMillis(10),
+        ) { request ->
+            FakeWorker(
+                request = request,
+                configuredStopResult = if (workers.isEmpty()) {
+                    LlmDaemonWorkerStopResult.TERMINATION_PENDING
+                } else {
+                    LlmDaemonWorkerStopResult.DRAINED
+                },
+            ).also(workers::add)
+        }.start()
+
+        awaitState(supervisor, LlmDaemonObservedState.RUNNING)
+        val pendingWorker = workers.single()
+        snapshotState.markUnavailable()
+        supervisor.notifyConfigChanged()
+        awaitReason(supervisor, LlmDaemonStatusReason.RUNTIME_CONFIG_UNAVAILABLE)
+
+        assertEquals(LlmDaemonWorkerStopResult.TERMINATION_PENDING, pendingWorker.stopResult)
+
+        pendingWorker.completeTermination()
+        snapshotState.update(enabledConfig)
+        awaitWorkerCount(workers, expected = 2)
+        awaitState(supervisor, LlmDaemonObservedState.RUNNING)
+
+        assertTrue(pendingWorker.stopRequested)
+        assertEquals(enabledConfig.daemon, workers.last().request.tradingConfig.daemon)
+
+        supervisor.close()
+    }
+
+    @Test
     fun intentionalStopReasonIsRestoredFromCompletedAuditAfterRestart() = runBlocking {
         val processConfig = TradingBotConfig()
         val snapshotState = MutableRuntimeSnapshot(processConfig)
@@ -410,9 +450,12 @@ private class MutableRuntimeSnapshot(initialConfig: TradingBotConfig) {
 private class FakeWorker(
     val request: LlmDaemonWorkerRequest,
     private val stopGate: CompletableDeferred<Unit>? = null,
-    private val configuredStopResult: LlmDaemonWorkerStopResult = LlmDaemonWorkerStopResult.DRAINED,
+    configuredStopResult: LlmDaemonWorkerStopResult = LlmDaemonWorkerStopResult.DRAINED,
     private val failOnStart: Boolean = false,
 ) : LlmDaemonWorkerHandle {
+    @Volatile
+    private var configuredStopResult = configuredStopResult
+
     var stopResult: LlmDaemonWorkerStopResult? = null
         private set
     var stopRequested = false
@@ -441,6 +484,10 @@ private class FakeWorker(
         stopResult = configuredStopResult
 
         return configuredStopResult
+    }
+
+    fun completeTermination() {
+        configuredStopResult = LlmDaemonWorkerStopResult.TIMED_OUT
     }
 
     fun emitInvocation(invocationId: String, startedAt: Instant) {

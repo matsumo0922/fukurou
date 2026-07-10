@@ -324,6 +324,7 @@ internal class LlmDaemonSupervisor(
     private val controlMutex = Mutex()
     private val stateLock = Any()
     private var currentWorker: LlmDaemonWorkerHandle? = null
+    private var workerTerminationPending = false
     private var workerGeneration = 0L
     private var daemonAppliedValues: Map<String, String>? = null
     private var daemonAppliedIdentity = emptyDaemonComponentIdentity()
@@ -537,6 +538,8 @@ internal class LlmDaemonSupervisor(
                 return
             }
 
+            if (!reapTerminationPendingWorkerLocked()) return
+
             val activeDaemonValues = snapshot.values.daemonValues()
             val workerNeedsRebuild = currentWorker != null && daemonAppliedValues != activeDaemonValues
 
@@ -548,6 +551,15 @@ internal class LlmDaemonSupervisor(
                 startWorkerLocked(snapshot)
             }
         }
+    }
+
+    private suspend fun reapTerminationPendingWorkerLocked(): Boolean {
+        if (!workerTerminationPending) {
+            return true
+        }
+
+        return stopCurrentWorkerLocked(LlmDaemonStatusReason.DRAIN_TIMED_OUT) !=
+            LlmDaemonWorkerStopResult.TERMINATION_PENDING
     }
 
     private suspend fun completedStopReason(): LlmDaemonDesiredStateChange? {
@@ -602,6 +614,7 @@ internal class LlmDaemonSupervisor(
         }
 
         currentWorker = worker
+        workerTerminationPending = false
         worker.start()
     }
 
@@ -622,6 +635,7 @@ internal class LlmDaemonSupervisor(
         val stopResult = worker.stopGracefully(drainTimeout)
 
         if (stopResult == LlmDaemonWorkerStopResult.TERMINATION_PENDING) {
+            workerTerminationPending = true
             val nextRetryAt = Instant.now(clock).plus(initialRetryDelay)
             updateStatus(
                 observedState = LlmDaemonObservedState.DEGRADED,
@@ -636,6 +650,7 @@ internal class LlmDaemonSupervisor(
         }
 
         currentWorker = null
+        workerTerminationPending = false
         daemonAppliedValues = null
 
         if (stopResult == LlmDaemonWorkerStopResult.TIMED_OUT) {
@@ -738,6 +753,7 @@ internal class LlmDaemonSupervisor(
                         }
 
                         currentWorker = null
+                        workerTerminationPending = false
                         daemonAppliedValues = null
                         handleStartFailureLocked(error)
                     }
