@@ -306,12 +306,14 @@ data class MarketRegimePerformance(
  *
  * @param inputTokens input token 数
  * @param outputTokens output token 数
+ * @param reasoningOutputTokens output token のうち reasoning token 数
  * @param cacheCreationInputTokens cache 作成 input token 数
  * @param cacheReadInputTokens cache read input token 数
  */
 data class LlmTokenUsage(
     val inputTokens: Long?,
     val outputTokens: Long?,
+    val reasoningOutputTokens: Long? = null,
     val cacheCreationInputTokens: Long?,
     val cacheReadInputTokens: Long?,
 )
@@ -328,7 +330,7 @@ data class LlmModelUsage(
 )
 
 /**
- * Claude JSON stdout から抽出した usage。
+ * provider の structured output から抽出した usage。
  *
  * @param totalCostUsd 合計 cost USD
  * @param numTurns turn 数
@@ -365,15 +367,19 @@ data class LlmPhaseUsageFact(
  * provider 別 LLM cost。
  *
  * @param provider provider 名
- * @param totalCostUsd 合計 cost USD
+ * @param knownCostUsd 取得済み cost の合計 USD。全 phase で未取得なら null
  * @param phaseCount phase 数
  * @param missingUsagePhaseCount usage 欠落 phase 数
+ * @param unpricedPhaseCount monetary cost 未取得 phase 数。usage 欠落 phase を含む
+ * @param unattributedTokenPhaseCount model attribution 欠落 phase 数
  */
 data class LlmProviderCostStats(
     val provider: String,
-    val totalCostUsd: BigDecimal,
+    val knownCostUsd: BigDecimal?,
     val phaseCount: Int,
     val missingUsagePhaseCount: Int,
+    val unpricedPhaseCount: Int,
+    val unattributedTokenPhaseCount: Int,
 )
 
 /**
@@ -382,6 +388,7 @@ data class LlmProviderCostStats(
  * @param model model 名
  * @param inputTokens input token 数
  * @param outputTokens output token 数
+ * @param reasoningOutputTokens output token のうち reasoning token 数
  * @param cacheCreationInputTokens cache 作成 input token 数
  * @param cacheReadInputTokens cache read input token 数
  */
@@ -389,6 +396,7 @@ data class LlmModelTokenStats(
     val model: String,
     val inputTokens: Long,
     val outputTokens: Long,
+    val reasoningOutputTokens: Long,
     val cacheCreationInputTokens: Long,
     val cacheReadInputTokens: Long,
 )
@@ -398,14 +406,18 @@ data class LlmModelTokenStats(
  *
  * @param phaseCount phase 数
  * @param missingUsagePhaseCount usage 欠落 phase 数
- * @param totalCostUsd 合計 cost USD
+ * @param unpricedPhaseCount monetary cost 未取得 phase 数。usage 欠落 phase を含む
+ * @param unattributedTokenPhaseCount model attribution 欠落 phase 数
+ * @param knownCostUsd 取得済み cost の合計 USD。全 phase で未取得なら null
  * @param byProvider provider 別 cost
  * @param byModel model 別 token 合計
  */
 data class LlmCostStats(
     val phaseCount: Int,
     val missingUsagePhaseCount: Int,
-    val totalCostUsd: BigDecimal,
+    val unpricedPhaseCount: Int,
+    val unattributedTokenPhaseCount: Int,
+    val knownCostUsd: BigDecimal?,
     val byProvider: List<LlmProviderCostStats>,
     val byModel: List<LlmModelTokenStats>,
 )

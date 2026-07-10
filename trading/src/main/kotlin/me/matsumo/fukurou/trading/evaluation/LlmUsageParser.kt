@@ -115,9 +115,16 @@ private fun JsonObject.toModelUsages(): List<LlmModelUsage> {
 private fun JsonObject.toTokenUsage(): LlmTokenUsage? {
     val inputTokens = longOrNull("input_tokens") ?: longOrNull("inputTokens")
     val outputTokens = longOrNull("output_tokens") ?: longOrNull("outputTokens")
+    val reasoningOutputTokens = longOrNull("reasoning_output_tokens") ?: longOrNull("reasoningOutputTokens")
     val cacheCreationInputTokens = longOrNull("cache_creation_input_tokens") ?: longOrNull("cacheCreationInputTokens")
     val cacheReadInputTokens = longOrNull("cache_read_input_tokens") ?: longOrNull("cacheReadInputTokens")
-    val tokenValues = listOf(inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens)
+    val tokenValues = listOf(
+        inputTokens,
+        outputTokens,
+        reasoningOutputTokens,
+        cacheCreationInputTokens,
+        cacheReadInputTokens,
+    )
     val hasAnyToken = tokenValues.any { value -> value != null }
 
     if (!hasAnyToken) {
@@ -127,6 +134,7 @@ private fun JsonObject.toTokenUsage(): LlmTokenUsage? {
     return LlmTokenUsage(
         inputTokens = inputTokens,
         outputTokens = outputTokens,
+        reasoningOutputTokens = reasoningOutputTokens,
         cacheCreationInputTokens = cacheCreationInputTokens,
         cacheReadInputTokens = cacheReadInputTokens,
     )
@@ -136,6 +144,7 @@ private fun LlmTokenUsage.toJsonObject(): JsonObject {
     return buildJsonObject {
         inputTokens?.let { value -> put("inputTokens", value) }
         outputTokens?.let { value -> put("outputTokens", value) }
+        reasoningOutputTokens?.let { value -> put("reasoningOutputTokens", value) }
         cacheCreationInputTokens?.let { value -> put("cacheCreationInputTokens", value) }
         cacheReadInputTokens?.let { value -> put("cacheReadInputTokens", value) }
     }

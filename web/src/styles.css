@@ -1404,13 +1404,16 @@ a:focus-visible {
     minmax(190px, 1.35fr);
 }
 
-.evaluation-table--benchmark .evaluation-table__row,
 .evaluation-table--costs .evaluation-table__row {
+  grid-template-columns: minmax(130px, 1.1fr) repeat(5, minmax(120px, 1fr));
+}
+
+.evaluation-table--benchmark .evaluation-table__row {
   grid-template-columns: minmax(130px, 1.1fr) repeat(3, minmax(120px, 1fr));
 }
 
 .evaluation-table--models .evaluation-table__row {
-  grid-template-columns: minmax(190px, 1.5fr) repeat(4, minmax(110px, 1fr));
+  grid-template-columns: minmax(190px, 1.5fr) repeat(5, minmax(110px, 1fr));
 }
 
 .evaluation-progress {

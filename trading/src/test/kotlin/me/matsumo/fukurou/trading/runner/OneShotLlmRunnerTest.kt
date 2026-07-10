@@ -88,6 +88,7 @@ import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ProcessRunner
 import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
+import me.matsumo.fukurou.trading.invoker.safeCodexFailureOrNull
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -101,6 +102,7 @@ import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import java.io.IOException
 import java.math.BigDecimal
+import java.nio.file.FileSystemException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Clock
@@ -116,6 +118,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -1495,8 +1498,8 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun claudePhaseAuditStoresUsageButCodexPhaseDoesNot() = runBlocking {
-        val usageStdout = """
+    fun phaseAuditStoresClaudeAndCodexStructuredUsage() = runBlocking {
+        val claudeUsageStdout = """
             {
               "total_cost_usd": 0.02,
               "num_turns": 2,
@@ -1507,16 +1510,21 @@ class OneShotLlmRunnerTest {
               }
             }
         """.trimIndent()
+        val codexUsageStdout = """
+            {"type":"thread.started","thread_id":"synthetic-thread"}
+            {"type":"item.completed","item":{"type":"agent_message","text":"approved"}}
+            {"type":"turn.completed","usage":{"input_tokens":80,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10}}
+        """.trimIndent()
         val fixture = runnerFixture { command ->
             if (command.isProposerLaunch()) {
                 submitDecision(fixtureRepository, command, DecisionAction.ENTER).getOrThrow()
 
-                return@runnerFixture cleanExit(stdout = usageStdout)
+                return@runnerFixture cleanExit(stdout = claudeUsageStdout)
             }
 
             submitFalsification(fixtureRepository, command, FalsificationVerdict.APPROVED).getOrThrow()
 
-            cleanExit(stdout = usageStdout)
+            cleanExit(stdout = codexUsageStdout)
         }
 
         fixture.runner.runOneShot(defaultRequest()).getOrThrow()
@@ -1528,7 +1536,9 @@ class OneShotLlmRunnerTest {
 
         assertTrue(proposerPhase.payload.contains("\"usage\""))
         assertTrue(proposerPhase.payload.contains("\"totalCostUsd\":\"0.02\""))
-        assertFalse(falsifierPhase.payload.contains("\"usage\""))
+        assertTrue(falsifierPhase.payload.contains("\"usage\""))
+        assertTrue(falsifierPhase.payload.contains("\"reasoningOutputTokens\":10"))
+        assertFalse(falsifierPhase.payload.contains("\"totalCostUsd\""))
     }
 
     @Test
@@ -1574,6 +1584,88 @@ class OneShotLlmRunnerTest {
         assertEquals(LLM_RUN_STATUS_FAILED, record.status)
         assertTrue(errorMessage.contains("[REDACTED]"))
         assertFalse(errorMessage.contains("test-password"))
+    }
+
+    @Test
+    fun codexInvokerFailure_omitsExceptionPathFromLlmRunAndNoTradeAudit() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = FakeMarketDataSource,
+        )
+        val failure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "cleanup path-message-marker",
+        )
+        val runner = OneShotLlmRunner(
+            tradingRuntime = runtime,
+            tradingConfig = TradingBotConfig(),
+            llmInvoker = ThrowingLlmInvoker(failure),
+            parentEnvironment = defaultParentEnvironment(),
+            clock = fixedClock(),
+            logger = {},
+        )
+        val request = defaultRequest().copy(
+            invocationId = "codex-failed-run",
+            proposerProvider = LlmProvider.CODEX,
+        )
+
+        val result = runner.runOneShot(request)
+        val record = runtime.llmRunRepository.findByInvocationId("codex-failed-run").getOrThrow()
+        val eventLog = runtime.commandEventLog as InMemoryCommandEventLog
+        val noTradeEvent = eventLog.events()
+            .single { event -> event.eventType == CommandEventType.NO_TRADE_EXIT }
+        val failureDisclosure = requireNotNull(result.exceptionOrNull()).safeCodexFailureOrNull()
+
+        assertTrue(result.isFailure)
+        assertEquals(failure, result.exceptionOrNull())
+        assertEquals("FileSystemException", failureDisclosure?.type)
+        assertEquals("Codex invocation failure details omitted.", record?.errorMessage)
+        assertFalse(noTradeEvent.payload.contains("auth-path-marker"))
+        assertFalse(noTradeEvent.payload.contains("path-message-marker"))
+        assertTrue(noTradeEvent.payload.contains("\"messageOmitted\":true"))
+    }
+
+    @Test
+    fun codexInvokerCancellation_preservesOriginalAndOmitsSuppressedCleanupPathFromAudit() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = FakeMarketDataSource,
+        )
+        val cancellation = CancellationException("cancellation path-message-marker")
+        val cleanupFailure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "cleanup path-message-marker",
+        )
+        cancellation.addSuppressed(cleanupFailure)
+        val runner = OneShotLlmRunner(
+            tradingRuntime = runtime,
+            tradingConfig = TradingBotConfig(),
+            llmInvoker = ThrowingLlmInvoker(cancellation),
+            parentEnvironment = defaultParentEnvironment(),
+            clock = fixedClock(),
+            logger = {},
+        )
+        val request = defaultRequest().copy(
+            invocationId = "codex-cancelled-run",
+            proposerProvider = LlmProvider.CODEX,
+        )
+
+        val propagated = assertFailsWith<CancellationException> {
+            runner.runOneShot(request)
+        }
+        val record = runtime.llmRunRepository.findByInvocationId("codex-cancelled-run").getOrThrow()
+        val noTradeEvent = (runtime.commandEventLog as InMemoryCommandEventLog).events()
+            .single { event -> event.eventType == CommandEventType.NO_TRADE_EXIT }
+
+        assertSame(cancellation, propagated)
+        assertTrue(propagated.suppressed.contains(cleanupFailure))
+        assertEquals("CancellationException", propagated.safeCodexFailureOrNull()?.type)
+        assertEquals("Codex invocation failure details omitted.", record?.errorMessage)
+        assertFalse(noTradeEvent.payload.contains("auth-path-marker"))
+        assertFalse(noTradeEvent.payload.contains("path-message-marker"))
+        assertTrue(noTradeEvent.payload.contains("\"messageOmitted\":true"))
     }
 
     @Test
@@ -1945,17 +2037,20 @@ private fun requestCapturingRunnerFixture(
 /**
  * LLM 起動時に例外を投げる test double。
  *
- * @param message 例外 message
+ * @param failure LLM 起動時に投げる例外
  */
 private class ThrowingLlmInvoker(
-    private val message: String,
+    private val failure: Throwable,
 ) : LlmInvoker {
+
+    constructor(message: String) : this(IllegalStateException(message))
+
     override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
         require(request.invocationId.isNotBlank()) {
             "invocationId must not be blank."
         }
 
-        throw IllegalStateException(message)
+        throw failure
     }
 }
 
@@ -2004,6 +2099,7 @@ private class RequestCapturingLlmInvoker(
             LlmInvocationResult(
                 request = request,
                 processResult = cleanExit(),
+                responseText = "",
             ),
         )
     }

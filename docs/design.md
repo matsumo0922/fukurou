@@ -1300,7 +1300,7 @@ entry EV の計算直前に、データ鮮度劣化時の probability cap を適
 
 [確定事項の改訂: 2026-07-04] 2026-07-03 の「評価 API は DB schema を追加しない」は、評価 API 専用の集計 table / SQL view / kline 永続化を増やさないという意味に限定する。`llm_runs` と `equity_snapshots` は評価 API の集計結果ではなく、runner 起動単位と paper equity 推移の一次 append-only 記録であるため追加対象に含める。
 
-`llm_runs` は `invocation_id` を primary key とし、`mode`、`symbol`、nullable な daemon `trigger_kind`、`status`、epoch millis の `started_at` / `finished_at`、redaction / truncate 済み `error_message`、開始時 runtime config の `runtime_config_version_id` / `runtime_config_hash` を保存する。LLM provider は phase ごとの `command_event_log` に残すため run-level には持たない。`stdout_path` / `stderr_path` も持たず、stdout / stderr は redaction 後の runner phase audit に残す。
+`llm_runs` は `invocation_id` を primary key とし、`mode`、`symbol`、nullable な daemon `trigger_kind`、`status`、epoch millis の `started_at` / `finished_at`、`error_message`、開始時 runtime config の `runtime_config_version_id` / `runtime_config_hash` を保存する。LLM provider は phase ごとの `command_event_log` に残すため run-level には持たない。`stdout_path` / `stderr_path` も持たない。Claude の `error_message` と stdout / stderr は redaction と truncate 後に保存し、stdout / stderr は historical usage fallback に使う。Codex は raw JSONL / stderr と起動境界の例外 message / path を永続化せず、`llm_runs.error_message` は固定文言、runner phase audit は固定 category と安全な例外 class 名だけを保存する。Codex の `NO_TRADE_EXIT` payload も例外 message を省略する。manual launch warning と standalone runner stderr でも元例外の message、path、stack trace は出さず、固定 category と安全な例外 class 名だけを出す。
 
 persistence bootstrap は、`status = RUNNING` かつ `finished_at IS NULL` の `llm_runs` のうち、`started_at` が `runner.perRunTimeout` と reflection PromptCandidates の timeout 上限の大きい方の3倍より古い行を `FAILED` に回収する。回収時は `finished_at` に bootstrap 時刻を保存し、`error_message` には前回プロセスまたは container shutdown で中断された run を bootstrap で回収したことを示す固定 message を保存する。閾値以内の新しい `RUNNING` 行と終了済みの行は変更しない。
 
@@ -1329,7 +1329,9 @@ kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `K
 
 benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は期間開始時点の paper equity（paper 初期資金 + 期間開始前の累計 realized trade PnL）とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
 
-LLM cost は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`pre_filter` / `proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON stdout から `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage` の数値と model 名だけを best-effort で抽出し、保存済み `details.usage` がない過去行は redacted `details.stdout` から可能な範囲で fallback parse する。Codex phase や parse 不能 phase は usage 欠落として数える。取得は既定 20,000 行で bounded にし、超過時は `/evaluation/costs` の `truncated` で示す。
+LLM cost / usage は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`pre_filter` / `proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON では `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage`、Codex JSONL では `codex exec` の単一 turn が返す `turn.completed.usage` を invocation 単位で best-effort に抽出する。Codex の `reasoning_output_tokens` は `output_tokens` の内数として別に保持し、token 合計へ二重加算しない。Codex の model は同じ thread ID を含む invocation 日の session filename を優先し、空振り時だけ更新日時が新しい session JSONL から bounded fallback で解決する。file 数または matching session の行数を上限で打ち切る場合は warning を残し、model が解決できない場合も semantic response と token usage は維持する。保存済み `details.usage` がない過去の Claude 行は redacted `details.stdout` から可能な範囲で fallback parse する。process output の解析後に一時 artifact の cleanup が失敗した場合も、audit は完了済み process の status、exit code、usage と `cleanupFailed` を保存してから runner を fail-closed にする。
+
+`/evaluation/costs` は usage 欠落の `missingUsagePhaseCount`、monetary cost 未取得の `unpricedPhaseCount`、token を model に帰属できない `unattributedTokenPhaseCount` を分けて返す。`unpricedPhaseCount` は usage 自体を取得できず cost も不明な phase を含み、Web UI は `missingUsagePhaseCount` をその内数として表示する。取得済み金額だけを nullable な `knownCostUsd` として合計し、全 phase で cost 未取得なら null とする。Web UI と Reflection report は未知の cost を `$0` や完全な total として表示しない。取得は既定 20,000 行で bounded にし、超過時は `truncated` で示す。
 
 ## 6. 発火エンジンと呼び出しモデル（A-7）
 

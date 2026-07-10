@@ -263,7 +263,7 @@ private fun List<String>.toRenderedCommand(request: RenderedCommandRequest): Ren
  * @param workingDirectory process working directory
  * @param timeout process timeout
  * @param stdin process stdin
- * @param cleanupPaths process 終了後に削除する path
+ * @param cleanupPaths provider output の解析後に削除する path
  */
 private data class RenderedCommandRequest(
     val args: List<String>,
@@ -486,7 +486,7 @@ private fun Path.deleteGeneratedPath() {
  * runner が生成した秘密値を含む一時設定 path。
  *
  * @param path CLI に渡す path
- * @param cleanupPaths process 終了後に削除する path
+ * @param cleanupPaths provider output の解析後に削除する path
  */
 private data class PrivateConfigPath(
     val path: Path,
@@ -547,6 +547,7 @@ val DEFAULT_CODEX_COMMON_ARGS = emptyList<String>()
  * Codex headless 実行で常に付ける安全側引数。
  */
 val ENFORCED_CODEX_COMMON_ARGS = listOf(
+    "--json",
     "--skip-git-repo-check",
     "--sandbox",
     "read-only",
@@ -560,6 +561,7 @@ val ENFORCED_CODEX_COMMON_ARGS = listOf(
  * renderer が同じ flag を強制付与するため、CLI へ二重渡ししない。
  */
 val DEDUPED_ENFORCED_CODEX_COMMON_FLAGS = setOf(
+    "--json",
     "--skip-git-repo-check",
 )
 
@@ -602,6 +604,7 @@ val CODEX_COMMON_ARG_FORBIDDEN_FLAGS = setOf(
     "--ask-for-approval",
     "--dangerously-bypass-approvals-and-sandbox",
     "--yolo",
+    "--ephemeral",
 )
 
 /**

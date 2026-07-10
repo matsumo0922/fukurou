@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.invoker
 
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import java.nio.file.Path
 import java.time.Duration
 
@@ -98,7 +99,7 @@ data class LlmInvocationRequest(
  * @param workingDirectory CLI process の working directory
  * @param timeout process timeout
  * @param stdin 標準入力へ渡す文字列
- * @param cleanupPaths process 終了後に削除する runner 生成ファイル
+ * @param cleanupPaths provider output の解析後に削除する runner 生成ファイル
  */
 data class RenderedLlmCommand(
     val executable: String,
@@ -144,9 +145,15 @@ data class ProcessRunResult(
  * LLM 起動境界の戻り値。
  *
  * @param request 元の起動要求
+ * @param responseText provider output から抽出した最終応答本文
+ * @param usage provider output から抽出した structured usage
  * @param processResult process 実行結果
+ * @param cleanupFailure process output の解析後に一時 artifact を削除できなかった failure
  */
 data class LlmInvocationResult(
     val request: LlmInvocationRequest,
     val processResult: ProcessRunResult,
+    val responseText: String,
+    val usage: LlmUsageDetails? = null,
+    val cleanupFailure: Throwable? = null,
 )

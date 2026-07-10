@@ -433,7 +433,7 @@ export interface paths {
         };
         /**
          * LLM cost と usage を取得する
-         * @description runner phase audit に保存された Claude usage を集計し、usage 欠落 phase 数も返します。
+         * @description runner phase audit に保存された provider usage と取得済み cost を集計し、usage・cost・model attribution の coverage を返します。
          */
         get: {
             parameters: {
@@ -1963,15 +1963,18 @@ export interface components {
         /** EvaluationProviderCostResponse */
         EvaluationProviderCostResponse: {
             provider: string;
-            totalCostUsd: string;
+            knownCostUsd?: string | null;
             phaseCount: number;
             missingUsagePhaseCount: number;
+            unpricedPhaseCount: number;
+            unattributedTokenPhaseCount: number;
         };
         /** EvaluationModelTokenResponse */
         EvaluationModelTokenResponse: {
             model: string;
             inputTokens: number;
             outputTokens: number;
+            reasoningOutputTokens: number;
             cacheCreationInputTokens: number;
             cacheReadInputTokens: number;
         };
@@ -1981,7 +1984,9 @@ export interface components {
             truncated: boolean;
             phaseCount: number;
             missingUsagePhaseCount: number;
-            totalCostUsd: string;
+            unpricedPhaseCount: number;
+            unattributedTokenPhaseCount: number;
+            knownCostUsd?: string | null;
             byProvider: components["schemas"]["EvaluationProviderCostResponse"][];
             byModel: components["schemas"]["EvaluationModelTokenResponse"][];
         };

@@ -126,8 +126,14 @@ function EvaluationSignalMetrics({
       />
       <Metric
         label={t("evaluation.metric.llmCost")}
-        value={queryValue(costsQuery, (data) => formatUsd(data.totalCostUsd), t)}
-        detail={costsQuery.data ? `${formatInteger(costsQuery.data.phaseCount)} ${t("evaluation.detail.phases")}` : queryDetail(costsQuery, t)}
+        value={queryValue(
+          costsQuery,
+          (data) => data.knownCostUsd == null ? t("evaluation.value.unavailable") : formatUsd(data.knownCostUsd),
+          t,
+        )}
+        detail={costsQuery.data
+          ? `${formatInteger(costsQuery.data.phaseCount)} ${t("evaluation.detail.phases")} · ${formatInteger(costsQuery.data.unpricedPhaseCount)} ${t("evaluation.detail.unpriced")}`
+          : queryDetail(costsQuery, t)}
       />
     </div>
   );
@@ -585,12 +591,21 @@ function CostsPanel({
           },
           {
             label: t("evaluation.label.totalCost"),
-            value: formatUsd(costsQuery.data.totalCostUsd),
+            value: costsQuery.data.knownCostUsd == null
+              ? t("evaluation.value.unavailable")
+              : formatUsd(costsQuery.data.knownCostUsd),
+            detail: costsQuery.data.unpricedPhaseCount > 0
+              ? t("evaluation.detail.partialKnownCost")
+              : undefined,
           },
           {
             label: t("evaluation.label.phases"),
             value: formatInteger(costsQuery.data.phaseCount),
-            detail: `${formatInteger(costsQuery.data.missingUsagePhaseCount)} ${t("evaluation.detail.missingUsage")}`,
+            detail: [
+              `${formatInteger(costsQuery.data.unpricedPhaseCount)} ${t("evaluation.detail.unpriced")} `
+                + `(${t("evaluation.detail.includingMissingUsage")} ${formatInteger(costsQuery.data.missingUsagePhaseCount)})`,
+              `${formatInteger(costsQuery.data.unattributedTokenPhaseCount)} ${t("evaluation.detail.unattributedTokens")}`,
+            ].join(" · "),
           },
         ]}
       />
@@ -615,14 +630,25 @@ function ProviderCostTable({ costs }: { costs: EvaluationCostsResponse["byProvid
           <span role="columnheader">{t("evaluation.table.provider")}</span>
           <span role="columnheader">{t("evaluation.table.cost")}</span>
           <span role="columnheader">{t("evaluation.label.phases")}</span>
-          <span role="columnheader">{t("evaluation.detail.missingUsage")}</span>
+          <span role="columnheader">{t("evaluation.detail.unpriced")}</span>
+          <span role="columnheader">{t("evaluation.detail.includingMissingUsage")}</span>
+          <span role="columnheader">{t("evaluation.detail.unattributedTokens")}</span>
         </div>
         {costs.map((cost) => (
           <div className="evaluation-table__row" role="row" key={cost.provider}>
             <span role="cell">{cost.provider}</span>
-            <span role="cell">{formatUsd(cost.totalCostUsd)}</span>
+            <span role="cell">
+              {cost.knownCostUsd == null
+                ? t("evaluation.value.unavailable")
+                : formatUsd(cost.knownCostUsd)}
+              {cost.knownCostUsd != null && cost.unpricedPhaseCount > 0
+                ? ` (${t("evaluation.value.partial")})`
+                : ""}
+            </span>
             <span role="cell">{formatInteger(cost.phaseCount)}</span>
+            <span role="cell">{formatInteger(cost.unpricedPhaseCount)}</span>
             <span role="cell">{formatInteger(cost.missingUsagePhaseCount)}</span>
+            <span role="cell">{formatInteger(cost.unattributedTokenPhaseCount)}</span>
           </div>
         ))}
       </div>
@@ -645,6 +671,7 @@ function ModelTokenTable({ models }: { models: EvaluationCostsResponse["byModel"
           <span role="columnheader">{t("evaluation.table.model")}</span>
           <span role="columnheader">{t("evaluation.table.input")}</span>
           <span role="columnheader">{t("evaluation.table.output")}</span>
+          <span role="columnheader">{t("evaluation.table.reasoning")}</span>
           <span role="columnheader">{t("evaluation.table.cacheCreate")}</span>
           <span role="columnheader">{t("evaluation.table.cacheRead")}</span>
         </div>
@@ -653,6 +680,7 @@ function ModelTokenTable({ models }: { models: EvaluationCostsResponse["byModel"
             <span role="cell">{model.model}</span>
             <span role="cell">{formatInteger(model.inputTokens)}</span>
             <span role="cell">{formatInteger(model.outputTokens)}</span>
+            <span role="cell">{formatInteger(model.reasoningOutputTokens)}</span>
             <span role="cell">{formatInteger(model.cacheCreationInputTokens)}</span>
             <span role="cell">{formatInteger(model.cacheReadInputTokens)}</span>
           </div>

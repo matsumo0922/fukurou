@@ -21,9 +21,11 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.runner.CHILD_ENV_ALLOWLIST
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.MAX_DAILY_INVOCATION_COUNT_WINDOW
@@ -214,8 +216,8 @@ class ReflectionPromptCandidateGenerator(
                 return failedAttemptFile(dataset, attemptCount, failure)
             }
 
-            val stdout = auditResult.getOrThrow().invocationResult.processResult.stdout
-            val validation = validateOutput(stdout, dataset)
+            val responseText = auditResult.getOrThrow().invocationResult.responseText
+            val validation = validateOutput(responseText, dataset)
 
             promptCandidateFileForValidation(
                 dataset = dataset,
@@ -338,7 +340,11 @@ class ReflectionPromptCandidateGenerator(
     ) {
         val finishedAt = clock.instant()
         val redactedMessage = cause?.let { throwable ->
-            redactor.redactAndTruncate("${throwable.javaClass.simpleName}: ${throwable.message.orEmpty()}")
+            if (tradingConfig.reflection.promptCandidateProvider == LlmProvider.CODEX) {
+                CODEX_FAILURE_DETAILS_OMITTED
+            } else {
+                redactor.redactAndTruncate("${throwable.javaClass.simpleName}: ${throwable.message.orEmpty()}")
+            }
         }
 
         llmRunRepository.finish(
@@ -429,7 +435,7 @@ class ReflectionPromptCandidateGenerator(
             |      "title": "short Japanese title",
             |      "target": "SystemPromptV1",
             |      "problem": "observed issue",
-            |      "evidence": ["decision_runs / decisions / closed_trades / llm_cost_usd / setup tag evidence"],
+            |      "evidence": ["decision_runs / decisions / closed_trades / llm_known_cost_usd / cost coverage / setup tag evidence"],
             |      "proposedChangeJa": "候補文",
             |      "expectedImpact": "expected impact",
             |      "risk": "risk",
@@ -835,7 +841,7 @@ private fun ReflectionWindowData.evidenceTerms(): Set<String> {
             "decisions",
             "closed_trades",
             "llm_runs",
-            "llm_cost_usd",
+            "llm_known_cost_usd",
             "setup",
             "truncated",
         ) + actionNames + setupTags

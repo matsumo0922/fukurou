@@ -71,6 +71,8 @@ class ReflectionRunnerTest {
             assertTrue(Files.exists(vaultPath.resolve("Knowledge/Setups/TagTaxonomy-2026-W26.md")))
             assertTrue(dailyReflection.contains("type: \"daily_reflection\""))
             assertTrue(dailyReflection.contains("sample_size_warning: true"))
+            assertTrue(dailyReflection.contains("llm_known_cost_usd: 0.0123000000"))
+            assertTrue(dailyReflection.contains("llm_unpriced_phases: 0"))
             assertTrue(dailyReflection.contains("truncated: false"))
             assertFalse(dailyReflection.contains("generated_at:"))
             assertFalse(dailyReflection.contains("sample_size_warning::"))
@@ -107,6 +109,32 @@ class ReflectionRunnerTest {
             assertTrue(dailyReflection.contains("llm_run_truncated: true"))
             assertTrue(dailyReflection.contains("closed_trade_truncated: true"))
             assertTrue(dailyReflection.contains("llm_usage_truncated: true"))
+        } finally {
+            deleteRecursively(vaultPath)
+        }
+    }
+
+    @Test
+    fun runOnce_marksUnknownCostWithoutReportingZeroTotal() = runBlocking {
+        val vaultPath = Files.createTempDirectory("fukurou-reflection-unknown-cost")
+        val runner = reflectionRunner(
+            vaultPath = vaultPath,
+            usageFacts = listOf(
+                llmUsageFact().copy(
+                    provider = "codex",
+                    usage = llmUsageFact().usage?.copy(totalCostUsd = null),
+                ),
+            ),
+        )
+
+        try {
+            runner.runOnce().getOrThrow()
+
+            val dailyReflection = Files.readString(vaultPath.resolve("Knowledge/DailyReflections/2026-07-02.md"))
+
+            assertTrue(dailyReflection.contains("llm_known_cost_usd: null"))
+            assertTrue(dailyReflection.contains("llm_unpriced_phases: 1"))
+            assertFalse(dailyReflection.contains("llm_cost_usd: 0"))
         } finally {
             deleteRecursively(vaultPath)
         }
@@ -430,6 +458,7 @@ private suspend fun reflectionRunner(
     recentDecisionLimit: Int = DEFAULT_REFLECTION_RECENT_DECISION_LIMIT,
     writerClock: Clock = WRITER_CLOCK,
     promptCandidateGenerator: ReflectionPromptCandidateGenerator? = null,
+    usageFacts: List<LlmPhaseUsageFact> = listOf(llmUsageFact()),
 ): ReflectionRunner {
     val decisionRepository = InMemoryDecisionRepository(FIXED_CLOCK)
     val llmRunRepository = InMemoryLlmRunRepository()
@@ -440,7 +469,7 @@ private suspend fun reflectionRunner(
             DecisionActionCount(action = DecisionAction.ENTER.name, count = 1),
             DecisionActionCount(action = DecisionAction.NO_TRADE.name, count = if (secondDecision) 1 else 0),
         ),
-        usageFacts = listOf(llmUsageFact()),
+        usageFacts = usageFacts,
         closedTradesTruncated = closedTradesTruncated,
         llmUsagesTruncated = llmUsagesTruncated,
     )

@@ -95,7 +95,11 @@ class ToolCallGuard(
         reason: String,
         cause: Throwable? = null,
     ): Result<Unit> {
-        val payload = buildNoTradeFailurePayload(reason, cause)
+        val payload = buildNoTradeFailurePayload(
+            reason = reason,
+            cause = cause,
+            llmProvider = call.decisionRunContext.llmProvider,
+        )
 
         return commandEventLog.append(
             CommandEvent(
@@ -204,6 +208,7 @@ class ToolCallGuard(
         val payload = buildNoTradeFailurePayload(
             reason = haltReason ?: "hard_halt",
             cause = cause,
+            llmProvider = call.decisionRunContext.llmProvider,
         )
 
         return commandEventLog.append(

@@ -18,11 +18,15 @@ import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
+import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
 import me.matsumo.fukurou.trading.runner.OneShotRunnerResult
 import me.matsumo.fukurou.trading.runner.OneShotRunnerStatus
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
+import java.nio.file.FileSystemException
 import java.nio.file.Path
 import java.time.Clock
 import java.time.Duration
@@ -31,6 +35,9 @@ import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.logging.Handler
+import java.util.logging.LogRecord
+import java.util.logging.Logger
 import kotlin.concurrent.thread
 import kotlin.coroutines.CoroutineContext
 import kotlin.test.Test
@@ -232,6 +239,66 @@ class ManualLlmLaunchServiceTest {
     }
 
     @Test
+    fun manualLaunch_codexFailureLogsOnlySafeCategoryAndType() = runBlocking {
+        val logHandler = RecordingManualLogHandler()
+        val logger = Logger.getAnonymousLogger().apply {
+            useParentHandlers = false
+            addHandler(logHandler)
+        }
+        val originalFailure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "cleanup path-message-marker",
+        )
+        val cleanupFailure = IllegalStateException("suppressed cleanup path-message-marker")
+        originalFailure.addSuppressed(cleanupFailure)
+        val fixture = manualFixture(
+            warnLogger = RateLimitedWarnLogger(logger, Clock.fixed(fixedInstant(), ZoneOffset.UTC)),
+            launchHandler = {
+                throw originalFailure.classifyLlmFailure(LlmProvider.CODEX)
+            },
+        )
+
+        fixture.service.launch("codex failure check").getOrThrow()
+        val finish = fixture.reservations.nextFinish()
+        val logRecord = logHandler.nextRecord()
+        val logOutput = logRecord.message + logRecord.thrown?.stackTraceToString().orEmpty()
+
+        assertEquals(LlmLaunchReservationStatus.FAILED, finish.status)
+        assertEquals("FileSystemException", finish.reason)
+        assertEquals(null, logRecord.thrown)
+        assertTrue(logOutput.contains("category=INVOCATION_RESULT_UNAVAILABLE"))
+        assertTrue(logOutput.contains("type=FileSystemException"))
+        assertFalse(logOutput.contains("auth-path-marker"))
+        assertFalse(logOutput.contains("path-message-marker"))
+        assertTrue(originalFailure.suppressed.contains(cleanupFailure))
+    }
+
+    @Test
+    fun manualLaunch_claudeFailureKeepsExistingThrowableLogging() = runBlocking {
+        val logHandler = RecordingManualLogHandler()
+        val logger = Logger.getAnonymousLogger().apply {
+            useParentHandlers = false
+            addHandler(logHandler)
+        }
+        val failure = IllegalStateException("synthetic claude failure")
+        val fixture = manualFixture(
+            warnLogger = RateLimitedWarnLogger(logger, Clock.fixed(fixedInstant(), ZoneOffset.UTC)),
+            launchHandler = {
+                throw failure.classifyLlmFailure(LlmProvider.CLAUDE)
+            },
+        )
+
+        fixture.service.launch("claude failure check").getOrThrow()
+        fixture.reservations.nextFinish()
+        val logRecord = logHandler.nextRecord()
+
+        assertEquals(failure, logRecord.thrown)
+        assertEquals("synthetic claude failure", logRecord.thrown.message)
+        assertTrue(failure.suppressed.isEmpty())
+    }
+
+    @Test
     fun manualLaunch_finishesReservationWhenLaunchedAuditFails() = runBlocking {
         val clock = ManualTestClock(fixedInstant())
         val riskStateRepository = InMemoryRiskStateRepository(clock)
@@ -429,6 +496,7 @@ private fun manualFixture(
     hasOpenRisk: Boolean = false,
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(Logger.getAnonymousLogger(), clock),
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): ManualFixture {
     val service = manualService(
@@ -442,6 +510,7 @@ private fun manualFixture(
         hasOpenRisk = hasOpenRisk,
         runtimeConfigSnapshot = runtimeConfigSnapshot,
         scope = scope,
+        warnLogger = warnLogger,
         launchHandler = launchHandler,
     )
 
@@ -466,6 +535,7 @@ private fun manualService(
     hasOpenRisk: Boolean = false,
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(Logger.getAnonymousLogger(), clock),
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): DefaultManualLlmLaunchService {
     return DefaultManualLlmLaunchService(
@@ -485,9 +555,29 @@ private fun manualService(
             },
             clock = clock,
             idGenerator = idGenerator,
+            warnLogger = warnLogger,
             scope = scope,
         ),
     )
+}
+
+/**
+ * manual launch test の warning log を channel へ保存する handler。
+ */
+private class RecordingManualLogHandler : Handler() {
+    private val records = Channel<LogRecord>(Channel.UNLIMITED)
+
+    override fun publish(record: LogRecord) {
+        records.trySend(record)
+    }
+
+    override fun flush() = Unit
+
+    override fun close() = Unit
+
+    suspend fun nextRecord(): LogRecord {
+        return records.receive()
+    }
 }
 
 /**

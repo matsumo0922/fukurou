@@ -320,13 +320,59 @@ class EvaluationMathTest {
 
         assertEquals(4, stats.phaseCount)
         assertEquals(1, stats.missingUsagePhaseCount)
-        assertEquals("0.3100000000", stats.totalCostUsd.toPlainString())
+        assertEquals(1, stats.unpricedPhaseCount)
+        assertEquals(0, stats.unattributedTokenPhaseCount)
+        assertEquals("0.3100000000", stats.knownCostUsd?.toPlainString())
         assertEquals(listOf("claude", "codex"), stats.byProvider.map { provider -> provider.provider })
         assertEquals(
             listOf("claude-haiku-4-5-20251001", "claude-sonnet-5"),
             stats.byModel.map { model -> model.model },
         )
         assertEquals(13L, stats.byModel.sumOf { model -> model.inputTokens })
+    }
+
+    @Test
+    fun summarizeLlmCostsSeparatesUnknownCostModelCoverageAndReasoningTokens() {
+        val tokenUsage = LlmTokenUsage(
+            inputTokens = 20,
+            outputTokens = 10,
+            reasoningOutputTokens = 4,
+            cacheCreationInputTokens = null,
+            cacheReadInputTokens = 5,
+        )
+        val stats = EvaluationMath.summarizeLlmCosts(
+            listOf(
+                llmUsageFact(
+                    phase = "falsifier",
+                    provider = "codex",
+                    usage = LlmUsageDetails(
+                        totalCostUsd = null,
+                        numTurns = null,
+                        durationMs = null,
+                        usage = tokenUsage,
+                        modelUsages = listOf(LlmModelUsage("gpt-5.4", tokenUsage)),
+                    ),
+                ),
+                llmUsageFact(
+                    phase = "reflection",
+                    provider = "codex",
+                    usage = LlmUsageDetails(
+                        totalCostUsd = null,
+                        numTurns = null,
+                        durationMs = null,
+                        usage = tokenUsage,
+                        modelUsages = emptyList(),
+                    ),
+                ),
+            ),
+        )
+
+        assertNull(stats.knownCostUsd)
+        assertEquals(0, stats.missingUsagePhaseCount)
+        assertEquals(2, stats.unpricedPhaseCount)
+        assertEquals(1, stats.unattributedTokenPhaseCount)
+        assertEquals(10, stats.byModel.single().outputTokens)
+        assertEquals(4, stats.byModel.single().reasoningOutputTokens)
     }
 }
 

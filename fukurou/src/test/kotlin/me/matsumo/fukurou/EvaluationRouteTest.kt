@@ -20,6 +20,10 @@ import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationTradeQueryResult
 import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
+import me.matsumo.fukurou.trading.evaluation.LlmModelUsage
+import me.matsumo.fukurou.trading.evaluation.LlmPhaseUsageFact
+import me.matsumo.fukurou.trading.evaluation.LlmTokenUsage
+import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import java.math.BigDecimal
@@ -70,6 +74,11 @@ class EvaluationRouteTest {
 
         assertTrue(summaryBody.contains("\"killCriterion\""))
         assertTrue(costsBody.contains("\"truncated\""))
+        assertTrue(costsBody.contains("\"knownCostUsd\":\"0.01\""))
+        assertTrue(costsBody.contains("\"knownCostUsd\":null"))
+        assertTrue(costsBody.contains("\"unpricedPhaseCount\":1"))
+        assertTrue(costsBody.contains("\"unattributedTokenPhaseCount\":1"))
+        assertTrue(costsBody.contains("\"reasoningOutputTokens\":2"))
     }
 
     @Test
@@ -193,7 +202,79 @@ private object FakeEvaluationRepository : EvaluationRepository {
     ): Result<EvaluationLlmUsageQueryResult> {
         return Result.success(
             EvaluationLlmUsageQueryResult(
-                facts = emptyList(),
+                facts = listOf(
+                    LlmPhaseUsageFact(
+                        decisionRunId = "claude-run",
+                        provider = "claude",
+                        phase = "proposer",
+                        occurredAt = Instant.parse("2026-07-02T00:00:00Z"),
+                        usage = LlmUsageDetails(
+                            totalCostUsd = BigDecimal("0.01"),
+                            numTurns = 1,
+                            durationMs = 100,
+                            usage = null,
+                            modelUsages = listOf(
+                                LlmModelUsage(
+                                    model = "claude-test",
+                                    usage = LlmTokenUsage(
+                                        inputTokens = 3,
+                                        outputTokens = 1,
+                                        cacheCreationInputTokens = null,
+                                        cacheReadInputTokens = null,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                    LlmPhaseUsageFact(
+                        decisionRunId = "codex-run",
+                        provider = "codex",
+                        phase = "falsifier",
+                        occurredAt = Instant.parse("2026-07-02T00:01:00Z"),
+                        usage = LlmUsageDetails(
+                            totalCostUsd = null,
+                            numTurns = null,
+                            durationMs = null,
+                            usage = LlmTokenUsage(
+                                inputTokens = 10,
+                                outputTokens = 4,
+                                reasoningOutputTokens = 2,
+                                cacheCreationInputTokens = null,
+                                cacheReadInputTokens = 5,
+                            ),
+                            modelUsages = listOf(
+                                LlmModelUsage(
+                                    model = "gpt-test",
+                                    usage = LlmTokenUsage(
+                                        inputTokens = 10,
+                                        outputTokens = 4,
+                                        reasoningOutputTokens = 2,
+                                        cacheCreationInputTokens = null,
+                                        cacheReadInputTokens = 5,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                    LlmPhaseUsageFact(
+                        decisionRunId = "unattributed-run",
+                        provider = "claude",
+                        phase = "reflection",
+                        occurredAt = Instant.parse("2026-07-02T00:02:00Z"),
+                        usage = LlmUsageDetails(
+                            totalCostUsd = BigDecimal.ZERO,
+                            numTurns = null,
+                            durationMs = null,
+                            usage = LlmTokenUsage(
+                                inputTokens = 1,
+                                outputTokens = 1,
+                                cacheCreationInputTokens = null,
+                                cacheReadInputTokens = null,
+                            ),
+                            modelUsages = emptyList(),
+                        ),
+                    ),
+                ),
                 truncated = false,
             ),
         )

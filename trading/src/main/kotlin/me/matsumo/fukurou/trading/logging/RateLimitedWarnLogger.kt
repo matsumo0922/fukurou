@@ -48,6 +48,13 @@ class RateLimitedWarnLogger(
             return
         }
 
+        val safeFields = throwable.safeLogFieldsOrNull()
+
+        if (safeFields != null) {
+            logger.warning("$message ${safeFields.format()}.")
+            return
+        }
+
         logger.log(Level.WARNING, message, throwable)
     }
 

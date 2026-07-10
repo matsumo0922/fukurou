@@ -51,16 +51,29 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.evaluation.LlmTokenUsage
+import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
+import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
+import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
+import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.ProcessRunResult
+import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
+import me.matsumo.fukurou.trading.runner.SecretRedactor
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
 import java.io.File
 import java.math.BigDecimal
+import java.nio.file.FileSystemException
+import java.nio.file.Path
 import java.sql.Connection
 import java.time.Clock
 import java.time.Duration
@@ -1250,6 +1263,106 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_auditDoesNotExposeCodexRawOutputAndKeepsStructuredUsage() = testApplication {
+        val eventLog = InMemoryCommandEventLog()
+        val request = codexAuditRequest()
+        val invocationResult = codexAuditInvocationResult(request)
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = eventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = fixedClock(),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = StaticOpsAuditLlmInvoker(invocationResult),
+        ).getOrThrow()
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsCommandEventFeedReader = eventLog,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/audit?eventType=RUNNER_PHASE_COMPLETED")
+        val responseText = response.bodyAsText()
+        val responseBody = Json.parseToJsonElement(responseText).jsonObject
+        val event = responseBody.getValue("events").jsonArray.single().jsonObject
+        val payload = Json.parseToJsonElement(event.getValue("payload").jsonPrimitive.content).jsonObject
+        val details = payload.getValue("details").jsonObject
+        val inputTokens = details
+            .getValue("usage").jsonObject
+            .getValue("usage").jsonObject
+            .getValue("inputTokens").jsonPrimitive.content
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertEquals("codex", details.getValue("provider").jsonPrimitive.content)
+        assertEquals("true", details.getValue("rawOutputOmitted").jsonPrimitive.content)
+        assertEquals("42", inputTokens)
+        assertFalse(details.containsKey("stdout"))
+        assertFalse(details.containsKey("stderr"))
+        assertFalse(responseText.contains("private trading strategy"))
+        assertFalse(responseText.contains("submit_decision"))
+        assertFalse(responseText.contains("private/session/path"))
+    }
+
+    @Test
+    fun opsRoutes_auditClassifiesCodexFailureWithoutExposingExceptionPath() = testApplication {
+        val eventLog = InMemoryCommandEventLog()
+        val request = codexAuditRequest()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = eventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = fixedClock(),
+        )
+        val failure = FileSystemException(
+            "/temporary/codex-home/auth-path-marker.json",
+            null,
+            "cleanup path-message-marker",
+        )
+
+        val invocation = auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = FailingOpsAuditLlmInvoker(failure),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsCommandEventFeedReader = eventLog,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/audit?eventType=RUNNER_PHASE_COMPLETED")
+        val responseText = response.bodyAsText()
+        val responseBody = Json.parseToJsonElement(responseText).jsonObject
+        val event = responseBody.getValue("events").jsonArray.single().jsonObject
+        val payload = Json.parseToJsonElement(event.getValue("payload").jsonPrimitive.content).jsonObject
+        val details = payload.getValue("details").jsonObject
+
+        assertTrue(invocation.isFailure)
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertEquals("FAILED_TO_START", details.getValue("status").jsonPrimitive.content)
+        assertEquals("null", details.getValue("exitCode").jsonPrimitive.content)
+        assertEquals(
+            "INVOCATION_RESULT_UNAVAILABLE",
+            details.getValue("failureCategory").jsonPrimitive.content,
+        )
+        assertEquals("FileSystemException", details.getValue("failureType").jsonPrimitive.content)
+        assertFalse(details.containsKey("error"))
+        assertFalse(responseText.contains("auth-path-marker"))
+        assertFalse(responseText.contains("path-message-marker"))
+        assertFalse(responseText.contains("temporary/codex-home"))
+    }
+
+    @Test
     fun opsRoutes_returnServiceUnavailableWhenDbServicesAreNotConfigured() = testApplication {
         application {
             module(
@@ -1429,6 +1542,74 @@ private fun auditEvent(
         payload = payload,
         occurredAt = occurredAt,
     )
+}
+
+private fun codexAuditRequest(): LlmInvocationRequest {
+    return LlmInvocationRequest(
+        invocationId = "codex-audit-run",
+        provider = LlmProvider.CODEX,
+        phase = LlmInvocationPhase.FALSIFIER,
+        prompt = "synthetic prompt",
+        timeout = Duration.ofSeconds(60),
+        workingDirectory = Path.of("."),
+        decisionRunContext = DecisionRunContext.EMPTY,
+        mcpServer = null,
+        environment = emptyMap(),
+        allowedTools = emptyList(),
+    )
+}
+
+private fun codexAuditInvocationResult(request: LlmInvocationRequest): LlmInvocationResult {
+    val usage = LlmUsageDetails(
+        totalCostUsd = null,
+        numTurns = null,
+        durationMs = null,
+        usage = LlmTokenUsage(
+            inputTokens = 42,
+            outputTokens = 12,
+            reasoningOutputTokens = 5,
+            cacheCreationInputTokens = null,
+            cacheReadInputTokens = 7,
+        ),
+        modelUsages = emptyList(),
+    )
+
+    return LlmInvocationResult(
+        request = request,
+        processResult = ProcessRunResult(
+            status = ProcessRunStatus.EXITED,
+            exitCode = 0,
+            stdout = """
+                {"type":"thread.started","prompt":"private trading strategy"}
+                {"type":"item.completed","item":{"type":"tool_call","name":"submit_decision","arguments":{"path":"/private/session/path"}}}
+            """.trimIndent(),
+            stderr = "diagnostic path=/private/session/path",
+        ),
+        responseText = "semantic response",
+        usage = usage,
+    )
+}
+
+/**
+ * ops audit route test 用の固定 LLM invoker。
+ */
+private class StaticOpsAuditLlmInvoker(
+    private val invocationResult: LlmInvocationResult,
+) : LlmInvoker {
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        return Result.success(invocationResult)
+    }
+}
+
+/**
+ * ops audit route test 用の失敗する LLM invoker。
+ */
+private class FailingOpsAuditLlmInvoker(
+    private val failure: Throwable,
+) : LlmInvoker {
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        return Result.failure(failure)
+    }
 }
 
 private fun readSharedTestdata(fileName: String): String {

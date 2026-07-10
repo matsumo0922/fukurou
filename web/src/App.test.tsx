@@ -246,6 +246,8 @@ describe("App", () => {
     expect(await screen.findByText("Bot 実績")).toBeInTheDocument();
     expect(screen.getAllByText("NO_TRADE").length).toBeGreaterThan(0);
     expect(screen.getByText("claude-sonnet-4")).toBeInTheDocument();
+    expect(screen.getByText("取得済み provider の合計・一部未取得")).toBeInTheDocument();
+    expect(screen.getByText("取得不可")).toBeInTheDocument();
   });
 
   it("localizes controls UI copy while keeping safety states unchanged", async () => {
@@ -325,6 +327,9 @@ describe("App", () => {
     expect(screen.getByText("latest 6 of 7")).toBeInTheDocument();
     expect(screen.getAllByText("2.88%").length).toBeGreaterThan(0);
     expect(screen.getAllByText("$0.1234").length).toBeGreaterThan(0);
+    expect(screen.getByText("known provider total · partially unavailable")).toBeInTheDocument();
+    expect(screen.getByText("2 cost unavailable (incl. missing usage 1) · 1 model unavailable")).toBeInTheDocument();
+    expect(screen.getByText("unavailable")).toBeInTheDocument();
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/evaluation/summary",
@@ -1281,13 +1286,25 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
           truncated: false,
           phaseCount: 4,
           missingUsagePhaseCount: 1,
-          totalCostUsd: "0.1234",
+          unpricedPhaseCount: 2,
+          unattributedTokenPhaseCount: 1,
+          knownCostUsd: "0.1234",
           byProvider: [
             {
               provider: "claude",
-              totalCostUsd: "0.1234",
-              phaseCount: 4,
+              knownCostUsd: "0.1234",
+              phaseCount: 3,
               missingUsagePhaseCount: 1,
+              unpricedPhaseCount: 1,
+              unattributedTokenPhaseCount: 0,
+            },
+            {
+              provider: "codex",
+              knownCostUsd: null,
+              phaseCount: 1,
+              missingUsagePhaseCount: 0,
+              unpricedPhaseCount: 1,
+              unattributedTokenPhaseCount: 1,
             },
           ],
           byModel: [
@@ -1295,6 +1312,7 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
               model: "claude-sonnet-4",
               inputTokens: 1200,
               outputTokens: 450,
+              reasoningOutputTokens: 0,
               cacheCreationInputTokens: 80,
               cacheReadInputTokens: 320,
             },

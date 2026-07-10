@@ -43,11 +43,14 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
+import me.matsumo.fukurou.trading.invoker.isCodexProvider
 import me.matsumo.fukurou.trading.invoker.readOptionalEnv
 import me.matsumo.fukurou.trading.invoker.splitCommandTemplate
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
@@ -318,7 +321,7 @@ class OneShotLlmRunner(
             Result.success(result)
         } catch (throwable: CancellationException) {
             handleCancelledRun(failureContext, llmRunStart, throwable)
-            throw throwable
+            throw throwable.classifyLlmFailure(failureContext.llmProvider)
         } catch (throwable: Throwable) {
             Result.failure(handleFailedRun(failureContext, llmRunStart, throwable))
         }
@@ -341,6 +344,7 @@ class OneShotLlmRunner(
                 start = llmRunStart,
                 status = LLM_RUN_STATUS_CANCELLED,
                 cause = throwable,
+                llmProvider = failureContext.llmProvider,
             )
         }
         throwable.withSuppressedFailure(auditResult)
@@ -361,6 +365,7 @@ class OneShotLlmRunner(
             start = llmRunStart,
             status = LLM_RUN_STATUS_FAILED,
             cause = throwable,
+            llmProvider = failureContext.llmProvider,
         )
 
         return throwable
@@ -928,6 +933,7 @@ private class OneShotRunAuditRecorder(
         start: LlmRunStart,
         status: String,
         cause: Throwable?,
+        llmProvider: String? = null,
     ): Result<Unit> {
         val finish = LlmRunFinish(
             invocationId = start.invocationId,
@@ -937,7 +943,7 @@ private class OneShotRunAuditRecorder(
             status = status,
             startedAt = start.startedAt,
             finishedAt = clock.instant(),
-            errorMessage = cause?.redactedErrorMessage(),
+            errorMessage = cause?.persistedErrorMessage(llmProvider),
             runtimeConfigVersionId = start.runtimeConfigVersionId,
             runtimeConfigHash = start.runtimeConfigHash,
         )
@@ -995,7 +1001,11 @@ private class OneShotRunAuditRecorder(
         )
     }
 
-    private fun Throwable.redactedErrorMessage(): String {
+    private fun Throwable.persistedErrorMessage(llmProvider: String?): String {
+        if (isCodexProvider(llmProvider)) {
+            return CODEX_FAILURE_DETAILS_OMITTED
+        }
+
         val typeName = javaClass.simpleName
         val detail = message.orEmpty()
         val message = if (detail.isBlank()) typeName else "$typeName: $detail"
@@ -1029,12 +1039,18 @@ private class OneShotPhaseInvoker(
         context: DecisionRunContext,
         request: LlmInvocationRequest,
     ): Result<LlmPhaseAuditResult> {
-        return invocationAuditor.invokeAndAudit(
-            phaseName = phaseName,
-            context = context,
-            request = request,
-            llmInvoker = llmInvoker,
-        )
+        return try {
+            invocationAuditor.invokeAndAudit(
+                phaseName = phaseName,
+                context = context,
+                request = request,
+                llmInvoker = llmInvoker,
+            )
+        } catch (throwable: CancellationException) {
+            throw throwable.classifyLlmFailure(request.provider)
+        } catch (throwable: Throwable) {
+            throw throwable.classifyLlmFailure(request.provider)
+        }
     }
 }
 

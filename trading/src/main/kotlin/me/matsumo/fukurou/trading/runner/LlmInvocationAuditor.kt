@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.runner
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -9,12 +10,15 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
+import me.matsumo.fukurou.trading.invoker.CODEX_INVOCATION_RESULT_UNAVAILABLE
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
+import me.matsumo.fukurou.trading.invoker.safeExceptionType
 import java.time.Clock
 import java.time.Duration
 
@@ -22,7 +26,7 @@ import java.time.Duration
  * LLM phase の process 実行結果を共通 event 形式で command_event_log へ保存する auditor。
  *
  * @param commandEventLog audit 保存先
- * @param redactor stdout / stderr / error message を保存前に伏せる redactor
+ * @param redactor Claude stdout / stderr と error message を保存前に伏せる redactor
  * @param clock event 発生時刻に使う clock
  * @param toolName audit event の tool 名
  * @param humanLogger 運用ログ出力
@@ -47,31 +51,37 @@ class LlmInvocationAuditor(
         llmInvoker: LlmInvoker,
     ): Result<LlmPhaseAuditResult> {
         val startedAt = System.nanoTime()
-        val result = llmInvoker.invoke(request)
+        val result = try {
+            llmInvoker.invoke(request)
+        } catch (throwable: CancellationException) {
+            throw throwable.classifyLlmFailure(request.provider)
+        } catch (throwable: Throwable) {
+            throw throwable.classifyLlmFailure(request.provider)
+        }
         val duration = Duration.ofNanos(System.nanoTime() - startedAt)
         val invocationResult = result.getOrNull()
         val processResult = invocationResult?.processResult
-        val startFailureError = result.exceptionOrNull()
+        val cleanupFailure = invocationResult?.cleanupFailure
+        val startFailure = result.exceptionOrNull()
             ?.takeIf { processResult == null }
-            ?.redactedQualifiedErrorMessage()
-        val usage = processResult?.let { completedProcess ->
-            usageForAudit(request.provider, completedProcess.stdout)
-        }
-        val auditSignals = processResult?.auditSignals() ?: LlmPhaseAuditSignals()
+        val usage = invocationResult?.usage
+        val auditSignals = (processResult?.auditSignals() ?: LlmPhaseAuditSignals()).copy(
+            cleanupFailed = cleanupFailure != null,
+        )
 
-        appendPhase(
+        val appendFailure = appendPhase(
             context = context,
             phaseName = phaseName,
             duration = duration,
             details = phaseDetails(
                 provider = request.provider,
                 processResult = processResult,
-                startFailureError = startFailureError,
+                startFailure = startFailure,
                 usage = usage,
                 auditSignals = auditSignals,
             ),
-        ).getOrThrow()
-        humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
+        ).exceptionOrNull()
+        appendFailure?.let { failure -> throw failure.classifyLlmFailure(request.provider) }
         if (auditSignals.authFailureSuspected && authFailureMessage != null) {
             humanLogger(authFailureMessage)
         }
@@ -79,11 +89,20 @@ class LlmInvocationAuditor(
         val processFailed = processResult?.didFail() ?: false
 
         if (processFailed) {
-            return Result.failure(IllegalStateException("$phaseName process did not exit cleanly."))
+            val failure = IllegalStateException("$phaseName process did not exit cleanly.")
+            cleanupFailure?.let { cleanup -> failure.addSuppressed(cleanup) }
+
+            return Result.failure(failure.classifyLlmFailure(request.provider))
+        }
+
+        if (cleanupFailure != null) {
+            return Result.failure(cleanupFailure.classifyLlmFailure(request.provider))
         }
 
         return result.fold(
             onSuccess = { invocation ->
+                humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
+
                 Result.success(
                     LlmPhaseAuditResult(
                         invocationResult = invocation,
@@ -93,7 +112,7 @@ class LlmInvocationAuditor(
                     ),
                 )
             },
-            onFailure = { throwable -> Result.failure(throwable) },
+            onFailure = { throwable -> Result.failure(throwable.classifyLlmFailure(request.provider)) },
         )
     }
 
@@ -132,15 +151,10 @@ class LlmInvocationAuditor(
         return redactor.redactAndTruncate(auditMessage)
     }
 
-    private fun usageForAudit(provider: LlmProvider, stdout: String) = when (provider) {
-        LlmProvider.CLAUDE -> LlmUsageParser.parseClaudeStdout(stdout)
-        LlmProvider.CODEX -> null
-    }
-
     private fun phaseDetails(
         provider: LlmProvider,
         processResult: ProcessRunResult?,
-        startFailureError: String?,
+        startFailure: Throwable?,
         usage: LlmUsageDetails?,
         auditSignals: LlmPhaseAuditSignals,
     ): JsonObject {
@@ -148,10 +162,29 @@ class LlmInvocationAuditor(
             put("provider", provider.name.lowercase())
             put("status", processResult?.status?.name ?: "FAILED_TO_START")
             put("exitCode", processResult?.exitCode?.toString() ?: "null")
-            startFailureError?.let { error -> put("error", error) }
-            processResult?.let { completedProcess ->
-                put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
-                put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
+            if (auditSignals.cleanupFailed) {
+                put("cleanupFailed", "true")
+            }
+            startFailure?.let { throwable ->
+                when (provider) {
+                    LlmProvider.CLAUDE -> put("error", throwable.redactedQualifiedErrorMessage())
+                    LlmProvider.CODEX -> {
+                        put("failureCategory", CODEX_INVOCATION_RESULT_UNAVAILABLE)
+                        put("failureType", throwable.safeExceptionType())
+                    }
+                }
+            }
+            when (provider) {
+                LlmProvider.CLAUDE -> processResult?.let { completedProcess ->
+                    put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
+                    put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
+                }
+
+                LlmProvider.CODEX -> {
+                    if (processResult != null) {
+                        put("rawOutputOmitted", "true")
+                    }
+                }
             }
             if (auditSignals.authFailureSuspected) {
                 put("authFailureSuspected", "true")
@@ -220,10 +253,12 @@ data class LlmPhaseAuditResult(
  *
  * @param authFailureSuspected CLI 認証失敗らしい出力を検出したか
  * @param cliErrorReported CLI が error 終了を報告する出力を検出したか
+ * @param cleanupFailed 一時 artifact の cleanup に失敗したか
  */
 private data class LlmPhaseAuditSignals(
     val authFailureSuspected: Boolean = false,
     val cliErrorReported: Boolean = false,
+    val cleanupFailed: Boolean = false,
 )
 
 /**
