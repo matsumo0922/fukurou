@@ -317,6 +317,7 @@ class ProtectionReconciler(
             tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
                 runPeriodicSafetyMaintenanceLocked()
             }
+            recordPeriodicMaintenanceRecovery().getOrThrow()
 
             Result.success(Unit)
         } catch (throwable: CancellationException) {
@@ -338,6 +339,11 @@ class ProtectionReconciler(
         }
 
         logPassFailure(ReconcilePassKind.LOOP, throwable)
+    }
+
+    /** periodic maintenance が成功したときに、直前の failure episode を監査上も閉じる。 */
+    private suspend fun recordPeriodicMaintenanceRecovery(): Result<Unit> {
+        return recordFailureRecovery(Instant.now(clock))
     }
 
     private suspend fun runPeriodicSafetyMaintenanceLocked() {
@@ -556,16 +562,28 @@ class ProtectionReconciler(
             return completedResult
         }
 
-        val shouldRecordRecovery = previousPassFailed && passKind != ReconcilePassKind.STARTUP_FULL
-        if (!shouldRecordRecovery) {
+        return if (passKind == ReconcilePassKind.STARTUP_FULL) {
+            Result.success(Unit)
+        } else {
+            recordFailureRecovery(reconciledAt)
+        }
+    }
+
+    private suspend fun recordFailureRecovery(recoveredAt: Instant): Result<Unit> {
+        if (!previousPassFailed) {
             return Result.success(Unit)
         }
 
-        return appendReconcilerEvent(
+        val recoveryResult = appendReconcilerEvent(
             eventType = CommandEventType.RECONCILER_PASS_RECOVERED,
             payload = LOOP_RECOVERED_PAYLOAD,
-            occurredAt = reconciledAt,
+            occurredAt = recoveredAt,
         )
+        if (recoveryResult.isSuccess) {
+            previousPassFailed = false
+        }
+
+        return recoveryResult
     }
 
     private suspend fun recordFailureTransition(passKind: ReconcilePassKind, throwable: Throwable): Result<Unit> {

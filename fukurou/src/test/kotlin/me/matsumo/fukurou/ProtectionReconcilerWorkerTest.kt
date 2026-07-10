@@ -13,6 +13,7 @@ import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
@@ -113,13 +114,13 @@ class ProtectionReconcilerWorkerTest {
     }
 
     @Test
-    fun worker_keeps_websocket_event_consumer_running_after_periodic_maintenance_failure() = runBlocking {
+    fun worker_recovers_periodic_maintenance_failure_episodes_without_stopping_websocket_consumer() = runBlocking {
         val clock = Clock.fixed(Instant.parse("2026-07-02T00:00:00Z"), ZoneOffset.UTC)
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000178")
         val events = Channel<Result<PaperMarketTradeEvent>>(Channel.UNLIMITED)
         val eventLog = InMemoryCommandEventLog()
         val integrityRepository = WorkerTestMarketDataIntegrityRepository()
-        val broker = FailingOnceMaintenanceBroker(
+        val broker = EpisodicMaintenanceFailureBroker(
             PaperBroker(
                 ledgerRepository = InMemoryPaperLedgerRepository(clock = clock),
                 riskStateRepository = InMemoryRiskStateRepository(clock = clock),
@@ -161,17 +162,37 @@ class ProtectionReconcilerWorkerTest {
                 }
             }
             withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
-                while (broker.maintenanceAttempts.get() < 2) {
+                while (
+                    broker.maintenanceAttempts.get() < 5 ||
+                    eventLog.failureEpisodeEventTypes().size < 4
+                ) {
                     delay(1.toDuration(DurationUnit.MILLISECONDS))
                 }
             }
         }
 
         assertEquals(2, broker.appliedEventCount.get())
-        assertTrue(broker.maintenanceAttempts.get() >= 2)
+        assertTrue(broker.maintenanceAttempts.get() >= 5)
         assertEquals(MarketDataConnectionState.CONNECTED, integrityRepository.snapshot().getOrThrow().state)
-        assertTrue(eventLog.events().any { event -> event.eventType == CommandEventType.RECONCILER_PASS_FAILED })
+        assertEquals(
+            listOf(
+                CommandEventType.RECONCILER_PASS_FAILED,
+                CommandEventType.RECONCILER_PASS_RECOVERED,
+                CommandEventType.RECONCILER_PASS_FAILED,
+                CommandEventType.RECONCILER_PASS_RECOVERED,
+            ),
+            eventLog.failureEpisodeEventTypes(),
+        )
     }
+}
+
+private suspend fun InMemoryCommandEventLog.failureEpisodeEventTypes(): List<CommandEventType> {
+    return events()
+        .map { event -> event.eventType }
+        .filter { eventType ->
+            eventType == CommandEventType.RECONCILER_PASS_FAILED ||
+                eventType == CommandEventType.RECONCILER_PASS_RECOVERED
+        }
 }
 
 private fun workerTestEvent(sessionId: UUID, sequence: Long): Result<PaperMarketTradeEvent> {
@@ -189,7 +210,7 @@ private fun workerTestEvent(sessionId: UUID, sequence: Long): Result<PaperMarket
     )
 }
 
-private class FailingOnceMaintenanceBroker(
+private class EpisodicMaintenanceFailureBroker(
     private val delegate: Broker,
 ) : Broker by delegate {
     val maintenanceAttempts = AtomicInteger(0)
@@ -200,7 +221,8 @@ private class FailingOnceMaintenanceBroker(
     }
 
     override suspend fun maintainProtections(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
-        if (maintenanceAttempts.incrementAndGet() == 1) {
+        val attempt = maintenanceAttempts.incrementAndGet()
+        if (attempt == 1 || attempt == 3) {
             return Result.failure(IllegalStateException("transient periodic maintenance failure"))
         }
 
@@ -219,9 +241,21 @@ private class FixedTickStream(
                 lastPrice = "10000000",
                 bidPrice = "10000000",
                 askPrice = "10000000",
+                symbolRules = workerTestSymbolRules(),
             ),
         )
     }
+}
+
+private fun workerTestSymbolRules(): SymbolRules {
+    return SymbolRules(
+        symbol = TradingSymbol.BTC.apiSymbol,
+        minOrderSize = "0.0001",
+        sizeStep = "0.0001",
+        tickSize = "1",
+        takerFee = "0.0005",
+        makerFee = "-0.0001",
+    )
 }
 
 private class WorkerTestMarketEventStream(
