@@ -58,6 +58,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Clock
 import java.time.Duration
+import java.time.Instant
 import java.util.UUID
 
 /**
@@ -649,8 +650,8 @@ class OneShotLlmRunner(
     private suspend fun launchEligibility(invocationId: String, context: DecisionRunContext): RunnerLaunchEligibility {
         val hourlySince = clock.instant().minus(MAX_INVOCATION_COUNT_WINDOW)
         val dailySince = clock.instant().minus(MAX_DAILY_INVOCATION_COUNT_WINDOW)
-        val currentHourlyCount = tradingRuntime.commandEventLog.countDistinctDecisionRunsSince(hourlySince).getOrThrow()
-        val currentDailyCount = tradingRuntime.commandEventLog.countDistinctDecisionRunsSince(dailySince).getOrThrow()
+        val currentHourlyCount = tradingRuntime.commandEventLog.countLlmLaunchesSince(hourlySince, invocationId)
+        val currentDailyCount = tradingRuntime.commandEventLog.countLlmLaunchesSince(dailySince, invocationId)
         val hourlyLimitExceeded = currentHourlyCount >= tradingConfig.runner.maxInvocationsPerHour
         val dailyLimitExceeded = currentDailyCount >= tradingConfig.runner.maxInvocationsPerDay
         val canLaunch = !hourlyLimitExceeded && !dailyLimitExceeded
@@ -892,6 +893,10 @@ class OneShotLlmRunner(
     private fun logHuman(message: String) {
         logger("[fukurou-runner] $message")
     }
+}
+
+private suspend fun CommandEventLog.countLlmLaunchesSince(since: Instant, excludedInvocationId: String): Int {
+    return countDistinctLlmLaunchesSince(since, excludedInvocationId).getOrThrow()
 }
 
 /**

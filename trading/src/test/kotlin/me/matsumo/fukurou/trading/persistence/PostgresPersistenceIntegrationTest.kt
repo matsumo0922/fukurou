@@ -23,6 +23,7 @@ import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
@@ -61,11 +62,18 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
+import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
+import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
+import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
+import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
+import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
+import me.matsumo.fukurou.trading.runner.OneShotRunnerStatus
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
+import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyViolation
@@ -73,6 +81,8 @@ import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
 import java.math.BigDecimal
+import java.nio.file.Files
+import java.nio.file.Path
 import java.sql.SQLTimeoutException
 import java.sql.Types
 import java.time.Clock
@@ -1971,6 +1981,87 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun llm_runner_preflight_usesReservationTimeAndExcludesCurrentReservationInPostgresPath() = runPostgresTest {
+        val observedAt = fixedInstant().plus(Duration.ofHours(25))
+        val clock = Clock.fixed(observedAt, ZoneOffset.UTC)
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1),
+        )
+
+        TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
+
+        val reservationRepository = ExposedLlmLaunchReservationRepository(database)
+        reserveAndFinishLlmLaunch(
+            repository = reservationRepository,
+            invocationId = "daemon-run-old",
+            config = config.runner,
+            reservedAt = fixedInstant(),
+        )
+        appendLlmLaunchAudit(
+            database = database,
+            invocationId = "daemon-run-old",
+            eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+            occurredAt = observedAt.minusSeconds(1),
+        )
+        val currentReservation = reservationRepository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "daemon-run-current",
+                config = config.runner,
+                reservedAt = observedAt,
+            ),
+        ).getOrThrow()
+        val fixture = postgresOneShotFixture(config, clock)
+
+        try {
+            val result = fixture.runner.runOneShot(postgresOneShotRequest("daemon-run-current")).getOrThrow()
+            val noTradeEvents = fixture.eventLog.findEvents(
+                limit = 100,
+                eventType = CommandEventType.NO_TRADE_EXIT,
+            ).getOrThrow()
+
+            assertEquals(LlmLaunchReservationOutcome.Reserved("daemon-run-current"), currentReservation)
+            assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+            assertEquals(1, fixture.invoker.requests.size)
+            assertEquals(false, noTradeEvents.any { event -> event.payload.contains("max_invocations_per_") })
+        } finally {
+            fixture.runtime.close()
+        }
+    }
+
+    @Test
+    fun llm_runner_preflight_rejectsInWindowReservationWithExistingAuditReasonInPostgresPath() = runPostgresTest {
+        val observedAt = fixedInstant().plus(Duration.ofHours(1))
+        val clock = Clock.fixed(observedAt, ZoneOffset.UTC)
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1),
+        )
+
+        TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
+
+        reserveAndFinishLlmLaunch(
+            repository = ExposedLlmLaunchReservationRepository(database),
+            invocationId = "daemon-run-existing",
+            config = config.runner,
+            reservedAt = observedAt.minus(Duration.ofMinutes(1)),
+        )
+        val fixture = postgresOneShotFixture(config, clock)
+
+        try {
+            val result = fixture.runner.runOneShot(postgresOneShotRequest("direct-run-current")).getOrThrow()
+            val noTradeEvents = fixture.eventLog.findEvents(
+                limit = 100,
+                eventType = CommandEventType.NO_TRADE_EXIT,
+            ).getOrThrow()
+
+            assertEquals(OneShotRunnerStatus.LAUNCH_REJECTED, result.status)
+            assertEquals(0, fixture.invoker.requests.size)
+            assertTrue(noTradeEvents.any { event -> event.payload.contains("max_invocations_per_hour_exceeded") })
+        } finally {
+            fixture.runtime.close()
+        }
+    }
+
+    @Test
     fun llm_launch_reservation_reportsFreshRunningReservationInPostgresPath() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -3592,6 +3683,79 @@ private suspend fun runWatermarkScenario(
         highestPriceSinceEntryJpy = position.highestPriceSinceEntryJpy,
         lowestPriceSinceEntryJpy = position.lowestPriceSinceEntryJpy,
     )
+}
+
+/**
+ * Postgres runtime を使う one-shot runner fixture。
+ *
+ * @param runtime production repository 配線の trading runtime
+ * @param eventLog Postgres command event log
+ * @param invoker 呼び出し記録付き LLM invoker
+ * @param runner test target runner
+ */
+private data class PostgresOneShotFixture(
+    val runtime: TradingRuntime,
+    val eventLog: ExposedCommandEventLog,
+    val invoker: RecordingFailureLlmInvoker,
+    val runner: OneShotLlmRunner,
+)
+
+private fun PostgresTestContext.postgresOneShotFixture(
+    config: TradingBotConfig,
+    clock: Clock,
+): PostgresOneShotFixture {
+    val runtime = TradingRuntimeFactory.connectedPostgres(
+        dataSource = dataSource,
+        database = database,
+        clock = clock,
+        tradingConfig = config,
+    )
+    val invoker = RecordingFailureLlmInvoker()
+    val runner = OneShotLlmRunner(
+        tradingRuntime = runtime,
+        tradingConfig = config,
+        llmInvoker = invoker,
+        parentEnvironment = emptyMap(),
+        clock = clock,
+        logger = {},
+    )
+
+    return PostgresOneShotFixture(
+        runtime = runtime,
+        eventLog = runtime.commandEventLog as ExposedCommandEventLog,
+        invoker = invoker,
+        runner = runner,
+    )
+}
+
+private fun postgresOneShotRequest(invocationId: String): OneShotRunnerRequest {
+    val workingDirectory = Path.of(".")
+        .toAbsolutePath()
+        .normalize()
+    val repositoryRoot = listOf(workingDirectory, requireNotNull(workingDirectory.parent))
+        .first { candidate -> Files.exists(candidate.resolve("prompts/system-prompt-v1.md")) }
+
+    return OneShotRunnerRequest(
+        repositoryRoot = repositoryRoot,
+        workingDirectory = workingDirectory,
+        mcpJarPath = "mcp/build/libs/fukurou-mcp-all.jar",
+        invocationId = invocationId,
+        marketSnapshotId = "snapshot-$invocationId",
+        triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+    )
+}
+
+/**
+ * 呼び出しを記録して失敗を返す LLM invoker。
+ */
+private class RecordingFailureLlmInvoker : LlmInvoker {
+    val requests = mutableListOf<LlmInvocationRequest>()
+
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        requests += request
+
+        return Result.failure(IllegalStateException("stop after preflight"))
+    }
 }
 
 private suspend fun reserveAndFinishLlmLaunch(

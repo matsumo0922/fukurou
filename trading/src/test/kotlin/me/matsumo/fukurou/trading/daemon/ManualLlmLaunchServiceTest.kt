@@ -503,7 +503,7 @@ private class FailingLaunchedCommandEventLog : CommandEventLog {
         return Result.success(Unit)
     }
 
-    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+    override suspend fun countDistinctLlmLaunchesSince(since: Instant, excludedInvocationId: String?): Result<Int> {
         return Result.success(0)
     }
 

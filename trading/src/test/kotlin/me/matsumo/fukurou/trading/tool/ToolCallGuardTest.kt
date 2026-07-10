@@ -310,7 +310,7 @@ private class ToolContextSwitchingCommandEventLog : CommandEventLog {
         }
     }
 
-    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+    override suspend fun countDistinctLlmLaunchesSince(since: Instant, excludedInvocationId: String?): Result<Int> {
         return Result.success(0)
     }
 
@@ -334,7 +334,7 @@ private object FailingCommandEventLog : CommandEventLog {
         return Result.failure(IllegalStateException("audit append failed"))
     }
 
-    override suspend fun countDistinctDecisionRunsSince(since: Instant): Result<Int> {
+    override suspend fun countDistinctLlmLaunchesSince(since: Instant, excludedInvocationId: String?): Result<Int> {
         return Result.failure(IllegalStateException("audit count failed"))
     }
 
