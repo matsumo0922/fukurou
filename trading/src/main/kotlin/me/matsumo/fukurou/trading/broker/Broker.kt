@@ -148,7 +148,9 @@ interface BrokerReconcileBoundary {
         return Result.success(
             PaperReconcileResult(
                 advanced = false,
-                triggeredOrderIds = emptyList(),
+                filledOrderIds = emptyList(),
+                canceledOrderIds = emptyList(),
+                rejectedOrderIds = emptyList(),
                 closedPositionIds = emptyList(),
                 executionIds = emptyList(),
             ),
