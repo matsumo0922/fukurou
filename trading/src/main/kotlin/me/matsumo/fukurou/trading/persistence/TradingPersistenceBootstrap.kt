@@ -35,22 +35,13 @@ internal const val STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE =
 private val ENSURE_ORDER_CANCEL_REASON_DOMAIN_SQL = run {
     val wireCodes = PaperOrderCancelReason.entries.joinToString { reason -> "'${reason.wireCode}'" }
     """
+        LOCK TABLE orders IN ACCESS EXCLUSIVE MODE;
         UPDATE orders
         SET cancel_reason = '${PaperOrderCancelReason.LEGACY_UNCLASSIFIED.wireCode}'
         WHERE cancel_reason IS NOT NULL AND cancel_reason NOT IN ($wireCodes);
-        DO ${'$'}${'$'}
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1
-                FROM pg_constraint
-                WHERE conname = 'orders_cancel_reason_domain'
-                    AND conrelid = 'orders'::regclass
-            ) THEN
-                ALTER TABLE orders ADD CONSTRAINT orders_cancel_reason_domain
-                    CHECK (cancel_reason IS NULL OR cancel_reason IN ($wireCodes));
-            END IF;
-        END
-        ${'$'}${'$'};
+        ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_cancel_reason_domain;
+        ALTER TABLE orders ADD CONSTRAINT orders_cancel_reason_domain
+            CHECK (cancel_reason IS NULL OR cancel_reason IN ($wireCodes));
     """.trimIndent()
 }
 

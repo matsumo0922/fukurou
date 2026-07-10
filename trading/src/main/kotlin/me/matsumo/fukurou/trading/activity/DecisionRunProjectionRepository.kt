@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.persistence.STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE
+import java.time.Duration
 import java.time.Instant
 
 /** decision run の機械判定 outcome。 */
@@ -248,8 +249,8 @@ fun DecisionRunOrder.withStrategyEvaluation(): DecisionRunOrder {
         )
     }
 
-    val delay = java.time.Duration.between(logicalExpiry, processingTime)
-        .coerceAtLeast(java.time.Duration.ZERO)
+    val delay = Duration.between(logicalExpiry, processingTime)
+        .coerceAtLeast(Duration.ZERO)
     val delayed = delay > PaperOrderLifecyclePolicy.cancellationGrace
 
     return copy(

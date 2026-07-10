@@ -97,6 +97,7 @@ import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -1284,8 +1285,18 @@ class PostgresPersistenceIntegrationTest {
         val repository = ExposedDecisionRunProjectionRepository(database)
         val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
         val detail = requireNotNull(repository.findRun("run-1").getOrThrow())
+        val actionRequiredRuns = repository
+            .listRuns(
+                cursor = null,
+                limit = 10,
+                filter = DecisionRunFilter.ACTION_REQUIRED,
+            )
+            .getOrThrow()
+            .runs
 
         assertEquals(DecisionRunOutcome.DENIED, summary.outcome)
+        assertFalse(summary.hasProcessFailure)
+        assertTrue(actionRequiredRuns.isEmpty())
         assertEquals("APPROVED", summary.falsificationVerdict)
         assertEquals("EXPECTED_VALUE_GATE", detail.safetyViolation?.rule)
         assertEquals("0.03357778", detail.safetyViolation?.measuredValue)
@@ -1601,6 +1612,77 @@ class PostgresPersistenceIntegrationTest {
             }
         }
         assertTrue(invalidWrite.isFailure)
+    }
+
+    @Test
+    fun persistenceBootstrapRefreshesCancelReasonDomainFromCurrentWireCodes() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val orderId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        val addedReason = PaperOrderCancelReason.entries.last()
+        val legacyWireCodes = PaperOrderCancelReason.entries
+            .dropLast(1)
+            .joinToString { reason -> "'${reason.wireCode}'" }
+
+        exposedTransaction(database) {
+            insertActivityContextOrder(
+                orderId = orderId,
+                positionId = null,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.CANCELED,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "legacy subset constraint",
+                decisionRunId = null,
+            )
+            executeUpdate("ALTER TABLE orders DROP CONSTRAINT orders_cancel_reason_domain")
+            executeUpdate(
+                """
+                    ALTER TABLE orders ADD CONSTRAINT orders_cancel_reason_domain
+                    CHECK (cancel_reason IS NULL OR cancel_reason IN ($legacyWireCodes))
+                """.trimIndent(),
+            )
+        }
+
+        val rejectedByLegacyConstraint = runCatching {
+            updateOrderCancelReason(
+                database = database,
+                orderId = orderId,
+                cancelReason = addedReason.wireCode,
+            )
+        }
+        assertTrue(rejectedByLegacyConstraint.isFailure)
+
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        val refreshedDefinition = selectOrderCancelReasonConstraintDefinition(database)
+        PaperOrderCancelReason.entries.forEach { reason ->
+            assertTrue(refreshedDefinition.contains(reason.wireCode))
+        }
+        updateOrderCancelReason(
+            database = database,
+            orderId = orderId,
+            cancelReason = addedReason.wireCode,
+        )
+        val storedOrder = ExposedPaperLedgerRepository(database)
+            .findOrdersByTradeGroupId(tradeGroupId)
+            .getOrThrow()
+            .single { order -> order.orderId == orderId.toString() }
+        assertEquals(addedReason, storedOrder.cancelReason)
+
+        bootstrap.ensureSchema().getOrThrow()
+        assertEquals(refreshedDefinition, selectOrderCancelReasonConstraintDefinition(database))
+        val unknownWrite = runCatching {
+            updateOrderCancelReason(
+                database = database,
+                orderId = orderId,
+                cancelReason = "unknown_cancel_reason",
+            )
+        }
+        assertTrue(unknownWrite.isFailure)
     }
 
     @Test
@@ -4308,6 +4390,45 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
         }
     } finally {
         container.stop()
+    }
+}
+
+/**
+ * order の cancel reason を直接更新する。
+ */
+private fun updateOrderCancelReason(
+    database: ExposedDatabase,
+    orderId: UUID,
+    cancelReason: String,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement("UPDATE orders SET cancel_reason = ? WHERE id = ?").use { statement ->
+            statement.setString(1, cancelReason)
+            statement.setObject(2, orderId)
+            check(statement.executeUpdate() == 1) { "Expected one order cancel reason to be updated." }
+        }
+    }
+}
+
+/**
+ * order cancel reason domain constraint の定義を返す。
+ */
+private fun selectOrderCancelReasonConstraintDefinition(database: ExposedDatabase): String {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                SELECT pg_get_constraintdef(oid) AS definition
+                FROM pg_constraint
+                WHERE conname = 'orders_cancel_reason_domain'
+                    AND conrelid = 'orders'::regclass
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "orders_cancel_reason_domain constraint was not found." }
+
+                resultSet.getString("definition")
+            }
+        }
     }
 }
 
