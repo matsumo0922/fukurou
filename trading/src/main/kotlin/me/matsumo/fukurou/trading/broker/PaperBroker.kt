@@ -391,6 +391,7 @@ private class PaperBrokerTradeDelegate(
                         tradeGroupId = preparedOrder.tradeGroupId,
                         stopOrderId = UUID.randomUUID(),
                         divergenceMemo = immediateUpdate.divergenceMemo,
+                        positionMarketEligibility = currentPositionMarketEligibility(),
                     ),
                 )
             }
@@ -449,6 +450,14 @@ private class PaperBrokerTradeDelegate(
             queueAheadBtc = queueAhead,
             queueSnapshotAt = queueSnapshotAt.takeIf { command.orderType == OrderType.LIMIT },
         )
+    }
+
+    private fun currentPositionMarketEligibility(): PositionMarketEligibility? {
+        val status = runtime.reconcilerStatusProvider.snapshot()
+        val sessionId = status.marketDataSessionId ?: return null
+        if (status.marketDataState != MarketDataConnectionState.CONNECTED) return null
+
+        return PositionMarketEligibility(sessionId, status.lastProcessedSequence)
     }
 
     private suspend fun calculateQueueAhead(command: PlaceOrderCommand): BigDecimal {

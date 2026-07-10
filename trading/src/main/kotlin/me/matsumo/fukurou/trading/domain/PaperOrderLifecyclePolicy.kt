@@ -20,6 +20,9 @@ enum class PaperOrderCancelReason(val wireCode: String) {
     /** HARD_HALT sweep による取消。 */
     HARD_HALT("hard_halt"),
 
+    /** market-data gap により未約定 entry を評価除外して取消。 */
+    MARKET_DATA_GAP("market_data_gap"),
+
     /** enum 導入前の自由記述値で理由を確定できない取消。 */
     LEGACY_UNCLASSIFIED("legacy_unclassified"),
     ;

@@ -195,6 +195,7 @@ private class InMemoryPaperLedgerState(
     val fallbackSymbolRules: SymbolRules = runtime.fallbackSymbolRules
     val clock: Clock = runtime.clock
     val orderMarketEligibility: MutableMap<String, RestingOrderMarketEligibility> = mutableMapOf()
+    val positionMarketEligibility: MutableMap<String, PositionMarketEligibility> = mutableMapOf()
     var marketSessionId: UUID? = null
     var lastMarketSequence: Long = 0
 
@@ -670,10 +671,19 @@ private class InMemoryPaperLedgerMutationWriter(
                 val progress = emptyReconcileProgress()
 
                 updateMarksLocked(event.priceJpy, null, fallbackSymbolRules, event.receivedAt)
-                expireRestingEntryOrdersLocked(event.receivedAt, progress)
+                expireRestingEntryOrdersLocked(clock.instant(), progress)
                 if (!accountSnapshot.isHardHaltDrawdownReached()) {
+                    val existingPositionIds = positions.mapTo(mutableSetOf(), Position::positionId)
                     fillTriggeredEntryOrdersLocked(context, progress)
-                    triggerPositionProtectionsLocked(context, progress)
+                    positions
+                        .filter { position -> position.positionId !in existingPositionIds }
+                        .forEach { position ->
+                            positionMarketEligibility[position.positionId] = PositionMarketEligibility(
+                                event.connectionSessionId,
+                                event.sequence,
+                            )
+                        }
+                    triggerPositionProtectionsLocked(context, progress, event)
                 }
                 lastMarketSequence = event.sequence
 
@@ -871,6 +881,9 @@ private class InMemoryPaperLedgerMutationWriter(
 
             orders += stopOrder
             positions += position
+            request.entry.positionMarketEligibility?.let { eligibility ->
+                positionMarketEligibility[position.positionId] = eligibility
+            }
             decisionRunIdsByPositionId[position.positionId] = command.auditContext.decisionRunContext.decisionRunId
 
             return stopOrder.orderId
@@ -890,8 +903,13 @@ private class InMemoryPaperLedgerMutationWriter(
     private fun InMemoryPaperLedgerState.triggerPositionProtectionsLocked(
         context: ReconcileMarketContext,
         progress: ReconcileProgress,
+        event: PaperMarketTradeEvent? = null,
     ) {
-        val openPositions = positions.filter { position -> position.status == PositionStatus.OPEN }
+        val openPositions = positions.filter { position ->
+            val eligibility = positionMarketEligibility[position.positionId]
+            position.status == PositionStatus.OPEN && (event == null || eligibility == null ||
+                (eligibility.sessionId == event.connectionSessionId && eligibility.eligibleAfterSequence < event.sequence))
+        }
 
         openPositions.forEach { position ->
             val stopPrice = position.currentStopLossJpy?.toBigDecimal()

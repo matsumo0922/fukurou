@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.market.MarketDataIntegritySnapshot
+import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Instant
 import java.util.UUID
@@ -281,12 +282,20 @@ private fun JdbcTransaction.applyGapImpact(
     prepare(
         """
             UPDATE orders
-            SET status = 'CANCELED', reason_ja = ?, updated_at = ?
-            WHERE status = 'OPEN' AND side = 'BUY' AND position_id IS NULL
+            SET status = 'CANCELED',
+                reason_ja = ?,
+                canceled_at = ?,
+                cancel_reason = ?,
+                updated_at = ?
+            WHERE status IN ('OPEN', 'PENDING_CANCEL')
+                AND side = 'BUY'
+                AND position_id IS NULL
         """,
     ).use { statement ->
         statement.setString(1, "market-data gap: ${reason.name}")
         statement.setLong(2, detectedAt.toEpochMilli())
+        statement.setString(3, PaperOrderCancelReason.MARKET_DATA_GAP.wireCode)
+        statement.setLong(4, detectedAt.toEpochMilli())
         statement.executeUpdate()
     }
     prepare("UPDATE market_data_gaps SET impact_applied_at = ? WHERE id = ?").use { statement ->
@@ -306,7 +315,7 @@ private fun JdbcTransaction.insertOrderAndRunExclusions(
         reason,
         at,
         "ORDER",
-        "SELECT id::text FROM orders WHERE status = 'OPEN' AND side = 'BUY' AND position_id IS NULL",
+        "SELECT id::text FROM orders WHERE status IN ('OPEN', 'PENDING_CANCEL') AND side = 'BUY' AND position_id IS NULL",
     )
     insertExclusionsFromQuery(
         gapId,
@@ -315,7 +324,10 @@ private fun JdbcTransaction.insertOrderAndRunExclusions(
         "DECISION_RUN",
         """
             SELECT DISTINCT decision_run_id FROM orders
-            WHERE status = 'OPEN' AND side = 'BUY' AND position_id IS NULL AND decision_run_id IS NOT NULL
+            WHERE status IN ('OPEN', 'PENDING_CANCEL')
+                AND side = 'BUY'
+                AND position_id IS NULL
+                AND decision_run_id IS NOT NULL
         """,
     )
 }

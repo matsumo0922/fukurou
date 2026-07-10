@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.PositionMarkUpdate
+import me.matsumo.fukurou.trading.broker.PositionMarketEligibility
 import me.matsumo.fukurou.trading.broker.ReconcileMarketContext
 import me.matsumo.fukurou.trading.broker.ReconcileProgress
 import me.matsumo.fukurou.trading.broker.RestingEntryFillRequest
@@ -470,7 +471,7 @@ private fun JdbcTransaction.applyPaperMarketEvent(
     val progress = emptyReconcileProgress()
 
     updateMarks(event.priceJpy, null, rules, clock)
-    expireRestingEntryOrders(event.receivedAt, progress)
+    expireRestingEntryOrders(clock.instant(), progress)
     bindExistingPositionsToSession(event)
 
     if (!paperAccountHardHaltReached()) {
@@ -507,16 +508,20 @@ private fun JdbcTransaction.bindExistingPositionsToSession(event: PaperMarketTra
     prepare(
         """
             UPDATE positions
-            SET market_data_session_id = ?, market_eligible_after_sequence = ?
+            SET market_data_session_id = ?,
+                market_eligible_after_sequence = CASE
+                    WHEN market_data_session_id IS NULL THEN ?
+                    ELSE ?
+                END
             WHERE status = 'OPEN'
                 AND (market_data_session_id IS NULL OR market_data_session_id <> ?)
         """,
     ).use { statement ->
         statement.setObject(1, event.connectionSessionId)
-        // gap 復旧後はこの event より前に存在した position を直ちに保護する。
-        // 通常接続で同期待ちの position と event 内で新規作成した position は同一 sequence を拒否する。
-        statement.setLong(2, eligibleAfterSequence)
-        statement.setObject(3, event.connectionSessionId)
+        // session 未紐付けの同期 entry と gap 復旧前からの position は最初の event で保護する。
+        statement.setLong(2, event.sequence - 1)
+        statement.setLong(3, eligibleAfterSequence)
+        statement.setObject(4, event.connectionSessionId)
         statement.executeUpdate()
     }
 }
@@ -899,7 +904,13 @@ private fun JdbcTransaction.upsertPositionForEntryFill(
     val fill = request.entry.fill
 
     if (existingPosition == null) {
-        insertPosition(command, fill, request.entry.positionId, request.entry.tradeGroupId)
+        insertPosition(
+            command = command,
+            fill = fill,
+            positionId = request.entry.positionId,
+            tradeGroupId = request.entry.tradeGroupId,
+            marketEligibility = request.entry.positionMarketEligibility,
+        )
         insertProtectiveStopOrder(
             command,
             request.entry.stopOrderId,
@@ -1315,6 +1326,7 @@ private fun JdbcTransaction.insertPosition(
     fill: SimulatedFill,
     positionId: UUID,
     tradeGroupId: UUID,
+    marketEligibility: PositionMarketEligibility?,
 ) {
     prepare(
         """
@@ -1324,9 +1336,9 @@ private fun JdbcTransaction.insertPosition(
                 current_take_profit_jpy, unrealized_pnl_jpy, unrealized_r, pyramid_add_count,
                 highest_price_since_entry_jpy, lowest_price_since_entry_jpy, decision_run_id, tool_call_id,
                 client_request_id, llm_provider, prompt_hash, system_prompt_version,
-                market_snapshot_id
+                market_snapshot_id, market_data_session_id, market_eligible_after_sequence
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         statement.setObject(1, positionId)
@@ -1347,6 +1359,8 @@ private fun JdbcTransaction.insertPosition(
         statement.setBigDecimal(16, fill.priceJpy.moneyScale())
         statement.setBigDecimal(17, fill.priceJpy.moneyScale())
         statement.bindAudit(18, command.auditContext)
+        statement.setObject(25, marketEligibility?.sessionId)
+        statement.setObject(26, marketEligibility?.eligibleAfterSequence)
         statement.executeUpdate()
     }
 }

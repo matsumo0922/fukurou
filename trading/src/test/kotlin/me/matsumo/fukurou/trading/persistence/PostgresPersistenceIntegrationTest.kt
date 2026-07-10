@@ -4686,7 +4686,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun paper_market_event_does_not_stop_new_position_until_a_later_sequence() = runPostgresTest {
+    fun paper_market_event_stops_synchronous_position_on_first_sequence() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000165")
         ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
@@ -4710,13 +4710,8 @@ class PostgresPersistenceIntegrationTest {
 
         val bindingEvent = paperTradeEvent(sessionId, 1, "0.0010", priceJpy = "9700000")
         broker.applyMarketEvent(bindingEvent).getOrThrow()
-        assertEquals(1, broker.getPositions().getOrThrow().size)
-
-        val stopEvent = paperTradeEvent(sessionId, 2, "0.0010", priceJpy = "9700000")
-        broker.applyMarketEvent(stopEvent).getOrThrow()
-
         assertTrue(broker.getPositions().getOrThrow().isEmpty())
-        assertEquals(stopEvent.receivedAt.toString(), ledgerRepository.getExecutions().getOrThrow().last().executedAt)
+        assertEquals(bindingEvent.receivedAt.toString(), ledgerRepository.getExecutions().getOrThrow().last().executedAt)
     }
 
     @Test

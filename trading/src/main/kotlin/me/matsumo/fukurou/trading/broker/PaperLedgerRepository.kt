@@ -317,6 +317,13 @@ data class MarketEntryFillRequest(
     val stopOrderId: UUID,
     val divergenceMemo: PaperExecutionDivergenceMemo? = null,
     val source: PaperMarketTradeEvent? = null,
+    val positionMarketEligibility: PositionMarketEligibility? = null,
+)
+
+/** 同期 entry position が次の realtime event から保護を受けるための境界。 */
+data class PositionMarketEligibility(
+    val sessionId: UUID,
+    val eligibleAfterSequence: Long,
 )
 
 /**
