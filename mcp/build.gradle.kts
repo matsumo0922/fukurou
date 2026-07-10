@@ -21,6 +21,9 @@ dependencies {
     implementation(libs.mcp.kotlin.server)
 
     testImplementation(libs.mcp.kotlin.client)
+    testImplementation(libs.exposed.jdbc)
+    testImplementation(libs.postgresql)
+    testImplementation(libs.testcontainers.postgresql)
     testImplementation(testFixtures(project(":mcp-core")))
     testImplementation(kotlin("test"))
 }

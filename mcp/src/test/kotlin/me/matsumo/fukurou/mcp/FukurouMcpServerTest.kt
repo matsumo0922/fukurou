@@ -32,6 +32,9 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.activity.DecisionRunDecision
+import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
+import me.matsumo.fukurou.trading.activity.DecisionRunIntent
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenial
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialPage
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialQuery
@@ -56,6 +59,7 @@ import me.matsumo.fukurou.trading.broker.PreviewOrderResult
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
@@ -75,24 +79,34 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.knowledge.KnowledgeService
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.runner.DEFAULT_RUNNER_MCP_SERVER_NAME
+import me.matsumo.fukurou.trading.runner.SecretRedactor
 import me.matsumo.fukurou.trading.runner.defaultFalsifierAllowedTools
 import me.matsumo.fukurou.trading.runner.defaultProposerAllowedTools
+import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import me.matsumo.fukurou.trading.safety.SafetyFloorRule
+import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
+import org.testcontainers.DockerClientFactory
+import org.testcontainers.containers.PostgreSQLContainer
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
  * MCP server の最小 contract を検証するテスト。
@@ -899,6 +913,168 @@ class FukurouMcpServerTest {
         assertEquals("0.03357778", denial.getValue("machine_outcome").jsonObject.getValue("measured_value").jsonPrimitive.contentOrNull)
         assertEquals(null, denial.getValue("prior_proposal").jsonPrimitive.contentOrNull)
         assertEquals(null, denial.getValue("falsifier").jsonPrimitive.contentOrNull)
+    }
+
+    @Test
+    fun knowledgeRecentLessonsTool_capsSafetyDenialsAsNewestFirstPrefix() = runBlocking {
+        val clock = fixedClock()
+        val runtime = TradingRuntimeFactory.inMemory(clock = clock)
+        val rawSecret = "raw-secret-value"
+        val reader = object : DecisionRunSafetyDenialReader {
+            override suspend fun readSafetyDenials(
+                query: DecisionRunSafetyDenialQuery,
+            ): Result<DecisionRunSafetyDenialPage> {
+                return Result.success(
+                    DecisionRunSafetyDenialPage(
+                        denials = (1..5).map { index ->
+                            largeSafetyDenial(index, rawSecret, Instant.now(clock).minusSeconds(index.toLong()))
+                        },
+                        truncated = false,
+                    ),
+                )
+            }
+        }
+        val knowledgeService = KnowledgeService(
+            decisionRepository = runtime.decisionRepository,
+            llmRunRepository = runtime.llmRunRepository,
+            evaluationRepository = runtime.evaluationRepository,
+            safetyDenialReader = reader,
+            clock = clock,
+            redactor = SecretRedactor.fromEnvironment(mapOf("API_SECRET" to rawSecret)),
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = clock,
+            tradingRuntime = runtime,
+            knowledgeService = knowledgeService,
+        ).createServer()
+
+        val result = callTool(server, "knowledge_get_recent_lessons", buildJsonObject {})
+        val structuredContent = assertNotNull(result.structuredContent)
+        val denials = structuredContent.getValue("safety_floor_denials").jsonArray
+        val first = denials.first().jsonObject
+
+        assertTrue(denials.size in 1..4)
+        assertEquals(
+            denials.size.toLong(),
+            structuredContent.getValue("safety_floor_denial_item_count").jsonPrimitive.longOrNull,
+        )
+        assertEquals(
+            true,
+            structuredContent.getValue("safety_floor_denials_truncated").jsonPrimitive.booleanOrNull,
+        )
+        assertEquals(
+            (1..denials.size).map { index -> "denial-$index" },
+            denials.map { denial ->
+                denial.jsonObject.getValue("invocation_id").jsonPrimitive.contentOrNull
+            },
+        )
+        assertTrue(denials.toString().toByteArray(Charsets.UTF_8).size <= 16 * 1024)
+        assertNotNull(first.getValue("prior_proposal").jsonObject)
+        assertNotNull(first.getValue("falsifier").jsonObject)
+        assertNotNull(first.getValue("machine_outcome").jsonObject)
+        assertTrue(!structuredContent.toString().contains(rawSecret))
+    }
+
+    @Test
+    fun knowledgeRecentLessonsTool_readsSafetyDenialThroughPostgresRuntime() = runBlocking {
+        if (!DockerClientFactory.instance().isDockerAvailable) return@runBlocking
+
+        val container = PostgreSQLContainer("postgres:16-alpine")
+        var runtime: me.matsumo.fukurou.trading.runtime.TradingRuntime? = null
+        container.start()
+
+        try {
+            val clock = fixedClock()
+            val database = ExposedDatabase.connect(
+                url = container.jdbcUrl,
+                driver = "org.postgresql.Driver",
+                user = container.username,
+                password = container.password,
+            )
+            TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
+            runtime = TradingRuntimeFactory.postgres(
+                config = TradingDatabaseConfig(container.jdbcUrl, container.username, container.password),
+                clock = clock,
+            )
+            val invocationId = "postgres-denial-run"
+            val startedAt = Instant.now(clock).minusSeconds(10)
+
+            runtime.llmRunRepository.insertRunning(
+                LlmRunStart(
+                    invocationId = invocationId,
+                    mode = TradingMode.PAPER,
+                    symbol = TradingSymbol.BTC,
+                    triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                    startedAt = startedAt,
+                ),
+            ).getOrThrow()
+            runtime.llmRunRepository.finish(
+                LlmRunFinish(
+                    invocationId = invocationId,
+                    mode = TradingMode.PAPER,
+                    symbol = TradingSymbol.BTC,
+                    triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                    status = "SUCCEEDED",
+                    startedAt = startedAt,
+                    finishedAt = Instant.now(clock),
+                    errorMessage = null,
+                ),
+            ).getOrThrow()
+            runtime.safetyViolationRepository.append(
+                SafetyViolation(
+                    rule = SafetyFloorRule.EXPECTED_VALUE_GATE,
+                    messageJa = "EV が不足しています。",
+                    measuredValue = "0.03357778",
+                    limitValue = "0.10",
+                    commandName = "preview_order",
+                    commandId = UUID.randomUUID(),
+                    orderId = null,
+                    decisionRunId = invocationId,
+                    toolCallId = "tool-postgres-denial",
+                    clientRequestId = "request-postgres-denial",
+                    hardHaltRequired = false,
+                    payloadJson = "{\"credential\":\"must-not-leak\"}",
+                    createdAt = Instant.now(clock),
+                ),
+            ).getOrThrow()
+            runtime.commandEventLog.append(
+                CommandEvent(
+                    decisionRunContext = DecisionRunContext(
+                        decisionRunId = invocationId,
+                        llmProvider = "claude",
+                        promptHash = "prompt-hash",
+                        systemPromptVersion = "system-prompt-v1.13",
+                        marketSnapshotId = "snapshot-1",
+                    ),
+                    toolName = "runner",
+                    toolCallId = null,
+                    clientRequestId = null,
+                    eventType = CommandEventType.NO_TRADE_EXIT,
+                    payload = "{\"reason\":\"preview_order_rejected\"}",
+                    occurredAt = Instant.now(clock),
+                ),
+            ).getOrThrow()
+            val server = FukurouMcpServer(
+                marketDataSource = FakeMarketDataSource,
+                clock = clock,
+                tradingRuntime = runtime,
+            ).createServer()
+
+            val result = callTool(server, "knowledge_get_recent_lessons", buildJsonObject {})
+            val denial = assertNotNull(result.structuredContent)
+                .getValue("safety_floor_denials")
+                .jsonArray
+                .single()
+                .jsonObject
+
+            assertEquals("postgres-denial-run", denial.getValue("invocation_id").jsonPrimitive.contentOrNull)
+            assertEquals("EXPECTED_VALUE_GATE", denial.getValue("machine_outcome").jsonObject.getValue("rule").jsonPrimitive.contentOrNull)
+            assertEquals("preview_order_rejected", denial.getValue("final_reason").jsonPrimitive.contentOrNull)
+        } finally {
+            runtime?.close()
+            container.stop()
+        }
     }
 
     @Test
@@ -2133,6 +2309,63 @@ private object PreviewMarketDataSource : MarketDataSource {
 
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+private fun largeSafetyDenial(
+    index: Int,
+    rawSecret: String,
+    deniedAt: Instant,
+): DecisionRunSafetyDenial {
+    val largeText = "あ".repeat(400)
+
+    return DecisionRunSafetyDenial(
+        invocationId = "denial-$index",
+        deniedAt = deniedAt,
+        finalReason = "preview_order_rejected",
+        decision = DecisionRunDecision(
+            decisionId = "decision-$index",
+            action = "ENTER",
+            provider = "claude",
+            estimatedWinProbability = "0.50",
+            expectedRMultiple = "0.11",
+            roundTripCostR = "0.01",
+            reasonJa = largeText,
+            setupTagsJson = "[\"$largeText\",\"$largeText\",\"$largeText\",\"$largeText\",\"$largeText\"]",
+            missingDataJaJson = "[]",
+            noTradeConditionsJaJson = "[]",
+            createdAt = deniedAt,
+        ),
+        intent = DecisionRunIntent(
+            intentId = "intent-$index",
+            tradePlanId = "plan-$index",
+            parentTradePlanId = null,
+            revisionCount = 0,
+            side = "BUY",
+            orderType = "LIMIT",
+            sizeBtc = "0.001",
+            priceJpy = "10000000",
+            protectiveStopPriceJpy = "9900000",
+            takeProfitPriceJpy = "10500000",
+            thesisJa = largeText,
+            invalidationConditionsJaJson = "[]",
+            targetPriceJpy = "10500000",
+            timeStopAt = null,
+            setupTagsJson = null,
+        ),
+        falsification = DecisionRunFalsification(
+            verdict = "APPROVED",
+            provider = "codex",
+            reasonJa = "approved",
+            createdAt = deniedAt,
+        ),
+        safetyViolation = DecisionRunSafetyViolation(
+            rule = "EXPECTED_VALUE_GATE",
+            measuredValue = "$rawSecret $largeText",
+            limitValue = largeText,
+            messageJa = "$rawSecret $largeText",
+            createdAt = deniedAt,
+        ),
+    )
 }
 
 private fun fixedInstant(): Instant {

@@ -359,8 +359,14 @@ private const val FIND_SAFETY_DENIAL_INVOCATIONS_SQL = """
     FROM ranked_denials
     WHERE row_number = 1
     ORDER BY created_at DESC, id DESC
-    LIMIT ?
+    LIMIT ? OFFSET ?
 """
+
+/** SafetyFloor denial reader が一度に outcome 判定する候補数。 */
+private const val SAFETY_DENIAL_SCAN_BATCH_SIZE = 100
+
+/** SafetyFloor denial reader が1 requestで走査する最大 batch 数。 */
+private const val MAX_SAFETY_DENIAL_SCAN_BATCHES = 10
 
 /**
  * PostgreSQL の append-only 台帳から decision run projection を構築する repository。
@@ -408,25 +414,41 @@ private fun JdbcTransaction.selectSafetyDenials(
     query: DecisionRunSafetyDenialQuery,
     observedAt: Instant,
 ): DecisionRunSafetyDenialPage {
-    val candidates = jdbcConnection().prepareStatement(FIND_SAFETY_DENIAL_INVOCATIONS_SQL).use { statement ->
+    val selected = mutableListOf<DecisionRunSafetyDenial>()
+
+    repeat(MAX_SAFETY_DENIAL_SCAN_BATCHES) { batchIndex ->
+        val candidates = selectSafetyDenialCandidates(query, batchIndex)
+        selected += candidates.mapNotNull { invocationId ->
+            selectRunDetail(invocationId, observedAt).toSafetyDenialOrNull()
+        }
+
+        if (selected.size > query.limit) {
+            return DecisionRunSafetyDenialPage(selected.take(query.limit), truncated = true)
+        }
+        if (candidates.size < SAFETY_DENIAL_SCAN_BATCH_SIZE) {
+            return DecisionRunSafetyDenialPage(selected, truncated = false)
+        }
+    }
+
+    return DecisionRunSafetyDenialPage(selected, truncated = true)
+}
+
+private fun JdbcTransaction.selectSafetyDenialCandidates(
+    query: DecisionRunSafetyDenialQuery,
+    batchIndex: Int,
+): List<String> {
+    return jdbcConnection().prepareStatement(FIND_SAFETY_DENIAL_INVOCATIONS_SQL).use { statement ->
         statement.setString(1, query.symbol.apiSymbol)
         statement.setLong(2, query.from.toEpochMilli())
         statement.setLong(3, query.toExclusive.toEpochMilli())
-        statement.setInt(4, query.limit + 1)
+        statement.setInt(4, SAFETY_DENIAL_SCAN_BATCH_SIZE)
+        statement.setInt(5, batchIndex * SAFETY_DENIAL_SCAN_BATCH_SIZE)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) add(resultSet.getString("decision_run_id"))
             }
         }
     }
-    val selected = candidates.mapNotNull { invocationId ->
-        selectRunDetail(invocationId, observedAt).toSafetyDenialOrNull()
-    }
-
-    return DecisionRunSafetyDenialPage(
-        denials = selected.take(query.limit),
-        truncated = candidates.size > query.limit || selected.size > query.limit,
-    )
 }
 
 private fun DecisionRunDetail?.toSafetyDenialOrNull(): DecisionRunSafetyDenial? {

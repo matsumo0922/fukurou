@@ -1872,7 +1872,7 @@ LLMに大量のノートを読ませず、MCP側でfrontmatterと要約を検索
 
 `knowledge_get_recent_lessons` は `knowledge.recent_lessons.v2` を返す。`safety_floor_denials` は同じ symbol と `safety_violations.created_at` の lookback 内で、最新の SafetyFloor 拒否を新しい順に最大5 run返す。同一 run の複数 violation は最新1件に畳み、order / execution の lifecycle evidence が優先して outcome が `DENIED` 以外になる run は含めない。`prior_proposal` は LLM 申告値、`machine_outcome` は typed `safety_violations` column から構築する機械判定値であり、Falsifier は別の `falsifier` object として返す。payload や tool evidence は返さない。
 
-denial section は identifier、rule、final reason を allowlist 化し、SecretRedactor 後に whitespace 正規化と長さ制限を適用する。`lookback_days` は既存の既定30日・最大365日を共用し、reader は1件多く読んで件数省略を `safety_floor_denials_truncated` に記録する。serialized UTF-8 JSON section は16 KiBまでとし、新しい順の prefix を返す。0件でも空配列、item count 0、truncated false を返す。
+denial section は identifier、rule、final reason を allowlist 化し、SecretRedactor 後に whitespace 正規化と長さ制限を適用する。`lookback_days` は既存の既定30日・最大365日を共用する。reader は Activity outcome を適用した eligible `DENIED` を最大5件と6件目まで判定し、件数省略を `safety_floor_denials_truncated` に記録する。候補 scan は request あたり上限を持ち、scan 上限に達した場合も `truncated=true` とする。serialized UTF-8 JSON section は16 KiBまでとし、新しい順の prefix を返す。0件でも空配列、item count 0、truncated false を返す。
 
 ### 8.8 1回のCLI起動内で行うこと/振り返りへ回すこと
 

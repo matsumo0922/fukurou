@@ -1330,10 +1330,13 @@ class PostgresPersistenceIntegrationTest {
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val decisionResult = decisionRepository.submitDecision(enterDecisionSubmission()).getOrThrow()
         val intentId = requireNotNull(decisionResult.tradeIntent?.intentId)
+        val filledRunIds = (1..7).map { index -> "run-filled-$index" }
 
         insertFinishedDecisionRun(llmRunRepository, "run-1", status = "SUCCEEDED", errorMessage = null)
         insertFinishedDecisionRun(llmRunRepository, "run-malformed", status = "SUCCEEDED", errorMessage = null)
-        insertFinishedDecisionRun(llmRunRepository, "run-filled", status = "SUCCEEDED", errorMessage = null)
+        filledRunIds.forEach { invocationId ->
+            insertFinishedDecisionRun(llmRunRepository, invocationId, status = "SUCCEEDED", errorMessage = null)
+        }
         insertFinishedDecisionRun(llmRunRepository, "run-old", status = "SUCCEEDED", errorMessage = null)
         decisionRepository.submitFalsification(
             FalsificationSubmission(
@@ -1348,24 +1351,34 @@ class PostgresPersistenceIntegrationTest {
         safetyRepository.append(testSafetyViolation("run-1", SafetyFloorRule.MAX_RISK_PER_TRADE, fixedInstant().minusSeconds(20))).getOrThrow()
         safetyRepository.append(testSafetyViolation("run-1", SafetyFloorRule.EXPECTED_VALUE_GATE, fixedInstant().minusSeconds(10))).getOrThrow()
         safetyRepository.append(testSafetyViolation("run-malformed", SafetyFloorRule.EXPECTED_VALUE_GATE, fixedInstant().minusSeconds(15))).getOrThrow()
-        safetyRepository.append(testSafetyViolation("run-filled", SafetyFloorRule.EXPECTED_VALUE_GATE, fixedInstant().minusSeconds(12))).getOrThrow()
+        filledRunIds.forEachIndexed { index, invocationId ->
+            safetyRepository.append(
+                testSafetyViolation(
+                    decisionRunId = invocationId,
+                    rule = SafetyFloorRule.EXPECTED_VALUE_GATE,
+                    createdAt = fixedInstant().minusSeconds((index + 1).toLong()),
+                ),
+            ).getOrThrow()
+        }
         safetyRepository.append(testSafetyViolation("run-old", SafetyFloorRule.EXPECTED_VALUE_GATE, fixedInstant().minus(Duration.ofDays(31)))).getOrThrow()
         appendNoTradeExit(database, "run-1", "{\"reason\":\"preview_order_rejected\"}", fixedInstant().minusSeconds(5))
         appendNoTradeExit(database, "run-malformed", "{", fixedInstant().minusSeconds(4))
         exposedTransaction(database) {
-            insertActivityContextOrder(
-                orderId = UUID.randomUUID(),
-                positionId = null,
-                tradeGroupId = UUID.randomUUID(),
-                side = OrderSide.BUY,
-                orderType = OrderType.LIMIT,
-                status = OrderStatus.FILLED,
-                limitPriceJpy = BigDecimal("10000000"),
-                triggerPriceJpy = null,
-                takeProfitPriceJpy = BigDecimal("10500000"),
-                reasonJa = "lifecycle precedence",
-                decisionRunId = "run-filled",
-            )
+            filledRunIds.forEach { invocationId ->
+                insertActivityContextOrder(
+                    orderId = UUID.randomUUID(),
+                    positionId = null,
+                    tradeGroupId = UUID.randomUUID(),
+                    side = OrderSide.BUY,
+                    orderType = OrderType.LIMIT,
+                    status = OrderStatus.FILLED,
+                    limitPriceJpy = BigDecimal("10000000"),
+                    triggerPriceJpy = null,
+                    takeProfitPriceJpy = BigDecimal("10500000"),
+                    reasonJa = "lifecycle precedence",
+                    decisionRunId = invocationId,
+                )
+            }
         }
         val repository = ExposedDecisionRunProjectionRepository(database, fixedClock())
         val denials = repository.readSafetyDenials(
@@ -1388,7 +1401,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(detail.safetyViolation?.rule, denials.denials.first().safetyViolation.rule)
         assertEquals(detail.summary.finalReason, denials.denials.first().finalReason)
         assertEquals(null, denials.denials.last().finalReason)
-        assertTrue(denials.denials.none { denial -> denial.invocationId == "run-filled" || denial.invocationId == "run-old" })
+        assertTrue(denials.denials.none { denial -> denial.invocationId in filledRunIds || denial.invocationId == "run-old" })
     }
 
     @Test
