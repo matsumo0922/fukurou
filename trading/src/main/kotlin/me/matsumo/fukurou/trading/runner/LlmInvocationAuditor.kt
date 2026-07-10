@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
+import me.matsumo.fukurou.trading.evaluation.LlmInvocationTimedOutException
 import me.matsumo.fukurou.trading.invoker.CODEX_INVOCATION_RESULT_UNAVAILABLE
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
@@ -87,6 +88,10 @@ class LlmInvocationAuditor(
         }
 
         val processFailed = processResult?.didFail() ?: false
+
+        if (processResult?.status == ProcessRunStatus.TIMED_OUT) {
+            return Result.failure(LlmInvocationTimedOutException(phaseName))
+        }
 
         if (processFailed) {
             val failure = IllegalStateException("$phaseName process did not exit cleanly.")

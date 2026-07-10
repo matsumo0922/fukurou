@@ -432,7 +432,7 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun freshRunningReservationSuppressesRepeatedTriggerAudit() = runBlocking {
+    fun freshRunningReservationAuditsBlockedSelectedTrigger() = runBlocking {
         val eventAt = fixedInstant().plus(Duration.ofMinutes(5))
         val launchStarted = CompletableDeferred<Unit>()
         val releaseLaunch = CompletableDeferred<Unit>()
@@ -466,9 +466,13 @@ class LlmDaemonSchedulerTest {
         firstTick.await()
 
         assertIs<LlmDaemonTickResult.Skipped>(secondResult)
-        assertEquals("no_trigger_due", secondResult.reason)
+        assertEquals("concurrent_invocation", secondResult.reason)
         assertEquals(1, fixture.launches.size)
-        assertTrue(skipEvents.none { event -> event.payload.contains("concurrent_invocation") })
+        assertTrue(skipEvents.any { event ->
+            event.payload.contains("concurrent_invocation") &&
+                event.payload.contains("activeInvocationId") &&
+                event.decisionRunContext.decisionRunId != null
+        })
     }
 
     @Test

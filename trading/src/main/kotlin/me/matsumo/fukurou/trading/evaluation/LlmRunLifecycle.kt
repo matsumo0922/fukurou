@@ -11,3 +11,6 @@ enum class LlmRunTerminalCause {
     RESTART_INTERRUPTED,
     LEGACY_UNCLASSIFIED,
 }
+
+/** process timeout を文字列解析せず runner へ伝える typed failure。 */
+class LlmInvocationTimedOutException(phaseName: String) : RuntimeException("$phaseName timed out")

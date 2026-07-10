@@ -150,6 +150,7 @@ class DefaultManualLlmLaunchService(
                 skipReason = skipReason,
                 requestReason = reason,
                 observedAt = observedAt,
+                activeReservation = reservationOutcome.activeReservation,
             ).getOrThrow()
 
             return ManualLlmLaunchResult.Rejected(skipReason)
@@ -294,10 +295,13 @@ class DefaultManualLlmLaunchService(
         skipReason: String,
         requestReason: String,
         observedAt: Instant,
+        activeReservation: LlmActiveLaunchReservation? = null,
     ): Result<Unit> {
         return commandEventLog.append(
             CommandEvent(
-                decisionRunContext = DecisionRunContext.EMPTY,
+                decisionRunContext = activeReservation?.let { active ->
+                    manualDecisionRunContext(active.invocationId, runtimeConfigSnapshot)
+                } ?: DecisionRunContext.EMPTY,
                 toolName = MANUAL_TOOL_NAME,
                 toolCallId = null,
                 clientRequestId = LLM_MANUAL_TRIGGER_KEY,
@@ -309,6 +313,12 @@ class DefaultManualLlmLaunchService(
                     put("triggerKey", LLM_MANUAL_TRIGGER_KEY)
                     put("eventName", null as String?)
                     put("observedAt", observedAt.toString())
+                    activeReservation?.let { active ->
+                        put("activeInvocationId", active.invocationId)
+                        put("activeTriggerKind", active.triggerKind.name)
+                        put("activeTriggerKey", active.triggerKey)
+                        put("activeReservedAt", active.reservedAt.toString())
+                    }
                     runtimeConfigSnapshot?.let { snapshot ->
                         put("runtimeConfigVersionId", snapshot.versionId)
                         put("runtimeConfigHash", snapshot.hash)

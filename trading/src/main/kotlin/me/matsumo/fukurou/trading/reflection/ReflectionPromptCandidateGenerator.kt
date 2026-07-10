@@ -19,6 +19,8 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmInvocationTimedOutException
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
@@ -314,7 +316,7 @@ class ReflectionPromptCandidateGenerator(
             start = start,
             status = REFLECTION_LLM_RUN_STATUS_SUCCEEDED,
             reservationStatus = LlmLaunchReservationStatus.FINISHED,
-            reason = status,
+            reason = LlmRunTerminalCause.NORMAL_COMPLETION.name,
             cause = null,
         )
     }
@@ -326,7 +328,7 @@ class ReflectionPromptCandidateGenerator(
             start = start,
             status = status,
             reservationStatus = LlmLaunchReservationStatus.FAILED,
-            reason = cause.javaClass.simpleName,
+            reason = terminalCauseFor(cause).name,
             cause = cause,
         )
     }
@@ -357,6 +359,7 @@ class ReflectionPromptCandidateGenerator(
                 startedAt = start.startedAt,
                 finishedAt = finishedAt,
                 errorMessage = redactedMessage,
+                terminalCause = cause?.let(::terminalCauseFor) ?: LlmRunTerminalCause.NORMAL_COMPLETION,
             ),
         ).onFailure { throwable ->
             logger(
@@ -377,6 +380,12 @@ class ReflectionPromptCandidateGenerator(
                     "error=${throwable.javaClass.simpleName}",
             )
         }
+    }
+
+    private fun terminalCauseFor(cause: Throwable): LlmRunTerminalCause = when (cause) {
+        is CancellationException -> LlmRunTerminalCause.CALLER_CANCELLED
+        is LlmInvocationTimedOutException -> LlmRunTerminalCause.TIMED_OUT
+        else -> LlmRunTerminalCause.RUNNER_FAILED
     }
 
     private fun llmRequest(

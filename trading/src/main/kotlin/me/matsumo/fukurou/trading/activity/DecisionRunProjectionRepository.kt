@@ -48,7 +48,7 @@ enum class DecisionRunFilter {
 data class DecisionRunOutcomeEvidence(
     val status: String,
     val errorMessage: String?,
-    val terminalCause: LlmRunTerminalCause?,
+    val terminalCause: LlmRunTerminalCause? = null,
     val action: String?,
     val safetyRule: String?,
     val orderCount: Int,
@@ -156,7 +156,7 @@ data class DecisionRunSummary(
     val startedAt: Instant,
     val finishedAt: Instant?,
     val errorMessage: String?,
-    val terminalCause: LlmRunTerminalCause?,
+    val terminalCause: LlmRunTerminalCause? = null,
     val action: String?,
     val reasonJa: String?,
     val falsificationVerdict: String?,

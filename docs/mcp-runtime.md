@@ -144,6 +144,8 @@ Ktor process 内の daemon scheduler は active runtime config の `daemon.enabl
 
 起動可否は `llm_launch_reservations` と `risk_state` を同一 DB transaction で確認し、同時起動、hour/day cap、HARD_HALT の TOCTOU を避ける。LLM には次回起動時刻を決める tool を渡さない。
 
+LLM invocation は in-flight run を supersede しない。scheduler は trigger を既存 priority で選んだ後に active reservation を確認し、阻まれた trigger と blocker の invocation ID / trigger kind / key を `DAEMON_TRIGGER_SKIPPED` に記録する。bootstrap は stale な `llm_runs` と対応する RUNNING reservation を同一 transaction で `RESTART_INTERRUPTED` として回収し、invocation ごとに `LLM_INVOCATION_RECOVERED` を残す。`llm_runs.terminal_cause` は status と直交する machine-readable な終了理由であり、legacy terminal row は `LEGACY_UNCLASSIFIED` として読む。
+
 hourly / daily cap の起動時刻は、対象 invocation に reservation が存在する場合は `reserved_at` を正本とする。reservation のない legacy run だけ `RUNNER_PHASE_COMPLETED` / `NO_TRADE_EXIT` の `ts` へ fallback し、複数 phase は invocation 単位で 1 起動にまとめる。
 
 手動 `OneShotRunnerMain` は daemon の `llm_launch_reservations` を通らないため、daemon の `CONCURRENT_INVOCATION` guard からは見えない。手動実行は daemon を停止してから行うこと。runner preflight の rolling cap は reservation 優先規則を使い、手動実行は reservation のない audit fallback として daemon 起動と相互に数える。preflight で拒否された手動実行も phase / NO_TRADE audit を残し、window 外へ出るまで 1 起動として数える。手動実行も開始時に active runtime config snapshot を解決し、その version id / hash を decision run audit へ残す。

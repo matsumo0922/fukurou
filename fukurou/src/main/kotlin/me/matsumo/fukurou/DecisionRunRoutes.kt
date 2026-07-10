@@ -95,7 +95,7 @@ data class OpsDecisionRunSummaryResponse(
     val safetyMessageJa: String?,
     val finalReason: String?,
     val errorMessage: String?,
-    val terminalCause: String?,
+    val terminalCause: String? = null,
     val orderCount: Int,
     val executionCount: Int,
     val hasProcessFailure: Boolean,
