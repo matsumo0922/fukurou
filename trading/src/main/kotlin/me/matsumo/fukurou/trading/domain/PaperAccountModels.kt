@@ -245,6 +245,7 @@ data class Position(
  * @param expiredAt lifecycle が期限到達を確定した時刻
  * @param canceledAt 取消を確定した時刻
  * @param cancelReason 取消理由 code
+ * @param canceledByDecisionRunId 取消を実行した decision run ID
  * @param createdAt 作成時刻
  * @param updatedAt 更新時刻
  */
@@ -273,6 +274,7 @@ data class Order(
     val expiredAt: String? = null,
     val canceledAt: String? = null,
     val cancelReason: String? = null,
+    val canceledByDecisionRunId: String? = null,
     val createdAt: String,
     val updatedAt: String,
 )

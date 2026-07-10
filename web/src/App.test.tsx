@@ -421,6 +421,7 @@ describe("App", () => {
       expiredAt: null,
       canceledAt: null,
       cancelReason: null,
+      canceledByDecisionRunId: null,
       createdAt: "2099-07-10T00:30:00.000Z",
     };
     const summary = {
@@ -433,7 +434,8 @@ describe("App", () => {
       orderCount: 1,
       order,
       currentQuote: {
-        priceJpy: "10000000.00000000",
+        bidPriceJpy: "9990000.00000000",
+        askPriceJpy: "10000000.00000000",
         observedAt: "2099-07-10T00:31:00.000Z",
         stale: false,
       },
@@ -465,6 +467,47 @@ describe("App", () => {
     expect(await within(detailPane).findByText(/best ask reaches 9900000\.00000000 JPY/)).toBeInTheDocument();
     expect(within(detailPane).getAllByText("SYSTEM_TTL").length).toBeGreaterThan(0);
     expect(within(detailPane).getByText("Reference display only. It is not paper fill evidence.")).toBeInTheDocument();
+  });
+
+  it("shows normal cancellation and the actor run provenance", async () => {
+    const order = {
+      ...decisionRunDetailResponse().orders[0],
+      status: "CANCELED",
+      canceledAt: "2026-07-10T00:50:00.000Z",
+      cancelReason: "EXIT canceled pending entry",
+      canceledByDecisionRunId: "exit-actor-run",
+    };
+    const summary = {
+      ...decisionRunsResponse().runs[0],
+      invocationId: "entry-canceled-run",
+      outcome: "CANCELED",
+      orderCount: 1,
+      executionCount: 0,
+      order,
+      currentQuote: null,
+    };
+    stubSystemFetch({
+      decisionRunsResponse: { status: 200, body: { runs: [summary], nextBefore: null } },
+      decisionRunDetails: {
+        "entry-canceled-run": {
+          ...decisionRunDetailResponse(),
+          summary,
+          orders: [order],
+          executions: [],
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    const canceledRow = within(runList).getByRole("button", { name: /BUY LIMIT/ });
+    expect(within(canceledRow).getByText("Canceled")).toBeInTheDocument();
+    fireEvent.click(canceledRow);
+
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect((await within(detailPane).findAllByText("exit-actor-run")).length).toBeGreaterThan(0);
   });
 
   it("loads older decision runs without duplicating the cursor boundary", async () => {

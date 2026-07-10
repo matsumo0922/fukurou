@@ -13,6 +13,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
@@ -1382,6 +1383,21 @@ class PostgresPersistenceIntegrationTest {
                     reasonJa = "decision run outcome fixture",
                     decisionRunId = invocationId,
                 )
+                if (invocationId == "filled-run") {
+                    insertActivityContextOrder(
+                        orderId = UUID.randomUUID(),
+                        positionId = positionId,
+                        tradeGroupId = tradeGroupId,
+                        side = OrderSide.SELL,
+                        orderType = OrderType.STOP,
+                        status = OrderStatus.OPEN,
+                        limitPriceJpy = null,
+                        triggerPriceJpy = BigDecimal("9700000"),
+                        takeProfitPriceJpy = null,
+                        reasonJa = "protective stop remains open",
+                        decisionRunId = invocationId,
+                    )
+                }
             }
         }
 
@@ -1399,6 +1415,143 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(listOf("filled-run"), executed.map { summary -> summary.invocationId })
         assertEquals(listOf("rejected-run"), failed.map { summary -> summary.invocationId })
+    }
+
+    @Test
+    fun decisionRunProjectionTracksNormalCancellationForTargetAndActorRuns() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val runIds = listOf(
+            "entry-exit-run",
+            "exit-actor-run",
+            "entry-hard-halt-run",
+            "hard-halt-actor-run",
+            "entry-executed-exit-run",
+            "executed-exit-actor-run",
+        )
+        runIds.forEach { invocationId ->
+            insertFinishedDecisionRun(
+                repository = llmRunRepository,
+                invocationId = invocationId,
+                status = if (invocationId.contains("actor")) LLM_RUN_STATUS_FAILED else "SUCCEEDED",
+                errorMessage = if (invocationId.contains("actor")) "runner ended after cancellation" else null,
+            )
+        }
+        val cancellationCases = listOf(
+            CancellationProjectionCase("entry-exit-run", "exit-actor-run", "EXIT canceled pending entry"),
+            CancellationProjectionCase(
+                "entry-hard-halt-run",
+                "hard-halt-actor-run",
+                "HARD_HALT canceled pending entry",
+            ),
+            CancellationProjectionCase(
+                "entry-executed-exit-run",
+                "executed-exit-actor-run",
+                "EXIT canceled pending entry before another execution",
+            ),
+        )
+        val repository = ExposedPaperLedgerRepository(database)
+
+        cancellationCases.forEach { cancellationCase ->
+            val orderId = UUID.randomUUID()
+            val positionId = UUID.randomUUID()
+            val tradeGroupId = UUID.randomUUID()
+            exposedTransaction(database) {
+                insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+                insertActivityContextOrder(
+                    orderId = orderId,
+                    positionId = positionId,
+                    tradeGroupId = tradeGroupId,
+                    side = OrderSide.BUY,
+                    orderType = OrderType.LIMIT,
+                    status = OrderStatus.OPEN,
+                    limitPriceJpy = BigDecimal("9900000"),
+                    triggerPriceJpy = null,
+                    takeProfitPriceJpy = null,
+                    reasonJa = "pending entry",
+                    decisionRunId = cancellationCase.targetRunId,
+                )
+            }
+            repository.cancelOrder(
+                CancelOrderCommand(
+                    commandId = UUID.randomUUID(),
+                    orderId = orderId,
+                    reasonJa = cancellationCase.reason,
+                    auditContext = cancellationAuditContext(cancellationCase.actorRunId),
+                ),
+            ).getOrThrow()
+        }
+        exposedTransaction(database) {
+            insertCancellationActorExecution("executed-exit-actor-run")
+        }
+
+        val projection = ExposedDecisionRunProjectionRepository(database, fixedClock())
+        val summaries = projection.listRuns(cursor = null, limit = 20).getOrThrow().runs.associateBy { it.invocationId }
+
+        assertEquals(DecisionRunOutcome.CANCELED, summaries.getValue("entry-exit-run").outcome)
+        assertEquals(DecisionRunOutcome.CANCELED, summaries.getValue("exit-actor-run").outcome)
+        assertEquals(DecisionRunOutcome.CANCELED, summaries.getValue("entry-hard-halt-run").outcome)
+        assertEquals(DecisionRunOutcome.CANCELED, summaries.getValue("hard-halt-actor-run").outcome)
+        assertEquals(DecisionRunOutcome.CANCELED, summaries.getValue("entry-executed-exit-run").outcome)
+        assertEquals(DecisionRunOutcome.FILLED, summaries.getValue("executed-exit-actor-run").outcome)
+        val exitTarget = requireNotNull(projection.findRun("entry-exit-run").getOrThrow())
+        assertEquals("exit-actor-run", exitTarget.orders.single().canceledByDecisionRunId)
+    }
+
+    @Test
+    fun decisionRunProjectionKeepsPersistenceCancellationFailureAsFailed() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        insertFinishedDecisionRun(
+            repository = llmRunRepository,
+            invocationId = "entry-persistence-failure-run",
+            status = "SUCCEEDED",
+            errorMessage = null,
+        )
+        insertFinishedDecisionRun(
+            repository = llmRunRepository,
+            invocationId = "cancel-persistence-failure-actor-run",
+            status = LLM_RUN_STATUS_FAILED,
+            errorMessage = "cancel persistence failed",
+        )
+        val orderId = UUID.randomUUID()
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        exposedTransaction(database) {
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = orderId,
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                status = OrderStatus.OPEN,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "pending entry before failed cancel",
+                decisionRunId = "entry-persistence-failure-run",
+            )
+            jdbcConnection().prepareStatement("ALTER TABLE orders DROP COLUMN canceled_by_decision_run_id").use {
+                it.executeUpdate()
+            }
+        }
+
+        val cancelResult = ExposedPaperLedgerRepository(database).cancelOrder(
+            CancelOrderCommand(
+                commandId = UUID.randomUUID(),
+                orderId = orderId,
+                reasonJa = "cancel write must fail",
+                auditContext = cancellationAuditContext("cancel-persistence-failure-actor-run"),
+            ),
+        )
+        assertTrue(cancelResult.isFailure)
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val projection = ExposedDecisionRunProjectionRepository(database, fixedClock())
+        val summaries = projection.listRuns(cursor = null, limit = 10).getOrThrow().runs.associateBy { it.invocationId }
+        assertEquals(DecisionRunOutcome.WAITING, summaries.getValue("entry-persistence-failure-run").outcome)
+        assertEquals(DecisionRunOutcome.FAILED, summaries.getValue("cancel-persistence-failure-actor-run").outcome)
     }
 
     @Test
@@ -4877,6 +5030,78 @@ private fun runnerPhaseEvent(
         payload = """{"phase":"$phase","details":$details}""",
         occurredAt = occurredAt,
     )
+}
+
+/**
+ * cancellation projection integration test の target / actor run 組。
+ *
+ * @param targetRunId 取消対象 order を作成した run ID
+ * @param actorRunId 取消を実行した run ID
+ * @param reason 取消理由
+ */
+private data class CancellationProjectionCase(
+    val targetRunId: String,
+    val actorRunId: String,
+    val reason: String,
+)
+
+private suspend fun insertFinishedDecisionRun(
+    repository: ExposedLlmRunRepository,
+    invocationId: String,
+    status: String,
+    errorMessage: String?,
+) {
+    val start = LlmRunStart(
+        invocationId = invocationId,
+        mode = TradingMode.PAPER,
+        symbol = TradingSymbol.BTC,
+        triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+        startedAt = fixedInstant(),
+    )
+    repository.insertRunning(start).getOrThrow()
+    repository.finish(
+        LlmRunFinish(
+            invocationId = invocationId,
+            mode = start.mode,
+            symbol = start.symbol,
+            triggerKind = start.triggerKind,
+            status = status,
+            startedAt = start.startedAt,
+            finishedAt = fixedInstant().plusSeconds(10),
+            errorMessage = errorMessage,
+        ),
+    ).getOrThrow()
+}
+
+private fun cancellationAuditContext(actorRunId: String): PaperTradeAuditContext {
+    return PaperTradeAuditContext(
+        decisionRunContext = DecisionRunContext(
+            decisionRunId = actorRunId,
+            llmProvider = "codex",
+            promptHash = "cancel-prompt-hash",
+            systemPromptVersion = "cancel-system-prompt",
+            marketSnapshotId = "cancel-market-snapshot",
+        ),
+        toolCallId = "cancel-tool-$actorRunId",
+        clientRequestId = "cancel-request-$actorRunId",
+    )
+}
+
+private fun JdbcTransaction.insertCancellationActorExecution(decisionRunId: String) {
+    jdbcConnection().prepareStatement(
+        """
+            INSERT INTO executions (
+                id, order_id, position_id, mode, symbol, side, price_jpy, size_btc,
+                fee_jpy, realized_pnl_jpy, liquidity, executed_at, decision_run_id
+            )
+            VALUES (?, NULL, NULL, 'PAPER', 'BTC', 'SELL', 10000000, 0.001, 0, 1000, 'TAKER', ?, ?)
+        """,
+    ).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setLong(2, fixedInstant().toEpochMilli())
+        statement.setString(3, decisionRunId)
+        statement.executeUpdate()
+    }
 }
 
 private fun runtimeConfigDraftCreation(note: String): RuntimeConfigDraftCreation {

@@ -323,6 +323,9 @@ private const val ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL = """
     CREATE INDEX IF NOT EXISTS idx_orders_decision_run_created
         ON orders (decision_run_id, created_at, id)
         WHERE decision_run_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_orders_canceled_by_decision_run
+        ON orders (canceled_by_decision_run_id, canceled_at, id)
+        WHERE canceled_by_decision_run_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_executions_decision_run_executed
         ON executions (decision_run_id, executed_at, id)
         WHERE decision_run_id IS NOT NULL;
@@ -565,6 +568,7 @@ private const val VERIFY_ORDERS_SCHEMA_SQL = """
         expired_at,
         canceled_at,
         cancel_reason,
+        canceled_by_decision_run_id,
         created_at,
         updated_at
     FROM orders

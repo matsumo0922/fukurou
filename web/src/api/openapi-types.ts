@@ -2255,11 +2255,13 @@ export interface components {
             expiredAt?: string | null;
             canceledAt?: string | null;
             cancelReason?: string | null;
+            canceledByDecisionRunId?: string | null;
             createdAt: string;
         };
         /** OpsDecisionRunQuoteResponse */
         OpsDecisionRunQuoteResponse: {
-            priceJpy: string;
+            bidPriceJpy: string;
+            askPriceJpy: string;
             observedAt: string;
             stale: boolean;
         };
@@ -2271,7 +2273,7 @@ export interface components {
             triggerKind?: string | null;
             status: string;
             /** @enum {string} */
-            outcome: "WAITING" | "FILLED" | "EXPIRED" | "NO_ENTRY" | "RUNNING" | "FAILED" | "ACTION_REQUIRED";
+            outcome: "WAITING" | "FILLED" | "EXPIRED" | "CANCELED" | "NO_ENTRY" | "RUNNING" | "FAILED" | "ACTION_REQUIRED";
             startedAt: string;
             finishedAt?: string | null;
             durationMillis?: number | null;
@@ -2430,6 +2432,7 @@ export interface components {
             expiredAt?: string | null;
             canceledAt?: string | null;
             cancelReason?: string | null;
+            canceledByDecisionRunId?: string | null;
             createdAt: string;
             updatedAt: string;
         };

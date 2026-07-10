@@ -118,6 +118,17 @@ class DecisionRunProjectionRepositoryTest {
 
         assertEquals(DecisionRunOutcome.EXPIRED, classifyDecisionRunOutcome(expired))
     }
+
+    @Test
+    fun normalCancellationIsDistinctFromProcessFailureForTargetAndActorRuns() {
+        val target = outcomeEvidence(action = "ENTER", orderCount = 1, canceledEntryOrderCount = 1)
+        val actor = outcomeEvidence(status = "FAILED", action = "EXIT", actorCanceledOrderCount = 1)
+        val executedActor = actor.copy(executionCount = 1)
+
+        assertEquals(DecisionRunOutcome.CANCELED, classifyDecisionRunOutcome(target))
+        assertEquals(DecisionRunOutcome.CANCELED, classifyDecisionRunOutcome(actor))
+        assertEquals(DecisionRunOutcome.FILLED, classifyDecisionRunOutcome(executedActor))
+    }
 }
 
 private fun outcomeEvidence(
@@ -129,6 +140,8 @@ private fun outcomeEvidence(
     hasNoTradeExit: Boolean = false,
     openOrderCount: Int = 0,
     ttlCanceledOrderCount: Int = 0,
+    canceledEntryOrderCount: Int = 0,
+    actorCanceledOrderCount: Int = 0,
 ): DecisionRunOutcomeEvidence {
     return DecisionRunOutcomeEvidence(
         status = status,
@@ -141,5 +154,7 @@ private fun outcomeEvidence(
         hasNoTradeExit = hasNoTradeExit,
         openOrderCount = openOrderCount,
         ttlCanceledOrderCount = ttlCanceledOrderCount,
+        canceledEntryOrderCount = canceledEntryOrderCount,
+        actorCanceledOrderCount = actorCanceledOrderCount,
     )
 }

@@ -216,6 +216,7 @@ private const val SELECT_OPEN_ORDERS_SQL = """
         expired_at,
         canceled_at,
         cancel_reason,
+        canceled_by_decision_run_id,
         created_at,
         updated_at
     FROM orders
@@ -257,6 +258,7 @@ private const val SELECT_OPEN_ORDERS_WITH_ACCOUNT_UPDATED_AT_SQL = """
         orders.expired_at,
         orders.canceled_at,
         orders.cancel_reason,
+        orders.canceled_by_decision_run_id,
         orders.created_at,
         orders.updated_at
     FROM paper_account
@@ -295,6 +297,7 @@ private const val SELECT_ORDERS_BY_CLIENT_REQUEST_ID_SQL = """
         expired_at,
         canceled_at,
         cancel_reason,
+        canceled_by_decision_run_id,
         created_at,
         updated_at
     FROM orders
@@ -335,6 +338,7 @@ private const val SELECT_ORDERS_BY_TRADE_GROUP_ID_SQL = """
         expired_at,
         canceled_at,
         cancel_reason,
+        canceled_by_decision_run_id,
         created_at,
         updated_at
     FROM orders
@@ -1354,6 +1358,7 @@ private fun ResultSet.toOrder(): Order {
         expiredAt = getNullableInstant("expired_at")?.toString(),
         canceledAt = getNullableInstant("canceled_at")?.toString(),
         cancelReason = getString("cancel_reason"),
+        canceledByDecisionRunId = getString("canceled_by_decision_run_id"),
         createdAt = getInstant("created_at").toString(),
         updatedAt = getInstant("updated_at").toString(),
     )

@@ -562,6 +562,7 @@ private class InMemoryPaperLedgerMutationWriter(
                     reasonJa = command.reasonJa,
                     canceledAt = canceledAt.toString(),
                     cancelReason = command.reasonJa,
+                    canceledByDecisionRunId = command.auditContext.decisionRunContext.decisionRunId,
                     updatedAt = canceledAt.toString(),
                 )
 

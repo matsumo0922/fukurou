@@ -24,6 +24,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunSummary
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.decision.requiresSafetyFloor
+import me.matsumo.fukurou.trading.domain.TradingSymbol
 import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.time.Instant
@@ -51,6 +52,7 @@ enum class OpsDecisionRunOutcome {
     WAITING,
     FILLED,
     EXPIRED,
+    CANCELED,
     NO_ENTRY,
     RUNNING,
     FAILED,
@@ -94,7 +96,8 @@ data class OpsDecisionRunSummaryResponse(
 /** Activity に表示する参考価格。paper fill の根拠には使わない。 */
 @Serializable
 data class OpsDecisionRunQuoteResponse(
-    val priceJpy: String,
+    val bidPriceJpy: String,
+    val askPriceJpy: String,
     val observedAt: String,
     val stale: Boolean,
 )
@@ -195,6 +198,7 @@ data class OpsDecisionRunOrderResponse(
     val expiredAt: String?,
     val canceledAt: String?,
     val cancelReason: String?,
+    val canceledByDecisionRunId: String?,
     val createdAt: String,
 )
 
@@ -330,13 +334,17 @@ private fun Route.registerOpsDecisionRunDetailRoute(dependencies: OpsRouteDepend
 }
 
 private suspend fun OpsRouteDependencies.referenceQuote(): OpsDecisionRunQuoteResponse? {
-    val snapshot = feed.paperLedgerRepository?.getAccountSnapshotWithUpdatedAt()?.getOrNull() ?: return null
-    val observedAt = snapshot.updatedAt
+    val ticker = feed.marketDataSource?.getTicker(TradingSymbol.BTC)?.getOrNull() ?: return null
+    val validBid = ticker.bid.toBigDecimalOrNull() ?: return null
+    val validAsk = ticker.ask.toBigDecimalOrNull() ?: return null
+    val observedAt = runCatching { Instant.parse(ticker.timestamp) }.getOrNull() ?: return null
+    val age = Duration.between(observedAt, clock.instant())
 
     return OpsDecisionRunQuoteResponse(
-        priceJpy = snapshot.accountSnapshot.btcMarkPriceJpy,
+        bidPriceJpy = validBid.toPlainString(),
+        askPriceJpy = validAsk.toPlainString(),
         observedAt = observedAt.toString(),
-        stale = Duration.between(observedAt, clock.instant()) > Duration.ofMinutes(2),
+        stale = age.isNegative || age > Duration.ofMinutes(2),
     )
 }
 
@@ -452,6 +460,7 @@ private fun DecisionRunOutcome.toResponse(): OpsDecisionRunOutcome {
         DecisionRunOutcome.WAITING -> OpsDecisionRunOutcome.WAITING
         DecisionRunOutcome.FILLED -> OpsDecisionRunOutcome.FILLED
         DecisionRunOutcome.EXPIRED -> OpsDecisionRunOutcome.EXPIRED
+        DecisionRunOutcome.CANCELED -> OpsDecisionRunOutcome.CANCELED
         DecisionRunOutcome.NO_ENTRY -> OpsDecisionRunOutcome.NO_ENTRY
         DecisionRunOutcome.RUNNING -> OpsDecisionRunOutcome.RUNNING
         DecisionRunOutcome.FAILED -> OpsDecisionRunOutcome.FAILED
@@ -523,6 +532,7 @@ private fun DecisionRunOrder.toResponse() = OpsDecisionRunOrderResponse(
     expiredAt = expiredAt?.toString(),
     canceledAt = canceledAt?.toString(),
     cancelReason = cancelReason,
+    canceledByDecisionRunId = canceledByDecisionRunId,
     createdAt = createdAt.toString(),
 )
 

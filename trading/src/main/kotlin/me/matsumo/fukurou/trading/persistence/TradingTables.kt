@@ -580,6 +580,9 @@ object OrdersTable : Table("orders") {
     /** 取消理由 code。 */
     val cancelReason = varchar("cancel_reason", length = 128).nullable()
 
+    /** 取消を実行した decision run ID。 */
+    val canceledByDecisionRunId = varchar("canceled_by_decision_run_id", length = 128).nullable()
+
     /**
      * 作成時刻。epoch millis で保存する。
      */

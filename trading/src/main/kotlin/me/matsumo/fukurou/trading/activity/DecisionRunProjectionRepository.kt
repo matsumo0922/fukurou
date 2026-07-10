@@ -12,6 +12,7 @@ enum class DecisionRunOutcome {
     WAITING,
     FILLED,
     EXPIRED,
+    CANCELED,
     NO_ENTRY,
     RUNNING,
     FAILED,
@@ -39,6 +40,8 @@ data class DecisionRunOutcomeEvidence(
     val openOrderCount: Int = 0,
     val overdueOpenOrderCount: Int = 0,
     val ttlCanceledOrderCount: Int = 0,
+    val canceledEntryOrderCount: Int = 0,
+    val actorCanceledOrderCount: Int = 0,
 )
 
 /** 保存済み run 証跡から fail-closed な outcome を決定する。 */
@@ -50,13 +53,21 @@ fun classifyDecisionRunOutcome(evidence: DecisionRunOutcomeEvidence): DecisionRu
         evidence.openOrderCount > 0 -> DecisionRunOutcome.WAITING
         hasExecutionEvidence -> DecisionRunOutcome.FILLED
         evidence.ttlCanceledOrderCount > 0 -> DecisionRunOutcome.EXPIRED
+        evidence.hasNormalCancellationEvidence() -> DecisionRunOutcome.CANCELED
         evidence.status == LLM_RUN_STATUS_RUNNING -> DecisionRunOutcome.RUNNING
-        evidence.safetyRule != null -> DecisionRunOutcome.NO_ENTRY
-        evidence.action == DecisionAction.NO_TRADE.name || evidence.hasNoTradeExit -> DecisionRunOutcome.NO_ENTRY
+        evidence.hasNoEntryEvidence() -> DecisionRunOutcome.NO_ENTRY
         evidence.errorMessage == STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE -> DecisionRunOutcome.FAILED
         evidence.status == LLM_RUN_STATUS_FAILED || evidence.status == LLM_RUN_STATUS_CANCELLED -> DecisionRunOutcome.FAILED
         else -> DecisionRunOutcome.FAILED
     }
+}
+
+private fun DecisionRunOutcomeEvidence.hasNormalCancellationEvidence(): Boolean {
+    return canceledEntryOrderCount > 0 || actorCanceledOrderCount > 0
+}
+
+private fun DecisionRunOutcomeEvidence.hasNoEntryEvidence(): Boolean {
+    return safetyRule != null || action == DecisionAction.NO_TRADE.name || hasNoTradeExit
 }
 
 /** outcome が目的別 filter に一致するかを返す。 */
@@ -65,7 +76,10 @@ fun DecisionRunOutcome.matches(filter: DecisionRunFilter): Boolean {
         DecisionRunFilter.ACTION_REQUIRED -> this == DecisionRunOutcome.ACTION_REQUIRED || this == DecisionRunOutcome.FAILED
         DecisionRunFilter.WAITING -> this == DecisionRunOutcome.WAITING
         DecisionRunFilter.FILLED -> this == DecisionRunOutcome.FILLED
-        DecisionRunFilter.NO_ENTRY -> this == DecisionRunOutcome.NO_ENTRY || this == DecisionRunOutcome.EXPIRED
+        DecisionRunFilter.NO_ENTRY ->
+            this == DecisionRunOutcome.NO_ENTRY ||
+                this == DecisionRunOutcome.EXPIRED ||
+                this == DecisionRunOutcome.CANCELED
     }
 }
 
@@ -177,6 +191,7 @@ data class DecisionRunOrder(
     val expiredAt: Instant? = null,
     val canceledAt: Instant? = null,
     val cancelReason: String? = null,
+    val canceledByDecisionRunId: String? = null,
     val createdAt: Instant,
 )
 

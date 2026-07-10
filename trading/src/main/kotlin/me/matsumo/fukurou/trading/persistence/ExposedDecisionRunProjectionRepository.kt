@@ -67,6 +67,8 @@ private val LIST_RUNS_SQL = """
         order_count.open_value AS open_order_count,
         order_count.overdue_value AS overdue_open_order_count,
         order_count.ttl_canceled_value AS ttl_canceled_order_count,
+        order_count.canceled_value AS canceled_entry_order_count,
+        cancellation_actor.value AS actor_canceled_order_count,
         execution_count.value AS execution_count,
         no_trade.reason AS no_trade_reason,
         no_trade.present AS has_no_trade_exit,
@@ -86,6 +88,7 @@ private val LIST_RUNS_SQL = """
         entry_order.expired_at AS entry_expired_at,
         entry_order.canceled_at AS entry_canceled_at,
         entry_order.cancel_reason AS entry_cancel_reason,
+        entry_order.canceled_by_decision_run_id AS entry_canceled_by_decision_run_id,
         entry_order.created_at AS entry_created_at
     FROM candidate_runs run
     LEFT JOIN LATERAL (
@@ -114,12 +117,31 @@ private val LIST_RUNS_SQL = """
         SELECT
             COUNT(*)::INT AS value,
             COUNT(*) FILTER (WHERE status = ?)::INT AS filled_value,
-            COUNT(*) FILTER (WHERE status = ?)::INT AS open_value,
-            COUNT(*) FILTER (WHERE status = ? AND expires_at IS NOT NULL AND expires_at <= ?)::INT AS overdue_value,
-            COUNT(*) FILTER (WHERE status = ? AND cancel_reason = ?)::INT AS ttl_canceled_value
+            COUNT(*) FILTER (
+                WHERE side = 'BUY' AND order_type IN ('LIMIT', 'STOP') AND status = ?
+            )::INT AS open_value,
+            COUNT(*) FILTER (
+                WHERE side = 'BUY' AND order_type IN ('LIMIT', 'STOP')
+                    AND status = ? AND expires_at IS NOT NULL AND expires_at <= ?
+            )::INT AS overdue_value,
+            COUNT(*) FILTER (
+                WHERE side = 'BUY' AND order_type IN ('LIMIT', 'STOP')
+                    AND status = ? AND cancel_reason = ?
+            )::INT AS ttl_canceled_value,
+            COUNT(*) FILTER (
+                WHERE side = 'BUY' AND order_type IN ('LIMIT', 'STOP')
+                    AND status = ? AND cancel_reason IS DISTINCT FROM ?
+            )::INT AS canceled_value
         FROM orders
         WHERE decision_run_id = run.invocation_id
     ) order_count ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*)::INT AS value
+        FROM orders
+        WHERE canceled_by_decision_run_id = run.invocation_id
+            AND status = ?
+            AND cancel_reason IS DISTINCT FROM ?
+    ) cancellation_actor ON TRUE
     LEFT JOIN LATERAL (
         SELECT *
         FROM orders
@@ -197,16 +219,34 @@ private val FIND_RUN_SQL = """
                 AND status = ?
         ) AS filled_order_count,
         (SELECT COUNT(*) FROM executions WHERE decision_run_id = run.invocation_id) AS execution_count,
-        (SELECT COUNT(*) FROM orders WHERE decision_run_id = run.invocation_id AND status = ?) AS open_order_count,
         (
             SELECT COUNT(*) FROM orders
-            WHERE decision_run_id = run.invocation_id AND status = ?
+            WHERE decision_run_id = run.invocation_id
+                AND side = 'BUY' AND order_type IN ('LIMIT', 'STOP') AND status = ?
+        ) AS open_order_count,
+        (
+            SELECT COUNT(*) FROM orders
+            WHERE decision_run_id = run.invocation_id
+                AND side = 'BUY' AND order_type IN ('LIMIT', 'STOP') AND status = ?
                 AND expires_at IS NOT NULL AND expires_at <= ?
         ) AS overdue_open_order_count,
         (
             SELECT COUNT(*) FROM orders
-            WHERE decision_run_id = run.invocation_id AND status = ? AND cancel_reason = ?
+            WHERE decision_run_id = run.invocation_id
+                AND side = 'BUY' AND order_type IN ('LIMIT', 'STOP')
+                AND status = ? AND cancel_reason = ?
         ) AS ttl_canceled_order_count,
+        (
+            SELECT COUNT(*) FROM orders
+            WHERE decision_run_id = run.invocation_id
+                AND side = 'BUY' AND order_type IN ('LIMIT', 'STOP')
+                AND status = ? AND cancel_reason IS DISTINCT FROM ?
+        ) AS canceled_entry_order_count,
+        (
+            SELECT COUNT(*) FROM orders
+            WHERE canceled_by_decision_run_id = run.invocation_id
+                AND status = ? AND cancel_reason IS DISTINCT FROM ?
+        ) AS actor_canceled_order_count,
         no_trade.reason AS no_trade_reason,
         no_trade.present AS has_no_trade_exit
     FROM llm_runs run
@@ -250,7 +290,7 @@ private val FIND_RUN_SQL = """
 private const val FIND_ORDERS_SQL = """
     SELECT id, intent_id, position_id, trade_group_id, side, order_type, status, size_btc,
         limit_price_jpy, reason_ja, expires_at, expiry_source, effective_ttl_seconds,
-        expired_at, canceled_at, cancel_reason, created_at
+        expired_at, canceled_at, cancel_reason, canceled_by_decision_run_id, created_at
     FROM orders
     WHERE decision_run_id = ?
     ORDER BY created_at ASC, id ASC
@@ -357,6 +397,10 @@ private fun JdbcTransaction.selectRunBatch(
         statement.setLong(9, observedAt.toEpochMilli())
         statement.setString(10, OrderStatus.CANCELED.name)
         statement.setString(11, RESTING_ENTRY_TTL_CANCEL_REASON)
+        statement.setString(12, OrderStatus.CANCELED.name)
+        statement.setString(13, RESTING_ENTRY_TTL_CANCEL_REASON)
+        statement.setString(14, OrderStatus.CANCELED.name)
+        statement.setString(15, RESTING_ENTRY_TTL_CANCEL_REASON)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) add(resultSet.toSummary())
@@ -373,7 +417,11 @@ private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: In
         statement.setLong(4, observedAt.toEpochMilli())
         statement.setString(5, OrderStatus.CANCELED.name)
         statement.setString(6, RESTING_ENTRY_TTL_CANCEL_REASON)
-        statement.setString(7, invocationId)
+        statement.setString(7, OrderStatus.CANCELED.name)
+        statement.setString(8, RESTING_ENTRY_TTL_CANCEL_REASON)
+        statement.setString(9, OrderStatus.CANCELED.name)
+        statement.setString(10, RESTING_ENTRY_TTL_CANCEL_REASON)
+        statement.setString(11, invocationId)
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.toDetailBase() else null
         }
@@ -419,6 +467,7 @@ private fun JdbcTransaction.selectOrders(invocationId: String): List<DecisionRun
                             expiredAt = resultSet.nullableInstant("expired_at"),
                             canceledAt = resultSet.nullableInstant("canceled_at"),
                             cancelReason = resultSet.getString("cancel_reason"),
+                            canceledByDecisionRunId = resultSet.getString("canceled_by_decision_run_id"),
                             createdAt = Instant.ofEpochMilli(resultSet.getLong("created_at")),
                         ),
                     )
@@ -487,6 +536,8 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
     val openOrderCount = getInt("open_order_count")
     val overdueOpenOrderCount = getInt("overdue_open_order_count")
     val ttlCanceledOrderCount = getInt("ttl_canceled_order_count")
+    val canceledEntryOrderCount = getInt("canceled_entry_order_count")
+    val actorCanceledOrderCount = getInt("actor_canceled_order_count")
 
     return DecisionRunSummary(
         invocationId = getString("invocation_id"),
@@ -519,6 +570,8 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
                 openOrderCount = openOrderCount,
                 overdueOpenOrderCount = overdueOpenOrderCount,
                 ttlCanceledOrderCount = ttlCanceledOrderCount,
+                canceledEntryOrderCount = canceledEntryOrderCount,
+                actorCanceledOrderCount = actorCanceledOrderCount,
             ),
         ),
     )
@@ -570,6 +623,7 @@ private fun ResultSet.toSummaryOrder(): DecisionRunOrder? {
         expiredAt = nullableInstant("entry_expired_at"),
         canceledAt = nullableInstant("entry_canceled_at"),
         cancelReason = getString("entry_cancel_reason"),
+        canceledByDecisionRunId = getString("entry_canceled_by_decision_run_id"),
         createdAt = Instant.ofEpochMilli(getLong("entry_created_at")),
     )
 }
@@ -672,6 +726,7 @@ private fun DecisionRunOrder.toRawRecord(): DecisionRunRawRecord {
             "expiredAt" to expiredAt?.toString(),
             "canceledAt" to canceledAt?.toString(),
             "cancelReason" to cancelReason,
+            "canceledByDecisionRunId" to canceledByDecisionRunId,
         ),
     )
 }

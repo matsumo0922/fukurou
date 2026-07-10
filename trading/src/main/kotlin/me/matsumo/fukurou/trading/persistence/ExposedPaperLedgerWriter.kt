@@ -321,7 +321,13 @@ internal class ExposedPaperLedgerWriter(
                         "protective STOP cannot be cancelled directly. Use update_protection or close_position."
                     }
 
-                    updateOrderStatus(order.orderId, OrderStatus.CANCELED, command.reasonJa, clock)
+                    updateOrderStatus(
+                        orderId = order.orderId,
+                        status = OrderStatus.CANCELED,
+                        reasonJa = command.reasonJa,
+                        clock = clock,
+                        canceledByDecisionRunId = command.auditContext.decisionRunContext.decisionRunId,
+                    )
 
                     PaperTradeResult(
                         accepted = true,
@@ -1197,6 +1203,7 @@ private fun JdbcTransaction.updateOrderStatus(
     status: OrderStatus,
     reasonJa: String,
     clock: Clock,
+    canceledByDecisionRunId: String? = null,
 ) {
     prepare(
         """
@@ -1205,6 +1212,7 @@ private fun JdbcTransaction.updateOrderStatus(
                 reason_ja = ?,
                 canceled_at = CASE WHEN ? = ? THEN ? ELSE canceled_at END,
                 cancel_reason = CASE WHEN ? = ? THEN ? ELSE cancel_reason END,
+                canceled_by_decision_run_id = CASE WHEN ? = ? THEN ? ELSE canceled_by_decision_run_id END,
                 updated_at = ?
             WHERE id = ?
         """,
@@ -1217,8 +1225,11 @@ private fun JdbcTransaction.updateOrderStatus(
         statement.setString(6, status.name)
         statement.setString(7, OrderStatus.CANCELED.name)
         statement.setString(8, reasonJa)
-        statement.setLong(9, nowMillis(clock))
-        statement.setObject(10, UUID.fromString(orderId))
+        statement.setString(9, status.name)
+        statement.setString(10, OrderStatus.CANCELED.name)
+        statement.setString(11, canceledByDecisionRunId)
+        statement.setLong(12, nowMillis(clock))
+        statement.setObject(13, UUID.fromString(orderId))
         statement.executeUpdate()
     }
 }

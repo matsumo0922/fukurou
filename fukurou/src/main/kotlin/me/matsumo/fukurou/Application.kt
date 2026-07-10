@@ -75,6 +75,7 @@ fun interface ReadinessProbe {
  * @param opsLlmAuthService ops API 用 CLI auth service。null なら環境変数から構築する
  * @param opsDecisionRepository ops API 用 decision repository。null なら DB 設定から構築する
  * @param opsPaperLedgerRepository ops API 用 paper ledger repository。null なら DB 設定から構築する
+ * @param opsMarketDataSource ops Activity 表示用 market data source。null なら DB 設定時だけ GMO source を構築する
  * @param opsCommandEventLog ops API 用 command_event_log writer。null なら DB 設定から構築する
  * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
  * @param opsDecisionRunProjectionRepository ops decision run projection。null なら DB 設定から構築する
@@ -97,6 +98,7 @@ fun Application.module(
     opsLlmAuthService: LlmAuthService? = null,
     opsDecisionRepository: DecisionRepository? = null,
     opsPaperLedgerRepository: PaperLedgerRepository? = null,
+    opsMarketDataSource: MarketDataSource? = null,
     opsCommandEventLog: CommandEventLog? = null,
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
     opsDecisionRunProjectionRepository: DecisionRunProjectionRepository? = null,
@@ -136,6 +138,7 @@ fun Application.module(
             llmAuthService = opsLlmAuthService,
             decisionRepository = opsDecisionRepository,
             paperLedgerRepository = opsPaperLedgerRepository,
+            marketDataSource = opsMarketDataSource,
             commandEventLog = opsCommandEventLog,
             commandEventFeedReader = opsCommandEventFeedReader,
             decisionRunProjectionRepository = opsDecisionRunProjectionRepository,
@@ -566,6 +569,14 @@ private fun createOpsFeedRouteDependencies(
         commandEventFeedReader = opsOverrides.commandEventFeedReader ?: createdCommandEventLog,
         decisionRunProjectionRepository = opsOverrides.decisionRunProjectionRepository
             ?: database?.let(::ExposedDecisionRunProjectionRepository),
+        marketDataSource = opsOverrides.marketDataSource ?: database
+            ?.takeIf { runtime.tradingRuntimeAvailable }
+            ?.let {
+                GmoPublicMarketDataSource.fromConfig(
+                    config = runtime.tradingConfig.gmoPublicClient,
+                    clock = runtime.clock,
+                )
+            },
     )
 }
 
@@ -960,6 +971,7 @@ private data class ApplicationEvaluationOverrides(
  * @param llmAuthService CLI auth service
  * @param decisionRepository decision repository
  * @param paperLedgerRepository paper ledger repository
+ * @param marketDataSource ops Activity 表示用 market data source
  * @param commandEventLog command_event_log writer
  * @param commandEventFeedReader command_event_log feed reader
  * @param runtimeConfigAdminService runtime config admin service
@@ -970,6 +982,7 @@ private data class ApplicationOpsOverrides(
     val llmAuthService: LlmAuthService?,
     val decisionRepository: DecisionRepository?,
     val paperLedgerRepository: PaperLedgerRepository?,
+    val marketDataSource: MarketDataSource?,
     val commandEventLog: CommandEventLog?,
     val commandEventFeedReader: CommandEventFeedReader?,
     val decisionRunProjectionRepository: DecisionRunProjectionRepository?,

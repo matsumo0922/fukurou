@@ -299,6 +299,7 @@ function RunDetailContent({
           [t("activity.runs.label.expiredAt"), order?.expiredAt],
           [t("activity.runs.label.canceledAt"), order?.canceledAt],
           [t("activity.runs.label.cancelReason"), order?.cancelReason, true],
+          [t("activity.runs.label.canceledByRun"), order?.canceledByDecisionRunId, true],
         ]} />
       </DetailSection>
 
@@ -403,6 +404,7 @@ function RunOrderRecords({ orders }: { orders: OpsDecisionRunDetailResponse["ord
             [t("activity.runs.label.expiredAt"), order.expiredAt],
             [t("activity.runs.label.canceledAt"), order.canceledAt],
             [t("activity.runs.label.cancelReason"), order.cancelReason, true],
+            [t("activity.runs.label.canceledByRun"), order.canceledByDecisionRunId, true],
             [t("activity.runs.label.createdAt"), order.createdAt],
             [t("activity.runs.label.entryReason"), order.reasonJa, true],
           ]} />
@@ -466,17 +468,27 @@ function formatReferenceQuote(run: OpsDecisionRunSummaryResponse, locale: AppLoc
   if (!quote) return "—";
 
   const stale = quote.stale ? (locale === "ja" ? " · stale" : " · stale") : "";
-  return `${quote.priceJpy} @ ${formatDateTime(quote.observedAt, locale)}${stale}`;
+  const price = referenceQuotePrice(run);
+  const quoteName = run.order?.side === "SELL"
+    ? (locale === "ja" ? "買" : "bid")
+    : (locale === "ja" ? "売" : "ask");
+  return `${quoteName} ${price} @ ${formatDateTime(quote.observedAt, locale)}${stale}`;
 }
 
 function formatPriceDistance(run: OpsDecisionRunSummaryResponse): string {
   const limit = Number(run.order?.limitPriceJpy);
-  const quote = Number(run.currentQuote?.priceJpy);
+  const quote = Number(referenceQuotePrice(run));
   if (!Number.isFinite(limit) || !Number.isFinite(quote) || quote === 0) return "—";
 
   const distance = run.order?.side === "SELL" ? limit - quote : quote - limit;
   const ratio = distance / quote * 100;
   return `${distance.toLocaleString()} JPY (${ratio.toFixed(2)}%)`;
+}
+
+function referenceQuotePrice(run: OpsDecisionRunSummaryResponse): string | undefined {
+  if (run.order?.side === "SELL") return run.currentQuote?.bidPriceJpy;
+
+  return run.currentQuote?.askPriceJpy;
 }
 
 function formatExpiry(expiresAt: string | null | undefined, locale: AppLocale): string {
@@ -562,6 +574,7 @@ function runOutcomeLabel(outcome: OpsDecisionRunSummaryResponse["outcome"], t: T
     WAITING: "activity.runs.outcome.waiting",
     FILLED: "activity.runs.outcome.filled",
     EXPIRED: "activity.runs.outcome.expired",
+    CANCELED: "activity.runs.outcome.canceled",
     NO_ENTRY: "activity.runs.outcome.noEntry",
     RUNNING: "activity.runs.outcome.running",
     FAILED: "activity.runs.outcome.failed",
@@ -574,7 +587,7 @@ function OutcomeIcon({ outcome }: { outcome: OpsDecisionRunSummaryResponse["outc
     ? Clock3
     : outcome === "FILLED"
       ? CircleCheck
-      : outcome === "EXPIRED" || outcome === "NO_ENTRY"
+      : outcome === "EXPIRED" || outcome === "CANCELED" || outcome === "NO_ENTRY"
         ? Ban
         : CircleAlert;
 
