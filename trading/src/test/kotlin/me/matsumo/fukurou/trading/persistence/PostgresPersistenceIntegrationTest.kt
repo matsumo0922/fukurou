@@ -527,7 +527,6 @@ private const val INSERT_TEST_POSITION_SQL = """
 private const val INSERT_TEST_ORDER_SQL = """
     INSERT INTO orders (
         id,
-        intent_id,
         position_id,
         trade_group_id,
         mode,
