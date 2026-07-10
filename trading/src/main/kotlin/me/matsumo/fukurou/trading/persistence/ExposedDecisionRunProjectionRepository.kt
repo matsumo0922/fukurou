@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialQuery
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialReader
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
+import me.matsumo.fukurou.trading.activity.DecisionRunTradeLifecycle
 import me.matsumo.fukurou.trading.activity.classifyDecisionRunOutcome
 import me.matsumo.fukurou.trading.activity.matches
 import me.matsumo.fukurou.trading.activity.safeDecisionRunFinalReason
@@ -327,10 +328,42 @@ private const val FIND_ORDERS_SQL = """
 """
 
 private const val FIND_EXECUTIONS_SQL = """
-    SELECT id, order_id, position_id, side, price_jpy, size_btc, realized_pnl_jpy, executed_at
-    FROM executions
-    WHERE decision_run_id = ?
-    ORDER BY executed_at ASC, id ASC
+    SELECT execution.id, execution.order_id, execution.position_id, execution.side, execution.price_jpy,
+        execution.size_btc, execution.fee_jpy, execution.realized_pnl_jpy, execution.liquidity,
+        execution.executed_at, "order".order_type
+    FROM executions execution
+    LEFT JOIN orders "order" ON "order".id = execution.order_id
+    WHERE execution.decision_run_id = ?
+    ORDER BY execution.executed_at ASC, execution.id ASC
+"""
+
+private const val FIND_TRADE_LIFECYCLES_SQL = """
+    WITH run_orders AS (
+        SELECT id
+        FROM orders
+        WHERE decision_run_id = ?
+    ), entry_positions AS (
+        SELECT DISTINCT execution.position_id
+        FROM executions execution
+        JOIN run_orders ON run_orders.id = execution.order_id
+        WHERE execution.position_id IS NOT NULL
+    )
+    SELECT execution.id, execution.order_id, execution.position_id, execution.side, execution.price_jpy,
+        execution.size_btc, execution.fee_jpy, execution.realized_pnl_jpy, execution.liquidity,
+        execution.executed_at, "order".order_type, position.status AS position_status,
+        CASE
+            WHEN run_orders.id IS NOT NULL THEN 'ENTRY'
+            WHEN "order".order_type = 'STOP' THEN 'STOP'
+            WHEN "order".order_type = 'LIMIT' THEN 'TAKE_PROFIT'
+            WHEN "order".order_type = 'MARKET' THEN 'MANUAL_CLOSE'
+            ELSE 'POSITION_EXECUTION'
+        END AS execution_kind
+    FROM executions execution
+    JOIN entry_positions entry ON entry.position_id = execution.position_id
+    LEFT JOIN run_orders ON run_orders.id = execution.order_id
+    LEFT JOIN orders "order" ON "order".id = execution.order_id
+    LEFT JOIN positions position ON position.id = execution.position_id
+    ORDER BY execution.executed_at ASC, execution.id ASC
 """
 
 private const val FIND_SAFE_AUDIT_SQL = """
@@ -545,6 +578,7 @@ private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: In
     val base = selectRunDetailBase(invocationId, observedAt) ?: return null
     val orders = selectOrders(invocationId)
     val executions = selectExecutions(invocationId)
+    val tradeLifecycles = selectTradeLifecycles(invocationId)
     val raw = buildList {
         addAll(base.raw)
         addAll(selectSafeAudit(invocationId))
@@ -556,6 +590,7 @@ private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: In
         summary = base.summary.copy(order = orders.lastOrNull { order -> order.side == "BUY" }),
         orders = orders,
         executions = executions,
+        tradeLifecycles = tradeLifecycles,
         raw = raw,
     )
 }
@@ -630,12 +665,57 @@ private fun JdbcTransaction.selectExecutions(invocationId: String): List<Decisio
                             side = resultSet.getString("side"),
                             priceJpy = resultSet.getString("price_jpy"),
                             sizeBtc = resultSet.getString("size_btc"),
+                            feeJpy = resultSet.getString("fee_jpy"),
                             realizedPnlJpy = resultSet.getString("realized_pnl_jpy"),
+                            liquidity = resultSet.getString("liquidity"),
+                            orderType = resultSet.getString("order_type"),
+                            kind = "DIRECT_RUN",
                             executedAt = Instant.ofEpochMilli(resultSet.getLong("executed_at")),
                         ),
                     )
                 }
             }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectTradeLifecycles(invocationId: String): List<DecisionRunTradeLifecycle> {
+    return jdbcConnection().prepareStatement(FIND_TRADE_LIFECYCLES_SQL).use { statement ->
+        statement.setString(1, invocationId)
+        statement.executeQuery().use { resultSet ->
+            val lifecycleRows = buildList {
+                while (resultSet.next()) {
+                    add(
+                        Triple(
+                            resultSet.getString("position_id"),
+                            DecisionRunExecution(
+                                executionId = resultSet.getString("id"),
+                                orderId = resultSet.getString("order_id"),
+                                positionId = resultSet.getString("position_id"),
+                                side = resultSet.getString("side"),
+                                priceJpy = resultSet.getString("price_jpy"),
+                                sizeBtc = resultSet.getString("size_btc"),
+                                feeJpy = resultSet.getString("fee_jpy"),
+                                realizedPnlJpy = resultSet.getString("realized_pnl_jpy"),
+                                liquidity = resultSet.getString("liquidity"),
+                                orderType = resultSet.getString("order_type"),
+                                kind = resultSet.getString("execution_kind"),
+                                executedAt = Instant.ofEpochMilli(resultSet.getLong("executed_at")),
+                            ),
+                            resultSet.getString("position_status"),
+                        ),
+                    )
+                }
+            }
+
+            lifecycleRows.groupBy { row -> row.first }
+                .map { (positionId, rows) ->
+                    DecisionRunTradeLifecycle(
+                        positionId = positionId,
+                        status = rows.first().third ?: "UNKNOWN",
+                        executions = rows.map { row -> row.second },
+                    )
+                }
         }
     }
 }
@@ -743,6 +823,7 @@ private fun ResultSet.toDetailBase(): DecisionRunDetail {
         safetyViolation = toSafetyViolation(),
         orders = emptyList(),
         executions = emptyList(),
+        tradeLifecycles = emptyList(),
         raw = listOf(runRaw),
     )
 }

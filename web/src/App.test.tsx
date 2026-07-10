@@ -363,7 +363,7 @@ describe("App", () => {
     const filters = screen.getByRole("group", { name: "Decision run purpose filters" });
     expect(within(runList).getByText("preview_order_rejected")).toBeInTheDocument();
     expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "false");
-    expect(within(filters).getByRole("button", { name: /All/ })).toHaveTextContent("2 loaded");
+    expect(within(filters).getByRole("button", { name: /All/ })).toHaveTextContent("All");
     expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("limit") === "50")).toBe(true);
 
     fireEvent.click(within(filters).getByRole("button", { name: /Denied/ }));
@@ -372,9 +372,7 @@ describe("App", () => {
     await waitFor(() => {
       expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("filter") === "DENIED")).toBe(true);
     });
-    await waitFor(() => {
-      expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveTextContent("1 loaded");
-    });
+    await waitFor(() => expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveTextContent("Denied"));
 
     const filteredRunList = await screen.findByRole("main", { name: "Decision runs, newest first" });
     const selectedRun = within(filteredRunList).getByRole("button", { name: /ENTER/ });
@@ -465,9 +463,10 @@ describe("App", () => {
 
     const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
     const waitingRow = within(runList).getByRole("button", { name: /BUY LIMIT/ });
-    expect(within(waitingRow).getByText("Waiting for fill")).toBeInTheDocument();
-    expect(within(waitingRow).getByText(/10000000\.00000000/)).toBeInTheDocument();
-    expect(within(waitingRow).getByText(/100,000 JPY/)).toBeInTheDocument();
+    const waitingCard = waitingRow.closest("article")!;
+    expect(within(waitingCard).getByText("Waiting for fill")).toBeInTheDocument();
+    expect(within(waitingCard).getByText(/10000000\.00000000/)).toBeInTheDocument();
+    expect(within(waitingCard).getByText(/100,000 JPY/)).toBeInTheDocument();
 
     fireEvent.click(waitingRow);
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
@@ -509,11 +508,76 @@ describe("App", () => {
 
     const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
     const canceledRow = within(runList).getByRole("button", { name: /BUY LIMIT/ });
-    expect(within(canceledRow).getByText("Canceled")).toBeInTheDocument();
+    expect(within(canceledRow.closest("article")!).getByText("Canceled")).toBeInTheDocument();
     fireEvent.click(canceledRow);
 
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
     expect((await within(detailPane).findAllByText("exit-actor-run")).length).toBeGreaterThan(0);
+  });
+
+  it("opens an exact run ID outside the current filter and shows only saved trade lifecycle evidence", async () => {
+    const summary = {
+      ...decisionRunsResponse().runs[0],
+      invocationId: "run-archived-filled",
+      outcome: "FILLED",
+      orderCount: 1,
+      executionCount: 0,
+    };
+    stubSystemFetch({
+      decisionRunsResponse: { status: 200, body: { runs: [], nextBefore: null } },
+      decisionRunDetails: {
+        "run-archived-filled": {
+          ...decisionRunDetailResponse(),
+          summary,
+          tradeLifecycles: [{
+            positionId: "position-archived",
+            status: "CLOSED",
+            executions: [{
+              executionId: "execution-entry",
+              orderId: "order-entry",
+              positionId: "position-archived",
+              side: "BUY",
+              priceJpy: "9900000",
+              sizeBtc: "0.010000000000",
+              feeJpy: "10",
+              realizedPnlJpy: "0",
+              liquidity: "MAKER",
+              orderType: "LIMIT",
+              kind: "ENTRY",
+              executedAt: "2026-07-10T00:00:00.000Z",
+            }, {
+              executionId: "execution-stop",
+              orderId: "order-stop",
+              positionId: "position-archived",
+              side: "SELL",
+              priceJpy: "9800000",
+              sizeBtc: "0.010000000000",
+              feeJpy: "10",
+              realizedPnlJpy: "-1000",
+              liquidity: "TAKER",
+              orderType: "STOP",
+              kind: "STOP",
+              executedAt: "2026-07-10T00:01:00.000Z",
+            }],
+          }],
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const input = await screen.findByLabelText("Find an exact run ID");
+    fireEvent.change(input, { target: { value: "run-archived-filled" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(await within(detailPane).findByText("position-archived")).toBeInTheDocument();
+    expect(within(detailPane).getByText(/ENTRY · BUY LIMIT/)).toBeInTheDocument();
+    expect(within(detailPane).getByText(/STOP · SELL STOP/)).toBeInTheDocument();
+    expect(within(detailPane).getByText(/MAKER/)).toBeInTheDocument();
+    expect(within(detailPane).getAllByText(/fee 10 JPY/)).toHaveLength(2);
+    expect(within(detailPane).queryByText(/best ask reaches/)).not.toBeInTheDocument();
   });
 
   it("loads older decision runs without duplicating the cursor boundary", async () => {
@@ -551,9 +615,9 @@ describe("App", () => {
     render(<App />);
 
     const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
-    const timeoutRow = within(runList).getByText("provider timed out after 120 seconds").closest("button");
-    const authRow = within(runList).getByText("provider authentication failed").closest("button");
-    const interruptedRow = within(runList).getByText("previous process/container shutdown recovery").closest("button");
+    const timeoutRow = within(runList).getByText("provider timed out after 120 seconds").closest("article");
+    const authRow = within(runList).getByText("provider authentication failed").closest("article");
+    const interruptedRow = within(runList).getByText("previous process/container shutdown recovery").closest("article");
     expect(timeoutRow).not.toBeNull();
     expect(authRow).not.toBeNull();
     expect(interruptedRow).not.toBeNull();
@@ -562,7 +626,7 @@ describe("App", () => {
     expect(within(authRow!).getByText(/caller_failed/)).toBeInTheDocument();
     expect(within(runList).getByText("market_conditions_not_met")).toBeInTheDocument();
 
-    fireEvent.click(timeoutRow!);
+    fireEvent.click(within(timeoutRow!).getByRole("button", { name: /run-timeout/ }));
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
     expect(
       await within(detailPane).findByText("provider timed out after 120 seconds", {

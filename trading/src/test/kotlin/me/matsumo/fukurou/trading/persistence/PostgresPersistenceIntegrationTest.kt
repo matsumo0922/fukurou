@@ -674,7 +674,7 @@ private const val INSERT_ACTIVITY_CONTEXT_EXECUTION_SQL = """
         0.010000000000,
         10.00000000,
         ?,
-        'TAKER',
+        ?,
         ?
     )
 """
@@ -1450,6 +1450,68 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(denials.truncated)
         assertEquals(6, detailLookupCount.get())
         assertEquals(0, supplementalLookupCount.get())
+    }
+
+    @Test
+    fun decisionRunProjectionFollowsOrderExecutionIntoClosedPositionLifecycle() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runId = "entry-lifecycle-run"
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        val entryOrderId = UUID.randomUUID()
+        val stopOrderId = UUID.randomUUID()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        insertFinishedDecisionRun(llmRunRepository, runId, "SUCCEEDED", errorMessage = null)
+
+        exposedTransaction(database) {
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = entryOrderId,
+                positionId = null,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                limitPriceJpy = BigDecimal("9900000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "run entry",
+                decisionRunId = runId,
+            )
+            insertActivityContextOrder(
+                orderId = stopOrderId,
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.SELL,
+                orderType = OrderType.STOP,
+                limitPriceJpy = null,
+                triggerPriceJpy = BigDecimal("9800000"),
+                takeProfitPriceJpy = null,
+                reasonJa = "protective stop",
+                decisionRunId = null,
+            )
+            insertActivityContextExecution(
+                entryOrderId,
+                positionId,
+                OrderSide.BUY,
+                BigDecimal("9900000"),
+                BigDecimal.ZERO,
+                liquidity = "MAKER",
+            )
+            insertActivityContextExecution(stopOrderId, positionId, OrderSide.SELL, BigDecimal("9800000"), BigDecimal("-1000"))
+            jdbcConnection().prepareStatement("UPDATE positions SET status = 'CLOSED' WHERE id = ?").use { statement ->
+                statement.setObject(1, positionId)
+                statement.executeUpdate()
+            }
+        }
+
+        val detail = requireNotNull(ExposedDecisionRunProjectionRepository(database).findRun(runId).getOrThrow())
+        val lifecycle = detail.tradeLifecycles.single()
+
+        assertEquals(positionId.toString(), lifecycle.positionId)
+        assertEquals("CLOSED", lifecycle.status)
+        assertEquals(listOf("ENTRY", "STOP"), lifecycle.executions.map { execution -> execution.kind })
+        assertEquals(listOf(entryOrderId.toString(), stopOrderId.toString()), lifecycle.executions.map { execution -> execution.orderId })
+        assertEquals(listOf("MAKER", "TAKER"), lifecycle.executions.map { execution -> execution.liquidity })
     }
 
     @Test
@@ -5375,6 +5437,7 @@ private fun JdbcTransaction.insertActivityContextExecution(
     side: OrderSide,
     priceJpy: BigDecimal,
     realizedPnlJpy: BigDecimal,
+    liquidity: String = "TAKER",
 ) {
     jdbcConnection().prepareStatement(INSERT_ACTIVITY_CONTEXT_EXECUTION_SQL).use { statement ->
         statement.setObject(1, UUID.randomUUID())
@@ -5383,7 +5446,8 @@ private fun JdbcTransaction.insertActivityContextExecution(
         statement.setString(4, side.name)
         statement.setBigDecimal(5, priceJpy)
         statement.setBigDecimal(6, realizedPnlJpy)
-        statement.setLong(7, fixedInstant().toEpochMilli())
+        statement.setString(7, liquidity)
+        statement.setLong(8, fixedInstant().toEpochMilli())
         statement.executeUpdate()
     }
 }

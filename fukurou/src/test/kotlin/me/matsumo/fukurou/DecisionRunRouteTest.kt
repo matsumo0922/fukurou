@@ -8,6 +8,7 @@ import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunDetail
+import me.matsumo.fukurou.trading.activity.DecisionRunExecution
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
@@ -18,6 +19,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
+import me.matsumo.fukurou.trading.activity.DecisionRunTradeLifecycle
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
@@ -102,6 +104,10 @@ class DecisionRunRouteTest {
         assertEquals("[\"trend-breakout\"]", detail.intent?.setupTagsJson)
         assertEquals(0, detail.orders.size)
         assertEquals(0, detail.executions.size)
+        assertEquals("position-1", detail.tradeLifecycles.single().positionId)
+        assertEquals("CLOSED", detail.tradeLifecycles.single().status)
+        assertEquals("STOP", detail.tradeLifecycles.single().executions.single().kind)
+        assertEquals("TAKER", detail.tradeLifecycles.single().executions.single().liquidity)
         assertTrue(detail.raw.none { raw -> raw.values.keys.any { key -> key.contains("secret", ignoreCase = true) } })
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?limit=0").status)
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?before=invalid").status)
@@ -239,6 +245,28 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
                 ),
                 orders = emptyList(),
                 executions = emptyList(),
+                tradeLifecycles = listOf(
+                    DecisionRunTradeLifecycle(
+                        positionId = "position-1",
+                        status = "CLOSED",
+                        executions = listOf(
+                            DecisionRunExecution(
+                                executionId = "execution-stop",
+                                orderId = "order-stop",
+                                positionId = "position-1",
+                                side = "SELL",
+                                priceJpy = "9800000",
+                                sizeBtc = "0.01",
+                                feeJpy = "10",
+                                realizedPnlJpy = "-1000",
+                                liquidity = "TAKER",
+                                orderType = "STOP",
+                                kind = "STOP",
+                                executedAt = Instant.parse("2026-07-10T00:47:36Z"),
+                            ),
+                        ),
+                    ),
+                ),
                 raw = listOf(
                     DecisionRunRawRecord(
                         source = "audit",
@@ -352,6 +380,7 @@ private fun safetyPassedDetail(action: DecisionAction): DecisionRunDetail {
             ),
         ),
         executions = emptyList(),
+        tradeLifecycles = emptyList(),
         raw = emptyList(),
     )
 }
