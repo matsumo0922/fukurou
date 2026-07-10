@@ -1,5 +1,3 @@
-@file:Suppress("ImportOrdering")
-
 package me.matsumo.fukurou
 
 import kotlinx.coroutines.CoroutineScope
@@ -12,9 +10,9 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
@@ -611,8 +609,7 @@ internal class LlmDaemonSupervisor(
 
             return true
         }
-        val drainTimeout = processSnapshot.tradingConfig.runner.perRunTimeout.plus(drainGrace)
-        val stopResult = worker.stopGracefully(drainTimeout)
+        val stopResult = worker.stopGracefully(TERMINATION_REAP_TIMEOUT)
 
         if (stopResult == LlmDaemonWorkerStopResult.TERMINATION_PENDING) {
             terminationRetryAttempt = (terminationRetryAttempt + 1).coerceAtMost(MAX_RETRY_EXPONENT)
@@ -1186,6 +1183,10 @@ private const val DEFAULT_RUNTIME_CONFIG_ACTIVATION_REASON = "runtime config act
 private val DEFAULT_DAEMON_DRAIN_GRACE: Duration = Duration.ofSeconds(30)
 private val DEFAULT_DAEMON_RETRY_DELAY: Duration = Duration.ofSeconds(5)
 private val MAX_DAEMON_RETRY_DELAY: Duration = Duration.ofMinutes(5)
+
+/** cancel 済み worker の終端確認を再開する際は、drain を再実行しない。 */
+private val TERMINATION_REAP_TIMEOUT: Duration = Duration.ZERO
+
 private val DAEMON_SUPERVISOR_LOGGER: Logger = Logger.getLogger(LlmDaemonSupervisor::class.java.name)
 
 private const val KEEP_DETAIL = "__keep_detail__"

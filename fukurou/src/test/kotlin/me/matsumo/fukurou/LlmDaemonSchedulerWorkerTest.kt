@@ -99,7 +99,7 @@ class LlmDaemonSchedulerWorkerTest {
 
         delay(250)
         assertEquals(LlmDaemonWorkerStopResult.TIMED_OUT, worker.stopGracefully(Duration.ofMillis(10)))
-        worker.close()
+        worker.shutdown()
     }
 
     @Test
@@ -123,7 +123,7 @@ class LlmDaemonSchedulerWorkerTest {
         assertEquals("bootstrap failed", failure.await().message)
         assertEquals(0, attempts.get())
 
-        worker.close()
+        worker.shutdown()
     }
 }
 

@@ -11,7 +11,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -153,7 +152,7 @@ internal class LlmDaemonSchedulerWorker(
     private val lifecycleListener: LlmDaemonWorkerLifecycleListener = object : LlmDaemonWorkerLifecycleListener {},
     private val cancellationJoinTimeout: Duration = DEFAULT_WORKER_CANCELLATION_JOIN_TIMEOUT,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-) : LlmDaemonWorkerHandle, AutoCloseable {
+) : LlmDaemonWorkerHandle {
 
     private var job: Job? = null
     private val stopRequested = CompletableDeferred<Unit>()
@@ -231,8 +230,6 @@ internal class LlmDaemonSchedulerWorker(
         stopGracefully(Duration.ZERO)
         scope.cancel()
     }
-
-    override fun close() = runBlocking { shutdown() }
 
     private suspend fun Job.awaitCancelledTermination(): LlmDaemonWorkerStopResult {
         val completed = withTimeoutOrNull(cancellationJoinTimeout.toMillis().coerceAtLeast(1L)) {

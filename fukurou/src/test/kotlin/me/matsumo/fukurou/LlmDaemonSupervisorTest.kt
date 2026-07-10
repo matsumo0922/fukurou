@@ -336,7 +336,7 @@ class LlmDaemonSupervisorTest {
         snapshotState.markUnavailable()
         supervisor.notifyConfigChanged()
         awaitWorkerStopResult(worker, LlmDaemonWorkerStopResult.TERMINATION_PENDING)
-        delay(80)
+        awaitWorkerStopCalls(worker, expected = 3)
 
         val events = eventLog.events()
         val stoppingEvents = events.filter { event ->
@@ -347,7 +347,6 @@ class LlmDaemonSupervisorTest {
             event.eventType == CommandEventType.DAEMON_DRAIN_TIMED_OUT
         }
 
-        assertTrue(worker.stopCallCount >= 3)
         assertEquals(1, stoppingEvents.size)
         assertEquals(1, timeoutEvents.size)
         assertEquals(LlmDaemonStatusReason.RUNTIME_CONFIG_UNAVAILABLE, supervisor.status().reason)
@@ -379,7 +378,7 @@ class LlmDaemonSupervisorTest {
 
         awaitState(supervisor, LlmDaemonObservedState.RUNNING)
         supervisor.setDesiredEnabled(false, "operator stop").getOrThrow()
-        delay(80)
+        awaitWorkerStopCalls(worker, expected = 3)
 
         val events = eventLog.events()
         val stoppingEvents = events.filter { event ->
@@ -390,7 +389,6 @@ class LlmDaemonSupervisorTest {
             event.eventType == CommandEventType.DAEMON_DRAIN_TIMED_OUT
         }
 
-        assertTrue(worker.stopCallCount >= 3)
         assertEquals(1, stoppingEvents.size)
         assertEquals(1, timeoutEvents.size)
         assertEquals(clock.instant().plusMillis(20), supervisor.status().nextRetryAt)
@@ -629,6 +627,18 @@ class LlmDaemonSupervisorTest {
 
         error("worker did not reach stop result $expected")
     }
+
+    private suspend fun awaitWorkerStopCalls(worker: FakeWorker, expected: Int) {
+        repeat(200) {
+            if (worker.stopCallCount >= expected) {
+                return
+            }
+
+            delay(5)
+        }
+
+        error("worker did not receive $expected stop calls")
+    }
 }
 
 private class MutableRuntimeSnapshot(initialConfig: TradingBotConfig) {
@@ -699,8 +709,11 @@ private class FakeWorker(
         private set
     var stopTimeout: Duration? = null
         private set
+
+    @Volatile
     var stopCallCount = 0
         private set
+
     var closeCount = 0
         private set
 
