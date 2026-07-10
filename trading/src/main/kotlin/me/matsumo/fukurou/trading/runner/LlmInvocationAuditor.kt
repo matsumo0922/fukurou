@@ -22,7 +22,7 @@ import java.time.Duration
  * LLM phase の process 実行結果を共通 event 形式で command_event_log へ保存する auditor。
  *
  * @param commandEventLog audit 保存先
- * @param redactor stdout / stderr / error message を保存前に伏せる redactor
+ * @param redactor Claude stdout / stderr と error message を保存前に伏せる redactor
  * @param clock event 発生時刻に使う clock
  * @param toolName audit event の tool 名
  * @param humanLogger 運用ログ出力
@@ -142,9 +142,17 @@ class LlmInvocationAuditor(
             put("status", processResult?.status?.name ?: "FAILED_TO_START")
             put("exitCode", processResult?.exitCode?.toString() ?: "null")
             startFailureError?.let { error -> put("error", error) }
-            processResult?.let { completedProcess ->
-                put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
-                put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
+            when (provider) {
+                LlmProvider.CLAUDE -> processResult?.let { completedProcess ->
+                    put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
+                    put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
+                }
+
+                LlmProvider.CODEX -> {
+                    if (processResult != null) {
+                        put("rawOutputOmitted", "true")
+                    }
+                }
             }
             if (auditSignals.authFailureSuspected) {
                 put("authFailureSuspected", "true")

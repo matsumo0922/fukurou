@@ -119,7 +119,14 @@ class LlmInvocationAuditorTest {
         assertTrue(result.isFailure)
         assertEquals("1", details["exitCode"]?.jsonPrimitive?.content)
         assertEquals("2", auditUsage["usage"]?.jsonObject?.get("reasoningOutputTokens")?.jsonPrimitive?.content)
+        assertEquals("true", details["rawOutputOmitted"]?.jsonPrimitive?.content)
+        assertEquals("true", details["authFailureSuspected"]?.jsonPrimitive?.content)
+        assertFalse(details.containsKey("stdout"))
+        assertFalse(details.containsKey("stderr"))
         assertFalse(auditUsage.containsKey("totalCostUsd"))
+        assertFalse(commandEventLog.events().single().payload.contains("private trading strategy"))
+        assertFalse(commandEventLog.events().single().payload.contains("submit_decision"))
+        assertFalse(commandEventLog.events().single().payload.contains("private/session/path"))
     }
 }
 
@@ -148,8 +155,11 @@ private class StaticStructuredAuditLlmInvoker(
                 processResult = ProcessRunResult(
                     status = ProcessRunStatus.EXITED,
                     exitCode = 1,
-                    stdout = "partial structured output",
-                    stderr = "synthetic failure",
+                    stdout = """
+                        {"type":"thread.started","prompt":"private trading strategy"}
+                        {"type":"item.completed","item":{"type":"tool_call","name":"submit_decision","arguments":{"path":"/private/session/path"}}}
+                    """.trimIndent(),
+                    stderr = "401 unauthorized at /private/session/path",
                 ),
                 responseText = "partial response",
                 usage = usage,

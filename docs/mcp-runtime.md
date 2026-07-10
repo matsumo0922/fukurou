@@ -95,7 +95,7 @@ FUKUROU_CODEX_FALSIFIER_ARGS=
 
 runner の成功判定は DB が唯一の正本であり、LLM の stdout や exit code から decision は parse しない。Proposer 終了後に `FUKUROU_INVOCATION_ID` に紐づく `decisions` 行を読み、行がなければ `CallerNoTradeGuard` で no-trade audit を残して fail closed する。
 
-CLI process 終了後は provider output を semantic response、structured usage、raw process result に分離する。pre-filter と Reflection は semantic response だけを読み、Codex JSONL 全文を応答本文として扱わない。raw stdout / stderr は redaction と truncate 後の audit だけに保存する。runner 生成の一時 config、session、auth copy は Codex session から model を解決した後、成功、timeout、非 0 exit、起動失敗、cancellation の各経路で削除する。timeout や非 0 exit でも取得済み usage は audit へ残すが、phase は成功へ昇格させない。
+CLI process 終了後は provider output を semantic response、structured usage、raw process result に分離する。pre-filter と Reflection は semantic response だけを読み、Codex JSONL 全文を応答本文として扱わない。Claude の raw stdout / stderr は historical usage fallback のため redaction と truncate 後の audit に保存する。Codex の raw stdout / stderr は prompt、tool payload、command output、path を含み得るため永続化せず、audit には `rawOutputOmitted` と status、exit code、usage、検出済み generic signal だけを保存する。runner 生成の一時 config、session、auth copy は Codex session から model を解決した後、成功、timeout、非 0 exit、起動失敗、cancellation の各経路で削除する。timeout や非 0 exit でも取得済み usage は audit へ残すが、phase は成功へ昇格させない。
 
 `ENTER` / `ADD_LONG` decision は Falsifier を起動し、fresh な `APPROVED` が DB にあるときだけ persisted `trade_intents` の宣言値から `PlaceOrderCommand` を組み立て、`ToolCallGuard.runTradeTool -> PaperBroker -> SafetyFloor` の既存経路へ流す。`EXIT` / `REDUCE` / `ADJUST_PROTECTION` decision は Falsifier と EV gate を通さず、保存済み decision と paper ledger から対象を一意に決められる場合だけ runner が決定論的に close / reduce / protection update を実行する。`REDUCE` は `close_ratio` を必須にし、`EXIT` は常に full close として扱う。order placement 用の第三 LLM session は起動しない。
 
