@@ -893,7 +893,7 @@ private class InMemoryPaperLedgerMutationWriter(
                     positionId = position.positionId,
                     orderId = UUID.randomUUID(),
                     fill = fill,
-                    reasonJa = "reconciler virtual take profit trigger",
+                    reasonJa = VIRTUAL_TAKE_PROFIT_TRIGGER_REASON,
                 )
 
                 progress.closedPositionIds += position.positionId

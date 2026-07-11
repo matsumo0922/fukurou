@@ -21,6 +21,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunPage
 import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
+import me.matsumo.fukurou.trading.activity.DecisionRunTradeLifecycle
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.decision.requiresSafetyFloor
@@ -121,6 +122,7 @@ data class OpsDecisionRunDetailResponse(
     val safetyViolation: OpsDecisionRunSafetyViolationResponse?,
     val orders: List<OpsDecisionRunOrderResponse>,
     val executions: List<OpsDecisionRunExecutionResponse>,
+    val tradeLifecycles: List<OpsDecisionRunTradeLifecycleResponse>,
     val raw: List<OpsDecisionRunRawRecordResponse>,
 )
 
@@ -222,8 +224,20 @@ data class OpsDecisionRunExecutionResponse(
     val side: String,
     val priceJpy: String,
     val sizeBtc: String,
+    val feeJpy: String,
     val realizedPnlJpy: String,
+    val liquidity: String,
+    val orderType: String?,
+    val kind: String,
     val executedAt: String,
+)
+
+/** run 起点で辿った position の保存済み約定 lifecycle。 */
+@Serializable
+data class OpsDecisionRunTradeLifecycleResponse(
+    val positionId: String,
+    val status: String,
+    val executions: List<OpsDecisionRunExecutionResponse>,
 )
 
 /** secret payload を除外した raw/debug section。 */
@@ -319,7 +333,7 @@ private fun Route.registerOpsDecisionRunDetailRoute(dependencies: OpsRouteDepend
         call.respond(detail.toResponse(dependencies.referenceQuote()))
     }.describe {
         summary = "decision run 詳細を取得する"
-        description = "Trigger から Order / Execution までの段階、LLM 申告値、Falsifier、SafetyFloor、関連 ledger、secret を除外した raw/debug 情報を返します。"
+        description = "Trigger から Order / Execution までの段階、run の order から因果的に辿る position 約定 lifecycle、LLM 申告値、Falsifier、SafetyFloor、関連 ledger、secret を除外した raw/debug 情報を返します。"
         tag(RUNS_TAG)
         parameters {
             path("invocationId") {
@@ -408,6 +422,7 @@ private fun DecisionRunDetail.toResponse(quote: OpsDecisionRunQuoteResponse?): O
         safetyViolation = safetyViolation?.toResponse(),
         orders = orders.map(DecisionRunOrder::toResponse),
         executions = executions.map(DecisionRunExecution::toResponse),
+        tradeLifecycles = tradeLifecycles.map(DecisionRunTradeLifecycle::toResponse),
         raw = raw.map(DecisionRunRawRecord::toResponse),
     )
 }
@@ -559,8 +574,18 @@ private fun DecisionRunExecution.toResponse() = OpsDecisionRunExecutionResponse(
     side = side,
     priceJpy = priceJpy,
     sizeBtc = sizeBtc,
+    feeJpy = feeJpy,
     realizedPnlJpy = realizedPnlJpy,
+    liquidity = liquidity,
+    orderType = orderType,
+    kind = kind,
     executedAt = executedAt.toString(),
+)
+
+private fun DecisionRunTradeLifecycle.toResponse() = OpsDecisionRunTradeLifecycleResponse(
+    positionId = positionId,
+    status = status,
+    executions = executions.map(DecisionRunExecution::toResponse),
 )
 
 private fun DecisionRunRawRecord.toResponse() = OpsDecisionRunRawRecordResponse(

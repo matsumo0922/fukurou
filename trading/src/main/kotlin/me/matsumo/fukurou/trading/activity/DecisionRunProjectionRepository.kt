@@ -279,8 +279,19 @@ data class DecisionRunExecution(
     val side: String,
     val priceJpy: String,
     val sizeBtc: String,
+    val feeJpy: String,
     val realizedPnlJpy: String,
+    val liquidity: String,
+    val orderType: String?,
+    val kind: String,
     val executedAt: Instant,
+)
+
+/** run が作成した entry から因果的に辿った position の約定 lifecycle。 */
+data class DecisionRunTradeLifecycle(
+    val positionId: String,
+    val status: String,
+    val executions: List<DecisionRunExecution>,
 )
 
 /** secret を含む payload を除外した raw/debug 行。 */
@@ -304,6 +315,7 @@ data class DecisionRunDetail(
     val safetyViolation: DecisionRunSafetyViolation?,
     val orders: List<DecisionRunOrder>,
     val executions: List<DecisionRunExecution>,
+    val tradeLifecycles: List<DecisionRunTradeLifecycle>,
     val raw: List<DecisionRunRawRecord>,
 )
 

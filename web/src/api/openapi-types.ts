@@ -1668,7 +1668,7 @@ export interface paths {
         };
         /**
          * decision run 詳細を取得する
-         * @description Trigger から Order / Execution までの段階、LLM 申告値、Falsifier、SafetyFloor、関連 ledger、secret を除外した raw/debug 情報を返します。
+         * @description Trigger から Order / Execution までの段階、run の order から因果的に辿る position 約定 lifecycle、LLM 申告値、Falsifier、SafetyFloor、関連 ledger、secret を除外した raw/debug 情報を返します。
          */
         get: {
             parameters: {
@@ -2359,8 +2359,18 @@ export interface components {
             side: string;
             priceJpy: string;
             sizeBtc: string;
+            feeJpy: string;
             realizedPnlJpy: string;
+            liquidity: string;
+            orderType?: string | null;
+            kind: string;
             executedAt: string;
+        };
+        /** OpsDecisionRunTradeLifecycleResponse */
+        OpsDecisionRunTradeLifecycleResponse: {
+            positionId: string;
+            status: string;
+            executions: components["schemas"]["OpsDecisionRunExecutionResponse"][];
         };
         /** OpsDecisionRunRawRecordResponse */
         OpsDecisionRunRawRecordResponse: {
@@ -2381,6 +2391,7 @@ export interface components {
             safetyViolation?: components["schemas"]["OpsDecisionRunSafetyViolationResponse"] | null;
             orders: components["schemas"]["OpsDecisionRunOrderResponse"][];
             executions: components["schemas"]["OpsDecisionRunExecutionResponse"][];
+            tradeLifecycles: components["schemas"]["OpsDecisionRunTradeLifecycleResponse"][];
             raw: components["schemas"]["OpsDecisionRunRawRecordResponse"][];
         };
         /** Position */

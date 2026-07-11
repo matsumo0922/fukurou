@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right.mjs";
 import CircleAlert from "lucide-react/dist/esm/icons/circle-alert.mjs";
@@ -17,6 +17,7 @@ import {
   type OpsDecisionRunDetailResponse,
   type OpsDecisionRunSummaryResponse,
 } from "../api/ops";
+import { ApiClientError } from "../api/client";
 import { useI18n } from "../i18n/useI18n";
 import { EmptyState } from "../ui/components/EmptyState";
 import { SectionHeader } from "../ui/components/SectionHeader";
@@ -25,6 +26,8 @@ import { describeError, formatDateTime } from "../ui/format";
 export function ActivityPage() {
   const [filter, setFilter] = useState<DecisionRunFilterOption>(loadRunFilter);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [searchedRunId, setSearchedRunId] = useState<string | null>(null);
+  const [runIdQuery, setRunIdQuery] = useState("");
   const selectedRunButtonRef = useRef<HTMLButtonElement | null>(null);
   const runsQuery = useInfiniteQuery({
     queryKey: ["ops", "decision-runs", filter],
@@ -43,8 +46,16 @@ export function ActivityPage() {
     [runsQuery.data?.pages],
   );
   const latestMarketQuote = runsQuery.data?.pages[0]?.latestMarketQuote ?? null;
-  const activeSelectedId = selectedId && runs.some((run) => run.invocationId === selectedId) ? selectedId : null;
-  const detailQuery = useQuery(opsDecisionRunDetailQuery(activeSelectedId));
+  const activeSelectedId = selectedId;
+  const detailQuery = useQuery(opsDecisionRunDetailQuery(activeSelectedId ?? searchedRunId));
+  const exactSearchResult = searchedRunId && detailQuery.data?.summary.invocationId === searchedRunId
+    ? detailQuery.data
+    : null;
+  const displayedRuns = exactSearchResult ? [exactSearchResult.summary] : runs;
+  const displayedLatestMarketQuote = exactSearchResult?.latestMarketQuote ?? latestMarketQuote;
+  const exactSearchNotFound = searchedRunId != null
+    && detailQuery.error instanceof ApiClientError
+    && detailQuery.error.status === 404;
   const closeDetail = useCallback(() => {
     setSelectedId(null);
     window.setTimeout(() => selectedRunButtonRef.current?.focus(), 0);
@@ -60,7 +71,32 @@ export function ActivityPage() {
         eyebrow="Operations"
         title="Activity"
         description={t("activity.runs.description")}
-        action={
+        action={<div className="run-header-actions">
+          <label className="run-id-search">
+            <span className="sr-only">{t("activity.runs.search.label")}</span>
+            <input
+              value={runIdQuery}
+              placeholder={t("activity.runs.search.placeholder")}
+              onChange={(event) => setRunIdQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  setRunIdQuery("");
+                  setSelectedId(null);
+                  setSearchedRunId(null);
+                }
+                if (event.key === "Enter" && runIdQuery.trim()) {
+                  const runId = runIdQuery.trim();
+                  setSearchedRunId(runId);
+                  setSelectedId(runId);
+                }
+              }}
+            />
+            {runIdQuery ? <button type="button" aria-label={t("activity.runs.search.clear")} onClick={() => {
+              setRunIdQuery("");
+              setSelectedId(null);
+              setSearchedRunId(null);
+            }}><X size={14} aria-hidden="true" /></button> : null}
+          </label>
           <button
             className="icon-text-button icon-text-button--prominent"
             type="button"
@@ -70,7 +106,7 @@ export function ActivityPage() {
             <RefreshCw size={16} aria-hidden="true" />
             {runsQuery.isFetching ? t("common.refreshing") : t("common.refresh")}
           </button>
-        }
+        </div>}
       />
 
       <div className="run-filterbar" role="group" aria-label={t("activity.runs.filters.aria")}>
@@ -83,12 +119,10 @@ export function ActivityPage() {
             onClick={() => {
               setFilter(outcome);
               setSelectedId(null);
+              setSearchedRunId(null);
             }}
           >
             {filterLabel(outcome, t)}
-            {filter === outcome ? (
-              <span className="run-filter__count">{runs.length} {t("activity.runs.filter.loaded")}</span>
-            ) : null}
           </button>
         ))}
       </div>
@@ -103,7 +137,8 @@ export function ActivityPage() {
       {runsQuery.isSuccess ? (
         <div className={activeSelectedId ? "decision-runs-layout decision-runs-layout--detail" : "decision-runs-layout"}>
           <main className="decision-run-list" aria-label={t("activity.runs.list.aria")}>
-            {runs.length === 0 ? (
+            {exactSearchNotFound ? <RunListNotice text={t("activity.runs.search.notFound")} /> : null}
+            {displayedRuns.length === 0 ? (
               <EmptyState
                 title={t(runsQuery.hasNextPage ? "activity.runs.empty.scanTitle" : "activity.runs.empty.title")}
                 description={t(
@@ -111,13 +146,14 @@ export function ActivityPage() {
                 )}
               />
             ) : (
-              runs.map((run) => (
+              displayedRuns.map((run) => (
                 <RunRow
                   run={run}
-                  latestMarketQuote={latestMarketQuote}
+                  latestMarketQuote={displayedLatestMarketQuote}
                   selected={run.invocationId === activeSelectedId}
                   selectedChanged={(button) => {
                     selectedRunButtonRef.current = button;
+                    if (!exactSearchResult) setSearchedRunId(null);
                     setSelectedId(run.invocationId);
                   }}
                   key={run.invocationId}
@@ -162,17 +198,11 @@ function RunRow({
   selectedChanged: (button: HTMLButtonElement) => void;
 }) {
   const { locale, t } = useI18n();
-  const primaryReason = runSummaryPrimaryReason(run);
   const order = run.order;
+  const detailTitle = order ? `${order.side} ${order.orderType}` : run.action ?? run.status;
 
   return (
-    <button
-      className="decision-run-row"
-      type="button"
-      aria-selected={selected}
-      data-outcome={run.outcome}
-      onClick={(event) => selectedChanged(event.currentTarget)}
-    >
+    <article className="decision-run-row" data-selected={selected} data-outcome={run.outcome}>
       <span className="decision-run-row__rail"><span className="decision-run-row__dot" /></span>
       <span className="decision-run-card">
         <span className="decision-run-card__top">
@@ -187,17 +217,18 @@ function RunRow({
               <CircleAlert size={15} aria-label={t("activity.runs.processFailure")} />
             </span>
           ) : null}
-          <ChevronRight className="decision-run-card__arrow" size={17} aria-hidden="true" />
+          <button
+            className="decision-run-card__open"
+            type="button"
+            aria-label={`${t("activity.runs.detail.open")} ${detailTitle} ${run.invocationId}`}
+            aria-expanded={selected}
+            aria-controls="decision-run-detail-pane"
+            onClick={(event) => selectedChanged(event.currentTarget)}
+          ><ChevronRight size={17} aria-hidden="true" /></button>
         </span>
         <span className="decision-run-card__headline">
           <strong>{order ? `${order.side} ${order.orderType} · ${order.sizeBtc} BTC` : run.action ?? run.status}</strong>
           <code>{run.mode}</code>
-        </span>
-        <span className="decision-run-card__reason">
-          <span>{primaryReason ?? t("activity.runs.reason.none")}</span>
-          {run.finalReason && run.finalReason !== primaryReason ? (
-            <small><strong>{t("activity.runs.label.finalReason")}</strong> {run.finalReason}</small>
-          ) : null}
         </span>
         <span className="decision-run-card__facts">
           <span>{t("activity.runs.label.price")} <strong>{order?.limitPriceJpy ?? "—"}</strong></span>
@@ -205,8 +236,11 @@ function RunRow({
           <span>{t("activity.runs.label.distance")} <strong>{formatPriceDistance(run, latestMarketQuote)}</strong></span>
           <span>{t("activity.runs.label.effectiveExpiry")} <strong>{formatExpiry(order?.expiresAt, locale)}</strong></span>
         </span>
+        {run.finalReason ? <small className="decision-run-card__terminal">{run.finalReason}</small> : null}
+        {run.errorMessage ? <small className="decision-run-card__terminal">{run.errorMessage}</small> : null}
+        <span className="decision-run-card__id"><code>{run.invocationId}</code></span>
       </span>
-    </button>
+    </article>
   );
 }
 
@@ -222,7 +256,9 @@ function RunDetailPane({
   closed: () => void;
 }) {
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const paneRef = useRef<HTMLElement>(null);
   const [rawOpen, setRawOpen] = useState(false);
+  const [paneHeight, setPaneHeight] = useState<number | null>(null);
   const { locale, t } = useI18n();
 
   useEffect(() => {
@@ -234,8 +270,43 @@ function RunDetailPane({
     return () => window.removeEventListener("keydown", keyDown);
   }, [closed]);
 
+  useLayoutEffect(() => {
+    const updatePaneHeight = () => {
+      const top = paneRef.current?.getBoundingClientRect().top;
+      if (top == null) return;
+      setPaneHeight(Math.max(280, window.innerHeight - top - 12));
+    };
+    const resizeObserver = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(updatePaneHeight);
+    const page = paneRef.current?.closest(".decision-runs-page");
+    const observedElements = [
+      page?.querySelector(".section-header"),
+      page?.querySelector(".run-filterbar"),
+      paneRef.current?.parentElement,
+    ];
+    observedElements.forEach((element) => {
+      if (element) resizeObserver?.observe(element);
+    });
+
+    updatePaneHeight();
+    window.addEventListener("resize", updatePaneHeight);
+    window.addEventListener("scroll", updatePaneHeight, { passive: true });
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", updatePaneHeight);
+      window.removeEventListener("scroll", updatePaneHeight);
+    };
+  }, []);
+
   return (
-    <aside className="decision-run-detail" aria-label={t("activity.runs.detail.aria")}>
+    <aside
+      id="decision-run-detail-pane"
+      ref={paneRef}
+      className="decision-run-detail"
+      aria-label={t("activity.runs.detail.aria")}
+      style={paneHeight ? { "--detail-pane-height": `${paneHeight}px` } as React.CSSProperties : undefined}
+    >
       <header className="decision-run-detail__header">
         <span className="decision-run-detail__eyebrow">Decision run</span>
         {detail ? (
@@ -279,12 +350,20 @@ function RunDetailContent({
   const intent = detail.intent;
   const safety = detail.safetyViolation;
   const order = detail.summary.order ?? detail.orders.find((candidate) => candidate.side === "BUY") ?? null;
+  const isFilled = detail.summary.outcome === "FILLED";
+  const isPendingOrder = ["WAITING", "EXPIRING", "ACTION_REQUIRED"].includes(detail.summary.outcome);
+  const isCanceledOrExpired = ["CANCELED", "EXPIRED"].includes(detail.summary.outcome);
+  const isDecisionOutcome = !isFilled && !isPendingOrder && !isCanceledOrExpired;
+  const detailIndex = isFilled || isCanceledOrExpired || isDecisionOutcome ? "02" : "01";
 
   return (
     <>
-      {order ? <p className="run-order-explanation">{orderExplanation(order, locale)}</p> : null}
+      {isFilled ? <TradeLifecycleSection lifecycles={detail.tradeLifecycles ?? []} executions={detail.executions} /> : null}
+      {isCanceledOrExpired ? <CancellationSection detail={detail} order={order} /> : null}
+      {isDecisionOutcome ? <DecisionOutcomeSection detail={detail} /> : null}
 
-      <DetailSection index="01" title={t("activity.runs.section.orderConditions")}>
+      <DetailSection index={detailIndex} title={t("activity.runs.section.orderConditions")}>
+        {isPendingOrder && order ? <p className="run-order-conditions">{orderExplanation(order, locale)}</p> : null}
         <FactGrid facts={[
           [t("activity.runs.label.mode"), detail.summary.mode],
           [t("activity.runs.label.order"), order ? `${order.side} ${order.orderType}` : null],
@@ -295,10 +374,10 @@ function RunDetailContent({
           [t("activity.runs.label.quoteNotice"), detail.latestMarketQuote?.stale ? t("activity.runs.quote.stale") : t("activity.runs.quote.reference"), true],
         ]} />
         <RunOrderRecords orders={detail.orders} />
-        <RunExecutionRecords executions={detail.executions} />
+        {!isFilled ? <RunExecutionRecords executions={detail.executions} /> : null}
       </DetailSection>
 
-      <DetailSection index="02" title={t("activity.runs.section.expiry")}>
+      <DetailSection index={String(Number(detailIndex) + 1).padStart(2, "0")} title={t("activity.runs.section.expiry")}>
         <FactGrid facts={[
           [t("activity.runs.label.effectiveExpiry"), order?.expiresAt ? formatDateTime(order.expiresAt, locale) : t("activity.runs.expiry.unrecorded")],
           [t("activity.runs.label.remaining"), formatExpiry(order?.expiresAt, locale)],
@@ -313,7 +392,7 @@ function RunDetailContent({
         ]} />
       </DetailSection>
 
-      <DetailSection index="03" title={t("activity.runs.section.safety")}>
+      <DetailSection index={String(Number(detailIndex) + 2).padStart(2, "0")} title={t("activity.runs.section.safety")}>
         <div className="run-value-comparison">
           <div><small>{t("activity.runs.comparison.llm")}</small><strong>{decision?.expectedRMultiple ?? "—"}</strong><span>expectedR</span></div>
           <span aria-hidden="true">→</span>
@@ -330,7 +409,7 @@ function RunDetailContent({
         ]} />
       </DetailSection>
 
-      <DetailSection index="04" title={t("activity.runs.section.processingPath")}>
+      <DetailSection index={String(Number(detailIndex) + 3).padStart(2, "0")} title={t("activity.runs.section.processingPath")}>
         <ol className="run-phase-list">
           {detail.phases.map((phase) => (
             <li className="run-phase" data-state={phase.status.toLowerCase()} key={phase.key}>
@@ -349,11 +428,14 @@ function RunDetailContent({
           [t("activity.runs.label.provider"), decision?.provider],
           [t("activity.runs.label.parentPlan"), intent?.parentTradePlanId],
           [t("activity.runs.label.setupTags"), formatJsonList(intent?.setupTagsJson), true],
-          [t("activity.runs.label.thesis"), intent?.thesisJa, true],
-          [t("activity.runs.label.invalidation"), formatJsonList(intent?.invalidationConditionsJaJson), true],
           [t("activity.runs.label.runtimeError"), detail.summary.errorMessage, true],
-          [t("activity.runs.label.reason"), decision?.reasonJa, true],
         ]} />
+        <div className="run-narratives">
+          <Narrative label={t("activity.runs.label.reason")} value={decision?.reasonJa} />
+          <Narrative label={t("activity.runs.label.falsifierReason")} value={detail.falsification?.reasonJa} />
+          <Narrative label={t("activity.runs.label.thesis")} value={intent?.thesisJa} />
+          <Narrative label={t("activity.runs.label.invalidation")} value={formatJsonList(intent?.invalidationConditionsJaJson)} />
+        </div>
         <button
           className="run-raw-toggle"
           type="button"
@@ -368,6 +450,76 @@ function RunDetailContent({
       </DetailSection>
     </>
   );
+}
+
+function CancellationSection({
+  detail,
+  order,
+}: {
+  detail: OpsDecisionRunDetailResponse;
+  order: OpsDecisionRunDetailResponse["orders"][number] | null;
+}) {
+  const { locale, t } = useI18n();
+  const canceledOrExpiredAt = order?.canceledAt ?? order?.expiredAt ?? null;
+
+  return <DetailSection index="01" title={t("activity.runs.section.cancellation")}>
+    <FactGrid facts={[
+      [t("activity.runs.label.status"), order?.status ?? detail.summary.outcome],
+      [t("activity.runs.label.canceledAt"), canceledOrExpiredAt ? formatDateTime(canceledOrExpiredAt, locale) : null],
+      [t("activity.runs.label.cancelReason"), order?.cancelReason, true],
+      [t("activity.runs.label.canceledByRun"), order?.canceledByDecisionRunId, true],
+      [t("activity.runs.label.finalReason"), detail.summary.finalReason, true],
+    ]} />
+  </DetailSection>;
+}
+
+function DecisionOutcomeSection({ detail }: { detail: OpsDecisionRunDetailResponse }) {
+  const { t } = useI18n();
+
+  return <DetailSection index="01" title={t("activity.runs.section.decision")}>
+    <FactGrid facts={[
+      [t("activity.runs.label.action"), detail.decision?.action],
+      [t("activity.runs.label.status"), detail.summary.status],
+      [t("activity.runs.label.finalReason"), detail.summary.finalReason, true],
+      [t("activity.runs.label.message"), detail.safetyViolation?.messageJa, true],
+    ]} />
+    <div className="run-narratives">
+      <Narrative label={t("activity.runs.label.reason")} value={detail.decision?.reasonJa} />
+      <Narrative label={t("activity.runs.label.falsifierReason")} value={detail.falsification?.reasonJa} />
+    </div>
+  </DetailSection>;
+}
+
+function Narrative({ label, value }: { label: string; value: string | null | undefined }) {
+  if (!value) return null;
+  return <section className="run-narrative"><h4>{label}</h4><p>{value}</p></section>;
+}
+
+function TradeLifecycleSection({
+  lifecycles,
+  executions,
+}: {
+  lifecycles: OpsDecisionRunDetailResponse["tradeLifecycles"];
+  executions: OpsDecisionRunDetailResponse["executions"];
+}) {
+  const { locale, t } = useI18n();
+  if (lifecycles.length === 0) {
+    if (executions.length > 0) {
+      return <DetailSection index="01" title={t("activity.runs.section.execution")}><RunExecutionRecords executions={executions} /></DetailSection>;
+    }
+
+    return <DetailSection index="01" title={t("activity.runs.section.execution")}><p className="run-detail-notice run-detail-notice--warning">{t("activity.runs.executions.missing")}</p></DetailSection>;
+  }
+  return <DetailSection index="01" title={t("activity.runs.section.execution")}>
+    {lifecycles.map((lifecycle) => <article className="run-lifecycle" key={lifecycle.positionId}>
+      <h4>{t("activity.runs.label.position")} <code>{lifecycle.positionId}</code> · {lifecycle.status === "CLOSED" ? t("activity.runs.position.closed") : t("activity.runs.position.open")}</h4>
+      {lifecycle.executions.map((execution) => <div className="run-lifecycle__entry" key={execution.executionId}>
+        <strong>{execution.kind} · {execution.side} {execution.orderType ?? "—"}</strong>
+        <span>{execution.sizeBtc} BTC @ {execution.priceJpy} JPY · {execution.liquidity} · fee {execution.feeJpy} JPY · PnL {execution.realizedPnlJpy} JPY</span>
+        <time>{formatDateTime(execution.executedAt, locale)}</time><code>order {execution.orderId ?? "—"} / execution {execution.executionId}</code>
+      </div>)}
+    </article>)}
+  </DetailSection>;
 }
 
 function DetailSection({ index, title, children }: { index: string; title: string; children: React.ReactNode }) {
@@ -439,8 +591,12 @@ function RunExecutionRecords({ executions }: { executions: OpsDecisionRunDetailR
             ["order ID", execution.orderId],
             [t("activity.runs.label.position"), execution.positionId],
             [t("activity.runs.label.side"), execution.side],
+            [t("activity.runs.label.orderType"), execution.orderType],
+            [t("activity.runs.label.executionKind"), execution.kind],
             [t("activity.runs.label.price"), execution.priceJpy],
             [t("activity.runs.label.size"), `${execution.sizeBtc} BTC`],
+            [t("activity.runs.label.liquidity"), execution.liquidity],
+            [t("activity.runs.label.fee"), execution.feeJpy],
             [t("activity.runs.label.realizedPnl"), execution.realizedPnlJpy],
             [t("activity.runs.label.executedAt"), execution.executedAt],
           ]} />
@@ -548,26 +704,13 @@ function orderExplanation(
       ? (locale === "ja" ? "最良売気配" : "best ask")
       : (locale === "ja" ? "最良買気配" : "best bid");
     const comparison = order.side === "BUY" ? (locale === "ja" ? "以下" : "or lower") : (locale === "ja" ? "以上" : "or higher");
-
     return locale === "ja"
       ? `${quoteName}が ${order.limitPriceJpy} JPY ${comparison}になると、${order.sizeBtc} BTC の paper 約定を作成します。`
       : `A paper fill for ${order.sizeBtc} BTC is created when the ${quoteName} reaches ${order.limitPriceJpy} JPY ${comparison}.`;
   }
-
   return locale === "ja"
     ? `${order.orderType} 条件で ${order.sizeBtc} BTC の paper 約定を待っています。`
     : `Waiting for a paper fill of ${order.sizeBtc} BTC under the ${order.orderType} condition.`;
-}
-
-function runSummaryPrimaryReason(run: OpsDecisionRunSummaryResponse): string | null {
-  if (run.outcome === "FAILED" || run.outcome === "ACTION_REQUIRED") {
-    return run.errorMessage ?? run.finalReason ?? run.safetyMessageJa ?? run.reasonJa ?? null;
-  }
-  if (run.outcome === "NO_ENTRY") {
-    return run.finalReason ?? run.reasonJa ?? run.errorMessage ?? null;
-  }
-
-  return run.errorMessage ?? run.safetyMessageJa ?? run.reasonJa ?? run.finalReason ?? null;
 }
 
 function formatJsonList(value: string | null | undefined): string | null {

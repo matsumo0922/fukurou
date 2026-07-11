@@ -363,7 +363,7 @@ describe("App", () => {
     const filters = screen.getByRole("group", { name: "Decision run purpose filters" });
     expect(within(runList).getByText("preview_order_rejected")).toBeInTheDocument();
     expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveAttribute("aria-pressed", "false");
-    expect(within(filters).getByRole("button", { name: /All/ })).toHaveTextContent("2 loaded");
+    expect(within(filters).getByRole("button", { name: /All/ })).toHaveTextContent("All");
     expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("limit") === "50")).toBe(true);
 
     fireEvent.click(within(filters).getByRole("button", { name: /Denied/ }));
@@ -372,14 +372,16 @@ describe("App", () => {
     await waitFor(() => {
       expect(hasGetCall(fetchMock, "/ops/runs", (params) => params.get("filter") === "DENIED")).toBe(true);
     });
-    await waitFor(() => {
-      expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveTextContent("1 loaded");
-    });
+    await waitFor(() => expect(within(filters).getByRole("button", { name: /Denied/ })).toHaveTextContent("Denied"));
 
     const filteredRunList = await screen.findByRole("main", { name: "Decision runs, newest first" });
     const selectedRun = within(filteredRunList).getByRole("button", { name: /ENTER/ });
+    expect(selectedRun).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(selectedRun);
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(selectedRun).toHaveAttribute("aria-expanded", "true");
+    expect(selectedRun.closest("article")).toHaveAttribute("data-selected", "true");
+    expect(selectedRun.closest("article")).not.toHaveAttribute("aria-selected");
     expect(await within(detailPane).findByText("0.1100000000")).toBeInTheDocument();
     expect(within(detailPane).getByText("0.03357778")).toBeInTheDocument();
     expect(within(detailPane).getAllByText("APPROVED").length).toBeGreaterThan(0);
@@ -401,6 +403,48 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("complementary", { name: "Decision run detail" })).not.toBeInTheDocument());
     await waitFor(() => expect(selectedRun).toHaveFocus());
+  });
+
+  it("recalculates the decision run pane for surrounding layout changes and scrolling", async () => {
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    let resizeCallback: ResizeObserverCallback = () => undefined;
+    let detailTop = 100;
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback;
+      }
+
+      observe = observe;
+      unobserve = vi.fn();
+      disconnect = disconnect;
+    });
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(900);
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const top = this.classList.contains("decision-run-detail") ? detailTop : 0;
+      return new DOMRect(0, top, 0, 0);
+    });
+    stubSystemFetch();
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    fireEvent.click(within(runList).getByRole("button", { name: /ENTER/ }));
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(detailPane).toHaveStyle("--detail-pane-height: 788px");
+    expect(observe).toHaveBeenCalledTimes(3);
+
+    detailTop = 220;
+    resizeCallback([], {} as ResizeObserver);
+    await waitFor(() => expect(detailPane).toHaveStyle("--detail-pane-height: 668px"));
+
+    detailTop = 300;
+    fireEvent.scroll(window);
+    await waitFor(() => expect(detailPane).toHaveStyle("--detail-pane-height: 588px"));
+
+    fireEvent.click(within(detailPane).getByRole("button", { name: "Close decision run detail" }));
+    await waitFor(() => expect(disconnect).toHaveBeenCalledOnce());
   });
 
   it("shows resting order quote distance expiry and natural fill condition", async () => {
@@ -465,9 +509,10 @@ describe("App", () => {
 
     const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
     const waitingRow = within(runList).getByRole("button", { name: /BUY LIMIT/ });
-    expect(within(waitingRow).getByText("Waiting for fill")).toBeInTheDocument();
-    expect(within(waitingRow).getByText(/10000000\.00000000/)).toBeInTheDocument();
-    expect(within(waitingRow).getByText(/100,000 JPY/)).toBeInTheDocument();
+    const waitingCard = waitingRow.closest("article")!;
+    expect(within(waitingCard).getByText("Waiting for fill")).toBeInTheDocument();
+    expect(within(waitingCard).getByText(/10000000\.00000000/)).toBeInTheDocument();
+    expect(within(waitingCard).getByText(/100,000 JPY/)).toBeInTheDocument();
 
     fireEvent.click(waitingRow);
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
@@ -509,11 +554,164 @@ describe("App", () => {
 
     const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
     const canceledRow = within(runList).getByRole("button", { name: /BUY LIMIT/ });
-    expect(within(canceledRow).getByText("Canceled")).toBeInTheDocument();
+    expect(within(canceledRow.closest("article")!).getByText("Canceled")).toBeInTheDocument();
     fireEvent.click(canceledRow);
 
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
     expect((await within(detailPane).findAllByText("exit-actor-run")).length).toBeGreaterThan(0);
+    expect(within(detailPane).getByRole("heading", { name: "Cancellation result" })).toBeInTheDocument();
+    expect(within(detailPane).queryByText(/best ask reaches/)).not.toBeInTheDocument();
+  });
+
+  it("opens an exact run ID outside the current filter and shows only saved trade lifecycle evidence", async () => {
+    const summary = {
+      ...decisionRunsResponse().runs[0],
+      invocationId: "run-archived-filled",
+      outcome: "FILLED",
+      orderCount: 1,
+      executionCount: 0,
+    };
+    stubSystemFetch({
+      decisionRunsResponse: { status: 200, body: { runs: [], nextBefore: null } },
+      decisionRunDetails: {
+        "run-archived-filled": {
+          ...decisionRunDetailResponse(),
+          summary,
+          tradeLifecycles: [{
+            positionId: "position-archived",
+            status: "CLOSED",
+            executions: [{
+              executionId: "execution-entry",
+              orderId: "order-entry",
+              positionId: "position-archived",
+              side: "BUY",
+              priceJpy: "9900000",
+              sizeBtc: "0.010000000000",
+              feeJpy: "10",
+              realizedPnlJpy: "0",
+              liquidity: "MAKER",
+              orderType: "LIMIT",
+              kind: "ENTRY",
+              executedAt: "2026-07-10T00:00:00.000Z",
+            }, {
+              executionId: "execution-stop",
+              orderId: "order-stop",
+              positionId: "position-archived",
+              side: "SELL",
+              priceJpy: "9800000",
+              sizeBtc: "0.010000000000",
+              feeJpy: "10",
+              realizedPnlJpy: "-1000",
+              liquidity: "TAKER",
+              orderType: "STOP",
+              kind: "STOP",
+              executedAt: "2026-07-10T00:01:00.000Z",
+            }],
+          }],
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const input = await screen.findByLabelText("Find an exact run ID");
+    fireEvent.change(input, { target: { value: "run-archived-filled" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    expect(await within(runList).findByRole("button", { name: /run-archived-filled/ })).toBeInTheDocument();
+    expect(within(runList).queryByText(/Exact run result/)).not.toBeInTheDocument();
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(await within(detailPane).findByText("position-archived")).toBeInTheDocument();
+    expect(within(detailPane).getByText(/ENTRY · BUY LIMIT/)).toBeInTheDocument();
+    expect(within(detailPane).getByText(/STOP · SELL STOP/)).toBeInTheDocument();
+    expect(within(detailPane).getByText(/MAKER/)).toBeInTheDocument();
+    expect(within(detailPane).getAllByText(/fee 10 JPY/)).toHaveLength(2);
+    expect(within(detailPane).queryByText(/best ask reaches/)).not.toBeInTheDocument();
+
+    fireEvent.click(within(detailPane).getByRole("button", { name: "Close decision run detail" }));
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Decision run detail" })).not.toBeInTheDocument());
+    const exactResultButton = within(runList).getByRole("button", { name: /run-archived-filled/ });
+    expect(exactResultButton).toBeInTheDocument();
+    expect(input).toHaveValue("run-archived-filled");
+
+    fireEvent.click(exactResultButton);
+    const reopenedDetailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    fireEvent.click(within(reopenedDetailPane).getByRole("button", { name: "Close decision run detail" }));
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Decision run detail" })).not.toBeInTheDocument());
+    expect(within(runList).getByRole("button", { name: /run-archived-filled/ })).toBeInTheDocument();
+  });
+
+  it("shows saved direct execution evidence for a filled exit without an entry lifecycle", async () => {
+    const summary = {
+      ...decisionRunsResponse().runs[0],
+      invocationId: "run-filled-exit",
+      action: "EXIT",
+      outcome: "FILLED",
+      orderCount: 1,
+      executionCount: 1,
+    };
+    const directExecution = {
+      executionId: "execution-direct-exit",
+      orderId: "order-direct-exit",
+      positionId: "position-direct-exit",
+      side: "SELL",
+      priceJpy: "10100000",
+      sizeBtc: "0.010000000000",
+      feeJpy: "10",
+      realizedPnlJpy: "1000",
+      liquidity: "TAKER",
+      orderType: "MARKET",
+      kind: "DIRECT_RUN",
+      executedAt: "2026-07-10T00:02:00.000Z",
+    };
+    stubSystemFetch({
+      decisionRunsResponse: { status: 200, body: { runs: [summary], nextBefore: null } },
+      decisionRunDetails: {
+        "run-filled-exit": {
+          ...decisionRunDetailResponse(),
+          summary,
+          tradeLifecycles: [],
+          executions: [directExecution],
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    fireEvent.click(within(runList).getByRole("button", { name: /run-filled-exit/ }));
+
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(await within(detailPane).findByText("execution-direct-exit")).toBeInTheDocument();
+    expect(within(detailPane).getByText("SELL")).toBeInTheDocument();
+    expect(within(detailPane).getByText("10100000")).toBeInTheDocument();
+    expect(within(detailPane).getByText("0.010000000000 BTC")).toBeInTheDocument();
+    expect(within(detailPane).getByText("MARKET")).toBeInTheDocument();
+    expect(within(detailPane).getByText("DIRECT_RUN")).toBeInTheDocument();
+    expect(within(detailPane).getByText("TAKER")).toBeInTheDocument();
+    expect(within(detailPane).getByText("10")).toBeInTheDocument();
+    expect(within(detailPane).getByText("1000")).toBeInTheDocument();
+    expect(within(detailPane).queryByText(/no saved execution evidence/)).not.toBeInTheDocument();
+  });
+
+  it("shows an explicit error without rendering a fake row for an exact run ID that is not found", async () => {
+    stubSystemFetch({
+      decisionRunsResponse: { status: 200, body: { runs: [], nextBefore: null } },
+      decisionRunDetails: {},
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const input = await screen.findByLabelText("Find an exact run ID");
+    fireEvent.change(input, { target: { value: "missing-run" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(await screen.findByText("The requested run ID was not found.")).toBeInTheDocument();
+    expect(screen.queryByText("missing-run")).not.toBeInTheDocument();
   });
 
   it("loads older decision runs without duplicating the cursor boundary", async () => {
@@ -551,9 +749,9 @@ describe("App", () => {
     render(<App />);
 
     const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
-    const timeoutRow = within(runList).getByText("provider timed out after 120 seconds").closest("button");
-    const authRow = within(runList).getByText("provider authentication failed").closest("button");
-    const interruptedRow = within(runList).getByText("previous process/container shutdown recovery").closest("button");
+    const timeoutRow = within(runList).getByText("provider timed out after 120 seconds").closest("article");
+    const authRow = within(runList).getByText("provider authentication failed").closest("article");
+    const interruptedRow = within(runList).getByText("previous process/container shutdown recovery").closest("article");
     expect(timeoutRow).not.toBeNull();
     expect(authRow).not.toBeNull();
     expect(interruptedRow).not.toBeNull();
@@ -562,7 +760,7 @@ describe("App", () => {
     expect(within(authRow!).getByText(/caller_failed/)).toBeInTheDocument();
     expect(within(runList).getByText("market_conditions_not_met")).toBeInTheDocument();
 
-    fireEvent.click(timeoutRow!);
+    fireEvent.click(within(timeoutRow!).getByRole("button", { name: /run-timeout/ }));
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
     expect(
       await within(detailPane).findByText("provider timed out after 120 seconds", {
@@ -574,6 +772,7 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(within(detailPane).getAllByText("caller_failed").length).toBeGreaterThan(0);
     expect(within(detailPane).getByText("runtime error")).toBeInTheDocument();
+    expect(detailPane.querySelector(".run-detail-section h3")).toHaveTextContent("Proposer decision");
     expect(within(detailPane).queryByText(/must-not-leak/)).not.toBeInTheDocument();
   });
 
