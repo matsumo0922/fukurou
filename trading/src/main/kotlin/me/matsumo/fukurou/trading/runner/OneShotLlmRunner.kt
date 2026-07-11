@@ -25,8 +25,6 @@ import me.matsumo.fukurou.trading.broker.PreviewOrderResult
 import me.matsumo.fukurou.trading.broker.calculatePreviewHash
 import me.matsumo.fukurou.trading.broker.toJsonObject
 import me.matsumo.fukurou.trading.broker.toPreviewOrderNormalizedContent
-import me.matsumo.fukurou.trading.config.FUKUROU_MCP_ACT_TOOL_CALL_LIMIT_ENV
-import me.matsumo.fukurou.trading.config.FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT_ENV
 import me.matsumo.fukurou.trading.config.LlmRoleAssignment
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
@@ -47,11 +45,13 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
+import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupQuarantine
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.McpLaunchManifestWriter
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.invoker.isCodexProvider
 import me.matsumo.fukurou.trading.invoker.readOptionalEnv
@@ -154,6 +154,12 @@ data class OneShotRunnerCliConfig(
         }
         require(falsifierForbiddenTools.isEmpty()) {
             "falsifierAllowedTools must not include trade or proposer tools: $falsifierForbiddenTools"
+        }
+        require(shortMcpToolNames(proposerAllowedTools).toSet() == CANONICAL_PROPOSER_MCP_TOOL_NAMES) {
+            "proposerAllowedTools must match the canonical Proposer policy."
+        }
+        require(shortMcpToolNames(falsifierAllowedTools).toSet() == CANONICAL_FALSIFIER_MCP_TOOL_NAMES) {
+            "falsifierAllowedTools must match the canonical Falsifier policy."
         }
     }
 
@@ -1131,79 +1137,87 @@ private class OneShotLlmRequestFactory(
 ) {
     fun llmRequest(input: LlmRequestInput): LlmInvocationRequest {
         val allowedTools = allowedToolsForPhase(input.phase, input.request.cliConfig)
-
-        return LlmInvocationRequest(
+        val mcpServer = mcpServerConfig(
             invocationId = input.invocationId,
-            provider = input.provider,
             phase = input.phase,
-            prompt = input.prompt,
-            timeout = tradingConfig.runner.perRunTimeout,
-            workingDirectory = input.request.workingDirectory,
-            decisionRunContext = input.decisionRunContext,
-            mcpServer = mcpServerConfig(
-                mcpJarPath = input.request.mcpJarPath,
-                context = input.decisionRunContext,
-                cliConfig = input.request.cliConfig,
-                allowedTools = allowedTools,
-                provider = input.provider,
-            ),
-            environment = childEnvironment(input.decisionRunContext, input.intentId),
+            context = input.decisionRunContext,
+            cliConfig = input.request.cliConfig,
             allowedTools = allowedTools,
-            model = input.assignment.model,
-            effort = input.assignment.effort,
-            useConfiguredModelFallback = false,
+            provider = input.provider,
         )
+
+        return try {
+            LlmInvocationRequest(
+                invocationId = input.invocationId,
+                provider = input.provider,
+                phase = input.phase,
+                prompt = input.prompt,
+                timeout = tradingConfig.runner.perRunTimeout,
+                workingDirectory = input.request.workingDirectory,
+                decisionRunContext = input.decisionRunContext,
+                mcpServer = mcpServer,
+                environment = childEnvironment(input.decisionRunContext, input.intentId),
+                allowedTools = allowedTools,
+                model = input.assignment.model,
+                effort = input.assignment.effort,
+                useConfiguredModelFallback = false,
+            )
+        } catch (throwable: Throwable) {
+            runCatching { Files.deleteIfExists(mcpServer.manifestPath) }
+                .exceptionOrNull()
+                ?.let { cleanupFailure ->
+                    LlmArtifactCleanupQuarantine.activate(cleanupFailure)
+                    throwable.addSuppressed(cleanupFailure)
+                }
+            throw throwable
+        }
     }
 
+    @Suppress("LongParameterList")
     private fun mcpServerConfig(
-        mcpJarPath: String,
+        invocationId: String,
+        phase: LlmInvocationPhase,
         context: DecisionRunContext,
         cliConfig: OneShotRunnerCliConfig,
         allowedTools: List<String>,
         provider: LlmProvider,
     ): LlmMcpServerConfig {
-        return LlmMcpServerConfig(
-            name = cliConfig.mcpServerName,
-            command = cliConfig.mcpServerCommand,
-            args = mcpServerArgs(mcpJarPath, cliConfig),
-            environment = mcpEnvironment(
-                context = context,
-                allowedTools = allowedTools,
-            ),
-            autoApprovedTools = autoApprovedTools(provider, allowedTools),
+        LlmArtifactCleanupQuarantine.requireClear().getOrThrow()
+
+        val manifestDirectory = parentEnvironment[FUKUROU_MCP_MANIFEST_DIRECTORY_ENV]
+            ?.let { value -> Path.of(value) }
+            ?: Path.of(System.getProperty("java.io.tmpdir"), "fukurou-mcp-manifests")
+        val capability = McpLaunchManifestWriter(manifestDirectory).write(
+            invocationId = invocationId,
+            phase = phase,
+            context = context,
+            allowedTools = allowedTools,
+            databaseUrl = requireNotNull(parentEnvironment["DB_URL"]) { "DB_URL is required for MCP manifest." },
+            databaseUser = parentEnvironment["FUKUROU_MCP_DB_USER"] ?: DEFAULT_MCP_DATABASE_USER,
+            gmoPublicBaseUrl = tradingConfig.gmoPublicClient.baseUrl,
+            runtimeEnvironment = RuntimeConfigCatalog.runtimeEnvironment(tradingConfig),
+            timeout = tradingConfig.runner.perRunTimeout,
+            totalToolCallLimit = tradingConfig.runner.maxToolCallsPerRun,
+            actToolCallLimit = tradingConfig.runner.maxActToolCallsPerRun,
         )
-    }
 
-    private fun mcpServerArgs(mcpJarPath: String, cliConfig: OneShotRunnerCliConfig): List<String> {
-        val configuredArgs = cliConfig.mcpServerArgs
-            ?: return listOf("-jar", mcpJarPath)
-
-        return configuredArgs.map { argument ->
-            argument.replace(MCP_JAR_PATH_PLACEHOLDER, mcpJarPath)
-        }
-    }
-
-    private fun mcpEnvironment(context: DecisionRunContext, allowedTools: List<String>): Map<String, String> {
-        val runEnvironment = runEnvironment(context)
-        val databaseEnvironment = DB_ENV_KEYS.mapNotNull { key ->
-            parentEnvironment[key]?.let { value -> key to value }
-        }.toMap()
-        val configEnvironment = parentEnvironment
-            .filterKeys { key -> key.startsWith("FUKUROU_") }
-            .filterKeys { key -> !isForbiddenSecretEnvKey(key) }
-            .filterKeys { key -> key !in RuntimeConfigCatalog.runtimeLegacyEnvNames() }
-        val runtimeEnvironment = RuntimeConfigCatalog.runtimeEnvironment(tradingConfig)
-        val mcpAllowedTools = shortMcpToolNames(allowedTools).joinToString(",")
-
-        return configEnvironment +
-            runtimeEnvironment +
-            databaseEnvironment +
-            runEnvironment +
-            mapOf(
-                FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT_ENV to tradingConfig.runner.maxToolCallsPerRun.toString(),
-                FUKUROU_MCP_ACT_TOOL_CALL_LIMIT_ENV to tradingConfig.runner.maxActToolCallsPerRun.toString(),
-                FUKUROU_MCP_ALLOWED_TOOLS_ENV to mcpAllowedTools,
+        return try {
+            LlmMcpServerConfig(
+                name = cliConfig.mcpServerName,
+                command = cliConfig.mcpServerCommand,
+                manifestId = capability.id,
+                manifestPath = capability.path,
+                autoApprovedTools = autoApprovedTools(provider, allowedTools),
             )
+        } catch (throwable: Throwable) {
+            runCatching { Files.deleteIfExists(capability.path) }
+                .exceptionOrNull()
+                ?.let { cleanupFailure ->
+                    LlmArtifactCleanupQuarantine.activate(cleanupFailure)
+                    throwable.addSuppressed(cleanupFailure)
+                }
+            throw throwable
+        }
     }
 
     private fun childEnvironment(context: DecisionRunContext, intentId: UUID?): Map<String, String> {
@@ -1313,12 +1327,14 @@ const val DEFAULT_RUNNER_MCP_SERVER_NAME = "fukurou-mcp"
 /**
  * runner が既定で使う MCP server 起動 command。
  */
-const val DEFAULT_RUNNER_MCP_SERVER_COMMAND = "java"
+const val DEFAULT_RUNNER_MCP_SERVER_COMMAND = "/usr/local/libexec/fukurou-mcp-launcher"
 
 /**
  * MCP jar path placeholder。
  */
 const val MCP_JAR_PATH_PLACEHOLDER = $$"${mcpJarPath}"
+private const val DEFAULT_MCP_DATABASE_USER = "fukurou_mcp"
+private const val FUKUROU_MCP_MANIFEST_DIRECTORY_ENV = "FUKUROU_MCP_MANIFEST_DIRECTORY"
 
 /**
  * prompt 読み込み前の caller failure audit に使う placeholder。
@@ -1605,7 +1621,7 @@ const val FUKUROU_FALSIFIER_ALLOWED_TOOLS_ENV = "FUKUROU_FALSIFIER_ALLOWED_TOOLS
  * Proposer が既定で呼べる MCP tool allowlist を作る。
  */
 fun defaultProposerAllowedTools(serverName: String): List<String> {
-    return DEFAULT_PROPOSER_TOOL_NAMES.map { toolName ->
+    return CANONICAL_PROPOSER_MCP_TOOL_NAMES.map { toolName ->
         mcpToolName(serverName, toolName)
     }
 }
@@ -1614,7 +1630,7 @@ fun defaultProposerAllowedTools(serverName: String): List<String> {
  * Falsifier が既定で呼べる MCP tool allowlist を作る。
  */
 fun defaultFalsifierAllowedTools(serverName: String): List<String> {
-    return DEFAULT_FALSIFIER_TOOL_NAMES.map { toolName ->
+    return CANONICAL_FALSIFIER_MCP_TOOL_NAMES.map { toolName ->
         mcpToolName(serverName, toolName)
     }
 }
@@ -1622,7 +1638,7 @@ fun defaultFalsifierAllowedTools(serverName: String): List<String> {
 /**
  * Proposer が既定で呼べる MCP tool の短い名前。
  */
-private val DEFAULT_PROPOSER_TOOL_NAMES = listOf(
+val CANONICAL_PROPOSER_MCP_TOOL_NAMES = setOf(
     "get_trade_intent",
     "get_ticker",
     "get_candles",
@@ -1642,7 +1658,7 @@ private val DEFAULT_PROPOSER_TOOL_NAMES = listOf(
 /**
  * Falsifier が既定で呼べる MCP tool の短い名前。
  */
-private val DEFAULT_FALSIFIER_TOOL_NAMES = listOf(
+val CANONICAL_FALSIFIER_MCP_TOOL_NAMES = setOf(
     "get_trade_intent",
     "preview_order",
     "get_ticker",

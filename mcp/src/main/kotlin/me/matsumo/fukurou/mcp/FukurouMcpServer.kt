@@ -385,8 +385,33 @@ private data class LimitedToolContext(
  */
 fun main() {
     redirectProcessStdoutToStderrForMcpStdio()
+    if (useTestInMemoryRuntime()) {
+        FukurouMcpServer().run()
+        return
+    }
+    val bootstrap = McpLaunchBootstrap.read()
+    val tradingConfig = bootstrap.tradingConfig.copy(
+        gmoPublicClient = bootstrap.gmoPublicClientConfig,
+        runner = bootstrap.tradingConfig.runner.copy(
+            maxToolCallsPerRun = bootstrap.totalToolCallLimit,
+            maxActToolCallsPerRun = bootstrap.actToolCallLimit,
+        ),
+    )
+    val marketDataSource = GmoPublicMarketDataSource.fromConfig(tradingConfig.gmoPublicClient)
+    val runtime = TradingRuntimeFactory.postgresForMcp(
+        config = bootstrap.databaseConfig,
+        marketDataSource = marketDataSource,
+        tradingConfig = tradingConfig,
+    )
 
-    FukurouMcpServer().run()
+    FukurouMcpServer(
+        tradingConfig = tradingConfig,
+        marketDataSource = marketDataSource,
+        tradingRuntime = runtime,
+        decisionRunContext = bootstrap.decisionRunContext,
+        allowedToolNames = bootstrap.allowedTools,
+        expiresAt = bootstrap.expiresAt,
+    ).run()
 }
 
 /**
@@ -416,12 +441,16 @@ class FukurouMcpServer(
         clock = clock,
     ),
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
+    allowedToolNames: Set<String>? = mcpAllowedToolNamesFromEnvironment(),
+    expiresAt: Instant? = null,
     private val toolCallLimiter: McpToolCallLimiter = McpToolCallLimiter(
         config = tradingConfig.runner,
         toolCallGuard = tradingRuntime.toolCallGuard,
-        allowedToolNames = mcpAllowedToolNamesFromEnvironment(),
+        allowedToolNames = allowedToolNames,
         countedToolNames = MCP_TOOL_NAMES,
         actToolNames = MCP_ACT_TOOL_NAMES,
+        expiresAt = expiresAt,
+        clock = clock,
     ),
 ) {
 

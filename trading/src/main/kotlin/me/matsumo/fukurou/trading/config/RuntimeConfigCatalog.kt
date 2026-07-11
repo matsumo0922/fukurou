@@ -888,14 +888,6 @@ object RuntimeConfigCatalog {
                     safetyTier = RuntimeConfigSafetyTier.SAFETY_CRITICAL,
                 ),
                 deploymentItem(
-                    key = "llm.codexPersistentHome",
-                    legacyEnvName = FUKUROU_CODEX_PERSISTENT_HOME_ENV,
-                    valueType = RuntimeConfigValueType.STRING,
-                    defaultValue = null,
-                    effectiveValue = deploymentValues.rendererConfig.codexPersistentHome?.toString(),
-                    unit = null,
-                ),
-                deploymentItem(
                     key = "app.revision",
                     legacyEnvName = FUKUROU_REVISION_ENV,
                     valueType = RuntimeConfigValueType.STRING,
@@ -1342,7 +1334,6 @@ private const val FUKUROU_CODEX_COMMAND_TEMPLATE_ENV = "FUKUROU_CODEX_COMMAND_TE
 private const val FUKUROU_CLAUDE_COMMON_ARGS_ENV = "FUKUROU_CLAUDE_COMMON_ARGS"
 private const val FUKUROU_CODEX_COMMON_ARGS_ENV = "FUKUROU_CODEX_COMMON_ARGS"
 private const val FUKUROU_CODEX_FALSIFIER_ARGS_ENV = "FUKUROU_CODEX_FALSIFIER_ARGS"
-private const val FUKUROU_CODEX_PERSISTENT_HOME_ENV = "FUKUROU_CODEX_PERSISTENT_HOME"
 private const val FUKUROU_REVISION_ENV = "FUKUROU_REVISION"
 private const val FUKUROU_WEB_ROOT_ENV = "FUKUROU_WEB_ROOT"
 private const val FUKUROU_PROD_BASE_URL_ENV = "FUKUROU_PROD_BASE_URL"

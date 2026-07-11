@@ -1143,6 +1143,7 @@ class OneShotLlmRunnerTest {
         }
         val proposerCommand = fixture.processRunner.launches.first()
         val mcpConfigContent = proposerCommand.claudeMcpConfigContent()
+        val manifestContent = proposerCommand.mcpManifestContent()
 
         assertEquals("claude", decision.submission.llmProvider)
         assertEquals(SystemPromptV1.VERSION, decision.submission.systemPromptVersion)
@@ -1150,18 +1151,15 @@ class OneShotLlmRunnerTest {
         assertNotNull(decision.submission.promptHash)
         assertNotNull(decision.submission.marketSnapshotId)
         assertEquals(decision.submission.invocationId, auditEvent.decisionRunContext.decisionRunId)
-        assertTrue(mcpConfigContent.contains(FUKUROU_INVOCATION_ID_ENV))
-        assertTrue(mcpConfigContent.contains(FUKUROU_LLM_PROVIDER_ENV))
-        assertTrue(mcpConfigContent.contains(FUKUROU_PROMPT_HASH_ENV))
-        assertTrue(mcpConfigContent.contains(FUKUROU_SYSTEM_PROMPT_VERSION_ENV))
-        assertTrue(mcpConfigContent.contains(FUKUROU_MARKET_SNAPSHOT_ID_ENV))
+        assertFalse(mcpConfigContent.contains("DB_PASSWORD"))
+        assertTrue(manifestContent.contains(decision.submission.invocationId))
+        assertTrue(manifestContent.contains(decision.submission.promptHash))
+        assertTrue(manifestContent.contains(decision.submission.marketSnapshotId))
     }
 
     @Test
     fun cliConfigControlsMcpServerNameCommandAndToolAllowlist() = runBlocking {
         val customServerName = "custom-mcp"
-        val customSubmitDecisionTool = "mcp__custom-mcp__submit_decision"
-        val customSubmitFalsificationTool = "mcp__custom-mcp__submit_falsification"
         val fixture = runnerFixture { command ->
             if (command.isProposerLaunch()) {
                 submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
@@ -1176,8 +1174,8 @@ class OneShotLlmRunnerTest {
                     mcpServerName = customServerName,
                     mcpServerCommand = "custom-java",
                     mcpServerArgs = listOf("-jar", MCP_JAR_PATH_PLACEHOLDER),
-                    proposerAllowedTools = listOf(customSubmitDecisionTool),
-                    falsifierAllowedTools = listOf(customSubmitFalsificationTool),
+                    proposerAllowedTools = defaultProposerAllowedTools(customServerName),
+                    falsifierAllowedTools = defaultFalsifierAllowedTools(customServerName),
                 ),
             ),
         ).getOrThrow()
@@ -1188,7 +1186,7 @@ class OneShotLlmRunnerTest {
 
         assertTrue(mcpConfigContent.contains(customServerName))
         assertTrue(mcpConfigContent.contains("custom-java"))
-        assertTrue(joinedArgs.contains(customSubmitDecisionTool))
+        assertTrue(joinedArgs.contains("mcp__custom-mcp__submit_decision"))
         assertFalse(joinedArgs.contains("mcp__fukurou-mcp__submit_decision"))
     }
 
@@ -1306,10 +1304,11 @@ class OneShotLlmRunnerTest {
         val allowedToolsConfig = falsifierCommand.codexConfigContent()
 
         assertTrue(allowedToolsConfig.contains("submit_falsification"))
-        assertTrue(allowedToolsConfig.contains("get_trade_intent"))
-        assertTrue(allowedToolsConfig.contains("knowledge_get_recent_lessons"))
-        assertTrue(allowedToolsConfig.contains("knowledge_search_similar_setups"))
-        assertTrue(allowedToolsConfig.contains("preview_order"))
+        val manifestContent = falsifierCommand.mcpManifestContent()
+        assertTrue(manifestContent.contains("get_trade_intent"))
+        assertTrue(manifestContent.contains("knowledge_get_recent_lessons"))
+        assertTrue(manifestContent.contains("knowledge_search_similar_setups"))
+        assertTrue(manifestContent.contains("preview_order"))
         assertFalse(allowedToolsConfig.contains("place_order"))
         assertFalse(allowedToolsConfig.contains("submit_decision"))
     }
@@ -1372,24 +1371,14 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun runnerDoesNotAutoApproveWhenFalsifierWriteToolIsNotAllowed() = runBlocking {
+    fun cliConfigRejectsNonCanonicalFalsifierAllowlist() {
         val readOnlyFalsifierTools = defaultFalsifierAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME)
             .filterNot { toolName -> toolName.endsWith("__submit_falsification") }
-        val fixture = requestCapturingRunnerFixture()
-
-        fixture.runner.runOneShot(
-            defaultRequest().copy(
-                cliConfig = OneShotRunnerCliConfig(
-                    falsifierAllowedTools = readOnlyFalsifierTools,
-                ),
-            ),
-        ).getOrThrow()
-
-        val falsifierRequest = fixture.invoker.requests.single { request ->
-            request.phase == LlmInvocationPhase.FALSIFIER
+        assertFailsWith<IllegalArgumentException> {
+            OneShotRunnerCliConfig(
+                falsifierAllowedTools = readOnlyFalsifierTools,
+            )
         }
-
-        assertEquals(emptyList(), requireNotNull(falsifierRequest.mcpServer).autoApprovedTools)
     }
 
     @Test
@@ -1485,9 +1474,9 @@ class OneShotLlmRunnerTest {
             assertFalse(joinedArgs.contains(secretName), secretName)
         }
         assertFalse(joinedArgs.contains("DB_PASSWORD"))
-        assertTrue(codexConfigContent.contains("DB_URL"))
-        assertTrue(codexConfigContent.contains("DB_USER"))
-        assertTrue(codexConfigContent.contains("DB_PASSWORD"))
+        assertFalse(codexConfigContent.contains("DB_URL"))
+        assertFalse(codexConfigContent.contains("DB_USER"))
+        assertFalse(codexConfigContent.contains("DB_PASSWORD"))
         assertNotNull(falsifierCommand.environment[FUKUROU_FALSIFIER_INTENT_ID_ENV])
 
         Unit
@@ -2598,6 +2587,12 @@ private fun RenderedLlmCommand.codexConfigContent(): String {
     val codexHome = Path.of(requireNotNull(environment[CODEX_HOME_ENV]))
 
     return Files.readString(codexHome.resolve("config.toml"))
+}
+
+private fun RenderedLlmCommand.mcpManifestContent(): String {
+    val manifestPath = cleanupPaths.single { path -> path.fileName.toString().matches(Regex("[0-9a-f]{48}\\.json")) }
+
+    return Files.readString(manifestPath)
 }
 
 private fun cleanExit(stdout: String = "", stderr: String = ""): ProcessRunResult {

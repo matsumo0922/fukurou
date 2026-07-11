@@ -67,15 +67,16 @@ enum class LlmInvocationPhase {
  * @param name MCP server 名
  * @param command MCP server 起動 command
  * @param args MCP server 起動引数
- * @param environment MCP server 子プロセスへ明示的に渡す環境変数
+ * @param manifestId root-owned launcher が検証する per-run manifest ID
+ * @param manifestPath runner が cleanup する manifest path
  * @param autoApprovedTools codex の MCP 承認ゲートを approve で通す tool 名。
  * write tool を phase 単位で最小限指定する
  */
 data class LlmMcpServerConfig(
     val name: String,
     val command: String,
-    val args: List<String>,
-    val environment: Map<String, String>,
+    val manifestId: String,
+    val manifestPath: Path,
     val autoApprovedTools: List<String> = emptyList(),
 )
 

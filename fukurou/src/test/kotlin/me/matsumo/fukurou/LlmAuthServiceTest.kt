@@ -7,7 +7,6 @@ import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
-import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_PERSISTENT_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.HOME_ENV
 import java.io.ByteArrayInputStream
 import java.io.InputStream
@@ -64,7 +63,6 @@ class LlmAuthServiceTest {
                     HOME_ENV to cliHome.toString(),
                     TEST_PATH_ENV to TEST_PATH_VALUE,
                     SECRET_ENV to "secret-value",
-                    FUKUROU_CODEX_PERSISTENT_HOME_ENV to codexHome.toString(),
                 ),
             ),
             processStarter = processStarter,
@@ -78,7 +76,6 @@ class LlmAuthServiceTest {
                     TEST_PATH_ENV to TEST_PATH_VALUE,
                     HOME_ENV to cliHome.toString(),
                     CODEX_HOME_ENV to codexHome.toString(),
-                    FUKUROU_CODEX_PERSISTENT_HOME_ENV to codexHome.toString(),
                 ),
                 processStarter.environments.single(),
             )

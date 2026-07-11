@@ -265,6 +265,30 @@ scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/activate" \
 scripts/prod-curl /ops/runtime-config
 ```
 
+## MCP credential isolation の移行
+
+この移行は operator が daemon を無効化した状態で実施する。merge/deploy 前に production credential を変更しない。
+
+1. WebUI で `daemon.enabled=false` を active 化し、running reservation がないことを確認する。
+2. root:root 0400 の `/srv/fukurou/secrets/fukurou_mcp_db_password` を dummy ではない新規値で作成し、値を shell history、log、PR に出さない。
+3. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を daemon 停止中の maintenance connection で実行し、`fukurou_mcp` role を provision する。password file path は NAS `.env` の必須 `FUKUROU_MCP_DB_PASSWORD_FILE` と compose bind mountで一致させる。失敗時はapp/superuser credentialへfallbackしない。
+4. 新 image を deploy し、`scripts/mcp-credential-isolation-check <exact-image>` と paper smoke を実行する。
+5. canary scan 完了後、旧 shared `config.toml` と session artifact を auth source から分離して削除する。
+6. running Ktor containerの`/run/fukurou/llm-homes`がtmpfsであることを`docker inspect`で確認する。旧`fukurou_llm-runs` volumeが残っている場合は、一時containerへread-only mountして残存per-run auth copy、session、quarantine artifactを監査し、必要な証跡を保存してから`fukurou_llm-runs`だけを削除する。永続auth sourceの`fukurou_llm-auth`とDBの`fukurou_pgdata`は削除しない。
+7. app の旧 credential を PostgreSQL と NAS `.env` で同時に rotateし、Ktor containerを再起動して新しい値を反映する。旧 credentialで接続できないことを確認する。
+8. `/health/ready`、role flag、membership、ownership、effective grant、required MCP call matrix を再確認する。
+9. 証跡を保存してから daemon を再有効化する。
+
+role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolbypassrls` はすべて false、membership と object ownership は 0 であることを確認する。`runtime_config_versions`、`runtime_config_values`、`llm_launch_reservations`、`equity_snapshots` と ledger の UPDATE/DELETE/TRUNCATE は拒否される。必要 call の permission failure は role SQL と inventory を修正して disposable test からやり直す。
+
+merge 前の自動証跡は `McpDatabaseRoleIntegrationTest` の role/effective privilege/required-call matrix と、`scripts/mcp-credential-isolation-check` の tool audit export・DB data-only dump・encoding scan を含む。scan coverage や dump が欠けた run は無効とし、再実行する。real provider model output probe は operator auth を必要とする別の human check として記録し、自動 check 成功へ読み替えない。
+
+cleanup failure では `/run/fukurou/llm-homes/.cleanup-quarantine` が残り、manual/daemon の次 run は current container process 内で fail closed になる。marker と per-run artifact は同じtmpfsにあり、container restartでは両方が同時に破棄される。operatorはdaemonを無効のまま残存per-run homeとmanifestを監査し、filesystem原因を解消してからmarkerを削除するか、監査後にcontainerを再起動する。markerだけを先に消したり、strategy NO_TRADEとして成績へ混ぜたりしない。
+
+rotation 後は旧 image で LLM phase を再有効化しない。障害時は daemon disabled のまま現 image を維持するか、修正版へ roll-forward する。
+
+この境界はfixed setuid helper 2個とdeployごとのprivilege inventory gateに依存する。merge前にfinal imageでsetuid/setgid、file capability、runtime/root control socket、LLM/MCP process属性のexact checkが通ることを確認する。
+
 ## Rollback
 
 rollback は過去の commit SHA tag を指定して workflow_dispatch を再実行する。指定できるのは `origin/main` から到達可能で、かつ `docker-compose.prod.yml` を含む commit に限る。

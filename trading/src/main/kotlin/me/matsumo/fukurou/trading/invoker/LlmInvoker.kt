@@ -3,8 +3,12 @@ package me.matsumo.fukurou.trading.invoker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardOpenOption
 import java.time.Clock
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * LLM CLI の起動境界。
@@ -74,10 +78,16 @@ class ShellLlmInvoker(
 ) : LlmInvoker {
 
     override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        LlmArtifactCleanupQuarantine.requireClear()
+            .exceptionOrNull()
+            ?.let { failure -> return Result.failure(failure.classifyLlmFailure(request.provider)) }
         val command = try {
             commandRenderer.render(request).getOrThrow()
         } catch (throwable: CancellationException) {
             throw throwable.classifyLlmFailure(request.provider)
+        } catch (throwable: LlmArtifactCleanupException) {
+            LlmArtifactCleanupQuarantine.activate(throwable)
+            return Result.failure(throwable.classifyLlmFailure(request.provider))
         } catch (throwable: Throwable) {
             return Result.failure(throwable.classifyLlmFailure(request.provider))
         }
@@ -99,19 +109,22 @@ class ShellLlmInvoker(
                 responseText = parsedOutput.responseText,
                 usage = parsedOutput.usage,
                 processResult = processResult,
-                cleanupFailure = cleanupNonCancellable(command)
-                    .exceptionOrNull()
-                    ?.classifyLlmFailure(request.provider),
+                cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()?.let { failure ->
+                    LlmArtifactCleanupQuarantine.activate(failure)
+                    failure.classifyLlmFailure(request.provider)
+                },
             )
 
             Result.success(invocationResult)
         } catch (throwable: CancellationException) {
             val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
+            cleanupFailure?.let { failure -> LlmArtifactCleanupQuarantine.activate(failure) }
             cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }
 
             throw throwable.classifyLlmFailure(request.provider)
         } catch (throwable: Throwable) {
             val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
+            cleanupFailure?.let { failure -> LlmArtifactCleanupQuarantine.activate(failure) }
             cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }
 
             Result.failure(throwable.classifyLlmFailure(request.provider))
@@ -128,3 +141,59 @@ class ShellLlmInvoker(
         }
     }
 }
+
+/** request/render 中に生成済み artifact を回収できなかった failure。 */
+internal class LlmArtifactCleanupException(cause: Throwable) : IllegalStateException(
+    "LLM generated artifact cleanup failed.",
+    cause,
+)
+
+/**
+ * cleanup failure 後の追加 LLM run を current process で拒否する quarantine。
+ *
+ * marker と per-run artifact は同じ tmpfs に置く。marker 書き込みに失敗しても process 内の gate は維持し、
+ * container restart では tmpfs 上の artifact と marker を同時に破棄して解除する。
+ */
+internal object LlmArtifactCleanupQuarantine {
+    private val processQuarantined = AtomicBoolean(false)
+    private val markerPath: Path
+        get() = Path.of(
+            System.getProperty(
+                QUARANTINE_PATH_PROPERTY,
+                Path.of(System.getProperty("java.io.tmpdir"), ".fukurou-llm-cleanup-quarantine").toString(),
+            ),
+        )
+
+    fun requireClear(): Result<Unit> = runCatching {
+        check(Files.isDirectory(markerPath.parent) && Files.isWritable(markerPath.parent)) {
+            "LLM artifact cleanup quarantine storage is unavailable; remediation or container restart is required."
+        }
+        check(!processQuarantined.get() && !Files.exists(markerPath)) {
+            "LLM artifact cleanup quarantine is active; remediation or container restart is required."
+        }
+    }
+
+    fun activate(cause: Throwable) {
+        processQuarantined.set(true)
+        runCatching {
+            Files.writeString(
+                markerPath,
+                "cleanup_failed\n",
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE,
+            )
+        }.onFailure { markerFailure -> cause.addSuppressed(markerFailure) }
+    }
+
+    internal fun resetForTest() {
+        processQuarantined.set(false)
+        Files.deleteIfExists(markerPath)
+    }
+
+    internal fun simulateRestartForTest() {
+        processQuarantined.set(false)
+    }
+}
+
+private const val QUARANTINE_PATH_PROPERTY = "fukurou.llm.cleanupQuarantinePath"

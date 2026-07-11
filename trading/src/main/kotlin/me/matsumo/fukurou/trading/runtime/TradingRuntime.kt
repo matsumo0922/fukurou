@@ -36,6 +36,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRuntimeConfigRepository
 import me.matsumo.fukurou.trading.persistence.ExposedSafetyViolationRepository
+import me.matsumo.fukurou.trading.persistence.McpPersistenceSchemaVerifier
 import me.matsumo.fukurou.trading.persistence.PostgresGlobalTradingLock
 import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
@@ -134,6 +135,8 @@ data class TradingDatabaseConfig(
     val user: String,
     val password: String,
 ) {
+    override fun toString(): String = "TradingDatabaseConfig(url=$url, user=$user, password=<redacted>)"
+
     companion object {
         /**
          * 環境変数 DB_URL / DB_USER / DB_PASSWORD から DB 設定を読む。
@@ -307,6 +310,34 @@ object TradingRuntimeFactory {
         }
     }
 
+    /** least-privilege MCP role 向けに narrow schema contract だけを検証して runtime を構築する。 */
+    fun postgresForMcp(
+        config: TradingDatabaseConfig,
+        clock: Clock = Clock.systemUTC(),
+        marketDataSource: MarketDataSource? = null,
+        tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
+    ): TradingRuntime {
+        val dataSource = createDataSource(config)
+
+        try {
+            McpPersistenceSchemaVerifier(dataSource).verify().getOrThrow()
+            val database = ExposedDatabase.connect(dataSource)
+
+            return connectedPostgres(
+                dataSource = dataSource,
+                database = database,
+                clock = clock,
+                marketDataSource = marketDataSource,
+                tradingConfig = tradingConfig,
+                closeDataSource = true,
+                verifyApplicationSchema = false,
+            )
+        } catch (throwable: Throwable) {
+            dataSource.close()
+            throw throwable
+        }
+    }
+
     /**
      * 既存 DataSource / Exposed database から Postgres runtime を構築する。
      */
@@ -318,11 +349,12 @@ object TradingRuntimeFactory {
         marketDataSource: MarketDataSource? = null,
         tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
         closeDataSource: Boolean = false,
+        verifyApplicationSchema: Boolean = true,
     ): TradingRuntime {
         val connection = PostgresRuntimeConnection(dataSource, database, closeDataSource)
         val context = PostgresRuntimeContext(clock, reconcilerStatusProvider, marketDataSource, tradingConfig)
 
-        verifyPostgresSchema(connection, context)
+        if (verifyApplicationSchema) verifyPostgresSchema(connection, context)
 
         val repositories = createPostgresRepositories(connection, context)
         val services = createPostgresServices(connection, context, repositories)
