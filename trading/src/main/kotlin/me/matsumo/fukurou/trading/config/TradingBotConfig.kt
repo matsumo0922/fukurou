@@ -8,6 +8,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicWebSocketConfig
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CLAUDE_MODEL_ENV
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_MODEL_ENV
 import me.matsumo.fukurou.trading.invoker.LlmProvider
@@ -37,6 +38,7 @@ import java.time.Instant
  * @param reflection deterministic reflection runner 設定
  * @param killCriterion 評価成績による HARD_HALT 基準
  * @param gmoPublicClient GMO Public API client 設定
+ * @param gmoPublicWebSocket GMO Public WebSocket client 設定
  */
 data class TradingBotConfig(
     val symbol: TradingSymbol = TradingSymbol.BTC,
@@ -53,6 +55,7 @@ data class TradingBotConfig(
     val reflection: ReflectionConfig = ReflectionConfig(),
     val killCriterion: KillCriterionConfig = KillCriterionConfig(),
     val gmoPublicClient: GmoPublicClientConfig = GmoPublicClientConfig(),
+    val gmoPublicWebSocket: GmoPublicWebSocketConfig = GmoPublicWebSocketConfig(),
 ) {
     init {
         require(mode == TradingMode.PAPER) {
@@ -109,6 +112,7 @@ data class TradingBotConfig(
                 reflection = environment.readReflectionConfig(),
                 killCriterion = environment.readKillCriterionConfig(),
                 gmoPublicClient = environment.readGmoPublicClientConfig(),
+                gmoPublicWebSocket = environment.readGmoPublicWebSocketConfig(),
             )
         }
     }
@@ -651,6 +655,19 @@ private const val FUKUROU_KILL_MIN_CLOSED_TRADES_ENV = "FUKUROU_KILL_MIN_CLOSED_
  */
 private const val FUKUROU_KILL_MIN_PROFIT_FACTOR_ENV = "FUKUROU_KILL_MIN_PROFIT_FACTOR"
 
+/** GMO Public WebSocket endpoint の環境変数名。 */
+private const val FUKUROU_GMO_PUBLIC_WEBSOCKET_URL_ENV = "FUKUROU_GMO_PUBLIC_WEBSOCKET_URL"
+
+/** GMO Public WebSocket connect timeout の環境変数名。 */
+private const val FUKUROU_GMO_WEBSOCKET_CONNECT_TIMEOUT_MS_ENV = "FUKUROU_GMO_WEBSOCKET_CONNECT_TIMEOUT_MS"
+
+/** GMO Public WebSocket message stale timeout の環境変数名。 */
+private const val FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS_ENV =
+    "FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS"
+
+/** GMO Public WebSocket reconnect backoff の環境変数名。 */
+private const val FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS_ENV = "FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS"
+
 /**
  * paper 初期残高の既定値。
  */
@@ -1099,6 +1116,26 @@ private fun Map<String, String>.readKillCriterionConfig(): KillCriterionConfig {
 
 private fun Map<String, String>.readGmoPublicClientConfig(): GmoPublicClientConfig {
     return GmoPublicClientConfig.fromEnvironment(this)
+}
+
+private fun Map<String, String>.readGmoPublicWebSocketConfig(): GmoPublicWebSocketConfig {
+    val defaults = GmoPublicWebSocketConfig()
+
+    return GmoPublicWebSocketConfig(
+        endpoint = readOptional(FUKUROU_GMO_PUBLIC_WEBSOCKET_URL_ENV) ?: defaults.endpoint,
+        connectTimeout = readOptional(FUKUROU_GMO_WEBSOCKET_CONNECT_TIMEOUT_MS_ENV)
+            ?.toLong()
+            ?.let { millis -> Duration.ofMillis(millis) }
+            ?: defaults.connectTimeout,
+        messageStaleTimeout = readOptional(FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS_ENV)
+            ?.toLong()
+            ?.let { seconds -> Duration.ofSeconds(seconds) }
+            ?: defaults.messageStaleTimeout,
+        reconnectBackoff = readOptional(FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS_ENV)
+            ?.toLong()
+            ?.let { millis -> Duration.ofMillis(millis) }
+            ?: defaults.reconnectBackoff,
+    )
 }
 
 private fun Map<String, String>.readEconomicEventBlackouts(): List<EconomicEventBlackout> {

@@ -20,6 +20,9 @@ enum class PaperOrderCancelReason(val wireCode: String) {
     /** HARD_HALT sweep による取消。 */
     HARD_HALT("hard_halt"),
 
+    /** market-data gap により未約定 entry を評価除外して取消。 */
+    MARKET_DATA_GAP("market_data_gap"),
+
     /** enum 導入前の自由記述値で理由を確定できない取消。 */
     LEGACY_UNCLASSIFIED("legacy_unclassified"),
     ;
@@ -51,7 +54,7 @@ enum class RestingEntryExpiryState {
  * role は BUY、position 未紐付け、LIMIT/STOP の組み合わせで決まる。status は用途別に判定する。
  */
 object PaperOrderLifecyclePolicy {
-    /** ProtectionReconciler の標準 polling 間隔。 */
+    /** ProtectionReconciler の REST periodic maintenance と idle event 待機の標準間隔。 */
     val reconcilerInterval: Duration = Duration.ofSeconds(5)
 
     /** 期限到達後に通常の取消処理を待つ猶予。 */

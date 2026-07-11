@@ -2346,6 +2346,10 @@ private fun ExecutionActivityRecord.toOpsActivityEventResponse(): OpsActivityEve
         occurredAt = response.executedAt,
         metadata = listOf(
             OpsActivityMetadataResponse(
+                label = "evaluation",
+                value = evaluationExclusionReason?.let { reason -> "excluded: $reason" } ?: "eligible",
+            ),
+            OpsActivityMetadataResponse(
                 label = "realized pnl",
                 value = response.realizedPnlJpy,
             ),
@@ -2408,9 +2412,40 @@ private fun ExecutionActivityRecord.toExecutionActivityDetailsMetadata(
     response: OpsExecutionResponse,
 ): List<OpsActivityMetadataResponse> {
     return response.toExecutionSummaryMetadata() +
+        toExecutionIntegrityMetadata() +
         toOrderContextMetadata() +
         toPositionContextMetadata() +
         toDecisionContextMetadata()
+}
+
+private fun ExecutionActivityRecord.toExecutionIntegrityMetadata(): List<OpsActivityMetadataResponse> {
+    val source = sourceEvidence
+
+    return listOf(
+        OpsActivityMetadataResponse(
+            label = "evaluation",
+            value = evaluationExclusionReason?.let { reason -> "excluded: $reason" } ?: "eligible",
+        ),
+        OpsActivityMetadataResponse(
+            label = "market session",
+            value = source?.sessionId ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "market sequence",
+            value = source?.sequence?.toString() ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "exchange / received",
+            value = source?.let { evidence -> "${evidence.exchangeAt} / ${evidence.receivedAt}" }
+                ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+        OpsActivityMetadataResponse(
+            label = "source trade",
+            value = source?.let { evidence ->
+                "${evidence.side} ${evidence.sizeBtc} BTC at ${evidence.priceJpy} JPY"
+            } ?: ACTIVITY_NOT_LINKED_VALUE,
+        ),
+    )
 }
 
 private fun OpsExecutionResponse.toExecutionSummaryMetadata(): List<OpsActivityMetadataResponse> {

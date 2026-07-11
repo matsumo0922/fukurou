@@ -31,8 +31,12 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
+import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
+import me.matsumo.fukurou.trading.reconciler.ReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -1598,6 +1602,226 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun periodic_rest_maintenance_does_not_execute_protective_stop_but_market_event_does() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        broker.maintainProtections(stopGapTickSnapshot()).getOrThrow()
+
+        assertEquals(1, broker.getPositions().getOrThrow().size)
+        assertEquals(1, repository.getExecutions().getOrThrow().size)
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.SELL,
+                priceJpy = BigDecimal("9600000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(1),
+                receivedAt = fixedInstant().plusSeconds(1),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000171"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+        val closeActivity = repository.findExecutionActivitiesForStableFeed(
+            StableFeedCursor(Instant.MAX, includesSameTimestamp = false, afterId = null),
+            limit = 1,
+        ).getOrThrow().single()
+        assertEquals("00000000-0000-0000-0000-000000000171", closeActivity.sourceEvidence?.sessionId)
+        assertEquals(1, closeActivity.sourceEvidence?.sequence)
+    }
+
+    @Test
+    fun market_event_limit_entry_consumes_sell_queue_once_before_fill() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000178")
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val reconcilerStatus = MutableReconcilerStatus()
+        val marketDataSource = MutableOrderbookMarketDataSource(
+            orderbook = Orderbook(
+                symbol = "BTC",
+                bids = listOf(OrderbookLevel(price = "9900000", size = "0.0020")),
+                asks = listOf(OrderbookLevel(price = "10000000", size = "1.0000")),
+            ),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            reconcilerStatusProvider = reconcilerStatus,
+            requireRealtimeIntegrityForRestingOrders = true,
+            clock = fixedClock(),
+        )
+        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 1, OrderSide.SELL, "0.0010")).getOrThrow()
+        reconcilerStatus.updateMarketData(
+            ReconcilerStatus(
+                lastReconciledAt = fixedInstant(),
+                startupFullReconcileCompleted = true,
+                lastMarketDataAt = fixedInstant(),
+                marketDataState = MarketDataConnectionState.CONNECTED,
+                marketDataSessionId = sessionId,
+                lastProcessedSequence = 1,
+                startupRecoveryCompleted = true,
+            ),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand())).getOrThrow()
+
+        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 2, OrderSide.BUY, "1.0000")).getOrThrow()
+        broker.applyMarketEvent(
+            inMemoryPaperTradeEvent(sessionId, 3, OrderSide.SELL, "0.0040", priceJpy = "9800000"),
+        ).getOrThrow()
+        broker.applyMarketEvent(
+            inMemoryPaperTradeEvent(sessionId, 3, OrderSide.SELL, "0.0040", priceJpy = "9800000"),
+        ).getOrThrow()
+
+        assertTrue(repository.getExecutions().getOrThrow().isEmpty())
+
+        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 4, OrderSide.SELL, "0.0030")).getOrThrow()
+
+        assertEquals(1, repository.getExecutions().getOrThrow().size)
+        assertEquals(OrderType.STOP, broker.getOpenOrders().getOrThrow().single().orderType)
+        val activity = repository.findExecutionActivitiesForStableFeed(
+            StableFeedCursor(Instant.MAX, includesSameTimestamp = false, afterId = null),
+            limit = 1,
+        ).getOrThrow().single()
+        assertEquals(sessionId.toString(), activity.sourceEvidence?.sessionId)
+        assertEquals(4, activity.sourceEvidence?.sequence)
+    }
+
+    @Test
+    fun periodic_rest_maintenance_does_not_execute_virtual_take_profit_but_market_event_does() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        broker.maintainProtections(watermarkTickSnapshot("10600000")).getOrThrow()
+
+        assertEquals(1, broker.getPositions().getOrThrow().size)
+        assertEquals(1, repository.getExecutions().getOrThrow().size)
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.BUY,
+                priceJpy = BigDecimal("10600000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(1),
+                receivedAt = fixedInstant().plusSeconds(1),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000172"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun market_event_session_switch_rebinds_existing_position_for_first_recovered_event() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.SELL,
+                priceJpy = BigDecimal("10000000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(1),
+                receivedAt = fixedInstant().plusSeconds(1),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000176"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.SELL,
+                priceJpy = BigDecimal("9600000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(2),
+                receivedAt = fixedInstant().plusSeconds(2),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000177"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun market_event_session_switch_rebinds_existing_position_for_first_recovered_take_profit() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.SELL,
+                priceJpy = BigDecimal("10000000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(1),
+                receivedAt = fixedInstant().plusSeconds(1),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000176"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        broker.applyMarketEvent(
+            PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.BUY,
+                priceJpy = BigDecimal("10600000"),
+                sizeBtc = BigDecimal("0.0010"),
+                exchangeAt = fixedInstant().plusSeconds(2),
+                receivedAt = fixedInstant().plusSeconds(2),
+                connectionSessionId = UUID.fromString("00000000-0000-0000-0000-000000000177"),
+                sequence = 1,
+            ),
+        ).getOrThrow()
+
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
     fun reconcile_buy_limit_reaches_when_best_ask_is_at_limit_even_if_last_price_is_above_limit() = runBlocking {
         val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
@@ -2414,6 +2638,27 @@ private fun atrCandles(
  */
 private fun fixedInstant(): Instant {
     return Instant.parse("2026-07-02T00:00:00Z")
+}
+
+private fun inMemoryPaperTradeEvent(
+    sessionId: UUID,
+    sequence: Long,
+    side: OrderSide,
+    sizeBtc: String,
+    priceJpy: String = "9900000",
+): PaperMarketTradeEvent {
+    val receivedAt = fixedInstant().plusSeconds(sequence)
+
+    return PaperMarketTradeEvent(
+        symbol = TradingSymbol.BTC,
+        side = side,
+        priceJpy = BigDecimal(priceJpy),
+        sizeBtc = BigDecimal(sizeBtc),
+        exchangeAt = receivedAt,
+        receivedAt = receivedAt,
+        connectionSessionId = sessionId,
+        sequence = sequence,
+    )
 }
 
 /**

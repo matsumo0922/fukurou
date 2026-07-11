@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.MarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.PaperExecutionSimulator
 import me.matsumo.fukurou.trading.broker.PaperLedgerMutationRepository
+import me.matsumo.fukurou.trading.broker.PaperLedgerReconcileScope
 import me.matsumo.fukurou.trading.broker.PaperOrderUpdate
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperSimulationContext
@@ -17,10 +18,12 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.PositionMarkUpdate
+import me.matsumo.fukurou.trading.broker.PositionMarketEligibility
 import me.matsumo.fukurou.trading.broker.ReconcileMarketContext
 import me.matsumo.fukurou.trading.broker.ReconcileProgress
 import me.matsumo.fukurou.trading.broker.RestingEntryFillRequest
 import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
+import me.matsumo.fukurou.trading.broker.RestingOrderMarketEligibility
 import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
@@ -57,6 +60,7 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.domain.isRestingEntryLifecycleCandidate
 import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
@@ -120,6 +124,7 @@ internal class ExposedPaperLedgerWriter(
                             expiresAt = request.expiresAt,
                             expirySource = request.expirySource,
                             effectiveTtlSeconds = request.effectiveTtlSeconds,
+                            marketEligibility = request.marketEligibility,
                         ),
                         clock,
                     )
@@ -189,6 +194,7 @@ internal class ExposedPaperLedgerWriter(
                             expiresAt = request.order.expiresAt,
                             expirySource = request.order.expirySource,
                             effectiveTtlSeconds = request.order.effectiveTtlSeconds,
+                            marketEligibility = request.order.marketEligibility,
                         ),
                         clock,
                     )
@@ -348,12 +354,13 @@ internal class ExposedPaperLedgerWriter(
     }
 
     /**
-     * tick に応じて resting order / protection を前進させる。
+     * tick に応じて [PaperLedgerReconcileScope] の範囲で ledger を保守する。
      */
     override suspend fun reconcile(
         tickSnapshot: TickSnapshot,
         simulator: PaperExecutionSimulator,
         simulationContext: PaperSimulationContext?,
+        reconcileScope: PaperLedgerReconcileScope,
     ): Result<PaperReconcileResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -375,11 +382,26 @@ internal class ExposedPaperLedgerWriter(
                     expireRestingEntryOrders(clock.instant(), progress)
 
                     if (!paperAccountHardHaltReached()) {
-                        fillTriggeredEntryOrders(reconcileContext, progress, clock)
-                        triggerPositionProtections(reconcileContext, progress, clock)
+                        if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
+                            fillTriggeredEntryOrders(reconcileContext, progress, clock)
+                            triggerPositionProtections(reconcileContext, progress, clock)
+                        }
                     }
 
                     progress.toPaperReconcileResult()
+                }
+            }
+        }
+    }
+
+    override suspend fun applyMarketEvent(
+        event: PaperMarketTradeEvent,
+        simulator: PaperExecutionSimulator,
+    ): Result<PaperReconcileResult> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    applyPaperMarketEvent(event, simulator, fallbackSymbolRules, clock)
                 }
             }
         }
@@ -420,6 +442,375 @@ private fun JdbcTransaction.expireRestingEntryOrders(processedAt: Instant, progr
         }
 }
 
+private fun JdbcTransaction.applyPaperMarketEvent(
+    event: PaperMarketTradeEvent,
+    simulator: PaperExecutionSimulator,
+    rules: SymbolRules,
+    clock: Clock,
+): PaperReconcileResult {
+    val cursor = lockMarketDataCursor(event.connectionSessionId)
+
+    if (event.sequence <= cursor) {
+        return emptyReconcileProgress().toPaperReconcileResult()
+    }
+    require(event.sequence == cursor + 1) {
+        "market-data sequence gap: expected ${cursor + 1}, received ${event.sequence}"
+    }
+
+    val ticker = Ticker(
+        symbol = event.symbol.apiSymbol,
+        last = event.priceJpy.toPlainString(),
+        bid = event.priceJpy.toPlainString(),
+        ask = event.priceJpy.toPlainString(),
+        high = event.priceJpy.toPlainString(),
+        low = event.priceJpy.toPlainString(),
+        volume = event.sizeBtc.toPlainString(),
+        timestamp = event.receivedAt.toString(),
+    )
+    val simulationContext = PaperSimulationContext(ticker = ticker, rules = rules)
+    val progress = emptyReconcileProgress()
+
+    updateMarks(event.priceJpy, null, rules, clock)
+    expireRestingEntryOrders(clock.instant(), progress)
+    bindExistingPositionsToSession(event)
+
+    if (!paperAccountHardHaltReached()) {
+        applyEventToRestingEntries(event, simulator, simulationContext, progress, clock)
+        applyEventToPositionProtections(event, simulator, simulationContext, progress, clock)
+    }
+
+    advanceMarketDataCursor(event)
+
+    return progress.toPaperReconcileResult()
+}
+
+private fun JdbcTransaction.lockMarketDataCursor(sessionId: UUID): Long {
+    return prepare(
+        """
+            SELECT last_processed_sequence
+            FROM market_data_sessions
+            WHERE id = ? AND state = 'CONNECTED'
+            FOR UPDATE
+        """,
+    ).use { statement ->
+        statement.setObject(1, sessionId)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) { "market-data session is not connected." }
+            resultSet.getLong("last_processed_sequence")
+        }
+    }
+}
+
+private fun JdbcTransaction.bindExistingPositionsToSession(event: PaperMarketTradeEvent) {
+    val isFirstEventAfterRecoveredGap = hasUnrecoveredGapBefore(event.connectionSessionId)
+    val eligibleAfterSequence = if (isFirstEventAfterRecoveredGap) event.sequence - 1 else event.sequence
+
+    prepare(
+        """
+            UPDATE positions
+            SET market_data_session_id = ?,
+                market_eligible_after_sequence = CASE
+                    WHEN market_data_session_id IS NULL THEN ?
+                    ELSE ?
+                END
+            WHERE status = 'OPEN'
+                AND (market_data_session_id IS NULL OR market_data_session_id <> ?)
+        """,
+    ).use { statement ->
+        statement.setObject(1, event.connectionSessionId)
+        // session 未紐付けの同期 entry と gap 復旧前からの position は最初の event で保護する。
+        statement.setLong(2, event.sequence - 1)
+        statement.setLong(3, eligibleAfterSequence)
+        statement.setObject(4, event.connectionSessionId)
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.hasUnrecoveredGapBefore(sessionId: UUID): Boolean {
+    return prepare(
+        "SELECT 1 FROM market_data_gaps WHERE recovered_at IS NULL AND session_id <> ? LIMIT 1",
+    ).use { statement ->
+        statement.setObject(1, sessionId)
+        statement.executeQuery().use { resultSet -> resultSet.next() }
+    }
+}
+
+private fun JdbcTransaction.applyEventToRestingEntries(
+    event: PaperMarketTradeEvent,
+    simulator: PaperExecutionSimulator,
+    context: PaperSimulationContext,
+    progress: ReconcileProgress,
+    clock: Clock,
+) {
+    selectMarketEligibleEntryOrders(event, clock.instant()).forEach { marketOrder ->
+        val order = marketOrder.order
+        val shouldTrigger = when (order.orderType) {
+            OrderType.LIMIT -> consumeLimitQueue(event, marketOrder)
+            OrderType.STOP -> event.priceJpy >= requireNotNull(order.triggerPriceJpy).toBigDecimal()
+            OrderType.MARKET -> false
+        }
+        if (!shouldTrigger) return@forEach
+
+        val update = order.createEntryUpdate(
+            ticker = context.ticker,
+            rules = context.rules,
+            simulator = simulator,
+            simulationContext = context,
+        )
+        val fill = requireNotNull(update.fill).copy(executedAt = event.receivedAt)
+
+        if (!hasCashForBuyFill(fill)) {
+            updateOrderStatus(order.orderId, OrderStatus.REJECTED, "market event entry rejected: insufficient paper cash", clock)
+            progress.rejectedOrderIds += order.orderId
+            return@forEach
+        }
+
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
+        insertEntryFill(
+            EntryFillWriteRequest(
+                entry = MarketEntryFillRequest(
+                    command = order.toPlaceOrderCommand(),
+                    fill = fill,
+                    positionId = positionId,
+                    tradeGroupId = tradeGroupId,
+                    stopOrderId = UUID.randomUUID(),
+                    source = event,
+                ),
+                entryOrderId = UUID.fromString(order.orderId),
+                insertEntryOrder = false,
+            ),
+            clock,
+        )
+        bindPositionToEvent(positionId, event)
+        progress.filledOrderIds += order.orderId
+        progress.executionIds += fill.executionId.toString()
+    }
+}
+
+private fun JdbcTransaction.selectMarketEligibleEntryOrders(
+    event: PaperMarketTradeEvent,
+    processedAt: Instant,
+): List<MarketEligibleOrder> {
+    return prepare(
+        """
+            SELECT id, queue_ahead_btc, queue_consumed_btc
+            FROM orders
+            WHERE status = 'OPEN'
+                AND side = 'BUY'
+                AND position_id IS NULL
+                AND market_data_session_id = ?
+                AND market_eligible_after_sequence < ?
+                AND market_eligible_from < ?
+                AND expires_at > ?
+            ORDER BY created_at, id
+        """,
+    ).use { statement ->
+        statement.setObject(1, event.connectionSessionId)
+        statement.setLong(2, event.sequence)
+        statement.setLong(3, event.receivedAt.toEpochMilli())
+        statement.setLong(4, processedAt.toEpochMilli())
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                val ordersById = selectOpenOrders().associateBy(Order::orderId)
+                while (resultSet.next()) {
+                    val orderId = resultSet.getObject("id", UUID::class.java).toString()
+                    val order = requireNotNull(ordersById[orderId])
+                    add(
+                        MarketEligibleOrder(
+                            order = order,
+                            queueAheadBtc = resultSet.getBigDecimal("queue_ahead_btc"),
+                            queueConsumedBtc = resultSet.getBigDecimal("queue_consumed_btc") ?: BigDecimal.ZERO,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.consumeLimitQueue(event: PaperMarketTradeEvent, marketOrder: MarketEligibleOrder): Boolean {
+    if (event.side != OrderSide.SELL) return false
+    val limitPrice = requireNotNull(marketOrder.order.limitPriceJpy).toBigDecimal()
+    if (event.priceJpy > limitPrice) return false
+    val queueAhead = requireNotNull(marketOrder.queueAheadBtc) { "LIMIT queue snapshot is unavailable." }
+    val consumed = marketOrder.queueConsumedBtc.add(event.sizeBtc).btcScale()
+
+    prepare("UPDATE orders SET queue_consumed_btc = ?, updated_at = ? WHERE id = ?").use { statement ->
+        statement.setBigDecimal(1, consumed)
+        statement.setLong(2, event.receivedAt.toEpochMilli())
+        statement.setObject(3, UUID.fromString(marketOrder.order.orderId))
+        statement.executeUpdate()
+    }
+
+    return consumed >= queueAhead.add(marketOrder.order.sizeBtc.toBigDecimal())
+}
+
+private fun JdbcTransaction.bindPositionToEvent(positionId: UUID, event: PaperMarketTradeEvent) {
+    prepare(
+        """
+            UPDATE positions
+            SET market_data_session_id = ?, market_eligible_after_sequence = ?
+            WHERE id = ?
+        """,
+    ).use { statement ->
+        statement.setObject(1, event.connectionSessionId)
+        statement.setLong(2, event.sequence)
+        statement.setObject(3, positionId)
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.applyEventToPositionProtections(
+    event: PaperMarketTradeEvent,
+    simulator: PaperExecutionSimulator,
+    context: PaperSimulationContext,
+    progress: ReconcileProgress,
+    clock: Clock,
+) {
+    val protectionContext = EventProtectionContext(event, simulator, context, progress, clock)
+
+    selectEventEligiblePositions(event).forEach { position ->
+        val stopPrice = position.currentStopLossJpy?.toBigDecimal()
+        val takeProfitPrice = position.currentTakeProfitJpy?.toBigDecimal()
+
+        when {
+            stopPrice != null && event.priceJpy <= stopPrice -> triggerEventStop(position, stopPrice, protectionContext)
+            takeProfitPrice != null && event.priceJpy >= takeProfitPrice -> triggerEventTakeProfit(position, protectionContext)
+        }
+    }
+}
+
+private fun JdbcTransaction.triggerEventStop(
+    position: Position,
+    stopPrice: BigDecimal,
+    context: EventProtectionContext,
+) {
+    val event = context.event
+    val stopOrder = requireLinkedStopOrder(position.positionId)
+    val fill = context.simulator.stopFill(
+        OrderSide.SELL,
+        position.sizeBtc.toBigDecimal(),
+        stopPrice,
+        context.simulationContext,
+    )
+        .copy(executedAt = event.receivedAt)
+    val realizedFill = fill.withRealizedPnl(position)
+
+    updateOrderStatus(stopOrder.orderId, OrderStatus.FILLED, "market event stop trigger", context.clock)
+    insertExecution(eventExecutionRequest(stopOrder.orderId, position, realizedFill, event))
+    closePositionRow(position, realizedFill)
+    updateAccountAfterSell(realizedFill, context.clock)
+    context.progress.filledOrderIds += stopOrder.orderId
+    context.progress.closedPositionIds += position.positionId
+    context.progress.executionIds += realizedFill.executionId.toString()
+}
+
+private fun JdbcTransaction.triggerEventTakeProfit(position: Position, context: EventProtectionContext) {
+    val event = context.event
+    val stopOrder = requireLinkedStopOrder(position.positionId)
+    updateOrderStatus(
+        stopOrder.orderId,
+        OrderStatus.CANCELED,
+        "market event virtual take profit trigger",
+        context.clock,
+        PaperOrderCancelReason.POSITION_CLOSE,
+    )
+    val fill = context.simulator.marketFill(OrderSide.SELL, position.sizeBtc.toBigDecimal(), context.simulationContext)
+        .copy(executedAt = event.receivedAt)
+    val realizedFill = fill.withRealizedPnl(position)
+    val closeOrderId = UUID.randomUUID()
+
+    insertCloseOrder(
+        CloseOrderInsertRequest(
+            closeOrderId, position, realizedFill.sizeBtc, "market event virtual take profit trigger", PaperTradeAuditContext.EMPTY,
+        ),
+        context.clock,
+    )
+    insertExecution(eventExecutionRequest(closeOrderId.toString(), position, realizedFill, event))
+    closePositionRow(position, realizedFill)
+    updateAccountAfterSell(realizedFill, context.clock)
+    context.progress.canceledOrderIds += stopOrder.orderId
+    context.progress.filledOrderIds += closeOrderId.toString()
+    context.progress.closedPositionIds += position.positionId
+    context.progress.executionIds += realizedFill.executionId.toString()
+}
+
+private data class EventProtectionContext(
+    val event: PaperMarketTradeEvent,
+    val simulator: PaperExecutionSimulator,
+    val simulationContext: PaperSimulationContext,
+    val progress: ReconcileProgress,
+    val clock: Clock,
+)
+
+private fun eventExecutionRequest(
+    orderId: String,
+    position: Position,
+    fill: SimulatedFill,
+    event: PaperMarketTradeEvent,
+): ExecutionInsertRequest {
+    return ExecutionInsertRequest(
+        orderId, position.positionId, position.mode, OrderSide.SELL, fill, PaperTradeAuditContext.EMPTY, event,
+    )
+}
+
+private fun JdbcTransaction.selectEventEligiblePositions(event: PaperMarketTradeEvent): List<Position> {
+    return prepare(
+        """
+            SELECT id FROM positions
+            WHERE status = 'OPEN'
+                AND market_data_session_id = ?
+                AND market_eligible_after_sequence < ?
+        """,
+    ).use { statement ->
+        statement.setObject(1, event.connectionSessionId)
+        statement.setLong(2, event.sequence)
+        statement.executeQuery().use { resultSet ->
+            val positionsById = selectOpenPositions().associateBy(Position::positionId)
+            buildList {
+                while (resultSet.next()) {
+                    val positionId = resultSet.getObject("id", UUID::class.java).toString()
+                    add(requireNotNull(positionsById[positionId]))
+                }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.advanceMarketDataCursor(event: PaperMarketTradeEvent) {
+    prepare(
+        """
+            UPDATE market_data_sessions
+            SET last_processed_sequence = ?, last_received_at = ?
+            WHERE id = ? AND state = 'CONNECTED'
+        """,
+    ).use { statement ->
+        statement.setLong(1, event.sequence)
+        statement.setLong(2, event.receivedAt.toEpochMilli())
+        statement.setObject(3, event.connectionSessionId)
+        require(statement.executeUpdate() == 1) { "market-data cursor update failed." }
+    }
+    prepare(
+        """
+            UPDATE market_data_gaps
+            SET recovered_at = ?
+            WHERE recovered_at IS NULL
+                AND session_id <> ?
+        """,
+    ).use { statement ->
+        statement.setLong(1, event.receivedAt.toEpochMilli())
+        statement.setObject(2, event.connectionSessionId)
+        statement.executeUpdate()
+    }
+}
+
+private data class MarketEligibleOrder(
+    val order: Order,
+    val queueAheadBtc: BigDecimal?,
+    val queueConsumedBtc: BigDecimal,
+)
+
 private fun JdbcTransaction.insertEntryFill(request: EntryFillWriteRequest, clock: Clock): PaperTradeResult {
     val command = request.entry.command
     val fill = request.entry.fill
@@ -443,6 +834,7 @@ private fun JdbcTransaction.insertEntryFill(request: EntryFillWriteRequest, cloc
             side = command.side,
             fill = fill,
             auditContext = command.auditContext,
+            source = request.entry.source,
         ),
     )
     updateAccountAfterBuy(fill, clock)
@@ -515,7 +907,13 @@ private fun JdbcTransaction.upsertPositionForEntryFill(
     val fill = request.entry.fill
 
     if (existingPosition == null) {
-        insertPosition(command, fill, request.entry.positionId, request.entry.tradeGroupId)
+        insertPosition(
+            command = command,
+            fill = fill,
+            positionId = request.entry.positionId,
+            tradeGroupId = request.entry.tradeGroupId,
+            marketEligibility = request.entry.positionMarketEligibility,
+        )
         insertProtectiveStopOrder(
             command,
             request.entry.stopOrderId,
@@ -779,6 +1177,8 @@ private fun JdbcTransaction.updateMarks(
 }
 
 private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, clock: Clock) {
+    request.marketEligibility?.let { eligibility -> verifyMarketEligibilitySession(eligibility) }
+
     prepare(
         """
             INSERT INTO orders (
@@ -787,9 +1187,11 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
                 take_profit_price_jpy, estimated_win_probability, reason_ja,
                 decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
                 system_prompt_version, market_snapshot_id, expires_at, expiry_source,
-                effective_ttl_seconds, expired_at, canceled_at, cancel_reason, created_at, updated_at
+                effective_ttl_seconds, expired_at, canceled_at, cancel_reason, canceled_by_decision_run_id,
+                queue_ahead_btc, queue_consumed_btc, queue_snapshot_at, market_data_session_id,
+                market_eligible_after_sequence, market_eligible_from, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         val command = request.command
@@ -817,10 +1219,39 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
         statement.setObject(27, null)
         statement.setObject(28, null)
         statement.setString(29, null)
+        statement.setString(30, null)
+        val eligibility = request.marketEligibility
+        statement.setNullableBigDecimal(31, eligibility?.queueAheadBtc?.btcScale())
+        statement.setNullableBigDecimal(32, eligibility?.queueAheadBtc?.let { BigDecimal.ZERO.btcScale() })
+        statement.setObject(33, eligibility?.queueSnapshotAt?.toEpochMilli())
+        statement.setObject(34, eligibility?.sessionId)
+        statement.setObject(35, eligibility?.eligibleAfterSequence)
+        statement.setObject(36, eligibility?.eligibleFrom?.toEpochMilli())
         val createdAt = request.createdAt?.toEpochMilli() ?: nowMillis(clock)
-        statement.setLong(30, createdAt)
-        statement.setLong(31, createdAt)
+        statement.setLong(37, createdAt)
+        statement.setLong(38, createdAt)
         statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.verifyMarketEligibilitySession(eligibility: RestingOrderMarketEligibility) {
+    prepare(
+        """
+            SELECT last_processed_sequence
+            FROM market_data_sessions
+            WHERE id = ? AND state = 'CONNECTED'
+            FOR UPDATE
+        """,
+    ).use { statement ->
+        statement.setObject(1, eligibility.sessionId)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) {
+                "QUEUE_SNAPSHOT_UNAVAILABLE: market-data session is not connected."
+            }
+            require(resultSet.getLong("last_processed_sequence") == eligibility.eligibleAfterSequence) {
+                "QUEUE_SNAPSHOT_UNAVAILABLE: market-data session advanced during order creation."
+            }
+        }
     }
 }
 
@@ -898,6 +1329,7 @@ private fun JdbcTransaction.insertPosition(
     fill: SimulatedFill,
     positionId: UUID,
     tradeGroupId: UUID,
+    marketEligibility: PositionMarketEligibility?,
 ) {
     prepare(
         """
@@ -907,9 +1339,9 @@ private fun JdbcTransaction.insertPosition(
                 current_take_profit_jpy, unrealized_pnl_jpy, unrealized_r, pyramid_add_count,
                 highest_price_since_entry_jpy, lowest_price_since_entry_jpy, decision_run_id, tool_call_id,
                 client_request_id, llm_provider, prompt_hash, system_prompt_version,
-                market_snapshot_id
+                market_snapshot_id, market_data_session_id, market_eligible_after_sequence
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         statement.setObject(1, positionId)
@@ -930,6 +1362,8 @@ private fun JdbcTransaction.insertPosition(
         statement.setBigDecimal(16, fill.priceJpy.moneyScale())
         statement.setBigDecimal(17, fill.priceJpy.moneyScale())
         statement.bindAudit(18, command.auditContext)
+        statement.setObject(25, marketEligibility?.sessionId)
+        statement.setObject(26, marketEligibility?.eligibleAfterSequence)
         statement.executeUpdate()
     }
 }
@@ -941,9 +1375,10 @@ private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
                 id, order_id, position_id, mode, symbol, side, price_jpy, size_btc,
                 fee_jpy, realized_pnl_jpy, liquidity, executed_at, decision_run_id,
                 tool_call_id, client_request_id, llm_provider, prompt_hash,
-                system_prompt_version, market_snapshot_id
+                system_prompt_version, market_snapshot_id, source_session_id, source_sequence,
+                source_exchange_at, source_received_at, source_side, source_price_jpy, source_size_btc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         statement.setObject(1, request.fill.executionId)
@@ -959,6 +1394,14 @@ private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
         statement.setString(11, request.fill.liquidity.name)
         statement.setLong(12, request.fill.executedAt.toEpochMilli())
         statement.bindAudit(13, request.auditContext)
+        val source = request.source
+        statement.setObject(20, source?.connectionSessionId)
+        statement.setObject(21, source?.sequence)
+        statement.setObject(22, source?.exchangeAt?.toEpochMilli())
+        statement.setObject(23, source?.receivedAt?.toEpochMilli())
+        statement.setString(24, source?.side?.name)
+        statement.setNullableBigDecimal(25, source?.priceJpy?.moneyScale())
+        statement.setNullableBigDecimal(26, source?.sizeBtc?.btcScale())
         statement.executeUpdate()
     }
 }
@@ -1477,7 +1920,7 @@ private fun JdbcTransaction.requireLinkedStopOrder(positionId: String): Order {
         ?: throw IllegalArgumentException("linked protective STOP order was not found.")
 }
 
-private fun JdbcTransaction.prepare(sql: String): PreparedStatement {
+internal fun JdbcTransaction.prepare(sql: String): PreparedStatement {
     return jdbcConnection().prepareStatement(sql.trimIndent())
 }
 
@@ -1524,6 +1967,7 @@ private data class EntryOrderInsertRequest(
     val expiresAt: Instant? = null,
     val expirySource: OrderExpirySource? = null,
     val effectiveTtlSeconds: Long? = null,
+    val marketEligibility: RestingOrderMarketEligibility? = null,
 )
 
 /**
@@ -1571,6 +2015,7 @@ private data class ExecutionInsertRequest(
     val side: OrderSide,
     val fill: SimulatedFill,
     val auditContext: PaperTradeAuditContext,
+    val source: PaperMarketTradeEvent? = null,
 )
 
 private fun Order.isEntryTriggered(context: ReconcileMarketContext): Boolean {

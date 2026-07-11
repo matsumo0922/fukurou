@@ -47,6 +47,7 @@ function SystemStatus({ data, isStale }: { data: SystemStatusSnapshot; isStale: 
   const { locale, t } = useI18n();
   const readinessTone = readinessStatusTone(data.readiness.status);
   const authSummary = llmAuthSummary(data);
+  const marketDataState = data.readiness.marketDataState ?? "DISCONNECTED";
 
   return (
     <>
@@ -57,6 +58,7 @@ function SystemStatus({ data, isStale }: { data: SystemStatusSnapshot; isStale: 
           detail={data.health.service ?? t("overview.detail.serviceNotReported")}
         />
         <Metric label={t("system.metric.readiness")} value={data.readiness.status} detail={`HTTP ${data.readinessHttpStatus}`} />
+        <Metric label={t("system.metric.marketData")} value={marketDataState} detail={data.readiness.gapReason ?? t("common.notReported")} />
         <Metric label={t("system.metric.revision")} value={data.revision} detail={`HTTP ${data.revisionHttpStatus}`} />
         <Metric label={t("system.metric.llmAuth")} value={authSummary.value} detail={authSummary.detail} />
         <div className="metric">
@@ -109,6 +111,15 @@ function SystemStatus({ data, isStale }: { data: SystemStatusSnapshot; isStale: 
             {
               label: t("system.label.lastMarketDataAt"),
               value: formatDateTime(data.readiness.lastMarketDataAt, locale),
+            },
+            {
+              label: t("system.label.gapStartedAt"),
+              value: formatDateTime(data.readiness.gapStartedAt, locale),
+              detail: data.readiness.gapReason ?? undefined,
+            },
+            {
+              label: t("system.label.recoveredAt"),
+              value: formatDateTime(data.readiness.recoveredAt, locale),
             },
           ]}
         />

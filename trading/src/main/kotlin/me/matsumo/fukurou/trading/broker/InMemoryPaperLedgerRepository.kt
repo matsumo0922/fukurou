@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.evaluation.InMemoryEquitySnapshotRepository
 import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.math.BigDecimal
@@ -193,6 +194,12 @@ private class InMemoryPaperLedgerState(
     val equitySnapshotRepository: InMemoryEquitySnapshotRepository = runtime.equitySnapshotRepository
     val fallbackSymbolRules: SymbolRules = runtime.fallbackSymbolRules
     val clock: Clock = runtime.clock
+    val orderMarketEligibility: MutableMap<String, RestingOrderMarketEligibility> = mutableMapOf()
+    val orderQueueConsumedBtc: MutableMap<String, BigDecimal> = mutableMapOf()
+    val positionMarketEligibility: MutableMap<String, PositionMarketEligibility> = mutableMapOf()
+    val executionMarketSources: MutableMap<String, PaperMarketTradeEvent> = mutableMapOf()
+    var marketSessionId: UUID? = null
+    var lastMarketSequence: Long = 0
 
     fun <T> read(block: InMemoryPaperLedgerState.() -> T): T {
         return synchronized(lock) { block() }
@@ -434,6 +441,7 @@ private class InMemoryPaperLedgerHistoryReader(
  *
  * @param state 共有 mutable state
  */
+@Suppress("LargeClass")
 private class InMemoryPaperLedgerMutationWriter(
     private val state: InMemoryPaperLedgerState,
 ) : PaperLedgerMutationRepository {
@@ -466,6 +474,12 @@ private class InMemoryPaperLedgerMutationWriter(
                 )
 
                 orders += order
+                request.marketEligibility?.let { eligibility ->
+                    orderMarketEligibility[order.orderId] = eligibility
+                    if (eligibility.queueAheadBtc != null) {
+                        orderQueueConsumedBtc[order.orderId] = BigDecimal.ZERO.btcScale()
+                    }
+                }
 
                 PaperTradeResult(
                     accepted = true,
@@ -567,6 +581,8 @@ private class InMemoryPaperLedgerMutationWriter(
                     canceledByDecisionRunId = command.auditContext.decisionRunContext.decisionRunId,
                     updatedAt = canceledAt.toString(),
                 )
+                orderMarketEligibility.remove(order.orderId)
+                orderQueueConsumedBtc.remove(order.orderId)
 
                 PaperTradeResult(
                     accepted = true,
@@ -584,6 +600,7 @@ private class InMemoryPaperLedgerMutationWriter(
         tickSnapshot: TickSnapshot,
         simulator: PaperExecutionSimulator,
         simulationContext: PaperSimulationContext?,
+        reconcileScope: PaperLedgerReconcileScope,
     ): Result<PaperReconcileResult> {
         return runCatching {
             state.write {
@@ -604,8 +621,10 @@ private class InMemoryPaperLedgerMutationWriter(
                 expireRestingEntryOrdersLocked(clock.instant(), progress)
 
                 if (!accountSnapshot.isHardHaltDrawdownReached()) {
-                    fillTriggeredEntryOrdersLocked(reconcileContext, progress)
-                    triggerPositionProtectionsLocked(reconcileContext, progress)
+                    if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
+                        fillTriggeredEntryOrdersLocked(reconcileContext, progress)
+                        triggerPositionProtectionsLocked(reconcileContext, progress)
+                    }
                 }
 
                 progress.toPaperReconcileResult()
@@ -630,7 +649,65 @@ private class InMemoryPaperLedgerMutationWriter(
                 cancelReason = PaperOrderCancelReason.TTL_EXPIRY,
                 updatedAt = processedAt.toString(),
             )
+            orderMarketEligibility.remove(order.orderId)
+            orderQueueConsumedBtc.remove(order.orderId)
             progress.canceledOrderIds += order.orderId
+        }
+    }
+
+    override suspend fun applyMarketEvent(
+        event: PaperMarketTradeEvent,
+        simulator: PaperExecutionSimulator,
+    ): Result<PaperReconcileResult> {
+        return runCatching {
+            state.write {
+                if (marketSessionId != event.connectionSessionId) {
+                    positions
+                        .filter { position -> position.status == PositionStatus.OPEN }
+                        .forEach { position ->
+                            positionMarketEligibility[position.positionId] = PositionMarketEligibility(
+                                sessionId = event.connectionSessionId,
+                                eligibleAfterSequence = event.sequence - 1,
+                            )
+                        }
+                    marketSessionId = event.connectionSessionId
+                    lastMarketSequence = 0
+                }
+                if (event.sequence <= lastMarketSequence) {
+                    return@write emptyReconcileProgress().toPaperReconcileResult()
+                }
+                require(event.sequence == lastMarketSequence + 1) { "market-data sequence gap." }
+
+                val tick = TickSnapshot(
+                    symbol = event.symbol.apiSymbol,
+                    observedAt = event.receivedAt,
+                    lastPrice = event.priceJpy.toPlainString(),
+                    bidPrice = event.priceJpy.toPlainString(),
+                    askPrice = event.priceJpy.toPlainString(),
+                    symbolRules = fallbackSymbolRules,
+                )
+                val context = tick.toReconcileMarketContext(fallbackSymbolRules, simulator, null)
+                val progress = emptyReconcileProgress()
+
+                updateMarksLocked(event.priceJpy, null, fallbackSymbolRules, event.receivedAt)
+                expireRestingEntryOrdersLocked(clock.instant(), progress)
+                if (!accountSnapshot.isHardHaltDrawdownReached()) {
+                    val existingPositionIds = positions.mapTo(mutableSetOf(), Position::positionId)
+                    fillMarketEventEntryOrdersLocked(event, context, progress)
+                    positions
+                        .filter { position -> position.positionId !in existingPositionIds }
+                        .forEach { position ->
+                            positionMarketEligibility[position.positionId] = PositionMarketEligibility(
+                                event.connectionSessionId,
+                                event.sequence,
+                            )
+                        }
+                    triggerPositionProtectionsLocked(context, progress, event)
+                }
+                lastMarketSequence = event.sequence
+
+                progress.toPaperReconcileResult()
+            }
         }
     }
 
@@ -639,6 +716,7 @@ private class InMemoryPaperLedgerMutationWriter(
         orderId: UUID,
         fill: SimulatedFill,
         reasonJa: String,
+        source: PaperMarketTradeEvent? = null,
     ): PaperTradeResult {
         val positionIndex = positions.indexOfFirst { position -> position.positionId == positionId }
 
@@ -671,16 +749,19 @@ private class InMemoryPaperLedgerMutationWriter(
 
         orders += closeOrder
         positions[positionIndex] = closeUpdate.position
-        executions += realizedFill.toExecution(
+        val execution = realizedFill.toExecution(
             orderId = closeOrder.orderId,
             positionId = position.positionId,
             mode = position.mode,
             side = OrderSide.SELL,
         )
+        executions += execution
+        source?.let { event -> executionMarketSources[execution.executionId] = event }
         if (closeUpdate.isPartialClose) {
             updateLinkedStopOrderSizeLocked(position.positionId, closeUpdate.remainingSize, reasonJa)
         } else {
             cancelOpenStopOrdersLocked(position.positionId, reasonJa)
+            positionMarketEligibility.remove(position.positionId)
         }
         accountSnapshot = accountSnapshot.afterSellFill(realizedFill)
         accountUpdatedAt = realizedFill.executedAt
@@ -750,6 +831,90 @@ private class InMemoryPaperLedgerMutationWriter(
         }
     }
 
+    private fun InMemoryPaperLedgerState.fillMarketEventEntryOrdersLocked(
+        event: PaperMarketTradeEvent,
+        context: ReconcileMarketContext,
+        progress: ReconcileProgress,
+    ) {
+        val entryOrders = orders
+            .filter { order -> order.status == OrderStatus.OPEN && order.side == OrderSide.BUY }
+            .filter { order -> isEligibleForMarketEvent(order, event) }
+
+        entryOrders.forEach { order ->
+            val shouldTrigger = when (order.orderType) {
+                OrderType.LIMIT -> consumeLimitQueue(event, order)
+                OrderType.STOP -> event.priceJpy >= requireNotNull(order.triggerPriceJpy).toBigDecimal()
+                OrderType.MARKET -> false
+            }
+            if (!shouldTrigger) return@forEach
+
+            val orderUpdate = order.createEntryUpdate(
+                ticker = context.ticker,
+                rules = context.rules,
+                simulator = context.simulator,
+                simulationContext = context.simulationContext,
+            )
+            val fill = requireNotNull(orderUpdate.fill) {
+                "Triggered entry order must create a fill."
+            }.copy(executedAt = event.receivedAt)
+
+            if (!accountSnapshot.hasCashForBuyFill(fill)) {
+                markOrderStatusLocked(order.orderId, OrderStatus.REJECTED, "market event entry rejected: insufficient paper cash")
+                orderMarketEligibility.remove(order.orderId)
+                orderQueueConsumedBtc.remove(order.orderId)
+                progress.rejectedOrderIds += order.orderId
+
+                return@forEach
+            }
+
+            val positionId = UUID.randomUUID()
+            val tradeGroupId = UUID.fromString(requireNotNull(order.tradeGroupId))
+            fillEntryLocked(
+                EntryFillWriteRequest(
+                    entry = MarketEntryFillRequest(
+                        command = order.toPlaceOrderCommand(),
+                        fill = fill,
+                        positionId = positionId,
+                        tradeGroupId = tradeGroupId,
+                        stopOrderId = UUID.randomUUID(),
+                        source = event,
+                    ),
+                    entryOrderId = UUID.fromString(order.orderId),
+                    insertEntryOrder = false,
+                ),
+            )
+            progress.filledOrderIds += order.orderId
+            progress.executionIds += fill.executionId.toString()
+        }
+    }
+
+    private fun InMemoryPaperLedgerState.consumeLimitQueue(event: PaperMarketTradeEvent, order: Order): Boolean {
+        if (event.side != OrderSide.SELL) return false
+        if (event.priceJpy > requireNotNull(order.limitPriceJpy).toBigDecimal()) return false
+
+        val eligibility = requireNotNull(orderMarketEligibility[order.orderId])
+        val queueAhead = requireNotNull(eligibility.queueAheadBtc) { "LIMIT queue snapshot is unavailable." }
+        val consumed = orderQueueConsumedBtc
+            .getOrDefault(order.orderId, BigDecimal.ZERO)
+            .add(event.sizeBtc)
+            .btcScale()
+        orderQueueConsumedBtc[order.orderId] = consumed
+
+        return consumed >= queueAhead.add(order.sizeBtc.toBigDecimal())
+    }
+
+    private fun InMemoryPaperLedgerState.isEligibleForMarketEvent(
+        order: Order,
+        event: PaperMarketTradeEvent,
+    ): Boolean {
+        val eligibility = orderMarketEligibility[order.orderId] ?: return false
+        val belongsToCurrentSession = eligibility.sessionId == event.connectionSessionId
+        val isNewerSequence = eligibility.eligibleAfterSequence < event.sequence
+        val wasReceivedAfterCreation = event.receivedAt.isAfter(eligibility.eligibleFrom)
+
+        return belongsToCurrentSession && isNewerSequence && wasReceivedAfterCreation
+    }
+
     private fun InMemoryPaperLedgerState.fillEntryLocked(request: EntryFillWriteRequest): PaperTradeResult {
         val command = request.entry.command
         val fill = request.entry.fill
@@ -784,7 +949,9 @@ private class InMemoryPaperLedgerMutationWriter(
             existingPosition = existingPosition,
             existingPositionIndex = existingPositionIndex,
         )
-        executions += fill.toExecution(entryOrder.orderId, targetPositionId.toString(), command)
+        val execution = fill.toExecution(entryOrder.orderId, targetPositionId.toString(), command)
+        executions += execution
+        request.entry.source?.let { event -> executionMarketSources[execution.executionId] = event }
         accountSnapshot = accountSnapshot.afterBuyFill(fill)
         accountUpdatedAt = fill.executedAt
         appendFillEquitySnapshot(fill.executedAt)
@@ -823,6 +990,9 @@ private class InMemoryPaperLedgerMutationWriter(
 
             orders += stopOrder
             positions += position
+            request.entry.positionMarketEligibility?.let { eligibility ->
+                positionMarketEligibility[position.positionId] = eligibility
+            }
             decisionRunIdsByPositionId[position.positionId] = command.auditContext.decisionRunContext.decisionRunId
 
             return stopOrder.orderId
@@ -842,8 +1012,15 @@ private class InMemoryPaperLedgerMutationWriter(
     private fun InMemoryPaperLedgerState.triggerPositionProtectionsLocked(
         context: ReconcileMarketContext,
         progress: ReconcileProgress,
+        event: PaperMarketTradeEvent? = null,
     ) {
-        val openPositions = positions.filter { position -> position.status == PositionStatus.OPEN }
+        val openPositions = positions.filter { position ->
+            val eligibility = positionMarketEligibility[position.positionId]
+            val isEligibleForEvent = event == null || eligibility == null ||
+                eligibility.sessionId == event.connectionSessionId && eligibility.eligibleAfterSequence < event.sequence
+
+            position.status == PositionStatus.OPEN && isEligibleForEvent
+        }
 
         openPositions.forEach { position ->
             val stopPrice = position.currentStopLossJpy?.toBigDecimal()
@@ -858,12 +1035,13 @@ private class InMemoryPaperLedgerMutationWriter(
                     position.sizeBtc.toBigDecimal(),
                     stopPrice,
                     context.simulationContext,
-                )
+                ).withMarketEventTime(event)
                 val result = closePositionLocked(
                     positionId = position.positionId,
                     orderId = UUID.fromString(requireNotNull(stopOrder).orderId),
                     fill = fill,
                     reasonJa = "reconciler stop trigger",
+                    source = event,
                 )
 
                 markOrderStatusLocked(stopOrder.orderId, OrderStatus.FILLED)
@@ -888,12 +1066,13 @@ private class InMemoryPaperLedgerMutationWriter(
                     OrderSide.SELL,
                     position.sizeBtc.toBigDecimal(),
                     context.simulationContext,
-                )
+                ).withMarketEventTime(event)
                 val result = closePositionLocked(
                     positionId = position.positionId,
                     orderId = UUID.randomUUID(),
                     fill = fill,
                     reasonJa = VIRTUAL_TAKE_PROFIT_TRIGGER_REASON,
+                    source = event,
                 )
 
                 progress.closedPositionIds += position.positionId
@@ -1016,6 +1195,8 @@ private class InMemoryPaperLedgerMutationWriter(
             status = OrderStatus.FILLED,
             reasonJa = reasonJa,
         )
+        orderMarketEligibility.remove(orderId)
+        orderQueueConsumedBtc.remove(orderId)
     }
 
     private fun InMemoryPaperLedgerState.cancelOpenStopOrdersLocked(positionId: String, reasonJa: String) {
@@ -1143,6 +1324,19 @@ private fun InMemoryPaperLedgerState.toExecutionActivityRecord(execution: Execut
         order = orderContext,
         position = positionContext,
         entryDecision = decisionContext,
+        sourceEvidence = executionMarketSources[execution.executionId]?.toActivitySourceEvidence(),
+    )
+}
+
+private fun PaperMarketTradeEvent.toActivitySourceEvidence(): ExecutionActivitySourceEvidence {
+    return ExecutionActivitySourceEvidence(
+        sessionId = connectionSessionId.toString(),
+        sequence = sequence,
+        exchangeAt = exchangeAt.toString(),
+        receivedAt = receivedAt.toString(),
+        side = side.name,
+        priceJpy = priceJpy.moneyScale().toPlainString(),
+        sizeBtc = sizeBtc.btcScale().toPlainString(),
     )
 }
 
@@ -1345,6 +1539,10 @@ private fun SimulatedFill.toExecution(
         mode = TradingMode.PAPER,
         side = command.side,
     )
+}
+
+private fun SimulatedFill.withMarketEventTime(event: PaperMarketTradeEvent?): SimulatedFill {
+    return event?.let { marketEvent -> copy(executedAt = marketEvent.receivedAt) } ?: this
 }
 
 private fun SimulatedFill.toExecution(

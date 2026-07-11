@@ -84,7 +84,9 @@ import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -301,6 +303,25 @@ private const val SELECT_ORDERS_CLIENT_REQUEST_ID_INDEX_COUNT_SQL = """
     WHERE schemaname = current_schema()
         AND tablename = 'orders'
         AND indexname = 'idx_orders_client_request_id_unique'
+"""
+
+private const val SELECT_MARKET_DATA_CONNECTED_SESSION_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'market_data_sessions'
+        AND indexname = 'idx_market_data_sessions_connected_unique'
+"""
+
+private const val SELECT_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND indexname IN (
+            'idx_evaluation_exclusions_gap_entity_unique',
+            'idx_market_data_gaps_session_started',
+            'idx_evaluation_exclusions_entity'
+        )
 """
 
 /**
@@ -804,12 +825,76 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(2, selectCommandEventLogIndexCount(database))
         assertEquals(1, selectOrdersClientRequestIdIndexCount(database))
         assertEquals(1, selectOrdersActivityContextIndexCount(database))
+        assertEquals(1, selectMarketDataConnectedSessionIndexCount(database))
+        assertEquals(3, selectMarketDataIntegrityIndexCount(database))
         assertEquals(1, selectDecisionsInvocationIdIndexCount(database))
         assertEquals(3, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))
         assertEquals(1, selectRecentSafetyDenialIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
         assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
+    }
+
+    @Test
+    fun market_data_connected_session_is_unique_at_database_boundary() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        repository.beginSession(UUID.randomUUID(), fixedInstant()).getOrThrow()
+
+        val duplicateInsert = runCatching {
+            exposedTransaction(database) {
+                prepare(
+                    "INSERT INTO market_data_sessions (id, state, connected_at) VALUES (?, 'CONNECTED', ?)",
+                ).use { statement ->
+                    statement.setObject(1, UUID.randomUUID())
+                    statement.setLong(2, fixedInstant().plusSeconds(1).toEpochMilli())
+                    statement.executeUpdate()
+                }
+            }
+        }
+
+        assertTrue(duplicateInsert.isFailure)
+    }
+
+    @Test
+    fun evaluation_exclusion_is_unique_per_gap_and_entity_at_database_boundary() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        repository.markDisconnected(
+            sessionId = sessionId,
+            reason = MarketDataGapReason.DISCONNECTED,
+            detectedAt = fixedInstant().plusSeconds(1),
+        ).getOrThrow()
+        insertEvaluationExclusion(database, sessionId, "position-1")
+
+        val duplicateInsert = runCatching {
+            insertEvaluationExclusion(database, sessionId, "position-1")
+        }
+
+        assertTrue(duplicateInsert.isFailure)
+    }
+
+    @Test
+    fun reconciler_status_keeps_market_freshness_separate_from_maintenance_success() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        updateMarketDataSessionReceivedAt(database, sessionId, fixedInstant())
+
+        val beforeMaintenance = ExposedReconcilerStatusProvider(database).snapshot()
+
+        assertEquals(fixedInstant(), beforeMaintenance.lastMarketDataAt)
+        assertEquals(null, beforeMaintenance.lastReconciledAt)
+
+        val maintenanceAt = fixedInstant().plusSeconds(5)
+        repository.markMaintenanceSucceeded(sessionId, maintenanceAt).getOrThrow()
+        val afterMaintenance = ExposedReconcilerStatusProvider(database).snapshot()
+
+        assertEquals(fixedInstant(), afterMaintenance.lastMarketDataAt)
+        assertEquals(maintenanceAt, afterMaintenance.lastReconciledAt)
     }
 
     @Test
@@ -3293,10 +3378,10 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(LlmLaunchReservationOutcome.Reserved("reflection-run"), reflectionOutcome)
         assertEquals(false, reflectionOnlyRunning)
         assertEquals(LlmLaunchReservationOutcome.Reserved("trading-run"), tradingOutcome)
-        assertEquals(
-            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION),
-            reflectionBlockedOutcome,
-        )
+        val reflectionRejection = assertIs<LlmLaunchReservationOutcome.Rejected>(reflectionBlockedOutcome)
+        assertEquals(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION, reflectionRejection.reason)
+        assertEquals("reflection-run", reflectionRejection.activeReservation?.invocationId)
+        assertEquals(LlmDaemonTriggerKind.REFLECTION, reflectionRejection.activeReservation?.triggerKind)
     }
 
     @Test
@@ -4508,6 +4593,304 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun paper_market_event_cursor_queue_fill_and_gap_impact_are_atomic_in_postgres_path() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val integrityRepository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000163")
+        integrityRepository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val marketDataSource = MutablePostgresOrderbookMarketDataSource(
+            Orderbook(
+                symbol = "BTC",
+                bids = listOf(
+                    OrderbookLevel(price = "9990000", size = "0.0020"),
+                    OrderbookLevel(price = "9980000", size = "1.0000"),
+                ),
+                asks = listOf(OrderbookLevel(price = "10000000", size = "1.0000")),
+            ),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
+            requireRealtimeIntegrityForRestingOrders = true,
+            clock = fixedClock(),
+        )
+        broker.applyMarketEvent(paperTradeEvent(sessionId, 1, "0.0010", receivedAt = fixedInstant())).getOrThrow()
+        val command = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9990000"),
+                sizeBtc = BigDecimal("0.0050"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+        broker.placeOrder(command).getOrThrow()
+        broker.applyMarketEvent(paperTradeEvent(sessionId, 1, "1.0000", receivedAt = fixedInstant())).getOrThrow()
+        assertEquals(0, ledgerRepository.getExecutions().getOrThrow().size)
+
+        val first = paperTradeEvent(sessionId, 2, "0.0040")
+        val second = paperTradeEvent(sessionId, 3, "0.0030")
+        broker.applyMarketEvent(first).getOrThrow()
+        assertEquals(0, ledgerRepository.getExecutions().getOrThrow().size)
+
+        broker.applyMarketEvent(second).getOrThrow()
+        broker.applyMarketEvent(second).getOrThrow()
+        assertEquals(1, ledgerRepository.getExecutions().getOrThrow().size)
+        assertEquals(3, integrityRepository.snapshot().getOrThrow().lastProcessedSequence)
+
+        updateOrderDecisionRun(
+            database = database,
+            orderId = requireNotNull(ledgerRepository.getExecutions().getOrThrow().single().orderId),
+            decisionRunId = "run-entry-related-filled-buy",
+        )
+        updateOpenPositionDecisionRun(
+            database = database,
+            decisionRunId = "run-current-position",
+        )
+
+        integrityRepository.recordGap(
+            sessionId,
+            MarketDataGapReason.DISCONNECTED,
+            second.receivedAt.plusSeconds(1),
+        ).getOrThrow()
+        val exclusionSummary = ExposedEvaluationRepository(database).fetchExclusionSummary(
+            EvaluationPeriod(fixedInstant(), second.receivedAt.plusSeconds(2)),
+        ).getOrThrow()
+
+        assertEquals(1, exclusionSummary.positionCount)
+        assertEquals(2, exclusionSummary.decisionRunCount)
+        assertEquals(MarketDataGapReason.DISCONNECTED, integrityRepository.snapshot().getOrThrow().gapReason)
+    }
+
+    @Test
+    fun paper_market_events_trigger_buy_stop_then_virtual_take_profit_on_later_events() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000164")
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
+            requireRealtimeIntegrityForRestingOrders = true,
+            clock = fixedClock(),
+        )
+        broker.applyMarketEvent(paperTradeEvent(sessionId, 1, "0.0010", receivedAt = fixedInstant())).getOrThrow()
+        val command = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.STOP,
+                priceJpy = BigDecimal("10100000"),
+                sizeBtc = BigDecimal("0.0010"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+        val placeResult = broker.placeOrder(command).getOrThrow()
+        assertTrue(placeResult.accepted, placeResult.messageJa)
+
+        val entryEvent = paperTradeEvent(sessionId, 2, "0.0010", priceJpy = "10100000")
+        broker.applyMarketEvent(entryEvent).getOrThrow()
+        assertEquals(1, ledgerRepository.getExecutions().getOrThrow().size)
+
+        val takeProfitEvent = paperTradeEvent(sessionId, 3, "0.0010", priceJpy = "10500000")
+        broker.applyMarketEvent(takeProfitEvent).getOrThrow()
+        val executions = ledgerRepository.getExecutions().getOrThrow()
+
+        assertEquals(2, executions.size)
+        assertEquals(takeProfitEvent.receivedAt.toString(), executions.last().executedAt)
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+    }
+
+    @Test
+    fun recovered_split_gap_applies_impact_and_runtime_ttl_rejects_boundary_event() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000168")
+        val integrityRepository = ExposedMarketDataIntegrityRepository(database)
+        integrityRepository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = MutablePostgresOrderbookMarketDataSource(
+                Orderbook(
+                    symbol = "BTC",
+                    bids = listOf(OrderbookLevel(price = "9990000", size = "0.0010")),
+                    asks = listOf(OrderbookLevel(price = "10000000", size = "1.0000")),
+                ),
+            ),
+            reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
+            requireRealtimeIntegrityForRestingOrders = true,
+            restingEntryOrderTtl = Duration.ofSeconds(2),
+            clock = fixedClock(),
+        )
+        broker.applyMarketEvent(paperTradeEvent(sessionId, 1, "0.0010", receivedAt = fixedInstant())).getOrThrow()
+        broker.placeOrder(
+            approvedPostgresEntryCommand(
+                decisionRepository,
+                postgresEntryCommand(
+                    orderType = OrderType.LIMIT,
+                    priceJpy = BigDecimal("9990000"),
+                    sizeBtc = BigDecimal("0.0010"),
+                    takeProfitPriceJpy = BigDecimal("10500000"),
+                ),
+            ),
+        ).getOrThrow()
+
+        broker.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 2,
+                sizeBtc = "0.0020",
+                receivedAt = fixedInstant().plusSeconds(2),
+            ),
+        ).getOrThrow()
+        assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+        assertTrue(broker.getOpenOrders().getOrThrow().isEmpty())
+
+        integrityRepository.markDisconnected(
+            sessionId,
+            MarketDataGapReason.PROCESS_RESTART,
+            fixedInstant().plusSeconds(3),
+        ).getOrThrow()
+        integrityRepository.recoverStaleSession(fixedInstant().plusSeconds(4)).getOrThrow()
+
+        assertTrue(broker.getOpenOrders().getOrThrow().isEmpty())
+        assertEquals(MarketDataGapReason.PROCESS_RESTART, integrityRepository.snapshot().getOrThrow().gapReason)
+    }
+
+    @Test
+    fun paper_market_event_stops_synchronous_position_on_first_sequence() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000165")
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                protectiveStopPriceJpy = BigDecimal("9700000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+        broker.placeOrder(command).getOrThrow()
+
+        val bindingEvent = paperTradeEvent(sessionId, 1, "0.0010", priceJpy = "9700000")
+        broker.applyMarketEvent(bindingEvent).getOrThrow()
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(bindingEvent.receivedAt.toString(), ledgerRepository.getExecutions().getOrThrow().last().executedAt)
+    }
+
+    @Test
+    fun postgres_periodic_rest_maintenance_does_not_execute_virtual_take_profit_but_market_event_does() =
+        runPostgresTest {
+            TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+            val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000175")
+            ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+            val ledgerRepository = ExposedPaperLedgerRepository(database)
+            val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+            val broker = PaperBroker(
+                ledgerRepository = ledgerRepository,
+                riskStateRepository = ExposedRiskStateRepository(database),
+                decisionRepository = decisionRepository,
+                marketDataSource = PostgresFakeMarketDataSource,
+                clock = fixedClock(),
+            )
+            broker.placeOrder(
+                approvedPostgresEntryCommand(
+                    decisionRepository,
+                    postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+                ),
+            ).getOrThrow()
+
+            broker.maintainProtections(watermarkTickSnapshot("10600000")).getOrThrow()
+
+            assertEquals(1, broker.getPositions().getOrThrow().size)
+            assertEquals(1, ledgerRepository.getExecutions().getOrThrow().size)
+
+            broker.applyMarketEvent(
+                paperTradeEvent(
+                    sessionId = sessionId,
+                    sequence = 1,
+                    sizeBtc = "0.0010",
+                    priceJpy = "10400000",
+                ),
+            ).getOrThrow()
+
+            broker.applyMarketEvent(
+                paperTradeEvent(
+                    sessionId = sessionId,
+                    sequence = 2,
+                    sizeBtc = "0.0010",
+                    priceJpy = "10600000",
+                ),
+            ).getOrThrow()
+
+            assertTrue(broker.getPositions().getOrThrow().isEmpty())
+            assertEquals(2, ledgerRepository.getExecutions().getOrThrow().size)
+        }
+
+    @Test
+    fun paper_market_event_protects_existing_position_on_first_event_after_recovered_gap() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val firstSessionId = UUID.fromString("00000000-0000-0000-0000-000000000166")
+        val recoveredSessionId = UUID.fromString("00000000-0000-0000-0000-000000000167")
+        val integrityRepository = ExposedMarketDataIntegrityRepository(database)
+        integrityRepository.beginSession(firstSessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                protectiveStopPriceJpy = BigDecimal("9700000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+        broker.placeOrder(command).getOrThrow()
+        integrityRepository.recordGap(
+            firstSessionId,
+            MarketDataGapReason.DISCONNECTED,
+            fixedInstant().plusSeconds(1),
+        ).getOrThrow()
+        integrityRepository.beginSession(recoveredSessionId, fixedInstant().plusSeconds(2)).getOrThrow()
+
+        val recoveredEvent = paperTradeEvent(
+            sessionId = recoveredSessionId,
+            sequence = 1,
+            sizeBtc = "0.0010",
+            priceJpy = "9700000",
+            receivedAt = fixedInstant().plusSeconds(3),
+        )
+        broker.applyMarketEvent(recoveredEvent).getOrThrow()
+
+        assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(recoveredEvent.receivedAt.toString(), ledgerRepository.getExecutions().getOrThrow().last().executedAt)
+    }
+
+    @Test
     fun risk_state_command_service_rolls_back_when_audit_append_fails() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -5600,6 +5983,69 @@ private fun selectOrdersActivityContextIndexCount(database: ExposedDatabase): In
     }
 }
 
+/** CONNECTED market-data session unique index 件数を読む。 */
+private fun selectMarketDataConnectedSessionIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_MARKET_DATA_CONNECTED_SESSION_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "market-data connected session index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/** market-data integrity補助index件数を読む。 */
+private fun selectMarketDataIntegrityIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "market-data integrity index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+/** market-data event 受信時刻だけを更新する。 */
+private fun updateMarketDataSessionReceivedAt(
+    database: ExposedDatabase,
+    sessionId: UUID,
+    receivedAt: Instant,
+) {
+    exposedTransaction(database) {
+        prepare("UPDATE market_data_sessions SET last_received_at = ? WHERE id = ?").use { statement ->
+            statement.setLong(1, receivedAt.toEpochMilli())
+            statement.setObject(2, sessionId)
+            require(statement.executeUpdate() == 1) { "market-data session was not found." }
+        }
+    }
+}
+
+/** 指定sessionのgapへ評価除外を直接追加する。 */
+private fun insertEvaluationExclusion(
+    database: ExposedDatabase,
+    sessionId: UUID,
+    entityId: String,
+) {
+    exposedTransaction(database) {
+        prepare(
+            """
+                INSERT INTO evaluation_exclusions (id, gap_id, entity_type, entity_id, reason, created_at)
+                VALUES (?, (SELECT id FROM market_data_gaps WHERE session_id = ?), 'POSITION', ?, 'DISCONNECTED', ?)
+            """,
+        ).use { statement ->
+            statement.setObject(1, UUID.randomUUID())
+            statement.setObject(2, sessionId)
+            statement.setString(3, entityId)
+            statement.setLong(4, fixedInstant().toEpochMilli())
+            statement.executeUpdate()
+        }
+    }
+}
+
 /**
  * decisions invocation_id lookup index 件数を読む。
  */
@@ -6319,6 +6765,50 @@ private fun runtimeConfigDraftCreation(note: String): RuntimeConfigDraftCreation
  */
 private fun fixedInstant(): Instant {
     return Instant.parse("2026-07-02T00:00:00Z")
+}
+
+private fun paperTradeEvent(
+    sessionId: UUID,
+    sequence: Long,
+    sizeBtc: String,
+    priceJpy: String = "9990000",
+    receivedAt: Instant = fixedInstant().plusSeconds(sequence),
+): PaperMarketTradeEvent {
+    return PaperMarketTradeEvent(
+        symbol = TradingSymbol.BTC,
+        side = OrderSide.SELL,
+        priceJpy = BigDecimal(priceJpy),
+        sizeBtc = BigDecimal(sizeBtc),
+        exchangeAt = fixedInstant().plusSeconds(sequence),
+        receivedAt = receivedAt,
+        connectionSessionId = sessionId,
+        sequence = sequence,
+    )
+}
+
+/** filled entry と current position の decision run が異なる trade group を再現する。 */
+private fun updateOrderDecisionRun(
+    database: ExposedDatabase,
+    orderId: String,
+    decisionRunId: String,
+) {
+    exposedTransaction(database) {
+        prepare("UPDATE orders SET decision_run_id = ? WHERE id = ?").use { statement ->
+            statement.setString(1, decisionRunId)
+            statement.setObject(2, UUID.fromString(orderId))
+            require(statement.executeUpdate() == 1) { "filled entry order was not found." }
+        }
+    }
+}
+
+/** current position と先行 filled entry の decision run が異なる group を再現する。 */
+private fun updateOpenPositionDecisionRun(database: ExposedDatabase, decisionRunId: String) {
+    exposedTransaction(database) {
+        prepare("UPDATE positions SET decision_run_id = ? WHERE status = 'OPEN'").use { statement ->
+            statement.setString(1, decisionRunId)
+            require(statement.executeUpdate() == 1) { "open position was not found." }
+        }
+    }
 }
 
 /**

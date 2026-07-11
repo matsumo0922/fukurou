@@ -27,7 +27,9 @@ import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
 import me.matsumo.fukurou.trading.market.IndicatorType
+import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.NoReconcilerStatusProvider
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
@@ -106,6 +108,7 @@ class PaperBroker private constructor(
         paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
         fillSimulator: PaperExecutionSimulator? = null,
         reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
+        requireRealtimeIntegrityForRestingOrders: Boolean = false,
         clock: Clock = Clock.systemUTC(),
         tradingDateZone: ZoneId = TRADING_DATE_ZONE,
         warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(
@@ -135,6 +138,7 @@ class PaperBroker private constructor(
                     clock = clock,
                 ),
                 warnLogger = warnLogger,
+                requireRealtimeIntegrityForRestingOrders = requireRealtimeIntegrityForRestingOrders,
             ),
             time = PaperBrokerTimeConfig(
                 clock = clock,
@@ -188,6 +192,7 @@ private data class PaperBrokerMarketServices(
     val paperExecutionConfig: PaperExecutionConfig,
     val fillSimulator: PaperExecutionSimulator,
     val warnLogger: RateLimitedWarnLogger,
+    val requireRealtimeIntegrityForRestingOrders: Boolean,
 )
 
 /**
@@ -386,6 +391,7 @@ private class PaperBrokerTradeDelegate(
                         tradeGroupId = preparedOrder.tradeGroupId,
                         stopOrderId = UUID.randomUUID(),
                         divergenceMemo = immediateUpdate.divergenceMemo,
+                        positionMarketEligibility = currentPositionMarketEligibility(),
                     ),
                 )
             }
@@ -396,10 +402,89 @@ private class PaperBrokerTradeDelegate(
                 rules = preparedOrder.symbolRules,
             )
 
+            val marketEligibility = createRestingOrderMarketEligibility(preparedOrder.command)
+
             intentConsumer.createRestingEntryOrderAndConsumeIntent(
-                runtime.restingEntryOrderRequest(preparedOrder),
+                runtime.restingEntryOrderRequest(preparedOrder).copy(
+                    marketEligibility = marketEligibility,
+                ),
             )
         }
+    }
+
+    private suspend fun createRestingOrderMarketEligibility(
+        command: PlaceOrderCommand,
+    ): RestingOrderMarketEligibility? {
+        if (!runtime.market.requireRealtimeIntegrityForRestingOrders) return null
+
+        val before = runtime.reconcilerStatusProvider.snapshot()
+        require(before.marketDataState == MarketDataConnectionState.CONNECTED) {
+            "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session is not connected."
+        }
+        val sessionId = requireNotNull(before.marketDataSessionId) {
+            "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session is unavailable."
+        }
+        val now = Instant.now(runtime.time.clock)
+        val lastMarketDataAt = requireNotNull(before.lastMarketDataAt) {
+            "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session has not received an event."
+        }
+        require(!lastMarketDataAt.isAfter(now) && Duration.between(lastMarketDataAt, now) <= MARKET_DATA_FRESHNESS_WINDOW) {
+            "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session is stale."
+        }
+        val queueSnapshotAt = Instant.now(runtime.time.clock)
+        val queueAhead = if (command.orderType == OrderType.LIMIT) {
+            calculateQueueAhead(command)
+        } else {
+            null
+        }
+        val after = runtime.reconcilerStatusProvider.snapshot()
+        require(after.marketDataState == MarketDataConnectionState.CONNECTED && after.marketDataSessionId == sessionId) {
+            "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session changed during order creation."
+        }
+        val eligibleFrom = Instant.now(runtime.time.clock)
+
+        return RestingOrderMarketEligibility(
+            sessionId = sessionId,
+            eligibleAfterSequence = after.lastProcessedSequence,
+            eligibleFrom = eligibleFrom,
+            queueAheadBtc = queueAhead,
+            queueSnapshotAt = queueSnapshotAt.takeIf { command.orderType == OrderType.LIMIT },
+        )
+    }
+
+    private fun currentPositionMarketEligibility(): PositionMarketEligibility? {
+        val status = runtime.reconcilerStatusProvider.snapshot()
+        val sessionId = status.marketDataSessionId ?: return null
+        if (status.marketDataState != MarketDataConnectionState.CONNECTED) return null
+
+        return PositionMarketEligibility(sessionId, status.lastProcessedSequence)
+    }
+
+    private suspend fun calculateQueueAhead(command: PlaceOrderCommand): BigDecimal {
+        val limitPrice = requireNotNull(command.priceJpy)
+        val orderbook = requireNotNull(runtime.market.marketDataSource)
+            .getOrderbook(command.symbol, PAPER_EXECUTION_ORDERBOOK_DEPTH)
+            .getOrElse { throwable ->
+                throw IllegalStateException("QUEUE_SNAPSHOT_UNAVAILABLE: orderbook request failed.", throwable)
+            }
+        val bidPrices = orderbook.bids.mapNotNull { level -> level.price.toBigDecimalOrNull() }
+        val minimumCoveredBid = bidPrices.minOrNull()
+            ?: error("QUEUE_SNAPSHOT_UNAVAILABLE: orderbook has no valid bid depth.")
+        require(limitPrice >= minimumCoveredBid) {
+            "QUEUE_SNAPSHOT_UNAVAILABLE: limit price is outside returned bid depth."
+        }
+        val exchangeQueue = orderbook.bids
+            .filter { level -> level.price.toBigDecimalOrNull() == limitPrice }
+            .sumOf { level -> level.size.toBigDecimal() }
+        val ownQueue = runtime.stores.ledgerRepository.getOpenOrders().getOrThrow()
+            .filter { order ->
+                order.side == OrderSide.BUY &&
+                    order.orderType == OrderType.LIMIT &&
+                    order.limitPriceJpy?.toBigDecimalOrNull() == limitPrice
+            }
+            .sumOf { order -> order.sizeBtc.toBigDecimal() }
+
+        return exchangeQueue.add(ownQueue).btcScale()
     }
 
     private suspend fun immediateEntryUpdateOrNull(
@@ -682,6 +767,18 @@ private class PaperBrokerReconcileDelegate(
 ) : BrokerReconcileBoundary {
     private val safetyGate = PaperBrokerSafetyGate(runtime)
 
+    override suspend fun applyMarketEvent(event: PaperMarketTradeEvent): Result<PaperReconcileResult> {
+        return runCatching {
+            val result = runtime.stores.ledgerRepository
+                .applyMarketEvent(event, runtime.market.fillSimulator)
+                .getOrThrow()
+
+            safetyGate.activateHardHaltIfAccountDrawdownReached()
+
+            result
+        }
+    }
+
     override suspend fun reconcile(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
         return runCatching {
             val simulationContext = runtime.reconcileSimulationContext(tickSnapshot)
@@ -690,6 +787,25 @@ private class PaperBrokerReconcileDelegate(
                     tickSnapshot = tickSnapshot,
                     simulator = runtime.market.fillSimulator,
                     simulationContext = simulationContext,
+                    reconcileScope = PaperLedgerReconcileScope.FULL_TICK_EXECUTION,
+                )
+                .getOrThrow()
+
+            safetyGate.activateHardHaltIfAccountDrawdownReached()
+
+            result
+        }
+    }
+
+    override suspend fun maintainProtections(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
+        return runCatching {
+            val simulationContext = runtime.reconcileSimulationContext(tickSnapshot)
+            val result = runtime.stores.ledgerRepository
+                .reconcile(
+                    tickSnapshot = tickSnapshot,
+                    simulator = runtime.market.fillSimulator,
+                    simulationContext = simulationContext,
+                    reconcileScope = PaperLedgerReconcileScope.PERIODIC_MAINTENANCE,
                 )
                 .getOrThrow()
 
@@ -1589,6 +1705,9 @@ private val TRADING_DATE_ZONE = ZoneId.of("Asia/Tokyo")
  * ATR 算出に取得する 5分足本数。
  */
 private const val ATR_CANDLE_LIMIT = 64
+
+/** resting order 作成を許す market-data freshness window。 */
+private val MARKET_DATA_FRESHNESS_WINDOW: Duration = Duration.ofSeconds(30)
 
 /**
  * ATR の期間。

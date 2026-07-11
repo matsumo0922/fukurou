@@ -20,12 +20,20 @@ data class HealthResponse(
  * @param status 状態。準備完了は "ready"、未準備は "not_ready"
  * @param lastReconciledAt ProtectionReconciler が最後に pass を完了した時刻
  * @param lastMarketDataAt ProtectionReconciler が最後に market data を見た時刻
+ * @param marketDataState realtime market-data 接続状態
+ * @param gapStartedAt active または直近 gap の開始時刻
+ * @param recoveredAt gap 復旧後の最初の realtime event 時刻
+ * @param gapReason gap 理由
  */
 @Serializable
 data class ReadinessResponse(
     val status: String,
     val lastReconciledAt: String? = null,
     val lastMarketDataAt: String? = null,
+    val marketDataState: String = "DISCONNECTED",
+    val gapStartedAt: String? = null,
+    val recoveredAt: String? = null,
+    val gapReason: String? = null,
 )
 
 /**

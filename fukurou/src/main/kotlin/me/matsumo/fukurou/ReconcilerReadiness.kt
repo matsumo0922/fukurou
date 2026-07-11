@@ -1,5 +1,6 @@
 package me.matsumo.fukurou
 
+import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
 import java.time.Clock
 import java.time.Duration
@@ -39,7 +40,10 @@ class ReconcilerFreshnessReadinessProbe(
         val reconcilerFreshEnough = lastReconciledAt.isFreshEnough(now, staleAfter)
         val marketDataFreshEnough = lastMarketDataAt.isFreshEnough(now, staleAfter)
 
-        return status.startupFullReconcileCompleted && reconcilerFreshEnough && marketDataFreshEnough
+        val connected = status.marketDataState == MarketDataConnectionState.CONNECTED
+        val activeGap = status.gapStartedAt != null && status.recoveredAt == null
+
+        return status.startupRecoveryCompleted && connected && !activeGap && reconcilerFreshEnough && marketDataFreshEnough
     }
 }
 

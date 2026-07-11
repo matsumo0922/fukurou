@@ -18,6 +18,15 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
+import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
+import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
+import me.matsumo.fukurou.trading.market.MarketDataGapReason
+import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
+import me.matsumo.fukurou.trading.market.MarketDataMessageStaleException
+import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
+import me.matsumo.fukurou.trading.market.MarketEventStream
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
+import me.matsumo.fukurou.trading.market.UnavailableMarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -25,6 +34,7 @@ import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.util.UUID
 import java.util.logging.Logger
 import kotlin.time.DurationUnit
 import kotlin.time.toDuration
@@ -33,6 +43,9 @@ import kotlin.time.toDuration
  * ProtectionReconciler の lock owner 名。
  */
 private const val RECONCILER_LOCK_OWNER = "protection-reconciler"
+
+/** market event 適用時の global lock owner 名。 */
+private const val MARKET_EVENT_LOCK_OWNER = "paper-market-event"
 
 /**
  * worker 起動 audit の payload。
@@ -68,6 +81,9 @@ private val RECONCILER_LOGGER = Logger.getLogger(ProtectionReconciler::class.jav
  * Reconciler が HARD_HALT 掃引を実行する理由。
  */
 private const val HARD_HALT_SWEEP_REASON = "ProtectionReconciler HARD_HALT sweep"
+
+/** gap 永続化失敗時に fail-closed のまま再試行する間隔。 */
+private val DEFAULT_GAP_RETRY_BACKOFF = Duration.ofSeconds(2)
 
 /**
  * ProtectionReconciler の pass 種別。
@@ -105,6 +121,9 @@ class ProtectionReconciler(
     private val commandEventLog: CommandEventLog,
     private val tradingLock: TradingLock,
     private val tickStream: TickStream = EmptyTickStream,
+    private val marketEventStream: MarketEventStream? = null,
+    private val marketDataIntegrityRepository: MarketDataIntegrityRepository =
+        UnavailableMarketDataIntegrityRepository,
     private val broker: Broker? = null,
     private val killCriterionEvaluator: KillCriterionEvaluator? = null,
     private val equitySnapshotRecorder: EquitySnapshotRecorder? = null,
@@ -130,6 +149,11 @@ class ProtectionReconciler(
             )
         }
 
+        if (marketEventStream != null) {
+            runMarketEventLoop(interval)
+            return
+        }
+
         while (currentCoroutineContext().isActive) {
             val startupResult = reconcileOnce(ReconcilePassKind.STARTUP_FULL)
 
@@ -153,6 +177,248 @@ class ProtectionReconciler(
                 logPassFailure(ReconcilePassKind.LOOP, throwable)
             }
         }
+    }
+
+    private suspend fun runMarketEventLoop(maintenanceInterval: Duration) {
+        val reconnectBackoff = requireNotNull(marketEventStream).reconnectBackoff
+        while (currentCoroutineContext().isActive) {
+            val session = marketEventStream.connect().getOrElse { throwable ->
+                logPassFailure(ReconcilePassKind.LOOP, throwable)
+                delay(reconnectBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
+                continue
+            }
+
+            val beginResult = marketDataIntegrityRepository.beginSession(session.sessionId, session.connectedAt)
+            if (beginResult.isFailure) {
+                session.close()
+                beginResult.exceptionOrNull()?.let { throwable -> logPassFailure(ReconcilePassKind.LOOP, throwable) }
+                delay(reconnectBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
+                continue
+            }
+            refreshMarketDataStatus()
+
+            try {
+                consumeMarketEventSession(session, maintenanceInterval)
+            } finally {
+                session.close()
+            }
+
+            delay(reconnectBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
+        }
+    }
+
+    private suspend fun consumeMarketEventSession(
+        session: me.matsumo.fukurou.trading.market.MarketEventSession,
+        maintenanceInterval: Duration,
+    ) {
+        var nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
+        var lastReceivedAt = session.connectedAt
+        val messageStaleTimeout = requireNotNull(marketEventStream).messageStaleTimeout
+
+        while (currentCoroutineContext().isActive) {
+            val maintenanceWaitMillis = remainingWaitMillis(nextMaintenanceAtNanos)
+            val staleWaitMillis = remainingStaleWaitMillis(lastReceivedAt, messageStaleTimeout)
+            val eventResult = kotlinx.coroutines.withTimeoutOrNull(
+                minOf(maintenanceWaitMillis, staleWaitMillis),
+            ) {
+                session.receive()
+            }
+            if (eventResult == null) {
+                if (lastReceivedAt.isMarketDataStale(Instant.now(clock), messageStaleTimeout)) {
+                    recordMarketDataGap(
+                        sessionId = session.sessionId,
+                        throwable = MarketDataMessageStaleException("GMO WebSocket trade message became stale."),
+                    )
+                    refreshMarketDataStatus()
+                    return
+                }
+
+                runPeriodicSafetyMaintenance(session.sessionId)
+                nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
+                continue
+            }
+            val event = eventResult.getOrNull()
+
+            if (event == null) {
+                recordMarketDataGap(
+                    sessionId = session.sessionId,
+                    throwable = eventResult.exceptionOrNull(),
+                )
+                refreshMarketDataStatus()
+                return
+            }
+
+            lastReceivedAt = event.receivedAt
+
+            val applied = applyMarketEvent(event)
+            if (applied.isFailure) {
+                recordMarketDataGap(
+                    sessionId = session.sessionId,
+                    throwable = applied.exceptionOrNull(),
+                )
+                refreshMarketDataStatus()
+                return
+            }
+
+            if (System.nanoTime() >= nextMaintenanceAtNanos) {
+                runPeriodicSafetyMaintenance(session.sessionId)
+                nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
+            }
+        }
+    }
+
+    /** realtime event の量によらず periodic maintenance を rate limit する次回期限を返す。 */
+    private fun nextMaintenanceAtNanos(maintenanceInterval: Duration): Long {
+        require(!maintenanceInterval.isNegative && !maintenanceInterval.isZero) {
+            "maintenanceInterval must be positive."
+        }
+
+        return System.nanoTime() + maintenanceInterval.toNanos()
+    }
+
+    /** 指定期限まで event を待機できるミリ秒を返す。 */
+    private fun remainingWaitMillis(deadlineAtNanos: Long): Long {
+        val remainingNanos = (deadlineAtNanos - System.nanoTime()).coerceAtLeast(0)
+
+        return ((remainingNanos + 999_999) / 1_000_000).coerceAtLeast(1)
+    }
+
+    /** 最後のevent受信時刻からstale期限までの待機ミリ秒を返す。 */
+    private fun remainingStaleWaitMillis(lastReceivedAt: Instant, staleTimeout: Duration): Long {
+        val staleAt = lastReceivedAt.plus(staleTimeout)
+        val remaining = Duration.between(Instant.now(clock), staleAt)
+        if (remaining.isNegative || remaining.isZero) return 1
+
+        return ((remaining.toNanos() + 999_999) / 1_000_000).coerceAtLeast(1)
+    }
+
+    private suspend fun recordMarketDataGap(sessionId: UUID, throwable: Throwable?) {
+        val reason = throwable.toGapReason()
+        val detectedAt = Instant.now(clock)
+
+        markMarketDataUnavailable(sessionId, reason, detectedAt)
+        while (currentCoroutineContext().isActive) {
+            val result = runCatching {
+                marketDataIntegrityRepository.markDisconnected(
+                    sessionId = sessionId,
+                    reason = reason,
+                    detectedAt = detectedAt,
+                    detail = throwable.toMarketDataGapDetail(),
+                ).getOrThrow()
+
+                tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
+                    marketDataIntegrityRepository.applyGapImpact(
+                        sessionId = sessionId,
+                        reason = reason,
+                        detectedAt = detectedAt,
+                    ).getOrThrow()
+                }
+            }
+            if (result.isSuccess) {
+                refreshMarketDataStatus()
+                return
+            }
+
+            result.exceptionOrNull()?.let { failure -> logPassFailure(ReconcilePassKind.LOOP, failure) }
+            val retryBackoff = marketEventStream?.reconnectBackoff ?: DEFAULT_GAP_RETRY_BACKOFF
+            delay(retryBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
+        }
+    }
+
+    private suspend fun applyMarketEvent(event: PaperMarketTradeEvent): Result<Unit> {
+        return try {
+            tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
+                broker?.applyMarketEvent(event)?.getOrThrow()
+            }
+            refreshMarketDataStatus()
+            Result.success(Unit)
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            Result.failure(throwable)
+        }
+    }
+
+    /** REST は約定根拠にせず、定期的な safety / evaluation 保守だけに使う。 */
+    private suspend fun runPeriodicSafetyMaintenance(sessionId: UUID): Result<Unit> {
+        return try {
+            tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
+                runPeriodicSafetyMaintenanceLocked()
+            }
+            recordPeriodicMaintenanceRecovery().getOrThrow()
+            marketDataIntegrityRepository.markMaintenanceSucceeded(sessionId, Instant.now(clock)).getOrThrow()
+
+            Result.success(Unit)
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            recordPeriodicMaintenanceFailure(throwable)
+
+            Result.failure(throwable)
+        }
+    }
+
+    /** periodic maintenance の失敗を loop failure と同じ監査・ログ規約で残す。 */
+    private suspend fun recordPeriodicMaintenanceFailure(throwable: Throwable) {
+        val auditResult = recordFailureTransition(ReconcilePassKind.LOOP, throwable)
+        if (auditResult.isSuccess) {
+            previousPassFailed = true
+        } else {
+            auditResult.exceptionOrNull()?.let(throwable::addSuppressed)
+        }
+
+        logPassFailure(ReconcilePassKind.LOOP, throwable)
+    }
+
+    /** periodic maintenance が成功したときに、直前の failure episode を監査上も閉じる。 */
+    private suspend fun recordPeriodicMaintenanceRecovery(): Result<Unit> {
+        return recordFailureRecovery(Instant.now(clock))
+    }
+
+    private suspend fun runPeriodicSafetyMaintenanceLocked() {
+        val tickSnapshot = readTickSnapshot()
+        if (tickSnapshot != null) {
+            broker?.maintainProtections(tickSnapshot)?.getOrThrow()
+            val swept = enforceHardHaltSweepIfNeeded(tickSnapshot)
+            if (!swept) {
+                killCriterionEvaluator?.evaluate(tickSnapshot)?.getOrThrow()
+            }
+        }
+        equitySnapshotRecorder?.recordDailyIfNeeded()
+    }
+
+    private fun markMarketDataUnavailable(
+        sessionId: UUID,
+        reason: MarketDataGapReason,
+        detectedAt: Instant,
+    ) {
+        val current = status.snapshot()
+        status.updateMarketData(
+            current.copy(
+                marketDataState = me.matsumo.fukurou.trading.market.MarketDataConnectionState.DISCONNECTED,
+                marketDataSessionId = sessionId,
+                gapStartedAt = detectedAt,
+                gapReason = reason,
+            ),
+        )
+    }
+
+    private suspend fun refreshMarketDataStatus() {
+        val integrity = marketDataIntegrityRepository.snapshot().getOrThrow()
+        status.updateMarketData(
+            ReconcilerStatus(
+                lastReconciledAt = integrity.lastMaintenanceAt,
+                startupFullReconcileCompleted = integrity.startupRecoveryCompleted,
+                lastMarketDataAt = integrity.lastReceivedAt,
+                marketDataState = integrity.state,
+                marketDataSessionId = integrity.sessionId,
+                lastProcessedSequence = integrity.lastProcessedSequence,
+                gapStartedAt = integrity.gapStartedAt,
+                recoveredAt = integrity.recoveredAt,
+                gapReason = integrity.gapReason,
+                startupRecoveryCompleted = integrity.startupRecoveryCompleted,
+            ),
+        )
     }
 
     /**
@@ -324,16 +590,28 @@ class ProtectionReconciler(
             return completedResult
         }
 
-        val shouldRecordRecovery = previousPassFailed && passKind != ReconcilePassKind.STARTUP_FULL
-        if (!shouldRecordRecovery) {
+        return if (passKind == ReconcilePassKind.STARTUP_FULL) {
+            Result.success(Unit)
+        } else {
+            recordFailureRecovery(reconciledAt)
+        }
+    }
+
+    private suspend fun recordFailureRecovery(recoveredAt: Instant): Result<Unit> {
+        if (!previousPassFailed) {
             return Result.success(Unit)
         }
 
-        return appendReconcilerEvent(
+        val recoveryResult = appendReconcilerEvent(
             eventType = CommandEventType.RECONCILER_PASS_RECOVERED,
             payload = LOOP_RECOVERED_PAYLOAD,
-            occurredAt = reconciledAt,
+            occurredAt = recoveredAt,
         )
+        if (recoveryResult.isSuccess) {
+            previousPassFailed = false
+        }
+
+        return recoveryResult
     }
 
     private suspend fun recordFailureTransition(passKind: ReconcilePassKind, throwable: Throwable): Result<Unit> {
@@ -419,4 +697,34 @@ private fun ReconcilePassKind.payloadName(): String {
         ReconcilePassKind.STARTUP_FULL -> "startup_full"
         ReconcilePassKind.LOOP -> "loop"
     }
+}
+
+private fun Throwable?.toGapReason(): MarketDataGapReason {
+    return when {
+        this is MarketDataMessageStaleException -> MarketDataGapReason.MESSAGE_STALE
+        this is InvalidMarketDataMessageException -> MarketDataGapReason.INVALID_MESSAGE
+        this?.message.orEmpty().contains("sequence gap", ignoreCase = true) -> MarketDataGapReason.SEQUENCE_GAP
+        this is java.sql.SQLException -> MarketDataGapReason.DATABASE_FAILURE
+        else -> MarketDataGapReason.DISCONNECTED
+    }
+}
+
+private fun Throwable?.toMarketDataGapDetail(): String? {
+    this ?: return null
+
+    return when (this) {
+        is InvalidMarketDataMessageException,
+        is MarketDataBackpressureException,
+        is MarketDataSubscriptionException,
+        is MarketDataMessageStaleException,
+        -> "${javaClass.simpleName}: ${message.orEmpty()}"
+
+        else -> javaClass.simpleName
+    }
+}
+
+private fun Instant.isMarketDataStale(now: Instant, staleTimeout: Duration): Boolean {
+    if (isAfter(now)) return false
+
+    return Duration.between(this, now) >= staleTimeout
 }

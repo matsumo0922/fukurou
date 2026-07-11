@@ -1,6 +1,9 @@
 package me.matsumo.fukurou.trading.reconciler
 
+import me.matsumo.fukurou.trading.market.MarketDataConnectionState
+import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import java.time.Instant
+import java.util.UUID
 
 /**
  * ProtectionReconciler の現在状態。
@@ -13,6 +16,13 @@ data class ReconcilerStatus(
     val lastReconciledAt: Instant? = null,
     val startupFullReconcileCompleted: Boolean = false,
     val lastMarketDataAt: Instant? = null,
+    val marketDataState: MarketDataConnectionState = MarketDataConnectionState.DISCONNECTED,
+    val marketDataSessionId: UUID? = null,
+    val lastProcessedSequence: Long = 0,
+    val gapStartedAt: Instant? = null,
+    val recoveredAt: Instant? = null,
+    val gapReason: MarketDataGapReason? = null,
+    val startupRecoveryCompleted: Boolean = false,
 )
 
 /**
@@ -50,6 +60,11 @@ class MutableReconcilerStatus : ReconcilerStatusProvider {
             startupFullReconcileCompleted = currentStatus.startupFullReconcileCompleted || startupFullReconcileCompleted,
             lastMarketDataAt = lastMarketDataAt ?: currentStatus.lastMarketDataAt,
         )
+    }
+
+    /** 永続 market-data integrity 状態を反映する。 */
+    fun updateMarketData(status: ReconcilerStatus) {
+        currentStatus = status
     }
 }
 

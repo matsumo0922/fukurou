@@ -637,6 +637,30 @@ object RuntimeConfigCatalog {
                     effectiveValue = config.gmoPublicClient.symbolRulesCacheTtl.seconds.toString(),
                     unit = "seconds",
                 ),
+                runtimeItem(
+                    key = "gmoPublic.websocketConnectTimeout",
+                    legacyEnvName = FUKUROU_GMO_WEBSOCKET_CONNECT_TIMEOUT_MS_ENV,
+                    valueType = RuntimeConfigValueType.INT,
+                    defaultValue = defaults.config.gmoPublicWebSocket.connectTimeout.toMillis().toString(),
+                    effectiveValue = config.gmoPublicWebSocket.connectTimeout.toMillis().toString(),
+                    unit = "milliseconds",
+                ),
+                runtimeItem(
+                    key = "gmoPublic.websocketStaleTimeout",
+                    legacyEnvName = FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS_ENV,
+                    valueType = RuntimeConfigValueType.DURATION_SECONDS,
+                    defaultValue = defaults.config.gmoPublicWebSocket.messageStaleTimeout.seconds.toString(),
+                    effectiveValue = config.gmoPublicWebSocket.messageStaleTimeout.seconds.toString(),
+                    unit = "seconds",
+                ),
+                runtimeItem(
+                    key = "gmoPublic.websocketReconnectBackoff",
+                    legacyEnvName = FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS_ENV,
+                    valueType = RuntimeConfigValueType.INT,
+                    defaultValue = defaults.config.gmoPublicWebSocket.reconnectBackoff.toMillis().toString(),
+                    effectiveValue = config.gmoPublicWebSocket.reconnectBackoff.toMillis().toString(),
+                    unit = "milliseconds",
+                ),
             ).map { item -> item.withCurrentValue(environment) },
         )
     }
@@ -675,6 +699,14 @@ object RuntimeConfigCatalog {
                     valueType = RuntimeConfigValueType.URL,
                     defaultValue = defaults.config.gmoPublicClient.baseUrl,
                     effectiveValue = config.gmoPublicClient.baseUrl,
+                    unit = null,
+                ),
+                deploymentItem(
+                    key = "gmoPublic.websocketUrl",
+                    legacyEnvName = FUKUROU_GMO_PUBLIC_WEBSOCKET_URL_ENV,
+                    valueType = RuntimeConfigValueType.URL,
+                    defaultValue = defaults.config.gmoPublicWebSocket.endpoint,
+                    effectiveValue = config.gmoPublicWebSocket.endpoint,
                     unit = null,
                 ),
                 deploymentItem(
@@ -1229,6 +1261,11 @@ private const val FUKUROU_GMO_RETRY_BACKOFF_MULTIPLIER_ENV = "FUKUROU_GMO_RETRY_
 private const val FUKUROU_GMO_CONNECT_TIMEOUT_MS_ENV = "FUKUROU_GMO_CONNECT_TIMEOUT_MS"
 private const val FUKUROU_GMO_REQUEST_TIMEOUT_MS_ENV = "FUKUROU_GMO_REQUEST_TIMEOUT_MS"
 private const val FUKUROU_GMO_SYMBOL_RULES_CACHE_TTL_SECONDS_ENV = "FUKUROU_GMO_SYMBOL_RULES_CACHE_TTL_SECONDS"
+private const val FUKUROU_GMO_PUBLIC_WEBSOCKET_URL_ENV = "FUKUROU_GMO_PUBLIC_WEBSOCKET_URL"
+private const val FUKUROU_GMO_WEBSOCKET_CONNECT_TIMEOUT_MS_ENV = "FUKUROU_GMO_WEBSOCKET_CONNECT_TIMEOUT_MS"
+private const val FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS_ENV =
+    "FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS"
+private const val FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS_ENV = "FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS"
 private const val FUKUROU_REPOSITORY_ROOT_ENV = "FUKUROU_REPOSITORY_ROOT"
 private const val FUKUROU_LLM_WORKING_DIRECTORY_ENV = "FUKUROU_LLM_WORKING_DIRECTORY"
 private const val FUKUROU_CLAUDE_COMMAND_TEMPLATE_ENV = "FUKUROU_CLAUDE_COMMAND_TEMPLATE"

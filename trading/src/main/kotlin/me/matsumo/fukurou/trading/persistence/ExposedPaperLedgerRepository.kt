@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.broker.ExecutionActivityDecisionContext
 import me.matsumo.fukurou.trading.broker.ExecutionActivityOrderContext
 import me.matsumo.fukurou.trading.broker.ExecutionActivityPositionContext
 import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
+import me.matsumo.fukurou.trading.broker.ExecutionActivitySourceEvidence
 import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
@@ -618,6 +619,14 @@ private const val SELECT_EXECUTION_ACTIVITIES_FOR_STABLE_FEED_SQL_PREFIX = """
         e.realized_pnl_jpy AS execution_realized_pnl_jpy,
         e.liquidity AS execution_liquidity,
         e.executed_at AS execution_executed_at,
+        e.source_session_id AS execution_source_session_id,
+        e.source_sequence AS execution_source_sequence,
+        e.source_exchange_at AS execution_source_exchange_at,
+        e.source_received_at AS execution_source_received_at,
+        e.source_side AS execution_source_side,
+        e.source_price_jpy AS execution_source_price_jpy,
+        e.source_size_btc AS execution_source_size_btc,
+        exclusion.reason AS evaluation_exclusion_reason,
         direct_order.id AS context_order_id,
         direct_order.order_type AS context_order_type,
         direct_order.trigger_price_jpy AS context_trigger_price_jpy,
@@ -675,6 +684,14 @@ private const val SELECT_EXECUTION_ACTIVITIES_FOR_STABLE_FEED_SQL_PREFIX = """
         ORDER BY decisions.created_at DESC
         LIMIT 1
     ) entry_decision ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT evaluation_exclusions.reason
+        FROM evaluation_exclusions
+        WHERE evaluation_exclusions.entity_type = 'POSITION'
+            AND evaluation_exclusions.entity_id = COALESCE(linked_position.id, e.position_id)::text
+        ORDER BY evaluation_exclusions.created_at ASC
+        LIMIT 1
+    ) exclusion ON TRUE
     WHERE e.mode = (
         SELECT mode
         FROM paper_account
@@ -1391,6 +1408,22 @@ private fun ResultSet.toExecutionActivityRecord(): ExecutionActivityRecord {
         order = toExecutionActivityOrderContext(),
         position = toExecutionActivityPositionContext(),
         entryDecision = toExecutionActivityDecisionContext(),
+        sourceEvidence = toExecutionActivitySourceEvidence(),
+        evaluationExclusionReason = getString("evaluation_exclusion_reason"),
+    )
+}
+
+private fun ResultSet.toExecutionActivitySourceEvidence(): ExecutionActivitySourceEvidence? {
+    val sessionId = getObject("execution_source_session_id")?.toString() ?: return null
+
+    return ExecutionActivitySourceEvidence(
+        sessionId = sessionId,
+        sequence = getLong("execution_source_sequence"),
+        exchangeAt = getInstant("execution_source_exchange_at").toString(),
+        receivedAt = getInstant("execution_source_received_at").toString(),
+        side = getString("execution_source_side"),
+        priceJpy = getBigDecimal("execution_source_price_jpy").toPlainString(),
+        sizeBtc = getBigDecimal("execution_source_size_btc").toPlainString(),
     )
 }
 

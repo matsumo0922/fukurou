@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
@@ -118,12 +119,27 @@ interface PaperLedgerOrderRepository {
  * @param order 直接紐づく order context
  * @param position 約定または order から解決した position context
  * @param entryDecision 同じ position / trade group の entry decision context
+ * @param sourceEvidence realtime market event の約定根拠
+ * @param evaluationExclusionReason infrastructure failure による評価除外理由
  */
 data class ExecutionActivityRecord(
     val execution: Execution,
     val order: ExecutionActivityOrderContext?,
     val position: ExecutionActivityPositionContext?,
     val entryDecision: ExecutionActivityDecisionContext?,
+    val sourceEvidence: ExecutionActivitySourceEvidence? = null,
+    val evaluationExclusionReason: String? = null,
+)
+
+/** Activity に表示する realtime execution source evidence。 */
+data class ExecutionActivitySourceEvidence(
+    val sessionId: String,
+    val sequence: Long,
+    val exchangeAt: String,
+    val receivedAt: String,
+    val side: String,
+    val priceJpy: String,
+    val sizeBtc: String,
 )
 
 /**
@@ -223,13 +239,37 @@ interface PaperLedgerMutationRepository {
     suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult>
 
     /**
-     * tick をもとに resting order / protection を決定的に前進させる。
+     * tick をもとに paper ledger を保守する。
+     *
+     * [reconcileScope] が [PaperLedgerReconcileScope.PERIODIC_MAINTENANCE] の場合、REST tick は
+     * mark、ATR trailing、resting entry の期限処理だけに使う。resting entry、protective STOP、
+     * virtual TP の execution は realtime market event からのみ発生する。
      */
     suspend fun reconcile(
         tickSnapshot: TickSnapshot,
         simulator: PaperExecutionSimulator,
         simulationContext: PaperSimulationContext? = null,
+        reconcileScope: PaperLedgerReconcileScope = PaperLedgerReconcileScope.FULL_TICK_EXECUTION,
     ): Result<PaperReconcileResult>
+
+    /**
+     * realtime market event と session cursor を同一 transaction で ledger に適用する。
+     */
+    suspend fun applyMarketEvent(
+        event: PaperMarketTradeEvent,
+        simulator: PaperExecutionSimulator,
+    ): Result<PaperReconcileResult>
+}
+
+/**
+ * tick による paper ledger 保守で許可する execution の範囲。
+ */
+enum class PaperLedgerReconcileScope {
+    /** 既存の同期 tick reconcile。entry と protection execution を許可する。 */
+    FULL_TICK_EXECUTION,
+
+    /** REST periodic maintenance。市場 execution は一切許可しない。 */
+    PERIODIC_MAINTENANCE,
 }
 
 /**
@@ -278,6 +318,14 @@ data class MarketEntryFillRequest(
     val tradeGroupId: UUID,
     val stopOrderId: UUID,
     val divergenceMemo: PaperExecutionDivergenceMemo? = null,
+    val source: PaperMarketTradeEvent? = null,
+    val positionMarketEligibility: PositionMarketEligibility? = null,
+)
+
+/** 同期 entry position が次の realtime event から保護を受けるための境界。 */
+data class PositionMarketEligibility(
+    val sessionId: UUID,
+    val eligibleAfterSequence: Long,
 )
 
 /**
@@ -299,6 +347,24 @@ data class RestingEntryOrderRequest(
     val expiresAt: Instant,
     val expirySource: OrderExpirySource,
     val effectiveTtlSeconds: Long,
+    val marketEligibility: RestingOrderMarketEligibility? = null,
+)
+
+/**
+ * resting order が realtime event を受理するための永続境界。
+ *
+ * @param sessionId 作成時の WebSocket session
+ * @param eligibleAfterSequence 作成時点の処理済み sequence
+ * @param eligibleFrom 作成時刻。同一時刻 event は不適格
+ * @param queueAheadBtc LIMIT の先行 queue 数量。STOP は null
+ * @param queueSnapshotAt LIMIT queue snapshot 時刻。STOP は null
+ */
+data class RestingOrderMarketEligibility(
+    val sessionId: UUID,
+    val eligibleAfterSequence: Long,
+    val eligibleFrom: Instant,
+    val queueAheadBtc: BigDecimal? = null,
+    val queueSnapshotAt: Instant? = null,
 )
 
 /**

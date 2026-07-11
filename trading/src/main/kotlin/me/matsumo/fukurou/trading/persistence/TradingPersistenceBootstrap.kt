@@ -281,6 +281,31 @@ private const val ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL = """
         AND trade_group_id IS NOT NULL
 """
 
+/** CONNECTED market-data session を一意にする partial unique index を作る SQL。 */
+private const val ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_market_data_sessions_connected_unique
+    ON market_data_sessions (state)
+    WHERE state = 'CONNECTED'
+"""
+
+/** evaluation exclusion の重複を防ぐ unique index を作る SQL。 */
+private const val ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluation_exclusions_gap_entity_unique
+    ON evaluation_exclusions (gap_id, entity_type, entity_id)
+"""
+
+/** market-data gap の session lookup index を作る SQL。 */
+private const val ENSURE_MARKET_DATA_GAPS_SESSION_STARTED_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_market_data_gaps_session_started
+    ON market_data_gaps (session_id, started_at DESC)
+"""
+
+/** evaluation exclusion の entity lookup index を作る SQL。 */
+private const val ENSURE_EVALUATION_EXCLUSIONS_ENTITY_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_evaluation_exclusions_entity
+    ON evaluation_exclusions (entity_type, entity_id)
+"""
+
 /**
  * Activity execution context join 用の decision lookup index を作る SQL。
  */
@@ -421,6 +446,29 @@ private const val VERIFY_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL = """
         AND indexname = 'idx_orders_activity_context_entry'
 """
 
+/** CONNECTED market-data session の partial unique index 存在を確認する SQL。 */
+private const val VERIFY_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'market_data_sessions'
+        AND indexname = 'idx_market_data_sessions_connected_unique'
+"""
+
+/** market-data integrity 補助indexの存在を確認するSQL。 */
+private const val VERIFY_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND indexname IN (
+            'idx_evaluation_exclusions_gap_entity_unique',
+            'idx_market_data_gaps_session_started',
+            'idx_evaluation_exclusions_entity'
+        )
+    GROUP BY schemaname
+    HAVING COUNT(*) = 3
+"""
+
 /**
  * Activity execution context join 用 decision lookup index 存在を確認する SQL。
  */
@@ -543,6 +591,8 @@ private const val VERIFY_POSITIONS_SCHEMA_SQL = """
         prompt_hash,
         system_prompt_version,
         market_snapshot_id
+        ,market_data_session_id
+        ,market_eligible_after_sequence
     FROM positions
     LIMIT 0
 """
@@ -582,6 +632,12 @@ private const val VERIFY_ORDERS_SCHEMA_SQL = """
         canceled_at,
         cancel_reason,
         canceled_by_decision_run_id,
+        queue_ahead_btc,
+        queue_consumed_btc,
+        queue_snapshot_at,
+        market_data_session_id,
+        market_eligible_after_sequence,
+        market_eligible_from,
         created_at,
         updated_at
     FROM orders
@@ -629,7 +685,42 @@ private const val VERIFY_EXECUTIONS_SCHEMA_SQL = """
         prompt_hash,
         system_prompt_version,
         market_snapshot_id
+        ,source_session_id
+        ,source_sequence
+        ,source_exchange_at
+        ,source_received_at
+        ,source_side
+        ,source_price_jpy
+        ,source_size_btc
     FROM executions
+    LIMIT 0
+"""
+
+/** market-data integrity schema の存在を確認する SQL。 */
+private const val VERIFY_MARKET_DATA_INTEGRITY_SCHEMA_SQL = """
+    SELECT
+        s.id,
+        s.state,
+        s.connected_at,
+        s.disconnected_at,
+        s.last_processed_sequence,
+        s.last_received_at,
+        s.last_maintenance_at,
+        g.id,
+        g.session_id,
+        g.reason,
+        g.started_at,
+        g.impact_applied_at,
+        g.recovered_at,
+        e.id,
+        e.gap_id,
+        e.entity_type,
+        e.entity_id,
+        e.reason,
+        e.created_at
+    FROM market_data_sessions s
+    LEFT JOIN market_data_gaps g ON g.session_id = s.id
+    LEFT JOIN evaluation_exclusions e ON e.gap_id = g.id
     LIMIT 0
 """
 
@@ -797,6 +888,9 @@ class TradingPersistenceBootstrap(
                     PositionsTable,
                     OrdersTable,
                     ExecutionsTable,
+                    MarketDataSessionsTable,
+                    MarketDataGapsTable,
+                    EvaluationExclusionsTable,
                     CommandEventLogTable,
                     LlmLaunchReservationsTable,
                     SafetyViolationsTable,
@@ -873,6 +967,10 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL)
+    executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_MARKET_DATA_GAPS_SESSION_STARTED_INDEX_SQL)
+    executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_ENTITY_INDEX_SQL)
     executeUpdate(ENSURE_DECISIONS_INVOCATION_ID_CREATED_AT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
@@ -967,6 +1065,18 @@ private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
     verifySchemaBySql(
         sql = VERIFY_EXECUTIONS_SCHEMA_SQL,
         missingMessage = "executions schema was not initialized.",
+    )
+    verifySchemaBySql(
+        sql = VERIFY_MARKET_DATA_INTEGRITY_SCHEMA_SQL,
+        missingMessage = "market-data integrity schema was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL,
+        missingMessage = "market-data connected session unique index was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL,
+        missingMessage = "market-data integrity indexes were not initialized.",
     )
     verifySchemaBySql(
         sql = VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL,

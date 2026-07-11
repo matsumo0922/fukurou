@@ -44,7 +44,24 @@ class ExposedReconcilerStatusProvider(
 
     override fun snapshot(): ReconcilerStatus {
         return exposedTransaction(database) {
-            selectLatestReconcilerStatus()
+            val integrity = selectMarketDataIntegritySnapshot()
+
+            if (integrity.sessionId == null) {
+                return@exposedTransaction selectLatestReconcilerStatus()
+            }
+
+            ReconcilerStatus(
+                lastReconciledAt = integrity.lastMaintenanceAt,
+                startupFullReconcileCompleted = integrity.startupRecoveryCompleted,
+                lastMarketDataAt = integrity.lastReceivedAt,
+                marketDataState = integrity.state,
+                marketDataSessionId = integrity.sessionId,
+                lastProcessedSequence = integrity.lastProcessedSequence,
+                gapStartedAt = integrity.gapStartedAt,
+                recoveredAt = integrity.recoveredAt,
+                gapReason = integrity.gapReason,
+                startupRecoveryCompleted = integrity.startupRecoveryCompleted,
+            )
         }
     }
 }
