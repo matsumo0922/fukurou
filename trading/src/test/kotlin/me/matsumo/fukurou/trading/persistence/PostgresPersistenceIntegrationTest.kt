@@ -3455,7 +3455,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun runtime_postgres_reads_reconciler_freshness_from_command_event_log() = runPostgresTest {
+    fun runtime_postgres_audit_log_fallback_restores_maintenance_freshness_only() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         ExposedCommandEventLog(database).append(
             CommandEvent(
@@ -3478,7 +3478,7 @@ class PostgresPersistenceIntegrationTest {
             val protectionStatus = runtime.broker.getAccountStatus().getOrThrow().protectionStatus
 
             assertEquals(fixedInstant().toString(), protectionStatus.lastReconciledAt)
-            assertEquals(fixedInstant().toString(), protectionStatus.lastMarketDataAt)
+            assertEquals(null, protectionStatus.lastMarketDataAt)
         } finally {
             runtime.close()
         }
