@@ -420,7 +420,7 @@ private fun JdbcTransaction.selectSafetyDenials(
         val candidates = selectSafetyDenialCandidates(query, batchIndex)
 
         for (invocationId in candidates) {
-            val denial = selectRunDetail(invocationId, observedAt).toSafetyDenialOrNull() ?: continue
+            val denial = selectRunDetailBase(invocationId, observedAt).toSafetyDenialOrNull() ?: continue
             selected += denial
 
             if (selected.size > query.limit) {
@@ -542,7 +542,26 @@ private fun JdbcTransaction.selectRunBatch(
 }
 
 private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: Instant): DecisionRunDetail? {
-    val base = jdbcConnection().prepareStatement(FIND_RUN_SQL).use { statement ->
+    val base = selectRunDetailBase(invocationId, observedAt) ?: return null
+    val orders = selectOrders(invocationId)
+    val executions = selectExecutions(invocationId)
+    val raw = buildList {
+        addAll(base.raw)
+        addAll(selectSafeAudit(invocationId))
+        addAll(orders.map { order -> order.toRawRecord() })
+        addAll(executions.map { execution -> execution.toRawRecord() })
+    }.sortedBy { record -> record.occurredAt }
+
+    return base.copy(
+        summary = base.summary.copy(order = orders.lastOrNull { order -> order.side == "BUY" }),
+        orders = orders,
+        executions = executions,
+        raw = raw,
+    )
+}
+
+private fun JdbcTransaction.selectRunDetailBase(invocationId: String, observedAt: Instant): DecisionRunDetail? {
+    return jdbcConnection().prepareStatement(FIND_RUN_SQL).use { statement ->
         val overdueCutoff = observedAt.minus(PaperOrderLifecyclePolicy.cancellationGrace).toEpochMilli()
         val waitingStatus = PaperOrderLifecyclePolicy.waitingStatuses.single().name
         statement.setString(1, OrderStatus.FILLED.name)
@@ -560,22 +579,7 @@ private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: In
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.toDetailBase() else null
         }
-    } ?: return null
-    val orders = selectOrders(invocationId)
-    val executions = selectExecutions(invocationId)
-    val raw = buildList {
-        addAll(base.raw)
-        addAll(selectSafeAudit(invocationId))
-        addAll(orders.map { order -> order.toRawRecord() })
-        addAll(executions.map { execution -> execution.toRawRecord() })
-    }.sortedBy { record -> record.occurredAt }
-
-    return base.copy(
-        summary = base.summary.copy(order = orders.lastOrNull { order -> order.side == "BUY" }),
-        orders = orders,
-        executions = executions,
-        raw = raw,
-    )
+    }
 }
 
 private fun JdbcTransaction.selectOrders(invocationId: String): List<DecisionRunOrder> {

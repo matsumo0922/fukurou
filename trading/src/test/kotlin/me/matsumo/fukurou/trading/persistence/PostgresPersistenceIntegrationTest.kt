@@ -1427,7 +1427,14 @@ class PostgresPersistenceIntegrationTest {
             ).getOrThrow()
         }
         val detailLookupCount = AtomicInteger()
-        val countingDatabase = ExposedDatabase.connect(countingDataSource(dataSource, detailLookupCount))
+        val supplementalLookupCount = AtomicInteger()
+        val countingDatabase = ExposedDatabase.connect(
+            countingDataSource(
+                dataSource = dataSource,
+                detailLookupCount = detailLookupCount,
+                supplementalLookupCount = supplementalLookupCount,
+            ),
+        )
         val repository = ExposedDecisionRunProjectionRepository(countingDatabase, fixedClock())
 
         val denials = repository.readSafetyDenials(
@@ -1442,6 +1449,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(5, denials.denials.size)
         assertTrue(denials.truncated)
         assertEquals(6, detailLookupCount.get())
+        assertEquals(0, supplementalLookupCount.get())
     }
 
     @Test
@@ -4527,7 +4535,11 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
     }
 }
 
-private fun countingDataSource(dataSource: DataSource, detailLookupCount: AtomicInteger): DataSource {
+private fun countingDataSource(
+    dataSource: DataSource,
+    detailLookupCount: AtomicInteger,
+    supplementalLookupCount: AtomicInteger,
+): DataSource {
     return Proxy.newProxyInstance(
         DataSource::class.java.classLoader,
         arrayOf(DataSource::class.java),
@@ -4544,6 +4556,16 @@ private fun countingDataSource(dataSource: DataSource, detailLookupCount: Atomic
 
             if (connectionMethod.name == "prepareStatement" && sql?.contains("WHERE run.invocation_id = ?") == true) {
                 detailLookupCount.incrementAndGet()
+            }
+            val normalizedSql = sql?.trimStart().orEmpty()
+            val supplementalLookupPrefixes = listOf(
+                "SELECT id, intent_id, position_id",
+                "SELECT id, order_id, position_id",
+                "SELECT event_type, tool_name, ts",
+            )
+
+            if (connectionMethod.name == "prepareStatement" && supplementalLookupPrefixes.any(normalizedSql::startsWith)) {
+                supplementalLookupCount.incrementAndGet()
             }
 
             connectionMethod.invoke(result, *(connectionArguments ?: emptyArray()))
