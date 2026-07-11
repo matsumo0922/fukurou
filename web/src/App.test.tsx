@@ -597,6 +597,52 @@ describe("App", () => {
     expect(within(runList).getByRole("button", { name: /run-archived-filled/ })).toBeInTheDocument();
   });
 
+  it("shows saved direct execution evidence for a filled exit without an entry lifecycle", async () => {
+    const summary = {
+      ...decisionRunsResponse().runs[0],
+      invocationId: "run-filled-exit",
+      action: "EXIT",
+      outcome: "FILLED",
+      orderCount: 1,
+      executionCount: 1,
+    };
+    const directExecution = {
+      executionId: "execution-direct-exit",
+      orderId: "order-direct-exit",
+      positionId: "position-direct-exit",
+      side: "SELL",
+      priceJpy: "10100000",
+      sizeBtc: "0.010000000000",
+      realizedPnlJpy: "1000",
+      executedAt: "2026-07-10T00:02:00.000Z",
+    };
+    stubSystemFetch({
+      decisionRunsResponse: { status: 200, body: { runs: [summary], nextBefore: null } },
+      decisionRunDetails: {
+        "run-filled-exit": {
+          ...decisionRunDetailResponse(),
+          summary,
+          tradeLifecycles: [],
+          executions: [directExecution],
+        },
+      },
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    fireEvent.click(within(runList).getByRole("button", { name: /run-filled-exit/ }));
+
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(await within(detailPane).findByText("execution-direct-exit")).toBeInTheDocument();
+    expect(within(detailPane).getByText("SELL")).toBeInTheDocument();
+    expect(within(detailPane).getByText("10100000")).toBeInTheDocument();
+    expect(within(detailPane).getByText("0.010000000000 BTC")).toBeInTheDocument();
+    expect(within(detailPane).getByText("1000")).toBeInTheDocument();
+    expect(within(detailPane).queryByText(/no saved execution evidence/)).not.toBeInTheDocument();
+  });
+
   it("shows an explicit error without rendering a fake row for an exact run ID that is not found", async () => {
     stubSystemFetch({
       decisionRunsResponse: { status: 200, body: { runs: [], nextBefore: null } },

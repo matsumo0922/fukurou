@@ -337,7 +337,7 @@ function RunDetailContent({
 
   return (
     <>
-      {isFilled ? <TradeLifecycleSection lifecycles={detail.tradeLifecycles ?? []} /> : null}
+      {isFilled ? <TradeLifecycleSection lifecycles={detail.tradeLifecycles ?? []} executions={detail.executions} /> : null}
       {isCanceledOrExpired ? <CancellationSection detail={detail} order={order} /> : null}
       {isDecisionOutcome ? <DecisionOutcomeSection detail={detail} /> : null}
 
@@ -474,9 +474,19 @@ function Narrative({ label, value }: { label: string; value: string | null | und
   return <section className="run-narrative"><h4>{label}</h4><p>{value}</p></section>;
 }
 
-function TradeLifecycleSection({ lifecycles }: { lifecycles: OpsDecisionRunDetailResponse["tradeLifecycles"] }) {
+function TradeLifecycleSection({
+  lifecycles,
+  executions,
+}: {
+  lifecycles: OpsDecisionRunDetailResponse["tradeLifecycles"];
+  executions: OpsDecisionRunDetailResponse["executions"];
+}) {
   const { locale, t } = useI18n();
   if (lifecycles.length === 0) {
+    if (executions.length > 0) {
+      return <DetailSection index="01" title={t("activity.runs.section.execution")}><RunExecutionRecords executions={executions} /></DetailSection>;
+    }
+
     return <DetailSection index="01" title={t("activity.runs.section.execution")}><p className="run-detail-notice run-detail-notice--warning">{t("activity.runs.executions.missing")}</p></DetailSection>;
   }
   return <DetailSection index="01" title={t("activity.runs.section.execution")}>
