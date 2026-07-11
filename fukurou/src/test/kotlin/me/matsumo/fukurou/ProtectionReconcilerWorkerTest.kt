@@ -215,7 +215,7 @@ class ProtectionReconcilerWorkerTest {
         )
         val stream = WorkerTestMarketEventStream(
             session = WorkerSignalMarketEventSession(sessionId, clock.instant(), signals),
-            transportLivenessTimeout = Duration.ofMillis(200),
+            transportLivenessTimeout = Duration.ofMillis(50),
         )
         val reconciler = ProtectionReconciler(
             riskStateRepository = InMemoryRiskStateRepository(clock = clock),
@@ -231,6 +231,13 @@ class ProtectionReconcilerWorkerTest {
 
         worker.use {
             worker.start()
+
+            withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
+                while (stream.connectCount == 0) {
+                    delay(1.toDuration(DurationUnit.MILLISECONDS))
+                }
+            }
+            delay(35.toDuration(DurationUnit.MILLISECONDS))
             signals.send(
                 Result.success(
                     MarketEventSessionSignal.TransportActivity(
@@ -240,17 +247,49 @@ class ProtectionReconcilerWorkerTest {
                 ),
             )
 
+            delay(30.toDuration(DurationUnit.MILLISECONDS))
+        }
+
+        assertEquals(1, stream.connectCount)
+        assertEquals(1, integrityRepository.markTransportActivityCount)
+        assertTrue(broker.maintenanceAttempts.get() >= 4)
+        assertEquals(MarketDataConnectionState.CONNECTED, integrityRepository.snapshot().getOrThrow().state)
+        assertEquals(null, integrityRepository.snapshot().getOrThrow().gapReason)
+    }
+
+    @Test
+    fun worker_creates_transport_gap_and_reconnects_when_ping_is_absent() = runBlocking {
+        val clock = Clock.fixed(Instant.parse("2026-07-02T00:00:00Z"), ZoneOffset.UTC)
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000181")
+        val signals = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
+        val integrityRepository = WorkerTestMarketDataIntegrityRepository()
+        val stream = WorkerTestMarketEventStream(
+            session = WorkerSignalMarketEventSession(sessionId, clock.instant(), signals),
+            transportLivenessTimeout = Duration.ofMillis(40),
+        )
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = clock),
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = InMemoryTradingLock(clock),
+            tickStream = FixedTickStream(clock),
+            marketEventStream = stream,
+            marketDataIntegrityRepository = integrityRepository,
+            clock = clock,
+        )
+        val worker = ProtectionReconcilerWorker(reconciler, interval = Duration.ofMillis(10))
+
+        worker.use {
+            worker.start()
+
             withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
-                while (broker.maintenanceAttempts.get() < 2) {
+                while (stream.connectCount < 2) {
                     delay(1.toDuration(DurationUnit.MILLISECONDS))
                 }
             }
         }
 
-        assertEquals(1, stream.connectCount)
-        assertEquals(1, integrityRepository.markTransportActivityCount)
-        assertEquals(MarketDataConnectionState.CONNECTED, integrityRepository.snapshot().getOrThrow().state)
-        assertEquals(null, integrityRepository.snapshot().getOrThrow().gapReason)
+        assertEquals(MarketDataGapReason.TRANSPORT_LIVENESS_LOST, integrityRepository.snapshot().getOrThrow().gapReason)
+        assertTrue(stream.connectCount >= 2)
     }
 }
 

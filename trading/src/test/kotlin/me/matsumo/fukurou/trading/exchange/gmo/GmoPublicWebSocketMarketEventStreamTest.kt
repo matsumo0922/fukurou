@@ -26,7 +26,9 @@ import java.time.ZoneOffset
 import java.util.Optional
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLParameters
 import kotlin.test.Test
@@ -224,6 +226,39 @@ class GmoPublicWebSocketMarketEventStreamTest {
         assertEquals(error, session.receive().exceptionOrNull())
     }
 
+    @Test
+    fun `terminal確定後に未完了Pongが完了してもactivityをenqueueしない`() = runBlocking {
+        val messages = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
+        val session = GmoMarketEventSession(sessionId, Instant.EPOCH, NoOpWebSocket, messages)
+        val terminalClaimed = CountDownLatch(1)
+        val allowTerminalDispatch = CountDownLatch(1)
+        val pongSocket = DeferredPongWebSocket()
+        val listener = GmoWebSocketListener(
+            messages = messages,
+            decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
+            clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+            afterTerminalClaim = {
+                terminalClaimed.countDown()
+                check(allowTerminalDispatch.await(1, TimeUnit.SECONDS))
+            },
+        )
+
+        listener.onPing(pongSocket, ByteBuffer.wrap(byteArrayOf(1)))
+        val closeThread = Thread {
+            listener.onClose(pongSocket, WebSocket.NORMAL_CLOSURE, "closed")
+        }
+        closeThread.start()
+        assertTrue(terminalClaimed.await(1, TimeUnit.SECONDS))
+
+        val pongThread = Thread { pongSocket.completePong() }
+        pongThread.start()
+        allowTerminalDispatch.countDown()
+        closeThread.join()
+        pongThread.join()
+
+        assertTrue(session.receive().exceptionOrNull()?.message.orEmpty().contains("closed"))
+    }
+
     private fun tradePayload(): String {
         return """
             {
@@ -282,6 +317,16 @@ private class FailingSubscribeWebSocket : WebSocket by NoOpWebSocket {
 
     override fun abort() {
         aborted = true
+    }
+}
+
+private class DeferredPongWebSocket : WebSocket by NoOpWebSocket {
+    private val pongFuture = CompletableFuture<WebSocket>()
+
+    override fun sendPong(message: ByteBuffer): CompletableFuture<WebSocket> = pongFuture
+
+    fun completePong() {
+        pongFuture.complete(this)
     }
 }
 

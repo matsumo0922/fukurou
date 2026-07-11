@@ -200,8 +200,10 @@ internal class GmoWebSocketListener(
     private val decoder: GmoTradeMessageDecoder,
     private val clock: Clock,
     private val terminalFailure: AtomicReference<Throwable?> = AtomicReference(),
+    private val afterTerminalClaim: () -> Unit = {},
 ) : WebSocket.Listener {
     private val fragments = StringBuilder()
+    private val dispatchLock = Any()
 
     override fun onOpen(webSocket: WebSocket) {
         webSocket.request(1)
@@ -279,16 +281,26 @@ internal class GmoWebSocketListener(
     }
 
     private fun sendResult(result: Result<MarketEventSessionSignal>) {
-        val sendResult = messages.trySend(result)
-        if (sendResult.isSuccess || sendResult.isClosed) return
+        synchronized(dispatchLock) {
+            if (terminalFailure.get() != null) return
 
-        val failure = MarketDataBackpressureException("GMO WebSocket market event buffer overflowed.")
-        sendTerminalFailure(failure)
+            val sendResult = messages.trySend(result)
+            if (sendResult.isSuccess || sendResult.isClosed) return
+
+            sendTerminalFailureLocked(MarketDataBackpressureException("GMO WebSocket market event buffer overflowed."))
+        }
     }
 
     private fun sendTerminalFailure(throwable: Throwable) {
+        synchronized(dispatchLock) {
+            sendTerminalFailureLocked(throwable)
+        }
+    }
+
+    private fun sendTerminalFailureLocked(throwable: Throwable) {
         if (!terminalFailure.compareAndSet(null, throwable)) return
 
+        afterTerminalClaim()
         messages.trySend(Result.failure(throwable))
         messages.close(throwable)
     }
