@@ -74,6 +74,30 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
+    fun renderRoleAssignmentWithoutModel_ignoresProviderModelFallback() {
+        val renderer = DefaultLlmCommandRenderer(
+            LlmCommandRendererConfig(
+                claudeModel = "legacy-claude-model",
+                codexModel = "legacy-codex-model",
+            ),
+        )
+
+        val claudeCommand = renderer.render(
+            request(LlmProvider.CLAUDE, LlmInvocationPhase.PROPOSER, null)
+                .copy(useConfiguredModelFallback = false),
+        ).getOrThrow()
+        val codexCommand = renderer.render(
+            request(LlmProvider.CODEX, LlmInvocationPhase.FALSIFIER, null)
+                .copy(useConfiguredModelFallback = false),
+        ).getOrThrow()
+
+        assertFalse(claudeCommand.args.contains("legacy-claude-model"))
+        assertFalse(codexCommand.args.contains("legacy-codex-model"))
+        claudeCommand.deleteCleanupPaths()
+        codexCommand.deleteCleanupPaths()
+    }
+
+    @Test
     fun renderCodex_usesConfiguredCommandTemplateModelAndRequestMcpServerName() {
         val renderer = DefaultLlmCommandRenderer(
             config = LlmCommandRendererConfig(

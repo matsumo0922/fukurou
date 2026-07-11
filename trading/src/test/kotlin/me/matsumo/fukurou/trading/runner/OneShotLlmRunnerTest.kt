@@ -1337,6 +1337,23 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun runnerRoleAssignmentWithoutModel_disablesProviderModelFallback() = runBlocking {
+        val fixture = requestCapturingRunnerFixture(
+            tradingConfig = TradingBotConfig(
+                llmRoleAssignments = me.matsumo.fukurou.trading.config.LlmRoleAssignments(
+                    proposer = me.matsumo.fukurou.trading.config.LlmRoleAssignment(provider = LlmProvider.CLAUDE),
+                    falsifier = me.matsumo.fukurou.trading.config.LlmRoleAssignment(provider = LlmProvider.CODEX),
+                ),
+            ),
+        )
+
+        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        assertTrue(fixture.invoker.requests.all { request -> !request.useConfiguredModelFallback })
+        assertTrue(fixture.invoker.requests.all { request -> request.model == null })
+    }
+
+    @Test
     fun runnerAutoApprovesCodexProposerWriteTool() = runBlocking {
         val fixture = requestCapturingRunnerFixture(
             proposerAction = DecisionAction.NO_TRADE,
@@ -2019,6 +2036,7 @@ private fun highEquityAccountSnapshotWithBtc(): AccountSnapshot {
 private fun requestCapturingRunnerFixture(
     proposerAction: DecisionAction = DecisionAction.ENTER,
     parentEnvironment: Map<String, String> = defaultParentEnvironment(),
+    tradingConfig: TradingBotConfig = TradingBotConfig(),
 ): RequestCapturingRunnerFixture {
     val runtime = TradingRuntimeFactory.inMemory(
         clock = fixedClock(),
@@ -2031,7 +2049,7 @@ private fun requestCapturingRunnerFixture(
     )
     val runner = OneShotLlmRunner(
         tradingRuntime = runtime,
-        tradingConfig = TradingBotConfig(),
+        tradingConfig = tradingConfig,
         llmInvoker = invoker,
         parentEnvironment = parentEnvironment,
         clock = fixedClock(),

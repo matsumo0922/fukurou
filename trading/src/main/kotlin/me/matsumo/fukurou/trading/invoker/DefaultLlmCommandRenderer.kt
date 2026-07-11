@@ -233,7 +233,7 @@ class DefaultLlmCommandRenderer(
 }
 
 private fun LlmInvocationRequest.claudeModelArgs(fallbackModel: String?): List<String> {
-    val model = model ?: fallbackModel ?: return emptyList()
+    val model = model ?: fallbackModel.takeIf { useConfiguredModelFallback } ?: return emptyList()
 
     return listOf("--model", model)
 }
@@ -245,7 +245,7 @@ private fun LlmInvocationRequest.claudeEffortArgs(): List<String> {
 }
 
 private fun LlmInvocationRequest.codexModelArgs(fallbackModel: String?): List<String> {
-    val model = model ?: fallbackModel ?: return emptyList()
+    val model = model ?: fallbackModel.takeIf { useConfiguredModelFallback } ?: return emptyList()
 
     return listOf("-m", model)
 }

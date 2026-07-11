@@ -91,6 +91,7 @@ data class LlmMcpServerConfig(
  * @param allowedTools CLI に許可する MCP tool 名
  * @param model この invocation に設定した model。null の場合は CLI の既定値を使う
  * @param effort この invocation に設定した reasoning effort
+ * @param useConfiguredModelFallback renderer config の provider model override を使うか。role assignment は false にする
  */
 data class LlmInvocationRequest(
     val invocationId: String,
@@ -105,6 +106,7 @@ data class LlmInvocationRequest(
     val allowedTools: List<String>,
     val model: String? = null,
     val effort: LlmEffort = LlmEffort.DEFAULT,
+    val useConfiguredModelFallback: Boolean = true,
 )
 
 /**

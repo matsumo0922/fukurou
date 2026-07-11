@@ -1151,6 +1151,7 @@ private class OneShotLlmRequestFactory(
             allowedTools = allowedTools,
             model = input.assignment.model,
             effort = input.assignment.effort,
+            useConfiguredModelFallback = false,
         )
     }
 

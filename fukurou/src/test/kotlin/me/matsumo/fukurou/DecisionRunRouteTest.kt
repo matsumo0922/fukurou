@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunExecution
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
+import me.matsumo.fukurou.trading.activity.DecisionRunLlmPhaseAudit
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.activity.DecisionRunPage
@@ -124,12 +125,20 @@ class DecisionRunRouteTest {
         assertEquals("STOP", detail.tradeLifecycles.single().executions.single().kind)
         assertEquals("TAKER", detail.tradeLifecycles.single().executions.single().liquidity)
         assertTrue(detail.raw.none { raw -> raw.values.keys.any { key -> key.contains("secret", ignoreCase = true) } })
+        assertEquals(listOf("PROPOSER", "FALSIFIER"), detail.llmPhaseAudits.map { audit -> audit.phase })
+        assertEquals("claude-proposer", detail.llmPhaseAudits[0].configuredModel)
+        assertEquals("xhigh", detail.llmPhaseAudits[0].renderedEffort)
+        assertEquals("codex-falsifier", detail.llmPhaseAudits[1].configuredModel)
+        assertEquals("gpt-5-codex", detail.llmPhaseAudits[1].observedModels)
 
         val interruptedDetailResponse = client.get("/ops/runs/run-old")
         val interruptedDetail = Json.decodeFromString<OpsDecisionRunDetailResponse>(interruptedDetailResponse.body())
         assertEquals(HttpStatusCode.OK, interruptedDetailResponse.status)
         assertEquals("INTERRUPTED", interruptedDetail.phases.single { phase -> phase.key == "PROCESSING" }.status)
         assertEquals("RESTART_INTERRUPTED", interruptedDetail.phases.single { phase -> phase.key == "PROCESSING" }.detail)
+        assertEquals(listOf("PROPOSER"), interruptedDetail.llmPhaseAudits.map { audit -> audit.phase })
+        assertEquals("HIGH", interruptedDetail.llmPhaseAudits.single().configuredEffort)
+        assertEquals(null, interruptedDetail.llmPhaseAudits.single().configuredModel)
 
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?limit=0").status)
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?before=invalid").status)
@@ -309,6 +318,40 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
                         ),
                     ),
                 ),
+                llmPhaseAudits = if (summary.invocationId == "run-new") {
+                    listOf(
+                        DecisionRunLlmPhaseAudit(
+                            phase = "PROPOSER",
+                            provider = "claude",
+                            configuredModel = "claude-proposer",
+                            configuredEffort = "XHIGH",
+                            renderedEffort = "xhigh",
+                            observedModels = "claude-opus-4",
+                            modelObserved = true,
+                        ),
+                        DecisionRunLlmPhaseAudit(
+                            phase = "FALSIFIER",
+                            provider = "codex",
+                            configuredModel = "codex-falsifier",
+                            configuredEffort = "HIGH",
+                            renderedEffort = "high",
+                            observedModels = "gpt-5-codex",
+                            modelObserved = true,
+                        ),
+                    )
+                } else {
+                    listOf(
+                        DecisionRunLlmPhaseAudit(
+                            phase = "PROPOSER",
+                            provider = "claude",
+                            configuredModel = null,
+                            configuredEffort = "HIGH",
+                            renderedEffort = "high",
+                            observedModels = null,
+                            modelObserved = false,
+                        ),
+                    )
+                },
                 raw = listOf(
                     DecisionRunRawRecord(
                         source = "audit",

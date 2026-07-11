@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunExecution
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
+import me.matsumo.fukurou.trading.activity.DecisionRunLlmPhaseAudit
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
 import me.matsumo.fukurou.trading.activity.DecisionRunPage
@@ -127,7 +128,20 @@ data class OpsDecisionRunDetailResponse(
     val orders: List<OpsDecisionRunOrderResponse>,
     val executions: List<OpsDecisionRunExecutionResponse>,
     val tradeLifecycles: List<OpsDecisionRunTradeLifecycleResponse>,
+    val llmPhaseAudits: List<OpsDecisionRunLlmPhaseAuditResponse>,
     val raw: List<OpsDecisionRunRawRecordResponse>,
+)
+
+/** role ごとの安全な LLM phase assignment audit。 */
+@Serializable
+data class OpsDecisionRunLlmPhaseAuditResponse(
+    val phase: String,
+    val provider: String?,
+    val configuredModel: String?,
+    val configuredEffort: String?,
+    val renderedEffort: String?,
+    val observedModels: String?,
+    val modelObserved: Boolean,
 )
 
 /** run 内の段階表示。 */
@@ -430,6 +444,7 @@ private fun DecisionRunDetail.toResponse(quote: OpsDecisionRunQuoteResponse?): O
         orders = orders.map(DecisionRunOrder::toResponse),
         executions = executions.map(DecisionRunExecution::toResponse),
         tradeLifecycles = tradeLifecycles.map(DecisionRunTradeLifecycle::toResponse),
+        llmPhaseAudits = llmPhaseAudits.map(DecisionRunLlmPhaseAudit::toResponse),
         raw = raw.map(DecisionRunRawRecord::toResponse),
     )
 }
@@ -606,6 +621,16 @@ private fun DecisionRunTradeLifecycle.toResponse() = OpsDecisionRunTradeLifecycl
     positionId = positionId,
     status = status,
     executions = executions.map(DecisionRunExecution::toResponse),
+)
+
+private fun DecisionRunLlmPhaseAudit.toResponse() = OpsDecisionRunLlmPhaseAuditResponse(
+    phase = phase,
+    provider = provider,
+    configuredModel = configuredModel,
+    configuredEffort = configuredEffort,
+    renderedEffort = renderedEffort,
+    observedModels = observedModels,
+    modelObserved = modelObserved,
 )
 
 private fun DecisionRunRawRecord.toResponse() = OpsDecisionRunRawRecordResponse(

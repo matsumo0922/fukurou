@@ -368,7 +368,6 @@ function RunDetailContent({
   const isCanceledOrExpired = ["CANCELED", "EXPIRED"].includes(detail.summary.outcome);
   const isDecisionOutcome = !isFilled && !isPendingOrder && !isCanceledOrExpired;
   const detailIndex = isFilled || isCanceledOrExpired || isDecisionOutcome ? "02" : "01";
-  const llmAssignments = llmAssignmentAudit(detail.raw);
 
   return (
     <>
@@ -444,11 +443,8 @@ function RunDetailContent({
           [t("activity.runs.label.parentPlan"), intent?.parentTradePlanId],
           [t("activity.runs.label.setupTags"), formatJsonList(intent?.setupTagsJson), true],
           [t("activity.runs.label.runtimeError"), detail.summary.errorMessage, true],
-          [t("activity.runs.label.configuredModel"), llmAssignments.configuredModel],
-          [t("activity.runs.label.configuredEffort"), llmAssignments.configuredEffort],
-          [t("activity.runs.label.renderedEffort"), llmAssignments.renderedEffort],
-          [t("activity.runs.label.observedModels"), llmAssignments.observedModels],
         ]} />
+        <LlmPhaseAssignmentAudits audits={detail.llmPhaseAudits} />
         <div className="run-narratives">
           <Narrative label={t("activity.runs.label.reason")} value={decision?.reasonJa} />
           <Narrative label={t("activity.runs.label.falsifierReason")} value={detail.falsification?.reasonJa} />
@@ -471,18 +467,24 @@ function RunDetailContent({
   );
 }
 
-function llmAssignmentAudit(raw: OpsDecisionRunDetailResponse["raw"]) {
-  const values = raw
-    .filter((record) => record.source === "audit")
-    .map((record) => record.values)
-    .find((record) => record.configuredEffort != null || record.configuredModel != null);
+function LlmPhaseAssignmentAudits({ audits }: { audits: OpsDecisionRunDetailResponse["llmPhaseAudits"] }) {
+  const { t } = useI18n();
+  const phaseAudits = audits ?? [];
 
-  return {
-    configuredModel: values?.configuredModel ?? null,
-    configuredEffort: values?.configuredEffort ?? null,
-    renderedEffort: values?.renderedEffort ?? null,
-    observedModels: values?.modelObserved === "true" ? values.observedModels ?? null : null,
-  };
+  if (phaseAudits.length === 0) return null;
+
+  return <div className="run-narratives">
+    {phaseAudits.map((audit) => <div key={audit.phase}>
+      <Narrative label={t("activity.runs.label.llmRole")} value={audit.phase} />
+      <FactGrid facts={[
+        [t("activity.runs.label.provider"), audit.provider],
+        [t("activity.runs.label.configuredModel"), audit.configuredModel],
+        [t("activity.runs.label.configuredEffort"), audit.configuredEffort],
+        [t("activity.runs.label.renderedEffort"), audit.renderedEffort],
+        [t("activity.runs.label.observedModels"), audit.modelObserved ? audit.observedModels : null],
+      ]} />
+    </div>)}
+  </div>;
 }
 
 function CancellationSection({
