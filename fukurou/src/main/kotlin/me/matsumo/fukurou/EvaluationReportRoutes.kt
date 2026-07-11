@@ -136,6 +136,14 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
                 description = "scopeKey 省略時の互換 preset 日数です。"
                 schema = jsonSchema<Int>()
             }
+            query("epochId") {
+                description = "immutable account epoch ID。省略時は active epoch です。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "CURRENT / LEGACY_PRE_WS / UNSUPPORTED_EXECUTION_SEMANTICS。"
+                schema = jsonSchema<String>()
+            }
         }
         responses {
             HttpStatusCode.OK { schema = jsonSchema<EvaluationReportResponse>() }
@@ -183,6 +191,14 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
             query("days") {
                 description = "scopeKey 省略時の互換 preset 日数です。"
                 schema = jsonSchema<Int>()
+            }
+            query("epochId") {
+                description = "履歴対象の immutable account epoch ID です。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "履歴対象 cohort です。"
+                schema = jsonSchema<String>()
             }
         }
         responses { HttpStatusCode.OK { schema = jsonSchema<EvaluationReportHistoryResponse>() } }
@@ -271,6 +287,8 @@ private class EvaluationReportStore(
             revisionId = UUID.randomUUID().toString(),
             status = "REQUESTED",
             stage = "ADMITTED",
+            epochId = scope.evaluationScope.accountEpochId.toString(),
+            cohort = scope.evaluationScope.cohort.name,
         )
         val admittedJob = persistence?.admit(job, scope.key)?.getOrThrow()?.job ?: job.copy(
             revisionNumber = revisionSequence.incrementAndGet(),
@@ -317,13 +335,16 @@ private class EvaluationReportStore(
                 zoneId = ReportZone,
             ),
         )
+        val benchmarkComparable = scope.evaluationScope.cohort !=
+            me.matsumo.fukurou.trading.domain.EvaluationCohort.LEGACY_PRE_WS
         val calibration = buildCalibrationResponse(queryResult.trades)
         val performanceLattice = buildPerformanceLattice(queryResult.trades, regimes)
         val usageResult = snapshot.usages
         require(!usageResult.truncated) { "USAGE_SNAPSHOT_TRUNCATED" }
         val costStats = EvaluationMath.summarizeLlmCosts(usageResult.facts)
         val exclusions = snapshot.exclusions
-        val benchmarkFacts = benchmark.points.flatMap { point ->
+        val benchmarkPoints = benchmark.points.takeIf { benchmarkComparable }.orEmpty()
+        val benchmarkFacts = benchmarkPoints.flatMap { point ->
             listOf(
                 EvaluationReportFact("benchmark.${point.date}.botEquityJpy", point.botEquityJpy.toPlainString(), "JPY", "AVAILABLE", listOf("paper-ledger")),
                 EvaluationReportFact("benchmark.${point.date}.buyAndHoldEquityJpy", point.buyAndHoldEquityJpy.toPlainString(), "JPY", "AVAILABLE", listOf("daily-candles")),
@@ -405,11 +426,9 @@ private class EvaluationReportStore(
             EvaluationReportSourceResponse("exclusion-audit", inputAsOf, "SNAPSHOT"),
             EvaluationReportSourceResponse("runner-audit", inputAsOf, "SNAPSHOT"),
         )
-        val benchmarkComparable = scope.evaluationScope.cohort !=
-            me.matsumo.fukurou.trading.domain.EvaluationCohort.LEGACY_PRE_WS
         val benchmarkResponse = ReportBenchmarkChartResponse(
-            baselineEquityJpy = baselineEquity.toPlainString(),
-            points = benchmark.points.map { point ->
+            baselineEquityJpy = baselineEquity.takeIf { benchmarkComparable }?.toPlainString(),
+            points = benchmarkPoints.map { point ->
                 ReportBenchmarkPointResponse(
                     date = point.date.toString(),
                     botEquityJpy = point.botEquityJpy.toPlainString(),
@@ -628,7 +647,16 @@ private class EvaluationReportStore(
         if (persisted != null) return@synchronized persisted
 
         reports[scopeKey].orEmpty().map { report ->
-            EvaluationReportHistoryItemResponse(report.jobId, report.revisionId, report.revisionNumber, report.status, report.generatedAt, true)
+            EvaluationReportHistoryItemResponse(
+                jobId = report.jobId,
+                revisionId = report.revisionId,
+                revisionNumber = report.revisionNumber,
+                status = report.status,
+                requestedAt = report.generatedAt,
+                pinned = true,
+                epochId = report.epochId,
+                cohort = report.cohort,
+            )
         }
     }
 }
@@ -945,6 +973,8 @@ data class EvaluationReportJobResponse(
     val failureMessage: String? = null,
     val activeInvocationId: String? = null,
     val retryAfterSeconds: Long? = null,
+    val epochId: String? = null,
+    val cohort: String? = null,
 )
 
 @Serializable
@@ -997,7 +1027,7 @@ data class ReportBenchmarkPointResponse(
 
 @Serializable
 data class ReportBenchmarkChartResponse(
-    val baselineEquityJpy: String,
+    val baselineEquityJpy: String?,
     val points: List<ReportBenchmarkPointResponse>,
     val botReturn: String?,
     val buyAndHoldReturn: String?,

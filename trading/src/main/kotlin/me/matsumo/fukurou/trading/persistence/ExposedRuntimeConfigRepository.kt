@@ -794,11 +794,19 @@ private fun JdbcTransaction.ensureActiveRuntimeConfigVersionValues(now: Instant)
 
     val unexpectedKeys = catalogKeyDiff.unknownKeys - retiredRuntimeConfigKeys
     val retiredKeys = catalogKeyDiff.unknownKeys intersect retiredRuntimeConfigKeys
+    val valueOverrides = buildMap {
+        val baselineKey = "paper.initialCashJpy"
+        if (values[baselineKey] == "100000" && defaultValues[baselineKey] == "1000000") {
+            put(baselineKey, requireNotNull(defaultValues[baselineKey]))
+        }
+    }
 
     require(unexpectedKeys.isEmpty()) {
         "Active runtime config contains catalog-incompatible keys: ${unexpectedKeys.sorted()}"
     }
-    if (catalogKeyDiff.missingKeys.isNotEmpty() || retiredKeys.isNotEmpty()) {
+    val needsReconciliation = catalogKeyDiff.missingKeys.isNotEmpty() ||
+        retiredKeys.isNotEmpty() || valueOverrides.isNotEmpty()
+    if (needsReconciliation) {
         reconcileActiveRuntimeConfigVersionValues(
             activeVersion = activeVersion,
             values = values,
@@ -806,6 +814,7 @@ private fun JdbcTransaction.ensureActiveRuntimeConfigVersionValues(now: Instant)
             reconciliation = RuntimeConfigCatalogReconciliation(
                 missingKeys = catalogKeyDiff.missingKeys,
                 retiredKeys = retiredKeys,
+                valueOverrides = valueOverrides,
             ),
             now = now,
         )
@@ -853,7 +862,7 @@ private fun JdbcTransaction.reconcileActiveRuntimeConfigVersionValues(
     now: Instant,
 ) {
     val versionId = UUID.randomUUID()
-    val completeValues = (defaultValues + values) - reconciliation.retiredKeys
+    val completeValues = ((defaultValues + values) - reconciliation.retiredKeys) + reconciliation.valueOverrides
 
     deactivateRuntimeConfigVersion(activeVersion.versionId)
     insertRuntimeConfigVersion(
@@ -862,6 +871,7 @@ private fun JdbcTransaction.reconcileActiveRuntimeConfigVersionValues(
         note = runtimeConfigCatalogReconciliationNote(
             missingKeys = reconciliation.missingKeys,
             retiredKeys = reconciliation.retiredKeys,
+            changedKeys = reconciliation.valueOverrides.keys,
         ),
     )
     insertRuntimeConfigValues(
@@ -995,10 +1005,15 @@ private fun JdbcTransaction.insertRuntimeConfigValues(versionId: UUID, values: M
     }
 }
 
-private fun runtimeConfigCatalogReconciliationNote(missingKeys: Set<String>, retiredKeys: Set<String>): String {
+private fun runtimeConfigCatalogReconciliationNote(
+    missingKeys: Set<String>,
+    retiredKeys: Set<String>,
+    changedKeys: Set<String>,
+): String {
     val changes = buildList {
         if (missingKeys.isNotEmpty()) add("added=${missingKeys.sorted().joinToString(",")}")
         if (retiredKeys.isNotEmpty()) add("removed=${retiredKeys.sorted().joinToString(",")}")
+        if (changedKeys.isNotEmpty()) add("changed=${changedKeys.sorted().joinToString(",")}")
     }
 
     return "$RUNTIME_CONFIG_CATALOG_RECONCILIATION_NOTE_PREFIX: ${changes.joinToString(";")}"
@@ -1088,8 +1103,10 @@ private data class RuntimeConfigCatalogKeyDiff(
  *
  * @param missingKeys catalog default から追加する key
  * @param retiredKeys active snapshot から除去する明示的な退役 key
+ * @param valueOverrides migration で canonical default へ置換する key/value
  */
 private data class RuntimeConfigCatalogReconciliation(
     val missingKeys: Set<String>,
     val retiredKeys: Set<String>,
+    val valueOverrides: Map<String, String>,
 )

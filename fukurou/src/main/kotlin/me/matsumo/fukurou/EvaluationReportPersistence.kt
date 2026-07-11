@@ -122,7 +122,7 @@ internal class EvaluationReportPersistence(
     fun job(jobId: String): Result<EvaluationReportJobResponse?> = runCatching {
         exposedTransaction(database) {
             jdbcConnection().prepareStatement(
-                "SELECT revision_id, revision_number, status, stage, failure_code, failure_message, active_invocation_id, retry_after_seconds FROM evaluation_report_jobs WHERE job_id=?",
+                "SELECT revision_id, revision_number, status, stage, failure_code, failure_message, active_invocation_id, retry_after_seconds, scope_key FROM evaluation_report_jobs WHERE job_id=?",
             ).use { statement ->
                 statement.setObject(1, UUID.fromString(jobId))
                 statement.executeQuery().use { result ->
@@ -138,6 +138,8 @@ internal class EvaluationReportPersistence(
                         failureMessage = result.getString(6),
                         activeInvocationId = result.getString(7),
                         retryAfterSeconds = result.getLong(8).takeUnless { result.wasNull() },
+                        epochId = result.getString(9).substringAfter("|EPOCH:", "").substringBefore("|COHORT:").ifBlank { null },
+                        cohort = result.getString(9).substringAfter("|COHORT:", "").ifBlank { null },
                     )
                 }
             }

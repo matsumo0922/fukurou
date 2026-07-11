@@ -4,6 +4,7 @@ import { generateReport, ReportAdmissionError } from "./evaluationReport";
 const job = {
   jobId: "job-1", revisionId: "revision-1", revisionNumber: 7, status: "REQUESTED", stage: "ADMITTED",
   failureCode: null, failureMessage: null, activeInvocationId: null, retryAfterSeconds: null,
+  epochId: "epoch-1", cohort: "CURRENT",
 };
 
 describe("evaluation report generation client", () => {
@@ -16,13 +17,16 @@ describe("evaluation report generation client", () => {
     }), { status: 409, headers: { "Content-Type": "application/json", "Retry-After": "15" } })));
     const progress = vi.fn();
 
-    const error = await generateReport({ kind: "PRESET", days: 30 }, new AbortController().signal, progress)
+    const error = await generateReport({ kind: "PRESET", days: 30 }, new AbortController().signal, progress, "epoch-1")
       .catch((cause: unknown) => cause);
 
     expect(error).toBeInstanceOf(ReportAdmissionError);
     expect((error as ReportAdmissionError).job.activeInvocationId).toBe("active-1");
     expect((error as ReportAdmissionError).retryAfter).toBe("15");
     expect(progress).toHaveBeenCalledOnce();
+    expect(JSON.parse((vi.mocked(fetch).mock.calls[0]?.[1]?.body as string))).toMatchObject({
+      epochId: "epoch-1", cohort: "CURRENT",
+    });
   });
 
   it("reports every stage and stops at terminal success", async () => {
@@ -33,7 +37,7 @@ describe("evaluation report generation client", () => {
     vi.stubGlobal("fetch", fetchMock);
     const progress = vi.fn();
 
-    await generateReport({ kind: "PRESET", days: 30 }, new AbortController().signal, progress);
+    await generateReport({ kind: "PRESET", days: 30 }, new AbortController().signal, progress, "epoch-1");
 
     expect(progress.mock.calls.map(([value]) => value.stage)).toEqual(["ADMITTED", "VALIDATING", "COMPLETE"]);
   });

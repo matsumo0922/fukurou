@@ -1,6 +1,6 @@
 # セルフホストデプロイ手順（Fukurou backend scaffold）
 
-起動時 bootstrap は既存 paper account の残高と履歴を変更せず `LEGACY_IMPORTED` account epoch を登録する。baseline 変更時に履歴 row を更新せず、新しい epoch として運用する。
+起動時 bootstrap は旧 active config / account の 100,000 円 baseline を新しい active config version と account metadata の 1,000,000 円へ揃え、残高、BTC、halt state、equity peak、position/order/execution/equity history を変更せず `LEGACY_IMPORTED` account epoch を登録する。baseline 変更時に履歴 row を更新せず、新しい epoch として運用する。
 
 `paper.initialCashJpy` を変更する deploy では、runtime config activation 前に open position、`OPEN` / `PENDING_CANCEL` order、BTC 残高が 0 であることを確認する。activation は account reset、risk equity 同期、`EPOCH_START` snapshot、監査 event を同一 transaction で保存し、既存の halt state は解除しない。
 

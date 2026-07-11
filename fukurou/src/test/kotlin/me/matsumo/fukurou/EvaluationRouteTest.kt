@@ -11,6 +11,10 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
 import kotlinx.coroutines.delay
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -165,6 +169,29 @@ class EvaluationRouteTest {
             expected = listOf(224),
             actual = marketDataSource.requestedLimits,
         )
+    }
+
+    @Test
+    fun evaluationBenchmark_legacyScopeDoesNotExposeSyntheticBaselineSeriesOrReturns() = testApplication {
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = FakeEvaluationRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/evaluation/benchmark?cohort=LEGACY_PRE_WS")
+        val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertEquals("BASELINE_NOT_COMPARABLE", body.getValue("state").jsonPrimitive.content)
+        assertTrue(body.getValue("baselineEquityJpy") is kotlinx.serialization.json.JsonNull)
+        assertTrue(body.getValue("returns") is kotlinx.serialization.json.JsonNull)
+        assertTrue(body.getValue("points").jsonArray.isEmpty())
     }
 
     @Test

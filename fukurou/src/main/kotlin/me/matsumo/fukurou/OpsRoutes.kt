@@ -648,7 +648,20 @@ data class OpsPaperAccountEpochSwitchConflictResponse(
     val openPositionCount: Int,
     val openOrderCount: Int,
     val btcQuantity: String,
-)
+    val type: String = "me.matsumo.fukurou.OpsPaperAccountEpochSwitchConflictResponse",
+) : OpsRuntimeConfigConflictResponse
+
+/** runtime config activation の validation / epoch gate 競合 union contract。 */
+@Serializable
+sealed interface OpsRuntimeConfigConflictResponse
+
+/** validation rejection の実レスポンスと同形状の OpenAPI contract。 */
+@Serializable
+data class OpsRuntimeConfigValidationConflictResponse(
+    val valid: Boolean,
+    val errors: List<RuntimeConfigValidationError>,
+    val type: String = "me.matsumo.fukurou.OpsRuntimeConfigValidationConflictResponse",
+) : OpsRuntimeConfigConflictResponse
 
 /**
  * ops risk 操作用 route の依存関係。
@@ -883,7 +896,7 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
             }
             HttpStatusCode.Conflict {
                 description = "validation または account epoch の zero-open-risk gate により拒否されました。"
-                schema = jsonSchema<OpsPaperAccountEpochSwitchConflictResponse>()
+                schema = jsonSchema<OpsRuntimeConfigConflictResponse>()
             }
             HttpStatusCode.ServiceUnavailable {
                 description = "runtime config admin service が利用できません。"
@@ -930,7 +943,7 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
             }
             HttpStatusCode.Conflict {
                 description = "validation または account epoch の zero-open-risk gate により拒否されました。"
-                schema = jsonSchema<OpsPaperAccountEpochSwitchConflictResponse>()
+                schema = jsonSchema<OpsRuntimeConfigConflictResponse>()
             }
             HttpStatusCode.ServiceUnavailable {
                 description = "runtime config admin service が利用できません。"
@@ -2078,7 +2091,13 @@ private suspend fun <T : Any> ApplicationCall.respondRuntimeConfigResult(result:
     val throwable = requireNotNull(result.exceptionOrNull())
 
     if (throwable is RuntimeConfigValidationRejectedException) {
-        respond(HttpStatusCode.Conflict, throwable.validation)
+        respond(
+            HttpStatusCode.Conflict,
+            OpsRuntimeConfigValidationConflictResponse(
+                valid = throwable.validation.valid,
+                errors = throwable.validation.errors,
+            ),
+        )
 
         return null
     }

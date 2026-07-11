@@ -49,6 +49,17 @@ class ApiDocumentationRouteTest {
         val terminalCause = schemas.getValue("OpsDecisionRunSummaryResponse").jsonObject
             .getValue("properties").jsonObject
             .getValue("terminalCause").jsonObject
+        val runtimeConfigConflict = schemas.getValue("OpsRuntimeConfigConflictResponse").jsonObject
+            .getValue("oneOf").jsonArray
+            .map { schema -> schema.jsonObject.getValue("${'$'}ref").jsonPrimitive.content }
+        assertEquals(
+            setOf(
+                "#/components/schemas/OpsPaperAccountEpochSwitchConflictResponse",
+                "#/components/schemas/OpsRuntimeConfigValidationConflictResponse",
+            ),
+            runtimeConfigConflict.toSet(),
+        )
+        assertTrue(paths.containsKey("/evaluation/epochs"))
 
         assertEquals(
             listOf(

@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigCandidateValidator
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedException
+import me.matsumo.fukurou.trading.config.PaperAccountEpochSwitchRejectedException
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -674,6 +675,42 @@ class OpsRouteTest {
         assertEquals("runtimeConfig.validation.typedBetweenInclusive", validationError.getValue("code").jsonPrimitive.content)
         assertEquals("runner.maxToolCallsPerRun", validationError.getValue("key").jsonPrimitive.content)
         assertEquals("48", validationError.getValue("params").jsonObject.getValue("max").jsonPrimitive.content)
+    }
+
+    @Test
+    fun opsRoutes_runtimeConfigActivationReturnsMachineReadableEpochConflict() = testApplication {
+        val adminService = FakeRuntimeConfigAdminService(
+            activationFailure = PaperAccountEpochSwitchRejectedException(
+                openPositionCount = 1,
+                openOrderCount = 2,
+                btcQuantity = "0.010000000000",
+            ),
+        )
+        application {
+            module(
+                readinessProbe = { true },
+                opsRuntimeConfigAdminService = adminService,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+        val draft = client.post("/ops/runtime-config/drafts") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"values":{"paper.initialCashJpy":"900000"},"note":"epoch conflict"}""")
+        }
+        val versionId = Json.parseToJsonElement(draft.bodyAsText()).jsonObject
+            .getValue("version").jsonObject.getValue("id").jsonPrimitive.content
+
+        val response = client.post("/ops/runtime-config/drafts/$versionId/activate") {
+            contentType(ContentType.Application.Json)
+            setBody("""{}""")
+        }
+        val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+
+        assertEquals(HttpStatusCode.Conflict, response.status)
+        assertEquals("PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED", body.getValue("code").jsonPrimitive.content)
+        assertEquals(1, body.getValue("openPositionCount").jsonPrimitive.content.toInt())
+        assertEquals(2, body.getValue("openOrderCount").jsonPrimitive.content.toInt())
+        assertEquals("0.010000000000", body.getValue("btcQuantity").jsonPrimitive.content)
     }
 
     @Test
@@ -1758,6 +1795,7 @@ private fun metadataValue(container: JsonObject, label: String): String {
 
 private class FakeRuntimeConfigAdminService(
     private val listVersionsFailure: Throwable? = null,
+    private val activationFailure: Throwable? = null,
 ) : RuntimeConfigAdminService {
     private val versions = mutableMapOf<String, RuntimeConfigVersionDetail>()
     private var activeVersionId: String = "active-runtime-config"
@@ -1811,6 +1849,7 @@ private class FakeRuntimeConfigAdminService(
     }
 
     override fun activateDraft(versionId: String): Result<RuntimeConfigActivationResult> {
+        activationFailure?.let { failure -> return Result.failure(failure) }
         val detail = versions.getValue(versionId)
 
         if (!detail.validation.valid) {

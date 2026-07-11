@@ -1391,6 +1391,16 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
             },
           ],
         });
+      case "/evaluation/epochs":
+        return jsonResponse({
+          epochs: [{
+            epochId: "00000000-0000-0000-0000-000000000001",
+            kind: "CONFIG_ACTIVATED",
+            initialCashJpy: "1000000.00000000",
+            createdAt: "2026-07-05T00:00:00Z",
+            active: true,
+          }],
+        });
       case "/evaluation/summary":
         return jsonResponse({
           period: {

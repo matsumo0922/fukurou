@@ -196,6 +196,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/evaluation/epochs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 評価 account epoch 一覧を取得する
+         * @description current と legacy を含む immutable account epoch selector の候補を返します。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationEpochsResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/evaluation/summary": {
         parameters: {
             query?: never;
@@ -648,6 +686,10 @@ export interface paths {
                     scopeKey?: string;
                     /** @description scopeKey 省略時の互換 preset 日数です。 */
                     days?: number;
+                    /** @description immutable account epoch ID。省略時は active epoch です。 */
+                    epochId?: string;
+                    /** @description CURRENT / LEGACY_PRE_WS / UNSUPPORTED_EXECUTION_SEMANTICS。 */
+                    cohort?: string;
                 };
                 header?: never;
                 path?: never;
@@ -699,6 +741,10 @@ export interface paths {
                     scopeKey?: string;
                     /** @description scopeKey 省略時の互換 preset 日数です。 */
                     days?: number;
+                    /** @description 履歴対象の immutable account epoch ID です。 */
+                    epochId?: string;
+                    /** @description 履歴対象 cohort です。 */
+                    cohort?: string;
                 };
                 header?: never;
                 path?: never;
@@ -1109,7 +1155,7 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["OpsPaperAccountEpochSwitchConflictResponse"];
+                        "application/json": components["schemas"]["OpsRuntimeConfigConflictResponse"];
                     };
                 };
                 /** @description runtime config admin service が利用できません。 */
@@ -1183,7 +1229,7 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["OpsPaperAccountEpochSwitchConflictResponse"];
+                        "application/json": components["schemas"]["OpsRuntimeConfigConflictResponse"];
                     };
                 };
                 /** @description runtime config admin service が利用できません。 */
@@ -2263,6 +2309,18 @@ export interface components {
             recoveredAt?: string | null;
             gapReason?: string | null;
         };
+        /** EvaluationEpochResponse */
+        EvaluationEpochResponse: {
+            epochId: string;
+            kind: string;
+            initialCashJpy: string;
+            createdAt: string;
+            active: boolean;
+        };
+        /** EvaluationEpochsResponse */
+        EvaluationEpochsResponse: {
+            epochs: components["schemas"]["EvaluationEpochResponse"][];
+        };
         /** EvaluationPeriodResponse */
         EvaluationPeriodResponse: {
             from: string;
@@ -2275,6 +2333,7 @@ export interface components {
             cohort: string;
             executionSemanticsVersion?: string | null;
             initialCashJpy: string;
+            populationState?: string;
         };
         /** EvaluationAttributionCoverageResponse */
         EvaluationAttributionCoverageResponse: {
@@ -2399,9 +2458,9 @@ export interface components {
             period: components["schemas"]["EvaluationPeriodResponse"];
             scope: components["schemas"]["EvaluationScopeResponse"];
             assumptionsJa: string;
-            baselineEquityJpy: string;
+            baselineEquityJpy?: string | null;
             points: components["schemas"]["EvaluationBenchmarkPointResponse"][];
-            returns: components["schemas"]["EvaluationBenchmarkReturnResponse"];
+            returns?: components["schemas"]["EvaluationBenchmarkReturnResponse"] | null;
             state: string;
         };
         /** EvaluationProviderCostResponse */
@@ -2455,6 +2514,8 @@ export interface components {
             failureMessage?: string | null;
             activeInvocationId?: string | null;
             retryAfterSeconds?: number | null;
+            epochId?: string | null;
+            cohort?: string | null;
         };
         /** EvaluationReportPeriodResponse */
         EvaluationReportPeriodResponse: {
@@ -2564,7 +2625,7 @@ export interface components {
         };
         /** ReportBenchmarkChartResponse */
         ReportBenchmarkChartResponse: {
-            baselineEquityJpy: string;
+            baselineEquityJpy?: string | null;
             points: components["schemas"]["ReportBenchmarkPointResponse"][];
             botReturn?: string | null;
             buyAndHoldReturn?: string | null;
@@ -2801,7 +2862,24 @@ export interface components {
             openPositionCount: number;
             openOrderCount: number;
             btcQuantity: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "me.matsumo.fukurou.OpsPaperAccountEpochSwitchConflictResponse";
         };
+        /** OpsRuntimeConfigValidationConflictResponse */
+        OpsRuntimeConfigValidationConflictResponse: {
+            valid: boolean;
+            errors: components["schemas"]["RuntimeConfigValidationError"][];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "me.matsumo.fukurou.OpsRuntimeConfigValidationConflictResponse";
+        };
+        /** OpsRuntimeConfigConflictResponse */
+        OpsRuntimeConfigConflictResponse: components["schemas"]["OpsPaperAccountEpochSwitchConflictResponse"] | components["schemas"]["OpsRuntimeConfigValidationConflictResponse"];
         /** OpsHaltRequest */
         OpsHaltRequest: {
             /** @enum {string} */

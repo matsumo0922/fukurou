@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
-import { fetchReportHistory, fetchReportRevision, generateReport, pinReport, reportQuery, reportScopeKey, type EvaluationReport, type ReportJob, type ReportScope } from "../api/evaluationReport";
+import { fetchEvaluationEpochs, fetchReportHistory, fetchReportRevision, generateReport, pinReport, reportQuery, reportScopeKey, type EvaluationReport, type ReportJob, type ReportScope } from "../api/evaluationReport";
 import { LazyHistoricalOutcomeRidge } from "./evaluation-report/HistoricalOutcomeRidge.lazy";
 import { LazyEvidenceRelationshipGraph } from "./evaluation-report/EvidenceRelationshipGraph.lazy";
 import { initialContextState } from "./evaluation-report/currentContextStateMachine";
@@ -13,31 +13,36 @@ export function EvaluationPage() {
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
   const [cohort, setCohort] = useState<"CURRENT" | "LEGACY_PRE_WS">("CURRENT");
+  const epochs = useQuery({ queryKey: ["evaluation-epochs"], queryFn: fetchEvaluationEpochs, staleTime: 30_000 });
+  const [epochId, setEpochId] = useState("");
+  const selectedEpochId = epochId || epochs.data?.find((epoch) => epoch.active)?.epochId || epochs.data?.[0]?.epochId || "";
   const scope: ReportScope = custom ? { kind: "CUSTOM", from: customFrom, toInclusive: customTo } : { kind: "PRESET", days: days as 7 | 30 | 90 };
   const scopeKey = reportScopeKey(scope);
   const queryClient = useQueryClient();
-  const query = useQuery({ ...reportQuery(scopeKey, cohort), enabled: !custom || Boolean(customFrom && customTo) });
-  const history = useQuery({ queryKey: ["evaluation-report-history", scopeKey, cohort], queryFn: () => fetchReportHistory(scopeKey, cohort), enabled: !custom || Boolean(customFrom && customTo) });
-  const [preview, setPreview] = useState<{ scopeKey: string; report: EvaluationReport } | null>(null);
+  const scopeReady = Boolean(selectedEpochId) && (!custom || Boolean(customFrom && customTo));
+  const query = useQuery({ ...reportQuery(scopeKey, selectedEpochId, cohort), enabled: scopeReady });
+  const history = useQuery({ queryKey: ["evaluation-report-history", scopeKey, selectedEpochId, cohort], queryFn: () => fetchReportHistory(scopeKey, selectedEpochId, cohort), enabled: scopeReady });
+  const [preview, setPreview] = useState<{ identity: string; report: EvaluationReport } | null>(null);
   const [generationJob, setGenerationJob] = useState<ReportJob | null>(null);
   const generationAbort = useRef<AbortController | null>(null);
   useEffect(() => () => generationAbort.current?.abort(), []);
-  useEffect(() => () => generationAbort.current?.abort(), [scopeKey]);
+  useEffect(() => () => generationAbort.current?.abort(), [scopeKey, selectedEpochId, cohort]);
   const generation = useMutation({
     mutationFn: () => {
       generationAbort.current?.abort();
       generationAbort.current = new AbortController();
-      return generateReport(scope, generationAbort.current.signal, setGenerationJob, cohort);
+      return generateReport(scope, generationAbort.current.signal, setGenerationJob, selectedEpochId, cohort);
     },
     onSuccess: () => {
       setPreview(null);
       return Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey] }),
-        queryClient.invalidateQueries({ queryKey: ["evaluation-report-history", scopeKey] }),
+        queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey, selectedEpochId, cohort] }),
+        queryClient.invalidateQueries({ queryKey: ["evaluation-report-history", scopeKey, selectedEpochId, cohort] }),
       ]);
     },
   });
-  const displayedReport = preview?.scopeKey === scopeKey ? preview.report : query.data;
+  const identity = `${scopeKey}|${selectedEpochId}|${cohort}`;
+  const displayedReport = preview?.identity === identity ? preview.report : query.data;
   const displayedIsPinned = history.data?.some((item) => item.pinned && item.revisionId === displayedReport?.revisionId) ?? false;
 
   return <main className="evaluation-console">
@@ -46,17 +51,18 @@ export function EvaluationPage() {
       <div className="console-actions" aria-label="Report period and generation">
         {[7, 30, 90].map((value) => <button key={value} className={!custom && days === value ? "is-active" : ""} onClick={() => { setCustom(false); setDays(value); }}>{value}D</button>)}
         <button className={custom ? "is-active" : ""} onClick={() => setCustom(true)}>CUSTOM</button>
+        <label>Epoch<select value={selectedEpochId} onChange={(event) => { setPreview(null); setEpochId(event.target.value); }}>{epochs.data?.map((epoch) => <option value={epoch.epochId} key={epoch.epochId}>{epoch.active ? "ACTIVE · " : ""}{epoch.kind} · {epoch.initialCashJpy} JPY · {epoch.epochId.slice(0, 8)}</option>)}</select></label>
         <label>Cohort<select value={cohort} onChange={(event) => setCohort(event.target.value as "CURRENT" | "LEGACY_PRE_WS")}><option value="CURRENT">CURRENT</option><option value="LEGACY_PRE_WS">LEGACY / REFERENCE</option></select></label>
         {custom && <><label>From<input type="date" value={customFrom} onChange={(event) => setCustomFrom(event.target.value)} /></label><label>To<input type="date" value={customTo} onChange={(event) => setCustomTo(event.target.value)} /></label></>}
-        <button className="generate-button" disabled={generation.isPending || (custom && (!customFrom || !customTo))} onClick={() => generation.mutate()}><RefreshCw size={15} aria-hidden />{generation.isPending ? "GENERATING" : "GENERATE REPORT"}</button>
+        <button className="generate-button" disabled={generation.isPending || !scopeReady} onClick={() => generation.mutate()}><RefreshCw size={15} aria-hidden />{generation.isPending ? "GENERATING" : "GENERATE REPORT"}</button>
       </div>
     </header>
-    {cohort === "LEGACY_PRE_WS" && <div className="console-alert" role="status">Legacy pre-WebSocket trades are reference-only and never merge into current KPI.</div>}
+    {cohort === "LEGACY_PRE_WS" && <div className="console-alert" role="status">Legacy pre-WebSocket trades are reference-only. Baseline benchmark series and returns are not comparable.</div>}
     <CurrentContextStrip />
     {generationJob && generation.isPending && <div className="console-alert" role="status">Job {generationJob.jobId.slice(0, 12)} · revision #{generationJob.revisionNumber} · {generationJob.stage}. Existing pinned revision remains authoritative.</div>}
     {generation.isError && <div className="console-alert" role="alert">Generation failed: {generation.error.message}. Existing revision remains authoritative.</div>}
     {query.isPending ? <div className="console-empty">Loading immutable report revision…</div> : query.isError ? <div className="console-alert" role="alert">Report request failed: {query.error.message}</div> : displayedReport == null ? <EmptyReport onGenerate={() => generation.mutate()} /> : <ReportConsole report={displayedReport} pinned={displayedIsPinned} />}
-    <section className="report-panel" aria-labelledby="report-history-title"><header className="report-panel__header"><div><span className="console-kicker">IMMUTABLE REVISION HISTORY</span><h2 id="report-history-title">Reports / failed jobs</h2></div></header><div className="console-table-wrap"><table><thead><tr><th>Revision</th><th>Status</th><th>Requested</th><th>Default</th><th>Actions</th></tr></thead><tbody>{history.data?.map((item) => <tr key={item.jobId}><td>#{item.revisionNumber || "—"}</td><td>{item.status}</td><td>{new Date(item.requestedAt).toLocaleString()}</td><td>{item.pinned ? "PINNED" : "—"}</td><td>{item.status === "SUCCEEDED" && <><button onClick={() => void fetchReportRevision(item.revisionId).then((report) => setPreview({ scopeKey, report }))}>PREVIEW</button><button onClick={() => void pinReport(scopeKey, item.revisionId, cohort).then(() => { setPreview(null); return queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey, cohort] }); })}>PIN</button></>}</td></tr>)}</tbody></table></div></section>
+    <section className="report-panel" aria-labelledby="report-history-title"><header className="report-panel__header"><div><span className="console-kicker">IMMUTABLE REVISION HISTORY</span><h2 id="report-history-title">Reports / failed jobs</h2></div></header><div className="console-table-wrap"><table><thead><tr><th>Revision</th><th>Scope</th><th>Status</th><th>Requested</th><th>Default</th><th>Actions</th></tr></thead><tbody>{history.data?.map((item) => <tr key={item.jobId}><td>#{item.revisionNumber || "—"}</td><td>{item.epochId?.slice(0, 8) ?? "legacy"} · {item.cohort ?? "unversioned"}</td><td>{item.status}</td><td>{new Date(item.requestedAt).toLocaleString()}</td><td>{item.pinned ? "PINNED" : "—"}</td><td>{item.status === "SUCCEEDED" && <><button onClick={() => void fetchReportRevision(item.revisionId).then((report) => setPreview({ identity, report }))}>PREVIEW</button><button onClick={() => void pinReport(scopeKey, item.revisionId, selectedEpochId, cohort).then(() => { setPreview(null); return queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey, selectedEpochId, cohort] }); })}>PIN</button></>}</td></tr>)}</tbody></table></div></section>
   </main>;
 }
 
@@ -136,7 +142,7 @@ function ReportStage({ report, pinned, selectedClaim, onSelectClaim }: { report:
 function EvidenceSummary({ report }: { report: EvaluationReport }) {
   const missing = report.facts.filter((fact) => fact.availability !== "AVAILABLE").length;
   const availableR = report.outcomeRidge.groupings.find((item) => item.groupBy === "SETUP")?.groups.reduce((sum, group) => sum + group.availableRCount, 0) ?? 0;
-  return <section className="evidence-summary"><div><span>Deterministic facts</span><strong>{report.facts.length}</strong></div><div><span>Sources</span><strong>{report.sources.length}</strong></div><div><span>R available</span><strong>{availableR}</strong></div><div><span>Missing facts</span><strong>{missing}</strong></div><div><span>Coverage</span><strong>{report.truncated ? "PARTIAL SNAPSHOT" : "COMPLETE"}</strong></div></section>;
+  return <section className="evidence-summary"><div><span>Deterministic facts</span><strong>{report.facts.length}</strong></div><div><span>Sources</span><strong>{report.sources.length}</strong></div><div><span>R available</span><strong>{availableR}</strong></div><div><span>Missing facts</span><strong>{missing}</strong></div><div><span>Attribution</span><strong>{report.attributionCoverage == null ? "UNAVAILABLE" : `${report.attributionCoverage.attributed}/${report.attributionCoverage.total}`}</strong><small>{report.attributionCoverage?.missing ?? "—"} missing</small></div><div><span>Coverage</span><strong>{report.truncated ? "PARTIAL SNAPSHOT" : "COMPLETE"}</strong></div></section>;
 }
 
 function DeterministicEvidenceBoard({ report }: { report: EvaluationReport }) {

@@ -111,6 +111,11 @@ private fun EvaluationScope.toResponse(): EvaluationScopeResponse = EvaluationSc
     cohort = cohort.name,
     executionSemanticsVersion = executionSemanticsVersion,
     initialCashJpy = initialCashJpy.toPlainString(),
+    populationState = if (cohort == me.matsumo.fukurou.trading.domain.EvaluationCohort.CURRENT) {
+        "AVAILABLE"
+    } else {
+        "NOT_ATTRIBUTABLE"
+    },
 )
 
 private fun me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage.toResponse() =
@@ -121,6 +126,7 @@ private fun me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage.
  */
 @OptIn(ExperimentalKtorApi::class)
 internal fun Route.evaluationRoutes(dependencies: EvaluationRouteDependencies) {
+    registerEvaluationEpochsRoute(dependencies)
     registerEvaluationSummaryRoute(dependencies)
     registerEvaluationSetupsRoute(dependencies)
     registerEvaluationCalibrationRoute(dependencies)
@@ -128,6 +134,31 @@ internal fun Route.evaluationRoutes(dependencies: EvaluationRouteDependencies) {
     registerEvaluationCostsRoute(dependencies)
     evaluationReportRoutes(dependencies)
     currentContextWebSocketRoutes(dependencies)
+}
+
+@OptIn(ExperimentalKtorApi::class)
+private fun Route.registerEvaluationEpochsRoute(dependencies: EvaluationRouteDependencies) {
+    get("/evaluation/epochs") {
+        val repository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
+        call.respond(
+            EvaluationEpochsResponse(
+                epochs = repository.listEpochs().getOrThrow().map { epoch ->
+                    EvaluationEpochResponse(
+                        epochId = epoch.epochId.toString(),
+                        kind = epoch.kind,
+                        initialCashJpy = epoch.initialCashJpy.toPlainString(),
+                        createdAt = epoch.createdAt.toString(),
+                        active = epoch.active,
+                    )
+                },
+            ),
+        )
+    }.describe {
+        summary = "評価 account epoch 一覧を取得する"
+        description = "current と legacy を含む immutable account epoch selector の候補を返します。"
+        tag(EVALUATION_TAG)
+        responses { HttpStatusCode.OK { schema = jsonSchema<EvaluationEpochsResponse>() } }
+    }
 }
 
 @OptIn(ExperimentalKtorApi::class)
@@ -140,9 +171,9 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         val evaluationRiskStateRepository = call.requireRiskStateRepository(dependencies.riskStateRepository) ?: return@get
         val period = dateRange.toPeriod()
         val tradeResult = evaluationRepository.fetchClosedTrades(period, scope = scope).getOrThrow()
-        val runCount = evaluationRepository.countDecisionRuns(period).getOrThrow()
-        val actionCounts = evaluationRepository.countDecisionsByAction(period).getOrThrow()
-        val exclusionSummary = evaluationRepository.fetchExclusionSummary(period).getOrThrow()
+        val runCount = evaluationRepository.countDecisionRuns(period, scope).getOrThrow()
+        val actionCounts = evaluationRepository.countDecisionsByAction(period, scope).getOrThrow()
+        val exclusionSummary = evaluationRepository.fetchExclusionSummary(period, scope).getOrThrow()
         val performance = EvaluationMath.summarizeTrades(tradeResult.trades)
         val killStats = me.matsumo.fukurou.trading.evaluation.KillCriterionStats(
             closedTrades = performance.tradeCount,
@@ -355,20 +386,19 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
                 zoneId = EvaluationZone,
             ),
         )
+        val baselineComparable = scope.cohort !=
+            me.matsumo.fukurou.trading.domain.EvaluationCohort.LEGACY_PRE_WS
 
         call.respond(
             EvaluationBenchmarkResponse(
                 period = dateRange.toResponsePeriod(),
                 scope = scope.toResponse(),
                 assumptionsJa = "buy & hold は開始日 close で全額 BTC を買い、手数料・スリッページを無視します。bot equity は realized PnL のみを close 日に計上し、未実現損益は含めません。",
-                baselineEquityJpy = baselineEquityJpy.toDecimalString(),
-                points = benchmark.points.map { point -> EvaluationBenchmarkPointResponse.fromPoint(point) },
-                returns = EvaluationBenchmarkReturnResponse.fromResult(benchmark),
-                state = if (scope.cohort == me.matsumo.fukurou.trading.domain.EvaluationCohort.LEGACY_PRE_WS) {
-                    "BASELINE_NOT_COMPARABLE"
-                } else {
-                    "AVAILABLE"
-                },
+                baselineEquityJpy = baselineEquityJpy.takeIf { baselineComparable }?.toDecimalString(),
+                points = benchmark.points.takeIf { baselineComparable }.orEmpty()
+                    .map { point -> EvaluationBenchmarkPointResponse.fromPoint(point) },
+                returns = EvaluationBenchmarkReturnResponse.fromResult(benchmark).takeIf { baselineComparable },
+                state = if (baselineComparable) "AVAILABLE" else "BASELINE_NOT_COMPARABLE",
             ),
         )
     }.describe {
@@ -408,7 +438,7 @@ private fun Route.registerEvaluationCostsRoute(dependencies: EvaluationRouteDepe
         val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
         val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
         val scope = call.resolveEvaluationScope(evaluationRepository) ?: return@get
-        val usageResult = evaluationRepository.fetchLlmPhaseUsages(dateRange.toPeriod()).getOrThrow()
+        val usageResult = evaluationRepository.fetchLlmPhaseUsages(dateRange.toPeriod(), scope = scope).getOrThrow()
         val costs = EvaluationMath.summarizeLlmCosts(usageResult.facts)
 
         call.respond(
@@ -618,6 +648,21 @@ data class EvaluationScopeResponse(
     val cohort: String,
     val executionSemanticsVersion: String?,
     val initialCashJpy: String,
+    val populationState: String = "AVAILABLE",
+)
+
+/** immutable epoch selector response。 */
+@Serializable
+data class EvaluationEpochsResponse(val epochs: List<EvaluationEpochResponse>)
+
+/** immutable epoch selector item。 */
+@Serializable
+data class EvaluationEpochResponse(
+    val epochId: String,
+    val kind: String,
+    val initialCashJpy: String,
+    val createdAt: String,
+    val active: Boolean,
 )
 
 /** execution-based attribution coverage。 */
@@ -954,9 +999,9 @@ data class EvaluationBenchmarkResponse(
     val period: EvaluationPeriodResponse,
     val scope: EvaluationScopeResponse,
     val assumptionsJa: String,
-    val baselineEquityJpy: String,
+    val baselineEquityJpy: String?,
     val points: List<EvaluationBenchmarkPointResponse>,
-    val returns: EvaluationBenchmarkReturnResponse,
+    val returns: EvaluationBenchmarkReturnResponse?,
     val state: String,
 )
 

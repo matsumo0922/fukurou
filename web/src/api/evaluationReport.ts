@@ -26,14 +26,19 @@ export type EvaluationReport = {
   sources: { sourceId: string; observedAt: string; freshness: string }[];
   chartIndex: { chartId: string; catalogVersion: string; factIds: string[] }[];
   outcomeRidge: { catalogVersion: string; observationKind: string; domain: { minInclusive: string; maxExclusive: string; binWidth: string }; referenceLines: string[]; groupings: { groupBy: string; groups: OutcomeRidgeGroup[] }[] };
-  benchmark: { baselineEquityJpy: string; points: { date: string; botEquityJpy: string; buyAndHoldEquityJpy: string; noTradeEquityJpy: string }[]; botReturn: string | null; buyAndHoldReturn: string | null; state: string };
+  benchmark: { baselineEquityJpy: string | null; points: { date: string; botEquityJpy: string; buyAndHoldEquityJpy: string; noTradeEquityJpy: string }[]; botReturn: string | null; buyAndHoldReturn: string | null; state: string };
   calibration: { unit: string; authority: string; state: string; cells: { groupBy: string; groupKey: string; lowerBoundInclusive: string; upperBound: string; averageForecastProbability: string | null; realizedWinRate: string | null; sampleCount: number; state: string }[] };
   performanceLattice: { unit: string; authority: string; state: string; cells: { setup: string; marketRegime: string; tradeCount: number; expectedR: string | null; totalPnlJpy: string; profitFactor: string | null; state: string }[] };
   integrity: { eligibleTradeCount: number; missingRCount: number; excludedOrderCount: number; excludedPositionCount: number; excludedDecisionRunCount: number; exclusionReasons: Record<string, number>; llmPhaseCount: number; missingUsagePhaseCount: number; unpricedPhaseCount: number; knownCostUsd: string | null; usageTruncated: boolean };
   truncated: boolean;
+  epochId: string | null;
+  cohort: string | null;
+  executionSemanticsVersion: string | null;
+  attributionCoverage: { attributed: number; missing: number; total: number } | null;
 };
-export type ReportJob = { jobId: string; revisionId: string; revisionNumber: number; status: string; stage: string; failureCode: string | null; failureMessage: string | null; activeInvocationId: string | null; retryAfterSeconds: number | null };
-export type ReportHistoryItem = { jobId: string; revisionId: string; revisionNumber: number; status: string; requestedAt: string; pinned: boolean };
+export type ReportJob = { jobId: string; revisionId: string; revisionNumber: number; status: string; stage: string; failureCode: string | null; failureMessage: string | null; activeInvocationId: string | null; retryAfterSeconds: number | null; epochId: string | null; cohort: string | null };
+export type ReportHistoryItem = { jobId: string; revisionId: string; revisionNumber: number; status: string; requestedAt: string; pinned: boolean; epochId: string | null; cohort: string | null };
+export type EvaluationEpoch = { epochId: string; kind: string; initialCashJpy: string; createdAt: string; active: boolean };
 
 export type ReportScope = { kind: "PRESET"; days: 7 | 30 | 90 } | { kind: "CUSTOM"; from: string; toInclusive: string };
 
@@ -41,8 +46,12 @@ export function reportScopeKey(scope: ReportScope): string {
   return scope.kind === "PRESET" ? `PRESET:${scope.days}D` : `CUSTOM:${scope.from}:${scope.toInclusive}`;
 }
 
-export async function fetchDefaultReport(scopeKey: string, cohort = "CURRENT"): Promise<EvaluationReport | null> {
-  const response = await fetch(`/evaluation/reports/default?scopeKey=${encodeURIComponent(scopeKey)}&cohort=${cohort}`, { headers: { Accept: "application/json" } });
+export async function fetchEvaluationEpochs(): Promise<EvaluationEpoch[]> {
+  return getJsonByPath<{ epochs: EvaluationEpoch[] }>("/evaluation/epochs").then((response) => response.epochs);
+}
+
+export async function fetchDefaultReport(scopeKey: string, epochId: string, cohort = "CURRENT"): Promise<EvaluationReport | null> {
+  const response = await fetch(`/evaluation/reports/default?scopeKey=${encodeURIComponent(scopeKey)}&epochId=${encodeURIComponent(epochId)}&cohort=${cohort}`, { headers: { Accept: "application/json" } });
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`report request failed (${response.status})`);
   return response.json() as Promise<EvaluationReport>;
@@ -54,11 +63,11 @@ export class ReportAdmissionError extends Error {
   }
 }
 
-export async function generateReport(scope: ReportScope, signal: AbortSignal, onProgress: (job: ReportJob) => void, cohort = "CURRENT"): Promise<ReportJob> {
+export async function generateReport(scope: ReportScope, signal: AbortSignal, onProgress: (job: ReportJob) => void, epochId: string, cohort = "CURRENT"): Promise<ReportJob> {
   const response = await fetch("/evaluation/reports/jobs", {
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ ...scope, cohort }),
+    body: JSON.stringify({ ...scope, epochId, cohort }),
     signal,
   });
   const accepted = await response.json() as ReportJob;
@@ -81,8 +90,8 @@ export async function generateReport(scope: ReportScope, signal: AbortSignal, on
   }
 }
 
-export async function fetchReportHistory(scopeKey: string, cohort = "CURRENT"): Promise<ReportHistoryItem[]> {
-  const response = await getJsonByPath<{ revisions: ReportHistoryItem[] }>(`/evaluation/reports/revisions?scopeKey=${encodeURIComponent(scopeKey)}&cohort=${cohort}`);
+export async function fetchReportHistory(scopeKey: string, epochId: string, cohort = "CURRENT"): Promise<ReportHistoryItem[]> {
+  const response = await getJsonByPath<{ revisions: ReportHistoryItem[] }>(`/evaluation/reports/revisions?scopeKey=${encodeURIComponent(scopeKey)}&epochId=${encodeURIComponent(epochId)}&cohort=${cohort}`);
   return response.revisions;
 }
 
@@ -90,11 +99,11 @@ export async function fetchReportRevision(revisionId: string): Promise<Evaluatio
   return getJsonByPath(`/evaluation/reports/revisions/${encodeURIComponent(revisionId)}`);
 }
 
-export async function pinReport(scopeKey: string, revisionId: string, cohort = "CURRENT"): Promise<void> {
-  const response = await fetch("/evaluation/reports/pins", { method: "PUT", headers: { Accept: "application/json", "Content-Type": "application/json" }, body: JSON.stringify({ scopeKey, revisionId, cohort }) });
+export async function pinReport(scopeKey: string, revisionId: string, epochId: string, cohort = "CURRENT"): Promise<void> {
+  const response = await fetch("/evaluation/reports/pins", { method: "PUT", headers: { Accept: "application/json", "Content-Type": "application/json" }, body: JSON.stringify({ scopeKey, revisionId, epochId, cohort }) });
   if (!response.ok) throw new Error(`pin failed (${response.status})`);
 }
 
-export function reportQuery(scopeKey: string, cohort = "CURRENT") {
-  return { queryKey: ["evaluation-report", scopeKey, cohort], queryFn: () => fetchDefaultReport(scopeKey, cohort), staleTime: Infinity };
+export function reportQuery(scopeKey: string, epochId: string, cohort = "CURRENT") {
+  return { queryKey: ["evaluation-report", scopeKey, epochId, cohort], queryFn: () => fetchDefaultReport(scopeKey, epochId, cohort), staleTime: Infinity };
 }
