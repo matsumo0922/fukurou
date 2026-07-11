@@ -3632,7 +3632,10 @@ class PostgresPersistenceIntegrationTest {
         val excludedEvents = eventLog.findEvents(
             limit = 10,
             eventType = null,
-            excludeEventTypes = setOf(CommandEventType.DAEMON_TRIGGER_LAUNCHED),
+            excludeEventTypes = setOf(
+                CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+                CommandEventType.PAPER_ACCOUNT_EPOCH_IMPORTED,
+            ),
         ).getOrThrow()
 
         assertEquals(listOf("daemon-latest", "daemon-new"), allEvents.map { event -> event.toolName })
