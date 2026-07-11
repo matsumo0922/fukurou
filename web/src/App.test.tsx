@@ -249,7 +249,7 @@ describe("App", () => {
 
     expect(await screen.findByRole("heading", { name: "Auditable LLM evaluation" })).toBeInTheDocument();
     expect(screen.getByText("CURRENT CONTEXT · NOT REPORT EVIDENCE")).toBeInTheDocument();
-    expect(screen.getByText("Live trading is not enabled")).toBeInTheDocument();
+    expect(screen.getByText(/live trading is not enabled/i)).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "No immutable report revision" })).toBeInTheDocument();
   });
 
@@ -322,7 +322,7 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "Auditable LLM evaluation" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Evaluation/ })).toHaveAttribute("href", "/app/evaluation");
     expect(await screen.findByRole("heading", { name: "No immutable report revision" })).toBeInTheDocument();
-    expect(hasGetCall(fetchMock, "/evaluation/reports/default", (params) => params.get("days") === "30")).toBe(true);
+    expect(hasGetCall(fetchMock, "/evaluation/reports/default", (params) => params.get("scopeKey") === "PRESET:30D")).toBe(true);
     expect(fetchMock).not.toHaveBeenCalledWith("/evaluation/summary", expect.anything());
   });
 

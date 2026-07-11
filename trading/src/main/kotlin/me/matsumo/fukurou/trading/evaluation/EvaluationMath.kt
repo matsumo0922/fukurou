@@ -75,8 +75,13 @@ object EvaluationMath {
     }
 
     /** observed realized R を server-owned fixed bins へ集計する。 */
-    fun historicalOutcomeRidges(trades: List<ClosedTradeFact>, zoneId: ZoneId): OutcomeRidgeChartFacts {
+    fun historicalOutcomeRidges(
+        trades: List<ClosedTradeFact>,
+        zoneId: ZoneId,
+        regimes: List<MarketRegimeLabel> = emptyList(),
+    ): OutcomeRidgeChartFacts {
         val evaluated = trades.map { trade -> evaluateTrade(trade) }
+        val regimeByDate = regimes.associateBy { regime -> regime.date }
         val groupings = listOf(
             OutcomeRidgeGroupingFacts(
                 groupBy = OutcomeRidgeGrouping.SETUP,
@@ -84,6 +89,15 @@ object EvaluationMath {
                     .flatMap { trade ->
                         trade.fact.setupTags.ifEmpty { listOf(UNCLASSIFIED_SETUP_TAG) }
                             .map { setup -> setup to trade }
+                    }
+                    .toRidgeGroups(),
+            ),
+            OutcomeRidgeGroupingFacts(
+                groupBy = OutcomeRidgeGrouping.MARKET_REGIME,
+                groups = evaluated
+                    .groupBy { trade ->
+                        val regime = regimeByDate[trade.fact.openedAt.atZone(zoneId).toLocalDate()]
+                        if (regime == null) "UNKNOWN" else "${regime.trend.name}/${regime.volatility.name}"
                     }
                     .toRidgeGroups(),
             ),

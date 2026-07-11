@@ -50,6 +50,10 @@ import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
+import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
+import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
+import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import java.io.File
 import java.time.Clock
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -424,6 +428,17 @@ private fun createEvaluationRouteDependencies(
         riskStateRepository = riskStateRepository,
         marketDataSource = marketDataSource,
         tradingConfig = runtime.tradingConfig,
+        llmInvoker = database?.let {
+            ShellLlmInvoker(
+                commandRenderer = DefaultLlmCommandRenderer(
+                    config = LlmCommandRendererConfig.fromEnvironment(databaseResources.environment),
+                ),
+                processRunner = ShellProcessRunner(),
+            )
+        },
+        environment = databaseResources.environment,
+        database = database,
+        latestMarketQuoteStore = runtime.latestMarketQuoteStore,
         clock = runtime.clock,
     )
 }
@@ -748,6 +763,7 @@ private fun Application.installApplicationPlugins(webRoot: File?) {
     install(ContentNegotiation) {
         json(ApiJson)
     }
+    install(io.ktor.server.websocket.WebSockets)
     install(StatusPages) {
         exception<Throwable> { call, cause ->
             call.application.log.error("Unhandled exception while processing request", cause)

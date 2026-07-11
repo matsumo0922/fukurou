@@ -56,6 +56,9 @@ enum class LlmInvocationPhase {
      * 週次 reflection から prompt candidate を生成する phase。
      */
     REFLECTION,
+
+    /** immutable evaluation snapshot を説明する report generation phase。 */
+    EVALUATION_REPORT,
 }
 
 /**

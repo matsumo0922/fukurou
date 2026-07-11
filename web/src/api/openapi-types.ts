@@ -523,6 +523,22 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportAdmissionErrorResponse"];
+                    };
+                };
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportAdmissionErrorResponse"];
+                    };
+                };
                 500: {
                     headers: {
                         [name: string]: unknown;
@@ -533,6 +549,54 @@ export interface paths {
                 };
             };
         };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluation/reports/jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 評価レポート job の進捗を取得する
+         * @description manual generation の stage、terminal failure、revision identity を返します。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    jobId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportJobResponse"];
+                    };
+                };
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -614,6 +678,153 @@ export interface paths {
                     };
                 };
             };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluation/reports/revisions/{revisionId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 評価レポート revision を取得する
+         * @description 履歴から選択した immutable artifact と同一 snapshot evidence を返します。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    revisionId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportResponse"];
+                    };
+                };
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluation/reports/pins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 評価レポート revision を pin する
+         * @description successful immutable revision を選択 scope の既定表示へ明示的に固定します。
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": components["schemas"]["EvaluationReportPinRequest"];
+                };
+            };
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportPinResponse"];
+                    };
+                };
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        post?: never;
+        /**
+         * 評価レポート pin を解除する
+         * @description artifact を削除せず、scope の明示 pin だけを解除します。
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description pin を解除しました。 */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/current-context/ws": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: {
+            parameters: {
+                query?: never;
+                header?: {
+                    Connection?: string;
+                    Upgrade?: string;
+                };
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: never;
         };
         put?: never;
         post?: never;
@@ -2149,13 +2360,23 @@ export interface components {
         };
         /** EvaluationReportGenerateRequest */
         EvaluationReportGenerateRequest: {
-            days: number;
+            days?: number | null;
+            kind?: string;
+            from?: string | null;
+            toInclusive?: string | null;
         };
         /** EvaluationReportJobResponse */
         EvaluationReportJobResponse: {
             jobId: string;
             revisionId: string;
             status: string;
+            stage: string;
+            failureCode?: string | null;
+            failureMessage?: string | null;
+        };
+        /** EvaluationReportAdmissionErrorResponse */
+        EvaluationReportAdmissionErrorResponse: {
+            code: string;
         };
         /** EvaluationReportPeriodResponse */
         EvaluationReportPeriodResponse: {
@@ -2199,6 +2420,12 @@ export interface components {
             sourceId: string;
             observedAt: string;
             freshness: string;
+        };
+        /** EvaluationChartIndexResponse */
+        EvaluationChartIndexResponse: {
+            chartId: string;
+            catalogVersion: string;
+            factIds: string[];
         };
         /** OutcomeRidgeDomainResponse */
         OutcomeRidgeDomainResponse: {
@@ -2258,6 +2485,7 @@ export interface components {
             validation: components["schemas"]["EvaluationClaimValidationResponse"][];
             facts: components["schemas"]["EvaluationReportFactResponse"][];
             sources: components["schemas"]["EvaluationReportSourceResponse"][];
+            chartIndex: components["schemas"]["EvaluationChartIndexResponse"][];
             outcomeRidge: components["schemas"]["OutcomeRidgeResponse"];
             truncated: boolean;
         };
@@ -2273,6 +2501,17 @@ export interface components {
         /** EvaluationReportHistoryResponse */
         EvaluationReportHistoryResponse: {
             revisions: components["schemas"]["EvaluationReportHistoryItemResponse"][];
+        };
+        /** EvaluationReportPinRequest */
+        EvaluationReportPinRequest: {
+            days?: number | null;
+            scopeKey?: string | null;
+            revisionId: string;
+        };
+        /** EvaluationReportPinResponse */
+        EvaluationReportPinResponse: {
+            scopeKey: string;
+            revisionId: string;
         };
         /** RuntimeConfigItem */
         RuntimeConfigItem: {

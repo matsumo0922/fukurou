@@ -1,8 +1,12 @@
 package me.matsumo.fukurou
 
 import io.ktor.client.request.get
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Candle
@@ -147,6 +151,53 @@ class EvaluationRouteTest {
             expected = emptyList(),
             actual = marketDataSource.requestedLimits,
         )
+    }
+
+    @Test
+    fun evaluationReport_acceptsPresetAndCustomManualJobs() = testApplication {
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = FakeEvaluationRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val preset = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"PRESET","days":30}""")
+        }
+        val custom = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"CUSTOM","from":"2026-06-01","toInclusive":"2026-06-30"}""")
+        }
+
+        assertEquals(HttpStatusCode.Accepted, preset.status)
+        assertEquals(HttpStatusCode.Accepted, custom.status)
+    }
+
+    @Test
+    fun evaluationReport_rejectsInvalidCustomRange() = testApplication {
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = FakeEvaluationRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"CUSTOM","from":"2026-06-30","toInclusive":"2026-06-01"}""")
+        }
+
+        assertEquals(HttpStatusCode.BadRequest, response.status)
     }
 }
 

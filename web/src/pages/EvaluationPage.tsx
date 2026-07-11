@@ -1,40 +1,73 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
-import { generateReport, reportQuery, type EvaluationReport } from "../api/evaluationReport";
+import { fetchReportHistory, fetchReportRevision, generateReport, pinReport, reportQuery, reportScopeKey, type EvaluationReport, type ReportScope } from "../api/evaluationReport";
 import { HistoricalOutcomeRidge } from "./evaluation-report/HistoricalOutcomeRidge";
 import { LazyEvidenceRelationshipGraph } from "./evaluation-report/EvidenceRelationshipGraph.lazy";
 
 export function EvaluationPage() {
   const [days, setDays] = useState(30);
+  const [custom, setCustom] = useState(false);
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const scope: ReportScope = custom ? { kind: "CUSTOM", from: customFrom, toInclusive: customTo } : { kind: "PRESET", days: days as 7 | 30 | 90 };
+  const scopeKey = reportScopeKey(scope);
   const queryClient = useQueryClient();
-  const query = useQuery(reportQuery(days));
+  const query = useQuery({ ...reportQuery(scopeKey), enabled: !custom || Boolean(customFrom && customTo) });
+  const history = useQuery({ queryKey: ["evaluation-report-history", scopeKey], queryFn: () => fetchReportHistory(scopeKey), enabled: !custom || Boolean(customFrom && customTo) });
+  const [preview, setPreview] = useState<EvaluationReport | null>(null);
   const generation = useMutation({
-    mutationFn: () => generateReport(days),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["evaluation-report", days] }),
+    mutationFn: () => generateReport(scope),
+    onSuccess: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey] }),
+      queryClient.invalidateQueries({ queryKey: ["evaluation-report-history", scopeKey] }),
+    ]),
   });
 
   return <main className="evaluation-console">
     <header className="console-header">
       <div><span className="console-kicker">EVALUATION / REPORT CONSOLE</span><h1>Auditable LLM evaluation</h1><p>Immutable report revisions and deterministic paper evidence share this screen without sharing authority.</p></div>
       <div className="console-actions" aria-label="Report period and generation">
-        {[7, 30, 90].map((value) => <button key={value} className={days === value ? "is-active" : ""} onClick={() => setDays(value)}>{value}D</button>)}
-        <button className="generate-button" disabled={generation.isPending} onClick={() => generation.mutate()}><RefreshCw size={15} aria-hidden />{generation.isPending ? "GENERATING" : "GENERATE REPORT"}</button>
+        {[7, 30, 90].map((value) => <button key={value} className={!custom && days === value ? "is-active" : ""} onClick={() => { setCustom(false); setDays(value); }}>{value}D</button>)}
+        <button className={custom ? "is-active" : ""} onClick={() => setCustom(true)}>CUSTOM</button>
+        {custom && <><label>From<input type="date" value={customFrom} onChange={(event) => setCustomFrom(event.target.value)} /></label><label>To<input type="date" value={customTo} onChange={(event) => setCustomTo(event.target.value)} /></label></>}
+        <button className="generate-button" disabled={generation.isPending || (custom && (!customFrom || !customTo))} onClick={() => generation.mutate()}><RefreshCw size={15} aria-hidden />{generation.isPending ? "GENERATING" : "GENERATE REPORT"}</button>
       </div>
     </header>
     <CurrentContextStrip />
     {generation.isError && <div className="console-alert" role="alert">Generation failed: {generation.error.message}. Existing revision remains authoritative.</div>}
-    {query.isPending ? <div className="console-empty">Loading immutable report revision…</div> : query.isError ? <div className="console-alert" role="alert">Report request failed: {query.error.message}</div> : query.data == null ? <EmptyReport onGenerate={() => generation.mutate()} /> : <ReportConsole report={query.data} />}
+    {query.isPending ? <div className="console-empty">Loading immutable report revision…</div> : query.isError ? <div className="console-alert" role="alert">Report request failed: {query.error.message}</div> : (preview ?? query.data) == null ? <EmptyReport onGenerate={() => generation.mutate()} /> : <ReportConsole report={(preview ?? query.data)!} />}
+    <section className="report-panel" aria-labelledby="report-history-title"><header className="report-panel__header"><div><span className="console-kicker">IMMUTABLE REVISION HISTORY</span><h2 id="report-history-title">Reports / failed jobs</h2></div></header><div className="console-table-wrap"><table><thead><tr><th>Revision</th><th>Status</th><th>Requested</th><th>Default</th><th>Actions</th></tr></thead><tbody>{history.data?.map((item) => <tr key={item.jobId}><td>#{item.revisionNumber || "—"}</td><td>{item.status}</td><td>{new Date(item.requestedAt).toLocaleString()}</td><td>{item.pinned ? "PINNED" : "—"}</td><td>{item.status === "SUCCEEDED" && <><button onClick={() => void fetchReportRevision(item.revisionId).then(setPreview)}>PREVIEW</button><button onClick={() => void pinReport(scopeKey, item.revisionId).then(() => queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey] }))}>PIN</button></>}</td></tr>)}</tbody></table></div></section>
   </main>;
 }
 
 function CurrentContextStrip() {
+  const [context, setContext] = useState<{ state: string; sequence: number | null; sources: { source: string; freshness: string; value: Record<string, string> | null }[] }>({ state: "CONNECTING", sequence: null, sources: [] });
+  useEffect(() => {
+    if (typeof WebSocket === "undefined") return undefined;
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(`${protocol}://${window.location.host}/ops/current-context/ws`);
+    socket.onmessage = (event) => {
+      const envelope = JSON.parse(String(event.data)) as { sequence: number; sources: { source: string; freshness: string; value: Record<string, string> | null }[] };
+      setContext((current) => current.sequence != null && envelope.sequence !== current.sequence + 1 ? { state: "RESYNCING", sequence: envelope.sequence, sources: envelope.sources } : { state: "CONNECTED", sequence: envelope.sequence, sources: envelope.sources });
+    };
+    socket.onclose = () => setContext((current) => ({ ...current, state: "DISCONNECTED" }));
+    socket.onerror = () => setContext((current) => ({ ...current, state: "DISCONNECTED" }));
+    return () => socket.close();
+  }, []);
+  const quote = context.sources.find((source) => source.source === "MARKET_QUOTE");
+  const runtime = context.sources.find((source) => source.source === "RUNTIME_STATE");
+  const account = context.sources.find((source) => source.source === "PAPER_ACCOUNT");
+  const latestRun = context.sources.find((source) => source.source === "LATEST_LLM_RUN");
+
   return <section className="current-context" aria-label="Current context">
     <div><span>CURRENT CONTEXT · NOT REPORT EVIDENCE</span><strong>READ-ONLY</strong></div>
-    <div><span>Connection</span><strong>UNAVAILABLE</strong><small>No current-context WebSocket snapshot</small></div>
-    <div><span>Market quote</span><strong>MISSING</strong><small>Never backfilled into report evidence</small></div>
-    <div><span>Risk / mode</span><strong>PAPER</strong><small>Live trading is not enabled</small></div>
-    <div><span>Freshness</span><strong>DISCONNECTED</strong><small>Historical revision remains unchanged</small></div>
+    <div><span>Connection</span><strong>{context.state}</strong><small>sequence {context.sequence ?? "—"}</small></div>
+    <div><span>Market quote</span><strong>{quote?.value?.bidPriceJpy ?? "MISSING"}</strong><small>{quote?.freshness ?? "UNAVAILABLE"} · never report evidence</small></div>
+    <div><span>Risk / mode</span><strong>{runtime?.value?.riskState ?? "PAPER"}</strong><small>{runtime?.value?.mode ?? "PAPER"} · live trading is not enabled</small></div>
+    <div><span>Paper equity / exposure</span><strong>{account?.value?.equityJpy ?? "UNAVAILABLE"}</strong><small>{account?.value?.exposureJpy ?? "UNAVAILABLE"} JPY exposure</small></div>
+    <div><span>Latest LLM run</span><strong>{latestRun?.value?.status ?? "UNAVAILABLE"}</strong><small>{latestRun?.value?.invocationId ?? "no persisted run"}</small></div>
+    <div><span>Freshness</span><strong>{quote?.freshness ?? "UNAVAILABLE"}</strong><small>Historical revision remains unchanged</small></div>
   </section>;
 }
 

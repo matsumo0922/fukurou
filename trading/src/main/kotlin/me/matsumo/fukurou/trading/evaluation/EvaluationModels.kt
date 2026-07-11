@@ -111,6 +111,7 @@ data class EvaluatedTrade(
 /** Historical Outcome Ridge の集計単位。 */
 enum class OutcomeRidgeGrouping {
     SETUP,
+    MARKET_REGIME,
     WEEK,
     PROVIDER,
 }

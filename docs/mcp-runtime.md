@@ -186,6 +186,8 @@ Cloudflare Access は `/app/*` と `/ops/*` を保護し、runtime config draft 
 - TTL 取消の `canceledAt - expiredAt` が 10 秒を超える場合は infrastructure / monitoring delay として `strategyEvaluationEligible=false` と `LIFECYCLE_MONITORING_DELAY` を返す。この order は勝率、EV、profit factor などの strategy outcome 集計へ含めない。現行集計は closed position と execution を正本とするため、未約定の取消 order は集計入力にならない。
 
 Evaluation Report Console の Historical Outcome Ridge と Evidence Relationship Graph は immutable report snapshot だけを authority とする。historical ridge は observed realized R であり forecast ではない。Evidence Relationship Graph は report の evidence reference であり decision provenance や causality ではない。market-data gap、monitoring gap、missing R、truncated input は欠損または除外として表示し、価格履歴から遡及補完しない。current browser context は report evidence、paper fill、historical outcome の入力へ混ぜない。
+
+Evaluation Report Console の current context は `/ops/current-context/ws` の browser read-only WebSocket で配信する。envelope は session ID と sequence を持ち、sequence gap、切断、再接続中は UI が resync 状態を明示する。market quote と runtime risk state は freshness を伴う別 projection であり、pin 済み report revision、claim validation、paper execution の authority にはならない。
 - paper STOP は `ProtectionReconciler` が動いている間だけ約定判定される。live の native STOP は bot 停止中も取引所側で作動するため、paper の方が保護が弱い。
 - paper の resting BUY LIMIT は発注時に exact-price bid と先行する同価格の自 paper order を `queueAheadBtc` として保存する。WebSocket の eligible SELL 数量が `queueAheadBtc + order.sizeBtc` に達した event でだけ、LIMIT 価格の maker 全量約定にする。partial fill と先行 exchange order cancellation は再現しない。
 - transport がhealthyでも、resting BUY LIMITのqueue snapshotは直近realtime tradeを必要とする。`lastTradeAt` が30秒を超える、または未観測の場合は `QUEUE_SNAPSHOT_UNAVAILABLE` としてfail-closedにする。

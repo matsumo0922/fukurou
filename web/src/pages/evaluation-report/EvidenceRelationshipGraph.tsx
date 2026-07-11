@@ -57,6 +57,10 @@ function projectGraph(report: EvaluationReport, selectedClaim: string | null): G
     fact.sourceIds.filter((sourceId) => sourceIds.has(sourceId)).forEach((sourceId) => edges.push(makeEdge(`fact:${fact.factId}`, `source:${sourceId}`, false)));
   });
   report.sources.forEach((source) => nodes.push(makeNode(`source:${source.sourceId}`, `${source.sourceId}\n${source.freshness}`, "source", 3)));
+  report.chartIndex.forEach((chart) => {
+    nodes.push(makeNode(`chart:${chart.chartId}`, `${chart.chartId}\n${chart.catalogVersion}`, "chart", 3));
+    chart.factIds.forEach((factId) => edges.push(makeEdge(`fact:${factId}`, `chart:${chart.chartId}`, false)));
+  });
 
   return layout(nodes, edges, paths);
 }

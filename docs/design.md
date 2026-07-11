@@ -1327,7 +1327,7 @@ kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `K
 - `GET /evaluation/benchmark`
 - `GET /evaluation/costs`
 
-Evaluation Report Console は `POST /evaluation/reports/jobs` で 7D / 30D / 90D の complete calendar days を手動 snapshot 化し、`GET /evaluation/reports/default` と `GET /evaluation/reports/revisions` から immutable revision を読む。revision は `inputAsOf`、snapshot ID、canonical `inputHash`、typed facts、claim validation、Historical Outcome Ridge を同じ artifact に保持する。validator は prose を書き換えず、claim ごとに verified / conflict / insufficient evidence / fact missing / not verifiable を返す。
+Evaluation Report Console は `POST /evaluation/reports/jobs` で 7D / 30D / 90D または最大365日の CUSTOM complete calendar days を手動 snapshot 化し、`GET /evaluation/reports/default` と `GET /evaluation/reports/revisions` から scope ごとの immutable revision を読む。manual job、LLM launch reservation、revision、明示 pin は PostgreSQL へ保存し、admission と reservation を同一 transaction で確定する。生成は browser request から分離した async job とし、server-side LLM invocation は MCP と tool を無効にした JSON-only report prompt を使う。revision は `inputAsOf`、snapshot ID、canonical `inputHash`、typed facts、claim validation、Historical Outcome Ridge を同じ artifact に保持する。validator は prose を書き換えず、claim ごとに verified / conflict / insufficient evidence / fact missing / not verifiable を返す。
 
 Historical Outcome Ridge は observed paper trade の realized R だけを `[-2R, +3R)`、0.25R 幅の fixed bins へ集計する。`-2R` は first bin、`2.75R` は last bin、`3R` 以上は overflow、`-2R` 未満は underflow とし、missing R を 0R や端 bin へ補完しない。SETUP / WEEK / PROVIDER grouping は同じ snapshot から導出し、Web UI の SHARE / COUNT 切替では再集計しない。
 
