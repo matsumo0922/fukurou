@@ -6,9 +6,14 @@ import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.webSocket
 import io.ktor.http.HttpHeaders
 import io.ktor.server.testing.testApplication
+import io.ktor.server.application.install
+import io.ktor.server.routing.routing
+import io.ktor.server.websocket.WebSockets as ServerWebSockets
 import io.ktor.websocket.Frame
 import io.ktor.websocket.readText
 import kotlinx.serialization.decodeFromString
+import kotlinx.coroutines.delay
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import java.math.BigDecimal
@@ -21,6 +26,43 @@ import kotlin.test.assertNotEquals
 
 /** current context WebSocket の snapshot authority を検証する。 */
 class CurrentContextWebSocketRouteTest {
+
+    @Test
+    fun websocket_rejectsMissingForeignAndCrossSchemeOrigins() = testApplication {
+        application { module(clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC)) }
+        val client = createClient { install(WebSockets) }
+        listOf(null, "https://localhost", "http://foreign.example").forEach { origin ->
+            client.webSocket("/ops/current-context/ws", request = { origin?.let { headers.append(HttpHeaders.Origin, it) } }) {
+                assertEquals(io.ktor.websocket.CloseReason.Codes.VIOLATED_POLICY.code, closeReason.await()?.code)
+            }
+        }
+        assertEquals(true, originAllowed("https://example.com", "https", "example.com", 443))
+        assertEquals(false, originAllowed("http://example.com", "https", "example.com", 443))
+    }
+
+    @Test
+    fun websocket_closesSlowClientWithTryAgainLater() = testApplication {
+        application {
+            install(ServerWebSockets)
+            routing {
+                currentContextWebSocketRoutes(
+                    EvaluationRouteDependencies(
+                        repository = null,
+                        riskStateRepository = null,
+                        marketDataSource = null,
+                        tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+                        clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC),
+                        currentContextSendTimeoutMillis = 1,
+                        currentContextSendOverride = { delay(100) },
+                    ),
+                )
+            }
+        }
+        val client = createClient { install(WebSockets) }
+        client.webSocket("/ops/current-context/ws", request = { headers.append(HttpHeaders.Origin, "http://localhost") }) {
+            assertEquals(io.ktor.websocket.CloseReason.Codes.TRY_AGAIN_LATER.code, closeReason.await()?.code)
+        }
+    }
 
     @Test
     fun websocket_usesConnectionScopedSessionAndRestartsSequence() = testApplication {

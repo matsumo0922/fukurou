@@ -54,6 +54,16 @@ function projectGraph(report: EvaluationReport, selectedClaim: string | null, pa
     nodes.push(makeNode(`chart:${chart.chartId}`, `${chart.chartId}\n${chart.catalogVersion}`, "chart", 3));
     chart.factIds.forEach((factId) => edges.push(makeEdge(`fact:${factId}`, `chart:${chart.chartId}`, false)));
   });
+  paths.forEach((path) => {
+    const sourceId = `source:${path.source}`;
+    const chartId = `chart:${path.chart}`;
+    if (!nodes.some((node) => node.id === sourceId)) nodes.push(makeNode(sourceId, path.source, "source unavailable", 3));
+    if (!nodes.some((node) => node.id === chartId)) nodes.push(makeNode(chartId, path.chart, "chart unavailable", 3));
+    const sourceEdge = makeEdge(`fact:${path.fact}`, sourceId, false);
+    const chartEdge = makeEdge(`fact:${path.fact}`, chartId, false);
+    if (!edges.some((edge) => edge.id === sourceEdge.id)) edges.push(sourceEdge);
+    if (!edges.some((edge) => edge.id === chartEdge.id)) edges.push(chartEdge);
+  });
 
   const visibleIds = new Set(paths.flatMap((path) => [`segment:${path.segment}`, `claim:${path.claim}`, `fact:${path.fact}`, `source:${path.source}`, `chart:${path.chart}`]));
   return layout(nodes.filter((node) => visibleIds.has(node.id)), edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target)), paths);

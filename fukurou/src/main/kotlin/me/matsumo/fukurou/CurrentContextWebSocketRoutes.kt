@@ -2,7 +2,7 @@
 
 package me.matsumo.fukurou
 
-import io.ktor.server.request.host
+import io.ktor.server.plugins.origin
 import io.ktor.server.routing.Route
 import io.ktor.server.websocket.webSocket
 import io.ktor.server.routing.openapi.describe
@@ -24,7 +24,8 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 @OptIn(ExperimentalKtorApi::class)
 internal fun Route.currentContextWebSocketRoutes(dependencies: EvaluationRouteDependencies) {
     webSocket("/ops/current-context/ws") {
-        if (!originAllowed(call.request.headers["Origin"], call.request.host())) {
+        val requestOrigin = call.request.origin
+        if (!originAllowed(call.request.headers["Origin"], requestOrigin.scheme, requestOrigin.serverHost, requestOrigin.serverPort)) {
             close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "origin is not allowed"))
             return@webSocket
         }
@@ -46,9 +47,11 @@ internal fun Route.currentContextWebSocketRoutes(dependencies: EvaluationRouteDe
                 sentAt = dependencies.clock.instant().toString(),
                 sources = if (previous == sources) emptyList() else sources,
             )
+            val encodedEnvelope = ApiJson.encodeToString(envelope)
             runCatching {
-                withTimeout(Duration.ofSeconds(1).toMillis()) {
-                    send(Frame.Text(ApiJson.encodeToString(envelope)))
+                withTimeout(dependencies.currentContextSendTimeoutMillis) {
+                    dependencies.currentContextSendOverride?.invoke(encodedEnvelope)
+                        ?: send(Frame.Text(encodedEnvelope))
                 }
             }.getOrElse {
                 close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "current context client is too slow"))
@@ -187,9 +190,18 @@ private fun freshness(
     }
 }
 
-private fun originAllowed(origin: String?, host: String): Boolean {
+internal fun originAllowed(
+    origin: String?,
+    scheme: String,
+    host: String,
+    port: Int,
+): Boolean {
     if (origin == null) return false
-    return runCatching { java.net.URI(origin).authority == host }.getOrDefault(false)
+    return runCatching {
+        val uri = java.net.URI(origin)
+        val originPort = if (uri.port >= 0) uri.port else if (uri.scheme == "https") 443 else 80
+        uri.scheme == scheme && uri.host.equals(host, ignoreCase = true) && originPort == port
+    }.getOrDefault(false)
 }
 
 @Serializable

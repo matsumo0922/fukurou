@@ -371,6 +371,19 @@ private class EvaluationReportStore(
             EvaluationReportClaim("claim-pnl-direction", "FACT_DIRECTION", listOf("performance.totalPnlJpy"), direction(stats.totalPnlJpy)),
             EvaluationReportClaim("claim-trade-count", "FACT_VALUE", listOf("performance.tradeCount"), stats.tradeCount.toString()),
         )
+        val integrity = EvaluationIntegrityResponse(
+            eligibleTradeCount = queryResult.trades.size,
+            missingRCount = stats.rUnavailableCount,
+            excludedOrderCount = exclusions.orderCount,
+            excludedPositionCount = exclusions.positionCount,
+            excludedDecisionRunCount = exclusions.decisionRunCount,
+            exclusionReasons = exclusions.reasons,
+            llmPhaseCount = costStats.phaseCount,
+            missingUsagePhaseCount = costStats.missingUsagePhaseCount,
+            unpricedPhaseCount = costStats.unpricedPhaseCount,
+            knownCostUsd = costStats.knownCostUsd?.toPlainString(),
+            usageTruncated = false,
+        )
         val inputAsOf = clock.instant().toString()
         val reportSources = listOf(
             EvaluationReportSourceResponse("paper-ledger", inputAsOf, "SNAPSHOT"),
@@ -406,8 +419,7 @@ private class EvaluationReportStore(
                 benchmark = benchmarkResponse,
                 calibration = calibration,
                 performanceLattice = performanceLattice,
-                exclusions = exclusions.reasons,
-                usage = EvaluationSnapshotUsage(costStats.phaseCount, costStats.missingUsagePhaseCount, costStats.unpricedPhaseCount, false),
+                integrity = integrity,
             ),
         )
         val inputHash = sha256(canonical)
@@ -455,19 +467,7 @@ private class EvaluationReportStore(
             benchmark = benchmarkResponse,
             calibration = calibration,
             performanceLattice = performanceLattice,
-            integrity = EvaluationIntegrityResponse(
-                eligibleTradeCount = queryResult.trades.size,
-                missingRCount = stats.rUnavailableCount,
-                excludedOrderCount = exclusions.orderCount,
-                excludedPositionCount = exclusions.positionCount,
-                excludedDecisionRunCount = exclusions.decisionRunCount,
-                exclusionReasons = exclusions.reasons,
-                llmPhaseCount = costStats.phaseCount,
-                missingUsagePhaseCount = costStats.missingUsagePhaseCount,
-                unpricedPhaseCount = costStats.unpricedPhaseCount,
-                knownCostUsd = costStats.knownCostUsd?.toPlainString(),
-                usageTruncated = usageResult.truncated,
-            ),
+            integrity = integrity,
             truncated = queryResult.truncated,
         )
         persistence?.complete(report, job)?.getOrThrow()
@@ -490,6 +490,7 @@ private class EvaluationReportStore(
         synchronized(jobs) { jobs[job.jobId] = failedJob }
     }
 
+    @Suppress("LongMethod")
     private suspend fun generateArtifact(
         fallbackClaims: List<EvaluationReportClaim>,
         facts: List<EvaluationReportFact>,
@@ -504,6 +505,7 @@ private class EvaluationReportStore(
         val auditor = requireNotNull(llmInvocationAuditor) { "LLM invocation auditor is unavailable" }
         val prompt = reportPrompt(days, facts)
         val promptHash = sha256(prompt)
+        val effort = evaluationReportEffort(environment)
         val workingDirectory = Files.createTempDirectory("fukurou-evaluation-report-")
         val safeEnvironment = environment.filterKeys { key -> key in REPORT_CHILD_ENV_ALLOWLIST }
         val audited = try {
@@ -533,6 +535,7 @@ private class EvaluationReportStore(
                     mcpServer = null,
                     environment = safeEnvironment,
                     allowedTools = emptyList(),
+                    effort = effort,
                 ),
                 llmInvoker = invoker,
             ).getOrThrow()
@@ -551,7 +554,7 @@ private class EvaluationReportStore(
                 promptHash = promptHash,
                 promptVersion = REPORT_PROMPT_VERSION,
                 schemaVersion = REPORT_SCHEMA_VERSION,
-                effort = environment["FUKUROU_CLAUDE_EFFORT"] ?: "DEFAULT",
+                effort = effort.name,
             ),
         )
     }
@@ -607,6 +610,11 @@ private val REPORT_CHILD_ENV_ALLOWLIST = setOf("HOME", "PATH", "TMPDIR", "CODEX_
 
 private const val REPORT_PROMPT_VERSION = "evaluation-report-prompt-v1"
 private const val REPORT_SCHEMA_VERSION = "evaluation-report-schema-v1"
+internal fun evaluationReportEffort(environment: Map<String, String>): me.matsumo.fukurou.trading.invoker.LlmEffort =
+    environment["FUKUROU_CLAUDE_EFFORT"]?.let(me.matsumo.fukurou.trading.invoker.LlmEffort::valueOf)
+        ?: me.matsumo.fukurou.trading.invoker.LlmEffort.DEFAULT
+internal fun canonicalIntegrityHash(integrity: EvaluationIntegrityResponse): String =
+    sha256(ReportJson.encodeToString(integrity))
 private fun reportPrompt(days: Int, facts: List<EvaluationReportFact>): String = """
     Generate a factual evaluation report for the previous $days complete calendar days.
     Return JSON only with this exact shape:
@@ -1015,16 +1023,7 @@ private data class CanonicalEvaluationSnapshot(
     val benchmark: ReportBenchmarkChartResponse,
     val calibration: ReportCalibrationChartResponse,
     val performanceLattice: ReportPerformanceLatticeResponse,
-    val exclusions: Map<String, Int>,
-    val usage: EvaluationSnapshotUsage,
-)
-
-@Serializable
-private data class EvaluationSnapshotUsage(
-    val phaseCount: Int,
-    val missingUsageCount: Int,
-    val unpricedCount: Int,
-    val truncated: Boolean,
+    val integrity: EvaluationIntegrityResponse,
 )
 
 @Serializable

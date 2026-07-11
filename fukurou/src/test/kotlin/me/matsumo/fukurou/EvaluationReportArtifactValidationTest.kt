@@ -4,10 +4,23 @@ package me.matsumo.fukurou
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
 import kotlin.test.assertFailsWith
 
 /** untrusted LLM report artifact の structural bounds を検証する。 */
 class EvaluationReportArtifactValidationTest {
+
+    @Test
+    fun canonicalIntegrityHash_coversEveryIntegrityCountAndEffortUsesSingleConfiguredValue() {
+        val base = EvaluationIntegrityResponse(1, 2, 3, 4, 5, mapOf("reason" to 6), 7, 8, 9, "0.1", false)
+        val variants = listOf(
+            base.copy(eligibleTradeCount = 11), base.copy(missingRCount = 12), base.copy(excludedOrderCount = 13),
+            base.copy(excludedPositionCount = 14), base.copy(excludedDecisionRunCount = 15),
+            base.copy(llmPhaseCount = 17), base.copy(missingUsagePhaseCount = 18), base.copy(unpricedPhaseCount = 19),
+        )
+        variants.forEach { variant -> assertNotEquals(canonicalIntegrityHash(base), canonicalIntegrityHash(variant)) }
+        assertEquals(me.matsumo.fukurou.trading.invoker.LlmEffort.HIGH, evaluationReportEffort(mapOf("FUKUROU_CLAUDE_EFFORT" to "HIGH")))
+    }
 
     @Test
     fun validator_rejectsDuplicateIdsUnknownKindsAndDanglingClaimReferences() {

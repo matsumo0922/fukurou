@@ -4,7 +4,8 @@ import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import { fetchReportHistory, fetchReportRevision, generateReport, pinReport, reportQuery, reportScopeKey, type EvaluationReport, type ReportJob, type ReportScope } from "../api/evaluationReport";
 import { LazyHistoricalOutcomeRidge } from "./evaluation-report/HistoricalOutcomeRidge.lazy";
 import { LazyEvidenceRelationshipGraph } from "./evaluation-report/EvidenceRelationshipGraph.lazy";
-import { disconnectedContext, initialContextState, transitionCurrentContext, type ContextEnvelope } from "./evaluation-report/currentContextStateMachine";
+import { initialContextState } from "./evaluation-report/currentContextStateMachine";
+import { startCurrentContextClient } from "./evaluation-report/currentContextClient";
 
 export function EvaluationPage() {
   const [days, setDays] = useState(30);
@@ -61,46 +62,11 @@ function CurrentContextStrip() {
   useEffect(() => {
     if (typeof WebSocket === "undefined") return undefined;
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    let socket: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
-    let stopped = false;
-    const reconnect = () => {
-      if (stopped) return;
-      setContext(disconnectedContext);
-      reconnectTimer = setTimeout(connect, 1000);
-    };
-    const armHeartbeatTimeout = () => {
-      if (heartbeatTimer) clearTimeout(heartbeatTimer);
-      heartbeatTimer = setTimeout(() => { socket?.close(); }, 45_000);
-    };
-    const connect = () => {
-      socket = new WebSocket(`${protocol}://${window.location.host}/ops/current-context/ws`);
-      socket.onmessage = (event) => {
-        try {
-          const envelope = JSON.parse(String(event.data)) as ContextEnvelope;
-          setContext((current) => {
-            const transition = transitionCurrentContext(current, envelope);
-            if (transition.close) socket?.close();
-            return transition.context;
-          });
-          armHeartbeatTimeout();
-        } catch {
-          setContext(disconnectedContext);
-          socket?.close();
-        }
-      };
-      socket.onclose = reconnect;
-      socket.onerror = () => socket?.close();
-      armHeartbeatTimeout();
-    };
-    connect();
-    return () => {
-      stopped = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (heartbeatTimer) clearTimeout(heartbeatTimer);
-      socket?.close();
-    };
+    return startCurrentContextClient({
+      url: `${protocol}://${window.location.host}/ops/current-context/ws`,
+      createSocket: (url) => new WebSocket(url),
+      onContext: setContext,
+    });
   }, []);
   const quote = context.sources.find((source) => source.source === "MARKET_QUOTE");
   const runtime = context.sources.find((source) => source.source === "RUNTIME_STATE");

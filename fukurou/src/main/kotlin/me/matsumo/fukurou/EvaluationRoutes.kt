@@ -88,6 +88,8 @@ internal data class EvaluationRouteDependencies(
     val database: ExposedDatabase? = null,
     val latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
     val clock: Clock = Clock.systemUTC(),
+    val currentContextSendTimeoutMillis: Long = 1_000,
+    val currentContextSendOverride: (suspend (String) -> Unit)? = null,
 )
 
 /**
