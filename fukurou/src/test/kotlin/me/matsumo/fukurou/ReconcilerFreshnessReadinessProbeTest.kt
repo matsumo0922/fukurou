@@ -21,15 +21,14 @@ class ReconcilerFreshnessReadinessProbeTest {
     fun ready_when_dependency_ready_and_reconciler_fresh() = runBlocking {
         val status = MutableReconcilerStatus()
         status.markReconciled(
-            reconciledAt = Instant.parse("2026-07-02T00:00:00Z"),
             startupFullReconcileCompleted = true,
-            lastMarketDataAt = Instant.parse("2026-07-02T00:00:00Z"),
+            lastMaintenanceAt = Instant.parse("2026-07-02T00:00:00Z"),
         )
         status.updateMarketData(
             ReconcilerStatus(
-                lastReconciledAt = Instant.parse("2026-07-02T00:00:00Z"),
                 startupFullReconcileCompleted = true,
-                lastMarketDataAt = Instant.parse("2026-07-02T00:00:00Z"),
+                lastTransportActivityAt = Instant.parse("2026-07-02T00:00:00Z"),
+                lastMaintenanceAt = Instant.parse("2026-07-02T00:00:00Z"),
                 marketDataState = MarketDataConnectionState.CONNECTED,
                 startupRecoveryCompleted = true,
             ),
@@ -44,9 +43,9 @@ class ReconcilerFreshnessReadinessProbeTest {
         val status = MutableReconcilerStatus()
         status.updateMarketData(
             ReconcilerStatus(
-                lastReconciledAt = Instant.parse("2026-07-01T23:59:00Z"),
                 startupFullReconcileCompleted = true,
-                lastMarketDataAt = Instant.parse("2026-07-02T00:00:00Z"),
+                lastTransportActivityAt = Instant.parse("2026-07-02T00:00:00Z"),
+                lastMaintenanceAt = Instant.parse("2026-07-01T23:59:00Z"),
                 marketDataState = MarketDataConnectionState.CONNECTED,
                 startupRecoveryCompleted = true,
             ),
@@ -61,9 +60,9 @@ class ReconcilerFreshnessReadinessProbeTest {
         val status = MutableReconcilerStatus()
         status.updateMarketData(
             ReconcilerStatus(
-                lastReconciledAt = Instant.parse("2026-07-02T00:00:00Z"),
                 startupFullReconcileCompleted = true,
-                lastMarketDataAt = Instant.parse("2026-07-01T23:59:00Z"),
+                lastTransportActivityAt = Instant.parse("2026-07-01T23:59:00Z"),
+                lastMaintenanceAt = Instant.parse("2026-07-02T00:00:00Z"),
                 marketDataState = MarketDataConnectionState.CONNECTED,
                 startupRecoveryCompleted = true,
             ),
@@ -83,5 +82,6 @@ private fun createProbe(status: MutableReconcilerStatus): ReconcilerFreshnessRea
         reconcilerStatusProvider = status,
         clock = Clock.fixed(Instant.parse("2026-07-02T00:00:10Z"), ZoneOffset.UTC),
         staleAfter = Duration.ofSeconds(30),
+        transportLivenessTimeout = Duration.ofSeconds(30),
     )
 }

@@ -205,7 +205,7 @@ private fun nonDefaultRuntimeConfig(): TradingBotConfig {
         gmoPublicWebSocket = GmoPublicWebSocketConfig(
             endpoint = "wss://example.invalid/fukurou-test",
             connectTimeout = Duration.ofMillis(6100),
-            messageStaleTimeout = Duration.ofSeconds(31),
+            transportLivenessTimeout = Duration.ofSeconds(31),
             reconnectBackoff = Duration.ofMillis(2100),
         ),
     )

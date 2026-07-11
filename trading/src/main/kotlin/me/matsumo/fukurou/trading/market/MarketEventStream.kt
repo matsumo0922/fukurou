@@ -11,9 +11,9 @@ interface MarketEventStream {
     val reconnectBackoff: java.time.Duration
         get() = java.time.Duration.ofSeconds(5)
 
-    /** event が届かない接続を gap と判定するまでの時間。 */
-    val messageStaleTimeout: java.time.Duration
-        get() = java.time.Duration.ofSeconds(30)
+    /** transport activity が届かない接続を gap と判定するまでの時間。 */
+    val transportLivenessTimeout: java.time.Duration
+        get() = java.time.Duration.ofSeconds(150)
 
     /**
      * 新しい接続 session を開く。
@@ -32,9 +32,27 @@ interface MarketEventSession : AutoCloseable {
     val connectedAt: Instant
 
     /**
-     * 次の realtime trade event を待つ。切断、parse failure は failure を返す。
+     * 次の realtime market signal を待つ。切断、parse failure は failure を返す。
      */
-    suspend fun receive(): Result<PaperMarketTradeEvent>
+    suspend fun receive(): Result<MarketEventSessionSignal>
+}
+
+/** WebSocket session から Reconciler へ渡す signal。 */
+sealed interface MarketEventSessionSignal {
+    /** paper execution の正本となる realtime trade。 */
+    data class Trade(val event: PaperMarketTradeEvent) : MarketEventSessionSignal
+
+    /** 約定を表さない transport activity。 */
+    data class TransportActivity(
+        val observedAt: Instant,
+        val kind: TransportActivityKind,
+    ) : MarketEventSessionSignal
+}
+
+/** transport activity の種別。 */
+enum class TransportActivityKind {
+    SUBSCRIPTION_ACKNOWLEDGED,
+    PING_PONG_COMPLETED,
 }
 
 /** market-data message の形式または値が不正であることを示す例外。 */
@@ -44,8 +62,8 @@ class InvalidMarketDataMessageException(message: String, cause: Throwable? = nul
 /** market-data subscription が取引所に拒否されたことを示す例外。 */
 class MarketDataSubscriptionException(message: String) : IllegalStateException(message)
 
-/** market-data message が期限内に届かなかったことを示す例外。 */
-class MarketDataMessageStaleException(message: String) : IllegalStateException(message)
+/** transport activity が期限内に届かなかったことを示す例外。 */
+class MarketDataTransportLivenessException(message: String) : IllegalStateException(message)
 
 /** market-data consumer が受信速度に追従できないことを示す例外。 */
 class MarketDataBackpressureException(message: String) : IllegalStateException(message)

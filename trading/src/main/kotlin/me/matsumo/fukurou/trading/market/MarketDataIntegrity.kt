@@ -12,7 +12,10 @@ enum class MarketDataConnectionState {
 /** market-data gap の理由。 */
 enum class MarketDataGapReason {
     DISCONNECTED,
+
+    /** historical row の読取互換だけに使う旧trade-stale理由。新規gapには使わない。 */
     MESSAGE_STALE,
+    TRANSPORT_LIVENESS_LOST,
     INVALID_MESSAGE,
     SEQUENCE_GAP,
     DATABASE_FAILURE,
@@ -26,7 +29,8 @@ data class MarketDataIntegritySnapshot(
     val state: MarketDataConnectionState = MarketDataConnectionState.DISCONNECTED,
     val sessionId: UUID? = null,
     val lastProcessedSequence: Long = 0,
-    val lastReceivedAt: Instant? = null,
+    val lastTransportActivityAt: Instant? = null,
+    val lastTradeAt: Instant? = null,
     val lastMaintenanceAt: Instant? = null,
     val gapStartedAt: Instant? = null,
     val recoveredAt: Instant? = null,
@@ -43,6 +47,9 @@ interface MarketDataIntegrityRepository {
 
     /** 新しい接続 session を開始する。 */
     suspend fun beginSession(sessionId: UUID, connectedAt: Instant): Result<Unit>
+
+    /** transport activity を単調増加で保存する。 */
+    suspend fun markTransportActivity(sessionId: UUID, observedAt: Instant): Result<Unit>
 
     /** periodic safety maintenance の最終成功時刻を保存する。 */
     suspend fun markMaintenanceSucceeded(sessionId: UUID, succeededAt: Instant): Result<Unit>
@@ -81,6 +88,10 @@ object UnavailableMarketDataIntegrityRepository : MarketDataIntegrityRepository 
     }
 
     override suspend fun beginSession(sessionId: UUID, connectedAt: Instant): Result<Unit> {
+        return Result.failure(IllegalStateException("market-data integrity repository is unavailable."))
+    }
+
+    override suspend fun markTransportActivity(sessionId: UUID, observedAt: Instant): Result<Unit> {
         return Result.failure(IllegalStateException("market-data integrity repository is unavailable."))
     }
 

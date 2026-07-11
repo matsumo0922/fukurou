@@ -8,14 +8,16 @@ import java.util.UUID
 /**
  * ProtectionReconciler の現在状態。
  *
- * @param lastReconciledAt 最後に reconcile pass が完了した時刻
  * @param startupFullReconcileCompleted 起動時 full reconcile pass が完了済みか
- * @param lastMarketDataAt 最後に tick を確認した時刻
+ * @param lastTransportActivityAt 最後に transport activity を確認した時刻
+ * @param lastTradeAt 最後に realtime trade を確認した時刻
+ * @param lastMaintenanceAt 最後に periodic maintenance が成功した時刻
  */
 data class ReconcilerStatus(
-    val lastReconciledAt: Instant? = null,
     val startupFullReconcileCompleted: Boolean = false,
-    val lastMarketDataAt: Instant? = null,
+    val lastTransportActivityAt: Instant? = null,
+    val lastTradeAt: Instant? = null,
+    val lastMaintenanceAt: Instant? = null,
     val marketDataState: MarketDataConnectionState = MarketDataConnectionState.DISCONNECTED,
     val marketDataSessionId: UUID? = null,
     val lastProcessedSequence: Long = 0,
@@ -50,15 +52,10 @@ class MutableReconcilerStatus : ReconcilerStatusProvider {
     /**
      * reconcile pass 完了状態を記録する。
      */
-    fun markReconciled(
-        reconciledAt: Instant,
-        startupFullReconcileCompleted: Boolean,
-        lastMarketDataAt: Instant?,
-    ) {
+    fun markReconciled(startupFullReconcileCompleted: Boolean, lastMaintenanceAt: Instant?) {
         currentStatus = currentStatus.copy(
-            lastReconciledAt = reconciledAt,
             startupFullReconcileCompleted = currentStatus.startupFullReconcileCompleted || startupFullReconcileCompleted,
-            lastMarketDataAt = lastMarketDataAt ?: currentStatus.lastMarketDataAt,
+            lastMaintenanceAt = lastMaintenanceAt ?: currentStatus.lastMaintenanceAt,
         )
     }
 

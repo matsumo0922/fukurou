@@ -178,11 +178,19 @@ private fun ProtectionReconcilerWorkerInputs.createRuntimeComponents(): Protecti
         tradingLock = PostgresGlobalTradingLock(dataSource, clock),
         marketDataSource = marketDataSource,
         broker = broker,
-        marketEventStream = GmoPublicWebSocketMarketEventStream(
-            config = tradingConfig.gmoPublicWebSocket,
-            symbol = tradingConfig.symbol,
-            clock = clock,
-        ),
+        marketEventStream = createGmoMarketEventStream(tradingConfig, clock),
+    )
+}
+
+/** runtime config を WebSocket transport へ投影する。 */
+internal fun createGmoMarketEventStream(
+    tradingConfig: TradingBotConfig,
+    clock: Clock,
+): GmoPublicWebSocketMarketEventStream {
+    return GmoPublicWebSocketMarketEventStream(
+        config = tradingConfig.gmoPublicWebSocket,
+        symbol = tradingConfig.symbol,
+        clock = clock,
     )
 }
 

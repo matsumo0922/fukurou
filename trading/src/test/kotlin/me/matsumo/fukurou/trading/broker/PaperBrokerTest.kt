@@ -151,12 +151,17 @@ class PaperBrokerTest {
     }
 
     @Test
-    fun get_account_status_includes_reconciler_freshness() = runBlocking {
+    fun get_account_status_projects_last_maintenance_at_to_compatible_last_reconciled_at() = runBlocking {
         val reconcilerStatus = MutableReconcilerStatus()
-        reconcilerStatus.markReconciled(
-            reconciledAt = fixedInstant(),
-            startupFullReconcileCompleted = true,
-            lastMarketDataAt = fixedInstant(),
+        reconcilerStatus.updateMarketData(
+            ReconcilerStatus(
+                lastTransportActivityAt = fixedInstant(),
+                lastTradeAt = fixedInstant(),
+                lastMaintenanceAt = fixedInstant(),
+                startupFullReconcileCompleted = true,
+                marketDataState = MarketDataConnectionState.CONNECTED,
+                startupRecoveryCompleted = true,
+            ),
         )
         val broker = PaperBroker(
             ledgerRepository = InMemoryPaperLedgerRepository(),
@@ -1667,9 +1672,10 @@ class PaperBrokerTest {
         broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 1, OrderSide.SELL, "0.0010")).getOrThrow()
         reconcilerStatus.updateMarketData(
             ReconcilerStatus(
-                lastReconciledAt = fixedInstant(),
                 startupFullReconcileCompleted = true,
-                lastMarketDataAt = fixedInstant(),
+                lastTransportActivityAt = fixedInstant(),
+                lastTradeAt = fixedInstant(),
+                lastMaintenanceAt = fixedInstant(),
                 marketDataState = MarketDataConnectionState.CONNECTED,
                 marketDataSessionId = sessionId,
                 lastProcessedSequence = 1,
@@ -1698,6 +1704,40 @@ class PaperBrokerTest {
         ).getOrThrow().single()
         assertEquals(sessionId.toString(), activity.sourceEvidence?.sessionId)
         assertEquals(4, activity.sourceEvidence?.sequence)
+    }
+
+    @Test
+    fun resting_limit_fails_closed_when_realtime_session_has_not_received_a_trade() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000183")
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val reconcilerStatus = MutableReconcilerStatus()
+        reconcilerStatus.updateMarketData(
+            ReconcilerStatus(
+                startupFullReconcileCompleted = true,
+                lastTransportActivityAt = fixedInstant(),
+                lastMaintenanceAt = fixedInstant(),
+                marketDataState = MarketDataConnectionState.CONNECTED,
+                marketDataSessionId = sessionId,
+                startupRecoveryCompleted = true,
+            ),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            reconcilerStatusProvider = reconcilerStatus,
+            requireRealtimeIntegrityForRestingOrders = true,
+            clock = fixedClock(),
+        )
+
+        val result = broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand()))
+
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("QUEUE_SNAPSHOT_UNAVAILABLE"))
+        assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("has not received an event"))
+        assertTrue(broker.getOpenOrders().getOrThrow().isEmpty())
     }
 
     @Test

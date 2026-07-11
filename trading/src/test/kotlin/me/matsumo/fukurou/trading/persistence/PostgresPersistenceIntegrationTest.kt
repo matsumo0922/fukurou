@@ -509,9 +509,8 @@ private const val TEST_RECONCILER_COMPLETED_PAYLOAD = """
     {
         "pass": "loop",
         "state": "completed",
-        "lastReconciledAt": "2026-07-02T00:00:00Z",
         "startupFullReconcileCompleted": true,
-        "lastMarketDataAt": "2026-07-02T00:00:00Z"
+        "lastMaintenanceAt": "2026-07-02T00:00:00Z"
     }
 """
 
@@ -877,24 +876,24 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun reconciler_status_keeps_market_freshness_separate_from_maintenance_success() = runPostgresTest {
+    fun reconciler_status_keeps_trade_timestamp_separate_from_maintenance_success() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedMarketDataIntegrityRepository(database)
         val sessionId = UUID.randomUUID()
         repository.beginSession(sessionId, fixedInstant()).getOrThrow()
-        updateMarketDataSessionReceivedAt(database, sessionId, fixedInstant())
+        updateMarketDataSessionTradeAt(database, sessionId, fixedInstant())
 
         val beforeMaintenance = ExposedReconcilerStatusProvider(database).snapshot()
 
-        assertEquals(fixedInstant(), beforeMaintenance.lastMarketDataAt)
-        assertEquals(null, beforeMaintenance.lastReconciledAt)
+        assertEquals(fixedInstant(), beforeMaintenance.lastTradeAt)
+        assertEquals(null, beforeMaintenance.lastMaintenanceAt)
 
         val maintenanceAt = fixedInstant().plusSeconds(5)
         repository.markMaintenanceSucceeded(sessionId, maintenanceAt).getOrThrow()
         val afterMaintenance = ExposedReconcilerStatusProvider(database).snapshot()
 
-        assertEquals(fixedInstant(), afterMaintenance.lastMarketDataAt)
-        assertEquals(maintenanceAt, afterMaintenance.lastReconciledAt)
+        assertEquals(fixedInstant(), afterMaintenance.lastTradeAt)
+        assertEquals(maintenanceAt, afterMaintenance.lastMaintenanceAt)
     }
 
     @Test
@@ -3455,7 +3454,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun runtime_postgres_reads_reconciler_freshness_from_command_event_log() = runPostgresTest {
+    fun runtime_postgres_audit_log_fallback_restores_maintenance_freshness_only() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         ExposedCommandEventLog(database).append(
             CommandEvent(
@@ -3478,7 +3477,7 @@ class PostgresPersistenceIntegrationTest {
             val protectionStatus = runtime.broker.getAccountStatus().getOrThrow().protectionStatus
 
             assertEquals(fixedInstant().toString(), protectionStatus.lastReconciledAt)
-            assertEquals(fixedInstant().toString(), protectionStatus.lastMarketDataAt)
+            assertEquals(null, protectionStatus.lastMarketDataAt)
         } finally {
             runtime.close()
         }
@@ -6009,14 +6008,14 @@ private fun selectMarketDataIntegrityIndexCount(database: ExposedDatabase): Int 
     }
 }
 
-/** market-data event 受信時刻だけを更新する。 */
-private fun updateMarketDataSessionReceivedAt(
+/** realtime trade時刻だけを更新する。 */
+private fun updateMarketDataSessionTradeAt(
     database: ExposedDatabase,
     sessionId: UUID,
     receivedAt: Instant,
 ) {
     exposedTransaction(database) {
-        prepare("UPDATE market_data_sessions SET last_received_at = ? WHERE id = ?").use { statement ->
+        prepare("UPDATE market_data_sessions SET last_trade_at = ? WHERE id = ?").use { statement ->
             statement.setLong(1, receivedAt.toEpochMilli())
             statement.setObject(2, sessionId)
             require(statement.executeUpdate() == 1) { "market-data session was not found." }

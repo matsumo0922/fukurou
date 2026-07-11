@@ -335,8 +335,8 @@ private class PaperBrokerReadDelegate(
             orphanStopCount = orphanStopCount,
             orphanTakeProfitCount = orphanTakeProfitCount,
             pendingCancelCount = pendingCancelCount,
-            lastReconciledAt = reconcilerStatus.lastReconciledAt?.toString(),
-            lastMarketDataAt = reconcilerStatus.lastMarketDataAt?.toString(),
+            lastReconciledAt = reconcilerStatus.lastMaintenanceAt?.toString(),
+            lastMarketDataAt = reconcilerStatus.lastTradeAt?.toString(),
             tradingLockOwner = null,
         )
     }
@@ -425,7 +425,7 @@ private class PaperBrokerTradeDelegate(
             "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session is unavailable."
         }
         val now = Instant.now(runtime.time.clock)
-        val lastMarketDataAt = requireNotNull(before.lastMarketDataAt) {
+        val lastMarketDataAt = requireNotNull(before.lastTradeAt) {
             "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session has not received an event."
         }
         require(!lastMarketDataAt.isAfter(now) && Duration.between(lastMarketDataAt, now) <= MARKET_DATA_FRESHNESS_WINDOW) {

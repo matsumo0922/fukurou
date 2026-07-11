@@ -38,15 +38,41 @@ class ExposedMarketDataIntegrityRepository(
                     prepare(
                         """
                             INSERT INTO market_data_sessions (
-                                id, state, connected_at, last_processed_sequence
-                            ) VALUES (?, 'CONNECTED', ?, 0)
+                                id, state, connected_at, last_processed_sequence, last_transport_activity_at
+                            ) VALUES (?, 'CONNECTED', ?, 0, ?)
                         """,
                     ).use { statement ->
                         statement.setObject(1, sessionId)
                         statement.setLong(2, connectedAt.toEpochMilli())
+                        statement.setLong(3, connectedAt.toEpochMilli())
                         statement.executeUpdate()
                     }
                     Unit
+                }
+            }
+        }
+    }
+
+    override suspend fun markTransportActivity(sessionId: UUID, observedAt: Instant): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    val updated = prepare(
+                        """
+                            UPDATE market_data_sessions
+                            SET last_transport_activity_at = GREATEST(
+                                COALESCE(last_transport_activity_at, ?),
+                                ?
+                            )
+                            WHERE id = ? AND state = 'CONNECTED'
+                        """,
+                    ).use { statement ->
+                        statement.setLong(1, observedAt.toEpochMilli())
+                        statement.setLong(2, observedAt.toEpochMilli())
+                        statement.setObject(3, sessionId)
+                        statement.executeUpdate()
+                    }
+                    require(updated == 1) { "Connected market-data session was not found." }
                 }
             }
         }
@@ -152,7 +178,8 @@ internal fun JdbcTransaction.selectMarketDataIntegritySnapshot(): MarketDataInte
                 s.id,
                 s.state,
                 s.last_processed_sequence,
-                s.last_received_at,
+                s.last_transport_activity_at,
+                s.last_trade_at,
                 s.last_maintenance_at,
                 g.started_at,
                 g.recovered_at,
@@ -178,7 +205,10 @@ internal fun JdbcTransaction.selectMarketDataIntegritySnapshot(): MarketDataInte
                 state = MarketDataConnectionState.valueOf(resultSet.getString("state")),
                 sessionId = resultSet.getObject("id", UUID::class.java),
                 lastProcessedSequence = resultSet.getLong("last_processed_sequence"),
-                lastReceivedAt = resultSet.getLong("last_received_at")
+                lastTransportActivityAt = resultSet.getLong("last_transport_activity_at")
+                    .takeUnless { resultSet.wasNull() }
+                    ?.let(Instant::ofEpochMilli),
+                lastTradeAt = resultSet.getLong("last_trade_at")
                     .takeUnless { resultSet.wasNull() }
                     ?.let(Instant::ofEpochMilli),
                 lastMaintenanceAt = resultSet.getLong("last_maintenance_at")

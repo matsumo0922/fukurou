@@ -319,7 +319,7 @@ data class Execution(
  * @param orphanStopCount position に紐づかない STOP 注文数
  * @param orphanTakeProfitCount position に紐づかない TP 注文数
  * @param pendingCancelCount 取消待ち注文数
- * @param lastReconciledAt 最後の reconciler 完了時刻
+ * @param lastReconciledAt 互換のため最後の maintenance 成功時刻を投影する
  * @param lastMarketDataAt 最後の market data 確認時刻
  * @param tradingLockOwner 現在の lock owner
  */

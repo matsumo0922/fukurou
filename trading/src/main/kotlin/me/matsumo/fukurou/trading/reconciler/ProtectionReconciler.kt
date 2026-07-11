@@ -20,10 +20,13 @@ import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
+import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
-import me.matsumo.fukurou.trading.market.MarketDataMessageStaleException
 import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
+import me.matsumo.fukurou.trading.market.MarketDataTransportLivenessException
+import me.matsumo.fukurou.trading.market.MarketEventSession
+import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.market.UnavailableMarketDataIntegrityRepository
@@ -66,6 +69,10 @@ private const val PASS_FAILURE_LOG_KEY = "protection-reconciler-pass-failure"
  * market data failure log の rate limit key。
  */
 private const val MARKET_DATA_FAILURE_LOG_KEY = "protection-reconciler-market-data-failure"
+
+/** market-data status projection failure log の rate limit key。 */
+private const val MARKET_DATA_STATUS_PROJECTION_FAILURE_LOG_KEY =
+    "protection-reconciler-market-data-status-projection-failure"
 
 /**
  * start audit failure log の rate limit key。
@@ -207,64 +214,82 @@ class ProtectionReconciler(
         }
     }
 
-    private suspend fun consumeMarketEventSession(
-        session: me.matsumo.fukurou.trading.market.MarketEventSession,
-        maintenanceInterval: Duration,
-    ) {
+    private suspend fun consumeMarketEventSession(session: MarketEventSession, maintenanceInterval: Duration) {
         var nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
-        var lastReceivedAt = session.connectedAt
-        val messageStaleTimeout = requireNotNull(marketEventStream).messageStaleTimeout
+        var transportDeadlineAtNanos = nextMaintenanceAtNanos(
+            requireNotNull(marketEventStream).transportLivenessTimeout,
+        )
 
         while (currentCoroutineContext().isActive) {
             val maintenanceWaitMillis = remainingWaitMillis(nextMaintenanceAtNanos)
-            val staleWaitMillis = remainingStaleWaitMillis(lastReceivedAt, messageStaleTimeout)
+            val transportWaitMillis = remainingWaitMillis(transportDeadlineAtNanos)
             val eventResult = kotlinx.coroutines.withTimeoutOrNull(
-                minOf(maintenanceWaitMillis, staleWaitMillis),
+                minOf(maintenanceWaitMillis, transportWaitMillis),
             ) {
                 session.receive()
             }
             if (eventResult == null) {
-                if (lastReceivedAt.isMarketDataStale(Instant.now(clock), messageStaleTimeout)) {
-                    recordMarketDataGap(
-                        sessionId = session.sessionId,
-                        throwable = MarketDataMessageStaleException("GMO WebSocket trade message became stale."),
-                    )
-                    refreshMarketDataStatus()
-                    return
-                }
-
-                runPeriodicSafetyMaintenance(session.sessionId)
+                if (handleMarketSessionTimeout(session, nextMaintenanceAtNanos, transportDeadlineAtNanos)) return
                 nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
                 continue
             }
-            val event = eventResult.getOrNull()
+            val signal = eventResult.getOrNull()
 
-            if (event == null) {
+            if (signal == null) {
                 recordMarketDataGap(
                     sessionId = session.sessionId,
                     throwable = eventResult.exceptionOrNull(),
                 )
-                refreshMarketDataStatus()
                 return
             }
 
-            lastReceivedAt = event.receivedAt
-
-            val applied = applyMarketEvent(event)
-            if (applied.isFailure) {
-                recordMarketDataGap(
-                    sessionId = session.sessionId,
-                    throwable = applied.exceptionOrNull(),
-                )
-                refreshMarketDataStatus()
-                return
-            }
+            if (!handleMarketSessionSignal(session, signal)) return
+            transportDeadlineAtNanos = nextMaintenanceAtNanos(requireNotNull(marketEventStream).transportLivenessTimeout)
 
             if (System.nanoTime() >= nextMaintenanceAtNanos) {
                 runPeriodicSafetyMaintenance(session.sessionId)
                 nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
             }
         }
+    }
+
+    private suspend fun handleMarketSessionTimeout(
+        session: MarketEventSession,
+        nextMaintenanceAtNanos: Long,
+        transportDeadlineAtNanos: Long,
+    ): Boolean {
+        if (System.nanoTime() >= transportDeadlineAtNanos) {
+            recordMarketDataGap(
+                sessionId = session.sessionId,
+                throwable = MarketDataTransportLivenessException("GMO WebSocket transport activity became stale."),
+            )
+            return true
+        }
+
+        if (System.nanoTime() >= nextMaintenanceAtNanos) runPeriodicSafetyMaintenance(session.sessionId)
+
+        return false
+    }
+
+    private suspend fun handleMarketSessionSignal(
+        session: MarketEventSession,
+        signal: MarketEventSessionSignal,
+    ): Boolean {
+        val result = when (signal) {
+            is MarketEventSessionSignal.Trade -> applyMarketEvent(signal.event)
+            is MarketEventSessionSignal.TransportActivity -> marketDataIntegrityRepository.markTransportActivity(
+                sessionId = session.sessionId,
+                observedAt = signal.observedAt,
+            )
+        }
+        if (result.isSuccess) {
+            refreshMarketDataStatus()
+            return true
+        }
+
+        recordMarketDataGap(session.sessionId, result.exceptionOrNull())
+
+        return false
     }
 
     /** realtime event の量によらず periodic maintenance を rate limit する次回期限を返す。 */
@@ -281,15 +306,6 @@ class ProtectionReconciler(
         val remainingNanos = (deadlineAtNanos - System.nanoTime()).coerceAtLeast(0)
 
         return ((remainingNanos + 999_999) / 1_000_000).coerceAtLeast(1)
-    }
-
-    /** 最後のevent受信時刻からstale期限までの待機ミリ秒を返す。 */
-    private fun remainingStaleWaitMillis(lastReceivedAt: Instant, staleTimeout: Duration): Long {
-        val staleAt = lastReceivedAt.plus(staleTimeout)
-        val remaining = Duration.between(Instant.now(clock), staleAt)
-        if (remaining.isNegative || remaining.isZero) return 1
-
-        return ((remaining.toNanos() + 999_999) / 1_000_000).coerceAtLeast(1)
     }
 
     private suspend fun recordMarketDataGap(sessionId: UUID, throwable: Throwable?) {
@@ -330,7 +346,6 @@ class ProtectionReconciler(
             tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
                 broker?.applyMarketEvent(event)?.getOrThrow()
             }
-            refreshMarketDataStatus()
             Result.success(Unit)
         } catch (throwable: CancellationException) {
             throw throwable
@@ -341,7 +356,7 @@ class ProtectionReconciler(
 
     /** REST は約定根拠にせず、定期的な safety / evaluation 保守だけに使う。 */
     private suspend fun runPeriodicSafetyMaintenance(sessionId: UUID): Result<Unit> {
-        return try {
+        val maintenanceResult = try {
             tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
                 runPeriodicSafetyMaintenanceLocked()
             }
@@ -353,6 +368,28 @@ class ProtectionReconciler(
             throw throwable
         } catch (throwable: Throwable) {
             recordPeriodicMaintenanceFailure(throwable)
+
+            Result.failure(throwable)
+        }
+        if (maintenanceResult.isFailure) return maintenanceResult
+
+        return refreshMarketDataStatusAfterMaintenance()
+    }
+
+    /** maintenance 成功後の status projection を、maintenance outcome と別に反映する。 */
+    private suspend fun refreshMarketDataStatusAfterMaintenance(): Result<Unit> {
+        return try {
+            refreshMarketDataStatus()
+
+            Result.success(Unit)
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            warnLogger.warn(
+                key = MARKET_DATA_STATUS_PROJECTION_FAILURE_LOG_KEY,
+                message = "ProtectionReconciler market-data status projection failed after periodic maintenance.",
+                throwable = throwable,
+            )
 
             Result.failure(throwable)
         }
@@ -395,7 +432,7 @@ class ProtectionReconciler(
         val current = status.snapshot()
         status.updateMarketData(
             current.copy(
-                marketDataState = me.matsumo.fukurou.trading.market.MarketDataConnectionState.DISCONNECTED,
+                marketDataState = MarketDataConnectionState.DISCONNECTED,
                 marketDataSessionId = sessionId,
                 gapStartedAt = detectedAt,
                 gapReason = reason,
@@ -407,9 +444,10 @@ class ProtectionReconciler(
         val integrity = marketDataIntegrityRepository.snapshot().getOrThrow()
         status.updateMarketData(
             ReconcilerStatus(
-                lastReconciledAt = integrity.lastMaintenanceAt,
                 startupFullReconcileCompleted = integrity.startupRecoveryCompleted,
-                lastMarketDataAt = integrity.lastReceivedAt,
+                lastTransportActivityAt = integrity.lastTransportActivityAt,
+                lastTradeAt = integrity.lastTradeAt,
+                lastMaintenanceAt = integrity.lastMaintenanceAt,
                 marketDataState = integrity.state,
                 marketDataSessionId = integrity.sessionId,
                 lastProcessedSequence = integrity.lastProcessedSequence,
@@ -545,12 +583,12 @@ class ProtectionReconciler(
         divergenceMemos: List<PaperExecutionDivergenceMemo>,
     ): Result<Unit> {
         val isStartupFullPass = passKind == ReconcilePassKind.STARTUP_FULL
-        val lastMarketDataAt = tickSnapshot?.observedAt ?: status.snapshot().lastMarketDataAt
+        val lastMaintenanceAt = tickSnapshot?.observedAt ?: status.snapshot().lastMaintenanceAt
         val auditResult = recordSuccessTransition(
             passKind = passKind,
             reconciledAt = reconciledAt,
             startupFullReconcileCompleted = isStartupFullPass,
-            lastMarketDataAt = lastMarketDataAt,
+            lastMaintenanceAt = lastMaintenanceAt,
             divergenceMemos = divergenceMemos,
         )
 
@@ -559,9 +597,8 @@ class ProtectionReconciler(
         }
 
         status.markReconciled(
-            reconciledAt = reconciledAt,
             startupFullReconcileCompleted = isStartupFullPass,
-            lastMarketDataAt = lastMarketDataAt,
+            lastMaintenanceAt = lastMaintenanceAt,
         )
 
         return Result.success(Unit)
@@ -571,16 +608,15 @@ class ProtectionReconciler(
         passKind: ReconcilePassKind,
         reconciledAt: Instant,
         startupFullReconcileCompleted: Boolean,
-        lastMarketDataAt: Instant?,
+        lastMaintenanceAt: Instant?,
         divergenceMemos: List<PaperExecutionDivergenceMemo>,
     ): Result<Unit> {
         val completedResult = appendReconcilerEvent(
             eventType = CommandEventType.RECONCILER_PASS_COMPLETED,
             payload = buildPassCompletedPayload(
                 passKind = passKind,
-                reconciledAt = reconciledAt,
                 startupFullReconcileCompleted = startupFullReconcileCompleted,
-                lastMarketDataAt = lastMarketDataAt,
+                lastMaintenanceAt = lastMaintenanceAt,
                 divergenceMemos = divergenceMemos,
             ),
             occurredAt = reconciledAt,
@@ -658,18 +694,16 @@ class ProtectionReconciler(
  */
 private fun buildPassCompletedPayload(
     passKind: ReconcilePassKind,
-    reconciledAt: Instant,
     startupFullReconcileCompleted: Boolean,
-    lastMarketDataAt: Instant?,
+    lastMaintenanceAt: Instant?,
     divergenceMemos: List<PaperExecutionDivergenceMemo>,
 ): String {
     return buildJsonObject {
         put("pass", passKind.payloadName())
         put("state", "completed")
-        put("lastReconciledAt", reconciledAt.toString())
         put("startupFullReconcileCompleted", startupFullReconcileCompleted)
-        lastMarketDataAt?.let { marketDataAt ->
-            put("lastMarketDataAt", marketDataAt.toString())
+        lastMaintenanceAt?.let { maintenanceAt ->
+            put("lastMaintenanceAt", maintenanceAt.toString())
         }
         if (divergenceMemos.isNotEmpty()) {
             put("paperExecutionDivergenceMemos", JsonArray(divergenceMemos.map { memo -> memo.toJsonObject() }))
@@ -701,7 +735,7 @@ private fun ReconcilePassKind.payloadName(): String {
 
 private fun Throwable?.toGapReason(): MarketDataGapReason {
     return when {
-        this is MarketDataMessageStaleException -> MarketDataGapReason.MESSAGE_STALE
+        this is MarketDataTransportLivenessException -> MarketDataGapReason.TRANSPORT_LIVENESS_LOST
         this is InvalidMarketDataMessageException -> MarketDataGapReason.INVALID_MESSAGE
         this?.message.orEmpty().contains("sequence gap", ignoreCase = true) -> MarketDataGapReason.SEQUENCE_GAP
         this is java.sql.SQLException -> MarketDataGapReason.DATABASE_FAILURE
@@ -716,15 +750,9 @@ private fun Throwable?.toMarketDataGapDetail(): String? {
         is InvalidMarketDataMessageException,
         is MarketDataBackpressureException,
         is MarketDataSubscriptionException,
-        is MarketDataMessageStaleException,
+        is MarketDataTransportLivenessException,
         -> "${javaClass.simpleName}: ${message.orEmpty()}"
 
         else -> javaClass.simpleName
     }
-}
-
-private fun Instant.isMarketDataStale(now: Instant, staleTimeout: Duration): Boolean {
-    if (isAfter(now)) return false
-
-    return Duration.between(this, now) >= staleTimeout
 }

@@ -56,12 +56,17 @@ class HealthRouteTest {
     }
 
     @Test
-    fun ready_includes_reconciler_last_reconciled_at() = testApplication {
+    fun ready_includes_transport_trade_and_maintenance_timestamps() = testApplication {
         val reconcilerStatus = MutableReconcilerStatus()
-        reconcilerStatus.markReconciled(
-            reconciledAt = Instant.parse("2026-07-02T00:00:00Z"),
-            startupFullReconcileCompleted = true,
-            lastMarketDataAt = null,
+        reconcilerStatus.updateMarketData(
+            ReconcilerStatus(
+                lastTransportActivityAt = Instant.parse("2026-07-02T00:00:00Z"),
+                lastTradeAt = null,
+                lastMaintenanceAt = Instant.parse("2026-07-02T00:00:01Z"),
+                startupFullReconcileCompleted = true,
+                marketDataState = MarketDataConnectionState.CONNECTED,
+                startupRecoveryCompleted = true,
+            ),
         )
 
         application {
@@ -74,7 +79,8 @@ class HealthRouteTest {
         val response = client.get("/health/ready")
 
         assertEquals(HttpStatusCode.OK, response.status)
-        assertTrue(response.bodyAsText().contains("\"lastReconciledAt\":\"2026-07-02T00:00:00Z\""))
+        assertTrue(response.bodyAsText().contains("\"lastTransportActivityAt\":\"2026-07-02T00:00:00Z\""))
+        assertTrue(response.bodyAsText().contains("\"lastMaintenanceAt\":\"2026-07-02T00:00:01Z\""))
     }
 
     @Test

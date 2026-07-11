@@ -27,6 +27,7 @@ import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
  */
 internal val retiredRuntimeConfigKeys = setOf(
     "obsidian.vaultPath",
+    "gmoPublic.websocketStaleTimeout",
 )
 
 /**
@@ -708,11 +709,11 @@ object RuntimeConfigCatalog {
                     unit = "milliseconds",
                 ),
                 runtimeItem(
-                    key = "gmoPublic.websocketStaleTimeout",
-                    legacyEnvName = FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS_ENV,
+                    key = "gmoPublic.websocketTransportLivenessTimeout",
+                    legacyEnvName = FUKUROU_GMO_WEBSOCKET_TRANSPORT_LIVENESS_TIMEOUT_SECONDS_ENV,
                     valueType = RuntimeConfigValueType.DURATION_SECONDS,
-                    defaultValue = defaults.config.gmoPublicWebSocket.messageStaleTimeout.seconds.toString(),
-                    effectiveValue = config.gmoPublicWebSocket.messageStaleTimeout.seconds.toString(),
+                    defaultValue = defaults.config.gmoPublicWebSocket.transportLivenessTimeout.seconds.toString(),
+                    effectiveValue = config.gmoPublicWebSocket.transportLivenessTimeout.seconds.toString(),
                     unit = "seconds",
                 ),
                 runtimeItem(
@@ -1331,8 +1332,8 @@ private const val FUKUROU_GMO_REQUEST_TIMEOUT_MS_ENV = "FUKUROU_GMO_REQUEST_TIME
 private const val FUKUROU_GMO_SYMBOL_RULES_CACHE_TTL_SECONDS_ENV = "FUKUROU_GMO_SYMBOL_RULES_CACHE_TTL_SECONDS"
 private const val FUKUROU_GMO_PUBLIC_WEBSOCKET_URL_ENV = "FUKUROU_GMO_PUBLIC_WEBSOCKET_URL"
 private const val FUKUROU_GMO_WEBSOCKET_CONNECT_TIMEOUT_MS_ENV = "FUKUROU_GMO_WEBSOCKET_CONNECT_TIMEOUT_MS"
-private const val FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS_ENV =
-    "FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS"
+private const val FUKUROU_GMO_WEBSOCKET_TRANSPORT_LIVENESS_TIMEOUT_SECONDS_ENV =
+    "FUKUROU_GMO_WEBSOCKET_TRANSPORT_LIVENESS_TIMEOUT_SECONDS"
 private const val FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS_ENV = "FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS"
 private const val FUKUROU_REPOSITORY_ROOT_ENV = "FUKUROU_REPOSITORY_ROOT"
 private const val FUKUROU_LLM_WORKING_DIRECTORY_ENV = "FUKUROU_LLM_WORKING_DIRECTORY"

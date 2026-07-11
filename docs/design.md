@@ -151,7 +151,7 @@ flowchart LR
 
 #### 2.3.1 市場データの流れ
 
-1. `ProtectionReconciler` は GMO Public WebSocket `trades/BTC` を接続単位で直列消費し、受信 event で resting entry と保護を前進させる。
+1. `ProtectionReconciler` は GMO Public WebSocket `trades/BTC` を接続単位で直列消費し、realtime trade event だけで resting entry と保護を前進させる。subscription acknowledgement とPing/Pongはtransport livenessを更新するが、約定、sequence、gap recoveryを前進させない。
 2. connection session と local sequence、exchange/received time、gap、recovery、約定 source evidence を PostgreSQL に保存し、event と ledger cursor を同一 transaction で確定する。
 3. RESTで5分・1時間・日足のOHLCVを補完する。
 4. `MarketDataSource` 実装が、ローソク足、板、約定、指標、マイクロストラクチャ要約を統一モデルへ変換する。
@@ -1266,7 +1266,7 @@ interface GmoSymbolMapper {
 
 entry EV の計算直前に、データ鮮度劣化時の probability cap を適用する。鮮度シグナルは paper broker が Safety Floor へ渡す ticker の取引所 timestamp とし、単なるローカル fetch 時刻では判定しない。runtime key `safety.dataQualityStaleAfter` の既定は60秒、`safety.dataQualityCappedProbability` の既定は0.5である。申告 `estimated_win_probability` は decisions / orders に生値で保存し、Safety Floor の EV 計算だけで `min(申告p, cappedProbability)` を使う。cap が発動して EV 拒否になった場合は、拒否 message に cap 済み p を残す。
 
-[確定事項の改訂: 2026-07-04] 実装済み MCP read tool は、既存 structuredContent の直下へ additive な `freshness` object を追加する。9.3 の共通レスポンス envelope は、既存の MCP response 構造と LLM 側の期待を壊すため現時点では採用しない。`freshness.fetchedAt` は response を組み立てた app 側時刻、`freshness.sourceTimestamp` は取引所または paper ledger が宣言した source 側時刻である。`stalenessMs = responseBuildTime - (sourceTimestamp ?: fetchedAt)` とし、`stalenessMs == staleAfterMs` は fresh、超過時だけ stale とする。source は GMO public market data が `GMO_PUBLIC_REST`、paper account / position / order 系が `PAPER_LEDGER` である。ticker は 5秒、orderbook は 3秒、trades は 10秒、5分足 candle は final candle openTime + 5分 + 90秒、1時間足 candle は final candle openTime + 1時間 + 5分、paper ledger 系は 10秒を既定とする。`TickSnapshot.observedAt` と `ReconcilerStatus.lastMarketDataAt` は app 側の観測・処理時刻であり、取引所 source timestamp ではないため p cap の鮮度判定には使わない。ticker timestamp parse 失敗などで `marketDataObservedAt == null` になった場合、p cap は fresh とみなさず stale として fail-closed し、cap が申告 p を下げる場合は Safety Floor の EV 計算に cap 済み p を使う。
+[確定事項の改訂: 2026-07-04] 実装済み MCP read tool は、既存 structuredContent の直下へ additive な `freshness` object を追加する。9.3 の共通レスポンス envelope は、既存の MCP response 構造と LLM 側の期待を壊すため現時点では採用しない。`freshness.fetchedAt` は response を組み立てた app 側時刻、`freshness.sourceTimestamp` は取引所または paper ledger が宣言した source 側時刻である。`stalenessMs = responseBuildTime - (sourceTimestamp ?: fetchedAt)` とし、`stalenessMs == staleAfterMs` は fresh、超過時だけ stale とする。source は GMO public market data が `GMO_PUBLIC_REST`、paper account / position / order 系が `PAPER_LEDGER` である。ticker は 5秒、orderbook は 3秒、trades は 10秒、5分足 candle は final candle openTime + 5分 + 90秒、1時間足 candle は final candle openTime + 1時間 + 5分、paper ledger 系は 10秒を既定とする。`TickSnapshot.observedAt` と `ReconcilerStatus.lastMaintenanceAt` は app 側の観測・処理時刻であり、取引所 source timestamp ではないため p cap の鮮度判定には使わない。ticker timestamp parse 失敗などで `marketDataObservedAt == null` になった場合、p cap は fresh とみなさず stale として fail-closed し、cap が申告 p を下げる場合は Safety Floor の EV 計算に cap 済み p を使う。
 
 ### 5.5 指標計算
 
@@ -3592,7 +3592,7 @@ Private POSTは取引所上限より安全側に、bot内部の実効上限を `
 7. DDを再計算し、-15%到達なら全停止。
 8. 起動時復旧triggerを保存し、必要ならLLMではなくdaemonが安全バックストップを適用する。
 
-[確定] `ProtectionReconciler` は起動時に必ずfull reconcile passを実行する。これはクラッシュ復元と同じ経路にし、main pushごとのdeploy方針は変えない。`/health/ready` はDB接続だけでなく `lastReconciledAt` と `lastMarketDataAt` の鮮度を確認し、保護ループが止まっている状態をreadyにしない。
+[確定] `ProtectionReconciler` は起動時に必ずfull reconcile passを実行する。これはクラッシュ復元と同じ経路にし、main pushごとのdeploy方針は変えない。`/health/ready` はDB接続だけでなく `lastTransportActivityAt` と `lastMaintenanceAt` の鮮度、接続状態、未回復gapを確認し、保護ループが止まっている状態をreadyにしない。`lastTradeAt` は正常無音を許容するため readiness の必須条件にしない。
 
 重大不一致例:
 

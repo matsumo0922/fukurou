@@ -753,7 +753,11 @@ object MarketDataSessionsTable : Table("market_data_sessions") {
     val connectedAt = long("connected_at")
     val disconnectedAt = long("disconnected_at").nullable()
     val lastProcessedSequence = long("last_processed_sequence").default(0)
+
+    /** 旧trade timestampの互換/backfill専用列。同PRではdropせず、新規書込には使わない。 */
     val lastReceivedAt = long("last_received_at").nullable()
+    val lastTransportActivityAt = long("last_transport_activity_at").nullable()
+    val lastTradeAt = long("last_trade_at").nullable()
     val lastMaintenanceAt = long("last_maintenance_at").nullable()
     val disconnectReason = varchar("disconnect_reason", length = 64).nullable()
 

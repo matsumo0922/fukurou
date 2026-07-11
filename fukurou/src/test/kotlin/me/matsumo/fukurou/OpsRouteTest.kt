@@ -709,9 +709,8 @@ class OpsRouteTest {
             )
             val reconcilerStatus = MutableReconcilerStatus()
             reconcilerStatus.markReconciled(
-                reconciledAt = fixedInstant(),
                 startupFullReconcileCompleted = true,
-                lastMarketDataAt = fixedInstant(),
+                lastMaintenanceAt = fixedInstant(),
             )
 
             application {

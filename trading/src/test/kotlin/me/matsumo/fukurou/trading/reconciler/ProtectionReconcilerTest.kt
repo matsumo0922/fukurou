@@ -49,6 +49,7 @@ import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.market.MarketDataIntegritySnapshot
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.MarketEventSession
+import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -87,12 +88,14 @@ class ProtectionReconcilerTest {
         )
 
         val result = reconciler.reconcileOnce(ReconcilePassKind.STARTUP_FULL)
+        val completedPayload = eventLog.events().single().payload
 
         assertTrue(result.isSuccess)
         assertEquals(1, lock.acquisitionCount)
-        assertEquals(fixedInstant(), status.snapshot().lastReconciledAt)
+        assertEquals(fixedInstant(), status.snapshot().lastMaintenanceAt)
         assertTrue(status.snapshot().startupFullReconcileCompleted)
-        assertEquals(fixedInstant(), status.snapshot().lastMarketDataAt)
+        assertEquals(fixedInstant(), status.snapshot().lastMaintenanceAt)
+        assertFalse(completedPayload.contains("lastReconciledAt"))
         assertTrue(eventLog.events().any { event -> event.eventType == CommandEventType.RECONCILER_PASS_COMPLETED })
     }
 
@@ -132,7 +135,7 @@ class ProtectionReconcilerTest {
         }
 
         withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
-            while (status.snapshot().lastReconciledAt == null) {
+            while (status.snapshot().lastMaintenanceAt == null) {
                 delay(10.toDuration(DurationUnit.MILLISECONDS))
             }
         }
@@ -220,7 +223,7 @@ class ProtectionReconcilerTest {
     }
 
     @Test
-    fun tick_failure_advances_reconciled_freshness_without_market_freshness() = runBlocking {
+    fun tick_failure_keeps_last_maintenance_at() = runBlocking {
         val firstInstant = Instant.parse("2026-07-02T00:00:00Z")
         val secondInstant = Instant.parse("2026-07-02T00:00:05Z")
         val clock = MutableTestClock(firstInstant)
@@ -244,8 +247,7 @@ class ProtectionReconcilerTest {
         val eventTypes = eventLog.events().map { event -> event.eventType }
 
         assertTrue(result.isSuccess)
-        assertEquals(secondInstant, snapshot.lastReconciledAt)
-        assertEquals(firstInstant, snapshot.lastMarketDataAt)
+        assertEquals(firstInstant, snapshot.lastMaintenanceAt)
         assertEquals(
             listOf(
                 CommandEventType.RECONCILER_PASS_COMPLETED,
@@ -329,8 +331,7 @@ class ProtectionReconcilerTest {
 
         assertTrue(result.isFailure)
         assertFalse(snapshot.startupFullReconcileCompleted)
-        assertEquals(null, snapshot.lastReconciledAt)
-        assertEquals(null, snapshot.lastMarketDataAt)
+        assertEquals(null, snapshot.lastMaintenanceAt)
     }
 
     @Test
@@ -709,6 +710,7 @@ class ProtectionReconcilerTest {
         assertEquals(listOf(event), broker.appliedEvents)
         assertEquals(2, integrity.markDisconnectedCount)
         assertEquals(1, integrity.applyGapImpactCount)
+        assertEquals(3, integrity.snapshotCount)
         assertTrue(lock.owners.count { owner -> owner == "paper-market-event" } >= 2)
         assertEquals(MarketDataConnectionState.DISCONNECTED, status.snapshot().marketDataState)
     }
@@ -839,20 +841,58 @@ class ProtectionReconcilerTest {
     }
 
     @Test
-    fun market_event_idle_session_records_message_stale_after_configured_timeout() = runBlocking {
+    fun market_data_status_projection_failure_does_not_record_maintenance_failure() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000182")
+        val eventLog = InMemoryCommandEventLog()
+        val integrity = RetryableMarketDataIntegrityRepository(
+            failMarkDisconnectedTimes = 0,
+            failSnapshotCalls = setOf(2),
+        )
+        val status = MutableReconcilerStatus()
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            commandEventLog = eventLog,
+            tradingLock = CountingTradingLock(fixedClock()),
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            marketEventStream = SingleSessionMarketEventStream(
+                BurstThenIdleMarketEventSession(sessionId, fixedInstant(), emptyList()),
+            ),
+            marketDataIntegrityRepository = integrity,
+            status = status,
+            clock = fixedClock(),
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(10))
+        }
+
+        withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
+            while (integrity.markMaintenanceSucceededCount < 2) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertFalse(eventLog.events().any { event -> event.eventType == CommandEventType.RECONCILER_PASS_FAILED })
+        assertTrue(integrity.snapshotCount >= 3)
+        assertEquals(fixedInstant(), status.snapshot().lastMaintenanceAt)
+    }
+
+    @Test
+    fun market_event_idle_session_records_transport_liveness_gap_after_configured_timeout() = runBlocking {
         val clock = Clock.systemUTC()
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000179")
         val integrity = RetryableMarketDataIntegrityRepository(0)
         val status = MutableReconcilerStatus()
+        val stream = SingleSessionMarketEventStream(
+            session = BurstThenIdleMarketEventSession(sessionId, clock.instant(), emptyList()),
+            transportLivenessTimeout = Duration.ofMillis(50),
+        )
         val reconciler = ProtectionReconciler(
             riskStateRepository = InMemoryRiskStateRepository(clock = clock),
             commandEventLog = InMemoryCommandEventLog(),
             tradingLock = CountingTradingLock(clock),
             tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
-            marketEventStream = SingleSessionMarketEventStream(
-                session = BurstThenIdleMarketEventSession(sessionId, clock.instant(), emptyList()),
-                messageStaleTimeout = Duration.ofMillis(50),
-            ),
+            marketEventStream = stream,
             marketDataIntegrityRepository = integrity,
             status = status,
             clock = clock,
@@ -862,14 +902,15 @@ class ProtectionReconcilerTest {
         }
 
         withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
-            while (integrity.applyGapImpactCount == 0) {
+            while (integrity.applyGapImpactCount == 0 || stream.connectCount < 2) {
                 delay(1.toDuration(DurationUnit.MILLISECONDS))
             }
         }
         job.cancelAndJoin()
 
-        assertEquals(MarketDataGapReason.MESSAGE_STALE, status.snapshot().gapReason)
+        assertEquals(MarketDataGapReason.TRANSPORT_LIVENESS_LOST, status.snapshot().gapReason)
         assertEquals(1, integrity.applyGapImpactCount)
+        assertTrue(stream.connectCount >= 2)
     }
 }
 
@@ -946,10 +987,11 @@ private class RecordingBroker(
 /** 1 session の event と切断を返し、その後の reconnect を失敗させる stream。 */
 private class SingleSessionMarketEventStream(
     private val session: MarketEventSession,
-    override val messageStaleTimeout: Duration = Duration.ofSeconds(30),
+    override val transportLivenessTimeout: Duration = Duration.ofSeconds(30),
 ) : MarketEventStream {
     override val reconnectBackoff: Duration = Duration.ofMillis(1)
-    private var connectCount = 0
+    var connectCount = 0
+        private set
 
     override suspend fun connect(): Result<MarketEventSession> {
         connectCount += 1
@@ -966,13 +1008,13 @@ private class ScriptedMarketEventSession(
 ) : MarketEventSession {
     private var nextIndex = 0
 
-    override suspend fun receive(): Result<PaperMarketTradeEvent> {
+    override suspend fun receive(): Result<MarketEventSessionSignal> {
         val result = results.getOrElse(nextIndex) {
             Result.failure(IllegalStateException("scripted session exhausted"))
         }
         nextIndex += 1
 
-        return result
+        return result.map { event -> MarketEventSessionSignal.Trade(event) }
     }
 
     override fun close() = Unit
@@ -986,12 +1028,12 @@ private class BurstThenIdleMarketEventSession(
 ) : MarketEventSession {
     private var nextIndex = 0
 
-    override suspend fun receive(): Result<PaperMarketTradeEvent> {
+    override suspend fun receive(): Result<MarketEventSessionSignal> {
         val event = events.getOrNull(nextIndex)
         if (event != null) {
             nextIndex += 1
 
-            return Result.success(event)
+            return Result.success(MarketEventSessionSignal.Trade(event))
         }
 
         delay(Long.MAX_VALUE)
@@ -1004,6 +1046,7 @@ private class BurstThenIdleMarketEventSession(
 /** 切断永続化の一時失敗を再現する integrity repository。 */
 private class RetryableMarketDataIntegrityRepository(
     private var failMarkDisconnectedTimes: Int,
+    private val failSnapshotCalls: Set<Int> = emptySet(),
 ) : MarketDataIntegrityRepository {
     private var snapshot = MarketDataIntegritySnapshot()
 
@@ -1011,8 +1054,19 @@ private class RetryableMarketDataIntegrityRepository(
         private set
     var applyGapImpactCount = 0
         private set
+    var snapshotCount = 0
+        private set
+    var markMaintenanceSucceededCount = 0
+        private set
 
-    override suspend fun snapshot(): Result<MarketDataIntegritySnapshot> = Result.success(snapshot)
+    override suspend fun snapshot(): Result<MarketDataIntegritySnapshot> {
+        snapshotCount += 1
+        if (snapshotCount in failSnapshotCalls) {
+            return Result.failure(IllegalStateException("transient status projection failure"))
+        }
+
+        return Result.success(snapshot)
+    }
 
     override suspend fun beginSession(sessionId: UUID, connectedAt: Instant): Result<Unit> {
         snapshot = MarketDataIntegritySnapshot(
@@ -1024,7 +1078,14 @@ private class RetryableMarketDataIntegrityRepository(
         return Result.success(Unit)
     }
 
+    override suspend fun markTransportActivity(sessionId: UUID, observedAt: Instant): Result<Unit> {
+        snapshot = snapshot.copy(lastTransportActivityAt = observedAt)
+
+        return Result.success(Unit)
+    }
+
     override suspend fun markMaintenanceSucceeded(sessionId: UUID, succeededAt: Instant): Result<Unit> {
+        markMaintenanceSucceededCount += 1
         snapshot = snapshot.copy(lastMaintenanceAt = succeededAt)
 
         return Result.success(Unit)
