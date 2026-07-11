@@ -37,13 +37,23 @@ export type EvaluationReport = {
   attributionCoverage: { attributed: number; missing: number; total: number } | null;
 };
 export type ReportJob = { jobId: string; revisionId: string; revisionNumber: number; status: string; stage: string; failureCode: string | null; failureMessage: string | null; activeInvocationId: string | null; retryAfterSeconds: number | null; epochId: string | null; cohort: string | null };
-export type ReportHistoryItem = { jobId: string; revisionId: string; revisionNumber: number; status: string; requestedAt: string; pinned: boolean; epochId: string | null; cohort: string | null };
+export type ReportHistoryItem = { jobId: string; revisionId: string; revisionNumber: number; status: string; requestedAt: string; pinned: boolean; epochId: string | null; cohort: string | null; scopeKey: string | null };
 export type EvaluationEpoch = { epochId: string; kind: string; initialCashJpy: string; createdAt: string; active: boolean };
 
 export type ReportScope = { kind: "PRESET"; days: 7 | 30 | 90 } | { kind: "CUSTOM"; from: string; toInclusive: string };
 
 export function reportScopeKey(scope: ReportScope): string {
   return scope.kind === "PRESET" ? `PRESET:${scope.days}D` : `CUSTOM:${scope.from}:${scope.toInclusive}`;
+}
+
+export function reportRevisionMatchesScope(
+  revision: Pick<ReportHistoryItem, "epochId" | "cohort" | "scopeKey">,
+  scopeKey: string,
+  epochId: string,
+  cohort: string,
+): boolean {
+  return revision.epochId === epochId && revision.cohort === cohort &&
+    revision.scopeKey === `${scopeKey}|EPOCH:${epochId}|COHORT:${cohort}`;
 }
 
 export async function fetchEvaluationEpochs(): Promise<EvaluationEpoch[]> {
@@ -95,8 +105,8 @@ export async function fetchReportHistory(scopeKey: string, epochId: string, coho
   return response.revisions;
 }
 
-export async function fetchReportRevision(revisionId: string): Promise<EvaluationReport> {
-  return getJsonByPath(`/evaluation/reports/revisions/${encodeURIComponent(revisionId)}`);
+export async function fetchReportRevision(revisionId: string, scopeKey: string, epochId: string, cohort: string): Promise<EvaluationReport> {
+  return getJsonByPath(`/evaluation/reports/revisions/${encodeURIComponent(revisionId)}?scopeKey=${encodeURIComponent(scopeKey)}&epochId=${encodeURIComponent(epochId)}&cohort=${encodeURIComponent(cohort)}`);
 }
 
 export async function pinReport(scopeKey: string, revisionId: string, epochId: string, cohort = "CURRENT"): Promise<void> {

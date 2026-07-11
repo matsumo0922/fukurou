@@ -257,6 +257,7 @@ internal class EvaluationReportPersistence(
                                         .substringBefore("|")
                                         .ifBlank { null },
                                     cohort = scopeKey.substringAfter("|COHORT:", "").ifBlank { null },
+                                    scopeKey = scopeKey,
                                 ),
                             )
                         }

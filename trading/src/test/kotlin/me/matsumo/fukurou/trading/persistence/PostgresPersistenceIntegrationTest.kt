@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.persistence
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
@@ -25,6 +26,7 @@ import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.config.PaperAccountEpochSwitchRejectedException
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
@@ -987,6 +989,65 @@ class PostgresPersistenceIntegrationTest {
         assertEquals("900000.00000000", risk.equityPeak.toPlainString())
         assertEquals(activated.accountEpochId, account.accountEpochId)
         assertEquals(1, selectCommandEventCountByType(database, CommandEventType.PAPER_ACCOUNT_EPOCH_SWITCHED))
+    }
+
+    @Test
+    fun runtimeConfigEpochSwitchAndWriterDmlRaceKeepsActivationAndLineageAtomic() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val configRepository = ExposedRuntimeConfigRepository(database, fixedClock(), emptyMap())
+        val original = configRepository.activeSnapshot().getOrThrow()
+        val draft = configRepository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = original.versionId,
+                values = mapOf("paper.initialCashJpy" to "900000"),
+                note = "concurrent epoch switch",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(database),
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisions,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            decisions,
+            postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
+        val start = CompletableDeferred<Unit>()
+
+        val (activation, write) = coroutineScope {
+            val activationTask = async(Dispatchers.IO) {
+                start.await()
+                configRepository.activateDraftWithContext(draft.version.id, "concurrent switch", "test")
+            }
+            val writerTask = async(Dispatchers.IO) {
+                start.await()
+                broker.placeOrder(command)
+            }
+            start.complete(Unit)
+            activationTask.await() to writerTask.await()
+        }
+
+        val active = configRepository.activeSnapshot().getOrThrow()
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        assertEquals(
+            0,
+            active.values.getValue("paper.initialCashJpy").toBigDecimal()
+                .compareTo(account.initialCashJpy.toBigDecimal()),
+        )
+        if (activation.isSuccess) {
+            assertEquals(activation.getOrThrow().accountEpochId, account.accountEpochId)
+            assertEquals("900000", active.values.getValue("paper.initialCashJpy"))
+        } else {
+            assertIs<PaperAccountEpochSwitchRejectedException>(activation.exceptionOrNull())
+            assertTrue(write.isSuccess)
+            assertEquals(original.versionId, active.versionId)
+        }
+        assertTrue(write.isSuccess || activation.isSuccess)
+        assertLedgerLineage(database, "concurrent activation/writer race")
     }
 
     @Test
@@ -3964,6 +4025,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf(OrderSide.BUY, OrderSide.SELL), executions.map { execution -> execution.side })
         assertEquals("10005000.00000000", watermark.highestPriceSinceEntryJpy)
         assertEquals("9685155.00000000", watermark.lowestPriceSinceEntryJpy)
+        assertLedgerLineage(database, "STOP")
     }
 
     @Test
@@ -4160,6 +4222,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, placeResult.orderIds.size)
         assertEquals(1, reconcileResult.filledOrderIds.size)
         assertEquals(1, executions.size)
+        assertLedgerLineage(database, "resting fill")
     }
 
     @Test
@@ -4407,6 +4470,41 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun current_non_trade_population_starts_at_import_lifecycle_boundary() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val eventLog = ExposedCommandEventLog(database)
+        val preImport = fixedInstant().minusSeconds(1)
+        val postImport = fixedInstant().plusSeconds(1)
+        listOf("pre-import" to preImport, "post-import" to postImport).forEach { (runId, occurredAt) ->
+            eventLog.append(
+                CommandEvent(
+                    decisionRunContext = DecisionRunContext(
+                        decisionRunId = runId,
+                        llmProvider = null,
+                        promptHash = null,
+                        systemPromptVersion = null,
+                        marketSnapshotId = null,
+                    ),
+                    toolName = "one-shot-runner",
+                    toolCallId = null,
+                    clientRequestId = null,
+                    eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+                    payload = """{"phase":"proposer","usage":{"inputTokens":1,"outputTokens":1}}""",
+                    occurredAt = occurredAt,
+                ),
+            ).getOrThrow()
+        }
+        val repository = ExposedEvaluationRepository(database)
+        val scope = repository.resolveScope(null, "CURRENT").getOrThrow()
+        val period = EvaluationPeriod(preImport.minusSeconds(1), postImport.plusSeconds(1))
+
+        assertEquals(fixedInstant(), scope.lifecycleFromInclusive)
+        assertEquals(1, repository.countDecisionRuns(period, scope).getOrThrow())
+        val usages = repository.fetchLlmPhaseUsages(period, scope = scope).getOrThrow().facts
+        assertEquals(listOf("post-import"), usages.map { usage -> usage.decisionRunId })
+    }
+
+    @Test
     fun evaluation_repository_treats_partial_closes_and_adds_as_one_closed_trade() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -4494,6 +4592,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals("9758000", trade.entryWeightedProtectiveStopPriceJpy?.stripTrailingZeros()?.toPlainString())
         assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
         assertEquals("247000", evaluatedTrade.initialRiskPriceWidthJpy?.stripTrailingZeros()?.toPlainString())
+        assertLedgerLineage(database, "manual close")
     }
 
     @Test
@@ -4767,6 +4866,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(2, executions.size)
         assertEquals("10100000.00000000", watermark.highestPriceSinceEntryJpy)
         assertEquals("10005000.00000000", watermark.lowestPriceSinceEntryJpy)
+        assertLedgerLineage(database, "virtual TP")
     }
 
     @Test
@@ -4803,6 +4903,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(0, openOrders.size)
         assertEquals("10005000.00000000", watermark.highestPriceSinceEntryJpy)
         assertEquals("9885055.00000000", watermark.lowestPriceSinceEntryJpy)
+        assertLedgerLineage(database, "reconciler hard-halt close")
     }
 
     @Test
@@ -4958,6 +5059,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(2, executions.size)
         assertEquals(takeProfitEvent.receivedAt.toString(), executions.last().executedAt)
         assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertLedgerLineage(database, "WebSocket market event")
     }
 
     @Test
@@ -5192,6 +5294,35 @@ class PostgresPersistenceIntegrationTest {
 
             assertTrue(throwable is SQLTimeoutException)
         }
+    }
+}
+
+private fun assertLedgerLineage(database: ExposedDatabase, path: String) {
+    val activeHash = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow().hash
+    exposedTransaction(database) {
+        val mismatches = prepare(
+            """
+                SELECT
+                    (SELECT COUNT(*) FROM orders value, paper_account account
+                     WHERE account.id=? AND (value.account_epoch_id IS NULL OR
+                       value.account_epoch_id<>account.current_epoch_id OR
+                       value.execution_semantics_version<>'PAPER_WS_V1' OR value.runtime_config_hash<>?)) +
+                    (SELECT COUNT(*) FROM executions value, paper_account account
+                     WHERE account.id=? AND (value.account_epoch_id IS NULL OR
+                       value.account_epoch_id<>account.current_epoch_id OR
+                       value.execution_semantics_version<>'PAPER_WS_V1' OR value.runtime_config_hash<>?))
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+            statement.setString(2, activeHash)
+            statement.setInt(3, PAPER_ACCOUNT_SINGLE_ROW_ID)
+            statement.setString(4, activeHash)
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getInt(1)
+            }
+        }
+        assertEquals(0, mismatches, "$path must persist current epoch, semantics, and config hash")
     }
 }
 

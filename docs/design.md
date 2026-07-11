@@ -1304,9 +1304,7 @@ entry EV の計算直前に、データ鮮度劣化時の probability cap を適
 
 persistence bootstrap は、`status = RUNNING` かつ `finished_at IS NULL` の `llm_runs` のうち、`started_at` が `runner.perRunTimeout` と reflection PromptCandidates の timeout 上限の大きい方の3倍より古い行を `FAILED` に回収する。回収時は `finished_at` に bootstrap 時刻を保存し、`error_message` には前回プロセスまたは container shutdown で中断された run を bootstrap で回収したことを示す固定 message を保存する。閾値以内の新しい `RUNNING` 行と終了済みの行は変更しない。
 
-`equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP`）、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。旧スケッチからの差分として、日次重複防止のため JST 日付を物理列 `trading_date` として持ち、`reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置く。`drawdown_ratio` は旧案の decimal(12,8) ではなく、正本である `paper_account` と同じ decimal(20,10) に揃える。BOOTSTRAP は並行 bootstrap でも mode ごとに 1 件に収まるよう `reason = 'BOOTSTRAP'` に限定した `(mode, reason)` partial unique index で防御する。FILL は paper account 更新と同一 transaction で追加する。
-
-`equity_snapshots` の reason は `FILL` / `DAILY` / `BOOTSTRAP` / `EPOCH_START` とし、nullable な `account_epoch_id` を持つ。EPOCH_START は account reset と同一 transaction、FILL は paper account 更新と同一 transaction で保存する。legacy row の epoch は捏造して backfill しない。
+`equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP` / `EPOCH_START`）、nullable な `account_epoch_id`、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。日次重複防止のため `reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置き、BOOTSTRAP は `(mode, reason)` partial unique index で防御する。FILL は paper account 更新、EPOCH_START は account reset と同一 transaction で追加する。legacy row の epoch は捏造して backfill しない。
 
 評価式は次の通り。
 
@@ -1337,7 +1335,9 @@ Historical Outcome Ridge は observed paper trade の realized R だけを `[-2R
 
 Evidence Relationship Graph は report segment → typed claim → deterministic fact → source の参照関係を client-side の fixed DAG として投影する。これは因果・相関・確率・confidence を表さず、node size と edge width にそれらの意味を持たせない。graph が利用できない場合も native table と Claim Inspector から同じ evidence に到達できる。
 
-benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は期間開始時点の paper equity（paper 初期資金 + 期間開始前の累計 realized trade PnL）とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
+benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は選択した immutable account epoch の初期資金と同じ epoch/cohort の期間開始前 realized PnL だけから算出する。開始前 baseline を再構成できない `LEGACY_PRE_WS` は series、return、benchmark fact を生成せず `BASELINE_NOT_COMPARABLE` とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
+
+LLM usage、run rate、decision/action、exclusion などの non-trade population は account epoch の作成時刻を lifecycle 開始境界とし、trade history の legacy fallback 境界とは分離する。CURRENT 以外へ non-trade fact を推測帰属せず、API/report は `NOT_ATTRIBUTABLE` として扱う。Reflection と Knowledge も active epoch + CURRENT を明示解決し、decision、run、usage、trade の全取得を同じ lifecycle scope に限定する。
 
 LLM cost / usage は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`pre_filter` / `proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON では `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage`、Codex JSONL では `codex exec` の単一 turn が返す `turn.completed.usage` を invocation 単位で best-effort に抽出する。Codex の `reasoning_output_tokens` は `output_tokens` の内数として別に保持し、token 合計へ二重加算しない。Codex の model は同じ thread ID を含む invocation 日の session filename を優先し、空振り時だけ更新日時が新しい session JSONL から bounded fallback で解決する。file 数または matching session の行数を上限で打ち切る場合は warning を残し、model が解決できない場合も semantic response と token usage は維持する。保存済み `details.usage` がない過去の Claude 行は redacted `details.stdout` から可能な範囲で fallback parse する。process output の解析後に一時 artifact の cleanup が失敗した場合も、audit は完了済み process の status、exit code、usage と `cleanupFailed` を保存してから runner を fail-closed にする。
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { generateReport, ReportAdmissionError } from "./evaluationReport";
+import { generateReport, reportRevisionMatchesScope, ReportAdmissionError } from "./evaluationReport";
 
 const job = {
   jobId: "job-1", revisionId: "revision-1", revisionNumber: 7, status: "REQUESTED", stage: "ADMITTED",
@@ -9,6 +9,14 @@ const job = {
 
 describe("evaluation report generation client", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it("never exposes pin eligibility across epoch/cohort or legacy unversioned scope", () => {
+    const selected = { epochId: "epoch-1", cohort: "CURRENT", scopeKey: "PRESET:30D|EPOCH:epoch-1|COHORT:CURRENT" };
+    expect(reportRevisionMatchesScope(selected, "PRESET:30D", "epoch-1", "CURRENT")).toBe(true);
+    expect(reportRevisionMatchesScope({ ...selected, epochId: null, cohort: null, scopeKey: "PRESET:30D" }, "PRESET:30D", "epoch-1", "CURRENT")).toBe(false);
+    expect(reportRevisionMatchesScope(selected, "PRESET:30D", "epoch-2", "CURRENT")).toBe(false);
+    expect(reportRevisionMatchesScope(selected, "PRESET:30D", "epoch-1", "LEGACY_PRE_WS")).toBe(false);
+  });
 
   it("surfaces rejected job identity and Retry-After", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({

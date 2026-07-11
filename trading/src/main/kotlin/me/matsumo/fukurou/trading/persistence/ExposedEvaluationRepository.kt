@@ -356,11 +356,7 @@ class ExposedEvaluationRepository(
                                 cohort = requestedCohort,
                                 executionSemanticsVersion = if (requestedCohort == EvaluationCohort.CURRENT) "PAPER_WS_V1" else null,
                                 initialCashJpy = resultSet.getBigDecimal("initial_cash_jpy"),
-                                fromInclusive = if (resultSet.getString("kind") == "LEGACY_IMPORTED") {
-                                    Instant.EPOCH
-                                } else {
-                                    Instant.ofEpochMilli(resultSet.getLong("created_at"))
-                                },
+                                lifecycleFromInclusive = Instant.ofEpochMilli(resultSet.getLong("created_at")),
                                 toExclusive = resultSet.getLong("next_created_at").takeUnless { resultSet.wasNull() }
                                     ?.let(Instant::ofEpochMilli),
                             )
@@ -402,7 +398,7 @@ class ExposedEvaluationRepository(
                     db = database,
                 ) {
                     val scopedPeriod = EvaluationPeriod(
-                        maxOf(period.from, scope.fromInclusive),
+                        maxOf(period.from, scope.lifecycleFromInclusive),
                         minOf(period.toExclusive, scope.toExclusive ?: period.toExclusive),
                     )
                     val trades = selectClosedTrades(
@@ -584,11 +580,7 @@ private fun JdbcTransaction.selectCurrentEvaluationScope(): EvaluationScope {
                 cohort = EvaluationCohort.CURRENT,
                 executionSemanticsVersion = "PAPER_WS_V1",
                 initialCashJpy = resultSet.getBigDecimal("initial_cash_jpy"),
-                fromInclusive = if (resultSet.getString("kind") == "LEGACY_IMPORTED") {
-                    Instant.EPOCH
-                } else {
-                    Instant.ofEpochMilli(resultSet.getLong("created_at"))
-                },
+                lifecycleFromInclusive = Instant.ofEpochMilli(resultSet.getLong("created_at")),
             )
         }
     }

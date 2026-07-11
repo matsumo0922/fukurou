@@ -3,7 +3,9 @@
 package me.matsumo.fukurou
 
 import io.ktor.client.request.get
+import io.ktor.client.request.delete
 import io.ktor.client.request.post
+import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
@@ -265,6 +267,46 @@ class EvaluationRouteTest {
         assertTrue(generated.contains("\"snapshotId\":"))
         assertTrue(generated.contains("\"promptVersion\":\"evaluation-report-prompt-v1\""))
         assertTrue(generated.contains("\"schemaVersion\":\"evaluation-report-schema-v1\""))
+    }
+
+    @Test
+    fun evaluationReport_rejectsRevisionScopeMismatchForPreviewAndPin() = testApplication {
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = FakeEvaluationRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+        val accepted = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"PRESET","days":30,"cohort":"CURRENT"}""")
+        }.bodyAsText()
+        val revisionId = requireNotNull(Regex("\\\"revisionId\\\":\\\"([^\\\"]+)").find(accepted)).groupValues[1]
+        var ready = false
+        repeat(100) {
+            if (client.get("/evaluation/reports/revisions/$revisionId").status == HttpStatusCode.OK) ready = true
+            if (!ready) delay(10)
+        }
+        assertTrue(ready)
+
+        val preview = client.get(
+            "/evaluation/reports/revisions/$revisionId?scopeKey=PRESET:30D&cohort=LEGACY_PRE_WS",
+        )
+        val pin = client.put("/evaluation/reports/pins") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"scopeKey":"PRESET:30D","revisionId":"$revisionId","cohort":"LEGACY_PRE_WS"}""")
+        }
+        val delete = client.delete("/evaluation/reports/pins?scopeKey=PRESET:30D&cohort=CURRENT")
+
+        assertEquals(HttpStatusCode.BadRequest, preview.status)
+        assertTrue(preview.bodyAsText().contains("REPORT_SCOPE_MISMATCH"))
+        assertEquals(HttpStatusCode.BadRequest, pin.status)
+        assertTrue(pin.bodyAsText().contains("REPORT_SCOPE_MISMATCH"))
+        assertEquals(HttpStatusCode.NoContent, delete.status)
     }
 
     @Test

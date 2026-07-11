@@ -28,7 +28,7 @@ data class EvaluationScope(
     val cohort: EvaluationCohort,
     val executionSemanticsVersion: String?,
     val initialCashJpy: BigDecimal,
-    val fromInclusive: Instant = Instant.EPOCH,
+    val lifecycleFromInclusive: Instant = Instant.EPOCH,
     val toExclusive: Instant? = null,
 )
 

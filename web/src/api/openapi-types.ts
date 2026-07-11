@@ -783,7 +783,14 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description preview対象の期間scope keyです。 */
+                    scopeKey?: string;
+                    /** @description preview対象のimmutable account epoch IDです。 */
+                    epochId?: string;
+                    /** @description preview対象cohortです。 */
+                    cohort?: string;
+                };
                 header?: never;
                 path: {
                     revisionId: string;
@@ -798,6 +805,14 @@ export interface paths {
                     };
                     content: {
                         "application/json": components["schemas"]["EvaluationReportResponse"];
+                    };
+                };
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportScopeErrorResponse"];
                     };
                 };
                 404: {
@@ -856,7 +871,7 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
+                        "application/json": components["schemas"]["EvaluationReportScopeErrorResponse"];
                     };
                 };
             };
@@ -873,6 +888,10 @@ export interface paths {
                     scopeKey?: string;
                     /** @description scopeKey 省略時の互換 preset 日数です。 */
                     days?: number;
+                    /** @description pin scopeのimmutable account epoch IDです。 */
+                    epochId?: string;
+                    /** @description pin scopeのcohortです。 */
+                    cohort?: string;
                 };
                 header?: never;
                 path?: never;
@@ -2725,10 +2744,16 @@ export interface components {
             pinned: boolean;
             epochId?: string | null;
             cohort?: string | null;
+            scopeKey?: string | null;
         };
         /** EvaluationReportHistoryResponse */
         EvaluationReportHistoryResponse: {
             revisions: components["schemas"]["EvaluationReportHistoryItemResponse"][];
+        };
+        /** EvaluationReportScopeErrorResponse */
+        EvaluationReportScopeErrorResponse: {
+            code: string;
+            message: string;
         };
         /** EvaluationReportPinRequest */
         EvaluationReportPinRequest: {

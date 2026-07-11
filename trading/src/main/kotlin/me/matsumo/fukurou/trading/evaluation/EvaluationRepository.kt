@@ -65,7 +65,7 @@ interface EvaluationRepository {
         period: EvaluationPeriod,
         scope: EvaluationScope,
     ): Result<EvaluationExclusionSummary> = if (scope.isCurrentPopulation()) {
-        fetchExclusionSummary(period.intersect(scope))
+        fetchExclusionSummary(period.intersectLifecycle(scope))
     } else {
         Result.success(EvaluationExclusionSummary())
     }
@@ -92,7 +92,7 @@ interface EvaluationRepository {
 
     /** immutable epoch lifecycle に限定した decision run 数。 */
     suspend fun countDecisionRuns(period: EvaluationPeriod, scope: EvaluationScope): Result<Int> =
-        if (scope.isCurrentPopulation()) countDecisionRuns(period.intersect(scope)) else Result.success(0)
+        if (scope.isCurrentPopulation()) countDecisionRuns(period.intersectLifecycle(scope)) else Result.success(0)
 
     /**
      * 期間内の decision action 別件数を取得する。
@@ -104,7 +104,7 @@ interface EvaluationRepository {
         period: EvaluationPeriod,
         scope: EvaluationScope,
     ): Result<List<DecisionActionCount>> = if (scope.isCurrentPopulation()) {
-        countDecisionsByAction(period.intersect(scope))
+        countDecisionsByAction(period.intersectLifecycle(scope))
     } else {
         Result.success(emptyList())
     }
@@ -138,7 +138,7 @@ interface EvaluationRepository {
         limit: Int = DEFAULT_EVALUATION_QUERY_LIMIT,
         scope: EvaluationScope,
     ): Result<EvaluationLlmUsageQueryResult> = if (scope.isCurrentPopulation()) {
-        fetchLlmPhaseUsages(period.intersect(scope), limit)
+        fetchLlmPhaseUsages(period.intersectLifecycle(scope), limit)
     } else {
         Result.success(EvaluationLlmUsageQueryResult(emptyList(), truncated = false))
     }
@@ -149,8 +149,9 @@ interface EvaluationRepository {
     suspend fun fetchKillCriterionStats(): Result<KillCriterionStats>
 }
 
-private fun EvaluationPeriod.intersect(scope: EvaluationScope): EvaluationPeriod {
-    val from = maxOf(from, scope.fromInclusive)
+/** audit/non-trade population を immutable epoch lifecycle と交差させる。 */
+fun EvaluationPeriod.intersectLifecycle(scope: EvaluationScope): EvaluationPeriod {
+    val from = maxOf(from, scope.lifecycleFromInclusive)
     val to = minOf(toExclusive, scope.toExclusive ?: toExclusive)
     return EvaluationPeriod(from, maxOf(from, to))
 }

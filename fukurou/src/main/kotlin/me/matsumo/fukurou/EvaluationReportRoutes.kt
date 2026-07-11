@@ -210,13 +210,40 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
             call.respond(HttpStatusCode.NotFound, ErrorResponse("report revision was not found"))
             return@get
         }
+        val hasScopeContract = listOf("scopeKey", "days", "epochId", "cohort")
+            .any { key -> call.request.queryParameters[key] != null }
+        if (hasScopeContract) {
+            val expectedScopeKey = call.reportScopeKey(dependencies.repository) ?: return@get
+            if (revision.scopeKey != expectedScopeKey) {
+                call.respond(
+                    HttpStatusCode.BadRequest,
+                    EvaluationReportScopeErrorResponse("REPORT_SCOPE_MISMATCH", "revision scope does not match requested scope"),
+                )
+                return@get
+            }
+        }
         call.respond(revision)
     }.describe {
         summary = "評価レポート revision を取得する"
         description = "履歴から選択した immutable artifact と同一 snapshot evidence を返します。"
         tag(EVALUATION_REPORT_TAG)
+        parameters {
+            query("scopeKey") {
+                schema = jsonSchema<String>()
+                description = "preview対象の期間scope keyです。"
+            }
+            query("epochId") {
+                schema = jsonSchema<String>()
+                description = "preview対象のimmutable account epoch IDです。"
+            }
+            query("cohort") {
+                schema = jsonSchema<String>()
+                description = "preview対象cohortです。"
+            }
+        }
         responses {
             HttpStatusCode.OK { schema = jsonSchema<EvaluationReportResponse>() }
+            HttpStatusCode.BadRequest { schema = jsonSchema<EvaluationReportScopeErrorResponse>() }
             HttpStatusCode.NotFound { schema = jsonSchema<ErrorResponse>() }
         }
     }
@@ -228,7 +255,8 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
             return@put
         }
         store.pin(scopeKey, request.revisionId).getOrElse { error ->
-            call.respond(HttpStatusCode.BadRequest, ErrorResponse(error.message ?: "pin failed"))
+            val code = if (error.message == "REPORT_SCOPE_MISMATCH") "REPORT_SCOPE_MISMATCH" else "REPORT_PIN_REJECTED"
+            call.respond(HttpStatusCode.BadRequest, EvaluationReportScopeErrorResponse(code, error.message ?: "pin failed"))
             return@put
         }
         call.respond(EvaluationReportPinResponse(scopeKey, request.revisionId))
@@ -239,7 +267,7 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
         requestBody { schema = jsonSchema<EvaluationReportPinRequest>() }
         responses {
             HttpStatusCode.OK { schema = jsonSchema<EvaluationReportPinResponse>() }
-            HttpStatusCode.BadRequest { schema = jsonSchema<ErrorResponse>() }
+            HttpStatusCode.BadRequest { schema = jsonSchema<EvaluationReportScopeErrorResponse>() }
         }
     }
 
@@ -259,6 +287,14 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
             query("days") {
                 description = "scopeKey 省略時の互換 preset 日数です。"
                 schema = jsonSchema<Int>()
+            }
+            query("epochId") {
+                description = "pin scopeのimmutable account epoch IDです。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "pin scopeのcohortです。"
+                schema = jsonSchema<String>()
             }
         }
         responses { HttpStatusCode.NoContent { description = "pin を解除しました。" } }
@@ -626,7 +662,7 @@ private class EvaluationReportStore(
         val report = revision(revisionId)
         return runCatching {
             require(report != null && report.status == "SUCCEEDED") { "revision must be successful" }
-            require(report.scopeKey == scopeKey) { "revision scope does not match pin scope" }
+            require(report.scopeKey == scopeKey) { "REPORT_SCOPE_MISMATCH" }
             persistence?.pin(scopeKey, revisionId)?.getOrThrow()
             synchronized(reports) { pins[scopeKey] = revisionId }
         }
@@ -656,6 +692,7 @@ private class EvaluationReportStore(
                 pinned = true,
                 epochId = report.epochId,
                 cohort = report.cohort,
+                scopeKey = report.scopeKey,
             )
         }
     }
@@ -937,18 +974,22 @@ data class EvaluationReportPinRequest(
 @Serializable
 data class EvaluationReportPinResponse(val scopeKey: String, val revisionId: String)
 
+/** report scope contract 違反の machine-readable response。 */
+@Serializable
+data class EvaluationReportScopeErrorResponse(val code: String, val message: String)
+
 private suspend fun EvaluationReportPinRequest.resolvedScopeKey(repository: EvaluationRepository?): String? {
     val scope = repository?.resolveScope(epochId, cohort)?.getOrNull() ?: return null
     val base = scopeKey ?: "PRESET:${days ?: 30}D"
-    if ("|EPOCH:" in base) return base
-    return "$base|EPOCH:${scope.accountEpochId}|COHORT:${scope.cohort.name}"
+    val unversionedBase = base.substringBefore("|EPOCH:")
+    val resolved = "$unversionedBase|EPOCH:${scope.accountEpochId}|COHORT:${scope.cohort.name}"
+    return resolved.takeIf { "|EPOCH:" !in base || base == resolved }
 }
 
 private suspend fun io.ktor.server.application.ApplicationCall.reportScopeKey(
     repository: EvaluationRepository?,
 ): String? {
     val suppliedKey = request.queryParameters["scopeKey"]
-    if (suppliedKey != null && "|EPOCH:" in suppliedKey) return suppliedKey
     val scope = repository?.resolveScope(
         request.queryParameters["epochId"],
         request.queryParameters["cohort"],
@@ -957,9 +998,16 @@ private suspend fun io.ktor.server.application.ApplicationCall.reportScopeKey(
         respond(HttpStatusCode.BadRequest, ErrorResponse("evaluation scope is invalid"))
         return null
     }
-    val base = suppliedKey ?: "PRESET:${request.queryParameters["days"]?.toIntOrNull() ?: 30}D"
-    return "$base|" +
-        "EPOCH:${scope.accountEpochId}|COHORT:${scope.cohort.name}"
+    val base = suppliedKey?.substringBefore("|EPOCH:")
+        ?: "PRESET:${request.queryParameters["days"]?.toIntOrNull() ?: 30}D"
+    val resolved = "$base|EPOCH:${scope.accountEpochId}|COHORT:${scope.cohort.name}"
+    val versionedScopeMismatch = suppliedKey != null &&
+        "|EPOCH:" in suppliedKey && suppliedKey != resolved
+    if (versionedScopeMismatch) {
+        respond(HttpStatusCode.BadRequest, EvaluationReportScopeErrorResponse("REPORT_SCOPE_MISMATCH", "scopeKey does not match epochId/cohort"))
+        return null
+    }
+    return resolved
 }
 
 @Serializable
@@ -1162,6 +1210,7 @@ data class EvaluationReportHistoryItemResponse(
     val pinned: Boolean,
     val epochId: String? = null,
     val cohort: String? = null,
+    val scopeKey: String? = null,
 )
 
 @Serializable
