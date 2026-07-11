@@ -688,7 +688,7 @@ private const val FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS_ENV = "FUKUROU_GMO_
 /**
  * paper 初期残高の既定値。
  */
-private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("100000")
+private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("1000000")
 
 /**
  * MARKET / STOP の既定 slippage bps。

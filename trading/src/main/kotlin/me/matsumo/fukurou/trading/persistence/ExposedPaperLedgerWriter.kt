@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
@@ -50,6 +52,8 @@ import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.PAPER_EXECUTION_SEMANTICS_VERSION
+import me.matsumo.fukurou.trading.domain.PaperExecutionLineage
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
@@ -1185,6 +1189,7 @@ private fun JdbcTransaction.updateMarks(
 
 private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, clock: Clock) {
     request.marketEligibility?.let { eligibility -> verifyMarketEligibilitySession(eligibility) }
+    val lineage = resolvePaperExecutionLineage(request.command.auditContext)
 
     prepare(
         """
@@ -1196,9 +1201,10 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
                 system_prompt_version, market_snapshot_id, expires_at, expiry_source,
                 effective_ttl_seconds, expired_at, canceled_at, cancel_reason, canceled_by_decision_run_id,
                 queue_ahead_btc, queue_consumed_btc, queue_snapshot_at, market_data_session_id,
-                market_eligible_after_sequence, market_eligible_from, created_at, updated_at
+                market_eligible_after_sequence, market_eligible_from, created_at, updated_at,
+                account_epoch_id, execution_semantics_version, runtime_config_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         val command = request.command
@@ -1237,6 +1243,7 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
         val createdAt = request.createdAt?.toEpochMilli() ?: nowMillis(clock)
         statement.setLong(37, createdAt)
         statement.setLong(38, createdAt)
+        statement.bindLineage(39, lineage)
         statement.executeUpdate()
     }
 }
@@ -1269,6 +1276,7 @@ private fun JdbcTransaction.insertProtectiveStopOrder(
     tradeGroupId: UUID,
     clock: Clock,
 ) {
+    val lineage = resolvePaperExecutionLineage(command.auditContext)
     prepare(
         """
             INSERT INTO orders (
@@ -1276,9 +1284,10 @@ private fun JdbcTransaction.insertProtectiveStopOrder(
                 size_btc, limit_price_jpy, trigger_price_jpy, protective_stop_price_jpy,
                 take_profit_price_jpy, estimated_win_probability, reason_ja,
                 decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
-                system_prompt_version, market_snapshot_id, created_at, updated_at
+                system_prompt_version, market_snapshot_id, created_at, updated_at,
+                account_epoch_id, execution_semantics_version, runtime_config_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         val protectiveStopAuditContext = command.auditContext.copy(clientRequestId = null)
@@ -1295,11 +1304,13 @@ private fun JdbcTransaction.insertProtectiveStopOrder(
         statement.bindAudit(12, protectiveStopAuditContext)
         statement.setLong(19, nowMillis(clock))
         statement.setLong(20, nowMillis(clock))
+        statement.bindLineage(21, lineage)
         statement.executeUpdate()
     }
 }
 
 private fun JdbcTransaction.insertCloseOrder(request: CloseOrderInsertRequest, clock: Clock) {
+    val lineage = resolvePaperExecutionLineage(request.auditContext)
     prepare(
         """
             INSERT INTO orders (
@@ -1307,9 +1318,10 @@ private fun JdbcTransaction.insertCloseOrder(request: CloseOrderInsertRequest, c
                 size_btc, limit_price_jpy, trigger_price_jpy, protective_stop_price_jpy,
                 take_profit_price_jpy, estimated_win_probability, reason_ja,
                 decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
-                system_prompt_version, market_snapshot_id, created_at, updated_at
+                system_prompt_version, market_snapshot_id, created_at, updated_at,
+                account_epoch_id, execution_semantics_version, runtime_config_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         statement.bindOrderId(
@@ -1327,6 +1339,7 @@ private fun JdbcTransaction.insertCloseOrder(request: CloseOrderInsertRequest, c
         statement.bindAudit(11, request.auditContext)
         statement.setLong(18, nowMillis(clock))
         statement.setLong(19, nowMillis(clock))
+        statement.bindLineage(20, lineage)
         statement.executeUpdate()
     }
 }
@@ -1338,6 +1351,7 @@ private fun JdbcTransaction.insertPosition(
     tradeGroupId: UUID,
     marketEligibility: PositionMarketEligibility?,
 ) {
+    val lineage = resolvePaperExecutionLineage(command.auditContext)
     prepare(
         """
             INSERT INTO positions (
@@ -1346,9 +1360,10 @@ private fun JdbcTransaction.insertPosition(
                 current_take_profit_jpy, unrealized_pnl_jpy, unrealized_r, pyramid_add_count,
                 highest_price_since_entry_jpy, lowest_price_since_entry_jpy, decision_run_id, tool_call_id,
                 client_request_id, llm_provider, prompt_hash, system_prompt_version,
-                market_snapshot_id, market_data_session_id, market_eligible_after_sequence
+                market_snapshot_id, market_data_session_id, market_eligible_after_sequence,
+                account_epoch_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         statement.setObject(1, positionId)
@@ -1371,11 +1386,13 @@ private fun JdbcTransaction.insertPosition(
         statement.bindAudit(18, command.auditContext)
         statement.setObject(25, marketEligibility?.sessionId)
         statement.setObject(26, marketEligibility?.eligibleAfterSequence)
+        statement.setObject(27, UUID.fromString(lineage.accountEpochId))
         statement.executeUpdate()
     }
 }
 
 private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
+    val lineage = resolvePaperExecutionLineage(request.auditContext)
     prepare(
         """
             INSERT INTO executions (
@@ -1383,9 +1400,10 @@ private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
                 fee_jpy, realized_pnl_jpy, liquidity, executed_at, decision_run_id,
                 tool_call_id, client_request_id, llm_provider, prompt_hash,
                 system_prompt_version, market_snapshot_id, source_session_id, source_sequence,
-                source_exchange_at, source_received_at, source_side, source_price_jpy, source_size_btc
+                source_exchange_at, source_received_at, source_side, source_price_jpy, source_size_btc,
+                account_epoch_id, execution_semantics_version, runtime_config_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         statement.setObject(1, request.fill.executionId)
@@ -1409,8 +1427,45 @@ private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
         statement.setString(24, source?.side?.name)
         statement.setNullableBigDecimal(25, source?.priceJpy?.moneyScale())
         statement.setNullableBigDecimal(26, source?.sizeBtc?.btcScale())
+        statement.bindLineage(27, lineage)
         statement.executeUpdate()
     }
+}
+
+/** current account epoch と active config hash を同一 ledger transaction で固定する。 */
+private fun JdbcTransaction.resolvePaperExecutionLineage(auditContext: PaperTradeAuditContext): PaperExecutionLineage {
+    val result = prepare(
+        """
+            SELECT account.current_epoch_id, epoch.runtime_config_hash
+            FROM paper_account account
+            JOIN paper_account_epochs epoch ON epoch.id = account.current_epoch_id
+            WHERE account.id = ?
+            FOR SHARE
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "PAPER_EXECUTION_LINEAGE_UNAVAILABLE: current account epoch is missing." }
+            resultSet.getObject("current_epoch_id", UUID::class.java) to resultSet.getString("runtime_config_hash")
+        }
+    }
+    val auditHash = auditContext.decisionRunContext.runtimeConfigHash
+    require(auditHash == null || auditHash == result.second) {
+        "PAPER_EXECUTION_LINEAGE_MISMATCH: command and current account epoch runtime config hashes differ."
+    }
+
+    return PaperExecutionLineage(
+        accountEpochId = result.first.toString(),
+        executionSemanticsVersion = PAPER_EXECUTION_SEMANTICS_VERSION,
+        runtimeConfigHash = result.second,
+    )
+}
+
+/** prepared statement の連続3列へ lineage を bind する。 */
+private fun PreparedStatement.bindLineage(startIndex: Int, lineage: PaperExecutionLineage) {
+    setObject(startIndex, UUID.fromString(lineage.accountEpochId))
+    setString(startIndex + 1, lineage.executionSemanticsVersion)
+    setString(startIndex + 2, lineage.runtimeConfigHash)
 }
 
 private fun JdbcTransaction.updatePositionMark(update: PositionMarkUpdate) {

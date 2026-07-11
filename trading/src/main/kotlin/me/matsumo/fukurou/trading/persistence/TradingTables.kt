@@ -139,6 +139,9 @@ object PaperAccountTable : Table("paper_account") {
      */
     val id = integer("id")
 
+    /** 現在 active な immutable account epoch ID。 */
+    val currentEpochId = uuid("current_epoch_id").nullable()
+
     /**
      * 取引 mode。
      */
@@ -188,6 +191,32 @@ object PaperAccountTable : Table("paper_account") {
      * 最終更新時刻。epoch millis で保存する。
      */
     val updatedAt = long("updated_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** immutable な paper account baseline epoch を表す table。 */
+object PaperAccountEpochsTable : Table("paper_account_epochs") {
+    /** epoch ID。 */
+    val id = uuid("id")
+
+    /** import / config activation の種別。 */
+    val kind = varchar("kind", length = 32)
+
+    /** epoch の基準資金。 */
+    val initialCashJpy = decimal("initial_cash_jpy", precision = 24, scale = 8)
+
+    /** 作成元 active runtime config の canonical hash。 */
+    val runtimeConfigHash = varchar("runtime_config_hash", length = 64)
+
+    /** secret を含まない作成理由。 */
+    val reason = text("reason")
+
+    /** 作成主体。 */
+    val actor = varchar("actor", length = 128)
+
+    /** 作成時刻。epoch millis で保存する。 */
+    val createdAt = long("created_at")
 
     override val primaryKey = PrimaryKey(id)
 }
@@ -261,6 +290,9 @@ object EquitySnapshotsTable : Table("equity_snapshots") {
      */
     val id = uuid("id")
 
+    /** snapshot が属する account epoch。旧 row は null。 */
+    val accountEpochId = uuid("account_epoch_id").nullable()
+
     /**
      * 取引 mode。
      */
@@ -322,6 +354,9 @@ object PositionsTable : Table("positions") {
      * position ID。
      */
     val id = uuid("id")
+
+    /** position が属する account epoch。旧 row は null。 */
+    val accountEpochId = uuid("account_epoch_id").nullable()
 
     /**
      * group 単位リスク評価用 ID。
@@ -460,6 +495,15 @@ object OrdersTable : Table("orders") {
      * 注文 ID。
      */
     val id = uuid("id")
+
+    /** order が属する account epoch。旧 row は null。 */
+    val accountEpochId = uuid("account_epoch_id").nullable()
+
+    /** order 作成時の execution semantics。旧 row は null。 */
+    val executionSemanticsVersion = varchar("execution_semantics_version", length = 64).nullable()
+
+    /** order 作成時の canonical runtime config hash。旧 row は null。 */
+    val runtimeConfigHash = varchar("runtime_config_hash", length = 64).nullable()
 
     /**
      * entry intent ID。
@@ -631,6 +675,15 @@ object ExecutionsTable : Table("executions") {
      * 約定 ID。
      */
     val id = uuid("id")
+
+    /** execution が属する account epoch。旧 row は null。 */
+    val accountEpochId = uuid("account_epoch_id").nullable()
+
+    /** execution 時の semantics。旧 row は null。 */
+    val executionSemanticsVersion = varchar("execution_semantics_version", length = 64).nullable()
+
+    /** execution 時の canonical runtime config hash。旧 row は null。 */
+    val runtimeConfigHash = varchar("runtime_config_hash", length = 64).nullable()
 
     /**
      * 関連注文 ID。

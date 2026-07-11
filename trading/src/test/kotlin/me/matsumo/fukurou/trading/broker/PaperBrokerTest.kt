@@ -81,7 +81,7 @@ class PaperBrokerTest {
 
         assertEquals(TradingMode.PAPER, accountStatus.mode)
         assertEquals("RUNNING", accountStatus.riskState)
-        assertEquals("100000.00000000", accountStatus.currentEquityJpy)
+        assertEquals("1000000.00000000", accountStatus.currentEquityJpy)
         assertEquals("0", accountStatus.todayRealizedPnlJpy)
         assertFalse(accountStatus.hardHalt)
         assertEquals(0, accountStatus.protectionStatus.protectedPositionCount)
@@ -1221,6 +1221,7 @@ class PaperBrokerTest {
         val command = approvedCommand(
             repository = decisionRepository,
             command = marketEntryCommand(
+                sizeBtc = BigDecimal("0.0300"),
                 protectiveStopPriceJpy = BigDecimal("9000000"),
                 takeProfitPriceJpy = BigDecimal("10500000"),
             ),
@@ -1293,7 +1294,7 @@ class PaperBrokerTest {
         val command = approvedCommand(
             repository = decisionRepository,
             command = marketEntryCommand(
-                sizeBtc = BigDecimal("0.0090"),
+                sizeBtc = BigDecimal("0.0900"),
                 protectiveStopPriceJpy = BigDecimal("9900000"),
                 takeProfitPriceJpy = BigDecimal("10100000"),
             ),

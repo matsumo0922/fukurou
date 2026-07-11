@@ -9,6 +9,8 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
+import me.matsumo.fukurou.trading.domain.PaperAccountEpochKind
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
@@ -892,6 +894,7 @@ class TradingPersistenceBootstrap(
                     RuntimeConfigVersionsTable,
                     RuntimeConfigValuesTable,
                     RiskStateTable,
+                    PaperAccountEpochsTable,
                     PaperAccountTable,
                     LlmRunsTable,
                     EquitySnapshotsTable,
@@ -922,6 +925,7 @@ class TradingPersistenceBootstrap(
                     statement.executeUpdate()
                 }
                 ensurePaperAccountRow(now, paperAccountConfig)
+                ensureLegacyPaperAccountEpoch(now)
                 ensureRiskStateEquityPeak(now, paperAccountConfig.initialCashJpy)
                 ensureBootstrapEquitySnapshot(now)
                 jdbcConnection().prepareStatement(
@@ -955,6 +959,64 @@ class TradingPersistenceBootstrap(
                 selectPaperAccount()
             }
         }
+    }
+}
+
+/** 既存 ledger を変更せず current epoch だけを初回登録する。 */
+private fun JdbcTransaction.ensureLegacyPaperAccountEpoch(now: Instant) {
+    val account = jdbcConnection().prepareStatement(
+        "SELECT current_epoch_id, initial_cash_jpy FROM paper_account WHERE id = ? FOR UPDATE",
+    ).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "paper_account row is missing." }
+            resultSet.getObject("current_epoch_id", UUID::class.java) to
+                resultSet.getBigDecimal("initial_cash_jpy")
+        }
+    }
+    if (account.first != null) return
+
+    val values = linkedMapOf<String, String>()
+    jdbcConnection().prepareStatement(
+        """
+            SELECT value.config_key, value.config_value
+            FROM runtime_config_values value
+            JOIN runtime_config_versions version ON version.id = value.version_id
+            WHERE version.status = 'ACTIVE'
+            ORDER BY value.config_key
+        """.trimIndent(),
+    ).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            while (resultSet.next()) {
+                values[resultSet.getString("config_key")] = resultSet.getString("config_value")
+            }
+        }
+    }
+    val runtimeConfigHash = calculateRuntimeConfigHash(values)
+    val epochId = UUID.randomUUID()
+
+    jdbcConnection().prepareStatement(
+        """
+            INSERT INTO paper_account_epochs (
+                id, kind, initial_cash_jpy, runtime_config_hash, reason, actor, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, epochId)
+        statement.setString(2, PaperAccountEpochKind.LEGACY_IMPORTED.name)
+        statement.setBigDecimal(3, account.second)
+        statement.setString(4, runtimeConfigHash)
+        statement.setString(5, "non-destructive schema adoption")
+        statement.setString(6, "persistence-bootstrap")
+        statement.setLong(7, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+    jdbcConnection().prepareStatement(
+        "UPDATE paper_account SET current_epoch_id = ? WHERE id = ? AND current_epoch_id IS NULL",
+    ).use { statement ->
+        statement.setObject(1, epochId)
+        statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        check(statement.executeUpdate() == 1) { "paper account epoch adoption lost its lock." }
     }
 }
 

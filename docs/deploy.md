@@ -1,5 +1,7 @@
 # セルフホストデプロイ手順（Fukurou backend scaffold）
 
+起動時 bootstrap は既存 paper account の残高と履歴を変更せず `LEGACY_IMPORTED` account epoch を登録する。baseline 変更時に履歴 row を更新せず、新しい epoch として運用する。
+
 Fukurou の最小 Ktor backend を NAS 上で常時稼働させ、Cloudflare Tunnel + Access で公開・保護するための運用手順。
 
 この scaffold では `ktor` + `postgres` + `cloudflared` の 3 サービスを扱う。Ktor backend、paper trading runtime、常駐 `ProtectionReconciler`、MCP stdio fat jar の image 同梱、LlmInvoker、daemon scheduler、Obsidian Writer、Reflection Runner、週次 PromptCandidates 生成まで実装済み。Knowledge note の自動適用と live 実発注は実装しない。

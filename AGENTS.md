@@ -18,6 +18,9 @@
 
 ### Paper Simulation Fidelity
 
+- production paper baseline の正本は current account epoch の 1,000,000 円とする。baseline は runtime config activation に伴う監査済み epoch switch だけで変更し、既存履歴の rescale や destructive backfill を行わない。
+- evaluation は account epoch と execution semantics cohort を分離し、`LEGACY_PRE_WS` を current KPI へ黙って混ぜない。attribution 不能 trade は missing として母集団に残す。
+
 - paper trading は、実資金投入前に LLM の判断、SafetyFloor、注文ライフサイクルを評価するためのシミュレーションとして扱う。paper 成績を良く見せるための例外や、live で再現できない状態遷移を導入しない。
 - 「約定した可能性がある」を「約定した」に変換しない。観測・処理できなかった市場事象は未知またはデータ欠損として記録し、過去の価格履歴から paper 約定を遡及作成しない。
 - infrastructure failure、market-data gap、監視停止は strategy outcome と分離する。影響を受けた期間・注文・position は評価不能であることを明示し、勝率、EV、profit factor などの戦略評価へ黙って混ぜない。

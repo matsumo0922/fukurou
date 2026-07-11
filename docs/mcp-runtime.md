@@ -1,5 +1,7 @@
 # MCP runtime / Docker 配線メモ
 
+paper ledger の write は current account epoch、`PAPER_WS_V1` execution semantics、active runtime config hash が揃う場合だけ成功する。decision run の audit hash と current epoch の hash が異なる場合は fail closed とし、config 切替中の lineage 混在を防ぐ。
+
 Step6 時点の `fukurou-mcp` runtime と Docker 配線の正本メモ。
 
 ## 現在の構成

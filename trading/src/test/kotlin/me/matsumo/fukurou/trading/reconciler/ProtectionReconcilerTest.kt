@@ -35,6 +35,7 @@ import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
+import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
@@ -667,7 +668,18 @@ class ProtectionReconcilerTest {
 
     @Test
     fun reconcile_pass_cancels_open_entry_before_fill_when_tick_reaches_drawdown_halt() = runBlocking {
-        val repository = InMemoryPaperLedgerRepository()
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = AccountSnapshot(
+                mode = TradingMode.PAPER,
+                cashJpy = "100000.00000000",
+                initialCashJpy = "100000.00000000",
+                btcQuantity = "0.000000000000",
+                btcMarkPriceJpy = "0.00000000",
+                totalEquityJpy = "100000.00000000",
+                equityPeakJpy = "100000.00000000",
+                drawdownRatio = "0.0000000000",
+            ),
+        )
         val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
         val broker = PaperBroker(

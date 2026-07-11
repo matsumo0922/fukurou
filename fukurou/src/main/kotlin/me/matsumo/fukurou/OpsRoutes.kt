@@ -338,6 +338,7 @@ data class OpsAccountResponse(
     val equityPeakJpy: String,
     val drawdownRatio: String,
     val updatedAt: String,
+    val accountEpochId: String? = null,
 )
 
 /**
@@ -380,6 +381,9 @@ data class OpsExecutionResponse(
     val realizedPnlJpy: String,
     val liquidity: String,
     val executedAt: String,
+    val accountEpochId: String? = null,
+    val executionSemanticsVersion: String? = null,
+    val runtimeConfigHash: String? = null,
 )
 
 /**
@@ -2331,6 +2335,7 @@ private fun AccountSnapshotWithUpdatedAt.toOpsAccountResponse(): OpsAccountRespo
         equityPeakJpy = snapshot.equityPeakJpy,
         drawdownRatio = snapshot.drawdownRatio,
         updatedAt = updatedAt.toString(),
+        accountEpochId = snapshot.accountEpochId,
     )
 }
 
@@ -2365,6 +2370,18 @@ private fun ExecutionActivityRecord.toOpsActivityEventResponse(): OpsActivityEve
             OpsActivityMetadataResponse(
                 label = "order",
                 value = response.orderId ?: ACTIVITY_NOT_LINKED_VALUE,
+            ),
+            OpsActivityMetadataResponse(
+                label = "account epoch",
+                value = response.accountEpochId ?: ACTIVITY_NOT_LINKED_VALUE,
+            ),
+            OpsActivityMetadataResponse(
+                label = "execution semantics",
+                value = response.executionSemanticsVersion ?: "LEGACY_PRE_WS",
+            ),
+            OpsActivityMetadataResponse(
+                label = "runtime config hash",
+                value = response.runtimeConfigHash ?: ACTIVITY_NOT_LINKED_VALUE,
             ),
         ),
         details = OpsActivityDetailsResponse(
@@ -2571,6 +2588,9 @@ private fun Execution.toOpsExecutionResponse(): OpsExecutionResponse {
         realizedPnlJpy = realizedPnlJpy,
         liquidity = liquidity.name,
         executedAt = executedAt,
+        accountEpochId = accountEpochId,
+        executionSemanticsVersion = executionSemanticsVersion,
+        runtimeConfigHash = runtimeConfigHash,
     )
 }
 

@@ -14,6 +14,8 @@ import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
 import me.matsumo.fukurou.trading.evaluation.EvaluationExclusionSummary
+import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
+import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionStatus
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationReportSnapshotFacts
@@ -23,6 +25,7 @@ import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
 import me.matsumo.fukurou.trading.evaluation.LlmPhaseUsageFact
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
+import me.matsumo.fukurou.trading.domain.EvaluationCohort
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
@@ -58,16 +61,45 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         ORDER BY p.closed_at ASC
         LIMIT ?
     ),
+    initial_buy_executions AS (
+        SELECT DISTINCT ON (e.position_id)
+            e.position_id,
+            e.order_id
+        FROM executions e
+        JOIN closed_positions p ON p.id = e.position_id
+        WHERE e.side = 'BUY'
+        ORDER BY e.position_id, e.executed_at ASC, e.id ASC
+    ),
     entry_orders AS (
-        SELECT DISTINCT ON (o.position_id)
-            o.position_id,
+        SELECT
+            initial.position_id,
             o.intent_id,
             o.protective_stop_price_jpy
-        FROM orders o
-        JOIN closed_positions p ON p.id = o.position_id
-        WHERE o.side = 'BUY'
-            AND o.intent_id IS NOT NULL
-        ORDER BY o.position_id, o.created_at ASC
+        FROM initial_buy_executions initial
+        LEFT JOIN orders o ON o.id = initial.order_id
+    ),
+    execution_lineage AS (
+        SELECT
+            e.position_id,
+            MIN(e.account_epoch_id::text) AS account_epoch_id,
+            CASE
+                WHEN BOOL_AND(e.execution_semantics_version = 'PAPER_WS_V1')
+                    AND BOOL_AND(o.execution_semantics_version = 'PAPER_WS_V1') THEN 'CURRENT'
+                WHEN BOOL_OR(
+                    COALESCE(e.execution_semantics_version, '') NOT IN ('', 'PAPER_WS_V1') OR
+                    COALESCE(o.execution_semantics_version, '') NOT IN ('', 'PAPER_WS_V1')
+                ) THEN 'UNSUPPORTED_EXECUTION_SEMANTICS'
+                ELSE 'LEGACY_PRE_WS'
+            END AS cohort,
+            CASE
+                WHEN COUNT(DISTINCT e.execution_semantics_version) = 1
+                    THEN MIN(e.execution_semantics_version)
+                ELSE NULL
+            END AS execution_semantics_version
+        FROM executions e
+        LEFT JOIN orders o ON o.id = e.order_id
+        JOIN closed_positions p ON p.id = e.position_id
+        GROUP BY e.position_id
     ),
     entry_fills AS (
         SELECT
@@ -102,11 +134,16 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         COALESCE(position_pnl.sell_realized_pnl_jpy, 0) - COALESCE(position_pnl.entry_fee_jpy, 0) AS trade_pnl_jpy,
         d.estimated_win_probability,
         COALESCE(d.setup_tags, tp.setup_tags, '[]') AS setup_tags,
-        d.llm_provider
+        d.llm_provider,
+        el.account_epoch_id,
+        el.cohort,
+        el.execution_semantics_version,
+        CASE WHEN d.id IS NULL THEN 'MISSING' ELSE 'ATTRIBUTED' END AS attribution_status
     FROM closed_positions p
     LEFT JOIN entry_orders eo ON eo.position_id = p.id
     LEFT JOIN entry_fills ef ON ef.position_id = p.id
     LEFT JOIN position_pnl ON position_pnl.position_id = p.id
+    LEFT JOIN execution_lineage el ON el.position_id = p.id
     LEFT JOIN trade_intents ti ON ti.id = eo.intent_id
     LEFT JOIN decisions d ON d.id = ti.decision_id
     LEFT JOIN trade_plans tp ON tp.id = ti.trade_plan_id
@@ -448,6 +485,15 @@ private fun JdbcTransaction.selectClosedTrades(period: EvaluationPeriod, limit: 
             EvaluationTradeQueryResult(
                 trades = trades.take(limit),
                 truncated = truncated,
+                attributionCoverage = EvaluationAttributionCoverage(
+                    attributed = trades.count { trade ->
+                        trade.attributionStatus == EvaluationAttributionStatus.ATTRIBUTED
+                    },
+                    missing = trades.count { trade ->
+                        trade.attributionStatus == EvaluationAttributionStatus.MISSING
+                    },
+                    total = trades.size,
+                ),
             )
         }
     }
@@ -583,6 +629,10 @@ private fun ResultSet.toClosedTradeFact(): ClosedTradeFact {
         estimatedWinProbability = getNullableBigDecimal("estimated_win_probability"),
         setupTags = parseSetupTags(getString("setup_tags")),
         llmProvider = getNullableString("llm_provider"),
+        accountEpochId = getNullableString("account_epoch_id")?.let(UUID::fromString),
+        cohort = EvaluationCohort.valueOf(getString("cohort") ?: EvaluationCohort.LEGACY_PRE_WS.name),
+        executionSemanticsVersion = getNullableString("execution_semantics_version"),
+        attributionStatus = EvaluationAttributionStatus.valueOf(getString("attribution_status")),
     )
 }
 

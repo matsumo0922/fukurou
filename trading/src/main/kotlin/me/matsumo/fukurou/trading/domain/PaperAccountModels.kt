@@ -173,6 +173,7 @@ data class AccountSnapshot(
     val totalEquityJpy: String,
     val equityPeakJpy: String,
     val drawdownRatio: String,
+    val accountEpochId: String? = null,
 )
 
 /**
@@ -309,6 +310,9 @@ data class Execution(
     val realizedPnlJpy: String,
     val liquidity: ExecutionLiquidity,
     val executedAt: String,
+    val accountEpochId: String? = null,
+    val executionSemanticsVersion: String? = null,
+    val runtimeConfigHash: String? = null,
 )
 
 /**

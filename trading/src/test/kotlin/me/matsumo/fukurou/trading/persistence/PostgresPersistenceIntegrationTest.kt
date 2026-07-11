@@ -1273,6 +1273,50 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun bootstrap_imports_epoch_non_destructively_and_writer_persists_lineage() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        val accountBefore = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+
+        bootstrap.ensureSchema().getOrThrow()
+        val accountAfter = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        assertEquals(accountBefore, accountAfter)
+        assertNotNull(accountAfter.accountEpochId)
+
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(database),
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
+        broker.placeOrder(command).getOrThrow()
+
+        exposedTransaction(database) {
+            val missingLineage = jdbcConnection().prepareStatement(
+                """
+                    SELECT
+                        (SELECT COUNT(*) FROM orders WHERE account_epoch_id IS NULL OR
+                            execution_semantics_version IS NULL OR runtime_config_hash IS NULL) +
+                        (SELECT COUNT(*) FROM executions WHERE account_epoch_id IS NULL OR
+                            execution_semantics_version IS NULL OR runtime_config_hash IS NULL)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.executeQuery().use { resultSet ->
+                    check(resultSet.next())
+                    resultSet.getInt(1)
+                }
+            }
+            assertEquals(0, missingLineage)
+        }
+    }
+
+    @Test
     fun bootstrap_equitySnapshotRejectsDuplicateBootstrapRowsInPostgresPath() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -2936,11 +2980,11 @@ class PostgresPersistenceIntegrationTest {
             val riskState = ExposedRiskStateRepository(database).current().getOrThrow()
 
             assertEquals(TradingMode.PAPER, balance.mode)
-            assertEquals("100000.00000000", balance.cashJpy)
-            assertEquals("100000.00000000", balance.totalEquityJpy)
-            assertEquals("100000.00000000", balance.equityPeakJpy)
-            assertEquals("100000.00000000", riskState.equityPeak.toPlainString())
-            assertEquals("100000.00000000", accountStatus.currentEquityJpy)
+            assertEquals("1000000.00000000", balance.cashJpy)
+            assertEquals("1000000.00000000", balance.totalEquityJpy)
+            assertEquals("1000000.00000000", balance.equityPeakJpy)
+            assertEquals("1000000.00000000", riskState.equityPeak.toPlainString())
+            assertEquals("1000000.00000000", accountStatus.currentEquityJpy)
             assertEquals("0", accountStatus.todayRealizedPnlJpy)
             assertEquals(0, broker.getPositions().getOrThrow().size)
             assertEquals(0, broker.getOpenOrders().getOrThrow().size)
