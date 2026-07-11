@@ -2275,11 +2275,7 @@ a:focus-visible {
 .decision-run-card__open { display: grid; place-items: center; margin-left: auto; border: 0; background: transparent; color: var(--ink-faint); cursor: pointer; }
 .decision-run-card__open:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
 .decision-run-card__id { display: block; margin-top: 10px; color: var(--ink-muted); font-size: 0.7rem; overflow-wrap: anywhere; user-select: text; }
-.run-lifecycle { display: grid; gap: 9px; border: 1px solid var(--line); border-radius: 9px; padding: 12px; }
 .run-order-conditions { margin: 0 0 14px; color: var(--ink-muted); font-size: 0.84rem; line-height: 1.55; }
-.run-lifecycle + .run-lifecycle { margin-top: 10px; }
-.run-lifecycle h4 { margin: 0; font-size: 0.78rem; }
-.run-lifecycle__entry { display: grid; gap: 3px; border-left: 2px solid var(--green); padding-left: 10px; font-family: var(--mono), monospace; font-size: 0.72rem; line-height: 1.45; overflow-wrap: anywhere; }
 .run-narratives { display: grid; gap: 12px; margin-top: 16px; }
 .run-narrative { border-top: 1px solid var(--line); padding-top: 10px; }
 .run-narrative h4 { margin: 0 0 5px; color: var(--ink-muted); font-size: 0.72rem; }
