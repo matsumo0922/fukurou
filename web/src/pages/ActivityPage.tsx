@@ -198,7 +198,7 @@ function RunRow({
   selectedChanged: (button: HTMLButtonElement) => void;
 }) {
   const { locale, t } = useI18n();
-  const primaryReason = runSummaryPrimaryReason(run, t);
+  const terminalCause = terminalCauseLabel(run.terminalCause, t);
   const order = run.order;
   const detailTitle = order ? `${order.side} ${order.orderType}` : run.action ?? run.status;
 
@@ -237,6 +237,7 @@ function RunRow({
           <span>{t("activity.runs.label.distance")} <strong>{formatPriceDistance(run, latestMarketQuote)}</strong></span>
           <span>{t("activity.runs.label.effectiveExpiry")} <strong>{formatExpiry(order?.expiresAt, locale)}</strong></span>
         </span>
+        {terminalCause ? <small className="decision-run-card__terminal">{terminalCause}</small> : null}
         {run.finalReason ? <small className="decision-run-card__terminal">{run.finalReason}</small> : null}
         {run.errorMessage ? <small className="decision-run-card__terminal">{run.errorMessage}</small> : null}
         <span className="decision-run-card__id"><code>{run.invocationId}</code></span>
@@ -713,20 +714,6 @@ function orderExplanation(
   return locale === "ja"
     ? `${order.orderType} 条件で ${order.sizeBtc} BTC の paper 約定を待っています。`
     : `Waiting for a paper fill of ${order.sizeBtc} BTC under the ${order.orderType} condition.`;
-}
-
-function runSummaryPrimaryReason(run: OpsDecisionRunSummaryResponse, t: Translator): string | null {
-  const terminalCause = terminalCauseLabel(run.terminalCause, t);
-  if (terminalCause) return terminalCause;
-
-  if (run.outcome === "FAILED" || run.outcome === "ACTION_REQUIRED") {
-    return run.errorMessage ?? run.finalReason ?? run.safetyMessageJa ?? run.reasonJa ?? null;
-  }
-  if (run.outcome === "NO_ENTRY") {
-    return run.finalReason ?? run.reasonJa ?? run.errorMessage ?? null;
-  }
-
-  return run.errorMessage ?? run.safetyMessageJa ?? run.reasonJa ?? run.finalReason ?? null;
 }
 
 function terminalCauseLabel(cause: string | null | undefined, t: Translator): string | null {
