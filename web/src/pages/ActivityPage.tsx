@@ -570,8 +570,12 @@ function RunExecutionRecords({ executions }: { executions: OpsDecisionRunDetailR
             ["order ID", execution.orderId],
             [t("activity.runs.label.position"), execution.positionId],
             [t("activity.runs.label.side"), execution.side],
+            [t("activity.runs.label.orderType"), execution.orderType],
+            [t("activity.runs.label.executionKind"), execution.kind],
             [t("activity.runs.label.price"), execution.priceJpy],
             [t("activity.runs.label.size"), `${execution.sizeBtc} BTC`],
+            [t("activity.runs.label.liquidity"), execution.liquidity],
+            [t("activity.runs.label.fee"), execution.feeJpy],
             [t("activity.runs.label.realizedPnl"), execution.realizedPnlJpy],
             [t("activity.runs.label.executedAt"), execution.executedAt],
           ]} />

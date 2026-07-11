@@ -103,7 +103,18 @@ class DecisionRunRouteTest {
         assertEquals(2, detail.intent?.revisionCount)
         assertEquals("[\"trend-breakout\"]", detail.intent?.setupTagsJson)
         assertEquals(0, detail.orders.size)
-        assertEquals(0, detail.executions.size)
+        val directExecution = detail.executions.single()
+        assertEquals("execution-direct", directExecution.executionId)
+        assertEquals("order-direct", directExecution.orderId)
+        assertEquals("SELL", directExecution.side)
+        assertEquals("MARKET", directExecution.orderType)
+        assertEquals("DIRECT_RUN", directExecution.kind)
+        assertEquals("10100000", directExecution.priceJpy)
+        assertEquals("0.01", directExecution.sizeBtc)
+        assertEquals("10", directExecution.feeJpy)
+        assertEquals("TAKER", directExecution.liquidity)
+        assertEquals("1000", directExecution.realizedPnlJpy)
+        assertEquals("2026-07-10T00:47:37Z", directExecution.executedAt)
         assertEquals("position-1", detail.tradeLifecycles.single().positionId)
         assertEquals("CLOSED", detail.tradeLifecycles.single().status)
         assertEquals("STOP", detail.tradeLifecycles.single().executions.single().kind)
@@ -244,7 +255,22 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
                     createdAt = Instant.parse("2026-07-10T00:47:35Z"),
                 ),
                 orders = emptyList(),
-                executions = emptyList(),
+                executions = listOf(
+                    DecisionRunExecution(
+                        executionId = "execution-direct",
+                        orderId = "order-direct",
+                        positionId = "position-direct",
+                        side = "SELL",
+                        priceJpy = "10100000",
+                        sizeBtc = "0.01",
+                        feeJpy = "10",
+                        realizedPnlJpy = "1000",
+                        liquidity = "TAKER",
+                        orderType = "MARKET",
+                        kind = "DIRECT_RUN",
+                        executedAt = Instant.parse("2026-07-10T00:47:37Z"),
+                    ),
+                ),
                 tradeLifecycles = listOf(
                     DecisionRunTradeLifecycle(
                         positionId = "position-1",

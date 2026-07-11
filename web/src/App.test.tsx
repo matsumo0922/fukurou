@@ -613,7 +613,11 @@ describe("App", () => {
       side: "SELL",
       priceJpy: "10100000",
       sizeBtc: "0.010000000000",
+      feeJpy: "10",
       realizedPnlJpy: "1000",
+      liquidity: "TAKER",
+      orderType: "MARKET",
+      kind: "DIRECT_RUN",
       executedAt: "2026-07-10T00:02:00.000Z",
     };
     stubSystemFetch({
@@ -639,6 +643,10 @@ describe("App", () => {
     expect(within(detailPane).getByText("SELL")).toBeInTheDocument();
     expect(within(detailPane).getByText("10100000")).toBeInTheDocument();
     expect(within(detailPane).getByText("0.010000000000 BTC")).toBeInTheDocument();
+    expect(within(detailPane).getByText("MARKET")).toBeInTheDocument();
+    expect(within(detailPane).getByText("DIRECT_RUN")).toBeInTheDocument();
+    expect(within(detailPane).getByText("TAKER")).toBeInTheDocument();
+    expect(within(detailPane).getByText("10")).toBeInTheDocument();
     expect(within(detailPane).getByText("1000")).toBeInTheDocument();
     expect(within(detailPane).queryByText(/no saved execution evidence/)).not.toBeInTheDocument();
   });
