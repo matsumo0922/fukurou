@@ -5,11 +5,17 @@ import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.temporal.WeekFields
 
 /**
  * 評価系の DB 非依存な数値計算。
  */
+@Suppress("TooManyFunctions")
 object EvaluationMath {
+
+    private val RidgeMin = BigDecimal("-2.0")
+    private val RidgeMax = BigDecimal("3.0")
+    private val RidgeBinWidth = BigDecimal("0.25")
 
     /**
      * closed trade fact へ R 系指標を付与する。
@@ -66,6 +72,57 @@ object EvaluationMath {
                 )
             }
             .sortedBy { performance -> performance.setupTag }
+    }
+
+    /** observed realized R を server-owned fixed bins へ集計する。 */
+    fun historicalOutcomeRidges(
+        trades: List<ClosedTradeFact>,
+        zoneId: ZoneId,
+        regimes: List<MarketRegimeLabel> = emptyList(),
+    ): OutcomeRidgeChartFacts {
+        val evaluated = trades.map { trade -> evaluateTrade(trade) }
+        val regimeByDate = regimes.associateBy { regime -> regime.date }
+        val groupings = listOf(
+            OutcomeRidgeGroupingFacts(
+                groupBy = OutcomeRidgeGrouping.SETUP,
+                groups = evaluated
+                    .flatMap { trade ->
+                        trade.fact.setupTags.ifEmpty { listOf(UNCLASSIFIED_SETUP_TAG) }
+                            .map { setup -> setup to trade }
+                    }
+                    .toRidgeGroups(),
+            ),
+            OutcomeRidgeGroupingFacts(
+                groupBy = OutcomeRidgeGrouping.MARKET_REGIME,
+                groups = evaluated
+                    .groupBy { trade ->
+                        val regime = regimeByDate[trade.fact.openedAt.atZone(zoneId).toLocalDate()]
+                        if (regime == null) "UNKNOWN" else "${regime.trend.name}/${regime.volatility.name}"
+                    }
+                    .toRidgeGroups(),
+            ),
+            OutcomeRidgeGroupingFacts(
+                groupBy = OutcomeRidgeGrouping.WEEK,
+                groups = evaluated
+                    .groupBy { trade -> trade.fact.closedAt.atZone(zoneId).toLocalDate().isoWeekKey() }
+                    .toRidgeGroups(),
+            ),
+            OutcomeRidgeGroupingFacts(
+                groupBy = OutcomeRidgeGrouping.PROVIDER,
+                groups = evaluated
+                    .groupBy { trade -> trade.fact.llmProvider ?: UNKNOWN_PROVIDER }
+                    .toRidgeGroups(),
+            ),
+        )
+
+        return OutcomeRidgeChartFacts(
+            catalogVersion = "historical-realized-r-v1",
+            domainMinInclusive = RidgeMin,
+            domainMaxExclusive = RidgeMax,
+            binWidth = RidgeBinWidth,
+            referenceLines = listOf(BigDecimal("-1.0"), BigDecimal.ZERO, BigDecimal.ONE),
+            groupings = groupings,
+        )
     }
 
     /**
@@ -242,6 +299,66 @@ object EvaluationMath {
             byModel = byModel,
         )
     }
+}
+
+private fun Map<String, List<EvaluatedTrade>>.toRidgeGroups(): List<OutcomeRidgeGroup> {
+    return entries
+        .sortedBy { entry -> entry.key }
+        .map { entry -> entry.key to entry.value }
+        .map { group -> group.toRidgeGroup() }
+}
+
+private fun List<Pair<String, EvaluatedTrade>>.toRidgeGroups(): List<OutcomeRidgeGroup> {
+    return groupBy(keySelector = { entry -> entry.first }, valueTransform = { entry -> entry.second })
+        .toRidgeGroups()
+}
+
+private fun Pair<String, List<EvaluatedTrade>>.toRidgeGroup(): OutcomeRidgeGroup {
+    val values = second.mapNotNull { trade -> trade.realizedR }.sorted()
+    val bins = (0 until 20).map { index ->
+        val lower = BigDecimal("-2.0").add(BigDecimal("0.25").multiply(index.toBigDecimal()))
+        val upper = lower.add(BigDecimal("0.25"))
+
+        OutcomeRidgeBin(
+            lowerInclusive = lower,
+            upperExclusive = upper,
+            count = values.count { value -> value >= lower && value < upper },
+        )
+    }
+    val median = when {
+        values.isEmpty() -> null
+        values.size % 2 == 1 -> values[values.size / 2]
+        else -> values[values.size / 2 - 1].add(values[values.size / 2]).divide(BigDecimal(2))
+    }
+
+    return OutcomeRidgeGroup(
+        groupKey = first,
+        label = first,
+        tradeCount = second.size,
+        availableRCount = values.size,
+        missingRCount = second.size - values.size,
+        underflowCount = values.count { value -> value < BigDecimal("-2.0") },
+        overflowCount = values.count { value -> value >= BigDecimal("3.0") },
+        bins = bins,
+        medianR = median,
+        positiveCount = values.count { value -> value > BigDecimal.ZERO },
+        negativeCount = values.count { value -> value < BigDecimal.ZERO },
+        zeroCount = values.count { value -> value.compareTo(BigDecimal.ZERO) == 0 },
+        tailLossCount = values.count { value -> value <= BigDecimal("-1.0") },
+        sampleState = when {
+            values.size < 10 -> OutcomeRidgeSampleState.REFERENCE
+            values.size < 30 -> OutcomeRidgeSampleState.PROVISIONAL
+            else -> OutcomeRidgeSampleState.COMPARABLE
+        },
+    )
+}
+
+private fun LocalDate.isoWeekKey(): String {
+    val weekFields = WeekFields.ISO
+    val year = get(weekFields.weekBasedYear())
+    val week = get(weekFields.weekOfWeekBasedYear())
+
+    return "%04d-W%02d".format(year, week)
 }
 
 /**

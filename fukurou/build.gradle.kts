@@ -21,6 +21,7 @@ dependencies {
     implementation(libs.ktor.server.config.yaml)
     implementation(libs.ktor.server.routing.openapi)
     implementation(libs.ktor.server.swagger)
+    implementation(libs.ktor.server.websockets)
     implementation(libs.ktor.serialization.json)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.core)

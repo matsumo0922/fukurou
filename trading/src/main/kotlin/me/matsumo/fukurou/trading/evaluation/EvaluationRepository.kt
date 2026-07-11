@@ -7,6 +7,18 @@ import java.time.Instant
  * 評価系が参照する DB 読み取り repository。
  */
 interface EvaluationRepository {
+    /** report 用 internal facts を単一 snapshot として取得する。 */
+    suspend fun fetchReportSnapshot(period: EvaluationPeriod): Result<EvaluationReportSnapshotFacts> = runCatching {
+        EvaluationReportSnapshotFacts(
+            trades = fetchClosedTrades(period).getOrThrow(),
+            dailyPnl = fetchDailyTradePnl(period).getOrThrow(),
+            priorPnlJpy = sumTradePnlBefore(period.from).getOrThrow(),
+            initialCashJpy = fetchInitialCashJpy().getOrThrow(),
+            usages = fetchLlmPhaseUsages(period).getOrThrow(),
+            exclusions = fetchExclusionSummary(period).getOrThrow(),
+        )
+    }
+
     /** market-data gap による評価除外 summary を返す。 */
     suspend fun fetchExclusionSummary(period: EvaluationPeriod): Result<EvaluationExclusionSummary> {
         return Result.success(EvaluationExclusionSummary())
@@ -58,6 +70,16 @@ interface EvaluationRepository {
      */
     suspend fun fetchKillCriterionStats(): Result<KillCriterionStats>
 }
+
+/** immutable evaluation report の DB snapshot facts。 */
+data class EvaluationReportSnapshotFacts(
+    val trades: EvaluationTradeQueryResult,
+    val dailyPnl: List<DailyTradePnlFact>,
+    val priorPnlJpy: BigDecimal,
+    val initialCashJpy: BigDecimal,
+    val usages: EvaluationLlmUsageQueryResult,
+    val exclusions: EvaluationExclusionSummary,
+)
 
 /**
  * unit test と in-memory runtime 用の空の評価 repository。

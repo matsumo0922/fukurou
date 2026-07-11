@@ -481,6 +481,389 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/evaluation/reports/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 評価レポートを手動生成する
+         * @description complete calendar days の immutable facts snapshot を固定し、typed claim の検証済みレポート revision を生成します。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": components["schemas"]["EvaluationReportGenerateRequest"];
+                };
+            };
+            responses: {
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportJobResponse"];
+                    };
+                };
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description 共通 LLM reservation が使用中です。Retry-After と rejected job を返します。 */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportJobResponse"];
+                    };
+                };
+                /** @description 起動予算または report request rate を超過しました。Retry-After と rejected job を返します。 */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportJobResponse"];
+                    };
+                };
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluation/reports/jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 評価レポート job の進捗を取得する
+         * @description manual generation の stage、terminal failure、revision identity を返します。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    jobId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportJobResponse"];
+                    };
+                };
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluation/reports/default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 既定の評価レポートを取得する
+         * @description 選択期間へ pin された immutable revision と deterministic evidence snapshot を返します。current context は含みません。
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description PRESET:30D または CUSTOM:from:to の report scope key です。 */
+                    scopeKey?: string;
+                    /** @description scopeKey 省略時の互換 preset 日数です。 */
+                    days?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportResponse"];
+                    };
+                };
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluation/reports/revisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 評価レポート履歴を取得する
+         * @description 生成 request ごとに保持する immutable revision 履歴を新しい順で返します。
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description 履歴対象の report scope key です。 */
+                    scopeKey?: string;
+                    /** @description scopeKey 省略時の互換 preset 日数です。 */
+                    days?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportHistoryResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluation/reports/revisions/{revisionId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 評価レポート revision を取得する
+         * @description 履歴から選択した immutable artifact と同一 snapshot evidence を返します。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    revisionId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportResponse"];
+                    };
+                };
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluation/reports/pins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 評価レポート revision を pin する
+         * @description successful immutable revision を選択 scope の既定表示へ明示的に固定します。
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": components["schemas"]["EvaluationReportPinRequest"];
+                };
+            };
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportPinResponse"];
+                    };
+                };
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        post?: never;
+        /**
+         * 評価レポート pin を解除する
+         * @description artifact を削除せず、scope の明示 pin だけを解除します。
+         */
+        delete: {
+            parameters: {
+                query?: {
+                    /** @description pin を解除する report scope key です。 */
+                    scopeKey?: string;
+                    /** @description scopeKey 省略時の互換 preset 日数です。 */
+                    days?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description pin を解除しました。 */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ops/current-context/ws": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 現在の read-only 運用 context を WebSocket 配信する
+         * @description protocolVersion=1、connection-scoped sessionId、session内で単調増加するsequence、SNAPSHOT/UPDATE/HEARTBEAT envelope と source ごとの observedAt/receivedAt/staleAfterMillis/freshness を配信します。Originは必須で、FUKUROU_PUBLIC_ORIGINと一致する場合だけ許可します。45秒無応答または slow client は再接続が必要です。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: {
+                    Connection?: string;
+                    Upgrade?: string;
+                };
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                101: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CurrentContextEnvelopeResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ops/runtime-config": {
         parameters: {
             query?: never;
@@ -1847,13 +2230,13 @@ export interface components {
         /** ReadinessResponse */
         ReadinessResponse: {
             status: string;
+            lastTransportActivityAt?: string | null;
+            lastTradeAt?: string | null;
+            lastMaintenanceAt?: string | null;
             marketDataState?: string;
             gapStartedAt?: string | null;
             recoveredAt?: string | null;
             gapReason?: string | null;
-            lastTransportActivityAt?: string | null;
-            lastTradeAt?: string | null;
-            lastMaintenanceAt?: string | null;
         };
         /** EvaluationPeriodResponse */
         EvaluationPeriodResponse: {
@@ -2004,6 +2387,263 @@ export interface components {
             knownCostUsd?: string | null;
             byProvider: components["schemas"]["EvaluationProviderCostResponse"][];
             byModel: components["schemas"]["EvaluationModelTokenResponse"][];
+        };
+        /** EvaluationReportGenerateRequest */
+        EvaluationReportGenerateRequest: {
+            days?: number | null;
+            kind?: string;
+            from?: string | null;
+            toInclusive?: string | null;
+        };
+        /** EvaluationReportJobResponse */
+        EvaluationReportJobResponse: {
+            jobId: string;
+            revisionId: string;
+            revisionNumber?: number;
+            status: string;
+            stage: string;
+            failureCode?: string | null;
+            failureMessage?: string | null;
+            activeInvocationId?: string | null;
+            retryAfterSeconds?: number | null;
+        };
+        /** EvaluationReportPeriodResponse */
+        EvaluationReportPeriodResponse: {
+            from: string;
+            toInclusive: string;
+            timezone: string;
+        };
+        /** EvaluationReportGenerationMetadataResponse */
+        EvaluationReportGenerationMetadataResponse: {
+            invocationId: string;
+            provider: string;
+            durationMillis?: number | null;
+            totalCostUsd?: string | null;
+            observedModels?: string[] | null;
+            promptHash?: string | null;
+            promptVersion?: string;
+            schemaVersion?: string;
+            effort?: string;
+        };
+        /** EvaluationReportSegmentResponse */
+        EvaluationReportSegmentResponse: {
+            segmentId: string;
+            kind: string;
+            text: string;
+            claimIds: string[];
+        };
+        /** EvaluationReportClaimResponse */
+        EvaluationReportClaimResponse: {
+            claimId: string;
+            type: string;
+            factIds: string[];
+            asserted: string;
+        };
+        /** EvaluationClaimValidationResponse */
+        EvaluationClaimValidationResponse: {
+            claimId: string;
+            status: string;
+            asserted: string;
+            actual?: string | null;
+            factIds: string[];
+            code: string;
+        };
+        /** EvaluationReportFactResponse */
+        EvaluationReportFactResponse: {
+            factId: string;
+            value?: string | null;
+            unit?: string | null;
+            availability: string;
+            sourceIds: string[];
+        };
+        /** EvaluationReportSourceResponse */
+        EvaluationReportSourceResponse: {
+            sourceId: string;
+            observedAt: string;
+            freshness: string;
+        };
+        /** EvaluationChartIndexResponse */
+        EvaluationChartIndexResponse: {
+            chartId: string;
+            catalogVersion: string;
+            factIds: string[];
+        };
+        /** OutcomeRidgeDomainResponse */
+        OutcomeRidgeDomainResponse: {
+            minInclusive: string;
+            maxExclusive: string;
+            binWidth: string;
+        };
+        /** OutcomeRidgeBinResponse */
+        OutcomeRidgeBinResponse: {
+            lowerInclusive: string;
+            upperExclusive: string;
+            count: number;
+        };
+        /** OutcomeRidgeGroupResponse */
+        OutcomeRidgeGroupResponse: {
+            groupKey: string;
+            label: string;
+            tradeCount: number;
+            availableRCount: number;
+            missingRCount: number;
+            underflowCount: number;
+            overflowCount: number;
+            bins: components["schemas"]["OutcomeRidgeBinResponse"][];
+            medianR?: string | null;
+            sampleState: string;
+        };
+        /** OutcomeRidgeGroupingResponse */
+        OutcomeRidgeGroupingResponse: {
+            groupBy: string;
+            groups: components["schemas"]["OutcomeRidgeGroupResponse"][];
+        };
+        /** OutcomeRidgeResponse */
+        OutcomeRidgeResponse: {
+            catalogVersion: string;
+            observationKind: string;
+            domain: components["schemas"]["OutcomeRidgeDomainResponse"];
+            referenceLines: string[];
+            groupings: components["schemas"]["OutcomeRidgeGroupingResponse"][];
+        };
+        /** ReportBenchmarkPointResponse */
+        ReportBenchmarkPointResponse: {
+            date: string;
+            botEquityJpy: string;
+            buyAndHoldEquityJpy: string;
+            noTradeEquityJpy: string;
+        };
+        /** ReportBenchmarkChartResponse */
+        ReportBenchmarkChartResponse: {
+            baselineEquityJpy: string;
+            points: components["schemas"]["ReportBenchmarkPointResponse"][];
+            botReturn?: string | null;
+            buyAndHoldReturn?: string | null;
+            state: string;
+        };
+        /** ReportCalibrationCellResponse */
+        ReportCalibrationCellResponse: {
+            groupBy: string;
+            groupKey: string;
+            lowerBoundInclusive: string;
+            upperBound: string;
+            averageForecastProbability?: string | null;
+            realizedWinRate?: string | null;
+            sampleCount: number;
+            state: string;
+        };
+        /** ReportCalibrationChartResponse */
+        ReportCalibrationChartResponse: {
+            unit: string;
+            authority: string;
+            cells: components["schemas"]["ReportCalibrationCellResponse"][];
+            state: string;
+        };
+        /** ReportPerformanceCellResponse */
+        ReportPerformanceCellResponse: {
+            setup: string;
+            marketRegime: string;
+            tradeCount: number;
+            expectedR?: string | null;
+            totalPnlJpy: string;
+            profitFactor?: string | null;
+            state: string;
+        };
+        /** ReportPerformanceLatticeResponse */
+        ReportPerformanceLatticeResponse: {
+            unit: string;
+            authority: string;
+            cells: components["schemas"]["ReportPerformanceCellResponse"][];
+            state: string;
+        };
+        /** EvaluationIntegrityResponse */
+        EvaluationIntegrityResponse: {
+            eligibleTradeCount: number;
+            missingRCount: number;
+            excludedOrderCount: number;
+            excludedPositionCount: number;
+            excludedDecisionRunCount: number;
+            exclusionReasons: {
+                [key: string]: number;
+            };
+            llmPhaseCount: number;
+            missingUsagePhaseCount: number;
+            unpricedPhaseCount: number;
+            knownCostUsd?: string | null;
+            usageTruncated: boolean;
+        };
+        /** EvaluationReportResponse */
+        EvaluationReportResponse: {
+            jobId: string;
+            revisionId: string;
+            revisionNumber: number;
+            scopeKey: string;
+            status: string;
+            period: components["schemas"]["EvaluationReportPeriodResponse"];
+            inputAsOf: string;
+            inputHash: string;
+            snapshotId: string;
+            generatedAt: string;
+            provider: string;
+            model: string;
+            generation: components["schemas"]["EvaluationReportGenerationMetadataResponse"];
+            title: string;
+            segments: components["schemas"]["EvaluationReportSegmentResponse"][];
+            claims: components["schemas"]["EvaluationReportClaimResponse"][];
+            validation: components["schemas"]["EvaluationClaimValidationResponse"][];
+            facts: components["schemas"]["EvaluationReportFactResponse"][];
+            sources: components["schemas"]["EvaluationReportSourceResponse"][];
+            chartIndex: components["schemas"]["EvaluationChartIndexResponse"][];
+            outcomeRidge: components["schemas"]["OutcomeRidgeResponse"];
+            benchmark: components["schemas"]["ReportBenchmarkChartResponse"];
+            calibration: components["schemas"]["ReportCalibrationChartResponse"];
+            performanceLattice: components["schemas"]["ReportPerformanceLatticeResponse"];
+            integrity: components["schemas"]["EvaluationIntegrityResponse"];
+            truncated: boolean;
+        };
+        /** EvaluationReportHistoryItemResponse */
+        EvaluationReportHistoryItemResponse: {
+            jobId: string;
+            revisionId: string;
+            revisionNumber: number;
+            status: string;
+            requestedAt: string;
+            pinned: boolean;
+        };
+        /** EvaluationReportHistoryResponse */
+        EvaluationReportHistoryResponse: {
+            revisions: components["schemas"]["EvaluationReportHistoryItemResponse"][];
+        };
+        /** EvaluationReportPinRequest */
+        EvaluationReportPinRequest: {
+            days?: number | null;
+            scopeKey?: string | null;
+            revisionId: string;
+        };
+        /** EvaluationReportPinResponse */
+        EvaluationReportPinResponse: {
+            scopeKey: string;
+            revisionId: string;
+        };
+        /** CurrentContextSourceResponse */
+        CurrentContextSourceResponse: {
+            source: string;
+            observedAt?: string | null;
+            receivedAt: string;
+            staleAfterMillis: number;
+            freshness: string;
+            value?: {
+                [key: string]: string;
+            } | null;
+        };
+        /** CurrentContextEnvelopeResponse */
+        CurrentContextEnvelopeResponse: {
+            protocolVersion: number;
+            type: string;
+            sessionId: string;
+            sequence: number;
+            sentAt: string;
+            sources: components["schemas"]["CurrentContextSourceResponse"][];
         };
         /** RuntimeConfigItem */
         RuntimeConfigItem: {
@@ -2390,14 +3030,6 @@ export interface components {
             status: string;
             executions: components["schemas"]["OpsDecisionRunExecutionResponse"][];
         };
-        /** OpsDecisionRunRawRecordResponse */
-        OpsDecisionRunRawRecordResponse: {
-            source: string;
-            occurredAt: string;
-            values: {
-                [key: string]: string | null;
-            };
-        };
         /** OpsDecisionRunLlmPhaseAuditResponse */
         OpsDecisionRunLlmPhaseAuditResponse: {
             phase: string;
@@ -2407,6 +3039,14 @@ export interface components {
             renderedEffort?: string | null;
             observedModels?: string | null;
             modelObserved: boolean;
+        };
+        /** OpsDecisionRunRawRecordResponse */
+        OpsDecisionRunRawRecordResponse: {
+            source: string;
+            occurredAt: string;
+            values: {
+                [key: string]: string | null;
+            };
         };
         /** OpsDecisionRunDetailResponse */
         OpsDecisionRunDetailResponse: {

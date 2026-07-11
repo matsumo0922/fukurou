@@ -17,6 +17,29 @@ import kotlin.test.assertNull
 class EvaluationMathTest {
 
     @Test
+    fun historicalOutcomeRidges_keepsExactBoundariesAndMissingSeparate() {
+        val ridge = EvaluationMath.historicalOutcomeRidges(
+            trades = listOf(
+                trade("-20"),
+                trade("27.5"),
+                trade("30"),
+                trade("-21"),
+                trade("5", entryWeightedProtectiveStopPriceJpy = null),
+            ),
+            zoneId = ZoneId.of("Asia/Tokyo"),
+        )
+        val setup = ridge.groupings.first { grouping -> grouping.groupBy == OutcomeRidgeGrouping.SETUP }.groups.single()
+
+        assertEquals(5, setup.tradeCount)
+        assertEquals(4, setup.availableRCount)
+        assertEquals(1, setup.missingRCount)
+        assertEquals(1, setup.underflowCount)
+        assertEquals(1, setup.overflowCount)
+        assertEquals(1, setup.bins.first().count)
+        assertEquals(1, setup.bins.last().count)
+    }
+
+    @Test
     fun summarizeTrades_calculatesPfWinRateAndExpectedR() {
         val stats = EvaluationMath.summarizeTrades(
             listOf(

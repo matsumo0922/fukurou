@@ -50,6 +50,12 @@ import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
+import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
+import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
+import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
+import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
+import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.io.File
 import java.time.Clock
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -94,6 +100,9 @@ fun Application.module(
     evaluationRepository: EvaluationRepository? = null,
     evaluationRiskStateRepository: RiskStateRepository? = null,
     evaluationMarketDataSource: MarketDataSource? = null,
+    evaluationLlmInvoker: me.matsumo.fukurou.trading.invoker.LlmInvoker? = null,
+    evaluationLlmInvocationAuditor: LlmInvocationAuditor? = null,
+    evaluationPublicOrigin: String? = System.getenv()["FUKUROU_PUBLIC_ORIGIN"],
     opsRiskStateCommandService: RiskStateCommandService? = null,
     opsManualLlmLaunchService: ManualLlmLaunchService? = null,
     opsLlmAuthService: LlmAuthService? = null,
@@ -133,6 +142,9 @@ fun Application.module(
             repository = evaluationRepository,
             riskStateRepository = evaluationRiskStateRepository,
             marketDataSource = evaluationMarketDataSource,
+            llmInvoker = evaluationLlmInvoker,
+            llmInvocationAuditor = evaluationLlmInvocationAuditor,
+            publicOrigin = evaluationPublicOrigin,
         ),
         opsOverrides = ApplicationOpsOverrides(
             riskStateCommandService = opsRiskStateCommandService,
@@ -424,7 +436,27 @@ private fun createEvaluationRouteDependencies(
         riskStateRepository = riskStateRepository,
         marketDataSource = marketDataSource,
         tradingConfig = runtime.tradingConfig,
+        llmInvoker = overrides.llmInvoker ?: database?.let {
+            ShellLlmInvoker(
+                commandRenderer = DefaultLlmCommandRenderer(
+                    config = LlmCommandRendererConfig.fromEnvironment(databaseResources.environment),
+                ),
+                processRunner = ShellProcessRunner(),
+            )
+        },
+        llmInvocationAuditor = overrides.llmInvocationAuditor ?: database?.let { connectedDatabase ->
+            LlmInvocationAuditor(
+                commandEventLog = ExposedCommandEventLog(connectedDatabase),
+                redactor = SecretRedactor.fromEnvironment(databaseResources.environment),
+                clock = runtime.clock,
+                toolName = "evaluation_report",
+            )
+        },
+        environment = databaseResources.environment,
+        database = database,
+        latestMarketQuoteStore = runtime.latestMarketQuoteStore,
         clock = runtime.clock,
+        currentContextPublicOrigin = overrides.publicOrigin,
     )
 }
 
@@ -748,6 +780,11 @@ private fun Application.installApplicationPlugins(webRoot: File?) {
     install(ContentNegotiation) {
         json(ApiJson)
     }
+    install(io.ktor.server.websocket.WebSockets) {
+        pingPeriodMillis = java.time.Duration.ofSeconds(15).toMillis()
+        timeoutMillis = java.time.Duration.ofSeconds(45).toMillis()
+        maxFrameSize = 1_048_576
+    }
     install(StatusPages) {
         exception<Throwable> { call, cause ->
             call.application.log.error("Unhandled exception while processing request", cause)
@@ -961,6 +998,9 @@ private data class ApplicationEvaluationOverrides(
     val repository: EvaluationRepository?,
     val riskStateRepository: RiskStateRepository?,
     val marketDataSource: MarketDataSource?,
+    val llmInvoker: me.matsumo.fukurou.trading.invoker.LlmInvoker?,
+    val llmInvocationAuditor: LlmInvocationAuditor?,
+    val publicOrigin: String?,
 )
 
 /**

@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou
 
 import io.ktor.http.HttpStatusCode
@@ -28,14 +30,18 @@ import me.matsumo.fukurou.trading.evaluation.LlmProviderCostStats
 import me.matsumo.fukurou.trading.evaluation.MarketRegimePerformance
 import me.matsumo.fukurou.trading.evaluation.SetupPerformance
 import me.matsumo.fukurou.trading.evaluation.TradePerformanceStats
+import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
 import java.time.LocalDate
 import java.time.ZoneId
+import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
  * 評価系エンドポイントを分類する OpenAPI タグ。
@@ -76,7 +82,15 @@ internal data class EvaluationRouteDependencies(
     val riskStateRepository: RiskStateRepository?,
     val marketDataSource: MarketDataSource?,
     val tradingConfig: TradingBotConfig,
+    val llmInvoker: LlmInvoker? = null,
+    val llmInvocationAuditor: LlmInvocationAuditor? = null,
+    val environment: Map<String, String> = emptyMap(),
+    val database: ExposedDatabase? = null,
+    val latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
     val clock: Clock = Clock.systemUTC(),
+    val currentContextSendTimeoutMillis: Long = 1_000,
+    val currentContextSendOverride: (suspend (String) -> Unit)? = null,
+    val currentContextPublicOrigin: String? = environment["FUKUROU_PUBLIC_ORIGIN"],
 )
 
 /**
@@ -89,6 +103,8 @@ internal fun Route.evaluationRoutes(dependencies: EvaluationRouteDependencies) {
     registerEvaluationCalibrationRoute(dependencies)
     registerEvaluationBenchmarkRoute(dependencies)
     registerEvaluationCostsRoute(dependencies)
+    evaluationReportRoutes(dependencies)
+    currentContextWebSocketRoutes(dependencies)
 }
 
 @OptIn(ExperimentalKtorApi::class)

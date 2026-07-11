@@ -1285,6 +1285,7 @@ private class OneShotLlmRequestFactory(
             LlmInvocationPhase.PROPOSER -> cliConfig.proposerAllowedTools
             LlmInvocationPhase.FALSIFIER -> cliConfig.falsifierAllowedTools
             LlmInvocationPhase.REFLECTION -> emptyList()
+            LlmInvocationPhase.EVALUATION_REPORT -> emptyList()
         }
     }
 

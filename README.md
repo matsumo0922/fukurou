@@ -40,7 +40,7 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `GET /revision`
 - `GET /health/live`
 - `GET /health/ready`
-- `/evaluation/*`
+- `/evaluation/*`: 既存集計 API と、共通 LLM reservation / audited manual generation / immutable revision / deterministic evidence を扱う Evaluation Report Console API
 - `/ops/*`
 - `GET /ops/runtime-config`
 - `GET /ops/runs`
@@ -98,6 +98,8 @@ make dev-web
 `make dev-api` は `.env` を dotenvx で読み込み、ローカル PostgreSQL 向けの `DB_URL` / `DB_USER` / `DB_PASSWORD` を補完して Ktor を起動します。
 
 Vite dev server は既定で `http://localhost:8080` の Ktor API へ proxy します。接続先は `VITE_FUKUROU_API_TARGET` で上書きできます。
+
+current-context WebSocket は `.env` の `FUKUROU_PUBLIC_ORIGIN=http://localhost:5173` を local browser origin の正本として検証します。production では Cloudflare Tunnel の Public Hostname origin を設定し、未設定時は接続を拒否します。
 
 WebUI の `Config` 画面（`/app/config`）は `/ops/runtime-config` を表示します。Runtime group は Proposer / Falsifier ごとの provider、model、reasoning effort を含む draft 編集、diff preview、validation、activate、rollback を扱います。provider と effort は catalog 候補から選択し、model が空なら CLI 側の既定を使います。Deployment group は read-only で表示し、Secrets group は設定有無だけを表示します。warning がある場合は validation error を i18n 表示し、復旧操作の入口を維持します。secret 値は API response と画面のどちらにも出しません。
 

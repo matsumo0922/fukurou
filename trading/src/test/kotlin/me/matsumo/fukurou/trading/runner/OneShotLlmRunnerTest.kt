@@ -2121,6 +2121,7 @@ private class RequestCapturingLlmInvoker(
                 submitFalsificationFromRequest(repository, request, FalsificationVerdict.APPROVED).getOrThrow()
             }
             LlmInvocationPhase.REFLECTION -> Unit
+            LlmInvocationPhase.EVALUATION_REPORT -> Unit
         }
 
         return Result.success(

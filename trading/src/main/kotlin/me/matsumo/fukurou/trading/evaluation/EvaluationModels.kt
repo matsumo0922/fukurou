@@ -108,6 +108,62 @@ data class EvaluatedTrade(
     val mfeR: BigDecimal?,
 )
 
+/** Historical Outcome Ridge の集計単位。 */
+enum class OutcomeRidgeGrouping {
+    SETUP,
+    MARKET_REGIME,
+    WEEK,
+    PROVIDER,
+}
+
+/** Historical Outcome Ridge の標本状態。 */
+enum class OutcomeRidgeSampleState {
+    REFERENCE,
+    PROVISIONAL,
+    COMPARABLE,
+}
+
+/** Historical Outcome Ridge の fixed bin。 */
+data class OutcomeRidgeBin(
+    val lowerInclusive: BigDecimal,
+    val upperExclusive: BigDecimal,
+    val count: Int,
+)
+
+/** Historical Outcome Ridge の group。 */
+data class OutcomeRidgeGroup(
+    val groupKey: String,
+    val label: String,
+    val tradeCount: Int,
+    val availableRCount: Int,
+    val missingRCount: Int,
+    val underflowCount: Int,
+    val overflowCount: Int,
+    val bins: List<OutcomeRidgeBin>,
+    val medianR: BigDecimal?,
+    val positiveCount: Int,
+    val negativeCount: Int,
+    val zeroCount: Int,
+    val tailLossCount: Int,
+    val sampleState: OutcomeRidgeSampleState,
+)
+
+/** Historical Outcome Ridge の grouping。 */
+data class OutcomeRidgeGroupingFacts(
+    val groupBy: OutcomeRidgeGrouping,
+    val groups: List<OutcomeRidgeGroup>,
+)
+
+/** immutable snapshot に格納する Historical Outcome Ridge facts。 */
+data class OutcomeRidgeChartFacts(
+    val catalogVersion: String,
+    val domainMinInclusive: BigDecimal,
+    val domainMaxExclusive: BigDecimal,
+    val binWidth: BigDecimal,
+    val referenceLines: List<BigDecimal>,
+    val groupings: List<OutcomeRidgeGroupingFacts>,
+)
+
 /**
  * trade 成績の集計値。
  *

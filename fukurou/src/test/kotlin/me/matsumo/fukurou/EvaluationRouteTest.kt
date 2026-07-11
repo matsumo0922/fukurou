@@ -1,9 +1,16 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou
 
 import io.ktor.client.request.get
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
+import kotlinx.coroutines.delay
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -39,6 +46,37 @@ import kotlin.test.assertTrue
  * evaluation route の HTTP contract を検証するテスト。
  */
 class EvaluationRouteTest {
+
+    @Test
+    fun evaluationReport_failsClosedBeforeGenerationWhenUsageSnapshotIsTruncated() = testApplication {
+        val truncatedRepository = object : EvaluationRepository by FakeEvaluationRepository {
+            override suspend fun fetchReportSnapshot(period: EvaluationPeriod) =
+                FakeEvaluationRepository.fetchReportSnapshot(period).map { snapshot ->
+                    snapshot.copy(usages = snapshot.usages.copy(truncated = true))
+                }
+        }
+        application {
+            module(
+                readinessProbe = { true }, clock = fixedClock(), evaluationRepository = truncatedRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+        val accepted = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"PRESET","days":30}""")
+        }.bodyAsText()
+        val jobId = requireNotNull(Regex("\\\"jobId\\\":\\\"([^\\\"]+)").find(accepted)).groupValues[1]
+        var terminal = ""
+        var attempts = 100
+        while (attempts > 0 && !terminal.contains("\"status\":\"FAILED\"")) {
+            terminal = client.get("/evaluation/reports/jobs/$jobId").bodyAsText()
+            if (!terminal.contains("\"status\":\"FAILED\"")) delay(10)
+            attempts -= 1
+        }
+        assertTrue(terminal.contains("USAGE_SNAPSHOT_TRUNCATED"))
+    }
 
     @Test
     fun evaluationRoutes_returnOkShapes() = testApplication {
@@ -147,6 +185,74 @@ class EvaluationRouteTest {
             expected = emptyList(),
             actual = marketDataSource.requestedLimits,
         )
+    }
+
+    @Test
+    fun evaluationReport_acceptsPresetAndCustomManualJobs() = testApplication {
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = FakeEvaluationRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val preset = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"PRESET","days":30}""")
+        }
+        val custom = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"CUSTOM","from":"2026-06-01","toInclusive":"2026-06-30"}""")
+        }
+
+        assertEquals(HttpStatusCode.Accepted, preset.status)
+        assertEquals(HttpStatusCode.Accepted, custom.status)
+
+        val revisionId = requireNotNull(Regex("\\\"revisionId\\\":\\\"([^\\\"]+)").find(custom.bodyAsText()))
+            .groupValues[1]
+        var revisionBody: String? = null
+        var attemptsRemaining = 100
+        while (revisionBody == null && attemptsRemaining > 0) {
+            val revision = client.get("/evaluation/reports/revisions/$revisionId")
+            if (revision.status == HttpStatusCode.OK) revisionBody = revision.bodyAsText()
+            if (revisionBody == null) delay(20)
+            attemptsRemaining -= 1
+        }
+        val generated = requireNotNull(revisionBody)
+        assertTrue(generated.contains("\"scopeKey\":\"CUSTOM:2026-06-01:2026-06-30\""))
+        assertTrue(generated.contains("\"benchmark\""))
+        assertTrue(generated.contains("\"calibration\""))
+        assertTrue(generated.contains("\"performanceLattice\""))
+        assertTrue(generated.contains("\"integrity\""))
+        assertTrue(generated.contains("\"inputAsOf\":\"2026-07-03T00:00:00Z\""))
+        assertTrue(generated.contains("\"snapshotId\":"))
+        assertTrue(generated.contains("\"promptVersion\":\"evaluation-report-prompt-v1\""))
+        assertTrue(generated.contains("\"schemaVersion\":\"evaluation-report-schema-v1\""))
+    }
+
+    @Test
+    fun evaluationReport_rejectsInvalidCustomRange() = testApplication {
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = FakeEvaluationRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"CUSTOM","from":"2026-06-30","toInclusive":"2026-06-01"}""")
+        }
+
+        assertEquals(HttpStatusCode.BadRequest, response.status)
     }
 }
 

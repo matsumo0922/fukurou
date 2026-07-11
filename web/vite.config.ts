@@ -24,6 +24,7 @@ export default defineConfig({
       "/ops": {
         target: backendTarget,
         changeOrigin: true,
+        ws: true,
       },
       "/revision": {
         target: backendTarget,
