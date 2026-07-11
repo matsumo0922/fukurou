@@ -64,6 +64,7 @@ data class LlmRunFinish(
     val startedAt: Instant,
     val finishedAt: Instant,
     val errorMessage: String?,
+    val terminalCause: LlmRunTerminalCause = LlmRunTerminalCause.LEGACY_UNCLASSIFIED,
     val runtimeConfigVersionId: String? = null,
     val runtimeConfigHash: String? = null,
 )
@@ -91,6 +92,7 @@ data class LlmRunRecord(
     val startedAt: Instant,
     val finishedAt: Instant?,
     val errorMessage: String?,
+    val terminalCause: LlmRunTerminalCause? = null,
     val runtimeConfigVersionId: String? = null,
     val runtimeConfigHash: String? = null,
 )
@@ -147,6 +149,7 @@ class InMemoryLlmRunRepository : LlmRunRepository {
                         startedAt = start.startedAt,
                         finishedAt = null,
                         errorMessage = null,
+                        terminalCause = null,
                         runtimeConfigVersionId = start.runtimeConfigVersionId,
                         runtimeConfigHash = start.runtimeConfigHash,
                     ),
@@ -166,6 +169,7 @@ class InMemoryLlmRunRepository : LlmRunRepository {
                         status = finish.status,
                         finishedAt = finish.finishedAt,
                         errorMessage = finish.errorMessage,
+                        terminalCause = finish.terminalCause,
                         runtimeConfigVersionId = finish.runtimeConfigVersionId,
                         runtimeConfigHash = finish.runtimeConfigHash,
                     )
@@ -179,6 +183,7 @@ class InMemoryLlmRunRepository : LlmRunRepository {
                         startedAt = finish.startedAt,
                         finishedAt = finish.finishedAt,
                         errorMessage = finish.errorMessage,
+                        terminalCause = finish.terminalCause,
                         runtimeConfigVersionId = finish.runtimeConfigVersionId,
                         runtimeConfigHash = finish.runtimeConfigHash,
                     )

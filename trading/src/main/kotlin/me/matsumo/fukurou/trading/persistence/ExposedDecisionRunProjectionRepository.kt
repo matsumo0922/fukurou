@@ -31,6 +31,7 @@ import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.ResultSet
@@ -64,7 +65,7 @@ private const val SAFE_NO_TRADE_REASON_EXPRESSION =
 
 private val LIST_RUNS_SQL = """
     WITH candidate_runs AS (
-        SELECT invocation_id, mode, symbol, trigger_kind, status, started_at, finished_at, error_message
+        SELECT invocation_id, mode, symbol, trigger_kind, status, started_at, finished_at, error_message, terminal_cause
         FROM llm_runs
         WHERE trigger_kind IS DISTINCT FROM 'REFLECTION'
             AND (CAST(? AS BIGINT) IS NULL OR started_at < ? OR (started_at = ? AND invocation_id < ?))
@@ -80,6 +81,7 @@ private val LIST_RUNS_SQL = """
         run.started_at,
         run.finished_at,
         run.error_message,
+        run.terminal_cause,
         decision.action,
         decision.reason_ja,
         falsification.verdict,
@@ -202,6 +204,7 @@ private val FIND_RUN_SQL = """
         run.started_at,
         run.finished_at,
         run.error_message,
+        run.terminal_cause,
         decision.id AS decision_id,
         decision.action,
         decision.llm_provider,
@@ -754,6 +757,7 @@ private fun JdbcTransaction.selectSafeAudit(invocationId: String): List<Decision
     }
 }
 
+@Suppress("LongMethod")
 private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummary {
     val action = getString("action")
     val safetyRule = getString("rule")
@@ -762,6 +766,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
     val executionCount = getInt("execution_count")
     val status = getString("status")
     val errorMessage = getString("error_message")
+    val terminalCause = getString("terminal_cause")?.let(LlmRunTerminalCause::valueOf)
     val noTradeReason = getString("no_trade_reason")
     val hasNoTradeExit = getBoolean("has_no_trade_exit")
     val openOrderCount = getInt("open_order_count")
@@ -780,6 +785,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
         startedAt = Instant.ofEpochMilli(getLong("started_at")),
         finishedAt = nullableInstant("finished_at"),
         errorMessage = errorMessage,
+        terminalCause = terminalCause,
         action = action,
         reasonJa = getString("reason_ja"),
         falsificationVerdict = getString("verdict"),
@@ -788,7 +794,12 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
         finalReason = noTradeReason.safeDecisionRunFinalReason(),
         orderCount = orderCount,
         executionCount = executionCount,
-        hasProcessFailure = errorMessage != null ||
+        hasProcessFailure = terminalCause in setOf(
+            LlmRunTerminalCause.RESTART_INTERRUPTED,
+            LlmRunTerminalCause.CALLER_CANCELLED,
+            LlmRunTerminalCause.TIMED_OUT,
+            LlmRunTerminalCause.RUNNER_FAILED,
+        ) || errorMessage != null ||
             status == LLM_RUN_STATUS_FAILED ||
             status == LLM_RUN_STATUS_CANCELLED,
         order = if (includeOrder) toSummaryOrder() else null,
@@ -796,6 +807,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
             DecisionRunOutcomeEvidence(
                 status = status,
                 errorMessage = errorMessage,
+                terminalCause = terminalCause,
                 action = action,
                 safetyRule = safetyRule,
                 orderCount = orderCount,

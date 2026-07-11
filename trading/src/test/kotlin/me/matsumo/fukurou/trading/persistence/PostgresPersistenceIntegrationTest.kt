@@ -23,16 +23,28 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
+import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
+import me.matsumo.fukurou.trading.daemon.LlmActiveLaunchReservation
+import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -66,6 +78,7 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -81,6 +94,8 @@ import me.matsumo.fukurou.trading.runner.OneShotRunnerStatus
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
+import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyViolation
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
@@ -102,7 +117,10 @@ import java.util.concurrent.atomic.AtomicInteger
 import javax.sql.DataSource
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -2498,6 +2516,7 @@ class PostgresPersistenceIntegrationTest {
 
         bootstrap.ensureSchema().getOrThrow()
         val repository = ExposedLlmRunRepository(database)
+        val reservationRepository = ExposedLlmLaunchReservationRepository(database)
         val staleStartedAt = fixedInstant().minus(recoveryThreshold).minusSeconds(1)
         val freshStartedAt = fixedInstant().minus(recoveryThreshold).plusSeconds(1)
         val alreadyFinishedAt = fixedInstant().minusSeconds(1_200)
@@ -2508,6 +2527,13 @@ class PostgresPersistenceIntegrationTest {
                 symbol = TradingSymbol.BTC,
                 triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
                 startedAt = staleStartedAt,
+            ),
+        ).getOrThrow()
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest(
+                invocationId = "stale-running-run",
+                config = TradingBotConfig.fromEnvironment(emptyMap()).runner,
+                reservedAt = staleStartedAt,
             ),
         ).getOrThrow()
         repository.insertRunning(
@@ -2537,17 +2563,150 @@ class PostgresPersistenceIntegrationTest {
         val staleRun = requireNotNull(repository.findByInvocationId("stale-running-run").getOrThrow())
         val freshRun = requireNotNull(repository.findByInvocationId("fresh-running-run").getOrThrow())
         val alreadyFinishedRun = requireNotNull(repository.findByInvocationId("already-finished-run").getOrThrow())
+        val recoveredEvent = ExposedCommandEventLog(database)
+            .findEvents(limit = 20, eventType = CommandEventType.LLM_INVOCATION_RECOVERED)
+            .getOrThrow()
+            .single()
 
         assertEquals(listOf(1), recoveredCounts)
         assertEquals(LLM_RUN_STATUS_FAILED, staleRun.status)
         assertEquals(fixedInstant(), staleRun.finishedAt)
         assertEquals(STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE, staleRun.errorMessage)
+        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RESTART_INTERRUPTED, staleRun.terminalCause)
+        assertEquals("stale-running-run", recoveredEvent.decisionRunContext.decisionRunId)
+        assertTrue(recoveredEvent.payload.contains("reservationRecovered"))
         assertEquals(LLM_RUN_STATUS_RUNNING, freshRun.status)
         assertNull(freshRun.finishedAt)
         assertNull(freshRun.errorMessage)
         assertEquals(LLM_RUN_STATUS_FAILED, alreadyFinishedRun.status)
         assertEquals(alreadyFinishedAt, alreadyFinishedRun.finishedAt)
         assertEquals("already failed", alreadyFinishedRun.errorMessage)
+    }
+
+    @Test
+    fun lifecycleRecoveryRollsBackRunAndReservationTogether() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val staleAt = fixedInstant().minus(Duration.ofHours(1))
+        val runRepository = ExposedLlmRunRepository(database)
+        val reservationRepository = ExposedLlmLaunchReservationRepository(database)
+        val runnerConfig = TradingBotConfig.fromEnvironment(emptyMap()).runner
+
+        runRepository.insertRunning(
+            LlmRunStart(
+                invocationId = "rollback-run",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                startedAt = staleAt,
+            ),
+        ).getOrThrow()
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest("rollback-run", runnerConfig, staleAt),
+        ).getOrThrow()
+
+        assertFailsWith<IllegalStateException> {
+            exposedTransaction(database) {
+                recoverStaleLlmRunLifecycle(fixedInstant(), Duration.ofMinutes(9))
+                error("force rollback")
+            }
+        }
+
+        val run = requireNotNull(runRepository.findByInvocationId("rollback-run").getOrThrow())
+        assertEquals(LLM_RUN_STATUS_RUNNING, run.status)
+        assertNull(run.terminalCause)
+        assertNotNull(
+            reservationRepository.findBlockingRunningReservation(
+                LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                fixedInstant().minus(Duration.ofHours(2)),
+            ).getOrThrow(),
+        )
+    }
+
+    @Test
+    fun lifecycleRecoveryClassifiesLockedRunReservationPairsByRunAuthority() = runPostgresTest {
+        val recoveryThreshold = Duration.ofMinutes(9)
+        val bootstrap =
+            TradingPersistenceBootstrap(
+                database = database,
+                clock = fixedClock(),
+                staleLlmRunRecoveryThreshold = recoveryThreshold,
+            )
+        val runRepository = ExposedLlmRunRepository(database)
+        val reservationRepository = ExposedLlmLaunchReservationRepository(database)
+        val eventLog = ExposedCommandEventLog(database)
+        val staleAt = fixedInstant().minus(Duration.ofHours(1))
+        val freshAt = fixedInstant()
+        val runnerConfig = TradingBotConfig.fromEnvironment(emptyMap()).runner
+
+        bootstrap.ensureSchema().getOrThrow()
+        runRepository.insertRunning(llmRunStart("stale-run-fresh-reservation", staleAt)).getOrThrow()
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest("stale-run-fresh-reservation", runnerConfig, freshAt),
+        ).getOrThrow()
+        bootstrap.ensureSchema().getOrThrow()
+
+        assertEquals(LLM_RUN_STATUS_FAILED, runRepository.findByInvocationId("stale-run-fresh-reservation").getOrThrow()?.status)
+        assertNull(
+            reservationRepository.findBlockingRunningReservation(
+                LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                staleAt,
+            ).getOrThrow(),
+        )
+
+        runRepository.insertRunning(llmRunStart("fresh-run-stale-reservation", freshAt)).getOrThrow()
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest("fresh-run-stale-reservation", runnerConfig, staleAt),
+        ).getOrThrow()
+        bootstrap.ensureSchema().getOrThrow()
+
+        assertEquals(LLM_RUN_STATUS_RUNNING, runRepository.findByInvocationId("fresh-run-stale-reservation").getOrThrow()?.status)
+        assertNotNull(
+            reservationRepository.findBlockingRunningReservation(
+                LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                staleAt.minus(Duration.ofMinutes(1)),
+            ).getOrThrow(),
+        )
+        reservationRepository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "fresh-run-stale-reservation",
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = LlmRunTerminalCause.NORMAL_COMPLETION.name,
+                finishedAt = freshAt,
+            ),
+        ).getOrThrow()
+
+        reservationRepository.tryReserve(llmLaunchReservationRequest("orphan-stale-reservation", runnerConfig, staleAt)).getOrThrow()
+        bootstrap.ensureSchema().getOrThrow()
+
+        runRepository.insertRunning(llmRunStart("terminal-run-stale-reservation", staleAt)).getOrThrow()
+        runRepository.finish(
+            LlmRunFinish(
+                invocationId = "terminal-run-stale-reservation",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                status = "SUCCEEDED",
+                startedAt = staleAt,
+                finishedAt = freshAt,
+                errorMessage = null,
+                terminalCause = LlmRunTerminalCause.NORMAL_COMPLETION,
+            ),
+        ).getOrThrow()
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest("terminal-run-stale-reservation", runnerConfig, staleAt),
+        ).getOrThrow()
+        bootstrap.ensureSchema().getOrThrow()
+
+        val recoveryEvents = eventLog.findEvents(
+            limit = 20,
+            eventType = CommandEventType.LLM_INVOCATION_RECOVERED,
+        ).getOrThrow()
+        assertEquals(3, recoveryEvents.size)
+        assertTrue(recoveryEvents.any { event -> event.decisionRunContext.decisionRunId == "orphan-stale-reservation" && event.payload.contains("\"runRecovered\":false") })
+        assertEquals(
+            LlmRunTerminalCause.NORMAL_COMPLETION,
+            runRepository.findByInvocationId("terminal-run-stale-reservation").getOrThrow()?.terminalCause,
+        )
     }
 
     @Test
@@ -3038,6 +3197,68 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(true, runningExists)
         assertEquals(false, runningExistsAfterFinish)
+    }
+
+    @Test
+    fun schedulerAuditsHighPriorityTriggerBlockedByAtomicReservationRaceInPostgresPath() = runPostgresTest {
+        val clock = Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+        TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
+        val delegate = ExposedLlmLaunchReservationRepository(database)
+        val reservationRepository = RaceInjectingPostgresReservationRepository(
+            delegate = delegate,
+            competingRequest = llmLaunchReservationRequest(
+                invocationId = "race-active-invocation",
+                config = LlmRunnerConfig(),
+                reservedAt = fixedInstant(),
+                triggerKind = LlmDaemonTriggerKind.HOLDING_DENSE_CHECK,
+            ),
+        )
+        val eventLog = ExposedCommandEventLog(database)
+        val scheduler = LlmDaemonScheduler(
+            tradingConfig = TradingBotConfig(
+                safetyFloor = SafetyFloorConfig(
+                    economicEventBlackouts = listOf(
+                        EconomicEventBlackout(
+                            eventId = "cpi-race",
+                            eventName = "CPI",
+                            eventAt = fixedInstant(),
+                            blackoutBefore = Duration.ZERO,
+                            blackoutAfter = Duration.ofMinutes(30),
+                        ),
+                    ),
+                ),
+                daemon = LlmDaemonConfig(enabled = true),
+            ),
+            dependencies = LlmDaemonSchedulerDependencies(
+                riskStateRepository = ExposedRiskStateRepository(database),
+                commandEventLog = eventLog,
+                launchReservationRepository = reservationRepository,
+                openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
+                tickerReader = LlmDaemonTickerReader {
+                    Result.success(LlmDaemonTickerSnapshot(BigDecimal("10000000"), fixedInstant()))
+                },
+                positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
+                entryFillReader = LlmDaemonEntryFillReader { Result.success(null) },
+            ),
+            runtime = LlmDaemonSchedulerRuntime(
+                requestBase = postgresOneShotRequest("race-request"),
+                launchOneShot = { error("blocked scheduler must not cross the external runner boundary") },
+                clock = clock,
+                idGenerator = { UUID(0L, 99L) },
+            ),
+        )
+
+        val result = assertIs<LlmDaemonTickResult.Skipped>(scheduler.tick())
+        val skippedEvent = eventLog.findEvents(
+            limit = 10,
+            eventType = CommandEventType.DAEMON_TRIGGER_SKIPPED,
+        ).getOrThrow().single()
+
+        assertEquals("concurrent_invocation", result.reason)
+        assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, result.triggerKind)
+        assertEquals("race-active-invocation", skippedEvent.decisionRunContext.decisionRunId)
+        assertTrue(skippedEvent.payload.contains("race-active-invocation"))
+        assertTrue(skippedEvent.payload.contains(LlmDaemonTriggerKind.ECONOMIC_EVENT.name))
     }
 
     @Test
@@ -4816,6 +5037,16 @@ private fun llmLaunchReservationRequest(
     )
 }
 
+private fun llmRunStart(invocationId: String, startedAt: Instant): LlmRunStart {
+    return LlmRunStart(
+        invocationId = invocationId,
+        mode = TradingMode.PAPER,
+        symbol = TradingSymbol.BTC,
+        triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+        startedAt = startedAt,
+    )
+}
+
 private fun stopTickSnapshot(): TickSnapshot {
     return TickSnapshot(
         symbol = "BTC",
@@ -4968,6 +5199,37 @@ private class MutablePostgresOrderbookMarketDataSource(
 /**
  * fukurou integration test 用 Postgres container。
  */
+/** pre-read 後に実DBへ competing reservation を追加する TOCTOU fixture。 */
+private class RaceInjectingPostgresReservationRepository(
+    private val delegate: LlmLaunchReservationRepository,
+    private val competingRequest: LlmLaunchReservationRequest,
+) : LlmLaunchReservationRepository {
+
+    private var competingReservationCreated = false
+
+    override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
+        if (!competingReservationCreated) {
+            delegate.tryReserve(competingRequest).getOrThrow()
+            competingReservationCreated = true
+        }
+
+        return delegate.tryReserve(request)
+    }
+
+    override suspend fun finish(finish: LlmLaunchReservationFinish): Result<Unit> = delegate.finish(finish)
+
+    override suspend fun latestReservedAt(triggerKey: String): Result<Instant?> = delegate.latestReservedAt(triggerKey)
+
+    override suspend fun latestFinishedReservedAt(triggerKey: String): Result<Instant?> {
+        return delegate.latestFinishedReservedAt(triggerKey)
+    }
+
+    override suspend fun findBlockingRunningReservation(
+        requestTriggerKind: LlmDaemonTriggerKind,
+        activeSince: Instant,
+    ): Result<LlmActiveLaunchReservation?> = Result.success(null)
+}
+
 private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
 
 /**

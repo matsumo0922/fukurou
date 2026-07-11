@@ -236,6 +236,9 @@ object LlmRunsTable : Table("llm_runs") {
      */
     val errorMessage = text("error_message").nullable()
 
+    /** 終了理由の安定コード。RUNNING 行だけ null。 */
+    val terminalCause = varchar("terminal_cause", length = 64).nullable()
+
     /**
      * 起動開始時の runtime config version ID。
      */

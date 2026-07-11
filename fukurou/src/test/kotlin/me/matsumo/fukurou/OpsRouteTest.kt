@@ -9,7 +9,9 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -51,6 +53,9 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.LlmTokenUsage
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
@@ -61,7 +66,9 @@ import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
 import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
+import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -93,6 +100,55 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
  */
 @Suppress("LargeClass")
 class OpsRouteTest {
+
+    @Test
+    fun sharedPersistenceBootstrap_recoversStaleRunThroughProductionFactory() = runBlocking {
+        if (!isDockerAvailable()) {
+            println("Skipping shared persistence bootstrap test because Docker is unavailable.")
+            return@runBlocking
+        }
+
+        val container = FukurouPostgresContainer()
+        container.start()
+
+        try {
+            val database = ExposedDatabase.connect(
+                url = container.jdbcUrl,
+                driver = "org.postgresql.Driver",
+                user = container.username,
+                password = container.password,
+            )
+            val clock = fixedClock()
+            TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
+            val runRepository = ExposedLlmRunRepository(database)
+            runRepository.insertRunning(
+                LlmRunStart(
+                    invocationId = "production-bootstrap-stale-run",
+                    mode = TradingMode.PAPER,
+                    symbol = TradingSymbol.BTC,
+                    triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                    startedAt = fixedInstant().minus(Duration.ofHours(1)),
+                ),
+            ).getOrThrow()
+            val recoveredCounts = mutableListOf<Int>()
+            val bootstrap = sharedTradingPersistenceBootstrap(
+                database = database,
+                tradingConfig = TradingBotConfig(),
+                clock = clock,
+                onStaleLlmRunsRecovered = recoveredCounts::add,
+            )
+
+            bootstrap().getOrThrow()
+
+            assertEquals(listOf(1), recoveredCounts)
+            assertEquals(
+                LlmRunTerminalCause.RESTART_INTERRUPTED,
+                runRepository.findByInvocationId("production-bootstrap-stale-run").getOrThrow()?.terminalCause,
+            )
+        } finally {
+            container.stop()
+        }
+    }
 
     @Test
     fun opsRoutes_haltResumeAndReadRiskState() = testApplication {
@@ -1134,11 +1190,19 @@ class OpsRouteTest {
         val response = client.get("/ops/activity/catalog")
         val responseText = response.bodyAsText()
         val expectedJson = Json.parseToJsonElement(readSharedTestdata("ops-activity-catalog.golden.json"))
-        val actualJson = Json.parseToJsonElement(responseText)
+        val actualJson = Json.parseToJsonElement(responseText).jsonObject
+        val auditEventTypes = actualJson.getValue("auditEventTypes").jsonArray
+        val recoveryEvent = auditEventTypes.single { element ->
+            element.jsonObject.getValue("value").jsonPrimitive.content == "LLM_INVOCATION_RECOVERED"
+        }
+        val normalizedActual = JsonObject(
+            actualJson + ("auditEventTypes" to JsonArray(auditEventTypes.filter { it != recoveryEvent })),
+        )
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertNoSecretLikeText(responseText)
-        assertEquals(expectedJson, actualJson)
+        assertEquals("activity.catalog.audit.llmInvocationRecovered.label", recoveryEvent.jsonObject.getValue("labelKey").jsonPrimitive.content)
+        assertEquals(expectedJson, normalizedActual)
     }
 
     @Test

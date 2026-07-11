@@ -17,6 +17,8 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
+import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -150,6 +152,7 @@ class DefaultManualLlmLaunchService(
                 skipReason = skipReason,
                 requestReason = reason,
                 observedAt = observedAt,
+                activeReservation = reservationOutcome.activeReservation,
             ).getOrThrow()
 
             return ManualLlmLaunchResult.Rejected(skipReason)
@@ -178,10 +181,10 @@ class DefaultManualLlmLaunchService(
         }
 
         job.invokeOnCompletion { throwable ->
-            val cancellation = throwable as? CancellationException ?: return@invokeOnCompletion
+            throwable as? CancellationException ?: return@invokeOnCompletion
 
             if (!started.get()) {
-                finishCancelledBeforeStart(invocationId, cancellation)
+                finishCancelledBeforeStart(invocationId)
             }
         }
     }
@@ -202,7 +205,7 @@ class DefaultManualLlmLaunchService(
             finishReservedInvocation(
                 invocationId = invocationId,
                 status = LlmLaunchReservationStatus.FAILED,
-                reason = appendFailure.javaClass.simpleName,
+                reason = LlmRunTerminalCause.RUNNER_FAILED.name,
                 finishedAt = Instant.now(clock),
             )
         }
@@ -210,12 +213,12 @@ class DefaultManualLlmLaunchService(
         return appendResult
     }
 
-    private fun finishCancelledBeforeStart(invocationId: String, cancellation: CancellationException) {
+    private fun finishCancelledBeforeStart(invocationId: String) {
         runBlocking {
             finishReservedInvocation(
                 invocationId = invocationId,
                 status = LlmLaunchReservationStatus.FAILED,
-                reason = cancellation.javaClass.simpleName,
+                reason = LlmRunTerminalCause.CALLER_CANCELLED.name,
                 finishedAt = Instant.now(clock),
             )
         }
@@ -237,7 +240,7 @@ class DefaultManualLlmLaunchService(
         } else {
             LlmLaunchReservationStatus.FAILED
         }
-        val finishReason = runnerResult?.status?.name ?: failure?.javaClass?.simpleName
+        val finishReason = (runnerResult?.terminalCause ?: terminalCauseForInvocationFailure(failure)).name
 
         finishReservedInvocation(
             invocationId = invocationId,
@@ -294,10 +297,13 @@ class DefaultManualLlmLaunchService(
         skipReason: String,
         requestReason: String,
         observedAt: Instant,
+        activeReservation: LlmActiveLaunchReservation? = null,
     ): Result<Unit> {
         return commandEventLog.append(
             CommandEvent(
-                decisionRunContext = DecisionRunContext.EMPTY,
+                decisionRunContext = activeReservation?.let { active ->
+                    manualDecisionRunContext(active.invocationId, runtimeConfigSnapshot)
+                } ?: DecisionRunContext.EMPTY,
                 toolName = MANUAL_TOOL_NAME,
                 toolCallId = null,
                 clientRequestId = LLM_MANUAL_TRIGGER_KEY,
@@ -309,6 +315,12 @@ class DefaultManualLlmLaunchService(
                     put("triggerKey", LLM_MANUAL_TRIGGER_KEY)
                     put("eventName", null as String?)
                     put("observedAt", observedAt.toString())
+                    activeReservation?.let { active ->
+                        put("activeInvocationId", active.invocationId)
+                        put("activeTriggerKind", active.triggerKind.name)
+                        put("activeTriggerKey", active.triggerKey)
+                        put("activeReservedAt", active.reservedAt.toString())
+                    }
                     runtimeConfigSnapshot?.let { snapshot ->
                         put("runtimeConfigVersionId", snapshot.versionId)
                         put("runtimeConfigHash", snapshot.hash)

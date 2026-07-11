@@ -8,6 +8,7 @@
 - 売買能力は自作 MCP サーバー（`fukurou-mcp`）としてツール提供し、LLM がツール呼び出しで取引する
 - LLM は CLI（`claude` / `codex`）シェルアウトで実行（サブスク利用）
 - 取引・監査ログは PostgreSQL を正本にし、Obsidian Writer / Reflection Runner が人間向けノートを生成する
+- LLM run の終了理由は stable な terminal cause で記録し、daemon は in-flight invocation を supersede せず blocker を監査する
 
 ## 安全床
 

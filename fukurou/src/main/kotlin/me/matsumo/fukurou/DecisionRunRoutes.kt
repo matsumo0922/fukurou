@@ -25,6 +25,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunTradeLifecycle
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.decision.requiresSafetyFloor
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.time.Instant
@@ -37,6 +38,8 @@ private const val MAX_RUN_LIMIT = 100
 /** decision run 一覧 endpoint の OpenAPI description。 */
 private const val RUNS_DESCRIPTION =
     "llm_runs を起点に decision、Falsifier、SafetyFloor、order、execution を正規化した run 一覧を新しい順で返します。" +
+        "outcome は注文・約定を含む業務上の状態、terminalCause は runner 終端の安定コードであり、両者は直交します。" +
+        "terminalCause が null の run は旧データなど終端原因を保持していない記録です。" +
         "outcome filter は bounded window を走査し、上限到達時は次の window 用 cursor を返します。"
 
 /** decision run 一覧 response。 */
@@ -95,6 +98,7 @@ data class OpsDecisionRunSummaryResponse(
     val safetyMessageJa: String?,
     val finalReason: String?,
     val errorMessage: String?,
+    val terminalCause: LlmRunTerminalCause? = null,
     val orderCount: Int,
     val executionCount: Int,
     val hasProcessFailure: Boolean,
@@ -333,7 +337,9 @@ private fun Route.registerOpsDecisionRunDetailRoute(dependencies: OpsRouteDepend
         call.respond(detail.toResponse(dependencies.referenceQuote()))
     }.describe {
         summary = "decision run 詳細を取得する"
-        description = "Trigger から Order / Execution までの段階、run の order から因果的に辿る position 約定 lifecycle、LLM 申告値、Falsifier、SafetyFloor、関連 ledger、secret を除外した raw/debug 情報を返します。"
+        description = "Trigger から Order / Execution までの段階、run の order から因果的に辿る position 約定 lifecycle、LLM 申告値、Falsifier、SafetyFloor、関連 ledger、secret を除外した raw/debug 情報を返します。" +
+            "terminalCause は status や業務 outcome と直交する runner 終端の安定コードで、null は旧データなど終端原因を保持していない記録です。" +
+            "PROCESSING phase は runner 処理経路を表し、restart による中断は INTERRUPTED、timeout や runner failure は FAILED として表示します。"
         tag(RUNS_TAG)
         parameters {
             path("invocationId") {
@@ -404,6 +410,7 @@ private fun DecisionRunSummary.toResponse(): OpsDecisionRunSummaryResponse {
         safetyMessageJa = safetyMessageJa,
         finalReason = finalReason,
         errorMessage = errorMessage,
+        terminalCause = terminalCause,
         orderCount = orderCount,
         executionCount = executionCount,
         hasProcessFailure = hasProcessFailure,
@@ -432,6 +439,7 @@ private fun DecisionRunDetail.phases(): List<OpsDecisionRunPhaseResponse> {
     val stoppedStatus = if (isRunning) "RUNNING" else "NOT_REACHED"
     return listOf(
         OpsDecisionRunPhaseResponse("TRIGGER", "COMPLETED", summary.triggerKind ?: "MANUAL"),
+        OpsDecisionRunPhaseResponse("PROCESSING", processingPhaseStatus(), summary.terminalCause?.name),
         OpsDecisionRunPhaseResponse("PROPOSER", decision?.let { "COMPLETED" } ?: stoppedStatus, decision?.provider),
         OpsDecisionRunPhaseResponse("INTENT", intentPhaseStatus(stoppedStatus), intent?.intentId),
         OpsDecisionRunPhaseResponse(
@@ -450,6 +458,18 @@ private fun DecisionRunDetail.phases(): List<OpsDecisionRunPhaseResponse> {
             "orders=${orders.size}, executions=${executions.size}",
         ),
     )
+}
+
+private fun DecisionRunDetail.processingPhaseStatus(): String {
+    return when (summary.terminalCause) {
+        LlmRunTerminalCause.RESTART_INTERRUPTED -> "INTERRUPTED"
+        LlmRunTerminalCause.CALLER_CANCELLED -> "CANCELLED"
+        LlmRunTerminalCause.TIMED_OUT,
+        LlmRunTerminalCause.RUNNER_FAILED,
+        -> "FAILED"
+        null -> if (summary.outcome == DecisionRunOutcome.RUNNING) "RUNNING" else "COMPLETED"
+        else -> "COMPLETED"
+    }
 }
 
 private fun DecisionRunDetail.intentPhaseStatus(stoppedStatus: String): String {

@@ -42,9 +42,37 @@ class ApiDocumentationRouteTest {
         val openApiDocument = Json.parseToJsonElement(responseBody).jsonObject
         val info = openApiDocument.getValue("info").jsonObject
         val paths = openApiDocument.getValue("paths").jsonObject
+        val schemas = openApiDocument.getValue("components").jsonObject.getValue("schemas").jsonObject
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertEquals("Fukurou API", info.getValue("title").jsonPrimitive.content)
+        val terminalCause = schemas.getValue("OpsDecisionRunSummaryResponse").jsonObject
+            .getValue("properties").jsonObject
+            .getValue("terminalCause").jsonObject
+
+        assertEquals(
+            listOf(
+                "NORMAL_COMPLETION",
+                "NO_TRADE",
+                "SAFETY_DENIED",
+                "TIMED_OUT",
+                "RUNNER_FAILED",
+                "CALLER_CANCELLED",
+                "RESTART_INTERRUPTED",
+                "LEGACY_UNCLASSIFIED",
+            ),
+            terminalCause.getValue("enum").jsonArray.map { value -> value.jsonPrimitive.content },
+        )
+        val decisionRunsDescription = paths.getValue("/ops/runs").jsonObject
+            .getValue("get").jsonObject
+            .getValue("description").jsonPrimitive.content
+        assertTrue(decisionRunsDescription.contains("terminalCause は runner 終端の安定コード"))
+        assertTrue(decisionRunsDescription.contains("旧データ"))
+        val decisionRunDetailDescription = paths.getValue("/ops/runs/{invocationId}").jsonObject
+            .getValue("get").jsonObject
+            .getValue("description").jsonPrimitive.content
+        assertTrue(decisionRunDetailDescription.contains("status や業務 outcome と直交"))
+        assertTrue(decisionRunDetailDescription.contains("PROCESSING phase"))
         assertOperation(
             paths = paths,
             path = "/health/live",

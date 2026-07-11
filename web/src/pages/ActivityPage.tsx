@@ -198,6 +198,7 @@ function RunRow({
   selectedChanged: (button: HTMLButtonElement) => void;
 }) {
   const { locale, t } = useI18n();
+  const terminalCause = terminalCauseLabel(run.terminalCause, t);
   const order = run.order;
   const detailTitle = order ? `${order.side} ${order.orderType}` : run.action ?? run.status;
 
@@ -236,6 +237,7 @@ function RunRow({
           <span>{t("activity.runs.label.distance")} <strong>{formatPriceDistance(run, latestMarketQuote)}</strong></span>
           <span>{t("activity.runs.label.effectiveExpiry")} <strong>{formatExpiry(order?.expiresAt, locale)}</strong></span>
         </span>
+        {terminalCause ? <small className="decision-run-card__terminal">{terminalCause}</small> : null}
         {run.finalReason ? <small className="decision-run-card__terminal">{run.finalReason}</small> : null}
         {run.errorMessage ? <small className="decision-run-card__terminal">{run.errorMessage}</small> : null}
         <span className="decision-run-card__id"><code>{run.invocationId}</code></span>
@@ -424,6 +426,7 @@ function RunDetailContent({
           </p>
         ) : null}
         <FactGrid facts={[
+          [t("activity.runs.label.terminalCause"), terminalCauseLabel(detail.summary.terminalCause, t)],
           [t("activity.runs.label.action"), decision?.action],
           [t("activity.runs.label.provider"), decision?.provider],
           [t("activity.runs.label.parentPlan"), intent?.parentTradePlanId],
@@ -713,6 +716,12 @@ function orderExplanation(
     : `Waiting for a paper fill of ${order.sizeBtc} BTC under the ${order.orderType} condition.`;
 }
 
+function terminalCauseLabel(cause: string | null | undefined, t: Translator): string | null {
+  if (!cause) return null;
+
+  return t(`activity.runs.terminalCause.${cause}` as Parameters<Translator>[0]);
+}
+
 function formatJsonList(value: string | null | undefined): string | null {
   if (!value) return null;
 
@@ -780,6 +789,7 @@ function OutcomeIcon({ outcome }: { outcome: OpsDecisionRunSummaryResponse["outc
 function phaseLabel(phase: string, t: Translator): string {
   const keys = {
     TRIGGER: "activity.runs.phase.trigger",
+    PROCESSING: "activity.runs.phase.processing",
     PROPOSER: "activity.runs.phase.proposer",
     INTENT: "activity.runs.phase.intent",
     FALSIFIER: "activity.runs.phase.falsifier",

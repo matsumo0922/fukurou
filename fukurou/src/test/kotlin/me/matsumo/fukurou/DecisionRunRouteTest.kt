@@ -75,6 +75,10 @@ class DecisionRunRouteTest {
         assertEquals(HttpStatusCode.OK, filteredResponse.status)
         val filteredPage = Json.decodeFromString<OpsDecisionRunsResponse>(filteredResponse.body())
         assertEquals(listOf("run-old"), filteredPage.runs.map { run -> run.invocationId })
+        assertEquals(
+            me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RESTART_INTERRUPTED,
+            filteredPage.runs.single().terminalCause,
+        )
         assertEquals(DecisionRunFilter.ACTION_REQUIRED, repository.lastFilter)
 
         val cappedResponse = client.get("/ops/runs?filter=WAITING")
@@ -120,6 +124,13 @@ class DecisionRunRouteTest {
         assertEquals("STOP", detail.tradeLifecycles.single().executions.single().kind)
         assertEquals("TAKER", detail.tradeLifecycles.single().executions.single().liquidity)
         assertTrue(detail.raw.none { raw -> raw.values.keys.any { key -> key.contains("secret", ignoreCase = true) } })
+
+        val interruptedDetailResponse = client.get("/ops/runs/run-old")
+        val interruptedDetail = Json.decodeFromString<OpsDecisionRunDetailResponse>(interruptedDetailResponse.body())
+        assertEquals(HttpStatusCode.OK, interruptedDetailResponse.status)
+        assertEquals("INTERRUPTED", interruptedDetail.phases.single { phase -> phase.key == "PROCESSING" }.status)
+        assertEquals("RESTART_INTERRUPTED", interruptedDetail.phases.single { phase -> phase.key == "PROCESSING" }.detail)
+
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?limit=0").status)
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?before=invalid").status)
         assertEquals(HttpStatusCode.BadRequest, client.get("/ops/runs?filter=UNKNOWN").status)
@@ -169,6 +180,7 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
         startedAt = Instant.parse("2026-07-10T00:47:27Z"),
         finishedAt = Instant.parse("2026-07-10T00:20:00Z"),
         errorMessage = "previous process/container shutdown recovery",
+        terminalCause = me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RESTART_INTERRUPTED,
         action = null,
         reasonJa = null,
         falsificationVerdict = null,
@@ -206,11 +218,15 @@ private class FakeDecisionRunProjectionRepository : DecisionRunProjectionReposit
     }
 
     override suspend fun findRun(invocationId: String): Result<DecisionRunDetail?> {
-        if (invocationId != denied.invocationId) return Result.success(null)
+        val summary = when (invocationId) {
+            denied.invocationId -> denied
+            interrupted.invocationId -> interrupted
+            else -> return Result.success(null)
+        }
 
         return Result.success(
             DecisionRunDetail(
-                summary = denied,
+                summary = summary,
                 decision = DecisionRunDecision(
                     decisionId = "decision-1",
                     action = "ENTER",

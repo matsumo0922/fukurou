@@ -43,6 +43,8 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
+import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -225,6 +227,7 @@ data class OneShotRunnerResult(
     val decision: DecisionSubmissionResult?,
     val intent: TradeIntentRecord?,
     val tradeResult: PaperTradeResult?,
+    val terminalCause: LlmRunTerminalCause = classifyOneShotTerminalCause(status, tradeResult),
 )
 
 /**
@@ -239,6 +242,7 @@ data class OneShotRunnerResult(
  * @param idGenerator invocation / tool call ID generator
  * @param logger 人間向け runner log 出力
  */
+@Suppress("LargeClass")
 class OneShotLlmRunner(
     private val tradingRuntime: TradingRuntime,
     private val tradingConfig: TradingBotConfig,
@@ -316,6 +320,7 @@ class OneShotLlmRunner(
                 start = llmRunStart,
                 status = result.status.name,
                 cause = null,
+                terminalCause = result.terminalCause,
             )
 
             Result.success(result)
@@ -440,6 +445,7 @@ class OneShotLlmRunner(
             decision = null,
             intent = null,
             tradeResult = null,
+            terminalCause = terminalCauseForNoTrade(cause),
         )
     }
 
@@ -468,6 +474,7 @@ class OneShotLlmRunner(
                 decision = null,
                 intent = null,
                 tradeResult = null,
+                terminalCause = terminalCauseForNoTrade(proposerResult.failure),
             )
         }
 
@@ -543,6 +550,7 @@ class OneShotLlmRunner(
         )
     }
 
+    @Suppress("LongMethod")
     private suspend fun runApprovedEntryFlow(
         input: OneShotAfterPreflightRequest,
         decision: DecisionSubmissionResult,
@@ -569,7 +577,13 @@ class OneShotLlmRunner(
                 cause = falsifierResult.failure,
             ).getOrThrow()
 
-            return entryFlowResult(invocationId, decision, intent, OneShotRunnerStatus.NO_TRADE_AUDITED)
+            return entryFlowResult(
+                invocationId = invocationId,
+                decision = decision,
+                intent = intent,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                terminalCause = terminalCauseForNoTrade(falsifierResult.failure),
+            )
         }
 
         input.failureContextUpdated(proposerContext)
@@ -593,7 +607,13 @@ class OneShotLlmRunner(
                 cause = placeResult.exceptionOrNull(),
             ).getOrThrow()
 
-            return entryFlowResult(invocationId, decision, intent, OneShotRunnerStatus.NO_TRADE_AUDITED)
+            return entryFlowResult(
+                invocationId = invocationId,
+                decision = decision,
+                intent = intent,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                terminalCause = terminalCauseForNoTrade(placeResult.exceptionOrNull()),
+            )
         }
 
         val finalStatus = if (placed.accepted) {
@@ -611,6 +631,7 @@ class OneShotLlmRunner(
         intent: TradeIntentRecord,
         status: OneShotRunnerStatus,
         tradeResult: PaperTradeResult? = null,
+        terminalCause: LlmRunTerminalCause? = null,
     ): OneShotRunnerResult {
         return OneShotRunnerResult(
             invocationId = invocationId,
@@ -618,6 +639,7 @@ class OneShotLlmRunner(
             decision = decision,
             intent = intent,
             tradeResult = tradeResult,
+            terminalCause = terminalCause ?: classifyOneShotTerminalCause(status, tradeResult),
         )
     }
 
@@ -954,6 +976,7 @@ private class OneShotRunAuditRecorder(
         start: LlmRunStart,
         status: String,
         cause: Throwable?,
+        terminalCause: LlmRunTerminalCause? = null,
         llmProvider: String? = null,
     ): Result<Unit> {
         val finish = LlmRunFinish(
@@ -965,6 +988,11 @@ private class OneShotRunAuditRecorder(
             startedAt = start.startedAt,
             finishedAt = clock.instant(),
             errorMessage = cause?.persistedErrorMessage(llmProvider),
+            terminalCause = terminalCause ?: if (status == LLM_RUN_STATUS_FAILED && cause == null) {
+                LlmRunTerminalCause.RUNNER_FAILED
+            } else {
+                terminalCauseForInvocationFailure(cause)
+            },
             runtimeConfigVersionId = start.runtimeConfigVersionId,
             runtimeConfigHash = start.runtimeConfigHash,
         )
@@ -1666,6 +1694,25 @@ private val FALSIFIER_FORBIDDEN_TOOL_NAMES = setOf(
 
 private fun mcpToolName(serverName: String, toolName: String): String {
     return "mcp__${serverName}__$toolName"
+}
+
+private fun classifyOneShotTerminalCause(
+    status: OneShotRunnerStatus,
+    tradeResult: PaperTradeResult?,
+): LlmRunTerminalCause {
+    if (tradeResult?.safetyViolation != null) return LlmRunTerminalCause.SAFETY_DENIED
+
+    return when (status) {
+        OneShotRunnerStatus.NO_TRADE_DECISION,
+        OneShotRunnerStatus.NO_TRADE_AUDITED,
+        OneShotRunnerStatus.LAUNCH_REJECTED,
+        -> LlmRunTerminalCause.NO_TRADE
+        else -> LlmRunTerminalCause.NORMAL_COMPLETION
+    }
+}
+
+private fun terminalCauseForNoTrade(cause: Throwable?): LlmRunTerminalCause {
+    return cause?.let(::terminalCauseForInvocationFailure) ?: LlmRunTerminalCause.NO_TRADE
 }
 
 private fun String.isMcpToolNameFor(serverName: String): Boolean {

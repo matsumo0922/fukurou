@@ -432,7 +432,7 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun freshRunningReservationSuppressesRepeatedTriggerAudit() = runBlocking {
+    fun freshRunningReservationAuditsBlockedSelectedTrigger() = runBlocking {
         val eventAt = fixedInstant().plus(Duration.ofMinutes(5))
         val launchStarted = CompletableDeferred<Unit>()
         val releaseLaunch = CompletableDeferred<Unit>()
@@ -466,9 +466,38 @@ class LlmDaemonSchedulerTest {
         firstTick.await()
 
         assertIs<LlmDaemonTickResult.Skipped>(secondResult)
-        assertEquals("no_trigger_due", secondResult.reason)
+        assertEquals("concurrent_invocation", secondResult.reason)
         assertEquals(1, fixture.launches.size)
-        assertTrue(skipEvents.none { event -> event.payload.contains("concurrent_invocation") })
+        assertTrue(
+            skipEvents.any { event ->
+                event.payload.contains("concurrent_invocation") &&
+                    event.payload.contains("activeInvocationId") &&
+                    event.decisionRunContext.decisionRunId != null
+            },
+        )
+    }
+
+    @Test
+    fun reserveRaceAuditsBlockingReservationIdentity() = runBlocking {
+        val activeReservation = LlmActiveLaunchReservation(
+            invocationId = "already-running",
+            triggerKind = LlmDaemonTriggerKind.HOLDING_DENSE_CHECK,
+            triggerKey = "holding-dense-check",
+            reservedAt = fixedInstant(),
+        )
+        val fixture = schedulerFixture(
+            reservations = RaceRejectingReservationRepository(activeReservation),
+        )
+
+        val result = fixture.scheduler.tick()
+        val skippedEvent = fixture.eventLog.events().single { event ->
+            event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED
+        }
+
+        assertIs<LlmDaemonTickResult.Skipped>(result)
+        assertEquals("concurrent_invocation", result.reason)
+        assertEquals("already-running", Json.parseToJsonElement(skippedEvent.payload).jsonObject.stringValue("activeInvocationId"))
+        assertEquals("already-running", skippedEvent.decisionRunContext.decisionRunId)
     }
 
     @Test
@@ -506,7 +535,7 @@ class LlmDaemonSchedulerTest {
         val resumedResult = fixture.scheduler.tick()
 
         assertIs<LlmDaemonTickResult.Failed>(failedResult)
-        assertEquals("IllegalStateException", failedResult.reason)
+        assertEquals("RUNNER_FAILED", failedResult.reason)
         assertIs<LlmDaemonTickResult.Launched>(resumedResult)
         assertEquals(2, fixture.launches.size)
     }
@@ -1046,7 +1075,7 @@ private fun schedulerFixture(
     clock: MutableClock = MutableClock(fixedInstant()),
     riskStateRepository: InMemoryRiskStateRepository = InMemoryRiskStateRepository(clock),
     eventLog: InMemoryCommandEventLog = InMemoryCommandEventLog(),
-    reservations: InMemoryLlmLaunchReservationRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository),
+    reservations: LlmLaunchReservationRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository),
     launches: MutableList<OneShotRunnerRequest> = mutableListOf(),
     idGenerator: () -> UUID = deterministicIds(),
     hasOpenRisk: Boolean = false,
@@ -1155,7 +1184,7 @@ private data class SchedulerFixture(
     val clock: MutableClock,
     val riskStateRepository: InMemoryRiskStateRepository,
     val eventLog: InMemoryCommandEventLog,
-    val reservations: InMemoryLlmLaunchReservationRepository,
+    val reservations: LlmLaunchReservationRepository,
     val launches: MutableList<OneShotRunnerRequest>,
     val idGenerator: () -> UUID,
     val tickerReader: FakeTickerReader,
@@ -1190,6 +1219,32 @@ private class FakeTickerReader(
             ),
         )
     }
+}
+
+/** pre-read 後に atomic reserve が競合で拒否した状態を再現する repository。 */
+private class RaceRejectingReservationRepository(
+    private val activeReservation: LlmActiveLaunchReservation,
+) : LlmLaunchReservationRepository {
+
+    override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
+        return Result.success(
+            LlmLaunchReservationOutcome.Rejected(
+                reason = LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION,
+                activeReservation = activeReservation,
+            ),
+        )
+    }
+
+    override suspend fun finish(finish: LlmLaunchReservationFinish): Result<Unit> = Result.success(Unit)
+
+    override suspend fun latestReservedAt(triggerKey: String): Result<Instant?> = Result.success(null)
+
+    override suspend fun latestFinishedReservedAt(triggerKey: String): Result<Instant?> = Result.success(null)
+
+    override suspend fun findBlockingRunningReservation(
+        requestTriggerKind: LlmDaemonTriggerKind,
+        activeSince: Instant,
+    ): Result<LlmActiveLaunchReservation?> = Result.success(null)
 }
 
 /**

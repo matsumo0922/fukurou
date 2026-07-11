@@ -21,6 +21,8 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
+import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -244,7 +246,7 @@ class ReflectionPromptCandidateGenerator(
     ): ReflectionPromptCandidateGeneration {
         return when (validation) {
             is PromptCandidateValidation.Valid -> {
-                finishSucceededRun(start, ReflectionPromptCandidateGenerationStatus.GENERATED.wireValue)
+                finishSucceededRun(start)
 
                 generatedFile(dataset, attemptCount, validation.candidates)
             }
@@ -255,7 +257,7 @@ class ReflectionPromptCandidateGenerator(
                 nextRetryAfter = null,
                 rejectionReason = validation.reason,
             ).also {
-                finishSucceededRun(start, ReflectionPromptCandidateGenerationStatus.INVALID_OUTPUT.wireValue)
+                finishSucceededRun(start)
             }
         }
     }
@@ -309,12 +311,12 @@ class ReflectionPromptCandidateGenerator(
             }
     }
 
-    private suspend fun finishSucceededRun(start: LlmRunStart, status: String) {
+    private suspend fun finishSucceededRun(start: LlmRunStart) {
         finishRun(
             start = start,
             status = REFLECTION_LLM_RUN_STATUS_SUCCEEDED,
             reservationStatus = LlmLaunchReservationStatus.FINISHED,
-            reason = status,
+            reason = LlmRunTerminalCause.NORMAL_COMPLETION.name,
             cause = null,
         )
     }
@@ -326,7 +328,7 @@ class ReflectionPromptCandidateGenerator(
             start = start,
             status = status,
             reservationStatus = LlmLaunchReservationStatus.FAILED,
-            reason = cause.javaClass.simpleName,
+            reason = terminalCauseFor(cause).name,
             cause = cause,
         )
     }
@@ -357,6 +359,7 @@ class ReflectionPromptCandidateGenerator(
                 startedAt = start.startedAt,
                 finishedAt = finishedAt,
                 errorMessage = redactedMessage,
+                terminalCause = cause?.let(::terminalCauseFor) ?: LlmRunTerminalCause.NORMAL_COMPLETION,
             ),
         ).onFailure { throwable ->
             logger(
@@ -378,6 +381,8 @@ class ReflectionPromptCandidateGenerator(
             )
         }
     }
+
+    private fun terminalCauseFor(cause: Throwable): LlmRunTerminalCause = terminalCauseForInvocationFailure(cause)
 
     private fun llmRequest(
         dataset: ReflectionDataset,

@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import me.matsumo.fukurou.trading.daemon.LlmActiveLaunchReservation
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
@@ -37,12 +38,14 @@ private const val INSERT_LLM_LAUNCH_RESERVATION_SQL = """
 /**
  * RUNNING の LLM 起動予約数を数える SQL。
  */
-private const val COUNT_ACTIVE_LLM_LAUNCH_RESERVATIONS_SQL = """
-    SELECT COUNT(*)
+private const val SELECT_ACTIVE_LLM_LAUNCH_RESERVATION_SQL = """
+    SELECT invocation_id, trigger_kind, trigger_key, reserved_at
     FROM llm_launch_reservations
     WHERE status = ?
         AND reserved_at >= ?
         AND (? OR trigger_kind <> ?)
+    ORDER BY reserved_at ASC, invocation_id ASC
+    LIMIT 1
 """
 
 /**
@@ -125,11 +128,14 @@ class ExposedLlmLaunchReservationRepository(
         }
     }
 
-    override suspend fun hasFreshRunningReservation(activeSince: Instant): Result<Boolean> {
+    override suspend fun findBlockingRunningReservation(
+        requestTriggerKind: LlmDaemonTriggerKind,
+        activeSince: Instant,
+    ): Result<LlmActiveLaunchReservation?> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    countFreshTradingReservations(activeSince) > 0
+                    selectBlockingActiveReservation(requestTriggerKind, activeSince)
                 }
             }
         }
@@ -146,10 +152,13 @@ private fun JdbcTransaction.tryReserveInTransaction(
     }
 
     val activeSince = request.reservedAt.minus(request.activeReservationStaleAfter)
-    val activeCount = countBlockingActiveReservations(request, activeSince)
+    val activeReservation = selectBlockingActiveReservation(request.triggerKind, activeSince)
 
-    if (activeCount > 0) {
-        return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION)
+    if (activeReservation != null) {
+        return LlmLaunchReservationOutcome.Rejected(
+            LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION,
+            activeReservation,
+        )
     }
 
     val hourlyCount = countDistinctLlmLaunchesSince(request.reservedAt.minus(request.hourlyWindow))
@@ -164,33 +173,24 @@ private fun JdbcTransaction.tryReserveInTransaction(
     return LlmLaunchReservationOutcome.Reserved(request.invocationId)
 }
 
-private fun JdbcTransaction.countBlockingActiveReservations(
-    request: LlmLaunchReservationRequest,
+private fun JdbcTransaction.selectBlockingActiveReservation(
+    requestTriggerKind: LlmDaemonTriggerKind,
     activeSince: Instant,
-): Int {
-    val includeReflection = request.triggerKind == LlmDaemonTriggerKind.REFLECTION
-
-    return countActiveReservations(
-        activeSince = activeSince,
-        includeReflection = includeReflection,
-    )
-}
-
-private fun JdbcTransaction.countFreshTradingReservations(activeSince: Instant): Int {
-    return countActiveReservations(
-        activeSince = activeSince,
-        includeReflection = false,
-    )
-}
-
-private fun JdbcTransaction.countActiveReservations(activeSince: Instant, includeReflection: Boolean): Int {
-    return jdbcConnection().prepareStatement(COUNT_ACTIVE_LLM_LAUNCH_RESERVATIONS_SQL).use { statement ->
+): LlmActiveLaunchReservation? {
+    val includeReflection = requestTriggerKind == LlmDaemonTriggerKind.REFLECTION
+    return jdbcConnection().prepareStatement(SELECT_ACTIVE_LLM_LAUNCH_RESERVATION_SQL).use { statement ->
         statement.setString(1, LlmLaunchReservationStatus.RUNNING.name)
         statement.setLong(2, activeSince.toEpochMilli())
         statement.setBoolean(3, includeReflection)
         statement.setString(4, LlmDaemonTriggerKind.REFLECTION.name)
         statement.executeQuery().use { resultSet ->
-            if (resultSet.next()) resultSet.getInt(1) else 0
+            if (!resultSet.next()) return@use null
+            LlmActiveLaunchReservation(
+                invocationId = resultSet.getString("invocation_id"),
+                triggerKind = LlmDaemonTriggerKind.valueOf(resultSet.getString("trigger_kind")),
+                triggerKey = resultSet.getString("trigger_key"),
+                reservedAt = Instant.ofEpochMilli(resultSet.getLong("reserved_at")),
+            )
         }
     }
 }

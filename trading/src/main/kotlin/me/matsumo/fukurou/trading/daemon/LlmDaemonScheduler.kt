@@ -22,6 +22,7 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.FreshnessDefaults
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -256,10 +257,6 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped(LLM_DAEMON_SKIP_HARD_HALT, null)
         }
 
-        if (hasFreshRunningReservation(observedAt)) {
-            return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
-        }
-
         val hasOpenRisk = openRiskReader.hasOpenRisk().getOrThrow()
 
         if (riskState.state == RiskHaltState.SOFT_HALT && !hasOpenRisk) {
@@ -275,13 +272,21 @@ class LlmDaemonScheduler(
         val trigger = selectTrigger(hasOpenRisk, observedAt)
             ?: return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
 
+        val activeReservation = launchReservationRepository.findBlockingRunningReservation(
+            requestTriggerKind = trigger.kind,
+            activeSince = observedAt.minus(daemonConfig.launchReservationStaleAfter),
+        ).getOrThrow()
+        if (activeReservation != null) {
+            appendSkip(
+                reason = "concurrent_invocation",
+                trigger = trigger,
+                observedAt = observedAt,
+                activeReservation = activeReservation,
+            ).getOrThrow()
+            return LlmDaemonTickResult.Skipped("concurrent_invocation", trigger.kind)
+        }
+
         return reserveAndLaunch(trigger, observedAt)
-    }
-
-    private suspend fun hasFreshRunningReservation(observedAt: Instant): Boolean {
-        val activeSince = observedAt.minus(daemonConfig.launchReservationStaleAfter)
-
-        return launchReservationRepository.hasFreshRunningReservation(activeSince).getOrThrow()
     }
 
     private suspend fun reserveAndLaunch(trigger: LlmDaemonTrigger, observedAt: Instant): LlmDaemonTickResult {
@@ -305,6 +310,7 @@ class LlmDaemonScheduler(
                 reason = reason,
                 trigger = trigger,
                 observedAt = observedAt,
+                activeReservation = reservationOutcome.activeReservation,
             ).getOrThrow()
 
             return LlmDaemonTickResult.Skipped(reason, trigger.kind)
@@ -358,7 +364,7 @@ class LlmDaemonScheduler(
                         trigger = trigger,
                         invocationId = invocationId,
                         status = LlmLaunchReservationStatus.FAILED,
-                        reason = failure.javaClass.simpleName,
+                        reason = terminalCauseForInvocationFailure(failure).name,
                         finishedAt = Instant.now(clock),
                     )
                 }.onFailure { finishFailure ->
@@ -379,7 +385,8 @@ class LlmDaemonScheduler(
         } else {
             LlmLaunchReservationStatus.FAILED
         }
-        val reason = runnerResult?.status?.name ?: failure?.javaClass?.simpleName
+        val terminalCause = runnerResult?.terminalCause ?: terminalCauseForInvocationFailure(failure)
+        val reason = terminalCause.name
 
         finishReservedInvocation(trigger, invocationId, status, reason, finishedAt)
 
@@ -387,7 +394,7 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Failed(
                 invocationId = invocationId,
                 triggerKind = trigger.kind,
-                reason = reason ?: "unknown",
+                reason = reason,
             )
         }
 
@@ -724,10 +731,12 @@ class LlmDaemonScheduler(
         reason: String,
         trigger: LlmDaemonTrigger?,
         observedAt: Instant,
+        activeReservation: LlmActiveLaunchReservation? = null,
     ): Result<Unit> {
         return commandEventLog.append(
             CommandEvent(
-                decisionRunContext = DecisionRunContext.EMPTY,
+                decisionRunContext = activeReservation?.let { daemonDecisionRunContext(it.invocationId, runtimeConfigSnapshot) }
+                    ?: DecisionRunContext.EMPTY,
                 toolName = DAEMON_TOOL_NAME,
                 toolCallId = null,
                 clientRequestId = trigger?.key,
@@ -738,6 +747,12 @@ class LlmDaemonScheduler(
                     put("triggerKey", trigger?.key)
                     put("eventName", trigger?.eventName)
                     put("observedAt", observedAt.toString())
+                    activeReservation?.let {
+                        put("activeInvocationId", it.invocationId)
+                        put("activeTriggerKind", it.triggerKind.name)
+                        put("activeTriggerKey", it.triggerKey)
+                        put("activeReservedAt", it.reservedAt.toString())
+                    }
                     runtimeConfigSnapshot?.let { snapshot ->
                         put("runtimeConfigVersionId", snapshot.versionId)
                         put("runtimeConfigHash", snapshot.hash)

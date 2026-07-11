@@ -93,6 +93,9 @@ enum class CommandEventType {
      */
     DAEMON_INVOCATION_COMPLETED,
 
+    /** bootstrap が deploy/restart で取り残された LLM invocation を回収した。 */
+    LLM_INVOCATION_RECOVERED,
+
     /**
      * CLI auth login process を開始した。
      */

@@ -8,6 +8,7 @@ import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 
 /**
  * LLM 起動予約の既定 hourly / daily 境界を検証するテスト。
@@ -72,6 +73,22 @@ class LlmLaunchReservationRepositoryTest {
             LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY),
             hundredTwentyFirstOutcome,
         )
+    }
+
+    @Test
+    fun legacyBooleanHelperDerivesFromBlockingReservationIdentity() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val reservedAt = launchBudgetFixedInstant()
+        repository.tryReserve(launchBudgetRequest("active", LlmRunnerConfig(), reservedAt)).getOrThrow()
+
+        val blocker = repository.findBlockingRunningReservation(
+            LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+            reservedAt.minus(Duration.ofMinutes(1)),
+        ).getOrThrow()
+        val active = repository.hasFreshRunningReservation(reservedAt.minus(Duration.ofMinutes(1))).getOrThrow()
+
+        assertEquals("active", assertNotNull(blocker).invocationId)
+        assertEquals(true, active)
     }
 }
 
