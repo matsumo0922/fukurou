@@ -92,6 +92,7 @@ sudo editor /srv/fukurou/.env
 
 ```dotenv
 CLOUDFLARED_TUNNEL_TOKEN=
+FUKUROU_PUBLIC_ORIGIN=https://fukurou.example.com
 
 POSTGRES_DB=fukurou
 POSTGRES_USER=fukurou

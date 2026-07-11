@@ -832,7 +832,7 @@ export interface paths {
         };
         /**
          * 現在の read-only 運用 context を WebSocket 配信する
-         * @description protocolVersion=1、connection-scoped sessionId、session内で単調増加するsequence、SNAPSHOT/UPDATE/HEARTBEAT envelope と source ごとの observedAt/receivedAt/staleAfterMillis/freshness を配信します。Originは必須かつsame-originです。45秒無応答または slow client は再接続が必要です。
+         * @description protocolVersion=1、connection-scoped sessionId、session内で単調増加するsequence、SNAPSHOT/UPDATE/HEARTBEAT envelope と source ごとの observedAt/receivedAt/staleAfterMillis/freshness を配信します。Originは必須で、FUKUROU_PUBLIC_ORIGINと一致する場合だけ許可します。45秒無応答または slow client は再接続が必要です。
          */
         get: {
             parameters: {

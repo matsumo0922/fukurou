@@ -2,7 +2,6 @@
 
 package me.matsumo.fukurou
 
-import io.ktor.server.plugins.origin
 import io.ktor.server.routing.Route
 import io.ktor.server.websocket.webSocket
 import io.ktor.server.routing.openapi.describe
@@ -24,8 +23,7 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 @OptIn(ExperimentalKtorApi::class)
 internal fun Route.currentContextWebSocketRoutes(dependencies: EvaluationRouteDependencies) {
     webSocket("/ops/current-context/ws") {
-        val requestOrigin = call.request.origin
-        if (!originAllowed(call.request.headers["Origin"], requestOrigin.scheme, requestOrigin.serverHost, requestOrigin.serverPort)) {
+        if (!originAllowed(call.request.headers["Origin"], dependencies.currentContextPublicOrigin)) {
             close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "origin is not allowed"))
             return@webSocket
         }
@@ -62,7 +60,7 @@ internal fun Route.currentContextWebSocketRoutes(dependencies: EvaluationRouteDe
         }
     }.describe {
         summary = "現在の read-only 運用 context を WebSocket 配信する"
-        description = "protocolVersion=1、connection-scoped sessionId、session内で単調増加するsequence、SNAPSHOT/UPDATE/HEARTBEAT envelope と source ごとの observedAt/receivedAt/staleAfterMillis/freshness を配信します。Originは必須かつsame-originです。45秒無応答または slow client は再接続が必要です。"
+        description = "protocolVersion=1、connection-scoped sessionId、session内で単調増加するsequence、SNAPSHOT/UPDATE/HEARTBEAT envelope と source ごとの observedAt/receivedAt/staleAfterMillis/freshness を配信します。Originは必須で、FUKUROU_PUBLIC_ORIGINと一致する場合だけ許可します。45秒無応答または slow client は再接続が必要です。"
         tag("評価レポート")
         responses {
             io.ktor.http.HttpStatusCode.SwitchingProtocols {
@@ -190,18 +188,19 @@ private fun freshness(
     }
 }
 
-internal fun originAllowed(
-    origin: String?,
-    scheme: String,
-    host: String,
-    port: Int,
-): Boolean {
-    if (origin == null) return false
+internal fun originAllowed(origin: String?, publicOrigin: String?): Boolean {
+    if (origin == null || publicOrigin == null) return false
     return runCatching {
-        val uri = java.net.URI(origin)
-        val originPort = if (uri.port >= 0) uri.port else if (uri.scheme == "https") 443 else 80
-        uri.scheme == scheme && uri.host.equals(host, ignoreCase = true) && originPort == port
+        val actual = java.net.URI(origin).normalizedOrigin()
+        val trusted = java.net.URI(publicOrigin).normalizedOrigin()
+        actual == trusted
     }.getOrDefault(false)
+}
+
+private fun java.net.URI.normalizedOrigin(): String {
+    require(scheme in setOf("http", "https") && userInfo == null && path.orEmpty() in setOf("", "/") && query == null && fragment == null)
+    val effectivePort = if (port >= 0) port else if (scheme == "https") 443 else 80
+    return "${scheme.lowercase()}://${requireNotNull(host).lowercase()}:$effectivePort"
 }
 
 @Serializable

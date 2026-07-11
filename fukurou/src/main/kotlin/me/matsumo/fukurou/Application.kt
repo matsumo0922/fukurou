@@ -102,6 +102,7 @@ fun Application.module(
     evaluationMarketDataSource: MarketDataSource? = null,
     evaluationLlmInvoker: me.matsumo.fukurou.trading.invoker.LlmInvoker? = null,
     evaluationLlmInvocationAuditor: LlmInvocationAuditor? = null,
+    evaluationPublicOrigin: String? = System.getenv()["FUKUROU_PUBLIC_ORIGIN"],
     opsRiskStateCommandService: RiskStateCommandService? = null,
     opsManualLlmLaunchService: ManualLlmLaunchService? = null,
     opsLlmAuthService: LlmAuthService? = null,
@@ -143,6 +144,7 @@ fun Application.module(
             marketDataSource = evaluationMarketDataSource,
             llmInvoker = evaluationLlmInvoker,
             llmInvocationAuditor = evaluationLlmInvocationAuditor,
+            publicOrigin = evaluationPublicOrigin,
         ),
         opsOverrides = ApplicationOpsOverrides(
             riskStateCommandService = opsRiskStateCommandService,
@@ -454,6 +456,7 @@ private fun createEvaluationRouteDependencies(
         database = database,
         latestMarketQuoteStore = runtime.latestMarketQuoteStore,
         clock = runtime.clock,
+        currentContextPublicOrigin = overrides.publicOrigin,
     )
 }
 
@@ -997,6 +1000,7 @@ private data class ApplicationEvaluationOverrides(
     val marketDataSource: MarketDataSource?,
     val llmInvoker: me.matsumo.fukurou.trading.invoker.LlmInvoker?,
     val llmInvocationAuditor: LlmInvocationAuditor?,
+    val publicOrigin: String?,
 )
 
 /**

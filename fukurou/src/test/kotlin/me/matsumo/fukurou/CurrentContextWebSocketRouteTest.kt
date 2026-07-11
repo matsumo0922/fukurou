@@ -28,16 +28,40 @@ import kotlin.test.assertNotEquals
 class CurrentContextWebSocketRouteTest {
 
     @Test
+    fun websocket_acceptsConfiguredExternalHttpsOriginOverInternalHttpRoute() = testApplication {
+        application {
+            module(
+                clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC),
+                evaluationPublicOrigin = "https://fukurou.example.com",
+            )
+        }
+        val client = createClient { install(WebSockets) }
+        client.webSocket(
+            "/ops/current-context/ws",
+            request = { headers.append(HttpHeaders.Origin, "https://fukurou.example.com") },
+        ) {
+            val envelope = ApiJson.decodeFromString<CurrentContextEnvelopeResponse>((incoming.receive() as Frame.Text).readText())
+            assertEquals("SNAPSHOT", envelope.type)
+        }
+    }
+
+    @Test
     fun websocket_rejectsMissingForeignAndCrossSchemeOrigins() = testApplication {
-        application { module(clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC)) }
+        application {
+            module(
+                clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC),
+                evaluationPublicOrigin = "http://localhost",
+            )
+        }
         val client = createClient { install(WebSockets) }
         listOf(null, "https://localhost", "http://foreign.example").forEach { origin ->
             client.webSocket("/ops/current-context/ws", request = { origin?.let { headers.append(HttpHeaders.Origin, it) } }) {
                 assertEquals(io.ktor.websocket.CloseReason.Codes.VIOLATED_POLICY.code, closeReason.await()?.code)
             }
         }
-        assertEquals(true, originAllowed("https://example.com", "https", "example.com", 443))
-        assertEquals(false, originAllowed("http://example.com", "https", "example.com", 443))
+        assertEquals(true, originAllowed("https://example.com", "https://example.com"))
+        assertEquals(false, originAllowed("http://example.com", "https://example.com"))
+        assertEquals(false, originAllowed("https://example.com", null))
     }
 
     @Test
@@ -54,6 +78,7 @@ class CurrentContextWebSocketRouteTest {
                         clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC),
                         currentContextSendTimeoutMillis = 1,
                         currentContextSendOverride = { delay(100) },
+                        currentContextPublicOrigin = "http://localhost",
                     ),
                 )
             }
@@ -66,7 +91,12 @@ class CurrentContextWebSocketRouteTest {
 
     @Test
     fun websocket_usesConnectionScopedSessionAndRestartsSequence() = testApplication {
-        application { module(clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC)) }
+        application {
+            module(
+                clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC),
+                evaluationPublicOrigin = "http://localhost",
+            )
+        }
         val client = createClient { install(WebSockets) }
         suspend fun snapshot(): CurrentContextEnvelopeResponse {
             var result: CurrentContextEnvelopeResponse? = null
@@ -92,6 +122,7 @@ class CurrentContextWebSocketRouteTest {
             module(
                 latestMarketQuoteStore = store,
                 clock = Clock.fixed(observedAt.plusSeconds(2), ZoneOffset.UTC),
+                evaluationPublicOrigin = "http://localhost",
             )
         }
         val client = createClient { install(WebSockets) }
@@ -118,6 +149,7 @@ class CurrentContextWebSocketRouteTest {
             module(
                 latestMarketQuoteStore = store,
                 clock = Clock.fixed(observedAt.plusSeconds(16), ZoneOffset.UTC),
+                evaluationPublicOrigin = "http://localhost",
             )
         }
         val client = createClient { install(WebSockets) }
