@@ -523,20 +523,22 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
+                /** @description 共通 LLM reservation が使用中です。Retry-After と rejected job を返します。 */
                 409: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["EvaluationReportAdmissionErrorResponse"];
+                        "application/json": components["schemas"]["EvaluationReportJobResponse"];
                     };
                 };
+                /** @description 起動予算または report request rate を超過しました。Retry-After と rejected job を返します。 */
                 429: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["EvaluationReportAdmissionErrorResponse"];
+                        "application/json": components["schemas"]["EvaluationReportJobResponse"];
                     };
                 };
                 500: {
@@ -616,7 +618,12 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description PRESET:30D または CUSTOM:from:to の report scope key です。 */
+                    scopeKey?: string;
+                    /** @description scopeKey 省略時の互換 preset 日数です。 */
+                    days?: number;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -662,7 +669,12 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description 履歴対象の report scope key です。 */
+                    scopeKey?: string;
+                    /** @description scopeKey 省略時の互換 preset 日数です。 */
+                    days?: number;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -785,7 +797,12 @@ export interface paths {
          */
         delete: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description pin を解除する report scope key です。 */
+                    scopeKey?: string;
+                    /** @description scopeKey 省略時の互換 preset 日数です。 */
+                    days?: number;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -813,6 +830,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
+        /**
+         * 現在の read-only 運用 context を WebSocket 配信する
+         * @description protocolVersion=1、boot sessionId、connection sequence、SNAPSHOT/UPDATE/HEARTBEAT envelope と source ごとの observedAt/receivedAt/staleAfterMillis/freshness を配信します。45秒無応答または slow client は再接続が必要です。
+         */
         get: {
             parameters: {
                 query?: never;
@@ -824,7 +845,16 @@ export interface paths {
                 cookie?: never;
             };
             requestBody?: never;
-            responses: never;
+            responses: {
+                101: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CurrentContextEnvelopeResponse"];
+                    };
+                };
+            };
         };
         put?: never;
         post?: never;
@@ -2369,20 +2399,27 @@ export interface components {
         EvaluationReportJobResponse: {
             jobId: string;
             revisionId: string;
+            revisionNumber?: number;
             status: string;
             stage: string;
             failureCode?: string | null;
             failureMessage?: string | null;
-        };
-        /** EvaluationReportAdmissionErrorResponse */
-        EvaluationReportAdmissionErrorResponse: {
-            code: string;
+            activeInvocationId?: string | null;
+            retryAfterSeconds?: number | null;
         };
         /** EvaluationReportPeriodResponse */
         EvaluationReportPeriodResponse: {
             from: string;
             toInclusive: string;
             timezone: string;
+        };
+        /** EvaluationReportGenerationMetadataResponse */
+        EvaluationReportGenerationMetadataResponse: {
+            invocationId: string;
+            provider: string;
+            durationMillis?: number | null;
+            totalCostUsd?: string | null;
+            observedModels?: string[] | null;
         };
         /** EvaluationReportSegmentResponse */
         EvaluationReportSegmentResponse: {
@@ -2545,6 +2582,7 @@ export interface components {
             generatedAt: string;
             provider: string;
             model: string;
+            generation: components["schemas"]["EvaluationReportGenerationMetadataResponse"];
             title: string;
             segments: components["schemas"]["EvaluationReportSegmentResponse"][];
             claims: components["schemas"]["EvaluationReportClaimResponse"][];
@@ -2582,6 +2620,26 @@ export interface components {
         EvaluationReportPinResponse: {
             scopeKey: string;
             revisionId: string;
+        };
+        /** CurrentContextSourceResponse */
+        CurrentContextSourceResponse: {
+            source: string;
+            observedAt?: string | null;
+            receivedAt: string;
+            staleAfterMillis: number;
+            freshness: string;
+            value?: {
+                [key: string]: string;
+            } | null;
+        };
+        /** CurrentContextEnvelopeResponse */
+        CurrentContextEnvelopeResponse: {
+            protocolVersion: number;
+            type: string;
+            sessionId: string;
+            sequence: number;
+            sentAt: string;
+            sources: components["schemas"]["CurrentContextSourceResponse"][];
         };
         /** RuntimeConfigItem */
         RuntimeConfigItem: {

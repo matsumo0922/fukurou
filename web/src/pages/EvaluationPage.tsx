@@ -1,8 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
-import { fetchReportHistory, fetchReportRevision, generateReport, pinReport, reportQuery, reportScopeKey, type EvaluationReport, type ReportScope } from "../api/evaluationReport";
-import { HistoricalOutcomeRidge } from "./evaluation-report/HistoricalOutcomeRidge";
+import { fetchReportHistory, fetchReportRevision, generateReport, pinReport, reportQuery, reportScopeKey, type EvaluationReport, type ReportJob, type ReportScope } from "../api/evaluationReport";
+import { LazyHistoricalOutcomeRidge } from "./evaluation-report/HistoricalOutcomeRidge.lazy";
 import { LazyEvidenceRelationshipGraph } from "./evaluation-report/EvidenceRelationshipGraph.lazy";
 
 export function EvaluationPage() {
@@ -15,14 +15,27 @@ export function EvaluationPage() {
   const queryClient = useQueryClient();
   const query = useQuery({ ...reportQuery(scopeKey), enabled: !custom || Boolean(customFrom && customTo) });
   const history = useQuery({ queryKey: ["evaluation-report-history", scopeKey], queryFn: () => fetchReportHistory(scopeKey), enabled: !custom || Boolean(customFrom && customTo) });
-  const [preview, setPreview] = useState<EvaluationReport | null>(null);
+  const [preview, setPreview] = useState<{ scopeKey: string; report: EvaluationReport } | null>(null);
+  const [generationJob, setGenerationJob] = useState<ReportJob | null>(null);
+  const generationAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => generationAbort.current?.abort(), []);
+  useEffect(() => () => generationAbort.current?.abort(), [scopeKey]);
   const generation = useMutation({
-    mutationFn: () => generateReport(scope),
-    onSuccess: () => Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey] }),
-      queryClient.invalidateQueries({ queryKey: ["evaluation-report-history", scopeKey] }),
-    ]),
+    mutationFn: () => {
+      generationAbort.current?.abort();
+      generationAbort.current = new AbortController();
+      return generateReport(scope, generationAbort.current.signal, setGenerationJob);
+    },
+    onSuccess: () => {
+      setPreview(null);
+      return Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey] }),
+        queryClient.invalidateQueries({ queryKey: ["evaluation-report-history", scopeKey] }),
+      ]);
+    },
   });
+  const displayedReport = preview?.scopeKey === scopeKey ? preview.report : query.data;
+  const displayedIsPinned = history.data?.some((item) => item.pinned && item.revisionId === displayedReport?.revisionId) ?? false;
 
   return <main className="evaluation-console">
     <header className="console-header">
@@ -35,25 +48,63 @@ export function EvaluationPage() {
       </div>
     </header>
     <CurrentContextStrip />
+    {generationJob && generation.isPending && <div className="console-alert" role="status">Job {generationJob.jobId.slice(0, 12)} · revision #{generationJob.revisionNumber} · {generationJob.stage}. Existing pinned revision remains authoritative.</div>}
     {generation.isError && <div className="console-alert" role="alert">Generation failed: {generation.error.message}. Existing revision remains authoritative.</div>}
-    {query.isPending ? <div className="console-empty">Loading immutable report revision…</div> : query.isError ? <div className="console-alert" role="alert">Report request failed: {query.error.message}</div> : (preview ?? query.data) == null ? <EmptyReport onGenerate={() => generation.mutate()} /> : <ReportConsole report={(preview ?? query.data)!} />}
-    <section className="report-panel" aria-labelledby="report-history-title"><header className="report-panel__header"><div><span className="console-kicker">IMMUTABLE REVISION HISTORY</span><h2 id="report-history-title">Reports / failed jobs</h2></div></header><div className="console-table-wrap"><table><thead><tr><th>Revision</th><th>Status</th><th>Requested</th><th>Default</th><th>Actions</th></tr></thead><tbody>{history.data?.map((item) => <tr key={item.jobId}><td>#{item.revisionNumber || "—"}</td><td>{item.status}</td><td>{new Date(item.requestedAt).toLocaleString()}</td><td>{item.pinned ? "PINNED" : "—"}</td><td>{item.status === "SUCCEEDED" && <><button onClick={() => void fetchReportRevision(item.revisionId).then(setPreview)}>PREVIEW</button><button onClick={() => void pinReport(scopeKey, item.revisionId).then(() => queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey] }))}>PIN</button></>}</td></tr>)}</tbody></table></div></section>
+    {query.isPending ? <div className="console-empty">Loading immutable report revision…</div> : query.isError ? <div className="console-alert" role="alert">Report request failed: {query.error.message}</div> : displayedReport == null ? <EmptyReport onGenerate={() => generation.mutate()} /> : <ReportConsole report={displayedReport} pinned={displayedIsPinned} />}
+    <section className="report-panel" aria-labelledby="report-history-title"><header className="report-panel__header"><div><span className="console-kicker">IMMUTABLE REVISION HISTORY</span><h2 id="report-history-title">Reports / failed jobs</h2></div></header><div className="console-table-wrap"><table><thead><tr><th>Revision</th><th>Status</th><th>Requested</th><th>Default</th><th>Actions</th></tr></thead><tbody>{history.data?.map((item) => <tr key={item.jobId}><td>#{item.revisionNumber || "—"}</td><td>{item.status}</td><td>{new Date(item.requestedAt).toLocaleString()}</td><td>{item.pinned ? "PINNED" : "—"}</td><td>{item.status === "SUCCEEDED" && <><button onClick={() => void fetchReportRevision(item.revisionId).then((report) => setPreview({ scopeKey, report }))}>PREVIEW</button><button onClick={() => void pinReport(scopeKey, item.revisionId).then(() => { setPreview(null); return queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey] }); })}>PIN</button></>}</td></tr>)}</tbody></table></div></section>
   </main>;
 }
 
 function CurrentContextStrip() {
-  const [context, setContext] = useState<{ state: string; sequence: number | null; sources: { source: string; freshness: string; value: Record<string, string> | null }[] }>({ state: "CONNECTING", sequence: null, sources: [] });
+  const [context, setContext] = useState<{ state: string; sessionId: string | null; sequence: number | null; sources: { source: string; freshness: string; value: Record<string, string> | null }[] }>({ state: "CONNECTING", sessionId: null, sequence: null, sources: [] });
   useEffect(() => {
     if (typeof WebSocket === "undefined") return undefined;
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const socket = new WebSocket(`${protocol}://${window.location.host}/ops/current-context/ws`);
-    socket.onmessage = (event) => {
-      const envelope = JSON.parse(String(event.data)) as { sequence: number; sources: { source: string; freshness: string; value: Record<string, string> | null }[] };
-      setContext((current) => current.sequence != null && envelope.sequence !== current.sequence + 1 ? { state: "RESYNCING", sequence: envelope.sequence, sources: envelope.sources } : { state: "CONNECTED", sequence: envelope.sequence, sources: envelope.sources });
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
+    const reconnect = () => {
+      if (stopped) return;
+      setContext((current) => ({ ...current, state: "RESYNCING" }));
+      reconnectTimer = setTimeout(connect, 1000);
     };
-    socket.onclose = () => setContext((current) => ({ ...current, state: "DISCONNECTED" }));
-    socket.onerror = () => setContext((current) => ({ ...current, state: "DISCONNECTED" }));
-    return () => socket.close();
+    const armHeartbeatTimeout = () => {
+      if (heartbeatTimer) clearTimeout(heartbeatTimer);
+      heartbeatTimer = setTimeout(() => { socket?.close(); }, 45_000);
+    };
+    const connect = () => {
+      socket = new WebSocket(`${protocol}://${window.location.host}/ops/current-context/ws`);
+      socket.onmessage = (event) => {
+        try {
+          const envelope = JSON.parse(String(event.data)) as { protocolVersion: number; type: string; sessionId: string; sequence: number; sources: { source: string; freshness: string; value: Record<string, string> | null }[] };
+          setContext((current) => {
+            const fullSnapshot = envelope.protocolVersion === 1 && envelope.type === "SNAPSHOT" && envelope.sequence === 1;
+            if (current.state === "RESYNCING" || current.sessionId == null) {
+              if (!fullSnapshot) { socket?.close(); return current; }
+              return { state: "CONNECTED", sessionId: envelope.sessionId, sequence: envelope.sequence, sources: envelope.sources };
+            }
+            const validEnvelope = envelope.protocolVersion === 1 && envelope.sessionId === current.sessionId &&
+              envelope.sequence === (current.sequence ?? 0) + 1 && ["UPDATE", "HEARTBEAT"].includes(envelope.type);
+            if (!validEnvelope) { socket?.close(); return { ...current, state: "RESYNCING" }; }
+            return { ...current, state: "CONNECTED", sequence: envelope.sequence, sources: envelope.type === "UPDATE" ? envelope.sources : current.sources };
+          });
+          armHeartbeatTimeout();
+        } catch {
+          socket?.close();
+        }
+      };
+      socket.onclose = reconnect;
+      socket.onerror = () => socket?.close();
+      armHeartbeatTimeout();
+    };
+    connect();
+    return () => {
+      stopped = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (heartbeatTimer) clearTimeout(heartbeatTimer);
+      socket?.close();
+    };
   }, []);
   const quote = context.sources.find((source) => source.source === "MARKET_QUOTE");
   const runtime = context.sources.find((source) => source.source === "RUNTIME_STATE");
@@ -75,24 +126,24 @@ function EmptyReport({ onGenerate }: { onGenerate: () => void }) {
   return <section className="console-empty"><h2>No immutable report revision</h2><p>Generate a report to snapshot eligible paper evidence. Missing data is retained as missing.</p><button className="generate-button" onClick={onGenerate}>GENERATE 30D REPORT</button></section>;
 }
 
-function ReportConsole({ report }: { report: EvaluationReport }) {
+function ReportConsole({ report, pinned }: { report: EvaluationReport; pinned: boolean }) {
   const firstConflict = report.validation.find((result) => result.status === "CONFLICT")?.claimId;
   const [selectedClaim, setSelectedClaim] = useState<string | null>(firstConflict ?? report.claims[0]?.claimId ?? null);
 
   return <>
-    <RevisionRail report={report} />
-    <ReportStage report={report} selectedClaim={selectedClaim} onSelectClaim={setSelectedClaim} />
+    <RevisionRail report={report} pinned={pinned} />
+    <ReportStage report={report} pinned={pinned} selectedClaim={selectedClaim} onSelectClaim={setSelectedClaim} />
     <EvidenceSummary report={report} />
     <DeterministicEvidenceBoard report={report} />
-    <HistoricalOutcomeRidge report={report} />
+    <LazyHistoricalOutcomeRidge report={report} />
     <LazyEvidenceRelationshipGraph report={report} selectedClaim={selectedClaim} onSelectClaim={setSelectedClaim} />
   </>;
 }
 
-function RevisionRail({ report }: { report: EvaluationReport }) {
+function RevisionRail({ report, pinned }: { report: EvaluationReport; pinned: boolean }) {
   const verified = report.validation.filter((result) => result.status === "VERIFIED").length;
   return <section className="revision-rail" aria-label="Immutable report revision metadata">
-    <div><span>Revision</span><strong>#{report.revisionNumber} · PINNED</strong><small>{report.scopeKey}</small></div>
+    <div><span>Revision</span><strong>#{report.revisionNumber} · {pinned ? "PINNED" : "PREVIEW"}</strong><small>{report.scopeKey}</small></div>
     <div><span>Snapshot authority</span><strong>{report.snapshotId.slice(0, 12)}</strong><small>{report.inputHash.slice(0, 20)}</small></div>
     <div><span>Input as of</span><strong>{new Date(report.inputAsOf).toLocaleString()}</strong><small>{report.period.from} — {report.period.toInclusive}</small></div>
     <div><span>Generator</span><strong>{report.provider}</strong><small>{report.model}</small></div>
@@ -101,13 +152,13 @@ function RevisionRail({ report }: { report: EvaluationReport }) {
   </section>;
 }
 
-function ReportStage({ report, selectedClaim, onSelectClaim }: { report: EvaluationReport; selectedClaim: string | null; onSelectClaim: (claimId: string) => void }) {
+function ReportStage({ report, pinned, selectedClaim, onSelectClaim }: { report: EvaluationReport; pinned: boolean; selectedClaim: string | null; onSelectClaim: (claimId: string) => void }) {
   const selected = report.claims.find((claim) => claim.claimId === selectedClaim);
   const validation = report.validation.find((result) => result.claimId === selectedClaim);
   const facts = useMemo(() => report.facts.filter((fact) => selected?.factIds.includes(fact.factId)), [report.facts, selected]);
 
   return <section className="report-stage report-panel" aria-labelledby="report-title">
-    <header className="report-panel__header"><div><span className="console-kicker">PINNED REPORT ARTIFACT · EXPLANATION ONLY</span><h2 id="report-title">{report.title}</h2></div><span className="report-status">{report.validation.some((result) => result.status === "CONFLICT") ? "WARNING" : "VALIDATED"}</span></header>
+    <header className="report-panel__header"><div><span className="console-kicker">{pinned ? "PINNED" : "HISTORY PREVIEW"} REPORT ARTIFACT · EXPLANATION ONLY</span><h2 id="report-title">{report.title}</h2></div><span className="report-status">{report.validation.some((result) => result.status === "CONFLICT") ? "WARNING" : "VALIDATED"}</span></header>
     <div className="report-stage__grid"><div className="report-prose">{report.segments.map((segment) => {
       const results = report.validation.filter((result) => segment.claimIds.includes(result.claimId));
       const conflict = results.some((result) => result.status === "CONFLICT");

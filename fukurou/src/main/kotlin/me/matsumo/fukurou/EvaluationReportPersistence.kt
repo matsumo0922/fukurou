@@ -6,6 +6,7 @@
     "FunctionSignature",
     "PropertyWrapping",
     "TrailingCommaOnCallSite",
+    "TooManyFunctions",
 )
 
 package me.matsumo.fukurou
@@ -14,6 +15,14 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
+import me.matsumo.fukurou.trading.persistence.finishLlmLaunchInTransaction
+import me.matsumo.fukurou.trading.persistence.tryReserveLlmLaunchInTransaction
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Clock
 import java.time.Duration
@@ -29,19 +38,51 @@ internal class EvaluationReportPersistence(
     private val clock: Clock,
 ) {
     init {
-        exposedTransaction(database) { ensureSchema() }
+        exposedTransaction(database) {
+            ensureSchema()
+            recoverInterruptedJobs()
+        }
     }
 
-    /** quota/concurrency check、job identity、LLM reservation を atomic に作成する。 */
-    fun admit(job: EvaluationReportJobResponse, scopeKey: String): Result<Unit> = runCatching {
+    /** request identity、revision number、共通 LLM reservation または rejection を atomic に保存する。 */
+    fun admit(job: EvaluationReportJobResponse, scopeKey: String): Result<EvaluationReportAdmission> = runCatching {
         exposedTransaction(database) {
-            val now = clock.instant().toEpochMilli()
-            advisoryLock()
-            requireNoConcurrentInvocation(now)
-            requireReportRateLimit(now)
-            requireLlmHeadroom(now)
-            insertJob(job, scopeKey, now)
-            insertReservation(job, now)
+            val now = clock.instant()
+            val numberedJob = job.copy(revisionNumber = nextRevisionNumberInTransaction())
+            val reportRateExceeded = count(
+                "SELECT COUNT(*) FROM evaluation_report_jobs WHERE requested_at >= ?",
+                now.minus(Duration.ofHours(1)).toEpochMilli(),
+            ) >= 3L
+            val outcome = if (reportRateExceeded) {
+                LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR)
+            } else {
+                tryReserveLlmLaunchInTransaction(
+                    LlmLaunchReservationRequest(
+                        invocationId = numberedJob.jobId,
+                        triggerKind = LlmDaemonTriggerKind.EVALUATION_REPORT,
+                        triggerKey = "evaluation-report:$scopeKey",
+                        reservedAt = now,
+                        runnerConfig = runnerConfig,
+                        hourlyWindow = Duration.ofHours(1),
+                        dailyWindow = Duration.ofDays(1),
+                        activeReservationStaleAfter = staleAfter,
+                    ),
+                )
+            }
+            val persistedJob = when (outcome) {
+                is LlmLaunchReservationOutcome.Reserved -> numberedJob
+                is LlmLaunchReservationOutcome.Rejected -> numberedJob.copy(
+                    status = "REJECTED",
+                    stage = "REJECTED",
+                    failureCode = outcome.reason.name,
+                    failureMessage = "Report admission was rejected by the shared LLM launch policy.",
+                    activeInvocationId = outcome.activeReservation?.invocationId,
+                    retryAfterSeconds = retryAfterSeconds(outcome.reason),
+                )
+            }
+            insertJob(persistedJob, scopeKey, now.toEpochMilli())
+
+            EvaluationReportAdmission(persistedJob, outcome)
         }
     }
 
@@ -58,14 +99,28 @@ internal class EvaluationReportPersistence(
                 statement.setObject(6, UUID.fromString(job.jobId))
                 check(statement.executeUpdate() == 1)
             }
-            if (job.status == "SUCCEEDED" || job.status == "FAILED") finishReservation(job)
+        }
+    }
+
+    fun saveSnapshot(snapshotId: String, scopeKey: String, payload: String, inputHash: String): Result<Unit> = runCatching {
+        exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                "INSERT INTO evaluation_report_snapshots (snapshot_id, scope_key, canonical_payload, input_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+            ).use { statement ->
+                statement.setObject(1, UUID.fromString(snapshotId))
+                statement.setString(2, scopeKey)
+                statement.setString(3, payload)
+                statement.setString(4, inputHash)
+                statement.setLong(5, clock.instant().toEpochMilli())
+                statement.executeUpdate()
+            }
         }
     }
 
     fun job(jobId: String): Result<EvaluationReportJobResponse?> = runCatching {
         exposedTransaction(database) {
             jdbcConnection().prepareStatement(
-                "SELECT revision_id, status, stage, failure_code, failure_message FROM evaluation_report_jobs WHERE job_id=?",
+                "SELECT revision_id, revision_number, status, stage, failure_code, failure_message, active_invocation_id, retry_after_seconds FROM evaluation_report_jobs WHERE job_id=?",
             ).use { statement ->
                 statement.setObject(1, UUID.fromString(jobId))
                 statement.executeQuery().use { result ->
@@ -74,31 +129,20 @@ internal class EvaluationReportPersistence(
                     EvaluationReportJobResponse(
                         jobId = jobId,
                         revisionId = result.getObject(1).toString(),
-                        status = result.getString(2),
-                        stage = result.getString(3),
-                        failureCode = result.getString(4),
-                        failureMessage = result.getString(5),
+                        revisionNumber = result.getLong(2),
+                        status = result.getString(3),
+                        stage = result.getString(4),
+                        failureCode = result.getString(5),
+                        failureMessage = result.getString(6),
+                        activeInvocationId = result.getString(7),
+                        retryAfterSeconds = result.getLong(8).takeUnless { result.wasNull() },
                     )
                 }
             }
         }
     }
 
-    fun nextRevisionNumber(): Result<Long> = runCatching {
-        exposedTransaction(database) {
-            advisoryLock()
-            jdbcConnection().prepareStatement(
-                "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM evaluation_report_revisions",
-            ).use { statement ->
-                statement.executeQuery().use { result ->
-                    check(result.next())
-                    result.getLong(1)
-                }
-            }
-        }
-    }
-
-    fun saveReport(report: EvaluationReportResponse): Result<Unit> = runCatching {
+    fun complete(report: EvaluationReportResponse, job: EvaluationReportJobResponse): Result<Unit> = runCatching {
         exposedTransaction(database) {
             jdbcConnection().prepareStatement(
                 """
@@ -126,6 +170,19 @@ internal class EvaluationReportPersistence(
                 statement.setLong(3, clock.instant().toEpochMilli())
                 statement.executeUpdate()
             }
+            updateJobInTransaction(job.copy(status = "SUCCEEDED", stage = "COMPLETE"))
+            finishLlmLaunchInTransaction(
+                LlmLaunchReservationFinish(job.jobId, LlmLaunchReservationStatus.FINISHED, null, clock.instant()),
+            )
+        }
+    }
+
+    fun fail(job: EvaluationReportJobResponse): Result<Unit> = runCatching {
+        exposedTransaction(database) {
+            updateJobInTransaction(job)
+            finishLlmLaunchInTransaction(
+                LlmLaunchReservationFinish(job.jobId, LlmLaunchReservationStatus.FAILED, job.failureCode, clock.instant()),
+            )
         }
     }
 
@@ -134,12 +191,15 @@ internal class EvaluationReportPersistence(
             jdbcConnection().prepareStatement(
                 """
                 SELECT revision.report_json
-                FROM evaluation_report_pins pin
-                JOIN evaluation_report_revisions revision ON revision.revision_id=pin.revision_id
-                WHERE pin.scope_key=?
+                FROM evaluation_report_revisions revision
+                LEFT JOIN evaluation_report_pins pin ON pin.revision_id=revision.revision_id AND pin.scope_key=?
+                WHERE revision.scope_key=?
+                ORDER BY (pin.revision_id IS NOT NULL) DESC, revision.revision_number DESC
+                LIMIT 1
                 """.trimIndent(),
             ).use { statement ->
                 statement.setString(1, scopeKey)
+                statement.setString(2, scopeKey)
                 statement.executeQuery().use { result ->
                     if (result.next()) PersistenceJson.decodeFromString(result.getString(1)) else null
                 }
@@ -151,7 +211,7 @@ internal class EvaluationReportPersistence(
         exposedTransaction(database) {
             jdbcConnection().prepareStatement(
                 """
-                SELECT job.job_id, job.revision_id, COALESCE(revision.revision_number, 0), job.status,
+                SELECT job.job_id, job.revision_id, job.revision_number, job.status,
                        job.requested_at, pin.revision_id IS NOT NULL
                 FROM evaluation_report_jobs job
                 LEFT JOIN evaluation_report_revisions revision ON revision.revision_id=job.revision_id
@@ -225,52 +285,30 @@ internal class EvaluationReportPersistence(
             """
             CREATE TABLE IF NOT EXISTS evaluation_report_jobs (
               job_id UUID PRIMARY KEY, revision_id UUID UNIQUE NOT NULL, scope_key VARCHAR(400) NOT NULL,
+              revision_number BIGINT NOT NULL,
               status VARCHAR(32) NOT NULL, stage VARCHAR(64) NOT NULL, failure_code VARCHAR(128),
-              failure_message TEXT, requested_at BIGINT NOT NULL, updated_at BIGINT NOT NULL
+              failure_message TEXT, active_invocation_id VARCHAR(255), retry_after_seconds BIGINT,
+              requested_at BIGINT NOT NULL, updated_at BIGINT NOT NULL
             );
+            CREATE SEQUENCE IF NOT EXISTS evaluation_report_revision_number_seq;
             CREATE TABLE IF NOT EXISTS evaluation_report_revisions (
               revision_id UUID PRIMARY KEY, job_id UUID UNIQUE NOT NULL REFERENCES evaluation_report_jobs(job_id),
               scope_key VARCHAR(400) NOT NULL, revision_number BIGINT NOT NULL, report_json TEXT NOT NULL, generated_at BIGINT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS evaluation_report_snapshots (
+              snapshot_id UUID PRIMARY KEY, scope_key VARCHAR(400) NOT NULL,
+              canonical_payload TEXT NOT NULL, input_hash VARCHAR(64) NOT NULL, created_at BIGINT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS evaluation_report_pins (
               scope_key VARCHAR(400) PRIMARY KEY, revision_id UUID NOT NULL REFERENCES evaluation_report_revisions(revision_id), pinned_at BIGINT NOT NULL
             );
             """.trimIndent(),
         )
-    }
-
-    private fun JdbcTransaction.advisoryLock() {
-        exec("SELECT pg_advisory_xact_lock(177)")
-    }
-
-    private fun JdbcTransaction.requireNoConcurrentInvocation(now: Long) {
-        val activeSince = now - staleAfter.toMillis()
-        val count = count(
-            "SELECT COUNT(*) FROM llm_launch_reservations WHERE status='RUNNING' AND reserved_at >= ?",
-            activeSince,
-        )
-        check(count == 0L) { "CONCURRENT_INVOCATION" }
-    }
-
-    private fun JdbcTransaction.requireReportRateLimit(now: Long) {
-        val count = count(
-            "SELECT COUNT(*) FROM evaluation_report_jobs WHERE requested_at >= ?",
-            now - Duration.ofHours(1).toMillis(),
-        )
-        check(count < 3L) { "REPORT_RATE_LIMIT" }
-    }
-
-    private fun JdbcTransaction.requireLlmHeadroom(now: Long) {
-        val hourly = count(
-            "SELECT COUNT(*) FROM llm_launch_reservations WHERE reserved_at >= ?",
-            now - Duration.ofHours(1).toMillis(),
-        )
-        val daily = count(
-            "SELECT COUNT(*) FROM llm_launch_reservations WHERE reserved_at >= ?",
-            now - Duration.ofDays(1).toMillis(),
-        )
-        check(hourly < (runnerConfig.maxInvocationsPerHour - 1).coerceAtLeast(0)) { "QUOTA_EXHAUSTED" }
-        check(daily < (runnerConfig.maxInvocationsPerDay - 1).coerceAtLeast(0)) { "QUOTA_EXHAUSTED" }
+        exec("ALTER TABLE evaluation_report_jobs ADD COLUMN IF NOT EXISTS revision_number BIGINT")
+        exec("ALTER TABLE evaluation_report_jobs ADD COLUMN IF NOT EXISTS active_invocation_id VARCHAR(255)")
+        exec("ALTER TABLE evaluation_report_jobs ADD COLUMN IF NOT EXISTS retry_after_seconds BIGINT")
+        exec("UPDATE evaluation_report_jobs SET revision_number=nextval('evaluation_report_revision_number_seq') WHERE revision_number IS NULL")
+        exec("ALTER TABLE evaluation_report_jobs ALTER COLUMN revision_number SET NOT NULL")
     }
 
     private fun JdbcTransaction.count(sql: String, since: Long): Long {
@@ -289,42 +327,80 @@ internal class EvaluationReportPersistence(
         now: Long,
     ) {
         jdbcConnection().prepareStatement(
-            "INSERT INTO evaluation_report_jobs VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+            "INSERT INTO evaluation_report_jobs (job_id, revision_id, scope_key, revision_number, status, stage, failure_code, failure_message, active_invocation_id, retry_after_seconds, requested_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         ).use { statement ->
             statement.setObject(1, UUID.fromString(job.jobId))
             statement.setObject(2, UUID.fromString(job.revisionId))
             statement.setString(3, scopeKey)
-            statement.setString(4, job.status)
-            statement.setString(5, job.stage)
-            statement.setLong(6, now)
-            statement.setLong(7, now)
+            statement.setLong(4, job.revisionNumber)
+            statement.setString(5, job.status)
+            statement.setString(6, job.stage)
+            statement.setString(7, job.failureCode)
+            statement.setString(8, job.failureMessage)
+            statement.setString(9, job.activeInvocationId)
+            job.retryAfterSeconds?.let { statement.setLong(10, it) }
+                ?: statement.setNull(10, java.sql.Types.BIGINT)
+            statement.setLong(11, now)
+            statement.setLong(12, now)
             statement.executeUpdate()
         }
     }
 
-    private fun JdbcTransaction.insertReservation(job: EvaluationReportJobResponse, now: Long) {
-        jdbcConnection().prepareStatement(
-            "INSERT INTO llm_launch_reservations (id, invocation_id, trigger_kind, trigger_key, status, reserved_at) VALUES (?, ?, 'EVALUATION_REPORT', ?, 'RUNNING', ?)",
-        ).use { statement ->
-            statement.setObject(1, UUID.randomUUID())
-            statement.setString(2, job.jobId)
-            statement.setString(3, "evaluation-report:${job.revisionId}")
-            statement.setLong(4, now)
-            statement.executeUpdate()
-        }
-    }
+    private fun JdbcTransaction.nextRevisionNumberInTransaction(): Long =
+        exec("SELECT nextval('evaluation_report_revision_number_seq')") { result ->
+            result.next()
+            result.getLong(1)
+        } ?: error("revision sequence did not return a value")
 
-    private fun JdbcTransaction.finishReservation(job: EvaluationReportJobResponse) {
+    private fun JdbcTransaction.updateJobInTransaction(job: EvaluationReportJobResponse) {
         jdbcConnection().prepareStatement(
-            "UPDATE llm_launch_reservations SET status=?, finished_at=?, reason=? WHERE invocation_id=? AND status='RUNNING'",
+            "UPDATE evaluation_report_jobs SET status=?, stage=?, failure_code=?, failure_message=?, updated_at=? WHERE job_id=?",
         ).use { statement ->
-            statement.setString(1, if (job.status == "SUCCEEDED") "FINISHED" else "FAILED")
-            statement.setLong(2, clock.instant().toEpochMilli())
+            statement.setString(1, job.status)
+            statement.setString(2, job.stage)
             statement.setString(3, job.failureCode)
-            statement.setString(4, job.jobId)
-            statement.executeUpdate()
+            statement.setString(4, job.failureMessage)
+            statement.setLong(5, clock.instant().toEpochMilli())
+            statement.setObject(6, UUID.fromString(job.jobId))
+            check(statement.executeUpdate() == 1)
         }
     }
+
+    private fun JdbcTransaction.recoverInterruptedJobs() {
+        val now = clock.instant().toEpochMilli()
+        exec(
+            "UPDATE evaluation_report_jobs SET status='FAILED', stage='FAILED', failure_code='FAILED_PROCESS_INTERRUPTED', failure_message='Server restarted before report generation completed.', updated_at=" +
+                now + " WHERE status IN ('REQUESTED','RUNNING')",
+        )
+        if (relationExists("llm_launch_reservations")) {
+            exec(
+                "UPDATE llm_launch_reservations SET status='FAILED', reason='FAILED_PROCESS_INTERRUPTED', finished_at=" +
+                    now + " WHERE trigger_kind='EVALUATION_REPORT' AND status='RUNNING'",
+            )
+        }
+    }
+
+    private fun JdbcTransaction.relationExists(name: String): Boolean =
+        jdbcConnection().prepareStatement("SELECT to_regclass(?) IS NOT NULL").use { statement ->
+            statement.setString(1, name)
+            statement.executeQuery().use { rows -> rows.next() && rows.getBoolean(1) }
+        }
+}
+
+internal data class EvaluationReportAdmission(
+    val job: EvaluationReportJobResponse,
+    val reservationOutcome: LlmLaunchReservationOutcome,
+)
+
+private fun retryAfterSeconds(reason: LlmLaunchReservationRejectionReason): Long = when (reason) {
+    LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION -> 15
+    LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR,
+    LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM,
+    -> Duration.ofHours(1).seconds
+    LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY,
+    LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM,
+    -> Duration.ofDays(1).seconds
+    LlmLaunchReservationRejectionReason.HARD_HALT -> 60
 }
 
 private val PersistenceJson = Json {

@@ -39,6 +39,32 @@ class CurrentContextWebSocketRouteTest {
             assertEquals("SNAPSHOT", envelope.type)
             assertEquals("FRESH", envelope.sources.first { source -> source.source == "MARKET_QUOTE" }.freshness)
             assertEquals("100", envelope.sources.first().value?.get("bidPriceJpy"))
+            assertEquals(15_000, envelope.sources.first().staleAfterMillis)
+            assertEquals(observedAt.plusSeconds(2).toString(), envelope.sources.first().receivedAt)
+        }
+    }
+
+    @Test
+    fun websocket_marksQuoteStaleFromObservedTimestamp() = testApplication {
+        val observedAt = Instant.parse("2026-07-12T00:00:00Z")
+        val store = LatestMarketQuoteStore().apply {
+            update(LatestMarketQuote(BigDecimal("100"), BigDecimal("102"), observedAt))
+        }
+        application {
+            module(
+                latestMarketQuoteStore = store,
+                clock = Clock.fixed(observedAt.plusSeconds(16), ZoneOffset.UTC),
+            )
+        }
+        val client = createClient { install(WebSockets) }
+
+        client.webSocket("/ops/current-context/ws") {
+            val envelope = ApiJson.decodeFromString<CurrentContextEnvelopeResponse>(
+                (incoming.receive() as Frame.Text).readText(),
+            )
+
+            assertEquals("STALE", envelope.sources.first { source -> source.source == "MARKET_QUOTE" }.freshness)
+            assertEquals("UNAVAILABLE", envelope.sources.first { source -> source.source == "PAPER_ACCOUNT" }.freshness)
         }
     }
 }

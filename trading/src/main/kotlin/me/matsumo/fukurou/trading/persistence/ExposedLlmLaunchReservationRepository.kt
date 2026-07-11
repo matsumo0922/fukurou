@@ -92,7 +92,7 @@ class ExposedLlmLaunchReservationRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    tryReserveInTransaction(request)
+                    tryReserveLlmLaunchInTransaction(request)
                 }
             }
         }
@@ -102,7 +102,7 @@ class ExposedLlmLaunchReservationRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    finishInTransaction(finish)
+                    finishLlmLaunchInTransaction(finish)
                 }
             }
         }
@@ -142,7 +142,8 @@ class ExposedLlmLaunchReservationRepository(
     }
 }
 
-private fun JdbcTransaction.tryReserveInTransaction(
+/** risk_state row lock と共通 quota policy を使って LLM 起動を予約する。 */
+fun JdbcTransaction.tryReserveLlmLaunchInTransaction(
     request: LlmLaunchReservationRequest,
 ): LlmLaunchReservationOutcome {
     val riskState = selectRiskState(forUpdate = true)
@@ -207,7 +208,8 @@ private fun JdbcTransaction.insertReservation(request: LlmLaunchReservationReque
     }
 }
 
-private fun JdbcTransaction.finishInTransaction(finish: LlmLaunchReservationFinish) {
+/** 既存予約を同じ caller transaction 内で terminal にする。 */
+fun JdbcTransaction.finishLlmLaunchInTransaction(finish: LlmLaunchReservationFinish) {
     val updatedRows = jdbcConnection().prepareStatement(FINISH_LLM_LAUNCH_RESERVATION_SQL).use { statement ->
         statement.setString(1, finish.status.name)
         statement.setLong(2, finish.finishedAt.toEpochMilli())

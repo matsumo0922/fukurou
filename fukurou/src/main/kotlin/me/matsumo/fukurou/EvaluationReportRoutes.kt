@@ -3,6 +3,7 @@
 package me.matsumo.fukurou
 
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.HttpHeaders
 import io.ktor.openapi.jsonSchema
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
@@ -55,6 +56,7 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
         marketDataSource = dependencies.marketDataSource,
         symbol = dependencies.tradingConfig.symbol,
         llmInvoker = dependencies.llmInvoker,
+        llmInvocationAuditor = dependencies.llmInvocationAuditor,
         environment = dependencies.environment,
         persistence = dependencies.database?.let { database ->
             EvaluationReportPersistence(
@@ -76,10 +78,13 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
         }
 
         val job = runCatching { store.request(scope) }.getOrElse { error ->
-            val code = error.message ?: "REPORT_ADMISSION_FAILED"
-            val status = if (code == "CONCURRENT_INVOCATION") HttpStatusCode.Conflict else HttpStatusCode.TooManyRequests
-
-            call.respond(status, EvaluationReportAdmissionErrorResponse(code))
+            call.respond(HttpStatusCode.InternalServerError, ErrorResponse(error.message ?: "report admission failed"))
+            return@post
+        }
+        if (job.status == "REJECTED") {
+            job.retryAfterSeconds?.let { seconds -> call.response.headers.append(HttpHeaders.RetryAfter, seconds.toString()) }
+            val status = if (job.failureCode == "CONCURRENT_INVOCATION") HttpStatusCode.Conflict else HttpStatusCode.TooManyRequests
+            call.respond(status, job)
             return@post
         }
         call.application.launch {
@@ -94,8 +99,14 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
         responses {
             HttpStatusCode.Accepted { schema = jsonSchema<EvaluationReportJobResponse>() }
             HttpStatusCode.BadRequest { schema = jsonSchema<ErrorResponse>() }
-            HttpStatusCode.Conflict { schema = jsonSchema<EvaluationReportAdmissionErrorResponse>() }
-            HttpStatusCode.TooManyRequests { schema = jsonSchema<EvaluationReportAdmissionErrorResponse>() }
+            HttpStatusCode.Conflict {
+                description = "共通 LLM reservation が使用中です。Retry-After と rejected job を返します。"
+                schema = jsonSchema<EvaluationReportJobResponse>()
+            }
+            HttpStatusCode.TooManyRequests {
+                description = "起動予算または report request rate を超過しました。Retry-After と rejected job を返します。"
+                schema = jsonSchema<EvaluationReportJobResponse>()
+            }
             HttpStatusCode.InternalServerError { schema = jsonSchema<ErrorResponse>() }
         }
     }
@@ -113,6 +124,16 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
         summary = "既定の評価レポートを取得する"
         description = "選択期間へ pin された immutable revision と deterministic evidence snapshot を返します。current context は含みません。"
         tag(EVALUATION_REPORT_TAG)
+        parameters {
+            query("scopeKey") {
+                description = "PRESET:30D または CUSTOM:from:to の report scope key です。"
+                schema = jsonSchema<String>()
+            }
+            query("days") {
+                description = "scopeKey 省略時の互換 preset 日数です。"
+                schema = jsonSchema<Int>()
+            }
+        }
         responses {
             HttpStatusCode.OK { schema = jsonSchema<EvaluationReportResponse>() }
             HttpStatusCode.NotFound { schema = jsonSchema<ErrorResponse>() }
@@ -145,6 +166,16 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
         summary = "評価レポート履歴を取得する"
         description = "生成 request ごとに保持する immutable revision 履歴を新しい順で返します。"
         tag(EVALUATION_REPORT_TAG)
+        parameters {
+            query("scopeKey") {
+                description = "履歴対象の report scope key です。"
+                schema = jsonSchema<String>()
+            }
+            query("days") {
+                description = "scopeKey 省略時の互換 preset 日数です。"
+                schema = jsonSchema<Int>()
+            }
+        }
         responses { HttpStatusCode.OK { schema = jsonSchema<EvaluationReportHistoryResponse>() } }
     }
 
@@ -190,6 +221,16 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
         summary = "評価レポート pin を解除する"
         description = "artifact を削除せず、scope の明示 pin だけを解除します。"
         tag(EVALUATION_REPORT_TAG)
+        parameters {
+            query("scopeKey") {
+                description = "pin を解除する report scope key です。"
+                schema = jsonSchema<String>()
+            }
+            query("days") {
+                description = "scopeKey 省略時の互換 preset 日数です。"
+                schema = jsonSchema<Int>()
+            }
+        }
         responses { HttpStatusCode.NoContent { description = "pin を解除しました。" } }
     }
 }
@@ -200,6 +241,7 @@ private class EvaluationReportStore(
     private val marketDataSource: MarketDataSource?,
     private val symbol: me.matsumo.fukurou.trading.domain.TradingSymbol,
     private val llmInvoker: LlmInvoker?,
+    private val llmInvocationAuditor: me.matsumo.fukurou.trading.runner.LlmInvocationAuditor?,
     private val environment: Map<String, String>,
     private val persistence: EvaluationReportPersistence?,
     private val clock: Clock,
@@ -216,10 +258,12 @@ private class EvaluationReportStore(
             status = "REQUESTED",
             stage = "ADMITTED",
         )
-        persistence?.admit(job, scope.key)?.getOrThrow()
-        synchronized(jobs) { jobs[job.jobId] = job }
+        val admittedJob = persistence?.admit(job, scope.key)?.getOrThrow()?.job ?: job.copy(
+            revisionNumber = revisionSequence.incrementAndGet(),
+        )
+        synchronized(jobs) { jobs[admittedJob.jobId] = admittedJob }
 
-        return job
+        return admittedJob
     }
 
     @Suppress("LongMethod", "CyclomaticComplexMethod")
@@ -236,21 +280,23 @@ private class EvaluationReportStore(
             from = from.atStartOfDay(ReportZone).toInstant(),
             toExclusive = toInclusive.plusDays(1).atStartOfDay(ReportZone).toInstant(),
         )
-        val queryResult = source.fetchClosedTrades(period).getOrThrow()
+        val snapshotId = UUID.randomUUID().toString()
+        val snapshot = source.fetchReportSnapshot(period).getOrThrow()
+        val queryResult = snapshot.trades
+        require(!queryResult.truncated) { "SNAPSHOT_TRUNCATED" }
         val candles = marketDataSource?.getCandles(
             symbol = symbol,
             interval = CandleInterval.ONE_DAY,
             limit = (scope.days + 40).coerceAtMost(500),
-        )?.getOrDefault(emptyList()).orEmpty()
+        )?.getOrThrow() ?: error("market data source is unavailable")
         val regimes = EvaluationMath.classifyMarketRegimes(candles, ReportZone)
         val stats = EvaluationMath.summarizeTrades(queryResult.trades)
         val ridge = EvaluationMath.historicalOutcomeRidges(queryResult.trades, ReportZone, regimes)
-        val baselineEquity = source.fetchInitialCashJpy().getOrThrow()
-            .add(source.sumTradePnlBefore(period.from).getOrThrow())
+        val baselineEquity = snapshot.initialCashJpy.add(snapshot.priorPnlJpy)
         val benchmark = EvaluationMath.benchmark(
             BenchmarkCalculationRequest(
                 candles = candles,
-                dailyPnlFacts = source.fetchDailyTradePnl(period).getOrThrow(),
+                dailyPnlFacts = snapshot.dailyPnl,
                 baselineEquityJpy = baselineEquity,
                 fromDate = from,
                 toDateInclusive = toInclusive,
@@ -259,9 +305,9 @@ private class EvaluationReportStore(
         )
         val calibration = buildCalibrationResponse(queryResult.trades)
         val performanceLattice = buildPerformanceLattice(queryResult.trades, regimes)
-        val usageResult = source.fetchLlmPhaseUsages(period).getOrThrow()
+        val usageResult = snapshot.usages
         val costStats = EvaluationMath.summarizeLlmCosts(usageResult.facts)
-        val exclusions = source.fetchExclusionSummary(period).getOrThrow()
+        val exclusions = snapshot.exclusions
         val benchmarkFacts = benchmark.points.flatMap { point ->
             listOf(
                 EvaluationReportFact("benchmark.${point.date}.botEquityJpy", point.botEquityJpy.toPlainString(), "JPY", "AVAILABLE", listOf("paper-ledger")),
@@ -324,39 +370,39 @@ private class EvaluationReportStore(
             EvaluationReportClaim("claim-pnl-direction", "FACT_DIRECTION", listOf("performance.totalPnlJpy"), direction(stats.totalPnlJpy)),
             EvaluationReportClaim("claim-trade-count", "FACT_VALUE", listOf("performance.tradeCount"), stats.tradeCount.toString()),
         )
+        val canonical = buildCanonicalSnapshot(
+            from = from,
+            toInclusive = toInclusive,
+            facts = facts,
+            ridge = ridge,
+            benchmark = benchmark,
+            calibration = calibration,
+            performanceLattice = performanceLattice,
+            exclusions = exclusions.reasons,
+            phaseCount = costStats.phaseCount,
+            missingUsageCount = costStats.missingUsagePhaseCount,
+            unpricedCount = costStats.unpricedPhaseCount,
+        )
+        val inputHash = sha256(canonical)
+        persistence?.saveSnapshot(snapshotId, scope.key, canonical, inputHash)?.getOrThrow()
         updateJob(job.copy(status = "RUNNING", stage = "GENERATING_REPORT"))
-        val artifact = generateArtifact(
+        val generated = generateArtifact(
             fallbackClaims = claims,
             facts = facts,
             days = scope.days,
-            snapshotId = UUID.randomUUID().toString(),
+            snapshotId = snapshotId,
+            invocationId = job.jobId,
         )
+        val artifact = generated.artifact
         updateJob(job.copy(status = "RUNNING", stage = "VALIDATING"))
+        validateGeneratedArtifact(artifact)
         val validation = EvaluationClaimValidator.validate(artifact.claims.toDomain(), facts)
         validateSnapshotReferences(
             facts = facts,
             sourceIds = setOf("paper-ledger", "daily-candles", "exclusion-audit", "runner-audit"),
             chartIndex = chartIndex,
-            claims = artifact.claims,
         )
-        val canonical = buildString {
-            append(from).append('|').append(toInclusive).append('|').append(queryResult.truncated)
-            facts.forEach { fact -> append('|').append(fact.factId).append('=').append(fact.value) }
-            ridge.groupings.forEach { grouping ->
-                grouping.groups.forEach { group ->
-                    val binCounts = group.bins.joinToString { bin -> bin.count.toString() }
-
-                    append('|').append(grouping.groupBy).append(':').append(group.groupKey).append(':').append(binCounts)
-                }
-            }
-            append("|benchmarkReturns=").append(benchmark.botReturn).append(':').append(benchmark.buyAndHoldReturn)
-            append("|calibrationState=").append(calibration.state)
-            append("|latticeState=").append(performanceLattice.state)
-            append("|exclusions=").append(exclusions.reasons.toSortedMap())
-            append("|usageCoverage=").append(costStats.phaseCount).append(':')
-                .append(costStats.missingUsagePhaseCount).append(':').append(costStats.unpricedPhaseCount)
-        }
-        val revisionNumber = persistence?.nextRevisionNumber()?.getOrThrow() ?: revisionSequence.incrementAndGet()
+        val revisionNumber = job.revisionNumber
         val report = EvaluationReportResponse(
             jobId = job.jobId,
             revisionId = job.revisionId,
@@ -365,11 +411,12 @@ private class EvaluationReportStore(
             status = "SUCCEEDED",
             period = EvaluationReportPeriodResponse(from.toString(), toInclusive.toString(), ReportZone.id),
             inputAsOf = clock.instant().toString(),
-            inputHash = sha256(canonical),
-            snapshotId = UUID.randomUUID().toString(),
+            inputHash = inputHash,
+            snapshotId = snapshotId,
             generatedAt = clock.instant().toString(),
             provider = if (llmInvoker == null) "DETERMINISTIC_FALLBACK" else LlmProvider.CLAUDE.name,
             model = environment["FUKUROU_CLAUDE_MODEL"] ?: "CLI_DEFAULT",
+            generation = generated.metadata,
             title = "${scope.label} PERFORMANCE / EVIDENCE REVIEW",
             segments = artifact.segments,
             claims = artifact.claims,
@@ -414,19 +461,22 @@ private class EvaluationReportStore(
             ),
             truncated = queryResult.truncated,
         )
-        synchronized(reports) { reports.getOrPut(scope.key) { mutableListOf() }.add(0, report) }
-        persistence?.saveReport(report)?.getOrThrow()
-        updateJob(job.copy(status = "SUCCEEDED", stage = "COMPLETE"))
+        persistence?.complete(report, job)?.getOrThrow()
+        synchronized(reports) {
+            reports.getOrPut(scope.key) { mutableListOf() }.add(0, report)
+            pins[scope.key] = report.revisionId
+        }
+        synchronized(jobs) { jobs[job.jobId] = job.copy(status = "SUCCEEDED", stage = "COMPLETE") }
         report
     }.onFailure { error ->
-        updateJob(
-            job.copy(
-                status = "FAILED",
-                stage = "FAILED",
-                failureCode = error::class.simpleName ?: "REPORT_GENERATION_FAILED",
-                failureMessage = error.message?.take(300),
-            ),
+        val failedJob = job.copy(
+            status = "FAILED",
+            stage = "FAILED",
+            failureCode = error::class.simpleName ?: "REPORT_GENERATION_FAILED",
+            failureMessage = error.message?.take(300),
         )
+        persistence?.fail(failedJob)?.getOrThrow()
+        synchronized(jobs) { jobs[job.jobId] = failedJob }
     }
 
     private suspend fun generateArtifact(
@@ -434,15 +484,27 @@ private class EvaluationReportStore(
         facts: List<EvaluationReportFact>,
         days: Int,
         snapshotId: String,
-    ): GeneratedEvaluationArtifact {
-        val invoker = llmInvoker ?: return fallbackArtifact(fallbackClaims, facts, days)
-        val invocationId = UUID.randomUUID().toString()
+        invocationId: String,
+    ): GeneratedReportArtifact {
+        val invoker = llmInvoker ?: return GeneratedReportArtifact(
+            fallbackArtifact(fallbackClaims, facts),
+            EvaluationReportGenerationMetadataResponse(invocationId, "DETERMINISTIC_FALLBACK", null, null, null),
+        )
+        val auditor = requireNotNull(llmInvocationAuditor) { "LLM invocation auditor is unavailable" }
         val promptHash = sha256(facts.joinToString { fact -> "${fact.factId}=${fact.value}" })
         val workingDirectory = Files.createTempDirectory("fukurou-evaluation-report-")
         val safeEnvironment = environment.filterKeys { key -> key in REPORT_CHILD_ENV_ALLOWLIST }
-        val response = try {
-            invoker.invoke(
-                LlmInvocationRequest(
+        val audited = try {
+            auditor.invokeAndAudit(
+                phaseName = "evaluation_report",
+                context = DecisionRunContext(
+                    decisionRunId = invocationId,
+                    llmProvider = LlmProvider.CLAUDE.name,
+                    promptHash = promptHash,
+                    systemPromptVersion = "evaluation-report-v1",
+                    marketSnapshotId = snapshotId,
+                ),
+                request = LlmInvocationRequest(
                     invocationId = invocationId,
                     provider = LlmProvider.CLAUDE,
                     phase = LlmInvocationPhase.EVALUATION_REPORT,
@@ -460,19 +522,29 @@ private class EvaluationReportStore(
                     environment = safeEnvironment,
                     allowedTools = emptyList(),
                 ),
-            ).getOrThrow().responseText
+                llmInvoker = invoker,
+            ).getOrThrow()
         } finally {
             workingDirectory.toFile().deleteRecursively()
         }
-
-        return ReportJson.decodeFromString(response.removeJsonFence())
+        val usage = audited.invocationResult.usage
+        return GeneratedReportArtifact(
+            artifact = ReportJson.decodeFromString(audited.invocationResult.responseText.removeJsonFence()),
+            metadata = EvaluationReportGenerationMetadataResponse(
+                invocationId = invocationId,
+                provider = LlmProvider.CLAUDE.name,
+                durationMillis = audited.duration.toMillis(),
+                totalCostUsd = usage?.totalCostUsd?.toPlainString(),
+                observedModels = usage?.modelUsages?.map { model -> model.model }.orEmpty(),
+            ),
+        )
     }
 
     fun default(scopeKey: String): EvaluationReportResponse? = synchronized(reports) {
+        persistence?.default(scopeKey)?.getOrThrow()?.let { report -> return@synchronized report }
         val pinnedId = pins[scopeKey]
         reports[scopeKey]?.firstOrNull { report -> report.revisionId == pinnedId }
             ?: reports[scopeKey]?.firstOrNull()
-            ?: persistence?.default(scopeKey)?.getOrThrow()
     }
 
     fun job(jobId: String): EvaluationReportJobResponse? = synchronized(jobs) {
@@ -539,7 +611,6 @@ private fun validateSnapshotReferences(
     facts: List<EvaluationReportFact>,
     sourceIds: Set<String>,
     chartIndex: List<EvaluationChartIndexResponse>,
-    claims: List<EvaluationReportClaimResponse>,
 ) {
     val factIds = facts.map { fact -> fact.factId }.toSet()
     require(facts.size == factIds.size) { "duplicate fact ID" }
@@ -549,15 +620,42 @@ private fun validateSnapshotReferences(
 
     val chartFactsAreValid = chartIndex.flatMap { chart -> chart.factIds }.all { factId -> factId in factIds }
     require(chartFactsAreValid) { "dangling chart fact reference" }
+}
 
-    val claimFactsAreValid = claims.flatMap { claim -> claim.factIds }.all { factId -> factId in factIds }
-    require(claimFactsAreValid) { "dangling claim fact reference" }
+internal fun validateGeneratedArtifact(artifact: GeneratedEvaluationArtifact) {
+    require(artifact.segments.size in 1..12) { "report must contain 1..12 segments" }
+    require(artifact.claims.size <= 40) { "report must contain at most 40 claims" }
+    require(artifact.segments.sumOf { segment -> segment.text.length } <= 16_000) { "report body is too large" }
+    val idPattern = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+    val segmentIds = artifact.segments.map { segment -> segment.segmentId }
+    val claimIds = artifact.claims.map { claim -> claim.claimId }
+    require(segmentIds.distinct().size == segmentIds.size && segmentIds.all(idPattern::matches)) {
+        "segment IDs must be unique and bounded"
+    }
+    require(claimIds.distinct().size == claimIds.size && claimIds.all(idPattern::matches)) {
+        "claim IDs must be unique and bounded"
+    }
+    require(
+        artifact.segments.all { segment ->
+            segment.kind in setOf("SUMMARY", "PERFORMANCE", "COVERAGE", "LIMITATION") &&
+                segment.text.length in 1..4_000 &&
+                segment.claimIds.all { claimId -> claimId in claimIds } &&
+                (!segment.text.contains(Regex("[0-9]")) || segment.claimIds.isNotEmpty())
+        },
+    ) { "segment kind, text, or claim reference is invalid" }
+    require(
+        artifact.claims.all { claim ->
+            claim.type in setOf("FACT_VALUE", "FACT_DIRECTION", "FACT_COMPARISON") &&
+                claim.factIds.size in 1..2 &&
+                claim.factIds.all(idPattern::matches) &&
+                claim.asserted.length in 1..200
+        },
+    ) { "claim type, fact binding, or assertion is invalid" }
 }
 
 private fun fallbackArtifact(
     claims: List<EvaluationReportClaim>,
     facts: List<EvaluationReportFact>,
-    days: Int,
 ): GeneratedEvaluationArtifact = GeneratedEvaluationArtifact(
     segments = listOf(
         EvaluationReportSegmentResponse(
@@ -569,7 +667,7 @@ private fun fallbackArtifact(
         EvaluationReportSegmentResponse(
             segmentId = "segment-limitations",
             kind = "LIMITATION",
-            text = "欠損または除外された evidence は favorable outcome に補完されません。対象期間は ${days}D です。",
+            text = "欠損または除外された evidence は favorable outcome に補完されません。選択した対象期間だけを評価します。",
             claimIds = emptyList(),
         ),
     ),
@@ -577,6 +675,35 @@ private fun fallbackArtifact(
         EvaluationReportClaimResponse(claim.claimId, claim.type, claim.factIds, claim.asserted)
     },
 )
+
+@Suppress("LongParameterList")
+private fun buildCanonicalSnapshot(
+    from: LocalDate,
+    toInclusive: LocalDate,
+    facts: List<EvaluationReportFact>,
+    ridge: OutcomeRidgeChartFacts,
+    benchmark: me.matsumo.fukurou.trading.evaluation.BenchmarkResult,
+    calibration: ReportCalibrationChartResponse,
+    performanceLattice: ReportPerformanceLatticeResponse,
+    exclusions: Map<String, Int>,
+    phaseCount: Int,
+    missingUsageCount: Int,
+    unpricedCount: Int,
+): String = buildString {
+    append(from).append('|').append(toInclusive)
+    facts.forEach { fact -> append('|').append(fact.factId).append('=').append(fact.value) }
+    ridge.groupings.forEach { grouping ->
+        grouping.groups.forEach { group ->
+            append('|').append(grouping.groupBy).append(':').append(group.groupKey).append(':')
+                .append(group.bins.joinToString { bin -> bin.count.toString() })
+        }
+    }
+    append("|benchmarkReturns=").append(benchmark.botReturn).append(':').append(benchmark.buyAndHoldReturn)
+    append("|calibrationState=").append(calibration.state)
+    append("|latticeState=").append(performanceLattice.state)
+    append("|exclusions=").append(exclusions.toSortedMap())
+    append("|usageCoverage=").append(phaseCount).append(':').append(missingUsageCount).append(':').append(unpricedCount)
+}
 
 private fun buildCalibrationResponse(trades: List<ClosedTradeFact>): ReportCalibrationChartResponse {
     fun cells(groupBy: String, groups: List<me.matsumo.fukurou.trading.evaluation.CalibrationGroupStats>) =
@@ -646,9 +773,14 @@ private fun sampleState(count: Int): String = when {
 }
 
 @Serializable
-private data class GeneratedEvaluationArtifact(
+internal data class GeneratedEvaluationArtifact(
     val segments: List<EvaluationReportSegmentResponse>,
     val claims: List<EvaluationReportClaimResponse>,
+)
+
+private data class GeneratedReportArtifact(
+    val artifact: GeneratedEvaluationArtifact,
+    val metadata: EvaluationReportGenerationMetadataResponse,
 )
 
 private fun direction(value: java.math.BigDecimal): String = when {
@@ -746,10 +878,13 @@ private fun io.ktor.server.application.ApplicationCall.reportScopeKey(): String 
 data class EvaluationReportJobResponse(
     val jobId: String,
     val revisionId: String,
+    val revisionNumber: Long = 0,
     val status: String,
     val stage: String,
     val failureCode: String? = null,
     val failureMessage: String? = null,
+    val activeInvocationId: String? = null,
+    val retryAfterSeconds: Long? = null,
 )
 
 @Serializable
@@ -864,6 +999,15 @@ data class EvaluationIntegrityResponse(
 )
 
 @Serializable
+data class EvaluationReportGenerationMetadataResponse(
+    val invocationId: String,
+    val provider: String,
+    val durationMillis: Long?,
+    val totalCostUsd: String?,
+    val observedModels: List<String>?,
+)
+
+@Serializable
 data class EvaluationReportResponse(
     val jobId: String,
     val revisionId: String,
@@ -877,6 +1021,7 @@ data class EvaluationReportResponse(
     val generatedAt: String,
     val provider: String,
     val model: String,
+    val generation: EvaluationReportGenerationMetadataResponse,
     val title: String,
     val segments: List<EvaluationReportSegmentResponse>,
     val claims: List<EvaluationReportClaimResponse>,

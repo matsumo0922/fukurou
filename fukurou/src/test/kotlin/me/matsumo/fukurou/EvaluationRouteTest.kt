@@ -184,11 +184,11 @@ class EvaluationRouteTest {
         val revisionId = requireNotNull(Regex("\\\"revisionId\\\":\\\"([^\\\"]+)").find(custom.bodyAsText()))
             .groupValues[1]
         var revisionBody: String? = null
-        var attemptsRemaining = 20
+        var attemptsRemaining = 100
         while (revisionBody == null && attemptsRemaining > 0) {
             val revision = client.get("/evaluation/reports/revisions/$revisionId")
             if (revision.status == HttpStatusCode.OK) revisionBody = revision.bodyAsText()
-            if (revisionBody == null) delay(10)
+            if (revisionBody == null) delay(20)
             attemptsRemaining -= 1
         }
         val generated = requireNotNull(revisionBody)

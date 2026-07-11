@@ -31,7 +31,7 @@ export type EvaluationReport = {
   integrity: { eligibleTradeCount: number; missingRCount: number; excludedOrderCount: number; excludedPositionCount: number; excludedDecisionRunCount: number; exclusionReasons: Record<string, number>; llmPhaseCount: number; missingUsagePhaseCount: number; unpricedPhaseCount: number; knownCostUsd: string | null; usageTruncated: boolean };
   truncated: boolean;
 };
-export type ReportJob = { jobId: string; revisionId: string; status: string; stage: string; failureCode: string | null; failureMessage: string | null };
+export type ReportJob = { jobId: string; revisionId: string; revisionNumber: number; status: string; stage: string; failureCode: string | null; failureMessage: string | null; activeInvocationId: string | null; retryAfterSeconds: number | null };
 export type ReportHistoryItem = { jobId: string; revisionId: string; revisionNumber: number; status: string; requestedAt: string; pinned: boolean };
 
 export type ReportScope = { kind: "PRESET"; days: 7 | 30 | 90 } | { kind: "CUSTOM"; from: string; toInclusive: string };
@@ -47,19 +47,36 @@ export async function fetchDefaultReport(scopeKey: string): Promise<EvaluationRe
   return response.json() as Promise<EvaluationReport>;
 }
 
-export async function generateReport(scope: ReportScope): Promise<ReportJob> {
+export class ReportAdmissionError extends Error {
+  constructor(public readonly job: ReportJob, public readonly retryAfter: string | null) {
+    super(`${job.failureCode ?? "generation rejected"}: ${job.failureMessage ?? ""}${retryAfter ? ` Retry after ${retryAfter}s.` : ""}`);
+  }
+}
+
+export async function generateReport(scope: ReportScope, signal: AbortSignal, onProgress: (job: ReportJob) => void): Promise<ReportJob> {
   const response = await fetch("/evaluation/reports/jobs", {
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
     body: JSON.stringify(scope),
+    signal,
   });
-  if (!response.ok) throw new Error(`generation failed (${response.status})`);
   const accepted = await response.json() as ReportJob;
+  onProgress(accepted);
+  if (response.status === 409 || response.status === 429) throw new ReportAdmissionError(accepted, response.headers.get("Retry-After"));
+  if (!response.ok) throw new Error(`generation failed (${response.status})`);
+  const deadline = Date.now() + 10 * 60 * 1000;
   for (;;) {
-    const job = await getJsonByPath<ReportJob>(`/evaluation/reports/jobs/${accepted.jobId}`);
+    if (Date.now() > deadline) throw new Error("generation polling timed out");
+    const polled = await fetch(`/evaluation/reports/jobs/${accepted.jobId}`, { signal, headers: { Accept: "application/json" } });
+    if (!polled.ok) throw new Error(`job polling failed (${polled.status})`);
+    const job = await polled.json() as ReportJob;
+    onProgress(job);
     if (job.status === "SUCCEEDED") return job;
-    if (job.status === "FAILED") throw new Error(`${job.failureCode ?? "generation failed"}: ${job.failureMessage ?? ""}`);
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (job.status === "FAILED" || job.status === "REJECTED") throw new Error(`${job.failureCode ?? "generation failed"}: ${job.failureMessage ?? ""}`);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, 1000);
+      signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+    });
   }
 }
 

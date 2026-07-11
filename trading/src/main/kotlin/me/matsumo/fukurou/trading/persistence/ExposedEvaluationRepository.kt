@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
@@ -14,6 +16,7 @@ import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
 import me.matsumo.fukurou.trading.evaluation.EvaluationExclusionSummary
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
+import me.matsumo.fukurou.trading.evaluation.EvaluationReportSnapshotFacts
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationTradeQueryResult
 import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
@@ -278,6 +281,26 @@ private const val SELECT_KILL_CRITERION_STATS_SQL = """
 class ExposedEvaluationRepository(
     private val database: ExposedDatabase,
 ) : EvaluationRepository {
+
+    override suspend fun fetchReportSnapshot(period: EvaluationPeriod): Result<EvaluationReportSnapshotFacts> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(
+                    transactionIsolation = java.sql.Connection.TRANSACTION_REPEATABLE_READ,
+                    db = database,
+                ) {
+                    EvaluationReportSnapshotFacts(
+                        trades = selectClosedTrades(period, me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT),
+                        dailyPnl = selectDailyTradePnl(period),
+                        priorPnlJpy = sumTradePnlBeforeInstant(period.from),
+                        initialCashJpy = selectInitialCashJpy(),
+                        usages = selectLlmPhaseUsages(period, me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT),
+                        exclusions = selectEvaluationExclusionSummary(period),
+                    )
+                }
+            }
+        }
+    }
 
     override suspend fun fetchExclusionSummary(period: EvaluationPeriod): Result<EvaluationExclusionSummary> {
         return withContext(Dispatchers.IO) {

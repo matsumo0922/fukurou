@@ -40,7 +40,7 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `GET /revision`
 - `GET /health/live`
 - `GET /health/ready`
-- `/evaluation/*`: 既存集計 API と、manual generation / immutable revision / deterministic evidence を扱う Evaluation Report Console API
+- `/evaluation/*`: 既存集計 API と、共通 LLM reservation / audited manual generation / immutable revision / deterministic evidence を扱う Evaluation Report Console API
 - `/ops/*`
 - `GET /ops/runtime-config`
 - `GET /ops/runs`

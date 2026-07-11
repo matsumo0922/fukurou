@@ -51,6 +51,11 @@ enum class LlmDaemonTriggerKind {
      * 週次 reflection による prompt candidate 生成。
      */
     REFLECTION,
+
+    /**
+     * Evaluation Report Console の手動 report 生成。
+     */
+    EVALUATION_REPORT,
 }
 
 /**

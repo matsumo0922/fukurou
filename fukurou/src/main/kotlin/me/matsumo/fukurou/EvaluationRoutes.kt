@@ -35,6 +35,7 @@ import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
@@ -82,6 +83,7 @@ internal data class EvaluationRouteDependencies(
     val marketDataSource: MarketDataSource?,
     val tradingConfig: TradingBotConfig,
     val llmInvoker: LlmInvoker? = null,
+    val llmInvocationAuditor: LlmInvocationAuditor? = null,
     val environment: Map<String, String> = emptyMap(),
     val database: ExposedDatabase? = null,
     val latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
