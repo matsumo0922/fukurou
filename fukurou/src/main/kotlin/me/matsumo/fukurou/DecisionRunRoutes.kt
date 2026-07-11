@@ -337,7 +337,9 @@ private fun Route.registerOpsDecisionRunDetailRoute(dependencies: OpsRouteDepend
         call.respond(detail.toResponse(dependencies.referenceQuote()))
     }.describe {
         summary = "decision run 詳細を取得する"
-        description = "Trigger から Order / Execution までの段階、run の order から因果的に辿る position 約定 lifecycle、LLM 申告値、Falsifier、SafetyFloor、関連 ledger、secret を除外した raw/debug 情報を返します。"
+        description = "Trigger から Order / Execution までの段階、run の order から因果的に辿る position 約定 lifecycle、LLM 申告値、Falsifier、SafetyFloor、関連 ledger、secret を除外した raw/debug 情報を返します。" +
+            "terminalCause は status や業務 outcome と直交する runner 終端の安定コードで、null は旧データなど終端原因を保持していない記録です。" +
+            "PROCESSING phase は runner 処理経路を表し、restart による中断は INTERRUPTED、timeout や runner failure は FAILED として表示します。"
         tag(RUNS_TAG)
         parameters {
             path("invocationId") {

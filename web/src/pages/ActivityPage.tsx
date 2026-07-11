@@ -802,6 +802,7 @@ function OutcomeIcon({ outcome }: { outcome: OpsDecisionRunSummaryResponse["outc
 function phaseLabel(phase: string, t: Translator): string {
   const keys = {
     TRIGGER: "activity.runs.phase.trigger",
+    PROCESSING: "activity.runs.phase.processing",
     PROPOSER: "activity.runs.phase.proposer",
     INTENT: "activity.runs.phase.intent",
     FALSIFIER: "activity.runs.phase.falsifier",

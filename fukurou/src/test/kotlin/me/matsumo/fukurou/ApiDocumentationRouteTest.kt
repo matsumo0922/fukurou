@@ -68,6 +68,11 @@ class ApiDocumentationRouteTest {
             .getValue("description").jsonPrimitive.content
         assertTrue(decisionRunsDescription.contains("terminalCause は runner 終端の安定コード"))
         assertTrue(decisionRunsDescription.contains("旧データ"))
+        val decisionRunDetailDescription = paths.getValue("/ops/runs/{invocationId}").jsonObject
+            .getValue("get").jsonObject
+            .getValue("description").jsonPrimitive.content
+        assertTrue(decisionRunDetailDescription.contains("status や業務 outcome と直交"))
+        assertTrue(decisionRunDetailDescription.contains("PROCESSING phase"))
         assertOperation(
             paths = paths,
             path = "/health/live",

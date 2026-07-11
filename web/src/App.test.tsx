@@ -760,6 +760,12 @@ describe("App", () => {
     expect(within(authRow!).getByText("runner failed")).toBeInTheDocument();
     expect(within(runList).getByText("no trade")).toBeInTheDocument();
 
+    fireEvent.click(within(interruptedRow!).getByRole("button", { name: /run-interrupted/ }));
+    const interruptedDetailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(await within(interruptedDetailPane).findByText("Processing")).toBeInTheDocument();
+    expect(within(interruptedDetailPane).getByText("INTERRUPTED")).toBeInTheDocument();
+    expect(within(interruptedDetailPane).queryByText("Unknown phase")).not.toBeInTheDocument();
+
     fireEvent.click(within(timeoutRow!).getByRole("button", { name: /run-timeout/ }));
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
     expect(
@@ -1974,6 +1980,11 @@ function terminalDecisionRunDetailResponse(summary: ReturnType<typeof terminalDe
     latestMarketQuote: null,
     phases: [
       { key: "TRIGGER", status: "COMPLETED", detail: summary.triggerKind },
+      {
+        key: "PROCESSING",
+        status: summary.terminalCause === "RESTART_INTERRUPTED" ? "INTERRUPTED" : "FAILED",
+        detail: summary.terminalCause,
+      },
       { key: "PROPOSER", status: "FAILED", detail: summary.finalReason },
       { key: "INTENT", status: "NOT_REACHED", detail: null },
       { key: "FALSIFIER", status: "NOT_REACHED", detail: null },

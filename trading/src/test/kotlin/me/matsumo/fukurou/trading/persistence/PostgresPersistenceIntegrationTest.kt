@@ -78,6 +78,7 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -2622,6 +2623,93 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun lifecycleRecoveryClassifiesLockedRunReservationPairsByRunAuthority() = runPostgresTest {
+        val recoveryThreshold = Duration.ofMinutes(9)
+        val bootstrap =
+            TradingPersistenceBootstrap(
+                database = database,
+                clock = fixedClock(),
+                staleLlmRunRecoveryThreshold = recoveryThreshold,
+            )
+        val runRepository = ExposedLlmRunRepository(database)
+        val reservationRepository = ExposedLlmLaunchReservationRepository(database)
+        val eventLog = ExposedCommandEventLog(database)
+        val staleAt = fixedInstant().minus(Duration.ofHours(1))
+        val freshAt = fixedInstant()
+        val runnerConfig = TradingBotConfig.fromEnvironment(emptyMap()).runner
+
+        bootstrap.ensureSchema().getOrThrow()
+        runRepository.insertRunning(llmRunStart("stale-run-fresh-reservation", staleAt)).getOrThrow()
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest("stale-run-fresh-reservation", runnerConfig, freshAt),
+        ).getOrThrow()
+        bootstrap.ensureSchema().getOrThrow()
+
+        assertEquals(LLM_RUN_STATUS_FAILED, runRepository.findByInvocationId("stale-run-fresh-reservation").getOrThrow()?.status)
+        assertNull(
+            reservationRepository.findBlockingRunningReservation(
+                LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                staleAt,
+            ).getOrThrow(),
+        )
+
+        runRepository.insertRunning(llmRunStart("fresh-run-stale-reservation", freshAt)).getOrThrow()
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest("fresh-run-stale-reservation", runnerConfig, staleAt),
+        ).getOrThrow()
+        bootstrap.ensureSchema().getOrThrow()
+
+        assertEquals(LLM_RUN_STATUS_RUNNING, runRepository.findByInvocationId("fresh-run-stale-reservation").getOrThrow()?.status)
+        assertNotNull(
+            reservationRepository.findBlockingRunningReservation(
+                LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                staleAt.minus(Duration.ofMinutes(1)),
+            ).getOrThrow(),
+        )
+        reservationRepository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "fresh-run-stale-reservation",
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = LlmRunTerminalCause.NORMAL_COMPLETION.name,
+                finishedAt = freshAt,
+            ),
+        ).getOrThrow()
+
+        reservationRepository.tryReserve(llmLaunchReservationRequest("orphan-stale-reservation", runnerConfig, staleAt)).getOrThrow()
+        bootstrap.ensureSchema().getOrThrow()
+
+        runRepository.insertRunning(llmRunStart("terminal-run-stale-reservation", staleAt)).getOrThrow()
+        runRepository.finish(
+            LlmRunFinish(
+                invocationId = "terminal-run-stale-reservation",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                status = "SUCCEEDED",
+                startedAt = staleAt,
+                finishedAt = freshAt,
+                errorMessage = null,
+                terminalCause = LlmRunTerminalCause.NORMAL_COMPLETION,
+            ),
+        ).getOrThrow()
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest("terminal-run-stale-reservation", runnerConfig, staleAt),
+        ).getOrThrow()
+        bootstrap.ensureSchema().getOrThrow()
+
+        val recoveryEvents = eventLog.findEvents(
+            limit = 20,
+            eventType = CommandEventType.LLM_INVOCATION_RECOVERED,
+        ).getOrThrow()
+        assertEquals(3, recoveryEvents.size)
+        assertTrue(recoveryEvents.any { event -> event.decisionRunContext.decisionRunId == "orphan-stale-reservation" && event.payload.contains("\"runRecovered\":false") })
+        assertEquals(
+            LlmRunTerminalCause.NORMAL_COMPLETION,
+            runRepository.findByInvocationId("terminal-run-stale-reservation").getOrThrow()?.terminalCause,
+        )
+    }
+
+    @Test
     fun obsidian_range_queries_filterOrderLimitAndReturnFieldValuesInPostgresPath() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -4946,6 +5034,16 @@ private fun llmLaunchReservationRequest(
         hourlyWindow = Duration.ofHours(1),
         dailyWindow = Duration.ofHours(24),
         activeReservationStaleAfter = Duration.ofMinutes(30),
+    )
+}
+
+private fun llmRunStart(invocationId: String, startedAt: Instant): LlmRunStart {
+    return LlmRunStart(
+        invocationId = invocationId,
+        mode = TradingMode.PAPER,
+        symbol = TradingSymbol.BTC,
+        triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+        startedAt = startedAt,
     )
 }
 

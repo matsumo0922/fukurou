@@ -1106,48 +1106,36 @@ internal fun JdbcTransaction.recoverStaleLlmRuns(now: Instant, threshold: Durati
 /** stale run と対応する RUNNING reservation を bootstrap transaction 内で回収する。 */
 internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(now: Instant, threshold: Duration): Int {
     val cutoff = now.minus(threshold)
-    val staleRuns = selectStaleLlmRunsForUpdate(cutoff)
-    val staleReservations = selectStaleLlmReservationsForUpdate(cutoff)
-    val recoveredRunIds = staleRuns
-        .filter { run -> recoverStaleLlmRun(run.invocationId, now) }
-        .mapTo(mutableSetOf()) { run -> run.invocationId }
-    val recoveredReservationIds = staleReservations
-        .filter { reservation -> recoverStaleLlmReservation(reservation.invocationId, now) }
-        .mapTo(mutableSetOf()) { reservation -> reservation.invocationId }
-    val runsByInvocationId = staleRuns.associateBy(StaleLlmRun::invocationId)
-    val reservationsByInvocationId = staleReservations.associateBy(StaleLlmReservation::invocationId)
-
-    (recoveredRunIds + recoveredReservationIds)
+    val reservations = selectRunningLlmReservationsForUpdate()
+    val runs = selectLifecycleRunsForUpdate()
+    val runsByInvocationId = runs.associateBy(LockedLlmRun::invocationId)
+    val reservationsByInvocationId = reservations.associateBy(LockedLlmReservation::invocationId)
+    val recoveries = (runsByInvocationId.keys + reservationsByInvocationId.keys)
         .sorted()
-        .map { invocationId ->
-            val run = runsByInvocationId[invocationId]
-            val reservation = reservationsByInvocationId[invocationId]
-            StaleLlmInvocationRecovery(
-                invocationId = invocationId,
-                triggerKind = run?.triggerKind ?: reservation?.triggerKind,
-                triggerKey = reservation?.triggerKey,
-                startedAt = run?.startedAt,
-                reservedAt = reservation?.reservedAt,
-                runRecovered = invocationId in recoveredRunIds,
-                reservationRecovered = invocationId in recoveredReservationIds,
-                runtimeConfigVersionId = run?.runtimeConfigVersionId,
-                runtimeConfigHash = run?.runtimeConfigHash,
+        .mapNotNull { invocationId ->
+            recoverLockedLlmInvocation(
+                run = runsByInvocationId[invocationId],
+                reservation = reservationsByInvocationId[invocationId],
+                now = now,
+                cutoff = cutoff,
             )
         }
-        .forEach { recovery -> insertLlmInvocationRecoveryEvent(recovery, now) }
 
-    return recoveredRunIds.size
+    recoveries.forEach { recovery -> insertLlmInvocationRecoveryEvent(recovery, now) }
+
+    return recoveries.count { recovery -> recovery.runRecovered }
 }
 
-private data class StaleLlmRun(
+private data class LockedLlmRun(
     val invocationId: String,
+    val status: String,
     val triggerKind: String?,
     val startedAt: Long?,
     val runtimeConfigVersionId: String?,
     val runtimeConfigHash: String?,
 )
 
-private data class StaleLlmReservation(
+private data class LockedLlmReservation(
     val invocationId: String,
     val triggerKind: String?,
     val triggerKey: String?,
@@ -1166,24 +1154,26 @@ private data class StaleLlmInvocationRecovery(
     val runtimeConfigHash: String?,
 )
 
-private fun JdbcTransaction.selectStaleLlmRunsForUpdate(cutoff: Instant): List<StaleLlmRun> {
+private fun JdbcTransaction.selectLifecycleRunsForUpdate(): List<LockedLlmRun> {
     val sql = """
-        SELECT invocation_id, trigger_kind, started_at, runtime_config_version_id, runtime_config_hash
+        SELECT invocation_id, status, trigger_kind, started_at, runtime_config_version_id, runtime_config_hash
         FROM llm_runs
-        WHERE status = ? AND finished_at IS NULL AND started_at < ?
+        WHERE status = ? OR invocation_id IN (
+            SELECT invocation_id FROM llm_launch_reservations WHERE status = 'RUNNING'
+        )
         ORDER BY invocation_id ASC
         FOR UPDATE
     """.trimIndent()
 
     return jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setString(1, LLM_RUN_STATUS_RUNNING)
-        statement.setLong(2, cutoff.toEpochMilli())
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {
                     add(
-                        StaleLlmRun(
+                        LockedLlmRun(
                             invocationId = resultSet.getString("invocation_id"),
+                            status = resultSet.getString("status"),
                             triggerKind = resultSet.getString("trigger_kind"),
                             startedAt = resultSet.getLong("started_at").takeUnless { resultSet.wasNull() },
                             runtimeConfigVersionId = resultSet.getString("runtime_config_version_id"),
@@ -1196,23 +1186,22 @@ private fun JdbcTransaction.selectStaleLlmRunsForUpdate(cutoff: Instant): List<S
     }
 }
 
-private fun JdbcTransaction.selectStaleLlmReservationsForUpdate(cutoff: Instant): List<StaleLlmReservation> {
+private fun JdbcTransaction.selectRunningLlmReservationsForUpdate(): List<LockedLlmReservation> {
     val sql = """
         SELECT invocation_id, trigger_kind, trigger_key, reserved_at
         FROM llm_launch_reservations
-        WHERE status = ? AND reserved_at < ?
+        WHERE status = ?
         ORDER BY invocation_id ASC
         FOR UPDATE
     """.trimIndent()
 
     return jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setString(1, "RUNNING")
-        statement.setLong(2, cutoff.toEpochMilli())
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {
                     add(
-                        StaleLlmReservation(
+                        LockedLlmReservation(
                             invocationId = resultSet.getString("invocation_id"),
                             triggerKind = resultSet.getString("trigger_kind"),
                             triggerKey = resultSet.getString("trigger_key"),
@@ -1223,6 +1212,43 @@ private fun JdbcTransaction.selectStaleLlmReservationsForUpdate(cutoff: Instant)
             }
         }
     }
+}
+
+private fun JdbcTransaction.recoverLockedLlmInvocation(
+    run: LockedLlmRun?,
+    reservation: LockedLlmReservation?,
+    now: Instant,
+    cutoff: Instant,
+): StaleLlmInvocationRecovery? {
+    val staleRun = run?.status == LLM_RUN_STATUS_RUNNING && run.startedAt?.let { startedAt ->
+        Instant.ofEpochMilli(startedAt).isBefore(cutoff)
+    } == true
+    val staleReservation = reservation?.reservedAt?.let { reservedAt ->
+        Instant.ofEpochMilli(reservedAt).isBefore(cutoff)
+    } == true
+    val recoverRun = staleRun
+    val recoverReservation = when {
+        run?.status == LLM_RUN_STATUS_RUNNING -> staleRun
+        else -> staleReservation
+    }
+    if (!recoverRun && !recoverReservation) return null
+
+    val invocationId = run?.invocationId ?: requireNotNull(reservation).invocationId
+    val runRecovered = recoverRun && recoverStaleLlmRun(invocationId, now)
+    val reservationRecovered = recoverReservation && recoverStaleLlmReservation(invocationId, now)
+    if (!runRecovered && !reservationRecovered) return null
+
+    return StaleLlmInvocationRecovery(
+        invocationId = invocationId,
+        triggerKind = run?.triggerKind ?: reservation?.triggerKind,
+        triggerKey = reservation?.triggerKey,
+        startedAt = run?.startedAt,
+        reservedAt = reservation?.reservedAt,
+        runRecovered = runRecovered,
+        reservationRecovered = reservationRecovered,
+        runtimeConfigVersionId = run?.runtimeConfigVersionId,
+        runtimeConfigHash = run?.runtimeConfigHash,
+    )
 }
 
 private fun JdbcTransaction.recoverStaleLlmRun(invocationId: String, now: Instant): Boolean {
