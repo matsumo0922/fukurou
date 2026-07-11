@@ -991,23 +991,7 @@ private fun JdbcTransaction.ensureLegacyPaperAccountEpoch(now: Instant) {
     }
     if (account.first != null) return
 
-    val values = linkedMapOf<String, String>()
-    jdbcConnection().prepareStatement(
-        """
-            SELECT value.config_key, value.config_value
-            FROM runtime_config_values value
-            JOIN runtime_config_versions version ON version.id = value.version_id
-            WHERE version.status = 'ACTIVE'
-            ORDER BY value.config_key
-        """.trimIndent(),
-    ).use { statement ->
-        statement.executeQuery().use { resultSet ->
-            while (resultSet.next()) {
-                values[resultSet.getString("config_key")] = resultSet.getString("config_value")
-            }
-        }
-    }
-    val runtimeConfigHash = calculateRuntimeConfigHash(values)
+    val runtimeConfigHash = selectActiveRuntimeConfigHash()
     val epochId = UUID.randomUUID()
 
     jdbcConnection().prepareStatement(
@@ -1032,6 +1016,58 @@ private fun JdbcTransaction.ensureLegacyPaperAccountEpoch(now: Instant) {
         statement.setObject(1, epochId)
         statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
         check(statement.executeUpdate() == 1) { "paper account epoch adoption lost its lock." }
+    }
+    insertPaperAccountEpochImportedEvent(epochId, account.second, runtimeConfigHash, now)
+}
+
+private fun JdbcTransaction.selectActiveRuntimeConfigHash(): String {
+    val values = linkedMapOf<String, String>()
+    jdbcConnection().prepareStatement(
+        """
+            SELECT value.config_key, value.config_value
+            FROM runtime_config_values value
+            JOIN runtime_config_versions version ON version.id = value.version_id
+            WHERE version.status = 'ACTIVE'
+            ORDER BY value.config_key
+        """.trimIndent(),
+    ).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            while (resultSet.next()) {
+                values[resultSet.getString("config_key")] = resultSet.getString("config_value")
+            }
+        }
+    }
+    return calculateRuntimeConfigHash(values)
+}
+
+private fun JdbcTransaction.insertPaperAccountEpochImportedEvent(
+    epochId: UUID,
+    initialCashJpy: BigDecimal,
+    runtimeConfigHash: String,
+    now: Instant,
+) {
+    jdbcConnection().prepareStatement(
+        """
+            INSERT INTO command_event_log (
+                id, tool_name, event_type, payload, ts, runtime_config_hash
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setString(2, "paper-account-epoch")
+        statement.setString(3, CommandEventType.PAPER_ACCOUNT_EPOCH_IMPORTED.name)
+        statement.setString(
+            4,
+            buildJsonObject {
+                put("accountEpochId", epochId.toString())
+                put("initialCashJpy", initialCashJpy.toPlainString())
+                put("runtimeConfigHash", runtimeConfigHash)
+                put("reason", "non-destructive schema adoption")
+            }.toString(),
+        )
+        statement.setLong(5, now.toEpochMilli())
+        statement.setString(6, runtimeConfigHash)
+        statement.executeUpdate()
     }
 }
 

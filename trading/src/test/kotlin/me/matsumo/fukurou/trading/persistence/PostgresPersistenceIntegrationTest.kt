@@ -1334,6 +1334,10 @@ class PostgresPersistenceIntegrationTest {
         val accountAfter = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
         assertEquals(accountBefore, accountAfter)
         assertNotNull(accountAfter.accountEpochId)
+        assertEquals(
+            1,
+            selectCommandEventCountByType(database, CommandEventType.PAPER_ACCOUNT_EPOCH_IMPORTED),
+        )
 
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(

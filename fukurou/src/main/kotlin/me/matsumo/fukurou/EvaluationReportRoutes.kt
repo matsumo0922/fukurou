@@ -405,6 +405,8 @@ private class EvaluationReportStore(
             EvaluationReportSourceResponse("exclusion-audit", inputAsOf, "SNAPSHOT"),
             EvaluationReportSourceResponse("runner-audit", inputAsOf, "SNAPSHOT"),
         )
+        val benchmarkComparable = scope.evaluationScope.cohort !=
+            me.matsumo.fukurou.trading.domain.EvaluationCohort.LEGACY_PRE_WS
         val benchmarkResponse = ReportBenchmarkChartResponse(
             baselineEquityJpy = baselineEquity.toPlainString(),
             points = benchmark.points.map { point ->
@@ -415,9 +417,13 @@ private class EvaluationReportStore(
                     noTradeEquityJpy = point.noTradeEquityJpy.toPlainString(),
                 )
             },
-            botReturn = benchmark.botReturn?.toPlainString(),
-            buyAndHoldReturn = benchmark.buyAndHoldReturn?.toPlainString(),
-            state = if (benchmark.points.isEmpty()) "INSUFFICIENT_SAMPLE" else "AVAILABLE",
+            botReturn = benchmark.botReturn?.takeIf { benchmarkComparable }?.toPlainString(),
+            buyAndHoldReturn = benchmark.buyAndHoldReturn?.takeIf { benchmarkComparable }?.toPlainString(),
+            state = when {
+                !benchmarkComparable -> "BASELINE_NOT_COMPARABLE"
+                benchmark.points.isEmpty() -> "INSUFFICIENT_SAMPLE"
+                else -> "AVAILABLE"
+            },
         )
         val canonical = ReportJson.encodeToString(
             CanonicalEvaluationSnapshot(

@@ -59,8 +59,6 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
                 SELECT 1 FROM evaluation_exclusions x
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
-        ORDER BY p.closed_at ASC
-        LIMIT ?
     ),
     initial_buy_executions AS (
         SELECT DISTINCT ON (e.position_id)
@@ -374,11 +372,38 @@ class ExposedEvaluationRepository(
         period: EvaluationPeriod,
         scope: EvaluationScope,
     ): Result<EvaluationReportSnapshotFacts> {
-        return fetchReportSnapshot(period).map { snapshot ->
-            snapshot.copy(
-                trades = fetchClosedTrades(period, scope = scope).getOrThrow(),
-                initialCashJpy = scope.initialCashJpy,
-            )
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(
+                    transactionIsolation = java.sql.Connection.TRANSACTION_REPEATABLE_READ,
+                    db = database,
+                ) {
+                    val trades = selectClosedTrades(
+                        period,
+                        me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT,
+                        scope,
+                    )
+                    val priorTrades = selectClosedTrades(
+                        EvaluationPeriod(Instant.EPOCH, period.from),
+                        Int.MAX_VALUE,
+                        scope,
+                    ).trades
+
+                    EvaluationReportSnapshotFacts(
+                        trades = trades,
+                        dailyPnl = trades.trades.map { trade ->
+                            DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
+                        },
+                        priorPnlJpy = priorTrades.sumOf(ClosedTradeFact::tradePnlJpy),
+                        initialCashJpy = scope.initialCashJpy,
+                        usages = selectLlmPhaseUsages(
+                            period,
+                            me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT,
+                        ),
+                        exclusions = selectEvaluationExclusionSummary(period),
+                    )
+                }
+            }
         }
     }
 
@@ -533,7 +558,6 @@ private fun JdbcTransaction.selectClosedTrades(
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.setLong(2, period.from.toEpochMilli())
         statement.setLong(3, period.toExclusive.toEpochMilli())
-        statement.setInt(4, fetchLimit)
         statement.executeQuery().use { resultSet ->
             val trades = buildList {
                 while (resultSet.next()) {

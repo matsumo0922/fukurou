@@ -37,8 +37,17 @@ interface EvaluationRepository {
         period: EvaluationPeriod,
         scope: EvaluationScope,
     ): Result<EvaluationReportSnapshotFacts> = runCatching {
+        val tradeResult = fetchClosedTrades(period, scope = scope).getOrThrow()
+        val priorTrades = fetchClosedTrades(
+            period = EvaluationPeriod(Instant.EPOCH, period.from),
+            limit = Int.MAX_VALUE,
+            scope = scope,
+        ).getOrThrow().trades
+
         fetchReportSnapshot(period).getOrThrow().copy(
-            trades = fetchClosedTrades(period, scope = scope).getOrThrow(),
+            trades = tradeResult,
+            dailyPnl = tradeResult.trades.map { trade -> DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy) },
+            priorPnlJpy = priorTrades.sumOf(ClosedTradeFact::tradePnlJpy),
             initialCashJpy = scope.initialCashJpy,
         )
     }
