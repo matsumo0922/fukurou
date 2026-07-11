@@ -509,7 +509,6 @@ private const val TEST_RECONCILER_COMPLETED_PAYLOAD = """
     {
         "pass": "loop",
         "state": "completed",
-        "lastReconciledAt": "2026-07-02T00:00:00Z",
         "startupFullReconcileCompleted": true,
         "lastMaintenanceAt": "2026-07-02T00:00:00Z"
     }

@@ -88,12 +88,14 @@ class ProtectionReconcilerTest {
         )
 
         val result = reconciler.reconcileOnce(ReconcilePassKind.STARTUP_FULL)
+        val completedPayload = eventLog.events().single().payload
 
         assertTrue(result.isSuccess)
         assertEquals(1, lock.acquisitionCount)
         assertEquals(fixedInstant(), status.snapshot().lastMaintenanceAt)
         assertTrue(status.snapshot().startupFullReconcileCompleted)
         assertEquals(fixedInstant(), status.snapshot().lastMaintenanceAt)
+        assertFalse(completedPayload.contains("lastReconciledAt"))
         assertTrue(eventLog.events().any { event -> event.eventType == CommandEventType.RECONCILER_PASS_COMPLETED })
     }
 
@@ -839,6 +841,43 @@ class ProtectionReconcilerTest {
     }
 
     @Test
+    fun market_data_status_projection_failure_does_not_record_maintenance_failure() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000182")
+        val eventLog = InMemoryCommandEventLog()
+        val integrity = RetryableMarketDataIntegrityRepository(
+            failMarkDisconnectedTimes = 0,
+            failSnapshotCalls = setOf(2),
+        )
+        val status = MutableReconcilerStatus()
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            commandEventLog = eventLog,
+            tradingLock = CountingTradingLock(fixedClock()),
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            marketEventStream = SingleSessionMarketEventStream(
+                BurstThenIdleMarketEventSession(sessionId, fixedInstant(), emptyList()),
+            ),
+            marketDataIntegrityRepository = integrity,
+            status = status,
+            clock = fixedClock(),
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(10))
+        }
+
+        withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
+            while (integrity.markMaintenanceSucceededCount < 2) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertFalse(eventLog.events().any { event -> event.eventType == CommandEventType.RECONCILER_PASS_FAILED })
+        assertTrue(integrity.snapshotCount >= 3)
+        assertEquals(fixedInstant(), status.snapshot().lastMaintenanceAt)
+    }
+
+    @Test
     fun market_event_idle_session_records_transport_liveness_gap_after_configured_timeout() = runBlocking {
         val clock = Clock.systemUTC()
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000179")
@@ -1007,6 +1046,7 @@ private class BurstThenIdleMarketEventSession(
 /** 切断永続化の一時失敗を再現する integrity repository。 */
 private class RetryableMarketDataIntegrityRepository(
     private var failMarkDisconnectedTimes: Int,
+    private val failSnapshotCalls: Set<Int> = emptySet(),
 ) : MarketDataIntegrityRepository {
     private var snapshot = MarketDataIntegritySnapshot()
 
@@ -1016,9 +1056,14 @@ private class RetryableMarketDataIntegrityRepository(
         private set
     var snapshotCount = 0
         private set
+    var markMaintenanceSucceededCount = 0
+        private set
 
     override suspend fun snapshot(): Result<MarketDataIntegritySnapshot> {
         snapshotCount += 1
+        if (snapshotCount in failSnapshotCalls) {
+            return Result.failure(IllegalStateException("transient status projection failure"))
+        }
 
         return Result.success(snapshot)
     }
@@ -1040,6 +1085,7 @@ private class RetryableMarketDataIntegrityRepository(
     }
 
     override suspend fun markMaintenanceSucceeded(sessionId: UUID, succeededAt: Instant): Result<Unit> {
+        markMaintenanceSucceededCount += 1
         snapshot = snapshot.copy(lastMaintenanceAt = succeededAt)
 
         return Result.success(Unit)

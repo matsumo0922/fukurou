@@ -1707,6 +1707,40 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun resting_limit_fails_closed_when_realtime_session_has_not_received_a_trade() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000183")
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val reconcilerStatus = MutableReconcilerStatus()
+        reconcilerStatus.updateMarketData(
+            ReconcilerStatus(
+                startupFullReconcileCompleted = true,
+                lastTransportActivityAt = fixedInstant(),
+                lastMaintenanceAt = fixedInstant(),
+                marketDataState = MarketDataConnectionState.CONNECTED,
+                marketDataSessionId = sessionId,
+                startupRecoveryCompleted = true,
+            ),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = FakeMarketDataSource,
+            reconcilerStatusProvider = reconcilerStatus,
+            requireRealtimeIntegrityForRestingOrders = true,
+            clock = fixedClock(),
+        )
+
+        val result = broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand()))
+
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("QUEUE_SNAPSHOT_UNAVAILABLE"))
+        assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("has not received an event"))
+        assertTrue(broker.getOpenOrders().getOrThrow().isEmpty())
+    }
+
+    @Test
     fun periodic_rest_maintenance_does_not_execute_virtual_take_profit_but_market_event_does() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val decisionRepository = InMemoryDecisionRepository(fixedClock())

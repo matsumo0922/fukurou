@@ -70,6 +70,10 @@ private const val PASS_FAILURE_LOG_KEY = "protection-reconciler-pass-failure"
  */
 private const val MARKET_DATA_FAILURE_LOG_KEY = "protection-reconciler-market-data-failure"
 
+/** market-data status projection failure log の rate limit key。 */
+private const val MARKET_DATA_STATUS_PROJECTION_FAILURE_LOG_KEY =
+    "protection-reconciler-market-data-status-projection-failure"
+
 /**
  * start audit failure log の rate limit key。
  */
@@ -352,19 +356,40 @@ class ProtectionReconciler(
 
     /** REST は約定根拠にせず、定期的な safety / evaluation 保守だけに使う。 */
     private suspend fun runPeriodicSafetyMaintenance(sessionId: UUID): Result<Unit> {
-        return try {
+        val maintenanceResult = try {
             tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
                 runPeriodicSafetyMaintenanceLocked()
             }
             recordPeriodicMaintenanceRecovery().getOrThrow()
             marketDataIntegrityRepository.markMaintenanceSucceeded(sessionId, Instant.now(clock)).getOrThrow()
-            refreshMarketDataStatus()
 
             Result.success(Unit)
         } catch (throwable: CancellationException) {
             throw throwable
         } catch (throwable: Throwable) {
             recordPeriodicMaintenanceFailure(throwable)
+
+            Result.failure(throwable)
+        }
+        if (maintenanceResult.isFailure) return maintenanceResult
+
+        return refreshMarketDataStatusAfterMaintenance()
+    }
+
+    /** maintenance 成功後の status projection を、maintenance outcome と別に反映する。 */
+    private suspend fun refreshMarketDataStatusAfterMaintenance(): Result<Unit> {
+        return try {
+            refreshMarketDataStatus()
+
+            Result.success(Unit)
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            warnLogger.warn(
+                key = MARKET_DATA_STATUS_PROJECTION_FAILURE_LOG_KEY,
+                message = "ProtectionReconciler market-data status projection failed after periodic maintenance.",
+                throwable = throwable,
+            )
 
             Result.failure(throwable)
         }
@@ -590,7 +615,6 @@ class ProtectionReconciler(
             eventType = CommandEventType.RECONCILER_PASS_COMPLETED,
             payload = buildPassCompletedPayload(
                 passKind = passKind,
-                reconciledAt = reconciledAt,
                 startupFullReconcileCompleted = startupFullReconcileCompleted,
                 lastMaintenanceAt = lastMaintenanceAt,
                 divergenceMemos = divergenceMemos,
@@ -670,7 +694,6 @@ class ProtectionReconciler(
  */
 private fun buildPassCompletedPayload(
     passKind: ReconcilePassKind,
-    reconciledAt: Instant,
     startupFullReconcileCompleted: Boolean,
     lastMaintenanceAt: Instant?,
     divergenceMemos: List<PaperExecutionDivergenceMemo>,
@@ -678,7 +701,6 @@ private fun buildPassCompletedPayload(
     return buildJsonObject {
         put("pass", passKind.payloadName())
         put("state", "completed")
-        put("lastReconciledAt", reconciledAt.toString())
         put("startupFullReconcileCompleted", startupFullReconcileCompleted)
         lastMaintenanceAt?.let { maintenanceAt ->
             put("lastMaintenanceAt", maintenanceAt.toString())
