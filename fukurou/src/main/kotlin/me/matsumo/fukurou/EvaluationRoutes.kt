@@ -501,6 +501,7 @@ data class EvaluationPeriodResponse(
  * @param performance 全体成績
  * @param killCriterion kill 基準への近接度
  * @param runRates 起動数に対する action rate
+ * @param exclusions market-data gap による評価除外
  * @param marketRegimes 相場局面別成績
  */
 @Serializable

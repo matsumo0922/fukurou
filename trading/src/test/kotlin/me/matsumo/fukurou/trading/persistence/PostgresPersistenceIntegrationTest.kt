@@ -313,6 +313,17 @@ private const val SELECT_MARKET_DATA_CONNECTED_SESSION_INDEX_COUNT_SQL = """
         AND indexname = 'idx_market_data_sessions_connected_unique'
 """
 
+private const val SELECT_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND indexname IN (
+            'idx_evaluation_exclusions_gap_entity_unique',
+            'idx_market_data_gaps_session_started',
+            'idx_evaluation_exclusions_entity'
+        )
+"""
+
 /**
  * orders activity context entry index 件数を読む SQL。
  */
@@ -815,6 +826,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, selectOrdersClientRequestIdIndexCount(database))
         assertEquals(1, selectOrdersActivityContextIndexCount(database))
         assertEquals(1, selectMarketDataConnectedSessionIndexCount(database))
+        assertEquals(3, selectMarketDataIntegrityIndexCount(database))
         assertEquals(1, selectDecisionsInvocationIdIndexCount(database))
         assertEquals(3, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))
@@ -839,6 +851,26 @@ class PostgresPersistenceIntegrationTest {
                     statement.executeUpdate()
                 }
             }
+        }
+
+        assertTrue(duplicateInsert.isFailure)
+    }
+
+    @Test
+    fun evaluation_exclusion_is_unique_per_gap_and_entity_at_database_boundary() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        repository.markDisconnected(
+            sessionId = sessionId,
+            reason = MarketDataGapReason.DISCONNECTED,
+            detectedAt = fixedInstant().plusSeconds(1),
+        ).getOrThrow()
+        insertEvaluationExclusion(database, sessionId, "position-1")
+
+        val duplicateInsert = runCatching {
+            insertEvaluationExclusion(database, sessionId, "position-1")
         }
 
         assertTrue(duplicateInsert.isFailure)
@@ -5964,6 +5996,19 @@ private fun selectMarketDataConnectedSessionIndexCount(database: ExposedDatabase
     }
 }
 
+/** market-data integrity補助index件数を読む。 */
+private fun selectMarketDataIntegrityIndexCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(SELECT_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "market-data integrity index count did not return a row." }
+
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
 /** market-data event 受信時刻だけを更新する。 */
 private fun updateMarketDataSessionReceivedAt(
     database: ExposedDatabase,
@@ -5975,6 +6020,28 @@ private fun updateMarketDataSessionReceivedAt(
             statement.setLong(1, receivedAt.toEpochMilli())
             statement.setObject(2, sessionId)
             require(statement.executeUpdate() == 1) { "market-data session was not found." }
+        }
+    }
+}
+
+/** 指定sessionのgapへ評価除外を直接追加する。 */
+private fun insertEvaluationExclusion(
+    database: ExposedDatabase,
+    sessionId: UUID,
+    entityId: String,
+) {
+    exposedTransaction(database) {
+        prepare(
+            """
+                INSERT INTO evaluation_exclusions (id, gap_id, entity_type, entity_id, reason, created_at)
+                VALUES (?, (SELECT id FROM market_data_gaps WHERE session_id = ?), 'POSITION', ?, 'DISCONNECTED', ?)
+            """,
+        ).use { statement ->
+            statement.setObject(1, UUID.randomUUID())
+            statement.setObject(2, sessionId)
+            statement.setString(3, entityId)
+            statement.setLong(4, fixedInstant().toEpochMilli())
+            statement.executeUpdate()
         }
     }
 }

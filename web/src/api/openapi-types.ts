@@ -1895,6 +1895,15 @@ export interface components {
             entryRate?: string | null;
             noTradeRate?: string | null;
         };
+        /** EvaluationExclusionSummaryResponse */
+        EvaluationExclusionSummaryResponse: {
+            orderCount?: number;
+            decisionRunCount?: number;
+            tradeCount?: number;
+            reasons?: {
+                [key: string]: number;
+            };
+        };
         /** EvaluationMarketRegimeResponse */
         EvaluationMarketRegimeResponse: {
             trend: string;
@@ -1908,8 +1917,8 @@ export interface components {
             performance: components["schemas"]["EvaluationPerformanceResponse"];
             killCriterion: components["schemas"]["EvaluationKillCriterionResponse"];
             runRates: components["schemas"]["EvaluationRunRatesResponse"];
-            marketRegimes: components["schemas"]["EvaluationMarketRegimeResponse"][];
             exclusions?: components["schemas"]["EvaluationExclusionSummaryResponse"];
+            marketRegimes: components["schemas"]["EvaluationMarketRegimeResponse"][];
         };
         /** EvaluationSetupResponse */
         EvaluationSetupResponse: {
@@ -2455,7 +2464,7 @@ export interface components {
             expiredAt?: string | null;
             canceledAt?: string | null;
             /** @enum {string|null} */
-            cancelReason?: "TTL_EXPIRY" | "EXPLICIT_CANCEL" | "LEGACY_TTL_SWEEP" | "POSITION_CLOSE" | "HARD_HALT" | "LEGACY_UNCLASSIFIED" | null;
+            cancelReason?: "TTL_EXPIRY" | "EXPLICIT_CANCEL" | "LEGACY_TTL_SWEEP" | "POSITION_CLOSE" | "HARD_HALT" | "MARKET_DATA_GAP" | "LEGACY_UNCLASSIFIED" | null;
             canceledByDecisionRunId?: string | null;
             createdAt: string;
             updatedAt: string;
@@ -2477,15 +2486,6 @@ export interface components {
         /** OpsAuditResponse */
         OpsAuditResponse: {
             events: components["schemas"]["OpsAuditEventResponse"][];
-        };
-        /** EvaluationExclusionSummaryResponse */
-        EvaluationExclusionSummaryResponse: {
-            orderCount?: number;
-            decisionRunCount?: number;
-            tradeCount?: number;
-            reasons?: {
-                [key: string]: number;
-            };
         };
     };
     responses: never;

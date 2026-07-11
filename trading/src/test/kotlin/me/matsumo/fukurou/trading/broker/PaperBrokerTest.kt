@@ -31,6 +31,7 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
@@ -1633,6 +1634,12 @@ class PaperBrokerTest {
 
         assertTrue(broker.getPositions().getOrThrow().isEmpty())
         assertEquals(2, repository.getExecutions().getOrThrow().size)
+        val closeActivity = repository.findExecutionActivitiesForStableFeed(
+            StableFeedCursor(Instant.MAX, includesSameTimestamp = false, afterId = null),
+            limit = 1,
+        ).getOrThrow().single()
+        assertEquals("00000000-0000-0000-0000-000000000171", closeActivity.sourceEvidence?.sessionId)
+        assertEquals(1, closeActivity.sourceEvidence?.sequence)
     }
 
     @Test
@@ -1672,8 +1679,12 @@ class PaperBrokerTest {
         broker.placeOrder(approvedCommand(decisionRepository, restingLimitCommand())).getOrThrow()
 
         broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 2, OrderSide.BUY, "1.0000")).getOrThrow()
-        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 3, OrderSide.SELL, "0.0040")).getOrThrow()
-        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 3, OrderSide.SELL, "0.0040")).getOrThrow()
+        broker.applyMarketEvent(
+            inMemoryPaperTradeEvent(sessionId, 3, OrderSide.SELL, "0.0040", priceJpy = "9800000"),
+        ).getOrThrow()
+        broker.applyMarketEvent(
+            inMemoryPaperTradeEvent(sessionId, 3, OrderSide.SELL, "0.0040", priceJpy = "9800000"),
+        ).getOrThrow()
 
         assertTrue(repository.getExecutions().getOrThrow().isEmpty())
 
@@ -1681,6 +1692,12 @@ class PaperBrokerTest {
 
         assertEquals(1, repository.getExecutions().getOrThrow().size)
         assertEquals(OrderType.STOP, broker.getOpenOrders().getOrThrow().single().orderType)
+        val activity = repository.findExecutionActivitiesForStableFeed(
+            StableFeedCursor(Instant.MAX, includesSameTimestamp = false, afterId = null),
+            limit = 1,
+        ).getOrThrow().single()
+        assertEquals(sessionId.toString(), activity.sourceEvidence?.sessionId)
+        assertEquals(4, activity.sourceEvidence?.sequence)
     }
 
     @Test
@@ -2628,13 +2645,14 @@ private fun inMemoryPaperTradeEvent(
     sequence: Long,
     side: OrderSide,
     sizeBtc: String,
+    priceJpy: String = "9900000",
 ): PaperMarketTradeEvent {
     val receivedAt = fixedInstant().plusSeconds(sequence)
 
     return PaperMarketTradeEvent(
         symbol = TradingSymbol.BTC,
         side = side,
-        priceJpy = BigDecimal("9900000"),
+        priceJpy = BigDecimal(priceJpy),
         sizeBtc = BigDecimal(sizeBtc),
         exchangeAt = receivedAt,
         receivedAt = receivedAt,

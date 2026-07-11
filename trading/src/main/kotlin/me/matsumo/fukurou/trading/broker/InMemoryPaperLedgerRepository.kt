@@ -197,6 +197,7 @@ private class InMemoryPaperLedgerState(
     val orderMarketEligibility: MutableMap<String, RestingOrderMarketEligibility> = mutableMapOf()
     val orderQueueConsumedBtc: MutableMap<String, BigDecimal> = mutableMapOf()
     val positionMarketEligibility: MutableMap<String, PositionMarketEligibility> = mutableMapOf()
+    val executionMarketSources: MutableMap<String, PaperMarketTradeEvent> = mutableMapOf()
     var marketSessionId: UUID? = null
     var lastMarketSequence: Long = 0
 
@@ -715,6 +716,7 @@ private class InMemoryPaperLedgerMutationWriter(
         orderId: UUID,
         fill: SimulatedFill,
         reasonJa: String,
+        source: PaperMarketTradeEvent? = null,
     ): PaperTradeResult {
         val positionIndex = positions.indexOfFirst { position -> position.positionId == positionId }
 
@@ -747,16 +749,19 @@ private class InMemoryPaperLedgerMutationWriter(
 
         orders += closeOrder
         positions[positionIndex] = closeUpdate.position
-        executions += realizedFill.toExecution(
+        val execution = realizedFill.toExecution(
             orderId = closeOrder.orderId,
             positionId = position.positionId,
             mode = position.mode,
             side = OrderSide.SELL,
         )
+        executions += execution
+        source?.let { event -> executionMarketSources[execution.executionId] = event }
         if (closeUpdate.isPartialClose) {
             updateLinkedStopOrderSizeLocked(position.positionId, closeUpdate.remainingSize, reasonJa)
         } else {
             cancelOpenStopOrdersLocked(position.positionId, reasonJa)
+            positionMarketEligibility.remove(position.positionId)
         }
         accountSnapshot = accountSnapshot.afterSellFill(realizedFill)
         accountUpdatedAt = realizedFill.executedAt
@@ -944,7 +949,9 @@ private class InMemoryPaperLedgerMutationWriter(
             existingPosition = existingPosition,
             existingPositionIndex = existingPositionIndex,
         )
-        executions += fill.toExecution(entryOrder.orderId, targetPositionId.toString(), command)
+        val execution = fill.toExecution(entryOrder.orderId, targetPositionId.toString(), command)
+        executions += execution
+        request.entry.source?.let { event -> executionMarketSources[execution.executionId] = event }
         accountSnapshot = accountSnapshot.afterBuyFill(fill)
         accountUpdatedAt = fill.executedAt
         appendFillEquitySnapshot(fill.executedAt)
@@ -1028,12 +1035,13 @@ private class InMemoryPaperLedgerMutationWriter(
                     position.sizeBtc.toBigDecimal(),
                     stopPrice,
                     context.simulationContext,
-                )
+                ).withMarketEventTime(event)
                 val result = closePositionLocked(
                     positionId = position.positionId,
                     orderId = UUID.fromString(requireNotNull(stopOrder).orderId),
                     fill = fill,
                     reasonJa = "reconciler stop trigger",
+                    source = event,
                 )
 
                 markOrderStatusLocked(stopOrder.orderId, OrderStatus.FILLED)
@@ -1058,12 +1066,13 @@ private class InMemoryPaperLedgerMutationWriter(
                     OrderSide.SELL,
                     position.sizeBtc.toBigDecimal(),
                     context.simulationContext,
-                )
+                ).withMarketEventTime(event)
                 val result = closePositionLocked(
                     positionId = position.positionId,
                     orderId = UUID.randomUUID(),
                     fill = fill,
                     reasonJa = VIRTUAL_TAKE_PROFIT_TRIGGER_REASON,
+                    source = event,
                 )
 
                 progress.closedPositionIds += position.positionId
@@ -1315,6 +1324,19 @@ private fun InMemoryPaperLedgerState.toExecutionActivityRecord(execution: Execut
         order = orderContext,
         position = positionContext,
         entryDecision = decisionContext,
+        sourceEvidence = executionMarketSources[execution.executionId]?.toActivitySourceEvidence(),
+    )
+}
+
+private fun PaperMarketTradeEvent.toActivitySourceEvidence(): ExecutionActivitySourceEvidence {
+    return ExecutionActivitySourceEvidence(
+        sessionId = connectionSessionId.toString(),
+        sequence = sequence,
+        exchangeAt = exchangeAt.toString(),
+        receivedAt = receivedAt.toString(),
+        side = side.name,
+        priceJpy = priceJpy.moneyScale().toPlainString(),
+        sizeBtc = sizeBtc.btcScale().toPlainString(),
     )
 }
 
@@ -1517,6 +1539,10 @@ private fun SimulatedFill.toExecution(
         mode = TradingMode.PAPER,
         side = command.side,
     )
+}
+
+private fun SimulatedFill.withMarketEventTime(event: PaperMarketTradeEvent?): SimulatedFill {
+    return event?.let { marketEvent -> copy(executedAt = marketEvent.receivedAt) } ?: this
 }
 
 private fun SimulatedFill.toExecution(

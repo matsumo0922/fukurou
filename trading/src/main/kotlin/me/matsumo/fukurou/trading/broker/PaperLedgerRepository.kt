@@ -119,6 +119,8 @@ interface PaperLedgerOrderRepository {
  * @param order 直接紐づく order context
  * @param position 約定または order から解決した position context
  * @param entryDecision 同じ position / trade group の entry decision context
+ * @param sourceEvidence realtime market event の約定根拠
+ * @param evaluationExclusionReason infrastructure failure による評価除外理由
  */
 data class ExecutionActivityRecord(
     val execution: Execution,

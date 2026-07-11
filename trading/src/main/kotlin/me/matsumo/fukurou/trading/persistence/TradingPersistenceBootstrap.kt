@@ -288,6 +288,16 @@ private const val ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
     WHERE state = 'CONNECTED'
 """
 
+/** market-data gap / evaluation exclusion の一意性とlookup indexを作るSQL。 */
+private const val ENSURE_MARKET_DATA_INTEGRITY_INDEXES_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluation_exclusions_gap_entity_unique
+        ON evaluation_exclusions (gap_id, entity_type, entity_id);
+    CREATE INDEX IF NOT EXISTS idx_market_data_gaps_session_started
+        ON market_data_gaps (session_id, started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_evaluation_exclusions_entity
+        ON evaluation_exclusions (entity_type, entity_id);
+"""
+
 /**
  * Activity execution context join 用の decision lookup index を作る SQL。
  */
@@ -435,6 +445,20 @@ private const val VERIFY_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
     WHERE schemaname = current_schema()
         AND tablename = 'market_data_sessions'
         AND indexname = 'idx_market_data_sessions_connected_unique'
+"""
+
+/** market-data integrity 補助indexの存在を確認するSQL。 */
+private const val VERIFY_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND indexname IN (
+            'idx_evaluation_exclusions_gap_entity_unique',
+            'idx_market_data_gaps_session_started',
+            'idx_evaluation_exclusions_entity'
+        )
+    GROUP BY schemaname
+    HAVING COUNT(*) = 3
 """
 
 /**
@@ -936,6 +960,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_MARKET_DATA_INTEGRITY_INDEXES_SQL)
     executeUpdate(ENSURE_DECISIONS_INVOCATION_ID_CREATED_AT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
@@ -1038,6 +1063,10 @@ private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
     verifyExistsBySql(
         sql = VERIFY_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL,
         missingMessage = "market-data connected session unique index was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL,
+        missingMessage = "market-data integrity indexes were not initialized.",
     )
     verifySchemaBySql(
         sql = VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL,

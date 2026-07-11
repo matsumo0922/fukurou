@@ -42,6 +42,7 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.lock.TradingLockLease
+import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
@@ -713,6 +714,41 @@ class ProtectionReconcilerTest {
     }
 
     @Test
+    fun market_event_invalid_message_is_recorded_with_invalid_message_reason() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000180")
+        val integrity = RetryableMarketDataIntegrityRepository(0)
+        val status = MutableReconcilerStatus()
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = CountingTradingLock(fixedClock()),
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            marketEventStream = SingleSessionMarketEventStream(
+                ScriptedMarketEventSession(
+                    sessionId = sessionId,
+                    connectedAt = fixedInstant(),
+                    results = listOf(Result.failure(InvalidMarketDataMessageException("invalid symbol"))),
+                ),
+            ),
+            marketDataIntegrityRepository = integrity,
+            status = status,
+            clock = fixedClock(),
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(10))
+        }
+
+        withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
+            while (integrity.applyGapImpactCount == 0) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertEquals(MarketDataGapReason.INVALID_MESSAGE, status.snapshot().gapReason)
+    }
+
+    @Test
     fun market_event_burst_rate_limits_periodic_rest_maintenance() = runBlocking {
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000173")
         val events = (1..100).map { sequence ->
@@ -801,6 +837,40 @@ class ProtectionReconcilerTest {
         assertTrue(broker.appliedEvents.isEmpty())
         assertTrue(broker.maintenanceCount >= 2)
     }
+
+    @Test
+    fun market_event_idle_session_records_message_stale_after_configured_timeout() = runBlocking {
+        val clock = Clock.systemUTC()
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000179")
+        val integrity = RetryableMarketDataIntegrityRepository(0)
+        val status = MutableReconcilerStatus()
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = clock),
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = CountingTradingLock(clock),
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            marketEventStream = SingleSessionMarketEventStream(
+                session = BurstThenIdleMarketEventSession(sessionId, clock.instant(), emptyList()),
+                messageStaleTimeout = Duration.ofMillis(50),
+            ),
+            marketDataIntegrityRepository = integrity,
+            status = status,
+            clock = clock,
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(10))
+        }
+
+        withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
+            while (integrity.applyGapImpactCount == 0) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertEquals(MarketDataGapReason.MESSAGE_STALE, status.snapshot().gapReason)
+        assertEquals(1, integrity.applyGapImpactCount)
+    }
 }
 
 private suspend fun InMemoryPaperLedgerRepository.fillEquitySnapshotCount(): Int {
@@ -876,6 +946,7 @@ private class RecordingBroker(
 /** 1 session の event と切断を返し、その後の reconnect を失敗させる stream。 */
 private class SingleSessionMarketEventStream(
     private val session: MarketEventSession,
+    override val messageStaleTimeout: Duration = Duration.ofSeconds(30),
 ) : MarketEventStream {
     override val reconnectBackoff: Duration = Duration.ofMillis(1)
     private var connectCount = 0
