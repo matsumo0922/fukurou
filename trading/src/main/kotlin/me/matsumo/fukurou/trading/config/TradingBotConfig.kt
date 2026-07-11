@@ -678,9 +678,9 @@ private const val FUKUROU_GMO_PUBLIC_WEBSOCKET_URL_ENV = "FUKUROU_GMO_PUBLIC_WEB
 /** GMO Public WebSocket connect timeout の環境変数名。 */
 private const val FUKUROU_GMO_WEBSOCKET_CONNECT_TIMEOUT_MS_ENV = "FUKUROU_GMO_WEBSOCKET_CONNECT_TIMEOUT_MS"
 
-/** GMO Public WebSocket message stale timeout の環境変数名。 */
-private const val FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS_ENV =
-    "FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS"
+/** GMO Public WebSocket transport liveness timeout の環境変数名。 */
+private const val FUKUROU_GMO_WEBSOCKET_TRANSPORT_LIVENESS_TIMEOUT_SECONDS_ENV =
+    "FUKUROU_GMO_WEBSOCKET_TRANSPORT_LIVENESS_TIMEOUT_SECONDS"
 
 /** GMO Public WebSocket reconnect backoff の環境変数名。 */
 private const val FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS_ENV = "FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS"
@@ -1184,10 +1184,10 @@ private fun Map<String, String>.readGmoPublicWebSocketConfig(): GmoPublicWebSock
             ?.toLong()
             ?.let { millis -> Duration.ofMillis(millis) }
             ?: defaults.connectTimeout,
-        messageStaleTimeout = readOptional(FUKUROU_GMO_WEBSOCKET_STALE_TIMEOUT_SECONDS_ENV)
+        transportLivenessTimeout = readOptional(FUKUROU_GMO_WEBSOCKET_TRANSPORT_LIVENESS_TIMEOUT_SECONDS_ENV)
             ?.toLong()
             ?.let { seconds -> Duration.ofSeconds(seconds) }
-            ?: defaults.messageStaleTimeout,
+            ?: defaults.transportLivenessTimeout,
         reconnectBackoff = readOptional(FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS_ENV)
             ?.toLong()
             ?.let { millis -> Duration.ofMillis(millis) }

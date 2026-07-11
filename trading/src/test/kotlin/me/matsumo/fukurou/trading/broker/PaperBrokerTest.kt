@@ -153,10 +153,16 @@ class PaperBrokerTest {
     @Test
     fun get_account_status_includes_reconciler_freshness() = runBlocking {
         val reconcilerStatus = MutableReconcilerStatus()
-        reconcilerStatus.markReconciled(
-            reconciledAt = fixedInstant(),
-            startupFullReconcileCompleted = true,
-            lastMarketDataAt = fixedInstant(),
+        reconcilerStatus.updateMarketData(
+            ReconcilerStatus(
+                lastReconciledAt = fixedInstant(),
+                lastTransportActivityAt = fixedInstant(),
+                lastTradeAt = fixedInstant(),
+                lastMaintenanceAt = fixedInstant(),
+                startupFullReconcileCompleted = true,
+                marketDataState = MarketDataConnectionState.CONNECTED,
+                startupRecoveryCompleted = true,
+            ),
         )
         val broker = PaperBroker(
             ledgerRepository = InMemoryPaperLedgerRepository(),
@@ -1669,7 +1675,9 @@ class PaperBrokerTest {
             ReconcilerStatus(
                 lastReconciledAt = fixedInstant(),
                 startupFullReconcileCompleted = true,
-                lastMarketDataAt = fixedInstant(),
+                lastTransportActivityAt = fixedInstant(),
+                lastTradeAt = fixedInstant(),
+                lastMaintenanceAt = fixedInstant(),
                 marketDataState = MarketDataConnectionState.CONNECTED,
                 marketDataSessionId = sessionId,
                 lastProcessedSequence = 1,

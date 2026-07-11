@@ -966,13 +966,13 @@ private class ScriptedMarketEventSession(
 ) : MarketEventSession {
     private var nextIndex = 0
 
-    override suspend fun receive(): Result<PaperMarketTradeEvent> {
+    override suspend fun receive(): Result<me.matsumo.fukurou.trading.market.MarketEventSessionSignal> {
         val result = results.getOrElse(nextIndex) {
             Result.failure(IllegalStateException("scripted session exhausted"))
         }
         nextIndex += 1
 
-        return result
+        return result.map { event -> me.matsumo.fukurou.trading.market.MarketEventSessionSignal.Trade(event) }
     }
 
     override fun close() = Unit
@@ -986,12 +986,12 @@ private class BurstThenIdleMarketEventSession(
 ) : MarketEventSession {
     private var nextIndex = 0
 
-    override suspend fun receive(): Result<PaperMarketTradeEvent> {
+    override suspend fun receive(): Result<me.matsumo.fukurou.trading.market.MarketEventSessionSignal> {
         val event = events.getOrNull(nextIndex)
         if (event != null) {
             nextIndex += 1
 
-            return Result.success(event)
+            return Result.success(me.matsumo.fukurou.trading.market.MarketEventSessionSignal.Trade(event))
         }
 
         delay(Long.MAX_VALUE)

@@ -782,13 +782,20 @@ private fun JdbcTransaction.advanceMarketDataCursor(event: PaperMarketTradeEvent
     prepare(
         """
             UPDATE market_data_sessions
-            SET last_processed_sequence = ?, last_received_at = ?
+            SET last_processed_sequence = ?,
+                last_trade_at = ?,
+                last_transport_activity_at = GREATEST(
+                    COALESCE(last_transport_activity_at, ?),
+                    ?
+                )
             WHERE id = ? AND state = 'CONNECTED'
         """,
     ).use { statement ->
         statement.setLong(1, event.sequence)
         statement.setLong(2, event.receivedAt.toEpochMilli())
-        statement.setObject(3, event.connectionSessionId)
+        statement.setLong(3, event.receivedAt.toEpochMilli())
+        statement.setLong(4, event.receivedAt.toEpochMilli())
+        statement.setObject(5, event.connectionSessionId)
         require(statement.executeUpdate() == 1) { "market-data cursor update failed." }
     }
     prepare(

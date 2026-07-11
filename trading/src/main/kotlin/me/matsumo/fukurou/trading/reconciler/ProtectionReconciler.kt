@@ -22,8 +22,8 @@ import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
-import me.matsumo.fukurou.trading.market.MarketDataMessageStaleException
 import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
+import me.matsumo.fukurou.trading.market.MarketDataTransportLivenessException
 import me.matsumo.fukurou.trading.market.MarketEventStream
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.market.UnavailableMarketDataIntegrityRepository
@@ -212,34 +212,26 @@ class ProtectionReconciler(
         maintenanceInterval: Duration,
     ) {
         var nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
-        var lastReceivedAt = session.connectedAt
-        val messageStaleTimeout = requireNotNull(marketEventStream).messageStaleTimeout
+        var transportDeadlineAtNanos = nextMaintenanceAtNanos(
+            requireNotNull(marketEventStream).transportLivenessTimeout,
+        )
 
         while (currentCoroutineContext().isActive) {
             val maintenanceWaitMillis = remainingWaitMillis(nextMaintenanceAtNanos)
-            val staleWaitMillis = remainingStaleWaitMillis(lastReceivedAt, messageStaleTimeout)
+            val transportWaitMillis = remainingWaitMillis(transportDeadlineAtNanos)
             val eventResult = kotlinx.coroutines.withTimeoutOrNull(
-                minOf(maintenanceWaitMillis, staleWaitMillis),
+                minOf(maintenanceWaitMillis, transportWaitMillis),
             ) {
                 session.receive()
             }
             if (eventResult == null) {
-                if (lastReceivedAt.isMarketDataStale(Instant.now(clock), messageStaleTimeout)) {
-                    recordMarketDataGap(
-                        sessionId = session.sessionId,
-                        throwable = MarketDataMessageStaleException("GMO WebSocket trade message became stale."),
-                    )
-                    refreshMarketDataStatus()
-                    return
-                }
-
-                runPeriodicSafetyMaintenance(session.sessionId)
+                if (handleMarketSessionTimeout(session, nextMaintenanceAtNanos, transportDeadlineAtNanos)) return
                 nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
                 continue
             }
-            val event = eventResult.getOrNull()
+            val signal = eventResult.getOrNull()
 
-            if (event == null) {
+            if (signal == null) {
                 recordMarketDataGap(
                     sessionId = session.sessionId,
                     throwable = eventResult.exceptionOrNull(),
@@ -248,23 +240,55 @@ class ProtectionReconciler(
                 return
             }
 
-            lastReceivedAt = event.receivedAt
-
-            val applied = applyMarketEvent(event)
-            if (applied.isFailure) {
-                recordMarketDataGap(
-                    sessionId = session.sessionId,
-                    throwable = applied.exceptionOrNull(),
-                )
-                refreshMarketDataStatus()
-                return
-            }
+            if (!handleMarketSessionSignal(session, signal)) return
+            transportDeadlineAtNanos = nextMaintenanceAtNanos(requireNotNull(marketEventStream).transportLivenessTimeout)
 
             if (System.nanoTime() >= nextMaintenanceAtNanos) {
                 runPeriodicSafetyMaintenance(session.sessionId)
                 nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
             }
         }
+    }
+
+    private suspend fun handleMarketSessionTimeout(
+        session: me.matsumo.fukurou.trading.market.MarketEventSession,
+        nextMaintenanceAtNanos: Long,
+        transportDeadlineAtNanos: Long,
+    ): Boolean {
+        if (System.nanoTime() >= transportDeadlineAtNanos) {
+            recordMarketDataGap(
+                sessionId = session.sessionId,
+                throwable = MarketDataTransportLivenessException("GMO WebSocket transport activity became stale."),
+            )
+            refreshMarketDataStatus()
+            return true
+        }
+
+        if (System.nanoTime() >= nextMaintenanceAtNanos) runPeriodicSafetyMaintenance(session.sessionId)
+
+        return false
+    }
+
+    private suspend fun handleMarketSessionSignal(
+        session: me.matsumo.fukurou.trading.market.MarketEventSession,
+        signal: me.matsumo.fukurou.trading.market.MarketEventSessionSignal,
+    ): Boolean {
+        val result = when (signal) {
+            is me.matsumo.fukurou.trading.market.MarketEventSessionSignal.Trade -> applyMarketEvent(signal.event)
+            is me.matsumo.fukurou.trading.market.MarketEventSessionSignal.TransportActivity -> marketDataIntegrityRepository.markTransportActivity(
+                sessionId = session.sessionId,
+                observedAt = signal.observedAt,
+            )
+        }
+        if (result.isSuccess) {
+            refreshMarketDataStatus()
+            return true
+        }
+
+        recordMarketDataGap(session.sessionId, result.exceptionOrNull())
+        refreshMarketDataStatus()
+
+        return false
     }
 
     /** realtime event の量によらず periodic maintenance を rate limit する次回期限を返す。 */
@@ -281,15 +305,6 @@ class ProtectionReconciler(
         val remainingNanos = (deadlineAtNanos - System.nanoTime()).coerceAtLeast(0)
 
         return ((remainingNanos + 999_999) / 1_000_000).coerceAtLeast(1)
-    }
-
-    /** 最後のevent受信時刻からstale期限までの待機ミリ秒を返す。 */
-    private fun remainingStaleWaitMillis(lastReceivedAt: Instant, staleTimeout: Duration): Long {
-        val staleAt = lastReceivedAt.plus(staleTimeout)
-        val remaining = Duration.between(Instant.now(clock), staleAt)
-        if (remaining.isNegative || remaining.isZero) return 1
-
-        return ((remaining.toNanos() + 999_999) / 1_000_000).coerceAtLeast(1)
     }
 
     private suspend fun recordMarketDataGap(sessionId: UUID, throwable: Throwable?) {
@@ -409,7 +424,9 @@ class ProtectionReconciler(
             ReconcilerStatus(
                 lastReconciledAt = integrity.lastMaintenanceAt,
                 startupFullReconcileCompleted = integrity.startupRecoveryCompleted,
-                lastMarketDataAt = integrity.lastReceivedAt,
+                lastTransportActivityAt = integrity.lastTransportActivityAt,
+                lastTradeAt = integrity.lastTradeAt,
+                lastMaintenanceAt = integrity.lastMaintenanceAt,
                 marketDataState = integrity.state,
                 marketDataSessionId = integrity.sessionId,
                 lastProcessedSequence = integrity.lastProcessedSequence,
@@ -545,7 +562,7 @@ class ProtectionReconciler(
         divergenceMemos: List<PaperExecutionDivergenceMemo>,
     ): Result<Unit> {
         val isStartupFullPass = passKind == ReconcilePassKind.STARTUP_FULL
-        val lastMarketDataAt = tickSnapshot?.observedAt ?: status.snapshot().lastMarketDataAt
+        val lastMarketDataAt = tickSnapshot?.observedAt ?: status.snapshot().lastMaintenanceAt
         val auditResult = recordSuccessTransition(
             passKind = passKind,
             reconciledAt = reconciledAt,
@@ -701,7 +718,7 @@ private fun ReconcilePassKind.payloadName(): String {
 
 private fun Throwable?.toGapReason(): MarketDataGapReason {
     return when {
-        this is MarketDataMessageStaleException -> MarketDataGapReason.MESSAGE_STALE
+        this is MarketDataTransportLivenessException -> MarketDataGapReason.TRANSPORT_LIVENESS_LOST
         this is InvalidMarketDataMessageException -> MarketDataGapReason.INVALID_MESSAGE
         this?.message.orEmpty().contains("sequence gap", ignoreCase = true) -> MarketDataGapReason.SEQUENCE_GAP
         this is java.sql.SQLException -> MarketDataGapReason.DATABASE_FAILURE
@@ -716,15 +733,9 @@ private fun Throwable?.toMarketDataGapDetail(): String? {
         is InvalidMarketDataMessageException,
         is MarketDataBackpressureException,
         is MarketDataSubscriptionException,
-        is MarketDataMessageStaleException,
+        is MarketDataTransportLivenessException,
         -> "${javaClass.simpleName}: ${message.orEmpty()}"
 
         else -> javaClass.simpleName
     }
-}
-
-private fun Instant.isMarketDataStale(now: Instant, staleTimeout: Duration): Boolean {
-    if (isAfter(now)) return false
-
-    return Duration.between(this, now) >= staleTimeout
 }

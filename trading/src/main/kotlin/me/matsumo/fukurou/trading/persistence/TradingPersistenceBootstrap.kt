@@ -288,6 +288,14 @@ private const val ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
     WHERE state = 'CONNECTED'
 """
 
+/** historical trade timestamp を新しい正本列へ一度だけ移す SQL。 */
+private const val BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL = """
+    UPDATE market_data_sessions
+    SET last_trade_at = last_received_at
+    WHERE last_trade_at IS NULL
+        AND last_received_at IS NOT NULL
+"""
+
 /** evaluation exclusion の重複を防ぐ unique index を作る SQL。 */
 private const val ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL = """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluation_exclusions_gap_entity_unique
@@ -705,6 +713,8 @@ private const val VERIFY_MARKET_DATA_INTEGRITY_SCHEMA_SQL = """
         s.disconnected_at,
         s.last_processed_sequence,
         s.last_received_at,
+        s.last_transport_activity_at,
+        s.last_trade_at,
         s.last_maintenance_at,
         g.id,
         g.session_id,
@@ -968,6 +978,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
+    executeUpdate(BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_GAPS_SESSION_STARTED_INDEX_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_ENTITY_INDEX_SQL)

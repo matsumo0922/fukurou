@@ -12,8 +12,10 @@ import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
 import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
 import me.matsumo.fukurou.trading.market.MarketEventSession
+import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
+import me.matsumo.fukurou.trading.market.TransportActivityKind
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.WebSocket
@@ -47,17 +49,17 @@ class GmoPublicWebSocketMarketEventStream(
     override val reconnectBackoff: java.time.Duration
         get() = config.reconnectBackoff
 
-    override val messageStaleTimeout: java.time.Duration
-        get() = config.messageStaleTimeout
+    override val transportLivenessTimeout: java.time.Duration
+        get() = config.transportLivenessTimeout
 
     override suspend fun connect(): Result<MarketEventSession> {
         var socket: WebSocket? = null
-        var messages: Channel<Result<PaperMarketTradeEvent>>? = null
+        var messages: Channel<Result<MarketEventSessionSignal>>? = null
 
         return runCatching {
             val sessionId = UUID.randomUUID()
             val connectedAt = clock.instant()
-            val sessionMessages = Channel<Result<PaperMarketTradeEvent>>(capacity = MARKET_EVENT_BUFFER_CAPACITY)
+            val sessionMessages = Channel<Result<MarketEventSessionSignal>>(capacity = MARKET_EVENT_BUFFER_CAPACITY)
             val terminalFailure = AtomicReference<Throwable?>()
             messages = sessionMessages
             val listener = GmoWebSocketListener(
@@ -92,13 +94,13 @@ class GmoPublicWebSocketMarketEventStream(
  *
  * @param endpoint Public WebSocket endpoint
  * @param connectTimeout 接続 timeout
- * @param messageStaleTimeout 最終trade messageからgap判定までの時間
+ * @param transportLivenessTimeout transport activity からgap判定までの時間
  * @param reconnectBackoff 再接続前の待機時間
  */
 data class GmoPublicWebSocketConfig(
     val endpoint: String = "wss://api.coin.z.com/ws/public/v1",
     val connectTimeout: java.time.Duration = java.time.Duration.ofSeconds(5),
-    val messageStaleTimeout: java.time.Duration = java.time.Duration.ofSeconds(30),
+    val transportLivenessTimeout: java.time.Duration = java.time.Duration.ofSeconds(150),
     val reconnectBackoff: java.time.Duration = java.time.Duration.ofSeconds(2),
 ) {
     init {
@@ -108,11 +110,11 @@ data class GmoPublicWebSocketConfig(
         require(!connectTimeout.isNegative && !connectTimeout.isZero) {
             "connectTimeout must be greater than 0."
         }
-        require(!messageStaleTimeout.isNegative && !messageStaleTimeout.isZero) {
-            "messageStaleTimeout must be greater than 0."
+        require(!transportLivenessTimeout.isNegative && !transportLivenessTimeout.isZero) {
+            "transportLivenessTimeout must be greater than 0."
         }
-        require(!reconnectBackoff.isNegative && !reconnectBackoff.isZero) {
-            "reconnectBackoff must be greater than 0."
+        require(reconnectBackoff >= java.time.Duration.ofSeconds(1)) {
+            "reconnectBackoff must be at least 1 second."
         }
     }
 }
@@ -121,12 +123,12 @@ data class GmoPublicWebSocketConfig(
 private class GmoMarketEventSession(
     private val metadata: MarketEventSessionMetadata,
     private val socket: WebSocket,
-    private val messages: Channel<Result<PaperMarketTradeEvent>>,
+    private val messages: Channel<Result<MarketEventSessionSignal>>,
     private val terminalFailure: AtomicReference<Throwable?>,
 ) : MarketEventSession {
     override val sessionId: UUID = metadata.sessionId
     override val connectedAt: Instant = metadata.connectedAt
-    override suspend fun receive(): Result<PaperMarketTradeEvent> {
+    override suspend fun receive(): Result<MarketEventSessionSignal> {
         terminalFailure.get()?.let { throwable -> return Result.failure(throwable) }
 
         return try {
@@ -206,7 +208,7 @@ internal class GmoTradeMessageDecoder(
 
 /** GMO WebSocket callbackを順序付きmarket eventへ変換するlistener。 */
 internal class GmoWebSocketListener(
-    private val messages: Channel<Result<PaperMarketTradeEvent>>,
+    private val messages: Channel<Result<MarketEventSessionSignal>>,
     private val decoder: GmoTradeMessageDecoder,
     private val clock: Clock,
     private val terminalFailure: AtomicReference<Throwable?> = AtomicReference(),
@@ -231,10 +233,21 @@ internal class GmoWebSocketListener(
                     decoder.decode(fragments.toString(), receivedAt)
                 }
                 decoded.exceptionOrNull()?.let { throwable ->
-                    sendResult(Result.failure(throwable))
+                    sendTerminalFailure(throwable)
                 }
-                decoded.getOrNull()?.let { event ->
-                    sendResult(Result.success(event))
+                if (decoded.isSuccess) {
+                    decoded.getOrNull()?.let { event ->
+                        sendResult(Result.success(MarketEventSessionSignal.Trade(event)))
+                    } ?: run {
+                        sendResult(
+                            Result.success(
+                                MarketEventSessionSignal.TransportActivity(
+                                    observedAt = receivedAt,
+                                    kind = TransportActivityKind.SUBSCRIPTION_ACKNOWLEDGED,
+                                ),
+                            ),
+                        )
+                    }
                 }
                 fragments.setLength(0)
             }
@@ -247,7 +260,20 @@ internal class GmoWebSocketListener(
     override fun onPing(webSocket: WebSocket, message: ByteBuffer): CompletionStage<*> {
         webSocket.request(1)
 
-        return webSocket.sendPong(message)
+        return webSocket.sendPong(message).whenComplete { _, throwable ->
+            if (throwable == null) {
+                sendResult(
+                    Result.success(
+                        MarketEventSessionSignal.TransportActivity(
+                            observedAt = clock.instant(),
+                            kind = TransportActivityKind.PING_PONG_COMPLETED,
+                        ),
+                    ),
+                )
+            } else {
+                sendTerminalFailure(throwable)
+            }
+        }
     }
 
     override fun onClose(
@@ -255,24 +281,28 @@ internal class GmoWebSocketListener(
         statusCode: Int,
         reason: String,
     ): CompletionStage<*>? {
-        sendResult(Result.failure(IllegalStateException("GMO WebSocket closed: $statusCode")))
-        messages.close()
+        sendTerminalFailure(IllegalStateException("GMO WebSocket closed: $statusCode"))
 
         return null
     }
 
     override fun onError(webSocket: WebSocket, error: Throwable) {
-        sendResult(Result.failure(error))
-        messages.close(error)
+        sendTerminalFailure(error)
     }
 
-    private fun sendResult(result: Result<PaperMarketTradeEvent>) {
+    private fun sendResult(result: Result<MarketEventSessionSignal>) {
         val sendResult = messages.trySend(result)
         if (sendResult.isSuccess || sendResult.isClosed) return
 
         val failure = MarketDataBackpressureException("GMO WebSocket market event buffer overflowed.")
-        terminalFailure.compareAndSet(null, failure)
-        messages.close(failure)
+        sendTerminalFailure(failure)
+    }
+
+    private fun sendTerminalFailure(throwable: Throwable) {
+        if (!terminalFailure.compareAndSet(null, throwable)) return
+
+        messages.trySend(Result.failure(throwable))
+        messages.close(throwable)
     }
 }
 
