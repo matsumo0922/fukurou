@@ -4,6 +4,7 @@ import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
 import { fetchReportHistory, fetchReportRevision, generateReport, pinReport, reportQuery, reportScopeKey, type EvaluationReport, type ReportJob, type ReportScope } from "../api/evaluationReport";
 import { LazyHistoricalOutcomeRidge } from "./evaluation-report/HistoricalOutcomeRidge.lazy";
 import { LazyEvidenceRelationshipGraph } from "./evaluation-report/EvidenceRelationshipGraph.lazy";
+import { disconnectedContext, initialContextState, transitionCurrentContext, type ContextEnvelope } from "./evaluation-report/currentContextStateMachine";
 
 export function EvaluationPage() {
   const [days, setDays] = useState(30);
@@ -56,7 +57,7 @@ export function EvaluationPage() {
 }
 
 function CurrentContextStrip() {
-  const [context, setContext] = useState<{ state: string; sessionId: string | null; sequence: number | null; sources: { source: string; freshness: string; value: Record<string, string> | null }[] }>({ state: "CONNECTING", sessionId: null, sequence: null, sources: [] });
+  const [context, setContext] = useState(initialContextState);
   useEffect(() => {
     if (typeof WebSocket === "undefined") return undefined;
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
@@ -66,7 +67,7 @@ function CurrentContextStrip() {
     let stopped = false;
     const reconnect = () => {
       if (stopped) return;
-      setContext((current) => ({ ...current, state: "RESYNCING" }));
+      setContext(disconnectedContext);
       reconnectTimer = setTimeout(connect, 1000);
     };
     const armHeartbeatTimeout = () => {
@@ -77,20 +78,15 @@ function CurrentContextStrip() {
       socket = new WebSocket(`${protocol}://${window.location.host}/ops/current-context/ws`);
       socket.onmessage = (event) => {
         try {
-          const envelope = JSON.parse(String(event.data)) as { protocolVersion: number; type: string; sessionId: string; sequence: number; sources: { source: string; freshness: string; value: Record<string, string> | null }[] };
+          const envelope = JSON.parse(String(event.data)) as ContextEnvelope;
           setContext((current) => {
-            const fullSnapshot = envelope.protocolVersion === 1 && envelope.type === "SNAPSHOT" && envelope.sequence === 1;
-            if (current.state === "RESYNCING" || current.sessionId == null) {
-              if (!fullSnapshot) { socket?.close(); return current; }
-              return { state: "CONNECTED", sessionId: envelope.sessionId, sequence: envelope.sequence, sources: envelope.sources };
-            }
-            const validEnvelope = envelope.protocolVersion === 1 && envelope.sessionId === current.sessionId &&
-              envelope.sequence === (current.sequence ?? 0) + 1 && ["UPDATE", "HEARTBEAT"].includes(envelope.type);
-            if (!validEnvelope) { socket?.close(); return { ...current, state: "RESYNCING" }; }
-            return { ...current, state: "CONNECTED", sequence: envelope.sequence, sources: envelope.type === "UPDATE" ? envelope.sources : current.sources };
+            const transition = transitionCurrentContext(current, envelope);
+            if (transition.close) socket?.close();
+            return transition.context;
           });
           armHeartbeatTimeout();
         } catch {
+          setContext(disconnectedContext);
           socket?.close();
         }
       };
@@ -146,7 +142,8 @@ function RevisionRail({ report, pinned }: { report: EvaluationReport; pinned: bo
     <div><span>Revision</span><strong>#{report.revisionNumber} · {pinned ? "PINNED" : "PREVIEW"}</strong><small>{report.scopeKey}</small></div>
     <div><span>Snapshot authority</span><strong>{report.snapshotId.slice(0, 12)}</strong><small>{report.inputHash.slice(0, 20)}</small></div>
     <div><span>Input as of</span><strong>{new Date(report.inputAsOf).toLocaleString()}</strong><small>{report.period.from} — {report.period.toInclusive}</small></div>
-    <div><span>Generator</span><strong>{report.provider}</strong><small>{report.model}</small></div>
+    <div><span>Generator</span><strong>{report.generation.provider}</strong><small>{report.generation.observedModels?.join(", ") || report.model} · {report.generation.effort}</small></div>
+    <div><span>LLM cost</span><strong>{report.generation.totalCostUsd ? `$${report.generation.totalCostUsd}` : "UNPRICED"}</strong><small>{report.generation.durationMillis == null ? "duration unavailable" : `${report.generation.durationMillis}ms`} · {report.generation.schemaVersion}</small></div>
     <div><span>Claim coverage</span><strong>{verified}/{report.validation.length} verified</strong><small>{report.validation.filter((result) => result.status === "CONFLICT").length} conflict</small></div>
     <div><span>Snapshot</span><strong>{report.truncated ? "PARTIAL" : "COMPLETE"}</strong><small>immutable historical evidence</small></div>
   </section>;

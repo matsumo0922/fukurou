@@ -1,7 +1,10 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou
 
 import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.webSocket
+import io.ktor.http.HttpHeaders
 import io.ktor.server.testing.testApplication
 import io.ktor.websocket.Frame
 import io.ktor.websocket.readText
@@ -14,9 +17,28 @@ import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
 
 /** current context WebSocket の snapshot authority を検証する。 */
 class CurrentContextWebSocketRouteTest {
+
+    @Test
+    fun websocket_usesConnectionScopedSessionAndRestartsSequence() = testApplication {
+        application { module(clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC)) }
+        val client = createClient { install(WebSockets) }
+        suspend fun snapshot(): CurrentContextEnvelopeResponse {
+            var result: CurrentContextEnvelopeResponse? = null
+            client.webSocket("/ops/current-context/ws", request = { headers.append(HttpHeaders.Origin, "http://localhost") }) {
+                result = ApiJson.decodeFromString((incoming.receive() as Frame.Text).readText())
+            }
+            return requireNotNull(result)
+        }
+        val first = snapshot()
+        val second = snapshot()
+        assertNotEquals(first.sessionId, second.sessionId)
+        assertEquals(1, first.sequence)
+        assertEquals(1, second.sequence)
+    }
 
     @Test
     fun websocket_sendsReadOnlySnapshotWithQuoteFreshness() = testApplication {
@@ -32,7 +54,7 @@ class CurrentContextWebSocketRouteTest {
         }
         val client = createClient { install(WebSockets) }
 
-        client.webSocket("/ops/current-context/ws") {
+        client.webSocket("/ops/current-context/ws", request = { headers.append(HttpHeaders.Origin, "http://localhost") }) {
             val frame = incoming.receive() as Frame.Text
             val envelope = ApiJson.decodeFromString<CurrentContextEnvelopeResponse>(frame.readText())
 
@@ -58,7 +80,7 @@ class CurrentContextWebSocketRouteTest {
         }
         val client = createClient { install(WebSockets) }
 
-        client.webSocket("/ops/current-context/ws") {
+        client.webSocket("/ops/current-context/ws", request = { headers.append(HttpHeaders.Origin, "http://localhost") }) {
             val envelope = ApiJson.decodeFromString<CurrentContextEnvelopeResponse>(
                 (incoming.receive() as Frame.Text).readText(),
             )

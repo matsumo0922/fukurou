@@ -17,6 +17,7 @@ export type EvaluationReport = {
   generatedAt: string;
   provider: string;
   model: string;
+  generation: { invocationId: string; provider: string; durationMillis: number | null; totalCostUsd: string | null; observedModels: string[] | null; promptHash: string | null; promptVersion: string; schemaVersion: string; effort: string };
   title: string;
   segments: { segmentId: string; kind: string; text: string; claimIds: string[] }[];
   claims: ReportClaim[];

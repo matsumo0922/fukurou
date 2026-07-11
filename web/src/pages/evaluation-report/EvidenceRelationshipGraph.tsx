@@ -1,15 +1,14 @@
 import dagre from "@dagrejs/dagre";
 import { Background, Controls, ReactFlow, type Edge, type Node } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import type { EvaluationReport } from "../../api/evaluationReport";
+import type { EvidencePath } from "./evidenceProjection";
 
 type GraphData = { nodes: Node[]; edges: Edge[]; paths: EvidencePath[] };
-type EvidencePath = { segment: string; claim: string; validation: string; fact: string; source: string; chart: string };
 
-export default function EvidenceRelationshipGraph({ report, selectedClaim, onSelectClaim }: { report: EvaluationReport; selectedClaim: string | null; onSelectClaim: (claimId: string) => void }) {
-  const [showTable, setShowTable] = useState(false);
-  const graph = useMemo(() => projectGraph(report, selectedClaim), [report, selectedClaim]);
+export default function EvidenceRelationshipGraph({ report, selectedClaim, onSelectClaim, paths }: { report: EvaluationReport; selectedClaim: string | null; onSelectClaim: (claimId: string) => void; paths: EvidencePath[] }) {
+  const graph = useMemo(() => projectGraph(report, selectedClaim, paths), [report, selectedClaim, paths]);
 
   return <section className="report-panel report-panel--wide" aria-labelledby="evidence-graph-title">
     <header className="report-panel__header"><div><span className="console-kicker">EVIDENCE RELATIONSHIP GRAPH</span><h2 id="evidence-graph-title">Segment → claim → fact → source</h2></div><div className="console-badges"><span>REFERENCE GRAPH · NOT CAUSAL</span><code>{report.inputHash.slice(0, 12)}</code></div></header>
@@ -25,17 +24,14 @@ export default function EvidenceRelationshipGraph({ report, selectedClaim, onSel
         onNodeClick={(_, node) => { if (node.id.startsWith("claim:")) onSelectClaim(node.id.slice(6)); }}
       ><Background gap={24} size={1} /><Controls showInteractive={false} /></ReactFlow>
     </div>
-    <div className="console-toolbar"><button onClick={() => setShowTable((value) => !value)}>SHOW PATHS TABLE</button><span>Node size and edge width do not encode confidence, importance, profit or causality.</span></div>
-    {showTable && <div className="console-table-wrap"><table><caption>Evidence relationship text representation</caption><thead><tr><th>Segment</th><th>Claim</th><th>Status</th><th>Fact</th><th>Source</th></tr></thead><tbody>{graph.paths.map((path, index) => <tr key={`${path.claim}:${path.fact}:${index}`}><td>{path.segment}</td><td>{path.claim}</td><td>{path.validation}</td><td>{path.fact}</td><td>{path.source || "SOURCE_UNAVAILABLE"}</td></tr>)}</tbody></table></div>}
+    <div className="console-toolbar"><span>Node size and edge width do not encode confidence, importance, profit or causality.</span></div>
   </section>;
 }
 
-function projectGraph(report: EvaluationReport, selectedClaim: string | null): GraphData {
+function projectGraph(report: EvaluationReport, selectedClaim: string | null, paths: EvidencePath[]): GraphData {
   const nodes: Node[] = [];
   const edges: Edge[] = [];
-  const paths: EvidencePath[] = [];
   const validation = new Map(report.validation.map((item) => [item.claimId, item.status]));
-  const factById = new Map(report.facts.map((fact) => [fact.factId, fact]));
   const sourceIds = new Set(report.sources.map((source) => source.sourceId));
 
   report.segments.forEach((segment) => {
@@ -47,9 +43,6 @@ function projectGraph(report: EvaluationReport, selectedClaim: string | null): G
     nodes.push(makeNode(`claim:${claim.claimId}`, `${claim.claimId}\n${humanStatus(state)}`, `claim ${state.toLowerCase()}`, 1));
     claim.factIds.forEach((factId) => {
       edges.push(makeEdge(`claim:${claim.claimId}`, `fact:${factId}`, selectedClaim === claim.claimId));
-      const fact = factById.get(factId);
-      const sources = fact?.sourceIds.filter((sourceId) => sourceIds.has(sourceId)) ?? [];
-      paths.push({ segment: report.segments.find((segment) => segment.claimIds.includes(claim.claimId))?.segmentId ?? "UNBOUND", claim: claim.claimId, validation: humanStatus(state), fact: factId, source: sources.join(", "), chart: "" });
     });
   });
   report.facts.forEach((fact) => {
@@ -62,7 +55,8 @@ function projectGraph(report: EvaluationReport, selectedClaim: string | null): G
     chart.factIds.forEach((factId) => edges.push(makeEdge(`fact:${factId}`, `chart:${chart.chartId}`, false)));
   });
 
-  return layout(nodes, edges, paths);
+  const visibleIds = new Set(paths.flatMap((path) => [`segment:${path.segment}`, `claim:${path.claim}`, `fact:${path.fact}`, `source:${path.source}`, `chart:${path.chart}`]));
+  return layout(nodes.filter((node) => visibleIds.has(node.id)), edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target)), paths);
 }
 
 function makeNode(id: string, label: string, className: string, layer: number): Node {

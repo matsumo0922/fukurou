@@ -178,7 +178,10 @@ private fun JdbcTransaction.selectBlockingActiveReservation(
     requestTriggerKind: LlmDaemonTriggerKind,
     activeSince: Instant,
 ): LlmActiveLaunchReservation? {
-    val includeReflection = requestTriggerKind == LlmDaemonTriggerKind.REFLECTION
+    val includeReflection = requestTriggerKind in setOf(
+        LlmDaemonTriggerKind.REFLECTION,
+        LlmDaemonTriggerKind.EVALUATION_REPORT,
+    )
     return jdbcConnection().prepareStatement(SELECT_ACTIVE_LLM_LAUNCH_RESERVATION_SQL).use { statement ->
         statement.setString(1, LlmLaunchReservationStatus.RUNNING.name)
         statement.setLong(2, activeSince.toEpochMilli())

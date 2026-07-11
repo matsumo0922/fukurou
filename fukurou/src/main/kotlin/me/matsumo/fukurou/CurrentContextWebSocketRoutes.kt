@@ -30,6 +30,7 @@ internal fun Route.currentContextWebSocketRoutes(dependencies: EvaluationRouteDe
         }
 
         var sequence = 0L
+        val connectionSessionId = UUID.randomUUID().toString()
         var previous: List<CurrentContextSourceResponse>? = null
         while (true) {
             val sources = currentContextSources(dependencies)
@@ -40,7 +41,7 @@ internal fun Route.currentContextWebSocketRoutes(dependencies: EvaluationRouteDe
                     previous != sources -> "UPDATE"
                     else -> "HEARTBEAT"
                 },
-                sessionId = CurrentContextBootSessionId,
+                sessionId = connectionSessionId,
                 sequence = ++sequence,
                 sentAt = dependencies.clock.instant().toString(),
                 sources = if (previous == sources) emptyList() else sources,
@@ -58,7 +59,7 @@ internal fun Route.currentContextWebSocketRoutes(dependencies: EvaluationRouteDe
         }
     }.describe {
         summary = "現在の read-only 運用 context を WebSocket 配信する"
-        description = "protocolVersion=1、boot sessionId、connection sequence、SNAPSHOT/UPDATE/HEARTBEAT envelope と source ごとの observedAt/receivedAt/staleAfterMillis/freshness を配信します。45秒無応答または slow client は再接続が必要です。"
+        description = "protocolVersion=1、connection-scoped sessionId、session内で単調増加するsequence、SNAPSHOT/UPDATE/HEARTBEAT envelope と source ごとの observedAt/receivedAt/staleAfterMillis/freshness を配信します。Originは必須かつsame-originです。45秒無応答または slow client は再接続が必要です。"
         tag("評価レポート")
         responses {
             io.ktor.http.HttpStatusCode.SwitchingProtocols {
@@ -187,7 +188,7 @@ private fun freshness(
 }
 
 private fun originAllowed(origin: String?, host: String): Boolean {
-    if (origin == null) return true
+    if (origin == null) return false
     return runCatching { java.net.URI(origin).authority == host }.getOrDefault(false)
 }
 
@@ -210,5 +211,4 @@ data class CurrentContextSourceResponse(
     val freshness: String,
     val value: Map<String, String>?,
 )
-private val CurrentContextBootSessionId = UUID.randomUUID().toString()
 private const val CURRENT_CONTEXT_STALE_AFTER_MILLIS = 15_000L

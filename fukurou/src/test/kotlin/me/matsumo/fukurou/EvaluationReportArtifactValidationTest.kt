@@ -1,6 +1,9 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 
 /** untrusted LLM report artifact の structural bounds を検証する。 */
@@ -48,5 +51,25 @@ class EvaluationReportArtifactValidationTest {
                 claims = listOf(EvaluationReportClaimResponse("claim-1", "FACT_VALUE", listOf("unknown-fact"), "1")),
             ),
         )
+    }
+
+    @Test
+    fun validator_acceptsEveryVersionedKindAndTypeAndEnforcesTextBounds() {
+        val kinds = listOf("SUMMARY", "PERFORMANCE", "CALIBRATION", "RISK", "COST", "COVERAGE", "LIMITATION")
+        val types = listOf("FACT_VALUE", "FACT_DIRECTION", "FACT_COMPARISON", "FACT_DELTA", "FACT_COVERAGE")
+        val artifact = GeneratedEvaluationArtifact(
+            segments = kinds.mapIndexed { index, kind -> EvaluationReportSegmentResponse("segment-$index", kind, "text", listOf("claim-${index % types.size}")) },
+            claims = types.mapIndexed { index, type -> EvaluationReportClaimResponse("claim-$index", type, listOf("fact-$index"), "value") },
+        )
+        validateGeneratedArtifact(artifact)
+        assertEquals(kinds.size, artifact.segments.size)
+        assertFailsWith<IllegalArgumentException> {
+            validateGeneratedArtifact(artifact.copy(segments = listOf(EvaluationReportSegmentResponse("long", "SUMMARY", "x".repeat(1_201), emptyList()))))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            validateGeneratedArtifact(
+                artifact.copy(segments = List(11) { index -> EvaluationReportSegmentResponse("large-$index", "SUMMARY", "x".repeat(1_100), emptyList()) }),
+            )
+        }
     }
 }

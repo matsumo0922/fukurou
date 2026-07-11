@@ -54,7 +54,7 @@ internal class EvaluationReportPersistence(
                 now.minus(Duration.ofHours(1)).toEpochMilli(),
             ) >= 3L
             val outcome = if (reportRateExceeded) {
-                LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR)
+                LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.REPORT_RATE_LIMIT)
             } else {
                 tryReserveLlmLaunchInTransaction(
                     LlmLaunchReservationRequest(
@@ -81,6 +81,7 @@ internal class EvaluationReportPersistence(
                 )
             }
             insertJob(persistedJob, scopeKey, now.toEpochMilli())
+            insertJobEvent(persistedJob, now.toEpochMilli())
 
             EvaluationReportAdmission(persistedJob, outcome)
         }
@@ -99,6 +100,7 @@ internal class EvaluationReportPersistence(
                 statement.setObject(6, UUID.fromString(job.jobId))
                 check(statement.executeUpdate() == 1)
             }
+            insertJobEvent(job, clock.instant().toEpochMilli())
         }
     }
 
@@ -142,8 +144,24 @@ internal class EvaluationReportPersistence(
         }
     }
 
+    fun jobEvents(jobId: String): Result<List<EvaluationReportJobEvent>> = runCatching {
+        exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                "SELECT status, stage, code, occurred_at FROM evaluation_report_job_events WHERE job_id=? ORDER BY event_id",
+            ).use { statement ->
+                statement.setObject(1, UUID.fromString(jobId))
+                statement.executeQuery().use { rows ->
+                    buildList {
+                        while (rows.next()) add(EvaluationReportJobEvent(rows.getString(1), rows.getString(2), rows.getString(3), rows.getLong(4)))
+                    }
+                }
+            }
+        }
+    }
+
     fun complete(report: EvaluationReportResponse, job: EvaluationReportJobResponse): Result<Unit> = runCatching {
         exposedTransaction(database) {
+            val now = clock.instant().toEpochMilli()
             jdbcConnection().prepareStatement(
                 """
                 INSERT INTO evaluation_report_revisions (revision_id, job_id, scope_key, revision_number, report_json, generated_at)
@@ -171,6 +189,7 @@ internal class EvaluationReportPersistence(
                 statement.executeUpdate()
             }
             updateJobInTransaction(job.copy(status = "SUCCEEDED", stage = "COMPLETE"))
+            insertJobEvent(job.copy(status = "SUCCEEDED", stage = "COMPLETE"), now)
             finishLlmLaunchInTransaction(
                 LlmLaunchReservationFinish(job.jobId, LlmLaunchReservationStatus.FINISHED, null, clock.instant()),
             )
@@ -180,6 +199,7 @@ internal class EvaluationReportPersistence(
     fun fail(job: EvaluationReportJobResponse): Result<Unit> = runCatching {
         exposedTransaction(database) {
             updateJobInTransaction(job)
+            insertJobEvent(job, clock.instant().toEpochMilli())
             finishLlmLaunchInTransaction(
                 LlmLaunchReservationFinish(job.jobId, LlmLaunchReservationStatus.FAILED, job.failureCode, clock.instant()),
             )
@@ -302,6 +322,10 @@ internal class EvaluationReportPersistence(
             CREATE TABLE IF NOT EXISTS evaluation_report_pins (
               scope_key VARCHAR(400) PRIMARY KEY, revision_id UUID NOT NULL REFERENCES evaluation_report_revisions(revision_id), pinned_at BIGINT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS evaluation_report_job_events (
+              event_id BIGSERIAL PRIMARY KEY, job_id UUID NOT NULL REFERENCES evaluation_report_jobs(job_id),
+              status VARCHAR(32) NOT NULL, stage VARCHAR(64) NOT NULL, code VARCHAR(128), occurred_at BIGINT NOT NULL
+            );
             """.trimIndent(),
         )
         exec("ALTER TABLE evaluation_report_jobs ADD COLUMN IF NOT EXISTS revision_number BIGINT")
@@ -346,6 +370,19 @@ internal class EvaluationReportPersistence(
         }
     }
 
+    private fun JdbcTransaction.insertJobEvent(job: EvaluationReportJobResponse, occurredAt: Long) {
+        jdbcConnection().prepareStatement(
+            "INSERT INTO evaluation_report_job_events (job_id, status, stage, code, occurred_at) VALUES (?, ?, ?, ?, ?)",
+        ).use { statement ->
+            statement.setObject(1, UUID.fromString(job.jobId))
+            statement.setString(2, job.status)
+            statement.setString(3, job.stage)
+            statement.setString(4, job.failureCode)
+            statement.setLong(5, occurredAt)
+            statement.executeUpdate()
+        }
+    }
+
     private fun JdbcTransaction.nextRevisionNumberInTransaction(): Long =
         exec("SELECT nextval('evaluation_report_revision_number_seq')") { result ->
             result.next()
@@ -368,6 +405,11 @@ internal class EvaluationReportPersistence(
 
     private fun JdbcTransaction.recoverInterruptedJobs() {
         val now = clock.instant().toEpochMilli()
+        exec(
+            "INSERT INTO evaluation_report_job_events (job_id, status, stage, code, occurred_at) " +
+                "SELECT job_id, 'FAILED', 'FAILED', 'FAILED_PROCESS_INTERRUPTED', $now FROM evaluation_report_jobs " +
+                "WHERE status IN ('REQUESTED','RUNNING')",
+        )
         exec(
             "UPDATE evaluation_report_jobs SET status='FAILED', stage='FAILED', failure_code='FAILED_PROCESS_INTERRUPTED', failure_message='Server restarted before report generation completed.', updated_at=" +
                 now + " WHERE status IN ('REQUESTED','RUNNING')",
@@ -392,13 +434,18 @@ internal data class EvaluationReportAdmission(
     val reservationOutcome: LlmLaunchReservationOutcome,
 )
 
+internal data class EvaluationReportJobEvent(val status: String, val stage: String, val code: String?, val occurredAt: Long)
+
 private fun retryAfterSeconds(reason: LlmLaunchReservationRejectionReason): Long = when (reason) {
     LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION -> 15
+    LlmLaunchReservationRejectionReason.REPORT_RATE_LIMIT,
     LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR,
     LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM,
+    LlmLaunchReservationRejectionReason.INSUFFICIENT_EVALUATION_HOURLY_HEADROOM,
     -> Duration.ofHours(1).seconds
     LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY,
     LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM,
+    LlmLaunchReservationRejectionReason.INSUFFICIENT_EVALUATION_DAILY_HEADROOM,
     -> Duration.ofDays(1).seconds
     LlmLaunchReservationRejectionReason.HARD_HALT -> 60
 }

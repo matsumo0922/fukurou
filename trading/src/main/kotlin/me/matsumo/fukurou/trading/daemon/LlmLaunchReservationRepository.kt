@@ -153,6 +153,11 @@ sealed interface LlmLaunchReservationOutcome {
  */
 enum class LlmLaunchReservationRejectionReason {
     /**
+     * Evaluation report 固有の 1 時間 request rate を超過した。
+     */
+    REPORT_RATE_LIMIT,
+
+    /**
      * sticky HARD_HALT 中だった。
      */
     HARD_HALT,
@@ -181,6 +186,12 @@ enum class LlmLaunchReservationRejectionReason {
      * reflection 用に残すべき 24 時間 headroom を下回っていた。
      */
     INSUFFICIENT_REFLECTION_DAILY_HEADROOM,
+
+    /** evaluation report より高 priority の trading decision 用 1 時間 headroom が不足した。 */
+    INSUFFICIENT_EVALUATION_HOURLY_HEADROOM,
+
+    /** evaluation report より高 priority の trading decision 用 24 時間 headroom が不足した。 */
+    INSUFFICIENT_EVALUATION_DAILY_HEADROOM,
 }
 
 /**
@@ -294,7 +305,7 @@ class InMemoryLlmLaunchReservationRepository(
             mutex.withLock {
                 reservations.asSequence()
                     .filter { reservation -> reservation.isFreshRunning(activeSince) }
-                    .filter { reservation -> requestTriggerKind == LlmDaemonTriggerKind.REFLECTION || reservation.triggerKind != LlmDaemonTriggerKind.REFLECTION }
+                    .filter { reservation -> requestTriggerKind in setOf(LlmDaemonTriggerKind.REFLECTION, LlmDaemonTriggerKind.EVALUATION_REPORT) || reservation.triggerKind != LlmDaemonTriggerKind.REFLECTION }
                     .sortedWith(compareBy<LlmLaunchReservationRecord> { it.reservedAt }.thenBy { it.invocationId })
                     .firstOrNull()
                     ?.toActive()
@@ -308,7 +319,9 @@ class InMemoryLlmLaunchReservationRepository(
         return reservations.firstOrNull { reservation ->
             val freshRunning = reservation.isFreshRunning(activeSince)
             val blockingForRequest = when (request.triggerKind) {
-                LlmDaemonTriggerKind.REFLECTION -> true
+                LlmDaemonTriggerKind.REFLECTION,
+                LlmDaemonTriggerKind.EVALUATION_REPORT,
+                -> true
                 else -> reservation.triggerKind != LlmDaemonTriggerKind.REFLECTION
             }
 
@@ -418,6 +431,7 @@ internal fun launchBudgetRejection(
     val hourlyRemaining = request.runnerConfig.maxInvocationsPerHour - hourlyCount
     val dailyRemaining = request.runnerConfig.maxInvocationsPerDay - dailyCount
     val reflectionRequest = request.triggerKind == LlmDaemonTriggerKind.REFLECTION
+    val evaluationRequest = request.triggerKind == LlmDaemonTriggerKind.EVALUATION_REPORT
     val hourlyExceeded = hourlyRemaining <= 0
     val dailyExceeded = dailyRemaining <= 0
 
@@ -426,6 +440,12 @@ internal fun launchBudgetRejection(
     }
     if (reflectionRequest && dailyRemaining <= REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS) {
         return LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM
+    }
+    if (evaluationRequest && hourlyRemaining <= REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS) {
+        return LlmLaunchReservationRejectionReason.INSUFFICIENT_EVALUATION_HOURLY_HEADROOM
+    }
+    if (evaluationRequest && dailyRemaining <= REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS) {
+        return LlmLaunchReservationRejectionReason.INSUFFICIENT_EVALUATION_DAILY_HEADROOM
     }
 
     if (hourlyExceeded) {

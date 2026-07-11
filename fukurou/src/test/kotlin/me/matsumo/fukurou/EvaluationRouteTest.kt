@@ -48,6 +48,37 @@ import kotlin.test.assertTrue
 class EvaluationRouteTest {
 
     @Test
+    fun evaluationReport_failsClosedBeforeGenerationWhenUsageSnapshotIsTruncated() = testApplication {
+        val truncatedRepository = object : EvaluationRepository by FakeEvaluationRepository {
+            override suspend fun fetchReportSnapshot(period: EvaluationPeriod) =
+                FakeEvaluationRepository.fetchReportSnapshot(period).map { snapshot ->
+                    snapshot.copy(usages = snapshot.usages.copy(truncated = true))
+                }
+        }
+        application {
+            module(
+                readinessProbe = { true }, clock = fixedClock(), evaluationRepository = truncatedRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+        val accepted = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"PRESET","days":30}""")
+        }.bodyAsText()
+        val jobId = requireNotNull(Regex("\\\"jobId\\\":\\\"([^\\\"]+)").find(accepted)).groupValues[1]
+        var terminal = ""
+        var attempts = 100
+        while (attempts > 0 && !terminal.contains("\"status\":\"FAILED\"")) {
+            terminal = client.get("/evaluation/reports/jobs/$jobId").bodyAsText()
+            if (!terminal.contains("\"status\":\"FAILED\"")) delay(10)
+            attempts -= 1
+        }
+        assertTrue(terminal.contains("USAGE_SNAPSHOT_TRUNCATED"))
+    }
+
+    @Test
     fun evaluationRoutes_returnOkShapes() = testApplication {
         application {
             module(
@@ -197,6 +228,10 @@ class EvaluationRouteTest {
         assertTrue(generated.contains("\"calibration\""))
         assertTrue(generated.contains("\"performanceLattice\""))
         assertTrue(generated.contains("\"integrity\""))
+        assertTrue(generated.contains("\"inputAsOf\":\"2026-07-03T00:00:00Z\""))
+        assertTrue(generated.contains("\"snapshotId\":"))
+        assertTrue(generated.contains("\"promptVersion\":\"evaluation-report-prompt-v1\""))
+        assertTrue(generated.contains("\"schemaVersion\":\"evaluation-report-schema-v1\""))
     }
 
     @Test

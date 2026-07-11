@@ -89,6 +89,18 @@ class EvaluationReportPersistenceTest {
             val schedulerBlock = assertIs<LlmLaunchReservationOutcome.Rejected>(blockedReport.reservationOutcome)
             assertEquals("scheduler-active", schedulerBlock.activeReservation?.invocationId)
             assertEquals(LlmDaemonTriggerKind.MANUAL, schedulerBlock.activeReservation?.triggerKind)
+            val rateLimited = persistence.admit(
+                testJob("00000000-0000-0000-0000-000000000004"),
+                "PRESET:90D",
+            ).getOrThrow()
+            val rateRejection = assertIs<LlmLaunchReservationOutcome.Rejected>(rateLimited.reservationOutcome)
+            assertEquals(me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason.REPORT_RATE_LIMIT, rateRejection.reason)
+            assertEquals("REPORT_RATE_LIMIT", persistence.job(rateLimited.job.jobId).getOrThrow()?.failureCode)
+            assertEquals(listOf("REJECTED"), persistence.jobEvents(rateLimited.job.jobId).getOrThrow().map { event -> event.status })
+            assertEquals(
+                listOf("REQUESTED", "FAILED"),
+                persistence.jobEvents(first.job.jobId).getOrThrow().map { event -> event.status },
+            )
         } finally {
             container.stop()
         }

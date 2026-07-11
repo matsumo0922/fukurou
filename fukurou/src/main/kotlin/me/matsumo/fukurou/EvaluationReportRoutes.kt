@@ -306,6 +306,7 @@ private class EvaluationReportStore(
         val calibration = buildCalibrationResponse(queryResult.trades)
         val performanceLattice = buildPerformanceLattice(queryResult.trades, regimes)
         val usageResult = snapshot.usages
+        require(!usageResult.truncated) { "USAGE_SNAPSHOT_TRUNCATED" }
         val costStats = EvaluationMath.summarizeLlmCosts(usageResult.facts)
         val exclusions = snapshot.exclusions
         val benchmarkFacts = benchmark.points.flatMap { point ->
@@ -370,18 +371,44 @@ private class EvaluationReportStore(
             EvaluationReportClaim("claim-pnl-direction", "FACT_DIRECTION", listOf("performance.totalPnlJpy"), direction(stats.totalPnlJpy)),
             EvaluationReportClaim("claim-trade-count", "FACT_VALUE", listOf("performance.tradeCount"), stats.tradeCount.toString()),
         )
-        val canonical = buildCanonicalSnapshot(
-            from = from,
-            toInclusive = toInclusive,
-            facts = facts,
-            ridge = ridge,
-            benchmark = benchmark,
-            calibration = calibration,
-            performanceLattice = performanceLattice,
-            exclusions = exclusions.reasons,
-            phaseCount = costStats.phaseCount,
-            missingUsageCount = costStats.missingUsagePhaseCount,
-            unpricedCount = costStats.unpricedPhaseCount,
+        val inputAsOf = clock.instant().toString()
+        val reportSources = listOf(
+            EvaluationReportSourceResponse("paper-ledger", inputAsOf, "SNAPSHOT"),
+            EvaluationReportSourceResponse("daily-candles", candles.lastOrNull()?.openTime ?: inputAsOf, if (candles.isEmpty()) "UNAVAILABLE" else "SNAPSHOT"),
+            EvaluationReportSourceResponse("exclusion-audit", inputAsOf, "SNAPSHOT"),
+            EvaluationReportSourceResponse("runner-audit", inputAsOf, "SNAPSHOT"),
+        )
+        val benchmarkResponse = ReportBenchmarkChartResponse(
+            baselineEquityJpy = baselineEquity.toPlainString(),
+            points = benchmark.points.map { point ->
+                ReportBenchmarkPointResponse(
+                    date = point.date.toString(),
+                    botEquityJpy = point.botEquityJpy.toPlainString(),
+                    buyAndHoldEquityJpy = point.buyAndHoldEquityJpy.toPlainString(),
+                    noTradeEquityJpy = point.noTradeEquityJpy.toPlainString(),
+                )
+            },
+            botReturn = benchmark.botReturn?.toPlainString(),
+            buyAndHoldReturn = benchmark.buyAndHoldReturn?.toPlainString(),
+            state = if (benchmark.points.isEmpty()) "INSUFFICIENT_SAMPLE" else "AVAILABLE",
+        )
+        val canonical = ReportJson.encodeToString(
+            CanonicalEvaluationSnapshot(
+                snapshotId = snapshotId,
+                scopeKey = scope.key,
+                from = from.toString(),
+                toInclusive = toInclusive.toString(),
+                inputAsOf = inputAsOf,
+                facts = facts.map { fact -> EvaluationReportFactResponse(fact.factId, fact.value, fact.unit, fact.availability, fact.sourceIds) },
+                sources = reportSources,
+                chartIndex = chartIndex,
+                outcomeRidge = ridge.toResponse(),
+                benchmark = benchmarkResponse,
+                calibration = calibration,
+                performanceLattice = performanceLattice,
+                exclusions = exclusions.reasons,
+                usage = EvaluationSnapshotUsage(costStats.phaseCount, costStats.missingUsagePhaseCount, costStats.unpricedPhaseCount, false),
+            ),
         )
         val inputHash = sha256(canonical)
         persistence?.saveSnapshot(snapshotId, scope.key, canonical, inputHash)?.getOrThrow()
@@ -410,7 +437,7 @@ private class EvaluationReportStore(
             scopeKey = scope.key,
             status = "SUCCEEDED",
             period = EvaluationReportPeriodResponse(from.toString(), toInclusive.toString(), ReportZone.id),
-            inputAsOf = clock.instant().toString(),
+            inputAsOf = inputAsOf,
             inputHash = inputHash,
             snapshotId = snapshotId,
             generatedAt = clock.instant().toString(),
@@ -422,28 +449,10 @@ private class EvaluationReportStore(
             claims = artifact.claims,
             validation = validation.map { result -> EvaluationClaimValidationResponse(result.claimId, result.status.name, result.asserted, result.actual, result.factIds, result.code) },
             facts = facts.map { fact -> EvaluationReportFactResponse(fact.factId, fact.value, fact.unit, fact.availability, fact.sourceIds) },
-            sources = listOf(
-                EvaluationReportSourceResponse("paper-ledger", clock.instant().toString(), "SNAPSHOT"),
-                EvaluationReportSourceResponse("daily-candles", clock.instant().toString(), if (candles.isEmpty()) "UNAVAILABLE" else "SNAPSHOT"),
-                EvaluationReportSourceResponse("exclusion-audit", clock.instant().toString(), "SNAPSHOT"),
-                EvaluationReportSourceResponse("runner-audit", clock.instant().toString(), if (usageResult.truncated) "PARTIAL" else "SNAPSHOT"),
-            ),
+            sources = reportSources,
             chartIndex = chartIndex,
             outcomeRidge = ridge.toResponse(),
-            benchmark = ReportBenchmarkChartResponse(
-                baselineEquityJpy = baselineEquity.toPlainString(),
-                points = benchmark.points.map { point ->
-                    ReportBenchmarkPointResponse(
-                        date = point.date.toString(),
-                        botEquityJpy = point.botEquityJpy.toPlainString(),
-                        buyAndHoldEquityJpy = point.buyAndHoldEquityJpy.toPlainString(),
-                        noTradeEquityJpy = point.noTradeEquityJpy.toPlainString(),
-                    )
-                },
-                botReturn = benchmark.botReturn?.toPlainString(),
-                buyAndHoldReturn = benchmark.buyAndHoldReturn?.toPlainString(),
-                state = if (benchmark.points.isEmpty()) "INSUFFICIENT_SAMPLE" else "AVAILABLE",
-            ),
+            benchmark = benchmarkResponse,
             calibration = calibration,
             performanceLattice = performanceLattice,
             integrity = EvaluationIntegrityResponse(
@@ -469,11 +478,13 @@ private class EvaluationReportStore(
         synchronized(jobs) { jobs[job.jobId] = job.copy(status = "SUCCEEDED", stage = "COMPLETE") }
         report
     }.onFailure { error ->
+        val safeFailure = me.matsumo.fukurou.trading.runner.SecretRedactor.fromEnvironment(environment)
+            .redactAndTruncate(error.message ?: "Report generation failed")
         val failedJob = job.copy(
             status = "FAILED",
             stage = "FAILED",
             failureCode = error::class.simpleName ?: "REPORT_GENERATION_FAILED",
-            failureMessage = error.message?.take(300),
+            failureMessage = safeFailure.take(300),
         )
         persistence?.fail(failedJob)?.getOrThrow()
         synchronized(jobs) { jobs[job.jobId] = failedJob }
@@ -491,7 +502,8 @@ private class EvaluationReportStore(
             EvaluationReportGenerationMetadataResponse(invocationId, "DETERMINISTIC_FALLBACK", null, null, null),
         )
         val auditor = requireNotNull(llmInvocationAuditor) { "LLM invocation auditor is unavailable" }
-        val promptHash = sha256(facts.joinToString { fact -> "${fact.factId}=${fact.value}" })
+        val prompt = reportPrompt(days, facts)
+        val promptHash = sha256(prompt)
         val workingDirectory = Files.createTempDirectory("fukurou-evaluation-report-")
         val safeEnvironment = environment.filterKeys { key -> key in REPORT_CHILD_ENV_ALLOWLIST }
         val audited = try {
@@ -501,21 +513,21 @@ private class EvaluationReportStore(
                     decisionRunId = invocationId,
                     llmProvider = LlmProvider.CLAUDE.name,
                     promptHash = promptHash,
-                    systemPromptVersion = "evaluation-report-v1",
+                    systemPromptVersion = REPORT_PROMPT_VERSION,
                     marketSnapshotId = snapshotId,
                 ),
                 request = LlmInvocationRequest(
                     invocationId = invocationId,
                     provider = LlmProvider.CLAUDE,
                     phase = LlmInvocationPhase.EVALUATION_REPORT,
-                    prompt = reportPrompt(days, facts),
+                    prompt = prompt,
                     timeout = Duration.ofMinutes(5),
                     workingDirectory = workingDirectory,
                     decisionRunContext = DecisionRunContext(
                         decisionRunId = invocationId,
                         llmProvider = LlmProvider.CLAUDE.name,
                         promptHash = promptHash,
-                        systemPromptVersion = "evaluation-report-v1",
+                        systemPromptVersion = REPORT_PROMPT_VERSION,
                         marketSnapshotId = snapshotId,
                     ),
                     mcpServer = null,
@@ -536,6 +548,10 @@ private class EvaluationReportStore(
                 durationMillis = audited.duration.toMillis(),
                 totalCostUsd = usage?.totalCostUsd?.toPlainString(),
                 observedModels = usage?.modelUsages?.map { model -> model.model }.orEmpty(),
+                promptHash = promptHash,
+                promptVersion = REPORT_PROMPT_VERSION,
+                schemaVersion = REPORT_SCHEMA_VERSION,
+                effort = environment["FUKUROU_CLAUDE_EFFORT"] ?: "DEFAULT",
             ),
         )
     }
@@ -589,10 +605,12 @@ private class EvaluationReportStore(
 private val ReportJson = Json { ignoreUnknownKeys = false }
 private val REPORT_CHILD_ENV_ALLOWLIST = setOf("HOME", "PATH", "TMPDIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR")
 
+private const val REPORT_PROMPT_VERSION = "evaluation-report-prompt-v1"
+private const val REPORT_SCHEMA_VERSION = "evaluation-report-schema-v1"
 private fun reportPrompt(days: Int, facts: List<EvaluationReportFact>): String = """
     Generate a factual evaluation report for the previous $days complete calendar days.
     Return JSON only with this exact shape:
-    {"segments":[{"segmentId":"seg-1","kind":"SUMMARY|PERFORMANCE|COVERAGE|LIMITATION","text":"...","claimIds":["claim-1"]}],"claims":[{"claimId":"claim-1","type":"FACT_VALUE|FACT_DIRECTION|FACT_COMPARISON","factIds":["fact.id"],"asserted":"value or operator"}]}
+    {"segments":[{"segmentId":"seg-1","kind":"SUMMARY|PERFORMANCE|CALIBRATION|RISK|COST|COVERAGE|LIMITATION","text":"...","claimIds":["claim-1"]}],"claims":[{"claimId":"claim-1","type":"FACT_VALUE|FACT_DIRECTION|FACT_COMPARISON|FACT_DELTA|FACT_COVERAGE","factIds":["fact.id"],"asserted":"value or operator"}]}
     Every numeric or directional statement must bind a typed claim. Do not predict or prescribe trades.
     Facts: ${facts.joinToString { fact -> "${fact.factId}=${fact.value ?: "MISSING"} ${fact.unit.orEmpty()} availability=${fact.availability}" }}
 """.trimIndent()
@@ -625,7 +643,7 @@ private fun validateSnapshotReferences(
 internal fun validateGeneratedArtifact(artifact: GeneratedEvaluationArtifact) {
     require(artifact.segments.size in 1..12) { "report must contain 1..12 segments" }
     require(artifact.claims.size <= 40) { "report must contain at most 40 claims" }
-    require(artifact.segments.sumOf { segment -> segment.text.length } <= 16_000) { "report body is too large" }
+    require(artifact.segments.sumOf { segment -> segment.text.length } <= 12_000) { "report body is too large" }
     val idPattern = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
     val segmentIds = artifact.segments.map { segment -> segment.segmentId }
     val claimIds = artifact.claims.map { claim -> claim.claimId }
@@ -637,15 +655,15 @@ internal fun validateGeneratedArtifact(artifact: GeneratedEvaluationArtifact) {
     }
     require(
         artifact.segments.all { segment ->
-            segment.kind in setOf("SUMMARY", "PERFORMANCE", "COVERAGE", "LIMITATION") &&
-                segment.text.length in 1..4_000 &&
+            segment.kind in setOf("SUMMARY", "PERFORMANCE", "CALIBRATION", "RISK", "COST", "COVERAGE", "LIMITATION") &&
+                segment.text.length in 1..1_200 &&
                 segment.claimIds.all { claimId -> claimId in claimIds } &&
                 (!segment.text.contains(Regex("[0-9]")) || segment.claimIds.isNotEmpty())
         },
     ) { "segment kind, text, or claim reference is invalid" }
     require(
         artifact.claims.all { claim ->
-            claim.type in setOf("FACT_VALUE", "FACT_DIRECTION", "FACT_COMPARISON") &&
+            claim.type in setOf("FACT_VALUE", "FACT_DIRECTION", "FACT_COMPARISON", "FACT_DELTA", "FACT_COVERAGE") &&
                 claim.factIds.size in 1..2 &&
                 claim.factIds.all(idPattern::matches) &&
                 claim.asserted.length in 1..200
@@ -677,34 +695,6 @@ private fun fallbackArtifact(
 )
 
 @Suppress("LongParameterList")
-private fun buildCanonicalSnapshot(
-    from: LocalDate,
-    toInclusive: LocalDate,
-    facts: List<EvaluationReportFact>,
-    ridge: OutcomeRidgeChartFacts,
-    benchmark: me.matsumo.fukurou.trading.evaluation.BenchmarkResult,
-    calibration: ReportCalibrationChartResponse,
-    performanceLattice: ReportPerformanceLatticeResponse,
-    exclusions: Map<String, Int>,
-    phaseCount: Int,
-    missingUsageCount: Int,
-    unpricedCount: Int,
-): String = buildString {
-    append(from).append('|').append(toInclusive)
-    facts.forEach { fact -> append('|').append(fact.factId).append('=').append(fact.value) }
-    ridge.groupings.forEach { grouping ->
-        grouping.groups.forEach { group ->
-            append('|').append(grouping.groupBy).append(':').append(group.groupKey).append(':')
-                .append(group.bins.joinToString { bin -> bin.count.toString() })
-        }
-    }
-    append("|benchmarkReturns=").append(benchmark.botReturn).append(':').append(benchmark.buyAndHoldReturn)
-    append("|calibrationState=").append(calibration.state)
-    append("|latticeState=").append(performanceLattice.state)
-    append("|exclusions=").append(exclusions.toSortedMap())
-    append("|usageCoverage=").append(phaseCount).append(':').append(missingUsageCount).append(':').append(unpricedCount)
-}
-
 private fun buildCalibrationResponse(trades: List<ClosedTradeFact>): ReportCalibrationChartResponse {
     fun cells(groupBy: String, groups: List<me.matsumo.fukurou.trading.evaluation.CalibrationGroupStats>) =
         groups.flatMap { group ->
@@ -1005,6 +995,36 @@ data class EvaluationReportGenerationMetadataResponse(
     val durationMillis: Long?,
     val totalCostUsd: String?,
     val observedModels: List<String>?,
+    val promptHash: String? = null,
+    val promptVersion: String = REPORT_PROMPT_VERSION,
+    val schemaVersion: String = REPORT_SCHEMA_VERSION,
+    val effort: String = "DEFAULT",
+)
+
+@Serializable
+private data class CanonicalEvaluationSnapshot(
+    val snapshotId: String,
+    val scopeKey: String,
+    val from: String,
+    val toInclusive: String,
+    val inputAsOf: String,
+    val facts: List<EvaluationReportFactResponse>,
+    val sources: List<EvaluationReportSourceResponse>,
+    val chartIndex: List<EvaluationChartIndexResponse>,
+    val outcomeRidge: OutcomeRidgeResponse,
+    val benchmark: ReportBenchmarkChartResponse,
+    val calibration: ReportCalibrationChartResponse,
+    val performanceLattice: ReportPerformanceLatticeResponse,
+    val exclusions: Map<String, Int>,
+    val usage: EvaluationSnapshotUsage,
+)
+
+@Serializable
+private data class EvaluationSnapshotUsage(
+    val phaseCount: Int,
+    val missingUsageCount: Int,
+    val unpricedCount: Int,
+    val truncated: Boolean,
 )
 
 @Serializable
