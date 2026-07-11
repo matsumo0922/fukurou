@@ -376,8 +376,9 @@ describe("App", () => {
 
     const filteredRunList = await screen.findByRole("main", { name: "Decision runs, newest first" });
     const selectedRun = within(filteredRunList).getByRole("button", { name: /ENTER/ });
+    const selectedCard = selectedRun.closest(".decision-run-card")!;
     expect(selectedRun).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(selectedRun);
+    fireEvent.click(selectedCard);
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
     expect(selectedRun).toHaveAttribute("aria-expanded", "true");
     expect(selectedRun.closest("article")).toHaveAttribute("data-selected", "true");
@@ -403,6 +404,17 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("complementary", { name: "Decision run detail" })).not.toBeInTheDocument());
     await waitFor(() => expect(selectedRun).toHaveFocus());
+
+    const selection = window.getSelection()!;
+    const selectedText = selectedCard.querySelector(".decision-run-card__headline")!;
+    const range = document.createRange();
+    range.selectNodeContents(selectedText);
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    fireEvent.click(selectedCard);
+    expect(screen.queryByRole("complementary", { name: "Decision run detail" })).not.toBeInTheDocument();
+    selection.removeAllRanges();
   });
 
   it("recalculates the decision run pane for surrounding layout changes and scrolling", async () => {
@@ -615,7 +627,8 @@ describe("App", () => {
 
     render(<App />);
 
-    const input = await screen.findByLabelText("Find an exact run ID");
+    const input = await screen.findByRole("textbox", { name: "Exact run ID" });
+    expect(screen.queryByText("Find an exact run ID")).not.toBeInTheDocument();
     fireEvent.change(input, { target: { value: "run-archived-filled" } });
     fireEvent.keyDown(input, { key: "Enter" });
 
@@ -623,11 +636,15 @@ describe("App", () => {
     expect(await within(runList).findByRole("button", { name: /run-archived-filled/ })).toBeInTheDocument();
     expect(within(runList).queryByText(/Exact run result/)).not.toBeInTheDocument();
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
-    expect(await within(detailPane).findByText("position-archived")).toBeInTheDocument();
-    expect(within(detailPane).getByText(/ENTRY · BUY LIMIT/)).toBeInTheDocument();
-    expect(within(detailPane).getByText(/STOP · SELL STOP/)).toBeInTheDocument();
-    expect(within(detailPane).getByText(/MAKER/)).toBeInTheDocument();
-    expect(within(detailPane).getAllByText(/fee 10 JPY/)).toHaveLength(2);
+    const executionSection = within(detailPane).getByRole("heading", { name: "Order / Execution" }).closest(".run-detail-section") as HTMLElement;
+    expect(await within(executionSection).findByRole("heading", { name: "Position lifecycle 1" })).toBeInTheDocument();
+    expect(within(executionSection).getAllByText("position-archived")).toHaveLength(3);
+    expect(within(executionSection).getByText("Closed")).toBeInTheDocument();
+    expect(within(executionSection).getByText("execution-entry").closest(".run-fact-grid")).not.toBeNull();
+    expect(within(executionSection).getByText("execution-stop").closest(".run-fact-grid")).not.toBeNull();
+    expect(within(executionSection).getAllByText("MAKER")).toHaveLength(1);
+    expect(within(executionSection).getAllByText("10")).toHaveLength(2);
+    expect(within(executionSection).getByText("-1000")).toBeInTheDocument();
     expect(within(detailPane).queryByText(/best ask reaches/)).not.toBeInTheDocument();
 
     fireEvent.click(within(detailPane).getByRole("button", { name: "Close decision run detail" }));
@@ -706,7 +723,7 @@ describe("App", () => {
 
     render(<App />);
 
-    const input = await screen.findByLabelText("Find an exact run ID");
+    const input = await screen.findByRole("textbox", { name: "Exact run ID" });
     fireEvent.change(input, { target: { value: "missing-run" } });
     fireEvent.keyDown(input, { key: "Enter" });
 

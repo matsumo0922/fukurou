@@ -73,9 +73,9 @@ export function ActivityPage() {
         description={t("activity.runs.description")}
         action={<div className="run-header-actions">
           <label className="run-id-search">
-            <span className="sr-only">{t("activity.runs.search.label")}</span>
             <input
               value={runIdQuery}
+              aria-label={t("activity.runs.search.placeholder")}
               placeholder={t("activity.runs.search.placeholder")}
               onChange={(event) => setRunIdQuery(event.target.value)}
               onKeyDown={(event) => {
@@ -201,11 +201,18 @@ function RunRow({
   const terminalCause = terminalCauseLabel(run.terminalCause, t);
   const order = run.order;
   const detailTitle = order ? `${order.side} ${order.orderType}` : run.action ?? run.status;
+  const detailButtonRef = useRef<HTMLButtonElement>(null);
+
+  const cardSelected = (card: HTMLElement) => {
+    if (hasTextSelectionInside(card)) return;
+
+    selectedChanged(detailButtonRef.current!);
+  };
 
   return (
     <article className="decision-run-row" data-selected={selected} data-outcome={run.outcome}>
       <span className="decision-run-row__rail"><span className="decision-run-row__dot" /></span>
-      <span className="decision-run-card">
+      <span className="decision-run-card" onClick={(event) => cardSelected(event.currentTarget)}>
         <span className="decision-run-card__top">
           <time>{formatDateTime(run.startedAt, locale)}</time>
           <span className="decision-run-card__duration">{formatDuration(run.durationMillis)}</span>
@@ -219,12 +226,16 @@ function RunRow({
             </span>
           ) : null}
           <button
+            ref={detailButtonRef}
             className="decision-run-card__open"
             type="button"
             aria-label={`${t("activity.runs.detail.open")} ${detailTitle} ${run.invocationId}`}
             aria-expanded={selected}
             aria-controls="decision-run-detail-pane"
-            onClick={(event) => selectedChanged(event.currentTarget)}
+            onClick={(event) => {
+              event.stopPropagation();
+              selectedChanged(event.currentTarget);
+            }}
           ><ChevronRight size={17} aria-hidden="true" /></button>
         </span>
         <span className="decision-run-card__headline">
@@ -505,7 +516,7 @@ function TradeLifecycleSection({
   lifecycles: OpsDecisionRunDetailResponse["tradeLifecycles"];
   executions: OpsDecisionRunDetailResponse["executions"];
 }) {
-  const { locale, t } = useI18n();
+  const { t } = useI18n();
   if (lifecycles.length === 0) {
     if (executions.length > 0) {
       return <DetailSection index="01" title={t("activity.runs.section.execution")}><RunExecutionRecords executions={executions} /></DetailSection>;
@@ -514,14 +525,16 @@ function TradeLifecycleSection({
     return <DetailSection index="01" title={t("activity.runs.section.execution")}><p className="run-detail-notice run-detail-notice--warning">{t("activity.runs.executions.missing")}</p></DetailSection>;
   }
   return <DetailSection index="01" title={t("activity.runs.section.execution")}>
-    {lifecycles.map((lifecycle) => <article className="run-lifecycle" key={lifecycle.positionId}>
-      <h4>{t("activity.runs.label.position")} <code>{lifecycle.positionId}</code> · {lifecycle.status === "CLOSED" ? t("activity.runs.position.closed") : t("activity.runs.position.open")}</h4>
-      {lifecycle.executions.map((execution) => <div className="run-lifecycle__entry" key={execution.executionId}>
-        <strong>{execution.kind} · {execution.side} {execution.orderType ?? "—"}</strong>
-        <span>{execution.sizeBtc} BTC @ {execution.priceJpy} JPY · {execution.liquidity} · fee {execution.feeJpy} JPY · PnL {execution.realizedPnlJpy} JPY</span>
-        <time>{formatDateTime(execution.executedAt, locale)}</time><code>order {execution.orderId ?? "—"} / execution {execution.executionId}</code>
-      </div>)}
-    </article>)}
+    <div className="run-records">
+      {lifecycles.map((lifecycle, index) => <article className="run-record" key={lifecycle.positionId}>
+        <h4>{t("activity.runs.records.positionNumber")} {index + 1}</h4>
+        <FactGrid facts={[
+          [t("activity.runs.label.position"), lifecycle.positionId],
+          [t("activity.runs.label.status"), lifecycle.status === "CLOSED" ? t("activity.runs.position.closed") : t("activity.runs.position.open")],
+        ]} />
+        <RunExecutionRecords executions={lifecycle.executions} />
+      </article>)}
+    </div>
   </DetailSection>;
 }
 
@@ -587,26 +600,46 @@ function RunExecutionRecords({ executions }: { executions: OpsDecisionRunDetailR
     <div className="run-records">
       <h4>{t("activity.runs.records.executions")}</h4>
       {executions.length === 0 ? <p>{t("activity.runs.records.noExecutions")}</p> : executions.map((execution, index) => (
-        <article className="run-record" key={execution.executionId}>
-          <h5>{t("activity.runs.records.executionNumber")} {index + 1}</h5>
-          <FactGrid facts={[
-            ["execution ID", execution.executionId],
-            ["order ID", execution.orderId],
-            [t("activity.runs.label.position"), execution.positionId],
-            [t("activity.runs.label.side"), execution.side],
-            [t("activity.runs.label.orderType"), execution.orderType],
-            [t("activity.runs.label.executionKind"), execution.kind],
-            [t("activity.runs.label.price"), execution.priceJpy],
-            [t("activity.runs.label.size"), `${execution.sizeBtc} BTC`],
-            [t("activity.runs.label.liquidity"), execution.liquidity],
-            [t("activity.runs.label.fee"), execution.feeJpy],
-            [t("activity.runs.label.realizedPnl"), execution.realizedPnlJpy],
-            [t("activity.runs.label.executedAt"), execution.executedAt],
-          ]} />
-        </article>
+        <ExecutionRecord execution={execution} index={index} key={execution.executionId} />
       ))}
     </div>
   );
+}
+
+function ExecutionRecord({
+  execution,
+  index,
+}: {
+  execution: OpsDecisionRunDetailResponse["executions"][number];
+  index: number;
+}) {
+  const { t } = useI18n();
+
+  return <article className="run-record">
+    <h5>{t("activity.runs.records.executionNumber")} {index + 1}</h5>
+    <FactGrid facts={[
+      ["execution ID", execution.executionId],
+      ["order ID", execution.orderId],
+      [t("activity.runs.label.position"), execution.positionId],
+      [t("activity.runs.label.side"), execution.side],
+      [t("activity.runs.label.orderType"), execution.orderType],
+      [t("activity.runs.label.executionKind"), execution.kind],
+      [t("activity.runs.label.price"), execution.priceJpy],
+      [t("activity.runs.label.size"), `${execution.sizeBtc} BTC`],
+      [t("activity.runs.label.liquidity"), execution.liquidity],
+      [t("activity.runs.label.fee"), execution.feeJpy],
+      [t("activity.runs.label.realizedPnl"), execution.realizedPnlJpy],
+      [t("activity.runs.label.executedAt"), execution.executedAt],
+    ]} />
+  </article>;
+}
+
+function hasTextSelectionInside(element: HTMLElement): boolean {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return false;
+
+  return Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index))
+    .some((range) => range.intersectsNode(element));
 }
 
 function RunListNotice({ text, action }: { text: string; action?: () => void }) {
