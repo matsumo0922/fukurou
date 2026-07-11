@@ -20,6 +20,9 @@ import java.time.Instant
 import java.time.LocalDate
 import java.util.UUID
 
+/** reconciler が virtual take profit を約定させた注文に保存する理由。 */
+internal const val VIRTUAL_TAKE_PROFIT_TRIGGER_REASON = "reconciler virtual take profit trigger"
+
 /**
  * paper ledger の account / position / order 読み取り repository。
  */

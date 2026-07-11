@@ -21,6 +21,7 @@ import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
@@ -1736,6 +1737,122 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun decisionRunProjectionClassifiesOtherRunAddLongExecutionsAsPositionEntries() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runId = "entry-with-later-add-long-run"
+        val positionId = UUID.randomUUID()
+        val tradeGroupId = UUID.randomUUID()
+        val entryOrderId = UUID.randomUUID()
+        val addLongLimitOrderId = UUID.randomUUID()
+        val addLongMarketOrderId = UUID.randomUUID()
+        val stopOrderId = UUID.randomUUID()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        insertFinishedDecisionRun(llmRunRepository, runId, "SUCCEEDED", errorMessage = null)
+
+        exposedTransaction(database) {
+            insertTestPosition(positionId, tradeGroupId, TradingMode.PAPER.name)
+            insertActivityContextOrder(
+                orderId = entryOrderId,
+                intentId = UUID.randomUUID(),
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.MARKET,
+                limitPriceJpy = null,
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "original entry",
+                decisionRunId = runId,
+            )
+            insertActivityContextOrder(
+                orderId = addLongLimitOrderId,
+                intentId = UUID.randomUUID(),
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.LIMIT,
+                limitPriceJpy = BigDecimal("9950000"),
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "later limit add long",
+                decisionRunId = "later-limit-add-long-run",
+            )
+            insertActivityContextOrder(
+                orderId = addLongMarketOrderId,
+                intentId = UUID.randomUUID(),
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.BUY,
+                orderType = OrderType.MARKET,
+                limitPriceJpy = null,
+                triggerPriceJpy = null,
+                takeProfitPriceJpy = null,
+                reasonJa = "later market add long",
+                decisionRunId = "later-market-add-long-run",
+            )
+            insertActivityContextOrder(
+                orderId = stopOrderId,
+                positionId = positionId,
+                tradeGroupId = tradeGroupId,
+                side = OrderSide.SELL,
+                orderType = OrderType.STOP,
+                limitPriceJpy = null,
+                triggerPriceJpy = BigDecimal("9700000"),
+                takeProfitPriceJpy = null,
+                reasonJa = "protective stop",
+                decisionRunId = null,
+            )
+            insertActivityContextExecution(
+                entryOrderId,
+                positionId,
+                OrderSide.BUY,
+                BigDecimal("9900000"),
+                BigDecimal.ZERO,
+                decisionRunId = runId,
+                executedAt = fixedInstant(),
+            )
+            insertActivityContextExecution(
+                addLongLimitOrderId,
+                positionId,
+                OrderSide.BUY,
+                BigDecimal("9950000"),
+                BigDecimal.ZERO,
+                decisionRunId = "later-limit-add-long-run",
+                executedAt = fixedInstant().plusSeconds(1),
+            )
+            insertActivityContextExecution(
+                addLongMarketOrderId,
+                positionId,
+                OrderSide.BUY,
+                BigDecimal("10000000"),
+                BigDecimal.ZERO,
+                decisionRunId = "later-market-add-long-run",
+                executedAt = fixedInstant().plusSeconds(2),
+            )
+            insertActivityContextExecution(
+                stopOrderId,
+                positionId,
+                OrderSide.SELL,
+                BigDecimal("9700000"),
+                BigDecimal("-100"),
+                executedAt = fixedInstant().plusSeconds(3),
+            )
+        }
+
+        val detail = requireNotNull(ExposedDecisionRunProjectionRepository(database).findRun(runId).getOrThrow())
+        val lifecycle = detail.tradeLifecycles.single()
+
+        assertEquals(
+            listOf(entryOrderId, addLongLimitOrderId, addLongMarketOrderId, stopOrderId).map(UUID::toString),
+            lifecycle.executions.map { execution -> execution.orderId },
+        )
+        assertEquals(
+            listOf("ENTRY", "POSITION_ENTRY", "POSITION_ENTRY", "STOP"),
+            lifecycle.executions.map { execution -> execution.kind },
+        )
+    }
+
+    @Test
     fun decisionRunProjectionClassifiesVirtualTakeProfitFromSavedOrderReason() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val runId = "virtual-take-profit-lifecycle-run"
@@ -1770,7 +1887,7 @@ class PostgresPersistenceIntegrationTest {
                 limitPriceJpy = null,
                 triggerPriceJpy = null,
                 takeProfitPriceJpy = null,
-                reasonJa = "reconciler virtual take profit trigger",
+                reasonJa = VIRTUAL_TAKE_PROFIT_TRIGGER_REASON,
                 decisionRunId = null,
             )
             insertActivityContextExecution(

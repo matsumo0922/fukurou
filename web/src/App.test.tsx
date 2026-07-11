@@ -376,8 +376,12 @@ describe("App", () => {
 
     const filteredRunList = await screen.findByRole("main", { name: "Decision runs, newest first" });
     const selectedRun = within(filteredRunList).getByRole("button", { name: /ENTER/ });
+    expect(selectedRun).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(selectedRun);
     const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(selectedRun).toHaveAttribute("aria-expanded", "true");
+    expect(selectedRun.closest("article")).toHaveAttribute("data-selected", "true");
+    expect(selectedRun.closest("article")).not.toHaveAttribute("aria-selected");
     expect(await within(detailPane).findByText("0.1100000000")).toBeInTheDocument();
     expect(within(detailPane).getByText("0.03357778")).toBeInTheDocument();
     expect(within(detailPane).getAllByText("APPROVED").length).toBeGreaterThan(0);
@@ -399,6 +403,48 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("complementary", { name: "Decision run detail" })).not.toBeInTheDocument());
     await waitFor(() => expect(selectedRun).toHaveFocus());
+  });
+
+  it("recalculates the decision run pane for surrounding layout changes and scrolling", async () => {
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    let resizeCallback: ResizeObserverCallback = () => undefined;
+    let detailTop = 100;
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback;
+      }
+
+      observe = observe;
+      unobserve = vi.fn();
+      disconnect = disconnect;
+    });
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(900);
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const top = this.classList.contains("decision-run-detail") ? detailTop : 0;
+      return new DOMRect(0, top, 0, 0);
+    });
+    stubSystemFetch();
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    const runList = await screen.findByRole("main", { name: "Decision runs, newest first" });
+    fireEvent.click(within(runList).getByRole("button", { name: /ENTER/ }));
+    const detailPane = await screen.findByRole("complementary", { name: "Decision run detail" });
+    expect(detailPane).toHaveStyle("--detail-pane-height: 788px");
+    expect(observe).toHaveBeenCalledTimes(3);
+
+    detailTop = 220;
+    resizeCallback([], {} as ResizeObserver);
+    await waitFor(() => expect(detailPane).toHaveStyle("--detail-pane-height: 668px"));
+
+    detailTop = 300;
+    fireEvent.scroll(window);
+    await waitFor(() => expect(detailPane).toHaveStyle("--detail-pane-height: 588px"));
+
+    fireEvent.click(within(detailPane).getByRole("button", { name: "Close decision run detail" }));
+    await waitFor(() => expect(disconnect).toHaveBeenCalledOnce());
   });
 
   it("shows resting order quote distance expiry and natural fill condition", async () => {

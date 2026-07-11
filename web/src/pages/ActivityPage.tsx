@@ -202,7 +202,7 @@ function RunRow({
   const detailTitle = order ? `${order.side} ${order.orderType}` : run.action ?? run.status;
 
   return (
-    <article className="decision-run-row" aria-selected={selected} data-outcome={run.outcome}>
+    <article className="decision-run-row" data-selected={selected} data-outcome={run.outcome}>
       <span className="decision-run-row__rail"><span className="decision-run-row__dot" /></span>
       <span className="decision-run-card">
         <span className="decision-run-card__top">
@@ -221,6 +221,8 @@ function RunRow({
             className="decision-run-card__open"
             type="button"
             aria-label={`${t("activity.runs.detail.open")} ${detailTitle} ${run.invocationId}`}
+            aria-expanded={selected}
+            aria-controls="decision-run-detail-pane"
             onClick={(event) => selectedChanged(event.currentTarget)}
           ><ChevronRight size={17} aria-hidden="true" /></button>
         </span>
@@ -274,13 +276,32 @@ function RunDetailPane({
       if (top == null) return;
       setPaneHeight(Math.max(280, window.innerHeight - top - 12));
     };
+    const resizeObserver = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(updatePaneHeight);
+    const page = paneRef.current?.closest(".decision-runs-page");
+    const observedElements = [
+      page?.querySelector(".section-header"),
+      page?.querySelector(".run-filterbar"),
+      paneRef.current?.parentElement,
+    ];
+    observedElements.forEach((element) => {
+      if (element) resizeObserver?.observe(element);
+    });
+
     updatePaneHeight();
     window.addEventListener("resize", updatePaneHeight);
-    return () => window.removeEventListener("resize", updatePaneHeight);
+    window.addEventListener("scroll", updatePaneHeight, { passive: true });
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", updatePaneHeight);
+      window.removeEventListener("scroll", updatePaneHeight);
+    };
   }, []);
 
   return (
     <aside
+      id="decision-run-detail-pane"
       ref={paneRef}
       className="decision-run-detail"
       aria-label={t("activity.runs.detail.aria")}

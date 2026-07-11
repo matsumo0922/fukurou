@@ -23,6 +23,7 @@ import me.matsumo.fukurou.trading.broker.RestingEntryFillRequest
 import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
+import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.broker.btcScale
 import me.matsumo.fukurou.trading.broker.emptyReconcileProgress
 import me.matsumo.fukurou.trading.broker.hasTightenedStop
@@ -707,7 +708,7 @@ private fun JdbcTransaction.triggerTakeProfitProtection(
         updateOrderStatus(
             orderId = stopOrder.orderId,
             status = OrderStatus.CANCELED,
-            reasonJa = "reconciler virtual take profit trigger",
+            reasonJa = VIRTUAL_TAKE_PROFIT_TRIGGER_REASON,
             clock = clock,
             cancelReason = PaperOrderCancelReason.POSITION_CLOSE,
         )
@@ -727,7 +728,7 @@ private fun JdbcTransaction.triggerTakeProfitProtection(
             orderId = closeOrderId,
             position = position,
             sizeBtc = realizedFill.sizeBtc,
-            reasonJa = "reconciler virtual take profit trigger",
+            reasonJa = VIRTUAL_TAKE_PROFIT_TRIGGER_REASON,
             auditContext = PaperTradeAuditContext.EMPTY,
         ),
         clock = clock,

@@ -2112,7 +2112,6 @@ a:focus-visible {
   border: 0;
   background: transparent;
   color: inherit;
-  cursor: pointer;
   padding: 0;
   text-align: left;
 }
@@ -2174,7 +2173,7 @@ a:focus-visible {
   transform: translateY(-1px);
 }
 
-.decision-run-row[aria-selected="true"] .decision-run-card {
+.decision-run-row[data-selected="true"] .decision-run-card {
   border-color: var(--blue);
   background: var(--surface-raised);
   box-shadow: inset 3px 0 0 var(--blue), 0 16px 32px rgb(27 38 31 / 8%);

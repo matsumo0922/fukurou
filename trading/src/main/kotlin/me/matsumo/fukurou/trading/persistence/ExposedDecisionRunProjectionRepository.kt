@@ -25,6 +25,7 @@ import me.matsumo.fukurou.trading.activity.classifyDecisionRunOutcome
 import me.matsumo.fukurou.trading.activity.matches
 import me.matsumo.fukurou.trading.activity.safeDecisionRunFinalReason
 import me.matsumo.fukurou.trading.activity.withStrategyEvaluation
+import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
@@ -356,11 +357,12 @@ private const val FIND_TRADE_LIFECYCLES_SQL = """
         execution.executed_at, "order".order_type, position.status AS position_status,
         CASE
             WHEN entry_executions.id IS NOT NULL THEN 'ENTRY'
-            WHEN "order".order_type = 'STOP' THEN 'STOP'
-            WHEN "order".order_type = 'LIMIT' THEN 'TAKE_PROFIT'
-            WHEN "order".order_type = 'MARKET'
-                AND "order".reason_ja = 'reconciler virtual take profit trigger' THEN 'TAKE_PROFIT'
-            WHEN "order".order_type = 'MARKET' THEN 'MANUAL_CLOSE'
+            WHEN execution.side = 'BUY' THEN 'POSITION_ENTRY'
+            WHEN execution.side = 'SELL' AND "order".order_type = 'STOP' THEN 'STOP'
+            WHEN execution.side = 'SELL' AND "order".order_type = 'LIMIT' THEN 'TAKE_PROFIT'
+            WHEN execution.side = 'SELL' AND "order".order_type = 'MARKET'
+                AND "order".reason_ja = ? THEN 'TAKE_PROFIT'
+            WHEN execution.side = 'SELL' AND "order".order_type = 'MARKET' THEN 'MANUAL_CLOSE'
             ELSE 'POSITION_EXECUTION'
         END AS execution_kind
     FROM executions execution
@@ -691,6 +693,7 @@ private fun JdbcTransaction.selectExecutions(invocationId: String): List<Decisio
 private fun JdbcTransaction.selectTradeLifecycles(invocationId: String): List<DecisionRunTradeLifecycle> {
     return jdbcConnection().prepareStatement(FIND_TRADE_LIFECYCLES_SQL).use { statement ->
         statement.setString(1, invocationId)
+        statement.setString(2, VIRTUAL_TAKE_PROFIT_TRIGGER_REASON)
         statement.executeQuery().use { resultSet ->
             val lifecycleRows = buildList {
                 while (resultSet.next()) {
