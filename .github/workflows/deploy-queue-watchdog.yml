@@ -47,7 +47,7 @@ jobs:
             fi
 
             # run_id は GitHub search の qualifier ではないため、issue body を取得して文字列一致で dedupe する。
-            existing="$(gh issue list --label ops-alert --state open --json number,body \
+            existing="$(gh issue list --repo "${REPOSITORY}" --label ops-alert --state open --json number,body \
               --jq ".[] | select(.body | contains(\"run_id:${run_id}\")) | .number" \
               | head -n1)"
 
@@ -56,12 +56,13 @@ jobs:
             fi
 
             # label が未登録だと issue create が失敗するため、既存でも失敗しない形で用意する。
-            gh label create ops-alert --color B60205 --description "デプロイ pipeline の運用アラート" 2>/dev/null || true
+            gh label create ops-alert --repo "${REPOSITORY}" --color B60205 --description "デプロイ pipeline の運用アラート" 2>/dev/null || true
 
             body="$(printf 'run_id:%s\nrun URL: https://github.com/%s/actions/runs/%s\n\nDeploy on NAS job が %s 分経過しても開始していません。self-hosted runner (dxp4800plus-fukurou-prod / label fukurou-prod) の稼働状況と https://www.githubstatus.com/ を確認してください。' \
               "${run_id}" "${REPOSITORY}" "${run_id}" "${age_minutes}")"
 
             gh issue create \
+              --repo "${REPOSITORY}" \
               --title "Deploy on NAS が ${age_minutes} 分待機中 (run #${run_id})" \
               --label ops-alert \
               --body "${body}"
