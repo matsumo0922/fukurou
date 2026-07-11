@@ -3378,10 +3378,10 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(LlmLaunchReservationOutcome.Reserved("reflection-run"), reflectionOutcome)
         assertEquals(false, reflectionOnlyRunning)
         assertEquals(LlmLaunchReservationOutcome.Reserved("trading-run"), tradingOutcome)
-        assertEquals(
-            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION),
-            reflectionBlockedOutcome,
-        )
+        val reflectionRejection = assertIs<LlmLaunchReservationOutcome.Rejected>(reflectionBlockedOutcome)
+        assertEquals(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION, reflectionRejection.reason)
+        assertEquals("reflection-run", reflectionRejection.activeReservation?.invocationId)
+        assertEquals(LlmDaemonTriggerKind.REFLECTION, reflectionRejection.activeReservation?.triggerKind)
     }
 
     @Test

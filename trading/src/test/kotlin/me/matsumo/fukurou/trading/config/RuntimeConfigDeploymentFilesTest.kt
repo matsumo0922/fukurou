@@ -32,6 +32,7 @@ class RuntimeConfigDeploymentFilesTest {
             "FUKUROU_MCP_JAR_PATH",
             "FUKUROU_TRADING_MODE",
             "FUKUROU_GMO_PUBLIC_BASE_URL",
+            "FUKUROU_GMO_PUBLIC_WEBSOCKET_URL",
             "FUKUROU_OBSIDIAN_VAULT_PATH",
         )
         val primaryDeploymentFiles = listOf(

@@ -3514,7 +3514,7 @@ MCP は CLI から fat jar を stdio 子プロセスとして起動する。
 
 ### 13.5 `.env.example`
 
-repository root の `.env.example` が Docker Compose 用 template の正本である。Cloudflare Tunnel token と PostgreSQL credential、取引 symbol / mode、GMO Public base URL、Obsidian mount path、LLM / MCP 起動境界などの secret / deployment / bootstrap 値だけを列挙し、runtime tuning と default は列挙しない。
+repository root の `.env.example` が Docker Compose 用 template の正本である。Cloudflare Tunnel token と PostgreSQL credential、取引 symbol / mode、GMO Public REST / WebSocket URL、Obsidian mount path、LLM / MCP 起動境界などの secret / deployment / bootstrap 値だけを列挙し、runtime tuning と default は列挙しない。
 
 ---
 

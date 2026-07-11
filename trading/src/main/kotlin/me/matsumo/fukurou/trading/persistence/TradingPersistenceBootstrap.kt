@@ -288,14 +288,22 @@ private const val ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
     WHERE state = 'CONNECTED'
 """
 
-/** market-data gap / evaluation exclusion の一意性とlookup indexを作るSQL。 */
-private const val ENSURE_MARKET_DATA_INTEGRITY_INDEXES_SQL = """
+/** evaluation exclusion の重複を防ぐ unique index を作る SQL。 */
+private const val ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL = """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluation_exclusions_gap_entity_unique
-        ON evaluation_exclusions (gap_id, entity_type, entity_id);
+    ON evaluation_exclusions (gap_id, entity_type, entity_id)
+"""
+
+/** market-data gap の session lookup index を作る SQL。 */
+private const val ENSURE_MARKET_DATA_GAPS_SESSION_STARTED_INDEX_SQL = """
     CREATE INDEX IF NOT EXISTS idx_market_data_gaps_session_started
-        ON market_data_gaps (session_id, started_at DESC);
+    ON market_data_gaps (session_id, started_at DESC)
+"""
+
+/** evaluation exclusion の entity lookup index を作る SQL。 */
+private const val ENSURE_EVALUATION_EXCLUSIONS_ENTITY_INDEX_SQL = """
     CREATE INDEX IF NOT EXISTS idx_evaluation_exclusions_entity
-        ON evaluation_exclusions (entity_type, entity_id);
+    ON evaluation_exclusions (entity_type, entity_id)
 """
 
 /**
@@ -960,7 +968,9 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
-    executeUpdate(ENSURE_MARKET_DATA_INTEGRITY_INDEXES_SQL)
+    executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_MARKET_DATA_GAPS_SESSION_STARTED_INDEX_SQL)
+    executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_ENTITY_INDEX_SQL)
     executeUpdate(ENSURE_DECISIONS_INVOCATION_ID_CREATED_AT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
