@@ -2,6 +2,10 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunDetail
@@ -381,7 +385,7 @@ private const val FIND_TRADE_LIFECYCLES_SQL = """
 """
 
 private const val FIND_SAFE_AUDIT_SQL = """
-    SELECT event_type, tool_name, ts
+    SELECT event_type, tool_name, payload, ts
     FROM command_event_log
     WHERE decision_run_id = ?
     ORDER BY ts ASC, id ASC
@@ -748,7 +752,7 @@ private fun JdbcTransaction.selectSafeAudit(invocationId: String): List<Decision
                             values = mapOf(
                                 "eventType" to resultSet.getString("event_type"),
                                 "toolName" to resultSet.getString("tool_name"),
-                            ),
+                            ) + resultSet.getString("payload").safeLlmAssignmentAuditValues(),
                         ),
                     )
                 }
@@ -756,6 +760,26 @@ private fun JdbcTransaction.selectSafeAudit(invocationId: String): List<Decision
         }
     }
 }
+
+private fun String?.safeLlmAssignmentAuditValues(): Map<String, String?> {
+    val root = this
+        ?.let { payload -> runCatching { Json.parseToJsonElement(payload).jsonObject }.getOrNull() }
+        ?: return emptyMap()
+    val details = root["details"]?.jsonObject ?: return emptyMap()
+
+    return SAFE_LLM_ASSIGNMENT_AUDIT_KEYS.mapNotNull { key ->
+        details[key]?.jsonPrimitive?.contentOrNull?.let { value -> key to value }
+    }.toMap()
+}
+
+private val SAFE_LLM_ASSIGNMENT_AUDIT_KEYS = setOf(
+    "provider",
+    "configuredModel",
+    "configuredEffort",
+    "renderedEffort",
+    "observedModels",
+    "modelObserved",
+)
 
 @Suppress("LongMethod")
 private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummary {

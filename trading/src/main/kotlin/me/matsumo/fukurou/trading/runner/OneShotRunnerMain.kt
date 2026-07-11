@@ -68,7 +68,6 @@ private suspend fun launchOneShotRunner(environment: Map<String, String>): OneSh
                 commandRenderer = DefaultLlmCommandRenderer(
                     config = LlmCommandRendererConfig.fromEnvironment(
                         environment = environment,
-                        runtimeModels = tradingConfig.llmModels,
                     ),
                 ),
                 processRunner = ShellProcessRunner(),
@@ -88,6 +87,8 @@ private suspend fun launchOneShotRunner(environment: Map<String, String>): OneSh
             mcpJarPath = environment[FUKUROU_MCP_JAR_PATH_ENV] ?: "mcp/build/libs/fukurou-mcp-all.jar",
             cliConfig = OneShotRunnerCliConfig.fromEnvironment(environment),
             marketSnapshotId = environment["FUKUROU_MARKET_SNAPSHOT_ID"],
+            proposerAssignment = tradingConfig.llmRoleAssignments.proposer,
+            falsifierAssignment = tradingConfig.llmRoleAssignments.falsifier,
         )
         return runner.runOneShot(request).getOrThrow()
     } finally {

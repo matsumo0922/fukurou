@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicWebSocketConfig
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CLAUDE_MODEL_ENV
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_MODEL_ENV
+import me.matsumo.fukurou.trading.invoker.LlmEffort
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.reflection.ReflectionConfig
 import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
@@ -33,7 +34,8 @@ import java.time.Instant
  * @param decisionProtocol decision / Falsifier protocol 設定
  * @param runner LLM one-shot runner の保守的な上限設定
  * @param daemon Ktor 常駐 daemon scheduler 設定
- * @param llmModels LLM provider ごとの model override
+ * @param llmRoleAssignments Proposer / Falsifier の LLM 割り当て
+ * @param llmModels Reflection 用の LLM provider ごとの model override
  * @param obsidian Obsidian vault への機械生成 note writer 設定
  * @param reflection deterministic reflection runner 設定
  * @param killCriterion 評価成績による HARD_HALT 基準
@@ -50,6 +52,7 @@ data class TradingBotConfig(
     val decisionProtocol: DecisionProtocolConfig = DecisionProtocolConfig(),
     val runner: LlmRunnerConfig = LlmRunnerConfig(),
     val daemon: LlmDaemonConfig = LlmDaemonConfig(),
+    val llmRoleAssignments: LlmRoleAssignments = LlmRoleAssignments(),
     val llmModels: LlmModelConfig = LlmModelConfig(),
     val obsidian: ObsidianConfig = ObsidianConfig(),
     val reflection: ReflectionConfig = ReflectionConfig(),
@@ -107,6 +110,7 @@ data class TradingBotConfig(
                 decisionProtocol = environment.readDecisionProtocolConfig(),
                 runner = environment.readLlmRunnerConfig(),
                 daemon = environment.readLlmDaemonConfig(),
+                llmRoleAssignments = environment.readLlmRoleAssignments(),
                 llmModels = environment.readLlmModelConfig(),
                 obsidian = environment.readObsidianConfig(),
                 reflection = environment.readReflectionConfig(),
@@ -117,6 +121,19 @@ data class TradingBotConfig(
         }
     }
 }
+
+/** Proposer / Falsifier へ独立して渡す LLM 割り当て。 */
+data class LlmRoleAssignments(
+    val proposer: LlmRoleAssignment = LlmRoleAssignment(provider = LlmProvider.CLAUDE),
+    val falsifier: LlmRoleAssignment = LlmRoleAssignment(provider = LlmProvider.CODEX),
+)
+
+/** role ごとの provider、model、reasoning effort。 */
+data class LlmRoleAssignment(
+    val provider: LlmProvider,
+    val model: String? = null,
+    val effort: LlmEffort = LlmEffort.DEFAULT,
+)
 
 /**
  * LLM provider ごとの model override。
@@ -1066,6 +1083,46 @@ private fun Map<String, String>.readLlmModelConfig(): LlmModelConfig {
         codexModel = readOptional(FUKUROU_CODEX_MODEL_ENV),
     )
 }
+
+private fun Map<String, String>.readLlmRoleAssignments(): LlmRoleAssignments {
+    return LlmRoleAssignments(
+        proposer = readLlmRoleAssignment(
+            providerEnv = FUKUROU_PROPOSER_PROVIDER_ENV,
+            modelEnv = FUKUROU_PROPOSER_MODEL_ENV,
+            effortEnv = FUKUROU_PROPOSER_EFFORT_ENV,
+            defaultProvider = LlmProvider.CLAUDE,
+        ),
+        falsifier = readLlmRoleAssignment(
+            providerEnv = FUKUROU_FALSIFIER_PROVIDER_ENV,
+            modelEnv = FUKUROU_FALSIFIER_MODEL_ENV,
+            effortEnv = FUKUROU_FALSIFIER_EFFORT_ENV,
+            defaultProvider = LlmProvider.CODEX,
+        ),
+    )
+}
+
+private fun Map<String, String>.readLlmRoleAssignment(
+    providerEnv: String,
+    modelEnv: String,
+    effortEnv: String,
+    defaultProvider: LlmProvider,
+): LlmRoleAssignment {
+    val provider = readOptional(providerEnv)?.let(LlmProvider::valueOf) ?: defaultProvider
+    val effort = readOptional(effortEnv)?.let(LlmEffort::valueOf) ?: LlmEffort.DEFAULT
+
+    return LlmRoleAssignment(
+        provider = provider,
+        model = readOptional(modelEnv),
+        effort = effort,
+    )
+}
+
+const val FUKUROU_PROPOSER_PROVIDER_ENV = "FUKUROU_PROPOSER_PROVIDER"
+const val FUKUROU_PROPOSER_MODEL_ENV = "FUKUROU_PROPOSER_MODEL"
+const val FUKUROU_PROPOSER_EFFORT_ENV = "FUKUROU_PROPOSER_EFFORT"
+const val FUKUROU_FALSIFIER_PROVIDER_ENV = "FUKUROU_FALSIFIER_PROVIDER"
+const val FUKUROU_FALSIFIER_MODEL_ENV = "FUKUROU_FALSIFIER_MODEL"
+const val FUKUROU_FALSIFIER_EFFORT_ENV = "FUKUROU_FALSIFIER_EFFORT"
 
 private fun Map<String, String>.readReflectionConfig(): ReflectionConfig {
     val defaults = ReflectionConfig()

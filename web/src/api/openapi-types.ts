@@ -2024,6 +2024,7 @@ export interface components {
             safetyTier: "STANDARD" | "GUARDED" | "SAFETY_CRITICAL" | "DEPLOYMENT_BOUNDARY" | "SECRET";
             labelKey: string;
             descriptionKey: string;
+            enumValues?: string[];
         };
         /** RuntimeConfigGroup */
         RuntimeConfigGroup: {

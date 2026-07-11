@@ -368,6 +368,7 @@ function RunDetailContent({
   const isCanceledOrExpired = ["CANCELED", "EXPIRED"].includes(detail.summary.outcome);
   const isDecisionOutcome = !isFilled && !isPendingOrder && !isCanceledOrExpired;
   const detailIndex = isFilled || isCanceledOrExpired || isDecisionOutcome ? "02" : "01";
+  const llmAssignments = llmAssignmentAudit(detail.raw);
 
   return (
     <>
@@ -443,6 +444,10 @@ function RunDetailContent({
           [t("activity.runs.label.parentPlan"), intent?.parentTradePlanId],
           [t("activity.runs.label.setupTags"), formatJsonList(intent?.setupTagsJson), true],
           [t("activity.runs.label.runtimeError"), detail.summary.errorMessage, true],
+          [t("activity.runs.label.configuredModel"), llmAssignments.configuredModel],
+          [t("activity.runs.label.configuredEffort"), llmAssignments.configuredEffort],
+          [t("activity.runs.label.renderedEffort"), llmAssignments.renderedEffort],
+          [t("activity.runs.label.observedModels"), llmAssignments.observedModels],
         ]} />
         <div className="run-narratives">
           <Narrative label={t("activity.runs.label.reason")} value={decision?.reasonJa} />
@@ -464,6 +469,20 @@ function RunDetailContent({
       </DetailSection>
     </>
   );
+}
+
+function llmAssignmentAudit(raw: OpsDecisionRunDetailResponse["raw"]) {
+  const values = raw
+    .filter((record) => record.source === "audit")
+    .map((record) => record.values)
+    .find((record) => record.configuredEffort != null || record.configuredModel != null);
+
+  return {
+    configuredModel: values?.configuredModel ?? null,
+    configuredEffort: values?.configuredEffort ?? null,
+    renderedEffort: values?.renderedEffort ?? null,
+    observedModels: values?.modelObserved === "true" ? values.observedModels ?? null : null,
+  };
 }
 
 function CancellationSection({

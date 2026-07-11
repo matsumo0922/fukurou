@@ -491,6 +491,22 @@ function ConfigDraftCell({
     );
   }
 
+  const enumValues = item.enumValues ?? [];
+
+  if (item.valueType === "ENUM" && enumValues.length > 0) {
+    return (
+      <label className="config-draft-select" role="cell">
+        <select
+          aria-label={translatedOrFallback(item.labelKey, item.key, t)}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          {enumValues.map((option) => <option key={option} value={option}>{option}</option>)}
+        </select>
+      </label>
+    );
+  }
+
   if (item.valueType === "STRUCTURED_JSON_LIST" || item.valueType === "STRING_LIST") {
     return (
       <textarea
