@@ -89,6 +89,7 @@ internal fun Route.evaluationRoutes(dependencies: EvaluationRouteDependencies) {
     registerEvaluationCalibrationRoute(dependencies)
     registerEvaluationBenchmarkRoute(dependencies)
     registerEvaluationCostsRoute(dependencies)
+    evaluationReportRoutes(dependencies)
 }
 
 @OptIn(ExperimentalKtorApi::class)

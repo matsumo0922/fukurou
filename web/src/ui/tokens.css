@@ -1,4 +1,10 @@
 :root {
+  --console-surface: color-mix(in srgb, var(--surface) 94%, #16253a);
+  --console-grid: color-mix(in srgb, var(--line) 72%, transparent);
+  --console-live: #38bdf8;
+  --console-report: #a78bfa;
+  --console-conflict: #f472b6;
+  --console-ridge-fill: color-mix(in srgb, var(--green) 34%, var(--red) 24%);
   --canvas: #f4f6f3;
   --surface: #fbfcf8;
   --surface-muted: #f1f4ef;

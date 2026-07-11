@@ -481,6 +481,148 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/evaluation/reports/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 評価レポートを手動生成する
+         * @description complete calendar days の immutable facts snapshot を固定し、typed claim の検証済みレポート revision を生成します。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": components["schemas"]["EvaluationReportGenerateRequest"];
+                };
+            };
+            responses: {
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportJobResponse"];
+                    };
+                };
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluation/reports/default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 既定の評価レポートを取得する
+         * @description 選択期間へ pin された immutable revision と deterministic evidence snapshot を返します。current context は含みません。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportResponse"];
+                    };
+                };
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/evaluation/reports/revisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 評価レポート履歴を取得する
+         * @description 生成 request ごとに保持する immutable revision 履歴を新しい順で返します。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EvaluationReportHistoryResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ops/runtime-config": {
         parameters: {
             query?: never;
@@ -1847,13 +1989,13 @@ export interface components {
         /** ReadinessResponse */
         ReadinessResponse: {
             status: string;
+            lastTransportActivityAt?: string | null;
+            lastTradeAt?: string | null;
+            lastMaintenanceAt?: string | null;
             marketDataState?: string;
             gapStartedAt?: string | null;
             recoveredAt?: string | null;
             gapReason?: string | null;
-            lastTransportActivityAt?: string | null;
-            lastTradeAt?: string | null;
-            lastMaintenanceAt?: string | null;
         };
         /** EvaluationPeriodResponse */
         EvaluationPeriodResponse: {
@@ -2004,6 +2146,133 @@ export interface components {
             knownCostUsd?: string | null;
             byProvider: components["schemas"]["EvaluationProviderCostResponse"][];
             byModel: components["schemas"]["EvaluationModelTokenResponse"][];
+        };
+        /** EvaluationReportGenerateRequest */
+        EvaluationReportGenerateRequest: {
+            days: number;
+        };
+        /** EvaluationReportJobResponse */
+        EvaluationReportJobResponse: {
+            jobId: string;
+            revisionId: string;
+            status: string;
+        };
+        /** EvaluationReportPeriodResponse */
+        EvaluationReportPeriodResponse: {
+            from: string;
+            toInclusive: string;
+            timezone: string;
+        };
+        /** EvaluationReportSegmentResponse */
+        EvaluationReportSegmentResponse: {
+            segmentId: string;
+            kind: string;
+            text: string;
+            claimIds: string[];
+        };
+        /** EvaluationReportClaimResponse */
+        EvaluationReportClaimResponse: {
+            claimId: string;
+            type: string;
+            factIds: string[];
+            asserted: string;
+        };
+        /** EvaluationClaimValidationResponse */
+        EvaluationClaimValidationResponse: {
+            claimId: string;
+            status: string;
+            asserted: string;
+            actual?: string | null;
+            factIds: string[];
+            code: string;
+        };
+        /** EvaluationReportFactResponse */
+        EvaluationReportFactResponse: {
+            factId: string;
+            value?: string | null;
+            unit?: string | null;
+            availability: string;
+            sourceIds: string[];
+        };
+        /** EvaluationReportSourceResponse */
+        EvaluationReportSourceResponse: {
+            sourceId: string;
+            observedAt: string;
+            freshness: string;
+        };
+        /** OutcomeRidgeDomainResponse */
+        OutcomeRidgeDomainResponse: {
+            minInclusive: string;
+            maxExclusive: string;
+            binWidth: string;
+        };
+        /** OutcomeRidgeBinResponse */
+        OutcomeRidgeBinResponse: {
+            lowerInclusive: string;
+            upperExclusive: string;
+            count: number;
+        };
+        /** OutcomeRidgeGroupResponse */
+        OutcomeRidgeGroupResponse: {
+            groupKey: string;
+            label: string;
+            tradeCount: number;
+            availableRCount: number;
+            missingRCount: number;
+            underflowCount: number;
+            overflowCount: number;
+            bins: components["schemas"]["OutcomeRidgeBinResponse"][];
+            medianR?: string | null;
+            sampleState: string;
+        };
+        /** OutcomeRidgeGroupingResponse */
+        OutcomeRidgeGroupingResponse: {
+            groupBy: string;
+            groups: components["schemas"]["OutcomeRidgeGroupResponse"][];
+        };
+        /** OutcomeRidgeResponse */
+        OutcomeRidgeResponse: {
+            catalogVersion: string;
+            observationKind: string;
+            domain: components["schemas"]["OutcomeRidgeDomainResponse"];
+            referenceLines: string[];
+            groupings: components["schemas"]["OutcomeRidgeGroupingResponse"][];
+        };
+        /** EvaluationReportResponse */
+        EvaluationReportResponse: {
+            jobId: string;
+            revisionId: string;
+            revisionNumber: number;
+            scopeKey: string;
+            status: string;
+            period: components["schemas"]["EvaluationReportPeriodResponse"];
+            inputAsOf: string;
+            inputHash: string;
+            snapshotId: string;
+            generatedAt: string;
+            provider: string;
+            model: string;
+            title: string;
+            segments: components["schemas"]["EvaluationReportSegmentResponse"][];
+            claims: components["schemas"]["EvaluationReportClaimResponse"][];
+            validation: components["schemas"]["EvaluationClaimValidationResponse"][];
+            facts: components["schemas"]["EvaluationReportFactResponse"][];
+            sources: components["schemas"]["EvaluationReportSourceResponse"][];
+            outcomeRidge: components["schemas"]["OutcomeRidgeResponse"];
+            truncated: boolean;
+        };
+        /** EvaluationReportHistoryItemResponse */
+        EvaluationReportHistoryItemResponse: {
+            jobId: string;
+            revisionId: string;
+            revisionNumber: number;
+            status: string;
+            requestedAt: string;
+            pinned: boolean;
+        };
+        /** EvaluationReportHistoryResponse */
+        EvaluationReportHistoryResponse: {
+            revisions: components["schemas"]["EvaluationReportHistoryItemResponse"][];
         };
         /** RuntimeConfigItem */
         RuntimeConfigItem: {
@@ -2390,14 +2659,6 @@ export interface components {
             status: string;
             executions: components["schemas"]["OpsDecisionRunExecutionResponse"][];
         };
-        /** OpsDecisionRunRawRecordResponse */
-        OpsDecisionRunRawRecordResponse: {
-            source: string;
-            occurredAt: string;
-            values: {
-                [key: string]: string | null;
-            };
-        };
         /** OpsDecisionRunLlmPhaseAuditResponse */
         OpsDecisionRunLlmPhaseAuditResponse: {
             phase: string;
@@ -2407,6 +2668,14 @@ export interface components {
             renderedEffort?: string | null;
             observedModels?: string | null;
             modelObserved: boolean;
+        };
+        /** OpsDecisionRunRawRecordResponse */
+        OpsDecisionRunRawRecordResponse: {
+            source: string;
+            occurredAt: string;
+            values: {
+                [key: string]: string | null;
+            };
         };
         /** OpsDecisionRunDetailResponse */
         OpsDecisionRunDetailResponse: {

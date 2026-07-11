@@ -17,6 +17,88 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+.evaluation-console { display: grid; gap: 12px; max-width: 1440px; margin: 0 auto; }
+.console-header, .report-panel__header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.console-header { padding: 8px 2px 4px; }
+.console-header h1, .report-panel h2 { margin: 3px 0; letter-spacing: -.025em; }
+.console-header h1 { font-size: clamp(24px, 3vw, 30px); }
+.console-header p, .console-note { margin: 0; color: var(--ink-muted); }
+.console-kicker { color: var(--ink-muted); font: 700 11px/1.4 var(--mono); letter-spacing: .12em; }
+.console-actions, .console-toolbar, .console-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.console-actions button, .console-toolbar button, .generate-button { border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 5px; min-height: 34px; padding: 6px 10px; font: 700 11px/1 var(--mono); }
+.console-actions button.is-active, .console-toolbar button.is-active { border-color: var(--console-report); background: color-mix(in srgb, var(--console-report) 13%, var(--surface)); }
+.console-actions .generate-button, .generate-button { display: inline-flex; align-items: center; gap: 6px; border-color: var(--green); }
+.current-context, .revision-rail, .evidence-summary { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(150px, 1fr); overflow-x: auto; border: 1px solid var(--line); background: var(--console-surface); }
+.current-context { border-top: 2px solid var(--console-live); }
+.current-context > div, .revision-rail > div, .evidence-summary > div { display: grid; gap: 3px; min-width: 150px; padding: 10px 12px; border-right: 1px solid var(--line); }
+.current-context span, .revision-rail span, .evidence-summary span { color: var(--ink-muted); font: 700 10px/1.2 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+.current-context strong, .revision-rail strong, .evidence-summary strong { font: 700 12px/1.25 var(--mono); }
+.current-context small, .revision-rail small { color: var(--ink-muted); font: 11px/1.3 var(--mono); }
+.report-panel { border: 1px solid var(--line); background: var(--console-surface); padding: 13px; }
+.report-panel--wide { width: 100%; }
+.report-panel__header { padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.report-panel__header h2 { font-size: 18px; }
+.console-badges span, .console-badges code, .report-status { border: 1px solid var(--line); padding: 5px 7px; color: var(--ink-muted); font: 700 10px/1 var(--mono); }
+.report-status { color: var(--console-conflict); border-color: var(--console-conflict); }
+.report-stage { border-top: 2px solid var(--console-report); }
+.report-stage__grid { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(260px, .8fr); gap: 12px; padding-top: 12px; }
+.report-prose { display: grid; gap: 6px; }
+.report-segment { display: grid; grid-template-columns: 105px minmax(0, 1fr) auto; gap: 12px; align-items: start; padding: 12px; border: 1px solid var(--line); background: var(--surface); }
+.report-segment > span { color: var(--ink-muted); font: 700 10px/1.45 var(--mono); }
+.report-segment p { margin: 0; font-size: 15px; line-height: 1.65; }
+.report-segment.is-conflict { border-left: 3px solid var(--console-conflict); }
+.claim-button { border: 1px solid var(--green); background: transparent; color: var(--ink); padding: 5px; font: 700 10px/1 var(--mono); }
+.claim-button.is-conflict { border-color: var(--console-conflict); text-decoration: underline wavy var(--console-conflict); }
+.claim-inspector { padding: 12px; border: 1px solid var(--line); background: var(--surface); }
+.claim-inspector h3 { font: 700 14px/1.3 var(--mono); }
+.claim-inspector dl { display: grid; grid-template-columns: 82px 1fr; gap: 7px; font-size: 12px; }
+.claim-inspector dt { color: var(--ink-muted); }
+.claim-inspector dd { margin: 0; overflow-wrap: anywhere; }
+.inspector-fact { display: grid; gap: 5px; padding: 9px 0; border-top: 1px solid var(--line); font: 11px/1.4 var(--mono); }
+.console-toolbar { padding: 10px 0; color: var(--ink-muted); font: 11px/1.4 var(--mono); }
+.console-note { padding-top: 8px; font: 11px/1.5 var(--mono); }
+.console-empty, .console-alert { padding: 24px; border: 1px solid var(--line); background: var(--console-surface); text-align: center; }
+.console-alert { border-color: var(--red); color: var(--red); }
+.ridge-scroll { overflow-x: auto; }
+.ridge-scroll svg { display: block; min-width: 760px; width: 100%; }
+.ridge-reference { stroke: var(--line); stroke-dasharray: 4 4; }
+.ridge-reference--0 { stroke: var(--ink); stroke-width: 1.5; stroke-dasharray: none; }
+.ridge-line { fill: none; stroke: var(--ink); stroke-width: 1.4; }
+.ridge-median { fill: var(--console-conflict); }
+.ridge-label { fill: var(--ink); font: 700 12px var(--mono); }
+.ridge-meta { fill: var(--ink-muted); font: 11px var(--mono); }
+.console-table-wrap { overflow-x: auto; max-height: 360px; }
+.console-table-wrap table { width: 100%; border-collapse: collapse; font: 11px/1.4 var(--mono); }
+.console-table-wrap caption { text-align: left; padding: 8px 0; font-weight: 700; }
+.console-table-wrap th, .console-table-wrap td { padding: 7px 9px; border: 1px solid var(--line); text-align: left; }
+.evidence-graph { height: 500px; border: 1px solid var(--line); margin-top: 10px; background: var(--canvas); }
+.evidence-graph .react-flow__node { width: 220px; min-height: 64px; white-space: pre-line; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); color: var(--ink); padding: 9px; font: 11px/1.35 var(--mono); }
+.evidence-graph .react-flow__node.segment { border-color: var(--console-report); }
+.evidence-graph .react-flow__node.claim.conflict { border: 2px solid var(--console-conflict); }
+.evidence-graph .react-flow__node.fact { border-color: var(--blue); }
+.evidence-graph .react-flow__node.source { border-style: dashed; }
+.evidence-graph .react-flow__edge-path { stroke: var(--ink-muted); stroke-width: 1.25; }
+.evidence-graph .react-flow__edge.selected .react-flow__edge-path { stroke: var(--console-conflict); stroke-width: 3; }
+
+@media (max-width: 920px) {
+  .console-header { flex-direction: column; }
+  .report-stage__grid { grid-template-columns: 1fr; }
+  .report-segment { grid-template-columns: 82px minmax(0, 1fr); }
+  .report-segment > div { grid-column: 2; }
+}
+
+@media (max-width: 640px) {
+  .report-panel { padding: 10px; }
+  .report-panel__header { flex-direction: column; }
+  .report-segment { grid-template-columns: 1fr; }
+  .report-segment > div { grid-column: auto; }
+  .evidence-graph { height: 440px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .evaluation-console *, .evaluation-console *::before, .evaluation-console *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+}
+
 * {
   box-sizing: border-box;
 }

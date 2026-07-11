@@ -240,21 +240,17 @@ describe("App", () => {
     });
   });
 
-  it("localizes evaluation UI copy while keeping operational values unchanged", async () => {
+  it("keeps report authority labels explicit in Japanese locale", async () => {
     window.localStorage.setItem(LOCALE_STORAGE_KEY, "ja");
     stubSystemFetch();
     window.history.pushState({}, "", "/app/evaluation");
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Evaluation" })).toBeInTheDocument();
-    expect(screen.getByText("モデル品質、paper trading 成績、キャリブレーション、ベンチマーク、停止判定、LLM コスト。")).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "セットアップ成績" })).toBeInTheDocument();
-    expect(await screen.findByText("Bot 実績")).toBeInTheDocument();
-    expect(screen.getAllByText("NO_TRADE").length).toBeGreaterThan(0);
-    expect(screen.getByText("claude-sonnet-4")).toBeInTheDocument();
-    expect(screen.getByText("取得済み provider の合計・一部未取得")).toBeInTheDocument();
-    expect(screen.getByText("取得不可")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Auditable LLM evaluation" })).toBeInTheDocument();
+    expect(screen.getByText("CURRENT CONTEXT · NOT REPORT EVIDENCE")).toBeInTheDocument();
+    expect(screen.getByText("Live trading is not enabled")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "No immutable report revision" })).toBeInTheDocument();
   });
 
   it("localizes controls UI copy while keeping safety states unchanged", async () => {
@@ -317,48 +313,17 @@ describe("App", () => {
     expect(screen.getByText("within bounds")).toBeInTheDocument();
   });
 
-  it("shows evaluation data from the read APIs", async () => {
+  it("loads only the immutable report contract on Evaluation", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/evaluation");
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Evaluation" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Auditable LLM evaluation" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Evaluation/ })).toHaveAttribute("href", "/app/evaluation");
-    expect((await screen.findAllByText("trend-breakout")).length).toBeGreaterThan(0);
-    expect(screen.getByRole("heading", { name: "Setup performance" })).toBeInTheDocument();
-    expect(screen.getAllByText("claude").length).toBeGreaterThan(0);
-    expect(screen.getByText("claude-sonnet-4")).toBeInTheDocument();
-    expect(screen.getByText("Bot realized")).toBeInTheDocument();
-    expect(screen.getAllByText("¥101,000").length).toBeGreaterThan(0);
-    expect(screen.getByText("latest 6 of 7")).toBeInTheDocument();
-    expect(screen.getAllByText("2.88%").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("$0.1234").length).toBeGreaterThan(0);
-    expect(screen.getByText("known provider total · partially unavailable")).toBeInTheDocument();
-    expect(screen.getByText("2 cost unavailable (incl. missing usage 1) · 1 model unavailable")).toBeInTheDocument();
-    expect(screen.getByText("unavailable")).toBeInTheDocument();
-    expect(screen.getByText("DISCONNECTED 2 / SEQUENCE_GAP 1")).toBeInTheDocument();
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/evaluation/summary",
-      expect.objectContaining({ method: "GET" }),
-    );
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/evaluation/setups",
-      expect.objectContaining({ method: "GET" }),
-    );
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/evaluation/calibration",
-      expect.objectContaining({ method: "GET" }),
-    );
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/evaluation/benchmark",
-      expect.objectContaining({ method: "GET" }),
-    );
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/evaluation/costs",
-      expect.objectContaining({ method: "GET" }),
-    );
+    expect(await screen.findByRole("heading", { name: "No immutable report revision" })).toBeInTheDocument();
+    expect(hasGetCall(fetchMock, "/evaluation/reports/default", (params) => params.get("days") === "30")).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalledWith("/evaluation/summary", expect.anything());
   });
 
   it("filters decision runs and opens the normalized detail pane", async () => {
