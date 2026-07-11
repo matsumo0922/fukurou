@@ -73,7 +73,7 @@ class ManualLlmLaunchServiceTest {
         assertTrue(launchedPayload.contains("operator requested immediate check"))
         assertEquals(result.invocationId, finish.invocationId)
         assertEquals(LlmLaunchReservationStatus.FINISHED, finish.status)
-        assertEquals(LlmRunTerminalCause.NORMAL_COMPLETION.name, finish.reason)
+        assertEquals(LlmRunTerminalCause.NO_TRADE.name, finish.reason)
     }
 
     @Test
@@ -738,8 +738,11 @@ private class RecordingLlmLaunchReservationRepository(
         return delegate.latestFinishedReservedAt(triggerKey)
     }
 
-    override suspend fun hasFreshRunningReservation(activeSince: Instant): Result<Boolean> {
-        return delegate.hasFreshRunningReservation(activeSince)
+    override suspend fun findBlockingRunningReservation(
+        requestTriggerKind: LlmDaemonTriggerKind,
+        activeSince: Instant,
+    ): Result<LlmActiveLaunchReservation?> {
+        return delegate.findBlockingRunningReservation(requestTriggerKind, activeSince)
     }
 
     /**

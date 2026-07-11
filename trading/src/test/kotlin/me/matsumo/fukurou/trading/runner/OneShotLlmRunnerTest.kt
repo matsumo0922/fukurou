@@ -151,6 +151,7 @@ class OneShotLlmRunnerTest {
         val decisions = fixture.decisionRepository.snapshots.decisions()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
+        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.NO_TRADE, result.terminalCause)
         assertEquals(1, fixture.processRunner.launches.size)
         assertEquals(1, decisions.size)
         assertEquals(DecisionAction.NO_TRADE, decisions.single().submission.action)
@@ -1245,6 +1246,7 @@ class OneShotLlmRunnerTest {
         assertFalse(tradeResult.accepted)
         assertEquals(OrderStatus.REJECTED, tradeResult.status)
         assertEquals(SafetyFloorRule.MAX_DRAWDOWN_HALT, tradeResult.safetyViolation?.rule)
+        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.SAFETY_DENIED, result.terminalCause)
         assertEquals(RiskHaltState.HARD_HALT, riskState.state)
         assertTrue(requireNotNull(riskState.haltReason).contains("MAX_DRAWDOWN_HALT"))
         assertEquals(0, positions.size)
@@ -1282,6 +1284,7 @@ class OneShotLlmRunnerTest {
         assertFalse(tradeResult.accepted)
         assertEquals(OrderStatus.REJECTED, tradeResult.status)
         assertEquals(SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE, tradeResult.safetyViolation?.rule)
+        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.SAFETY_DENIED, result.terminalCause)
         assertEquals(0, positions.size)
         assertEquals(listOf("preview_order", "place_order"), toolCompletionOrder)
         assertEquals(listOf(SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE), violations.map { violation -> violation.rule })

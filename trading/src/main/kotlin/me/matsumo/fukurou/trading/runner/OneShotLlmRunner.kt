@@ -227,12 +227,7 @@ data class OneShotRunnerResult(
     val decision: DecisionSubmissionResult?,
     val intent: TradeIntentRecord?,
     val tradeResult: PaperTradeResult?,
-    val terminalCause: LlmRunTerminalCause = when (status) {
-        OneShotRunnerStatus.NO_TRADE_AUDITED,
-        OneShotRunnerStatus.LAUNCH_REJECTED,
-        -> LlmRunTerminalCause.NO_TRADE
-        else -> LlmRunTerminalCause.NORMAL_COMPLETION
-    },
+    val terminalCause: LlmRunTerminalCause = classifyOneShotTerminalCause(status, tradeResult),
 )
 
 /**

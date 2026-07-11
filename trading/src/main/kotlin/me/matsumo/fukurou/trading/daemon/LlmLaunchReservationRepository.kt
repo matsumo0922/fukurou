@@ -212,20 +212,7 @@ interface LlmLaunchReservationRepository {
     suspend fun findBlockingRunningReservation(
         requestTriggerKind: LlmDaemonTriggerKind,
         activeSince: Instant,
-    ): Result<LlmActiveLaunchReservation?> {
-        return hasFreshRunningReservation(activeSince).map { active ->
-            if (active) {
-                LlmActiveLaunchReservation(
-                    invocationId = "legacy-active-reservation",
-                    triggerKind = requestTriggerKind,
-                    triggerKey = "legacy-active-reservation",
-                    reservedAt = activeSince,
-                )
-            } else {
-                null
-            }
-        }
-    }
+    ): Result<LlmActiveLaunchReservation?>
 
     /** 既存 caller 互換用の blocker 有無判定。 */
     suspend fun hasFreshRunningReservation(activeSince: Instant): Result<Boolean> {

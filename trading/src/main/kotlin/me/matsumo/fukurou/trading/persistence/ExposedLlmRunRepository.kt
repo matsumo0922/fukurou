@@ -99,6 +99,7 @@ private const val SELECT_LLM_RUNS_STARTED_BETWEEN_SQL = """
         latest_runs.started_at,
         latest_runs.finished_at,
         latest_runs.error_message,
+        latest_runs.terminal_cause,
         latest_runs.runtime_config_version_id,
         latest_runs.runtime_config_hash
     FROM (
@@ -109,10 +110,10 @@ private const val SELECT_LLM_RUNS_STARTED_BETWEEN_SQL = """
             trigger_kind,
             status,
             started_at,
-        finished_at,
-        error_message,
-        terminal_cause,
-        runtime_config_version_id,
+            finished_at,
+            error_message,
+            terminal_cause,
+            runtime_config_version_id,
             runtime_config_hash
         FROM llm_runs
         WHERE started_at >= ?
