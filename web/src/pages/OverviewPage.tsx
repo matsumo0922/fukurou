@@ -160,12 +160,16 @@ function SystemReadinessPanel({ statusQuery }: { statusQuery: UseQueryResult<Sys
             detail: `HTTP ${statusQuery.data.revisionHttpStatus}`,
           },
           {
-            label: t("overview.label.lastReconciled"),
-            value: formatDateTime(statusQuery.data.readiness.lastReconciledAt, locale),
+            label: t("system.label.lastTransportActivityAt"),
+            value: formatDateTime(statusQuery.data.readiness.lastTransportActivityAt, locale),
           },
           {
-            label: t("overview.label.lastMarketData"),
-            value: formatDateTime(statusQuery.data.readiness.lastMarketDataAt, locale),
+            label: t("system.label.lastTradeAt"),
+            value: formatDateTime(statusQuery.data.readiness.lastTradeAt, locale),
+          },
+          {
+            label: t("system.label.lastMaintenanceAt"),
+            value: formatDateTime(statusQuery.data.readiness.lastMaintenanceAt, locale),
           },
           {
             label: t("overview.label.snapshot"),

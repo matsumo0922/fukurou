@@ -84,8 +84,9 @@ describe("App", () => {
       },
       readiness: {
         status: "ready",
-        lastReconciledAt: "2026-07-05T12:00:00.000Z",
-        lastMarketDataAt: "2026-07-05T12:00:01.000Z",
+        lastTransportActivityAt: "2026-07-05T12:00:00.000Z",
+        lastTradeAt: "2026-07-05T12:00:01.000Z",
+        lastMaintenanceAt: "2026-07-05T12:00:02.000Z",
         marketDataState: "CONNECTED",
         gapStartedAt: "2026-07-05T11:59:00.000Z",
         recoveredAt: "2026-07-05T12:00:01.000Z",
@@ -1104,8 +1105,9 @@ type SystemFetchFixture = {
   };
   readiness?: {
     status: string;
-    lastReconciledAt?: string | null;
-    lastMarketDataAt?: string | null;
+    lastTransportActivityAt?: string | null;
+    lastTradeAt?: string | null;
+    lastMaintenanceAt?: string | null;
     marketDataState?: string;
     gapStartedAt?: string | null;
     recoveredAt?: string | null;
@@ -1167,8 +1169,9 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
   };
   const readiness = fixture.readiness ?? {
     status: "ready",
-    lastReconciledAt: null,
-    lastMarketDataAt: null,
+    lastTransportActivityAt: null,
+    lastTradeAt: null,
+    lastMaintenanceAt: null,
   };
   const llmAuth = fixture.llmAuth ?? defaultLlmAuthResponse();
   const revision = fixture.revision ?? "test-sha";

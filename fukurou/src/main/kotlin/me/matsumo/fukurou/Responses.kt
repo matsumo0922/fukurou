@@ -18,8 +18,9 @@ data class HealthResponse(
  * readiness 応答。外部依存を含めた処理可否を表す。
  *
  * @param status 状態。準備完了は "ready"、未準備は "not_ready"
- * @param lastReconciledAt ProtectionReconciler が最後に pass を完了した時刻
- * @param lastMarketDataAt ProtectionReconciler が最後に market data を見た時刻
+ * @param lastTransportActivityAt 最後に transport activity を確認した時刻
+ * @param lastTradeAt 最後に realtime trade を確認した時刻
+ * @param lastMaintenanceAt 最後に periodic maintenance が成功した時刻
  * @param marketDataState realtime market-data 接続状態
  * @param gapStartedAt active または直近 gap の開始時刻
  * @param recoveredAt gap 復旧後の最初の realtime event 時刻
@@ -28,8 +29,9 @@ data class HealthResponse(
 @Serializable
 data class ReadinessResponse(
     val status: String,
-    val lastReconciledAt: String? = null,
-    val lastMarketDataAt: String? = null,
+    val lastTransportActivityAt: String? = null,
+    val lastTradeAt: String? = null,
+    val lastMaintenanceAt: String? = null,
     val marketDataState: String = "DISCONNECTED",
     val gapStartedAt: String? = null,
     val recoveredAt: String? = null,

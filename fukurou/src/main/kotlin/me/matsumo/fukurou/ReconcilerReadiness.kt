@@ -17,13 +17,15 @@ private val DEFAULT_RECONCILER_STALE_AFTER = Duration.ofSeconds(30)
  * @param delegate DB など既存外部依存の readiness probe
  * @param reconcilerStatusProvider Reconciler 状態 provider
  * @param clock 鮮度判定に使う clock
- * @param staleAfter この時間を超えて reconcile されていなければ not-ready
+ * @param staleAfter この時間を超えて maintenance されていなければ not-ready
+ * @param transportLivenessTimeout transport activity の鮮度許容時間
  */
 class ReconcilerFreshnessReadinessProbe(
     private val delegate: ReadinessProbe,
     private val reconcilerStatusProvider: ReconcilerStatusProvider,
     private val clock: Clock = Clock.systemUTC(),
     private val staleAfter: Duration = DEFAULT_RECONCILER_STALE_AFTER,
+    private val transportLivenessTimeout: Duration = Duration.ofSeconds(150),
 ) : ReadinessProbe {
 
     override suspend fun isReady(): Boolean {
@@ -34,16 +36,16 @@ class ReconcilerFreshnessReadinessProbe(
         }
 
         val status = reconcilerStatusProvider.snapshot()
-        val lastReconciledAt = status.lastReconciledAt ?: return false
-        val lastMarketDataAt = status.lastMarketDataAt ?: return false
+        val lastTransportActivityAt = status.lastTransportActivityAt ?: return false
+        val lastMaintenanceAt = status.lastMaintenanceAt ?: return false
         val now = Instant.now(clock)
-        val reconcilerFreshEnough = lastReconciledAt.isFreshEnough(now, staleAfter)
-        val marketDataFreshEnough = lastMarketDataAt.isFreshEnough(now, staleAfter)
+        val transportFreshEnough = lastTransportActivityAt.isFreshEnough(now, transportLivenessTimeout)
+        val maintenanceFreshEnough = lastMaintenanceAt.isFreshEnough(now, staleAfter)
 
         val connected = status.marketDataState == MarketDataConnectionState.CONNECTED
         val activeGap = status.gapStartedAt != null && status.recoveredAt == null
 
-        return status.startupRecoveryCompleted && connected && !activeGap && reconcilerFreshEnough && marketDataFreshEnough
+        return status.startupRecoveryCompleted && connected && !activeGap && transportFreshEnough && maintenanceFreshEnough
     }
 }
 

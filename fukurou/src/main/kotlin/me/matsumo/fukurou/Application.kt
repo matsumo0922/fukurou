@@ -725,6 +725,7 @@ private fun createApplicationReadinessProbe(
         delegate = baseReadinessProbe,
         reconcilerStatusProvider = runtime.reconcilerStatus,
         clock = runtime.clock,
+        transportLivenessTimeout = runtime.tradingConfig.gmoPublicWebSocket.transportLivenessTimeout,
     )
 
     return ReadinessProbe {

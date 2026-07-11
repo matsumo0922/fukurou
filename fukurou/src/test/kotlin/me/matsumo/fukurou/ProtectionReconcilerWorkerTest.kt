@@ -277,7 +277,9 @@ private class WorkerTestMarketEventSession(
     override val connectedAt: Instant,
     private val events: ReceiveChannel<Result<PaperMarketTradeEvent>>,
 ) : MarketEventSession {
-    override suspend fun receive(): Result<PaperMarketTradeEvent> = events.receive()
+    override suspend fun receive(): Result<me.matsumo.fukurou.trading.market.MarketEventSessionSignal> {
+        return events.receive().map { event -> me.matsumo.fukurou.trading.market.MarketEventSessionSignal.Trade(event) }
+    }
 
     override fun close() = Unit
 }

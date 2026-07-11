@@ -1847,12 +1847,13 @@ export interface components {
         /** ReadinessResponse */
         ReadinessResponse: {
             status: string;
-            lastReconciledAt?: string | null;
-            lastMarketDataAt?: string | null;
             marketDataState?: string;
             gapStartedAt?: string | null;
             recoveredAt?: string | null;
             gapReason?: string | null;
+            lastTransportActivityAt?: string | null;
+            lastTradeAt?: string | null;
+            lastMaintenanceAt?: string | null;
         };
         /** EvaluationPeriodResponse */
         EvaluationPeriodResponse: {

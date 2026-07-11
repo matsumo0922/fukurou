@@ -105,12 +105,16 @@ function SystemStatus({ data, isStale }: { data: SystemStatusSnapshot; isStale: 
         <DataStrip
           items={[
             {
-              label: t("system.label.lastReconciledAt"),
-              value: formatDateTime(data.readiness.lastReconciledAt, locale),
+              label: t("system.label.lastTransportActivityAt"),
+              value: formatDateTime(data.readiness.lastTransportActivityAt, locale),
             },
             {
-              label: t("system.label.lastMarketDataAt"),
-              value: formatDateTime(data.readiness.lastMarketDataAt, locale),
+              label: t("system.label.lastTradeAt"),
+              value: formatDateTime(data.readiness.lastTradeAt, locale),
+            },
+            {
+              label: t("system.label.lastMaintenanceAt"),
+              value: formatDateTime(data.readiness.lastMaintenanceAt, locale),
             },
             {
               label: t("system.label.gapStartedAt"),

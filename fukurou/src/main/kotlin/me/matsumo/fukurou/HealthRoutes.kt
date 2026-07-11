@@ -92,8 +92,9 @@ internal suspend fun respondReadiness(
     val reconcilerStatus = reconcilerStatusProvider.snapshot()
     val readinessResponse = ReadinessResponse(
         status = if (ready) "ready" else "not_ready",
-        lastReconciledAt = reconcilerStatus.lastReconciledAt?.toString(),
-        lastMarketDataAt = reconcilerStatus.lastMarketDataAt?.toString(),
+        lastTransportActivityAt = reconcilerStatus.lastTransportActivityAt?.toString(),
+        lastTradeAt = reconcilerStatus.lastTradeAt?.toString(),
+        lastMaintenanceAt = reconcilerStatus.lastMaintenanceAt?.toString(),
         marketDataState = reconcilerStatus.marketDataState.name,
         gapStartedAt = reconcilerStatus.gapStartedAt?.toString(),
         recoveredAt = reconcilerStatus.recoveredAt?.toString(),
