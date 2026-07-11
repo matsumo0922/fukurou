@@ -7,6 +7,8 @@ readonly ENV_FILE="${DEPLOY_ROOT}/.env"
 readonly LOCK_FILE="${FUKUROU_DEPLOY_LOCK:-/var/lock/fukurou-deploy.lock}"
 readonly COMPOSE_FILE="${REPO_DIR}/docker-compose.prod.yml"
 readonly MAIN_REF="${FUKUROU_MAIN_REF:-origin/main}"
+readonly IMAGE_REPOSITORY="ghcr.io/matsumo0922/fukurou"
+readonly IMAGE_RETENTION_COUNT="${FUKUROU_IMAGE_RETENTION_COUNT:-10}"
 
 usage() {
   echo "Usage: deploy-fukurou <40-character commit sha>" >&2
@@ -69,6 +71,32 @@ deploy_compose() {
   docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
 }
 
+prune_old_images() {
+  local running_image_id
+  running_image_id="$(docker inspect --format '{{.Image}}' fukurou-ktor 2>/dev/null || true)"
+
+  local -a image_ids
+  # CreatedAt 降順で列挙し、同一 digest（:main と :<sha> が同じ image を指す行）を除去する。
+  # --no-trunc でフル ID にし、docker inspect の {{.Image}} と同じ形式（sha256:<64hex>）に揃える。
+  mapfile -t image_ids < <(
+    docker images "${IMAGE_REPOSITORY}" --no-trunc --format '{{.CreatedAt}}|{{.ID}}' \
+      | sort -r \
+      | awk -F'|' '!seen[$2]++ { print $2 }'
+  )
+
+  local index=0
+  local image_id
+  for image_id in "${image_ids[@]}"; do
+    index=$((index + 1))
+    [[ "${index}" -le "${IMAGE_RETENTION_COUNT}" ]] && continue
+    [[ "${image_id}" == "${running_image_id}" ]] && continue
+
+    if ! docker rmi "${image_id}" >/dev/null 2>&1; then
+      echo "deploy-fukurou: skip pruning image ${image_id} (in use or already removed)" >&2
+    fi
+  done
+}
+
 main() {
   require_root
 
@@ -84,6 +112,7 @@ main() {
 
   checkout_deploy_sha "${deploy_sha}"
   deploy_compose "${deploy_sha}"
+  prune_old_images
 }
 
 main "$@"

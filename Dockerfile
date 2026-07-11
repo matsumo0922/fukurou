@@ -33,7 +33,6 @@ RUN npm run build
 
 # ---- runtime stage: 実行は軽量 JRE のみ ----
 FROM eclipse-temurin:21-jre AS runtime
-ARG FUKUROU_REVISION=unknown
 WORKDIR /app
 
 # 非 root 実行ユーザを用意する。
@@ -55,6 +54,10 @@ COPY prompts ./prompts
 # Vite SPA の production build output を Ktor から配信する。
 COPY --from=web-build /src/web/dist ./web
 USER appuser
+
+# ARG は実際に参照する ENV の直前で宣言し、commit SHA だけが変わる build で
+# 上記の重い RUN / COPY layer のキャッシュを壊さないようにする。
+ARG FUKUROU_REVISION=unknown
 
 # JVM をコンテナの memory limit に追従させる。
 ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"

@@ -1,0 +1,69 @@
+name: Deploy Queue Watchdog
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect stuck "Deploy on NAS" jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          THRESHOLD_MINUTES: "10"
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          runs="$(gh api "repos/${REPOSITORY}/actions/workflows/deploy.yml/runs" \
+            --jq '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued") | .id]')"
+
+          for run_id in $(echo "${runs}" | jq -r '.[]'); do
+            # re-run 等で同名 job が複数存在する場合があるため、最新の 1 件だけに絞る。
+            job="$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/jobs" \
+              --jq '[.jobs[] | select(.name=="Deploy on NAS")] | sort_by(.created_at) | last // empty')"
+
+            if [[ -z "${job}" ]]; then
+              continue
+            fi
+
+            status="$(echo "${job}" | jq -r '.status')"
+            created_at="$(echo "${job}" | jq -r '.created_at')"
+
+            if [[ "${status}" != "queued" ]]; then
+              continue
+            fi
+
+            age_minutes=$(( ( $(date -u +%s) - $(date -u -d "${created_at}" +%s) ) / 60 ))
+
+            if (( age_minutes < THRESHOLD_MINUTES )); then
+              continue
+            fi
+
+            # run_id は GitHub search の qualifier ではないため、issue body を取得して文字列一致で dedupe する。
+            existing="$(gh issue list --repo "${REPOSITORY}" --label ops-alert --state open --json number,body \
+              --jq ".[] | select(.body | contains(\"run_id:${run_id}\")) | .number" \
+              | head -n1)"
+
+            if [[ -n "${existing}" ]]; then
+              continue
+            fi
+
+            # label が未登録だと issue create が失敗するため、既存でも失敗しない形で用意する。
+            gh label create ops-alert --repo "${REPOSITORY}" --color B60205 --description "デプロイ pipeline の運用アラート" 2>/dev/null || true
+
+            body="$(printf 'run_id:%s\nrun URL: https://github.com/%s/actions/runs/%s\n\nDeploy on NAS job が %s 分経過しても開始していません。self-hosted runner (dxp4800plus-fukurou-prod / label fukurou-prod) の稼働状況と https://www.githubstatus.com/ を確認してください。' \
+              "${run_id}" "${REPOSITORY}" "${run_id}" "${age_minutes}")"
+
+            gh issue create \
+              --repo "${REPOSITORY}" \
+              --title "Deploy on NAS が ${age_minutes} 分待機中 (run #${run_id})" \
+              --label ops-alert \
+              --body "${body}"
+          done

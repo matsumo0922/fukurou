@@ -123,6 +123,7 @@ Docker Compose と GitHub Actions による GHCR image pull 型の NAS deploy sc
 - `docker-compose.dev.yml`
 - `docker-compose.prod.yml`
 - `.github/workflows/deploy.yml`
+- `.github/workflows/deploy-queue-watchdog.yml`
 - `scripts/deploy/deploy-fukurou`
 - `scripts/deploy/sudoers-fukurou`
 - `scripts/prod-curl`
