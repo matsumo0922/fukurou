@@ -41,8 +41,8 @@ export function reportScopeKey(scope: ReportScope): string {
   return scope.kind === "PRESET" ? `PRESET:${scope.days}D` : `CUSTOM:${scope.from}:${scope.toInclusive}`;
 }
 
-export async function fetchDefaultReport(scopeKey: string): Promise<EvaluationReport | null> {
-  const response = await fetch(`/evaluation/reports/default?scopeKey=${encodeURIComponent(scopeKey)}`, { headers: { Accept: "application/json" } });
+export async function fetchDefaultReport(scopeKey: string, cohort = "CURRENT"): Promise<EvaluationReport | null> {
+  const response = await fetch(`/evaluation/reports/default?scopeKey=${encodeURIComponent(scopeKey)}&cohort=${cohort}`, { headers: { Accept: "application/json" } });
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`report request failed (${response.status})`);
   return response.json() as Promise<EvaluationReport>;
@@ -54,11 +54,11 @@ export class ReportAdmissionError extends Error {
   }
 }
 
-export async function generateReport(scope: ReportScope, signal: AbortSignal, onProgress: (job: ReportJob) => void): Promise<ReportJob> {
+export async function generateReport(scope: ReportScope, signal: AbortSignal, onProgress: (job: ReportJob) => void, cohort = "CURRENT"): Promise<ReportJob> {
   const response = await fetch("/evaluation/reports/jobs", {
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify(scope),
+    body: JSON.stringify({ ...scope, cohort }),
     signal,
   });
   const accepted = await response.json() as ReportJob;
@@ -81,8 +81,8 @@ export async function generateReport(scope: ReportScope, signal: AbortSignal, on
   }
 }
 
-export async function fetchReportHistory(scopeKey: string): Promise<ReportHistoryItem[]> {
-  const response = await getJsonByPath<{ revisions: ReportHistoryItem[] }>(`/evaluation/reports/revisions?scopeKey=${encodeURIComponent(scopeKey)}`);
+export async function fetchReportHistory(scopeKey: string, cohort = "CURRENT"): Promise<ReportHistoryItem[]> {
+  const response = await getJsonByPath<{ revisions: ReportHistoryItem[] }>(`/evaluation/reports/revisions?scopeKey=${encodeURIComponent(scopeKey)}&cohort=${cohort}`);
   return response.revisions;
 }
 
@@ -90,11 +90,11 @@ export async function fetchReportRevision(revisionId: string): Promise<Evaluatio
   return getJsonByPath(`/evaluation/reports/revisions/${encodeURIComponent(revisionId)}`);
 }
 
-export async function pinReport(scopeKey: string, revisionId: string): Promise<void> {
-  const response = await fetch("/evaluation/reports/pins", { method: "PUT", headers: { Accept: "application/json", "Content-Type": "application/json" }, body: JSON.stringify({ scopeKey, revisionId }) });
+export async function pinReport(scopeKey: string, revisionId: string, cohort = "CURRENT"): Promise<void> {
+  const response = await fetch("/evaluation/reports/pins", { method: "PUT", headers: { Accept: "application/json", "Content-Type": "application/json" }, body: JSON.stringify({ scopeKey, revisionId, cohort }) });
   if (!response.ok) throw new Error(`pin failed (${response.status})`);
 }
 
-export function reportQuery(scopeKey: string) {
-  return { queryKey: ["evaluation-report", scopeKey], queryFn: () => fetchDefaultReport(scopeKey), staleTime: Infinity };
+export function reportQuery(scopeKey: string, cohort = "CURRENT") {
+  return { queryKey: ["evaluation-report", scopeKey, cohort], queryFn: () => fetchDefaultReport(scopeKey, cohort), staleTime: Infinity };
 }

@@ -1602,10 +1602,10 @@ run:
     maxSleepsTotalSeconds: 10
 
 accountSummary:
-  equityJpy: 100000
+  equityJpy: 1000000
   equityPeakJpy: 102300
   drawdownRatio: -0.0225
-  cashJpy: 100000
+  cashJpy: 1000000
   btcQuantity: 0
 
 positions:
@@ -2158,9 +2158,9 @@ get_runtime_limits
 ```json
 {
   "mode": "PAPER",
-  "cashJpy": "100000",
+  "cashJpy": "1000000",
   "btcQuantity": "0.00000000",
-  "totalEquityJpy": "100000",
+  "totalEquityJpy": "1000000",
   "equityPeakJpy": "102300",
   "drawdownRatio": "-0.0225"
 }

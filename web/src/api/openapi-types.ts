@@ -209,7 +209,12 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description 評価対象 account epoch ID。省略時は active epoch です。 */
+                    epochId?: string;
+                    /** @description CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。 */
+                    cohort?: string;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -266,7 +271,12 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description 評価対象 account epoch ID。省略時は active epoch です。 */
+                    epochId?: string;
+                    /** @description CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。 */
+                    cohort?: string;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -323,7 +333,12 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description 評価対象 account epoch ID。省略時は active epoch です。 */
+                    epochId?: string;
+                    /** @description CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。 */
+                    cohort?: string;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -380,7 +395,12 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description 評価対象 account epoch ID。省略時は active epoch です。 */
+                    epochId?: string;
+                    /** @description CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。 */
+                    cohort?: string;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -437,7 +457,12 @@ export interface paths {
          */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description 評価対象 account epoch ID。省略時は active epoch です。 */
+                    epochId?: string;
+                    /** @description CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。 */
+                    cohort?: string;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -1078,13 +1103,13 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
-                /** @description 現在の catalog / typed config validation に失敗しました。 */
+                /** @description validation または account epoch の zero-open-risk gate により拒否されました。 */
                 409: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["RuntimeConfigValidationResult"];
+                        "application/json": components["schemas"]["OpsPaperAccountEpochSwitchConflictResponse"];
                     };
                 };
                 /** @description runtime config admin service が利用できません。 */
@@ -1152,13 +1177,13 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
-                /** @description 現在の catalog / typed config validation に失敗しました。 */
+                /** @description validation または account epoch の zero-open-risk gate により拒否されました。 */
                 409: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["RuntimeConfigValidationResult"];
+                        "application/json": components["schemas"]["OpsPaperAccountEpochSwitchConflictResponse"];
                     };
                 };
                 /** @description runtime config admin service が利用できません。 */
@@ -2244,6 +2269,19 @@ export interface components {
             to: string;
             timezone: string;
         };
+        /** EvaluationScopeResponse */
+        EvaluationScopeResponse: {
+            epochId: string;
+            cohort: string;
+            executionSemanticsVersion?: string | null;
+            initialCashJpy: string;
+        };
+        /** EvaluationAttributionCoverageResponse */
+        EvaluationAttributionCoverageResponse: {
+            attributed: number;
+            missing: number;
+            total: number;
+        };
         /** EvaluationPerformanceResponse */
         EvaluationPerformanceResponse: {
             tradeCount: number;
@@ -2297,6 +2335,8 @@ export interface components {
         /** EvaluationSummaryResponse */
         EvaluationSummaryResponse: {
             period: components["schemas"]["EvaluationPeriodResponse"];
+            scope: components["schemas"]["EvaluationScopeResponse"];
+            attributionCoverage: components["schemas"]["EvaluationAttributionCoverageResponse"];
             truncated: boolean;
             performance: components["schemas"]["EvaluationPerformanceResponse"];
             killCriterion: components["schemas"]["EvaluationKillCriterionResponse"];
@@ -2312,6 +2352,8 @@ export interface components {
         /** EvaluationSetupsResponse */
         EvaluationSetupsResponse: {
             period: components["schemas"]["EvaluationPeriodResponse"];
+            scope: components["schemas"]["EvaluationScopeResponse"];
+            attributionCoverage: components["schemas"]["EvaluationAttributionCoverageResponse"];
             truncated: boolean;
             setups: components["schemas"]["EvaluationSetupResponse"][];
             marketRegimes: components["schemas"]["EvaluationMarketRegimeResponse"][];
@@ -2333,6 +2375,8 @@ export interface components {
         /** EvaluationCalibrationResponse */
         EvaluationCalibrationResponse: {
             period: components["schemas"]["EvaluationPeriodResponse"];
+            scope: components["schemas"]["EvaluationScopeResponse"];
+            attributionCoverage: components["schemas"]["EvaluationAttributionCoverageResponse"];
             truncated: boolean;
             bySetup: components["schemas"]["EvaluationCalibrationGroupResponse"][];
             byProvider: components["schemas"]["EvaluationCalibrationGroupResponse"][];
@@ -2353,10 +2397,12 @@ export interface components {
         /** EvaluationBenchmarkResponse */
         EvaluationBenchmarkResponse: {
             period: components["schemas"]["EvaluationPeriodResponse"];
+            scope: components["schemas"]["EvaluationScopeResponse"];
             assumptionsJa: string;
             baselineEquityJpy: string;
             points: components["schemas"]["EvaluationBenchmarkPointResponse"][];
             returns: components["schemas"]["EvaluationBenchmarkReturnResponse"];
+            state: string;
         };
         /** EvaluationProviderCostResponse */
         EvaluationProviderCostResponse: {
@@ -2379,6 +2425,7 @@ export interface components {
         /** EvaluationCostsResponse */
         EvaluationCostsResponse: {
             period: components["schemas"]["EvaluationPeriodResponse"];
+            scope: components["schemas"]["EvaluationScopeResponse"];
             truncated: boolean;
             phaseCount: number;
             missingUsagePhaseCount: number;
@@ -2394,6 +2441,8 @@ export interface components {
             kind?: string;
             from?: string | null;
             toInclusive?: string | null;
+            epochId?: string | null;
+            cohort?: string | null;
         };
         /** EvaluationReportJobResponse */
         EvaluationReportJobResponse: {
@@ -2600,6 +2649,10 @@ export interface components {
             performanceLattice: components["schemas"]["ReportPerformanceLatticeResponse"];
             integrity: components["schemas"]["EvaluationIntegrityResponse"];
             truncated: boolean;
+            epochId?: string | null;
+            cohort?: string | null;
+            executionSemanticsVersion?: string | null;
+            attributionCoverage?: components["schemas"]["EvaluationAttributionCoverageResponse"] | null;
         };
         /** EvaluationReportHistoryItemResponse */
         EvaluationReportHistoryItemResponse: {
@@ -2609,6 +2662,8 @@ export interface components {
             status: string;
             requestedAt: string;
             pinned: boolean;
+            epochId?: string | null;
+            cohort?: string | null;
         };
         /** EvaluationReportHistoryResponse */
         EvaluationReportHistoryResponse: {
@@ -2619,6 +2674,8 @@ export interface components {
             days?: number | null;
             scopeKey?: string | null;
             revisionId: string;
+            epochId?: string | null;
+            cohort?: string | null;
         };
         /** EvaluationReportPinResponse */
         EvaluationReportPinResponse: {
@@ -2734,6 +2791,16 @@ export interface components {
             activeVersion: components["schemas"]["RuntimeConfigVersionSummary"];
             previousActiveVersionId?: string | null;
             validation: components["schemas"]["RuntimeConfigValidationResult"];
+            accountEpochId?: string | null;
+        };
+        /** OpsPaperAccountEpochSwitchConflictResponse */
+        OpsPaperAccountEpochSwitchConflictResponse: {
+            valid?: boolean;
+            errors?: components["schemas"]["RuntimeConfigValidationError"][];
+            code?: string;
+            openPositionCount: number;
+            openOrderCount: number;
+            btcQuantity: string;
         };
         /** OpsHaltRequest */
         OpsHaltRequest: {
@@ -2819,6 +2886,7 @@ export interface components {
             equityPeakJpy: string;
             drawdownRatio: string;
             updatedAt: string;
+            accountEpochId?: string | null;
         };
         /** OpsDecisionResponse */
         OpsDecisionResponse: {
@@ -2848,6 +2916,9 @@ export interface components {
             realizedPnlJpy: string;
             liquidity: string;
             executedAt: string;
+            accountEpochId?: string | null;
+            executionSemanticsVersion?: string | null;
+            runtimeConfigHash?: string | null;
         };
         /** OpsExecutionsResponse */
         OpsExecutionsResponse: {

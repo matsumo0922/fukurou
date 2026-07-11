@@ -71,7 +71,10 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
 
     post("/evaluation/reports/jobs") {
         val request = runCatching { call.receive<EvaluationReportGenerateRequest>() }.getOrNull()
-        val scope = request?.toScope()
+        val evaluationScope = request?.let { value ->
+            dependencies.repository?.resolveScope(value.epochId, value.cohort)?.getOrNull()
+        }
+        val scope = if (evaluationScope == null) null else request.toScope(evaluationScope)
         if (scope == null) {
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("use preset days 7, 30, 90 or a valid CUSTOM from/toInclusive range"))
             return@post
@@ -112,7 +115,7 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
     }
 
     get("/evaluation/reports/default") {
-        val scopeKey = call.reportScopeKey()
+        val scopeKey = call.reportScopeKey(dependencies.repository) ?: return@get
         val report = store.default(scopeKey)
         if (report == null) {
             call.respond(HttpStatusCode.NotFound, ErrorResponse("report has not been generated"))
@@ -160,8 +163,14 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
     }
 
     get("/evaluation/reports/revisions") {
-        val scopeKey = call.reportScopeKey()
-        call.respond(EvaluationReportHistoryResponse(store.history(scopeKey)))
+        val scopeKey = call.reportScopeKey(dependencies.repository) ?: return@get
+        val currentHistory = store.history(scopeKey)
+        val legacyHistory = if (call.request.queryParameters["cohort"] == "LEGACY_PRE_WS") {
+            store.history(scopeKey.substringBefore("|EPOCH:"))
+        } else {
+            emptyList()
+        }
+        call.respond(EvaluationReportHistoryResponse(currentHistory + legacyHistory))
     }.describe {
         summary = "評価レポート履歴を取得する"
         description = "生成 request ごとに保持する immutable revision 履歴を新しい順で返します。"
@@ -198,11 +207,15 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
 
     put("/evaluation/reports/pins") {
         val request = call.receive<EvaluationReportPinRequest>()
-        store.pin(request.resolvedScopeKey(), request.revisionId).getOrElse { error ->
+        val scopeKey = request.resolvedScopeKey(dependencies.repository) ?: run {
+            call.respond(HttpStatusCode.BadRequest, ErrorResponse("evaluation scope is invalid"))
+            return@put
+        }
+        store.pin(scopeKey, request.revisionId).getOrElse { error ->
             call.respond(HttpStatusCode.BadRequest, ErrorResponse(error.message ?: "pin failed"))
             return@put
         }
-        call.respond(EvaluationReportPinResponse(request.resolvedScopeKey(), request.revisionId))
+        call.respond(EvaluationReportPinResponse(scopeKey, request.revisionId))
     }.describe {
         summary = "評価レポート revision を pin する"
         description = "successful immutable revision を選択 scope の既定表示へ明示的に固定します。"
@@ -215,7 +228,8 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
     }
 
     delete("/evaluation/reports/pins") {
-        store.unpin(call.reportScopeKey())
+        val scopeKey = call.reportScopeKey(dependencies.repository) ?: return@delete
+        store.unpin(scopeKey)
         call.respond(HttpStatusCode.NoContent)
     }.describe {
         summary = "評価レポート pin を解除する"
@@ -281,7 +295,7 @@ private class EvaluationReportStore(
             toExclusive = toInclusive.plusDays(1).atStartOfDay(ReportZone).toInstant(),
         )
         val snapshotId = UUID.randomUUID().toString()
-        val snapshot = source.fetchReportSnapshot(period).getOrThrow()
+        val snapshot = source.fetchReportSnapshot(period, scope.evaluationScope).getOrThrow()
         val queryResult = snapshot.trades
         require(!queryResult.truncated) { "SNAPSHOT_TRUNCATED" }
         val candles = marketDataSource?.getCandles(
@@ -447,6 +461,14 @@ private class EvaluationReportStore(
             revisionId = job.revisionId,
             revisionNumber = revisionNumber,
             scopeKey = scope.key,
+            epochId = scope.evaluationScope.accountEpochId.toString(),
+            cohort = scope.evaluationScope.cohort.name,
+            executionSemanticsVersion = scope.evaluationScope.executionSemanticsVersion,
+            attributionCoverage = EvaluationAttributionCoverageResponse(
+                attributed = queryResult.attributionCoverage.attributed,
+                missing = queryResult.attributionCoverage.missing,
+                total = queryResult.attributionCoverage.total,
+            ),
             status = "SUCCEEDED",
             period = EvaluationReportPeriodResponse(from.toString(), toInclusive.toString(), ReportZone.id),
             inputAsOf = inputAsOf,
@@ -823,6 +845,8 @@ data class EvaluationReportGenerateRequest(
     val kind: String = "PRESET",
     val from: String? = null,
     val toInclusive: String? = null,
+    val epochId: String? = null,
+    val cohort: String? = null,
 )
 
 private data class EvaluationReportScope(
@@ -831,11 +855,20 @@ private data class EvaluationReportScope(
     val label: String,
     val from: LocalDate? = null,
     val toInclusive: LocalDate? = null,
+    val evaluationScope: me.matsumo.fukurou.trading.evaluation.EvaluationScope,
 )
 
-private fun EvaluationReportGenerateRequest.toScope(): EvaluationReportScope? {
+private fun EvaluationReportGenerateRequest.toScope(
+    evaluationScope: me.matsumo.fukurou.trading.evaluation.EvaluationScope,
+): EvaluationReportScope? {
+    val suffix = "EPOCH:${evaluationScope.accountEpochId}|COHORT:${evaluationScope.cohort.name}"
     if (kind == "PRESET" && days in setOf(7, 30, 90)) {
-        return EvaluationReportScope(requireNotNull(days), "PRESET:${days}D", "${days}D")
+        return EvaluationReportScope(
+            days = requireNotNull(days),
+            key = "PRESET:${days}D|$suffix",
+            label = "${days}D / ${evaluationScope.cohort.name}",
+            evaluationScope = evaluationScope,
+        )
     }
     val hasCompleteCustomRange = kind == "CUSTOM" && from != null && toInclusive != null
     if (!hasCompleteCustomRange) return null
@@ -847,10 +880,11 @@ private fun EvaluationReportGenerateRequest.toScope(): EvaluationReportScope? {
 
     return EvaluationReportScope(
         days = customDays,
-        key = "CUSTOM:$parsedFrom:$parsedTo",
         label = "$parsedFrom — $parsedTo",
         from = parsedFrom,
         toInclusive = parsedTo,
+        evaluationScope = evaluationScope,
+        key = "CUSTOM:$parsedFrom:$parsedTo|$suffix",
     )
 }
 
@@ -862,15 +896,37 @@ data class EvaluationReportPinRequest(
     val days: Int? = null,
     val scopeKey: String? = null,
     val revisionId: String,
+    val epochId: String? = null,
+    val cohort: String? = null,
 )
 
 @Serializable
 data class EvaluationReportPinResponse(val scopeKey: String, val revisionId: String)
 
-private fun EvaluationReportPinRequest.resolvedScopeKey(): String = scopeKey ?: "PRESET:${days ?: 30}D"
+private suspend fun EvaluationReportPinRequest.resolvedScopeKey(repository: EvaluationRepository?): String? {
+    val scope = repository?.resolveScope(epochId, cohort)?.getOrNull() ?: return null
+    val base = scopeKey ?: "PRESET:${days ?: 30}D"
+    if ("|EPOCH:" in base) return base
+    return "$base|EPOCH:${scope.accountEpochId}|COHORT:${scope.cohort.name}"
+}
 
-private fun io.ktor.server.application.ApplicationCall.reportScopeKey(): String =
-    request.queryParameters["scopeKey"] ?: "PRESET:${request.queryParameters["days"]?.toIntOrNull() ?: 30}D"
+private suspend fun io.ktor.server.application.ApplicationCall.reportScopeKey(
+    repository: EvaluationRepository?,
+): String? {
+    val suppliedKey = request.queryParameters["scopeKey"]
+    if (suppliedKey != null && "|EPOCH:" in suppliedKey) return suppliedKey
+    val scope = repository?.resolveScope(
+        request.queryParameters["epochId"],
+        request.queryParameters["cohort"],
+    )?.getOrNull()
+    if (scope == null) {
+        respond(HttpStatusCode.BadRequest, ErrorResponse("evaluation scope is invalid"))
+        return null
+    }
+    val base = suppliedKey ?: "PRESET:${request.queryParameters["days"]?.toIntOrNull() ?: 30}D"
+    return "$base|" +
+        "EPOCH:${scope.accountEpochId}|COHORT:${scope.cohort.name}"
+}
 
 @Serializable
 data class EvaluationReportJobResponse(
@@ -1054,6 +1110,10 @@ data class EvaluationReportResponse(
     val performanceLattice: ReportPerformanceLatticeResponse,
     val integrity: EvaluationIntegrityResponse,
     val truncated: Boolean,
+    val epochId: String? = null,
+    val cohort: String? = null,
+    val executionSemanticsVersion: String? = null,
+    val attributionCoverage: EvaluationAttributionCoverageResponse? = null,
 )
 
 @Serializable
@@ -1064,6 +1124,8 @@ data class EvaluationReportHistoryItemResponse(
     val status: String,
     val requestedAt: String,
     val pinned: Boolean,
+    val epochId: String? = null,
+    val cohort: String? = null,
 )
 
 @Serializable

@@ -137,6 +137,7 @@ private const val ENSURE_PAPER_ACCOUNT_EPOCH_IMMUTABLE_TRIGGER_SQL = """
 private const val INSERT_BOOTSTRAP_EQUITY_SNAPSHOT_SQL = """
     INSERT INTO equity_snapshots (
         id,
+        account_epoch_id,
         mode,
         reason,
         trading_date,
@@ -150,6 +151,7 @@ private const val INSERT_BOOTSTRAP_EQUITY_SNAPSHOT_SQL = """
     )
     SELECT
         ?,
+        current_epoch_id,
         mode,
         ?,
         ?,

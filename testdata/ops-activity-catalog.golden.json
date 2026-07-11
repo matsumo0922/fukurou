@@ -141,6 +141,21 @@
       "value": "CLI_AUTH_CLOSE_WAIT_TIMED_OUT",
       "labelKey": "activity.catalog.audit.cliAuthCloseWaitTimedOut.label",
       "descriptionKey": "activity.catalog.audit.cliAuthCloseWaitTimedOut.description"
+    },
+    {
+      "value": "PAPER_ACCOUNT_EPOCH_IMPORTED",
+      "labelKey": "activity.catalog.audit.paperAccountEpochImported.label",
+      "descriptionKey": "activity.catalog.audit.paperAccountEpochImported.description"
+    },
+    {
+      "value": "PAPER_ACCOUNT_EPOCH_SWITCHED",
+      "labelKey": "activity.catalog.audit.paperAccountEpochSwitched.label",
+      "descriptionKey": "activity.catalog.audit.paperAccountEpochSwitched.description"
+    },
+    {
+      "value": "PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED",
+      "labelKey": "activity.catalog.audit.paperAccountEpochSwitchRejected.label",
+      "descriptionKey": "activity.catalog.audit.paperAccountEpochSwitchRejected.description"
     }
   ],
   "decisionActions": [

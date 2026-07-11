@@ -22,6 +22,14 @@ data class EvaluationPeriod(
     val toExclusive: Instant,
 )
 
+/** evaluation request 開始時に固定する immutable scope。 */
+data class EvaluationScope(
+    val accountEpochId: UUID,
+    val cohort: EvaluationCohort,
+    val executionSemanticsVersion: String?,
+    val initialCashJpy: BigDecimal,
+)
+
 /**
  * closed trade fact の取得結果。
  *

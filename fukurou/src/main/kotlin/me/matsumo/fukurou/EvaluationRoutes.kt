@@ -24,6 +24,7 @@ import me.matsumo.fukurou.trading.evaluation.EvaluationExclusionSummary
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
+import me.matsumo.fukurou.trading.evaluation.EvaluationScope
 import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
 import me.matsumo.fukurou.trading.evaluation.LlmModelTokenStats
 import me.matsumo.fukurou.trading.evaluation.LlmProviderCostStats
@@ -40,6 +41,7 @@ import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
 import java.time.LocalDate
+import java.time.Instant
 import java.time.ZoneId
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
@@ -93,6 +95,27 @@ internal data class EvaluationRouteDependencies(
     val currentContextPublicOrigin: String? = environment["FUKUROU_PUBLIC_ORIGIN"],
 )
 
+private suspend fun ApplicationCall.resolveEvaluationScope(repository: EvaluationRepository): EvaluationScope? {
+    val result = repository.resolveScope(
+        epochId = request.queryParameters["epochId"],
+        cohort = request.queryParameters["cohort"],
+    )
+    return result.getOrElse { throwable ->
+        respond(HttpStatusCode.BadRequest, ErrorResponse(throwable.message ?: "evaluation scope is invalid"))
+        null
+    }
+}
+
+private fun EvaluationScope.toResponse(): EvaluationScopeResponse = EvaluationScopeResponse(
+    epochId = accountEpochId.toString(),
+    cohort = cohort.name,
+    executionSemanticsVersion = executionSemanticsVersion,
+    initialCashJpy = initialCashJpy.toPlainString(),
+)
+
+private fun me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage.toResponse() =
+    EvaluationAttributionCoverageResponse(attributed, missing, total)
+
 /**
  * 評価系 route を定義する。
  */
@@ -108,17 +131,23 @@ internal fun Route.evaluationRoutes(dependencies: EvaluationRouteDependencies) {
 }
 
 @OptIn(ExperimentalKtorApi::class)
+@Suppress("LongMethod")
 private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDependencies) {
     get("/evaluation/summary") {
         val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
         val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
+        val scope = call.resolveEvaluationScope(evaluationRepository) ?: return@get
         val evaluationRiskStateRepository = call.requireRiskStateRepository(dependencies.riskStateRepository) ?: return@get
         val period = dateRange.toPeriod()
-        val tradeResult = evaluationRepository.fetchClosedTrades(period).getOrThrow()
+        val tradeResult = evaluationRepository.fetchClosedTrades(period, scope = scope).getOrThrow()
         val runCount = evaluationRepository.countDecisionRuns(period).getOrThrow()
         val actionCounts = evaluationRepository.countDecisionsByAction(period).getOrThrow()
         val exclusionSummary = evaluationRepository.fetchExclusionSummary(period).getOrThrow()
-        val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
+        val performance = EvaluationMath.summarizeTrades(tradeResult.trades)
+        val killStats = me.matsumo.fukurou.trading.evaluation.KillCriterionStats(
+            closedTrades = performance.tradeCount,
+            profitFactor = performance.profitFactor,
+        )
         val riskState = evaluationRiskStateRepository.current().getOrThrow()
         val candles = call.fetchDailyCandlesOrEmpty(
             marketDataSource = dependencies.marketDataSource,
@@ -130,8 +159,10 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         call.respond(
             EvaluationSummaryResponse(
                 period = dateRange.toResponsePeriod(),
+                scope = scope.toResponse(),
+                attributionCoverage = tradeResult.attributionCoverage.toResponse(),
                 truncated = tradeResult.truncated,
-                performance = EvaluationPerformanceResponse.fromStats(EvaluationMath.summarizeTrades(tradeResult.trades)),
+                performance = EvaluationPerformanceResponse.fromStats(performance),
                 killCriterion = EvaluationKillCriterionResponse.fromStats(
                     stats = killStats,
                     minClosedTrades = dependencies.tradingConfig.killCriterion.minClosedTrades,
@@ -151,6 +182,16 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         summary = "評価サマリーを取得する"
         description = "market-data gap の評価除外を適用した PF、勝率、期待 R、行動率、相場局面別成績と除外理由を返します。"
         tag(EVALUATION_TAG)
+        parameters {
+            query("epochId") {
+                description = "評価対象 account epoch ID。省略時は active epoch です。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。"
+                schema = jsonSchema<String>()
+            }
+        }
         responses {
             HttpStatusCode.OK {
                 description = "評価結果です。"
@@ -173,8 +214,9 @@ private fun Route.registerEvaluationSetupsRoute(dependencies: EvaluationRouteDep
     get("/evaluation/setups") {
         val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
         val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
+        val scope = call.resolveEvaluationScope(evaluationRepository) ?: return@get
         val period = dateRange.toPeriod()
-        val tradeResult = evaluationRepository.fetchClosedTrades(period).getOrThrow()
+        val tradeResult = evaluationRepository.fetchClosedTrades(period, scope = scope).getOrThrow()
         val candles = call.fetchDailyCandlesOrEmpty(
             marketDataSource = dependencies.marketDataSource,
             tradingConfig = dependencies.tradingConfig,
@@ -185,6 +227,8 @@ private fun Route.registerEvaluationSetupsRoute(dependencies: EvaluationRouteDep
         call.respond(
             EvaluationSetupsResponse(
                 period = dateRange.toResponsePeriod(),
+                scope = scope.toResponse(),
+                attributionCoverage = tradeResult.attributionCoverage.toResponse(),
                 truncated = tradeResult.truncated,
                 setups = EvaluationMath.summarizeBySetup(tradeResult.trades)
                     .map { performance -> EvaluationSetupResponse.fromPerformance(performance) },
@@ -199,6 +243,16 @@ private fun Route.registerEvaluationSetupsRoute(dependencies: EvaluationRouteDep
         summary = "setup 別成績を取得する"
         description = "setup tag 別の件数、PF、勝率、期待 R、MAE/MFE と、相場局面別の同指標を返します。"
         tag(EVALUATION_TAG)
+        parameters {
+            query("epochId") {
+                description = "評価対象 account epoch ID。省略時は active epoch です。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。"
+                schema = jsonSchema<String>()
+            }
+        }
         responses {
             HttpStatusCode.OK {
                 description = "評価結果です。"
@@ -221,11 +275,14 @@ private fun Route.registerEvaluationCalibrationRoute(dependencies: EvaluationRou
     get("/evaluation/calibration") {
         val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
         val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
-        val tradeResult = evaluationRepository.fetchClosedTrades(dateRange.toPeriod()).getOrThrow()
+        val scope = call.resolveEvaluationScope(evaluationRepository) ?: return@get
+        val tradeResult = evaluationRepository.fetchClosedTrades(dateRange.toPeriod(), scope = scope).getOrThrow()
 
         call.respond(
             EvaluationCalibrationResponse(
                 period = dateRange.toResponsePeriod(),
+                scope = scope.toResponse(),
+                attributionCoverage = tradeResult.attributionCoverage.toResponse(),
                 truncated = tradeResult.truncated,
                 bySetup = EvaluationMath.calibrationBySetup(tradeResult.trades)
                     .map { group -> EvaluationCalibrationGroupResponse.fromStats(group) },
@@ -237,6 +294,16 @@ private fun Route.registerEvaluationCalibrationRoute(dependencies: EvaluationRou
         summary = "申告 p の較正を取得する"
         description = "closed position に到達した ENTER decision を 0.1 幅 bin に分け、setup tag 別と LLM provider 別の実現勝率を返します。"
         tag(EVALUATION_TAG)
+        parameters {
+            query("epochId") {
+                description = "評価対象 account epoch ID。省略時は active epoch です。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。"
+                schema = jsonSchema<String>()
+            }
+        }
         responses {
             HttpStatusCode.OK {
                 description = "評価結果です。"
@@ -255,16 +322,23 @@ private fun Route.registerEvaluationCalibrationRoute(dependencies: EvaluationRou
 }
 
 @OptIn(ExperimentalKtorApi::class)
+@Suppress("LongMethod")
 private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRouteDependencies) {
     get("/evaluation/benchmark") {
         val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
         val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
+        val scope = call.resolveEvaluationScope(evaluationRepository) ?: return@get
         val evaluationMarketDataSource = call.requireMarketDataSource(dependencies.marketDataSource) ?: return@get
         val period = dateRange.toPeriod()
-        val initialCashJpy = evaluationRepository.fetchInitialCashJpy().getOrThrow()
-        val priorPnlJpy = evaluationRepository.sumTradePnlBefore(period.from).getOrThrow()
+        val initialCashJpy = scope.initialCashJpy
+        val priorPnlJpy = evaluationRepository.fetchClosedTrades(
+            EvaluationPeriod(Instant.EPOCH, period.from),
+            scope = scope,
+        ).getOrThrow().trades.sumOf { trade -> trade.tradePnlJpy }
         val baselineEquityJpy = initialCashJpy.add(priorPnlJpy)
-        val dailyPnl = evaluationRepository.fetchDailyTradePnl(period).getOrThrow()
+        val dailyPnl = evaluationRepository.fetchClosedTrades(period, scope = scope).getOrThrow().trades.map { trade ->
+            me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
+        }
         val dailyCandleLimit = call.requireDailyCandleLimit(dateRange) ?: return@get
         val candles = evaluationMarketDataSource.getCandles(
             symbol = dependencies.tradingConfig.symbol,
@@ -285,16 +359,32 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
         call.respond(
             EvaluationBenchmarkResponse(
                 period = dateRange.toResponsePeriod(),
+                scope = scope.toResponse(),
                 assumptionsJa = "buy & hold は開始日 close で全額 BTC を買い、手数料・スリッページを無視します。bot equity は realized PnL のみを close 日に計上し、未実現損益は含めません。",
                 baselineEquityJpy = baselineEquityJpy.toDecimalString(),
                 points = benchmark.points.map { point -> EvaluationBenchmarkPointResponse.fromPoint(point) },
                 returns = EvaluationBenchmarkReturnResponse.fromResult(benchmark),
+                state = if (scope.cohort == me.matsumo.fukurou.trading.domain.EvaluationCohort.LEGACY_PRE_WS) {
+                    "BASELINE_NOT_COMPARABLE"
+                } else {
+                    "AVAILABLE"
+                },
             ),
         )
     }.describe {
         summary = "benchmark 系列を取得する"
         description = "buy & hold、no-trade、bot realized equity の日次系列と期間 return を返します。"
         tag(EVALUATION_TAG)
+        parameters {
+            query("epochId") {
+                description = "評価対象 account epoch ID。省略時は active epoch です。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。"
+                schema = jsonSchema<String>()
+            }
+        }
         responses {
             HttpStatusCode.OK {
                 description = "評価結果です。"
@@ -317,12 +407,14 @@ private fun Route.registerEvaluationCostsRoute(dependencies: EvaluationRouteDepe
     get("/evaluation/costs") {
         val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
         val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
+        val scope = call.resolveEvaluationScope(evaluationRepository) ?: return@get
         val usageResult = evaluationRepository.fetchLlmPhaseUsages(dateRange.toPeriod()).getOrThrow()
         val costs = EvaluationMath.summarizeLlmCosts(usageResult.facts)
 
         call.respond(
             EvaluationCostsResponse(
                 period = dateRange.toResponsePeriod(),
+                scope = scope.toResponse(),
                 truncated = usageResult.truncated,
                 phaseCount = costs.phaseCount,
                 missingUsagePhaseCount = costs.missingUsagePhaseCount,
@@ -337,6 +429,16 @@ private fun Route.registerEvaluationCostsRoute(dependencies: EvaluationRouteDepe
         summary = "LLM cost と usage を取得する"
         description = "runner phase audit に保存された provider usage と取得済み cost を集計し、usage・cost・model attribution の coverage を返します。"
         tag(EVALUATION_TAG)
+        parameters {
+            query("epochId") {
+                description = "評価対象 account epoch ID。省略時は active epoch です。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。"
+                schema = jsonSchema<String>()
+            }
+        }
         responses {
             HttpStatusCode.OK {
                 description = "評価結果です。"
@@ -509,6 +611,23 @@ data class EvaluationPeriodResponse(
     val timezone: String,
 )
 
+/** evaluation response が使用した immutable epoch/cohort scope。 */
+@Serializable
+data class EvaluationScopeResponse(
+    val epochId: String,
+    val cohort: String,
+    val executionSemanticsVersion: String?,
+    val initialCashJpy: String,
+)
+
+/** execution-based attribution coverage。 */
+@Serializable
+data class EvaluationAttributionCoverageResponse(
+    val attributed: Int,
+    val missing: Int,
+    val total: Int,
+)
+
 /**
  * 評価サマリーレスポンス。
  *
@@ -523,6 +642,8 @@ data class EvaluationPeriodResponse(
 @Serializable
 data class EvaluationSummaryResponse(
     val period: EvaluationPeriodResponse,
+    val scope: EvaluationScopeResponse,
+    val attributionCoverage: EvaluationAttributionCoverageResponse,
     val truncated: Boolean,
     val performance: EvaluationPerformanceResponse,
     val killCriterion: EvaluationKillCriterionResponse,
@@ -695,6 +816,8 @@ data class EvaluationActionCountResponse(
 @Serializable
 data class EvaluationSetupsResponse(
     val period: EvaluationPeriodResponse,
+    val scope: EvaluationScopeResponse,
+    val attributionCoverage: EvaluationAttributionCoverageResponse,
     val truncated: Boolean,
     val setups: List<EvaluationSetupResponse>,
     val marketRegimes: List<EvaluationMarketRegimeResponse>,
@@ -756,6 +879,8 @@ data class EvaluationMarketRegimeResponse(
 @Serializable
 data class EvaluationCalibrationResponse(
     val period: EvaluationPeriodResponse,
+    val scope: EvaluationScopeResponse,
+    val attributionCoverage: EvaluationAttributionCoverageResponse,
     val truncated: Boolean,
     val bySetup: List<EvaluationCalibrationGroupResponse>,
     val byProvider: List<EvaluationCalibrationGroupResponse>,
@@ -827,10 +952,12 @@ data class EvaluationCalibrationBinResponse(
 @Serializable
 data class EvaluationBenchmarkResponse(
     val period: EvaluationPeriodResponse,
+    val scope: EvaluationScopeResponse,
     val assumptionsJa: String,
     val baselineEquityJpy: String,
     val points: List<EvaluationBenchmarkPointResponse>,
     val returns: EvaluationBenchmarkReturnResponse,
+    val state: String,
 )
 
 /**
@@ -900,6 +1027,7 @@ data class EvaluationBenchmarkReturnResponse(
 @Serializable
 data class EvaluationCostsResponse(
     val period: EvaluationPeriodResponse,
+    val scope: EvaluationScopeResponse,
     val truncated: Boolean,
     val phaseCount: Int,
     val missingUsagePhaseCount: Int,

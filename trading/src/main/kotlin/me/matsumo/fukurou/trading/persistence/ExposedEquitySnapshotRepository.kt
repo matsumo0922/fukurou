@@ -21,6 +21,7 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 private const val INSERT_EQUITY_SNAPSHOT_SQL = """
     INSERT INTO equity_snapshots (
         id,
+        account_epoch_id,
         mode,
         reason,
         trading_date,
@@ -32,7 +33,7 @@ private const val INSERT_EQUITY_SNAPSHOT_SQL = """
         equity_peak_jpy,
         drawdown_ratio
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, (SELECT current_epoch_id FROM paper_account WHERE id=1), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 /**
@@ -41,6 +42,7 @@ private const val INSERT_EQUITY_SNAPSHOT_SQL = """
 private const val INSERT_DAILY_EQUITY_SNAPSHOT_SQL = """
     INSERT INTO equity_snapshots (
         id,
+        account_epoch_id,
         mode,
         reason,
         trading_date,
@@ -52,7 +54,7 @@ private const val INSERT_DAILY_EQUITY_SNAPSHOT_SQL = """
         equity_peak_jpy,
         drawdown_ratio
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, (SELECT current_epoch_id FROM paper_account WHERE id=1), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (mode, trading_date) WHERE reason = 'DAILY' DO NOTHING
 """
 

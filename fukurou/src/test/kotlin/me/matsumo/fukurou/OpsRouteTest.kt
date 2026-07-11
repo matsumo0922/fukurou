@@ -767,7 +767,7 @@ class OpsRouteTest {
             }
 
             assertEquals(HttpStatusCode.Created, draftResponse.status)
-            assertEquals(HttpStatusCode.OK, activateResponse.status)
+            assertEquals(HttpStatusCode.OK, activateResponse.status, activateResponse.bodyAsText())
             assertEquals(HttpStatusCode.OK, recoveredConfigResponse.status)
             assertFalse(recoveredWarnings.contains("runtimeConfig.warning.activeValidationFailed"))
             assertEquals(HttpStatusCode.Accepted, recoveredTriggerResponse.status)

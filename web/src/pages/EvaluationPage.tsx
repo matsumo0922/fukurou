@@ -12,11 +12,12 @@ export function EvaluationPage() {
   const [custom, setCustom] = useState(false);
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
+  const [cohort, setCohort] = useState<"CURRENT" | "LEGACY_PRE_WS">("CURRENT");
   const scope: ReportScope = custom ? { kind: "CUSTOM", from: customFrom, toInclusive: customTo } : { kind: "PRESET", days: days as 7 | 30 | 90 };
   const scopeKey = reportScopeKey(scope);
   const queryClient = useQueryClient();
-  const query = useQuery({ ...reportQuery(scopeKey), enabled: !custom || Boolean(customFrom && customTo) });
-  const history = useQuery({ queryKey: ["evaluation-report-history", scopeKey], queryFn: () => fetchReportHistory(scopeKey), enabled: !custom || Boolean(customFrom && customTo) });
+  const query = useQuery({ ...reportQuery(scopeKey, cohort), enabled: !custom || Boolean(customFrom && customTo) });
+  const history = useQuery({ queryKey: ["evaluation-report-history", scopeKey, cohort], queryFn: () => fetchReportHistory(scopeKey, cohort), enabled: !custom || Boolean(customFrom && customTo) });
   const [preview, setPreview] = useState<{ scopeKey: string; report: EvaluationReport } | null>(null);
   const [generationJob, setGenerationJob] = useState<ReportJob | null>(null);
   const generationAbort = useRef<AbortController | null>(null);
@@ -26,7 +27,7 @@ export function EvaluationPage() {
     mutationFn: () => {
       generationAbort.current?.abort();
       generationAbort.current = new AbortController();
-      return generateReport(scope, generationAbort.current.signal, setGenerationJob);
+      return generateReport(scope, generationAbort.current.signal, setGenerationJob, cohort);
     },
     onSuccess: () => {
       setPreview(null);
@@ -45,15 +46,17 @@ export function EvaluationPage() {
       <div className="console-actions" aria-label="Report period and generation">
         {[7, 30, 90].map((value) => <button key={value} className={!custom && days === value ? "is-active" : ""} onClick={() => { setCustom(false); setDays(value); }}>{value}D</button>)}
         <button className={custom ? "is-active" : ""} onClick={() => setCustom(true)}>CUSTOM</button>
+        <label>Cohort<select value={cohort} onChange={(event) => setCohort(event.target.value as "CURRENT" | "LEGACY_PRE_WS")}><option value="CURRENT">CURRENT</option><option value="LEGACY_PRE_WS">LEGACY / REFERENCE</option></select></label>
         {custom && <><label>From<input type="date" value={customFrom} onChange={(event) => setCustomFrom(event.target.value)} /></label><label>To<input type="date" value={customTo} onChange={(event) => setCustomTo(event.target.value)} /></label></>}
         <button className="generate-button" disabled={generation.isPending || (custom && (!customFrom || !customTo))} onClick={() => generation.mutate()}><RefreshCw size={15} aria-hidden />{generation.isPending ? "GENERATING" : "GENERATE REPORT"}</button>
       </div>
     </header>
+    {cohort === "LEGACY_PRE_WS" && <div className="console-alert" role="status">Legacy pre-WebSocket trades are reference-only and never merge into current KPI.</div>}
     <CurrentContextStrip />
     {generationJob && generation.isPending && <div className="console-alert" role="status">Job {generationJob.jobId.slice(0, 12)} · revision #{generationJob.revisionNumber} · {generationJob.stage}. Existing pinned revision remains authoritative.</div>}
     {generation.isError && <div className="console-alert" role="alert">Generation failed: {generation.error.message}. Existing revision remains authoritative.</div>}
     {query.isPending ? <div className="console-empty">Loading immutable report revision…</div> : query.isError ? <div className="console-alert" role="alert">Report request failed: {query.error.message}</div> : displayedReport == null ? <EmptyReport onGenerate={() => generation.mutate()} /> : <ReportConsole report={displayedReport} pinned={displayedIsPinned} />}
-    <section className="report-panel" aria-labelledby="report-history-title"><header className="report-panel__header"><div><span className="console-kicker">IMMUTABLE REVISION HISTORY</span><h2 id="report-history-title">Reports / failed jobs</h2></div></header><div className="console-table-wrap"><table><thead><tr><th>Revision</th><th>Status</th><th>Requested</th><th>Default</th><th>Actions</th></tr></thead><tbody>{history.data?.map((item) => <tr key={item.jobId}><td>#{item.revisionNumber || "—"}</td><td>{item.status}</td><td>{new Date(item.requestedAt).toLocaleString()}</td><td>{item.pinned ? "PINNED" : "—"}</td><td>{item.status === "SUCCEEDED" && <><button onClick={() => void fetchReportRevision(item.revisionId).then((report) => setPreview({ scopeKey, report }))}>PREVIEW</button><button onClick={() => void pinReport(scopeKey, item.revisionId).then(() => { setPreview(null); return queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey] }); })}>PIN</button></>}</td></tr>)}</tbody></table></div></section>
+    <section className="report-panel" aria-labelledby="report-history-title"><header className="report-panel__header"><div><span className="console-kicker">IMMUTABLE REVISION HISTORY</span><h2 id="report-history-title">Reports / failed jobs</h2></div></header><div className="console-table-wrap"><table><thead><tr><th>Revision</th><th>Status</th><th>Requested</th><th>Default</th><th>Actions</th></tr></thead><tbody>{history.data?.map((item) => <tr key={item.jobId}><td>#{item.revisionNumber || "—"}</td><td>{item.status}</td><td>{new Date(item.requestedAt).toLocaleString()}</td><td>{item.pinned ? "PINNED" : "—"}</td><td>{item.status === "SUCCEEDED" && <><button onClick={() => void fetchReportRevision(item.revisionId).then((report) => setPreview({ scopeKey, report }))}>PREVIEW</button><button onClick={() => void pinReport(scopeKey, item.revisionId, cohort).then(() => { setPreview(null); return queryClient.invalidateQueries({ queryKey: ["evaluation-report", scopeKey, cohort] }); })}>PIN</button></>}</td></tr>)}</tbody></table></div></section>
   </main>;
 }
 

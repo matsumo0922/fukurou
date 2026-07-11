@@ -54,6 +54,11 @@ class EvaluationRouteTest {
                 FakeEvaluationRepository.fetchReportSnapshot(period).map { snapshot ->
                     snapshot.copy(usages = snapshot.usages.copy(truncated = true))
                 }
+
+            override suspend fun fetchReportSnapshot(
+                period: EvaluationPeriod,
+                scope: me.matsumo.fukurou.trading.evaluation.EvaluationScope,
+            ) = fetchReportSnapshot(period)
         }
         application {
             module(
@@ -223,7 +228,8 @@ class EvaluationRouteTest {
             attemptsRemaining -= 1
         }
         val generated = requireNotNull(revisionBody)
-        assertTrue(generated.contains("\"scopeKey\":\"CUSTOM:2026-06-01:2026-06-30\""))
+        assertTrue(generated.contains("\"scopeKey\":\"CUSTOM:2026-06-01:2026-06-30|EPOCH:"))
+        assertTrue(generated.contains("|COHORT:CURRENT\""))
         assertTrue(generated.contains("\"benchmark\""))
         assertTrue(generated.contains("\"calibration\""))
         assertTrue(generated.contains("\"performanceLattice\""))

@@ -1,4 +1,4 @@
-@file:Suppress("ImportOrdering")
+@file:Suppress("ImportOrdering", "TooManyFunctions")
 
 package me.matsumo.fukurou.trading.persistence
 
@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationReportSnapshotFacts
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
+import me.matsumo.fukurou.trading.evaluation.EvaluationScope
 import me.matsumo.fukurou.trading.evaluation.EvaluationTradeQueryResult
 import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
 import me.matsumo.fukurou.trading.evaluation.LlmPhaseUsageFact
@@ -81,7 +82,10 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
     execution_lineage AS (
         SELECT
             e.position_id,
-            MIN(e.account_epoch_id::text) AS account_epoch_id,
+            COALESCE(
+                MIN(e.account_epoch_id::text),
+                (SELECT id::text FROM paper_account_epochs WHERE kind='LEGACY_IMPORTED' ORDER BY created_at ASC LIMIT 1)
+            ) AS account_epoch_id,
             CASE
                 WHEN BOOL_AND(e.execution_semantics_version = 'PAPER_WS_V1')
                     AND BOOL_AND(o.execution_semantics_version = 'PAPER_WS_V1') THEN 'CURRENT'
@@ -319,6 +323,33 @@ class ExposedEvaluationRepository(
     private val database: ExposedDatabase,
 ) : EvaluationRepository {
 
+    override suspend fun resolveScope(epochId: String?, cohort: String?): Result<EvaluationScope> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    val requestedCohort = cohort?.let(EvaluationCohort::valueOf) ?: EvaluationCohort.CURRENT
+                    val sql = if (epochId == null) {
+                        "SELECT epoch.id, epoch.initial_cash_jpy FROM paper_account account JOIN paper_account_epochs epoch ON epoch.id=account.current_epoch_id WHERE account.id=?"
+                    } else {
+                        "SELECT id, initial_cash_jpy FROM paper_account_epochs WHERE id=?"
+                    }
+                    prepare(sql).use { statement ->
+                        if (epochId == null) statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID) else statement.setObject(1, UUID.fromString(epochId))
+                        statement.executeQuery().use { resultSet ->
+                            require(resultSet.next()) { "evaluation epoch was not found" }
+                            EvaluationScope(
+                                accountEpochId = resultSet.getObject("id", UUID::class.java),
+                                cohort = requestedCohort,
+                                executionSemanticsVersion = if (requestedCohort == EvaluationCohort.CURRENT) "PAPER_WS_V1" else null,
+                                initialCashJpy = resultSet.getBigDecimal("initial_cash_jpy"),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     override suspend fun fetchReportSnapshot(period: EvaluationPeriod): Result<EvaluationReportSnapshotFacts> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -339,6 +370,18 @@ class ExposedEvaluationRepository(
         }
     }
 
+    override suspend fun fetchReportSnapshot(
+        period: EvaluationPeriod,
+        scope: EvaluationScope,
+    ): Result<EvaluationReportSnapshotFacts> {
+        return fetchReportSnapshot(period).map { snapshot ->
+            snapshot.copy(
+                trades = fetchClosedTrades(period, scope = scope).getOrThrow(),
+                initialCashJpy = scope.initialCashJpy,
+            )
+        }
+    }
+
     override suspend fun fetchExclusionSummary(period: EvaluationPeriod): Result<EvaluationExclusionSummary> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -347,11 +390,24 @@ class ExposedEvaluationRepository(
         }
     }
 
-    override suspend fun fetchClosedTrades(period: EvaluationPeriod, limit: Int): Result<EvaluationTradeQueryResult> {
+    override suspend fun fetchClosedTrades(period: EvaluationPeriod, limit: Int): Result<EvaluationTradeQueryResult> =
+        fetchClosedTradesInternal(period, limit, null)
+
+    override suspend fun fetchClosedTrades(
+        period: EvaluationPeriod,
+        limit: Int,
+        scope: EvaluationScope,
+    ): Result<EvaluationTradeQueryResult> = fetchClosedTradesInternal(period, limit, scope)
+
+    private suspend fun fetchClosedTradesInternal(
+        period: EvaluationPeriod,
+        limit: Int,
+        scope: EvaluationScope?,
+    ): Result<EvaluationTradeQueryResult> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    selectClosedTrades(period, limit)
+                    selectClosedTrades(period, limit, scope)
                 }
             }
         }
@@ -466,7 +522,11 @@ private fun ResultSet.toEvaluationExclusionSummary(): EvaluationExclusionSummary
     )
 }
 
-private fun JdbcTransaction.selectClosedTrades(period: EvaluationPeriod, limit: Int): EvaluationTradeQueryResult {
+private fun JdbcTransaction.selectClosedTrades(
+    period: EvaluationPeriod,
+    limit: Int,
+    scope: EvaluationScope? = null,
+): EvaluationTradeQueryResult {
     val fetchLimit = limit + 1
 
     return jdbcConnection().prepareStatement(SELECT_CLOSED_TRADE_FACTS_SQL).use { statement ->
@@ -480,19 +540,25 @@ private fun JdbcTransaction.selectClosedTrades(period: EvaluationPeriod, limit: 
                     add(resultSet.toClosedTradeFact())
                 }
             }
-            val truncated = trades.size > limit
+            val scopedTrades = scope?.let { resolved ->
+                trades.filter { trade ->
+                    val epochMatches = trade.accountEpochId == resolved.accountEpochId
+                    epochMatches && trade.cohort == resolved.cohort
+                }
+            } ?: trades
+            val truncated = scopedTrades.size > limit
 
             EvaluationTradeQueryResult(
-                trades = trades.take(limit),
+                trades = scopedTrades.take(limit),
                 truncated = truncated,
                 attributionCoverage = EvaluationAttributionCoverage(
-                    attributed = trades.count { trade ->
+                    attributed = scopedTrades.count { trade ->
                         trade.attributionStatus == EvaluationAttributionStatus.ATTRIBUTED
                     },
-                    missing = trades.count { trade ->
+                    missing = scopedTrades.count { trade ->
                         trade.attributionStatus == EvaluationAttributionStatus.MISSING
                     },
-                    total = trades.size,
+                    total = scopedTrades.size,
                 ),
             )
         }

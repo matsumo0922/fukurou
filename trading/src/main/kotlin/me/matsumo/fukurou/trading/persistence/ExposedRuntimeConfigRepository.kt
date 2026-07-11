@@ -610,13 +610,21 @@ private fun JdbcTransaction.countRows(sql: String): Int = prepare(sql).use { sta
     }
 }
 
-private fun JdbcTransaction.selectCurrentPaperAccountEpochId(): String? = prepare(
-    "SELECT current_epoch_id FROM paper_account WHERE id=?",
-).use { statement ->
-    statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
-    statement.executeQuery().use { resultSet ->
-        check(resultSet.next())
-        resultSet.getObject(1)?.toString()
+private fun JdbcTransaction.selectCurrentPaperAccountEpochId(): String? {
+    val exists = prepare("SELECT to_regclass('paper_account') IS NOT NULL").use { statement ->
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next())
+            resultSet.getBoolean(1)
+        }
+    }
+    if (!exists) return null
+
+    return prepare("SELECT current_epoch_id FROM paper_account WHERE id=?").use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next())
+            resultSet.getObject(1)?.toString()
+        }
     }
 }
 

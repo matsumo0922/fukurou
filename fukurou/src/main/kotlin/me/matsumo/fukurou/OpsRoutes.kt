@@ -31,6 +31,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshot
 import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshotWarning
 import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedException
+import me.matsumo.fukurou.trading.config.RuntimeConfigValidationError
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -641,6 +642,8 @@ data class OpsRuntimeConfigVersionActionRequest(
 /** account epoch switch の zero-open-risk rejection。 */
 @Serializable
 data class OpsPaperAccountEpochSwitchConflictResponse(
+    val valid: Boolean = false,
+    val errors: List<RuntimeConfigValidationError> = emptyList(),
     val code: String = "PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED",
     val openPositionCount: Int,
     val openOrderCount: Int,

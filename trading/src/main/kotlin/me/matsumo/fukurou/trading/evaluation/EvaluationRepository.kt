@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions")
+
 package me.matsumo.fukurou.trading.evaluation
 
 import java.math.BigDecimal
@@ -7,6 +9,17 @@ import java.time.Instant
  * 評価系が参照する DB 読み取り repository。
  */
 interface EvaluationRepository {
+    /** request query を current epoch + CURRENT 既定へ解決する。 */
+    suspend fun resolveScope(epochId: String?, cohort: String?): Result<EvaluationScope> = runCatching {
+        EvaluationScope(
+            accountEpochId = epochId?.let(java.util.UUID::fromString) ?: java.util.UUID(0, 0),
+            cohort = cohort?.let(me.matsumo.fukurou.trading.domain.EvaluationCohort::valueOf)
+                ?: me.matsumo.fukurou.trading.domain.EvaluationCohort.CURRENT,
+            executionSemanticsVersion = me.matsumo.fukurou.trading.domain.PAPER_EXECUTION_SEMANTICS_VERSION,
+            initialCashJpy = BigDecimal.ZERO,
+        )
+    }
+
     /** report 用 internal facts を単一 snapshot として取得する。 */
     suspend fun fetchReportSnapshot(period: EvaluationPeriod): Result<EvaluationReportSnapshotFacts> = runCatching {
         EvaluationReportSnapshotFacts(
@@ -16,6 +29,17 @@ interface EvaluationRepository {
             initialCashJpy = fetchInitialCashJpy().getOrThrow(),
             usages = fetchLlmPhaseUsages(period).getOrThrow(),
             exclusions = fetchExclusionSummary(period).getOrThrow(),
+        )
+    }
+
+    /** immutable epoch/cohort を固定した report snapshot を返す。 */
+    suspend fun fetchReportSnapshot(
+        period: EvaluationPeriod,
+        scope: EvaluationScope,
+    ): Result<EvaluationReportSnapshotFacts> = runCatching {
+        fetchReportSnapshot(period).getOrThrow().copy(
+            trades = fetchClosedTrades(period, scope = scope).getOrThrow(),
+            initialCashJpy = scope.initialCashJpy,
         )
     }
 
@@ -31,6 +55,13 @@ interface EvaluationRepository {
         period: EvaluationPeriod,
         limit: Int = DEFAULT_EVALUATION_QUERY_LIMIT,
     ): Result<EvaluationTradeQueryResult>
+
+    /** immutable scope で closed trade fact を取得する。 */
+    suspend fun fetchClosedTrades(
+        period: EvaluationPeriod,
+        limit: Int = DEFAULT_EVALUATION_QUERY_LIMIT,
+        scope: EvaluationScope,
+    ): Result<EvaluationTradeQueryResult> = fetchClosedTrades(period, limit)
 
     /**
      * 期間内の distinct decision run 数を取得する。
