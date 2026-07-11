@@ -21,6 +21,19 @@ enum class LlmProvider {
 }
 
 /**
+ * LLM CLI に要求する reasoning effort。
+ *
+ * DEFAULT は provider CLI の既定を使うため、renderer は effort 指定を出力しない。
+ */
+enum class LlmEffort {
+    DEFAULT,
+    LOW,
+    MEDIUM,
+    HIGH,
+    XHIGH,
+}
+
+/**
  * one-shot runner 内の LLM 起動 phase。
  */
 enum class LlmInvocationPhase {
@@ -76,6 +89,9 @@ data class LlmMcpServerConfig(
  * @param mcpServer stdio MCP server 設定。null の場合は MCP を登録しない
  * @param environment CLI process へ allowlist で渡す環境変数
  * @param allowedTools CLI に許可する MCP tool 名
+ * @param model この invocation に設定した model。null の場合は CLI の既定値を使う
+ * @param effort この invocation に設定した reasoning effort
+ * @param useConfiguredModelFallback renderer config の provider model override を使うか。role assignment は false にする
  */
 data class LlmInvocationRequest(
     val invocationId: String,
@@ -88,6 +104,9 @@ data class LlmInvocationRequest(
     val mcpServer: LlmMcpServerConfig?,
     val environment: Map<String, String>,
     val allowedTools: List<String>,
+    val model: String? = null,
+    val effort: LlmEffort = LlmEffort.DEFAULT,
+    val useConfiguredModelFallback: Boolean = true,
 )
 
 /**

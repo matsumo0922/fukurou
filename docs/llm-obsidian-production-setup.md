@@ -30,7 +30,7 @@ FUKUROU_MCP_JAR_PATH=/app/fukurou-mcp-all.jar
 FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
 ```
 
-`llm.claudeModel` / `llm.codexModel` は WebUI `/app/config` の Runtime group で管理し、空なら CLI 側の既定 model を使う。低コスト運用を優先する場合は、まず smoke test でその account が受け付ける model 名を確認してから active 化する。
+`llm.proposer.provider` / `model` / `effort` と `llm.falsifier.provider` / `model` / `effort` は WebUI `/app/config` の Runtime group で role ごとに管理する。空の model は CLI 側の既定値を使い、`DEFAULT` effort は renderer が effort 指定を出さない。Claude は `--model` / `--effort`、Codex は `-m` と code-owned `model_reasoning_effort` TOML を使う。低コスト運用を優先する場合は、まず production container と同じ CLI で provider / model / effort の組み合わせを smoke test してから active 化する。`llm.claudeModel` / `llm.codexModel` は Reflection 用として維持する。
 
 ## WebUI CLI login
 
@@ -166,7 +166,7 @@ ssh dxp4800plus 'docker logs --since 10m fukurou-ktor | tail -200'
 
 - Claude / Codex CLI は access token を自動 refresh する。refresh token 自体が失効または revoke された場合だけ、WebUI または fallback で再ログインする。
 - Runner は stdout / stderr に `is_error: true` を含む CLI 出力を検出した場合、`RUNNER_PHASE_COMPLETED.details.cliErrorReported = "true"` を残す。認証失敗らしい stdout / stderr を検出し、かつ CLI process が非 0 exit または `is_error: true` を含む CLI 出力を返した場合、`RUNNER_PHASE_COMPLETED.details.authFailureSuspected = "true"` と login runbook の warn log も残す。どちらも運用上の発見シグナルであり、runner は `proposer_missing_decision` の no-trade に fail closed する。`proposer_no_tool_calls` は process failure、CLI error 報告、認証失敗疑いのいずれもなく、判断未保存かつ許可済み tool call 0 件の場合だけ記録する。
-- Codex の低コスト model 名は account / CLI の対応に依存する。未確認の model を `llm.codexModel` で active 化すると Falsifier phase が fail-closed する。
+- Codex の低コスト model 名は account / CLI の対応に依存する。未確認の model / effort 組み合わせを `llm.proposer.*` または `llm.falsifier.*` で active 化すると該当 phase が fail-closed する。
 - 既定の Codex Falsifier は `--skip-git-repo-check`、`--sandbox read-only`、`approval_policy="never"` で起動し、`CODEX_HOME/config.toml` に `submit_falsification` だけを tool 単位で `approval_mode = "approve"` として書く。これにより shell sandbox は保ったまま、ENTER 時の Falsifier verdict 保存まで進める。
 - `FUKUROU_CODEX_FALSIFIER_ARGS="--yolo"` や `--dangerously-bypass-approvals-and-sandbox` は通常運用には不要である。外部 sandbox で filesystem / network / secret mount を閉じた command template を明示 opt-in する場合の防御的 validation としてのみ残す。
 - live 実発注は未実装であり、production でも `PAPER` mode を維持する。

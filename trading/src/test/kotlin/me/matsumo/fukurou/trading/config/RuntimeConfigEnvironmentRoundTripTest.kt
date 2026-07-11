@@ -4,6 +4,7 @@ import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicWebSocketConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRateLimitConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
+import me.matsumo.fukurou.trading.invoker.LlmEffort
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
@@ -47,6 +48,12 @@ class RuntimeConfigEnvironmentRoundTripTest {
         assertEquals("240", environment.getValue("FUKUROU_LLM_RUN_TIMEOUT_SECONDS"))
         assertEquals("claude-runtime-test", environment.getValue("FUKUROU_CLAUDE_MODEL"))
         assertEquals("codex-runtime-test", environment.getValue("FUKUROU_CODEX_MODEL"))
+        assertEquals("CODEX", environment.getValue("FUKUROU_PROPOSER_PROVIDER"))
+        assertEquals("proposer-runtime-test", environment.getValue("FUKUROU_PROPOSER_MODEL"))
+        assertEquals("HIGH", environment.getValue("FUKUROU_PROPOSER_EFFORT"))
+        assertEquals("CLAUDE", environment.getValue("FUKUROU_FALSIFIER_PROVIDER"))
+        assertEquals("falsifier-runtime-test", environment.getValue("FUKUROU_FALSIFIER_MODEL"))
+        assertEquals("LOW", environment.getValue("FUKUROU_FALSIFIER_EFFORT"))
         assertEquals(
             """[{"eventId":"cpi-20260703","eventName":"CPI","eventAt":"2026-07-03T12:30:00Z","blackoutBeforeSeconds":30,"blackoutAfterSeconds":90}]""",
             environment.getValue("FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC"),
@@ -148,6 +155,18 @@ private fun nonDefaultRuntimeConfig(): TradingBotConfig {
         llmModels = LlmModelConfig(
             claudeModel = "claude-runtime-test",
             codexModel = "codex-runtime-test",
+        ),
+        llmRoleAssignments = LlmRoleAssignments(
+            proposer = LlmRoleAssignment(
+                provider = LlmProvider.CODEX,
+                model = "proposer-runtime-test",
+                effort = LlmEffort.HIGH,
+            ),
+            falsifier = LlmRoleAssignment(
+                provider = LlmProvider.CLAUDE,
+                model = "falsifier-runtime-test",
+                effort = LlmEffort.LOW,
+            ),
         ),
         obsidian = config.obsidian.copy(
             enabled = true,

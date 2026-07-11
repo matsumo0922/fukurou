@@ -11,6 +11,8 @@ import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CLAUDE_MODEL_ENV
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_MODEL_ENV
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
+import me.matsumo.fukurou.trading.invoker.LlmEffort
+import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.runner.FUKUROU_FALSIFIER_ALLOWED_TOOLS_ENV
 import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_JAR_PATH_ENV
 import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_SERVER_ARGS_ENV
@@ -319,6 +321,66 @@ object RuntimeConfigCatalog {
                     defaultValue = defaults.config.runner.maxInvocationsPerDay.toString(),
                     effectiveValue = config.runner.maxInvocationsPerDay.toString(),
                     unit = "invocations",
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
+                    key = "llm.proposer.provider",
+                    legacyEnvName = FUKUROU_PROPOSER_PROVIDER_ENV,
+                    valueType = RuntimeConfigValueType.ENUM,
+                    defaultValue = defaults.config.llmRoleAssignments.proposer.provider.name,
+                    effectiveValue = config.llmRoleAssignments.proposer.provider.name,
+                    unit = null,
+                    enumValues = LlmProvider.entries.map { provider -> provider.name },
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
+                    key = "llm.proposer.model",
+                    legacyEnvName = FUKUROU_PROPOSER_MODEL_ENV,
+                    valueType = RuntimeConfigValueType.STRING,
+                    defaultValue = defaults.config.llmRoleAssignments.proposer.model.orEmpty(),
+                    effectiveValue = config.llmRoleAssignments.proposer.model.orEmpty(),
+                    unit = null,
+                    blankAllowed = true,
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
+                    key = "llm.proposer.effort",
+                    legacyEnvName = FUKUROU_PROPOSER_EFFORT_ENV,
+                    valueType = RuntimeConfigValueType.ENUM,
+                    defaultValue = defaults.config.llmRoleAssignments.proposer.effort.name,
+                    effectiveValue = config.llmRoleAssignments.proposer.effort.name,
+                    unit = null,
+                    enumValues = LlmEffort.entries.map { effort -> effort.name },
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
+                    key = "llm.falsifier.provider",
+                    legacyEnvName = FUKUROU_FALSIFIER_PROVIDER_ENV,
+                    valueType = RuntimeConfigValueType.ENUM,
+                    defaultValue = defaults.config.llmRoleAssignments.falsifier.provider.name,
+                    effectiveValue = config.llmRoleAssignments.falsifier.provider.name,
+                    unit = null,
+                    enumValues = LlmProvider.entries.map { provider -> provider.name },
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
+                    key = "llm.falsifier.model",
+                    legacyEnvName = FUKUROU_FALSIFIER_MODEL_ENV,
+                    valueType = RuntimeConfigValueType.STRING,
+                    defaultValue = defaults.config.llmRoleAssignments.falsifier.model.orEmpty(),
+                    effectiveValue = config.llmRoleAssignments.falsifier.model.orEmpty(),
+                    unit = null,
+                    blankAllowed = true,
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
+                    key = "llm.falsifier.effort",
+                    legacyEnvName = FUKUROU_FALSIFIER_EFFORT_ENV,
+                    valueType = RuntimeConfigValueType.ENUM,
+                    defaultValue = defaults.config.llmRoleAssignments.falsifier.effort.name,
+                    effectiveValue = config.llmRoleAssignments.falsifier.effort.name,
+                    unit = null,
+                    enumValues = LlmEffort.entries.map { effort -> effort.name },
                     safetyTier = RuntimeConfigSafetyTier.GUARDED,
                 ),
                 runtimeItem(
@@ -884,6 +946,7 @@ object RuntimeConfigCatalog {
         unit: String?,
         safetyTier: RuntimeConfigSafetyTier = RuntimeConfigSafetyTier.STANDARD,
         blankAllowed: Boolean = false,
+        enumValues: List<String> = emptyList(),
     ): RuntimeConfigItem {
         return configItem(
             key = key,
@@ -897,6 +960,7 @@ object RuntimeConfigCatalog {
             editable = true,
             applyMode = RuntimeConfigApplyMode.NEXT_RESTART,
             blankAllowed = blankAllowed,
+            enumValues = enumValues,
         )
     }
 
@@ -955,6 +1019,7 @@ object RuntimeConfigCatalog {
         editable: Boolean,
         applyMode: RuntimeConfigApplyMode,
         blankAllowed: Boolean,
+        enumValues: List<String> = emptyList(),
     ): RuntimeConfigItem {
         return RuntimeConfigItem(
             key = key,
@@ -972,6 +1037,7 @@ object RuntimeConfigCatalog {
             labelKey = "config.item.$key.label",
             descriptionKey = "config.item.$key.description",
             blankAllowed = blankAllowed,
+            enumValues = enumValues,
         )
     }
 }
@@ -1038,6 +1104,7 @@ data class RuntimeConfigGroup(
  * @param labelKey UI label の i18n key
  * @param descriptionKey UI description の i18n key
  * @param blankAllowed runtime candidate に空文字を保存できるか
+ * @param enumValues ENUM で選択可能な code-owned value 一覧
  */
 @Serializable
 data class RuntimeConfigItem(
@@ -1057,6 +1124,7 @@ data class RuntimeConfigItem(
     val descriptionKey: String,
     @Transient
     val blankAllowed: Boolean = false,
+    val enumValues: List<String> = emptyList(),
 )
 
 /**

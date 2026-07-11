@@ -2024,6 +2024,7 @@ export interface components {
             safetyTier: "STANDARD" | "GUARDED" | "SAFETY_CRITICAL" | "DEPLOYMENT_BOUNDARY" | "SECRET";
             labelKey: string;
             descriptionKey: string;
+            enumValues?: string[];
         };
         /** RuntimeConfigGroup */
         RuntimeConfigGroup: {
@@ -2396,6 +2397,16 @@ export interface components {
                 [key: string]: string | null;
             };
         };
+        /** OpsDecisionRunLlmPhaseAuditResponse */
+        OpsDecisionRunLlmPhaseAuditResponse: {
+            phase: string;
+            provider?: string | null;
+            configuredModel?: string | null;
+            configuredEffort?: string | null;
+            renderedEffort?: string | null;
+            observedModels?: string | null;
+            modelObserved: boolean;
+        };
         /** OpsDecisionRunDetailResponse */
         OpsDecisionRunDetailResponse: {
             summary: components["schemas"]["OpsDecisionRunSummaryResponse"];
@@ -2408,6 +2419,7 @@ export interface components {
             orders: components["schemas"]["OpsDecisionRunOrderResponse"][];
             executions: components["schemas"]["OpsDecisionRunExecutionResponse"][];
             tradeLifecycles: components["schemas"]["OpsDecisionRunTradeLifecycleResponse"][];
+            llmPhaseAudits: components["schemas"]["OpsDecisionRunLlmPhaseAuditResponse"][];
             raw: components["schemas"]["OpsDecisionRunRawRecordResponse"][];
         };
         /** Position */

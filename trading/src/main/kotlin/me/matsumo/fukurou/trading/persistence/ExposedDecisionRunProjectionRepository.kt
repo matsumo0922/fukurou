@@ -2,6 +2,11 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunDetail
@@ -9,6 +14,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunExecution
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
+import me.matsumo.fukurou.trading.activity.DecisionRunLlmPhaseAudit
 import me.matsumo.fukurou.trading.activity.DecisionRunOrder
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcomeEvidence
 import me.matsumo.fukurou.trading.activity.DecisionRunPage
@@ -381,7 +387,7 @@ private const val FIND_TRADE_LIFECYCLES_SQL = """
 """
 
 private const val FIND_SAFE_AUDIT_SQL = """
-    SELECT event_type, tool_name, ts
+    SELECT event_type, tool_name, payload, ts
     FROM command_event_log
     WHERE decision_run_id = ?
     ORDER BY ts ASC, id ASC
@@ -593,9 +599,10 @@ private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: In
     val orders = selectOrders(invocationId)
     val executions = selectExecutions(invocationId)
     val tradeLifecycles = selectTradeLifecycles(invocationId)
+    val safeAudits = selectSafeAudits(invocationId)
     val raw = buildList {
         addAll(base.raw)
-        addAll(selectSafeAudit(invocationId))
+        addAll(safeAudits.map { audit -> audit.raw })
         addAll(orders.map { order -> order.toRawRecord() })
         addAll(executions.map { execution -> execution.toRawRecord() })
     }.sortedBy { record -> record.occurredAt }
@@ -605,6 +612,7 @@ private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: In
         orders = orders,
         executions = executions,
         tradeLifecycles = tradeLifecycles,
+        llmPhaseAudits = safeAudits.mapNotNull { audit -> audit.llmPhaseAudit },
         raw = raw,
     )
 }
@@ -735,20 +743,26 @@ private fun JdbcTransaction.selectTradeLifecycles(invocationId: String): List<De
     }
 }
 
-private fun JdbcTransaction.selectSafeAudit(invocationId: String): List<DecisionRunRawRecord> {
+private fun JdbcTransaction.selectSafeAudits(invocationId: String): List<SafeAuditProjection> {
     return jdbcConnection().prepareStatement(FIND_SAFE_AUDIT_SQL).use { statement ->
         statement.setString(1, invocationId)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {
+                    val payload = resultSet.getString("payload")
+                    val rawAudit = DecisionRunRawRecord(
+                        source = "audit",
+                        occurredAt = Instant.ofEpochMilli(resultSet.getLong("ts")),
+                        values = mapOf(
+                            "eventType" to resultSet.getString("event_type"),
+                            "toolName" to resultSet.getString("tool_name"),
+                        ) + payload.safeLlmAssignmentAuditValues(),
+                    )
+
                     add(
-                        DecisionRunRawRecord(
-                            source = "audit",
-                            occurredAt = Instant.ofEpochMilli(resultSet.getLong("ts")),
-                            values = mapOf(
-                                "eventType" to resultSet.getString("event_type"),
-                                "toolName" to resultSet.getString("tool_name"),
-                            ),
+                        SafeAuditProjection(
+                            raw = rawAudit,
+                            llmPhaseAudit = payload.toLlmPhaseAuditOrNull(),
                         ),
                     )
                 }
@@ -756,6 +770,58 @@ private fun JdbcTransaction.selectSafeAudit(invocationId: String): List<Decision
         }
     }
 }
+
+private data class SafeAuditProjection(
+    val raw: DecisionRunRawRecord,
+    val llmPhaseAudit: DecisionRunLlmPhaseAudit?,
+)
+
+private fun String?.toLlmPhaseAuditOrNull(): DecisionRunLlmPhaseAudit? {
+    val root = this
+        ?.let { payload -> runCatching { Json.parseToJsonElement(payload).jsonObject }.getOrNull() }
+        ?: return null
+    val phase = root["phase"]?.jsonPrimitive?.contentOrNull
+        ?.uppercase()
+        ?.takeIf { value -> value in ROLE_LLM_PHASES }
+        ?: return null
+    val details = root["details"]?.jsonObject ?: return null
+
+    return DecisionRunLlmPhaseAudit(
+        phase = phase,
+        provider = details.stringOrNull("provider"),
+        configuredModel = details.stringOrNull("configuredModel"),
+        configuredEffort = details.stringOrNull("configuredEffort"),
+        renderedEffort = details.stringOrNull("renderedEffort"),
+        observedModels = details.stringOrNull("observedModels"),
+        modelObserved = details.stringOrNull("modelObserved") == "true",
+    )
+}
+
+private fun String?.safeLlmAssignmentAuditValues(): Map<String, String?> {
+    val root = this
+        ?.let { payload -> runCatching { Json.parseToJsonElement(payload).jsonObject }.getOrNull() }
+        ?: return emptyMap()
+    val details = root["details"]?.jsonObject ?: return emptyMap()
+
+    return SAFE_LLM_ASSIGNMENT_AUDIT_KEYS.mapNotNull { key ->
+        details[key]?.jsonPrimitive?.contentOrNull?.let { value -> key to value }
+    }.toMap()
+}
+
+private fun JsonObject.stringOrNull(key: String): String? {
+    return this[key]?.jsonPrimitive?.contentOrNull
+}
+
+private val SAFE_LLM_ASSIGNMENT_AUDIT_KEYS = setOf(
+    "provider",
+    "configuredModel",
+    "configuredEffort",
+    "renderedEffort",
+    "observedModels",
+    "modelObserved",
+)
+
+private val ROLE_LLM_PHASES = setOf("PROPOSER", "FALSIFIER")
 
 @Suppress("LongMethod")
 private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummary {

@@ -8,6 +8,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
+import me.matsumo.fukurou.trading.invoker.LlmEffort
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.reflection.MAX_REFLECTION_LLM_TIMEOUT
 import me.matsumo.fukurou.trading.reflection.MIN_REFLECTION_MIN_INTERVAL
@@ -432,6 +433,18 @@ private fun validateTypedConfigConstraints(
             key = "reflection.promptCandidateProvider",
             allowedValues = LlmProvider.entries.map { provider -> provider.name }.toSet(),
         )
+        requireStringOneOf(
+            values = values,
+            key = "llm.proposer.provider",
+            allowedValues = LlmProvider.entries.map { provider -> provider.name }.toSet(),
+        )
+        requireStringOneOf(
+            values = values,
+            key = "llm.falsifier.provider",
+            allowedValues = LlmProvider.entries.map { provider -> provider.name }.toSet(),
+        )
+        requireLlmEffort(values, "llm.proposer.effort")
+        requireLlmEffort(values, "llm.falsifier.effort")
         requireLongBetweenInclusive(
             values = values,
             key = "reflection.promptCandidateTimeout",
@@ -455,6 +468,19 @@ private fun validateTypedConfigConstraints(
         requireLongGreaterThan(values, "gmoPublic.connectTimeout", 0)
         requireLongGreaterThan(values, "gmoPublic.requestTimeout", 0)
         requireLongGreaterThan(values, "gmoPublic.symbolRulesCacheTtl", 0)
+    }
+}
+
+private fun MutableList<RuntimeConfigValidationError>.requireLlmEffort(values: Map<String, String>, key: String) {
+    val value = values.getValue(key)
+    val supportedValues = LlmEffort.entries.map { effort -> effort.name }
+
+    if (value !in supportedValues) {
+        addTypedConfigError(
+            key = key,
+            code = "runtimeConfig.validation.llmEffortUnsupported",
+            params = mapOf("values" to supportedValues.joinToString(", ")),
+        )
     }
 }
 

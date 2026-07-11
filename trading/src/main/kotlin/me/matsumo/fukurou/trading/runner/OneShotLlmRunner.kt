@@ -27,6 +27,7 @@ import me.matsumo.fukurou.trading.broker.toJsonObject
 import me.matsumo.fukurou.trading.broker.toPreviewOrderNormalizedContent
 import me.matsumo.fukurou.trading.config.FUKUROU_MCP_ACT_TOOL_CALL_LIMIT_ENV
 import me.matsumo.fukurou.trading.config.FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT_ENV
+import me.matsumo.fukurou.trading.config.LlmRoleAssignment
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -78,6 +79,8 @@ import java.util.UUID
  * @param triggerKind daemon trigger 種別。手動起動では null
  * @param proposerProvider Proposer provider
  * @param falsifierProvider Falsifier provider
+ * @param proposerAssignment Proposer の provider / model / effort snapshot
+ * @param falsifierAssignment Falsifier の provider / model / effort snapshot
  */
 data class OneShotRunnerRequest(
     val repositoryRoot: Path,
@@ -89,7 +92,17 @@ data class OneShotRunnerRequest(
     val triggerKind: LlmDaemonTriggerKind? = null,
     val proposerProvider: LlmProvider = LlmProvider.CLAUDE,
     val falsifierProvider: LlmProvider = LlmProvider.CODEX,
+    val proposerAssignment: LlmRoleAssignment? = null,
+    val falsifierAssignment: LlmRoleAssignment? = null,
 )
+
+private fun OneShotRunnerRequest.effectiveProposerAssignment(): LlmRoleAssignment {
+    return proposerAssignment ?: LlmRoleAssignment(provider = proposerProvider)
+}
+
+private fun OneShotRunnerRequest.effectiveFalsifierAssignment(): LlmRoleAssignment {
+    return falsifierAssignment ?: LlmRoleAssignment(provider = falsifierProvider)
+}
 
 /**
  * one-shot runner が LLM CLI に渡す MCP 接続設定。
@@ -300,7 +313,7 @@ class OneShotLlmRunner(
         )
         var failureContext = requestFactory.decisionRunContext(
             invocationId = invocationId,
-            provider = request.proposerProvider,
+            provider = request.effectiveProposerAssignment().provider,
             promptHash = PROMPT_HASH_UNAVAILABLE,
             marketSnapshotId = marketSnapshotId,
         )
@@ -385,7 +398,7 @@ class OneShotLlmRunner(
         val promptHash = SystemPromptV1.calculateContentHash(promptContent)
         val proposerContext = requestFactory.decisionRunContext(
             invocationId = input.invocationId,
-            provider = input.request.proposerProvider,
+            provider = input.request.effectiveProposerAssignment().provider,
             promptHash = promptHash,
             marketSnapshotId = input.marketSnapshotId,
         )
@@ -491,7 +504,8 @@ class OneShotLlmRunner(
         val proposerRequest = requestFactory.llmRequest(
             LlmRequestInput(
                 invocationId = input.invocationId,
-                provider = request.proposerProvider,
+                provider = request.effectiveProposerAssignment().provider,
+                assignment = request.effectiveProposerAssignment(),
                 phase = LlmInvocationPhase.PROPOSER,
                 prompt = requestFactory.buildProposerPrompt(input.promptContent),
                 decisionRunContext = proposerContext,
@@ -563,7 +577,7 @@ class OneShotLlmRunner(
         }
         val falsifierContext = requestFactory.decisionRunContext(
             invocationId = invocationId,
-            provider = request.falsifierProvider,
+            provider = request.effectiveFalsifierAssignment().provider,
             promptHash = input.promptHash,
             marketSnapshotId = input.marketSnapshotId,
         )
@@ -652,7 +666,8 @@ class OneShotLlmRunner(
         val falsifierRequest = requestFactory.llmRequest(
             LlmRequestInput(
                 invocationId = input.invocationId,
-                provider = request.falsifierProvider,
+                provider = request.effectiveFalsifierAssignment().provider,
+                assignment = request.effectiveFalsifierAssignment(),
                 phase = LlmInvocationPhase.FALSIFIER,
                 prompt = requestFactory.buildFalsifierPrompt(input.promptContent, intent.intentId),
                 decisionRunContext = falsifierContext,
@@ -1134,6 +1149,9 @@ private class OneShotLlmRequestFactory(
             ),
             environment = childEnvironment(input.decisionRunContext, input.intentId),
             allowedTools = allowedTools,
+            model = input.assignment.model,
+            effort = input.assignment.effort,
+            useConfiguredModelFallback = false,
         )
     }
 
@@ -1405,6 +1423,7 @@ private data class DecisionToPlaceOrderPhaseInput(
 private data class LlmRequestInput(
     val invocationId: String,
     val provider: LlmProvider,
+    val assignment: LlmRoleAssignment,
     val phase: LlmInvocationPhase,
     val prompt: String,
     val decisionRunContext: DecisionRunContext,

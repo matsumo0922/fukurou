@@ -444,6 +444,7 @@ function RunDetailContent({
           [t("activity.runs.label.setupTags"), formatJsonList(intent?.setupTagsJson), true],
           [t("activity.runs.label.runtimeError"), detail.summary.errorMessage, true],
         ]} />
+        <LlmPhaseAssignmentAudits audits={detail.llmPhaseAudits} />
         <div className="run-narratives">
           <Narrative label={t("activity.runs.label.reason")} value={decision?.reasonJa} />
           <Narrative label={t("activity.runs.label.falsifierReason")} value={detail.falsification?.reasonJa} />
@@ -464,6 +465,26 @@ function RunDetailContent({
       </DetailSection>
     </>
   );
+}
+
+function LlmPhaseAssignmentAudits({ audits }: { audits: OpsDecisionRunDetailResponse["llmPhaseAudits"] }) {
+  const { t } = useI18n();
+  const phaseAudits = audits ?? [];
+
+  if (phaseAudits.length === 0) return null;
+
+  return <div className="run-narratives">
+    {phaseAudits.map((audit) => <div key={audit.phase}>
+      <Narrative label={t("activity.runs.label.llmRole")} value={audit.phase} />
+      <FactGrid facts={[
+        [t("activity.runs.label.provider"), audit.provider],
+        [t("activity.runs.label.configuredModel"), audit.configuredModel],
+        [t("activity.runs.label.configuredEffort"), audit.configuredEffort],
+        [t("activity.runs.label.renderedEffort"), audit.renderedEffort],
+        [t("activity.runs.label.observedModels"), audit.modelObserved ? audit.observedModels : null],
+      ]} />
+    </div>)}
+  </div>;
 }
 
 function CancellationSection({

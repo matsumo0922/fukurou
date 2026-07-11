@@ -271,7 +271,6 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
     )
     val commandRendererConfig = LlmCommandRendererConfig.fromEnvironment(
         environment = inputs.environment,
-        runtimeModels = inputs.tradingConfig.llmModels,
     )
     val tradingRuntime = TradingRuntimeFactory.connectedPostgres(
         dataSource = inputs.dataSource,
@@ -309,7 +308,10 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         marketDataSource = marketDataSource,
         paperLedgerRepository = paperLedgerRepository,
         launchReservationRepository = ExposedLlmLaunchReservationRepository(inputs.database),
-        requestBase = inputs.requestBase,
+        requestBase = inputs.requestBase.copy(
+            proposerAssignment = inputs.tradingConfig.llmRoleAssignments.proposer,
+            falsifierAssignment = inputs.tradingConfig.llmRoleAssignments.falsifier,
+        ),
         launchOneShot = runner.asDaemonLauncher(),
         preFilter = preFilter,
     )

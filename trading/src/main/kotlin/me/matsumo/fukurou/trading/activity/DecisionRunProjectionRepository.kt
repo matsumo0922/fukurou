@@ -310,6 +310,17 @@ data class DecisionRunRawRecord(
     val values: Map<String, String?>,
 )
 
+/** Activity に公開する LLM role phase の安全な assignment 監査情報。 */
+data class DecisionRunLlmPhaseAudit(
+    val phase: String,
+    val provider: String?,
+    val configuredModel: String?,
+    val configuredEffort: String?,
+    val renderedEffort: String?,
+    val observedModels: String?,
+    val modelObserved: Boolean,
+)
+
 /**
  * decision run 詳細の正規化 projection。
  *
@@ -325,6 +336,7 @@ data class DecisionRunDetail(
     val orders: List<DecisionRunOrder>,
     val executions: List<DecisionRunExecution>,
     val tradeLifecycles: List<DecisionRunTradeLifecycle>,
+    val llmPhaseAudits: List<DecisionRunLlmPhaseAudit> = emptyList(),
     val raw: List<DecisionRunRawRecord>,
 )
 

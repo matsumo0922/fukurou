@@ -19,6 +19,7 @@ import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
+import me.matsumo.fukurou.trading.invoker.renderedEffortOrNull
 import me.matsumo.fukurou.trading.invoker.safeExceptionType
 import java.time.Clock
 import java.time.Duration
@@ -76,7 +77,7 @@ class LlmInvocationAuditor(
             phaseName = phaseName,
             duration = duration,
             details = phaseDetails(
-                provider = request.provider,
+                request = request,
                 processResult = processResult,
                 startFailure = startFailure,
                 usage = usage,
@@ -158,21 +159,22 @@ class LlmInvocationAuditor(
     }
 
     private fun phaseDetails(
-        provider: LlmProvider,
+        request: LlmInvocationRequest,
         processResult: ProcessRunResult?,
         startFailure: Throwable?,
         usage: LlmUsageDetails?,
         auditSignals: LlmPhaseAuditSignals,
     ): JsonObject {
         return buildJsonObject {
-            put("provider", provider.name.lowercase())
+            put("provider", request.provider.name.lowercase())
+            putAssignmentAuditDetails(request, usage)
             put("status", processResult?.status?.name ?: "FAILED_TO_START")
             put("exitCode", processResult?.exitCode?.toString() ?: "null")
             if (auditSignals.cleanupFailed) {
                 put("cleanupFailed", "true")
             }
             startFailure?.let { throwable ->
-                when (provider) {
+                when (request.provider) {
                     LlmProvider.CLAUDE -> put("error", throwable.redactedQualifiedErrorMessage())
                     LlmProvider.CODEX -> {
                         put("failureCategory", CODEX_INVOCATION_RESULT_UNAVAILABLE)
@@ -180,7 +182,7 @@ class LlmInvocationAuditor(
                     }
                 }
             }
-            when (provider) {
+            when (request.provider) {
                 LlmProvider.CLAUDE -> processResult?.let { completedProcess ->
                     put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
                     put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
@@ -202,6 +204,19 @@ class LlmInvocationAuditor(
                 put("usage", LlmUsageParser.toJsonObject(parsedUsage))
             }
         }
+    }
+
+    private fun kotlinx.serialization.json.JsonObjectBuilder.putAssignmentAuditDetails(
+        request: LlmInvocationRequest,
+        usage: LlmUsageDetails?,
+    ) {
+        request.model?.let { configuredModel -> put("configuredModel", configuredModel) }
+        put("configuredEffort", request.effort.name)
+        request.effort.renderedEffortOrNull()?.let { renderedEffort -> put("renderedEffort", renderedEffort) }
+
+        val observedModels = usage?.modelUsages?.map { modelUsage -> modelUsage.model }.orEmpty()
+        observedModels.takeIf(List<String>::isNotEmpty)?.let { models -> put("observedModels", models.joinToString(",")) }
+        put("modelObserved", observedModels.isNotEmpty().toString())
     }
 
     private fun ProcessRunResult.auditSignals(): LlmPhaseAuditSignals {

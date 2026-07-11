@@ -151,7 +151,7 @@ class DefaultLlmCommandRenderer(
         val baseArgs = listOf(
             "-p",
             request.prompt,
-        ) + config.claudeModelArgs() + config.claudeCommonArgs
+        ) + request.claudeModelArgs(config.claudeModel) + request.claudeEffortArgs() + config.claudeCommonArgs
         val mcpArgs = listOf(
             "--mcp-config",
             mcpConfigFile.path.toString(),
@@ -202,11 +202,12 @@ class DefaultLlmCommandRenderer(
             mcpServer = request.mcpServer,
             environment = request.environment,
             persistentHome = config.codexPersistentHome,
+            effort = request.effort,
         )
         val commandEnvironment = request.environment + (CODEX_HOME_ENV to codexHome.path.toString())
         val codexCommonArgs = config.codexCommonArgs.withoutDuplicatedEnforcedCodexArgs()
         val args = listOf("exec") +
-            config.codexModelArgs() +
+            request.codexModelArgs(config.codexModel) +
             codexCommonArgs +
             ENFORCED_CODEX_COMMON_ARGS +
             phaseArgs +
@@ -231,16 +232,32 @@ class DefaultLlmCommandRenderer(
     }
 }
 
-private fun LlmCommandRendererConfig.claudeModelArgs(): List<String> {
-    val model = claudeModel ?: return emptyList()
+private fun LlmInvocationRequest.claudeModelArgs(fallbackModel: String?): List<String> {
+    val model = model ?: fallbackModel.takeIf { useConfiguredModelFallback } ?: return emptyList()
 
     return listOf("--model", model)
 }
 
-private fun LlmCommandRendererConfig.codexModelArgs(): List<String> {
-    val model = codexModel ?: return emptyList()
+private fun LlmInvocationRequest.claudeEffortArgs(): List<String> {
+    val renderedEffort = effort.renderedEffortOrNull() ?: return emptyList()
+
+    return listOf("--effort", renderedEffort)
+}
+
+private fun LlmInvocationRequest.codexModelArgs(fallbackModel: String?): List<String> {
+    val model = model ?: fallbackModel.takeIf { useConfiguredModelFallback } ?: return emptyList()
 
     return listOf("-m", model)
+}
+
+internal fun LlmEffort.renderedEffortOrNull(): String? {
+    return when (this) {
+        LlmEffort.DEFAULT -> null
+        LlmEffort.LOW -> "low"
+        LlmEffort.MEDIUM -> "medium"
+        LlmEffort.HIGH -> "high"
+        LlmEffort.XHIGH -> "xhigh"
+    }
 }
 
 private fun List<String>.toRenderedCommand(request: RenderedCommandRequest): RenderedLlmCommand {
@@ -292,23 +309,30 @@ private fun LlmMcpServerConfig.toClaudeMcpConfigJson(): String {
 
 private const val EMPTY_CLAUDE_MCP_CONFIG_JSON = """{"mcpServers":{}}"""
 
-private fun LlmMcpServerConfig.toCodexConfigToml(): String {
+private fun LlmMcpServerConfig?.toCodexConfigToml(effort: LlmEffort): String {
     return buildString {
+        effort.renderedEffortOrNull()?.let { renderedEffort ->
+            append("model_reasoning_effort = ")
+            append(renderedEffort.tomlQuoted())
+            append("\n\n")
+        }
+        val mcpServer = this@toCodexConfigToml ?: return@buildString
+
         append("[mcp_servers.")
-        append(name.tomlKey())
+        append(mcpServer.name.tomlKey())
         append("]\n")
         append("command = ")
-        append(command.tomlQuoted())
+        append(mcpServer.command.tomlQuoted())
         append("\n")
         append("args = ")
-        append(args.toTomlArray())
+        append(mcpServer.args.toTomlArray())
         append("\n")
 
-        if (environment.isNotEmpty()) {
+        if (mcpServer.environment.isNotEmpty()) {
             append("[mcp_servers.")
-            append(name.tomlKey())
+            append(mcpServer.name.tomlKey())
             append(".env]\n")
-            environment.forEach { (key, value) ->
+            mcpServer.environment.forEach { (key, value) ->
                 append(key.tomlKey())
                 append(" = ")
                 append(value.tomlQuoted())
@@ -316,9 +340,9 @@ private fun LlmMcpServerConfig.toCodexConfigToml(): String {
             }
         }
 
-        autoApprovedTools.forEach { toolName ->
+        mcpServer.autoApprovedTools.forEach { toolName ->
             append("[mcp_servers.")
-            append(name.tomlKey())
+            append(mcpServer.name.tomlKey())
             append(".tools.")
             append(toolName.tomlKey())
             append("]\n")
@@ -346,22 +370,27 @@ private fun writeCodexHome(
     mcpServer: LlmMcpServerConfig?,
     environment: Map<String, String>,
     persistentHome: Path?,
+    effort: LlmEffort,
 ): PrivateConfigPath {
     if (persistentHome != null) {
-        return writePersistentCodexHome(mcpServer, persistentHome)
+        return writePersistentCodexHome(mcpServer, persistentHome, effort)
     }
 
-    return writeTemporaryCodexHome(mcpServer, environment)
+    return writeTemporaryCodexHome(mcpServer, environment, effort)
 }
 
-private fun writePersistentCodexHome(mcpServer: LlmMcpServerConfig?, directory: Path): PrivateConfigPath {
+private fun writePersistentCodexHome(
+    mcpServer: LlmMcpServerConfig?,
+    directory: Path,
+    effort: LlmEffort,
+): PrivateConfigPath {
     Files.createDirectories(directory)
     directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
 
     val configFile = directory.resolve(CODEX_CONFIG_FILE_NAME)
     Files.writeString(
         configFile,
-        mcpServer?.toCodexConfigToml().orEmpty(),
+        mcpServer.toCodexConfigToml(effort),
         StandardOpenOption.CREATE,
         StandardOpenOption.TRUNCATE_EXISTING,
         StandardOpenOption.WRITE,
@@ -377,6 +406,7 @@ private fun writePersistentCodexHome(mcpServer: LlmMcpServerConfig?, directory: 
 private fun writeTemporaryCodexHome(
     mcpServer: LlmMcpServerConfig?,
     environment: Map<String, String>,
+    effort: LlmEffort,
 ): PrivateConfigPath {
     val directory = Files.createTempDirectory("fukurou-codex-home-")
     directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
@@ -385,7 +415,7 @@ private fun writeTemporaryCodexHome(
         val configFile = directory.resolve(CODEX_CONFIG_FILE_NAME)
         Files.writeString(
             configFile,
-            mcpServer?.toCodexConfigToml().orEmpty(),
+            mcpServer.toCodexConfigToml(effort),
             StandardOpenOption.CREATE_NEW,
             StandardOpenOption.WRITE,
         )
