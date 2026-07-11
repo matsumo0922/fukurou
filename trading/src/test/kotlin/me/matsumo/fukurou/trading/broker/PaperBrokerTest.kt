@@ -151,11 +151,10 @@ class PaperBrokerTest {
     }
 
     @Test
-    fun get_account_status_includes_reconciler_freshness() = runBlocking {
+    fun get_account_status_projects_last_maintenance_at_to_compatible_last_reconciled_at() = runBlocking {
         val reconcilerStatus = MutableReconcilerStatus()
         reconcilerStatus.updateMarketData(
             ReconcilerStatus(
-                lastReconciledAt = fixedInstant(),
                 lastTransportActivityAt = fixedInstant(),
                 lastTradeAt = fixedInstant(),
                 lastMaintenanceAt = fixedInstant(),
@@ -1673,7 +1672,6 @@ class PaperBrokerTest {
         broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 1, OrderSide.SELL, "0.0010")).getOrThrow()
         reconcilerStatus.updateMarketData(
             ReconcilerStatus(
-                lastReconciledAt = fixedInstant(),
                 startupFullReconcileCompleted = true,
                 lastTransportActivityAt = fixedInstant(),
                 lastTradeAt = fixedInstant(),

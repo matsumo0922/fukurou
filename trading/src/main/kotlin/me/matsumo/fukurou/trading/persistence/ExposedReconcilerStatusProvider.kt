@@ -51,7 +51,6 @@ class ExposedReconcilerStatusProvider(
             }
 
             ReconcilerStatus(
-                lastReconciledAt = integrity.lastMaintenanceAt,
                 startupFullReconcileCompleted = integrity.startupRecoveryCompleted,
                 lastTransportActivityAt = integrity.lastTransportActivityAt,
                 lastTradeAt = integrity.lastTradeAt,
@@ -83,9 +82,8 @@ internal fun JdbcTransaction.selectLatestReconcilerStatus(): ReconcilerStatus {
             val eventTimestamp = Instant.ofEpochMilli(resultSet.getLong("ts"))
 
             ReconcilerStatus(
-                lastReconciledAt = payloadObject.instantOrNull("lastReconciledAt") ?: eventTimestamp,
                 startupFullReconcileCompleted = payloadObject.booleanOrFalse("startupFullReconcileCompleted"),
-                lastMaintenanceAt = payloadObject.instantOrNull("lastMaintenanceAt"),
+                lastMaintenanceAt = payloadObject.instantOrNull("lastMaintenanceAt") ?: eventTimestamp,
             )
         }
     }

@@ -20,10 +20,13 @@ import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
+import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
 import me.matsumo.fukurou.trading.market.MarketDataTransportLivenessException
+import me.matsumo.fukurou.trading.market.MarketEventSession
+import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.market.UnavailableMarketDataIntegrityRepository
@@ -207,10 +210,7 @@ class ProtectionReconciler(
         }
     }
 
-    private suspend fun consumeMarketEventSession(
-        session: me.matsumo.fukurou.trading.market.MarketEventSession,
-        maintenanceInterval: Duration,
-    ) {
+    private suspend fun consumeMarketEventSession(session: MarketEventSession, maintenanceInterval: Duration) {
         var nextMaintenanceAtNanos = nextMaintenanceAtNanos(maintenanceInterval)
         var transportDeadlineAtNanos = nextMaintenanceAtNanos(
             requireNotNull(marketEventStream).transportLivenessTimeout,
@@ -236,7 +236,6 @@ class ProtectionReconciler(
                     sessionId = session.sessionId,
                     throwable = eventResult.exceptionOrNull(),
                 )
-                refreshMarketDataStatus()
                 return
             }
 
@@ -251,7 +250,7 @@ class ProtectionReconciler(
     }
 
     private suspend fun handleMarketSessionTimeout(
-        session: me.matsumo.fukurou.trading.market.MarketEventSession,
+        session: MarketEventSession,
         nextMaintenanceAtNanos: Long,
         transportDeadlineAtNanos: Long,
     ): Boolean {
@@ -260,7 +259,6 @@ class ProtectionReconciler(
                 sessionId = session.sessionId,
                 throwable = MarketDataTransportLivenessException("GMO WebSocket transport activity became stale."),
             )
-            refreshMarketDataStatus()
             return true
         }
 
@@ -270,12 +268,12 @@ class ProtectionReconciler(
     }
 
     private suspend fun handleMarketSessionSignal(
-        session: me.matsumo.fukurou.trading.market.MarketEventSession,
-        signal: me.matsumo.fukurou.trading.market.MarketEventSessionSignal,
+        session: MarketEventSession,
+        signal: MarketEventSessionSignal,
     ): Boolean {
         val result = when (signal) {
-            is me.matsumo.fukurou.trading.market.MarketEventSessionSignal.Trade -> applyMarketEvent(signal.event)
-            is me.matsumo.fukurou.trading.market.MarketEventSessionSignal.TransportActivity -> marketDataIntegrityRepository.markTransportActivity(
+            is MarketEventSessionSignal.Trade -> applyMarketEvent(signal.event)
+            is MarketEventSessionSignal.TransportActivity -> marketDataIntegrityRepository.markTransportActivity(
                 sessionId = session.sessionId,
                 observedAt = signal.observedAt,
             )
@@ -286,7 +284,6 @@ class ProtectionReconciler(
         }
 
         recordMarketDataGap(session.sessionId, result.exceptionOrNull())
-        refreshMarketDataStatus()
 
         return false
     }
@@ -345,7 +342,6 @@ class ProtectionReconciler(
             tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
                 broker?.applyMarketEvent(event)?.getOrThrow()
             }
-            refreshMarketDataStatus()
             Result.success(Unit)
         } catch (throwable: CancellationException) {
             throw throwable
@@ -362,6 +358,7 @@ class ProtectionReconciler(
             }
             recordPeriodicMaintenanceRecovery().getOrThrow()
             marketDataIntegrityRepository.markMaintenanceSucceeded(sessionId, Instant.now(clock)).getOrThrow()
+            refreshMarketDataStatus()
 
             Result.success(Unit)
         } catch (throwable: CancellationException) {
@@ -410,7 +407,7 @@ class ProtectionReconciler(
         val current = status.snapshot()
         status.updateMarketData(
             current.copy(
-                marketDataState = me.matsumo.fukurou.trading.market.MarketDataConnectionState.DISCONNECTED,
+                marketDataState = MarketDataConnectionState.DISCONNECTED,
                 marketDataSessionId = sessionId,
                 gapStartedAt = detectedAt,
                 gapReason = reason,
@@ -422,7 +419,6 @@ class ProtectionReconciler(
         val integrity = marketDataIntegrityRepository.snapshot().getOrThrow()
         status.updateMarketData(
             ReconcilerStatus(
-                lastReconciledAt = integrity.lastMaintenanceAt,
                 startupFullReconcileCompleted = integrity.startupRecoveryCompleted,
                 lastTransportActivityAt = integrity.lastTransportActivityAt,
                 lastTradeAt = integrity.lastTradeAt,
@@ -576,7 +572,6 @@ class ProtectionReconciler(
         }
 
         status.markReconciled(
-            reconciledAt = reconciledAt,
             startupFullReconcileCompleted = isStartupFullPass,
             lastMaintenanceAt = lastMaintenanceAt,
         )

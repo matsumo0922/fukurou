@@ -335,7 +335,7 @@ private class PaperBrokerReadDelegate(
             orphanStopCount = orphanStopCount,
             orphanTakeProfitCount = orphanTakeProfitCount,
             pendingCancelCount = pendingCancelCount,
-            lastReconciledAt = reconcilerStatus.lastReconciledAt?.toString(),
+            lastReconciledAt = reconcilerStatus.lastMaintenanceAt?.toString(),
             lastMarketDataAt = reconcilerStatus.lastTradeAt?.toString(),
             tradingLockOwner = null,
         )

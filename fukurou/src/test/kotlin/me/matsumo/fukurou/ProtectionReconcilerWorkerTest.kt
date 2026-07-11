@@ -40,7 +40,6 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.DurationUnit
 import kotlin.time.toDuration
@@ -80,13 +79,12 @@ class ProtectionReconcilerWorkerTest {
         worker.use {
             worker.start()
             withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
-                while (status.snapshot().lastReconciledAt == null) {
+                while (!status.snapshot().startupFullReconcileCompleted) {
                     delay(10.toDuration(DurationUnit.MILLISECONDS))
                 }
             }
         }
 
-        assertNotNull(status.snapshot().lastReconciledAt)
         assertTrue(status.snapshot().startupFullReconcileCompleted)
     }
 
@@ -117,7 +115,7 @@ class ProtectionReconcilerWorkerTest {
         worker.use {
             worker.start()
             withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
-                while (status.snapshot().lastReconciledAt == null) {
+                while (!status.snapshot().startupFullReconcileCompleted) {
                     delay(10.toDuration(DurationUnit.MILLISECONDS))
                 }
             }
@@ -215,7 +213,7 @@ class ProtectionReconcilerWorkerTest {
         )
         val stream = WorkerTestMarketEventStream(
             session = WorkerSignalMarketEventSession(sessionId, clock.instant(), signals),
-            transportLivenessTimeout = Duration.ofMillis(50),
+            transportLivenessTimeout = Duration.ofMillis(400),
         )
         val reconciler = ProtectionReconciler(
             riskStateRepository = InMemoryRiskStateRepository(clock = clock),
@@ -237,7 +235,7 @@ class ProtectionReconcilerWorkerTest {
                     delay(1.toDuration(DurationUnit.MILLISECONDS))
                 }
             }
-            delay(35.toDuration(DurationUnit.MILLISECONDS))
+            delay(300.toDuration(DurationUnit.MILLISECONDS))
             signals.send(
                 Result.success(
                     MarketEventSessionSignal.TransportActivity(
@@ -247,7 +245,7 @@ class ProtectionReconcilerWorkerTest {
                 ),
             )
 
-            delay(30.toDuration(DurationUnit.MILLISECONDS))
+            delay(150.toDuration(DurationUnit.MILLISECONDS))
         }
 
         assertEquals(1, stream.connectCount)
@@ -265,7 +263,7 @@ class ProtectionReconcilerWorkerTest {
         val integrityRepository = WorkerTestMarketDataIntegrityRepository()
         val stream = WorkerTestMarketEventStream(
             session = WorkerSignalMarketEventSession(sessionId, clock.instant(), signals),
-            transportLivenessTimeout = Duration.ofMillis(40),
+            transportLivenessTimeout = Duration.ofMillis(200),
         )
         val reconciler = ProtectionReconciler(
             riskStateRepository = InMemoryRiskStateRepository(clock = clock),
@@ -281,7 +279,7 @@ class ProtectionReconcilerWorkerTest {
         worker.use {
             worker.start()
 
-            withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
+            withTimeout(2_000.toDuration(DurationUnit.MILLISECONDS)) {
                 while (stream.connectCount < 2) {
                     delay(1.toDuration(DurationUnit.MILLISECONDS))
                 }
@@ -386,8 +384,8 @@ private class WorkerTestMarketEventSession(
     override val connectedAt: Instant,
     private val events: ReceiveChannel<Result<PaperMarketTradeEvent>>,
 ) : MarketEventSession {
-    override suspend fun receive(): Result<me.matsumo.fukurou.trading.market.MarketEventSessionSignal> {
-        return events.receive().map { event -> me.matsumo.fukurou.trading.market.MarketEventSessionSignal.Trade(event) }
+    override suspend fun receive(): Result<MarketEventSessionSignal> {
+        return events.receive().map { event -> MarketEventSessionSignal.Trade(event) }
     }
 
     override fun close() = Unit

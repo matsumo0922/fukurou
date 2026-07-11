@@ -21,7 +21,6 @@ class ReconcilerFreshnessReadinessProbeTest {
     fun ready_when_dependency_ready_and_reconciler_fresh() = runBlocking {
         val status = MutableReconcilerStatus()
         status.markReconciled(
-            reconciledAt = Instant.parse("2026-07-02T00:00:00Z"),
             startupFullReconcileCompleted = true,
             lastMaintenanceAt = Instant.parse("2026-07-02T00:00:00Z"),
         )

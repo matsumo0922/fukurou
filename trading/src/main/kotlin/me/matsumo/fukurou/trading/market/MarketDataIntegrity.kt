@@ -12,6 +12,8 @@ enum class MarketDataConnectionState {
 /** market-data gap の理由。 */
 enum class MarketDataGapReason {
     DISCONNECTED,
+
+    /** historical row の読取互換だけに使う旧trade-stale理由。新規gapには使わない。 */
     MESSAGE_STALE,
     TRANSPORT_LIVENESS_LOST,
     INVALID_MESSAGE,
@@ -47,7 +49,7 @@ interface MarketDataIntegrityRepository {
     suspend fun beginSession(sessionId: UUID, connectedAt: Instant): Result<Unit>
 
     /** transport activity を単調増加で保存する。 */
-    suspend fun markTransportActivity(sessionId: UUID, observedAt: Instant): Result<Unit> = Result.success(Unit)
+    suspend fun markTransportActivity(sessionId: UUID, observedAt: Instant): Result<Unit>
 
     /** periodic safety maintenance の最終成功時刻を保存する。 */
     suspend fun markMaintenanceSucceeded(sessionId: UUID, succeededAt: Instant): Result<Unit>

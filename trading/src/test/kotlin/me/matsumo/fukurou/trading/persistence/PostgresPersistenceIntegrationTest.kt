@@ -887,14 +887,14 @@ class PostgresPersistenceIntegrationTest {
         val beforeMaintenance = ExposedReconcilerStatusProvider(database).snapshot()
 
         assertEquals(fixedInstant(), beforeMaintenance.lastTradeAt)
-        assertEquals(null, beforeMaintenance.lastReconciledAt)
+        assertEquals(null, beforeMaintenance.lastMaintenanceAt)
 
         val maintenanceAt = fixedInstant().plusSeconds(5)
         repository.markMaintenanceSucceeded(sessionId, maintenanceAt).getOrThrow()
         val afterMaintenance = ExposedReconcilerStatusProvider(database).snapshot()
 
         assertEquals(fixedInstant(), afterMaintenance.lastTradeAt)
-        assertEquals(maintenanceAt, afterMaintenance.lastReconciledAt)
+        assertEquals(maintenanceAt, afterMaintenance.lastMaintenanceAt)
     }
 
     @Test

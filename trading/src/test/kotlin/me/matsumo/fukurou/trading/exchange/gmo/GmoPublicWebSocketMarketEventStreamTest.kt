@@ -121,6 +121,13 @@ class GmoPublicWebSocketMarketEventStreamTest {
     }
 
     @Test
+    fun `reconnect backoff は1秒未満を拒否する`() {
+        assertFailsWith<IllegalArgumentException> {
+            GmoPublicWebSocketConfig(reconnectBackoff = Duration.ofMillis(999))
+        }
+    }
+
+    @Test
     fun `listener は complete message 受信時点で event の時刻と連番を固定する`() = runBlocking {
         val messages = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
         val clock = MutableWebSocketTestClock(Instant.parse("2026-07-10T00:00:01Z"))
