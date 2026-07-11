@@ -30,8 +30,6 @@ data class MarketDataIntegritySnapshot(
     val lastTransportActivityAt: Instant? = null,
     val lastTradeAt: Instant? = null,
     val lastMaintenanceAt: Instant? = null,
-    @Deprecated("Use lastTradeAt.")
-    val lastReceivedAt: Instant? = null,
     val gapStartedAt: Instant? = null,
     val recoveredAt: Instant? = null,
     val gapReason: MarketDataGapReason? = null,

@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.SymbolRules
@@ -21,8 +22,10 @@ import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.market.MarketDataIntegritySnapshot
 import me.matsumo.fukurou.trading.market.MarketEventSession
+import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
+import me.matsumo.fukurou.trading.market.TransportActivityKind
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ProtectionReconciler
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
@@ -46,6 +49,17 @@ import kotlin.time.toDuration
  * Ktor backend worker が ProtectionReconciler loop を起動することを検証するテスト。
  */
 class ProtectionReconcilerWorkerTest {
+
+    @Test
+    fun production_worker_stream_uses_configured_transport_liveness_timeout() {
+        val config = TradingBotConfig.fromEnvironment(
+            mapOf("FUKUROU_GMO_WEBSOCKET_TRANSPORT_LIVENESS_TIMEOUT_SECONDS" to "150"),
+        )
+
+        val stream = createGmoMarketEventStream(config, Clock.fixed(Instant.EPOCH, ZoneOffset.UTC))
+
+        assertEquals(Duration.ofSeconds(150), stream.transportLivenessTimeout)
+    }
 
     @Test
     fun worker_starts_reconciler_loop() = runBlocking {
@@ -184,6 +198,60 @@ class ProtectionReconcilerWorkerTest {
             eventLog.failureEpisodeEventTypes(),
         )
     }
+
+    @Test
+    fun worker_keeps_normal_trade_silence_connected_after_ping_activity() = runBlocking {
+        val clock = Clock.fixed(Instant.parse("2026-07-02T00:00:00Z"), ZoneOffset.UTC)
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000180")
+        val signals = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
+        val integrityRepository = WorkerTestMarketDataIntegrityRepository()
+        val broker = EpisodicMaintenanceFailureBroker(
+            PaperBroker(
+                ledgerRepository = InMemoryPaperLedgerRepository(clock = clock),
+                riskStateRepository = InMemoryRiskStateRepository(clock = clock),
+                decisionRepository = InMemoryDecisionRepository(clock),
+                clock = clock,
+            ),
+        )
+        val stream = WorkerTestMarketEventStream(
+            session = WorkerSignalMarketEventSession(sessionId, clock.instant(), signals),
+            transportLivenessTimeout = Duration.ofMillis(200),
+        )
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = clock),
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = InMemoryTradingLock(clock),
+            tickStream = FixedTickStream(clock),
+            marketEventStream = stream,
+            marketDataIntegrityRepository = integrityRepository,
+            broker = broker,
+            clock = clock,
+        )
+        val worker = ProtectionReconcilerWorker(reconciler, interval = Duration.ofMillis(10))
+
+        worker.use {
+            worker.start()
+            signals.send(
+                Result.success(
+                    MarketEventSessionSignal.TransportActivity(
+                        observedAt = clock.instant(),
+                        kind = TransportActivityKind.PING_PONG_COMPLETED,
+                    ),
+                ),
+            )
+
+            withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
+                while (broker.maintenanceAttempts.get() < 2) {
+                    delay(1.toDuration(DurationUnit.MILLISECONDS))
+                }
+            }
+        }
+
+        assertEquals(1, stream.connectCount)
+        assertEquals(1, integrityRepository.markTransportActivityCount)
+        assertEquals(MarketDataConnectionState.CONNECTED, integrityRepository.snapshot().getOrThrow().state)
+        assertEquals(null, integrityRepository.snapshot().getOrThrow().gapReason)
+    }
 }
 
 private suspend fun InMemoryCommandEventLog.failureEpisodeEventTypes(): List<CommandEventType> {
@@ -260,14 +328,16 @@ private fun workerTestSymbolRules(): SymbolRules {
 
 private class WorkerTestMarketEventStream(
     private val session: MarketEventSession,
+    override val transportLivenessTimeout: Duration = Duration.ofSeconds(150),
 ) : MarketEventStream {
     override val reconnectBackoff: Duration = Duration.ofMillis(1)
-    private var connected = false
+    var connectCount = 0
+        private set
 
     override suspend fun connect(): Result<MarketEventSession> {
-        if (connected) return Result.failure(IllegalStateException("unexpected reconnect"))
+        connectCount += 1
+        if (connectCount > 1) return Result.failure(IllegalStateException("unexpected reconnect"))
 
-        connected = true
         return Result.success(session)
     }
 }
@@ -284,8 +354,20 @@ private class WorkerTestMarketEventSession(
     override fun close() = Unit
 }
 
+private class WorkerSignalMarketEventSession(
+    override val sessionId: UUID,
+    override val connectedAt: Instant,
+    private val signals: ReceiveChannel<Result<MarketEventSessionSignal>>,
+) : MarketEventSession {
+    override suspend fun receive(): Result<MarketEventSessionSignal> = signals.receive()
+
+    override fun close() = Unit
+}
+
 private class WorkerTestMarketDataIntegrityRepository : MarketDataIntegrityRepository {
     private var current = MarketDataIntegritySnapshot()
+    var markTransportActivityCount = 0
+        private set
 
     override suspend fun snapshot(): Result<MarketDataIntegritySnapshot> = Result.success(current)
 
@@ -293,8 +375,16 @@ private class WorkerTestMarketDataIntegrityRepository : MarketDataIntegrityRepos
         current = MarketDataIntegritySnapshot(
             state = MarketDataConnectionState.CONNECTED,
             sessionId = sessionId,
+            lastTransportActivityAt = connectedAt,
             startupRecoveryCompleted = true,
         )
+
+        return Result.success(Unit)
+    }
+
+    override suspend fun markTransportActivity(sessionId: UUID, observedAt: Instant): Result<Unit> {
+        markTransportActivityCount += 1
+        current = current.copy(lastTransportActivityAt = observedAt)
 
         return Result.success(Unit)
     }

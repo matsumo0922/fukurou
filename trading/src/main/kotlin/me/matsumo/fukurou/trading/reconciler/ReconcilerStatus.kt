@@ -20,8 +20,6 @@ data class ReconcilerStatus(
     val lastTransportActivityAt: Instant? = null,
     val lastTradeAt: Instant? = null,
     val lastMaintenanceAt: Instant? = null,
-    @Deprecated("Use lastTradeAt.")
-    val lastMarketDataAt: Instant? = null,
     val marketDataState: MarketDataConnectionState = MarketDataConnectionState.DISCONNECTED,
     val marketDataSessionId: UUID? = null,
     val lastProcessedSequence: Long = 0,
@@ -59,13 +57,12 @@ class MutableReconcilerStatus : ReconcilerStatusProvider {
     fun markReconciled(
         reconciledAt: Instant,
         startupFullReconcileCompleted: Boolean,
-        lastMarketDataAt: Instant?,
+        lastMaintenanceAt: Instant?,
     ) {
         currentStatus = currentStatus.copy(
             lastReconciledAt = reconciledAt,
             startupFullReconcileCompleted = currentStatus.startupFullReconcileCompleted || startupFullReconcileCompleted,
-            lastMaintenanceAt = lastMarketDataAt ?: currentStatus.lastMaintenanceAt,
-            lastMarketDataAt = lastMarketDataAt ?: currentStatus.lastMarketDataAt,
+            lastMaintenanceAt = lastMaintenanceAt ?: currentStatus.lastMaintenanceAt,
         )
     }
 

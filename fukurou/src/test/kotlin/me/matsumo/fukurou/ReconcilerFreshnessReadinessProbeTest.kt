@@ -23,7 +23,7 @@ class ReconcilerFreshnessReadinessProbeTest {
         status.markReconciled(
             reconciledAt = Instant.parse("2026-07-02T00:00:00Z"),
             startupFullReconcileCompleted = true,
-            lastMarketDataAt = Instant.parse("2026-07-02T00:00:00Z"),
+            lastMaintenanceAt = Instant.parse("2026-07-02T00:00:00Z"),
         )
         status.updateMarketData(
             ReconcilerStatus(

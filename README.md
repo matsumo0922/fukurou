@@ -49,7 +49,7 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `GET /swagger`
 - `GET /openapi.json`
 
-`/health/ready` は `DB_URL` / `DB_USER` / `DB_PASSWORD` が揃っている場合に Hikari + Exposed で PostgreSQL に接続し、`SELECT 1` が成功したら ready を返します。
+`/health/ready` は、Hikari + Exposed による PostgreSQL 接続、runtime config の有効性、startup recovery 完了、WebSocket が `CONNECTED`、未回復の market-data gap がないこと、fresh な transport activity と periodic maintenance をすべて確認して ready を返します。trade は正常に無音になり得るため、readiness の必須条件にしません。
 
 ## Local development
 

@@ -511,7 +511,7 @@ private const val TEST_RECONCILER_COMPLETED_PAYLOAD = """
         "state": "completed",
         "lastReconciledAt": "2026-07-02T00:00:00Z",
         "startupFullReconcileCompleted": true,
-        "lastMarketDataAt": "2026-07-02T00:00:00Z"
+        "lastMaintenanceAt": "2026-07-02T00:00:00Z"
     }
 """
 
@@ -877,23 +877,23 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun reconciler_status_keeps_market_freshness_separate_from_maintenance_success() = runPostgresTest {
+    fun reconciler_status_keeps_trade_timestamp_separate_from_maintenance_success() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedMarketDataIntegrityRepository(database)
         val sessionId = UUID.randomUUID()
         repository.beginSession(sessionId, fixedInstant()).getOrThrow()
-        updateMarketDataSessionReceivedAt(database, sessionId, fixedInstant())
+        updateMarketDataSessionTradeAt(database, sessionId, fixedInstant())
 
         val beforeMaintenance = ExposedReconcilerStatusProvider(database).snapshot()
 
-        assertEquals(fixedInstant(), beforeMaintenance.lastMarketDataAt)
+        assertEquals(fixedInstant(), beforeMaintenance.lastTradeAt)
         assertEquals(null, beforeMaintenance.lastReconciledAt)
 
         val maintenanceAt = fixedInstant().plusSeconds(5)
         repository.markMaintenanceSucceeded(sessionId, maintenanceAt).getOrThrow()
         val afterMaintenance = ExposedReconcilerStatusProvider(database).snapshot()
 
-        assertEquals(fixedInstant(), afterMaintenance.lastMarketDataAt)
+        assertEquals(fixedInstant(), afterMaintenance.lastTradeAt)
         assertEquals(maintenanceAt, afterMaintenance.lastReconciledAt)
     }
 
@@ -6009,14 +6009,14 @@ private fun selectMarketDataIntegrityIndexCount(database: ExposedDatabase): Int 
     }
 }
 
-/** market-data event 受信時刻だけを更新する。 */
-private fun updateMarketDataSessionReceivedAt(
+/** realtime trade時刻だけを更新する。 */
+private fun updateMarketDataSessionTradeAt(
     database: ExposedDatabase,
     sessionId: UUID,
     receivedAt: Instant,
 ) {
     exposedTransaction(database) {
-        prepare("UPDATE market_data_sessions SET last_received_at = ? WHERE id = ?").use { statement ->
+        prepare("UPDATE market_data_sessions SET last_trade_at = ? WHERE id = ?").use { statement ->
             statement.setLong(1, receivedAt.toEpochMilli())
             statement.setObject(2, sessionId)
             require(statement.executeUpdate() == 1) { "market-data session was not found." }

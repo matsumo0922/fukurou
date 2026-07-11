@@ -15,11 +15,6 @@ interface MarketEventStream {
     val transportLivenessTimeout: java.time.Duration
         get() = java.time.Duration.ofSeconds(150)
 
-    /** @deprecated transport liveness timeout を使用する。 */
-    @Deprecated("Use transportLivenessTimeout.")
-    val messageStaleTimeout: java.time.Duration
-        get() = transportLivenessTimeout
-
     /**
      * 新しい接続 session を開く。
      */
@@ -66,9 +61,6 @@ class InvalidMarketDataMessageException(message: String, cause: Throwable? = nul
 
 /** market-data subscription が取引所に拒否されたことを示す例外。 */
 class MarketDataSubscriptionException(message: String) : IllegalStateException(message)
-
-/** historical market-data message stale gap を示す例外。 */
-class MarketDataMessageStaleException(message: String) : IllegalStateException(message)
 
 /** transport activity が期限内に届かなかったことを示す例外。 */
 class MarketDataTransportLivenessException(message: String) : IllegalStateException(message)

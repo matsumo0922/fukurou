@@ -27,7 +27,6 @@ import java.util.Optional
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executor
-import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLParameters
 import kotlin.test.Test
@@ -143,20 +142,20 @@ class GmoPublicWebSocketMarketEventStreamTest {
     }
 
     @Test
-    fun `listener buffer overflowはterminal failureにする`() {
+    fun `listener buffer overflowはqueued tradeの後にterminal failureにする`() = runBlocking {
         val messages = Channel<Result<MarketEventSessionSignal>>(capacity = 1)
-        val terminalFailure = AtomicReference<Throwable?>()
+        val session = GmoMarketEventSession(sessionId, Instant.EPOCH, NoOpWebSocket, messages)
         val listener = GmoWebSocketListener(
             messages = messages,
             decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
             clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
-            terminalFailure = terminalFailure,
         )
 
         listener.onText(NoOpWebSocket, tradePayload(), true)
         listener.onText(NoOpWebSocket, tradePayload(), true)
 
-        assertTrue(terminalFailure.get() is MarketDataBackpressureException)
+        assertTrue(session.receive().getOrThrow() is MarketEventSessionSignal.Trade)
+        assertTrue(session.receive().exceptionOrNull() is MarketDataBackpressureException)
     }
 
     @Test
@@ -178,6 +177,51 @@ class GmoPublicWebSocketMarketEventStreamTest {
         assertEquals(TransportActivityKind.SUBSCRIPTION_ACKNOWLEDGED, acknowledgement.kind)
         assertEquals(TransportActivityKind.PING_PONG_COMPLETED, pong.kind)
         assertEquals(observedAt, pong.observedAt)
+    }
+
+    @Test
+    fun `closeはqueued tradeとPongの後にterminal failureとして届く`() = runBlocking {
+        val messages = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
+        val session = GmoMarketEventSession(sessionId, Instant.EPOCH, NoOpWebSocket, messages)
+        val listener = GmoWebSocketListener(
+            messages = messages,
+            decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
+            clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+        )
+
+        listener.onText(NoOpWebSocket, tradePayload(), true)
+        listener.onPing(NoOpWebSocket, ByteBuffer.wrap(byteArrayOf(1)))
+        listener.onClose(NoOpWebSocket, WebSocket.NORMAL_CLOSURE, "closed")
+
+        assertTrue(session.receive().getOrThrow() is MarketEventSessionSignal.Trade)
+        assertEquals(
+            TransportActivityKind.PING_PONG_COMPLETED,
+            (session.receive().getOrThrow() as MarketEventSessionSignal.TransportActivity).kind,
+        )
+        assertTrue(session.receive().exceptionOrNull()?.message.orEmpty().contains("closed"))
+    }
+
+    @Test
+    fun `errorはqueued tradeとPongの後にterminal failureとして届く`() = runBlocking {
+        val messages = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
+        val session = GmoMarketEventSession(sessionId, Instant.EPOCH, NoOpWebSocket, messages)
+        val listener = GmoWebSocketListener(
+            messages = messages,
+            decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
+            clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+        )
+        val error = IllegalStateException("network error")
+
+        listener.onText(NoOpWebSocket, tradePayload(), true)
+        listener.onPing(NoOpWebSocket, ByteBuffer.wrap(byteArrayOf(1)))
+        listener.onError(NoOpWebSocket, error)
+
+        assertTrue(session.receive().getOrThrow() is MarketEventSessionSignal.Trade)
+        assertEquals(
+            TransportActivityKind.PING_PONG_COMPLETED,
+            (session.receive().getOrThrow() as MarketEventSessionSignal.TransportActivity).kind,
+        )
+        assertEquals(error, session.receive().exceptionOrNull())
     }
 
     private fun tradePayload(): String {

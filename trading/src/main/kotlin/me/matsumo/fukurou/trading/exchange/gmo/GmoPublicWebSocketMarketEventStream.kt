@@ -60,13 +60,11 @@ class GmoPublicWebSocketMarketEventStream(
             val sessionId = UUID.randomUUID()
             val connectedAt = clock.instant()
             val sessionMessages = Channel<Result<MarketEventSessionSignal>>(capacity = MARKET_EVENT_BUFFER_CAPACITY)
-            val terminalFailure = AtomicReference<Throwable?>()
             messages = sessionMessages
             val listener = GmoWebSocketListener(
                 messages = sessionMessages,
                 decoder = GmoTradeMessageDecoder(symbol, sessionId),
                 clock = clock,
-                terminalFailure = terminalFailure,
             )
             val connectedSocket = httpClient.newWebSocketBuilder()
                 .connectTimeout(config.connectTimeout)
@@ -77,10 +75,10 @@ class GmoPublicWebSocketMarketEventStream(
             connectedSocket.sendText(subscribeMessage(symbol), true).join()
 
             GmoMarketEventSession(
-                metadata = MarketEventSessionMetadata(sessionId, connectedAt),
+                sessionId = sessionId,
+                connectedAt = connectedAt,
                 socket = connectedSocket,
                 messages = sessionMessages,
-                terminalFailure = terminalFailure,
             )
         }.onFailure { throwable ->
             socket?.abort()
@@ -120,17 +118,13 @@ data class GmoPublicWebSocketConfig(
 }
 
 /** GMO WebSocket 1接続分のevent受信session。 */
-private class GmoMarketEventSession(
-    private val metadata: MarketEventSessionMetadata,
+internal class GmoMarketEventSession(
+    override val sessionId: UUID,
+    override val connectedAt: Instant,
     private val socket: WebSocket,
     private val messages: Channel<Result<MarketEventSessionSignal>>,
-    private val terminalFailure: AtomicReference<Throwable?>,
 ) : MarketEventSession {
-    override val sessionId: UUID = metadata.sessionId
-    override val connectedAt: Instant = metadata.connectedAt
     override suspend fun receive(): Result<MarketEventSessionSignal> {
-        terminalFailure.get()?.let { throwable -> return Result.failure(throwable) }
-
         return try {
             messages.receive()
         } catch (throwable: CancellationException) {
@@ -145,12 +139,6 @@ private class GmoMarketEventSession(
         messages.close()
     }
 }
-
-/** GMO WebSocket sessionの識別子と接続時刻。 */
-private data class MarketEventSessionMetadata(
-    val sessionId: UUID,
-    val connectedAt: Instant,
-)
 
 /** GMO JSON message を session-local sequence 付き event に変換する decoder。 */
 internal class GmoTradeMessageDecoder(

@@ -61,6 +61,7 @@ class TradingBotConfigTest {
         assertEquals(100, config.killCriterion.minClosedTrades)
         assertEquals(BigDecimal("0.8"), config.killCriterion.minProfitFactor)
         assertEquals(10, config.gmoPublicClient.rateLimit.permitsPerSecond)
+        assertEquals(Duration.ofSeconds(150), config.gmoPublicWebSocket.transportLivenessTimeout)
     }
 
     @Test
@@ -95,6 +96,7 @@ class TradingBotConfigTest {
                 "FUKUROU_GMO_RETRY_INITIAL_BACKOFF_MS" to "50",
                 "FUKUROU_GMO_RETRY_MAX_BACKOFF_MS" to "500",
                 "FUKUROU_GMO_RETRY_BACKOFF_MULTIPLIER" to "3",
+                "FUKUROU_GMO_WEBSOCKET_TRANSPORT_LIVENESS_TIMEOUT_SECONDS" to "180",
                 "FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT" to "20",
                 "FUKUROU_MCP_ACT_TOOL_CALL_LIMIT" to "2",
                 "FUKUROU_LLM_RUN_TIMEOUT_SECONDS" to "120",
@@ -148,6 +150,7 @@ class TradingBotConfigTest {
         assertEquals(BigDecimal("3.5"), config.safetyFloor.minExpectedMoveToCostRatio)
         assertEquals(Duration.ofSeconds(30), config.safetyFloor.dataQualityCap.staleAfter)
         assertEquals(BigDecimal("0.4"), config.safetyFloor.dataQualityCap.cappedProbability)
+        assertEquals(Duration.ofSeconds(180), config.gmoPublicWebSocket.transportLivenessTimeout)
         assertEquals(BigDecimal("0.0008"), config.safetyFloor.maxTakerFeeRatio)
         assertEquals(BigDecimal("8"), config.safetyFloor.marketSlippageReserveBps)
         assertEquals(Duration.ofSeconds(90), config.decisionProtocol.falsificationFreshnessWindow)

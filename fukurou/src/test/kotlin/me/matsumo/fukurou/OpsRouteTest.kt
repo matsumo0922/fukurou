@@ -711,7 +711,7 @@ class OpsRouteTest {
             reconcilerStatus.markReconciled(
                 reconciledAt = fixedInstant(),
                 startupFullReconcileCompleted = true,
-                lastMarketDataAt = fixedInstant(),
+                lastMaintenanceAt = fixedInstant(),
             )
 
             application {

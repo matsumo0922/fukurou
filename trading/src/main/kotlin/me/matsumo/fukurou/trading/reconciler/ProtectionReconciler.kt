@@ -562,12 +562,12 @@ class ProtectionReconciler(
         divergenceMemos: List<PaperExecutionDivergenceMemo>,
     ): Result<Unit> {
         val isStartupFullPass = passKind == ReconcilePassKind.STARTUP_FULL
-        val lastMarketDataAt = tickSnapshot?.observedAt ?: status.snapshot().lastMaintenanceAt
+        val lastMaintenanceAt = tickSnapshot?.observedAt ?: status.snapshot().lastMaintenanceAt
         val auditResult = recordSuccessTransition(
             passKind = passKind,
             reconciledAt = reconciledAt,
             startupFullReconcileCompleted = isStartupFullPass,
-            lastMarketDataAt = lastMarketDataAt,
+            lastMaintenanceAt = lastMaintenanceAt,
             divergenceMemos = divergenceMemos,
         )
 
@@ -578,7 +578,7 @@ class ProtectionReconciler(
         status.markReconciled(
             reconciledAt = reconciledAt,
             startupFullReconcileCompleted = isStartupFullPass,
-            lastMarketDataAt = lastMarketDataAt,
+            lastMaintenanceAt = lastMaintenanceAt,
         )
 
         return Result.success(Unit)
@@ -588,7 +588,7 @@ class ProtectionReconciler(
         passKind: ReconcilePassKind,
         reconciledAt: Instant,
         startupFullReconcileCompleted: Boolean,
-        lastMarketDataAt: Instant?,
+        lastMaintenanceAt: Instant?,
         divergenceMemos: List<PaperExecutionDivergenceMemo>,
     ): Result<Unit> {
         val completedResult = appendReconcilerEvent(
@@ -597,7 +597,7 @@ class ProtectionReconciler(
                 passKind = passKind,
                 reconciledAt = reconciledAt,
                 startupFullReconcileCompleted = startupFullReconcileCompleted,
-                lastMarketDataAt = lastMarketDataAt,
+                lastMaintenanceAt = lastMaintenanceAt,
                 divergenceMemos = divergenceMemos,
             ),
             occurredAt = reconciledAt,
@@ -677,7 +677,7 @@ private fun buildPassCompletedPayload(
     passKind: ReconcilePassKind,
     reconciledAt: Instant,
     startupFullReconcileCompleted: Boolean,
-    lastMarketDataAt: Instant?,
+    lastMaintenanceAt: Instant?,
     divergenceMemos: List<PaperExecutionDivergenceMemo>,
 ): String {
     return buildJsonObject {
@@ -685,8 +685,8 @@ private fun buildPassCompletedPayload(
         put("state", "completed")
         put("lastReconciledAt", reconciledAt.toString())
         put("startupFullReconcileCompleted", startupFullReconcileCompleted)
-        lastMarketDataAt?.let { marketDataAt ->
-            put("lastMarketDataAt", marketDataAt.toString())
+        lastMaintenanceAt?.let { maintenanceAt ->
+            put("lastMaintenanceAt", maintenanceAt.toString())
         }
         if (divergenceMemos.isNotEmpty()) {
             put("paperExecutionDivergenceMemos", JsonArray(divergenceMemos.map { memo -> memo.toJsonObject() }))
