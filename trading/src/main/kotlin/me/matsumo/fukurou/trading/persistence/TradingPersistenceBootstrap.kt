@@ -347,6 +347,9 @@ private const val ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL = """
     CREATE INDEX IF NOT EXISTS idx_safety_violations_decision_run_created
         ON safety_violations (decision_run_id, created_at DESC, id DESC)
         WHERE decision_run_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_safety_violations_recent_denials
+        ON safety_violations (created_at DESC, id DESC)
+        WHERE decision_run_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_trade_intents_decision_created
         ON trade_intents (decision_id, created_at DESC, id DESC);
     CREATE INDEX IF NOT EXISTS idx_decisions_run_projection
@@ -473,10 +476,11 @@ private const val VERIFY_DECISION_RUN_ACTIVITY_INDEXES_SQL = """
             'idx_orders_decision_run_created',
             'idx_executions_decision_run_executed',
             'idx_safety_violations_decision_run_created',
+            'idx_safety_violations_recent_denials',
             'idx_trade_intents_decision_created',
             'idx_decisions_run_projection'
         )
-    HAVING COUNT(*) = 7
+    HAVING COUNT(*) = 8
 """
 
 /**

@@ -21,8 +21,20 @@ dependencies {
     implementation(libs.mcp.kotlin.server)
 
     testImplementation(libs.mcp.kotlin.client)
+    testImplementation(libs.exposed.jdbc)
+    testImplementation(libs.postgresql)
+    testImplementation(libs.testcontainers.postgresql)
     testImplementation(testFixtures(project(":mcp-core")))
     testImplementation(kotlin("test"))
+
+    constraints {
+        testImplementation(libs.commons.compress) {
+            because(
+                "Testcontainers pulls commons-compress 1.24.0; " +
+                    "1.26.0+ fixes CVE-2024-25710/CVE-2024-26308.",
+            )
+        }
+    }
 }
 
 val mcpFatJar = tasks.register<Jar>("buildFatJar") {

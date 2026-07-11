@@ -194,6 +194,50 @@ data class KnowledgeSetupPerformanceSummary(
     val averageMfeR: String?,
 )
 
+/** SafetyFloor が拒否した過去 proposal。 */
+data class KnowledgeSafetyFloorDenial(
+    val invocationId: String,
+    val deniedAt: Instant,
+    val finalReason: String?,
+    val priorProposal: KnowledgePriorProposal?,
+    val falsifier: KnowledgeFalsifierOutcome?,
+    val machineOutcome: KnowledgeMachineOutcome,
+)
+
+/** LLM が提出した proposal 値。 */
+data class KnowledgePriorProposal(
+    val action: String,
+    val setupTags: List<String>,
+    val tradePlanThesisJa: String?,
+    val estimatedWinProbability: String?,
+    val expectedRMultiple: String?,
+    val roundTripCostR: String?,
+    val intent: KnowledgePriorIntent?,
+)
+
+/** prior proposal に紐づく注文 intent。 */
+data class KnowledgePriorIntent(
+    val orderType: String,
+    val sizeBtc: String,
+    val priceJpy: String?,
+    val protectiveStopPriceJpy: String,
+    val takeProfitPriceJpy: String?,
+)
+
+/** Falsifier layer の結果。 */
+data class KnowledgeFalsifierOutcome(
+    val verdict: String,
+    val createdAt: Instant,
+)
+
+/** SafetyFloor が typed column から再計算した outcome。 */
+data class KnowledgeMachineOutcome(
+    val rule: String,
+    val measuredValue: String,
+    val limitValue: String,
+    val messageJa: String,
+)
+
 /**
  * recent lessons tool の結果。
  *
@@ -205,6 +249,8 @@ data class KnowledgeSetupPerformanceSummary(
  * @param runSummaries llm_runs 要約一覧
  * @param setupPerformance evaluation aggregate 要約一覧
  * @param evaluationTruncated evaluation 取得結果が切り詰められたか
+ * @param safetyFloorDenials SafetyFloor 拒否一覧
+ * @param safetyFloorDenialsTruncated SafetyFloor 拒否取得結果が切り詰められたか
  */
 data class KnowledgeRecentLessonsResult(
     val symbol: TradingSymbol,
@@ -215,6 +261,8 @@ data class KnowledgeRecentLessonsResult(
     val runSummaries: List<KnowledgeRunSummary>,
     val setupPerformance: List<KnowledgeSetupPerformanceSummary>,
     val evaluationTruncated: Boolean,
+    val safetyFloorDenials: List<KnowledgeSafetyFloorDenial> = emptyList(),
+    val safetyFloorDenialsTruncated: Boolean = false,
 )
 
 /**

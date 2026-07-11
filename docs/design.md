@@ -57,7 +57,7 @@
 
 [確定] `safety.minExpectedMoveToCostRatio` の既定値は 2.5、`runner.maxInvocationsPerHour` の既定値は 7、`runner.maxInvocationsPerDay` は 120、flat / holding cadence は 15分とする。routine cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。production の active runtime config に明示値が保存済みの場合、catalog default 変更では上書きされないため、`/ops/runtime-config` の draft / activate で active 値を更新する。
 
-system prompt v1.12 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。EV gate は resting LIMIT entry を maker fee(rebate) と保護 exit 側 taker fee / slippage reserve で評価し、板を跨ぐ LIMIT / MARKET / STOP entry を taker fee と entry / exit 両側の market slippage reserve で評価する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
+system prompt v1.13 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。`knowledge_get_recent_lessons` の SafetyFloor 拒否は Falsifier verdict と別 layer として読み、同一 setup / thesis を再提案する場合は現在の MCP evidence と prior intent の客観差分を示す。申告勝率・expected R・TP・STOP を threshold に合わせるだけの変更は改善と扱わず、差分を示せない場合は NO_TRADE とする。EV gate は resting LIMIT entry を maker fee(rebate) と保護 exit 側 taker fee / slippage reserve で評価し、板を跨ぐ LIMIT / MARKET / STOP entry を taker fee と entry / exit 両側の market slippage reserve で評価する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
 
 ### 1.3 本設計の方針
 
@@ -1869,6 +1869,10 @@ headless `claude` → `codex` skill → MCP の成立性は、実装前に小ス
 - `knowledge_get_recent_overrides(limit=5)`
 
 LLMに大量のノートを読ませず、MCP側でfrontmatterと要約を検索し、短いヒットを返す。
+
+`knowledge_get_recent_lessons` は `knowledge.recent_lessons.v2` を返す。`safety_floor_denials` は tool input の `limit` を lessons と共用し、同じ symbol と `safety_violations.created_at` の lookback 内で、最新の SafetyFloor 拒否を新しい順に `min(limit, 5)` run返す。同一 run の複数 violation は最新1件に畳み、order / execution の lifecycle evidence が優先して outcome が `DENIED` 以外になる run は含めない。`prior_proposal` は LLM 申告値、`machine_outcome` は typed `safety_violations` column から構築する機械判定値であり、Falsifier は別の `falsifier` object として返す。payload や tool evidence は返さない。
+
+denial section は identifier、rule、final reason を allowlist 化し、SecretRedactor 後に whitespace 正規化と長さ制限を適用する。`lookback_days` は既存の既定30日・最大365日を共用する。reader は Activity outcome を適用した eligible `DENIED` を適用件数上限とその次の1件まで判定し、件数省略を `safety_floor_denials_truncated` に記録する。候補 scan は request あたり上限を持ち、scan 上限に達した場合も `truncated=true` とする。serialized UTF-8 JSON section は16 KiBまでとし、新しい順の prefix を返す。0件でも空配列、item count 0、truncated false を返す。
 
 ### 8.8 1回のCLI起動内で行うこと/振り返りへ回すこと
 

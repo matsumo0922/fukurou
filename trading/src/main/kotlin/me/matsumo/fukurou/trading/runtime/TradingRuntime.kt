@@ -2,6 +2,8 @@ package me.matsumo.fukurou.trading.runtime
 
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialReader
+import me.matsumo.fukurou.trading.activity.EmptyDecisionRunSafetyDenialReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.broker.Broker
@@ -24,6 +26,7 @@ import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
+import me.matsumo.fukurou.trading.persistence.ExposedDecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEquitySnapshotRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
@@ -88,6 +91,7 @@ private const val INITIALIZATION_FAIL_TIMEOUT = -1L
  * @param evaluationRepository evaluation aggregate repository
  * @param decisionRepository decision protocol repository
  * @param safetyViolationRepository SafetyFloor violation repository
+ * @param safetyDenialReader SafetyFloor 拒否 feedback reader
  * @param broker account / position ledger 読み取り境界
  * @param tradingLock global trading lock
  * @param toolCallGuard MCP tool call guard
@@ -103,6 +107,7 @@ data class TradingRuntime(
     val evaluationRepository: EvaluationRepository,
     val decisionRepository: DecisionRepository,
     val safetyViolationRepository: SafetyViolationRepository,
+    val safetyDenialReader: DecisionRunSafetyDenialReader,
     val broker: Broker,
     val tradingLock: TradingLock,
     val toolCallGuard: ToolCallGuard,
@@ -261,6 +266,7 @@ object TradingRuntimeFactory {
             evaluationRepository = evaluationRepository,
             decisionRepository = decisionRepository,
             safetyViolationRepository = safetyViolationRepository,
+            safetyDenialReader = EmptyDecisionRunSafetyDenialReader,
             broker = broker,
             tradingLock = tradingLock,
             toolCallGuard = toolCallGuard,
@@ -320,6 +326,7 @@ object TradingRuntimeFactory {
 
         val repositories = createPostgresRepositories(connection, context)
         val services = createPostgresServices(connection, context, repositories)
+        val safetyDenialReader = ExposedDecisionRunProjectionRepository(connection.database, context.clock)
         val closeAction = if (connection.closeDataSource) {
             { connection.dataSource.close() }
         } else {
@@ -335,6 +342,7 @@ object TradingRuntimeFactory {
             evaluationRepository = repositories.evaluationRepository,
             decisionRepository = repositories.decisionRepository,
             safetyViolationRepository = services.safetyViolationRepository,
+            safetyDenialReader = safetyDenialReader,
             broker = services.broker,
             tradingLock = services.tradingLock,
             toolCallGuard = services.toolCallGuard,

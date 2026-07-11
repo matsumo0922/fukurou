@@ -14,24 +14,28 @@ import me.matsumo.fukurou.trading.activity.DecisionRunOutcomeEvidence
 import me.matsumo.fukurou.trading.activity.DecisionRunPage
 import me.matsumo.fukurou.trading.activity.DecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.activity.DecisionRunRawRecord
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenial
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialPage
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialQuery
+import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialReader
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyViolation
 import me.matsumo.fukurou.trading.activity.DecisionRunSummary
 import me.matsumo.fukurou.trading.activity.classifyDecisionRunOutcome
 import me.matsumo.fukurou.trading.activity.matches
+import me.matsumo.fukurou.trading.activity.safeDecisionRunFinalReason
 import me.matsumo.fukurou.trading.activity.withStrategyEvaluation
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
+import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.ResultSet
 import java.time.Clock
 import java.time.Instant
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
-
-private val SAFE_FINAL_REASON_PATTERN = Regex("[a-z][a-z0-9_]{0,79}")
 
 /** domain policy から生成する resting entry role SQL。 */
 private val RESTING_ENTRY_ROLE_SQL = buildString {
@@ -336,6 +340,34 @@ private const val FIND_SAFE_AUDIT_SQL = """
     ORDER BY ts ASC, id ASC
 """
 
+private const val FIND_SAFETY_DENIAL_INVOCATIONS_SQL = """
+    WITH ranked_denials AS (
+        SELECT safety.decision_run_id, safety.created_at, safety.id,
+            ROW_NUMBER() OVER (
+                PARTITION BY safety.decision_run_id
+                ORDER BY safety.created_at DESC, safety.id DESC
+            ) AS row_number
+        FROM safety_violations safety
+        JOIN llm_runs run ON run.invocation_id = safety.decision_run_id
+        WHERE safety.decision_run_id IS NOT NULL
+            AND run.symbol = ?
+            AND run.trigger_kind IS DISTINCT FROM 'REFLECTION'
+            AND safety.created_at >= ?
+            AND safety.created_at < ?
+    )
+    SELECT decision_run_id
+    FROM ranked_denials
+    WHERE row_number = 1
+    ORDER BY created_at DESC, id DESC
+    LIMIT ? OFFSET ?
+"""
+
+/** SafetyFloor denial reader が一度に outcome 判定する候補数。 */
+private const val SAFETY_DENIAL_SCAN_BATCH_SIZE = 100
+
+/** SafetyFloor denial reader が1 requestで走査する最大 batch 数。 */
+private const val MAX_SAFETY_DENIAL_SCAN_BATCHES = 10
+
 /**
  * PostgreSQL の append-only 台帳から decision run projection を構築する repository。
  *
@@ -345,7 +377,7 @@ private const val FIND_SAFE_AUDIT_SQL = """
 class ExposedDecisionRunProjectionRepository(
     private val database: ExposedDatabase,
     private val clock: Clock = Clock.systemUTC(),
-) : DecisionRunProjectionRepository {
+) : DecisionRunProjectionRepository, DecisionRunSafetyDenialReader {
 
     override suspend fun listRuns(
         cursor: DecisionRunCursor?,
@@ -367,6 +399,77 @@ class ExposedDecisionRunProjectionRepository(
             }
         }
     }
+
+    override suspend fun readSafetyDenials(query: DecisionRunSafetyDenialQuery): Result<DecisionRunSafetyDenialPage> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(query.limit > 0) { "limit must be greater than 0." }
+                exposedTransaction(database) { selectSafetyDenials(query, clock.instant()) }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectSafetyDenials(
+    query: DecisionRunSafetyDenialQuery,
+    observedAt: Instant,
+): DecisionRunSafetyDenialPage {
+    val selected = mutableListOf<DecisionRunSafetyDenial>()
+
+    repeat(MAX_SAFETY_DENIAL_SCAN_BATCHES) { batchIndex ->
+        val candidates = selectSafetyDenialCandidates(query, batchIndex)
+
+        for (invocationId in candidates) {
+            val denial = selectRunDetailBase(invocationId, observedAt).toSafetyDenialOrNull() ?: continue
+            selected += denial
+
+            if (selected.size > query.limit) {
+                return DecisionRunSafetyDenialPage(selected.take(query.limit), truncated = true)
+            }
+        }
+
+        if (candidates.size < SAFETY_DENIAL_SCAN_BATCH_SIZE) {
+            return DecisionRunSafetyDenialPage(selected, truncated = false)
+        }
+    }
+
+    return DecisionRunSafetyDenialPage(selected, truncated = true)
+}
+
+private fun JdbcTransaction.selectSafetyDenialCandidates(
+    query: DecisionRunSafetyDenialQuery,
+    batchIndex: Int,
+): List<String> {
+    return jdbcConnection().prepareStatement(FIND_SAFETY_DENIAL_INVOCATIONS_SQL).use { statement ->
+        statement.setString(1, query.symbol.apiSymbol)
+        statement.setLong(2, query.from.toEpochMilli())
+        statement.setLong(3, query.toExclusive.toEpochMilli())
+        statement.setInt(4, SAFETY_DENIAL_SCAN_BATCH_SIZE)
+        statement.setInt(5, batchIndex * SAFETY_DENIAL_SCAN_BATCH_SIZE)
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) add(resultSet.getString("decision_run_id"))
+            }
+        }
+    }
+}
+
+private fun DecisionRunDetail?.toSafetyDenialOrNull(): DecisionRunSafetyDenial? {
+    val detail = this ?: return null
+    val violation = detail.safetyViolation ?: return null
+    val safeRule = violation.rule.takeIf { rule -> SafetyFloorRule.entries.any { candidate -> candidate.name == rule } }
+
+    if (detail.summary.outcome != me.matsumo.fukurou.trading.activity.DecisionRunOutcome.DENIED || safeRule == null) return null
+
+    return DecisionRunSafetyDenial(
+        invocationId = detail.summary.invocationId,
+        deniedAt = violation.createdAt,
+        finalReason = detail.summary.finalReason,
+        decision = detail.decision,
+        intent = detail.intent,
+        falsification = detail.falsification,
+        safetyViolation = violation.copy(rule = safeRule),
+    )
 }
 
 private fun JdbcTransaction.selectRuns(
@@ -439,7 +542,26 @@ private fun JdbcTransaction.selectRunBatch(
 }
 
 private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: Instant): DecisionRunDetail? {
-    val base = jdbcConnection().prepareStatement(FIND_RUN_SQL).use { statement ->
+    val base = selectRunDetailBase(invocationId, observedAt) ?: return null
+    val orders = selectOrders(invocationId)
+    val executions = selectExecutions(invocationId)
+    val raw = buildList {
+        addAll(base.raw)
+        addAll(selectSafeAudit(invocationId))
+        addAll(orders.map { order -> order.toRawRecord() })
+        addAll(executions.map { execution -> execution.toRawRecord() })
+    }.sortedBy { record -> record.occurredAt }
+
+    return base.copy(
+        summary = base.summary.copy(order = orders.lastOrNull { order -> order.side == "BUY" }),
+        orders = orders,
+        executions = executions,
+        raw = raw,
+    )
+}
+
+private fun JdbcTransaction.selectRunDetailBase(invocationId: String, observedAt: Instant): DecisionRunDetail? {
+    return jdbcConnection().prepareStatement(FIND_RUN_SQL).use { statement ->
         val overdueCutoff = observedAt.minus(PaperOrderLifecyclePolicy.cancellationGrace).toEpochMilli()
         val waitingStatus = PaperOrderLifecyclePolicy.waitingStatuses.single().name
         statement.setString(1, OrderStatus.FILLED.name)
@@ -457,22 +579,7 @@ private fun JdbcTransaction.selectRunDetail(invocationId: String, observedAt: In
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.toDetailBase() else null
         }
-    } ?: return null
-    val orders = selectOrders(invocationId)
-    val executions = selectExecutions(invocationId)
-    val raw = buildList {
-        addAll(base.raw)
-        addAll(selectSafeAudit(invocationId))
-        addAll(orders.map { order -> order.toRawRecord() })
-        addAll(executions.map { execution -> execution.toRawRecord() })
-    }.sortedBy { record -> record.occurredAt }
-
-    return base.copy(
-        summary = base.summary.copy(order = orders.lastOrNull { order -> order.side == "BUY" }),
-        orders = orders,
-        executions = executions,
-        raw = raw,
-    )
+    }
 }
 
 private fun JdbcTransaction.selectOrders(invocationId: String): List<DecisionRunOrder> {
@@ -586,7 +693,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
         falsificationVerdict = getString("verdict"),
         safetyRule = safetyRule,
         safetyMessageJa = getString("message_ja"),
-        finalReason = noTradeReason.safeNoTradeReason(),
+        finalReason = noTradeReason.safeDecisionRunFinalReason(),
         orderCount = orderCount,
         executionCount = executionCount,
         hasProcessFailure = errorMessage != null ||
@@ -740,10 +847,6 @@ private fun ResultSet.nullableInstant(column: String): Instant? {
 private fun ResultSet.nullableLong(column: String): Long? {
     val value = getLong(column)
     return if (wasNull()) null else value
-}
-
-private fun String?.safeNoTradeReason(): String? {
-    return this?.takeIf(SAFE_FINAL_REASON_PATTERN::matches)
 }
 
 private fun DecisionRunOrder.toRawRecord(): DecisionRunRawRecord {
