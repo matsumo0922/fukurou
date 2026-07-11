@@ -25,6 +25,10 @@ export type EvaluationReport = {
   sources: { sourceId: string; observedAt: string; freshness: string }[];
   chartIndex: { chartId: string; catalogVersion: string; factIds: string[] }[];
   outcomeRidge: { catalogVersion: string; observationKind: string; domain: { minInclusive: string; maxExclusive: string; binWidth: string }; referenceLines: string[]; groupings: { groupBy: string; groups: OutcomeRidgeGroup[] }[] };
+  benchmark: { baselineEquityJpy: string; points: { date: string; botEquityJpy: string; buyAndHoldEquityJpy: string; noTradeEquityJpy: string }[]; botReturn: string | null; buyAndHoldReturn: string | null; state: string };
+  calibration: { unit: string; authority: string; state: string; cells: { groupBy: string; groupKey: string; lowerBoundInclusive: string; upperBound: string; averageForecastProbability: string | null; realizedWinRate: string | null; sampleCount: number; state: string }[] };
+  performanceLattice: { unit: string; authority: string; state: string; cells: { setup: string; marketRegime: string; tradeCount: number; expectedR: string | null; totalPnlJpy: string; profitFactor: string | null; state: string }[] };
+  integrity: { eligibleTradeCount: number; missingRCount: number; excludedOrderCount: number; excludedPositionCount: number; excludedDecisionRunCount: number; exclusionReasons: Record<string, number>; llmPhaseCount: number; missingUsagePhaseCount: number; unpricedPhaseCount: number; knownCostUsd: string | null; usageTruncated: boolean };
   truncated: boolean;
 };
 export type ReportJob = { jobId: string; revisionId: string; status: string; stage: string; failureCode: string | null; failureMessage: string | null };

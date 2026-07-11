@@ -83,6 +83,7 @@ function ReportConsole({ report }: { report: EvaluationReport }) {
     <RevisionRail report={report} />
     <ReportStage report={report} selectedClaim={selectedClaim} onSelectClaim={setSelectedClaim} />
     <EvidenceSummary report={report} />
+    <DeterministicEvidenceBoard report={report} />
     <HistoricalOutcomeRidge report={report} />
     <LazyEvidenceRelationshipGraph report={report} selectedClaim={selectedClaim} onSelectClaim={setSelectedClaim} />
   </>;
@@ -119,6 +120,31 @@ function EvidenceSummary({ report }: { report: EvaluationReport }) {
   const missing = report.facts.filter((fact) => fact.availability !== "AVAILABLE").length;
   const availableR = report.outcomeRidge.groupings.find((item) => item.groupBy === "SETUP")?.groups.reduce((sum, group) => sum + group.availableRCount, 0) ?? 0;
   return <section className="evidence-summary"><div><span>Deterministic facts</span><strong>{report.facts.length}</strong></div><div><span>Sources</span><strong>{report.sources.length}</strong></div><div><span>R available</span><strong>{availableR}</strong></div><div><span>Missing facts</span><strong>{missing}</strong></div><div><span>Coverage</span><strong>{report.truncated ? "PARTIAL SNAPSHOT" : "COMPLETE"}</strong></div></section>;
+}
+
+function DeterministicEvidenceBoard({ report }: { report: EvaluationReport }) {
+  const setupCalibration = report.calibration.cells.filter((cell) => cell.groupBy === "SETUP" && cell.sampleCount > 0);
+  const realizedGroups = report.outcomeRidge.groupings.find((grouping) => grouping.groupBy === "SETUP")?.groups ?? [];
+
+  return <section className="report-panel" aria-labelledby="deterministic-evidence-title">
+    <header className="report-panel__header"><div><span className="console-kicker">DETERMINISTIC SNAPSHOT VISUALIZATIONS</span><h2 id="deterministic-evidence-title">Performance, calibration and integrity</h2><p>Authority: immutable closed paper trades, daily candles and persisted runner usage. These panels are descriptive, not forecasts.</p></div></header>
+    <div className="report-stage__grid">
+      <article><h3>Bot realized vs benchmark equity</h3><p>JPY · {report.benchmark.points.length} daily observations · {report.benchmark.state}</p><EquityChart report={report} /><table><caption>Equity series accessible fallback</caption><thead><tr><th>Date</th><th>Bot JPY</th><th>Buy &amp; hold JPY</th><th>No trade JPY</th></tr></thead><tbody>{report.benchmark.points.map((point) => <tr key={point.date}><td>{point.date}</td><td>{point.botEquityJpy}</td><td>{point.buyAndHoldEquityJpy}</td><td>{point.noTradeEquityJpy}</td></tr>)}</tbody></table></article>
+      <article><h3>Forecast calibration probability lattice</h3><p>{report.calibration.unit} · {report.calibration.authority} · {report.calibration.state}</p>{setupCalibration.length === 0 ? <p>Insufficient sample: no closed trade has a usable forecast probability.</p> : <table><caption>Forecast probability against realized win rate</caption><thead><tr><th>Setup / bin</th><th>Forecast p</th><th>Realized win rate</th><th>n / state</th></tr></thead><tbody>{setupCalibration.map((cell) => <tr key={`${cell.groupKey}-${cell.lowerBoundInclusive}`}><td>{cell.groupKey} [{cell.lowerBoundInclusive}, {cell.upperBound}]</td><td>{cell.averageForecastProbability ?? "missing"}</td><td>{cell.realizedWinRate ?? "insufficient"}</td><td>{cell.sampleCount} / {cell.state}</td></tr>)}</tbody></table>}</article>
+      <article><h3>Setup × market regime performance lattice</h3><p>{report.performanceLattice.unit} · {report.performanceLattice.authority} · {report.performanceLattice.state}</p>{report.performanceLattice.cells.length === 0 ? <p>Insufficient sample: there are no eligible closed trades.</p> : <table><caption>Expected realized R by setup and market regime</caption><thead><tr><th>Setup</th><th>Regime</th><th>Expected R</th><th>PnL JPY</th><th>n / state</th></tr></thead><tbody>{report.performanceLattice.cells.map((cell) => <tr key={`${cell.setup}-${cell.marketRegime}`}><td>{cell.setup}</td><td>{cell.marketRegime}</td><td>{cell.expectedR ?? "missing R"}</td><td>{cell.totalPnlJpy}</td><td>{cell.tradeCount} / {cell.state}</td></tr>)}</tbody></table>}</article>
+      <article><h3>Evidence integrity / coverage and cost</h3><p>Snapshot authority · missing and exclusions remain explicit</p><dl><dt>Eligible trades</dt><dd>{report.integrity.eligibleTradeCount}</dd><dt>Missing realized R</dt><dd>{report.integrity.missingRCount}</dd><dt>Excluded order / position / run</dt><dd>{report.integrity.excludedOrderCount} / {report.integrity.excludedPositionCount} / {report.integrity.excludedDecisionRunCount}</dd><dt>LLM usage phases</dt><dd>{report.integrity.llmPhaseCount} ({report.integrity.missingUsagePhaseCount} missing usage, {report.integrity.unpricedPhaseCount} unpriced)</dd><dt>Known cost USD</dt><dd>{report.integrity.knownCostUsd ?? "unavailable"}{report.integrity.usageTruncated ? " · partial" : ""}</dd></dl>{Object.keys(report.integrity.exclusionReasons).length === 0 ? <p>No persisted exclusion reason in this period.</p> : <ul>{Object.entries(report.integrity.exclusionReasons).map(([reason, count]) => <li key={reason}>{reason}: {count}</li>)}</ul>}</article>
+      <article><h3>Realized R outcome summary</h3><p>R multiple · observed closed trades only · separate summary of ridge facts</p>{realizedGroups.length === 0 ? <p>Insufficient sample: no setup distribution exists.</p> : <table><caption>Realized R availability and median by setup</caption><thead><tr><th>Setup</th><th>Median R</th><th>Available / missing</th><th>Sample state</th></tr></thead><tbody>{realizedGroups.map((group) => <tr key={group.groupKey}><td>{group.label}</td><td>{group.medianR ?? "insufficient"}</td><td>{group.availableRCount} / {group.missingRCount}</td><td>{group.sampleState}</td></tr>)}</tbody></table>}</article>
+    </div>
+  </section>;
+}
+
+function EquityChart({ report }: { report: EvaluationReport }) {
+  const points = report.benchmark.points;
+  if (points.length < 2) return <p>Insufficient sample: at least two daily observations are required.</p>;
+  const values = points.flatMap((point) => [Number(point.botEquityJpy), Number(point.buyAndHoldEquityJpy), Number(point.noTradeEquityJpy)]).filter(Number.isFinite);
+  const min = Math.min(...values); const max = Math.max(...values); const span = Math.max(max - min, 1);
+  const path = (field: "botEquityJpy" | "buyAndHoldEquityJpy" | "noTradeEquityJpy") => points.map((point, index) => `${(index / (points.length - 1)) * 100},${60 - ((Number(point[field]) - min) / span) * 50}`).join(" ");
+  return <><svg viewBox="0 0 100 65" role="img" aria-labelledby="equity-chart-title equity-chart-desc"><title id="equity-chart-title">Bot realized equity and benchmark lines</title><desc id="equity-chart-desc">JPY equity over {points.length} daily observations. Blue is bot realized, amber is buy and hold, gray is no trade.</desc><polyline points={path("botEquityJpy")} fill="none" stroke="currentColor" strokeWidth="1.5" /><polyline points={path("buyAndHoldEquityJpy")} fill="none" stroke="#c78b2c" strokeWidth="1.2" /><polyline points={path("noTradeEquityJpy")} fill="none" stroke="#777" strokeWidth="1" /></svg><p>Legend: bot realized (blue/current color), buy &amp; hold (amber), no trade (gray). Unit: JPY.</p></>;
 }
 
 function humanStatus(status: string): string {

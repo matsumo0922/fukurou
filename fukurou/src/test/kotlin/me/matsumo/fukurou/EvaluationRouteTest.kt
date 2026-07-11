@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou
 
 import io.ktor.client.request.get
@@ -8,6 +10,7 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
+import kotlinx.coroutines.delay
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -177,6 +180,23 @@ class EvaluationRouteTest {
 
         assertEquals(HttpStatusCode.Accepted, preset.status)
         assertEquals(HttpStatusCode.Accepted, custom.status)
+
+        val revisionId = requireNotNull(Regex("\\\"revisionId\\\":\\\"([^\\\"]+)").find(custom.bodyAsText()))
+            .groupValues[1]
+        var revisionBody: String? = null
+        var attemptsRemaining = 20
+        while (revisionBody == null && attemptsRemaining > 0) {
+            val revision = client.get("/evaluation/reports/revisions/$revisionId")
+            if (revision.status == HttpStatusCode.OK) revisionBody = revision.bodyAsText()
+            if (revisionBody == null) delay(10)
+            attemptsRemaining -= 1
+        }
+        val generated = requireNotNull(revisionBody)
+        assertTrue(generated.contains("\"scopeKey\":\"CUSTOM:2026-06-01:2026-06-30\""))
+        assertTrue(generated.contains("\"benchmark\""))
+        assertTrue(generated.contains("\"calibration\""))
+        assertTrue(generated.contains("\"performanceLattice\""))
+        assertTrue(generated.contains("\"integrity\""))
     }
 
     @Test

@@ -19,10 +19,13 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.evaluation.BenchmarkCalculationRequest
+import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.OutcomeRidgeChartFacts
+import me.matsumo.fukurou.trading.evaluation.MarketRegimeLabel
 import me.matsumo.fukurou.trading.evaluation.report.EvaluationClaimValidator
 import me.matsumo.fukurou.trading.evaluation.report.EvaluationReportClaim
 import me.matsumo.fukurou.trading.evaluation.report.EvaluationReportFact
@@ -219,7 +222,7 @@ private class EvaluationReportStore(
         return job
     }
 
-    @Suppress("LongMethod")
+    @Suppress("LongMethod", "CyclomaticComplexMethod")
     suspend fun generate(
         scope: EvaluationReportScope,
         job: EvaluationReportJobResponse,
@@ -242,6 +245,44 @@ private class EvaluationReportStore(
         val regimes = EvaluationMath.classifyMarketRegimes(candles, ReportZone)
         val stats = EvaluationMath.summarizeTrades(queryResult.trades)
         val ridge = EvaluationMath.historicalOutcomeRidges(queryResult.trades, ReportZone, regimes)
+        val baselineEquity = source.fetchInitialCashJpy().getOrThrow()
+            .add(source.sumTradePnlBefore(period.from).getOrThrow())
+        val benchmark = EvaluationMath.benchmark(
+            BenchmarkCalculationRequest(
+                candles = candles,
+                dailyPnlFacts = source.fetchDailyTradePnl(period).getOrThrow(),
+                baselineEquityJpy = baselineEquity,
+                fromDate = from,
+                toDateInclusive = toInclusive,
+                zoneId = ReportZone,
+            ),
+        )
+        val calibration = buildCalibrationResponse(queryResult.trades)
+        val performanceLattice = buildPerformanceLattice(queryResult.trades, regimes)
+        val usageResult = source.fetchLlmPhaseUsages(period).getOrThrow()
+        val costStats = EvaluationMath.summarizeLlmCosts(usageResult.facts)
+        val exclusions = source.fetchExclusionSummary(period).getOrThrow()
+        val benchmarkFacts = benchmark.points.flatMap { point ->
+            listOf(
+                EvaluationReportFact("benchmark.${point.date}.botEquityJpy", point.botEquityJpy.toPlainString(), "JPY", "AVAILABLE", listOf("paper-ledger")),
+                EvaluationReportFact("benchmark.${point.date}.buyAndHoldEquityJpy", point.buyAndHoldEquityJpy.toPlainString(), "JPY", "AVAILABLE", listOf("daily-candles")),
+                EvaluationReportFact("benchmark.${point.date}.noTradeEquityJpy", point.noTradeEquityJpy.toPlainString(), "JPY", "AVAILABLE", listOf("paper-ledger")),
+            )
+        }
+        val calibrationFacts = calibration.cells.flatMap { cell ->
+            listOf(
+                EvaluationReportFact("calibration.${cell.groupBy}.${cell.groupKey}.${cell.lowerBoundInclusive}.forecast", cell.averageForecastProbability, "PROBABILITY", if (cell.averageForecastProbability == null) "MISSING" else "AVAILABLE", listOf("paper-ledger")),
+                EvaluationReportFact("calibration.${cell.groupBy}.${cell.groupKey}.${cell.lowerBoundInclusive}.realized", cell.realizedWinRate, "PROBABILITY", if (cell.realizedWinRate == null) "MISSING" else "AVAILABLE", listOf("paper-ledger")),
+            )
+        }
+        val latticeFacts = performanceLattice.cells.map { cell ->
+            EvaluationReportFact("lattice.${cell.setup}.${cell.marketRegime}.expectedR", cell.expectedR, "R", if (cell.expectedR == null) "MISSING" else "AVAILABLE", listOf("paper-ledger", "daily-candles"))
+        }
+        val integrityFacts = listOf(
+            EvaluationReportFact("integrity.missingRCount", stats.rUnavailableCount.toString(), "COUNT", "AVAILABLE", listOf("paper-ledger")),
+            EvaluationReportFact("integrity.excludedPositionCount", exclusions.positionCount.toString(), "COUNT", "AVAILABLE", listOf("exclusion-audit")),
+            EvaluationReportFact("integrity.knownCostUsd", costStats.knownCostUsd?.toPlainString(), "USD", if (costStats.knownCostUsd == null) "MISSING" else "AVAILABLE", listOf("runner-audit")),
+        )
         val baseFacts = listOf(
             EvaluationReportFact("performance.tradeCount", stats.tradeCount.toString(), "COUNT", "AVAILABLE", listOf("paper-ledger")),
             EvaluationReportFact("performance.totalPnlJpy", stats.totalPnlJpy.toPlainString(), "JPY", "AVAILABLE", listOf("paper-ledger")),
@@ -267,13 +308,17 @@ private class EvaluationReportStore(
                 )
             }
         }
-        val facts = baseFacts + ridgeFacts
+        val facts = baseFacts + ridgeFacts + benchmarkFacts + calibrationFacts + latticeFacts + integrityFacts
         val chartIndex = listOf(
             EvaluationChartIndexResponse(
                 chartId = "historical-realized-r-ridge",
                 catalogVersion = ridge.catalogVersion,
                 factIds = ridgeFacts.map { fact -> fact.factId },
             ),
+            EvaluationChartIndexResponse("bot-benchmark-equity", "evaluation-report-v1", benchmarkFacts.map { fact -> fact.factId }),
+            EvaluationChartIndexResponse("forecast-calibration-lattice", "evaluation-report-v1", calibrationFacts.map { fact -> fact.factId }),
+            EvaluationChartIndexResponse("setup-market-regime-lattice", "evaluation-report-v1", latticeFacts.map { fact -> fact.factId }),
+            EvaluationChartIndexResponse("evidence-integrity", "evaluation-report-v1", integrityFacts.map { fact -> fact.factId }),
         )
         val claims = listOf(
             EvaluationReportClaim("claim-pnl-direction", "FACT_DIRECTION", listOf("performance.totalPnlJpy"), direction(stats.totalPnlJpy)),
@@ -290,7 +335,7 @@ private class EvaluationReportStore(
         val validation = EvaluationClaimValidator.validate(artifact.claims.toDomain(), facts)
         validateSnapshotReferences(
             facts = facts,
-            sourceIds = setOf("paper-ledger"),
+            sourceIds = setOf("paper-ledger", "daily-candles", "exclusion-audit", "runner-audit"),
             chartIndex = chartIndex,
             claims = artifact.claims,
         )
@@ -304,6 +349,12 @@ private class EvaluationReportStore(
                     append('|').append(grouping.groupBy).append(':').append(group.groupKey).append(':').append(binCounts)
                 }
             }
+            append("|benchmarkReturns=").append(benchmark.botReturn).append(':').append(benchmark.buyAndHoldReturn)
+            append("|calibrationState=").append(calibration.state)
+            append("|latticeState=").append(performanceLattice.state)
+            append("|exclusions=").append(exclusions.reasons.toSortedMap())
+            append("|usageCoverage=").append(costStats.phaseCount).append(':')
+                .append(costStats.missingUsagePhaseCount).append(':').append(costStats.unpricedPhaseCount)
         }
         val revisionNumber = persistence?.nextRevisionNumber()?.getOrThrow() ?: revisionSequence.incrementAndGet()
         val report = EvaluationReportResponse(
@@ -324,9 +375,43 @@ private class EvaluationReportStore(
             claims = artifact.claims,
             validation = validation.map { result -> EvaluationClaimValidationResponse(result.claimId, result.status.name, result.asserted, result.actual, result.factIds, result.code) },
             facts = facts.map { fact -> EvaluationReportFactResponse(fact.factId, fact.value, fact.unit, fact.availability, fact.sourceIds) },
-            sources = listOf(EvaluationReportSourceResponse("paper-ledger", clock.instant().toString(), "SNAPSHOT")),
+            sources = listOf(
+                EvaluationReportSourceResponse("paper-ledger", clock.instant().toString(), "SNAPSHOT"),
+                EvaluationReportSourceResponse("daily-candles", clock.instant().toString(), if (candles.isEmpty()) "UNAVAILABLE" else "SNAPSHOT"),
+                EvaluationReportSourceResponse("exclusion-audit", clock.instant().toString(), "SNAPSHOT"),
+                EvaluationReportSourceResponse("runner-audit", clock.instant().toString(), if (usageResult.truncated) "PARTIAL" else "SNAPSHOT"),
+            ),
             chartIndex = chartIndex,
             outcomeRidge = ridge.toResponse(),
+            benchmark = ReportBenchmarkChartResponse(
+                baselineEquityJpy = baselineEquity.toPlainString(),
+                points = benchmark.points.map { point ->
+                    ReportBenchmarkPointResponse(
+                        date = point.date.toString(),
+                        botEquityJpy = point.botEquityJpy.toPlainString(),
+                        buyAndHoldEquityJpy = point.buyAndHoldEquityJpy.toPlainString(),
+                        noTradeEquityJpy = point.noTradeEquityJpy.toPlainString(),
+                    )
+                },
+                botReturn = benchmark.botReturn?.toPlainString(),
+                buyAndHoldReturn = benchmark.buyAndHoldReturn?.toPlainString(),
+                state = if (benchmark.points.isEmpty()) "INSUFFICIENT_SAMPLE" else "AVAILABLE",
+            ),
+            calibration = calibration,
+            performanceLattice = performanceLattice,
+            integrity = EvaluationIntegrityResponse(
+                eligibleTradeCount = queryResult.trades.size,
+                missingRCount = stats.rUnavailableCount,
+                excludedOrderCount = exclusions.orderCount,
+                excludedPositionCount = exclusions.positionCount,
+                excludedDecisionRunCount = exclusions.decisionRunCount,
+                exclusionReasons = exclusions.reasons,
+                llmPhaseCount = costStats.phaseCount,
+                missingUsagePhaseCount = costStats.missingUsagePhaseCount,
+                unpricedPhaseCount = costStats.unpricedPhaseCount,
+                knownCostUsd = costStats.knownCostUsd?.toPlainString(),
+                usageTruncated = usageResult.truncated,
+            ),
             truncated = queryResult.truncated,
         )
         synchronized(reports) { reports.getOrPut(scope.key) { mutableListOf() }.add(0, report) }
@@ -493,6 +578,73 @@ private fun fallbackArtifact(
     },
 )
 
+private fun buildCalibrationResponse(trades: List<ClosedTradeFact>): ReportCalibrationChartResponse {
+    fun cells(groupBy: String, groups: List<me.matsumo.fukurou.trading.evaluation.CalibrationGroupStats>) =
+        groups.flatMap { group ->
+            group.bins.map { bin ->
+                ReportCalibrationCellResponse(
+                    groupBy = groupBy,
+                    groupKey = group.groupKey,
+                    lowerBoundInclusive = bin.lowerBoundInclusive.toPlainString(),
+                    upperBound = bin.upperBound.toPlainString(),
+                    averageForecastProbability = bin.averageEstimatedProbability?.toPlainString(),
+                    realizedWinRate = bin.realizedWinRate?.toPlainString(),
+                    sampleCount = bin.tradeCount,
+                    state = sampleState(bin.tradeCount),
+                )
+            }
+        }
+
+    val result = cells("SETUP", EvaluationMath.calibrationBySetup(trades)) +
+        cells("PROVIDER", EvaluationMath.calibrationByProvider(trades))
+    return ReportCalibrationChartResponse(
+        unit = "PROBABILITY_0_TO_1",
+        authority = "IMMUTABLE_CLOSED_PAPER_TRADES",
+        cells = result,
+        state = if (result.any { cell -> cell.sampleCount > 0 }) "AVAILABLE" else "INSUFFICIENT_SAMPLE",
+    )
+}
+
+private fun buildPerformanceLattice(
+    trades: List<ClosedTradeFact>,
+    regimes: List<MarketRegimeLabel>,
+): ReportPerformanceLatticeResponse {
+    val regimeByDate = regimes.associateBy { regime -> regime.date }
+    val grouped = trades.flatMap { trade ->
+        val regime = regimeByDate[trade.openedAt.atZone(ReportZone).toLocalDate()]
+        val regimeKey = regime?.let { value -> "${value.trend.name}/${value.volatility.name}" } ?: "UNKNOWN"
+        trade.setupTags.ifEmpty { listOf("UNCLASSIFIED") }.map { setup -> setup to regimeKey to trade }
+    }.groupBy(
+        keySelector = { entry -> entry.first },
+        valueTransform = { entry -> entry.second },
+    )
+    val cells = grouped.map { (keys, groupedTrades) ->
+        val stats = EvaluationMath.summarizeTrades(groupedTrades)
+        ReportPerformanceCellResponse(
+            setup = keys.first,
+            marketRegime = keys.second,
+            tradeCount = stats.tradeCount,
+            expectedR = stats.expectedR?.toPlainString(),
+            totalPnlJpy = stats.totalPnlJpy.toPlainString(),
+            profitFactor = stats.profitFactor?.toPlainString(),
+            state = sampleState(stats.tradeCount),
+        )
+    }.sortedWith(compareBy({ cell -> cell.setup }, { cell -> cell.marketRegime }))
+
+    return ReportPerformanceLatticeResponse(
+        unit = "EXPECTED_REALIZED_R",
+        authority = "IMMUTABLE_CLOSED_PAPER_TRADES_AND_DAILY_MARKET_REGIME",
+        cells = cells,
+        state = if (cells.isEmpty()) "INSUFFICIENT_SAMPLE" else "AVAILABLE",
+    )
+}
+
+private fun sampleState(count: Int): String = when {
+    count == 0 -> "EMPTY"
+    count < 10 -> "PROVISIONAL"
+    else -> "COMPARABLE"
+}
+
 @Serializable
 private data class GeneratedEvaluationArtifact(
     val segments: List<EvaluationReportSegmentResponse>,
@@ -641,6 +793,77 @@ data class OutcomeRidgeGroupingResponse(val groupBy: String, val groups: List<Ou
 data class OutcomeRidgeResponse(val catalogVersion: String, val observationKind: String, val domain: OutcomeRidgeDomainResponse, val referenceLines: List<String>, val groupings: List<OutcomeRidgeGroupingResponse>)
 
 @Serializable
+data class ReportBenchmarkPointResponse(
+    val date: String,
+    val botEquityJpy: String,
+    val buyAndHoldEquityJpy: String,
+    val noTradeEquityJpy: String,
+)
+
+@Serializable
+data class ReportBenchmarkChartResponse(
+    val baselineEquityJpy: String,
+    val points: List<ReportBenchmarkPointResponse>,
+    val botReturn: String?,
+    val buyAndHoldReturn: String?,
+    val state: String,
+)
+
+@Serializable
+data class ReportCalibrationCellResponse(
+    val groupBy: String,
+    val groupKey: String,
+    val lowerBoundInclusive: String,
+    val upperBound: String,
+    val averageForecastProbability: String?,
+    val realizedWinRate: String?,
+    val sampleCount: Int,
+    val state: String,
+)
+
+@Serializable
+data class ReportCalibrationChartResponse(
+    val unit: String,
+    val authority: String,
+    val cells: List<ReportCalibrationCellResponse>,
+    val state: String,
+)
+
+@Serializable
+data class ReportPerformanceCellResponse(
+    val setup: String,
+    val marketRegime: String,
+    val tradeCount: Int,
+    val expectedR: String?,
+    val totalPnlJpy: String,
+    val profitFactor: String?,
+    val state: String,
+)
+
+@Serializable
+data class ReportPerformanceLatticeResponse(
+    val unit: String,
+    val authority: String,
+    val cells: List<ReportPerformanceCellResponse>,
+    val state: String,
+)
+
+@Serializable
+data class EvaluationIntegrityResponse(
+    val eligibleTradeCount: Int,
+    val missingRCount: Int,
+    val excludedOrderCount: Int,
+    val excludedPositionCount: Int,
+    val excludedDecisionRunCount: Int,
+    val exclusionReasons: Map<String, Int>,
+    val llmPhaseCount: Int,
+    val missingUsagePhaseCount: Int,
+    val unpricedPhaseCount: Int,
+    val knownCostUsd: String?,
+    val usageTruncated: Boolean,
+)
+
+@Serializable
 data class EvaluationReportResponse(
     val jobId: String,
     val revisionId: String,
@@ -662,6 +885,10 @@ data class EvaluationReportResponse(
     val sources: List<EvaluationReportSourceResponse>,
     val chartIndex: List<EvaluationChartIndexResponse>,
     val outcomeRidge: OutcomeRidgeResponse,
+    val benchmark: ReportBenchmarkChartResponse,
+    val calibration: ReportCalibrationChartResponse,
+    val performanceLattice: ReportPerformanceLatticeResponse,
+    val integrity: EvaluationIntegrityResponse,
     val truncated: Boolean,
 )
 

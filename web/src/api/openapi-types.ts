@@ -2465,6 +2465,72 @@ export interface components {
             referenceLines: string[];
             groupings: components["schemas"]["OutcomeRidgeGroupingResponse"][];
         };
+        /** ReportBenchmarkPointResponse */
+        ReportBenchmarkPointResponse: {
+            date: string;
+            botEquityJpy: string;
+            buyAndHoldEquityJpy: string;
+            noTradeEquityJpy: string;
+        };
+        /** ReportBenchmarkChartResponse */
+        ReportBenchmarkChartResponse: {
+            baselineEquityJpy: string;
+            points: components["schemas"]["ReportBenchmarkPointResponse"][];
+            botReturn?: string | null;
+            buyAndHoldReturn?: string | null;
+            state: string;
+        };
+        /** ReportCalibrationCellResponse */
+        ReportCalibrationCellResponse: {
+            groupBy: string;
+            groupKey: string;
+            lowerBoundInclusive: string;
+            upperBound: string;
+            averageForecastProbability?: string | null;
+            realizedWinRate?: string | null;
+            sampleCount: number;
+            state: string;
+        };
+        /** ReportCalibrationChartResponse */
+        ReportCalibrationChartResponse: {
+            unit: string;
+            authority: string;
+            cells: components["schemas"]["ReportCalibrationCellResponse"][];
+            state: string;
+        };
+        /** ReportPerformanceCellResponse */
+        ReportPerformanceCellResponse: {
+            setup: string;
+            marketRegime: string;
+            tradeCount: number;
+            expectedR?: string | null;
+            totalPnlJpy: string;
+            profitFactor?: string | null;
+            state: string;
+        };
+        /** ReportPerformanceLatticeResponse */
+        ReportPerformanceLatticeResponse: {
+            unit: string;
+            authority: string;
+            cells: components["schemas"]["ReportPerformanceCellResponse"][];
+            state: string;
+        };
+        /** EvaluationIntegrityResponse */
+        EvaluationIntegrityResponse: {
+            eligibleTradeCount: number;
+            missingRCount: number;
+            excludedOrderCount: number;
+            excludedPositionCount: number;
+            excludedDecisionRunCount: number;
+            exclusionReasons: {
+                [key: string]: number;
+            };
+            llmPhaseCount: number;
+            missingUsagePhaseCount: number;
+            unpricedPhaseCount: number;
+            knownCostUsd?: string | null;
+            usageTruncated: boolean;
+        };
         /** EvaluationReportResponse */
         EvaluationReportResponse: {
             jobId: string;
@@ -2487,6 +2553,10 @@ export interface components {
             sources: components["schemas"]["EvaluationReportSourceResponse"][];
             chartIndex: components["schemas"]["EvaluationChartIndexResponse"][];
             outcomeRidge: components["schemas"]["OutcomeRidgeResponse"];
+            benchmark: components["schemas"]["ReportBenchmarkChartResponse"];
+            calibration: components["schemas"]["ReportCalibrationChartResponse"];
+            performanceLattice: components["schemas"]["ReportPerformanceLatticeResponse"];
+            integrity: components["schemas"]["EvaluationIntegrityResponse"];
             truncated: boolean;
         };
         /** EvaluationReportHistoryItemResponse */
