@@ -38,6 +38,8 @@ private const val MAX_RUN_LIMIT = 100
 /** decision run 一覧 endpoint の OpenAPI description。 */
 private const val RUNS_DESCRIPTION =
     "llm_runs を起点に decision、Falsifier、SafetyFloor、order、execution を正規化した run 一覧を新しい順で返します。" +
+        "outcome は注文・約定を含む業務上の状態、terminalCause は runner 終端の安定コードであり、両者は直交します。" +
+        "terminalCause が null の run は旧データなど終端原因を保持していない記録です。" +
         "outcome filter は bounded window を走査し、上限到達時は次の window 用 cursor を返します。"
 
 /** decision run 一覧 response。 */
@@ -435,6 +437,7 @@ private fun DecisionRunDetail.phases(): List<OpsDecisionRunPhaseResponse> {
     val stoppedStatus = if (isRunning) "RUNNING" else "NOT_REACHED"
     return listOf(
         OpsDecisionRunPhaseResponse("TRIGGER", "COMPLETED", summary.triggerKind ?: "MANUAL"),
+        OpsDecisionRunPhaseResponse("PROCESSING", processingPhaseStatus(), summary.terminalCause?.name),
         OpsDecisionRunPhaseResponse("PROPOSER", decision?.let { "COMPLETED" } ?: stoppedStatus, decision?.provider),
         OpsDecisionRunPhaseResponse("INTENT", intentPhaseStatus(stoppedStatus), intent?.intentId),
         OpsDecisionRunPhaseResponse(
@@ -453,6 +456,18 @@ private fun DecisionRunDetail.phases(): List<OpsDecisionRunPhaseResponse> {
             "orders=${orders.size}, executions=${executions.size}",
         ),
     )
+}
+
+private fun DecisionRunDetail.processingPhaseStatus(): String {
+    return when (summary.terminalCause) {
+        LlmRunTerminalCause.RESTART_INTERRUPTED -> "INTERRUPTED"
+        LlmRunTerminalCause.CALLER_CANCELLED -> "CANCELLED"
+        LlmRunTerminalCause.TIMED_OUT,
+        LlmRunTerminalCause.RUNNER_FAILED,
+        -> "FAILED"
+        null -> if (summary.outcome == DecisionRunOutcome.RUNNING) "RUNNING" else "COMPLETED"
+        else -> "COMPLETED"
+    }
 }
 
 private fun DecisionRunDetail.intentPhaseStatus(stoppedStatus: String): String {

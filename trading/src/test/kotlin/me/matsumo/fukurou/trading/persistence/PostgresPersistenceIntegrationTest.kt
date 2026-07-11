@@ -23,16 +23,28 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
+import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
+import me.matsumo.fukurou.trading.daemon.LlmActiveLaunchReservation
+import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
+import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -81,6 +93,8 @@ import me.matsumo.fukurou.trading.runner.OneShotRunnerStatus
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
+import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyViolation
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
@@ -104,6 +118,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -3097,6 +3112,68 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun schedulerAuditsHighPriorityTriggerBlockedByAtomicReservationRaceInPostgresPath() = runPostgresTest {
+        val clock = Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+        TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
+        val delegate = ExposedLlmLaunchReservationRepository(database)
+        val reservationRepository = RaceInjectingPostgresReservationRepository(
+            delegate = delegate,
+            competingRequest = llmLaunchReservationRequest(
+                invocationId = "race-active-invocation",
+                config = LlmRunnerConfig(),
+                reservedAt = fixedInstant(),
+                triggerKind = LlmDaemonTriggerKind.HOLDING_DENSE_CHECK,
+            ),
+        )
+        val eventLog = ExposedCommandEventLog(database)
+        val scheduler = LlmDaemonScheduler(
+            tradingConfig = TradingBotConfig(
+                safetyFloor = SafetyFloorConfig(
+                    economicEventBlackouts = listOf(
+                        EconomicEventBlackout(
+                            eventId = "cpi-race",
+                            eventName = "CPI",
+                            eventAt = fixedInstant(),
+                            blackoutBefore = Duration.ZERO,
+                            blackoutAfter = Duration.ofMinutes(30),
+                        ),
+                    ),
+                ),
+                daemon = LlmDaemonConfig(enabled = true),
+            ),
+            dependencies = LlmDaemonSchedulerDependencies(
+                riskStateRepository = ExposedRiskStateRepository(database),
+                commandEventLog = eventLog,
+                launchReservationRepository = reservationRepository,
+                openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
+                tickerReader = LlmDaemonTickerReader {
+                    Result.success(LlmDaemonTickerSnapshot(BigDecimal("10000000"), fixedInstant()))
+                },
+                positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
+                entryFillReader = LlmDaemonEntryFillReader { Result.success(null) },
+            ),
+            runtime = LlmDaemonSchedulerRuntime(
+                requestBase = postgresOneShotRequest("race-request"),
+                launchOneShot = { error("blocked scheduler must not cross the external runner boundary") },
+                clock = clock,
+                idGenerator = { UUID(0L, 99L) },
+            ),
+        )
+
+        val result = assertIs<LlmDaemonTickResult.Skipped>(scheduler.tick())
+        val skippedEvent = eventLog.findEvents(
+            limit = 10,
+            eventType = CommandEventType.DAEMON_TRIGGER_SKIPPED,
+        ).getOrThrow().single()
+
+        assertEquals("concurrent_invocation", result.reason)
+        assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, result.triggerKind)
+        assertEquals("race-active-invocation", skippedEvent.decisionRunContext.decisionRunId)
+        assertTrue(skippedEvent.payload.contains("race-active-invocation"))
+        assertTrue(skippedEvent.payload.contains(LlmDaemonTriggerKind.ECONOMIC_EVENT.name))
+    }
+
+    @Test
     fun llm_launch_reservation_treatsReflectionAsLowPriorityInPostgresPath() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -5024,6 +5101,37 @@ private class MutablePostgresOrderbookMarketDataSource(
 /**
  * fukurou integration test 用 Postgres container。
  */
+/** pre-read 後に実DBへ competing reservation を追加する TOCTOU fixture。 */
+private class RaceInjectingPostgresReservationRepository(
+    private val delegate: LlmLaunchReservationRepository,
+    private val competingRequest: LlmLaunchReservationRequest,
+) : LlmLaunchReservationRepository {
+
+    private var competingReservationCreated = false
+
+    override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
+        if (!competingReservationCreated) {
+            delegate.tryReserve(competingRequest).getOrThrow()
+            competingReservationCreated = true
+        }
+
+        return delegate.tryReserve(request)
+    }
+
+    override suspend fun finish(finish: LlmLaunchReservationFinish): Result<Unit> = delegate.finish(finish)
+
+    override suspend fun latestReservedAt(triggerKey: String): Result<Instant?> = delegate.latestReservedAt(triggerKey)
+
+    override suspend fun latestFinishedReservedAt(triggerKey: String): Result<Instant?> {
+        return delegate.latestFinishedReservedAt(triggerKey)
+    }
+
+    override suspend fun findBlockingRunningReservation(
+        requestTriggerKind: LlmDaemonTriggerKind,
+        activeSince: Instant,
+    ): Result<LlmActiveLaunchReservation?> = Result.success(null)
+}
+
 private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
 
 /**

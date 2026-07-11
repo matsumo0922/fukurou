@@ -17,6 +17,8 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
+import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -179,10 +181,10 @@ class DefaultManualLlmLaunchService(
         }
 
         job.invokeOnCompletion { throwable ->
-            val cancellation = throwable as? CancellationException ?: return@invokeOnCompletion
+            throwable as? CancellationException ?: return@invokeOnCompletion
 
             if (!started.get()) {
-                finishCancelledBeforeStart(invocationId, cancellation)
+                finishCancelledBeforeStart(invocationId)
             }
         }
     }
@@ -203,7 +205,7 @@ class DefaultManualLlmLaunchService(
             finishReservedInvocation(
                 invocationId = invocationId,
                 status = LlmLaunchReservationStatus.FAILED,
-                reason = appendFailure.javaClass.simpleName,
+                reason = LlmRunTerminalCause.RUNNER_FAILED.name,
                 finishedAt = Instant.now(clock),
             )
         }
@@ -211,12 +213,12 @@ class DefaultManualLlmLaunchService(
         return appendResult
     }
 
-    private fun finishCancelledBeforeStart(invocationId: String, cancellation: CancellationException) {
+    private fun finishCancelledBeforeStart(invocationId: String) {
         runBlocking {
             finishReservedInvocation(
                 invocationId = invocationId,
                 status = LlmLaunchReservationStatus.FAILED,
-                reason = cancellation.javaClass.simpleName,
+                reason = LlmRunTerminalCause.CALLER_CANCELLED.name,
                 finishedAt = Instant.now(clock),
             )
         }
@@ -238,7 +240,7 @@ class DefaultManualLlmLaunchService(
         } else {
             LlmLaunchReservationStatus.FAILED
         }
-        val finishReason = runnerResult?.terminalCause?.name ?: failure?.javaClass?.simpleName
+        val finishReason = (runnerResult?.terminalCause ?: terminalCauseForInvocationFailure(failure)).name
 
         finishReservedInvocation(
             invocationId = invocationId,

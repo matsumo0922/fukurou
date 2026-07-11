@@ -18,6 +18,8 @@ import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.evaluation.LlmInvocationTimedOutException
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
@@ -71,6 +73,40 @@ class ManualLlmLaunchServiceTest {
         assertTrue(launchedPayload.contains("operator requested immediate check"))
         assertEquals(result.invocationId, finish.invocationId)
         assertEquals(LlmLaunchReservationStatus.FINISHED, finish.status)
+        assertEquals(LlmRunTerminalCause.NORMAL_COMPLETION.name, finish.reason)
+    }
+
+    @Test
+    fun manualLaunch_persistsStableTerminalCauseForRunnerOutcomes() = runBlocking {
+        val noTradeFixture = manualFixture(
+            launchHandler = { request -> successfulRunnerResult(request, OneShotRunnerStatus.NO_TRADE_AUDITED) },
+        )
+        val safetyDeniedFixture = manualFixture(
+            launchHandler = { request ->
+                successfulRunnerResult(request).copy(terminalCause = LlmRunTerminalCause.SAFETY_DENIED)
+            },
+        )
+        val timeoutFixture = manualFixture(
+            launchHandler = { throw LlmInvocationTimedOutException("proposer") },
+        )
+        val cancelledFixture = manualFixture(
+            launchHandler = { throw CancellationException("operator stopped") },
+        )
+        val failedFixture = manualFixture(
+            launchHandler = { error("provider unavailable") },
+        )
+
+        noTradeFixture.service.launch("no trade").getOrThrow()
+        safetyDeniedFixture.service.launch("safety denied").getOrThrow()
+        timeoutFixture.service.launch("timeout").getOrThrow()
+        cancelledFixture.service.launch("cancelled").getOrThrow()
+        failedFixture.service.launch("failed").getOrThrow()
+
+        assertEquals(LlmRunTerminalCause.NO_TRADE.name, noTradeFixture.reservations.nextFinish().reason)
+        assertEquals(LlmRunTerminalCause.SAFETY_DENIED.name, safetyDeniedFixture.reservations.nextFinish().reason)
+        assertEquals(LlmRunTerminalCause.TIMED_OUT.name, timeoutFixture.reservations.nextFinish().reason)
+        assertEquals(LlmRunTerminalCause.CALLER_CANCELLED.name, cancelledFixture.reservations.nextFinish().reason)
+        assertEquals(LlmRunTerminalCause.RUNNER_FAILED.name, failedFixture.reservations.nextFinish().reason)
     }
 
     @Test
@@ -233,9 +269,9 @@ class ManualLlmLaunchServiceTest {
         val cancellationFinish = cancellationFixture.reservations.nextFinish()
 
         assertEquals(LlmLaunchReservationStatus.FAILED, failureFinish.status)
-        assertEquals("IllegalStateException", failureFinish.reason)
+        assertEquals(LlmRunTerminalCause.RUNNER_FAILED.name, failureFinish.reason)
         assertEquals(LlmLaunchReservationStatus.FAILED, cancellationFinish.status)
-        assertEquals("CancellationException", cancellationFinish.reason)
+        assertEquals(LlmRunTerminalCause.CALLER_CANCELLED.name, cancellationFinish.reason)
     }
 
     @Test
@@ -265,7 +301,7 @@ class ManualLlmLaunchServiceTest {
         val logOutput = logRecord.message + logRecord.thrown?.stackTraceToString().orEmpty()
 
         assertEquals(LlmLaunchReservationStatus.FAILED, finish.status)
-        assertEquals("FileSystemException", finish.reason)
+        assertEquals(LlmRunTerminalCause.RUNNER_FAILED.name, finish.reason)
         assertEquals(null, logRecord.thrown)
         assertTrue(logOutput.contains("category=INVOCATION_RESULT_UNAVAILABLE"))
         assertTrue(logOutput.contains("type=FileSystemException"))
@@ -325,7 +361,7 @@ class ManualLlmLaunchServiceTest {
         assertTrue(result.isFailure)
         assertEquals(emptyList(), launches)
         assertEquals(LlmLaunchReservationStatus.FAILED, finish.status)
-        assertEquals("IllegalStateException", finish.reason)
+        assertEquals(LlmRunTerminalCause.RUNNER_FAILED.name, finish.reason)
         assertFalse(hasFreshRunningReservation)
     }
 
@@ -384,7 +420,7 @@ class ManualLlmLaunchServiceTest {
         assertEquals(false, closeThread.isAlive)
         assertEquals(null, closeResult.await())
         assertEquals(LlmLaunchReservationStatus.FAILED, finish.status)
-        assertTrue(requireNotNull(finish.reason).contains("Cancellation"))
+        assertEquals(LlmRunTerminalCause.CALLER_CANCELLED.name, finish.reason)
         assertEquals(false, hasFreshRunningReservation)
     }
 
@@ -446,7 +482,7 @@ class ManualLlmLaunchServiceTest {
         assertEquals(false, closeThread.isAlive)
         assertEquals(null, closeResult.await())
         assertEquals(LlmLaunchReservationStatus.FAILED, finish.status)
-        assertTrue(requireNotNull(finish.reason).contains("Cancellation"))
+        assertEquals(LlmRunTerminalCause.CALLER_CANCELLED.name, finish.reason)
         assertEquals(false, hasFreshRunningReservationAfterClose)
     }
 

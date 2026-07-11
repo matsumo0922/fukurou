@@ -41,10 +41,10 @@ import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
-import me.matsumo.fukurou.trading.evaluation.LlmInvocationTimedOutException
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
+import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -993,12 +993,10 @@ private class OneShotRunAuditRecorder(
             startedAt = start.startedAt,
             finishedAt = clock.instant(),
             errorMessage = cause?.persistedErrorMessage(llmProvider),
-            terminalCause = terminalCause ?: when {
-                cause is CancellationException -> LlmRunTerminalCause.CALLER_CANCELLED
-                cause is LlmInvocationTimedOutException -> LlmRunTerminalCause.TIMED_OUT
-                cause != null -> LlmRunTerminalCause.RUNNER_FAILED
-                status == LLM_RUN_STATUS_FAILED -> LlmRunTerminalCause.RUNNER_FAILED
-                else -> LlmRunTerminalCause.NORMAL_COMPLETION
+            terminalCause = terminalCause ?: if (status == LLM_RUN_STATUS_FAILED && cause == null) {
+                LlmRunTerminalCause.RUNNER_FAILED
+            } else {
+                terminalCauseForInvocationFailure(cause)
             },
             runtimeConfigVersionId = start.runtimeConfigVersionId,
             runtimeConfigHash = start.runtimeConfigHash,
@@ -1719,12 +1717,7 @@ private fun classifyOneShotTerminalCause(
 }
 
 private fun terminalCauseForNoTrade(cause: Throwable?): LlmRunTerminalCause {
-    return when (cause) {
-        null -> LlmRunTerminalCause.NO_TRADE
-        is LlmInvocationTimedOutException -> LlmRunTerminalCause.TIMED_OUT
-        is CancellationException -> LlmRunTerminalCause.CALLER_CANCELLED
-        else -> LlmRunTerminalCause.RUNNER_FAILED
-    }
+    return cause?.let(::terminalCauseForInvocationFailure) ?: LlmRunTerminalCause.NO_TRADE
 }
 
 private fun String.isMcpToolNameFor(serverName: String): Boolean {

@@ -165,21 +165,6 @@ private const val BACKFILL_OPEN_POSITION_LOWEST_PRICE_SQL = """
 """
 
 /**
- * stale な RUNNING llm_runs を FAILED へ回収する SQL。
- */
-private const val RECOVER_STALE_LLM_RUNS_SQL = """
-    UPDATE llm_runs
-    SET
-        status = ?,
-        finished_at = ?,
-        error_message = ?,
-        terminal_cause = ?
-    WHERE status = ?
-        AND finished_at IS NULL
-        AND started_at < ?
-"""
-
-/**
  * command_event_log schema の存在を確認する SQL。
  */
 private const val VERIFY_COMMAND_EVENT_LOG_SCHEMA_SQL = """
@@ -1121,38 +1106,53 @@ internal fun JdbcTransaction.recoverStaleLlmRuns(now: Instant, threshold: Durati
 /** stale run と対応する RUNNING reservation を bootstrap transaction 内で回収する。 */
 internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(now: Instant, threshold: Duration): Int {
     val cutoff = now.minus(threshold)
-    val recoveries = selectStaleLlmInvocationRecoveries(cutoff)
+    val staleRuns = selectStaleLlmRunsForUpdate(cutoff)
+    val staleReservations = selectStaleLlmReservationsForUpdate(cutoff)
+    val recoveredRunIds = staleRuns
+        .filter { run -> recoverStaleLlmRun(run.invocationId, now) }
+        .mapTo(mutableSetOf()) { run -> run.invocationId }
+    val recoveredReservationIds = staleReservations
+        .filter { reservation -> recoverStaleLlmReservation(reservation.invocationId, now) }
+        .mapTo(mutableSetOf()) { reservation -> reservation.invocationId }
+    val runsByInvocationId = staleRuns.associateBy(StaleLlmRun::invocationId)
+    val reservationsByInvocationId = staleReservations.associateBy(StaleLlmReservation::invocationId)
 
-    jdbcConnection().prepareStatement(
-        """
-        UPDATE llm_launch_reservations
-        SET status = ?, finished_at = ?, reason = ?
-        WHERE status = ? AND reserved_at < ?
-    """,
-    ).use { statement ->
-        statement.setString(1, "FAILED")
-        statement.setLong(2, now.toEpochMilli())
-        statement.setString(3, LlmRunTerminalCause.RESTART_INTERRUPTED.name)
-        statement.setString(4, "RUNNING")
-        statement.setLong(5, cutoff.toEpochMilli())
-        statement.executeUpdate()
-    }
+    (recoveredRunIds + recoveredReservationIds)
+        .sorted()
+        .map { invocationId ->
+            val run = runsByInvocationId[invocationId]
+            val reservation = reservationsByInvocationId[invocationId]
+            StaleLlmInvocationRecovery(
+                invocationId = invocationId,
+                triggerKind = run?.triggerKind ?: reservation?.triggerKind,
+                triggerKey = reservation?.triggerKey,
+                startedAt = run?.startedAt,
+                reservedAt = reservation?.reservedAt,
+                runRecovered = invocationId in recoveredRunIds,
+                reservationRecovered = invocationId in recoveredReservationIds,
+                runtimeConfigVersionId = run?.runtimeConfigVersionId,
+                runtimeConfigHash = run?.runtimeConfigHash,
+            )
+        }
+        .forEach { recovery -> insertLlmInvocationRecoveryEvent(recovery, now) }
 
-    val recoveredRuns = jdbcConnection().prepareStatement(RECOVER_STALE_LLM_RUNS_SQL).use { statement ->
-        statement.setString(1, LLM_RUN_STATUS_FAILED)
-        statement.setLong(2, now.toEpochMilli())
-        statement.setString(3, STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE)
-        statement.setString(4, LlmRunTerminalCause.RESTART_INTERRUPTED.name)
-        statement.setString(5, LLM_RUN_STATUS_RUNNING)
-        statement.setLong(6, cutoff.toEpochMilli())
-
-        statement.executeUpdate()
-    }
-
-    recoveries.forEach { recovery -> insertLlmInvocationRecoveryEvent(recovery, now) }
-
-    return recoveredRuns
+    return recoveredRunIds.size
 }
+
+private data class StaleLlmRun(
+    val invocationId: String,
+    val triggerKind: String?,
+    val startedAt: Long?,
+    val runtimeConfigVersionId: String?,
+    val runtimeConfigHash: String?,
+)
+
+private data class StaleLlmReservation(
+    val invocationId: String,
+    val triggerKind: String?,
+    val triggerKey: String?,
+    val reservedAt: Long?,
+)
 
 private data class StaleLlmInvocationRecovery(
     val invocationId: String,
@@ -1166,35 +1166,26 @@ private data class StaleLlmInvocationRecovery(
     val runtimeConfigHash: String?,
 )
 
-private fun JdbcTransaction.selectStaleLlmInvocationRecoveries(cutoff: Instant): List<StaleLlmInvocationRecovery> {
+private fun JdbcTransaction.selectStaleLlmRunsForUpdate(cutoff: Instant): List<StaleLlmRun> {
     val sql = """
-        SELECT COALESCE(run.invocation_id, reservation.invocation_id) AS invocation_id,
-            COALESCE(run.trigger_kind, reservation.trigger_kind) AS trigger_kind,
-            reservation.trigger_key, run.started_at, reservation.reserved_at,
-            run.invocation_id IS NOT NULL AS run_recovered,
-            reservation.invocation_id IS NOT NULL AS reservation_recovered,
-            run.runtime_config_version_id, run.runtime_config_hash
-        FROM (SELECT * FROM llm_runs WHERE status = 'RUNNING' AND finished_at IS NULL AND started_at < ?) run
-        FULL OUTER JOIN (SELECT * FROM llm_launch_reservations WHERE status = 'RUNNING' AND reserved_at < ?) reservation
-            ON run.invocation_id = reservation.invocation_id
+        SELECT invocation_id, trigger_kind, started_at, runtime_config_version_id, runtime_config_hash
+        FROM llm_runs
+        WHERE status = ? AND finished_at IS NULL AND started_at < ?
         ORDER BY invocation_id ASC
+        FOR UPDATE
     """.trimIndent()
 
     return jdbcConnection().prepareStatement(sql).use { statement ->
-        statement.setLong(1, cutoff.toEpochMilli())
+        statement.setString(1, LLM_RUN_STATUS_RUNNING)
         statement.setLong(2, cutoff.toEpochMilli())
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {
                     add(
-                        StaleLlmInvocationRecovery(
+                        StaleLlmRun(
                             invocationId = resultSet.getString("invocation_id"),
                             triggerKind = resultSet.getString("trigger_kind"),
-                            triggerKey = resultSet.getString("trigger_key"),
                             startedAt = resultSet.getLong("started_at").takeUnless { resultSet.wasNull() },
-                            reservedAt = resultSet.getLong("reserved_at").takeUnless { resultSet.wasNull() },
-                            runRecovered = resultSet.getBoolean("run_recovered"),
-                            reservationRecovered = resultSet.getBoolean("reservation_recovered"),
                             runtimeConfigVersionId = resultSet.getString("runtime_config_version_id"),
                             runtimeConfigHash = resultSet.getString("runtime_config_hash"),
                         ),
@@ -1202,6 +1193,70 @@ private fun JdbcTransaction.selectStaleLlmInvocationRecoveries(cutoff: Instant):
                 }
             }
         }
+    }
+}
+
+private fun JdbcTransaction.selectStaleLlmReservationsForUpdate(cutoff: Instant): List<StaleLlmReservation> {
+    val sql = """
+        SELECT invocation_id, trigger_kind, trigger_key, reserved_at
+        FROM llm_launch_reservations
+        WHERE status = ? AND reserved_at < ?
+        ORDER BY invocation_id ASC
+        FOR UPDATE
+    """.trimIndent()
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setString(1, "RUNNING")
+        statement.setLong(2, cutoff.toEpochMilli())
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(
+                        StaleLlmReservation(
+                            invocationId = resultSet.getString("invocation_id"),
+                            triggerKind = resultSet.getString("trigger_kind"),
+                            triggerKey = resultSet.getString("trigger_key"),
+                            reservedAt = resultSet.getLong("reserved_at").takeUnless { resultSet.wasNull() },
+                        ),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.recoverStaleLlmRun(invocationId: String, now: Instant): Boolean {
+    val sql = """
+        UPDATE llm_runs
+        SET status = ?, finished_at = ?, error_message = ?, terminal_cause = ?
+        WHERE invocation_id = ? AND status = ? AND finished_at IS NULL
+    """.trimIndent()
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setString(1, LLM_RUN_STATUS_FAILED)
+        statement.setLong(2, now.toEpochMilli())
+        statement.setString(3, STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE)
+        statement.setString(4, LlmRunTerminalCause.RESTART_INTERRUPTED.name)
+        statement.setString(5, invocationId)
+        statement.setString(6, LLM_RUN_STATUS_RUNNING)
+        statement.executeUpdate() == 1
+    }
+}
+
+private fun JdbcTransaction.recoverStaleLlmReservation(invocationId: String, now: Instant): Boolean {
+    val sql = """
+        UPDATE llm_launch_reservations
+        SET status = ?, finished_at = ?, reason = ?
+        WHERE invocation_id = ? AND status = ?
+    """.trimIndent()
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setString(1, "FAILED")
+        statement.setLong(2, now.toEpochMilli())
+        statement.setString(3, LlmRunTerminalCause.RESTART_INTERRUPTED.name)
+        statement.setString(4, invocationId)
+        statement.setString(5, "RUNNING")
+        statement.executeUpdate() == 1
     }
 }
 

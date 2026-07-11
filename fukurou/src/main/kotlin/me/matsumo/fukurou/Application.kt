@@ -844,7 +844,7 @@ private fun Application.subscribeApplicationShutdown(
     }
 }
 
-private fun sharedTradingPersistenceBootstrap(
+internal fun sharedTradingPersistenceBootstrap(
     database: ExposedDatabase,
     tradingConfig: TradingBotConfig,
     clock: Clock,

@@ -22,6 +22,7 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.FreshnessDefaults
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -309,6 +310,7 @@ class LlmDaemonScheduler(
                 reason = reason,
                 trigger = trigger,
                 observedAt = observedAt,
+                activeReservation = reservationOutcome.activeReservation,
             ).getOrThrow()
 
             return LlmDaemonTickResult.Skipped(reason, trigger.kind)
@@ -362,7 +364,7 @@ class LlmDaemonScheduler(
                         trigger = trigger,
                         invocationId = invocationId,
                         status = LlmLaunchReservationStatus.FAILED,
-                        reason = failure.javaClass.simpleName,
+                        reason = terminalCauseForInvocationFailure(failure).name,
                         finishedAt = Instant.now(clock),
                     )
                 }.onFailure { finishFailure ->
@@ -383,7 +385,8 @@ class LlmDaemonScheduler(
         } else {
             LlmLaunchReservationStatus.FAILED
         }
-        val reason = runnerResult?.terminalCause?.name ?: failure?.javaClass?.simpleName
+        val terminalCause = runnerResult?.terminalCause ?: terminalCauseForInvocationFailure(failure)
+        val reason = terminalCause.name
 
         finishReservedInvocation(trigger, invocationId, status, reason, finishedAt)
 
@@ -391,7 +394,7 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Failed(
                 invocationId = invocationId,
                 triggerKind = trigger.kind,
-                reason = reason ?: "unknown",
+                reason = reason,
             )
         }
 

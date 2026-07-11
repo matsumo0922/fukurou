@@ -1604,7 +1604,7 @@ export interface paths {
         };
         /**
          * decision run 一覧を取得する
-         * @description llm_runs を起点に decision、Falsifier、SafetyFloor、order、execution を正規化した run 一覧を新しい順で返します。outcome filter は bounded window を走査し、上限到達時は次の window 用 cursor を返します。
+         * @description llm_runs を起点に decision、Falsifier、SafetyFloor、order、execution を正規化した run 一覧を新しい順で返します。outcome は注文・約定を含む業務上の状態、terminalCause は runner 終端の安定コードであり、両者は直交します。terminalCause が null の run は旧データなど終端原因を保持していない記録です。outcome filter は bounded window を走査し、上限到達時は次の window 用 cursor を返します。
          */
         get: {
             parameters: {

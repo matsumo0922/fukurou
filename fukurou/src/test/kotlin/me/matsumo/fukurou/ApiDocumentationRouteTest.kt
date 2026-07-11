@@ -63,6 +63,11 @@ class ApiDocumentationRouteTest {
             ),
             terminalCause.getValue("enum").jsonArray.map { value -> value.jsonPrimitive.content },
         )
+        val decisionRunsDescription = paths.getValue("/ops/runs").jsonObject
+            .getValue("get").jsonObject
+            .getValue("description").jsonPrimitive.content
+        assertTrue(decisionRunsDescription.contains("terminalCause は runner 終端の安定コード"))
+        assertTrue(decisionRunsDescription.contains("旧データ"))
         assertOperation(
             paths = paths,
             path = "/health/live",
