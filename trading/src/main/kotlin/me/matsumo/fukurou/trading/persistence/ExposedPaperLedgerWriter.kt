@@ -46,6 +46,7 @@ import me.matsumo.fukurou.trading.broker.unrealizedPnlAt
 import me.matsumo.fukurou.trading.broker.unrealizedRAt
 import me.matsumo.fukurou.trading.broker.withEntryCommandContext
 import me.matsumo.fukurou.trading.broker.withOrderContext
+import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderExpirySource
@@ -1434,11 +1435,10 @@ private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
 
 /** current account epoch と active config hash を同一 ledger transaction で固定する。 */
 private fun JdbcTransaction.resolvePaperExecutionLineage(auditContext: PaperTradeAuditContext): PaperExecutionLineage {
-    val result = prepare(
+    val epochId = prepare(
         """
-            SELECT account.current_epoch_id, epoch.runtime_config_hash
+            SELECT account.current_epoch_id
             FROM paper_account account
-            JOIN paper_account_epochs epoch ON epoch.id = account.current_epoch_id
             WHERE account.id = ?
             FOR SHARE
         """.trimIndent(),
@@ -1446,18 +1446,27 @@ private fun JdbcTransaction.resolvePaperExecutionLineage(auditContext: PaperTrad
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
             check(resultSet.next()) { "PAPER_EXECUTION_LINEAGE_UNAVAILABLE: current account epoch is missing." }
-            resultSet.getObject("current_epoch_id", UUID::class.java) to resultSet.getString("runtime_config_hash")
+            resultSet.getObject("current_epoch_id", UUID::class.java)
         }
     }
+    val activeValues = linkedMapOf<String, String>()
+    prepare(
+        "SELECT value.config_key, value.config_value FROM runtime_config_values value JOIN runtime_config_versions version ON version.id=value.version_id WHERE version.status='ACTIVE' ORDER BY value.config_key",
+    ).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            while (resultSet.next()) activeValues[resultSet.getString(1)] = resultSet.getString(2)
+        }
+    }
+    val activeHash = calculateRuntimeConfigHash(activeValues)
     val auditHash = auditContext.decisionRunContext.runtimeConfigHash
-    require(auditHash == null || auditHash == result.second) {
+    require(auditHash == null || auditHash == activeHash) {
         "PAPER_EXECUTION_LINEAGE_MISMATCH: command and current account epoch runtime config hashes differ."
     }
 
     return PaperExecutionLineage(
-        accountEpochId = result.first.toString(),
+        accountEpochId = epochId.toString(),
         executionSemanticsVersion = PAPER_EXECUTION_SEMANTICS_VERSION,
-        runtimeConfigHash = result.second,
+        runtimeConfigHash = activeHash,
     )
 }
 

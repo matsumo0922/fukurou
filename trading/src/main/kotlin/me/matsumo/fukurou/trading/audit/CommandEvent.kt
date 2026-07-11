@@ -130,6 +130,15 @@ enum class CommandEventType {
      * CLI auth service close が process / scope の終了待ちを timeout した。
      */
     CLI_AUTH_CLOSE_WAIT_TIMED_OUT,
+
+    /** bootstrap が既存 paper account epoch を非破壊 import した。 */
+    PAPER_ACCOUNT_EPOCH_IMPORTED,
+
+    /** runtime config activation と同一 transaction で epoch を切り替えた。 */
+    PAPER_ACCOUNT_EPOCH_SWITCHED,
+
+    /** open risk により epoch switch を拒否した。 */
+    PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED,
 }
 
 /**

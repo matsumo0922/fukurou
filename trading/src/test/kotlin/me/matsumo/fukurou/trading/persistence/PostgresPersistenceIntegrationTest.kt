@@ -951,6 +951,58 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun runtimeConfigBaselineActivationUsesAtomicZeroOpenRiskEpochSwitch() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedRuntimeConfigRepository(database, fixedClock(), emptyMap())
+        val original = repository.activeSnapshot().getOrThrow()
+        val draft = repository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = original.versionId,
+                values = mapOf("paper.initialCashJpy" to "900000"),
+                note = "epoch switch integration test",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+
+        exposedTransaction(database) {
+            executeUpdate("UPDATE paper_account SET btc_quantity=0.01 WHERE id=$PAPER_ACCOUNT_SINGLE_ROW_ID")
+        }
+        val rejected = repository.activateDraftWithContext(draft.version.id, "open risk rejection", "test")
+        assertTrue(rejected.isFailure)
+        assertEquals(original.versionId, repository.activeSnapshot().getOrThrow().versionId)
+        assertEquals(
+            1,
+            selectCommandEventCountByType(database, CommandEventType.PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED),
+        )
+
+        exposedTransaction(database) {
+            executeUpdate("UPDATE paper_account SET btc_quantity=0 WHERE id=$PAPER_ACCOUNT_SINGLE_ROW_ID")
+        }
+        val activated = repository.activateDraftWithContext(draft.version.id, "zero risk switch", "test").getOrThrow()
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        val risk = ExposedRiskStateRepository(database).current().getOrThrow()
+
+        assertEquals("900000.00000000", account.initialCashJpy)
+        assertEquals("900000.00000000", account.cashJpy)
+        assertEquals("900000.00000000", risk.equityPeak.toPlainString())
+        assertEquals(activated.accountEpochId, account.accountEpochId)
+        assertEquals(1, selectCommandEventCountByType(database, CommandEventType.PAPER_ACCOUNT_EPOCH_SWITCHED))
+    }
+
+    @Test
+    fun paperAccountEpochRowsAreImmutableAtDatabaseBoundary() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val mutation = runCatching {
+            exposedTransaction(database) {
+                executeUpdate("UPDATE paper_account_epochs SET reason='mutated'")
+            }
+        }
+
+        assertTrue(mutation.isFailure)
+    }
+
+    @Test
     fun runtimeConfigDraftCanonicalizesEnumBeforePersistenceAndHashing() = runPostgresTest {
         RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedRuntimeConfigRepository(
@@ -4199,6 +4251,65 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun evaluationAttributionRecoversTenTradesIncludingFourNullOrderPositionIds() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val ledger = ExposedPaperLedgerRepository(database)
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledger,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisions,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val entryOrderIds = mutableListOf<UUID>()
+        repeat(10) {
+            val command = approvedPostgresEntryCommand(
+                repository = decisions,
+                command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+            )
+            val placed = broker.placeOrder(command).getOrThrow()
+            entryOrderIds += UUID.fromString(placed.orderIds.first())
+            ledger.reconcile(takeProfitTickSnapshot(), FillSimulator(clock = fixedClock())).getOrThrow()
+        }
+        exposedTransaction(database) {
+            entryOrderIds.take(4).forEach { orderId ->
+                prepare("UPDATE orders SET position_id=NULL WHERE id=?").use { statement ->
+                    statement.setObject(1, orderId)
+                    statement.executeUpdate()
+                }
+            }
+        }
+
+        val repository = ExposedEvaluationRepository(database)
+        val scope = repository.resolveScope(null, "CURRENT").getOrThrow()
+        val result = repository.fetchClosedTrades(
+            period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1)),
+            scope = scope,
+        ).getOrThrow()
+
+        assertEquals(10, result.trades.size)
+        assertEquals(10, result.attributionCoverage.attributed)
+        assertEquals(0, result.attributionCoverage.missing)
+        assertEquals(10, result.attributionCoverage.total)
+        assertTrue(EvaluationMath.summarizeBySetup(result.trades).isNotEmpty())
+        assertTrue(EvaluationMath.calibrationBySetup(result.trades).isNotEmpty())
+
+        exposedTransaction(database) {
+            prepare("UPDATE orders SET intent_id=NULL WHERE id=?").use { statement ->
+                statement.setObject(1, entryOrderIds.last())
+                statement.executeUpdate()
+            }
+        }
+        val withMissing = repository.fetchClosedTrades(
+            period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1)),
+            scope = scope,
+        ).getOrThrow()
+        assertEquals(10, withMissing.trades.size)
+        assertEquals(1, withMissing.attributionCoverage.missing)
+    }
+
+    @Test
     fun evaluation_repository_treats_partial_closes_and_adds_as_one_closed_trade() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -4983,6 +5094,18 @@ class PostgresPersistenceIntegrationTest {
             val throwable = requireNotNull(waiterResult.exceptionOrNull())
 
             assertTrue(throwable is SQLTimeoutException)
+        }
+    }
+}
+
+private fun selectCommandEventCountByType(database: ExposedDatabase, type: CommandEventType): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement("SELECT COUNT(*) FROM command_event_log WHERE event_type=?").use { statement ->
+            statement.setString(1, type.name)
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getInt(1)
+            }
         }
     }
 }

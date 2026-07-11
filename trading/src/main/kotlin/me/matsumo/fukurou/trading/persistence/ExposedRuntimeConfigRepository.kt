@@ -1,7 +1,9 @@
-@file:Suppress("ImportOrdering", "LongMethod", "TooManyFunctions")
+@file:Suppress("ImportOrdering", "LongMethod", "LongParameterList", "TooManyFunctions")
 
 package me.matsumo.fukurou.trading.persistence
 
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.config.ActiveRuntimeConfigSnapshot
 import me.matsumo.fukurou.trading.config.ActiveRuntimeConfigSource
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
@@ -12,6 +14,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
+import me.matsumo.fukurou.trading.config.PaperAccountEpochSwitchRejectedException
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.config.canonicalizeRuntimeConfigValue
 import me.matsumo.fukurou.trading.config.requireValid
@@ -416,25 +419,48 @@ class ExposedRuntimeConfigRepository(
     }
 
     override fun activateDraft(versionId: String): Result<RuntimeConfigActivationResult> {
+        return activateDraftWithContext(versionId, "runtime config activation", RUNTIME_CONFIG_WEBUI_CREATED_BY)
+    }
+
+    override fun activateDraftWithContext(
+        versionId: String,
+        reason: String,
+        actor: String,
+    ): Result<RuntimeConfigActivationResult> {
         return activateVersion(
             versionId = versionId,
             allowedStatuses = setOf(RUNTIME_CONFIG_STATUS_DRAFT),
+            reason = reason,
+            actor = actor,
         )
     }
 
     override fun rollbackToVersion(versionId: String): Result<RuntimeConfigActivationResult> {
+        return rollbackToVersionWithContext(versionId, "runtime config rollback", RUNTIME_CONFIG_WEBUI_CREATED_BY)
+    }
+
+    override fun rollbackToVersionWithContext(
+        versionId: String,
+        reason: String,
+        actor: String,
+    ): Result<RuntimeConfigActivationResult> {
         return activateVersion(
             versionId = versionId,
             allowedStatuses = setOf(RUNTIME_CONFIG_STATUS_INACTIVE),
+            reason = reason,
+            actor = actor,
         )
     }
 
     private fun activateVersion(
         versionId: String,
         allowedStatuses: Set<String>,
+        reason: String,
+        actor: String,
     ): Result<RuntimeConfigActivationResult> {
-        return runCatching {
-            exposedTransaction(database) {
+        var rejection: PaperAccountEpochSwitchRejectedException? = null
+        val result = runCatching {
+            val activation = exposedTransaction(database) {
                 val targetVersion = requireRuntimeConfigVersion(versionId)
 
                 require(targetVersion.status in allowedStatuses) {
@@ -447,6 +473,11 @@ class ExposedRuntimeConfigRepository(
 
                 val previousActiveVersionId = requireSingleActiveRuntimeConfigVersion().versionId.toString()
                 val now = Instant.now(clock)
+                val epochResult = switchPaperAccountEpochIfRequired(values, reason, actor, now)
+                if (epochResult is EpochSwitchResult.Rejected) {
+                    rejection = epochResult.exception
+                    return@exposedTransaction null
+                }
                 deactivateActiveRuntimeConfigVersion()
                 activateRuntimeConfigVersion(targetVersion.versionId, now)
 
@@ -455,13 +486,179 @@ class ExposedRuntimeConfigRepository(
                     activeVersion = activeVersion.toSummary(values),
                     previousActiveVersionId = previousActiveVersionId,
                     validation = validation,
+                    accountEpochId = (epochResult as? EpochSwitchResult.Switched)?.epochId
+                        ?: selectCurrentPaperAccountEpochId(),
                 )
 
                 pruneRuntimeConfigVersions()
 
                 result
             }
+            rejection?.let { throw it }
+            checkNotNull(activation)
         }
+        return result
+    }
+}
+
+private sealed interface EpochSwitchResult {
+    data object Unchanged : EpochSwitchResult
+    data class Switched(val epochId: String) : EpochSwitchResult
+    data class Rejected(val exception: PaperAccountEpochSwitchRejectedException) : EpochSwitchResult
+}
+
+private fun JdbcTransaction.switchPaperAccountEpochIfRequired(
+    values: Map<String, String>,
+    reason: String,
+    actor: String,
+    now: Instant,
+): EpochSwitchResult {
+    val requestedBaseline = values.getValue("paper.initialCashJpy").toBigDecimal()
+    val hasPaperAccount = prepare("SELECT to_regclass('paper_account') IS NOT NULL").use { statement ->
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next())
+            resultSet.getBoolean(1)
+        }
+    }
+    if (!hasPaperAccount) return EpochSwitchResult.Unchanged
+
+    val account = prepare(
+        "SELECT current_epoch_id, initial_cash_jpy, btc_quantity FROM paper_account WHERE id = ? FOR UPDATE",
+    ).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next())
+            Triple(
+                resultSet.getObject("current_epoch_id", UUID::class.java),
+                resultSet.getBigDecimal("initial_cash_jpy"),
+                resultSet.getBigDecimal("btc_quantity"),
+            )
+        }
+    }
+    if (requestedBaseline.compareTo(account.second) == 0) return EpochSwitchResult.Unchanged
+
+    executeUpdate("LOCK TABLE positions, orders, executions IN SHARE ROW EXCLUSIVE MODE")
+    val openPositions = countRows("SELECT COUNT(*) FROM positions WHERE status = 'OPEN'")
+    val openOrders = countRows("SELECT COUNT(*) FROM orders WHERE status IN ('OPEN', 'PENDING_CANCEL')")
+    val hasOpenRisk = openPositions > 0 || openOrders > 0 || account.third.signum() != 0
+    val targetHash = calculateRuntimeConfigHash(values)
+    if (hasOpenRisk) {
+        appendEpochAudit(
+            eventType = "PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED",
+            payload = epochAuditPayload(account.first, null, account.second, requestedBaseline, targetHash, reason, actor, openPositions, openOrders, account.third),
+            now = now,
+            runtimeConfigHash = targetHash,
+        )
+        return EpochSwitchResult.Rejected(
+            PaperAccountEpochSwitchRejectedException(openPositions, openOrders, account.third.toPlainString()),
+        )
+    }
+
+    val epochId = UUID.randomUUID()
+    prepare(
+        "INSERT INTO paper_account_epochs (id, kind, initial_cash_jpy, runtime_config_hash, reason, actor, created_at) VALUES (?, 'CONFIG_ACTIVATED', ?, ?, ?, ?, ?)",
+    ).use { statement ->
+        statement.setObject(1, epochId)
+        statement.setBigDecimal(2, requestedBaseline)
+        statement.setString(3, targetHash)
+        statement.setString(4, reason)
+        statement.setString(5, actor)
+        statement.setLong(6, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+    prepare(
+        "UPDATE paper_account SET current_epoch_id=?, initial_cash_jpy=?, cash_jpy=?, btc_quantity=0, btc_mark_price_jpy=0, total_equity_jpy=?, equity_peak_jpy=?, drawdown_ratio=0, updated_at=? WHERE id=?",
+    ).use { statement ->
+        statement.setObject(1, epochId)
+        statement.setBigDecimal(2, requestedBaseline)
+        statement.setBigDecimal(3, requestedBaseline)
+        statement.setBigDecimal(4, requestedBaseline)
+        statement.setBigDecimal(5, requestedBaseline)
+        statement.setLong(6, now.toEpochMilli())
+        statement.setInt(7, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeUpdate()
+    }
+    prepare("UPDATE risk_state SET equity_peak=?, drawdown_ratio=0, updated_at=? WHERE id=?").use { statement ->
+        statement.setBigDecimal(1, requestedBaseline)
+        statement.setLong(2, now.toEpochMilli())
+        statement.setInt(3, RISK_STATE_SINGLE_ROW_ID)
+        statement.executeUpdate()
+    }
+    prepare(
+        "INSERT INTO equity_snapshots (id, account_epoch_id, mode, reason, trading_date, captured_at, cash_jpy, btc_quantity, btc_mark_price_jpy, total_equity_jpy, equity_peak_jpy, drawdown_ratio) SELECT ?, ?, mode, 'EPOCH_START', ?, ?, cash_jpy, btc_quantity, btc_mark_price_jpy, total_equity_jpy, equity_peak_jpy, drawdown_ratio FROM paper_account WHERE id=?",
+    ).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setObject(2, epochId)
+        statement.setString(3, now.atZone(java.time.ZoneId.of("Asia/Tokyo")).toLocalDate().toString())
+        statement.setLong(4, now.toEpochMilli())
+        statement.setInt(5, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeUpdate()
+    }
+    appendEpochAudit(
+        "PAPER_ACCOUNT_EPOCH_SWITCHED",
+        epochAuditPayload(account.first, epochId, account.second, requestedBaseline, targetHash, reason, actor, 0, 0, account.third),
+        now,
+        targetHash,
+    )
+    return EpochSwitchResult.Switched(epochId.toString())
+}
+
+private fun JdbcTransaction.countRows(sql: String): Int = prepare(sql).use { statement ->
+    statement.executeQuery().use { resultSet ->
+        check(resultSet.next())
+        resultSet.getInt(1)
+    }
+}
+
+private fun JdbcTransaction.selectCurrentPaperAccountEpochId(): String? = prepare(
+    "SELECT current_epoch_id FROM paper_account WHERE id=?",
+).use { statement ->
+    statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+    statement.executeQuery().use { resultSet ->
+        check(resultSet.next())
+        resultSet.getObject(1)?.toString()
+    }
+}
+
+private fun epochAuditPayload(
+    oldEpochId: UUID?,
+    newEpochId: UUID?,
+    oldBaseline: java.math.BigDecimal,
+    newBaseline: java.math.BigDecimal,
+    hash: String,
+    reason: String,
+    actor: String,
+    openPositions: Int,
+    openOrders: Int,
+    btc: java.math.BigDecimal,
+): String = buildJsonObject {
+    put("oldEpochId", oldEpochId?.toString())
+    put("newEpochId", newEpochId?.toString())
+    put("oldBaselineJpy", oldBaseline.toPlainString())
+    put("newBaselineJpy", newBaseline.toPlainString())
+    put("runtimeConfigHash", hash)
+    put("reason", reason)
+    put("actor", actor)
+    put("openPositionCount", openPositions)
+    put("openOrderCount", openOrders)
+    put("btcQuantity", btc.toPlainString())
+}.toString()
+
+private fun JdbcTransaction.appendEpochAudit(
+    eventType: String,
+    payload: String,
+    now: Instant,
+    runtimeConfigHash: String,
+) {
+    prepare(
+        "INSERT INTO command_event_log (id, tool_name, event_type, payload, ts, runtime_config_hash) VALUES (?, 'paper-account-epoch', ?, ?, ?, ?)",
+    ).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setString(2, eventType)
+        statement.setString(3, payload)
+        statement.setLong(4, now.toEpochMilli())
+        statement.setString(5, runtimeConfigHash)
+        statement.executeUpdate()
     }
 }
 

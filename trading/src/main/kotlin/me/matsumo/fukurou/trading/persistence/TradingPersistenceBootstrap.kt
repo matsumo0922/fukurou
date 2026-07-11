@@ -118,6 +118,19 @@ private const val INSERT_DEFAULT_PAPER_ACCOUNT_SQL = """
     ON CONFLICT (id) DO NOTHING
 """
 
+/** immutable epoch の UPDATE/DELETE を DB 境界で拒否する。 */
+private const val ENSURE_PAPER_ACCOUNT_EPOCH_IMMUTABLE_TRIGGER_SQL = """
+    CREATE OR REPLACE FUNCTION reject_paper_account_epoch_mutation() RETURNS trigger AS ${'$'}${'$'}
+    BEGIN
+        RAISE EXCEPTION 'paper_account_epochs are immutable';
+    END;
+    ${'$'}${'$'} LANGUAGE plpgsql;
+    DROP TRIGGER IF EXISTS paper_account_epochs_immutable ON paper_account_epochs;
+    CREATE TRIGGER paper_account_epochs_immutable
+        BEFORE UPDATE OR DELETE ON paper_account_epochs
+        FOR EACH ROW EXECUTE FUNCTION reject_paper_account_epoch_mutation();
+"""
+
 /**
  * bootstrap equity snapshot を初回だけ作る SQL。
  */
@@ -1035,6 +1048,7 @@ fun TradingBotConfig.staleLlmRunRecoveryThreshold(): Duration {
  */
 private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     ensureRuntimeConfigIndexes()
+    executeUpdate(ENSURE_PAPER_ACCOUNT_EPOCH_IMMUTABLE_TRIGGER_SQL)
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL)
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)

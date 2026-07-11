@@ -24,13 +24,13 @@ import me.matsumo.fukurou.trading.broker.ExecutionActivityOrderContext
 import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
+import me.matsumo.fukurou.trading.config.PaperAccountEpochSwitchRejectedException
 import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshot
 import me.matsumo.fukurou.trading.config.RuntimeConfigSnapshotWarning
 import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedException
-import me.matsumo.fukurou.trading.config.RuntimeConfigValidationResult
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -638,6 +638,15 @@ data class OpsRuntimeConfigVersionActionRequest(
     val reason: String? = null,
 )
 
+/** account epoch switch の zero-open-risk rejection。 */
+@Serializable
+data class OpsPaperAccountEpochSwitchConflictResponse(
+    val code: String = "PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED",
+    val openPositionCount: Int,
+    val openOrderCount: Int,
+    val btcQuantity: String,
+)
+
 /**
  * ops risk 操作用 route の依存関係。
  *
@@ -834,10 +843,14 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
     }
 
     post("/ops/runtime-config/drafts/{versionId}/activate") {
-        call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
+        val request = call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
         val versionId = call.requirePathValue(call.parameters["versionId"], "versionId is required") ?: return@post
         val service = call.requireRuntimeConfigAdminService(adminService) ?: return@post
-        val result = service.activateDraft(versionId)
+        val result = service.activateDraftWithContext(
+            versionId = versionId,
+            reason = request.reason?.takeIf(String::isNotBlank) ?: "runtime config activation",
+            actor = "webui",
+        )
         val response = call.respondRuntimeConfigResult(result) ?: return@post
 
         call.respond(response)
@@ -866,8 +879,8 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
                 schema = jsonSchema<ErrorResponse>()
             }
             HttpStatusCode.Conflict {
-                description = "現在の catalog / typed config validation に失敗しました。"
-                schema = jsonSchema<RuntimeConfigValidationResult>()
+                description = "validation または account epoch の zero-open-risk gate により拒否されました。"
+                schema = jsonSchema<OpsPaperAccountEpochSwitchConflictResponse>()
             }
             HttpStatusCode.ServiceUnavailable {
                 description = "runtime config admin service が利用できません。"
@@ -877,10 +890,14 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
     }
 
     post("/ops/runtime-config/versions/{versionId}/rollback") {
-        call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
+        val request = call.receiveBodyOrBadRequest<OpsRuntimeConfigVersionActionRequest>() ?: return@post
         val versionId = call.requirePathValue(call.parameters["versionId"], "versionId is required") ?: return@post
         val service = call.requireRuntimeConfigAdminService(adminService) ?: return@post
-        val result = service.rollbackToVersion(versionId)
+        val result = service.rollbackToVersionWithContext(
+            versionId = versionId,
+            reason = request.reason?.takeIf(String::isNotBlank) ?: "runtime config rollback",
+            actor = "webui",
+        )
         val response = call.respondRuntimeConfigResult(result) ?: return@post
 
         call.respond(response)
@@ -909,8 +926,8 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
                 schema = jsonSchema<ErrorResponse>()
             }
             HttpStatusCode.Conflict {
-                description = "現在の catalog / typed config validation に失敗しました。"
-                schema = jsonSchema<RuntimeConfigValidationResult>()
+                description = "validation または account epoch の zero-open-risk gate により拒否されました。"
+                schema = jsonSchema<OpsPaperAccountEpochSwitchConflictResponse>()
             }
             HttpStatusCode.ServiceUnavailable {
                 description = "runtime config admin service が利用できません。"
@@ -2063,6 +2080,19 @@ private suspend fun <T : Any> ApplicationCall.respondRuntimeConfigResult(result:
         return null
     }
 
+    if (throwable is PaperAccountEpochSwitchRejectedException) {
+        respond(
+            HttpStatusCode.Conflict,
+            OpsPaperAccountEpochSwitchConflictResponse(
+                openPositionCount = throwable.openPositionCount,
+                openOrderCount = throwable.openOrderCount,
+                btcQuantity = throwable.btcQuantity,
+            ),
+        )
+
+        return null
+    }
+
     if (throwable is IllegalArgumentException) {
         respond(HttpStatusCode.BadRequest, ErrorResponse(throwable.message ?: "runtime config request is invalid"))
 
@@ -2173,6 +2203,9 @@ private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalo
         CommandEventType.CLI_AUTH_LOGIN_FAILED -> "cliAuthLoginFailed"
         CommandEventType.CLI_AUTH_LOGIN_TIMED_OUT -> "cliAuthLoginTimedOut"
         CommandEventType.CLI_AUTH_CLOSE_WAIT_TIMED_OUT -> "cliAuthCloseWaitTimedOut"
+        CommandEventType.PAPER_ACCOUNT_EPOCH_IMPORTED -> "paperAccountEpochImported"
+        CommandEventType.PAPER_ACCOUNT_EPOCH_SWITCHED -> "paperAccountEpochSwitched"
+        CommandEventType.PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED -> "paperAccountEpochSwitchRejected"
     }
 
     return activityCatalogItem(name, "activity.catalog.audit.$keySuffix")
