@@ -316,7 +316,7 @@ role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolb
 
 merge 前の自動証跡は `McpDatabaseRoleIntegrationTest` の role/effective privilege/required-call matrix と、`scripts/mcp-credential-isolation-check` の tool audit export・DB data-only dump・encoding scan を含む。scan coverage や dump が欠けた run は無効とし、再実行する。real provider model output probe は operator auth を必要とする別の human check として記録し、自動 check 成功へ読み替えない。
 
-providerがper-run home内へshared groupから通常削除できないmodeのnested artifactを作成した場合、cleanupはfixed LLM launcherのpath限定cleanup modeへ委譲する。対象は`/run/fukurou/llm-homes`直下にappuserが作成したcanonical per-run homeだけで、symlinkを追跡せずtreeを削除する。helperを含むcleanup failureでは`/run/fukurou/llm-homes/.cleanup-quarantine`が残り、manual/daemonの次runはcurrent container process内でfail closedになる。markerとper-run artifactは同じtmpfsにあり、container restartでは両方が同時に破棄される。operatorはdaemonを無効のまま残存per-run homeとmanifestを監査し、filesystem原因を解消してからmarkerを削除するか、監査後にcontainerを再起動する。markerだけを先に消したり、strategy NO_TRADEとして成績へ混ぜたりしない。
+providerがper-run home内へshared groupから通常削除できないmodeのnested artifactを作成した場合、cleanupはfixed LLM launcherのpath限定cleanup modeへ委譲する。対象は`/run/fukurou/llm-homes`直下にappuserが作成したcanonical per-run homeだけで、symlinkを追跡せずtreeを削除する。helperはreal directoryのowner traversal/write権限だけを回復し、regular fileのread modeやscope外inodeを変更しない。helperを含むcleanup failureでは`/run/fukurou/llm-homes/.cleanup-quarantine`が残り、manual/daemonの次runはcurrent container process内でfail closedになる。markerとper-run artifactは同じtmpfsにあり、container restartでは両方が同時に破棄される。operatorはdaemonを無効のまま残存per-run homeとmanifestを監査し、filesystem原因を解消してからmarkerを削除するか、監査後にcontainerを再起動する。markerだけを先に消したり、strategy NO_TRADEとして成績へ混ぜたりしない。
 
 rotation 後は旧 image で LLM phase を再有効化しない。障害時は daemon disabled のまま現 image を維持するか、修正版へ roll-forward する。
 

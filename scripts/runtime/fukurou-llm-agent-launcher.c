@@ -86,9 +86,14 @@ static void verify_canary_security_state(void) {
 }
 
 static int transfer_cleanup_entry(const char *path, const struct stat *metadata, int type, struct FTW *state) {
-    (void)metadata;
-    (void)type;
     (void)state;
+    if (type == FTW_D) {
+        if (lchown(path, 0, LLM_GID) != 0) return -1;
+        int chmod_result = chmod(path, metadata->st_mode | S_IRUSR | S_IWUSR | S_IXUSR);
+        int handoff_result = lchown(path, APP_UID, LLM_GID);
+        if (chmod_result != 0 || handoff_result != 0) return -1;
+        return 0;
+    }
     return lchown(path, APP_UID, LLM_GID);
 }
 
