@@ -47,7 +47,7 @@ internal fun Logger.logSafeWarning(message: String, throwable: Throwable) {
     val safeFields = throwable.safeLogFieldsOrNull()
 
     if (safeFields != null) {
-        warning("$message ${safeFields.format()}.")
+        warning("$message outerType=${throwable.javaClass.simpleName} ${safeFields.format()}.")
         return
     }
 

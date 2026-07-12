@@ -473,7 +473,7 @@ class GmoPublicMarketDataSourceTest {
         val marketDataSource = fakeMarketDataSource(
             httpClient = httpClient,
             retryConfig = GmoRetryConfig(maxAttempts = 2),
-            requestRateLimiter = RecordingRateLimiter(Duration.ofMillis(12)),
+            requestRateLimiter = RecordingRateLimiter(),
             requestAuditSink = auditSink,
         )
         val correlation = GmoPublicRequestCorrelation(
@@ -984,18 +984,14 @@ private class FakeHttpResponse(
 /**
  * rate limiter 呼び出しを記録する fake。
  */
-private class RecordingRateLimiter(
-    private val permitWait: Duration = Duration.ZERO,
-) : GmoRequestRateLimiter {
+private class RecordingRateLimiter : GmoRequestRateLimiter {
     /**
      * permit を要求された endpoint 名。
      */
     val endpointNames = mutableListOf<String>()
 
-    override fun acquirePermit(endpointName: String): Duration {
+    override fun acquirePermit(endpointName: String) {
         endpointNames += endpointName
-
-        return permitWait
     }
 }
 
@@ -1058,9 +1054,7 @@ private class AdvancingRateLimiter(
     private val monotonicTimeSource: MutableMonotonicTimeSource,
     private val elapsed: Duration,
 ) : GmoRequestRateLimiter {
-    override fun acquirePermit(endpointName: String): Duration {
+    override fun acquirePermit(endpointName: String) {
         monotonicTimeSource.advance(elapsed)
-
-        return Duration.ofMillis(1)
     }
 }

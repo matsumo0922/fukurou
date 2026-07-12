@@ -32,15 +32,21 @@ class RateLimitedWarnLoggerTest {
         warnLogger.warn(
             key = "gmo-rate-limit",
             message = "GMO request failed.",
-            throwable = GmoRateLimitException("sentinel-rate-message /private/rate-path"),
+            throwable = IllegalStateException(
+                "sentinel-outer-rate-message /private/outer-rate-path",
+                GmoRateLimitException("sentinel-rate-message /private/rate-path"),
+            ),
         )
 
         val record = handler.records.single()
         val rendered = record.message + record.thrown?.stackTraceToString().orEmpty()
 
         assertNull(record.thrown)
+        assertTrue(rendered.contains("outerType=IllegalStateException"))
         assertTrue(rendered.contains("category=GMO_RATE_LIMITED"))
         assertTrue(rendered.contains("type=GmoRateLimitException"))
+        assertFalse(rendered.contains("sentinel-outer-rate-message"))
+        assertFalse(rendered.contains("outer-rate-path"))
         assertFalse(rendered.contains("sentinel-rate-message"))
         assertFalse(rendered.contains("rate-path"))
     }
@@ -52,6 +58,9 @@ class RateLimitedWarnLoggerTest {
         val rawFailure = IOException("sentinel-message /private/sentinel-path/key.json")
         val networkFailure = MarketNetworkException("network sentinel", rawFailure)
         val auditFailure = GmoRequestAuditException().apply { addSuppressed(networkFailure) }
+        val outerFailure = IllegalArgumentException("sentinel-outer-message /private/outer-path").apply {
+            addSuppressed(auditFailure)
+        }
         val warnLogger = RateLimitedWarnLogger(
             logger = logger,
             clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC),
@@ -60,17 +69,21 @@ class RateLimitedWarnLoggerTest {
         warnLogger.warn(
             key = "gmo-audit",
             message = "GMO request failed.",
-            throwable = auditFailure,
+            throwable = outerFailure,
         )
 
         val record = handler.records.single()
         val rendered = record.message + record.thrown?.stackTraceToString().orEmpty()
 
         assertNull(record.thrown)
+        assertTrue(rendered.contains("outerType=IllegalArgumentException"))
         assertTrue(rendered.contains("category=GMO_REQUEST_AUDIT_FAILED"))
         assertTrue(rendered.contains("type=GmoRequestAuditException"))
+        assertFalse(rendered.contains("sentinel-outer-message"))
+        assertFalse(rendered.contains("outer-path"))
         assertFalse(rendered.contains("sentinel-message"))
         assertFalse(rendered.contains("sentinel-path"))
+        assertSame(auditFailure, outerFailure.suppressed.single())
         assertSame(networkFailure, auditFailure.suppressed.single())
         assertSame(rawFailure, networkFailure.cause)
     }
@@ -89,9 +102,24 @@ class RateLimitedWarnLoggerTest {
         val rendered = record.message + record.thrown?.stackTraceToString().orEmpty()
 
         assertEquals(null, record.thrown)
+        assertTrue(rendered.contains("outerType=GmoRequestAuditException"))
         assertTrue(rendered.contains("category=GMO_REQUEST_AUDIT_FAILED"))
         assertFalse(rendered.contains("sentinel-direct-message"))
         assertFalse(rendered.contains("direct-path"))
+    }
+
+    @Test
+    fun directWarning_keepsOrdinaryExceptionLogging() {
+        val handler = CapturingLogHandler()
+        val logger = recordingLogger(handler)
+        val failure = IllegalStateException("ordinary failure")
+
+        logger.logSafeWarning("Direct boundary failed.", failure)
+
+        val record = handler.records.single()
+
+        assertEquals("Direct boundary failed.", record.message)
+        assertSame(failure, record.thrown)
     }
 }
 

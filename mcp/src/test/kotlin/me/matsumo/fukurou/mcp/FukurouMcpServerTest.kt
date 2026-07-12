@@ -88,6 +88,7 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.exchange.gmo.DeferredGmoPublicRequestAuditSink
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
@@ -139,6 +140,7 @@ class FukurouMcpServerTest {
     @Test
     fun constructor_acceptsInjectedMarketDataSource() {
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = TradingRuntimeFactory.inMemory(),
         )
@@ -149,6 +151,7 @@ class FukurouMcpServerTest {
     @Test
     fun createServer_exposesGmoCoinAndFukurouToolsOnSingleServer() {
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = TradingRuntimeFactory.inMemory(),
         ).createServer()
@@ -185,6 +188,7 @@ class FukurouMcpServerTest {
     @Test
     fun createServer_registeredToolNamesMatchClaudeAllowedToolPattern() {
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = TradingRuntimeFactory.inMemory(),
         ).createServer()
@@ -202,6 +206,7 @@ class FukurouMcpServerTest {
     @Test
     fun createServer_containsDefaultRunnerAllowlistTools() {
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = TradingRuntimeFactory.inMemory(),
         ).createServer()
@@ -224,6 +229,7 @@ class FukurouMcpServerTest {
     fun getBalanceTool_returnsFreshnessMetadataFromPaperAccountUpdatedAt() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -247,6 +253,7 @@ class FukurouMcpServerTest {
     fun getPositionsTool_returnsFreshnessMetadataFromPaperAccountUpdatedAt() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -270,6 +277,7 @@ class FukurouMcpServerTest {
     fun getOpenOrdersTool_returnsFreshnessMetadataFromPaperAccountUpdatedAt() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -293,6 +301,7 @@ class FukurouMcpServerTest {
     fun getAccountStatusTool_returnsFreshnessMetadataFromPaperAccountUpdatedAt() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -328,6 +337,7 @@ class FukurouMcpServerTest {
             ),
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -368,6 +378,7 @@ class FukurouMcpServerTest {
             ),
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -408,6 +419,7 @@ class FukurouMcpServerTest {
             ),
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -444,6 +456,7 @@ class FukurouMcpServerTest {
             ),
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -474,6 +487,7 @@ class FukurouMcpServerTest {
     @Test
     fun updateProtectionTool_allowsNullTakeProfitClearInSchema() {
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = TradingRuntimeFactory.inMemory(),
         ).createServer()
@@ -490,6 +504,7 @@ class FukurouMcpServerTest {
     @Test
     fun submitDecisionTool_requiresExpectedRMultipleInSchema() {
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = TradingRuntimeFactory.inMemory(),
         ).createServer()
@@ -501,6 +516,7 @@ class FukurouMcpServerTest {
     @Test
     fun submitDecisionTool_exposesPartialTradingActionsAndCloseRatioSchema() {
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = TradingRuntimeFactory.inMemory(),
         ).createServer()
@@ -522,6 +538,7 @@ class FukurouMcpServerTest {
     fun submitDecisionTool_recordsNoTradeInMemoryRuntime() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -547,6 +564,7 @@ class FukurouMcpServerTest {
     fun submitDecisionTool_rejectsMissingExpectedRMultiple() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -572,6 +590,7 @@ class FukurouMcpServerTest {
     fun submitDecisionTool_rejectsReduceWithoutCloseRatio() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -597,6 +616,7 @@ class FukurouMcpServerTest {
     fun submitDecisionTool_rejectsCloseRatioForExit() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -622,6 +642,7 @@ class FukurouMcpServerTest {
     fun submitDecisionTool_recordsReduceCloseRatio() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -645,6 +666,7 @@ class FukurouMcpServerTest {
     fun submitDecisionTool_acceptsNegativeExpectedRMultiple() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -665,6 +687,7 @@ class FukurouMcpServerTest {
     fun submitFalsificationTool_recordsVerdictForEnterIntentInMemoryRuntime() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -714,6 +737,7 @@ class FukurouMcpServerTest {
     fun submitDecisionTool_recordsAddLongIntentWithTradePlanRevision() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -744,6 +768,7 @@ class FukurouMcpServerTest {
     fun submitDecisionTool_rejectsAddLongWithoutSetupTags() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -778,6 +803,7 @@ class FukurouMcpServerTest {
     fun getTradeIntentTool_returnsIntentAndTradePlanForFalsifierReview() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -818,6 +844,7 @@ class FukurouMcpServerTest {
         val longInvocationId = "recent-run-" + "x".repeat(140)
         runtime.llmRunRepository.finish(failedLlmRun(longInvocationId)).getOrThrow()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -918,6 +945,7 @@ class FukurouMcpServerTest {
             clock = clock,
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = clock,
             tradingRuntime = runtime,
@@ -966,6 +994,7 @@ class FukurouMcpServerTest {
             redactor = SecretRedactor.fromEnvironment(mapOf("API_SECRET" to rawSecret)),
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = clock,
             tradingRuntime = runtime,
@@ -1079,6 +1108,7 @@ class FukurouMcpServerTest {
                 ),
             ).getOrThrow()
             val server = FukurouMcpServer(
+                clientRole = GmoPublicClientRole.UNSPECIFIED,
                 marketDataSource = FakeMarketDataSource,
                 clock = clock,
                 tradingRuntime = runtime,
@@ -1105,6 +1135,7 @@ class FukurouMcpServerTest {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
         runtime.llmRunRepository.finish(failedLlmRun("similar-run")).getOrThrow()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -1157,6 +1188,7 @@ class FukurouMcpServerTest {
     fun knowledgeSimilarSetupsTool_doesNotSubstringMatchShortSearchTokens() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -1189,6 +1221,7 @@ class FukurouMcpServerTest {
             marketDataSource = PreviewMarketDataSource,
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = PreviewMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -1247,12 +1280,22 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun gmoPublicClientRole_mapsEveryLlmInvocationPhaseExplicitly() {
+        assertEquals(GmoPublicClientRole.UNSPECIFIED, LlmInvocationPhase.PRE_FILTER.toGmoPublicClientRole())
+        assertEquals(GmoPublicClientRole.PROPOSER, LlmInvocationPhase.PROPOSER.toGmoPublicClientRole())
+        assertEquals(GmoPublicClientRole.FALSIFIER, LlmInvocationPhase.FALSIFIER.toGmoPublicClientRole())
+        assertEquals(GmoPublicClientRole.UNSPECIFIED, LlmInvocationPhase.REFLECTION.toGmoPublicClientRole())
+        assertEquals(GmoPublicClientRole.UNSPECIFIED, LlmInvocationPhase.EVALUATION_REPORT.toGmoPublicClientRole())
+    }
+
+    @Test
     fun previewOrderTool_rejectedPathMatchesPlaceOrderFirstSafetyViolation() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory(
             clock = fixedClock(),
             marketDataSource = PreviewMarketDataSource,
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = PreviewMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -1287,6 +1330,7 @@ class FukurouMcpServerTest {
             marketDataSource = PreviewMarketDataSource,
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = PreviewMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
@@ -1322,6 +1366,7 @@ class FukurouMcpServerTest {
     fun submitFalsificationTool_rejectsMissingIntentId() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -1347,6 +1392,7 @@ class FukurouMcpServerTest {
     fun submitDecisionTool_recordsTradePlanRevisionForNonEnterAction() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -1387,6 +1433,7 @@ class FukurouMcpServerTest {
     fun submitDecisionTool_rejectsTradePlanRevisionCountReset() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
         ).createServer()
@@ -1467,6 +1514,7 @@ class FukurouMcpServerTest {
             ),
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = failingRuntime,
         ).createServer()
@@ -1497,6 +1545,7 @@ class FukurouMcpServerTest {
         )
         val runtime = TradingRuntimeFactory.inMemory(tradingConfig = config)
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             tradingConfig = config,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
@@ -1552,6 +1601,7 @@ class FukurouMcpServerTest {
         ).getOrThrow()
 
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             tradingConfig = config,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
@@ -1640,6 +1690,7 @@ class FukurouMcpServerTest {
             ),
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
             decisionRunContext = decisionRunContext,
@@ -1672,6 +1723,7 @@ class FukurouMcpServerTest {
         )
         val runtime = TradingRuntimeFactory.inMemory(tradingConfig = config)
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             tradingConfig = config,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
@@ -1715,6 +1767,7 @@ class FukurouMcpServerTest {
             tradingConfig = config,
         )
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             tradingConfig = config,
             marketDataSource = PreviewMarketDataSource,
             clock = fixedClock(),
@@ -1738,6 +1791,7 @@ class FukurouMcpServerTest {
     fun toolAllowlistDenied_returnsToolErrorAndNoTradeAudit() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
             toolCallLimiter = McpToolCallLimiter(
@@ -1806,6 +1860,7 @@ class McpLaunchBootstrapPolicyTest {
         val bootstrap = decodeBootstrap(bootstrapManifest(LlmInvocationPhase.PROPOSER, clock), clock)
         val runtime = TradingRuntimeFactory.inMemory(clock = clock)
         val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = clock,
             tradingRuntime = runtime,

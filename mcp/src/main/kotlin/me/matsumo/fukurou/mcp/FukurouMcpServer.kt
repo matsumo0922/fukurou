@@ -395,7 +395,7 @@ private data class LimitedToolContext(
 fun main() {
     redirectProcessStdoutToStderrForMcpStdio()
     if (useTestInMemoryRuntime()) {
-        FukurouMcpServer().run()
+        FukurouMcpServer(clientRole = GmoPublicClientRole.UNSPECIFIED).run()
         return
     }
     val bootstrap = McpLaunchBootstrap.read()
@@ -433,6 +433,7 @@ fun main() {
 /**
  * fukurou の MCP stdio server。業務ロジックは `:trading` へ委譲する。
  *
+ * @param clientRole GMO Public request audit に記録する呼び出し元 role
  * @param tradingConfig 取引 bot 全体の typed config
  * @param marketDataSource 市場データ取得元
  * @param clock response 鮮度 metadata と default runtime を作る clock
@@ -441,6 +442,7 @@ fun main() {
  * @param decisionRunContext 呼び出し元の decision run context
  */
 class FukurouMcpServer(
+    private val clientRole: GmoPublicClientRole,
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     private val requestAuditSink: DeferredGmoPublicRequestAuditSink = DeferredGmoPublicRequestAuditSink(),
     private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource.fromConfig(
@@ -464,7 +466,6 @@ class FukurouMcpServer(
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
     allowedToolNames: Set<String>? = mcpAllowedToolNamesFromEnvironment(),
     expiresAt: Instant? = null,
-    private val clientRole: GmoPublicClientRole = GmoPublicClientRole.UNSPECIFIED,
     private val toolCallLimiter: McpToolCallLimiter = McpToolCallLimiter(
         config = tradingConfig.runner,
         toolCallGuard = tradingRuntime.toolCallGuard,
@@ -643,9 +644,11 @@ private class AuditedGmoCoinMarketToolExecutor(
 
 internal fun LlmInvocationPhase.toGmoPublicClientRole(): GmoPublicClientRole {
     return when (this) {
+        LlmInvocationPhase.PRE_FILTER -> GmoPublicClientRole.UNSPECIFIED
         LlmInvocationPhase.PROPOSER -> GmoPublicClientRole.PROPOSER
         LlmInvocationPhase.FALSIFIER -> GmoPublicClientRole.FALSIFIER
-        else -> GmoPublicClientRole.UNSPECIFIED
+        LlmInvocationPhase.REFLECTION -> GmoPublicClientRole.UNSPECIFIED
+        LlmInvocationPhase.EVALUATION_REPORT -> GmoPublicClientRole.UNSPECIFIED
     }
 }
 

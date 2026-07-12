@@ -22,14 +22,14 @@ fun interface GmoRequestRateLimiter {
     /**
      * 指定 endpoint の request permit を取得する。
      */
-    fun acquirePermit(endpointName: String): Duration
+    fun acquirePermit(endpointName: String)
 }
 
 /**
  * retry / rate-limit 待機を行わない test 用 rate limiter。
  */
 object NoopGmoRequestRateLimiter : GmoRequestRateLimiter {
-    override fun acquirePermit(endpointName: String): Duration = Duration.ZERO
+    override fun acquirePermit(endpointName: String) = Unit
 }
 
 /**
@@ -68,19 +68,16 @@ class GmoTokenBucketRateLimiter(
     private var availablePermits = config.burstSize.toDouble()
     private var lastRefillMillis = clock.millis()
 
-    override fun acquirePermit(endpointName: String): Duration {
+    override fun acquirePermit(endpointName: String) {
         require(endpointName.isNotBlank()) {
             "endpointName must not be blank."
         }
 
-        var totalWait = Duration.ZERO
-
         while (true) {
             val waitDuration = acquirePermitOrWaitDuration()
-                ?: return totalWait
+                ?: return
 
             sleeper.sleep(waitDuration)
-            totalWait = totalWait.plus(waitDuration)
         }
     }
 
