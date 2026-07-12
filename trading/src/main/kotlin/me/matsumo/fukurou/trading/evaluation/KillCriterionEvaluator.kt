@@ -16,8 +16,8 @@ import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
-import java.util.logging.Level
 import java.util.logging.Logger
+import me.matsumo.fukurou.trading.logging.logSafeWarning as logSafeWarningMessage
 
 /**
  * 評価成績に基づき既存 HARD_HALT へ接続する kill 基準 evaluator。
@@ -61,7 +61,7 @@ class KillCriterionEvaluator(
             val previousEvaluatedAt = lastEvaluatedAt
             lastEvaluatedAt = Instant.now(clock)
             val stats = statsSource().getOrElse { throwable ->
-                logger.log(Level.WARNING, "KillCriterionEvaluator stats source failed.", throwable)
+                logger.logSafeWarningMessage("KillCriterionEvaluator stats source failed.", throwable)
 
                 return Result.success(Unit)
             }
@@ -118,7 +118,7 @@ class KillCriterionEvaluator(
                 occurredAt = Instant.now(clock),
             ),
         ).onFailure { throwable ->
-            logger.log(Level.WARNING, "KillCriterionEvaluator breach audit append failed.", throwable)
+            logger.logSafeWarningMessage("KillCriterionEvaluator breach audit append failed.", throwable)
         }
     }
 

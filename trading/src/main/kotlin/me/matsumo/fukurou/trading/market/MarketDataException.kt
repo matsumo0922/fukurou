@@ -1,5 +1,8 @@
 package me.matsumo.fukurou.trading.market
 
+import me.matsumo.fukurou.trading.logging.SafeLogFields
+import me.matsumo.fukurou.trading.logging.SafeLoggableFailure
+
 /**
  * 市場データ取得失敗の再試行可否を表す分類。
  */
@@ -61,10 +64,16 @@ class GmoRateLimitException(
 /**
  * GMO Public request の監査保存に失敗したときの例外。
  */
-class GmoRequestAuditException : MarketDataException(
-    MarketDataFailureKind.PERMANENT,
-    "GMO public request audit failed after execution.",
-)
+class GmoRequestAuditException :
+    MarketDataException(MarketDataFailureKind.PERMANENT, "GMO public request audit failed after execution."),
+    SafeLoggableFailure {
+    override fun safeLogFields(): SafeLogFields {
+        return SafeLogFields(
+            category = "GMO_REQUEST_AUDIT_FAILED",
+            type = GmoRequestAuditException::class.java.simpleName,
+        )
+    }
+}
 
 /** GMO transport / request audit failure を lossy fallback へ変換してはならないかを返す。 */
 fun Throwable.isFailClosedGmoRequestFailure(): Boolean {

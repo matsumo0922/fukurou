@@ -3,7 +3,6 @@ package me.matsumo.fukurou.trading.logging
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
-import java.util.logging.Level
 import java.util.logging.Logger
 
 /**
@@ -48,14 +47,7 @@ class RateLimitedWarnLogger(
             return
         }
 
-        val safeFields = throwable.safeLogFieldsOrNull()
-
-        if (safeFields != null) {
-            logger.warning("$message ${safeFields.format()}.")
-            return
-        }
-
-        logger.log(Level.WARNING, message, throwable)
+        logger.logSafeWarning(message, throwable)
     }
 
     private fun shouldLog(key: String, now: Instant): Boolean {
