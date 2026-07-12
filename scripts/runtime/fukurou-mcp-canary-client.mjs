@@ -61,6 +61,7 @@ process.stdout.write(JSON.stringify({
   dumpable: process.env.FUKUROU_CANARY_LLM_DUMPABLE,
   coreLimit: process.env.FUKUROU_CANARY_LLM_CORE_LIMIT,
   launchFds: process.env.FUKUROU_CANARY_LLM_LAUNCH_FDS,
+  umask: process.umask().toString(8).padStart(4, "0"),
   liveFds: readdirSync("/proc/self/fd").sort((left, right) => Number(left) - Number(right)),
   env: Object.keys(process.env).sort(),
 }) + "\n");

@@ -152,18 +152,49 @@ class ShellProcessRunner : ProcessRunner {
     }
 
     private fun deleteCleanupPath(path: Path) {
-        if (!Files.isDirectory(path)) {
+        runCatching { deleteCleanupPathAsCurrentUser(path) }
+            .recoverCatching { failure ->
+                if (!path.isProductionPerRunHome()) throw failure
+
+                deleteProductionPerRunHome(path)
+            }
+            .getOrThrow()
+    }
+
+    private fun deleteCleanupPathAsCurrentUser(path: Path) {
+        if (Files.isDirectory(path)) {
+            Files.walk(path).use { paths ->
+                paths
+                    .sorted(Comparator.reverseOrder())
+                    .forEach { candidate -> Files.deleteIfExists(candidate) }
+            }
+        } else {
             Files.deleteIfExists(path)
-
-            return
-        }
-
-        Files.walk(path).use { paths ->
-            paths
-                .sorted(Comparator.reverseOrder())
-                .forEach { candidate -> Files.deleteIfExists(candidate) }
         }
     }
+
+    private fun deleteProductionPerRunHome(path: Path) {
+        val builder = ProcessBuilder(PRODUCTION_LLM_LAUNCHER, CLEANUP_MODE, path.toString())
+            .redirectInput(ProcessBuilder.Redirect.PIPE)
+        builder.environment().clear()
+        val process = builder.start()
+        process.outputStream.close()
+        val stderr = process.errorStream.bufferedReader().use { reader -> reader.readText() }
+        val exitCode = process.waitFor()
+
+        check(exitCode == 0) {
+            "Production LLM per-run home cleanup failed: ${stderr.trim()}"
+        }
+    }
+}
+
+private fun Path.isProductionPerRunHome(): Boolean {
+    val normalized = toAbsolutePath().normalize()
+    val parent = normalized.parent ?: return false
+    val name = normalized.fileName.toString()
+
+    return parent == PRODUCTION_LLM_HOME_ROOT &&
+        (name.startsWith(CODEX_HOME_PREFIX) || name.startsWith(CLAUDE_HOME_PREFIX))
 }
 
 private fun ProcessHandle.awaitExitQuietly() {
@@ -176,3 +207,8 @@ private fun ProcessHandle.awaitExitQuietly() {
  * process tree kill 後に exit を待つ秒数。
  */
 private const val PROCESS_TREE_KILL_WAIT_SECONDS = 2L
+private const val PRODUCTION_LLM_LAUNCHER = "/usr/local/libexec/fukurou-llm-agent-launcher"
+private const val CLEANUP_MODE = "cleanup"
+private const val CODEX_HOME_PREFIX = "fukurou-codex-home-"
+private const val CLAUDE_HOME_PREFIX = "fukurou-llm-config-"
+private val PRODUCTION_LLM_HOME_ROOT = Path.of("/run/fukurou/llm-homes")
