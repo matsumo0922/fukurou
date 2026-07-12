@@ -113,6 +113,7 @@ import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import org.testcontainers.DockerClientFactory
+import org.testcontainers.containers.Container
 import org.testcontainers.containers.PostgreSQLContainer
 import org.testcontainers.utility.MountableFile
 import java.net.InetSocketAddress
@@ -1927,6 +1928,7 @@ class McpDatabaseRoleIntegrationTest {
         try {
             val clock = fixedClock()
             val database = ExposedDatabase.connect(container.jdbcUrl, driver = "org.postgresql.Driver", user = container.username, password = container.password)
+            assertMcpRoleProvisionRequiresBootstrap(container)
             TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
             seedRequiredMatrixRun(container, clock)
             seedDirtyMcpPrivileges(container)
@@ -2139,22 +2141,38 @@ private suspend fun seedRequiredMatrixRun(container: PostgreSQLContainer<*>, clo
 }
 
 private fun provisionMcpRole(container: PostgreSQLContainer<*>) {
-    val sqlPath = generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { path -> path.parent }
-        .map { path -> path.resolve("scripts/deploy/sql/mcp-role.sql") }
-        .first { path -> java.nio.file.Files.isRegularFile(path) }
-    container.copyFileToContainer(MountableFile.forHostPath(sqlPath), "/tmp/mcp-role.sql")
-    val result = container.execInContainer(
-        "psql", "-U", container.username, "-d", container.databaseName,
-        "-v", "mcp_role=$MCP_TEST_ROLE", "-v", "mcp_password=$MCP_TEST_PASSWORD",
-        "-v", "database_name=${container.databaseName}", "-v", "app_role=${container.username}",
-        "-f", "/tmp/mcp-role.sql",
-    )
+    val result = runMcpRoleProvision(container)
     check(result.exitCode == 0) { "MCP role SQL failed: ${result.stderr}" }
     val roleCheck = container.execInContainer(
         "psql", "-U", container.username, "-d", container.databaseName,
         "-Atc", "SELECT rolname FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'",
     )
     check(roleCheck.stdout.trim() == MCP_TEST_ROLE) { "MCP role was not created; SQL output=${result.stdout}" }
+}
+
+private fun assertMcpRoleProvisionRequiresBootstrap(container: PostgreSQLContainer<*>) {
+    val result = runMcpRoleProvision(container)
+
+    assertTrue(result.exitCode != 0)
+    assertTrue(result.stderr.contains("deploy the application schema/bootstrap"))
+    val roleCheck = container.execInContainer(
+        "psql", "-U", container.username, "-d", container.databaseName,
+        "-Atc", "SELECT count(*) FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'",
+    )
+    assertEquals("0", roleCheck.stdout.trim())
+}
+
+private fun runMcpRoleProvision(container: PostgreSQLContainer<*>): Container.ExecResult {
+    val sqlPath = generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { path -> path.parent }
+        .map { path -> path.resolve("scripts/deploy/sql/mcp-role.sql") }
+        .first { path -> java.nio.file.Files.isRegularFile(path) }
+    container.copyFileToContainer(MountableFile.forHostPath(sqlPath), "/tmp/mcp-role.sql")
+    return container.execInContainer(
+        "psql", "-U", container.username, "-d", container.databaseName,
+        "-v", "mcp_role=$MCP_TEST_ROLE", "-v", "mcp_password=$MCP_TEST_PASSWORD",
+        "-v", "database_name=${container.databaseName}", "-v", "app_role=${container.username}",
+        "-f", "/tmp/mcp-role.sql",
+    )
 }
 
 @Suppress("NestedBlockDepth")

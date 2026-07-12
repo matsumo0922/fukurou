@@ -1,5 +1,16 @@
 \set ON_ERROR_STOP on
 
+BEGIN;
+
+DO $$
+BEGIN
+    IF to_regclass('public.mcp_current_evaluation_scope') IS NULL
+        OR to_regclass('public.mcp_evaluation_epochs') IS NULL THEN
+        RAISE EXCEPTION 'MCP evaluation views are missing; deploy the application schema/bootstrap before provisioning the MCP role';
+    END IF;
+END
+$$;
+
 SELECT format(
     'CREATE ROLE %I LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT',
     :'mcp_role',
@@ -128,3 +139,5 @@ WHERE member = (SELECT oid FROM pg_roles WHERE rolname = :'mcp_role') \gexec
 SELECT format('REVOKE %I FROM %I', :'mcp_role', member::regrole)
 FROM pg_auth_members
 WHERE roleid = (SELECT oid FROM pg_roles WHERE rolname = :'mcp_role') \gexec
+
+COMMIT;
