@@ -33,6 +33,8 @@ Kotlin/JVM ・ Ktor ・ Exposed ・ PostgreSQL ・ Docker Compose ・ MCP 公式
 
 現時点では、`:trading` の paper account / broker / safety / WebSocket paper execution / decision protocol / evaluation / knowledge writer / reflection runner / 週次 PromptCandidates / GMO Public market data、`:mcp-gmo-coin` の GMO Public market tools、`:mcp` の fukurou stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 worker、`web/` の Vite + React + TypeScript foundation が実装済みです。
 
+entry decision は full run 前に固定した bounded material-state manifest と、server が生成する episode / thesis / geometry / material-state identity を decision と intent に保存します。`/evaluation/summary` の `deduplication` と Overview は identity / shadow coverage、resting maintenance、false-suppression proxy の観測値を表示します。ゼロ分母の rate は `null` です。
+
 paper の未約定 LIMIT、BUY STOP、protective STOP、virtual TP は GMO Public WebSocket `trades/BTC` の接続中に受信した realtime event だけで前進します。transport activity、trade、periodic maintenance は別々に監査し、trade 無音だけでは接続障害にしません。close/error、decode failure、buffer overflow、transport liveness timeout は market-data gap として永続化し、影響する注文・position・decision run を成績評価から除外します。REST history、candle、再接続後の履歴から遡及約定は作りません。
 
 ## Backend / API

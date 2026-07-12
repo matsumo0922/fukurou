@@ -10,7 +10,14 @@ import java.util.UUID
 
 /** versioned canonicalization から server-owned identity を生成する。 */
 object DecisionIdentityGenerator {
-    /** thesis、geometry、material projection から identity を生成する。 */
+    /**
+     * canonical content の lowercase SHA-256。
+     */
+    fun contentHash(value: String): String = sha256(value)
+
+    /**
+     * thesis、geometry、material projection から identity を生成する。
+     */
     fun generate(
         episodeId: UUID,
         tradePlan: TradePlanDraft,

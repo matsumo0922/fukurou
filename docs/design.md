@@ -51,6 +51,7 @@
 - 既定値は flat heartbeat 15分、保有中 check 15分、hard cap 7/hour・120/day とする。routine cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。
 - 経済イベント trigger も同じ hourly / daily 予算を消費し、heartbeat とは別枠にしない。
 - open position が 0 件で position 未紐付けの BUY resting entry だけが生存する tick は、trigger reservation より前に決定論的 maintenance へ分岐する。データ欠損時も full LLM へ fail-openせず typed suppression reason を残し、注文の TTL、価格、種別、fill 判定は変更しない。open position が併存する場合は position safety 用 trigger を優先する。
+- Proposer 起動前の material-state manifest は invocation ID を主キーに append-only で保存する。decision と intent の episode / thesis / geometry / material-state identity は同一 transaction で dual-writeし、proposal の関係を append-only shadow observation として記録する。
 - flat 15分運転では rolling 1時間予算が heartbeat で飽和しやすいため、経済イベント trigger は最大約15分遅延して heartbeat 枠を置き換える可能性がある。
 - 最大120起動/日 x 実測 token は日次消費が大きいため、Usage UI と #28 の集計で過剰消費が見えた場合は cadence を再調整する。
 

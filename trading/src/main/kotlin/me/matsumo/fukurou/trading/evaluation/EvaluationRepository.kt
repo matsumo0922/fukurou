@@ -10,6 +10,7 @@ import java.time.Instant
 /**
  * 評価系が参照する DB 読み取り repository。
  */
+@Suppress("TooManyFunctions")
 interface EvaluationRepository {
     /** 明示選択可能な immutable epoch を新しい順で返す。 */
     suspend fun listEpochs(): Result<List<EvaluationEpochOption>> = Result.success(emptyList())
@@ -24,7 +25,16 @@ interface EvaluationRepository {
         )
     }
 
-    /** report 用 internal facts を単一 snapshot として取得する。 */
+    /**
+     * decision deduplication telemetry を返す。
+     */
+    suspend fun fetchDeduplicationMetrics(period: EvaluationPeriod): Result<DeduplicationMetrics> {
+        return Result.success(DeduplicationMetrics())
+    }
+
+    /**
+     * report 用 internal facts を単一 snapshot として取得する。
+     */
     suspend fun fetchReportSnapshot(period: EvaluationPeriod): Result<EvaluationReportSnapshotFacts> = runCatching {
         EvaluationReportSnapshotFacts(
             trades = fetchClosedTrades(period).getOrThrow(),
@@ -159,6 +169,24 @@ fun EvaluationPeriod.intersectLifecycle(scope: EvaluationScope): EvaluationPerio
 }
 
 private fun EvaluationScope.isCurrentPopulation(): Boolean = cohort == EvaluationCohort.CURRENT
+
+/** Phase 1 deduplication の coverage と shadow 集計。 */
+data class DeduplicationMetrics(
+    val decisionEligible: Int = 0,
+    val decisionComplete: Int = 0,
+    val intentEligible: Int = 0,
+    val intentComplete: Int = 0,
+    val shadowEligible: Int = 0,
+    val shadowComplete: Int = 0,
+    val classificationCounts: Map<String, Int> = emptyMap(),
+    val rawSuppressedHeartbeatCount: Int = 0,
+    val uniqueEpisodeCount: Int = 0,
+    val falseSuppressionCount: Int = 0,
+    val validSuppressionCount: Int = 0,
+    val pendingCount: Int = 0,
+    val unknownCount: Int = 0,
+    val restingOnlyDaemonFullRunCount: Int = 0,
+)
 
 /** immutable evaluation report の DB snapshot facts。 */
 data class EvaluationReportSnapshotFacts(

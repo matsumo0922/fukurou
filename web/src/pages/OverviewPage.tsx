@@ -77,8 +77,43 @@ export function OverviewPage() {
         <AccountSnapshotPanel accountQuery={accountQuery} />
         <PositionExposurePanel positionsQuery={positionsQuery} />
         <KillCriterionPanel evaluationQuery={evaluationQuery} />
+        <DeduplicationPanel evaluationQuery={evaluationQuery} />
       </div>
     </div>
+  );
+}
+
+type DeduplicationTelemetry = {
+  decisionIdentityCoverage: number | null;
+  intentIdentityCoverage: number | null;
+  shadowClassificationCoverage: number | null;
+  falseSuppressionRate: number | null;
+  pendingCount: number;
+  unknownCount: number;
+  restingOnlyDaemonFullRunCount: number;
+};
+
+function DeduplicationPanel({ evaluationQuery }: { evaluationQuery: UseQueryResult<EvaluationSummaryResponse, Error> }) {
+  const { t } = useI18n();
+  if (evaluationQuery.isPending) return <PanelLoading label={t("overview.loading.deduplication")} />;
+  if (evaluationQuery.isError) return <PanelError title={t("overview.error.evaluationSummary")} error={evaluationQuery.error} retried={() => void evaluationQuery.refetch()} />;
+
+  const deduplication = (evaluationQuery.data as EvaluationSummaryResponse & { deduplication: DeduplicationTelemetry }).deduplication;
+  return (
+    <Panel>
+      <div className="panel-heading">
+        <Activity size={18} aria-hidden="true" />
+        <h2>{t("overview.panel.deduplication")}</h2>
+        <StatusPill label={deduplication.restingOnlyDaemonFullRunCount === 0 ? "0 full runs" : `${deduplication.restingOnlyDaemonFullRunCount} full runs`} tone={deduplication.restingOnlyDaemonFullRunCount === 0 ? "positive" : "critical"} />
+      </div>
+      <DataStrip items={[
+        { label: t("overview.label.decisionIdentityCoverage"), value: formatRatioAsPercent(deduplication.decisionIdentityCoverage?.toString()) },
+        { label: t("overview.label.intentIdentityCoverage"), value: formatRatioAsPercent(deduplication.intentIdentityCoverage?.toString()) },
+        { label: t("overview.label.shadowCoverage"), value: formatRatioAsPercent(deduplication.shadowClassificationCoverage?.toString()) },
+        { label: t("overview.label.falseSuppression"), value: formatRatioAsPercent(deduplication.falseSuppressionRate?.toString()) },
+        { label: t("overview.label.pendingUnknown"), value: `${deduplication.pendingCount} / ${deduplication.unknownCount}` },
+      ]} />
+    </Panel>
   );
 }
 

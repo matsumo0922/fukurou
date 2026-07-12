@@ -1046,6 +1046,49 @@ object SafetyViolationsTable : Table("safety_violations") {
 /**
  * LLM の最終判断を append-only で保存する Exposed table。
  */
+/** full run 前に固定する immutable material-state manifest。 */
+object DecisionMaterialStateManifestsTable : Table("decision_material_state_manifests") {
+    val invocationId = varchar("invocation_id", 128)
+    val capturedAt = long("captured_at")
+    val schemaVersion = integer("schema_version")
+    val contentHash = varchar("content_hash", 64)
+    val manifestJson = text("manifest_json")
+    override val primaryKey = PrimaryKey(invocationId)
+}
+
+/** opportunity episode の明示 lifecycle。 */
+object OpportunityEpisodesTable : Table("opportunity_episodes") {
+    val id = uuid("id")
+    val symbol = varchar("symbol", 32)
+    val thesisId = varchar("thesis_id", 80)
+    val openedAt = long("opened_at")
+    val closedAt = long("closed_at").nullable()
+    val closeReason = varchar("close_reason", 64).nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** dedupe shadow classifier の append-only observation。 */
+object DedupeShadowObservationsTable : Table("dedupe_shadow_observations") {
+    val id = uuid("id")
+    val observationKind = varchar("observation_kind", 32)
+    val decisionId = uuid("decision_id").nullable()
+    val opportunityEpisodeId = uuid("opportunity_episode_id").nullable()
+    val classification = varchar("classification", 32).nullable()
+    val suppressionReason = varchar("suppression_reason", 64).nullable()
+    val dataQuality = varchar("data_quality", 32)
+    val observedAt = long("observed_at")
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** counterfactual label の append-only resolution。 */
+object DedupeShadowResolutionsTable : Table("dedupe_shadow_resolutions") {
+    val id = uuid("id")
+    val observationId = uuid("observation_id")
+    val resolution = varchar("resolution", 64)
+    val resolvedAt = long("resolved_at")
+    override val primaryKey = PrimaryKey(id)
+}
+
 object DecisionsTable : Table("decisions") {
     /**
      * decision ID。

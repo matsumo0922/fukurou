@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.CancellationException
@@ -36,6 +38,11 @@ import me.matsumo.fukurou.trading.decision.FalsificationRecord
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
+import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
+import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
+import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
+import me.matsumo.fukurou.trading.decision.identity.MaterialMissingSource
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
@@ -403,6 +410,8 @@ class OneShotLlmRunner(
     private suspend fun runOneShotBody(input: OneShotRunBodyInput): OneShotRunnerResult {
         runAuditRecorder.recordLlmRunStarted(input.llmRunStart)
 
+        captureMaterialManifest(input)
+
         val promptContent = requestFactory.readSystemPrompt(input.request.repositoryRoot)
         val promptHash = SystemPromptV1.calculateContentHash(promptContent)
         val proposerContext = requestFactory.decisionRunContext(
@@ -447,6 +456,52 @@ class OneShotLlmRunner(
                 failureContextUpdated = input.failureContextUpdated,
             ),
         )
+    }
+
+    private suspend fun captureMaterialManifest(input: OneShotRunBodyInput) {
+        val capturedAt = clock.instant()
+        val riskState = tradingRuntime.riskStateRepository.current().getOrThrow()
+        val positions = tradingRuntime.broker.getPositions().getOrThrow()
+        val orders = tradingRuntime.broker.getOpenOrders().getOrThrow()
+        val positionFacts = positions.map { position ->
+            "${position.positionId}|${position.status}|${position.side}"
+        }.distinct().sorted().take(32)
+        val orderFacts = orders.map { order ->
+            "${order.orderId}|${order.status}|${order.side}|${order.orderType}"
+        }.distinct().sorted().take(64)
+        val canonical = listOf(
+            "symbol=${tradingConfig.symbol.apiSymbol}",
+            "risk=${riskState.state}",
+            "positions=${positionFacts.joinToString(",")}",
+            "orders=${orderFacts.joinToString(",")}",
+            "freshness=UNKNOWN",
+            "missing=QUOTE:NOT_CAPTURED",
+        ).joinToString("\n")
+        val manifest = DecisionMaterialStateManifest(
+            invocationId = input.invocationId,
+            capturedAt = capturedAt,
+            triggerKind = if (input.request.triggerKind == null) DecisionTriggerKind.MANUAL else DecisionTriggerKind.DAEMON,
+            symbol = tradingConfig.symbol.apiSymbol,
+            runtimeConfigVersion = runtimeConfigSnapshot?.versionId,
+            runtimeConfigHash = runtimeConfigSnapshot?.hash,
+            riskState = riskState.state.name,
+            bestBidJpy = null,
+            bestAskJpy = null,
+            lastPriceJpy = null,
+            sourceTimestamp = null,
+            freshness = MaterialFreshness.UNKNOWN,
+            atr14FiveMinutesJpy = null,
+            latestCandleOpenJpy = null,
+            latestCandleHighJpy = null,
+            latestCandleLowJpy = null,
+            latestCandleCloseJpy = null,
+            openPositionFacts = positionFacts,
+            openOrderFacts = orderFacts,
+            missingSources = listOf(MaterialMissingSource("QUOTE", "NOT_CAPTURED")),
+            canonicalContentHash = DecisionIdentityGenerator.contentHash(canonical),
+        )
+
+        tradingRuntime.decisionMaterialStateRepository.append(manifest).getOrThrow()
     }
 
     private suspend fun recordTtlSweepFailure(

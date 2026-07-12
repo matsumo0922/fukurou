@@ -134,6 +134,7 @@ Ktor process 内の daemon scheduler は active runtime config の `daemon.enabl
 
 - flat 状態: 経済イベント条件や価格急変条件がなければ 15 分 heartbeat。
 - open position がなく resting entry だけが生存する状態: scheduler は reservation、pre-filter、one-shot runner より前に決定論的 maintenance へ分岐し、full LLM run を起動しない。identity や監視データが不足していても full run へ fail-open せず、stable suppression reason を監査する。operator の manual run はこの daemon 抑止とは別経路である。
+- full run は Proposer 起動前に secret と raw orderbook を含まない immutable material-state manifest を invocation ID ごとに1件保存する。entry decision / intent の identity は MCP input から受け取らず、この manifest と提出済み TradePlan / geometry から server が生成する。
 - event 条件: `safety.economicEventBlackouts` の active window、価格急変、STOP 接近、paper entry fill を既存 reservation / cap 経路で評価する。経済イベントは同じ active window で 1 回だけ起動する。
 - holding 状態: open position / open order が DB にある場合も 15 分 cadence。paper entry fill は最新 execution を起点に `ENTRY_FILL` として 1 回だけ起動し、cooldown 内の fill burst は後追い発火しない。
 - pre-filter: `daemon.preFilterEnabled=true` のとき、flat heartbeat / holding dense check は full LLM 起動前に Claude Haiku で market snapshot の有意変化を判定する。NO の場合は `pre_filter_no_change` として full run を省略し、pre-filter 失敗時は full run へ進む。pre-filter 自体も LLM 呼び出しなので予約済み invocation と hourly / daily cap を消費し、full run だけを省略する。価格急変、STOP 接近、paper entry fill、経済イベントには適用しない。

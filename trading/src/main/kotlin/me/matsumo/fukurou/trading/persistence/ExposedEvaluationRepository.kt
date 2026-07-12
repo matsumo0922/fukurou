@@ -14,6 +14,7 @@ import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
 import me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT
+import me.matsumo.fukurou.trading.evaluation.DeduplicationMetrics
 import me.matsumo.fukurou.trading.evaluation.EvaluationExclusionSummary
 import me.matsumo.fukurou.trading.evaluation.EvaluationEpochOption
 import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
@@ -401,9 +402,15 @@ private const val SELECT_SCOPED_PNL_BEFORE_SQL = """
  *
  * @param database Exposed database
  */
+@Suppress("TooManyFunctions")
 class ExposedEvaluationRepository(
     private val database: ExposedDatabase,
 ) : EvaluationRepository {
+    override suspend fun fetchDeduplicationMetrics(period: EvaluationPeriod): Result<DeduplicationMetrics> {
+        return withContext(Dispatchers.IO) {
+            runCatching { exposedTransaction(database) { selectDeduplicationMetrics(period) } }
+        }
+    }
 
     override suspend fun listEpochs(): Result<List<EvaluationEpochOption>> = withContext(Dispatchers.IO) {
         runCatching {
@@ -923,6 +930,62 @@ private fun JdbcTransaction.selectLlmPhaseUsages(period: EvaluationPeriod, limit
             EvaluationLlmUsageQueryResult(
                 facts = facts.take(limit),
                 truncated = truncated,
+            )
+        }
+    }
+}
+
+private fun JdbcTransaction.selectKillCriterionStats(): KillCriterionStats {
+    return jdbcConnection().prepareStatement(SELECT_KILL_CRITERION_STATS_SQL).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) { "kill criterion stats aggregate did not return a row." }
+
+            val closedTrades = resultSet.getInt(1)
+            val winningPnl = resultSet.getBigDecimal(2) ?: BigDecimal.ZERO
+            val losingPnl = resultSet.getBigDecimal(3) ?: BigDecimal.ZERO
+            val profitFactor = if (losingPnl < BigDecimal.ZERO) {
+                winningPnl.divide(losingPnl.abs(), EVALUATION_SQL_SCALE, java.math.RoundingMode.HALF_UP)
+            } else {
+                null
+            }
+
+            KillCriterionStats(
+                closedTrades = closedTrades,
+                profitFactor = profitFactor,
+            )
+        }
+    }
+}
+
+private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod): DeduplicationMetrics {
+    val sql = """SELECT
+        (SELECT COUNT(*) FROM decisions WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<?),
+        (SELECT COUNT(*) FROM decisions WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
+        (SELECT COUNT(*) FROM trade_intents WHERE created_at>=? AND created_at<?),
+        (SELECT COUNT(*) FROM trade_intents WHERE created_at>=? AND created_at<? AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
+        (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<?),
+        (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<? AND classification IS NOT NULL),
+        (SELECT COUNT(DISTINCT opportunity_episode_id) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<?),
+        (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observation_kind='RESTING_MAINTENANCE' AND observed_at>=? AND observed_at<?)
+    """.trimIndent()
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        var index = 1
+        repeat(8) {
+            statement.setLong(index++, period.from.toEpochMilli())
+            statement.setLong(index++, period.toExclusive.toEpochMilli())
+        }
+        statement.executeQuery().use { result ->
+            check(result.next())
+            DeduplicationMetrics(
+                decisionEligible = result.getInt(1),
+                decisionComplete = result.getInt(2),
+                intentEligible = result.getInt(3),
+                intentComplete = result.getInt(4),
+                shadowEligible = result.getInt(5),
+                shadowComplete = result.getInt(6),
+                uniqueEpisodeCount = result.getInt(7),
+                rawSuppressedHeartbeatCount = result.getInt(8),
             )
         }
     }

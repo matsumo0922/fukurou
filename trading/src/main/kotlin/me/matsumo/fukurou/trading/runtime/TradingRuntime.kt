@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.runtime
 
 import com.zaxxer.hikari.HikariConfig
@@ -16,6 +18,8 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
+import me.matsumo.fukurou.trading.decision.identity.InMemoryDecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.InMemoryEvaluationRepository
@@ -25,6 +29,7 @@ import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
+import me.matsumo.fukurou.trading.persistence.ExposedDecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEquitySnapshotRepository
@@ -114,6 +119,7 @@ data class TradingRuntime(
     val toolCallGuard: ToolCallGuard,
     val callerNoTradeGuard: CallerNoTradeGuard,
     val close: () -> Unit,
+    val decisionMaterialStateRepository: DecisionMaterialStateRepository = InMemoryDecisionMaterialStateRepository(),
 ) {
     /**
      * runtime resource を閉じる。
@@ -268,6 +274,7 @@ object TradingRuntimeFactory {
             equitySnapshotRepository = ledgerRepository.equitySnapshotRepository,
             evaluationRepository = evaluationRepository,
             decisionRepository = decisionRepository,
+            decisionMaterialStateRepository = InMemoryDecisionMaterialStateRepository(),
             safetyViolationRepository = safetyViolationRepository,
             safetyDenialReader = EmptyDecisionRunSafetyDenialReader,
             broker = broker,
@@ -373,6 +380,7 @@ object TradingRuntimeFactory {
             equitySnapshotRepository = repositories.equitySnapshotRepository,
             evaluationRepository = repositories.evaluationRepository,
             decisionRepository = repositories.decisionRepository,
+            decisionMaterialStateRepository = repositories.decisionMaterialStateRepository,
             safetyViolationRepository = services.safetyViolationRepository,
             safetyDenialReader = safetyDenialReader,
             broker = services.broker,
@@ -448,6 +456,7 @@ private fun createPostgresRepositories(
         equitySnapshotRepository = ExposedEquitySnapshotRepository(connection.database),
         evaluationRepository = ExposedEvaluationRepository(connection.database),
         decisionRepository = ExposedDecisionRepository(connection.database, context.clock),
+        decisionMaterialStateRepository = ExposedDecisionMaterialStateRepository(connection.database),
     )
 }
 
@@ -564,6 +573,7 @@ private data class PostgresRuntimeRepositories(
     val equitySnapshotRepository: ExposedEquitySnapshotRepository,
     val evaluationRepository: ExposedEvaluationRepository,
     val decisionRepository: ExposedDecisionRepository,
+    val decisionMaterialStateRepository: ExposedDecisionMaterialStateRepository,
 )
 
 /**

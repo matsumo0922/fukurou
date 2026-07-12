@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanRecord
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentity
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
+import me.matsumo.fukurou.trading.decision.identity.classifyShadow
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
 import me.matsumo.fukurou.trading.decision.validateDecisionSubmission
 import me.matsumo.fukurou.trading.decision.validateTradePlanLineage
@@ -587,6 +588,7 @@ class ExposedDecisionRepository(
     }
 }
 
+@Suppress("CyclomaticComplexMethod")
 private fun JdbcTransaction.insertDecisionSubmission(
     submission: DecisionSubmission,
     now: Instant,
@@ -600,12 +602,17 @@ private fun JdbcTransaction.insertDecisionSubmission(
 
     validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
 
-    val identity = submission.entryIntent?.let { intent ->
+    val materialStateHash = submission.invocationId?.let(::selectMaterialManifestHash)
+    val candidateIdentity = submission.entryIntent?.let { intent ->
         submission.tradePlan?.let { plan ->
-            submission.marketSnapshotId?.let { materialProjection ->
+            materialStateHash?.let { materialProjection ->
                 DecisionIdentityGenerator.generate(UUID.randomUUID(), plan, intent, materialProjection)
             }
         }
+    }
+    val previousIdentity = candidateIdentity?.let { candidate -> selectLatestIdentity(candidate.thesisId) }
+    val identity = candidateIdentity?.let { candidate ->
+        candidate.copy(opportunityEpisodeId = previousIdentity?.opportunityEpisodeId ?: candidate.opportunityEpisodeId)
     }
     val decision = DecisionRecord(
         decisionId = UUID.randomUUID(),
@@ -636,14 +643,72 @@ private fun JdbcTransaction.insertDecisionSubmission(
     }
 
     insertDecision(decision)
+    if (identity != null && previousIdentity == null) insertOpportunityEpisode(identity, submission, now)
     tradePlan?.let { record -> insertTradePlan(record) }
     tradeIntent?.let { record -> insertTradeIntent(record) }
+    identity?.let { current -> insertShadowObservation(decision.decisionId, previousIdentity, current, now) }
 
     return DecisionSubmissionResult(
         decision = decision,
         tradeIntent = tradeIntent,
         tradePlan = tradePlan,
     )
+}
+
+private fun JdbcTransaction.selectLatestIdentity(thesisId: String): DecisionIdentity? {
+    return jdbcConnection().prepareStatement(
+        "SELECT opportunity_episode_id, thesis_id, geometry_hash, material_state_hash, identity_schema_version " +
+            "FROM decisions WHERE thesis_id = ? ORDER BY created_at DESC LIMIT 1",
+    ).use { statement ->
+        statement.setString(1, thesisId)
+        statement.executeQuery().use { result -> if (result.next()) result.toDecisionIdentity() else null }
+    }
+}
+
+private fun JdbcTransaction.insertOpportunityEpisode(
+    identity: DecisionIdentity,
+    submission: DecisionSubmission,
+    now: Instant,
+) {
+    jdbcConnection().prepareStatement(
+        "INSERT INTO opportunity_episodes (id, symbol, thesis_id, opened_at) VALUES (?, ?, ?, ?)",
+    ).use { statement ->
+        statement.setObject(1, identity.opportunityEpisodeId)
+        statement.setString(2, requireNotNull(submission.entryIntent).symbol.apiSymbol)
+        statement.setString(3, identity.thesisId)
+        statement.setLong(4, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.insertShadowObservation(
+    decisionId: UUID,
+    previous: DecisionIdentity?,
+    current: DecisionIdentity,
+    now: Instant,
+) {
+    val classification = classifyShadow(previous, current, previousEpisodeOpen = previous != null)
+    jdbcConnection().prepareStatement(
+        "INSERT INTO dedupe_shadow_observations " +
+            "(id, observation_kind, decision_id, opportunity_episode_id, classification, data_quality, observed_at) " +
+            "VALUES (?, 'FULL_PROPOSAL', ?, ?, ?, 'COMPLETE', ?)",
+    ).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setObject(2, decisionId)
+        statement.setObject(3, current.opportunityEpisodeId)
+        statement.setString(4, classification.name)
+        statement.setLong(5, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.selectMaterialManifestHash(invocationId: String): String? {
+    return jdbcConnection().prepareStatement(
+        "SELECT content_hash FROM decision_material_state_manifests WHERE invocation_id = ?",
+    ).use { statement ->
+        statement.setString(1, invocationId)
+        statement.executeQuery().use { result -> if (result.next()) result.getString(1) else null }
+    }
 }
 
 private fun JdbcTransaction.insertFalsificationSubmission(

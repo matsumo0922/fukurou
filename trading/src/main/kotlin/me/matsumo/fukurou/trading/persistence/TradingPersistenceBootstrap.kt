@@ -944,6 +944,7 @@ class TradingPersistenceBootstrap(
     /**
      * Exposed table と risk_state single row を用意する。
      */
+    @Suppress("LongMethod")
     fun ensureSchema(): Result<Unit> {
         return runCatching {
             val recoveredCount = exposedTransaction(database) {
@@ -965,6 +966,10 @@ class TradingPersistenceBootstrap(
                     CommandEventLogTable,
                     LlmLaunchReservationsTable,
                     SafetyViolationsTable,
+                    DecisionMaterialStateManifestsTable,
+                    OpportunityEpisodesTable,
+                    DedupeShadowObservationsTable,
+                    DedupeShadowResolutionsTable,
                     DecisionsTable,
                     TradePlansTable,
                     TradeIntentsTable,

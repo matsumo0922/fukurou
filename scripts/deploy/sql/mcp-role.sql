@@ -116,6 +116,8 @@ FROM (VALUES
     ('executions'), ('market_data_sessions'), ('market_data_gaps'), ('trade_intents'),
     ('trade_plans'), ('falsifications'), ('trade_intent_consumptions'), ('decisions'),
     ('llm_runs'), ('evaluation_exclusions'), ('safety_violations'),
+    ('decision_material_state_manifests'),
+    ('opportunity_episodes'), ('dedupe_shadow_observations'), ('dedupe_shadow_resolutions'),
     ('mcp_current_evaluation_scope'), ('mcp_evaluation_epochs')
 ) AS inventory(table_name) \gexec
 
@@ -125,7 +127,8 @@ SELECT format(
     :'mcp_role'
 )
 FROM (VALUES
-    ('command_event_log'), ('decisions'), ('trade_plans'), ('trade_intents'), ('falsifications')
+    ('command_event_log'), ('decisions'), ('trade_plans'), ('trade_intents'), ('falsifications'),
+    ('opportunity_episodes'), ('dedupe_shadow_observations')
 ) AS inventory(table_name) \gexec
 
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_try_advisory_lock(bigint) FROM PUBLIC;
