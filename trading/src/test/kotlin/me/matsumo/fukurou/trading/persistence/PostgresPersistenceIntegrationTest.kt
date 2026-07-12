@@ -1513,7 +1513,7 @@ class PostgresPersistenceIntegrationTest {
             command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
         )
         broker.placeOrder(firstEntry).getOrThrow()
-        val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
+        assertEquals(1, broker.getPositions().getOrThrow().size)
         val writer = ExposedPaperLedgerWriter(database, postgresSymbolRules(), fixedClock())
         val restingCommand = postgresEntryCommand(
             orderType = OrderType.LIMIT,
@@ -1562,32 +1562,32 @@ class PostgresPersistenceIntegrationTest {
             ),
         )
         assertTrue(rejectedEntry.isFailure)
-        val close = broker.closePosition(
-            ClosePositionCommand(
-                commandId = UUID.randomUUID(),
-                positionId = positionId,
-                closeAll = false,
-                reasonJa = "baseline mismatch risk-reducing close",
-                auditContext = PaperTradeAuditContext.EMPTY,
-            ),
+        val reconcile = ledger.reconcile(
+            tickSnapshot = watermarkTickSnapshot("9600000"),
+            simulator = FillSimulator(clock = fixedClock()),
         ).getOrThrow()
-        assertTrue(close.accepted)
         val executions = ledger.getExecutions().getOrThrow()
+        val openOrders = ledger.getOpenOrders().getOrThrow()
+
+        assertEquals(1, reconcile.closedPositionIds.size)
         assertEquals(0, ledger.getOpenPositions().getOrThrow().size)
         assertEquals(1, executions.count { execution -> execution.side == OrderSide.SELL })
-        assertLedgerLineage(database, "baseline mismatch risk-reducing close")
+        assertEquals(1, executions.count { execution -> execution.side == OrderSide.BUY })
+        assertLedgerLineage(database, "baseline mismatch compound reconcile")
         exposedTransaction(database) {
             assertEquals(2, countRowsForTest("executions"))
         }
-        writer.cancelOrder(
-            CancelOrderCommand(
-                commandId = UUID.randomUUID(),
-                orderId = restingCommand.commandId,
-                cancelReason = PaperOrderCancelReason.EXPLICIT_CANCEL,
-                reasonJa = "zero-open-risk recovery",
-                auditContext = PaperTradeAuditContext.EMPTY,
-            ),
-        ).getOrThrow()
+        if (openOrders.any { order -> order.orderId == restingCommand.commandId.toString() }) {
+            writer.cancelOrder(
+                CancelOrderCommand(
+                    commandId = UUID.randomUUID(),
+                    orderId = restingCommand.commandId,
+                    cancelReason = PaperOrderCancelReason.EXPLICIT_CANCEL,
+                    reasonJa = "zero-open-risk recovery",
+                    auditContext = PaperTradeAuditContext.EMPTY,
+                ),
+            ).getOrThrow()
+        }
 
         val configRepository = ExposedRuntimeConfigRepository(database, fixedClock(), emptyMap())
         val active = configRepository.activeSnapshot().getOrThrow()

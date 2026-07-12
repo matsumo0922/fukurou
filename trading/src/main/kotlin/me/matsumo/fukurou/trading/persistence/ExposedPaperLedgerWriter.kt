@@ -409,7 +409,9 @@ internal class ExposedPaperLedgerWriter(
 
                     if (!paperAccountHardHaltReached()) {
                         if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
-                            fillTriggeredEntryOrders(reconcileContext, progress, writeContext, clock)
+                            if (writeContext.baselineAligned) {
+                                fillTriggeredEntryOrders(reconcileContext, progress, writeContext, clock)
+                            }
                             triggerPositionProtections(reconcileContext, progress, writeContext, clock)
                         }
                     }
@@ -503,7 +505,9 @@ private fun JdbcTransaction.applyPaperMarketEvent(
     bindExistingPositionsToSession(event)
 
     if (!paperAccountHardHaltReached()) {
-        applyEventToRestingEntries(event, simulator, simulationContext, progress, writeContext, clock)
+        if (writeContext.baselineAligned) {
+            applyEventToRestingEntries(event, simulator, simulationContext, progress, writeContext, clock)
+        }
         applyEventToPositionProtections(event, simulator, simulationContext, progress, writeContext, clock)
     }
 
