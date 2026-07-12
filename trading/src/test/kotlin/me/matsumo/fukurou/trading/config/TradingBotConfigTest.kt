@@ -21,7 +21,7 @@ class TradingBotConfigTest {
 
         assertEquals(TradingSymbol.BTC, config.symbol)
         assertEquals(TradingMode.PAPER, config.mode)
-        assertEquals(BigDecimal("100000"), config.paperAccount.initialCashJpy)
+        assertEquals(BigDecimal("1000000"), config.paperAccount.initialCashJpy)
         assertEquals(BigDecimal("5"), config.paperExecution.marketSlippageBps)
         assertEquals(BigDecimal("0.1"), config.paperExecution.volatilitySlippageMultiplier)
         assertEquals(BigDecimal("0.80"), config.safetyFloor.maxTotalExposureRatio)

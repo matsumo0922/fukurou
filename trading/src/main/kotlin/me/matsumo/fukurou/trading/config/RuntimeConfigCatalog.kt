@@ -403,6 +403,15 @@ object RuntimeConfigCatalog {
                     blankAllowed = true,
                 ),
                 runtimeItem(
+                    key = "llm.launchEnabled",
+                    legacyEnvName = FUKUROU_LLM_LAUNCH_ENABLED_ENV,
+                    valueType = RuntimeConfigValueType.BOOLEAN,
+                    defaultValue = defaults.config.daemon.launchEnabled.toString(),
+                    effectiveValue = config.daemon.launchEnabled.toString(),
+                    unit = null,
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
                     key = "daemon.enabled",
                     legacyEnvName = FUKUROU_LLM_DAEMON_ENABLED_ENV,
                     valueType = RuntimeConfigValueType.BOOLEAN,

@@ -122,11 +122,12 @@ internal class EvaluationReportPersistence(
     fun job(jobId: String): Result<EvaluationReportJobResponse?> = runCatching {
         exposedTransaction(database) {
             jdbcConnection().prepareStatement(
-                "SELECT revision_id, revision_number, status, stage, failure_code, failure_message, active_invocation_id, retry_after_seconds FROM evaluation_report_jobs WHERE job_id=?",
+                "SELECT revision_id, revision_number, status, stage, failure_code, failure_message, active_invocation_id, retry_after_seconds, scope_key FROM evaluation_report_jobs WHERE job_id=?",
             ).use { statement ->
                 statement.setObject(1, UUID.fromString(jobId))
                 statement.executeQuery().use { result ->
                     if (!result.next()) return@use null
+                    val scopeIdentity = EvaluationReportScopeKey.decode(result.getString(9))
 
                     EvaluationReportJobResponse(
                         jobId = jobId,
@@ -138,6 +139,8 @@ internal class EvaluationReportPersistence(
                         failureMessage = result.getString(6),
                         activeInvocationId = result.getString(7),
                         retryAfterSeconds = result.getLong(8).takeUnless { result.wasNull() },
+                        epochId = scopeIdentity.epochId,
+                        cohort = scopeIdentity.cohort,
                     )
                 }
             }
@@ -228,6 +231,7 @@ internal class EvaluationReportPersistence(
     }
 
     fun history(scopeKey: String): Result<List<EvaluationReportHistoryItemResponse>> = runCatching {
+        val scopeIdentity = EvaluationReportScopeKey.decode(scopeKey)
         exposedTransaction(database) {
             jdbcConnection().prepareStatement(
                 """
@@ -251,6 +255,9 @@ internal class EvaluationReportPersistence(
                                     status = result.getString(4),
                                     requestedAt = java.time.Instant.ofEpochMilli(result.getLong(5)).toString(),
                                     pinned = result.getBoolean(6),
+                                    epochId = scopeIdentity.epochId,
+                                    cohort = scopeIdentity.cohort,
+                                    scopeKey = scopeKey,
                                 ),
                             )
                         }

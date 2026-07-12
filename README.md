@@ -2,6 +2,10 @@
 
 暗号資産（BTC）現物のデイトレードを、LLM に判断させる自律トレーディング bot。
 
+paper trading の基準資金は immutable な account epoch で管理する。fresh install の current epoch は 1,000,000 円で、新規 order/execution は `PAPER_WS_V1` execution semantics と canonical runtime config hash を lineage として保存する。既存履歴は rescale せず `LEGACY_PRE_WS` cohort として current evaluation から分離する。
+
+`paper.initialCashJpy` の activate / rollback は、open position、resting order、BTC 残高がすべて 0 の場合だけ runtime config と同一 transaction で新 epoch を開始する。拒否時は config と口座を変更せず `PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED` を Activity に残す。Evaluation と report は未指定時に active epoch + `CURRENT` を使い、legacy は selector で参照する。
+
 ## コンセプト
 
 - コードは最低限の「安全床」だけを強制し、判断は LLM に広い裁量を与える

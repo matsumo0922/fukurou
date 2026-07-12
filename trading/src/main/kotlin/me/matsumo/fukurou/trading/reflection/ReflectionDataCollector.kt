@@ -3,7 +3,9 @@ package me.matsumo.fukurou.trading.reflection
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
+import me.matsumo.fukurou.trading.evaluation.EvaluationScope
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
+import me.matsumo.fukurou.trading.evaluation.intersectLifecycle
 import java.time.Clock
 import java.time.DayOfWeek
 import java.time.Duration
@@ -58,44 +60,47 @@ class ReflectionDataCollector(
             val weeklyPeriod = weeklyPeriod(tradingDate)
             val previousWeeklyPeriod = weeklyPeriod(previousWeekDate)
             val calibrationPeriod = calibrationPeriod(tradingDate)
+            val scope = evaluationRepository.resolveScope(null, "CURRENT").getOrThrow()
 
             ReflectionDataset(
                 tradingDate = tradingDate,
                 weekId = weekId(tradingDate),
-                daily = collectWindow(dailyPeriod),
+                daily = collectWindow(dailyPeriod, scope),
                 previousTradingDate = previousTradingDate,
-                previousDaily = collectWindow(previousDailyPeriod),
-                weekly = collectWindow(weeklyPeriod),
+                previousDaily = collectWindow(previousDailyPeriod, scope),
+                weekly = collectWindow(weeklyPeriod, scope),
                 previousWeekId = weekId(previousWeekDate),
-                previousWeekly = collectWindow(previousWeeklyPeriod),
-                calibration = collectWindow(calibrationPeriod),
+                previousWeekly = collectWindow(previousWeeklyPeriod, scope),
+                calibration = collectWindow(calibrationPeriod, scope),
             )
         }
     }
 
-    private suspend fun collectWindow(period: ReflectionPeriod): ReflectionWindowData {
-        val evaluationPeriod = period.toEvaluationPeriod()
+    private suspend fun collectWindow(period: ReflectionPeriod, scope: EvaluationScope): ReflectionWindowData {
+        val evaluationPeriod = period.toEvaluationPeriod().intersectLifecycle(scope)
         val decisions = fetchLimited(queryLimit) { limit ->
             decisionRepository.findDecisionsCreatedBetween(
-                from = period.from,
-                toExclusive = period.toExclusive,
+                from = evaluationPeriod.from,
+                toExclusive = evaluationPeriod.toExclusive,
                 limit = limit,
             ).getOrThrow()
         }
         val llmRuns = fetchLimited(queryLimit) { limit ->
             llmRunRepository.findRunsStartedBetween(
-                from = period.from,
-                toExclusive = period.toExclusive,
+                from = evaluationPeriod.from,
+                toExclusive = evaluationPeriod.toExclusive,
                 limit = limit,
             ).getOrThrow()
         }
         val closedTradeResult = evaluationRepository.fetchClosedTrades(
             period = evaluationPeriod,
             limit = queryLimit,
+            scope = scope,
         ).getOrThrow()
         val usageResult = evaluationRepository.fetchLlmPhaseUsages(
             period = evaluationPeriod,
             limit = queryLimit,
+            scope = scope,
         ).getOrThrow()
 
         return ReflectionWindowData(
@@ -103,8 +108,8 @@ class ReflectionDataCollector(
             decisions = decisions.values,
             llmRuns = llmRuns.values,
             closedTrades = closedTradeResult.trades,
-            decisionRunCount = evaluationRepository.countDecisionRuns(evaluationPeriod).getOrThrow(),
-            actionCounts = evaluationRepository.countDecisionsByAction(evaluationPeriod).getOrThrow(),
+            decisionRunCount = evaluationRepository.countDecisionRuns(evaluationPeriod, scope).getOrThrow(),
+            actionCounts = evaluationRepository.countDecisionsByAction(evaluationPeriod, scope).getOrThrow(),
             llmPhaseUsages = usageResult.facts,
             truncation = ReflectionTruncationFlags(
                 decisions = decisions.truncated,

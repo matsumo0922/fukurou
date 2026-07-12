@@ -9,6 +9,8 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
+import me.matsumo.fukurou.trading.domain.PaperAccountEpochKind
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
@@ -116,12 +118,51 @@ private const val INSERT_DEFAULT_PAPER_ACCOUNT_SQL = """
     ON CONFLICT (id) DO NOTHING
 """
 
+/** immutable epoch の UPDATE/DELETE を DB 境界で拒否する。 */
+private const val ENSURE_PAPER_ACCOUNT_EPOCH_IMMUTABLE_TRIGGER_SQL = """
+    CREATE OR REPLACE FUNCTION reject_paper_account_epoch_mutation() RETURNS trigger AS ${'$'}${'$'}
+    BEGIN
+        RAISE EXCEPTION 'paper_account_epochs are immutable';
+    END;
+    ${'$'}${'$'} LANGUAGE plpgsql;
+    DROP TRIGGER IF EXISTS paper_account_epochs_immutable ON paper_account_epochs;
+    CREATE TRIGGER paper_account_epochs_immutable
+        BEFORE UPDATE OR DELETE ON paper_account_epochs
+        FOR EACH ROW EXECUTE FUNCTION reject_paper_account_epoch_mutation();
+"""
+
+/** MCP evaluation が secret を含む runtime config tables を読まず current scope を解決する view。 */
+private const val ENSURE_MCP_CURRENT_EVALUATION_SCOPE_VIEW_SQL = """
+CREATE OR REPLACE VIEW mcp_current_evaluation_scope AS
+SELECT account.id AS account_id,
+       account.current_epoch_id AS account_epoch_id,
+       account.initial_cash_jpy AS account_initial_cash_jpy,
+       epoch.kind AS epoch_kind,
+       epoch.initial_cash_jpy AS epoch_initial_cash_jpy,
+       epoch.created_at AS epoch_created_at,
+       (SELECT value.config_value
+        FROM runtime_config_values value
+        JOIN runtime_config_versions version ON version.id = value.version_id
+        WHERE version.status = 'ACTIVE'
+          AND value.config_key = 'paper.initialCashJpy') AS config_initial_cash_jpy
+FROM paper_account account
+JOIN paper_account_epochs epoch ON epoch.id = account.current_epoch_id
+"""
+
+/** MCP evaluation に必要な immutable epoch metadata だけを公開する view。 */
+private const val ENSURE_MCP_EVALUATION_EPOCHS_VIEW_SQL = """
+CREATE OR REPLACE VIEW mcp_evaluation_epochs AS
+SELECT id, kind, initial_cash_jpy, created_at
+FROM paper_account_epochs
+"""
+
 /**
  * bootstrap equity snapshot を初回だけ作る SQL。
  */
 private const val INSERT_BOOTSTRAP_EQUITY_SNAPSHOT_SQL = """
     INSERT INTO equity_snapshots (
         id,
+        account_epoch_id,
         mode,
         reason,
         trading_date,
@@ -135,6 +176,7 @@ private const val INSERT_BOOTSTRAP_EQUITY_SNAPSHOT_SQL = """
     )
     SELECT
         ?,
+        current_epoch_id,
         mode,
         ?,
         ?,
@@ -279,6 +321,24 @@ private const val ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL = """
     ON orders (mode, side, trade_group_id, created_at, id)
     WHERE decision_run_id IS NOT NULL
         AND trade_group_id IS NOT NULL
+"""
+
+/** scoped closed-trade projection の bounded read 用 index。 */
+private const val ENSURE_EVALUATION_POSITION_SCOPE_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_positions_evaluation_scope
+    ON positions (mode, status, account_epoch_id, closed_at, id)
+"""
+
+/** position 単位の execution lineage/PnL 集計用 index。 */
+private const val ENSURE_EVALUATION_EXECUTION_POSITION_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_executions_evaluation_position
+    ON executions (position_id, executed_at, id)
+"""
+
+/** position 単位の entry order 解決用 index。 */
+private const val ENSURE_EVALUATION_ORDER_POSITION_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_orders_evaluation_position
+    ON orders (position_id, id)
 """
 
 /** CONNECTED market-data session を一意にする partial unique index を作る SQL。 */
@@ -892,6 +952,7 @@ class TradingPersistenceBootstrap(
                     RuntimeConfigVersionsTable,
                     RuntimeConfigValuesTable,
                     RiskStateTable,
+                    PaperAccountEpochsTable,
                     PaperAccountTable,
                     LlmRunsTable,
                     EquitySnapshotsTable,
@@ -921,7 +982,8 @@ class TradingPersistenceBootstrap(
                     statement.setString(2, RiskHaltState.RUNNING.name)
                     statement.executeUpdate()
                 }
-                ensurePaperAccountRow(now, paperAccountConfig)
+                ensurePaperAccount(now, paperAccountConfig)
+                ensureLegacyPaperAccountEpoch(now)
                 ensureRiskStateEquityPeak(now, paperAccountConfig.initialCashJpy)
                 ensureBootstrapEquitySnapshot(now)
                 jdbcConnection().prepareStatement(
@@ -958,6 +1020,104 @@ class TradingPersistenceBootstrap(
     }
 }
 
+private fun JdbcTransaction.ensurePaperAccount(now: Instant, config: PaperAccountConfig) {
+    ensurePaperAccountRow(now, config)
+}
+
+/** 既存 ledger を変更せず current epoch だけを初回登録する。 */
+private fun JdbcTransaction.ensureLegacyPaperAccountEpoch(now: Instant) {
+    val account = jdbcConnection().prepareStatement(
+        "SELECT current_epoch_id, initial_cash_jpy FROM paper_account WHERE id = ? FOR UPDATE",
+    ).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "paper_account row is missing." }
+            resultSet.getObject("current_epoch_id", UUID::class.java) to
+                resultSet.getBigDecimal("initial_cash_jpy")
+        }
+    }
+    if (account.first != null) return
+
+    val runtimeConfigHash = selectActiveRuntimeConfigHash()
+    val epochId = UUID.randomUUID()
+
+    jdbcConnection().prepareStatement(
+        """
+            INSERT INTO paper_account_epochs (
+                id, kind, initial_cash_jpy, runtime_config_hash, reason, actor, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, epochId)
+        statement.setString(2, PaperAccountEpochKind.LEGACY_IMPORTED.name)
+        statement.setBigDecimal(3, account.second)
+        statement.setString(4, runtimeConfigHash)
+        statement.setString(5, "non-destructive schema adoption")
+        statement.setString(6, "persistence-bootstrap")
+        statement.setLong(7, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+    jdbcConnection().prepareStatement(
+        "UPDATE paper_account SET current_epoch_id = ? WHERE id = ? AND current_epoch_id IS NULL",
+    ).use { statement ->
+        statement.setObject(1, epochId)
+        statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        check(statement.executeUpdate() == 1) { "paper account epoch adoption lost its lock." }
+    }
+    insertPaperAccountEpochImportedEvent(epochId, account.second, runtimeConfigHash, now)
+}
+
+private fun JdbcTransaction.selectActiveRuntimeConfigHash(): String {
+    val values = linkedMapOf<String, String>()
+    jdbcConnection().prepareStatement(
+        """
+            SELECT value.config_key, value.config_value
+            FROM runtime_config_values value
+            JOIN runtime_config_versions version ON version.id = value.version_id
+            WHERE version.status = 'ACTIVE'
+            ORDER BY value.config_key
+        """.trimIndent(),
+    ).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            while (resultSet.next()) {
+                values[resultSet.getString("config_key")] = resultSet.getString("config_value")
+            }
+        }
+    }
+    return calculateRuntimeConfigHash(values)
+}
+
+private fun JdbcTransaction.insertPaperAccountEpochImportedEvent(
+    epochId: UUID,
+    initialCashJpy: BigDecimal,
+    runtimeConfigHash: String,
+    now: Instant,
+) {
+    jdbcConnection().prepareStatement(
+        """
+            INSERT INTO command_event_log (
+                id, tool_name, event_type, payload, ts, runtime_config_hash
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setString(2, "paper-account-epoch")
+        statement.setString(3, CommandEventType.PAPER_ACCOUNT_EPOCH_IMPORTED.name)
+        statement.setString(
+            4,
+            buildJsonObject {
+                put("accountEpochId", epochId.toString())
+                put("initialCashJpy", initialCashJpy.toPlainString())
+                put("runtimeConfigHash", runtimeConfigHash)
+                put("reason", "non-destructive schema adoption")
+            }.toString(),
+        )
+        statement.setLong(5, now.toEpochMilli())
+        statement.setString(6, runtimeConfigHash)
+        statement.executeUpdate()
+    }
+}
+
 /**
  * stale な RUNNING llm_runs の回収閾値を取引設定から算出する。
  */
@@ -973,10 +1133,16 @@ fun TradingBotConfig.staleLlmRunRecoveryThreshold(): Duration {
  */
 private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     ensureRuntimeConfigIndexes()
+    executeUpdate(ENSURE_MCP_EVALUATION_EPOCHS_VIEW_SQL)
+    executeUpdate(ENSURE_MCP_CURRENT_EVALUATION_SCOPE_VIEW_SQL)
+    executeUpdate(ENSURE_PAPER_ACCOUNT_EPOCH_IMMUTABLE_TRIGGER_SQL)
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL)
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL)
+    executeUpdate(ENSURE_EVALUATION_POSITION_SCOPE_INDEX_SQL)
+    executeUpdate(ENSURE_EVALUATION_EXECUTION_POSITION_INDEX_SQL)
+    executeUpdate(ENSURE_EVALUATION_ORDER_POSITION_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
     executeUpdate(BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)

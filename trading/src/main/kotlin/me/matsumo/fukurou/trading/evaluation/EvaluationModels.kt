@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.evaluation
 
+import me.matsumo.fukurou.trading.domain.EvaluationCohort
 import java.math.BigDecimal
 import java.time.Instant
 import java.time.LocalDate
@@ -21,6 +22,25 @@ data class EvaluationPeriod(
     val toExclusive: Instant,
 )
 
+/** evaluation request 開始時に固定する immutable scope。 */
+data class EvaluationScope(
+    val accountEpochId: UUID,
+    val cohort: EvaluationCohort,
+    val executionSemanticsVersion: String?,
+    val initialCashJpy: BigDecimal,
+    val lifecycleFromInclusive: Instant = Instant.EPOCH,
+    val toExclusive: Instant? = null,
+)
+
+/** Web/API selector が表示する immutable account epoch。 */
+data class EvaluationEpochOption(
+    val epochId: UUID,
+    val kind: String,
+    val initialCashJpy: BigDecimal,
+    val createdAt: Instant,
+    val active: Boolean,
+)
+
 /**
  * closed trade fact の取得結果。
  *
@@ -30,7 +50,29 @@ data class EvaluationPeriod(
 data class EvaluationTradeQueryResult(
     val trades: List<ClosedTradeFact>,
     val truncated: Boolean,
+    val attributionCoverage: EvaluationAttributionCoverage = EvaluationAttributionCoverage.EMPTY,
 )
+
+/** execution-based evaluation attribution の coverage。 */
+data class EvaluationAttributionCoverage(
+    val attributed: Int,
+    val missing: Int,
+    val total: Int,
+) {
+    companion object {
+        /** trade がない母集団の coverage。 */
+        val EMPTY = EvaluationAttributionCoverage(attributed = 0, missing = 0, total = 0)
+    }
+}
+
+/** closed trade の attribution 状態。 */
+enum class EvaluationAttributionStatus {
+    /** initial BUY execution から decision まで解決できる。 */
+    ATTRIBUTED,
+
+    /** lineage が欠けており attribution 不能だが母集団には残る。 */
+    MISSING,
+}
 
 /**
  * LLM phase usage fact の取得結果。
@@ -89,6 +131,10 @@ data class ClosedTradeFact(
     val estimatedWinProbability: BigDecimal?,
     val setupTags: List<String>,
     val llmProvider: String?,
+    val accountEpochId: UUID? = null,
+    val cohort: EvaluationCohort = EvaluationCohort.LEGACY_PRE_WS,
+    val executionSemanticsVersion: String? = null,
+    val attributionStatus: EvaluationAttributionStatus = EvaluationAttributionStatus.MISSING,
 )
 
 /**

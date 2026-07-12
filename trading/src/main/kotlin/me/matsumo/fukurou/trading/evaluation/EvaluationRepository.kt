@@ -1,5 +1,9 @@
+@file:Suppress("TooManyFunctions")
+
 package me.matsumo.fukurou.trading.evaluation
 
+import me.matsumo.fukurou.trading.domain.EvaluationCohort
+import me.matsumo.fukurou.trading.domain.PAPER_EXECUTION_SEMANTICS_VERSION
 import java.math.BigDecimal
 import java.time.Instant
 
@@ -7,6 +11,19 @@ import java.time.Instant
  * 評価系が参照する DB 読み取り repository。
  */
 interface EvaluationRepository {
+    /** 明示選択可能な immutable epoch を新しい順で返す。 */
+    suspend fun listEpochs(): Result<List<EvaluationEpochOption>> = Result.success(emptyList())
+
+    /** request query を current epoch + CURRENT 既定へ解決する。 */
+    suspend fun resolveScope(epochId: String?, cohort: String?): Result<EvaluationScope> = runCatching {
+        EvaluationScope(
+            accountEpochId = epochId?.let(java.util.UUID::fromString) ?: java.util.UUID(0, 0),
+            cohort = cohort?.let(EvaluationCohort::valueOf) ?: EvaluationCohort.CURRENT,
+            executionSemanticsVersion = PAPER_EXECUTION_SEMANTICS_VERSION,
+            initialCashJpy = BigDecimal.ZERO,
+        )
+    }
+
     /** report 用 internal facts を単一 snapshot として取得する。 */
     suspend fun fetchReportSnapshot(period: EvaluationPeriod): Result<EvaluationReportSnapshotFacts> = runCatching {
         EvaluationReportSnapshotFacts(
@@ -19,9 +36,33 @@ interface EvaluationRepository {
         )
     }
 
+    /** immutable epoch/cohort を固定した report snapshot を返す。 */
+    suspend fun fetchReportSnapshot(
+        period: EvaluationPeriod,
+        scope: EvaluationScope,
+    ): Result<EvaluationReportSnapshotFacts> = runCatching {
+        val tradeResult = fetchClosedTrades(period, scope = scope).getOrThrow()
+        fetchReportSnapshot(period).getOrThrow().copy(
+            trades = tradeResult,
+            dailyPnl = tradeResult.trades.map { trade -> DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy) },
+            priorPnlJpy = sumTradePnlBefore(period.from, scope).getOrThrow(),
+            initialCashJpy = scope.initialCashJpy,
+        )
+    }
+
     /** market-data gap による評価除外 summary を返す。 */
     suspend fun fetchExclusionSummary(period: EvaluationPeriod): Result<EvaluationExclusionSummary> {
         return Result.success(EvaluationExclusionSummary())
+    }
+
+    /** immutable epoch lifecycle と期間の積集合に限定した exclusion summary。 */
+    suspend fun fetchExclusionSummary(
+        period: EvaluationPeriod,
+        scope: EvaluationScope,
+    ): Result<EvaluationExclusionSummary> = if (scope.isCurrentPopulation()) {
+        fetchExclusionSummary(period.intersectLifecycle(scope))
+    } else {
+        Result.success(EvaluationExclusionSummary())
     }
 
     /**
@@ -32,15 +73,38 @@ interface EvaluationRepository {
         limit: Int = DEFAULT_EVALUATION_QUERY_LIMIT,
     ): Result<EvaluationTradeQueryResult>
 
+    /** immutable scope で closed trade fact を取得する。 */
+    suspend fun fetchClosedTrades(
+        period: EvaluationPeriod,
+        limit: Int = DEFAULT_EVALUATION_QUERY_LIMIT,
+        scope: EvaluationScope,
+    ): Result<EvaluationTradeQueryResult> = Result.failure(
+        IllegalStateException("EVALUATION_SCOPE_UNSUPPORTED: repository must implement scoped closed-trade reads."),
+    )
+
     /**
      * 期間内の distinct decision run 数を取得する。
      */
     suspend fun countDecisionRuns(period: EvaluationPeriod): Result<Int>
 
+    /** immutable epoch lifecycle に限定した decision run 数。 */
+    suspend fun countDecisionRuns(period: EvaluationPeriod, scope: EvaluationScope): Result<Int> =
+        if (scope.isCurrentPopulation()) countDecisionRuns(period.intersectLifecycle(scope)) else Result.success(0)
+
     /**
      * 期間内の decision action 別件数を取得する。
      */
     suspend fun countDecisionsByAction(period: EvaluationPeriod): Result<List<DecisionActionCount>>
+
+    /** immutable epoch lifecycle に限定した decision action 数。 */
+    suspend fun countDecisionsByAction(
+        period: EvaluationPeriod,
+        scope: EvaluationScope,
+    ): Result<List<DecisionActionCount>> = if (scope.isCurrentPopulation()) {
+        countDecisionsByAction(period.intersectLifecycle(scope))
+    } else {
+        Result.success(emptyList())
+    }
 
     /**
      * benchmark 用の日次 realized PnL fact を取得する。
@@ -51,6 +115,11 @@ interface EvaluationRepository {
      * 指定時刻より前の realized PnL 合計を取得する。
      */
     suspend fun sumTradePnlBefore(instant: Instant): Result<BigDecimal>
+
+    /** epoch/cohort に限定した期間開始前 realized PnL の DB aggregate。 */
+    suspend fun sumTradePnlBefore(instant: Instant, scope: EvaluationScope): Result<BigDecimal> = Result.failure(
+        IllegalStateException("EVALUATION_SCOPE_UNSUPPORTED: repository must implement scoped prior-PnL aggregation."),
+    )
 
     /**
      * paper account の初期資金を取得する。
@@ -65,11 +134,31 @@ interface EvaluationRepository {
         limit: Int = DEFAULT_EVALUATION_QUERY_LIMIT,
     ): Result<EvaluationLlmUsageQueryResult>
 
+    /** immutable epoch lifecycle に限定した LLM usage。 */
+    suspend fun fetchLlmPhaseUsages(
+        period: EvaluationPeriod,
+        limit: Int = DEFAULT_EVALUATION_QUERY_LIMIT,
+        scope: EvaluationScope,
+    ): Result<EvaluationLlmUsageQueryResult> = if (scope.isCurrentPopulation()) {
+        fetchLlmPhaseUsages(period.intersectLifecycle(scope), limit)
+    } else {
+        Result.success(EvaluationLlmUsageQueryResult(emptyList(), truncated = false))
+    }
+
     /**
      * kill 基準に必要な closed trade 数と PF を取得する。
      */
     suspend fun fetchKillCriterionStats(): Result<KillCriterionStats>
 }
+
+/** audit/non-trade population を immutable epoch lifecycle と交差させる。 */
+fun EvaluationPeriod.intersectLifecycle(scope: EvaluationScope): EvaluationPeriod {
+    val from = maxOf(from, scope.lifecycleFromInclusive)
+    val to = minOf(toExclusive, scope.toExclusive ?: toExclusive)
+    return EvaluationPeriod(from, maxOf(from, to))
+}
+
+private fun EvaluationScope.isCurrentPopulation(): Boolean = cohort == EvaluationCohort.CURRENT
 
 /** immutable evaluation report の DB snapshot facts。 */
 data class EvaluationReportSnapshotFacts(
@@ -101,6 +190,12 @@ class InMemoryEvaluationRepository : EvaluationRepository {
         }
     }
 
+    override suspend fun fetchClosedTrades(
+        period: EvaluationPeriod,
+        limit: Int,
+        scope: EvaluationScope,
+    ): Result<EvaluationTradeQueryResult> = fetchClosedTrades(period.intersectLifecycle(scope), limit)
+
     override suspend fun countDecisionRuns(period: EvaluationPeriod): Result<Int> {
         return Result.success(0)
     }
@@ -116,6 +211,9 @@ class InMemoryEvaluationRepository : EvaluationRepository {
     override suspend fun sumTradePnlBefore(instant: Instant): Result<BigDecimal> {
         return Result.success(BigDecimal.ZERO)
     }
+
+    override suspend fun sumTradePnlBefore(instant: Instant, scope: EvaluationScope): Result<BigDecimal> =
+        Result.success(BigDecimal.ZERO)
 
     override suspend fun fetchInitialCashJpy(): Result<BigDecimal> {
         return Result.success(BigDecimal.ZERO)

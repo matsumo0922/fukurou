@@ -34,6 +34,8 @@ val MCP_REQUIRED_TABLES = setOf(
     "llm_runs",
     "evaluation_exclusions",
     "safety_violations",
+    "mcp_current_evaluation_scope",
+    "mcp_evaluation_epochs",
 )
 
 private val REQUIRED_TABLES = MCP_REQUIRED_TABLES.sorted()

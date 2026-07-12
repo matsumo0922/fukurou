@@ -17,6 +17,25 @@ import kotlin.test.assertTrue
 class OneShotRunnerMainTest {
 
     @Test
+    fun runOneShotRunnerMain_launchGateStopsBeforeChildLaunch() = runBlocking {
+        var launched = false
+
+        val result = runCatching {
+            runOneShotRunnerMain(
+                environment = emptyMap(),
+                requireLaunchAllowed = { error("LLM_LAUNCH_DISABLED") },
+                launch = {
+                    launched = true
+                    error("must not launch")
+                },
+            )
+        }
+
+        assertFalse(launched)
+        assertTrue(result.exceptionOrNull()?.message?.contains("LLM_LAUNCH_DISABLED") == true)
+    }
+
+    @Test
     fun runOneShotRunnerMain_successWritesSummaryAndReturnsSuccessExitCode() = runBlocking {
         val stdout = mutableListOf<String>()
         val result = OneShotRunnerResult(
@@ -29,6 +48,7 @@ class OneShotRunnerMainTest {
 
         val exitCode = runOneShotRunnerMain(
             environment = emptyMap(),
+            requireLaunchAllowed = {},
             launch = { result },
             stdout = stdout::add,
             stderr = {},
@@ -53,6 +73,7 @@ class OneShotRunnerMainTest {
 
         val exitCode = runOneShotRunnerMain(
             environment = emptyMap(),
+            requireLaunchAllowed = {},
             launch = { throw boundaryFailure },
             stdout = stdout::add,
             stderr = stderr::add,
@@ -77,6 +98,7 @@ class OneShotRunnerMainTest {
         val result = runCatching {
             runOneShotRunnerMain(
                 environment = emptyMap(),
+                requireLaunchAllowed = {},
                 launch = { throw failure },
                 stdout = {},
                 stderr = stderr::add,
@@ -101,6 +123,7 @@ class OneShotRunnerMainTest {
 
         val exitCode = runOneShotRunnerMain(
             environment = emptyMap(),
+            requireLaunchAllowed = {},
             launch = { throw classifiedCancellation },
             stdout = {},
             stderr = stderr::add,

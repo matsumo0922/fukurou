@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunRecord
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.SetupPerformance
+import me.matsumo.fukurou.trading.evaluation.intersectLifecycle
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.math.BigDecimal
 import java.time.Clock
@@ -116,7 +117,8 @@ class KnowledgeService(
         return runCatching {
             validateRecentLessonsQuery(query)
 
-            val period = query.toEvaluationPeriod(clock.instant())
+            val scope = evaluationRepository.resolveScope(null, "CURRENT").getOrThrow()
+            val period = query.toEvaluationPeriod(clock.instant()).intersectLifecycle(scope)
             val decisionRecords = fetchRecentDecisionRecords(period, query.limit)
                 .filter { record -> record.matchesSymbol(query.symbol) }
             val runRecords = fetchRecentRuns(period, query.limit)
@@ -124,6 +126,7 @@ class KnowledgeService(
             val tradeResult = evaluationRepository.fetchClosedTrades(
                 period = period,
                 limit = MAX_KNOWLEDGE_EVALUATION_TRADE_FETCH_LIMIT,
+                scope = scope,
             ).getOrThrow()
             val safetyDenialPage = safetyDenialReader.readSafetyDenials(
                 DecisionRunSafetyDenialQuery(
@@ -177,7 +180,8 @@ class KnowledgeService(
 
             val normalizedTags = normalizeTags(query.setupTags)
             val searchTerms = query.searchTerms()
-            val period = query.toEvaluationPeriod(clock.instant())
+            val scope = evaluationRepository.resolveScope(null, "CURRENT").getOrThrow()
+            val period = query.toEvaluationPeriod(clock.instant()).intersectLifecycle(scope)
             val runRecords = fetchRecentRuns(period, query.limit)
                 .filter { record -> record.symbol == query.symbol }
             val runsByInvocationId = runRecords.associateBy { record -> record.invocationId }
@@ -193,6 +197,7 @@ class KnowledgeService(
             val tradeResult = evaluationRepository.fetchClosedTrades(
                 period = period,
                 limit = MAX_KNOWLEDGE_EVALUATION_TRADE_FETCH_LIMIT,
+                scope = scope,
             ).getOrThrow()
             val setupPerformance = setupPerformanceSummaries(
                 trades = tradeResult.trades,

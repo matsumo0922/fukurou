@@ -166,7 +166,15 @@ data class RuntimeConfigActivationResult(
     val activeVersion: RuntimeConfigVersionSummary,
     val previousActiveVersionId: String?,
     val validation: RuntimeConfigValidationResult,
+    val accountEpochId: String? = null,
 )
+
+/** open risk により account epoch switch が拒否されたことを表す。 */
+class PaperAccountEpochSwitchRejectedException(
+    val openPositionCount: Int,
+    val openOrderCount: Int,
+    val btcQuantity: String,
+) : RuntimeException("PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED")
 
 /**
  * runtime config の draft / validate / activate / rollback 操作境界。
@@ -192,10 +200,24 @@ interface RuntimeConfigAdminService {
      */
     fun activateDraft(versionId: String): Result<RuntimeConfigActivationResult>
 
+    /** reason/actor を監査へ残して draft を active 化する。 */
+    fun activateDraftWithContext(
+        versionId: String,
+        reason: String,
+        actor: String,
+    ): Result<RuntimeConfigActivationResult> = activateDraft(versionId)
+
     /**
      * 保存済み inactive version へ rollback する。
      */
     fun rollbackToVersion(versionId: String): Result<RuntimeConfigActivationResult>
+
+    /** reason/actor を監査へ残して inactive version へ rollback する。 */
+    fun rollbackToVersionWithContext(
+        versionId: String,
+        reason: String,
+        actor: String,
+    ): Result<RuntimeConfigActivationResult> = rollbackToVersion(versionId)
 }
 
 /**

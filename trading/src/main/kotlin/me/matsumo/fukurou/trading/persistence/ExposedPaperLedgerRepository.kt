@@ -55,6 +55,7 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 private const val SELECT_PAPER_ACCOUNT_SQL = """
     SELECT
         mode,
+        current_epoch_id,
         initial_cash_jpy,
         cash_jpy,
         btc_quantity,
@@ -619,6 +620,9 @@ private const val SELECT_EXECUTION_ACTIVITIES_FOR_STABLE_FEED_SQL_PREFIX = """
         e.realized_pnl_jpy AS execution_realized_pnl_jpy,
         e.liquidity AS execution_liquidity,
         e.executed_at AS execution_executed_at,
+        e.account_epoch_id AS execution_account_epoch_id,
+        e.execution_semantics_version AS execution_semantics_version,
+        e.runtime_config_hash AS execution_runtime_config_hash,
         e.source_session_id AS execution_source_session_id,
         e.source_sequence AS execution_source_sequence,
         e.source_exchange_at AS execution_source_exchange_at,
@@ -1328,6 +1332,7 @@ private fun ResultSet.toAccountSnapshot(): AccountSnapshot {
         totalEquityJpy = getBigDecimal("total_equity_jpy").toPlainString(),
         equityPeakJpy = getBigDecimal("equity_peak_jpy").toPlainString(),
         drawdownRatio = getBigDecimal("drawdown_ratio").toPlainString(),
+        accountEpochId = getNullableString("current_epoch_id"),
     )
 }
 
@@ -1441,6 +1446,9 @@ private fun ResultSet.toActivityExecution(): Execution {
         realizedPnlJpy = getBigDecimal("execution_realized_pnl_jpy").toPlainString(),
         liquidity = ExecutionLiquidity.valueOf(getString("execution_liquidity")),
         executedAt = getInstant("execution_executed_at").toString(),
+        accountEpochId = getNullableUuid("execution_account_epoch_id")?.toString(),
+        executionSemanticsVersion = getString("execution_semantics_version"),
+        runtimeConfigHash = getString("execution_runtime_config_hash"),
     )
 }
 

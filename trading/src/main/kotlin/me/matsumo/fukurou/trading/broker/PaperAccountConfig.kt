@@ -17,7 +17,7 @@ private const val FUKUROU_TRADING_MODE_ENV = "FUKUROU_TRADING_MODE"
 /**
  * paper 初期残高の既定値。
  */
-private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("100000")
+private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("1000000")
 
 /**
  * paper account 初期化に使う設定。

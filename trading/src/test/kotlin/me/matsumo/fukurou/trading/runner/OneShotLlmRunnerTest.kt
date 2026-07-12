@@ -27,6 +27,7 @@ import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.config.DecisionProtocolConfig
+import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -1731,6 +1732,9 @@ class OneShotLlmRunnerTest {
 
     @Test
     fun daemonTickLaunch_recordsTriggerKindInLlmRun() = runBlocking {
+        val tradingConfig = TradingBotConfig(
+            daemon = LlmDaemonConfig(launchEnabled = true),
+        )
         val runtime = TradingRuntimeFactory.inMemory(
             clock = fixedClock(),
             marketDataSource = FakeMarketDataSource,
@@ -1745,7 +1749,7 @@ class OneShotLlmRunnerTest {
         }
         val runner = OneShotLlmRunner(
             tradingRuntime = runtime,
-            tradingConfig = TradingBotConfig(),
+            tradingConfig = tradingConfig,
             llmInvoker = ShellLlmInvoker(
                 commandRenderer = DefaultLlmCommandRenderer(),
                 processRunner = processRunner,
@@ -1755,7 +1759,7 @@ class OneShotLlmRunnerTest {
             logger = {},
         )
         val scheduler = LlmDaemonScheduler(
-            tradingConfig = TradingBotConfig(),
+            tradingConfig = tradingConfig,
             dependencies = LlmDaemonSchedulerDependencies(
                 riskStateRepository = runtime.riskStateRepository,
                 commandEventLog = runtime.commandEventLog,

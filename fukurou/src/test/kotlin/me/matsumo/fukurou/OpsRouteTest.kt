@@ -26,6 +26,7 @@ import me.matsumo.fukurou.trading.broker.ExecutionActivityPositionContext
 import me.matsumo.fukurou.trading.broker.ExecutionActivityRecord
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
+import me.matsumo.fukurou.trading.config.PaperAccountEpochSwitchRejectedException
 import me.matsumo.fukurou.trading.config.RuntimeConfigActivationResult
 import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
 import me.matsumo.fukurou.trading.config.RuntimeConfigCandidateValidator
@@ -36,6 +37,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
+import me.matsumo.fukurou.trading.daemon.LLM_LAUNCH_DISABLED
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -288,7 +290,7 @@ class OpsRouteTest {
     @Test
     fun opsRoutes_triggerReturnsConflictWhenManualLaunchIsRejected() = testApplication {
         val manualService = CapturingManualLlmLaunchService(
-            ManualLlmLaunchResult.Rejected("concurrent_invocation"),
+            ManualLlmLaunchResult.Rejected(LLM_LAUNCH_DISABLED),
         )
 
         application {
@@ -305,7 +307,7 @@ class OpsRouteTest {
         }
 
         assertEquals(HttpStatusCode.Conflict, response.status)
-        assertTrue(response.bodyAsText().contains("concurrent_invocation"))
+        assertTrue(response.bodyAsText().contains(LLM_LAUNCH_DISABLED))
     }
 
     @Test
@@ -677,6 +679,42 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_runtimeConfigActivationReturnsMachineReadableEpochConflict() = testApplication {
+        val adminService = FakeRuntimeConfigAdminService(
+            activationFailure = PaperAccountEpochSwitchRejectedException(
+                openPositionCount = 1,
+                openOrderCount = 2,
+                btcQuantity = "0.010000000000",
+            ),
+        )
+        application {
+            module(
+                readinessProbe = { true },
+                opsRuntimeConfigAdminService = adminService,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+        val draft = client.post("/ops/runtime-config/drafts") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"values":{"paper.initialCashJpy":"900000"},"note":"epoch conflict"}""")
+        }
+        val versionId = Json.parseToJsonElement(draft.bodyAsText()).jsonObject
+            .getValue("version").jsonObject.getValue("id").jsonPrimitive.content
+
+        val response = client.post("/ops/runtime-config/drafts/$versionId/activate") {
+            contentType(ContentType.Application.Json)
+            setBody("""{}""")
+        }
+        val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+
+        assertEquals(HttpStatusCode.Conflict, response.status)
+        assertEquals("PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED", body.getValue("code").jsonPrimitive.content)
+        assertEquals(1, body.getValue("openPositionCount").jsonPrimitive.content.toInt())
+        assertEquals(2, body.getValue("openOrderCount").jsonPrimitive.content.toInt())
+        assertEquals("0.010000000000", body.getValue("btcQuantity").jsonPrimitive.content)
+    }
+
+    @Test
     fun moduleKeepsRuntimeConfigRecoveryApiAvailableWhenActiveConfigIsInvalid() = testApplication {
         if (!isDockerAvailable()) {
             println("Skipping module runtime config recovery test because Docker is unavailable.")
@@ -767,7 +805,7 @@ class OpsRouteTest {
             }
 
             assertEquals(HttpStatusCode.Created, draftResponse.status)
-            assertEquals(HttpStatusCode.OK, activateResponse.status)
+            assertEquals(HttpStatusCode.OK, activateResponse.status, activateResponse.bodyAsText())
             assertEquals(HttpStatusCode.OK, recoveredConfigResponse.status)
             assertFalse(recoveredWarnings.contains("runtimeConfig.warning.activeValidationFailed"))
             assertEquals(HttpStatusCode.Accepted, recoveredTriggerResponse.status)
@@ -1758,6 +1796,7 @@ private fun metadataValue(container: JsonObject, label: String): String {
 
 private class FakeRuntimeConfigAdminService(
     private val listVersionsFailure: Throwable? = null,
+    private val activationFailure: Throwable? = null,
 ) : RuntimeConfigAdminService {
     private val versions = mutableMapOf<String, RuntimeConfigVersionDetail>()
     private var activeVersionId: String = "active-runtime-config"
@@ -1811,6 +1850,7 @@ private class FakeRuntimeConfigAdminService(
     }
 
     override fun activateDraft(versionId: String): Result<RuntimeConfigActivationResult> {
+        activationFailure?.let { failure -> return Result.failure(failure) }
         val detail = versions.getValue(versionId)
 
         if (!detail.validation.valid) {

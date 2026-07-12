@@ -16,7 +16,7 @@
 
 ### 1.1 確定事項の要約
 
-[確定] 本システムは、Docker(Linux)上で24時間常駐するKotlin/JVM製の暗号資産デイトレAI botである。対象はBTC一本、現物、GMOコイン取引所側に限定し、当初は仮想10万円のペーパートレードから開始する。時間軸は「数分〜数時間」から、往復コストを踏まえた「数時間寄りの短期デイトレ」へ改訂する。合格ラインは3ヶ月ペーパーで `PF > 1.2` かつ `最大DD < 15%` とし、達成後に少額実弾へ移行する。
+[確定] 本システムは、Docker(Linux)上で24時間常駐するKotlin/JVM製の暗号資産デイトレAI botである。対象はBTC一本、現物、GMOコイン取引所側に限定し、基準資金100万円のペーパートレードで評価する。時間軸は「数分〜数時間」から、往復コストを踏まえた「数時間寄りの短期デイトレ」へ改訂する。合格ラインは3ヶ月ペーパーで `PF > 1.2` かつ `最大DD < 15%` とし、達成後に少額実弾へ移行する。
 
 [確定] 判断思想は「コードは最低限の安全床のみを強制し、ツールは広く提供し、LLMに広い裁量を与える」。ただし、以下の安全床はMCPサーバー側で必ず強制し、override不可とする。
 
@@ -1296,7 +1296,7 @@ entry EV の計算直前に、データ鮮度劣化時の probability cap を適
 
 ### 5.6 評価系と benchmark
 
-[確定事項の改訂: 2026-07-03] 評価 API は paper の append-only ledger から読み取り専用で算出する。DB schema、kline 永続化、集計 table、SQL view は追加しない。closed trade fact は `positions` の CLOSED 行を正本にし、最古の BUY order から `trade_intents` / `decisions` / `trade_plans` を辿る。
+[確定事項の改訂: 2026-07-03] 評価 API は paper の append-only ledger から読み取り専用で算出する。DB schema、kline 永続化、集計 table、SQL view は追加しない。closed trade fact は `positions` の CLOSED 行を対象にし、最初の BUY execution の `order_id` から `trade_intents` / `decisions` / `trade_plans` を辿る。`orders.position_id` は attribution の正本にしない。
 
 [確定事項の改訂: 2026-07-04] 2026-07-03 の「評価 API は DB schema を追加しない」は、評価 API 専用の集計 table / SQL view / kline 永続化を増やさないという意味に限定する。`llm_runs` と `equity_snapshots` は評価 API の集計結果ではなく、runner 起動単位と paper equity 推移の一次 append-only 記録であるため追加対象に含める。
 
@@ -1304,7 +1304,7 @@ entry EV の計算直前に、データ鮮度劣化時の probability cap を適
 
 persistence bootstrap は、`status = RUNNING` かつ `finished_at IS NULL` の `llm_runs` のうち、`started_at` が `runner.perRunTimeout` と reflection PromptCandidates の timeout 上限の大きい方の3倍より古い行を `FAILED` に回収する。回収時は `finished_at` に bootstrap 時刻を保存し、`error_message` には前回プロセスまたは container shutdown で中断された run を bootstrap で回収したことを示す固定 message を保存する。閾値以内の新しい `RUNNING` 行と終了済みの行は変更しない。
 
-`equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP`）、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。旧スケッチからの差分として、日次重複防止のため JST 日付を物理列 `trading_date` として持ち、`reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置く。`drawdown_ratio` は旧案の decimal(12,8) ではなく、正本である `paper_account` と同じ decimal(20,10) に揃える。BOOTSTRAP は並行 bootstrap でも mode ごとに 1 件に収まるよう `reason = 'BOOTSTRAP'` に限定した `(mode, reason)` partial unique index で防御する。FILL は paper account 更新と同一 transaction で追加する。
+`equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP` / `EPOCH_START`）、nullable な `account_epoch_id`、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。日次重複防止のため `reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置き、BOOTSTRAP は `(mode, reason)` partial unique index で防御する。FILL は paper account 更新、EPOCH_START は account reset と同一 transaction で追加する。legacy row の epoch は捏造して backfill しない。
 
 評価式は次の通り。
 
@@ -1317,7 +1317,7 @@ persistence bootstrap は、`status = RUNNING` かつ `finished_at IS NULL` の 
 - `winRate = PnL > 0 の trade 数 / 全 closed trade 数`。`PnL == 0` は勝ちに含めない。
 - 較正 curve は closed position に到達した ENTER decision の申告 p を0.1幅の10 binへ分類し、件数、平均申告 p、実現勝率を返す。setup tag が複数ある場合は各 tag に重複計上する。
 
-kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `KILL_CRITERION_BREACHED` audit、`RiskStateCommandService.setHardHalt(reason)`、`Broker.sweepHardHalt(reasonJa, tickSnapshot)` の順で既存 HARD_HALT 経路へ接続する。既定値は `minClosedTrades = 100`、`minProfitFactor = 0.8`。runtime key `killCriterion.minClosedTrades` は下げる方向のみ、`killCriterion.minProfitFactor` は上げる方向のみ override できる。無効化スイッチは持たない。
+kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `KILL_CRITERION_BREACHED` audit、`RiskStateCommandService.setHardHalt(reason)`、`Broker.sweepHardHalt(reasonJa, tickSnapshot)` の順で既存 HARD_HALT 経路へ接続する。既定値は `minClosedTrades = 100`、`minProfitFactor = 0.8`。enforcement と `/evaluation/summary.killCriterion` はどちらも active epoch + `CURRENT` の全期間 DB aggregate を使う。epoch/cohort 切替で eligible closed trade が 0 になっても新しい population の評価が未着手という意味であり、既存 `HARD_HALT` は解除しない。runtime key `killCriterion.minClosedTrades` は下げる方向のみ、`killCriterion.minProfitFactor` は上げる方向のみ override できる。無効化スイッチは持たない。
 
 公開 API は次の5本とする。`from` / `to` は ISO-8601 日付を JST として解釈し、省略時は直近30日を返す。
 
@@ -1335,7 +1335,13 @@ Historical Outcome Ridge は observed paper trade の realized R だけを `[-2R
 
 Evidence Relationship Graph は report segment → typed claim → deterministic fact → source の参照関係を client-side の fixed DAG として投影する。これは因果・相関・確率・confidence を表さず、node size と edge width にそれらの意味を持たせない。graph が利用できない場合も native table と Claim Inspector から同じ evidence に到達できる。
 
-benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は期間開始時点の paper equity（paper 初期資金 + 期間開始前の累計 realized trade PnL）とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
+benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は選択した immutable account epoch の初期資金と同じ epoch/cohort の期間開始前 realized PnL だけから算出する。trade の epoch 帰属は約定時刻順で最初の BUY execution から決定し、その後の SELL execution が別 epoch でも開始前 realized PnL を正しい entry epoch に含める。開始前 baseline を再構成できない `LEGACY_PRE_WS` は series、return、benchmark fact を生成せず `BASELINE_NOT_COMPARABLE` とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
+
+benchmark の取引母集団が取得上限を超えた場合は `TRUNCATED_POPULATION` と attribution coverage を返し、baseline、series、return を生成しない。
+
+LLM usage、run rate、decision/action、exclusion などの non-trade population は account epoch の作成時刻を lifecycle 開始境界とし、trade history の legacy fallback 境界とは分離する。CURRENT 以外へ non-trade fact を推測帰属せず、API/report は `NOT_ATTRIBUTABLE` として扱う。Reflection と Knowledge も active epoch + CURRENT を明示解決し、decision、run、usage、trade の全取得を同じ lifecycle scope に限定する。
+
+評価 API/report は requested period と、requested period と epoch lifecycle の積集合である effective period をそれぞれ返す。requested period が epoch 開始前を含む場合は `PARTIAL_LIFECYCLE` と effective days を返し、積集合が空の場合は `EMPTY_LIFECYCLE` と null の effective date を返す。benchmark の trade population、prior PnL aggregate、market candle window は effective period で計算し、requested 90D を 90D の実績として表示しない。`EMPTY_LIFECYCLE` の report は baseline、return、chart point、canonical benchmark fact を生成しない。
 
 LLM cost / usage は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`pre_filter` / `proposer` / `falsifier` / `reflection`）だけを集計する。Claude JSON では `total_cost_usd`、`num_turns`、`duration_ms`、`usage`、`modelUsage`、Codex JSONL では `codex exec` の単一 turn が返す `turn.completed.usage` を invocation 単位で best-effort に抽出する。Codex の `reasoning_output_tokens` は `output_tokens` の内数として別に保持し、token 合計へ二重加算しない。Codex の model は同じ thread ID を含む invocation 日の session filename を優先し、空振り時だけ更新日時が新しい session JSONL から bounded fallback で解決する。file 数または matching session の行数を上限で打ち切る場合は warning を残し、model が解決できない場合も semantic response と token usage は維持する。保存済み `details.usage` がない過去の Claude 行は redacted `details.stdout` から可能な範囲で fallback parse する。process output の解析後に一時 artifact の cleanup が失敗した場合も、audit は完了済み process の status、exit code、usage と `cleanupFailed` を保存してから runner を fail-closed にする。
 
@@ -1602,10 +1608,10 @@ run:
     maxSleepsTotalSeconds: 10
 
 accountSummary:
-  equityJpy: 100000
+  equityJpy: 1000000
   equityPeakJpy: 102300
   drawdownRatio: -0.0225
-  cashJpy: 100000
+  cashJpy: 1000000
   btcQuantity: 0
 
 positions:
@@ -2158,9 +2164,9 @@ get_runtime_limits
 ```json
 {
   "mode": "PAPER",
-  "cashJpy": "100000",
+  "cashJpy": "1000000",
   "btcQuantity": "0.00000000",
-  "totalEquityJpy": "100000",
+  "totalEquityJpy": "1000000",
   "equityPeakJpy": "102300",
   "drawdownRatio": "-0.0225"
 }
@@ -2635,7 +2641,7 @@ class GmoCoinMcpServerApp(
 
 ### 10.1 リスク計算
 
-[確定] リスク/トレードは2%。仮想10万円では最大2,000円。
+[確定] リスク/トレードは2%。基準資金100万円では最大20,000円。
 
 [設計提案] サイズ計算:
 
@@ -2970,13 +2976,16 @@ object TradePlansTable : UUIDTable("trade_plans") {
  */
 object EquitySnapshotsTable : UUIDTable("equity_snapshots") {
     val mode = varchar("mode", 16)
+    val reason = varchar("reason", 32)
+    val accountEpochId = uuid("account_epoch_id").nullable()
+    val tradingDate = date("trading_date")
     val capturedAt = timestamp("captured_at")
     val cashJpy = decimal("cash_jpy", 24, 8)
     val btcQuantity = decimal("btc_quantity", 24, 12)
     val btcMarkPriceJpy = decimal("btc_mark_price_jpy", 24, 8)
     val totalEquityJpy = decimal("total_equity_jpy", 24, 8)
     val equityPeakJpy = decimal("equity_peak_jpy", 24, 8)
-    val drawdownRatio = decimal("drawdown_ratio", 12, 8)
+    val drawdownRatio = decimal("drawdown_ratio", 20, 10)
 }
 
 /**
@@ -3383,7 +3392,7 @@ app:
   timezone: "Asia/Tokyo"
   mode: "PAPER"
   symbol: "BTC"
-  initialCapitalJpy: "100000"
+  initialCapitalJpy: "1000000"
 
 risk:
   maxRiskPerTradeRatio: "0.02"
@@ -3477,6 +3486,8 @@ security:
 [確定] secretsは `.env` / 環境変数。コード外・ログに出さない。
 
 ### 13.2.1 Runtime config 実装状態
+
+既存 `paper_account.initial_cash_jpy` は歴史的事実のまま `LEGACY_IMPORTED` epoch へ取り込み、bootstrap は baseline、cash/equity、ledger history、active config を書き換えない。account/config/current epoch baseline が不一致な場合、CURRENT evaluation と entry、resting-entry fill、position add は fail closed する。STOP / take-profit SELL execution、manual close、HARD_HALT sweep などの risk-reducing write は current epoch と active config の監査 lineage を保存して継続する。owner が draft → validate → activate を実行すると、zero-open-risk gate 下で `CONFIG_ACTIVATED` epoch、account reset、`EPOCH_START` snapshot、audit を同一 transaction で作成する。
 
 runtime config は code-owned `RuntimeConfigCatalog` が管理する項目を `runtime_config_versions` / `runtime_config_values` の active version として保持し、DB active snapshot を `TradingBotConfig` へ解決する。bootstrap は active version が存在しない場合に catalog default から初期 active snapshot を作成する。active snapshot に不足する code-owned catalog key がある場合、bootstrap は既存値を保持した complete snapshot を新しい active version として作成する。明示的に退役した key は新しい active version から除去し、それ以外の unknown key は fail closed する。`RUNTIME` key は active DB config が正本で、`.env.example` と compose は runtime default を列挙しない。Proposer / Falsifier の provider、model、effort と Reflection Runner の interval / query / PromptCandidates 設定は `RUNTIME` として次回 process restart 後に反映し、role assignment の snapshot は daemon、manual、standalone runner が起動時に一度だけ解決して使い切る。Reflection 用の `llm.claudeModel` / `llm.codexModel` は role assignment と独立して維持する。Obsidian vault path は container mount と一致させる `DEPLOYMENT` として WebUI では read-only にする。active snapshot に catalog 不一致、欠損、不正値、validation failure がある場合、Ktor、WebUI、runtime config admin API は起動し、取引 runtime、manual trigger、daemon worker は fail closed する。valid な active version へ戻ると、runtime config warning、`/health/ready`、manual trigger gate は現在の active snapshot に基づいて再評価される。`GET /ops/runtime-config` は catalog 表示を維持し、現在の active snapshot の validation error、recovery state、version 履歴取得失敗を warning として返す。draft は active または指定 version の full snapshot から作成し、validate / activate / rollback は保存済み候補を現在の catalog / typed config で再検証する。validation error は WebUI i18n に使える code / params で返す。draft と inactive version は active version と newest 20 draft / newest 20 inactive version を残し、古い candidate values と version row を削除する。decision run / manual trigger / daemon launch の audit には runtime config version id と hash を残し、in-flight run は開始時 snapshot を使い切る。`LIVE` は typed model の予約値だが、`LiveGmoBroker` 実装前は起動時に fail closed する。SafetyFloor thresholds と fallback fee / spread は既定値と同等またはより保守的な値だけ受理する。
 

@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.persistence
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
@@ -21,10 +22,13 @@ import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
+import me.matsumo.fukurou.trading.config.KillCriterionConfig
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.config.PaperAccountEpochSwitchRejectedException
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
@@ -74,6 +78,7 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
+import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
@@ -88,6 +93,7 @@ import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
@@ -905,6 +911,7 @@ class PostgresPersistenceIntegrationTest {
         val snapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
 
         assertEquals(expectedValues, snapshot.values)
+        assertEquals("false", snapshot.values.getValue("llm.launchEnabled"))
         assertEquals(calculateRuntimeConfigHash(expectedValues), snapshot.hash)
     }
 
@@ -948,6 +955,117 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(previousActiveVersionId, rollback.activeVersion.id)
         assertEquals(defaultValues, repository.activeSnapshot().getOrThrow().values)
+    }
+
+    @Test
+    fun runtimeConfigBaselineActivationUsesAtomicZeroOpenRiskEpochSwitch() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedRuntimeConfigRepository(database, fixedClock(), emptyMap())
+        val original = repository.activeSnapshot().getOrThrow()
+        val draft = repository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = original.versionId,
+                values = mapOf("paper.initialCashJpy" to "900000"),
+                note = "epoch switch integration test",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+
+        exposedTransaction(database) {
+            executeUpdate("UPDATE paper_account SET btc_quantity=0.01 WHERE id=$PAPER_ACCOUNT_SINGLE_ROW_ID")
+        }
+        val rejected = repository.activateDraftWithContext(draft.version.id, "open risk rejection", "test")
+        assertTrue(rejected.isFailure)
+        assertEquals(original.versionId, repository.activeSnapshot().getOrThrow().versionId)
+        assertEquals(
+            1,
+            selectCommandEventCountByType(database, CommandEventType.PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED),
+        )
+
+        exposedTransaction(database) {
+            executeUpdate("UPDATE paper_account SET btc_quantity=0 WHERE id=$PAPER_ACCOUNT_SINGLE_ROW_ID")
+        }
+        val activated = repository.activateDraftWithContext(draft.version.id, "zero risk switch", "test").getOrThrow()
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        val risk = ExposedRiskStateRepository(database).current().getOrThrow()
+
+        assertEquals("900000.00000000", account.initialCashJpy)
+        assertEquals("900000.00000000", account.cashJpy)
+        assertEquals("900000.00000000", risk.equityPeak.toPlainString())
+        assertEquals(activated.accountEpochId, account.accountEpochId)
+        assertEquals(1, selectCommandEventCountByType(database, CommandEventType.PAPER_ACCOUNT_EPOCH_SWITCHED))
+    }
+
+    @Test
+    fun runtimeConfigEpochSwitchAndWriterDmlRaceKeepsActivationAndLineageAtomic() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val configRepository = ExposedRuntimeConfigRepository(database, fixedClock(), emptyMap())
+        val original = configRepository.activeSnapshot().getOrThrow()
+        val draft = configRepository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = original.versionId,
+                values = mapOf("paper.initialCashJpy" to "900000"),
+                note = "concurrent epoch switch",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(database),
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisions,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            decisions,
+            postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
+        val start = CompletableDeferred<Unit>()
+
+        val (activation, write) = coroutineScope {
+            val activationTask = async(Dispatchers.IO) {
+                start.await()
+                configRepository.activateDraftWithContext(draft.version.id, "concurrent switch", "test")
+            }
+            val writerTask = async(Dispatchers.IO) {
+                start.await()
+                broker.placeOrder(command)
+            }
+            start.complete(Unit)
+            activationTask.await() to writerTask.await()
+        }
+
+        val active = configRepository.activeSnapshot().getOrThrow()
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        assertEquals(
+            0,
+            active.values.getValue("paper.initialCashJpy").toBigDecimal()
+                .compareTo(account.initialCashJpy.toBigDecimal()),
+        )
+        if (activation.isSuccess) {
+            assertEquals(activation.getOrThrow().accountEpochId, account.accountEpochId)
+            assertEquals("900000", active.values.getValue("paper.initialCashJpy"))
+        } else {
+            assertIs<PaperAccountEpochSwitchRejectedException>(activation.exceptionOrNull())
+            assertTrue(write.isSuccess)
+            assertEquals(original.versionId, active.versionId)
+        }
+        assertTrue(write.isSuccess || activation.isSuccess)
+        assertLedgerLineage(database, "concurrent activation/writer race")
+    }
+
+    @Test
+    fun paperAccountEpochRowsAreImmutableAtDatabaseBoundary() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val mutation = runCatching {
+            exposedTransaction(database) {
+                executeUpdate("UPDATE paper_account_epochs SET reason='mutated'")
+            }
+        }
+
+        assertTrue(mutation.isFailure)
     }
 
     @Test
@@ -1068,6 +1186,7 @@ class PostgresPersistenceIntegrationTest {
         val missingKeys = mapOf(
             "safety.minExpectedMoveToCostRatio" to "FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO",
             "runner.maxInvocationsPerHour" to "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR",
+            "llm.launchEnabled" to "FUKUROU_LLM_LAUNCH_ENABLED",
         )
         val preservedKey = "runner.maxToolCallsPerRun"
         val preservedValue = "12"
@@ -1108,6 +1227,24 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(backfilledSnapshot.versionId, idempotentSnapshot.versionId)
         assertEquals(expectedValues, idempotentSnapshot.values)
+    }
+
+    @Test
+    fun runtimeConfigBootstrapPreservesExplicitlyEnabledLaunchGate() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        upsertActiveRuntimeConfigValue(
+            database = database,
+            configKey = "llm.launchEnabled",
+            configValue = "true",
+        )
+        val enabledSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val preservedSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+
+        assertEquals(enabledSnapshot.versionId, preservedSnapshot.versionId)
+        assertEquals("true", preservedSnapshot.values.getValue("llm.launchEnabled"))
     }
 
     @Test
@@ -1270,6 +1407,244 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(RiskHaltState.RUNNING, columns.state)
         assertEquals(false, columns.hardHalt)
+    }
+
+    @Test
+    fun bootstrap_imports_epoch_non_destructively_and_writer_persists_lineage() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        val accountBefore = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+
+        bootstrap.ensureSchema().getOrThrow()
+        val accountAfter = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        assertEquals(accountBefore, accountAfter)
+        assertNotNull(accountAfter.accountEpochId)
+        assertEquals(
+            1,
+            selectCommandEventCountByType(database, CommandEventType.PAPER_ACCOUNT_EPOCH_IMPORTED),
+        )
+
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(database),
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
+        broker.placeOrder(command).getOrThrow()
+
+        exposedTransaction(database) {
+            val missingLineage = jdbcConnection().prepareStatement(
+                """
+                    SELECT
+                        (SELECT COUNT(*) FROM orders WHERE account_epoch_id IS NULL OR
+                            execution_semantics_version IS NULL OR runtime_config_hash IS NULL) +
+                        (SELECT COUNT(*) FROM executions WHERE account_epoch_id IS NULL OR
+                            execution_semantics_version IS NULL OR runtime_config_hash IS NULL)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.executeQuery().use { resultSet ->
+                    check(resultSet.next())
+                    resultSet.getInt(1)
+                }
+            }
+            assertEquals(0, missingLineage)
+        }
+    }
+
+    @Test
+    fun bootstrap_imports_saved_legacy_baseline_without_hidden_reconciliation() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        upsertActiveRuntimeConfigValue(database, "paper.initialCashJpy", "100000")
+        exposedTransaction(database) {
+            executeUpdate("DELETE FROM command_event_log WHERE event_type='PAPER_ACCOUNT_EPOCH_IMPORTED'")
+            executeUpdate("UPDATE paper_account SET current_epoch_id=NULL, initial_cash_jpy=100000, cash_jpy=777777, btc_quantity=0.01234567")
+            executeUpdate("DROP TRIGGER paper_account_epochs_immutable ON paper_account_epochs")
+            executeUpdate("DELETE FROM paper_account_epochs")
+            executeUpdate("UPDATE risk_state SET state='HARD_HALT', hard_halt=TRUE, equity_peak=765432")
+        }
+
+        bootstrap.ensureSchema().getOrThrow()
+
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        val risk = ExposedRiskStateRepository(database).current().getOrThrow()
+        val active = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+        val scope = ExposedEvaluationRepository(database).resolveScope(null, null).getOrThrow()
+        assertEquals("100000", active.values.getValue("paper.initialCashJpy"))
+        assertEquals("100000.00000000", account.initialCashJpy)
+        assertEquals("777777.00000000", account.cashJpy)
+        assertEquals("0.012345670000", account.btcQuantity)
+        assertEquals(RiskHaltState.HARD_HALT, risk.state)
+        assertEquals(BigDecimal("765432.00000000"), risk.equityPeak)
+        assertEquals(BigDecimal("100000.00000000"), scope.initialCashJpy)
+        assertEquals(1, selectCommandEventCountByType(database, CommandEventType.PAPER_ACCOUNT_EPOCH_IMPORTED))
+    }
+
+    @Test
+    fun bootstrap_keeps_stale_config_mismatch_and_current_trading_evaluation_fail_closed() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        upsertActiveRuntimeConfigValue(database, "paper.initialCashJpy", "100000")
+
+        bootstrap.ensureSchema().getOrThrow()
+
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        val active = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+        assertEquals("1000000.00000000", account.initialCashJpy)
+        assertEquals("100000", active.values.getValue("paper.initialCashJpy"))
+        assertTrue(ExposedEvaluationRepository(database).resolveScope(null, null).isFailure)
+        assertTrue(
+            ExposedEvaluationRepository(database).resolveScope(account.accountEpochId, "CURRENT").isFailure,
+        )
+
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(database),
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
+        val rejectedEntry = broker.placeOrder(command)
+        assertTrue(rejectedEntry.isFailure || !rejectedEntry.getOrThrow().accepted)
+    }
+
+    @Test
+    fun current_epoch_baseline_mismatch_fails_closed_for_writer_and_evaluation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database)
+        val broker = PaperBroker(
+            ledgerRepository = ledger,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisions,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val firstEntry = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        )
+        broker.placeOrder(firstEntry).getOrThrow()
+        assertEquals(1, broker.getPositions().getOrThrow().size)
+        val writer = ExposedPaperLedgerWriter(database, postgresSymbolRules(), fixedClock())
+        val restingCommand = postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("9900000"),
+            takeProfitPriceJpy = BigDecimal("10100000"),
+        )
+        writer.createRestingEntryOrder(
+            RestingEntryOrderRequest(
+                command = restingCommand,
+                orderId = restingCommand.commandId,
+                tradeGroupId = UUID.randomUUID(),
+                createdAt = fixedInstant(),
+                expiresAt = fixedInstant().plusSeconds(300),
+                expirySource = OrderExpirySource.SYSTEM_TTL,
+                effectiveTtlSeconds = 300,
+            ),
+        ).getOrThrow()
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        val epochId = requireNotNull(account.accountEpochId)
+        exposedTransaction(database) {
+            executeUpdate("DROP TRIGGER paper_account_epochs_immutable ON paper_account_epochs")
+            prepare("UPDATE paper_account_epochs SET initial_cash_jpy=100000 WHERE id=?").use { statement ->
+                statement.setObject(1, UUID.fromString(epochId))
+                statement.executeUpdate()
+            }
+        }
+
+        val evaluation = ExposedEvaluationRepository(database)
+        assertTrue(evaluation.resolveScope(null, "CURRENT").isFailure)
+        assertTrue(evaluation.resolveScope(epochId, "CURRENT").isFailure)
+        assertTrue(evaluation.fetchKillCriterionStats().isFailure)
+        val killRiskState = InMemoryRiskStateRepository(fixedClock())
+        val killEvaluator = KillCriterionEvaluator(
+            config = KillCriterionConfig(minClosedTrades = 2, minProfitFactor = BigDecimal("0.80")),
+            riskStateRepository = killRiskState,
+            riskStateCommandService = InMemoryRiskStateCommandService(
+                riskStateRepository = killRiskState,
+                commandEventLog = ExposedCommandEventLog(database),
+                clock = fixedClock(),
+            ),
+            commandEventLog = ExposedCommandEventLog(database),
+            broker = broker,
+            statsSource = evaluation::fetchKillCriterionStats,
+            clock = fixedClock(),
+        )
+        assertTrue(killEvaluator.evaluate(watermarkTickSnapshot("9600000")).isSuccess)
+
+        val rejectedCommand = postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("9900000"),
+            takeProfitPriceJpy = BigDecimal("10100000"),
+        )
+        val rejectedEntry = writer.createRestingEntryOrder(
+            RestingEntryOrderRequest(
+                command = rejectedCommand,
+                orderId = rejectedCommand.commandId,
+                tradeGroupId = UUID.randomUUID(),
+                createdAt = fixedInstant(),
+                expiresAt = fixedInstant().plusSeconds(300),
+                expirySource = OrderExpirySource.SYSTEM_TTL,
+                effectiveTtlSeconds = 300,
+            ),
+        )
+        assertTrue(rejectedEntry.isFailure)
+        val reconcile = ledger.reconcile(
+            tickSnapshot = watermarkTickSnapshot("9600000"),
+            simulator = FillSimulator(clock = fixedClock()),
+        ).getOrThrow()
+        val executions = ledger.getExecutions().getOrThrow()
+        val openOrders = ledger.getOpenOrders().getOrThrow()
+
+        assertEquals(1, reconcile.closedPositionIds.size)
+        assertEquals(0, ledger.getOpenPositions().getOrThrow().size)
+        assertEquals(1, executions.count { execution -> execution.side == OrderSide.SELL })
+        assertEquals(1, executions.count { execution -> execution.side == OrderSide.BUY })
+        assertLedgerLineage(database, "baseline mismatch compound reconcile")
+        exposedTransaction(database) {
+            assertEquals(2, countRowsForTest("executions"))
+        }
+        if (openOrders.any { order -> order.orderId == restingCommand.commandId.toString() }) {
+            writer.cancelOrder(
+                CancelOrderCommand(
+                    commandId = UUID.randomUUID(),
+                    orderId = restingCommand.commandId,
+                    cancelReason = PaperOrderCancelReason.EXPLICIT_CANCEL,
+                    reasonJa = "zero-open-risk recovery",
+                    auditContext = PaperTradeAuditContext.EMPTY,
+                ),
+            ).getOrThrow()
+        }
+
+        val configRepository = ExposedRuntimeConfigRepository(database, fixedClock(), emptyMap())
+        val active = configRepository.activeSnapshot().getOrThrow()
+        val recovery = configRepository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = active.versionId,
+                values = mapOf("paper.initialCashJpy" to "1000000"),
+                note = "repair stale current epoch baseline",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+        val activated = configRepository.activateDraftWithContext(
+            recovery.version.id,
+            "repair stale current epoch baseline",
+            "test",
+        ).getOrThrow()
+        assertTrue(activated.accountEpochId != epochId)
+        assertTrue(evaluation.resolveScope(null, "CURRENT").isSuccess)
     }
 
     @Test
@@ -2936,11 +3311,11 @@ class PostgresPersistenceIntegrationTest {
             val riskState = ExposedRiskStateRepository(database).current().getOrThrow()
 
             assertEquals(TradingMode.PAPER, balance.mode)
-            assertEquals("100000.00000000", balance.cashJpy)
-            assertEquals("100000.00000000", balance.totalEquityJpy)
-            assertEquals("100000.00000000", balance.equityPeakJpy)
-            assertEquals("100000.00000000", riskState.equityPeak.toPlainString())
-            assertEquals("100000.00000000", accountStatus.currentEquityJpy)
+            assertEquals("1000000.00000000", balance.cashJpy)
+            assertEquals("1000000.00000000", balance.totalEquityJpy)
+            assertEquals("1000000.00000000", balance.equityPeakJpy)
+            assertEquals("1000000.00000000", riskState.equityPeak.toPlainString())
+            assertEquals("1000000.00000000", accountStatus.currentEquityJpy)
             assertEquals("0", accountStatus.todayRealizedPnlJpy)
             assertEquals(0, broker.getPositions().getOrThrow().size)
             assertEquals(0, broker.getOpenOrders().getOrThrow().size)
@@ -3311,7 +3686,10 @@ class PostgresPersistenceIntegrationTest {
                         ),
                     ),
                 ),
-                daemon = LlmDaemonConfig(enabled = true),
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    launchEnabled = true,
+                ),
             ),
             dependencies = LlmDaemonSchedulerDependencies(
                 riskStateRepository = ExposedRiskStateRepository(database),
@@ -3442,7 +3820,10 @@ class PostgresPersistenceIntegrationTest {
         val excludedEvents = eventLog.findEvents(
             limit = 10,
             eventType = null,
-            excludeEventTypes = setOf(CommandEventType.DAEMON_TRIGGER_LAUNCHED),
+            excludeEventTypes = setOf(
+                CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+                CommandEventType.PAPER_ACCOUNT_EPOCH_IMPORTED,
+            ),
         ).getOrThrow()
 
         assertEquals(listOf("daemon-latest", "daemon-new"), allEvents.map { event -> event.toolName })
@@ -3835,6 +4216,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf(OrderSide.BUY, OrderSide.SELL), executions.map { execution -> execution.side })
         assertEquals("10005000.00000000", watermark.highestPriceSinceEntryJpy)
         assertEquals("9685155.00000000", watermark.lowestPriceSinceEntryJpy)
+        assertLedgerLineage(database, "STOP")
     }
 
     @Test
@@ -4031,6 +4413,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, placeResult.orderIds.size)
         assertEquals(1, reconcileResult.filledOrderIds.size)
         assertEquals(1, executions.size)
+        assertLedgerLineage(database, "resting fill")
     }
 
     @Test
@@ -4155,6 +4538,272 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun evaluation_repository_bounds_large_scoped_populations_and_aggregates_prior_pnl() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedEvaluationRepository(database)
+        val scope = repository.resolveScope(null, "CURRENT").getOrThrow()
+        val runtimeHash = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow().hash
+        val period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1))
+
+        exposedTransaction(database) {
+            prepare(
+                """
+                    INSERT INTO positions (
+                        id, account_epoch_id, trade_group_id, mode, symbol, side, status,
+                        opened_at, closed_at, size_btc, average_entry_price_jpy,
+                        current_price_jpy, highest_price_since_entry_jpy, lowest_price_since_entry_jpy
+                    )
+                    SELECT md5('bulk-position:' || series)::uuid,
+                        CASE WHEN series=0 THEN ?::uuid ELSE NULL END,
+                        md5('bulk-group:' || series)::uuid, 'PAPER', 'BTC_JPY', 'LONG', 'CLOSED',
+                        ?, ?, 0, 10000000, 10000000, 10000000, 10000000
+                    FROM generate_series(0, 20001) series
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.setLong(2, fixedInstant().toEpochMilli())
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+            prepare(
+                """
+                    INSERT INTO orders (
+                        id, account_epoch_id, execution_semantics_version, runtime_config_hash,
+                        position_id, trade_group_id, mode, symbol, side, order_type, status,
+                        size_btc, protective_stop_price_jpy, created_at, updated_at
+                    )
+                    SELECT md5('bulk-order:' || series)::uuid,
+                        CASE WHEN series=0 THEN ?::uuid ELSE NULL END,
+                        CASE WHEN series=0 THEN 'PAPER_WS_V1' ELSE NULL END,
+                        CASE WHEN series=0 THEN ? ELSE NULL END,
+                        md5('bulk-position:' || series)::uuid, md5('bulk-group:' || series)::uuid,
+                        'PAPER', 'BTC_JPY', 'BUY', 'MARKET', 'FILLED', 0.001, 9700000, ?, ?
+                    FROM generate_series(0, 20001) series
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.setString(2, runtimeHash)
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.setLong(4, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+            prepare(
+                """
+                    INSERT INTO executions (
+                        id, account_epoch_id, execution_semantics_version, runtime_config_hash,
+                        order_id, position_id, mode, symbol, side, price_jpy, size_btc,
+                        fee_jpy, realized_pnl_jpy, liquidity, executed_at
+                    )
+                    SELECT md5('bulk-execution:' || series)::uuid,
+                        CASE WHEN series=0 THEN ?::uuid ELSE NULL END,
+                        CASE WHEN series=0 THEN 'PAPER_WS_V1' ELSE NULL END,
+                        CASE WHEN series=0 THEN ? ELSE NULL END,
+                        md5('bulk-order:' || series)::uuid, md5('bulk-position:' || series)::uuid,
+                        'PAPER', 'BTC_JPY', 'BUY', 10000000, 0.001, 1, 0, 'TAKER', ?
+                    FROM generate_series(0, 20001) series
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.setString(2, runtimeHash)
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+        }
+
+        val current = repository.fetchClosedTrades(period, scope = scope).getOrThrow()
+        val snapshot = repository.fetchReportSnapshot(
+            EvaluationPeriod(fixedInstant().plusSeconds(1), fixedInstant().plusSeconds(2)),
+            scope,
+        ).getOrThrow()
+        assertEquals(1, current.trades.size)
+        assertFalse(current.truncated)
+        assertEquals(0, snapshot.priorPnlJpy.compareTo(BigDecimal("-1.00000000")))
+
+        exposedTransaction(database) {
+            prepare("UPDATE positions SET account_epoch_id=?").use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.executeUpdate()
+            }
+            prepare("UPDATE orders SET account_epoch_id=?, execution_semantics_version='PAPER_WS_V1', runtime_config_hash=?").use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.setString(2, runtimeHash)
+                statement.executeUpdate()
+            }
+            prepare("UPDATE executions SET account_epoch_id=?, execution_semantics_version='PAPER_WS_V1', runtime_config_hash=?").use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.setString(2, runtimeHash)
+                statement.executeUpdate()
+            }
+        }
+        val oversizedSnapshot = repository.fetchReportSnapshot(period, scope).getOrThrow()
+        assertEquals(20_000, oversizedSnapshot.trades.trades.size)
+        assertTrue(oversizedSnapshot.trades.truncated)
+    }
+
+    @Test
+    fun evaluationAttributionRecoversTenTradesIncludingFourNullOrderPositionIds() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val ledger = ExposedPaperLedgerRepository(database)
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledger,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisions,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val entryOrderIds = mutableListOf<UUID>()
+        repeat(10) {
+            val command = approvedPostgresEntryCommand(
+                repository = decisions,
+                command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+            )
+            val placed = broker.placeOrder(command).getOrThrow()
+            entryOrderIds += UUID.fromString(placed.orderIds.first())
+            ledger.reconcile(takeProfitTickSnapshot(), FillSimulator(clock = fixedClock())).getOrThrow()
+        }
+        exposedTransaction(database) {
+            entryOrderIds.take(4).forEach { orderId ->
+                prepare("UPDATE orders SET position_id=NULL WHERE id=?").use { statement ->
+                    statement.setObject(1, orderId)
+                    statement.executeUpdate()
+                }
+            }
+        }
+
+        val repository = ExposedEvaluationRepository(database)
+        val scope = repository.resolveScope(null, "CURRENT").getOrThrow()
+        val result = repository.fetchClosedTrades(
+            period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1)),
+            scope = scope,
+        ).getOrThrow()
+
+        assertEquals(10, result.trades.size)
+        assertEquals(10, result.attributionCoverage.attributed)
+        assertEquals(0, result.attributionCoverage.missing)
+        assertEquals(10, result.attributionCoverage.total)
+        assertTrue(EvaluationMath.summarizeBySetup(result.trades).isNotEmpty())
+        assertTrue(EvaluationMath.calibrationBySetup(result.trades).isNotEmpty())
+
+        exposedTransaction(database) {
+            prepare("UPDATE orders SET intent_id=NULL WHERE id=?").use { statement ->
+                statement.setObject(1, entryOrderIds.last())
+                statement.executeUpdate()
+            }
+        }
+        val withMissing = repository.fetchClosedTrades(
+            period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1)),
+            scope = scope,
+        ).getOrThrow()
+        assertEquals(10, withMissing.trades.size)
+        assertEquals(1, withMissing.attributionCoverage.missing)
+    }
+
+    @Test
+    fun evaluation_cohort_requires_entry_and_all_fill_lineage_to_be_current_and_same_epoch() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val ledger = ExposedPaperLedgerRepository(database)
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledger,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisions,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            decisions,
+            postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        )
+        val entryOrderId = UUID.fromString(broker.placeOrder(command).getOrThrow().orderIds.first())
+        ledger.reconcile(takeProfitTickSnapshot(), FillSimulator(clock = fixedClock())).getOrThrow()
+        val repository = ExposedEvaluationRepository(database)
+        val period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1))
+        val currentScope = repository.resolveScope(null, "CURRENT").getOrThrow()
+        val legacyScope = repository.resolveScope(null, "LEGACY_PRE_WS").getOrThrow()
+        val unsupportedScope = repository.resolveScope(null, "UNSUPPORTED_EXECUTION_SEMANTICS").getOrThrow()
+        assertEquals(1, repository.fetchClosedTrades(period, scope = currentScope).getOrThrow().trades.size)
+
+        exposedTransaction(database) {
+            prepare("UPDATE orders SET execution_semantics_version=NULL WHERE id=?").use { statement ->
+                statement.setObject(1, entryOrderId)
+                statement.executeUpdate()
+            }
+        }
+        assertEquals(0, repository.fetchClosedTrades(period, scope = currentScope).getOrThrow().trades.size)
+        assertEquals(1, repository.fetchClosedTrades(period, scope = legacyScope).getOrThrow().trades.size)
+
+        exposedTransaction(database) {
+            prepare("UPDATE orders SET execution_semantics_version='PAPER_WS_V2' WHERE id=?").use { statement ->
+                statement.setObject(1, entryOrderId)
+                statement.executeUpdate()
+            }
+        }
+        assertEquals(1, repository.fetchClosedTrades(period, scope = unsupportedScope).getOrThrow().trades.size)
+
+        exposedTransaction(database) {
+            val otherEpochId = UUID.randomUUID()
+            prepare(
+                "INSERT INTO paper_account_epochs(id,kind,initial_cash_jpy,runtime_config_hash,reason,actor,created_at) VALUES (?, 'CONFIG_ACTIVATED', 1000000, 'mixed-test', 'test', 'test', ?)",
+            ).use { statement ->
+                statement.setObject(1, otherEpochId)
+                statement.setLong(2, fixedInstant().plusSeconds(1).toEpochMilli())
+                statement.executeUpdate()
+            }
+            prepare("UPDATE orders SET execution_semantics_version='PAPER_WS_V1' WHERE id=?").use { statement ->
+                statement.setObject(1, entryOrderId)
+                statement.executeUpdate()
+            }
+            prepare("UPDATE executions SET account_epoch_id=? WHERE side='SELL'").use { statement ->
+                statement.setObject(1, otherEpochId)
+                statement.executeUpdate()
+            }
+        }
+        assertEquals(0, repository.fetchClosedTrades(period, scope = currentScope).getOrThrow().trades.size)
+        val mixedTrade = repository.fetchClosedTrades(period, scope = legacyScope).getOrThrow().trades.single()
+        val reportPeriod = EvaluationPeriod(fixedInstant().plusSeconds(2), fixedInstant().plusSeconds(3))
+        val currentSnapshot = repository.fetchReportSnapshot(reportPeriod, currentScope).getOrThrow()
+        val legacySnapshot = repository.fetchReportSnapshot(reportPeriod, legacyScope).getOrThrow()
+        assertEquals(0, currentSnapshot.priorPnlJpy.compareTo(BigDecimal.ZERO))
+        assertEquals(0, legacySnapshot.priorPnlJpy.compareTo(mixedTrade.tradePnlJpy))
+    }
+
+    @Test
+    fun current_non_trade_population_starts_at_import_lifecycle_boundary() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val eventLog = ExposedCommandEventLog(database)
+        val preImport = fixedInstant().minusSeconds(1)
+        val postImport = fixedInstant().plusSeconds(1)
+        listOf("pre-import" to preImport, "post-import" to postImport).forEach { (runId, occurredAt) ->
+            eventLog.append(
+                CommandEvent(
+                    decisionRunContext = DecisionRunContext(
+                        decisionRunId = runId,
+                        llmProvider = null,
+                        promptHash = null,
+                        systemPromptVersion = null,
+                        marketSnapshotId = null,
+                    ),
+                    toolName = "one-shot-runner",
+                    toolCallId = null,
+                    clientRequestId = null,
+                    eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+                    payload = """{"phase":"proposer","usage":{"inputTokens":1,"outputTokens":1}}""",
+                    occurredAt = occurredAt,
+                ),
+            ).getOrThrow()
+        }
+        val repository = ExposedEvaluationRepository(database)
+        val scope = repository.resolveScope(null, "CURRENT").getOrThrow()
+        val period = EvaluationPeriod(preImport.minusSeconds(1), postImport.plusSeconds(1))
+
+        assertEquals(fixedInstant(), scope.lifecycleFromInclusive)
+        assertEquals(1, repository.countDecisionRuns(period, scope).getOrThrow())
+        val usages = repository.fetchLlmPhaseUsages(period, scope = scope).getOrThrow().facts
+        assertEquals(listOf("post-import"), usages.map { usage -> usage.decisionRunId })
+    }
+
+    @Test
     fun evaluation_repository_treats_partial_closes_and_adds_as_one_closed_trade() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -4242,6 +4891,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals("9758000", trade.entryWeightedProtectiveStopPriceJpy?.stripTrailingZeros()?.toPlainString())
         assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
         assertEquals("247000", evaluatedTrade.initialRiskPriceWidthJpy?.stripTrailingZeros()?.toPlainString())
+        assertLedgerLineage(database, "manual close")
     }
 
     @Test
@@ -4515,6 +5165,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(2, executions.size)
         assertEquals("10100000.00000000", watermark.highestPriceSinceEntryJpy)
         assertEquals("10005000.00000000", watermark.lowestPriceSinceEntryJpy)
+        assertLedgerLineage(database, "virtual TP")
     }
 
     @Test
@@ -4551,6 +5202,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(0, openOrders.size)
         assertEquals("10005000.00000000", watermark.highestPriceSinceEntryJpy)
         assertEquals("9885055.00000000", watermark.lowestPriceSinceEntryJpy)
+        assertLedgerLineage(database, "reconciler hard-halt close")
     }
 
     @Test
@@ -4706,6 +5358,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(2, executions.size)
         assertEquals(takeProfitEvent.receivedAt.toString(), executions.last().executedAt)
         assertTrue(broker.getPositions().getOrThrow().isEmpty())
+        assertLedgerLineage(database, "WebSocket market event")
     }
 
     @Test
@@ -4939,6 +5592,47 @@ class PostgresPersistenceIntegrationTest {
             val throwable = requireNotNull(waiterResult.exceptionOrNull())
 
             assertTrue(throwable is SQLTimeoutException)
+        }
+    }
+}
+
+private fun assertLedgerLineage(database: ExposedDatabase, path: String) {
+    val activeHash = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow().hash
+    exposedTransaction(database) {
+        val mismatches = prepare(
+            """
+                SELECT
+                    (SELECT COUNT(*) FROM orders value, paper_account account
+                     WHERE account.id=? AND (value.account_epoch_id IS NULL OR
+                       value.account_epoch_id<>account.current_epoch_id OR
+                       value.execution_semantics_version<>'PAPER_WS_V1' OR value.runtime_config_hash<>?)) +
+                    (SELECT COUNT(*) FROM executions value, paper_account account
+                     WHERE account.id=? AND (value.account_epoch_id IS NULL OR
+                       value.account_epoch_id<>account.current_epoch_id OR
+                       value.execution_semantics_version<>'PAPER_WS_V1' OR value.runtime_config_hash<>?))
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+            statement.setString(2, activeHash)
+            statement.setInt(3, PAPER_ACCOUNT_SINGLE_ROW_ID)
+            statement.setString(4, activeHash)
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getInt(1)
+            }
+        }
+        assertEquals(0, mismatches, "$path must persist current epoch, semantics, and config hash")
+    }
+}
+
+private fun selectCommandEventCountByType(database: ExposedDatabase, type: CommandEventType): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement("SELECT COUNT(*) FROM command_event_log WHERE event_type=?").use { statement ->
+            statement.setString(1, type.name)
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getInt(1)
+            }
         }
     }
 }
@@ -5642,6 +6336,16 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
         }
     } finally {
         container.stop()
+    }
+}
+
+private fun JdbcTransaction.countRowsForTest(table: String): Int {
+    require(table in setOf("orders", "positions", "executions"))
+    return prepare("SELECT COUNT(*) FROM $table").use { statement ->
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next())
+            resultSet.getInt(1)
+        }
     }
 }
 

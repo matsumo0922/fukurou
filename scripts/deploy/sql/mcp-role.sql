@@ -1,5 +1,16 @@
 \set ON_ERROR_STOP on
 
+BEGIN;
+
+DO $$
+BEGIN
+    IF to_regclass('public.mcp_current_evaluation_scope') IS NULL
+        OR to_regclass('public.mcp_evaluation_epochs') IS NULL THEN
+        RAISE EXCEPTION 'MCP evaluation views are missing; deploy the application schema/bootstrap before provisioning the MCP role';
+    END IF;
+END
+$$;
+
 SELECT format(
     'CREATE ROLE %I LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT',
     :'mcp_role',
@@ -104,7 +115,8 @@ FROM (VALUES
     ('command_event_log'), ('paper_account'), ('positions'), ('orders'), ('risk_state'),
     ('executions'), ('market_data_sessions'), ('market_data_gaps'), ('trade_intents'),
     ('trade_plans'), ('falsifications'), ('trade_intent_consumptions'), ('decisions'),
-    ('llm_runs'), ('evaluation_exclusions'), ('safety_violations')
+    ('llm_runs'), ('evaluation_exclusions'), ('safety_violations'),
+    ('mcp_current_evaluation_scope'), ('mcp_evaluation_epochs')
 ) AS inventory(table_name) \gexec
 
 SELECT format(
@@ -127,3 +139,5 @@ WHERE member = (SELECT oid FROM pg_roles WHERE rolname = :'mcp_role') \gexec
 SELECT format('REVOKE %I FROM %I', :'mcp_role', member::regrole)
 FROM pg_auth_members
 WHERE roleid = (SELECT oid FROM pg_roles WHERE rolname = :'mcp_role') \gexec
+
+COMMIT;

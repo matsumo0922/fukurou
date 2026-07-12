@@ -25,6 +25,9 @@ import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
+import me.matsumo.fukurou.trading.evaluation.EvaluationScope
+import me.matsumo.fukurou.trading.domain.EvaluationCohort
+import me.matsumo.fukurou.trading.evaluation.intersectLifecycle
 import me.matsumo.fukurou.trading.evaluation.OutcomeRidgeChartFacts
 import me.matsumo.fukurou.trading.evaluation.MarketRegimeLabel
 import me.matsumo.fukurou.trading.evaluation.report.EvaluationClaimValidator
@@ -71,7 +74,10 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
 
     post("/evaluation/reports/jobs") {
         val request = runCatching { call.receive<EvaluationReportGenerateRequest>() }.getOrNull()
-        val scope = request?.toScope()
+        val evaluationScope = request?.let { value ->
+            dependencies.repository?.resolveScope(value.epochId, value.cohort)?.getOrNull()
+        }
+        val scope = if (evaluationScope == null) null else request.toScope(evaluationScope)
         if (scope == null) {
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("use preset days 7, 30, 90 or a valid CUSTOM from/toInclusive range"))
             return@post
@@ -112,7 +118,7 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
     }
 
     get("/evaluation/reports/default") {
-        val scopeKey = call.reportScopeKey()
+        val scopeKey = call.reportScopeKey(dependencies.repository) ?: return@get
         val report = store.default(scopeKey)
         if (report == null) {
             call.respond(HttpStatusCode.NotFound, ErrorResponse("report has not been generated"))
@@ -132,6 +138,14 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
             query("days") {
                 description = "scopeKey 省略時の互換 preset 日数です。"
                 schema = jsonSchema<Int>()
+            }
+            query("epochId") {
+                description = "immutable account epoch ID。省略時は active epoch です。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "CURRENT / LEGACY_PRE_WS / UNSUPPORTED_EXECUTION_SEMANTICS。"
+                schema = jsonSchema<String>()
             }
         }
         responses {
@@ -160,8 +174,14 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
     }
 
     get("/evaluation/reports/revisions") {
-        val scopeKey = call.reportScopeKey()
-        call.respond(EvaluationReportHistoryResponse(store.history(scopeKey)))
+        val scopeKey = call.reportScopeKey(dependencies.repository) ?: return@get
+        val currentHistory = store.history(scopeKey)
+        val legacyHistory = if (call.request.queryParameters["cohort"] == "LEGACY_PRE_WS") {
+            store.history(EvaluationReportScopeKey.decode(scopeKey).base)
+        } else {
+            emptyList()
+        }
+        call.respond(EvaluationReportHistoryResponse(currentHistory + legacyHistory))
     }.describe {
         summary = "評価レポート履歴を取得する"
         description = "生成 request ごとに保持する immutable revision 履歴を新しい順で返します。"
@@ -175,6 +195,14 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
                 description = "scopeKey 省略時の互換 preset 日数です。"
                 schema = jsonSchema<Int>()
             }
+            query("epochId") {
+                description = "履歴対象の immutable account epoch ID です。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "履歴対象 cohort です。"
+                schema = jsonSchema<String>()
+            }
         }
         responses { HttpStatusCode.OK { schema = jsonSchema<EvaluationReportHistoryResponse>() } }
     }
@@ -185,24 +213,56 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
             call.respond(HttpStatusCode.NotFound, ErrorResponse("report revision was not found"))
             return@get
         }
+        val hasScopeContract = listOf("scopeKey", "days", "epochId", "cohort")
+            .any { key -> call.request.queryParameters[key] != null }
+        if (hasScopeContract) {
+            val expectedScopeKey = call.reportScopeKey(dependencies.repository) ?: return@get
+            if (revision.scopeKey != expectedScopeKey) {
+                call.respond(
+                    HttpStatusCode.BadRequest,
+                    EvaluationReportScopeErrorResponse("REPORT_SCOPE_MISMATCH", "revision scope does not match requested scope"),
+                )
+                return@get
+            }
+        }
         call.respond(revision)
     }.describe {
         summary = "評価レポート revision を取得する"
         description = "履歴から選択した immutable artifact と同一 snapshot evidence を返します。"
         tag(EVALUATION_REPORT_TAG)
+        parameters {
+            query("scopeKey") {
+                schema = jsonSchema<String>()
+                description = "preview対象の期間scope keyです。"
+            }
+            query("epochId") {
+                schema = jsonSchema<String>()
+                description = "preview対象のimmutable account epoch IDです。"
+            }
+            query("cohort") {
+                schema = jsonSchema<String>()
+                description = "preview対象cohortです。"
+            }
+        }
         responses {
             HttpStatusCode.OK { schema = jsonSchema<EvaluationReportResponse>() }
+            HttpStatusCode.BadRequest { schema = jsonSchema<EvaluationReportScopeErrorResponse>() }
             HttpStatusCode.NotFound { schema = jsonSchema<ErrorResponse>() }
         }
     }
 
     put("/evaluation/reports/pins") {
         val request = call.receive<EvaluationReportPinRequest>()
-        store.pin(request.resolvedScopeKey(), request.revisionId).getOrElse { error ->
-            call.respond(HttpStatusCode.BadRequest, ErrorResponse(error.message ?: "pin failed"))
+        val scopeKey = request.resolvedScopeKey(dependencies.repository) ?: run {
+            call.respond(HttpStatusCode.BadRequest, ErrorResponse("evaluation scope is invalid"))
             return@put
         }
-        call.respond(EvaluationReportPinResponse(request.resolvedScopeKey(), request.revisionId))
+        store.pin(scopeKey, request.revisionId).getOrElse { error ->
+            val code = if (error.message == "REPORT_SCOPE_MISMATCH") "REPORT_SCOPE_MISMATCH" else "REPORT_PIN_REJECTED"
+            call.respond(HttpStatusCode.BadRequest, EvaluationReportScopeErrorResponse(code, error.message ?: "pin failed"))
+            return@put
+        }
+        call.respond(EvaluationReportPinResponse(scopeKey, request.revisionId))
     }.describe {
         summary = "評価レポート revision を pin する"
         description = "successful immutable revision を選択 scope の既定表示へ明示的に固定します。"
@@ -210,12 +270,13 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
         requestBody { schema = jsonSchema<EvaluationReportPinRequest>() }
         responses {
             HttpStatusCode.OK { schema = jsonSchema<EvaluationReportPinResponse>() }
-            HttpStatusCode.BadRequest { schema = jsonSchema<ErrorResponse>() }
+            HttpStatusCode.BadRequest { schema = jsonSchema<EvaluationReportScopeErrorResponse>() }
         }
     }
 
     delete("/evaluation/reports/pins") {
-        store.unpin(call.reportScopeKey())
+        val scopeKey = call.reportScopeKey(dependencies.repository) ?: return@delete
+        store.unpin(scopeKey)
         call.respond(HttpStatusCode.NoContent)
     }.describe {
         summary = "評価レポート pin を解除する"
@@ -229,6 +290,14 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
             query("days") {
                 description = "scopeKey 省略時の互換 preset 日数です。"
                 schema = jsonSchema<Int>()
+            }
+            query("epochId") {
+                description = "pin scopeのimmutable account epoch IDです。"
+                schema = jsonSchema<String>()
+            }
+            query("cohort") {
+                description = "pin scopeのcohortです。"
+                schema = jsonSchema<String>()
             }
         }
         responses { HttpStatusCode.NoContent { description = "pin を解除しました。" } }
@@ -257,6 +326,8 @@ private class EvaluationReportStore(
             revisionId = UUID.randomUUID().toString(),
             status = "REQUESTED",
             stage = "ADMITTED",
+            epochId = scope.evaluationScope.accountEpochId.toString(),
+            cohort = scope.evaluationScope.cohort.name,
         )
         val admittedJob = persistence?.admit(job, scope.key)?.getOrThrow()?.job ?: job.copy(
             revisionNumber = revisionSequence.incrementAndGet(),
@@ -280,36 +351,53 @@ private class EvaluationReportStore(
             from = from.atStartOfDay(ReportZone).toInstant(),
             toExclusive = toInclusive.plusDays(1).atStartOfDay(ReportZone).toInstant(),
         )
+        val effectivePeriod = period.intersectLifecycle(scope.evaluationScope)
         val snapshotId = UUID.randomUUID().toString()
-        val snapshot = source.fetchReportSnapshot(period).getOrThrow()
+        val emptyLifecycle = effectivePeriod.from == effectivePeriod.toExclusive
+        val snapshot = source.fetchReportSnapshot(effectivePeriod, scope.evaluationScope).getOrThrow()
         val queryResult = snapshot.trades
         require(!queryResult.truncated) { "SNAPSHOT_TRUNCATED" }
-        val candles = marketDataSource?.getCandles(
-            symbol = symbol,
-            interval = CandleInterval.ONE_DAY,
-            limit = (scope.days + 40).coerceAtMost(500),
-        )?.getOrThrow() ?: error("market data source is unavailable")
+        val effectiveDays = java.time.Duration.between(effectivePeriod.from, effectivePeriod.toExclusive).toDays()
+        val candles = if (emptyLifecycle) {
+            emptyList()
+        } else {
+            marketDataSource?.getCandles(
+                symbol = symbol,
+                interval = CandleInterval.ONE_DAY,
+                limit = (effectiveDays.toInt() + 40).coerceAtMost(500),
+            )?.getOrThrow() ?: error("market data source is unavailable")
+        }
         val regimes = EvaluationMath.classifyMarketRegimes(candles, ReportZone)
         val stats = EvaluationMath.summarizeTrades(queryResult.trades)
         val ridge = EvaluationMath.historicalOutcomeRidges(queryResult.trades, ReportZone, regimes)
         val baselineEquity = snapshot.initialCashJpy.add(snapshot.priorPnlJpy)
+        val effectiveFromDate = effectivePeriod.from.atZone(ReportZone).toLocalDate()
+        val effectiveToDate = if (emptyLifecycle) {
+            effectiveFromDate
+        } else {
+            effectivePeriod.toExclusive.minusMillis(1).atZone(ReportZone).toLocalDate()
+        }
         val benchmark = EvaluationMath.benchmark(
             BenchmarkCalculationRequest(
                 candles = candles,
                 dailyPnlFacts = snapshot.dailyPnl,
                 baselineEquityJpy = baselineEquity,
-                fromDate = from,
-                toDateInclusive = toInclusive,
+                fromDate = effectiveFromDate,
+                toDateInclusive = effectiveToDate,
                 zoneId = ReportZone,
             ),
         )
+        val benchmarkComparable = scope.evaluationScope.cohort !=
+            EvaluationCohort.LEGACY_PRE_WS
+        val benchmarkAvailable = benchmarkComparable && !emptyLifecycle
         val calibration = buildCalibrationResponse(queryResult.trades)
         val performanceLattice = buildPerformanceLattice(queryResult.trades, regimes)
         val usageResult = snapshot.usages
         require(!usageResult.truncated) { "USAGE_SNAPSHOT_TRUNCATED" }
         val costStats = EvaluationMath.summarizeLlmCosts(usageResult.facts)
         val exclusions = snapshot.exclusions
-        val benchmarkFacts = benchmark.points.flatMap { point ->
+        val benchmarkPoints = benchmark.points.takeIf { benchmarkAvailable }.orEmpty()
+        val benchmarkFacts = benchmarkPoints.flatMap { point ->
             listOf(
                 EvaluationReportFact("benchmark.${point.date}.botEquityJpy", point.botEquityJpy.toPlainString(), "JPY", "AVAILABLE", listOf("paper-ledger")),
                 EvaluationReportFact("benchmark.${point.date}.buyAndHoldEquityJpy", point.buyAndHoldEquityJpy.toPlainString(), "JPY", "AVAILABLE", listOf("daily-candles")),
@@ -392,8 +480,8 @@ private class EvaluationReportStore(
             EvaluationReportSourceResponse("runner-audit", inputAsOf, "SNAPSHOT"),
         )
         val benchmarkResponse = ReportBenchmarkChartResponse(
-            baselineEquityJpy = baselineEquity.toPlainString(),
-            points = benchmark.points.map { point ->
+            baselineEquityJpy = baselineEquity.takeIf { benchmarkAvailable }?.toPlainString(),
+            points = benchmarkPoints.map { point ->
                 ReportBenchmarkPointResponse(
                     date = point.date.toString(),
                     botEquityJpy = point.botEquityJpy.toPlainString(),
@@ -401,9 +489,14 @@ private class EvaluationReportStore(
                     noTradeEquityJpy = point.noTradeEquityJpy.toPlainString(),
                 )
             },
-            botReturn = benchmark.botReturn?.toPlainString(),
-            buyAndHoldReturn = benchmark.buyAndHoldReturn?.toPlainString(),
-            state = if (benchmark.points.isEmpty()) "INSUFFICIENT_SAMPLE" else "AVAILABLE",
+            botReturn = benchmark.botReturn?.takeIf { benchmarkAvailable }?.toPlainString(),
+            buyAndHoldReturn = benchmark.buyAndHoldReturn?.takeIf { benchmarkAvailable }?.toPlainString(),
+            state = when {
+                emptyLifecycle -> "EMPTY_LIFECYCLE"
+                !benchmarkComparable -> "BASELINE_NOT_COMPARABLE"
+                benchmark.points.isEmpty() -> "INSUFFICIENT_SAMPLE"
+                else -> "AVAILABLE"
+            },
         )
         val canonical = ReportJson.encodeToString(
             CanonicalEvaluationSnapshot(
@@ -447,8 +540,30 @@ private class EvaluationReportStore(
             revisionId = job.revisionId,
             revisionNumber = revisionNumber,
             scopeKey = scope.key,
+            epochId = scope.evaluationScope.accountEpochId.toString(),
+            cohort = scope.evaluationScope.cohort.name,
+            executionSemanticsVersion = scope.evaluationScope.executionSemanticsVersion,
+            attributionCoverage = EvaluationAttributionCoverageResponse(
+                attributed = queryResult.attributionCoverage.attributed,
+                missing = queryResult.attributionCoverage.missing,
+                total = queryResult.attributionCoverage.total,
+            ),
             status = "SUCCEEDED",
-            period = EvaluationReportPeriodResponse(from.toString(), toInclusive.toString(), ReportZone.id),
+            period = EvaluationReportPeriodResponse(
+                from = from.toString(),
+                toInclusive = toInclusive.toString(),
+                timezone = ReportZone.id,
+                effectiveFrom = effectivePeriod.from.atZone(ReportZone).toLocalDate().toString()
+                    .takeUnless { emptyLifecycle },
+                effectiveToInclusive = effectivePeriod.toExclusive.minusMillis(1)
+                    .atZone(ReportZone).toLocalDate().toString().takeUnless { emptyLifecycle },
+                populationState = when {
+                    emptyLifecycle -> "EMPTY_LIFECYCLE"
+                    effectivePeriod == period -> "FULL_REQUESTED_PERIOD"
+                    else -> "PARTIAL_LIFECYCLE"
+                },
+                effectiveDays = effectiveDays,
+            ),
             inputAsOf = inputAsOf,
             inputHash = inputHash,
             snapshotId = snapshotId,
@@ -579,7 +694,7 @@ private class EvaluationReportStore(
         val report = revision(revisionId)
         return runCatching {
             require(report != null && report.status == "SUCCEEDED") { "revision must be successful" }
-            require(report.scopeKey == scopeKey) { "revision scope does not match pin scope" }
+            require(report.scopeKey == scopeKey) { "REPORT_SCOPE_MISMATCH" }
             persistence?.pin(scopeKey, revisionId)?.getOrThrow()
             synchronized(reports) { pins[scopeKey] = revisionId }
         }
@@ -600,7 +715,17 @@ private class EvaluationReportStore(
         if (persisted != null) return@synchronized persisted
 
         reports[scopeKey].orEmpty().map { report ->
-            EvaluationReportHistoryItemResponse(report.jobId, report.revisionId, report.revisionNumber, report.status, report.generatedAt, true)
+            EvaluationReportHistoryItemResponse(
+                jobId = report.jobId,
+                revisionId = report.revisionId,
+                revisionNumber = report.revisionNumber,
+                status = report.status,
+                requestedAt = report.generatedAt,
+                pinned = true,
+                epochId = report.epochId,
+                cohort = report.cohort,
+                scopeKey = report.scopeKey,
+            )
         }
     }
 }
@@ -823,6 +948,8 @@ data class EvaluationReportGenerateRequest(
     val kind: String = "PRESET",
     val from: String? = null,
     val toInclusive: String? = null,
+    val epochId: String? = null,
+    val cohort: String? = null,
 )
 
 private data class EvaluationReportScope(
@@ -831,11 +958,18 @@ private data class EvaluationReportScope(
     val label: String,
     val from: LocalDate? = null,
     val toInclusive: LocalDate? = null,
+    val evaluationScope: EvaluationScope,
 )
 
-private fun EvaluationReportGenerateRequest.toScope(): EvaluationReportScope? {
+private fun EvaluationReportGenerateRequest.toScope(evaluationScope: EvaluationScope): EvaluationReportScope? {
+    val suffix = "EPOCH:${evaluationScope.accountEpochId}|COHORT:${evaluationScope.cohort.name}"
     if (kind == "PRESET" && days in setOf(7, 30, 90)) {
-        return EvaluationReportScope(requireNotNull(days), "PRESET:${days}D", "${days}D")
+        return EvaluationReportScope(
+            days = requireNotNull(days),
+            key = "PRESET:${days}D|$suffix",
+            label = "${days}D / ${evaluationScope.cohort.name}",
+            evaluationScope = evaluationScope,
+        )
     }
     val hasCompleteCustomRange = kind == "CUSTOM" && from != null && toInclusive != null
     if (!hasCompleteCustomRange) return null
@@ -847,10 +981,11 @@ private fun EvaluationReportGenerateRequest.toScope(): EvaluationReportScope? {
 
     return EvaluationReportScope(
         days = customDays,
-        key = "CUSTOM:$parsedFrom:$parsedTo",
         label = "$parsedFrom — $parsedTo",
         from = parsedFrom,
         toInclusive = parsedTo,
+        evaluationScope = evaluationScope,
+        key = "CUSTOM:$parsedFrom:$parsedTo|$suffix",
     )
 }
 
@@ -862,15 +997,57 @@ data class EvaluationReportPinRequest(
     val days: Int? = null,
     val scopeKey: String? = null,
     val revisionId: String,
+    val epochId: String? = null,
+    val cohort: String? = null,
 )
 
 @Serializable
 data class EvaluationReportPinResponse(val scopeKey: String, val revisionId: String)
 
-private fun EvaluationReportPinRequest.resolvedScopeKey(): String = scopeKey ?: "PRESET:${days ?: 30}D"
+/** report scope contract 違反の machine-readable response。 */
+@Serializable
+data class EvaluationReportScopeErrorResponse(val code: String, val message: String)
 
-private fun io.ktor.server.application.ApplicationCall.reportScopeKey(): String =
-    request.queryParameters["scopeKey"] ?: "PRESET:${request.queryParameters["days"]?.toIntOrNull() ?: 30}D"
+private suspend fun EvaluationReportPinRequest.resolvedScopeKey(repository: EvaluationRepository?): String? {
+    val scope = repository?.resolveScope(epochId, cohort)?.getOrNull() ?: return null
+    val supplied = runCatching {
+        EvaluationReportScopeKey.decode(scopeKey ?: "PRESET:${days ?: 30}D")
+    }.getOrNull() ?: return null
+    val resolved = supplied.version(scope.accountEpochId.toString(), scope.cohort.name)
+    return resolved.encode().takeIf { !supplied.versioned || supplied == resolved }
+}
+
+private suspend fun io.ktor.server.application.ApplicationCall.reportScopeKey(
+    repository: EvaluationRepository?,
+): String? {
+    val suppliedKey = request.queryParameters["scopeKey"]
+    val scope = repository?.resolveScope(
+        request.queryParameters["epochId"],
+        request.queryParameters["cohort"],
+    )?.getOrNull()
+    if (scope == null) {
+        respond(HttpStatusCode.BadRequest, ErrorResponse("evaluation scope is invalid"))
+        return null
+    }
+    val supplied = runCatching {
+        EvaluationReportScopeKey.decode(
+            suppliedKey ?: "PRESET:${request.queryParameters["days"]?.toIntOrNull() ?: 30}D",
+        )
+    }.getOrNull()
+    if (supplied == null) {
+        respond(HttpStatusCode.BadRequest, EvaluationReportScopeErrorResponse("REPORT_SCOPE_INVALID", "scopeKey is malformed"))
+        return null
+    }
+    val resolvedScope = supplied.version(scope.accountEpochId.toString(), scope.cohort.name)
+    val resolved = resolvedScope.encode()
+    val versionedScopeMismatch = suppliedKey != null &&
+        supplied.versioned && supplied != resolvedScope
+    if (versionedScopeMismatch) {
+        respond(HttpStatusCode.BadRequest, EvaluationReportScopeErrorResponse("REPORT_SCOPE_MISMATCH", "scopeKey does not match epochId/cohort"))
+        return null
+    }
+    return resolved
+}
 
 @Serializable
 data class EvaluationReportJobResponse(
@@ -883,10 +1060,20 @@ data class EvaluationReportJobResponse(
     val failureMessage: String? = null,
     val activeInvocationId: String? = null,
     val retryAfterSeconds: Long? = null,
+    val epochId: String? = null,
+    val cohort: String? = null,
 )
 
 @Serializable
-data class EvaluationReportPeriodResponse(val from: String, val toInclusive: String, val timezone: String)
+data class EvaluationReportPeriodResponse(
+    val from: String,
+    val toInclusive: String,
+    val timezone: String,
+    val effectiveFrom: String? = from,
+    val effectiveToInclusive: String? = toInclusive,
+    val populationState: String = "LEGACY_UNVERSIONED_PERIOD",
+    val effectiveDays: Long = 0,
+)
 
 @Serializable
 data class EvaluationReportSegmentResponse(val segmentId: String, val kind: String, val text: String, val claimIds: List<String>)
@@ -935,7 +1122,7 @@ data class ReportBenchmarkPointResponse(
 
 @Serializable
 data class ReportBenchmarkChartResponse(
-    val baselineEquityJpy: String,
+    val baselineEquityJpy: String?,
     val points: List<ReportBenchmarkPointResponse>,
     val botReturn: String?,
     val buyAndHoldReturn: String?,
@@ -1054,6 +1241,10 @@ data class EvaluationReportResponse(
     val performanceLattice: ReportPerformanceLatticeResponse,
     val integrity: EvaluationIntegrityResponse,
     val truncated: Boolean,
+    val epochId: String? = null,
+    val cohort: String? = null,
+    val executionSemanticsVersion: String? = null,
+    val attributionCoverage: EvaluationAttributionCoverageResponse? = null,
 )
 
 @Serializable
@@ -1064,6 +1255,9 @@ data class EvaluationReportHistoryItemResponse(
     val status: String,
     val requestedAt: String,
     val pinned: Boolean,
+    val epochId: String? = null,
+    val cohort: String? = null,
+    val scopeKey: String? = null,
 )
 
 @Serializable

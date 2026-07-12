@@ -290,6 +290,7 @@ data class LlmRunnerConfig(
  */
 data class LlmDaemonConfig(
     val enabled: Boolean = DEFAULT_LLM_DAEMON_ENABLED,
+    val launchEnabled: Boolean = DEFAULT_LLM_LAUNCH_ENABLED,
     val pollInterval: Duration = DEFAULT_LLM_DAEMON_POLL_INTERVAL,
     val flatHeartbeatInterval: Duration = DEFAULT_LLM_FLAT_HEARTBEAT_INTERVAL,
     val holdingCheckInterval: Duration = DEFAULT_LLM_HOLDING_CHECK_INTERVAL,
@@ -528,6 +529,7 @@ private const val FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY_ENV = "FUKUROU_LLM_MAX_INV
  * LLM daemon scheduler 有効化の環境変数名。
  */
 private const val FUKUROU_LLM_DAEMON_ENABLED_ENV = "FUKUROU_LLM_DAEMON_ENABLED"
+const val FUKUROU_LLM_LAUNCH_ENABLED_ENV = "FUKUROU_LLM_LAUNCH_ENABLED"
 
 /**
  * LLM daemon loop poll 間隔秒数の環境変数名。
@@ -688,7 +690,7 @@ private const val FUKUROU_GMO_WEBSOCKET_RECONNECT_BACKOFF_MS_ENV = "FUKUROU_GMO_
 /**
  * paper 初期残高の既定値。
  */
-private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("100000")
+private val DEFAULT_INITIAL_CASH_JPY = BigDecimal("1000000")
 
 /**
  * MARKET / STOP の既定 slippage bps。
@@ -746,6 +748,7 @@ const val DEFAULT_MAX_INVOCATIONS_PER_DAY = 120
  * LLM daemon scheduler 有効化の既定値。
  */
 const val DEFAULT_LLM_DAEMON_ENABLED = false
+const val DEFAULT_LLM_LAUNCH_ENABLED = false
 
 /**
  * LLM daemon loop poll 間隔の既定値。
@@ -1003,10 +1006,13 @@ private fun Map<String, String>.readLlmRunnerConfig(): LlmRunnerConfig {
     )
 }
 
+@Suppress("LongMethod")
 private fun Map<String, String>.readLlmDaemonConfig(): LlmDaemonConfig {
     return LlmDaemonConfig(
         enabled = readOptional(FUKUROU_LLM_DAEMON_ENABLED_ENV)?.toBooleanStrictOrNull()
             ?: DEFAULT_LLM_DAEMON_ENABLED,
+        launchEnabled = readOptional(FUKUROU_LLM_LAUNCH_ENABLED_ENV)?.toBooleanStrictOrNull()
+            ?: DEFAULT_LLM_LAUNCH_ENABLED,
         pollInterval = Duration.ofSeconds(
             readOptional(FUKUROU_LLM_DAEMON_POLL_SECONDS_ENV)
                 ?.toLong()

@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.daemon.LLM_LAUNCH_DISABLED
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
@@ -28,11 +29,15 @@ fun main() {
  */
 internal suspend fun runOneShotRunnerMain(
     environment: Map<String, String>,
+    requireLaunchAllowed: suspend (Map<String, String>) -> Unit = ::requireOneShotLaunchAllowed,
     launch: suspend (Map<String, String>) -> OneShotRunnerResult = ::launchOneShotRunner,
     stdout: (String) -> Unit = { message -> System.out.println(message) },
     stderr: (String) -> Unit = { message -> System.err.println(message) },
 ): Int {
-    val result = runCatching { launch(environment) }
+    val result = runCatching {
+        requireLaunchAllowed(environment)
+        launch(environment)
+    }
 
     return result.fold(
         onSuccess = { runnerResult ->
@@ -94,6 +99,11 @@ private suspend fun launchOneShotRunner(environment: Map<String, String>): OneSh
     } finally {
         tradingRuntime.close()
     }
+}
+
+private fun requireOneShotLaunchAllowed(environment: Map<String, String>) {
+    val tradingConfig = TradingRuntimeFactory.resolveRuntimeConfigFromEnvironment(environment).tradingConfig
+    check(tradingConfig.daemon.launchEnabled) { LLM_LAUNCH_DISABLED }
 }
 
 private const val ONE_SHOT_RUNNER_SUCCESS_EXIT_CODE = 0

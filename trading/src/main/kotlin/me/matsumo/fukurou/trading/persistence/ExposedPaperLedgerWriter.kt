@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
@@ -44,12 +46,15 @@ import me.matsumo.fukurou.trading.broker.unrealizedPnlAt
 import me.matsumo.fukurou.trading.broker.unrealizedRAt
 import me.matsumo.fukurou.trading.broker.withEntryCommandContext
 import me.matsumo.fukurou.trading.broker.withOrderContext
+import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.PAPER_EXECUTION_SEMANTICS_VERSION
+import me.matsumo.fukurou.trading.domain.PaperExecutionLineage
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
@@ -93,12 +98,15 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    val writeIntent = resolvePaperWriteContext(request.command.auditContext)
+                        .intent(PaperWritePolicy.RISK_INCREASING)
                     insertEntryFill(
                         EntryFillWriteRequest(
                             entry = request,
                             entryOrderId = request.command.commandId,
                             insertEntryOrder = true,
                         ),
+                        writeIntent,
                         clock,
                     )
                 }
@@ -113,6 +121,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    val writeIntent = resolvePaperWriteContext(request.command.auditContext)
+                        .intent(PaperWritePolicy.RISK_INCREASING)
                     insertEntryOrder(
                         EntryOrderInsertRequest(
                             command = request.command,
@@ -120,6 +130,7 @@ internal class ExposedPaperLedgerWriter(
                             positionId = null,
                             tradeGroupId = request.tradeGroupId,
                             status = OrderStatus.OPEN,
+                            writeIntent = writeIntent,
                             createdAt = request.createdAt,
                             expiresAt = request.expiresAt,
                             expirySource = request.expirySource,
@@ -151,6 +162,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    val writeIntent = resolvePaperWriteContext(request.entry.command.auditContext)
+                        .intent(PaperWritePolicy.RISK_INCREASING)
                     insertTradeIntentConsumption(
                         request.consumption.intentId,
                         request.entry.command.commandId,
@@ -162,6 +175,7 @@ internal class ExposedPaperLedgerWriter(
                             entryOrderId = request.entry.command.commandId,
                             insertEntryOrder = true,
                         ),
+                        writeIntent,
                         clock,
                     )
                 }
@@ -178,6 +192,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    val writeIntent = resolvePaperWriteContext(request.order.command.auditContext)
+                        .intent(PaperWritePolicy.RISK_INCREASING)
                     insertTradeIntentConsumption(
                         request.consumption.intentId,
                         request.order.orderId,
@@ -190,6 +206,7 @@ internal class ExposedPaperLedgerWriter(
                             positionId = null,
                             tradeGroupId = request.order.tradeGroupId,
                             status = OrderStatus.OPEN,
+                            writeIntent = writeIntent,
                             createdAt = request.order.createdAt,
                             expiresAt = request.order.expiresAt,
                             expirySource = request.order.expirySource,
@@ -215,6 +232,7 @@ internal class ExposedPaperLedgerWriter(
     /**
      * position を close する。
      */
+    @Suppress("LongMethod")
     override suspend fun closePosition(
         command: ClosePositionCommand,
         positionId: UUID,
@@ -224,6 +242,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    val writeIntent = resolvePaperWriteContext(command.auditContext)
+                        .intent(PaperWritePolicy.RISK_REDUCING)
                     val position = requireOpenPosition(positionId)
                     val closeOrderId = orderId.toString()
                     val realizedFill = fill.withRealizedPnl(position)
@@ -239,6 +259,7 @@ internal class ExposedPaperLedgerWriter(
                             sizeBtc = realizedFill.sizeBtc,
                             reasonJa = command.reasonJa,
                             auditContext = command.auditContext,
+                            writeIntent = writeIntent,
                         ),
                         clock = clock,
                     )
@@ -250,6 +271,7 @@ internal class ExposedPaperLedgerWriter(
                             side = OrderSide.SELL,
                             fill = realizedFill,
                             auditContext = command.auditContext,
+                            writeIntent = writeIntent,
                         ),
                     )
                     val remainingSize = position.sizeBtc.toBigDecimal()
@@ -289,6 +311,7 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    requirePaperWriteAllowed(PaperWritePolicy.PROTECTION_MAINTENANCE, command.auditContext)
                     val position = requireOpenPosition(command.positionId)
                     val newStopPrice = command.newStopPriceJpy
                     val newTakeProfitPrice = if (command.takeProfitPriceSpecified) {
@@ -324,6 +347,7 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    requirePaperWriteAllowed(PaperWritePolicy.RISK_REDUCING, command.auditContext)
                     val order = requireOpenOrder(command.orderId)
                     val isProtectiveStop = order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.positionId != null
 
@@ -365,6 +389,7 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    val writeContext = resolvePaperWriteContext(PaperTradeAuditContext.EMPTY)
                     val reconcileContext = tickSnapshot.toReconcileMarketContext(
                         fallbackSymbolRules = fallbackSymbolRules,
                         simulator = simulator,
@@ -383,8 +408,10 @@ internal class ExposedPaperLedgerWriter(
 
                     if (!paperAccountHardHaltReached()) {
                         if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
-                            fillTriggeredEntryOrders(reconcileContext, progress, clock)
-                            triggerPositionProtections(reconcileContext, progress, clock)
+                            if (writeContext.baselineAligned) {
+                                fillTriggeredEntryOrders(reconcileContext, progress, writeContext, clock)
+                            }
+                            triggerPositionProtections(reconcileContext, progress, writeContext, clock)
                         }
                     }
 
@@ -401,7 +428,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    applyPaperMarketEvent(event, simulator, fallbackSymbolRules, clock)
+                    val writeContext = resolvePaperWriteContext(PaperTradeAuditContext.EMPTY)
+                    applyPaperMarketEvent(event, simulator, fallbackSymbolRules, writeContext, clock)
                 }
             }
         }
@@ -446,6 +474,7 @@ private fun JdbcTransaction.applyPaperMarketEvent(
     event: PaperMarketTradeEvent,
     simulator: PaperExecutionSimulator,
     rules: SymbolRules,
+    writeContext: PaperWriteContext,
     clock: Clock,
 ): PaperReconcileResult {
     val cursor = lockMarketDataCursor(event.connectionSessionId)
@@ -475,8 +504,10 @@ private fun JdbcTransaction.applyPaperMarketEvent(
     bindExistingPositionsToSession(event)
 
     if (!paperAccountHardHaltReached()) {
-        applyEventToRestingEntries(event, simulator, simulationContext, progress, clock)
-        applyEventToPositionProtections(event, simulator, simulationContext, progress, clock)
+        if (writeContext.baselineAligned) {
+            applyEventToRestingEntries(event, simulator, simulationContext, progress, writeContext, clock)
+        }
+        applyEventToPositionProtections(event, simulator, simulationContext, progress, writeContext, clock)
     }
 
     advanceMarketDataCursor(event)
@@ -535,11 +566,13 @@ private fun JdbcTransaction.hasUnrecoveredGapBefore(sessionId: UUID): Boolean {
     }
 }
 
+@Suppress("LongParameterList")
 private fun JdbcTransaction.applyEventToRestingEntries(
     event: PaperMarketTradeEvent,
     simulator: PaperExecutionSimulator,
     context: PaperSimulationContext,
     progress: ReconcileProgress,
+    writeContext: PaperWriteContext,
     clock: Clock,
 ) {
     selectMarketEligibleEntryOrders(event, clock.instant()).forEach { marketOrder ->
@@ -580,6 +613,7 @@ private fun JdbcTransaction.applyEventToRestingEntries(
                 entryOrderId = UUID.fromString(order.orderId),
                 insertEntryOrder = false,
             ),
+            writeContext.intent(PaperWritePolicy.RISK_INCREASING),
             clock,
         )
         bindPositionToEvent(positionId, event)
@@ -661,14 +695,23 @@ private fun JdbcTransaction.bindPositionToEvent(positionId: UUID, event: PaperMa
     }
 }
 
+@Suppress("LongParameterList")
 private fun JdbcTransaction.applyEventToPositionProtections(
     event: PaperMarketTradeEvent,
     simulator: PaperExecutionSimulator,
     context: PaperSimulationContext,
     progress: ReconcileProgress,
+    writeContext: PaperWriteContext,
     clock: Clock,
 ) {
-    val protectionContext = EventProtectionContext(event, simulator, context, progress, clock)
+    val protectionContext = EventProtectionContext(
+        event,
+        simulator,
+        context,
+        progress,
+        writeContext.intent(PaperWritePolicy.RISK_REDUCING),
+        clock,
+    )
 
     selectEventEligiblePositions(event).forEach { position ->
         val stopPrice = position.currentStopLossJpy?.toBigDecimal()
@@ -698,7 +741,7 @@ private fun JdbcTransaction.triggerEventStop(
     val realizedFill = fill.withRealizedPnl(position)
 
     updateOrderStatus(stopOrder.orderId, OrderStatus.FILLED, "market event stop trigger", context.clock)
-    insertExecution(eventExecutionRequest(stopOrder.orderId, position, realizedFill, event))
+    insertExecution(eventExecutionRequest(stopOrder.orderId, position, realizedFill, event, context.writeIntent))
     closePositionRow(position, realizedFill)
     updateAccountAfterSell(realizedFill, context.clock)
     context.progress.filledOrderIds += stopOrder.orderId
@@ -723,11 +766,16 @@ private fun JdbcTransaction.triggerEventTakeProfit(position: Position, context: 
 
     insertCloseOrder(
         CloseOrderInsertRequest(
-            closeOrderId, position, realizedFill.sizeBtc, "market event virtual take profit trigger", PaperTradeAuditContext.EMPTY,
+            closeOrderId,
+            position,
+            realizedFill.sizeBtc,
+            "market event virtual take profit trigger",
+            PaperTradeAuditContext.EMPTY,
+            context.writeIntent,
         ),
         context.clock,
     )
-    insertExecution(eventExecutionRequest(closeOrderId.toString(), position, realizedFill, event))
+    insertExecution(eventExecutionRequest(closeOrderId.toString(), position, realizedFill, event, context.writeIntent))
     closePositionRow(position, realizedFill)
     updateAccountAfterSell(realizedFill, context.clock)
     context.progress.canceledOrderIds += stopOrder.orderId
@@ -741,6 +789,7 @@ private data class EventProtectionContext(
     val simulator: PaperExecutionSimulator,
     val simulationContext: PaperSimulationContext,
     val progress: ReconcileProgress,
+    val writeIntent: PaperWriteIntent,
     val clock: Clock,
 )
 
@@ -749,9 +798,17 @@ private fun eventExecutionRequest(
     position: Position,
     fill: SimulatedFill,
     event: PaperMarketTradeEvent,
+    writeIntent: PaperWriteIntent,
 ): ExecutionInsertRequest {
     return ExecutionInsertRequest(
-        orderId, position.positionId, position.mode, OrderSide.SELL, fill, PaperTradeAuditContext.EMPTY, event,
+        orderId,
+        position.positionId,
+        position.mode,
+        OrderSide.SELL,
+        fill,
+        PaperTradeAuditContext.EMPTY,
+        writeIntent,
+        event,
     )
 }
 
@@ -818,12 +875,16 @@ private data class MarketEligibleOrder(
     val queueConsumedBtc: BigDecimal,
 )
 
-private fun JdbcTransaction.insertEntryFill(request: EntryFillWriteRequest, clock: Clock): PaperTradeResult {
+private fun JdbcTransaction.insertEntryFill(
+    request: EntryFillWriteRequest,
+    writeIntent: PaperWriteIntent,
+    clock: Clock,
+): PaperTradeResult {
     val command = request.entry.command
     val fill = request.entry.fill
     val target = resolveEntryFillTarget(request)
 
-    writeEntryOrderForFill(request, target.positionId, clock)
+    writeEntryOrderForFill(request, target.positionId, writeIntent, clock)
     val divergenceMemos = request.entry.divergenceMemo
         ?.withEntryCommandContext(
             command = command,
@@ -832,7 +893,7 @@ private fun JdbcTransaction.insertEntryFill(request: EntryFillWriteRequest, cloc
         )
         ?.let { memo -> listOf(memo) }
         .orEmpty()
-    val stopOrderId = upsertPositionForEntryFill(request, target.existingPosition, clock)
+    val stopOrderId = upsertPositionForEntryFill(request, target.existingPosition, writeIntent, clock)
     insertExecution(
         ExecutionInsertRequest(
             orderId = request.entryOrderId.toString(),
@@ -841,6 +902,7 @@ private fun JdbcTransaction.insertEntryFill(request: EntryFillWriteRequest, cloc
             side = command.side,
             fill = fill,
             auditContext = command.auditContext,
+            writeIntent = writeIntent,
             source = request.entry.source,
         ),
     )
@@ -878,6 +940,7 @@ private fun JdbcTransaction.resolveEntryFillTarget(request: EntryFillWriteReques
 private fun JdbcTransaction.writeEntryOrderForFill(
     request: EntryFillWriteRequest,
     positionId: UUID,
+    writeIntent: PaperWriteIntent,
     clock: Clock,
 ) {
     val command = request.entry.command
@@ -890,6 +953,7 @@ private fun JdbcTransaction.writeEntryOrderForFill(
                 positionId = positionId,
                 tradeGroupId = request.entry.tradeGroupId,
                 status = OrderStatus.FILLED,
+                writeIntent = writeIntent,
             ),
             clock,
         )
@@ -908,6 +972,7 @@ private fun JdbcTransaction.writeEntryOrderForFill(
 private fun JdbcTransaction.upsertPositionForEntryFill(
     request: EntryFillWriteRequest,
     existingPosition: Position?,
+    writeIntent: PaperWriteIntent,
     clock: Clock,
 ): String {
     val command = request.entry.command
@@ -920,12 +985,14 @@ private fun JdbcTransaction.upsertPositionForEntryFill(
             positionId = request.entry.positionId,
             tradeGroupId = request.entry.tradeGroupId,
             marketEligibility = request.entry.positionMarketEligibility,
+            writeIntent = writeIntent,
         )
         insertProtectiveStopOrder(
             command,
             request.entry.stopOrderId,
             request.entry.positionId,
             request.entry.tradeGroupId,
+            writeIntent,
             clock,
         )
 
@@ -992,6 +1059,7 @@ private fun JdbcTransaction.tradeIntentConsumed(intentId: UUID): Boolean {
 private fun JdbcTransaction.fillTriggeredEntryOrders(
     context: ReconcileMarketContext,
     progress: ReconcileProgress,
+    writeContext: PaperWriteContext,
     clock: Clock,
 ) {
     val triggeredOrders = selectOpenOrders()
@@ -1034,6 +1102,7 @@ private fun JdbcTransaction.fillTriggeredEntryOrders(
                 entryOrderId = UUID.fromString(order.orderId),
                 insertEntryOrder = false,
             ),
+            writeContext.intent(PaperWritePolicy.RISK_INCREASING),
             clock,
         )
 
@@ -1048,6 +1117,7 @@ private fun JdbcTransaction.fillTriggeredEntryOrders(
 private fun JdbcTransaction.triggerPositionProtections(
     context: ReconcileMarketContext,
     progress: ReconcileProgress,
+    writeContext: PaperWriteContext,
     clock: Clock,
 ) {
     selectOpenPositions().forEach { position ->
@@ -1057,22 +1127,24 @@ private fun JdbcTransaction.triggerPositionProtections(
         val takeProfitTriggered = takeProfitPrice != null && context.lastPrice >= takeProfitPrice
 
         if (stopTriggered) {
-            triggerStopProtection(position, stopPrice, context, progress, clock)
+            triggerStopProtection(position, stopPrice, context, progress, writeContext, clock)
 
             return@forEach
         }
 
         if (takeProfitTriggered) {
-            triggerTakeProfitProtection(position, context, progress, clock)
+            triggerTakeProfitProtection(position, context, progress, writeContext, clock)
         }
     }
 }
 
+@Suppress("LongParameterList")
 private fun JdbcTransaction.triggerStopProtection(
     position: Position,
     stopPrice: BigDecimal,
     context: ReconcileMarketContext,
     progress: ReconcileProgress,
+    writeContext: PaperWriteContext,
     clock: Clock,
 ) {
     val stopOrder = requireLinkedStopOrder(position.positionId)
@@ -1093,6 +1165,7 @@ private fun JdbcTransaction.triggerStopProtection(
             side = OrderSide.SELL,
             fill = realizedFill,
             auditContext = PaperTradeAuditContext.EMPTY,
+            writeIntent = writeContext.intent(PaperWritePolicy.RISK_REDUCING),
         ),
     )
     closePositionRow(position, realizedFill)
@@ -1107,6 +1180,7 @@ private fun JdbcTransaction.triggerTakeProfitProtection(
     position: Position,
     context: ReconcileMarketContext,
     progress: ReconcileProgress,
+    writeContext: PaperWriteContext,
     clock: Clock,
 ) {
     requireLinkedStopOrder(position.positionId).let { stopOrder ->
@@ -1135,6 +1209,7 @@ private fun JdbcTransaction.triggerTakeProfitProtection(
             sizeBtc = realizedFill.sizeBtc,
             reasonJa = VIRTUAL_TAKE_PROFIT_TRIGGER_REASON,
             auditContext = PaperTradeAuditContext.EMPTY,
+            writeIntent = writeContext.intent(PaperWritePolicy.RISK_REDUCING),
         ),
         clock = clock,
     )
@@ -1146,6 +1221,7 @@ private fun JdbcTransaction.triggerTakeProfitProtection(
             side = OrderSide.SELL,
             fill = realizedFill,
             auditContext = PaperTradeAuditContext.EMPTY,
+            writeIntent = writeContext.intent(PaperWritePolicy.RISK_REDUCING),
         ),
     )
     closePositionRow(position, realizedFill)
@@ -1185,6 +1261,7 @@ private fun JdbcTransaction.updateMarks(
 
 private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, clock: Clock) {
     request.marketEligibility?.let { eligibility -> verifyMarketEligibilitySession(eligibility) }
+    val lineage = request.writeIntent.lineage
 
     prepare(
         """
@@ -1196,9 +1273,10 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
                 system_prompt_version, market_snapshot_id, expires_at, expiry_source,
                 effective_ttl_seconds, expired_at, canceled_at, cancel_reason, canceled_by_decision_run_id,
                 queue_ahead_btc, queue_consumed_btc, queue_snapshot_at, market_data_session_id,
-                market_eligible_after_sequence, market_eligible_from, created_at, updated_at
+                market_eligible_after_sequence, market_eligible_from, created_at, updated_at,
+                account_epoch_id, execution_semantics_version, runtime_config_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         val command = request.command
@@ -1237,6 +1315,7 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
         val createdAt = request.createdAt?.toEpochMilli() ?: nowMillis(clock)
         statement.setLong(37, createdAt)
         statement.setLong(38, createdAt)
+        statement.bindLineage(39, lineage)
         statement.executeUpdate()
     }
 }
@@ -1262,13 +1341,16 @@ private fun JdbcTransaction.verifyMarketEligibilitySession(eligibility: RestingO
     }
 }
 
+@Suppress("LongParameterList")
 private fun JdbcTransaction.insertProtectiveStopOrder(
     command: PlaceOrderCommand,
     stopOrderId: UUID,
     positionId: UUID,
     tradeGroupId: UUID,
+    writeIntent: PaperWriteIntent,
     clock: Clock,
 ) {
+    val lineage = writeIntent.lineage
     prepare(
         """
             INSERT INTO orders (
@@ -1276,9 +1358,10 @@ private fun JdbcTransaction.insertProtectiveStopOrder(
                 size_btc, limit_price_jpy, trigger_price_jpy, protective_stop_price_jpy,
                 take_profit_price_jpy, estimated_win_probability, reason_ja,
                 decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
-                system_prompt_version, market_snapshot_id, created_at, updated_at
+                system_prompt_version, market_snapshot_id, created_at, updated_at,
+                account_epoch_id, execution_semantics_version, runtime_config_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         val protectiveStopAuditContext = command.auditContext.copy(clientRequestId = null)
@@ -1295,11 +1378,13 @@ private fun JdbcTransaction.insertProtectiveStopOrder(
         statement.bindAudit(12, protectiveStopAuditContext)
         statement.setLong(19, nowMillis(clock))
         statement.setLong(20, nowMillis(clock))
+        statement.bindLineage(21, lineage)
         statement.executeUpdate()
     }
 }
 
 private fun JdbcTransaction.insertCloseOrder(request: CloseOrderInsertRequest, clock: Clock) {
+    val lineage = request.writeIntent.lineage
     prepare(
         """
             INSERT INTO orders (
@@ -1307,9 +1392,10 @@ private fun JdbcTransaction.insertCloseOrder(request: CloseOrderInsertRequest, c
                 size_btc, limit_price_jpy, trigger_price_jpy, protective_stop_price_jpy,
                 take_profit_price_jpy, estimated_win_probability, reason_ja,
                 decision_run_id, tool_call_id, client_request_id, llm_provider, prompt_hash,
-                system_prompt_version, market_snapshot_id, created_at, updated_at
+                system_prompt_version, market_snapshot_id, created_at, updated_at,
+                account_epoch_id, execution_semantics_version, runtime_config_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         statement.bindOrderId(
@@ -1327,17 +1413,21 @@ private fun JdbcTransaction.insertCloseOrder(request: CloseOrderInsertRequest, c
         statement.bindAudit(11, request.auditContext)
         statement.setLong(18, nowMillis(clock))
         statement.setLong(19, nowMillis(clock))
+        statement.bindLineage(20, lineage)
         statement.executeUpdate()
     }
 }
 
+@Suppress("LongParameterList")
 private fun JdbcTransaction.insertPosition(
     command: PlaceOrderCommand,
     fill: SimulatedFill,
     positionId: UUID,
     tradeGroupId: UUID,
     marketEligibility: PositionMarketEligibility?,
+    writeIntent: PaperWriteIntent,
 ) {
+    val lineage = writeIntent.lineage
     prepare(
         """
             INSERT INTO positions (
@@ -1346,9 +1436,10 @@ private fun JdbcTransaction.insertPosition(
                 current_take_profit_jpy, unrealized_pnl_jpy, unrealized_r, pyramid_add_count,
                 highest_price_since_entry_jpy, lowest_price_since_entry_jpy, decision_run_id, tool_call_id,
                 client_request_id, llm_provider, prompt_hash, system_prompt_version,
-                market_snapshot_id, market_data_session_id, market_eligible_after_sequence
+                market_snapshot_id, market_data_session_id, market_eligible_after_sequence,
+                account_epoch_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         statement.setObject(1, positionId)
@@ -1371,11 +1462,13 @@ private fun JdbcTransaction.insertPosition(
         statement.bindAudit(18, command.auditContext)
         statement.setObject(25, marketEligibility?.sessionId)
         statement.setObject(26, marketEligibility?.eligibleAfterSequence)
+        statement.setObject(27, UUID.fromString(lineage.accountEpochId))
         statement.executeUpdate()
     }
 }
 
 private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
+    val lineage = request.writeIntent.lineage
     prepare(
         """
             INSERT INTO executions (
@@ -1383,9 +1476,10 @@ private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
                 fee_jpy, realized_pnl_jpy, liquidity, executed_at, decision_run_id,
                 tool_call_id, client_request_id, llm_provider, prompt_hash,
                 system_prompt_version, market_snapshot_id, source_session_id, source_sequence,
-                source_exchange_at, source_received_at, source_side, source_price_jpy, source_size_btc
+                source_exchange_at, source_received_at, source_side, source_price_jpy, source_size_btc,
+                account_epoch_id, execution_semantics_version, runtime_config_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         statement.setObject(1, request.fill.executionId)
@@ -1409,8 +1503,97 @@ private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
         statement.setString(24, source?.side?.name)
         statement.setNullableBigDecimal(25, source?.priceJpy?.moneyScale())
         statement.setNullableBigDecimal(26, source?.sizeBtc?.btcScale())
+        statement.bindLineage(27, lineage)
         statement.executeUpdate()
     }
+}
+
+/** transaction 入口で current lineage を一度だけ固定する。 */
+private fun JdbcTransaction.resolvePaperWriteContext(auditContext: PaperTradeAuditContext): PaperWriteContext {
+    val account = prepare(
+        """
+            SELECT account.current_epoch_id, account.initial_cash_jpy,
+                epoch.initial_cash_jpy AS epoch_baseline
+            FROM paper_account account
+            JOIN paper_account_epochs epoch ON epoch.id = account.current_epoch_id
+            WHERE account.id = ?
+            FOR SHARE
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "PAPER_EXECUTION_LINEAGE_UNAVAILABLE: current account epoch is missing." }
+            Triple(
+                resultSet.getObject("current_epoch_id", UUID::class.java),
+                resultSet.getBigDecimal("initial_cash_jpy"),
+                resultSet.getBigDecimal("epoch_baseline"),
+            )
+        }
+    }
+    val activeValues = linkedMapOf<String, String>()
+    prepare(
+        "SELECT value.config_key, value.config_value FROM runtime_config_values value JOIN runtime_config_versions version ON version.id=value.version_id WHERE version.status='ACTIVE' ORDER BY value.config_key",
+    ).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            while (resultSet.next()) activeValues[resultSet.getString(1)] = resultSet.getString(2)
+        }
+    }
+    val activeHash = calculateRuntimeConfigHash(activeValues)
+    val configBaseline = activeValues["paper.initialCashJpy"]?.let(::BigDecimal)
+    val accountMatchesEpoch = account.second.compareTo(account.third) == 0
+    val accountMatchesConfig = configBaseline != null && account.second.compareTo(configBaseline) == 0
+    val auditHash = auditContext.decisionRunContext.runtimeConfigHash
+    require(auditHash == null || auditHash == activeHash) {
+        "PAPER_EXECUTION_LINEAGE_MISMATCH: command and current account epoch runtime config hashes differ."
+    }
+
+    return PaperWriteContext(
+        lineage = PaperExecutionLineage(
+            accountEpochId = account.first.toString(),
+            executionSemanticsVersion = PAPER_EXECUTION_SEMANTICS_VERSION,
+            runtimeConfigHash = activeHash,
+        ),
+        baselineAligned = accountMatchesEpoch && accountMatchesConfig,
+    )
+}
+
+private enum class PaperWritePolicy {
+    RISK_INCREASING,
+    RISK_REDUCING,
+    PROTECTION_MAINTENANCE,
+}
+
+private data class PaperWriteContext(
+    val lineage: PaperExecutionLineage,
+    val baselineAligned: Boolean,
+) {
+    fun intent(policy: PaperWritePolicy): PaperWriteIntent {
+        requireAllowed(policy)
+
+        return PaperWriteIntent(lineage, policy)
+    }
+
+    fun requireAllowed(policy: PaperWritePolicy) {
+        require(policy != PaperWritePolicy.RISK_INCREASING || baselineAligned) {
+            "PAPER_ACCOUNT_BASELINE_MISMATCH: create, validate, and activate an operator runtime-config draft."
+        }
+    }
+}
+
+private fun JdbcTransaction.requirePaperWriteAllowed(policy: PaperWritePolicy, auditContext: PaperTradeAuditContext) {
+    resolvePaperWriteContext(auditContext).requireAllowed(policy)
+}
+
+private data class PaperWriteIntent(
+    val lineage: PaperExecutionLineage,
+    val policy: PaperWritePolicy,
+)
+
+/** prepared statement の連続3列へ lineage を bind する。 */
+private fun PreparedStatement.bindLineage(startIndex: Int, lineage: PaperExecutionLineage) {
+    setObject(startIndex, UUID.fromString(lineage.accountEpochId))
+    setString(startIndex + 1, lineage.executionSemanticsVersion)
+    setString(startIndex + 2, lineage.runtimeConfigHash)
 }
 
 private fun JdbcTransaction.updatePositionMark(update: PositionMarkUpdate) {
@@ -1970,6 +2153,7 @@ private data class EntryOrderInsertRequest(
     val positionId: UUID?,
     val tradeGroupId: UUID,
     val status: OrderStatus,
+    val writeIntent: PaperWriteIntent,
     val createdAt: Instant? = null,
     val expiresAt: Instant? = null,
     val expirySource: OrderExpirySource? = null,
@@ -2003,6 +2187,7 @@ private data class CloseOrderInsertRequest(
     val sizeBtc: BigDecimal,
     val reasonJa: String,
     val auditContext: PaperTradeAuditContext,
+    val writeIntent: PaperWriteIntent,
 )
 
 /**
@@ -2022,6 +2207,7 @@ private data class ExecutionInsertRequest(
     val side: OrderSide,
     val fill: SimulatedFill,
     val auditContext: PaperTradeAuditContext,
+    val writeIntent: PaperWriteIntent,
     val source: PaperMarketTradeEvent? = null,
 )
 

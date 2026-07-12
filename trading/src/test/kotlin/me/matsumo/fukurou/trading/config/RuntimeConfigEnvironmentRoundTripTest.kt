@@ -24,6 +24,7 @@ class RuntimeConfigEnvironmentRoundTripTest {
         val environment = assertRuntimeEnvironmentRoundTrips(TradingBotConfig())
 
         assertEquals("false", environment.getValue("FUKUROU_LLM_DAEMON_ENABLED"))
+        assertEquals("false", environment.getValue("FUKUROU_LLM_LAUNCH_ENABLED"))
         assertEquals("7", environment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"))
         assertEquals("120", environment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY"))
     }
@@ -43,6 +44,7 @@ class RuntimeConfigEnvironmentRoundTripTest {
         val environment = assertRuntimeEnvironmentRoundTrips(nonDefaultRuntimeConfig())
 
         assertEquals("true", environment.getValue("FUKUROU_LLM_DAEMON_ENABLED"))
+        assertEquals("true", environment.getValue("FUKUROU_LLM_LAUNCH_ENABLED"))
         assertEquals("123456.7800", environment.getValue("FUKUROU_PAPER_INITIAL_CASH_JPY"))
         assertEquals("0.0010", environment.getValue("FUKUROU_FALLBACK_TAKER_FEE_RATE"))
         assertEquals("240", environment.getValue("FUKUROU_LLM_RUN_TIMEOUT_SECONDS"))
@@ -138,6 +140,7 @@ private fun nonDefaultRuntimeConfig(): TradingBotConfig {
         ),
         daemon = config.daemon.copy(
             enabled = true,
+            launchEnabled = true,
             pollInterval = Duration.ofSeconds(120),
             flatHeartbeatInterval = Duration.ofMinutes(20),
             holdingCheckInterval = Duration.ofMinutes(20),

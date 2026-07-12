@@ -1,5 +1,9 @@
 # セルフホストデプロイ手順（Fukurou backend scaffold）
 
+起動時 bootstrap は保存済み `paper_account.initial_cash_jpy` を歴史的事実のまま `LEGACY_IMPORTED` account epoch へ登録し、active config、残高、BTC、halt state、equity peak、position/order/execution/equity history を変更しない。account/config baseline が不一致な場合は paper trading と CURRENT evaluation が fail closed するため、owner が runtime config draft を validate し、zero-open-risk 状態で activate する。baseline 変更時に履歴 row を更新せず、`CONFIG_ACTIVATED` epoch と `EPOCH_START` snapshot を監査付き transaction で作成する。
+
+`paper.initialCashJpy` を変更する deploy では、runtime config activation 前に open position、`OPEN` / `PENDING_CANCEL` order、BTC 残高が 0 であることを確認する。activation は account reset、risk equity 同期、`EPOCH_START` snapshot、監査 event を同一 transaction で保存し、既存の halt state は解除しない。
+
 Fukurou の最小 Ktor backend を NAS 上で常時稼働させ、Cloudflare Tunnel + Access で公開・保護するための運用手順。
 
 この scaffold では `ktor` + `postgres` + `cloudflared` の 3 サービスを扱う。Ktor backend、paper trading runtime、常駐 `ProtectionReconciler`、MCP stdio fat jar の image 同梱、LlmInvoker、daemon scheduler、Obsidian Writer、Reflection Runner、週次 PromptCandidates 生成まで実装済み。Knowledge note の自動適用と live 実発注は実装しない。
@@ -267,19 +271,48 @@ scripts/prod-curl /ops/runtime-config
 
 ## MCP credential isolation の移行
 
-この移行は operator が daemon を無効化した状態で実施する。merge/deploy 前に production credential を変更しない。
+この移行は旧imageを止めるPhase 0と、新imageのglobal gateを確認してからcredentialを移行するPhase 1に分ける。merge/deploy前にproduction credentialを変更しない。
 
-1. WebUI で `daemon.enabled=false` を active 化し、running reservation がないことを確認する。
-2. root:root 0400 の `/srv/fukurou/secrets/fukurou_mcp_db_password` を dummy ではない新規値で作成し、値を shell history、log、PR に出さない。provision時のpsql変数解釈を単純に保つため、十分な長さの英数字だけで生成する。
-3. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を daemon 停止中の maintenance connection で実行し、`fukurou_mcp` role を provision する。maintenance connectionはDB superuserを使用する。非superuserを使う場合は、既存default ACLの全grantor roleへ`SET ROLE`できるmembershipとrole変更・ownership移管に必要な権限を持つことを事前確認する。権限不足では`ON_ERROR_STOP`によりprovision全体が失敗し、daemonを再有効化しない。password file path は NAS `.env` の必須 `FUKUROU_MCP_DB_PASSWORD_FILE` と compose bind mountで一致させる。失敗時はapp credentialへfallbackしない。
-4. 新 image を deploy し、`scripts/mcp-credential-isolation-check <exact-image>` と paper smoke を実行する。
-5. canary scan 完了後、旧 shared `config.toml` と session artifact を auth source から分離して削除する。
-6. running Ktor containerの`/run/fukurou/llm-homes`がtmpfsであることを`docker inspect`で確認する。旧`fukurou_llm-runs` volumeが残っている場合は、一時containerへread-only mountして残存per-run auth copy、session、quarantine artifactを監査し、必要な証跡を保存してから`fukurou_llm-runs`だけを削除する。永続auth sourceの`fukurou_llm-auth`とDBの`fukurou_pgdata`は削除しない。
-7. app の旧 credential を PostgreSQL と NAS `.env` で同時に rotateし、Ktor containerを再起動して新しい値を反映する。旧 credentialで接続できないことを確認する。
-8. `/health/ready`、role flag、membership、ownership、effective grant、required MCP call matrix を再確認する。
-9. 証跡を保存してから daemon を再有効化する。
+### Phase 0: 旧imageをquiescentにする
 
-role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolbypassrls` はすべて false、membership と object ownership は 0 であることを確認する。`runtime_config_versions`、`runtime_config_values`、`llm_launch_reservations`、`equity_snapshots` と ledger の UPDATE/DELETE/TRUNCATE は拒否される。必要 call の permission failure は role SQL と inventory を修正して disposable test からやり直す。
+1. WebUI `/app/config` で `daemon.enabled=false` のdraftを作成し、validateしてactive化する。Ktorを再起動し、`/ops/runtime-config`でeffective valueがfalseであることと、再起動後にscheduler workerが作成されず新しい`DAEMON_STARTED` auditが記録されないことを確認する。旧imageは`llm.launchEnabled`を認識しないため、この段階でglobal gateを設定しようとしない。
+2. Phase 0開始後は`POST /ops/trigger`を呼ばず、`OneShotRunnerMain`も直接実行しない。scheduler worker不在と運用上のlaunch禁止を維持したまま、`pgrep -fa OneShotRunnerMain`が空であることを確認する。
+3. maintenance connectionで `SELECT count(*) FROM llm_launch_reservations WHERE status='RUNNING';` と `SELECT count(*) FROM llm_runs WHERE status='RUNNING';` がどちらも0であることを確認する。0になるまでdeploy、role provision、credential rotationへ進まない。
+
+### Phase 1: 新imageのglobal gate配下で移行する
+
+4. root:root 0400 の `/srv/fukurou/secrets/fukurou_mcp_db_password` を dummy ではない新規値で作成し、値を shell history、log、PR に出さない。provision時のpsql変数解釈を単純に保つため、十分な長さの英数字だけで生成する。
+5. 対象 SHA の新imageを `sudo /usr/local/sbin/deploy-fukurou <commit-sha>` でdeployする。欠落している`llm.launchEnabled`はbootstrapによってfalseでactive snapshotへ追加される。Ktor startupの`TradingPersistenceBootstrap`がMCP evaluation viewを作成するまでrole provisioningを実行しない。
+6. `sudo docker run --rm --network fukurou_edge curlimages/curl -fsS http://ktor:8080/health/ready` を実行し、maintenance connectionでrequired viewの存在を確認する。`/ops/runtime-config`で`daemon.enabled`と`llm.launchEnabled`のactive valueとeffective valueがすべてfalseであることを確認する。`daemon.enabled=false`なのでscheduler workerは作成されず、新しい`DAEMON_STARTED` auditも記録されない。
+7. `POST /ops/trigger`が`LLM_LAUNCH_DISABLED`の409を返すこと、direct `OneShotRunnerMain`がchild processやMCP credentialを使う前にnon-zeroで終了することを確認する。scheduler workerは不在なので`LLM_LAUNCH_DISABLED`のscheduler skip auditを期待しない。その後、手順3のRUNNING 0 queryと`pgrep`を再実行する。
+8. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を実行し、`fukurou_mcp` roleをprovisionする。preflightまたは権限不足ではtransaction全体が失敗するため、gateをOFFのまま維持する。
+9. `scripts/mcp-credential-isolation-check <exact-image>`、paper smoke、knowledge toolsを含むrequired MCP call matrixを実行する。role flag、membership、ownership、effective grantも確認する。
+10. canary scan 完了後、旧 shared `config.toml` と session artifact を auth source から分離して削除する。
+11. running Ktor containerの`/run/fukurou/llm-homes`がtmpfsであることを`docker inspect`で確認する。旧`fukurou_llm-runs` volumeが残っている場合は、一時containerへread-only mountして残存per-run auth copy、session、quarantine artifactを監査し、必要な証跡を保存してから`fukurou_llm-runs`だけを削除する。永続auth sourceの`fukurou_llm-auth`とDBの`fukurou_pgdata`は削除しない。
+12. app の旧 credential を PostgreSQL と NAS `.env` で同時に rotateし、Ktor containerを再起動して新しい値を反映する。旧 credentialで接続できないことを確認する。
+13. credential rotation後にも手順3のRUNNING 0 queryと`pgrep`を実行する。証跡を保存してから、次のように`llm.launchEnabled=true`と`daemon.enabled=true`を同一draftで作成し、validateしてactive化する。この2キーはどちらも`NEXT_RESTART`なので、別々のactive化や途中の再起動を行わない。
+
+    ```sh
+    draft_id="$(scripts/prod-curl \
+      /ops/runtime-config/drafts \
+      --json '{
+        "baseVersionId": null,
+        "values": {
+          "llm.launchEnabled": "true",
+          "daemon.enabled": "true"
+        },
+        "note": "resume LLM launch surfaces after MCP credential isolation"
+      }' | jq -r '.version.id')"
+
+    scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/validate" \
+      --json '{"reason":"resume LLM launch surfaces after MCP credential isolation"}'
+    scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/activate" \
+      --json '{"reason":"resume LLM launch surfaces after MCP credential isolation"}'
+    ```
+
+14. Ktorを1回だけ再起動し、`/ops/runtime-config`で両キーのactive valueとeffective valueがすべてtrueであること、新しい`DAEMON_STARTED` auditと通常cycleによってscheduler workerの再開を確認する。production smokeはreservationを共有する`POST /ops/trigger`に限定し、`LLM_LAUNCH_DISABLED`では拒否されず、reservation、起動上限、SafetyFloorなど通常の安全guardを通ることを確認する。direct `OneShotRunnerMain`のgate ONは自動テストを正本とし、通常のmigration完了経路では実行しない。productionでdirect canaryが必要な場合だけ、`docs/mcp-runtime.md`のdirect runner maintenance境界に従ってschedulerと隔離する。
+
+role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolbypassrls` はすべて false、membership と object ownership は 0 であることを確認する。MCP の evaluation scope は `mcp_current_evaluation_scope` と `mcp_evaluation_epochs` view から account epoch、3つのbaseline、epoch kind、作成時刻だけを読み、secretを含み得る `runtime_config_versions` / `runtime_config_values` や `paper_account_epochs` への直接SELECTは許可しない。`llm_launch_reservations`、`equity_snapshots` と ledger の UPDATE/DELETE/TRUNCATE も拒否される。必要 call の permission failure は role SQL と inventory を修正して disposable test からやり直す。
 
 merge 前の自動証跡は `McpDatabaseRoleIntegrationTest` の role/effective privilege/required-call matrix と、`scripts/mcp-credential-isolation-check` の tool audit export・DB data-only dump・encoding scan を含む。scan coverage や dump が欠けた run は無効とし、再実行する。real provider model output probe は operator auth を必要とする別の human check として記録し、自動 check 成功へ読み替えない。
 
