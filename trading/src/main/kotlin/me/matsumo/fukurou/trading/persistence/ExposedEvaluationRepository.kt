@@ -819,18 +819,19 @@ private fun JdbcTransaction.selectClosedTrades(
                 }
             }
             val truncated = trades.size > limit
+            val page = trades.take(limit)
 
             EvaluationTradeQueryResult(
-                trades = trades.take(limit),
+                trades = page,
                 truncated = truncated,
                 attributionCoverage = EvaluationAttributionCoverage(
-                    attributed = trades.take(limit).count { trade ->
+                    attributed = page.count { trade ->
                         trade.attributionStatus == EvaluationAttributionStatus.ATTRIBUTED
                     },
-                    missing = trades.take(limit).count { trade ->
+                    missing = page.count { trade ->
                         trade.attributionStatus == EvaluationAttributionStatus.MISSING
                     },
-                    total = trades.take(limit).size,
+                    total = page.size,
                 ),
             )
         }

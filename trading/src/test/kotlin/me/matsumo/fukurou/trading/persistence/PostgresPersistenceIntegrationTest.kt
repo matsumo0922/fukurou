@@ -22,6 +22,7 @@ import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
@@ -1491,12 +1492,45 @@ class PostgresPersistenceIntegrationTest {
             repository = decisionRepository,
             command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
         )
-        assertTrue(broker.placeOrder(command).isFailure)
+        val rejectedEntry = broker.placeOrder(command)
+        assertTrue(rejectedEntry.isFailure || !rejectedEntry.getOrThrow().accepted)
     }
 
     @Test
     fun current_epoch_baseline_mismatch_fails_closed_for_writer_and_evaluation() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database)
+        val broker = PaperBroker(
+            ledgerRepository = ledger,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisions,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val firstEntry = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        )
+        broker.placeOrder(firstEntry).getOrThrow()
+        val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
+        val writer = ExposedPaperLedgerWriter(database, postgresSymbolRules(), fixedClock())
+        val restingCommand = postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("9900000"),
+            takeProfitPriceJpy = BigDecimal("10100000"),
+        )
+        writer.createRestingEntryOrder(
+            RestingEntryOrderRequest(
+                command = restingCommand,
+                orderId = restingCommand.commandId,
+                tradeGroupId = UUID.randomUUID(),
+                createdAt = fixedInstant(),
+                expiresAt = fixedInstant().plusSeconds(300),
+                expirySource = OrderExpirySource.SYSTEM_TTL,
+                effectiveTtlSeconds = 300,
+            ),
+        ).getOrThrow()
         val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
         val epochId = requireNotNull(account.accountEpochId)
         exposedTransaction(database) {
@@ -1511,24 +1545,67 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(evaluation.resolveScope(null, "CURRENT").isFailure)
         assertTrue(evaluation.resolveScope(epochId, "CURRENT").isFailure)
 
-        val decisions = ExposedDecisionRepository(database, fixedClock())
-        val broker = PaperBroker(
-            ledgerRepository = ExposedPaperLedgerRepository(database),
-            riskStateRepository = ExposedRiskStateRepository(database),
-            decisionRepository = decisions,
-            marketDataSource = PostgresFakeMarketDataSource,
-            clock = fixedClock(),
+        val rejectedCommand = postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("9900000"),
+            takeProfitPriceJpy = BigDecimal("10100000"),
         )
-        val command = approvedPostgresEntryCommand(
-            repository = decisions,
-            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        val rejectedEntry = writer.createRestingEntryOrder(
+            RestingEntryOrderRequest(
+                command = rejectedCommand,
+                orderId = rejectedCommand.commandId,
+                tradeGroupId = UUID.randomUUID(),
+                createdAt = fixedInstant(),
+                expiresAt = fixedInstant().plusSeconds(300),
+                expirySource = OrderExpirySource.SYSTEM_TTL,
+                effectiveTtlSeconds = 300,
+            ),
         )
-        assertTrue(broker.placeOrder(command).isFailure)
+        assertTrue(rejectedEntry.isFailure)
+        val close = broker.closePosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = positionId,
+                closeAll = false,
+                reasonJa = "baseline mismatch risk-reducing close",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        assertTrue(close.accepted)
+        val executions = ledger.getExecutions().getOrThrow()
+        assertEquals(0, ledger.getOpenPositions().getOrThrow().size)
+        assertEquals(1, executions.count { execution -> execution.side == OrderSide.SELL })
+        assertLedgerLineage(database, "baseline mismatch risk-reducing close")
         exposedTransaction(database) {
-            assertEquals(0, countRowsForTest("orders"))
-            assertEquals(0, countRowsForTest("positions"))
-            assertEquals(0, countRowsForTest("executions"))
+            assertEquals(2, countRowsForTest("executions"))
         }
+        writer.cancelOrder(
+            CancelOrderCommand(
+                commandId = UUID.randomUUID(),
+                orderId = restingCommand.commandId,
+                cancelReason = PaperOrderCancelReason.EXPLICIT_CANCEL,
+                reasonJa = "zero-open-risk recovery",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+
+        val configRepository = ExposedRuntimeConfigRepository(database, fixedClock(), emptyMap())
+        val active = configRepository.activeSnapshot().getOrThrow()
+        val recovery = configRepository.createDraft(
+            RuntimeConfigDraftCreation(
+                baseVersionId = active.versionId,
+                values = mapOf("paper.initialCashJpy" to "1000000"),
+                note = "repair stale current epoch baseline",
+                createdBy = "test",
+            ),
+        ).getOrThrow()
+        val activated = configRepository.activateDraftWithContext(
+            recovery.version.id,
+            "repair stale current epoch baseline",
+            "test",
+        ).getOrThrow()
+        assertTrue(activated.accountEpochId != epochId)
+        assertTrue(evaluation.resolveScope(null, "CURRENT").isSuccess)
     }
 
     @Test

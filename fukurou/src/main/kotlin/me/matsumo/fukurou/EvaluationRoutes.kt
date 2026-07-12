@@ -367,6 +367,8 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
                 EvaluationBenchmarkResponse(
                     period = periodResponse,
                     scope = scope.toResponse(),
+                    attributionCoverage = EvaluationAttributionCoverageResponse(0, 0, 0),
+                    truncated = false,
                     assumptionsJa = "epoch lifecycle と requested period の積集合が空のため benchmark は計算しません。",
                     baselineEquityJpy = null,
                     points = emptyList(),
@@ -383,9 +385,24 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
         val initialCashJpy = scope.initialCashJpy
         val priorPnlJpy = evaluationRepository.sumTradePnlBefore(effectivePeriod.from, scope).getOrThrow()
         val baselineEquityJpy = initialCashJpy.add(priorPnlJpy)
-        val dailyPnl = evaluationRepository.fetchClosedTrades(effectivePeriod, scope = scope).getOrThrow().also { result ->
-            require(!result.truncated) { "EVALUATION_RESULT_TRUNCATED: benchmark population is incomplete." }
-        }.trades.map { trade ->
+        val tradeResult = evaluationRepository.fetchClosedTrades(effectivePeriod, scope = scope).getOrThrow()
+        if (tradeResult.truncated) {
+            call.respond(
+                EvaluationBenchmarkResponse(
+                    period = periodResponse,
+                    scope = scope.toResponse(),
+                    attributionCoverage = tradeResult.attributionCoverage.toResponse(),
+                    truncated = true,
+                    assumptionsJa = "取引母集団が取得上限を超えたため benchmark は計算しません。",
+                    baselineEquityJpy = null,
+                    points = emptyList(),
+                    returns = null,
+                    state = "TRUNCATED_POPULATION",
+                ),
+            )
+            return@get
+        }
+        val dailyPnl = tradeResult.trades.map { trade ->
             DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
         }
         val dailyCandleLimit = call.requireDailyCandleLimit(effectiveDateRange) ?: return@get
@@ -411,6 +428,8 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
             EvaluationBenchmarkResponse(
                 period = periodResponse,
                 scope = scope.toResponse(),
+                attributionCoverage = tradeResult.attributionCoverage.toResponse(),
+                truncated = false,
                 assumptionsJa = "buy & hold は開始日 close で全額 BTC を買い、手数料・スリッページを無視します。bot equity は realized PnL のみを close 日に計上し、未実現損益は含めません。",
                 baselineEquityJpy = baselineEquityJpy.takeIf { baselineComparable }?.toDecimalString(),
                 points = benchmark.points.takeIf { baselineComparable }.orEmpty()
@@ -421,7 +440,7 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
         )
     }.describe {
         summary = "benchmark 系列を取得する"
-        description = "buy & hold、no-trade、bot realized equity の日次系列と期間 return を返します。"
+        description = "buy & hold、no-trade、bot realized equity の日次系列と期間 return を返します。取引母集団が取得上限を超えた場合は TRUNCATED_POPULATION と coverage を返します。"
         tag(EVALUATION_TAG)
         parameters {
             query("epochId") {
@@ -1037,6 +1056,8 @@ data class EvaluationCalibrationBinResponse(
 data class EvaluationBenchmarkResponse(
     val period: EvaluationPeriodResponse,
     val scope: EvaluationScopeResponse,
+    val attributionCoverage: EvaluationAttributionCoverageResponse,
+    val truncated: Boolean,
     val assumptionsJa: String,
     val baselineEquityJpy: String?,
     val points: List<EvaluationBenchmarkPointResponse>,

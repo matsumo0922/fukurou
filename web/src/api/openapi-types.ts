@@ -429,7 +429,7 @@ export interface paths {
         };
         /**
          * benchmark 系列を取得する
-         * @description buy & hold、no-trade、bot realized equity の日次系列と期間 return を返します。
+         * @description buy & hold、no-trade、bot realized equity の日次系列と期間 return を返します。取引母集団が取得上限を超えた場合は TRUNCATED_POPULATION と coverage を返します。
          */
         get: {
             parameters: {
@@ -2480,6 +2480,8 @@ export interface components {
         EvaluationBenchmarkResponse: {
             period: components["schemas"]["EvaluationPeriodResponse"];
             scope: components["schemas"]["EvaluationScopeResponse"];
+            attributionCoverage: components["schemas"]["EvaluationAttributionCoverageResponse"];
+            truncated: boolean;
             assumptionsJa: string;
             baselineEquityJpy?: string | null;
             points: components["schemas"]["EvaluationBenchmarkPointResponse"][];

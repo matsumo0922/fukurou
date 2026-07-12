@@ -1,4 +1,4 @@
-@file:Suppress("ImportOrdering", "LongMethod", "TooManyFunctions")
+@file:Suppress("CyclomaticComplexMethod", "ImportOrdering", "LongMethod", "TooManyFunctions")
 
 package me.matsumo.fukurou.trading.persistence
 
@@ -21,6 +21,7 @@ import me.matsumo.fukurou.trading.config.requireValid
 import me.matsumo.fukurou.trading.config.retiredRuntimeConfigKeys
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
+import java.math.BigDecimal
 import java.sql.ResultSet
 import java.time.Clock
 import java.time.Instant
@@ -507,6 +508,13 @@ private sealed interface EpochSwitchResult {
     data class Rejected(val exception: PaperAccountEpochSwitchRejectedException) : EpochSwitchResult
 }
 
+private data class PaperAccountEpochState(
+    val currentEpochId: UUID,
+    val initialCashJpy: BigDecimal,
+    val btcQuantity: BigDecimal,
+    val epochBaseline: BigDecimal,
+)
+
 private fun JdbcTransaction.switchPaperAccountEpochIfRequired(
     values: Map<String, String>,
     reason: String,
@@ -523,45 +531,55 @@ private fun JdbcTransaction.switchPaperAccountEpochIfRequired(
     if (!hasPaperAccount) return EpochSwitchResult.Unchanged
 
     val account = prepare(
-        "SELECT current_epoch_id, initial_cash_jpy, btc_quantity FROM paper_account WHERE id = ? FOR UPDATE",
+        """
+            SELECT account.current_epoch_id, account.initial_cash_jpy, account.btc_quantity,
+                epoch.initial_cash_jpy AS epoch_baseline
+            FROM paper_account account
+            JOIN paper_account_epochs epoch ON epoch.id = account.current_epoch_id
+            WHERE account.id = ?
+            FOR UPDATE
+        """.trimIndent(),
     ).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
             check(resultSet.next())
-            Triple(
+            PaperAccountEpochState(
                 resultSet.getObject("current_epoch_id", UUID::class.java),
                 resultSet.getBigDecimal("initial_cash_jpy"),
                 resultSet.getBigDecimal("btc_quantity"),
+                resultSet.getBigDecimal("epoch_baseline"),
             )
         }
     }
-    if (requestedBaseline.compareTo(account.second) == 0) return EpochSwitchResult.Unchanged
+    val accountBaselineMatches = requestedBaseline.compareTo(account.initialCashJpy) == 0
+    val epochBaselineMatches = requestedBaseline.compareTo(account.epochBaseline) == 0
+    if (accountBaselineMatches && epochBaselineMatches) return EpochSwitchResult.Unchanged
 
     executeUpdate("LOCK TABLE positions, orders, executions IN SHARE ROW EXCLUSIVE MODE")
     val openPositions = countRows("SELECT COUNT(*) FROM positions WHERE status = 'OPEN'")
     val openOrders = countRows("SELECT COUNT(*) FROM orders WHERE status IN ('OPEN', 'PENDING_CANCEL')")
-    val hasOpenRisk = openPositions > 0 || openOrders > 0 || account.third.signum() != 0
+    val hasOpenRisk = openPositions > 0 || openOrders > 0 || account.btcQuantity.signum() != 0
     val targetHash = calculateRuntimeConfigHash(values)
     if (hasOpenRisk) {
         appendEpochAudit(
             eventType = "PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED",
             payload = EpochAuditPayload(
-                oldEpochId = account.first,
+                oldEpochId = account.currentEpochId,
                 newEpochId = null,
-                oldBaseline = account.second,
+                oldBaseline = account.initialCashJpy,
                 newBaseline = requestedBaseline,
                 hash = targetHash,
                 reason = reason,
                 actor = actor,
                 openPositions = openPositions,
                 openOrders = openOrders,
-                btc = account.third,
+                btc = account.btcQuantity,
             ).encode(),
             now = now,
             runtimeConfigHash = targetHash,
         )
         return EpochSwitchResult.Rejected(
-            PaperAccountEpochSwitchRejectedException(openPositions, openOrders, account.third.toPlainString()),
+            PaperAccountEpochSwitchRejectedException(openPositions, openOrders, account.btcQuantity.toPlainString()),
         )
     }
 
@@ -608,16 +626,16 @@ private fun JdbcTransaction.switchPaperAccountEpochIfRequired(
     appendEpochAudit(
         "PAPER_ACCOUNT_EPOCH_SWITCHED",
         EpochAuditPayload(
-            oldEpochId = account.first,
+            oldEpochId = account.currentEpochId,
             newEpochId = epochId,
-            oldBaseline = account.second,
+            oldBaseline = account.initialCashJpy,
             newBaseline = requestedBaseline,
             hash = targetHash,
             reason = reason,
             actor = actor,
             openPositions = 0,
             openOrders = 0,
-            btc = account.third,
+            btc = account.btcQuantity,
         ).encode(),
         now,
         targetHash,

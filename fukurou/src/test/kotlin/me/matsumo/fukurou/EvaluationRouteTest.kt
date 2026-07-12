@@ -29,6 +29,7 @@ import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
+import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationScope
@@ -53,6 +54,43 @@ import kotlin.test.assertTrue
  * evaluation route の HTTP contract を検証するテスト。
  */
 class EvaluationRouteTest {
+    @Test
+    fun benchmarkReturnsStructuredStateForTruncatedPopulation() = testApplication {
+        val truncatedRepository = object : EvaluationRepository by FakeEvaluationRepository {
+            override suspend fun fetchClosedTrades(
+                period: EvaluationPeriod,
+                limit: Int,
+                scope: EvaluationScope,
+            ): Result<EvaluationTradeQueryResult> = Result.success(
+                EvaluationTradeQueryResult(
+                    trades = FakeEvaluationRepository.fetchClosedTrades(period, limit).getOrThrow().trades,
+                    truncated = true,
+                    attributionCoverage = EvaluationAttributionCoverage(attributed = 20_000, missing = 0, total = 20_000),
+                ),
+            )
+        }
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = truncatedRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/evaluation/benchmark?from=2026-07-01&to=2026-07-03")
+        val body = response.bodyAsText()
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(body.contains("\"state\":\"TRUNCATED_POPULATION\""))
+        assertTrue(body.contains("\"truncated\":true"))
+        assertTrue(body.contains("\"points\":[]"))
+        assertTrue(body.contains("\"returns\":null"))
+        assertTrue(body.contains("\"total\":20000"))
+    }
+
     @Test
     fun evaluationRoutesExposeEmptyPartialAndFullLifecyclePeriods() = testApplication {
         val lifecycleRepository = object : EvaluationRepository by FakeEvaluationRepository {
