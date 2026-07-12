@@ -3805,6 +3805,45 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun evaluation_repository_countsDedupeLaunchesByCommandEventTimestampInPostgresPath() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val eventLog = ExposedCommandEventLog(database)
+
+        eventLog.append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext.EMPTY,
+                toolName = "manual-llm-launch",
+                toolCallId = null,
+                clientRequestId = "manual-launch",
+                eventType = CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+                payload = """{"triggerKind":"MANUAL","restingEntryOrderCount":1,"restingOnly":true}""",
+                occurredAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+        eventLog.append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext.EMPTY,
+                toolName = "llm-daemon-scheduler",
+                toolCallId = null,
+                clientRequestId = "daemon-launch",
+                eventType = CommandEventType.DAEMON_TRIGGER_LAUNCHED,
+                payload = """{"triggerKind":"FLAT_HEARTBEAT","restingEntryOrderCount":1,"restingOnly":true}""",
+                occurredAt = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+
+        val metrics = ExposedEvaluationRepository(database).fetchDeduplicationMetrics(
+            EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(2),
+            ),
+        ).getOrThrow()
+
+        assertEquals(1, metrics.manualFullRunCount)
+        assertEquals(1, metrics.restingOnlyDaemonFullRunCount)
+    }
+
+    @Test
     fun command_event_log_readsRawFeedWithLimitFilterAndDescendingOrderInPostgresPath() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 

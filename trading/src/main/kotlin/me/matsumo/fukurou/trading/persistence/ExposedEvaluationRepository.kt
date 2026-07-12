@@ -1047,7 +1047,7 @@ private fun JdbcTransaction.selectDedupeLaunchCounts(period: EvaluationPeriod): 
         WHERE payload LIKE '%\"restingOnly\":true%'
         AND payload NOT LIKE '%\"triggerKind\":\"MANUAL\"%'
       ) FROM command_event_log
-      WHERE event_type = 'DAEMON_TRIGGER_LAUNCHED' AND occurred_at >= ? AND occurred_at < ?
+      WHERE event_type = 'DAEMON_TRIGGER_LAUNCHED' AND ts >= ? AND ts < ?
     """.trimIndent()
     return jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setLong(1, period.from.toEpochMilli())
