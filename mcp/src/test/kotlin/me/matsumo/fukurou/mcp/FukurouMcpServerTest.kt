@@ -49,6 +49,7 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.FUKUROU_LLM_PHASE_ENV
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
@@ -1214,31 +1215,37 @@ class FukurouMcpServerTest {
 
     @Test
     fun previewOrderTool_propagatesCorrelationAndAuditFailureThroughProductionHandler() = runBlocking {
-        val marketDataSource = CorrelationAuditFailingMarketDataSource()
-        val runtime = TradingRuntimeFactory.inMemory(
-            clock = fixedClock(),
-            marketDataSource = marketDataSource,
-        )
-        val server = FukurouMcpServer(
-            marketDataSource = marketDataSource,
-            clock = fixedClock(),
-            tradingRuntime = runtime,
-            decisionRunContext = DecisionRunContext.EMPTY.copy(decisionRunId = "decision-correlation"),
-        ).createServer()
-        val intentId = submitApprovedEnterIntent(server)
+        mapOf(
+            "proposer" to GmoPublicClientRole.PROPOSER,
+            "falsifier" to GmoPublicClientRole.FALSIFIER,
+        ).forEach { (phase, expectedRole) ->
+            val marketDataSource = CorrelationAuditFailingMarketDataSource()
+            val runtime = TradingRuntimeFactory.inMemory(
+                clock = fixedClock(),
+                marketDataSource = marketDataSource,
+            )
+            val server = FukurouMcpServer(
+                marketDataSource = marketDataSource,
+                clock = fixedClock(),
+                tradingRuntime = runtime,
+                decisionRunContext = DecisionRunContext.EMPTY.copy(decisionRunId = "decision-$phase"),
+                environment = mapOf(FUKUROU_LLM_PHASE_ENV to phase),
+            ).createServer()
+            val intentId = submitApprovedEnterIntent(server)
 
-        val result = callTool(server, "preview_order", placeOrderArguments(intentId))
-        val structuredContent = assertNotNull(result.structuredContent)
-        val correlation = assertNotNull(marketDataSource.correlation)
+            val result = callTool(server, "preview_order", placeOrderArguments(intentId))
+            val structuredContent = assertNotNull(result.structuredContent)
+            val correlation = assertNotNull(marketDataSource.correlation)
 
-        assertEquals(true, result.isError)
-        assertEquals("audit_failed_after_execution", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
-        assertEquals("true", structuredContent.getValue("executed").jsonPrimitive.contentOrNull)
-        assertEquals("decision-correlation", correlation.decisionRunContext.decisionRunId)
-        assertTrue(correlation.toolCallId?.isNotBlank() == true)
-        assertEquals(GmoPublicClientRole.UNSPECIFIED, correlation.clientRole)
-        assertEquals(0, runtime.broker.getOpenOrders().getOrThrow().size)
-        assertEquals(0, runtime.broker.getPositions().getOrThrow().size)
+            assertEquals(true, result.isError)
+            assertEquals("audit_failed_after_execution", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+            assertEquals("true", structuredContent.getValue("executed").jsonPrimitive.contentOrNull)
+            assertEquals("decision-$phase", correlation.decisionRunContext.decisionRunId)
+            assertTrue(correlation.toolCallId?.isNotBlank() == true)
+            assertEquals(expectedRole, correlation.clientRole)
+            assertEquals(0, runtime.broker.getOpenOrders().getOrThrow().size)
+            assertEquals(0, runtime.broker.getPositions().getOrThrow().size)
+        }
     }
 
     @Test

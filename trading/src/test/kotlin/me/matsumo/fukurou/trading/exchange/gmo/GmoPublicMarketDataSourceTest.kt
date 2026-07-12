@@ -22,6 +22,7 @@ import java.net.http.HttpResponse
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.Optional
 import java.util.concurrent.CompletableFuture
@@ -297,6 +298,7 @@ class GmoPublicMarketDataSourceTest {
 
     @Test
     fun getCandles_allowsUnlimitedDailyKlineRequestBudget() = runBlocking {
+        val auditSink = RecordingRequestAuditSink()
         val httpClient = FakeHttpClient(
             responses = mapOf(
                 "symbol=BTC&interval=1hour&date=20260102" to klineResponse("2026-01-02T00:00:00Z"),
@@ -307,6 +309,7 @@ class GmoPublicMarketDataSourceTest {
         val marketDataSource = fakeMarketDataSource(
             httpClient = httpClient,
             dailyKlineRequestBudget = GmoUnlimitedDailyKlineRequestBudget,
+            requestAuditSink = auditSink,
         )
 
         val candles = marketDataSource.getCandles(TradingSymbol.BTC, CandleInterval.ONE_HOUR, limit = 3).getOrThrow()
@@ -323,6 +326,10 @@ class GmoPublicMarketDataSourceTest {
             listOf("2025-12-31T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
             candles.map { candle -> candle.openTime },
         )
+        assertEquals(3, auditSink.events.size)
+        assertEquals(listOf(1, 2, 3), auditSink.events.map { event -> event.requestSequence })
+        assertEquals(1, auditSink.events.map { event -> event.operationId }.distinct().size)
+        assertTrue(auditSink.events.all { event -> event.endpoint == GmoPublicEndpoint.KLINES })
     }
 
     @Test
@@ -399,6 +406,28 @@ class GmoPublicMarketDataSourceTest {
 
         assertEquals(listOf("ticker"), rateLimiter.endpointNames)
         assertEquals(listOf("symbol=BTC"), httpClient.requestQueries)
+    }
+
+    @Test
+    fun requestAudit_recordsActualTokenBucketPermitWait() = runBlocking {
+        val clock = AdvancingClock(Instant.parse("2026-01-02T00:00:00Z"))
+        val auditSink = RecordingRequestAuditSink()
+        val rateLimiter = GmoTokenBucketRateLimiter(
+            config = GmoRateLimitConfig(permitsPerSecond = 1, burstSize = 1),
+            clock = clock,
+            sleeper = AdvancingClockSleeper(clock),
+        )
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(responses = mapOf("symbol=BTC" to TICKER_SUCCESS_RESPONSE)),
+            clock = clock,
+            requestRateLimiter = rateLimiter,
+            requestAuditSink = auditSink,
+        )
+
+        marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+
+        assertEquals(listOf(0L, 1000L), auditSink.events.map { event -> event.permitWaitMillis })
     }
 
     @Test
@@ -927,5 +956,27 @@ private class RecordingSleeper : GmoSleeper {
 
     override fun sleep(duration: Duration) {
         durations += duration
+    }
+}
+
+private class AdvancingClock(
+    private var currentInstant: Instant,
+) : Clock() {
+    override fun getZone(): ZoneId = ZoneOffset.UTC
+
+    override fun withZone(zone: ZoneId): Clock = this
+
+    override fun instant(): Instant = currentInstant
+
+    fun advance(duration: Duration) {
+        currentInstant = currentInstant.plus(duration)
+    }
+}
+
+private class AdvancingClockSleeper(
+    private val clock: AdvancingClock,
+) : GmoSleeper {
+    override fun sleep(duration: Duration) {
+        clock.advance(duration)
     }
 }

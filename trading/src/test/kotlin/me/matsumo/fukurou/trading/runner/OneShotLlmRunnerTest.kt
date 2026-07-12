@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.FUKUROU_INVOCATION_ID_ENV
+import me.matsumo.fukurou.trading.audit.FUKUROU_LLM_PHASE_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_LLM_PROVIDER_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_MARKET_SNAPSHOT_ID_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_PROMPT_HASH_ENV
@@ -1478,6 +1479,9 @@ class OneShotLlmRunnerTest {
         assertFalse(codexConfigContent.contains("DB_USER"))
         assertFalse(codexConfigContent.contains("DB_PASSWORD"))
         assertNotNull(falsifierCommand.environment[FUKUROU_FALSIFIER_INTENT_ID_ENV])
+        assertTrue(proposerCommand.claudeMcpConfigContent().contains("\"$FUKUROU_LLM_PHASE_ENV\":\"proposer\""))
+        assertTrue(falsifierCommand.codexConfigContent().contains(FUKUROU_LLM_PHASE_ENV))
+        assertTrue(falsifierCommand.codexConfigContent().contains("falsifier"))
 
         Unit
     }

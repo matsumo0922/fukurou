@@ -1932,7 +1932,7 @@ export interface paths {
                     before?: string;
                     /** @description decision / audit / execution のいずれかに絞り込みます。未指定の場合は全 source を返します。 */
                     source?: string;
-                    /** @description audit event_type の許可リストです。複数指定可。未指定の場合は RECONCILER_PASS_COMPLETED を既定除外します。 */
+                    /** @description audit event_type の許可リストです。複数指定可。未指定の場合は RECONCILER_PASS_COMPLETED と GMO_PUBLIC_REST_REQUEST_COMPLETED を既定除外します。 */
                     auditEventType?: string[];
                 };
                 header?: never;
