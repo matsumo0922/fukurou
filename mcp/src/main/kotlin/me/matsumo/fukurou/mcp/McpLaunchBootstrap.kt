@@ -52,6 +52,7 @@ object McpLaunchBootstrap {
             else -> throw IllegalArgumentException("Unsupported MCP manifest phase.")
         }
         require(manifest.allowedTools.toSet() == canonicalTools) { "MCP manifest allowlist is not canonical." }
+        require(manifest.systemPromptVersion.isNotBlank()) { "MCP manifest system prompt version is required." }
         require(expiresAt.isAfter(Instant.now(clock))) { "MCP manifest is expired." }
         require(password.isNotEmpty()) { "MCP password descriptor must not be empty." }
         require(manifest.totalToolCallLimit in 1..DEFAULT_MAX_TOOL_CALLS_PER_RUN) {
@@ -74,7 +75,7 @@ object McpLaunchBootstrap {
                 decisionRunId = manifest.decisionRunId,
                 llmProvider = manifest.llmProvider,
                 promptHash = manifest.promptHash,
-                systemPromptVersion = null,
+                systemPromptVersion = manifest.systemPromptVersion,
                 marketSnapshotId = manifest.marketSnapshotId,
             ),
             allowedTools = manifest.allowedTools.toSet(),

@@ -1755,10 +1755,38 @@ class McpLaunchBootstrapPolicyTest {
                 canonical.copy(totalToolCallLimit = 1, actToolCallLimit = 2),
                 canonical.copy(runtimeEnvironment = emptyMap()),
                 canonical.copy(runtimeEnvironment = canonical.runtimeEnvironment + ("UNKNOWN_RUNTIME_KEY" to "tampered")),
+                canonical.copy(systemPromptVersion = ""),
             ).forEach { rejected ->
                 assertNotNull(runCatching { decodeBootstrap(rejected, clock) }.exceptionOrNull())
             }
         }
+    }
+
+    @Test
+    fun bootstrapSystemPromptVersion_isUsedBySubmitDecisionFallbackAndAudit() = runBlocking {
+        val clock = fixedClock()
+        val bootstrap = decodeBootstrap(bootstrapManifest(LlmInvocationPhase.PROPOSER, clock), clock)
+        val runtime = TradingRuntimeFactory.inMemory(clock = clock)
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = clock,
+            tradingRuntime = runtime,
+            decisionRunContext = bootstrap.decisionRunContext,
+            allowedToolNames = bootstrap.allowedTools,
+            expiresAt = bootstrap.expiresAt,
+        ).createServer()
+
+        val result = callTool(server, "submit_decision", enterDecisionArguments())
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+        val submission = repository.snapshots.decisions().single().submission
+        val auditEvents = (runtime.commandEventLog as InMemoryCommandEventLog).events()
+            .filter { event -> event.toolName == "submit_decision" }
+
+        assertTrue(result.isError != true)
+        assertEquals("fixture-system-prompt-v1", bootstrap.decisionRunContext.systemPromptVersion)
+        assertEquals("fixture-system-prompt-v1", submission.systemPromptVersion)
+        assertTrue(auditEvents.isNotEmpty())
+        assertTrue(auditEvents.all { event -> event.decisionRunContext.systemPromptVersion == "fixture-system-prompt-v1" })
     }
 }
 
@@ -1777,6 +1805,7 @@ private fun bootstrapManifest(phase: LlmInvocationPhase, clock: Clock): McpLaunc
         decisionRunId = "policy-test",
         llmProvider = "fixture",
         promptHash = "fixture-hash",
+        systemPromptVersion = "fixture-system-prompt-v1",
         marketSnapshotId = "fixture-snapshot",
         dbUrl = "jdbc:postgresql://fixture/fukurou",
         dbUser = MCP_TEST_ROLE,
@@ -2099,6 +2128,7 @@ private fun requiredMatrixBootstrap(
         decisionRunId = MCP_MATRIX_RUN_ID,
         llmProvider = "fixture",
         promptHash = "fixture-hash",
+        systemPromptVersion = "fixture-system-prompt-v1",
         marketSnapshotId = "fixture-snapshot",
         dbUrl = container.jdbcUrl,
         dbUser = MCP_TEST_ROLE,

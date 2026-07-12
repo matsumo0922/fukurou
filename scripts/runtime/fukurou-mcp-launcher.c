@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
     verify_final_security_state(canary);
 
     char *const args[] = {"java", "-jar", MCP_JAR, NULL};
-    char *const environment[] = {"FUKUROU_MCP_MANIFEST_FD=3", "FUKUROU_MCP_PASSWORD_FD=4", "PATH=/opt/java/openjdk/bin:/usr/bin:/bin", NULL};
+    char *const environment[] = {"PATH=/opt/java/openjdk/bin:/usr/bin:/bin", NULL};
     execve("/opt/java/openjdk/bin/java", args, environment);
     fail(strerror(errno));
 }

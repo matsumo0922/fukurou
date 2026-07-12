@@ -270,7 +270,7 @@ scripts/prod-curl /ops/runtime-config
 この移行は operator が daemon を無効化した状態で実施する。merge/deploy 前に production credential を変更しない。
 
 1. WebUI で `daemon.enabled=false` を active 化し、running reservation がないことを確認する。
-2. root:root 0400 の `/srv/fukurou/secrets/fukurou_mcp_db_password` を dummy ではない新規値で作成し、値を shell history、log、PR に出さない。
+2. root:root 0400 の `/srv/fukurou/secrets/fukurou_mcp_db_password` を dummy ではない新規値で作成し、値を shell history、log、PR に出さない。provision時のpsql変数解釈を単純に保つため、十分な長さの英数字だけで生成する。
 3. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を daemon 停止中の maintenance connection で実行し、`fukurou_mcp` role を provision する。maintenance connectionはDB superuserを使用する。非superuserを使う場合は、既存default ACLの全grantor roleへ`SET ROLE`できるmembershipとrole変更・ownership移管に必要な権限を持つことを事前確認する。権限不足では`ON_ERROR_STOP`によりprovision全体が失敗し、daemonを再有効化しない。password file path は NAS `.env` の必須 `FUKUROU_MCP_DB_PASSWORD_FILE` と compose bind mountで一致させる。失敗時はapp credentialへfallbackしない。
 4. 新 image を deploy し、`scripts/mcp-credential-isolation-check <exact-image>` と paper smoke を実行する。
 5. canary scan 完了後、旧 shared `config.toml` と session artifact を auth source から分離して削除する。
@@ -287,7 +287,7 @@ cleanup failure では `/run/fukurou/llm-homes/.cleanup-quarantine` が残り、
 
 rotation 後は旧 image で LLM phase を再有効化しない。障害時は daemon disabled のまま現 image を維持するか、修正版へ roll-forward する。
 
-この境界はfixed setuid helper 2個とdeployごとのprivilege inventory gateに依存する。merge前にfinal imageでsetuid/setgid、file capability、runtime/root control socket、LLM/MCP process属性のexact checkが通ることを確認する。
+この境界はfixed setuid helper 2個とdeployごとのprivilege inventory gateに依存する。merge前にfinal imageでsetuid/setgid、file capability、runtime/root control socket、LLM/MCP process属性のexact checkが通ることを確認する。imageまたはCLIを更新してNode内部FD配置が変わった場合は、差分を監査してから`validate-llm-launcher-probe.mjs`の`liveFds` exact inventoryを更新し、同じfinal imageでcanaryを再実行する。
 
 ## Rollback
 

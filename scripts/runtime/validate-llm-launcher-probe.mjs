@@ -16,8 +16,12 @@ const expectedKeys = [
 if (JSON.stringify(Object.keys(probe).sort()) !== JSON.stringify(expectedKeys)) throw new Error("launcher probe fields mismatch");
 const expectedEnvironment = [
   "FUKUROU_CANARY_LLM_CORE_LIMIT", "FUKUROU_CANARY_LLM_DUMPABLE", "FUKUROU_CANARY_LLM_LAUNCH_FDS",
+  "FUKUROU_INVOCATION_ID", "FUKUROU_LLM_PROVIDER", "FUKUROU_MARKET_SNAPSHOT_ID", "FUKUROU_PROMPT_HASH",
+  "FUKUROU_RUNTIME_CONFIG_HASH", "FUKUROU_RUNTIME_CONFIG_VERSION_ID", "FUKUROU_SYSTEM_PROMPT_VERSION",
   "HOME", "LANG", "LC_ALL", "PATH", "XDG_CACHE_HOME",
-  ...(phase === "PROPOSER" ? ["CLAUDE_CONFIG_DIR"] : ["CODEX_HOME", "FUKUROU_CANARY_INTENT_ID"]),
+  ...(phase === "PROPOSER"
+    ? ["CLAUDE_CONFIG_DIR"]
+    : ["CODEX_HOME", "FUKUROU_CANARY_INTENT_ID", "FUKUROU_FALSIFIER_INTENT_ID"]),
 ].sort();
 const expected = {
   uid: "10002\t10002\t10002\t10002",

@@ -25,6 +25,7 @@ data class McpLaunchManifest(
     val decisionRunId: String,
     val llmProvider: String,
     val promptHash: String,
+    val systemPromptVersion: String,
     val marketSnapshotId: String,
     val dbUrl: String,
     val dbUser: String,
@@ -70,6 +71,8 @@ class McpLaunchManifestWriter(
             decisionRunId = requireNotNull(context.decisionRunId) { "decisionRunId is required." },
             llmProvider = context.llmProvider.orEmpty(),
             promptHash = context.promptHash.orEmpty(),
+            systemPromptVersion = requireNotNull(context.systemPromptVersion) { "systemPromptVersion is required." }
+                .also { version -> require(version.isNotBlank()) { "systemPromptVersion must not be blank." } },
             marketSnapshotId = context.marketSnapshotId.orEmpty(),
             dbUrl = databaseUrl,
             dbUser = databaseUser,

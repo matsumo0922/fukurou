@@ -23,7 +23,12 @@ static void fail(const char *message) {
 }
 
 static int allowed_env(const char *entry) {
-    static const char *names[] = {"PATH=", "HOME=", "CODEX_HOME=", "CLAUDE_CONFIG_DIR=", "LANG=", "LC_ALL=", "TERM=", "TMPDIR=", "XDG_CACHE_HOME=", "FUKUROU_CANARY_INTENT_ID="};
+    static const char *names[] = {
+        "PATH=", "HOME=", "CODEX_HOME=", "CLAUDE_CONFIG_DIR=", "LANG=", "LC_ALL=", "TERM=", "TMPDIR=",
+        "XDG_CACHE_HOME=", "FUKUROU_INVOCATION_ID=", "FUKUROU_LLM_PROVIDER=", "FUKUROU_PROMPT_HASH=",
+        "FUKUROU_SYSTEM_PROMPT_VERSION=", "FUKUROU_MARKET_SNAPSHOT_ID=", "FUKUROU_RUNTIME_CONFIG_VERSION_ID=",
+        "FUKUROU_RUNTIME_CONFIG_HASH=", "FUKUROU_FALSIFIER_INTENT_ID=", "FUKUROU_CANARY_INTENT_ID=",
+    };
     for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
         if (strncmp(entry, names[index], strlen(names[index])) == 0) return 1;
     }
