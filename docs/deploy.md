@@ -271,7 +271,7 @@ scripts/prod-curl /ops/runtime-config
 
 1. WebUI で `daemon.enabled=false` を active 化し、running reservation がないことを確認する。
 2. root:root 0400 の `/srv/fukurou/secrets/fukurou_mcp_db_password` を dummy ではない新規値で作成し、値を shell history、log、PR に出さない。
-3. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を daemon 停止中の maintenance connection で実行し、`fukurou_mcp` role を provision する。password file path は NAS `.env` の必須 `FUKUROU_MCP_DB_PASSWORD_FILE` と compose bind mountで一致させる。失敗時はapp/superuser credentialへfallbackしない。
+3. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を daemon 停止中の maintenance connection で実行し、`fukurou_mcp` role を provision する。maintenance connectionはDB superuserを使用する。非superuserを使う場合は、既存default ACLの全grantor roleへ`SET ROLE`できるmembershipとrole変更・ownership移管に必要な権限を持つことを事前確認する。権限不足では`ON_ERROR_STOP`によりprovision全体が失敗し、daemonを再有効化しない。password file path は NAS `.env` の必須 `FUKUROU_MCP_DB_PASSWORD_FILE` と compose bind mountで一致させる。失敗時はapp credentialへfallbackしない。
 4. 新 image を deploy し、`scripts/mcp-credential-isolation-check <exact-image>` と paper smoke を実行する。
 5. canary scan 完了後、旧 shared `config.toml` と session artifact を auth source から分離して削除する。
 6. running Ktor containerの`/run/fukurou/llm-homes`がtmpfsであることを`docker inspect`で確認する。旧`fukurou_llm-runs` volumeが残っている場合は、一時containerへread-only mountして残存per-run auth copy、session、quarantine artifactを監査し、必要な証跡を保存してから`fukurou_llm-runs`だけを削除する。永続auth sourceの`fukurou_llm-auth`とDBの`fukurou_pgdata`は削除しない。
