@@ -61,8 +61,15 @@ import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.exchange.gmo.CommandEventLogGmoPublicRequestAuditSink
+import me.matsumo.fukurou.trading.exchange.gmo.DeferredGmoPublicRequestAuditSink
 import me.matsumo.fukurou.trading.exchange.gmo.GMO_MAX_DAILY_KLINE_REQUESTS
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
+import me.matsumo.fukurou.trading.exchange.gmo.withGmoPublicRequestCorrelation
+import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_RECENT_LESSONS_LIMIT
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_RECENT_LESSONS_LOOKBACK_DAYS
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LIMIT
@@ -93,6 +100,7 @@ import me.matsumo.fukurou.trading.market.FreshnessSource
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoHttpException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataException
 import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketDataSource
@@ -343,6 +351,7 @@ private val ToolErrorTypes: List<Pair<KClass<out Throwable>, String>> = listOf(
     ToolCallLimitUnavailableException::class to "tool_call_limit_unavailable",
     ToolCallNotAllowedException::class to "tool_call_not_allowed",
     ToolCompletionAuditFailedException::class to "audit_failed_after_execution",
+    GmoRequestAuditException::class to "audit_failed_after_execution",
     MarketInvalidRequestException::class to "invalid_request",
     GmoRateLimitException::class to "rate_limited",
     GmoApiStatusException::class to "gmo_status_error",
@@ -386,7 +395,7 @@ private data class LimitedToolContext(
 fun main() {
     redirectProcessStdoutToStderrForMcpStdio()
     if (useTestInMemoryRuntime()) {
-        FukurouMcpServer().run()
+        FukurouMcpServer(clientRole = GmoPublicClientRole.UNSPECIFIED).run()
         return
     }
     val bootstrap = McpLaunchBootstrap.read()
@@ -397,7 +406,12 @@ fun main() {
             maxActToolCallsPerRun = bootstrap.actToolCallLimit,
         ),
     )
-    val marketDataSource = GmoPublicMarketDataSource.fromConfig(tradingConfig.gmoPublicClient)
+    val requestAuditSink = DeferredGmoPublicRequestAuditSink()
+    val marketDataSource = GmoPublicMarketDataSource.fromConfig(
+        config = tradingConfig.gmoPublicClient,
+        clientType = GmoPublicClientType.FUKUROU_MCP,
+        requestAuditSink = requestAuditSink,
+    )
     val runtime = TradingRuntimeFactory.postgresForMcp(
         config = bootstrap.databaseConfig,
         marketDataSource = marketDataSource,
@@ -406,9 +420,11 @@ fun main() {
 
     FukurouMcpServer(
         tradingConfig = tradingConfig,
+        requestAuditSink = requestAuditSink,
         marketDataSource = marketDataSource,
         tradingRuntime = runtime,
         decisionRunContext = bootstrap.decisionRunContext,
+        clientRole = bootstrap.phase.toGmoPublicClientRole(),
         allowedToolNames = bootstrap.allowedTools,
         expiresAt = bootstrap.expiresAt,
     ).run()
@@ -417,6 +433,7 @@ fun main() {
 /**
  * fukurou の MCP stdio server。業務ロジックは `:trading` へ委譲する。
  *
+ * @param clientRole GMO Public request audit に記録する呼び出し元 role
  * @param tradingConfig 取引 bot 全体の typed config
  * @param marketDataSource 市場データ取得元
  * @param clock response 鮮度 metadata と default runtime を作る clock
@@ -425,8 +442,14 @@ fun main() {
  * @param decisionRunContext 呼び出し元の decision run context
  */
 class FukurouMcpServer(
+    private val clientRole: GmoPublicClientRole,
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
-    private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource.fromConfig(tradingConfig.gmoPublicClient),
+    private val requestAuditSink: DeferredGmoPublicRequestAuditSink = DeferredGmoPublicRequestAuditSink(),
+    private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource.fromConfig(
+        config = tradingConfig.gmoPublicClient,
+        clientType = GmoPublicClientType.FUKUROU_MCP,
+        requestAuditSink = requestAuditSink,
+    ),
     private val clock: Clock = Clock.systemUTC(),
     private val tradingRuntime: TradingRuntime = defaultTradingRuntime(
         tradingConfig = tradingConfig,
@@ -453,6 +476,10 @@ class FukurouMcpServer(
         clock = clock,
     ),
 ) {
+
+    init {
+        requestAuditSink.bind(CommandEventLogGmoPublicRequestAuditSink(tradingRuntime.commandEventLog))
+    }
 
     /**
      * 標準入出力に MCP server を接続し、client から閉じられるまで待機する。
@@ -500,6 +527,7 @@ class FukurouMcpServer(
                 toolCallGuard = tradingRuntime.toolCallGuard,
                 decisionRunContext = decisionRunContext,
                 toolCallLimiter = toolCallLimiter,
+                clientRole = clientRole,
             ),
             klineRequestBudgetHook = DescribedGmoCoinKlineRequestBudgetHook(GMO_MAX_DAILY_KLINE_REQUESTS),
             clock = clock,
@@ -552,11 +580,11 @@ class FukurouMcpServer(
     }
 
     private fun registerTradeTools(server: Server) {
-        server.registerPreviewOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter)
-        server.registerPlaceOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter)
-        server.registerClosePositionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
-        server.registerUpdateProtectionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
-        server.registerCancelOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter)
+        server.registerPreviewOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter, clientRole)
+        server.registerPlaceOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter, clientRole)
+        server.registerClosePositionTool(tradingRuntime, decisionRunContext, toolCallLimiter, clientRole)
+        server.registerUpdateProtectionTool(tradingRuntime, decisionRunContext, toolCallLimiter, clientRole)
+        server.registerCancelOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter, clientRole)
     }
 
     private fun registerDiagnosticTools(server: Server) {
@@ -575,6 +603,7 @@ private class AuditedGmoCoinMarketToolExecutor(
     private val toolCallGuard: ToolCallGuard,
     private val decisionRunContext: DecisionRunContext,
     private val toolCallLimiter: McpToolCallLimiter,
+    private val clientRole: GmoPublicClientRole,
 ) : GmoCoinMarketToolExecutor {
     override suspend fun <T> execute(
         toolName: String,
@@ -586,18 +615,40 @@ private class AuditedGmoCoinMarketToolExecutor(
             return Result.failure(throwable)
         }
 
-        return toolCallGuard.runReadOnlyTool(call, block)
+        return toolCallGuard.runReadOnlyTool(call) {
+            withGmoPublicRequestCorrelation(
+                GmoPublicRequestCorrelation(
+                    decisionRunContext = decisionRunContext,
+                    toolCallId = call.toolCallId,
+                    clientRole = clientRole,
+                ),
+                block,
+            )
+        }
     }
 
     override fun errorResponse(throwable: Throwable): GmoCoinMarketToolErrorResponse? {
-        if (throwable !is ToolCompletionAuditFailedException) {
-            return null
+        return when (throwable) {
+            is ToolCompletionAuditFailedException -> GmoCoinMarketToolErrorResponse(
+                type = "audit_failed_after_execution",
+                executed = throwable.executed,
+            )
+            is GmoRequestAuditException -> GmoCoinMarketToolErrorResponse(
+                type = "audit_failed_after_execution",
+                executed = true,
+            )
+            else -> null
         }
+    }
+}
 
-        return GmoCoinMarketToolErrorResponse(
-            type = "audit_failed_after_execution",
-            executed = throwable.executed,
-        )
+internal fun LlmInvocationPhase.toGmoPublicClientRole(): GmoPublicClientRole {
+    return when (this) {
+        LlmInvocationPhase.PRE_FILTER -> GmoPublicClientRole.UNSPECIFIED
+        LlmInvocationPhase.PROPOSER -> GmoPublicClientRole.PROPOSER
+        LlmInvocationPhase.FALSIFIER -> GmoPublicClientRole.FALSIFIER
+        LlmInvocationPhase.REFLECTION -> GmoPublicClientRole.UNSPECIFIED
+        LlmInvocationPhase.EVALUATION_REPORT -> GmoPublicClientRole.UNSPECIFIED
     }
 }
 
@@ -793,6 +844,7 @@ private fun Server.registerPreviewOrderTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    clientRole: GmoPublicClientRole,
 ) {
     addLimitedTool(
         definition = LimitedToolDefinition(
@@ -807,7 +859,7 @@ private fun Server.registerPreviewOrderTool(
         ),
         context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
-        handlePreviewOrder(request, tradingRuntime, call)
+        handlePreviewOrder(request, tradingRuntime, call, clientRole)
     }
 }
 
@@ -815,6 +867,7 @@ private fun Server.registerPlaceOrderTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    clientRole: GmoPublicClientRole,
 ) {
     addLimitedTool(
         definition = LimitedToolDefinition(
@@ -829,7 +882,7 @@ private fun Server.registerPlaceOrderTool(
         ),
         context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
-        handlePlaceOrder(request, tradingRuntime, call)
+        handlePlaceOrder(request, tradingRuntime, call, clientRole)
     }
 }
 
@@ -868,6 +921,7 @@ private fun Server.registerClosePositionTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    clientRole: GmoPublicClientRole,
 ) {
     addLimitedTool(
         definition = LimitedToolDefinition(
@@ -898,7 +952,7 @@ private fun Server.registerClosePositionTool(
         ),
         context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
-        handleClosePosition(request, tradingRuntime, call)
+        handleClosePosition(request, tradingRuntime, call, clientRole)
     }
 }
 
@@ -906,6 +960,7 @@ private fun Server.registerUpdateProtectionTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    clientRole: GmoPublicClientRole,
 ) {
     addLimitedTool(
         definition = LimitedToolDefinition(
@@ -929,7 +984,7 @@ private fun Server.registerUpdateProtectionTool(
         ),
         context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
-        handleUpdateProtection(request, tradingRuntime, call)
+        handleUpdateProtection(request, tradingRuntime, call, clientRole)
     }
 }
 
@@ -937,6 +992,7 @@ private fun Server.registerCancelOrderTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    clientRole: GmoPublicClientRole,
 ) {
     addLimitedTool(
         definition = LimitedToolDefinition(
@@ -958,7 +1014,7 @@ private fun Server.registerCancelOrderTool(
         ),
         context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
-        handleCancelOrder(request, tradingRuntime, call)
+        handleCancelOrder(request, tradingRuntime, call, clientRole)
     }
 }
 
@@ -1401,11 +1457,14 @@ private suspend fun handlePreviewOrder(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
     call: GuardedToolCall,
+    clientRole: GmoPublicClientRole,
 ): CallToolResult {
     val result = tradingRuntime.toolCallGuard.runReadOnlyTool(call) {
         val command = parsePlaceOrderCommand(request, call).getOrThrow()
 
-        tradingRuntime.broker.previewOrder(command).getOrThrow()
+        withMcpGmoRequestCorrelation(call, clientRole) {
+            tradingRuntime.broker.previewOrder(command).getOrThrow()
+        }
     }
 
     return result.fold(
@@ -1418,11 +1477,14 @@ private suspend fun handlePlaceOrder(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
     call: GuardedToolCall,
+    clientRole: GmoPublicClientRole,
 ): CallToolResult {
     val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
         val command = parsePlaceOrderCommand(request, call).getOrThrow()
 
-        tradingRuntime.broker.placeOrder(command).getOrThrow()
+        withMcpGmoRequestCorrelation(call, clientRole) {
+            tradingRuntime.broker.placeOrder(command).getOrThrow()
+        }
     }
 
     return result.fold(
@@ -1435,11 +1497,14 @@ private suspend fun handleClosePosition(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
     call: GuardedToolCall,
+    clientRole: GmoPublicClientRole,
 ): CallToolResult {
     val result = tradingRuntime.toolCallGuard.runRiskReducingTradeTool(call) {
         val command = parseClosePositionCommand(request, call).getOrThrow()
 
-        tradingRuntime.broker.closePosition(command).getOrThrow()
+        withMcpGmoRequestCorrelation(call, clientRole) {
+            tradingRuntime.broker.closePosition(command).getOrThrow()
+        }
     }
 
     return result.fold(
@@ -1452,11 +1517,14 @@ private suspend fun handleUpdateProtection(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
     call: GuardedToolCall,
+    clientRole: GmoPublicClientRole,
 ): CallToolResult {
     val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
         val command = parseUpdateProtectionCommand(request, call).getOrThrow()
 
-        tradingRuntime.broker.updateProtection(command).getOrThrow()
+        withMcpGmoRequestCorrelation(call, clientRole) {
+            tradingRuntime.broker.updateProtection(command).getOrThrow()
+        }
     }
 
     return result.fold(
@@ -1469,11 +1537,14 @@ private suspend fun handleCancelOrder(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
     call: GuardedToolCall,
+    clientRole: GmoPublicClientRole,
 ): CallToolResult {
     val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
         val command = parseCancelOrderCommand(request, call).getOrThrow()
 
-        tradingRuntime.broker.cancelOrder(command).getOrThrow()
+        withMcpGmoRequestCorrelation(call, clientRole) {
+            tradingRuntime.broker.cancelOrder(command).getOrThrow()
+        }
     }
 
     return result.fold(
@@ -2512,11 +2583,30 @@ private fun JsonObjectBuilder.putNullableString(name: String, value: String?) {
 
 private fun throwableResult(throwable: Throwable): CallToolResult {
     val type = toolErrorType(throwable)
-    val executed = if (throwable is ToolCompletionAuditFailedException) throwable.executed else null
+    val executed = when (throwable) {
+        is ToolCompletionAuditFailedException -> throwable.executed
+        is GmoRequestAuditException -> true
+        else -> null
+    }
 
     val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
 
     return mcpErrorResult(type, throwable.message.orEmpty(), executed, failureKind)
+}
+
+private suspend fun <T> withMcpGmoRequestCorrelation(
+    call: GuardedToolCall,
+    clientRole: GmoPublicClientRole,
+    block: suspend () -> T,
+): T {
+    return withGmoPublicRequestCorrelation(
+        GmoPublicRequestCorrelation(
+            decisionRunContext = call.decisionRunContext,
+            toolCallId = call.toolCallId,
+            clientRole = clientRole,
+        ),
+        block,
+    )
 }
 
 private fun toolErrorType(throwable: Throwable): String {

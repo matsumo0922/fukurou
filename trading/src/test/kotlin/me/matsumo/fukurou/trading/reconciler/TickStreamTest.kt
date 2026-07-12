@@ -10,12 +10,14 @@ import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 
 /**
  * TickStream の REST polling contract を検証するテスト。
@@ -46,12 +48,34 @@ class TickStreamTest {
         assertEquals("101", latestQuote.askPriceJpy.toPlainString())
         assertEquals(fixedInstant(), latestQuote.observedAt)
     }
+
+    @Test
+    fun rest_polling_tick_stream_propagatesAuditFailureFromAtrCandles() = runBlocking {
+        val tickStream = RestPollingTickStream(
+            marketDataSource = AuditFailingAtrMarketDataSource(),
+            latestMarketQuoteStore = LatestMarketQuoteStore(),
+            clock = fixedClock(),
+        )
+
+        assertFailsWith<GmoRequestAuditException> {
+            tickStream.latestTick().getOrThrow()
+        }
+        Unit
+    }
+}
+
+private class AuditFailingAtrMarketDataSource : RecordingMarketDataSource() {
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> = Result.failure(GmoRequestAuditException())
 }
 
 /**
  * 呼び出し回数を記録する market data source。
  */
-private class RecordingMarketDataSource : MarketDataSource {
+private open class RecordingMarketDataSource : MarketDataSource {
 
     /**
      * ticker 呼び出し回数。

@@ -1035,6 +1035,13 @@ class OpsRouteTest {
                 toolName = "reconciler",
             ),
         ).getOrThrow()
+        eventLog.append(
+            auditEvent(
+                eventType = CommandEventType.GMO_PUBLIC_REST_REQUEST_COMPLETED,
+                occurredAt = fixedInstant().plusSeconds(7),
+                toolName = "gmo_public_rest",
+            ),
+        ).getOrThrow()
         val ledgerRepository = InMemoryPaperLedgerRepository(
             executions = listOf(
                 execution(
@@ -1072,6 +1079,18 @@ class OpsRouteTest {
         val auditFilterResponse = client.get("/ops/activity?source=audit&auditEventType=HARD_HALT_SET&limit=10")
         val auditFilterBody = Json.parseToJsonElement(auditFilterResponse.bodyAsText()).jsonObject
         val auditFilterEvents = auditFilterBody.getValue("events").jsonArray.map { element -> element.jsonObject }
+        val gmoFilterResponse = client.get(
+            "/ops/activity?source=audit&auditEventType=GMO_PUBLIC_REST_REQUEST_COMPLETED&limit=10",
+        )
+        val gmoFilterEvents = Json.parseToJsonElement(gmoFilterResponse.bodyAsText())
+            .jsonObject
+            .getValue("events")
+            .jsonArray
+        val rawGmoResponse = client.get("/ops/audit?eventType=GMO_PUBLIC_REST_REQUEST_COMPLETED")
+        val rawGmoEvents = Json.parseToJsonElement(rawGmoResponse.bodyAsText())
+            .jsonObject
+            .getValue("events")
+            .jsonArray
 
         assertEquals(HttpStatusCode.OK, latestResponse.status)
         assertNoSecretLikeText(latestResponseText)
@@ -1090,6 +1109,10 @@ class OpsRouteTest {
         assertEquals(HttpStatusCode.OK, auditFilterResponse.status)
         assertEquals(1, auditFilterEvents.size)
         assertEquals("HARD_HALT_SET", auditFilterEvents.single().getValue("kind").jsonPrimitive.content)
+        assertEquals(HttpStatusCode.OK, gmoFilterResponse.status)
+        assertEquals(1, gmoFilterEvents.size)
+        assertEquals(HttpStatusCode.OK, rawGmoResponse.status)
+        assertEquals(1, rawGmoEvents.size)
     }
 
     @Test

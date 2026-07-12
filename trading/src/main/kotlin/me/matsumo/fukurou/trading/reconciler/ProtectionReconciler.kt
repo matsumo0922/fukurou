@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
+import me.matsumo.fukurou.trading.logging.safeLogFieldsOrNull
 import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
@@ -30,6 +31,7 @@ import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.market.UnavailableMarketDataIntegrityRepository
+import me.matsumo.fukurou.trading.market.isFailClosedGmoRequestFailure
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -538,6 +540,7 @@ class ProtectionReconciler(
                 message = "ProtectionReconciler market data refresh failed.",
                 throwable = throwable,
             )
+            if (throwable.isFailClosedGmoRequestFailure()) throw throwable
         }
 
         return tickResult.getOrNull()
@@ -715,11 +718,18 @@ private fun buildPassCompletedPayload(
  * 失敗した reconcile pass の payload を組み立てる。
  */
 private fun buildPassFailurePayload(passKind: ReconcilePassKind, throwable: Throwable): String {
+    val safeFields = throwable.safeLogFieldsOrNull()
+
     return buildJsonObject {
         put("pass", passKind.payloadName())
         put("state", "failed")
         put("cause", throwable.javaClass.simpleName)
-        put("message", throwable.message.orEmpty())
+        if (safeFields != null) {
+            put("failureCategory", safeFields.category)
+            put("failureType", safeFields.type)
+        } else {
+            put("message", throwable.message.orEmpty())
+        }
     }.toString()
 }
 

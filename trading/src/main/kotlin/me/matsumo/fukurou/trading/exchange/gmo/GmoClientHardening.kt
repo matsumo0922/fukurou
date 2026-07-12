@@ -4,6 +4,17 @@ import java.time.Clock
 import java.time.Duration
 import kotlin.math.ceil
 
+/** 経過時間の実測に使う monotonic time source。 */
+fun interface GmoMonotonicTimeSource {
+    /** 現在の monotonic time を nanoseconds で返す。 */
+    fun nanoTime(): Long
+}
+
+/** production の経過時間計測に使う monotonic time source。 */
+object SystemGmoMonotonicTimeSource : GmoMonotonicTimeSource {
+    override fun nanoTime(): Long = System.nanoTime()
+}
+
 /**
  * GMO API request 前に rate-limit permit を取得する境界。
  */

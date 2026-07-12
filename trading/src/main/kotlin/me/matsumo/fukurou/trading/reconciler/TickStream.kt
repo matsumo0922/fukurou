@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
 import me.matsumo.fukurou.trading.market.IndicatorType
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.market.isFailClosedGmoRequestFailure
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Clock
@@ -100,7 +101,9 @@ class RestPollingTickStream(
             symbol = symbol,
             interval = CandleInterval.FIVE_MINUTES,
             limit = ATR_CANDLE_LIMIT,
-        )
+        ).onFailure { throwable ->
+            if (throwable.isFailClosedGmoRequestFailure()) throw throwable
+        }
             .getOrNull()
             ?: return null
         val atr = IndicatorCalculator.calculate(

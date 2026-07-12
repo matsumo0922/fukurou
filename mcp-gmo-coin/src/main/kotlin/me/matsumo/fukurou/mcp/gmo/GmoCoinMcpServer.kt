@@ -7,8 +7,10 @@ import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import me.matsumo.fukurou.mcp.runtime.redirectProcessStdoutToStderrForMcpStdio
 import me.matsumo.fukurou.mcp.runtime.runStdioMcpServer
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoUnlimitedDailyKlineRequestBudget
+import me.matsumo.fukurou.trading.exchange.gmo.LoggingGmoPublicRequestAuditSink
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import java.time.Clock
 
@@ -77,5 +79,7 @@ private fun defaultStandaloneMarketDataSource(): MarketDataSource {
     return GmoPublicMarketDataSource.fromConfig(
         config = gmoPublicClientConfig,
         dailyKlineRequestBudget = GmoUnlimitedDailyKlineRequestBudget,
+        clientType = GmoPublicClientType.STANDALONE_MCP,
+        requestAuditSink = LoggingGmoPublicRequestAuditSink(),
     )
 }

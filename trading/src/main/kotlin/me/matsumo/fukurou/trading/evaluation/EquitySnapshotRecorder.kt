@@ -2,11 +2,11 @@ package me.matsumo.fukurou.trading.evaluation
 
 import kotlinx.coroutines.CancellationException
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
+import me.matsumo.fukurou.trading.logging.logSafeWarning
 import java.time.Clock
 import java.time.Instant
 import java.time.LocalDate
 import java.util.UUID
-import java.util.logging.Level
 import java.util.logging.Logger
 
 /**
@@ -44,7 +44,7 @@ class EquitySnapshotRecorder(
             lastRecordedDate = tradingDate
             val accountSnapshot = accountSource().getOrElse { throwable ->
                 lastRecordedDate = previousRecordedDate
-                logger.log(Level.WARNING, "EquitySnapshotRecorder account source failed.", throwable)
+                logger.logSafeWarning("EquitySnapshotRecorder account source failed.", throwable)
 
                 return Result.success(Unit)
             }
@@ -57,7 +57,7 @@ class EquitySnapshotRecorder(
                 )
             }.getOrElse { throwable ->
                 lastRecordedDate = previousRecordedDate
-                logger.log(Level.WARNING, "EquitySnapshotRecorder daily snapshot build failed.", throwable)
+                logger.logSafeWarning("EquitySnapshotRecorder daily snapshot build failed.", throwable)
 
                 return Result.success(Unit)
             }
@@ -68,21 +68,21 @@ class EquitySnapshotRecorder(
                 throw throwable
             } catch (throwable: Throwable) {
                 lastRecordedDate = previousRecordedDate
-                logger.log(Level.WARNING, "EquitySnapshotRecorder daily snapshot append failed.", throwable)
+                logger.logSafeWarning("EquitySnapshotRecorder daily snapshot append failed.", throwable)
 
                 return Result.success(Unit)
             }
 
             appendResult.onFailure { throwable ->
                 lastRecordedDate = previousRecordedDate
-                logger.log(Level.WARNING, "EquitySnapshotRecorder daily snapshot append failed.", throwable)
+                logger.logSafeWarning("EquitySnapshotRecorder daily snapshot append failed.", throwable)
             }
 
             Result.success(Unit)
         } catch (throwable: CancellationException) {
             throw throwable
         } catch (throwable: Throwable) {
-            logger.log(Level.WARNING, "EquitySnapshotRecorder daily snapshot record failed.", throwable)
+            logger.logSafeWarning("EquitySnapshotRecorder daily snapshot record failed.", throwable)
 
             Result.success(Unit)
         }

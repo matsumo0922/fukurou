@@ -9,6 +9,11 @@ import java.util.UUID
  */
 enum class CommandEventType {
     /**
+     * GMO Public REST の実 HTTP attempt が完了した。
+     */
+    GMO_PUBLIC_REST_REQUEST_COMPLETED,
+
+    /**
      * read 系を含む tool call が完了した。
      */
     TOOL_CALL_COMPLETED,

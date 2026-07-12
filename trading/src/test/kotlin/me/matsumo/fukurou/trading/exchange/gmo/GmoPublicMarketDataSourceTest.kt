@@ -1,14 +1,18 @@
 package me.matsumo.fukurou.trading.exchange.gmo
 
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataFailureKind
 import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
+import me.matsumo.fukurou.trading.market.MarketNetworkException
+import java.io.IOException
 import java.net.Authenticator
 import java.net.CookieHandler
 import java.net.ProxySelector
@@ -20,6 +24,7 @@ import java.net.http.HttpResponse
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.Optional
 import java.util.concurrent.CompletableFuture
@@ -30,6 +35,8 @@ import javax.net.ssl.SSLSession
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 /**
  * GMO Public market data source の parser と stitching を検証するテスト。
@@ -59,16 +66,20 @@ class GmoPublicMarketDataSourceTest {
 
     @Test
     fun parseTickerResponse_rejectsNonZeroStatus() {
-        assertFailsWith<GmoApiStatusException> {
+        val exception = assertFailsWith<GmoApiStatusException> {
             parseTickerResponse(ERROR_RESPONSE, TradingSymbol.BTC)
         }
+
+        assertTrue(exception.message.orEmpty().contains("sentinel-private-message").not())
     }
 
     @Test
     fun parseTickerResponse_mapsRateLimitMessage() {
-        assertFailsWith<GmoRateLimitException> {
+        val exception = assertFailsWith<GmoRateLimitException> {
             parseTickerResponse(RATE_LIMIT_RESPONSE, TradingSymbol.BTC)
         }
+
+        assertTrue(exception.message.orEmpty().contains("Requests are too many.").not())
     }
 
     @Test
@@ -290,6 +301,7 @@ class GmoPublicMarketDataSourceTest {
 
     @Test
     fun getCandles_allowsUnlimitedDailyKlineRequestBudget() = runBlocking {
+        val auditSink = RecordingRequestAuditSink()
         val httpClient = FakeHttpClient(
             responses = mapOf(
                 "symbol=BTC&interval=1hour&date=20260102" to klineResponse("2026-01-02T00:00:00Z"),
@@ -300,6 +312,7 @@ class GmoPublicMarketDataSourceTest {
         val marketDataSource = fakeMarketDataSource(
             httpClient = httpClient,
             dailyKlineRequestBudget = GmoUnlimitedDailyKlineRequestBudget,
+            requestAuditSink = auditSink,
         )
 
         val candles = marketDataSource.getCandles(TradingSymbol.BTC, CandleInterval.ONE_HOUR, limit = 3).getOrThrow()
@@ -316,6 +329,10 @@ class GmoPublicMarketDataSourceTest {
             listOf("2025-12-31T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
             candles.map { candle -> candle.openTime },
         )
+        assertEquals(3, auditSink.events.size)
+        assertEquals(listOf(1, 2, 3), auditSink.events.map { event -> event.requestSequence })
+        assertEquals(1, auditSink.events.map { event -> event.operationId }.distinct().size)
+        assertTrue(auditSink.events.all { event -> event.endpoint == GmoPublicEndpoint.KLINES })
     }
 
     @Test
@@ -395,6 +412,29 @@ class GmoPublicMarketDataSourceTest {
     }
 
     @Test
+    fun requestAudit_recordsActualTokenBucketPermitWait() = runBlocking {
+        val clock = AdvancingClock(Instant.parse("2026-01-02T00:00:00Z"))
+        val auditSink = RecordingRequestAuditSink()
+        val rateLimiter = GmoTokenBucketRateLimiter(
+            config = GmoRateLimitConfig(permitsPerSecond = 1, burstSize = 1),
+            clock = clock,
+            sleeper = AdvancingClockSleeper(clock),
+        )
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(responses = mapOf("symbol=BTC" to TICKER_SUCCESS_RESPONSE)),
+            clock = clock,
+            requestRateLimiter = rateLimiter,
+            requestAuditSink = auditSink,
+            monotonicTimeSource = clock,
+        )
+
+        marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+
+        assertEquals(listOf(0L, 1000L), auditSink.events.map { event -> event.permitWaitMillis })
+    }
+
+    @Test
     fun getTicker_retriesTemporaryHttpFailure() = runBlocking {
         val sleeper = RecordingSleeper()
         val httpClient = FakeHttpClient(
@@ -421,6 +461,122 @@ class GmoPublicMarketDataSourceTest {
         assertEquals("BTC", ticker.symbol)
         assertEquals(listOf("symbol=BTC", "symbol=BTC"), httpClient.requestQueries)
         assertEquals(listOf(Duration.ofMillis(25)), sleeper.durations)
+    }
+
+    @Test
+    fun requestAudit_recordsEveryRetryWithCorrelationAndSafeClassification() = runBlocking {
+        val auditSink = RecordingRequestAuditSink()
+        val httpClient = FakeHttpClient(
+            responses = mapOf("symbol=BTC" to TICKER_SUCCESS_RESPONSE),
+            statusCodes = mapOf("symbol=BTC" to listOf(429, 200)),
+        )
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(maxAttempts = 2),
+            requestRateLimiter = RecordingRateLimiter(),
+            requestAuditSink = auditSink,
+        )
+        val correlation = GmoPublicRequestCorrelation(
+            decisionRunContext = DecisionRunContext.EMPTY.copy(decisionRunId = "decision-1"),
+            toolCallId = "tool-1",
+            clientRole = GmoPublicClientRole.PROPOSER,
+        )
+
+        withGmoPublicRequestCorrelation(correlation) {
+            marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        }
+
+        assertEquals(listOf(1, 2), auditSink.events.map { event -> event.attempt })
+        assertEquals(listOf(1, 2), auditSink.events.map { event -> event.requestSequence })
+        assertEquals(1, auditSink.events.map { event -> event.operationId }.distinct().size)
+        assertEquals(GmoPublicRequestOutcome.HTTP_429, auditSink.events.first().outcome)
+        assertEquals(GmoPublicRequestOutcome.HTTP_RESPONSE, auditSink.events.last().outcome)
+        assertTrue(auditSink.events.all { event -> event.permitWaitMillis == 0L })
+        assertTrue(auditSink.events.all { event -> event.decisionRunId == "decision-1" && event.toolCallId == "tool-1" })
+    }
+
+    @Test
+    fun requestAudit_recordsMeasuredPermitWaitIncludingOversleep() = runBlocking {
+        val monotonicTimeSource = MutableMonotonicTimeSource()
+        val auditSink = RecordingRequestAuditSink()
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(responses = mapOf("symbol=BTC" to TICKER_SUCCESS_RESPONSE)),
+            requestRateLimiter = AdvancingRateLimiter(monotonicTimeSource, Duration.ofMillis(17)),
+            requestAuditSink = auditSink,
+            monotonicTimeSource = monotonicTimeSource,
+        )
+
+        marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+
+        assertEquals(17L, auditSink.events.single().permitWaitMillis)
+    }
+
+    @Test
+    fun requestAuditFailure_stopsWithoutAdditionalRetry() = runBlocking {
+        val httpClient = FakeHttpClient(responses = mapOf("symbol=BTC" to TICKER_SUCCESS_RESPONSE))
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(maxAttempts = 3),
+            requestAuditSink = GmoPublicRequestAuditSink { Result.failure(IllegalStateException("secret")) },
+        )
+
+        assertFailsWith<GmoRequestAuditException> {
+            marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        }
+        assertEquals(listOf("symbol=BTC"), httpClient.requestQueries)
+    }
+
+    @Test
+    fun networkAndAuditFailure_keepsAuditFailurePrimaryAndNetworkFailureSuppressed() = runBlocking {
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(
+                responses = emptyMap(),
+                failure = IOException("sentinel-private-network-message"),
+            ),
+            retryConfig = GmoRetryConfig(maxAttempts = 3),
+            requestAuditSink = GmoPublicRequestAuditSink { Result.failure(IllegalStateException("secret")) },
+        )
+
+        val exception = assertFailsWith<GmoRequestAuditException> {
+            marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        }
+        val suppressed = exception.suppressed.single()
+
+        assertTrue(suppressed is MarketNetworkException)
+        assertTrue(suppressed.cause is IOException)
+        assertEquals("GMO public request audit failed after execution.", exception.message)
+        assertTrue(exception.message.orEmpty().contains("sentinel-private-network-message").not())
+    }
+
+    @Test
+    fun rateLimitMessageGuard_rejectsFalsePositiveAndSkipsNormalPayload() {
+        assertFalse(hasPotentialGmoRateLimitMessage(TICKER_SUCCESS_RESPONSE))
+        assertTrue(hasPotentialGmoRateLimitMessage("{\"note\":\"ERR-5003\"}"))
+        assertFalse("{\"note\":\"ERR-5003\"}".hasGmoRateLimitMessage())
+    }
+
+    @Test
+    fun requestAudit_distinguishesJsonRateLimitAndClientInstances() = runBlocking {
+        val firstAuditSink = RecordingRequestAuditSink()
+        val secondAuditSink = RecordingRequestAuditSink()
+        val firstSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(responses = mapOf("symbol=BTC" to RATE_LIMIT_RESPONSE)),
+            retryConfig = GmoRetryConfig(maxAttempts = 1),
+            requestAuditSink = firstAuditSink,
+        )
+        val secondSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(responses = mapOf("symbol=BTC" to TICKER_SUCCESS_RESPONSE)),
+            requestAuditSink = secondAuditSink,
+        )
+
+        assertFailsWith<GmoRateLimitException> {
+            firstSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        }
+        secondSource.getTicker(TradingSymbol.BTC).getOrThrow()
+
+        assertEquals(GmoPublicRequestOutcome.JSON_ERR_5003, firstAuditSink.events.single().outcome)
+        assertEquals("ERR-5003", firstAuditSink.events.single().gmoMessageCode)
+        assertTrue(firstAuditSink.events.single().clientInstanceId != secondAuditSink.events.single().clientInstanceId)
     }
 
     @Test
@@ -474,6 +630,7 @@ private const val MISSING_SYMBOL_RESPONSE = """
 private const val ERROR_RESPONSE = """
 {
   "status": 1,
+  "messages": [{"message_code":"UNKNOWN-SENTINEL","message_string":"sentinel-private-message"}],
   "data": []
 }
 """
@@ -659,6 +816,8 @@ private fun fakeMarketDataSource(
         maxRequests = GMO_MAX_DAILY_KLINE_REQUESTS,
     ),
     sleeper: GmoSleeper = RecordingSleeper(),
+    requestAuditSink: GmoPublicRequestAuditSink = NoopGmoPublicRequestAuditSink,
+    monotonicTimeSource: GmoMonotonicTimeSource = FixedMonotonicTimeSource,
 ): GmoPublicMarketDataSource {
     return GmoPublicMarketDataSource(
         httpClient = httpClient,
@@ -669,7 +828,20 @@ private fun fakeMarketDataSource(
         retryConfig = retryConfig,
         dailyKlineRequestBudget = dailyKlineRequestBudget,
         sleeper = sleeper,
+        clientType = GmoPublicClientType.FUKUROU_MCP,
+        requestAuditSink = requestAuditSink,
+        monotonicTimeSource = monotonicTimeSource,
     )
+}
+
+private class RecordingRequestAuditSink : GmoPublicRequestAuditSink {
+    val events = mutableListOf<GmoPublicRequestAuditEvent>()
+
+    override suspend fun append(event: GmoPublicRequestAuditEvent): Result<Unit> {
+        events += event
+
+        return Result.success(Unit)
+    }
 }
 
 /**
@@ -681,6 +853,7 @@ private fun fakeMarketDataSource(
 private class FakeHttpClient(
     private val responses: Map<String, String>,
     private val statusCodes: Map<String, List<Int>> = emptyMap(),
+    private val failure: IOException? = null,
 ) : HttpClient() {
 
     /**
@@ -729,6 +902,8 @@ private class FakeHttpClient(
         request: HttpRequest,
         responseBodyHandler: HttpResponse.BodyHandler<ResponseBody>,
     ): HttpResponse<ResponseBody> {
+        failure?.let { throw it }
+
         val query = request.uri().rawQuery.orEmpty()
         val body = requireNotNull(responses[query]) {
             "No fake response for query: $query"
@@ -831,5 +1006,55 @@ private class RecordingSleeper : GmoSleeper {
 
     override fun sleep(duration: Duration) {
         durations += duration
+    }
+}
+
+private class AdvancingClock(
+    private var currentInstant: Instant,
+) : Clock(), GmoMonotonicTimeSource {
+    private var elapsedNanos: Long = 0
+
+    override fun getZone(): ZoneId = ZoneOffset.UTC
+
+    override fun withZone(zone: ZoneId): Clock = this
+
+    override fun instant(): Instant = currentInstant
+
+    fun advance(duration: Duration) {
+        currentInstant = currentInstant.plus(duration)
+        elapsedNanos += duration.toNanos()
+    }
+
+    override fun nanoTime(): Long = elapsedNanos
+}
+
+private class AdvancingClockSleeper(
+    private val clock: AdvancingClock,
+) : GmoSleeper {
+    override fun sleep(duration: Duration) {
+        clock.advance(duration)
+    }
+}
+
+private object FixedMonotonicTimeSource : GmoMonotonicTimeSource {
+    override fun nanoTime(): Long = 0
+}
+
+private class MutableMonotonicTimeSource : GmoMonotonicTimeSource {
+    private var currentNanos: Long = 0
+
+    override fun nanoTime(): Long = currentNanos
+
+    fun advance(duration: Duration) {
+        currentNanos += duration.toNanos()
+    }
+}
+
+private class AdvancingRateLimiter(
+    private val monotonicTimeSource: MutableMonotonicTimeSource,
+    private val elapsed: Duration,
+) : GmoRequestRateLimiter {
+    override fun acquirePermit(endpointName: String) {
+        monotonicTimeSource.advance(elapsed)
     }
 }

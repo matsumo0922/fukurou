@@ -71,6 +71,7 @@ object McpLaunchBootstrap {
 
         return McpBootstrapConfig(
             databaseConfig = TradingDatabaseConfig(manifest.dbUrl, manifest.dbUser, password),
+            phase = phase,
             decisionRunContext = DecisionRunContext(
                 decisionRunId = manifest.decisionRunId,
                 llmProvider = manifest.llmProvider,
@@ -98,6 +99,7 @@ object McpLaunchBootstrap {
 /** validated MCP bootstrap values。password を log/serialization 対象へ渡さない。 */
 data class McpBootstrapConfig(
     val databaseConfig: TradingDatabaseConfig,
+    val phase: LlmInvocationPhase,
     val decisionRunContext: DecisionRunContext,
     val allowedTools: Set<String>,
     val expiresAt: Instant,
@@ -108,6 +110,7 @@ data class McpBootstrapConfig(
 ) {
     override fun toString(): String = "McpBootstrapConfig(" +
         "databaseConfig=$databaseConfig, " +
+        "phase=$phase, " +
         "decisionRunContext=$decisionRunContext, " +
         "allowedTools=$allowedTools, " +
         "expiresAt=$expiresAt, " +

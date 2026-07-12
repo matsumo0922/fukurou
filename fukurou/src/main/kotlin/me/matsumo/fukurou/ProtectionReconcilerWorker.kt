@@ -16,6 +16,8 @@ import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
+import me.matsumo.fukurou.trading.exchange.gmo.CommandEventLogGmoPublicRequestAuditSink
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicWebSocketMarketEventStream
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
@@ -166,6 +168,8 @@ private fun ProtectionReconcilerWorkerInputs.createRuntimeComponents(): Protecti
     val marketDataSource = GmoPublicMarketDataSource.fromConfig(
         config = tradingConfig.gmoPublicClient,
         clock = clock,
+        clientType = GmoPublicClientType.KTOR_RECONCILER,
+        requestAuditSink = CommandEventLogGmoPublicRequestAuditSink(repositories.commandEventLog),
     )
     val broker = createBroker(
         repositories = repositories,

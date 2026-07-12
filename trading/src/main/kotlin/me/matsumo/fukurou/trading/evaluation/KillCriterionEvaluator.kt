@@ -9,6 +9,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.config.KillCriterionConfig
+import me.matsumo.fukurou.trading.logging.logSafeWarning
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
@@ -16,7 +17,6 @@ import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
-import java.util.logging.Level
 import java.util.logging.Logger
 
 /**
@@ -61,7 +61,7 @@ class KillCriterionEvaluator(
             val previousEvaluatedAt = lastEvaluatedAt
             lastEvaluatedAt = Instant.now(clock)
             val stats = statsSource().getOrElse { throwable ->
-                logger.log(Level.WARNING, "KillCriterionEvaluator stats source failed.", throwable)
+                logger.logSafeWarning("KillCriterionEvaluator stats source failed.", throwable)
 
                 return Result.success(Unit)
             }
@@ -118,7 +118,7 @@ class KillCriterionEvaluator(
                 occurredAt = Instant.now(clock),
             ),
         ).onFailure { throwable ->
-            logger.log(Level.WARNING, "KillCriterionEvaluator breach audit append failed.", throwable)
+            logger.logSafeWarning("KillCriterionEvaluator breach audit append failed.", throwable)
         }
     }
 

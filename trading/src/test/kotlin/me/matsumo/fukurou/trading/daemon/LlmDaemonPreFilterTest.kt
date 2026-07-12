@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.daemon
 
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.Candle
@@ -17,14 +18,21 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.market.MarketNetworkException
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
 import me.matsumo.fukurou.trading.runner.SecretRedactor
+import java.io.IOException
 import java.nio.file.Path
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.logging.Handler
+import java.util.logging.LogRecord
+import java.util.logging.Logger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -35,6 +43,41 @@ import kotlin.test.assertTrue
  * LlmDaemonPreFilter の Claude stdout parsing を検証するテスト。
  */
 class LlmDaemonPreFilterTest {
+
+    @Test
+    fun preFilterGate_sanitizesGmoAuditFailureWarning() = runBlocking {
+        val handler = PreFilterCapturingLogHandler()
+        val logger = Logger.getAnonymousLogger().apply {
+            useParentHandlers = false
+            addHandler(handler)
+        }
+        val rawFailure = IOException("sentinel-pre-filter-message /private/pre-filter-path")
+        val networkFailure = MarketNetworkException("network sentinel", rawFailure)
+        val auditFailure = GmoRequestAuditException().apply { addSuppressed(networkFailure) }
+        val request = preFilterRequest()
+        val gate = LlmDaemonPreFilterGate(
+            daemonConfig = LlmDaemonConfig(preFilterEnabled = true),
+            preFilter = LlmDaemonPreFilter { Result.failure(auditFailure) },
+            requestBase = request.runnerRequest,
+            warnLogger = RateLimitedWarnLogger(logger, Clock.fixed(FIXED_PRE_FILTER_INSTANT, ZoneOffset.UTC)),
+        )
+
+        val decision = gate.decisionIfNeeded(
+            triggerKind = request.triggerKind,
+            triggerKey = request.triggerKey,
+            invocationId = request.invocationId,
+            observedAt = request.observedAt,
+        )
+        val record = handler.records.single()
+        val rendered = record.message + record.thrown?.stackTraceToString().orEmpty()
+
+        assertEquals(LlmDaemonPreFilterDecision.RUN_FULL, decision)
+        assertEquals(null, record.thrown)
+        assertTrue(rendered.contains("category=GMO_REQUEST_AUDIT_FAILED"))
+        assertFalse(rendered.contains("sentinel-pre-filter-message"))
+        assertFalse(rendered.contains("pre-filter-path"))
+        assertEquals(networkFailure, auditFailure.suppressed.single())
+    }
 
     @Test
     fun defaultPreFilterParsesClaudeJsonResultYes() = runBlocking {
@@ -131,6 +174,18 @@ class LlmDaemonPreFilterTest {
         assertFalse(message.contains("MAYBE"))
         assertFalse(message.contains("previous decision thesis"))
     }
+}
+
+private class PreFilterCapturingLogHandler : Handler() {
+    val records = mutableListOf<LogRecord>()
+
+    override fun publish(record: LogRecord) {
+        records += record
+    }
+
+    override fun flush() = Unit
+
+    override fun close() = Unit
 }
 
 private fun preFilter(invoker: LlmInvoker): DefaultLlmDaemonPreFilter {
