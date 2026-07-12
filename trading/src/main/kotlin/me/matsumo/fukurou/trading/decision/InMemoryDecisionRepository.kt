@@ -437,7 +437,8 @@ fun validateDecisionSubmission(submission: DecisionSubmission, maxTradePlanRevis
             "${submission.action.name} decision requires setup_tags."
         }
         val predicates = requireNotNull(submission.tradePlan).invalidationPredicates
-        require(predicates.isNotEmpty()) {
+        val usesTypedInvalidationContract = submission.systemPromptVersion == SystemPromptV1.VERSION
+        require(predicates.isNotEmpty() || !usesTypedInvalidationContract) {
             "${submission.action.name} decision requires trade_plan_invalidation_predicates."
         }
         predicates.forEach(::validateInvalidationPredicate)

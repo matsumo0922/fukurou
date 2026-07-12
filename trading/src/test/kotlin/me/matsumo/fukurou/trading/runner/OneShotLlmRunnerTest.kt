@@ -52,6 +52,8 @@ import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
@@ -2430,6 +2432,12 @@ private fun tradePlanDraft(
         targetPriceJpy = targetPriceJpy,
         timeStopAt = null,
         setupTags = listOf("runner-test"),
+        invalidationPredicates = listOf(
+            TradePlanInvalidationPredicate(
+                type = TradePlanInvalidationType.LAST_PRICE_AT_OR_BELOW,
+                decimalThresholdJpy = BigDecimal("9700000"),
+            ),
+        ),
     )
 }
 
