@@ -219,6 +219,7 @@ enum class TradePlanInvalidationType {
 enum class TradePlanInvalidationState { VALID, INVALIDATED, UNKNOWN_DATA }
 
 /** typed quote / time だけで invalidation predicate を評価する。 */
+@Suppress("LongParameterList", "CyclomaticComplexMethod")
 fun evaluateInvalidationPredicates(
     predicates: List<TradePlanInvalidationPredicate>,
     lastPriceJpy: BigDecimal?,
@@ -231,10 +232,18 @@ fun evaluateInvalidationPredicates(
     var unknown = false
     predicates.forEach { predicate ->
         val invalidated = when (predicate.type) {
-            TradePlanInvalidationType.LAST_PRICE_AT_OR_BELOW -> lastPriceJpy?.let { it <= requireNotNull(predicate.decimalThresholdJpy) }
-            TradePlanInvalidationType.LAST_PRICE_AT_OR_ABOVE -> lastPriceJpy?.let { it >= requireNotNull(predicate.decimalThresholdJpy) }
-            TradePlanInvalidationType.BEST_BID_AT_OR_BELOW -> bestBidJpy?.let { it <= requireNotNull(predicate.decimalThresholdJpy) }
-            TradePlanInvalidationType.BEST_ASK_AT_OR_ABOVE -> bestAskJpy?.let { it >= requireNotNull(predicate.decimalThresholdJpy) }
+            TradePlanInvalidationType.LAST_PRICE_AT_OR_BELOW -> lastPriceJpy?.let {
+                it <= requireNotNull(predicate.decimalThresholdJpy)
+            }
+            TradePlanInvalidationType.LAST_PRICE_AT_OR_ABOVE -> lastPriceJpy?.let {
+                it >= requireNotNull(predicate.decimalThresholdJpy)
+            }
+            TradePlanInvalidationType.BEST_BID_AT_OR_BELOW -> bestBidJpy?.let {
+                it <= requireNotNull(predicate.decimalThresholdJpy)
+            }
+            TradePlanInvalidationType.BEST_ASK_AT_OR_ABOVE -> bestAskJpy?.let {
+                it >= requireNotNull(predicate.decimalThresholdJpy)
+            }
             TradePlanInvalidationType.TIME_AT_OR_AFTER -> !observedAt.isBefore(requireNotNull(predicate.instantThreshold))
             TradePlanInvalidationType.MATERIAL_STATE_CHANGED -> materialStateChanged
         }

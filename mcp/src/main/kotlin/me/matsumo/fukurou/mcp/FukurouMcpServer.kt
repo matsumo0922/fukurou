@@ -2240,11 +2240,13 @@ private fun tradeIntentResult(snapshot: TradeIntentReviewSnapshot): CallToolResu
                     put("invalidation_conditions_ja", ToolJson.encodeToJsonElement(tradePlan.draft.invalidationConditionsJa))
                     putJsonArray("invalidation_predicates") {
                         tradePlan.draft.invalidationPredicates.forEach { predicate ->
-                            add(buildJsonObject {
-                                put("type", predicate.type.name)
-                                predicate.decimalThresholdJpy?.let { put("threshold_jpy", it.toPlainString()) }
-                                predicate.instantThreshold?.let { put("threshold_at", it.toString()) }
-                            })
+                            add(
+                                buildJsonObject {
+                                    put("type", predicate.type.name)
+                                    predicate.decimalThresholdJpy?.let { put("threshold_jpy", it.toPlainString()) }
+                                    predicate.instantThreshold?.let { put("threshold_at", it.toString()) }
+                                },
+                            )
                         }
                     }
                     putNullableDecimal("target_price_jpy", tradePlan.draft.targetPriceJpy)

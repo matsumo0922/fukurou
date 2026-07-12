@@ -2406,12 +2406,17 @@ private fun enterDecisionArguments(invocationId: String? = null) = buildJsonObje
     put("trade_plan_revision_count", 0)
     put("trade_plan_thesis_ja", "1時間足の上昇継続に乗る。")
     put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ", "出来高急減"))
-    put("trade_plan_invalidation_predicates", buildJsonArray {
-        add(buildJsonObject {
-            put("type", "LAST_PRICE_AT_OR_BELOW")
-            put("threshold_jpy", "9700000")
-        })
-    })
+    put(
+        "trade_plan_invalidation_predicates",
+        buildJsonArray {
+            add(
+                buildJsonObject {
+                    put("type", "LAST_PRICE_AT_OR_BELOW")
+                    put("threshold_jpy", "9700000")
+                },
+            )
+        },
+    )
     put("trade_plan_target_price_jpy", "10500000")
     put("trade_plan_time_stop_at", "2026-07-02T01:00:00Z")
 }
@@ -2479,12 +2484,17 @@ private fun addLongDecisionArguments(
         put("trade_plan_revision_count", 1)
         put("trade_plan_thesis_ja", "既存仮説の継続に追加します。")
         put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ"))
-        put("trade_plan_invalidation_predicates", buildJsonArray {
-            add(buildJsonObject {
-                put("type", "LAST_PRICE_AT_OR_BELOW")
-                put("threshold_jpy", "9900000")
-            })
-        })
+        put(
+            "trade_plan_invalidation_predicates",
+            buildJsonArray {
+                add(
+                    buildJsonObject {
+                        put("type", "LAST_PRICE_AT_OR_BELOW")
+                        put("threshold_jpy", "9900000")
+                    },
+                )
+            },
+        )
         put("trade_plan_target_price_jpy", "10600000")
         put("trade_plan_time_stop_at", "2026-07-02T02:00:00Z")
     }
