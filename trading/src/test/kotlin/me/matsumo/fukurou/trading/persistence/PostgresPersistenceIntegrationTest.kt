@@ -63,6 +63,7 @@ import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
+import me.matsumo.fukurou.trading.decision.identity.InMemoryDecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
@@ -5730,35 +5731,142 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, openCount)
         runtime.close()
     }
+
+    @Test
+    fun material_manifest_roundTripsWithSameValueAsInMemoryRepository() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runtime = TradingRuntimeFactory.connectedPostgres(
+            dataSource = dataSource,
+            database = database,
+            clock = fixedClock(),
+            marketDataSource = PostgresFakeMarketDataSource,
+            tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+        )
+        val expected = identityManifest("manifest-round-trip")
+        val memory = InMemoryDecisionMaterialStateRepository()
+
+        memory.append(expected).getOrThrow()
+        runtime.decisionMaterialStateRepository.append(expected).getOrThrow()
+
+        assertEquals(memory.find(expected.invocationId).getOrThrow(), runtime.decisionMaterialStateRepository.find(expected.invocationId).getOrThrow())
+        runtime.close()
+    }
+
+    @Test
+    fun ttlAloneKeepsEpisodeUntilNextChangedProposal() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runtime = TradingRuntimeFactory.connectedPostgres(
+            dataSource = dataSource,
+            database = database,
+            clock = fixedClock(),
+            marketDataSource = PostgresFakeMarketDataSource,
+            tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+        )
+        val command = postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("10000000"),
+            takeProfitPriceJpy = BigDecimal("10500000"),
+        )
+        appendIdentityManifest(runtime, "run-entry-${command.commandId}")
+        val approved = approvedPostgresEntryCommand(runtime.decisionRepository, command)
+        val firstEpisode = requireNotNull(runtime.decisionRepository.latestDecisionByInvocationId("run-entry-${command.commandId}").getOrThrow())
+            .decision.identity!!.opportunityEpisodeId
+        exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                """INSERT INTO orders
+                    (id, intent_id, mode, symbol, side, order_type, status, size_btc, limit_price_jpy,
+                     cancel_reason, created_at, updated_at)
+                    VALUES (?, ?, 'PAPER', 'BTC', 'BUY', 'LIMIT', 'CANCELED', 0.005, 10000000,
+                     'resting_entry_order_ttl_expired', ?, ?)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, UUID.randomUUID())
+                statement.setObject(2, approved.intentId)
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.setLong(4, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+        }
+
+        appendIdentityManifest(runtime, "ttl-same")
+        val same = runtime.decisionRepository.submitDecision(
+            entryDecisionSubmission(command).copy(invocationId = "ttl-same"),
+        ).getOrThrow()
+        assertEquals(firstEpisode, same.decision.identity!!.opportunityEpisodeId)
+
+        runtime.decisionMaterialStateRepository.append(
+            identityManifest("ttl-changed").copy(lastPriceJpy = BigDecimal("10200000")),
+        ).getOrThrow()
+        val changed = runtime.decisionRepository.submitDecision(
+            entryDecisionSubmission(command).copy(invocationId = "ttl-changed"),
+        ).getOrThrow()
+        assertTrue(firstEpisode != changed.decision.identity!!.opportunityEpisodeId)
+        val closure = exposedTransaction(database) {
+            jdbcConnection().prepareStatement("SELECT close_reason FROM opportunity_episodes WHERE id=?").use { statement ->
+                statement.setObject(1, firstEpisode)
+                statement.executeQuery().use { result ->
+                    result.next()
+                    result.getString(1)
+                }
+            }
+        }
+        assertEquals("MATERIAL_STATE_CHANGED_AFTER_TTL", closure)
+        runtime.close()
+    }
+
+    @Test
+    fun missingManifestPersistsTypedDecisionAndIntentCoverageFailures() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedDecisionRepository(database, fixedClock())
+
+        val result = repository.submitDecision(enterDecisionSubmission().copy(invocationId = "missing-manifest")).getOrThrow()
+
+        assertEquals(null, result.decision.identity)
+        assertEquals(null, result.tradeIntent?.identity)
+        val failures = exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                """SELECT entity_kind, reason FROM decision_identity_generation_failures
+                    WHERE invocation_id='missing-manifest' ORDER BY entity_kind
+                """.trimIndent(),
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    buildList { while (rows.next()) add(rows.getString(1) to rows.getString(2)) }
+                }
+            }
+        }
+        assertEquals(listOf("DECISION" to "MANIFEST_MISSING", "INTENT" to "MANIFEST_MISSING"), failures)
+    }
 }
 
 private suspend fun appendIdentityManifest(runtime: TradingRuntime, invocationId: String) {
-    runtime.decisionMaterialStateRepository.append(
-        DecisionMaterialStateManifest(
-            invocationId = invocationId,
-            capturedAt = fixedInstant(),
-            triggerKind = DecisionTriggerKind.DAEMON,
-            symbol = TradingSymbol.BTC.apiSymbol,
-            runtimeConfigVersion = null,
-            runtimeConfigHash = null,
-            riskState = "RUNNING",
-            bestBidJpy = BigDecimal("9999000"),
-            bestAskJpy = BigDecimal("10000000"),
-            lastPriceJpy = BigDecimal("10000000"),
-            sourceTimestamp = fixedInstant(),
-            freshness = MaterialFreshness.FRESH,
-            atr14FiveMinutesJpy = BigDecimal("100000"),
-            latestCandleOpenJpy = null,
-            latestCandleHighJpy = null,
-            latestCandleLowJpy = null,
-            latestCandleCloseJpy = null,
-            openPositionFacts = emptyList(),
-            openOrderFacts = emptyList(),
-            missingSources = emptyList(),
-            canonicalContentHash = "b".repeat(64),
-            materialProjection = "risk=RUNNING\npriceMoveBand=0",
-        ),
-    ).getOrThrow()
+    runtime.decisionMaterialStateRepository.append(identityManifest(invocationId)).getOrThrow()
+}
+
+private fun identityManifest(invocationId: String): DecisionMaterialStateManifest {
+    return DecisionMaterialStateManifest(
+        invocationId = invocationId,
+        capturedAt = fixedInstant(),
+        triggerKind = DecisionTriggerKind.DAEMON,
+        symbol = TradingSymbol.BTC.apiSymbol,
+        runtimeConfigVersion = null,
+        runtimeConfigHash = null,
+        riskState = "RUNNING",
+        bestBidJpy = BigDecimal("9999000"),
+        bestAskJpy = BigDecimal("10000000"),
+        lastPriceJpy = BigDecimal("10000000"),
+        sourceTimestamp = fixedInstant(),
+        freshness = MaterialFreshness.FRESH,
+        atr14FiveMinutesJpy = BigDecimal("100000"),
+        latestCandleOpenJpy = null,
+        latestCandleHighJpy = null,
+        latestCandleLowJpy = null,
+        latestCandleCloseJpy = null,
+        openPositionFacts = emptyList(),
+        openOrderFacts = emptyList(),
+        missingSources = emptyList(),
+        canonicalContentHash = "b".repeat(64),
+        materialProjection = "risk=RUNNING\npriceMoveBand=0",
+    )
 }
 
 private fun assertLedgerLineage(database: ExposedDatabase, path: String) {

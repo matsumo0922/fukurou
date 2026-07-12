@@ -38,7 +38,9 @@ import me.matsumo.fukurou.trading.decision.FalsificationRecord
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationState
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjection
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
 import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
@@ -74,7 +76,6 @@ import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.tool.CallerInvocation
 import java.math.BigDecimal
-import java.math.RoundingMode
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.withSuppressedFailure
 import java.nio.file.Files
@@ -523,16 +524,21 @@ class OneShotLlmRunner(
             "freshness=${freshness.name}",
             "missing=${missingSources.joinToString(",") { "${it.source}:${it.reason}" }}",
         ).joinToString("\n")
-        val materialProjection = listOf(
-            "risk=${riskState.state}",
-            "freshness=${freshness.name}",
-            "openPosition=${positions.isNotEmpty()}",
-            "openOrder=${orders.isNotEmpty()}",
-            "priceMoveBand=0",
-            "atrPriceBand=${ratioBand(atr, last)}",
-            "spreadBand=${ratioBand(ask?.subtract(bid ?: ask), last)}",
-            "invalidation=UNKNOWN_DATA",
-        ).joinToString("\n")
+        val anchorPrice = orders.asSequence()
+            .mapNotNull { order -> order.limitPriceJpy?.toBigDecimalOrNull() }
+            .firstOrNull()
+        val materialProjection = DecisionMaterialProjection(
+            riskState = riskState.state.name,
+            freshness = freshness,
+            hasOpenPosition = positions.isNotEmpty(),
+            hasOpenOrder = orders.isNotEmpty(),
+            anchorPriceJpy = anchorPrice ?: last,
+            currentPriceJpy = last,
+            atr14Jpy = atr,
+            bestBidJpy = bid,
+            bestAskJpy = ask,
+            invalidationState = TradePlanInvalidationState.UNKNOWN_DATA,
+        ).canonical(tradingConfig.daemon.priceMoveThresholdRatio)
         val manifest = DecisionMaterialStateManifest(
             invocationId = input.invocationId,
             capturedAt = capturedAt,
@@ -559,13 +565,6 @@ class OneShotLlmRunner(
         )
 
         tradingRuntime.decisionMaterialStateRepository.append(manifest).getOrThrow()
-    }
-
-    private fun ratioBand(numerator: BigDecimal?, denominator: BigDecimal?): String {
-        val unavailable = numerator == null || denominator == null
-        if (unavailable || requireNotNull(denominator).signum() == 0) return "UNKNOWN"
-        val ratio = numerator.abs().divide(denominator.abs(), 12, RoundingMode.HALF_UP)
-        return ratio.divide(tradingConfig.daemon.priceMoveThresholdRatio, 0, RoundingMode.FLOOR).toPlainString()
     }
 
     private suspend fun recordTtlSweepFailure(

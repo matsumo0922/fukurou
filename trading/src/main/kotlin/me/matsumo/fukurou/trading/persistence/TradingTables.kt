@@ -1057,6 +1057,23 @@ object DecisionMaterialStateManifestsTable : Table("decision_material_state_mani
     override val primaryKey = PrimaryKey(invocationId)
 }
 
+/** identity schema が production 集計対象になった明示 boundary。 */
+object DecisionIdentitySchemaBoundariesTable : Table("decision_identity_schema_boundaries") {
+    val schemaVersion = integer("schema_version")
+    val activatedAt = long("activated_at")
+    override val primaryKey = PrimaryKey(schemaVersion)
+}
+
+/** post-boundary identity generation の typed coverage failure。 */
+object DecisionIdentityGenerationFailuresTable : Table("decision_identity_generation_failures") {
+    val id = uuid("id")
+    val invocationId = varchar("invocation_id", 128).nullable()
+    val entityKind = varchar("entity_kind", 16)
+    val reason = varchar("reason", 64)
+    val occurredAt = long("occurred_at")
+    override val primaryKey = PrimaryKey(id)
+}
+
 /** opportunity episode の明示 lifecycle。 */
 object OpportunityEpisodesTable : Table("opportunity_episodes") {
     val id = uuid("id")
@@ -1076,6 +1093,7 @@ object DedupeShadowObservationsTable : Table("dedupe_shadow_observations") {
     val opportunityEpisodeId = uuid("opportunity_episode_id").nullable()
     val classification = varchar("classification", 32).nullable()
     val suppressionReason = varchar("suppression_reason", 64).nullable()
+    val maintenanceTickId = uuid("maintenance_tick_id").nullable()
     val referenceOrderId = uuid("reference_order_id").nullable()
     val oldMaterialStateHash = varchar("old_material_state_hash", 80).nullable()
     val newMaterialStateHash = varchar("new_material_state_hash", 80).nullable()

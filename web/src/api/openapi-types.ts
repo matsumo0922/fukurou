@@ -2412,7 +2412,11 @@ export interface components {
         DeduplicationResponse: {
             decisionIdentityCoverage?: number | null;
             legacyExcludedCount?: number;
+            decisionLegacyExcludedCount?: number;
+            decisionGenerationFailureCount?: number;
             intentIdentityCoverage?: number | null;
+            intentLegacyExcludedCount?: number;
+            intentGenerationFailureCount?: number;
             shadowClassificationCoverage?: number | null;
             classificationCounts?: {
                 [key: string]: number;

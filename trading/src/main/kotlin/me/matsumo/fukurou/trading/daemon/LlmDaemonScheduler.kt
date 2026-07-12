@@ -265,6 +265,7 @@ class LlmDaemonScheduler(
 
         var openRisk = openRiskReader.snapshot().getOrThrow()
         var hasOpenRisk = openRisk.hasOpenRisk
+        if (!openRisk.isRestingEntryOnly) resetRestingSkipMirror()
 
         if (riskState.state == RiskHaltState.SOFT_HALT && !hasOpenRisk) {
             appendSkip(
@@ -798,11 +799,17 @@ class LlmDaemonScheduler(
         }
     }
 
+    private fun resetRestingSkipMirror() {
+        lastRestingSkipReason = null
+        lastRestingSkipMirroredAt = null
+    }
+
     private suspend fun appendLaunched(
         trigger: LlmDaemonTrigger,
         invocationId: String,
         observedAt: Instant,
     ): Result<Unit> {
+        val openRisk = openRiskReader.snapshot().getOrThrow()
         return commandEventLog.append(
             CommandEvent(
                 decisionRunContext = daemonDecisionRunContext(invocationId, runtimeConfigSnapshot),
@@ -815,7 +822,9 @@ class LlmDaemonScheduler(
                     put("triggerKey", trigger.key)
                     put("eventName", trigger.eventName)
                     put("invocationId", invocationId)
-                    put("restingOnly", false)
+                    put("restingOnly", openRisk.isRestingEntryOnly)
+                    put("openPositionCount", openRisk.openPositionCount)
+                    put("restingEntryOrderCount", openRisk.restingEntryOrders.size)
                     put("observedAt", observedAt.toString())
                     runtimeConfigSnapshot?.let { snapshot ->
                         put("runtimeConfigVersionId", snapshot.versionId)

@@ -3,6 +3,11 @@ package me.matsumo.fukurou.trading.persistence
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import me.matsumo.fukurou.trading.config.DEFAULT_LLM_PRICE_MOVE_THRESHOLD_RATIO
 import me.matsumo.fukurou.trading.decision.DecisionRecord
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -20,8 +25,11 @@ import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.TradePlanRecord
+import me.matsumo.fukurou.trading.decision.evaluateInvalidationPredicates
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentity
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjection
+import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
 import me.matsumo.fukurou.trading.decision.identity.classifyShadow
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
 import me.matsumo.fukurou.trading.decision.validateDecisionSubmission
@@ -32,6 +40,7 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import java.math.BigDecimal
 import java.sql.ResultSet
 import java.time.Clock
 import java.time.Duration
@@ -607,16 +616,21 @@ private fun JdbcTransaction.insertDecisionSubmission(
 
     validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
 
-    val materialStateHash = submission.invocationId?.let(::selectMaterialManifestHash)
+    val materialLookup = selectMaterialProjection(submission.invocationId)
+    submission.entryIntent?.let { intent -> lockOpportunityEpisodeSymbol(intent.symbol.apiSymbol) }
+    val thesisId = submission.tradePlan?.let(DecisionIdentityGenerator::thesisId)
+    val latestSameThesis = thesisId?.let(::selectLatestIdentity)
+    val episodeAnchor = latestSameThesis?.let { identity -> selectEpisodeAnchor(identity.opportunityEpisodeId) }
+    val materialProjection = submission.tradePlan?.let { plan ->
+        materialLookup.canonicalProjection(plan, episodeAnchor, now)
+    }
     val candidateIdentity = submission.entryIntent?.let { intent ->
         submission.tradePlan?.let { plan ->
-            materialStateHash?.let { materialProjection ->
-                DecisionIdentityGenerator.generate(UUID.randomUUID(), plan, intent, materialProjection)
+            materialProjection?.let { canonical ->
+                DecisionIdentityGenerator.generate(UUID.randomUUID(), plan, intent, canonical)
             }
         }
     }
-    submission.entryIntent?.let { intent -> lockOpportunityEpisodeSymbol(intent.symbol.apiSymbol) }
-    val latestSameThesis = candidateIdentity?.let { candidate -> selectLatestIdentity(candidate.thesisId) }
     val materialChangedAfterTtl = candidateIdentity != null && latestSameThesis != null &&
         candidateIdentity.materialStateHash != latestSameThesis.materialStateHash &&
         episodeHasTtlCancellation(latestSameThesis.opportunityEpisodeId)
@@ -665,6 +679,10 @@ private fun JdbcTransaction.insertDecisionSubmission(
     }
 
     insertDecision(decision)
+    if (submission.entryIntent != null && identity == null) {
+        appendIdentityGenerationFailure(submission.invocationId, "DECISION", materialLookup.failureReason, now)
+        appendIdentityGenerationFailure(submission.invocationId, "INTENT", materialLookup.failureReason, now)
+    }
     if (identity != null && previousIdentity == null) insertOpportunityEpisode(identity, submission, now)
     tradePlan?.let { record -> insertTradePlan(record) }
     tradeIntent?.let { record -> insertTradeIntent(record) }
@@ -696,7 +714,7 @@ private fun JdbcTransaction.isOpportunityEpisodeOpen(episodeId: UUID): Boolean {
 private fun JdbcTransaction.episodeHasTtlCancellation(episodeId: UUID): Boolean {
     val sql = """SELECT 1 FROM orders o JOIN trade_intents ti ON ti.id = o.intent_id
         WHERE ti.opportunity_episode_id = ? AND o.status = 'CANCELED'
-        AND o.cancel_reason IN ('ttl_expiry','legacy_ttl_sweep') LIMIT 1
+        AND o.cancel_reason IN ('resting_entry_order_ttl_expired','legacy_ttl_sweep') LIMIT 1
     """.trimIndent()
     return jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setObject(1, episodeId)
@@ -783,12 +801,89 @@ private fun JdbcTransaction.insertShadowObservation(
     }
 }
 
-private fun JdbcTransaction.selectMaterialManifestHash(invocationId: String): String? {
+private fun JdbcTransaction.selectMaterialProjection(invocationId: String?): MaterialProjectionLookup {
+    if (invocationId == null) return MaterialProjectionLookup(null, "INVOCATION_ID_MISSING")
     return jdbcConnection().prepareStatement(
-        "SELECT material_projection FROM decision_material_state_manifests WHERE invocation_id = ?",
+        "SELECT material_projection, manifest_json FROM decision_material_state_manifests WHERE invocation_id = ?",
     ).use { statement ->
         statement.setString(1, invocationId)
-        statement.executeQuery().use { result -> if (result.next()) result.getString(1) else null }
+        statement.executeQuery().use { result ->
+            if (!result.next()) return@use MaterialProjectionLookup(null, "MANIFEST_MISSING")
+            val projection = result.getString(1)?.takeIf(String::isNotBlank)
+            MaterialProjectionLookup(
+                projection = projection,
+                failureReason = if (projection == null) "PROJECTION_INCOMPLETE" else null,
+                manifestJson = result.getString(2),
+            )
+        }
+    }
+}
+
+private fun JdbcTransaction.appendIdentityGenerationFailure(
+    invocationId: String?,
+    entityKind: String,
+    reason: String?,
+    now: Instant,
+) {
+    jdbcConnection().prepareStatement(
+        "INSERT INTO decision_identity_generation_failures " +
+            "(id, invocation_id, entity_kind, reason, occurred_at) VALUES (?, ?, ?, ?, ?)",
+    ).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setNullableString(2, invocationId)
+        statement.setString(3, entityKind)
+        statement.setString(4, reason ?: "GENERATION_FAILED")
+        statement.setLong(5, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.selectEpisodeAnchor(episodeId: UUID): BigDecimal? {
+    return jdbcConnection().prepareStatement(
+        """SELECT ti.price_jpy FROM trade_intents ti JOIN decisions d ON d.id = ti.decision_id
+            WHERE ti.opportunity_episode_id = ? AND ti.price_jpy IS NOT NULL
+            ORDER BY d.created_at, d.id LIMIT 1
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, episodeId)
+        statement.executeQuery().use { result -> if (result.next()) result.getBigDecimal(1) else null }
+    }
+}
+
+private data class MaterialProjectionLookup(
+    val projection: String?,
+    val failureReason: String?,
+    val manifestJson: String? = null,
+) {
+    fun canonicalProjection(
+        plan: TradePlanDraft,
+        episodeAnchor: BigDecimal?,
+        observedAt: Instant,
+    ): String? {
+        if (projection == null || manifestJson == null) return null
+        val manifest = Json.parseToJsonElement(manifestJson).jsonObject
+        fun decimal(name: String) = manifest[name]?.jsonPrimitive?.contentOrNull?.toBigDecimalOrNull()
+        val last = decimal("lastPriceJpy")
+        val invalidation = evaluateInvalidationPredicates(
+            predicates = plan.invalidationPredicates,
+            lastPriceJpy = last,
+            bestBidJpy = decimal("bestBidJpy"),
+            bestAskJpy = decimal("bestAskJpy"),
+            observedAt = observedAt,
+            materialStateChanged = null,
+        )
+        return DecisionMaterialProjection(
+            riskState = manifest.getValue("riskState").jsonPrimitive.content,
+            freshness = MaterialFreshness.valueOf(manifest.getValue("freshness").jsonPrimitive.content),
+            hasOpenPosition = manifest.getValue("openPositionFacts").jsonArray.isNotEmpty(),
+            hasOpenOrder = manifest.getValue("openOrderFacts").jsonArray.isNotEmpty(),
+            anchorPriceJpy = episodeAnchor ?: last,
+            currentPriceJpy = last,
+            atr14Jpy = decimal("atr14FiveMinutesJpy"),
+            bestBidJpy = decimal("bestBidJpy"),
+            bestAskJpy = decimal("bestAskJpy"),
+            invalidationState = invalidation,
+        ).canonical(DEFAULT_LLM_PRICE_MOVE_THRESHOLD_RATIO)
     }
 }
 

@@ -2,6 +2,8 @@ package me.matsumo.fukurou.trading.decision.identity
 
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -53,6 +55,25 @@ class DecisionIdentityGeneratorTest {
         assertNotEquals(baseline.materialStateHash, changed.materialStateHash)
     }
 
+    @Test
+    fun freeTextOnlyChange_keepsTypedThesisIdentity() {
+        val episodeId = UUID.randomUUID()
+        val first = DecisionIdentityGenerator.generate(
+            episodeId,
+            tradePlan("自由記述 A", listOf("trend")),
+            intent("0.01"),
+            "priceBand=0",
+        )
+        val second = DecisionIdentityGenerator.generate(
+            episodeId,
+            tradePlan("自由記述 B", listOf("trend")),
+            intent("0.01"),
+            "priceBand=0",
+        )
+
+        assertEquals(first.thesisId, second.thesisId)
+    }
+
     private fun tradePlan(thesis: String, tags: List<String>) = TradePlanDraft(
         parentTradePlanId = null,
         revisionCount = 0,
@@ -62,6 +83,12 @@ class DecisionIdentityGeneratorTest {
         targetPriceJpy = null,
         timeStopAt = null,
         setupTags = tags,
+        invalidationPredicates = listOf(
+            TradePlanInvalidationPredicate(
+                type = TradePlanInvalidationType.LAST_PRICE_AT_OR_BELOW,
+                decimalThresholdJpy = BigDecimal("9900000"),
+            ),
+        ),
     )
 
     private fun intent(size: String) = EntryIntentDraft(

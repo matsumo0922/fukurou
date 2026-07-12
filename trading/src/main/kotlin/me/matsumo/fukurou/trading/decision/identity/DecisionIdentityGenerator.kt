@@ -10,6 +10,9 @@ import java.util.UUID
 
 /** versioned canonicalization から server-owned identity を生成する。 */
 object DecisionIdentityGenerator {
+    /** typed thesis facts だけから thesis ID を生成する。 */
+    fun thesisId(tradePlan: TradePlanDraft): String = "ths_v1_${sha256(thesisCanonical(tradePlan))}"
+
     /**
      * canonical content の lowercase SHA-256。
      */
@@ -26,7 +29,7 @@ object DecisionIdentityGenerator {
     ): DecisionIdentity {
         return DecisionIdentity(
             opportunityEpisodeId = episodeId,
-            thesisId = "ths_v1_${sha256(thesisCanonical(tradePlan))}",
+            thesisId = thesisId(tradePlan),
             geometryHash = "geo_v1_${sha256(geometryCanonical(intent))}",
             materialStateHash = "mat_v1_${sha256(materialProjection)}",
         )
@@ -48,11 +51,16 @@ object DecisionIdentityGenerator {
 
     private fun thesisCanonical(tradePlan: TradePlanDraft): String {
         val tags = tradePlan.setupTags.map(::canonicalText).distinct().sorted()
-        val invalidations = tradePlan.invalidationConditionsJa.map(::canonicalText).distinct().sorted()
+        val invalidations = tradePlan.invalidationPredicates.map { predicate ->
+            listOf(
+                predicate.type.name,
+                predicate.decimalThresholdJpy?.let(::canonicalDecimal).orEmpty(),
+                predicate.instantThreshold?.toString().orEmpty(),
+            ).joinToString("|")
+        }.distinct().sorted()
 
         return listOf(
             "symbol=${tradePlan.symbol.apiSymbol}",
-            "thesis=${canonicalText(tradePlan.thesisJa)}",
             "tags=${tags.joinToString("|")}",
             "invalidations=${invalidations.joinToString("|")}",
         ).joinToString("\n")

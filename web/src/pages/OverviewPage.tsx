@@ -86,7 +86,9 @@ export function OverviewPage() {
 type DeduplicationTelemetry = {
   decisionIdentityCoverage: number | null;
   legacyExcludedCount: number;
+  decisionGenerationFailureCount: number;
   intentIdentityCoverage: number | null;
+  intentGenerationFailureCount: number;
   shadowClassificationCoverage: number | null;
   classificationCounts: Record<string, number>;
   falseSuppressionRate: number | null;
@@ -115,6 +117,8 @@ function DeduplicationPanel({ evaluationQuery }: { evaluationQuery: UseQueryResu
       </div>
       <DataStrip items={[
         { label: t("overview.label.decisionIdentityCoverage"), value: formatRatioAsPercent(deduplication.decisionIdentityCoverage?.toString()) },
+        { label: t("overview.label.legacyExcluded"), value: String(deduplication.legacyExcludedCount) },
+        { label: t("overview.label.identityFailures"), value: `${deduplication.decisionGenerationFailureCount} / ${deduplication.intentGenerationFailureCount}` },
         { label: t("overview.label.intentIdentityCoverage"), value: formatRatioAsPercent(deduplication.intentIdentityCoverage?.toString()) },
         { label: t("overview.label.shadowCoverage"), value: formatRatioAsPercent(deduplication.shadowClassificationCoverage?.toString()) },
         { label: t("overview.label.falseSuppression"), value: formatRatioAsPercent(deduplication.falseSuppressionRate?.toString()) },

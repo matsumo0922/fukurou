@@ -959,20 +959,27 @@ private fun JdbcTransaction.selectKillCriterionStats(): KillCriterionStats {
 }
 
 private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod): DeduplicationMetrics {
-    val sql = """SELECT
-        (SELECT COUNT(*) FROM decisions WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at >= COALESCE((SELECT MIN(captured_at) FROM decision_material_state_manifests), created_at)),
-        (SELECT COUNT(*) FROM decisions WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at >= COALESCE((SELECT MIN(captured_at) FROM decision_material_state_manifests), created_at) AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
-        (SELECT COUNT(*) FROM trade_intents WHERE created_at>=? AND created_at<?),
-        (SELECT COUNT(*) FROM trade_intents WHERE created_at>=? AND created_at<? AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
+    val sql = """WITH boundary AS (
+        SELECT activated_at FROM decision_identity_schema_boundaries WHERE schema_version = 1
+      ) SELECT
+        (SELECT COUNT(*) FROM decisions, boundary WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at >= boundary.activated_at),
+        (SELECT COUNT(*) FROM decisions, boundary WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at >= boundary.activated_at AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
+        (SELECT COUNT(*) FROM trade_intents, boundary WHERE created_at>=? AND created_at<? AND created_at >= boundary.activated_at),
+        (SELECT COUNT(*) FROM trade_intents, boundary WHERE created_at>=? AND created_at<? AND created_at >= boundary.activated_at AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
         (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<?),
         (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<? AND classification IS NOT NULL AND opportunity_episode_id IS NOT NULL AND data_quality='COMPLETE'),
         (SELECT COUNT(DISTINCT opportunity_episode_id) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<?),
-        (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observation_kind='RESTING_MAINTENANCE' AND observed_at>=? AND observed_at<?),
-        (SELECT COUNT(*) FROM decisions WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at < COALESCE((SELECT MIN(captured_at) FROM decision_material_state_manifests), created_at))
+        (SELECT COUNT(DISTINCT (maintenance_tick_id, reference_order_id)) FROM dedupe_shadow_observations WHERE observation_kind='RESTING_MAINTENANCE' AND observed_at>=? AND observed_at<? AND maintenance_tick_id IS NOT NULL AND reference_order_id IS NOT NULL),
+        (SELECT COUNT(*) FROM decisions, boundary WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at < boundary.activated_at),
+        (SELECT COUNT(*) FROM trade_intents, boundary WHERE created_at>=? AND created_at<? AND created_at < boundary.activated_at)
     """.trimIndent()
     return jdbcConnection().prepareStatement(sql).use { statement ->
         var index = 1
-        repeat(9) {
+        repeat(8) {
+            statement.setLong(index++, period.from.toEpochMilli())
+            statement.setLong(index++, period.toExclusive.toEpochMilli())
+        }
+        repeat(2) {
             statement.setLong(index++, period.from.toEpochMilli())
             statement.setLong(index++, period.toExclusive.toEpochMilli())
         }
@@ -990,7 +997,11 @@ private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod)
                 shadowComplete = result.getInt(6),
                 uniqueEpisodeCount = result.getInt(7),
                 rawSuppressedHeartbeatCount = result.getInt(8),
-                legacyExcludedCount = result.getInt(9),
+                legacyExcludedCount = result.getInt(9) + result.getInt(10),
+                decisionLegacyExcludedCount = result.getInt(9),
+                decisionGenerationFailureCount = result.getInt(1) - result.getInt(2),
+                intentLegacyExcludedCount = result.getInt(10),
+                intentGenerationFailureCount = result.getInt(3) - result.getInt(4),
                 classificationCounts = classificationCounts,
                 falseSuppressionCount = resolutionCounts["FALSE_SUPPRESSION_PROXY"] ?: 0,
                 validSuppressionCount = resolutionCounts["VALID_SUPPRESSION_PROXY"] ?: 0,
@@ -1049,7 +1060,10 @@ private data class DedupeLaunchCounts(val restingOnlyDaemon: Int, val manual: In
 
 private fun JdbcTransaction.selectDedupeLaunchCounts(period: EvaluationPeriod): DedupeLaunchCounts {
     val sql = """SELECT
-      COUNT(*) FILTER (WHERE payload LIKE '%\"triggerKind\":\"MANUAL\"%'),
+      COUNT(*) FILTER (
+        WHERE payload LIKE '%\"triggerKind\":\"MANUAL\"%'
+        AND payload ~ '\"restingEntryOrderCount\":[1-9][0-9]*'
+      ),
       COUNT(*) FILTER (
         WHERE payload LIKE '%\"restingOnly\":true%'
       ) FROM command_event_log

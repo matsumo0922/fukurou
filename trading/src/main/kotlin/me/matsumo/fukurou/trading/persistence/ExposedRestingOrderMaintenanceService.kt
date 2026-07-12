@@ -12,6 +12,8 @@ import me.matsumo.fukurou.trading.decision.TradePlanInvalidationState
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.evaluateInvalidationPredicates
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjection
+import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.lock.TradingLock
@@ -49,11 +51,13 @@ class ExposedRestingOrderMaintenanceService(
         val quote = latestMarketQuoteStore.snapshot()
 
         tradingLock.withLock(LOCK_OWNER) {
+            val maintenanceTickId = UUID.randomUUID()
             val positionsAppeared = broker.getPositions().getOrThrow().isNotEmpty()
             val openOrderIds = broker.getOpenOrders().getOrThrow().map(Order::orderId).toSet()
             val observations = snapshot.restingEntryOrders.map { reference ->
                 evaluateOrder(
                     reference = reference,
+                    maintenanceTickId = maintenanceTickId,
                     orderStillOpen = reference.orderId in openOrderIds && !positionsAppeared,
                     quote = quote,
                     observedAt = observedAt,
@@ -69,6 +73,7 @@ class ExposedRestingOrderMaintenanceService(
 
     private suspend fun evaluateOrder(
         reference: Order,
+        maintenanceTickId: UUID,
         orderStillOpen: Boolean,
         quote: me.matsumo.fukurou.trading.reconciler.LatestMarketQuote?,
         observedAt: Instant,
@@ -77,7 +82,7 @@ class ExposedRestingOrderMaintenanceService(
         val executablePrice = reference.executablePrice(quote?.bidPriceJpy, quote?.askPriceJpy)
         val quoteStale = quote != null && Duration.between(quote.observedAt, observedAt) > maxQuoteAge
         val distance = reference.distanceFromEntry(executablePrice)
-        val baseline = identity?.episodeId?.let { episodeId -> findBaseline(episodeId) }
+        val baseline = identity?.episodeId?.let { episodeId -> findBaseline(episodeId, reference.orderId) }
         val priceApproached = reference.priceApproached(distance, baseline?.distanceJpy)
         val currentAtrRatio = quote?.atr14Jpy?.let { atr ->
             executablePrice?.takeUnless { it.signum() == 0 }?.let { price ->
@@ -108,6 +113,7 @@ class ExposedRestingOrderMaintenanceService(
             invalidationState = invalidationState,
         )
         return MaintenanceObservation(
+            maintenanceTickId = maintenanceTickId,
             identity = identity,
             orderId = reference.orderId,
             executablePrice = executablePrice,
@@ -126,10 +132,10 @@ class ExposedRestingOrderMaintenanceService(
     private fun List<MaintenanceObservation>.aggregateReason(): RestingSuppressionReason {
         val priority = listOf(
             RestingSuppressionReason.RESTING_ORDER_STATE_RACE,
-            RestingSuppressionReason.RESTING_ORDER_INVALIDATED,
-            RestingSuppressionReason.RESTING_ORDER_MATERIAL_CHANGED,
             RestingSuppressionReason.RESTING_ORDER_QUOTE_UNAVAILABLE,
             RestingSuppressionReason.RESTING_ORDER_IDENTITY_UNAVAILABLE,
+            RestingSuppressionReason.RESTING_ORDER_INVALIDATED,
+            RestingSuppressionReason.RESTING_ORDER_MATERIAL_CHANGED,
             RestingSuppressionReason.RESTING_ORDER_UNCHANGED,
         )
         return priority.first { reason -> any { observation -> observation.reason == reason } }
@@ -180,26 +186,31 @@ class ExposedRestingOrderMaintenanceService(
         }
     }
 
-    private suspend fun findBaseline(episodeId: UUID): EpisodeBaseline? = withContext(Dispatchers.IO) {
-        transaction(database) {
-            jdbcConnection().prepareStatement(
-                """SELECT distance_jpy, atr_price_ratio FROM dedupe_shadow_observations
-                    WHERE opportunity_episode_id = ? AND (distance_jpy IS NOT NULL OR atr_price_ratio IS NOT NULL)
-                    ORDER BY observed_at, id LIMIT 1
-                """.trimIndent(),
-            ).use { statement ->
-                statement.setObject(1, episodeId)
-                statement.executeQuery().use { result ->
-                    if (result.next()) EpisodeBaseline(result.getBigDecimal(1), result.getBigDecimal(2)) else null
+    private suspend fun findBaseline(episodeId: UUID, orderId: String?): EpisodeBaseline? =
+        withContext(Dispatchers.IO) {
+            val referenceOrderId = orderId.toUuidOrNull() ?: return@withContext null
+            transaction(database) {
+                jdbcConnection().prepareStatement(
+                    """SELECT distance_jpy, atr_price_ratio FROM dedupe_shadow_observations
+                        WHERE opportunity_episode_id = ? AND reference_order_id = ?
+                        AND distance_jpy IS NOT NULL AND atr_price_ratio IS NOT NULL AND data_quality = 'COMPLETE'
+                        ORDER BY observed_at, id LIMIT 1
+                    """.trimIndent(),
+                ).use { statement ->
+                    statement.setObject(1, episodeId)
+                    statement.setObject(2, referenceOrderId)
+                    statement.executeQuery().use { result ->
+                        if (result.next()) EpisodeBaseline(result.getBigDecimal(1), result.getBigDecimal(2)) else null
+                    }
                 }
             }
         }
-    }
 
     private suspend fun appendObservation(observation: MaintenanceObservation) = withContext(Dispatchers.IO) {
         transaction(database) { appendObservationRow(observation) }
     }
 
+    @Suppress("LongMethod")
     private fun JdbcTransaction.appendObservationRow(observation: MaintenanceObservation) {
         val observationId = UUID.randomUUID()
         val identity = observation.identity
@@ -209,15 +220,27 @@ class ExposedRestingOrderMaintenanceService(
             RestingSuppressionReason.RESTING_ORDER_INVALIDATED,
         )
         val newMaterialHash = if (materialChanged && identity != null) {
-            "mat_v1_${DecisionIdentityGenerator.contentHash("${identity.materialStateHash}|${observation.distance}")}"
+            val projection = DecisionMaterialProjection(
+                riskState = "UNKNOWN",
+                freshness = if (observation.quoteStale) MaterialFreshness.STALE else MaterialFreshness.FRESH,
+                hasOpenPosition = false,
+                hasOpenOrder = true,
+                anchorPriceJpy = observation.entryPrice,
+                currentPriceJpy = observation.executablePrice,
+                atr14Jpy = observation.atrPriceRatio?.multiply(observation.executablePrice ?: BigDecimal.ZERO),
+                bestBidJpy = null,
+                bestAskJpy = null,
+                invalidationState = observation.invalidationState,
+            ).canonical(priceMoveThresholdRatio)
+            "mat_v1_${DecisionIdentityGenerator.contentHash(projection)}"
         } else {
             identity?.materialStateHash
         }
         val sql = """INSERT INTO dedupe_shadow_observations
             (id, observation_kind, opportunity_episode_id, classification, suppression_reason,
-             reference_order_id, old_material_state_hash, new_material_state_hash,
+             maintenance_tick_id, reference_order_id, old_material_state_hash, new_material_state_hash,
              invalidation_state, distance_jpy, signed_distance_bps, atr_price_ratio, data_quality, observed_at)
-            VALUES (?, 'RESTING_MAINTENANCE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, 'RESTING_MAINTENANCE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """.trimIndent()
         jdbcConnection().prepareStatement(sql).use { statement ->
             statement.setObject(1, observationId)
@@ -231,15 +254,16 @@ class ExposedRestingOrderMaintenanceService(
                 },
             )
             statement.setString(4, observation.reason.wireCode)
-            statement.setObject(5, observation.orderId.toUuidOrNull())
-            statement.setString(6, identity?.materialStateHash)
-            statement.setString(7, newMaterialHash)
-            statement.setString(8, observation.invalidationState.name)
-            statement.setBigDecimal(9, observation.distance?.abs())
-            statement.setBigDecimal(10, observation.signedDistanceBps())
-            statement.setBigDecimal(11, observation.atrPriceRatio)
-            statement.setString(12, observation.dataQuality())
-            statement.setLong(13, observation.observedAt.toEpochMilli())
+            statement.setObject(5, observation.maintenanceTickId)
+            statement.setObject(6, observation.orderId.toUuidOrNull())
+            statement.setString(7, identity?.materialStateHash)
+            statement.setString(8, newMaterialHash)
+            statement.setString(9, observation.invalidationState.name)
+            statement.setBigDecimal(10, observation.distance?.abs())
+            statement.setBigDecimal(11, observation.signedDistanceBps())
+            statement.setBigDecimal(12, observation.atrPriceRatio)
+            statement.setString(13, observation.dataQuality())
+            statement.setLong(14, observation.observedAt.toEpochMilli())
             statement.executeUpdate()
         }
         appendResolution(
@@ -256,9 +280,6 @@ class ExposedRestingOrderMaintenanceService(
                 observation.invalidationState == TradePlanInvalidationState.INVALIDATED -> "TYPED_INVALIDATION"
                 hasFilledEntry(identity.episodeId) -> "ENTRY_FILL"
                 hasExplicitCancellation(identity.episodeId) -> "NON_TTL_CANCEL"
-                observation.priceApproached == true && hasTtlCancellation(identity.episodeId) -> {
-                    "MATERIAL_STATE_CHANGED_AFTER_TTL"
-                }
                 else -> null
             } ?: return@transaction
             val closed = jdbcConnection().prepareStatement(
@@ -286,7 +307,7 @@ class ExposedRestingOrderMaintenanceService(
               WHERE ti.opportunity_episode_id=e.id AND o.status='FILLED') THEN 'ENTRY_FILL'
             WHEN EXISTS (SELECT 1 FROM orders o JOIN trade_intents ti ON ti.id=o.intent_id
               WHERE ti.opportunity_episode_id=e.id AND o.status='CANCELED'
-              AND o.cancel_reason NOT IN ('ttl_expiry','legacy_ttl_sweep')) THEN 'NON_TTL_CANCEL'
+              AND o.cancel_reason NOT IN ('resting_entry_order_ttl_expired','legacy_ttl_sweep')) THEN 'NON_TTL_CANCEL'
           END
           FROM opportunity_episodes e WHERE e.closed_at IS NULL
         """.trimIndent()
@@ -317,14 +338,8 @@ class ExposedRestingOrderMaintenanceService(
     private fun JdbcTransaction.hasExplicitCancellation(episodeId: UUID): Boolean {
         return episodeHasOrder(
             episodeId,
-            "o.status = 'CANCELED' AND o.cancel_reason NOT IN ('ttl_expiry','legacy_ttl_sweep')",
-        )
-    }
-
-    private fun JdbcTransaction.hasTtlCancellation(episodeId: UUID): Boolean {
-        return episodeHasOrder(
-            episodeId,
-            "o.status = 'CANCELED' AND o.cancel_reason IN ('ttl_expiry','legacy_ttl_sweep')",
+            "o.status = 'CANCELED' AND o.cancel_reason NOT IN " +
+                "('resting_entry_order_ttl_expired','legacy_ttl_sweep')",
         )
     }
 
@@ -415,6 +430,7 @@ class ExposedRestingOrderMaintenanceService(
     )
 
     private data class MaintenanceObservation(
+        val maintenanceTickId: UUID,
         val identity: RestingIdentity?,
         val orderId: String?,
         val executablePrice: BigDecimal?,

@@ -65,7 +65,7 @@ class LlmDaemonSchedulerTest {
         val maintenanceCalls = mutableListOf<LlmDaemonOpenRiskSnapshot>()
         val snapshot = LlmDaemonOpenRiskSnapshot(
             openPositionCount = 0,
-            restingEntryOrders = listOf(restingEntryOrder(), restingEntryOrder()),
+            restingEntryOrders = listOf(restingEntryOrder("resting-order-1"), restingEntryOrder("resting-order-2")),
             otherOpenOrderCount = 0,
         )
         val fixture = schedulerFixture(
@@ -89,6 +89,38 @@ class LlmDaemonSchedulerTest {
         assertTrue(preFilter.requests.isEmpty())
         assertEquals(
             1,
+            fixture.eventLog.events().count { event ->
+                event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED &&
+                    event.payload.contains("resting_order_unchanged")
+            },
+        )
+    }
+
+    @Test
+    fun leavingRestingState_resetsMirrorThrottleBeforeSameReasonReentry() = runBlocking {
+        val resting = LlmDaemonOpenRiskSnapshot(0, listOf(restingEntryOrder()), 0)
+        val flat = LlmDaemonOpenRiskSnapshot(0, emptyList(), 0)
+        var reads = 0
+        val fixture = schedulerFixture(
+            openRiskReader = {
+                val snapshot = when (reads++) {
+                    0 -> resting
+                    1 -> flat
+                    else -> resting
+                }
+                Result.success(snapshot)
+            },
+            restingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
+                Result.success(RestingSuppressionReason.RESTING_ORDER_UNCHANGED)
+            },
+        )
+
+        fixture.scheduler.tick()
+        fixture.scheduler.tick()
+        fixture.scheduler.tick()
+
+        assertEquals(
+            2,
             fixture.eventLog.events().count { event ->
                 event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED &&
                     event.payload.contains("resting_order_unchanged")
@@ -1221,11 +1253,11 @@ private fun schedulerFixture(
     )
 }
 
-private fun restingEntryOrder(): Order {
+private fun restingEntryOrder(orderId: String = "resting-order-1"): Order {
     val now = fixedInstant().toString()
 
     return Order(
-        orderId = "resting-order-1",
+        orderId = orderId,
         intentId = "intent-1",
         positionId = null,
         tradeGroupId = null,

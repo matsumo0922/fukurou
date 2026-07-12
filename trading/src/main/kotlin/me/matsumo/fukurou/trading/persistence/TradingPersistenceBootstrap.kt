@@ -975,6 +975,8 @@ class TradingPersistenceBootstrap(
                     LlmLaunchReservationsTable,
                     SafetyViolationsTable,
                     DecisionMaterialStateManifestsTable,
+                    DecisionIdentitySchemaBoundariesTable,
+                    DecisionIdentityGenerationFailuresTable,
                     OpportunityEpisodesTable,
                     DedupeShadowObservationsTable,
                     DedupeShadowResolutionsTable,
@@ -987,6 +989,14 @@ class TradingPersistenceBootstrap(
                 )
                 ensureRuntimeSchemaObjects()
                 val now = Instant.now(clock)
+
+                jdbcConnection().prepareStatement(
+                    "INSERT INTO decision_identity_schema_boundaries (schema_version, activated_at) VALUES (1, ?) " +
+                        "ON CONFLICT (schema_version) DO NOTHING",
+                ).use { statement ->
+                    statement.setLong(1, now.toEpochMilli())
+                    statement.executeUpdate()
+                }
 
                 ensureActiveRuntimeConfigVersion(now)
                 ensureRiskStateRow(now, paperAccountConfig.initialCashJpy)

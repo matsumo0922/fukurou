@@ -128,9 +128,10 @@ class DefaultManualLlmLaunchService(
         }
 
         val riskState = riskStateRepository.current().getOrThrow()
+        val openRisk = openRiskReader.snapshot().getOrThrow()
 
         if (riskState.state == RiskHaltState.SOFT_HALT) {
-            val hasOpenRisk = openRiskReader.snapshot().getOrThrow().hasOpenRisk
+            val hasOpenRisk = openRisk.hasOpenRisk
 
             if (!hasOpenRisk) {
                 appendSkip(
@@ -174,6 +175,7 @@ class DefaultManualLlmLaunchService(
         appendLaunchedOrFinishReservation(
             invocationId = reservedOutcome.invocationId,
             reason = reason,
+            openRisk = openRisk,
             observedAt = observedAt,
         ).getOrThrow()
         launchReservedInvocation(reservedOutcome.invocationId)
@@ -203,11 +205,13 @@ class DefaultManualLlmLaunchService(
     private suspend fun appendLaunchedOrFinishReservation(
         invocationId: String,
         reason: String,
+        openRisk: LlmDaemonOpenRiskSnapshot,
         observedAt: Instant,
     ): Result<Unit> {
         val appendResult = appendLaunched(
             invocationId = invocationId,
             reason = reason,
+            openRisk = openRisk,
             observedAt = observedAt,
         )
         val appendFailure = appendResult.exceptionOrNull()
@@ -345,6 +349,7 @@ class DefaultManualLlmLaunchService(
     private suspend fun appendLaunched(
         invocationId: String,
         reason: String,
+        openRisk: LlmDaemonOpenRiskSnapshot,
         observedAt: Instant,
     ): Result<Unit> {
         return commandEventLog.append(
@@ -359,6 +364,9 @@ class DefaultManualLlmLaunchService(
                     put("triggerKey", LLM_MANUAL_TRIGGER_KEY)
                     put("eventName", null as String?)
                     put("invocationId", invocationId)
+                    put("restingOnly", openRisk.isRestingEntryOnly)
+                    put("openPositionCount", openRisk.openPositionCount)
+                    put("restingEntryOrderCount", openRisk.restingEntryOrders.size)
                     put("observedAt", observedAt.toString())
                     put("reason", reason)
                     runtimeConfigSnapshot?.let { snapshot ->

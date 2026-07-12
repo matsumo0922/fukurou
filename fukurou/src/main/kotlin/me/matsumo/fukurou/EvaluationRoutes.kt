@@ -763,7 +763,11 @@ data class EvaluationSummaryResponse(
 data class DeduplicationResponse(
     val decisionIdentityCoverage: Double? = null,
     val legacyExcludedCount: Int = 0,
+    val decisionLegacyExcludedCount: Int = 0,
+    val decisionGenerationFailureCount: Int = 0,
     val intentIdentityCoverage: Double? = null,
+    val intentLegacyExcludedCount: Int = 0,
+    val intentGenerationFailureCount: Int = 0,
     val shadowClassificationCoverage: Double? = null,
     val classificationCounts: Map<String, Int> = emptyMap(),
     val rawSuppressedHeartbeatCount: Int = 0,
@@ -782,7 +786,11 @@ data class DeduplicationResponse(
             return DeduplicationResponse(
                 decisionIdentityCoverage = coverage(metrics.decisionComplete, metrics.decisionEligible),
                 legacyExcludedCount = metrics.legacyExcludedCount,
+                decisionLegacyExcludedCount = metrics.decisionLegacyExcludedCount,
+                decisionGenerationFailureCount = metrics.decisionGenerationFailureCount,
                 intentIdentityCoverage = coverage(metrics.intentComplete, metrics.intentEligible),
+                intentLegacyExcludedCount = metrics.intentLegacyExcludedCount,
+                intentGenerationFailureCount = metrics.intentGenerationFailureCount,
                 shadowClassificationCoverage = coverage(metrics.shadowComplete, metrics.shadowEligible),
                 classificationCounts = metrics.classificationCounts,
                 rawSuppressedHeartbeatCount = metrics.rawSuppressedHeartbeatCount,
