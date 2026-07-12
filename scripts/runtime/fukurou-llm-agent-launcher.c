@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
-#include <ftw.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <linux/capability.h>
 
@@ -22,6 +22,11 @@
 
 static void fail(const char *message) {
     fprintf(stderr, "fukurou llm launcher: %s\n", message);
+    _exit(126);
+}
+
+static void fail_errno(const char *message) {
+    fprintf(stderr, "fukurou llm launcher: %s: %s\n", message, strerror(errno));
     _exit(126);
 }
 
@@ -85,23 +90,106 @@ static void verify_canary_security_state(void) {
     }
 }
 
-static int transfer_cleanup_entry(const char *path, const struct stat *metadata, int type, struct FTW *state) {
-    (void)state;
-    if (type == FTW_D) {
-        if (lchown(path, 0, LLM_GID) != 0) return -1;
-        int chmod_result = chmod(path, metadata->st_mode | S_IRUSR | S_IWUSR | S_IXUSR);
-        int handoff_result = lchown(path, APP_UID, LLM_GID);
-        if (chmod_result != 0 || handoff_result != 0) return -1;
-        return 0;
-    }
-    return lchown(path, APP_UID, LLM_GID);
+static int unlink_as_appuser(int directory_fd, const char *name, int flags) {
+    if (seteuid(APP_UID) != 0) return -1;
+    int result = unlinkat(directory_fd, name, flags);
+    int operation_errno = errno;
+    if (seteuid(0) != 0) fail("cleanup cannot restore effective uid");
+    errno = operation_errno;
+    return result;
 }
 
-static int delete_cleanup_entry(const char *path, const struct stat *metadata, int type, struct FTW *state) {
-    (void)metadata;
-    (void)state;
-    if (type == FTW_DP) return rmdir(path);
-    return unlink(path);
+static int cleanup_directory_contents(int directory_fd);
+
+static int cleanup_directory_entry(int directory_fd, const char *name) {
+    for (int attempt = 0; attempt < 128; attempt++) {
+        struct stat metadata;
+        if (fstatat(directory_fd, name, &metadata, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) return 0;
+            return -1;
+        }
+        if (!S_ISDIR(metadata.st_mode)) {
+            if (unlink_as_appuser(directory_fd, name, 0) == 0 || errno == ENOENT) return 0;
+            if (errno == EISDIR) continue;
+            return -1;
+        }
+
+        int child_fd = openat(directory_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (child_fd < 0) {
+            if (errno == ENOENT || errno == ELOOP || errno == ENOTDIR) continue;
+            return -1;
+        }
+        struct stat opened_metadata;
+        if (fstat(child_fd, &opened_metadata) != 0) {
+            int operation_errno = errno;
+            close(child_fd);
+            errno = operation_errno;
+            return -1;
+        }
+        if (metadata.st_dev != opened_metadata.st_dev || metadata.st_ino != opened_metadata.st_ino) {
+            close(child_fd);
+            continue;
+        }
+        int cleanup_result = cleanup_directory_contents(child_fd);
+        int operation_errno = errno;
+        close(child_fd);
+        if (cleanup_result != 0) {
+            errno = operation_errno;
+            return -1;
+        }
+        if (unlink_as_appuser(directory_fd, name, AT_REMOVEDIR) == 0 || errno == ENOENT) return 0;
+        if (errno == ENOTDIR || errno == ENOTEMPTY || errno == EEXIST) continue;
+        return -1;
+    }
+    errno = EBUSY;
+    return -1;
+}
+
+static int cleanup_directory_contents(int directory_fd) {
+    struct stat metadata;
+    if (fstat(directory_fd, &metadata) != 0 || !S_ISDIR(metadata.st_mode)) return -1;
+    if (fchown(directory_fd, 0, LLM_GID) != 0) return -1;
+    if (fchmod(directory_fd, metadata.st_mode | S_IRUSR | S_IWUSR | S_IXUSR) != 0) return -1;
+    if (fchown(directory_fd, APP_UID, LLM_GID) != 0) return -1;
+
+    for (int pass = 0; pass < 128; pass++) {
+        int scan_fd = dup(directory_fd);
+        if (scan_fd < 0) return -1;
+        DIR *directory = fdopendir(scan_fd);
+        if (directory == NULL) {
+            int operation_errno = errno;
+            close(scan_fd);
+            errno = operation_errno;
+            return -1;
+        }
+        int entry_count = 0;
+        int read_errno = 0;
+        while (1) {
+            errno = 0;
+            struct dirent *entry = readdir(directory);
+            if (entry == NULL) {
+                read_errno = errno;
+                break;
+            }
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            entry_count++;
+            if (cleanup_directory_entry(directory_fd, entry->d_name) != 0) {
+                int operation_errno = errno;
+                closedir(directory);
+                errno = operation_errno;
+                return -1;
+            }
+        }
+        int operation_errno = read_errno;
+        if (closedir(directory) != 0 && operation_errno == 0) operation_errno = errno;
+        if (operation_errno != 0) {
+            errno = operation_errno;
+            return -1;
+        }
+        if (entry_count == 0) return 0;
+    }
+    errno = EBUSY;
+    return -1;
 }
 
 static int decimal_suffix(const char *value) {
@@ -123,14 +211,43 @@ static void cleanup_per_run_home(const char *path) {
     if (strchr(name, '/') != NULL || suffix == NULL || !decimal_suffix(suffix)) {
         fail("cleanup path name rejected");
     }
+    int root_fd = open(LLM_HOME_ROOT, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root_fd < 0) fail_errno("cleanup root open failed");
+    int home_fd = openat(root_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (home_fd < 0) {
+        close(root_fd);
+        fail_errno("cleanup home open failed");
+    }
     struct stat metadata;
-    if (lstat(path, &metadata) != 0 || !S_ISDIR(metadata.st_mode) ||
-        metadata.st_uid != APP_UID || metadata.st_gid != LLM_GID) fail("cleanup root metadata rejected");
-    if (nftw(path, transfer_cleanup_entry, 32, FTW_PHYS) != 0) fail("cleanup ownership transfer failed");
-    if (setgroups(0, NULL) != 0) fail("cleanup cannot clear supplementary groups");
-    if (setresgid(LLM_GID, LLM_GID, LLM_GID) != 0) fail("cleanup cannot drop gid");
-    if (setresuid(APP_UID, APP_UID, APP_UID) != 0) fail("cleanup cannot drop uid");
-    if (nftw(path, delete_cleanup_entry, 32, FTW_DEPTH | FTW_PHYS) != 0) fail("cleanup traversal failed");
+    if (fstat(home_fd, &metadata) != 0 || !S_ISDIR(metadata.st_mode) ||
+        metadata.st_uid != APP_UID || metadata.st_gid != LLM_GID) {
+        close(home_fd);
+        close(root_fd);
+        fail("cleanup root metadata rejected");
+    }
+    if (setgroups(0, NULL) != 0) {
+        close(home_fd);
+        close(root_fd);
+        fail_errno("cleanup cannot clear supplementary groups");
+    }
+    if (cleanup_directory_contents(home_fd) != 0) {
+        int operation_errno = errno;
+        close(home_fd);
+        close(root_fd);
+        errno = operation_errno;
+        fail_errno("cleanup traversal failed");
+    }
+    if (close(home_fd) != 0) {
+        close(root_fd);
+        fail_errno("cleanup home descriptor close failed");
+    }
+    if (unlink_as_appuser(root_fd, name, AT_REMOVEDIR) != 0) {
+        int operation_errno = errno;
+        close(root_fd);
+        errno = operation_errno;
+        fail_errno("cleanup home removal failed");
+    }
+    if (close(root_fd) != 0) fail_errno("cleanup root descriptor close failed");
     _exit(0);
 }
 
