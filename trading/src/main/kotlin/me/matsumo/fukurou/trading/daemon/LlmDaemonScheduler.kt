@@ -176,6 +176,7 @@ sealed interface LlmDaemonTickResult {
  * @param dependencies scheduler が参照する repository / reader
  * @param runtime scheduler の実行時境界
  */
+@Suppress("LargeClass")
 class LlmDaemonScheduler(
     private val tradingConfig: TradingBotConfig,
     private val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
@@ -245,6 +246,16 @@ class LlmDaemonScheduler(
     }
 
     private suspend fun tickUnsafe(observedAt: Instant): LlmDaemonTickResult {
+        if (!daemonConfig.launchEnabled) {
+            appendSkip(
+                reason = LLM_LAUNCH_DISABLED,
+                trigger = null,
+                observedAt = observedAt,
+            ).getOrThrow()
+
+            return LlmDaemonTickResult.Skipped(LLM_LAUNCH_DISABLED, null)
+        }
+
         val riskState = riskStateRepository.current().getOrThrow()
 
         if (riskState.state == RiskHaltState.HARD_HALT) {

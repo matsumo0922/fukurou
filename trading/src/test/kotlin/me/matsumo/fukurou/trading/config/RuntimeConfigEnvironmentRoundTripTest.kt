@@ -138,6 +138,7 @@ private fun nonDefaultRuntimeConfig(): TradingBotConfig {
         ),
         daemon = config.daemon.copy(
             enabled = true,
+            launchEnabled = false,
             pollInterval = Duration.ofSeconds(120),
             flatHeartbeatInterval = Duration.ofMinutes(20),
             holdingCheckInterval = Duration.ofMinutes(20),

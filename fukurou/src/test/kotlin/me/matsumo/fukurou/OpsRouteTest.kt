@@ -37,6 +37,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
+import me.matsumo.fukurou.trading.daemon.LLM_LAUNCH_DISABLED
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -289,7 +290,7 @@ class OpsRouteTest {
     @Test
     fun opsRoutes_triggerReturnsConflictWhenManualLaunchIsRejected() = testApplication {
         val manualService = CapturingManualLlmLaunchService(
-            ManualLlmLaunchResult.Rejected("concurrent_invocation"),
+            ManualLlmLaunchResult.Rejected(LLM_LAUNCH_DISABLED),
         )
 
         application {
@@ -306,7 +307,7 @@ class OpsRouteTest {
         }
 
         assertEquals(HttpStatusCode.Conflict, response.status)
-        assertTrue(response.bodyAsText().contains("concurrent_invocation"))
+        assertTrue(response.bodyAsText().contains(LLM_LAUNCH_DISABLED))
     }
 
     @Test

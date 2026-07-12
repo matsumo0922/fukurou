@@ -1103,7 +1103,7 @@ private fun Route.registerOpsTriggerRoute(dependencies: OpsRouteDependencies) {
         }
     }.describe {
         summary = "LLM one-shot を手動起動する"
-        description = "reason 付きで MANUAL trigger の起動予約を取得し、runner を HTTP 応答後に非同期実行します。"
+        description = "reason 付きで MANUAL trigger の起動予約を取得し、runner を HTTP 応答後に非同期実行します。llm.launchEnabled=false の場合は LLM_LAUNCH_DISABLED で拒否します。"
         tag(OPS_TAG)
         requestBody {
             description = "手動起動理由です。"

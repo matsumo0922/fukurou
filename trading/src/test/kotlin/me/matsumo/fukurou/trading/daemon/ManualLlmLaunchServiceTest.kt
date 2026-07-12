@@ -56,6 +56,20 @@ import kotlin.time.toDuration
 class ManualLlmLaunchServiceTest {
 
     @Test
+    fun globalLaunchGateRejectsBeforeReservationOrChildLaunch() = runBlocking {
+        val config = tradingConfig().let { value ->
+            value.copy(daemon = value.daemon.copy(launchEnabled = false))
+        }
+        val fixture = manualFixture(tradingConfig = config)
+
+        val result = fixture.service.launch("maintenance").getOrThrow()
+
+        assertEquals(ManualLlmLaunchResult.Rejected(LLM_LAUNCH_DISABLED), result)
+        assertTrue(fixture.launches.isEmpty())
+        assertTrue(fixture.eventLog.events().any { event -> event.payload.contains(LLM_LAUNCH_DISABLED) })
+    }
+
+    @Test
     fun manualLaunch_reservesAuditsAndStartsRunnerWithManualTrigger() = runBlocking {
         val fixture = manualFixture()
 

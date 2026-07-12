@@ -46,6 +46,20 @@ import kotlin.test.assertTrue
 class LlmDaemonSchedulerTest {
 
     @Test
+    fun globalLaunchGateSkipsBeforeReservationOrChildLaunch() = runBlocking {
+        val config = tradingConfig().let { value ->
+            value.copy(daemon = value.daemon.copy(launchEnabled = false))
+        }
+        val fixture = schedulerFixture(tradingConfig = config)
+
+        val result = fixture.scheduler.tick()
+
+        assertEquals(LlmDaemonTickResult.Skipped(LLM_LAUNCH_DISABLED, null), result)
+        assertTrue(fixture.launches.isEmpty())
+        assertTrue(fixture.eventLog.events().any { event -> event.payload.contains(LLM_LAUNCH_DISABLED) })
+    }
+
+    @Test
     fun flatState_launchesOnlyOnFifteenMinuteHeartbeatWhenNoEventExists() = runBlocking {
         val fixture = schedulerFixture()
 

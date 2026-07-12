@@ -116,6 +116,17 @@ class DefaultManualLlmLaunchService(
 
     private suspend fun launchUnsafe(reason: String): ManualLlmLaunchResult {
         val observedAt = Instant.now(clock)
+
+        if (!tradingConfig.daemon.launchEnabled) {
+            appendSkip(
+                skipReason = LLM_LAUNCH_DISABLED,
+                requestReason = reason,
+                observedAt = observedAt,
+            ).getOrThrow()
+
+            return ManualLlmLaunchResult.Rejected(LLM_LAUNCH_DISABLED)
+        }
+
         val riskState = riskStateRepository.current().getOrThrow()
 
         if (riskState.state == RiskHaltState.SOFT_HALT) {
@@ -389,6 +400,8 @@ class DefaultManualLlmLaunchService(
         )
     }
 }
+
+const val LLM_LAUNCH_DISABLED = "LLM_LAUNCH_DISABLED"
 
 /**
  * 手動 LLM 起動 service が使う repository / reader 群。
