@@ -1434,7 +1434,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun bootstrap_reconciles_legacy_100k_baseline_without_rescaling_ledger_or_halt() = runPostgresTest {
+    fun bootstrap_imports_saved_legacy_baseline_without_hidden_reconciliation() = runPostgresTest {
         val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
         bootstrap.ensureSchema().getOrThrow()
         upsertActiveRuntimeConfigValue(database, "paper.initialCashJpy", "100000")
@@ -1452,14 +1452,43 @@ class PostgresPersistenceIntegrationTest {
         val risk = ExposedRiskStateRepository(database).current().getOrThrow()
         val active = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
         val scope = ExposedEvaluationRepository(database).resolveScope(null, null).getOrThrow()
-        assertEquals("1000000", active.values.getValue("paper.initialCashJpy"))
-        assertEquals("1000000.00000000", account.initialCashJpy)
+        assertEquals("100000", active.values.getValue("paper.initialCashJpy"))
+        assertEquals("100000.00000000", account.initialCashJpy)
         assertEquals("777777.00000000", account.cashJpy)
         assertEquals("0.012345670000", account.btcQuantity)
         assertEquals(RiskHaltState.HARD_HALT, risk.state)
         assertEquals(BigDecimal("765432.00000000"), risk.equityPeak)
-        assertEquals(BigDecimal("1000000.00000000"), scope.initialCashJpy)
+        assertEquals(BigDecimal("100000.00000000"), scope.initialCashJpy)
         assertEquals(1, selectCommandEventCountByType(database, CommandEventType.PAPER_ACCOUNT_EPOCH_IMPORTED))
+    }
+
+    @Test
+    fun bootstrap_keeps_stale_config_mismatch_and_current_trading_evaluation_fail_closed() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        upsertActiveRuntimeConfigValue(database, "paper.initialCashJpy", "100000")
+
+        bootstrap.ensureSchema().getOrThrow()
+
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        val active = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+        assertEquals("1000000.00000000", account.initialCashJpy)
+        assertEquals("100000", active.values.getValue("paper.initialCashJpy"))
+        assertTrue(ExposedEvaluationRepository(database).resolveScope(null, null).isFailure)
+
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(database),
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10500000")),
+        )
+        assertTrue(broker.placeOrder(command).isFailure)
     }
 
     @Test

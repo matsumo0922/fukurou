@@ -75,6 +75,7 @@ import java.sql.PreparedStatement
 import java.time.Clock
 import java.time.Instant
 import java.util.UUID
+import java.util.WeakHashMap
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
@@ -1435,9 +1436,26 @@ private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
 
 /** current account epoch と active config hash を同一 ledger transaction で固定する。 */
 private fun JdbcTransaction.resolvePaperExecutionLineage(auditContext: PaperTradeAuditContext): PaperExecutionLineage {
-    val epochId = prepare(
+    val auditHash = auditContext.decisionRunContext.runtimeConfigHash
+    val cached = synchronized(PaperExecutionLineageCache) {
+        PaperExecutionLineageCache[this]?.get(auditHash)
+    }
+    if (cached != null) return cached
+
+    val resolved = resolvePaperExecutionLineageUncached(auditContext)
+    synchronized(PaperExecutionLineageCache) {
+        PaperExecutionLineageCache.getOrPut(this) { mutableMapOf() }[auditHash] = resolved
+    }
+    return resolved
+}
+
+/** transaction 入口で current lineage を一度だけ固定する。 */
+private fun JdbcTransaction.resolvePaperExecutionLineageUncached(
+    auditContext: PaperTradeAuditContext,
+): PaperExecutionLineage {
+    val account = prepare(
         """
-            SELECT account.current_epoch_id
+            SELECT account.current_epoch_id, account.initial_cash_jpy
             FROM paper_account account
             WHERE account.id = ?
             FOR SHARE
@@ -1446,7 +1464,8 @@ private fun JdbcTransaction.resolvePaperExecutionLineage(auditContext: PaperTrad
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
             check(resultSet.next()) { "PAPER_EXECUTION_LINEAGE_UNAVAILABLE: current account epoch is missing." }
-            resultSet.getObject("current_epoch_id", UUID::class.java)
+            resultSet.getObject("current_epoch_id", UUID::class.java) to
+                resultSet.getBigDecimal("initial_cash_jpy")
         }
     }
     val activeValues = linkedMapOf<String, String>()
@@ -1458,17 +1477,23 @@ private fun JdbcTransaction.resolvePaperExecutionLineage(auditContext: PaperTrad
         }
     }
     val activeHash = calculateRuntimeConfigHash(activeValues)
+    val configBaseline = activeValues["paper.initialCashJpy"]?.let(::BigDecimal)
+    require(configBaseline != null && account.second.compareTo(configBaseline) == 0) {
+        "PAPER_ACCOUNT_BASELINE_MISMATCH: create, validate, and activate an operator runtime-config draft."
+    }
     val auditHash = auditContext.decisionRunContext.runtimeConfigHash
     require(auditHash == null || auditHash == activeHash) {
         "PAPER_EXECUTION_LINEAGE_MISMATCH: command and current account epoch runtime config hashes differ."
     }
 
     return PaperExecutionLineage(
-        accountEpochId = epochId.toString(),
+        accountEpochId = account.first.toString(),
         executionSemanticsVersion = PAPER_EXECUTION_SEMANTICS_VERSION,
         runtimeConfigHash = activeHash,
     )
 }
+
+private val PaperExecutionLineageCache = WeakHashMap<JdbcTransaction, MutableMap<String?, PaperExecutionLineage>>()
 
 /** prepared statement の連続3列へ lineage を bind する。 */
 private fun PreparedStatement.bindLineage(startIndex: Int, lineage: PaperExecutionLineage) {

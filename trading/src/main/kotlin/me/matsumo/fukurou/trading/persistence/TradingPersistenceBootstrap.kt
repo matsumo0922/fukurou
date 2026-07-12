@@ -979,23 +979,6 @@ class TradingPersistenceBootstrap(
 
 private fun JdbcTransaction.ensurePaperAccount(now: Instant, config: PaperAccountConfig) {
     ensurePaperAccountRow(now, config)
-    reconcileLegacyPaperAccountBaseline(config.initialCashJpy)
-}
-
-/** 旧 100,000 円 baseline だけを正本の 1,000,000 円へ移行し、残高と履歴は変更しない。 */
-private fun JdbcTransaction.reconcileLegacyPaperAccountBaseline(canonicalBaseline: BigDecimal) {
-    jdbcConnection().prepareStatement(
-        """
-            UPDATE paper_account
-            SET initial_cash_jpy = ?
-            WHERE id = ? AND initial_cash_jpy = 100000 AND ? = 1000000
-        """.trimIndent(),
-    ).use { statement ->
-        statement.setBigDecimal(1, canonicalBaseline)
-        statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
-        statement.setBigDecimal(3, canonicalBaseline)
-        statement.executeUpdate()
-    }
 }
 
 /** 既存 ledger を変更せず current epoch だけを初回登録する。 */

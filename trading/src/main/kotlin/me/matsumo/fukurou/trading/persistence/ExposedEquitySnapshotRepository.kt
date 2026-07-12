@@ -33,7 +33,7 @@ private const val INSERT_EQUITY_SNAPSHOT_SQL = """
         equity_peak_jpy,
         drawdown_ratio
     )
-    VALUES (?, (SELECT current_epoch_id FROM paper_account WHERE id=1), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, (SELECT current_epoch_id FROM paper_account WHERE id=?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 /**
@@ -54,7 +54,7 @@ private const val INSERT_DAILY_EQUITY_SNAPSHOT_SQL = """
         equity_peak_jpy,
         drawdown_ratio
     )
-    VALUES (?, (SELECT current_epoch_id FROM paper_account WHERE id=1), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, (SELECT current_epoch_id FROM paper_account WHERE id=?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (mode, trading_date) WHERE reason = 'DAILY' DO NOTHING
 """
 
@@ -152,16 +152,17 @@ private fun JdbcTransaction.selectEquitySnapshots(): List<EquitySnapshotRecord> 
 
 private fun PreparedStatement.bindEquitySnapshot(snapshot: EquitySnapshotRecord) {
     setObject(1, snapshot.id)
-    setString(2, snapshot.mode.name)
-    setString(3, snapshot.reason.name)
-    setString(4, snapshot.tradingDate.toString())
-    setLong(5, snapshot.capturedAt.toEpochMilli())
-    setBigDecimal(6, snapshot.cashJpy)
-    setBigDecimal(7, snapshot.btcQuantity)
-    setBigDecimal(8, snapshot.btcMarkPriceJpy)
-    setBigDecimal(9, snapshot.totalEquityJpy)
-    setBigDecimal(10, snapshot.equityPeakJpy)
-    setBigDecimal(11, snapshot.drawdownRatio)
+    setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
+    setString(3, snapshot.mode.name)
+    setString(4, snapshot.reason.name)
+    setString(5, snapshot.tradingDate.toString())
+    setLong(6, snapshot.capturedAt.toEpochMilli())
+    setBigDecimal(7, snapshot.cashJpy)
+    setBigDecimal(8, snapshot.btcQuantity)
+    setBigDecimal(9, snapshot.btcMarkPriceJpy)
+    setBigDecimal(10, snapshot.totalEquityJpy)
+    setBigDecimal(11, snapshot.equityPeakJpy)
+    setBigDecimal(12, snapshot.drawdownRatio)
 }
 
 private fun ResultSet.toEquitySnapshotRecord(): EquitySnapshotRecord {

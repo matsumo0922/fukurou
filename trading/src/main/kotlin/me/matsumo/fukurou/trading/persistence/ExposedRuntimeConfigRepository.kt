@@ -1,4 +1,4 @@
-@file:Suppress("ImportOrdering", "LongMethod", "LongParameterList", "TooManyFunctions")
+@file:Suppress("ImportOrdering", "LongMethod", "TooManyFunctions")
 
 package me.matsumo.fukurou.trading.persistence
 
@@ -545,7 +545,7 @@ private fun JdbcTransaction.switchPaperAccountEpochIfRequired(
     if (hasOpenRisk) {
         appendEpochAudit(
             eventType = "PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED",
-            payload = epochAuditPayload(account.first, null, account.second, requestedBaseline, targetHash, reason, actor, openPositions, openOrders, account.third),
+            payload = EpochAuditPayload(account.first, null, account.second, requestedBaseline, targetHash, reason, actor, openPositions, openOrders, account.third).encode(),
             now = now,
             runtimeConfigHash = targetHash,
         )
@@ -596,7 +596,7 @@ private fun JdbcTransaction.switchPaperAccountEpochIfRequired(
     }
     appendEpochAudit(
         "PAPER_ACCOUNT_EPOCH_SWITCHED",
-        epochAuditPayload(account.first, epochId, account.second, requestedBaseline, targetHash, reason, actor, 0, 0, account.third),
+        EpochAuditPayload(account.first, epochId, account.second, requestedBaseline, targetHash, reason, actor, 0, 0, account.third).encode(),
         now,
         targetHash,
     )
@@ -628,29 +628,31 @@ private fun JdbcTransaction.selectCurrentPaperAccountEpochId(): String? {
     }
 }
 
-private fun epochAuditPayload(
-    oldEpochId: UUID?,
-    newEpochId: UUID?,
-    oldBaseline: java.math.BigDecimal,
-    newBaseline: java.math.BigDecimal,
-    hash: String,
-    reason: String,
-    actor: String,
-    openPositions: Int,
-    openOrders: Int,
-    btc: java.math.BigDecimal,
-): String = buildJsonObject {
-    put("oldEpochId", oldEpochId?.toString())
-    put("newEpochId", newEpochId?.toString())
-    put("oldBaselineJpy", oldBaseline.toPlainString())
-    put("newBaselineJpy", newBaseline.toPlainString())
-    put("runtimeConfigHash", hash)
-    put("reason", reason)
-    put("actor", actor)
-    put("openPositionCount", openPositions)
-    put("openOrderCount", openOrders)
-    put("btcQuantity", btc.toPlainString())
-}.toString()
+private data class EpochAuditPayload(
+    val oldEpochId: UUID?,
+    val newEpochId: UUID?,
+    val oldBaseline: java.math.BigDecimal,
+    val newBaseline: java.math.BigDecimal,
+    val hash: String,
+    val reason: String,
+    val actor: String,
+    val openPositions: Int,
+    val openOrders: Int,
+    val btc: java.math.BigDecimal,
+) {
+    fun encode(): String = buildJsonObject {
+        put("oldEpochId", oldEpochId?.toString())
+        put("newEpochId", newEpochId?.toString())
+        put("oldBaselineJpy", oldBaseline.toPlainString())
+        put("newBaselineJpy", newBaseline.toPlainString())
+        put("runtimeConfigHash", hash)
+        put("reason", reason)
+        put("actor", actor)
+        put("openPositionCount", openPositions)
+        put("openOrderCount", openOrders)
+        put("btcQuantity", btc.toPlainString())
+    }.toString()
+}
 
 private fun JdbcTransaction.appendEpochAudit(
     eventType: String,
@@ -794,18 +796,11 @@ private fun JdbcTransaction.ensureActiveRuntimeConfigVersionValues(now: Instant)
 
     val unexpectedKeys = catalogKeyDiff.unknownKeys - retiredRuntimeConfigKeys
     val retiredKeys = catalogKeyDiff.unknownKeys intersect retiredRuntimeConfigKeys
-    val valueOverrides = buildMap {
-        val baselineKey = "paper.initialCashJpy"
-        if (values[baselineKey] == "100000" && defaultValues[baselineKey] == "1000000") {
-            put(baselineKey, requireNotNull(defaultValues[baselineKey]))
-        }
-    }
-
     require(unexpectedKeys.isEmpty()) {
         "Active runtime config contains catalog-incompatible keys: ${unexpectedKeys.sorted()}"
     }
     val needsReconciliation = catalogKeyDiff.missingKeys.isNotEmpty() ||
-        retiredKeys.isNotEmpty() || valueOverrides.isNotEmpty()
+        retiredKeys.isNotEmpty()
     if (needsReconciliation) {
         reconcileActiveRuntimeConfigVersionValues(
             activeVersion = activeVersion,
@@ -814,7 +809,6 @@ private fun JdbcTransaction.ensureActiveRuntimeConfigVersionValues(now: Instant)
             reconciliation = RuntimeConfigCatalogReconciliation(
                 missingKeys = catalogKeyDiff.missingKeys,
                 retiredKeys = retiredKeys,
-                valueOverrides = valueOverrides,
             ),
             now = now,
         )
@@ -862,7 +856,7 @@ private fun JdbcTransaction.reconcileActiveRuntimeConfigVersionValues(
     now: Instant,
 ) {
     val versionId = UUID.randomUUID()
-    val completeValues = ((defaultValues + values) - reconciliation.retiredKeys) + reconciliation.valueOverrides
+    val completeValues = (defaultValues + values) - reconciliation.retiredKeys
 
     deactivateRuntimeConfigVersion(activeVersion.versionId)
     insertRuntimeConfigVersion(
@@ -871,7 +865,7 @@ private fun JdbcTransaction.reconcileActiveRuntimeConfigVersionValues(
         note = runtimeConfigCatalogReconciliationNote(
             missingKeys = reconciliation.missingKeys,
             retiredKeys = reconciliation.retiredKeys,
-            changedKeys = reconciliation.valueOverrides.keys,
+            changedKeys = emptySet(),
         ),
     )
     insertRuntimeConfigValues(
@@ -1103,10 +1097,8 @@ private data class RuntimeConfigCatalogKeyDiff(
  *
  * @param missingKeys catalog default から追加する key
  * @param retiredKeys active snapshot から除去する明示的な退役 key
- * @param valueOverrides migration で canonical default へ置換する key/value
  */
 private data class RuntimeConfigCatalogReconciliation(
     val missingKeys: Set<String>,
     val retiredKeys: Set<String>,
-    val valueOverrides: Map<String, String>,
 )
