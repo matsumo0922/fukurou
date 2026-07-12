@@ -127,6 +127,42 @@ class EvaluationRouteTest {
 
         assertTrue(revision.contains("\"populationState\":\"PARTIAL_LIFECYCLE\""))
         assertTrue(revision.contains("\"effectiveFrom\":\"2026-07-02\""))
+
+        val emptyAccepted = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"CUSTOM","from":"2026-06-01","toInclusive":"2026-06-02"}""")
+        }.bodyAsText()
+        val emptyRevisionId = requireNotNull(
+            Regex("\\\"revisionId\\\":\\\"([^\\\"]+)").find(emptyAccepted),
+        ).groupValues[1]
+        var emptyRevision = ""
+        repeat(100) {
+            if (!emptyRevision.contains("\"status\":\"SUCCEEDED\"")) {
+                emptyRevision = client.get("/evaluation/reports/revisions/$emptyRevisionId").bodyAsText()
+                if (!emptyRevision.contains("\"status\":\"SUCCEEDED\"")) delay(10)
+            }
+        }
+        assertTrue(emptyRevision.contains("\"populationState\":\"EMPTY_LIFECYCLE\""))
+        assertTrue(emptyRevision.contains("\"benchmark\":{\"baselineEquityJpy\":null,\"points\":[]"))
+        assertTrue(emptyRevision.contains("\"state\":\"EMPTY_LIFECYCLE\""))
+        assertTrue(!emptyRevision.contains("\"factId\":\"benchmark."))
+
+        val fullAccepted = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"CUSTOM","from":"2026-07-03","toInclusive":"2026-07-04"}""")
+        }.bodyAsText()
+        val fullRevisionId = requireNotNull(
+            Regex("\\\"revisionId\\\":\\\"([^\\\"]+)").find(fullAccepted),
+        ).groupValues[1]
+        var fullRevision = ""
+        repeat(100) {
+            if (!fullRevision.contains("\"status\":\"SUCCEEDED\"")) {
+                fullRevision = client.get("/evaluation/reports/revisions/$fullRevisionId").bodyAsText()
+                if (!fullRevision.contains("\"status\":\"SUCCEEDED\"")) delay(10)
+            }
+        }
+        assertTrue(fullRevision.contains("\"populationState\":\"FULL_REQUESTED_PERIOD\""))
+        assertTrue(fullRevision.contains("\"effectiveFrom\":\"2026-07-03\""))
     }
 
     @Test

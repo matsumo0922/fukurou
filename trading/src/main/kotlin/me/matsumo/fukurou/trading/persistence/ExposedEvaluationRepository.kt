@@ -37,6 +37,12 @@ import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
+/** closed-trade projection 共通の initial BUY epoch 帰属式。 */
+private const val INITIAL_BUY_EPOCH_SQL = """
+    (ARRAY_AGG(e.account_epoch_id::text ORDER BY e.executed_at, e.id)
+        FILTER (WHERE e.side = 'BUY'))[1]
+"""
+
 /**
  * closed trade fact を取得する SQL。
  */
@@ -87,8 +93,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         SELECT
             e.position_id,
             COALESCE(
-                (ARRAY_AGG(e.account_epoch_id::text ORDER BY e.executed_at, e.id)
-                    FILTER (WHERE e.side = 'BUY'))[1],
+                $INITIAL_BUY_EPOCH_SQL,
                 (SELECT id::text FROM paper_account_epochs WHERE kind='LEGACY_IMPORTED' ORDER BY created_at ASC LIMIT 1)
             ) AS account_epoch_id,
             CASE
@@ -352,7 +357,7 @@ private const val SELECT_SCOPED_PNL_BEFORE_SQL = """
         SELECT
             p.id,
             COALESCE(
-                MIN(e.account_epoch_id::text),
+                $INITIAL_BUY_EPOCH_SQL,
                 (SELECT id::text FROM paper_account_epochs WHERE kind='LEGACY_IMPORTED' ORDER BY created_at ASC LIMIT 1)
             ) AS account_epoch_id,
             CASE

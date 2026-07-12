@@ -21,6 +21,8 @@ import me.matsumo.fukurou.trading.evaluation.BenchmarkResult
 import me.matsumo.fukurou.trading.evaluation.CalibrationBinStats
 import me.matsumo.fukurou.trading.evaluation.CalibrationGroupStats
 import me.matsumo.fukurou.trading.evaluation.DecisionRunRateStats
+import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
+import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
 import me.matsumo.fukurou.trading.evaluation.EvaluationExclusionSummary
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
@@ -119,7 +121,7 @@ private fun EvaluationScope.toResponse(): EvaluationScopeResponse = EvaluationSc
     },
 )
 
-private fun me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage.toResponse() =
+private fun EvaluationAttributionCoverage.toResponse() =
     EvaluationAttributionCoverageResponse(attributed, missing, total)
 
 /**
@@ -384,7 +386,7 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
         val dailyPnl = evaluationRepository.fetchClosedTrades(effectivePeriod, scope = scope).getOrThrow().also { result ->
             require(!result.truncated) { "EVALUATION_RESULT_TRUNCATED: benchmark population is incomplete." }
         }.trades.map { trade ->
-            me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
+            DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
         }
         val dailyCandleLimit = call.requireDailyCandleLimit(effectiveDateRange) ?: return@get
         val candles = evaluationMarketDataSource.getCandles(

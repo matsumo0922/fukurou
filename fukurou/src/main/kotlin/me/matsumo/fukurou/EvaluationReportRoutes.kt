@@ -371,25 +371,32 @@ private class EvaluationReportStore(
         val stats = EvaluationMath.summarizeTrades(queryResult.trades)
         val ridge = EvaluationMath.historicalOutcomeRidges(queryResult.trades, ReportZone, regimes)
         val baselineEquity = snapshot.initialCashJpy.add(snapshot.priorPnlJpy)
+        val effectiveFromDate = effectivePeriod.from.atZone(ReportZone).toLocalDate()
+        val effectiveToDate = if (emptyLifecycle) {
+            effectiveFromDate
+        } else {
+            effectivePeriod.toExclusive.minusMillis(1).atZone(ReportZone).toLocalDate()
+        }
         val benchmark = EvaluationMath.benchmark(
             BenchmarkCalculationRequest(
                 candles = candles,
                 dailyPnlFacts = snapshot.dailyPnl,
                 baselineEquityJpy = baselineEquity,
-                fromDate = from,
-                toDateInclusive = toInclusive,
+                fromDate = effectiveFromDate,
+                toDateInclusive = effectiveToDate,
                 zoneId = ReportZone,
             ),
         )
         val benchmarkComparable = scope.evaluationScope.cohort !=
             EvaluationCohort.LEGACY_PRE_WS
+        val benchmarkAvailable = benchmarkComparable && !emptyLifecycle
         val calibration = buildCalibrationResponse(queryResult.trades)
         val performanceLattice = buildPerformanceLattice(queryResult.trades, regimes)
         val usageResult = snapshot.usages
         require(!usageResult.truncated) { "USAGE_SNAPSHOT_TRUNCATED" }
         val costStats = EvaluationMath.summarizeLlmCosts(usageResult.facts)
         val exclusions = snapshot.exclusions
-        val benchmarkPoints = benchmark.points.takeIf { benchmarkComparable }.orEmpty()
+        val benchmarkPoints = benchmark.points.takeIf { benchmarkAvailable }.orEmpty()
         val benchmarkFacts = benchmarkPoints.flatMap { point ->
             listOf(
                 EvaluationReportFact("benchmark.${point.date}.botEquityJpy", point.botEquityJpy.toPlainString(), "JPY", "AVAILABLE", listOf("paper-ledger")),
@@ -473,7 +480,7 @@ private class EvaluationReportStore(
             EvaluationReportSourceResponse("runner-audit", inputAsOf, "SNAPSHOT"),
         )
         val benchmarkResponse = ReportBenchmarkChartResponse(
-            baselineEquityJpy = baselineEquity.takeIf { benchmarkComparable }?.toPlainString(),
+            baselineEquityJpy = baselineEquity.takeIf { benchmarkAvailable }?.toPlainString(),
             points = benchmarkPoints.map { point ->
                 ReportBenchmarkPointResponse(
                     date = point.date.toString(),
@@ -482,9 +489,10 @@ private class EvaluationReportStore(
                     noTradeEquityJpy = point.noTradeEquityJpy.toPlainString(),
                 )
             },
-            botReturn = benchmark.botReturn?.takeIf { benchmarkComparable }?.toPlainString(),
-            buyAndHoldReturn = benchmark.buyAndHoldReturn?.takeIf { benchmarkComparable }?.toPlainString(),
+            botReturn = benchmark.botReturn?.takeIf { benchmarkAvailable }?.toPlainString(),
+            buyAndHoldReturn = benchmark.buyAndHoldReturn?.takeIf { benchmarkAvailable }?.toPlainString(),
             state = when {
+                emptyLifecycle -> "EMPTY_LIFECYCLE"
                 !benchmarkComparable -> "BASELINE_NOT_COMPARABLE"
                 benchmark.points.isEmpty() -> "INSUFFICIENT_SAMPLE"
                 else -> "AVAILABLE"

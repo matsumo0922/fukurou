@@ -1455,8 +1455,10 @@ private fun JdbcTransaction.resolvePaperExecutionLineageUncached(
 ): PaperExecutionLineage {
     val account = prepare(
         """
-            SELECT account.current_epoch_id, account.initial_cash_jpy
+            SELECT account.current_epoch_id, account.initial_cash_jpy,
+                epoch.initial_cash_jpy AS epoch_baseline
             FROM paper_account account
+            JOIN paper_account_epochs epoch ON epoch.id = account.current_epoch_id
             WHERE account.id = ?
             FOR SHARE
         """.trimIndent(),
@@ -1464,8 +1466,11 @@ private fun JdbcTransaction.resolvePaperExecutionLineageUncached(
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
             check(resultSet.next()) { "PAPER_EXECUTION_LINEAGE_UNAVAILABLE: current account epoch is missing." }
-            resultSet.getObject("current_epoch_id", UUID::class.java) to
-                resultSet.getBigDecimal("initial_cash_jpy")
+            Triple(
+                resultSet.getObject("current_epoch_id", UUID::class.java),
+                resultSet.getBigDecimal("initial_cash_jpy"),
+                resultSet.getBigDecimal("epoch_baseline"),
+            )
         }
     }
     val activeValues = linkedMapOf<String, String>()
@@ -1478,7 +1483,9 @@ private fun JdbcTransaction.resolvePaperExecutionLineageUncached(
     }
     val activeHash = calculateRuntimeConfigHash(activeValues)
     val configBaseline = activeValues["paper.initialCashJpy"]?.let(::BigDecimal)
-    require(configBaseline != null && account.second.compareTo(configBaseline) == 0) {
+    val accountMatchesEpoch = account.second.compareTo(account.third) == 0
+    val accountMatchesConfig = configBaseline != null && account.second.compareTo(configBaseline) == 0
+    require(accountMatchesEpoch && accountMatchesConfig) {
         "PAPER_ACCOUNT_BASELINE_MISMATCH: create, validate, and activate an operator runtime-config draft."
     }
     val auditHash = auditContext.decisionRunContext.runtimeConfigHash

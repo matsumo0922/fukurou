@@ -1495,6 +1495,43 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun current_epoch_baseline_mismatch_fails_closed_for_writer_and_evaluation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val account = ExposedPaperLedgerRepository(database).getAccountSnapshot().getOrThrow()
+        val epochId = requireNotNull(account.accountEpochId)
+        exposedTransaction(database) {
+            executeUpdate("DROP TRIGGER paper_account_epochs_immutable ON paper_account_epochs")
+            prepare("UPDATE paper_account_epochs SET initial_cash_jpy=100000 WHERE id=?").use { statement ->
+                statement.setObject(1, UUID.fromString(epochId))
+                statement.executeUpdate()
+            }
+        }
+
+        val evaluation = ExposedEvaluationRepository(database)
+        assertTrue(evaluation.resolveScope(null, "CURRENT").isFailure)
+        assertTrue(evaluation.resolveScope(epochId, "CURRENT").isFailure)
+
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(database),
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisions,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        )
+        assertTrue(broker.placeOrder(command).isFailure)
+        exposedTransaction(database) {
+            assertEquals(0, countRowsForTest("orders"))
+            assertEquals(0, countRowsForTest("positions"))
+            assertEquals(0, countRowsForTest("executions"))
+        }
+    }
+
+    @Test
     fun bootstrap_equitySnapshotRejectsDuplicateBootstrapRowsInPostgresPath() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -4604,7 +4641,12 @@ class PostgresPersistenceIntegrationTest {
             }
         }
         assertEquals(0, repository.fetchClosedTrades(period, scope = currentScope).getOrThrow().trades.size)
-        assertEquals(1, repository.fetchClosedTrades(period, scope = legacyScope).getOrThrow().trades.size)
+        val mixedTrade = repository.fetchClosedTrades(period, scope = legacyScope).getOrThrow().trades.single()
+        val reportPeriod = EvaluationPeriod(fixedInstant().plusSeconds(2), fixedInstant().plusSeconds(3))
+        val currentSnapshot = repository.fetchReportSnapshot(reportPeriod, currentScope).getOrThrow()
+        val legacySnapshot = repository.fetchReportSnapshot(reportPeriod, legacyScope).getOrThrow()
+        assertEquals(0, currentSnapshot.priorPnlJpy.compareTo(BigDecimal.ZERO))
+        assertEquals(0, legacySnapshot.priorPnlJpy.compareTo(mixedTrade.tradePnlJpy))
     }
 
     @Test
@@ -6175,6 +6217,16 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
         }
     } finally {
         container.stop()
+    }
+}
+
+private fun JdbcTransaction.countRowsForTest(table: String): Int {
+    require(table in setOf("orders", "positions", "executions"))
+    return prepare("SELECT COUNT(*) FROM $table").use { statement ->
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next())
+            resultSet.getInt(1)
+        }
     }
 }
 
