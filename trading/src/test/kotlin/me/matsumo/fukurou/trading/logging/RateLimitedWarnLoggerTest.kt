@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.logging
 
+import me.matsumo.fukurou.trading.market.GmoRateLimitException
 import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketNetworkException
 import java.io.IOException
@@ -18,6 +19,31 @@ import kotlin.test.assertTrue
 
 /** human-facing warning の failure sanitization を検証するテスト。 */
 class RateLimitedWarnLoggerTest {
+
+    @Test
+    fun warn_sanitizesGmoRateLimitMessage() {
+        val handler = CapturingLogHandler()
+        val logger = recordingLogger(handler)
+        val warnLogger = RateLimitedWarnLogger(
+            logger = logger,
+            clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC),
+        )
+
+        warnLogger.warn(
+            key = "gmo-rate-limit",
+            message = "GMO request failed.",
+            throwable = GmoRateLimitException("sentinel-rate-message /private/rate-path"),
+        )
+
+        val record = handler.records.single()
+        val rendered = record.message + record.thrown?.stackTraceToString().orEmpty()
+
+        assertNull(record.thrown)
+        assertTrue(rendered.contains("category=GMO_RATE_LIMITED"))
+        assertTrue(rendered.contains("type=GmoRateLimitException"))
+        assertFalse(rendered.contains("sentinel-rate-message"))
+        assertFalse(rendered.contains("rate-path"))
+    }
 
     @Test
     fun warn_sanitizesGmoAuditFailureGraphWithoutDiscardingDiagnostics() {

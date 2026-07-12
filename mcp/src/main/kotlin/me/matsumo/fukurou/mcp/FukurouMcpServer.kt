@@ -70,6 +70,7 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.exchange.gmo.withGmoPublicRequestCorrelation
+import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_RECENT_LESSONS_LIMIT
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_RECENT_LESSONS_LOOKBACK_DAYS
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LIMIT
@@ -406,7 +407,12 @@ fun main() {
             maxActToolCallsPerRun = bootstrap.actToolCallLimit,
         ),
     )
-    val marketDataSource = GmoPublicMarketDataSource.fromConfig(tradingConfig.gmoPublicClient)
+    val requestAuditSink = DeferredGmoPublicRequestAuditSink()
+    val marketDataSource = GmoPublicMarketDataSource.fromConfig(
+        config = tradingConfig.gmoPublicClient,
+        clientType = GmoPublicClientType.FUKUROU_MCP,
+        requestAuditSink = requestAuditSink,
+    )
     val runtime = TradingRuntimeFactory.postgresForMcp(
         config = bootstrap.databaseConfig,
         marketDataSource = marketDataSource,
@@ -415,9 +421,11 @@ fun main() {
 
     FukurouMcpServer(
         tradingConfig = tradingConfig,
+        requestAuditSink = requestAuditSink,
         marketDataSource = marketDataSource,
         tradingRuntime = runtime,
         decisionRunContext = bootstrap.decisionRunContext,
+        clientRole = bootstrap.phase.toGmoPublicClientRole(),
         allowedToolNames = bootstrap.allowedTools,
         expiresAt = bootstrap.expiresAt,
     ).run()
@@ -458,6 +466,7 @@ class FukurouMcpServer(
     allowedToolNames: Set<String>? = mcpAllowedToolNamesFromEnvironment(),
     expiresAt: Instant? = null,
     private val environment: Map<String, String> = System.getenv(),
+    private val clientRole: GmoPublicClientRole = mcpClientRole(environment),
     private val toolCallLimiter: McpToolCallLimiter = McpToolCallLimiter(
         config = tradingConfig.runner,
         toolCallGuard = tradingRuntime.toolCallGuard,
@@ -468,8 +477,6 @@ class FukurouMcpServer(
         clock = clock,
     ),
 ) {
-
-    private val clientRole = mcpClientRole(environment)
 
     init {
         requestAuditSink.bind(CommandEventLogGmoPublicRequestAuditSink(tradingRuntime.commandEventLog))
@@ -640,6 +647,14 @@ private fun mcpClientRole(environment: Map<String, String>): GmoPublicClientRole
     return when (environment[FUKUROU_LLM_PHASE_ENV]?.lowercase()) {
         "proposer" -> GmoPublicClientRole.PROPOSER
         "falsifier" -> GmoPublicClientRole.FALSIFIER
+        else -> GmoPublicClientRole.UNSPECIFIED
+    }
+}
+
+internal fun LlmInvocationPhase.toGmoPublicClientRole(): GmoPublicClientRole {
+    return when (this) {
+        LlmInvocationPhase.PROPOSER -> GmoPublicClientRole.PROPOSER
+        LlmInvocationPhase.FALSIFIER -> GmoPublicClientRole.FALSIFIER
         else -> GmoPublicClientRole.UNSPECIFIED
     }
 }

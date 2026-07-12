@@ -44,6 +44,9 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
+import me.matsumo.fukurou.trading.exchange.gmo.withGmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.invoker.CODEX_FAILURE_DETAILS_OMITTED
 import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupQuarantine
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
@@ -789,7 +792,15 @@ class OneShotLlmRunner(
             commandId = idGenerator(),
         )
         val previewResult = tradingRuntime.toolCallGuard.runReadOnlyTool(previewCall) {
-            tradingRuntime.broker.previewOrder(previewCommand).getOrThrow()
+            withGmoPublicRequestCorrelation(
+                GmoPublicRequestCorrelation(
+                    decisionRunContext = context,
+                    toolCallId = previewCall.toolCallId,
+                    clientRole = GmoPublicClientRole.RUNNER,
+                ),
+            ) {
+                tradingRuntime.broker.previewOrder(previewCommand).getOrThrow()
+            }
         }
 
         return EntryPreviewResult(
@@ -827,7 +838,11 @@ class OneShotLlmRunner(
             "preview_hash_mismatch"
         }
         val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
-            tradingRuntime.broker.placeOrder(command).getOrThrow()
+            placeOrderWithCorrelation(
+                context = context,
+                call = call,
+                command = command,
+            )
         }
         val placeOrderExecutionDuration = Duration.ofNanos(System.nanoTime() - executionStartedAt)
 
@@ -859,6 +874,22 @@ class OneShotLlmRunner(
         }
 
         return result
+    }
+
+    private suspend fun placeOrderWithCorrelation(
+        context: DecisionRunContext,
+        call: GuardedToolCall,
+        command: PlaceOrderCommand,
+    ): PaperTradeResult {
+        return withGmoPublicRequestCorrelation(
+            GmoPublicRequestCorrelation(
+                decisionRunContext = context,
+                toolCallId = call.toolCallId,
+                clientRole = GmoPublicClientRole.RUNNER,
+            ),
+        ) {
+            tradingRuntime.broker.placeOrder(command).getOrThrow()
+        }
     }
 
     private fun runnerIntentPayload(intent: TradeIntentRecord): String {

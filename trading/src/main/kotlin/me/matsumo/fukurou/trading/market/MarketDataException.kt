@@ -59,7 +59,14 @@ class GmoHttpException(
  */
 class GmoRateLimitException(
     message: String,
-) : MarketDataException(MarketDataFailureKind.TEMPORARY, message)
+) : MarketDataException(MarketDataFailureKind.TEMPORARY, message), SafeLoggableFailure {
+    override fun safeLogFields(): SafeLogFields {
+        return SafeLogFields(
+            category = "GMO_RATE_LIMITED",
+            type = GmoRateLimitException::class.java.simpleName,
+        )
+    }
+}
 
 /**
  * GMO Public request の監査保存に失敗したときの例外。

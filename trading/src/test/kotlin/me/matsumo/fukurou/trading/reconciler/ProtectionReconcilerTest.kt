@@ -212,6 +212,9 @@ class ProtectionReconcilerTest {
         reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
 
         val eventTypes = eventLog.events().map { event -> event.eventType }
+        val failurePayload = eventLog.events().first { event ->
+            event.eventType == CommandEventType.RECONCILER_PASS_FAILED
+        }.payload
 
         assertEquals(
             listOf(
@@ -222,6 +225,8 @@ class ProtectionReconcilerTest {
             ),
             eventTypes,
         )
+        assertTrue(failurePayload.contains("risk_state unavailable"))
+        assertFalse(failurePayload.contains("failureCategory"))
     }
 
     @Test
@@ -266,7 +271,9 @@ class ProtectionReconcilerTest {
         val reconciler = createReconciler(
             eventLog = eventLog,
             status = status,
-            tickStream = SwitchableTickStream(Result.failure(GmoRateLimitException("rate limited"))),
+            tickStream = SwitchableTickStream(
+                Result.failure(GmoRateLimitException("sentinel-rate-limit-message /private/rate-limit-path")),
+            ),
         )
 
         val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
@@ -277,7 +284,33 @@ class ProtectionReconcilerTest {
             listOf(CommandEventType.RECONCILER_PASS_FAILED),
             eventLog.events().map { event -> event.eventType },
         )
-        assertTrue(eventLog.events().single().payload.contains("rate limited").not())
+        val payload = eventLog.events().single().payload
+
+        assertTrue(payload.contains("\"failureCategory\":\"GMO_RATE_LIMITED\""))
+        assertTrue(payload.contains("\"failureType\":\"GmoRateLimitException\""))
+        assertFalse(payload.contains("sentinel-rate-limit-message"))
+        assertFalse(payload.contains("rate-limit-path"))
+    }
+
+    @Test
+    fun auditFailure_recordsSafeClassificationWithoutRawDiagnosticGraph() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val auditFailure = GmoRequestAuditException().apply {
+            addSuppressed(IllegalStateException("sentinel-audit-message /private/audit-path"))
+        }
+        val reconciler = createReconciler(
+            eventLog = eventLog,
+            tickStream = SwitchableTickStream(Result.failure(auditFailure)),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+        val payload = eventLog.events().single().payload
+
+        assertEquals(auditFailure, result.exceptionOrNull())
+        assertTrue(payload.contains("\"failureCategory\":\"GMO_REQUEST_AUDIT_FAILED\""))
+        assertTrue(payload.contains("\"failureType\":\"GmoRequestAuditException\""))
+        assertFalse(payload.contains("sentinel-audit-message"))
+        assertFalse(payload.contains("audit-path"))
     }
 
     @Test

@@ -87,8 +87,10 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.exchange.gmo.DeferredGmoPublicRequestAuditSink
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
@@ -1895,7 +1897,13 @@ class McpDatabaseRoleIntegrationTest {
                     retry = GmoRetryConfig(maxAttempts = 1),
                 ),
             )
-            val marketDataSource = GmoPublicMarketDataSource.fromConfig(tradingConfig.gmoPublicClient, clock)
+            val requestAuditSink = DeferredGmoPublicRequestAuditSink()
+            val marketDataSource = GmoPublicMarketDataSource.fromConfig(
+                config = tradingConfig.gmoPublicClient,
+                clientType = GmoPublicClientType.FUKUROU_MCP,
+                requestAuditSink = requestAuditSink,
+                clock = clock,
+            )
             val fixtureMarketDataSource = RequiredMatrixMarketDataSource(marketDataSource)
             runtime = TradingRuntimeFactory.postgresForMcp(
                 config = bootstrap.databaseConfig,
@@ -1905,10 +1913,12 @@ class McpDatabaseRoleIntegrationTest {
             )
             var server = FukurouMcpServer(
                 tradingConfig = tradingConfig,
+                requestAuditSink = requestAuditSink,
                 marketDataSource = fixtureMarketDataSource,
                 clock = clock,
                 tradingRuntime = runtime,
                 decisionRunContext = bootstrap.decisionRunContext,
+                clientRole = bootstrap.phase.toGmoPublicClientRole(),
                 allowedToolNames = bootstrap.allowedTools,
                 expiresAt = bootstrap.expiresAt,
             ).createServer()
@@ -1955,18 +1965,29 @@ class McpDatabaseRoleIntegrationTest {
             results["get_trade_intent"] = callTool(server, "get_trade_intent", buildJsonObject { put("intent_id", intentId) })
             runtime.close()
             val falsifierBootstrap = requiredMatrixBootstrap(container, clock, LlmInvocationPhase.FALSIFIER)
+            val falsifierRequestAuditSink = DeferredGmoPublicRequestAuditSink()
+            val falsifierMarketDataSource = RequiredMatrixMarketDataSource(
+                GmoPublicMarketDataSource.fromConfig(
+                    config = tradingConfig.gmoPublicClient,
+                    clientType = GmoPublicClientType.FUKUROU_MCP,
+                    requestAuditSink = falsifierRequestAuditSink,
+                    clock = clock,
+                ),
+            )
             runtime = TradingRuntimeFactory.postgresForMcp(
                 config = falsifierBootstrap.databaseConfig,
                 clock = clock,
-                marketDataSource = fixtureMarketDataSource,
+                marketDataSource = falsifierMarketDataSource,
                 tradingConfig = tradingConfig,
             )
             server = FukurouMcpServer(
                 tradingConfig = tradingConfig,
-                marketDataSource = fixtureMarketDataSource,
+                requestAuditSink = falsifierRequestAuditSink,
+                marketDataSource = falsifierMarketDataSource,
                 clock = clock,
                 tradingRuntime = runtime,
                 decisionRunContext = falsifierBootstrap.decisionRunContext,
+                clientRole = falsifierBootstrap.phase.toGmoPublicClientRole(),
                 allowedToolNames = falsifierBootstrap.allowedTools,
                 expiresAt = falsifierBootstrap.expiresAt,
             ).createServer()

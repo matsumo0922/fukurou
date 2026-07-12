@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
+import me.matsumo.fukurou.trading.logging.safeLogFieldsOrNull
 import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
@@ -537,7 +538,7 @@ class ProtectionReconciler(
             warnLogger.warn(
                 key = MARKET_DATA_FAILURE_LOG_KEY,
                 message = "ProtectionReconciler market data refresh failed.",
-                throwable = throwable.toSafeReconcilerLogThrowable(),
+                throwable = throwable,
             )
             if (throwable.isFailClosedGmoRequestFailure()) throw throwable
         }
@@ -686,18 +687,8 @@ class ProtectionReconciler(
         warnLogger.warn(
             key = "$PASS_FAILURE_LOG_KEY-${passKind.payloadName()}",
             message = "ProtectionReconciler ${passKind.payloadName()} pass failed.",
-            throwable = throwable.toSafeReconcilerLogThrowable(),
+            throwable = throwable,
         )
-    }
-}
-
-private fun Throwable.toSafeReconcilerLogThrowable(): Throwable {
-    return when (this) {
-        is me.matsumo.fukurou.trading.market.GmoRateLimitException ->
-            me.matsumo.fukurou.trading.market.GmoRateLimitException("GMO public request was rate limited.")
-        is me.matsumo.fukurou.trading.market.GmoRequestAuditException ->
-            me.matsumo.fukurou.trading.market.GmoRequestAuditException()
-        else -> this
     }
 }
 
@@ -727,11 +718,16 @@ private fun buildPassCompletedPayload(
  * 失敗した reconcile pass の payload を組み立てる。
  */
 private fun buildPassFailurePayload(passKind: ReconcilePassKind, throwable: Throwable): String {
+    val safeFields = throwable.safeLogFieldsOrNull()
+
     return buildJsonObject {
         put("pass", passKind.payloadName())
         put("state", "failed")
         put("cause", throwable.javaClass.simpleName)
-        if (!throwable.isFailClosedGmoRequestFailure()) {
+        if (safeFields != null) {
+            put("failureCategory", safeFields.category)
+            put("failureType", safeFields.type)
+        } else {
             put("message", throwable.message.orEmpty())
         }
     }.toString()
