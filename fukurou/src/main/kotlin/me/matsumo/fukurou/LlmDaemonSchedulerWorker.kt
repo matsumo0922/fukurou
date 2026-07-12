@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.daemon.DefaultLlmDaemonPreFilterDependencies
 import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
@@ -355,15 +356,22 @@ private fun createLlmDaemonPreFilter(
 
 private fun TradingRuntime.openRiskReader(): LlmDaemonOpenRiskReader {
     return LlmDaemonOpenRiskReader {
-        runCatching { hasOpenRisk() }
+        runCatching { openRiskSnapshot() }
     }
 }
 
-private suspend fun TradingRuntime.hasOpenRisk(): Boolean {
+private suspend fun TradingRuntime.openRiskSnapshot(): LlmDaemonOpenRiskSnapshot {
     val positions = broker.getPositions().getOrThrow()
     val openOrders = broker.getOpenOrders().getOrThrow()
+    val restingEntryOrders = openOrders.filter { order ->
+        order.positionId == null && order.side == me.matsumo.fukurou.trading.domain.OrderSide.BUY
+    }
 
-    return positions.isNotEmpty() || openOrders.isNotEmpty()
+    return LlmDaemonOpenRiskSnapshot(
+        openPositionCount = positions.size,
+        restingEntryOrders = restingEntryOrders,
+        otherOpenOrderCount = openOrders.size - restingEntryOrders.size,
+    )
 }
 
 private fun GmoPublicMarketDataSource.tickerReader(tradingConfig: TradingBotConfig): LlmDaemonTickerReader {

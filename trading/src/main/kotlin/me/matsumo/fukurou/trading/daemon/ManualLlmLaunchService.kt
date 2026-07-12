@@ -130,7 +130,7 @@ class DefaultManualLlmLaunchService(
         val riskState = riskStateRepository.current().getOrThrow()
 
         if (riskState.state == RiskHaltState.SOFT_HALT) {
-            val hasOpenRisk = openRiskReader.hasOpenRisk().getOrThrow()
+            val hasOpenRisk = openRiskReader.snapshot().getOrThrow().hasOpenRisk
 
             if (!hasOpenRisk) {
                 appendSkip(

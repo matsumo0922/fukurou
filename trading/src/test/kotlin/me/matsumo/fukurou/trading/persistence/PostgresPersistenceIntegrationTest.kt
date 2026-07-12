@@ -3695,7 +3695,11 @@ class PostgresPersistenceIntegrationTest {
                 riskStateRepository = ExposedRiskStateRepository(database),
                 commandEventLog = eventLog,
                 launchReservationRepository = reservationRepository,
-                openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
+                openRiskReader = LlmDaemonOpenRiskReader {
+                    Result.success(
+                        me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskSnapshot(0, emptyList(), 0),
+                    )
+                },
                 tickerReader = LlmDaemonTickerReader {
                     Result.success(LlmDaemonTickerSnapshot(BigDecimal("10000000"), fixedInstant()))
                 },

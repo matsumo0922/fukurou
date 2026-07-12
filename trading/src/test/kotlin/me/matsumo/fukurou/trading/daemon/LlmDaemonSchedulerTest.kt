@@ -15,7 +15,10 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
+import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderStatus
+import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
@@ -54,6 +57,35 @@ class LlmDaemonSchedulerTest {
         assertEquals(LlmDaemonTickResult.Skipped(LLM_LAUNCH_DISABLED, null), result)
         assertTrue(fixture.launches.isEmpty())
         assertTrue(fixture.eventLog.events().any { event -> event.payload.contains(LLM_LAUNCH_DISABLED) })
+    }
+
+    @Test
+    fun restingEntryOnly_runsDeterministicMaintenanceWithoutLlmOrPreFilter() = runBlocking {
+        val preFilter = FakePreFilter()
+        val maintenanceCalls = mutableListOf<LlmDaemonOpenRiskSnapshot>()
+        val snapshot = LlmDaemonOpenRiskSnapshot(
+            openPositionCount = 0,
+            restingEntryOrders = listOf(restingEntryOrder()),
+            otherOpenOrderCount = 0,
+        )
+        val fixture = schedulerFixture(
+            openRiskReader = { Result.success(snapshot) },
+            preFilter = preFilter,
+            restingOrderMaintenanceService = RestingOrderMaintenanceService { observed, _ ->
+                maintenanceCalls += observed
+                Result.success(RestingSuppressionReason.RESTING_ORDER_UNCHANGED)
+            },
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertEquals(
+            LlmDaemonTickResult.Skipped("resting_order_unchanged", null),
+            result,
+        )
+        assertEquals(listOf(snapshot), maintenanceCalls)
+        assertTrue(fixture.launches.isEmpty())
+        assertTrue(preFilter.requests.isEmpty())
     }
 
     @Test
@@ -566,7 +598,7 @@ class LlmDaemonSchedulerTest {
                 if (readCount == 1) {
                     Result.failure(IllegalStateException("temporary broker read failure"))
                 } else {
-                    Result.success(false)
+                    Result.success(LlmDaemonOpenRiskSnapshot(0, emptyList(), 0))
                 }
             },
         )
@@ -1097,12 +1129,23 @@ private fun schedulerFixture(
     launches: MutableList<OneShotRunnerRequest> = mutableListOf(),
     idGenerator: () -> UUID = deterministicIds(),
     hasOpenRisk: Boolean = false,
-    openRiskReader: LlmDaemonOpenRiskReader = { Result.success(hasOpenRisk) },
+    openRiskReader: LlmDaemonOpenRiskReader = {
+        Result.success(
+            LlmDaemonOpenRiskSnapshot(
+                openPositionCount = if (hasOpenRisk) 1 else 0,
+                restingEntryOrders = emptyList(),
+                otherOpenOrderCount = 0,
+            ),
+        )
+    },
     tickerReader: FakeTickerReader = FakeTickerReader(clock),
     positionsReader: FakePositionsReader = FakePositionsReader(),
     entryFillReader: FakeEntryFillReader = FakeEntryFillReader(),
     preFilter: FakePreFilter = FakePreFilter(),
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
+    restingOrderMaintenanceService: RestingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
+        Result.success(RestingSuppressionReason.RESTING_ORDER_IDENTITY_UNAVAILABLE)
+    },
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): SchedulerFixture {
     val scheduler = LlmDaemonScheduler(
@@ -1116,6 +1159,7 @@ private fun schedulerFixture(
             tickerReader = tickerReader,
             positionsReader = positionsReader,
             entryFillReader = entryFillReader,
+            restingOrderMaintenanceService = restingOrderMaintenanceService,
         ),
         runtime = LlmDaemonSchedulerRuntime(
             requestBase = OneShotRunnerRequest(
@@ -1145,6 +1189,31 @@ private fun schedulerFixture(
         positionsReader = positionsReader,
         entryFillReader = entryFillReader,
         preFilter = preFilter,
+    )
+}
+
+private fun restingEntryOrder(): Order {
+    val now = fixedInstant().toString()
+
+    return Order(
+        orderId = "resting-order-1",
+        intentId = "intent-1",
+        positionId = null,
+        tradeGroupId = null,
+        symbol = TradingSymbol.BTC.apiSymbol,
+        mode = TradingMode.PAPER,
+        side = OrderSide.BUY,
+        orderType = OrderType.LIMIT,
+        status = OrderStatus.OPEN,
+        sizeBtc = "0.01",
+        limitPriceJpy = "10000000",
+        triggerPriceJpy = null,
+        protectiveStopPriceJpy = "9900000",
+        takeProfitPriceJpy = "10200000",
+        reasonJa = "押し目待ち",
+        clientRequestId = null,
+        createdAt = now,
+        updatedAt = now,
     )
 }
 

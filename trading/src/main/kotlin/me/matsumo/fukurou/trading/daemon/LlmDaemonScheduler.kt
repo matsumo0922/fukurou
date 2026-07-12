@@ -43,16 +43,6 @@ import kotlin.time.DurationUnit
 import kotlin.time.toDuration
 
 /**
- * daemon scheduler が参照する open risk 状態。
- */
-fun interface LlmDaemonOpenRiskReader {
-    /**
-     * open position または open order が存在するなら true を返す。
-     */
-    suspend fun hasOpenRisk(): Result<Boolean>
-}
-
-/**
  * daemon scheduler が参照する最小 ticker snapshot。
  *
  * @param lastPriceJpy 最終約定価格
@@ -190,6 +180,7 @@ class LlmDaemonScheduler(
     private val tickerReader = dependencies.tickerReader
     private val positionsReader = dependencies.positionsReader
     private val entryFillReader = dependencies.entryFillReader
+    private val restingOrderMaintenanceService = dependencies.restingOrderMaintenanceService
     private val requestBase = runtime.requestBase
     private val launchOneShot = runtime.launchOneShot
     private val clock = runtime.clock
@@ -268,7 +259,8 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped(LLM_DAEMON_SKIP_HARD_HALT, null)
         }
 
-        val hasOpenRisk = openRiskReader.hasOpenRisk().getOrThrow()
+        val openRisk = openRiskReader.snapshot().getOrThrow()
+        val hasOpenRisk = openRisk.hasOpenRisk
 
         if (riskState.state == RiskHaltState.SOFT_HALT && !hasOpenRisk) {
             appendSkip(
@@ -278,6 +270,20 @@ class LlmDaemonScheduler(
             ).getOrThrow()
 
             return LlmDaemonTickResult.Skipped(LLM_DAEMON_SKIP_SOFT_HALT_FLAT, null)
+        }
+
+        if (openRisk.isRestingEntryOnly) {
+            val reason = restingOrderMaintenanceService
+                .maintain(openRisk, observedAt)
+                .getOrThrow()
+
+            appendSkip(
+                reason = reason.wireCode,
+                trigger = null,
+                observedAt = observedAt,
+            ).getOrThrow()
+
+            return LlmDaemonTickResult.Skipped(reason.wireCode, null)
         }
 
         val trigger = selectTrigger(hasOpenRisk, observedAt)
@@ -901,6 +907,9 @@ data class LlmDaemonSchedulerDependencies(
     val tickerReader: LlmDaemonTickerReader,
     val positionsReader: LlmDaemonPositionsReader,
     val entryFillReader: LlmDaemonEntryFillReader,
+    val restingOrderMaintenanceService: RestingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
+        Result.success(RestingSuppressionReason.RESTING_ORDER_IDENTITY_UNAVAILABLE)
+    },
 )
 
 /**

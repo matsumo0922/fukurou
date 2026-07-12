@@ -227,7 +227,9 @@ class ManualLlmLaunchServiceTest {
                 riskStateRepository = riskStateRepository,
                 commandEventLog = eventLog,
                 launchReservationRepository = reservations,
-                openRiskReader = LlmDaemonOpenRiskReader { Result.success(false) },
+                openRiskReader = LlmDaemonOpenRiskReader {
+                    Result.success(LlmDaemonOpenRiskSnapshot(0, emptyList(), 0))
+                },
                 tickerReader = LlmDaemonTickerReader { error("ticker must not be read") },
                 positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
                 entryFillReader = LlmDaemonEntryFillReader { Result.success(null) },
@@ -596,7 +598,9 @@ private fun manualService(
             riskStateRepository = riskStateRepository,
             commandEventLog = eventLog,
             launchReservationRepository = reservations,
-            openRiskReader = { Result.success(hasOpenRisk) },
+            openRiskReader = {
+                Result.success(LlmDaemonOpenRiskSnapshot(if (hasOpenRisk) 1 else 0, emptyList(), 0))
+            },
         ),
         runtime = ManualLlmLaunchServiceRuntime(
             requestBase = defaultRequest(),

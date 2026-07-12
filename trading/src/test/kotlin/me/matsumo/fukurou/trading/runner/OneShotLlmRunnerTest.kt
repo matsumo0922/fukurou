@@ -1764,7 +1764,11 @@ class OneShotLlmRunnerTest {
                 riskStateRepository = runtime.riskStateRepository,
                 commandEventLog = runtime.commandEventLog,
                 launchReservationRepository = InMemoryLlmLaunchReservationRepository(runtime.riskStateRepository),
-                openRiskReader = { Result.success(false) },
+                openRiskReader = {
+                    Result.success(
+                        me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskSnapshot(0, emptyList(), 0),
+                    )
+                },
                 tickerReader = {
                     Result.success(
                         LlmDaemonTickerSnapshot(
