@@ -31,6 +31,7 @@ import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
+import me.matsumo.fukurou.trading.evaluation.EvaluationScope
 import me.matsumo.fukurou.trading.evaluation.EvaluationTradeQueryResult
 import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
 import me.matsumo.fukurou.trading.evaluation.LlmModelUsage
@@ -52,6 +53,16 @@ import kotlin.test.assertTrue
  * evaluation route の HTTP contract を検証するテスト。
  */
 class EvaluationRouteTest {
+    @Test
+    fun evaluationReportScopeKeyCodecKeepsLegacyAndVersionedIdentityCanonical() {
+        val legacy = EvaluationReportScopeKey.decode("PRESET:30D")
+        val versioned = legacy.version("epoch-1", "CURRENT")
+
+        assertEquals("PRESET:30D", legacy.encode())
+        assertEquals("PRESET:30D|EPOCH:epoch-1|COHORT:CURRENT", versioned.encode())
+        assertEquals(versioned, EvaluationReportScopeKey.decode(versioned.encode()))
+        assertTrue(runCatching { EvaluationReportScopeKey.decode("PRESET:30D|EPOCH:epoch-1") }.isFailure)
+    }
 
     @Test
     fun evaluationReport_failsClosedBeforeGenerationWhenUsageSnapshotIsTruncated() = testApplication {
@@ -344,6 +355,12 @@ private object FakeEvaluationRepository : EvaluationRepository {
             ),
         )
     }
+
+    override suspend fun fetchClosedTrades(
+        period: EvaluationPeriod,
+        limit: Int,
+        scope: EvaluationScope,
+    ): Result<EvaluationTradeQueryResult> = fetchClosedTrades(period, limit)
 
     override suspend fun countDecisionRuns(period: EvaluationPeriod): Result<Int> {
         return Result.success(2)

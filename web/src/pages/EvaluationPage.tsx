@@ -12,7 +12,7 @@ export function EvaluationPage() {
   const [custom, setCustom] = useState(false);
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
-  const [cohort, setCohort] = useState<"CURRENT" | "LEGACY_PRE_WS">("CURRENT");
+  const [cohort, setCohort] = useState<"CURRENT" | "LEGACY_PRE_WS" | "UNSUPPORTED_EXECUTION_SEMANTICS">("CURRENT");
   const epochs = useQuery({ queryKey: ["evaluation-epochs"], queryFn: fetchEvaluationEpochs, staleTime: 30_000 });
   const [epochId, setEpochId] = useState("");
   const selectedEpochId = epochId || epochs.data?.find((epoch) => epoch.active)?.epochId || epochs.data?.[0]?.epochId || "";
@@ -52,12 +52,13 @@ export function EvaluationPage() {
         {[7, 30, 90].map((value) => <button key={value} className={!custom && days === value ? "is-active" : ""} onClick={() => { setCustom(false); setDays(value); }}>{value}D</button>)}
         <button className={custom ? "is-active" : ""} onClick={() => setCustom(true)}>CUSTOM</button>
         <label>Epoch<select value={selectedEpochId} onChange={(event) => { setPreview(null); setEpochId(event.target.value); }}>{epochs.data?.map((epoch) => <option value={epoch.epochId} key={epoch.epochId}>{epoch.active ? "ACTIVE · " : ""}{epoch.kind} · {epoch.initialCashJpy} JPY · {epoch.epochId.slice(0, 8)}</option>)}</select></label>
-        <label>Cohort<select value={cohort} onChange={(event) => setCohort(event.target.value as "CURRENT" | "LEGACY_PRE_WS")}><option value="CURRENT">CURRENT</option><option value="LEGACY_PRE_WS">LEGACY / REFERENCE</option></select></label>
+        <label>Cohort<select value={cohort} onChange={(event) => setCohort(event.target.value as typeof cohort)}><option value="CURRENT">CURRENT</option><option value="LEGACY_PRE_WS">LEGACY / REFERENCE</option><option value="UNSUPPORTED_EXECUTION_SEMANTICS">UNSUPPORTED / NOT EVALUABLE</option></select></label>
         {custom && <><label>From<input type="date" value={customFrom} onChange={(event) => setCustomFrom(event.target.value)} /></label><label>To<input type="date" value={customTo} onChange={(event) => setCustomTo(event.target.value)} /></label></>}
         <button className="generate-button" disabled={generation.isPending || !scopeReady} onClick={() => generation.mutate()}><RefreshCw size={15} aria-hidden />{generation.isPending ? "GENERATING" : "GENERATE REPORT"}</button>
       </div>
     </header>
     {cohort === "LEGACY_PRE_WS" && <div className="console-alert" role="status">Legacy pre-WebSocket trades are reference-only. Baseline benchmark series and returns are not comparable.</div>}
+    {cohort === "UNSUPPORTED_EXECUTION_SEMANTICS" && <div className="console-alert" role="alert">Unsupported execution semantics are not evaluable. Coverage and missing attribution remain visible, but results must not be treated as CURRENT performance.</div>}
     <CurrentContextStrip />
     {generationJob && generation.isPending && <div className="console-alert" role="status">Job {generationJob.jobId.slice(0, 12)} · revision #{generationJob.revisionNumber} · {generationJob.stage}. Existing pinned revision remains authoritative.</div>}
     {generation.isError && <div className="console-alert" role="alert">Generation failed: {generation.error.message}. Existing revision remains authoritative.</div>}

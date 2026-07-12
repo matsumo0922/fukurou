@@ -25,6 +25,8 @@ import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
+import me.matsumo.fukurou.trading.evaluation.EvaluationScope
+import me.matsumo.fukurou.trading.evaluation.intersectLifecycle
 import me.matsumo.fukurou.trading.evaluation.OutcomeRidgeChartFacts
 import me.matsumo.fukurou.trading.evaluation.MarketRegimeLabel
 import me.matsumo.fukurou.trading.evaluation.report.EvaluationClaimValidator
@@ -174,7 +176,7 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
         val scopeKey = call.reportScopeKey(dependencies.repository) ?: return@get
         val currentHistory = store.history(scopeKey)
         val legacyHistory = if (call.request.queryParameters["cohort"] == "LEGACY_PRE_WS") {
-            store.history(scopeKey.substringBefore("|EPOCH:"))
+            store.history(EvaluationReportScopeKey.decode(scopeKey).base)
         } else {
             emptyList()
         }
@@ -348,6 +350,7 @@ private class EvaluationReportStore(
             from = from.atStartOfDay(ReportZone).toInstant(),
             toExclusive = toInclusive.plusDays(1).atStartOfDay(ReportZone).toInstant(),
         )
+        val effectivePeriod = period.intersectLifecycle(scope.evaluationScope)
         val snapshotId = UUID.randomUUID().toString()
         val snapshot = source.fetchReportSnapshot(period, scope.evaluationScope).getOrThrow()
         val queryResult = snapshot.trades
@@ -531,7 +534,16 @@ private class EvaluationReportStore(
                 total = queryResult.attributionCoverage.total,
             ),
             status = "SUCCEEDED",
-            period = EvaluationReportPeriodResponse(from.toString(), toInclusive.toString(), ReportZone.id),
+            period = EvaluationReportPeriodResponse(
+                from = from.toString(),
+                toInclusive = toInclusive.toString(),
+                timezone = ReportZone.id,
+                effectiveFrom = effectivePeriod.from.atZone(ReportZone).toLocalDate().toString(),
+                effectiveToInclusive = effectivePeriod.toExclusive.minusMillis(1)
+                    .atZone(ReportZone).toLocalDate().toString(),
+                populationState = if (effectivePeriod == period) "FULL_REQUESTED_PERIOD" else "PARTIAL_LIFECYCLE",
+                effectiveDays = java.time.Duration.between(effectivePeriod.from, effectivePeriod.toExclusive).toDays(),
+            ),
             inputAsOf = inputAsOf,
             inputHash = inputHash,
             snapshotId = snapshotId,
@@ -926,7 +938,7 @@ private data class EvaluationReportScope(
     val label: String,
     val from: LocalDate? = null,
     val toInclusive: LocalDate? = null,
-    val evaluationScope: me.matsumo.fukurou.trading.evaluation.EvaluationScope,
+    val evaluationScope: EvaluationScope,
 )
 
 private fun EvaluationReportGenerateRequest.toScope(
@@ -980,10 +992,11 @@ data class EvaluationReportScopeErrorResponse(val code: String, val message: Str
 
 private suspend fun EvaluationReportPinRequest.resolvedScopeKey(repository: EvaluationRepository?): String? {
     val scope = repository?.resolveScope(epochId, cohort)?.getOrNull() ?: return null
-    val base = scopeKey ?: "PRESET:${days ?: 30}D"
-    val unversionedBase = base.substringBefore("|EPOCH:")
-    val resolved = "$unversionedBase|EPOCH:${scope.accountEpochId}|COHORT:${scope.cohort.name}"
-    return resolved.takeIf { "|EPOCH:" !in base || base == resolved }
+    val supplied = runCatching {
+        EvaluationReportScopeKey.decode(scopeKey ?: "PRESET:${days ?: 30}D")
+    }.getOrNull() ?: return null
+    val resolved = supplied.version(scope.accountEpochId.toString(), scope.cohort.name)
+    return resolved.encode().takeIf { !supplied.versioned || supplied == resolved }
 }
 
 private suspend fun io.ktor.server.application.ApplicationCall.reportScopeKey(
@@ -998,11 +1011,19 @@ private suspend fun io.ktor.server.application.ApplicationCall.reportScopeKey(
         respond(HttpStatusCode.BadRequest, ErrorResponse("evaluation scope is invalid"))
         return null
     }
-    val base = suppliedKey?.substringBefore("|EPOCH:")
-        ?: "PRESET:${request.queryParameters["days"]?.toIntOrNull() ?: 30}D"
-    val resolved = "$base|EPOCH:${scope.accountEpochId}|COHORT:${scope.cohort.name}"
+    val supplied = runCatching {
+        EvaluationReportScopeKey.decode(
+            suppliedKey ?: "PRESET:${request.queryParameters["days"]?.toIntOrNull() ?: 30}D",
+        )
+    }.getOrNull()
+    if (supplied == null) {
+        respond(HttpStatusCode.BadRequest, EvaluationReportScopeErrorResponse("REPORT_SCOPE_INVALID", "scopeKey is malformed"))
+        return null
+    }
+    val resolvedScope = supplied.version(scope.accountEpochId.toString(), scope.cohort.name)
+    val resolved = resolvedScope.encode()
     val versionedScopeMismatch = suppliedKey != null &&
-        "|EPOCH:" in suppliedKey && suppliedKey != resolved
+        supplied.versioned && supplied != resolvedScope
     if (versionedScopeMismatch) {
         respond(HttpStatusCode.BadRequest, EvaluationReportScopeErrorResponse("REPORT_SCOPE_MISMATCH", "scopeKey does not match epochId/cohort"))
         return null
@@ -1026,7 +1047,15 @@ data class EvaluationReportJobResponse(
 )
 
 @Serializable
-data class EvaluationReportPeriodResponse(val from: String, val toInclusive: String, val timezone: String)
+data class EvaluationReportPeriodResponse(
+    val from: String,
+    val toInclusive: String,
+    val timezone: String,
+    val effectiveFrom: String = from,
+    val effectiveToInclusive: String = toInclusive,
+    val populationState: String = "LEGACY_UNVERSIONED_PERIOD",
+    val effectiveDays: Long = 0,
+)
 
 @Serializable
 data class EvaluationReportSegmentResponse(val segmentId: String, val kind: String, val text: String, val claimIds: List<String>)

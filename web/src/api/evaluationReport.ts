@@ -46,14 +46,22 @@ export function reportScopeKey(scope: ReportScope): string {
   return scope.kind === "PRESET" ? `PRESET:${scope.days}D` : `CUSTOM:${scope.from}:${scope.toInclusive}`;
 }
 
+export function parseReportScopeKey(value: string): { base: string; epochId: string | null; cohort: string | null } | null {
+  const match = /^(.*)\|EPOCH:([^|]+)\|COHORT:([^|]+)$/.exec(value);
+  if (match != null) return { base: match[1], epochId: match[2], cohort: match[3] };
+  if (value.length > 0 && !value.includes("|")) return { base: value, epochId: null, cohort: null };
+  return null;
+}
+
 export function reportRevisionMatchesScope(
   revision: Pick<ReportHistoryItem, "epochId" | "cohort" | "scopeKey">,
   scopeKey: string,
   epochId: string,
   cohort: string,
 ): boolean {
-  return revision.epochId === epochId && revision.cohort === cohort &&
-    revision.scopeKey === `${scopeKey}|EPOCH:${epochId}|COHORT:${cohort}`;
+  const identity = revision.scopeKey == null ? null : parseReportScopeKey(revision.scopeKey);
+  return identity?.base === scopeKey && identity.epochId === epochId && identity.cohort === cohort &&
+    revision.epochId === epochId && revision.cohort === cohort;
 }
 
 export async function fetchEvaluationEpochs(): Promise<EvaluationEpoch[]> {

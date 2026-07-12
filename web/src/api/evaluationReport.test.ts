@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { generateReport, reportRevisionMatchesScope, ReportAdmissionError } from "./evaluationReport";
+import { generateReport, parseReportScopeKey, reportRevisionMatchesScope, ReportAdmissionError } from "./evaluationReport";
 
 const job = {
   jobId: "job-1", revisionId: "revision-1", revisionNumber: 7, status: "REQUESTED", stage: "ADMITTED",
@@ -9,6 +9,12 @@ const job = {
 
 describe("evaluation report generation client", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it("decodes legacy and versioned report scope identities canonically", () => {
+    expect(parseReportScopeKey("PRESET:30D")).toEqual({ base: "PRESET:30D", epochId: null, cohort: null });
+    expect(parseReportScopeKey("PRESET:30D|EPOCH:epoch-1|COHORT:CURRENT")).toEqual({ base: "PRESET:30D", epochId: "epoch-1", cohort: "CURRENT" });
+    expect(parseReportScopeKey("PRESET:30D|EPOCH:epoch-1")).toBeNull();
+  });
 
   it("never exposes pin eligibility across epoch/cohort or legacy unversioned scope", () => {
     const selected = { epochId: "epoch-1", cohort: "CURRENT", scopeKey: "PRESET:30D|EPOCH:epoch-1|COHORT:CURRENT" };

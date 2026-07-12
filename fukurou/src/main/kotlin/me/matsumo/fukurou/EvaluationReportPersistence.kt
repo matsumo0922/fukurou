@@ -253,10 +253,8 @@ internal class EvaluationReportPersistence(
                                     status = result.getString(4),
                                     requestedAt = java.time.Instant.ofEpochMilli(result.getLong(5)).toString(),
                                     pinned = result.getBoolean(6),
-                                    epochId = scopeKey.substringAfter("|EPOCH:", "")
-                                        .substringBefore("|")
-                                        .ifBlank { null },
-                                    cohort = scopeKey.substringAfter("|COHORT:", "").ifBlank { null },
+                                    epochId = EvaluationReportScopeKey.decode(scopeKey).epochId,
+                                    cohort = EvaluationReportScopeKey.decode(scopeKey).cohort,
                                     scopeKey = scopeKey,
                                 ),
                             )

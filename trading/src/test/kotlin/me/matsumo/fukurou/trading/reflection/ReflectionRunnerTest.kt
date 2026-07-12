@@ -19,6 +19,7 @@ import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
+import me.matsumo.fukurou.trading.evaluation.EvaluationScope
 import me.matsumo.fukurou.trading.evaluation.EvaluationTradeQueryResult
 import me.matsumo.fukurou.trading.evaluation.InMemoryLlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
@@ -673,6 +674,11 @@ private class StaticReflectionEvaluationRepository(
     private val closedTradesTruncated: Boolean,
     private val llmUsagesTruncated: Boolean,
 ) : EvaluationRepository {
+    override suspend fun fetchClosedTrades(
+        period: EvaluationPeriod,
+        limit: Int,
+        scope: EvaluationScope,
+    ): Result<EvaluationTradeQueryResult> = fetchClosedTrades(period, limit)
 
     override suspend fun fetchClosedTrades(period: EvaluationPeriod, limit: Int): Result<EvaluationTradeQueryResult> {
         return Result.success(

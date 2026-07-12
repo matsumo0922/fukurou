@@ -2,6 +2,8 @@
 
 package me.matsumo.fukurou.trading.evaluation
 
+import me.matsumo.fukurou.trading.domain.EvaluationCohort
+import me.matsumo.fukurou.trading.domain.PAPER_EXECUTION_SEMANTICS_VERSION
 import java.math.BigDecimal
 import java.time.Instant
 
@@ -16,9 +18,8 @@ interface EvaluationRepository {
     suspend fun resolveScope(epochId: String?, cohort: String?): Result<EvaluationScope> = runCatching {
         EvaluationScope(
             accountEpochId = epochId?.let(java.util.UUID::fromString) ?: java.util.UUID(0, 0),
-            cohort = cohort?.let(me.matsumo.fukurou.trading.domain.EvaluationCohort::valueOf)
-                ?: me.matsumo.fukurou.trading.domain.EvaluationCohort.CURRENT,
-            executionSemanticsVersion = me.matsumo.fukurou.trading.domain.PAPER_EXECUTION_SEMANTICS_VERSION,
+            cohort = cohort?.let(EvaluationCohort::valueOf) ?: EvaluationCohort.CURRENT,
+            executionSemanticsVersion = PAPER_EXECUTION_SEMANTICS_VERSION,
             initialCashJpy = BigDecimal.ZERO,
         )
     }
@@ -83,7 +84,9 @@ interface EvaluationRepository {
         period: EvaluationPeriod,
         limit: Int = DEFAULT_EVALUATION_QUERY_LIMIT,
         scope: EvaluationScope,
-    ): Result<EvaluationTradeQueryResult> = fetchClosedTrades(period, limit)
+    ): Result<EvaluationTradeQueryResult> = Result.failure(
+        IllegalStateException("EVALUATION_SCOPE_UNSUPPORTED: repository must implement scoped closed-trade reads."),
+    )
 
     /**
      * 期間内の distinct decision run 数を取得する。
@@ -156,8 +159,7 @@ fun EvaluationPeriod.intersectLifecycle(scope: EvaluationScope): EvaluationPerio
     return EvaluationPeriod(from, maxOf(from, to))
 }
 
-private fun EvaluationScope.isCurrentPopulation(): Boolean =
-    cohort == me.matsumo.fukurou.trading.domain.EvaluationCohort.CURRENT
+private fun EvaluationScope.isCurrentPopulation(): Boolean = cohort == EvaluationCohort.CURRENT
 
 /** immutable evaluation report の DB snapshot facts。 */
 data class EvaluationReportSnapshotFacts(
@@ -188,6 +190,12 @@ class InMemoryEvaluationRepository : EvaluationRepository {
             )
         }
     }
+
+    override suspend fun fetchClosedTrades(
+        period: EvaluationPeriod,
+        limit: Int,
+        scope: EvaluationScope,
+    ): Result<EvaluationTradeQueryResult> = fetchClosedTrades(period.intersectLifecycle(scope), limit)
 
     override suspend fun countDecisionRuns(period: EvaluationPeriod): Result<Int> {
         return Result.success(0)

@@ -2345,6 +2345,10 @@ export interface components {
             from: string;
             to: string;
             timezone: string;
+            effectiveFrom: string;
+            effectiveTo: string;
+            populationState: string;
+            effectiveDays: number;
         };
         /** EvaluationScopeResponse */
         EvaluationScopeResponse: {
@@ -2541,6 +2545,10 @@ export interface components {
             from: string;
             toInclusive: string;
             timezone: string;
+            effectiveFrom?: string;
+            effectiveToInclusive?: string;
+            populationState?: string;
+            effectiveDays?: number;
         };
         /** EvaluationReportGenerationMetadataResponse */
         EvaluationReportGenerationMetadataResponse: {

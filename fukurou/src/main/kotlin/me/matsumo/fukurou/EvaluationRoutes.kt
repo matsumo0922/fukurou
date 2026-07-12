@@ -31,6 +31,7 @@ import me.matsumo.fukurou.trading.evaluation.LlmProviderCostStats
 import me.matsumo.fukurou.trading.evaluation.MarketRegimePerformance
 import me.matsumo.fukurou.trading.evaluation.SetupPerformance
 import me.matsumo.fukurou.trading.evaluation.TradePerformanceStats
+import me.matsumo.fukurou.trading.evaluation.intersectLifecycle
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
@@ -175,10 +176,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         val actionCounts = evaluationRepository.countDecisionsByAction(period, scope).getOrThrow()
         val exclusionSummary = evaluationRepository.fetchExclusionSummary(period, scope).getOrThrow()
         val performance = EvaluationMath.summarizeTrades(tradeResult.trades)
-        val killStats = me.matsumo.fukurou.trading.evaluation.KillCriterionStats(
-            closedTrades = performance.tradeCount,
-            profitFactor = performance.profitFactor,
-        )
+        val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
         val riskState = evaluationRiskStateRepository.current().getOrThrow()
         val candles = call.fetchDailyCandlesOrEmpty(
             marketDataSource = dependencies.marketDataSource,
@@ -189,7 +187,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
 
         call.respond(
             EvaluationSummaryResponse(
-                period = dateRange.toResponsePeriod(),
+                period = dateRange.toResponsePeriod(scope),
                 scope = scope.toResponse(),
                 attributionCoverage = tradeResult.attributionCoverage.toResponse(),
                 truncated = tradeResult.truncated,
@@ -257,7 +255,7 @@ private fun Route.registerEvaluationSetupsRoute(dependencies: EvaluationRouteDep
 
         call.respond(
             EvaluationSetupsResponse(
-                period = dateRange.toResponsePeriod(),
+                period = dateRange.toResponsePeriod(scope),
                 scope = scope.toResponse(),
                 attributionCoverage = tradeResult.attributionCoverage.toResponse(),
                 truncated = tradeResult.truncated,
@@ -311,7 +309,7 @@ private fun Route.registerEvaluationCalibrationRoute(dependencies: EvaluationRou
 
         call.respond(
             EvaluationCalibrationResponse(
-                period = dateRange.toResponsePeriod(),
+                period = dateRange.toResponsePeriod(scope),
                 scope = scope.toResponse(),
                 attributionCoverage = tradeResult.attributionCoverage.toResponse(),
                 truncated = tradeResult.truncated,
@@ -365,9 +363,13 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
         val priorPnlJpy = evaluationRepository.fetchClosedTrades(
             EvaluationPeriod(Instant.EPOCH, period.from),
             scope = scope,
-        ).getOrThrow().trades.sumOf { trade -> trade.tradePnlJpy }
+        ).getOrThrow().also { result ->
+            require(!result.truncated) { "EVALUATION_RESULT_TRUNCATED: benchmark prior population is incomplete." }
+        }.trades.sumOf { trade -> trade.tradePnlJpy }
         val baselineEquityJpy = initialCashJpy.add(priorPnlJpy)
-        val dailyPnl = evaluationRepository.fetchClosedTrades(period, scope = scope).getOrThrow().trades.map { trade ->
+        val dailyPnl = evaluationRepository.fetchClosedTrades(period, scope = scope).getOrThrow().also { result ->
+            require(!result.truncated) { "EVALUATION_RESULT_TRUNCATED: benchmark population is incomplete." }
+        }.trades.map { trade ->
             me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
         }
         val dailyCandleLimit = call.requireDailyCandleLimit(dateRange) ?: return@get
@@ -391,7 +393,7 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
 
         call.respond(
             EvaluationBenchmarkResponse(
-                period = dateRange.toResponsePeriod(),
+                period = dateRange.toResponsePeriod(scope),
                 scope = scope.toResponse(),
                 assumptionsJa = "buy & hold は開始日 close で全額 BTC を買い、手数料・スリッページを無視します。bot equity は realized PnL のみを close 日に計上し、未実現損益は含めません。",
                 baselineEquityJpy = baselineEquityJpy.takeIf { baselineComparable }?.toDecimalString(),
@@ -443,7 +445,7 @@ private fun Route.registerEvaluationCostsRoute(dependencies: EvaluationRouteDepe
 
         call.respond(
             EvaluationCostsResponse(
-                period = dateRange.toResponsePeriod(),
+                period = dateRange.toResponsePeriod(scope),
                 scope = scope.toResponse(),
                 truncated = usageResult.truncated,
                 phaseCount = costs.phaseCount,
@@ -607,11 +609,24 @@ private data class EvaluationDateRange(
         )
     }
 
-    fun toResponsePeriod(): EvaluationPeriodResponse {
+    fun toResponsePeriod(scope: EvaluationScope): EvaluationPeriodResponse {
+        val requested = toPeriod()
+        val effective = requested.intersectLifecycle(scope)
+        val effectiveFromDate = effective.from.atZone(EvaluationZone).toLocalDate()
+        val effectiveToDate = effective.toExclusive.minusMillis(1).atZone(EvaluationZone).toLocalDate()
+        val state = if (effective.from == requested.from && effective.toExclusive == requested.toExclusive) {
+            "FULL_REQUESTED_PERIOD"
+        } else {
+            "PARTIAL_LIFECYCLE"
+        }
         return EvaluationPeriodResponse(
             from = fromDate.toString(),
             to = toDate.toString(),
             timezone = EvaluationZone.id,
+            effectiveFrom = effectiveFromDate.toString(),
+            effectiveTo = effectiveToDate.toString(),
+            populationState = state,
+            effectiveDays = Duration.between(effective.from, effective.toExclusive).toDays(),
         )
     }
 
@@ -639,6 +654,10 @@ data class EvaluationPeriodResponse(
     val from: String,
     val to: String,
     val timezone: String,
+    val effectiveFrom: String,
+    val effectiveTo: String,
+    val populationState: String,
+    val effectiveDays: Long,
 )
 
 /** evaluation response が使用した immutable epoch/cohort scope。 */
