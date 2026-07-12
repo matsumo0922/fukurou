@@ -54,6 +54,82 @@ import kotlin.test.assertTrue
  */
 class EvaluationRouteTest {
     @Test
+    fun evaluationRoutesExposeEmptyPartialAndFullLifecyclePeriods() = testApplication {
+        val lifecycleRepository = object : EvaluationRepository by FakeEvaluationRepository {
+            override suspend fun resolveScope(epochId: String?, cohort: String?): Result<EvaluationScope> =
+                Result.success(
+                    EvaluationScope(
+                        accountEpochId = UUID.fromString("00000000-0000-0000-0000-000000000184"),
+                        cohort = me.matsumo.fukurou.trading.domain.EvaluationCohort.CURRENT,
+                        executionSemanticsVersion = "PAPER_WS_V1",
+                        initialCashJpy = BigDecimal("1000000"),
+                        lifecycleFromInclusive = Instant.parse("2026-07-02T00:00:00Z"),
+                    ),
+                )
+        }
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = lifecycleRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val empty = client.get("/evaluation/benchmark?from=2026-06-01&to=2026-06-02").bodyAsText()
+        val partial = client.get("/evaluation/summary?from=2026-07-01&to=2026-07-03").bodyAsText()
+        val full = client.get("/evaluation/costs?from=2026-07-03&to=2026-07-04").bodyAsText()
+
+        assertTrue(empty.contains("\"populationState\":\"EMPTY_LIFECYCLE\""))
+        assertTrue(empty.contains("\"effectiveFrom\":null"))
+        assertTrue(empty.contains("\"state\":\"EMPTY_LIFECYCLE\""))
+        assertTrue(partial.contains("\"populationState\":\"PARTIAL_LIFECYCLE\""))
+        assertTrue(partial.contains("\"effectiveFrom\":\"2026-07-02\""))
+        assertTrue(full.contains("\"populationState\":\"FULL_REQUESTED_PERIOD\""))
+    }
+
+    @Test
+    fun evaluationReportUsesEffectiveLifecyclePeriod() = testApplication {
+        val lifecycleRepository = object : EvaluationRepository by FakeEvaluationRepository {
+            override suspend fun resolveScope(epochId: String?, cohort: String?): Result<EvaluationScope> =
+                Result.success(
+                    EvaluationScope(
+                        accountEpochId = UUID.fromString("00000000-0000-0000-0000-000000000184"),
+                        cohort = me.matsumo.fukurou.trading.domain.EvaluationCohort.CURRENT,
+                        executionSemanticsVersion = "PAPER_WS_V1",
+                        initialCashJpy = BigDecimal("1000000"),
+                        lifecycleFromInclusive = Instant.parse("2026-07-02T00:00:00Z"),
+                    ),
+                )
+        }
+        application {
+            module(
+                readinessProbe = { true }, clock = fixedClock(), evaluationRepository = lifecycleRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+        val accepted = client.post("/evaluation/reports/jobs") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"kind":"CUSTOM","from":"2026-07-01","toInclusive":"2026-07-03"}""")
+        }.bodyAsText()
+        val revisionId = requireNotNull(Regex("\\\"revisionId\\\":\\\"([^\\\"]+)").find(accepted)).groupValues[1]
+        var revision = ""
+        repeat(100) {
+            if (!revision.contains("\"status\":\"SUCCEEDED\"")) {
+                revision = client.get("/evaluation/reports/revisions/$revisionId").bodyAsText()
+                if (!revision.contains("\"status\":\"SUCCEEDED\"")) delay(10)
+            }
+        }
+
+        assertTrue(revision.contains("\"populationState\":\"PARTIAL_LIFECYCLE\""))
+        assertTrue(revision.contains("\"effectiveFrom\":\"2026-07-02\""))
+    }
+
+    @Test
     fun evaluationReportScopeKeyCodecKeepsLegacyAndVersionedIdentityCanonical() {
         val legacy = EvaluationReportScopeKey.decode("PRESET:30D")
         val versioned = legacy.version("epoch-1", "CURRENT")
@@ -62,6 +138,11 @@ class EvaluationRouteTest {
         assertEquals("PRESET:30D|EPOCH:epoch-1|COHORT:CURRENT", versioned.encode())
         assertEquals(versioned, EvaluationReportScopeKey.decode(versioned.encode()))
         assertTrue(runCatching { EvaluationReportScopeKey.decode("PRESET:30D|EPOCH:epoch-1") }.isFailure)
+        assertTrue(
+            runCatching {
+                EvaluationReportScopeKey.decode("PRESET:30D|EPOCH:epoch-1|COHORT:CURRENT|EXTRA:value")
+            }.isFailure,
+        )
     }
 
     @Test
@@ -387,6 +468,10 @@ private object FakeEvaluationRepository : EvaluationRepository {
     }
 
     override suspend fun sumTradePnlBefore(instant: Instant): Result<BigDecimal> {
+        return Result.success(BigDecimal.ZERO)
+    }
+
+    override suspend fun sumTradePnlBefore(instant: Instant, scope: EvaluationScope): Result<BigDecimal> {
         return Result.success(BigDecimal.ZERO)
     }
 

@@ -2345,8 +2345,8 @@ export interface components {
             from: string;
             to: string;
             timezone: string;
-            effectiveFrom: string;
-            effectiveTo: string;
+            effectiveFrom?: string | null;
+            effectiveTo?: string | null;
             populationState: string;
             effectiveDays: number;
         };
@@ -2545,8 +2545,8 @@ export interface components {
             from: string;
             toInclusive: string;
             timezone: string;
-            effectiveFrom?: string;
-            effectiveToInclusive?: string;
+            effectiveFrom?: string | null;
+            effectiveToInclusive?: string | null;
             populationState?: string;
             effectiveDays?: number;
         };

@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
-import { fetchEvaluationEpochs, fetchReportHistory, fetchReportRevision, generateReport, pinReport, reportQuery, reportRevisionMatchesScope, reportScopeKey, type EvaluationReport, type ReportJob, type ReportScope } from "../api/evaluationReport";
+import { fetchEvaluationEpochs, fetchReportHistory, fetchReportRevision, generateReport, pinReport, reportEffectivePeriodLabel, reportQuery, reportRevisionMatchesScope, reportScopeKey, type EvaluationReport, type ReportJob, type ReportScope } from "../api/evaluationReport";
 import { LazyHistoricalOutcomeRidge } from "./evaluation-report/HistoricalOutcomeRidge.lazy";
 import { LazyEvidenceRelationshipGraph } from "./evaluation-report/EvidenceRelationshipGraph.lazy";
 import { initialContextState } from "./evaluation-report/currentContextStateMachine";
@@ -118,6 +118,7 @@ function RevisionRail({ report, pinned }: { report: EvaluationReport; pinned: bo
     <div><span>Revision</span><strong>#{report.revisionNumber} · {pinned ? "PINNED" : "PREVIEW"}</strong><small>{report.scopeKey}</small></div>
     <div><span>Snapshot authority</span><strong>{report.snapshotId.slice(0, 12)}</strong><small>{report.inputHash.slice(0, 20)}</small></div>
     <div><span>Input as of</span><strong>{new Date(report.inputAsOf).toLocaleString()}</strong><small>{report.period.from} — {report.period.toInclusive}</small></div>
+    <div><span>Effective population</span><strong>{report.period.populationState}</strong><small>{reportEffectivePeriodLabel(report.period)}</small></div>
     <div><span>Generator</span><strong>{report.generation.provider}</strong><small>{report.generation.observedModels?.join(", ") || report.model} · {report.generation.effort}</small></div>
     <div><span>LLM cost</span><strong>{report.generation.totalCostUsd ? `$${report.generation.totalCostUsd}` : "UNPRICED"}</strong><small>{report.generation.durationMillis == null ? "duration unavailable" : `${report.generation.durationMillis}ms`} · {report.generation.schemaVersion}</small></div>
     <div><span>Claim coverage</span><strong>{verified}/{report.validation.length} verified</strong><small>{report.validation.filter((result) => result.status === "CONFLICT").length} conflict</small></div>

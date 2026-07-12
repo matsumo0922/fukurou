@@ -26,6 +26,7 @@ import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationScope
+import me.matsumo.fukurou.trading.domain.EvaluationCohort
 import me.matsumo.fukurou.trading.evaluation.intersectLifecycle
 import me.matsumo.fukurou.trading.evaluation.OutcomeRidgeChartFacts
 import me.matsumo.fukurou.trading.evaluation.MarketRegimeLabel
@@ -352,14 +353,20 @@ private class EvaluationReportStore(
         )
         val effectivePeriod = period.intersectLifecycle(scope.evaluationScope)
         val snapshotId = UUID.randomUUID().toString()
-        val snapshot = source.fetchReportSnapshot(period, scope.evaluationScope).getOrThrow()
+        val emptyLifecycle = effectivePeriod.from == effectivePeriod.toExclusive
+        val snapshot = source.fetchReportSnapshot(effectivePeriod, scope.evaluationScope).getOrThrow()
         val queryResult = snapshot.trades
         require(!queryResult.truncated) { "SNAPSHOT_TRUNCATED" }
-        val candles = marketDataSource?.getCandles(
-            symbol = symbol,
-            interval = CandleInterval.ONE_DAY,
-            limit = (scope.days + 40).coerceAtMost(500),
-        )?.getOrThrow() ?: error("market data source is unavailable")
+        val effectiveDays = java.time.Duration.between(effectivePeriod.from, effectivePeriod.toExclusive).toDays()
+        val candles = if (emptyLifecycle) {
+            emptyList()
+        } else {
+            marketDataSource?.getCandles(
+                symbol = symbol,
+                interval = CandleInterval.ONE_DAY,
+                limit = (effectiveDays.toInt() + 40).coerceAtMost(500),
+            )?.getOrThrow() ?: error("market data source is unavailable")
+        }
         val regimes = EvaluationMath.classifyMarketRegimes(candles, ReportZone)
         val stats = EvaluationMath.summarizeTrades(queryResult.trades)
         val ridge = EvaluationMath.historicalOutcomeRidges(queryResult.trades, ReportZone, regimes)
@@ -375,7 +382,7 @@ private class EvaluationReportStore(
             ),
         )
         val benchmarkComparable = scope.evaluationScope.cohort !=
-            me.matsumo.fukurou.trading.domain.EvaluationCohort.LEGACY_PRE_WS
+            EvaluationCohort.LEGACY_PRE_WS
         val calibration = buildCalibrationResponse(queryResult.trades)
         val performanceLattice = buildPerformanceLattice(queryResult.trades, regimes)
         val usageResult = snapshot.usages
@@ -538,11 +545,16 @@ private class EvaluationReportStore(
                 from = from.toString(),
                 toInclusive = toInclusive.toString(),
                 timezone = ReportZone.id,
-                effectiveFrom = effectivePeriod.from.atZone(ReportZone).toLocalDate().toString(),
+                effectiveFrom = effectivePeriod.from.atZone(ReportZone).toLocalDate().toString()
+                    .takeUnless { emptyLifecycle },
                 effectiveToInclusive = effectivePeriod.toExclusive.minusMillis(1)
-                    .atZone(ReportZone).toLocalDate().toString(),
-                populationState = if (effectivePeriod == period) "FULL_REQUESTED_PERIOD" else "PARTIAL_LIFECYCLE",
-                effectiveDays = java.time.Duration.between(effectivePeriod.from, effectivePeriod.toExclusive).toDays(),
+                    .atZone(ReportZone).toLocalDate().toString().takeUnless { emptyLifecycle },
+                populationState = when {
+                    emptyLifecycle -> "EMPTY_LIFECYCLE"
+                    effectivePeriod == period -> "FULL_REQUESTED_PERIOD"
+                    else -> "PARTIAL_LIFECYCLE"
+                },
+                effectiveDays = effectiveDays,
             ),
             inputAsOf = inputAsOf,
             inputHash = inputHash,
@@ -941,9 +953,7 @@ private data class EvaluationReportScope(
     val evaluationScope: EvaluationScope,
 )
 
-private fun EvaluationReportGenerateRequest.toScope(
-    evaluationScope: me.matsumo.fukurou.trading.evaluation.EvaluationScope,
-): EvaluationReportScope? {
+private fun EvaluationReportGenerateRequest.toScope(evaluationScope: EvaluationScope): EvaluationReportScope? {
     val suffix = "EPOCH:${evaluationScope.accountEpochId}|COHORT:${evaluationScope.cohort.name}"
     if (kind == "PRESET" && days in setOf(7, 30, 90)) {
         return EvaluationReportScope(
@@ -1051,8 +1061,8 @@ data class EvaluationReportPeriodResponse(
     val from: String,
     val toInclusive: String,
     val timezone: String,
-    val effectiveFrom: String = from,
-    val effectiveToInclusive: String = toInclusive,
+    val effectiveFrom: String? = from,
+    val effectiveToInclusive: String? = toInclusive,
     val populationState: String = "LEGACY_UNVERSIONED_PERIOD",
     val effectiveDays: Long = 0,
 )

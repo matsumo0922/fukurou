@@ -14,6 +14,7 @@ import kotlinx.serialization.Serializable
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.EvaluationCohort
 import me.matsumo.fukurou.trading.evaluation.BenchmarkCalculationRequest
 import me.matsumo.fukurou.trading.evaluation.BenchmarkPoint
 import me.matsumo.fukurou.trading.evaluation.BenchmarkResult
@@ -42,7 +43,6 @@ import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
 import java.time.LocalDate
-import java.time.Instant
 import java.time.ZoneId
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
@@ -112,7 +112,7 @@ private fun EvaluationScope.toResponse(): EvaluationScopeResponse = EvaluationSc
     cohort = cohort.name,
     executionSemanticsVersion = executionSemanticsVersion,
     initialCashJpy = initialCashJpy.toPlainString(),
-    populationState = if (cohort == me.matsumo.fukurou.trading.domain.EvaluationCohort.CURRENT) {
+    populationState = if (cohort == EvaluationCohort.CURRENT) {
         "AVAILABLE"
     } else {
         "NOT_ATTRIBUTABLE"
@@ -357,22 +357,36 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
         val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
         val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
         val scope = call.resolveEvaluationScope(evaluationRepository) ?: return@get
-        val evaluationMarketDataSource = call.requireMarketDataSource(dependencies.marketDataSource) ?: return@get
         val period = dateRange.toPeriod()
+        val effectivePeriod = period.intersectLifecycle(scope)
+        val periodResponse = dateRange.toResponsePeriod(scope)
+        if (effectivePeriod.from == effectivePeriod.toExclusive) {
+            call.respond(
+                EvaluationBenchmarkResponse(
+                    period = periodResponse,
+                    scope = scope.toResponse(),
+                    assumptionsJa = "epoch lifecycle と requested period の積集合が空のため benchmark は計算しません。",
+                    baselineEquityJpy = null,
+                    points = emptyList(),
+                    returns = null,
+                    state = "EMPTY_LIFECYCLE",
+                ),
+            )
+            return@get
+        }
+        val evaluationMarketDataSource = call.requireMarketDataSource(dependencies.marketDataSource) ?: return@get
+        val effectiveFromDate = effectivePeriod.from.atZone(EvaluationZone).toLocalDate()
+        val effectiveToDate = effectivePeriod.toExclusive.minusMillis(1).atZone(EvaluationZone).toLocalDate()
+        val effectiveDateRange = EvaluationDateRange(effectiveFromDate, effectiveToDate, dateRange.referenceDate)
         val initialCashJpy = scope.initialCashJpy
-        val priorPnlJpy = evaluationRepository.fetchClosedTrades(
-            EvaluationPeriod(Instant.EPOCH, period.from),
-            scope = scope,
-        ).getOrThrow().also { result ->
-            require(!result.truncated) { "EVALUATION_RESULT_TRUNCATED: benchmark prior population is incomplete." }
-        }.trades.sumOf { trade -> trade.tradePnlJpy }
+        val priorPnlJpy = evaluationRepository.sumTradePnlBefore(effectivePeriod.from, scope).getOrThrow()
         val baselineEquityJpy = initialCashJpy.add(priorPnlJpy)
-        val dailyPnl = evaluationRepository.fetchClosedTrades(period, scope = scope).getOrThrow().also { result ->
+        val dailyPnl = evaluationRepository.fetchClosedTrades(effectivePeriod, scope = scope).getOrThrow().also { result ->
             require(!result.truncated) { "EVALUATION_RESULT_TRUNCATED: benchmark population is incomplete." }
         }.trades.map { trade ->
             me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
         }
-        val dailyCandleLimit = call.requireDailyCandleLimit(dateRange) ?: return@get
+        val dailyCandleLimit = call.requireDailyCandleLimit(effectiveDateRange) ?: return@get
         val candles = evaluationMarketDataSource.getCandles(
             symbol = dependencies.tradingConfig.symbol,
             interval = CandleInterval.ONE_DAY,
@@ -383,17 +397,17 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
                 candles = candles,
                 dailyPnlFacts = dailyPnl,
                 baselineEquityJpy = baselineEquityJpy,
-                fromDate = dateRange.fromDate,
-                toDateInclusive = dateRange.toDate,
+                fromDate = effectiveFromDate,
+                toDateInclusive = effectiveToDate,
                 zoneId = EvaluationZone,
             ),
         )
         val baselineComparable = scope.cohort !=
-            me.matsumo.fukurou.trading.domain.EvaluationCohort.LEGACY_PRE_WS
+            EvaluationCohort.LEGACY_PRE_WS
 
         call.respond(
             EvaluationBenchmarkResponse(
-                period = dateRange.toResponsePeriod(scope),
+                period = periodResponse,
                 scope = scope.toResponse(),
                 assumptionsJa = "buy & hold は開始日 close で全額 BTC を買い、手数料・スリッページを無視します。bot equity は realized PnL のみを close 日に計上し、未実現損益は含めません。",
                 baselineEquityJpy = baselineEquityJpy.takeIf { baselineComparable }?.toDecimalString(),
@@ -612,9 +626,13 @@ private data class EvaluationDateRange(
     fun toResponsePeriod(scope: EvaluationScope): EvaluationPeriodResponse {
         val requested = toPeriod()
         val effective = requested.intersectLifecycle(scope)
-        val effectiveFromDate = effective.from.atZone(EvaluationZone).toLocalDate()
-        val effectiveToDate = effective.toExclusive.minusMillis(1).atZone(EvaluationZone).toLocalDate()
-        val state = if (effective.from == requested.from && effective.toExclusive == requested.toExclusive) {
+        val empty = effective.from == effective.toExclusive
+        val effectiveFromDate = effective.from.atZone(EvaluationZone).toLocalDate().takeUnless { empty }
+        val effectiveToDate = effective.toExclusive.minusMillis(1)
+            .atZone(EvaluationZone).toLocalDate().takeUnless { empty }
+        val state = if (empty) {
+            "EMPTY_LIFECYCLE"
+        } else if (effective.from == requested.from && effective.toExclusive == requested.toExclusive) {
             "FULL_REQUESTED_PERIOD"
         } else {
             "PARTIAL_LIFECYCLE"
@@ -623,8 +641,8 @@ private data class EvaluationDateRange(
             from = fromDate.toString(),
             to = toDate.toString(),
             timezone = EvaluationZone.id,
-            effectiveFrom = effectiveFromDate.toString(),
-            effectiveTo = effectiveToDate.toString(),
+            effectiveFrom = effectiveFromDate?.toString(),
+            effectiveTo = effectiveToDate?.toString(),
             populationState = state,
             effectiveDays = Duration.between(effective.from, effective.toExclusive).toDays(),
         )
@@ -654,8 +672,8 @@ data class EvaluationPeriodResponse(
     val from: String,
     val to: String,
     val timezone: String,
-    val effectiveFrom: String,
-    val effectiveTo: String,
+    val effectiveFrom: String?,
+    val effectiveTo: String?,
     val populationState: String,
     val effectiveDays: Long,
 )

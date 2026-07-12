@@ -10,7 +10,7 @@ export type EvaluationReport = {
   revisionNumber: number;
   scopeKey: string;
   status: string;
-  period: { from: string; toInclusive: string; timezone: string };
+  period: { from: string; toInclusive: string; timezone: string; effectiveFrom: string | null; effectiveToInclusive: string | null; populationState: string; effectiveDays: number };
   inputAsOf: string;
   inputHash: string;
   snapshotId: string;
@@ -37,6 +37,11 @@ export type EvaluationReport = {
   attributionCoverage: { attributed: number; missing: number; total: number } | null;
 };
 export type ReportJob = { jobId: string; revisionId: string; revisionNumber: number; status: string; stage: string; failureCode: string | null; failureMessage: string | null; activeInvocationId: string | null; retryAfterSeconds: number | null; epochId: string | null; cohort: string | null };
+export function reportEffectivePeriodLabel(period: EvaluationReport["period"]): string {
+  return period.effectiveFrom == null || period.effectiveToInclusive == null
+    ? "No lifecycle overlap"
+    : `${period.effectiveFrom} — ${period.effectiveToInclusive} · ${period.effectiveDays}D`;
+}
 export type ReportHistoryItem = { jobId: string; revisionId: string; revisionNumber: number; status: string; requestedAt: string; pinned: boolean; epochId: string | null; cohort: string | null; scopeKey: string | null };
 export type EvaluationEpoch = { epochId: string; kind: string; initialCashJpy: string; createdAt: string; active: boolean };
 

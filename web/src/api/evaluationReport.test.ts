@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { generateReport, parseReportScopeKey, reportRevisionMatchesScope, ReportAdmissionError } from "./evaluationReport";
+import { generateReport, parseReportScopeKey, reportEffectivePeriodLabel, reportRevisionMatchesScope, ReportAdmissionError } from "./evaluationReport";
 
 const job = {
   jobId: "job-1", revisionId: "revision-1", revisionNumber: 7, status: "REQUESTED", stage: "ADMITTED",
@@ -14,6 +14,13 @@ describe("evaluation report generation client", () => {
     expect(parseReportScopeKey("PRESET:30D")).toEqual({ base: "PRESET:30D", epochId: null, cohort: null });
     expect(parseReportScopeKey("PRESET:30D|EPOCH:epoch-1|COHORT:CURRENT")).toEqual({ base: "PRESET:30D", epochId: "epoch-1", cohort: "CURRENT" });
     expect(parseReportScopeKey("PRESET:30D|EPOCH:epoch-1")).toBeNull();
+    expect(parseReportScopeKey("PRESET:30D|EPOCH:epoch-1|COHORT:CURRENT|EXTRA:value")).toBeNull();
+  });
+
+  it("labels empty and partial effective report periods without inventing dates", () => {
+    const base = { from: "2026-07-01", toInclusive: "2026-07-03", timezone: "Asia/Tokyo", populationState: "PARTIAL_LIFECYCLE", effectiveDays: 2 };
+    expect(reportEffectivePeriodLabel({ ...base, effectiveFrom: null, effectiveToInclusive: null })).toBe("No lifecycle overlap");
+    expect(reportEffectivePeriodLabel({ ...base, effectiveFrom: "2026-07-02", effectiveToInclusive: "2026-07-03" })).toBe("2026-07-02 — 2026-07-03 · 2D");
   });
 
   it("never exposes pin eligibility across epoch/cohort or legacy unversioned scope", () => {
