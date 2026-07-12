@@ -94,7 +94,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
             e.position_id,
             COALESCE(
                 $INITIAL_BUY_EPOCH_SQL,
-                (SELECT id::text FROM paper_account_epochs WHERE kind='LEGACY_IMPORTED' ORDER BY created_at ASC LIMIT 1)
+                (SELECT id::text FROM mcp_evaluation_epochs WHERE kind='LEGACY_IMPORTED' ORDER BY created_at ASC LIMIT 1)
             ) AS account_epoch_id,
             CASE
                 WHEN COUNT(*) FILTER (WHERE
@@ -358,7 +358,7 @@ private const val SELECT_SCOPED_PNL_BEFORE_SQL = """
             p.id,
             COALESCE(
                 $INITIAL_BUY_EPOCH_SQL,
-                (SELECT id::text FROM paper_account_epochs WHERE kind='LEGACY_IMPORTED' ORDER BY created_at ASC LIMIT 1)
+                (SELECT id::text FROM mcp_evaluation_epochs WHERE kind='LEGACY_IMPORTED' ORDER BY created_at ASC LIMIT 1)
             ) AS account_epoch_id,
             CASE
                 WHEN COUNT(*) FILTER (WHERE
@@ -412,7 +412,7 @@ class ExposedEvaluationRepository(
                     """
                         SELECT epoch.id, epoch.kind, epoch.initial_cash_jpy, epoch.created_at,
                             epoch.id = account.current_epoch_id AS active
-                        FROM paper_account_epochs epoch
+                        FROM mcp_evaluation_epochs epoch
                         CROSS JOIN paper_account account
                         WHERE account.id = ?
                         ORDER BY epoch.created_at DESC, epoch.id DESC
@@ -445,9 +445,9 @@ class ExposedEvaluationRepository(
                 exposedTransaction(database) {
                     val requestedCohort = cohort?.let(EvaluationCohort::valueOf) ?: EvaluationCohort.CURRENT
                     val sql = if (epochId == null) {
-                        "SELECT epoch.id, epoch.kind, epoch.initial_cash_jpy, epoch.created_at, NULL::bigint AS next_created_at FROM paper_account account JOIN paper_account_epochs epoch ON epoch.id=account.current_epoch_id WHERE account.id=?"
+                        "SELECT account_epoch_id AS id, epoch_kind AS kind, epoch_initial_cash_jpy AS initial_cash_jpy, epoch_created_at AS created_at, NULL::bigint AS next_created_at FROM mcp_current_evaluation_scope WHERE account_id=?"
                     } else {
-                        "SELECT epoch.id, epoch.kind, epoch.initial_cash_jpy, epoch.created_at, (SELECT MIN(next_epoch.created_at) FROM paper_account_epochs next_epoch WHERE next_epoch.created_at > epoch.created_at) AS next_created_at FROM paper_account_epochs epoch WHERE epoch.id=?"
+                        "SELECT epoch.id, epoch.kind, epoch.initial_cash_jpy, epoch.created_at, (SELECT MIN(next_epoch.created_at) FROM mcp_evaluation_epochs next_epoch WHERE next_epoch.created_at > epoch.created_at) AS next_created_at FROM mcp_evaluation_epochs epoch WHERE epoch.id=?"
                     }
                     prepare(sql).use { statement ->
                         if (epochId == null) statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID) else statement.setObject(1, UUID.fromString(epochId))
@@ -696,10 +696,10 @@ private fun JdbcTransaction.selectCurrentEvaluationScope(): EvaluationScope {
 
     return prepare(
         """
-            SELECT epoch.id, epoch.kind, epoch.initial_cash_jpy, epoch.created_at
-            FROM paper_account account
-            JOIN paper_account_epochs epoch ON epoch.id = account.current_epoch_id
-            WHERE account.id = ?
+            SELECT account_epoch_id AS id, epoch_kind AS kind,
+                epoch_initial_cash_jpy AS initial_cash_jpy, epoch_created_at AS created_at
+            FROM mcp_current_evaluation_scope
+            WHERE account_id = ?
         """.trimIndent(),
     ).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
@@ -720,14 +720,11 @@ private fun JdbcTransaction.selectCurrentEvaluationScope(): EvaluationScope {
 private fun JdbcTransaction.requireCurrentAccountBaselineMatchesRuntimeConfig() {
     val baselines = prepare(
         """
-            SELECT account.initial_cash_jpy, epoch.initial_cash_jpy AS epoch_baseline,
-                (SELECT value.config_value
-                 FROM runtime_config_values value
-                 JOIN runtime_config_versions version ON version.id = value.version_id
-                 WHERE version.status = 'ACTIVE' AND value.config_key = 'paper.initialCashJpy') AS config_baseline
-            FROM paper_account account
-            JOIN paper_account_epochs epoch ON epoch.id = account.current_epoch_id
-            WHERE account.id = ?
+            SELECT account_initial_cash_jpy AS initial_cash_jpy,
+                epoch_initial_cash_jpy AS epoch_baseline,
+                config_initial_cash_jpy AS config_baseline
+            FROM mcp_current_evaluation_scope
+            WHERE account_id = ?
         """.trimIndent(),
     ).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)

@@ -283,7 +283,7 @@ scripts/prod-curl /ops/runtime-config
 8. `/health/ready`、role flag、membership、ownership、effective grant、required MCP call matrix を再確認する。
 9. 証跡を保存してから daemon を再有効化する。
 
-role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolbypassrls` はすべて false、membership と object ownership は 0 であることを確認する。`runtime_config_versions`、`runtime_config_values`、`llm_launch_reservations`、`equity_snapshots` と ledger の UPDATE/DELETE/TRUNCATE は拒否される。必要 call の permission failure は role SQL と inventory を修正して disposable test からやり直す。
+role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolbypassrls` はすべて false、membership と object ownership は 0 であることを確認する。MCP の evaluation scope は `mcp_current_evaluation_scope` と `mcp_evaluation_epochs` view から account epoch、3つのbaseline、epoch kind、作成時刻だけを読み、secretを含み得る `runtime_config_versions` / `runtime_config_values` や `paper_account_epochs` への直接SELECTは許可しない。`llm_launch_reservations`、`equity_snapshots` と ledger の UPDATE/DELETE/TRUNCATE も拒否される。必要 call の permission failure は role SQL と inventory を修正して disposable test からやり直す。
 
 merge 前の自動証跡は `McpDatabaseRoleIntegrationTest` の role/effective privilege/required-call matrix と、`scripts/mcp-credential-isolation-check` の tool audit export・DB data-only dump・encoding scan を含む。scan coverage や dump が欠けた run は無効とし、再実行する。real provider model output probe は operator auth を必要とする別の human check として記録し、自動 check 成功へ読み替えない。
 

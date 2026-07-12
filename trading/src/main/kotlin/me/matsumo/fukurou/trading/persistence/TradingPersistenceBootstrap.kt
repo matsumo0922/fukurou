@@ -131,6 +131,31 @@ private const val ENSURE_PAPER_ACCOUNT_EPOCH_IMMUTABLE_TRIGGER_SQL = """
         FOR EACH ROW EXECUTE FUNCTION reject_paper_account_epoch_mutation();
 """
 
+/** MCP evaluation が secret を含む runtime config tables を読まず current scope を解決する view。 */
+private const val ENSURE_MCP_CURRENT_EVALUATION_SCOPE_VIEW_SQL = """
+CREATE OR REPLACE VIEW mcp_current_evaluation_scope AS
+SELECT account.id AS account_id,
+       account.current_epoch_id AS account_epoch_id,
+       account.initial_cash_jpy AS account_initial_cash_jpy,
+       epoch.kind AS epoch_kind,
+       epoch.initial_cash_jpy AS epoch_initial_cash_jpy,
+       epoch.created_at AS epoch_created_at,
+       (SELECT value.config_value
+        FROM runtime_config_values value
+        JOIN runtime_config_versions version ON version.id = value.version_id
+        WHERE version.status = 'ACTIVE'
+          AND value.config_key = 'paper.initialCashJpy') AS config_initial_cash_jpy
+FROM paper_account account
+JOIN paper_account_epochs epoch ON epoch.id = account.current_epoch_id
+"""
+
+/** MCP evaluation に必要な immutable epoch metadata だけを公開する view。 */
+private const val ENSURE_MCP_EVALUATION_EPOCHS_VIEW_SQL = """
+CREATE OR REPLACE VIEW mcp_evaluation_epochs AS
+SELECT id, kind, initial_cash_jpy, created_at
+FROM paper_account_epochs
+"""
+
 /**
  * bootstrap equity snapshot を初回だけ作る SQL。
  */
@@ -1108,6 +1133,8 @@ fun TradingBotConfig.staleLlmRunRecoveryThreshold(): Duration {
  */
 private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     ensureRuntimeConfigIndexes()
+    executeUpdate(ENSURE_MCP_EVALUATION_EPOCHS_VIEW_SQL)
+    executeUpdate(ENSURE_MCP_CURRENT_EVALUATION_SCOPE_VIEW_SQL)
     executeUpdate(ENSURE_PAPER_ACCOUNT_EPOCH_IMMUTABLE_TRIGGER_SQL)
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_TS_DECISION_RUN_INDEX_SQL)
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)

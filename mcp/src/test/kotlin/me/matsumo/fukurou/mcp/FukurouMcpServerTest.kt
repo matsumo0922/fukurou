@@ -2255,7 +2255,16 @@ private fun requiredMatrixBootstrap(
 
 private fun assertForbiddenDml(container: PostgreSQLContainer<*>) {
     mcpTestConnection(container).use { connection ->
-        listOf("UPDATE orders SET status=status", "DELETE FROM executions", "TRUNCATE positions", "INSERT INTO orders DEFAULT VALUES").forEach { sql ->
+        listOf(
+            "UPDATE orders SET status=status",
+            "DELETE FROM executions",
+            "TRUNCATE positions",
+            "INSERT INTO orders DEFAULT VALUES",
+            "UPDATE mcp_current_evaluation_scope SET account_initial_cash_jpy=account_initial_cash_jpy",
+            "UPDATE mcp_evaluation_epochs SET initial_cash_jpy=initial_cash_jpy",
+            "SELECT config_value FROM runtime_config_values LIMIT 1",
+            "SELECT runtime_config_hash FROM paper_account_epochs LIMIT 1",
+        ).forEach { sql ->
             assertNotNull(runCatching { connection.createStatement().use { it.execute(sql) } }.exceptionOrNull())
         }
     }

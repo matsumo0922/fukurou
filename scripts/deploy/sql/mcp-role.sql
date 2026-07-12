@@ -104,7 +104,8 @@ FROM (VALUES
     ('command_event_log'), ('paper_account'), ('positions'), ('orders'), ('risk_state'),
     ('executions'), ('market_data_sessions'), ('market_data_gaps'), ('trade_intents'),
     ('trade_plans'), ('falsifications'), ('trade_intent_consumptions'), ('decisions'),
-    ('llm_runs'), ('evaluation_exclusions'), ('safety_violations')
+    ('llm_runs'), ('evaluation_exclusions'), ('safety_violations'),
+    ('mcp_current_evaluation_scope'), ('mcp_evaluation_epochs')
 ) AS inventory(table_name) \gexec
 
 SELECT format(
