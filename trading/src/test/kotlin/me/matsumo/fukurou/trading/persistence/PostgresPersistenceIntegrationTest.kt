@@ -25,6 +25,7 @@ import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
+import me.matsumo.fukurou.trading.config.KillCriterionConfig
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.PaperAccountEpochSwitchRejectedException
@@ -77,6 +78,7 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
+import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
@@ -91,6 +93,7 @@ import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
@@ -1544,6 +1547,22 @@ class PostgresPersistenceIntegrationTest {
         val evaluation = ExposedEvaluationRepository(database)
         assertTrue(evaluation.resolveScope(null, "CURRENT").isFailure)
         assertTrue(evaluation.resolveScope(epochId, "CURRENT").isFailure)
+        assertTrue(evaluation.fetchKillCriterionStats().isFailure)
+        val killRiskState = InMemoryRiskStateRepository(fixedClock())
+        val killEvaluator = KillCriterionEvaluator(
+            config = KillCriterionConfig(minClosedTrades = 2, minProfitFactor = BigDecimal("0.80")),
+            riskStateRepository = killRiskState,
+            riskStateCommandService = InMemoryRiskStateCommandService(
+                riskStateRepository = killRiskState,
+                commandEventLog = ExposedCommandEventLog(database),
+                clock = fixedClock(),
+            ),
+            commandEventLog = ExposedCommandEventLog(database),
+            broker = broker,
+            statsSource = evaluation::fetchKillCriterionStats,
+            clock = fixedClock(),
+        )
+        assertTrue(killEvaluator.evaluate(watermarkTickSnapshot("9600000")).isSuccess)
 
         val rejectedCommand = postgresEntryCommand(
             orderType = OrderType.LIMIT,

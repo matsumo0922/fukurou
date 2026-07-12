@@ -1,4 +1,4 @@
-@file:Suppress("CyclomaticComplexMethod", "ImportOrdering", "LongMethod", "TooManyFunctions")
+@file:Suppress("ImportOrdering", "LongMethod", "TooManyFunctions")
 
 package me.matsumo.fukurou.trading.persistence
 
@@ -515,6 +515,7 @@ private data class PaperAccountEpochState(
     val epochBaseline: BigDecimal,
 )
 
+@Suppress("CyclomaticComplexMethod")
 private fun JdbcTransaction.switchPaperAccountEpochIfRequired(
     values: Map<String, String>,
     reason: String,

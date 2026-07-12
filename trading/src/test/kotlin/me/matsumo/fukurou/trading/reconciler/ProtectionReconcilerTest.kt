@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
+import me.matsumo.fukurou.trading.config.KillCriterionConfig
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -40,6 +41,7 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
+import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.lock.TradingLockLease
@@ -55,6 +57,7 @@ import me.matsumo.fukurou.trading.market.MarketEventSession
 import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
+import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
@@ -373,6 +376,59 @@ class ProtectionReconcilerTest {
         assertTrue(result.isSuccess)
         assertEquals(listOf(LocalDate.of(2026, 7, 3)), dailySnapshots.map { snapshot -> snapshot.tradingDate })
         assertEquitySnapshotMatchesAccount(dailySnapshots.single(), accountSnapshot)
+    }
+
+    @Test
+    fun killStatsFailureStillCompletesPassAndRecordsDailyEquity() = runBlocking {
+        val clock = MutableTestClock(Instant.parse("2026-07-02T15:00:00Z"))
+        val repository = InMemoryPaperLedgerRepository()
+        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val eventLog = InMemoryCommandEventLog()
+        val decisionRepository = InMemoryDecisionRepository(clock)
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = clock,
+        )
+        val evaluator = KillCriterionEvaluator(
+            config = KillCriterionConfig(minClosedTrades = 2, minProfitFactor = BigDecimal("0.80")),
+            riskStateRepository = riskStateRepository,
+            riskStateCommandService = InMemoryRiskStateCommandService(riskStateRepository, eventLog, clock),
+            commandEventLog = eventLog,
+            broker = broker,
+            statsSource = { Result.failure(IllegalStateException("baseline mismatch")) },
+            clock = clock,
+        )
+        val recorder = EquitySnapshotRecorder(
+            accountSource = { repository.getAccountSnapshot() },
+            repository = repository.equitySnapshotRepository,
+            clock = clock,
+            idGenerator = deterministicSnapshotIds(),
+        )
+        val status = MutableReconcilerStatus()
+        val reconciler = createReconciler(
+            clock = clock,
+            eventLog = eventLog,
+            status = status,
+            riskStateRepository = riskStateRepository,
+            tickStream = SwitchableTickStream(Result.success(fixedTickSnapshot(clock.currentInstant))),
+            broker = broker,
+            equitySnapshotRecorder = recorder,
+            killCriterionEvaluator = evaluator,
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+        val dailySnapshots = repository.equitySnapshotRepository.findAll().getOrThrow()
+            .filter { snapshot -> snapshot.reason == EquitySnapshotReason.DAILY }
+        val eventTypes = eventLog.events().map { event -> event.eventType }
+
+        assertTrue(result.isSuccess)
+        assertEquals(listOf(LocalDate.of(2026, 7, 3)), dailySnapshots.map { snapshot -> snapshot.tradingDate })
+        assertEquals(fixedTickSnapshot(clock.currentInstant).observedAt, status.snapshot().lastMaintenanceAt)
+        assertTrue(CommandEventType.RECONCILER_PASS_COMPLETED in eventTypes)
+        assertTrue(CommandEventType.RECONCILER_PASS_FAILED !in eventTypes)
     }
 
     @Test
@@ -1251,6 +1307,7 @@ private fun createReconciler(
     tickStream: TickStream = FixedTickStream,
     broker: Broker? = null,
     equitySnapshotRecorder: EquitySnapshotRecorder? = null,
+    killCriterionEvaluator: KillCriterionEvaluator? = null,
 ): ProtectionReconciler {
     return ProtectionReconciler(
         riskStateRepository = riskStateRepository,
@@ -1259,6 +1316,7 @@ private fun createReconciler(
         tickStream = tickStream,
         broker = broker,
         equitySnapshotRecorder = equitySnapshotRecorder,
+        killCriterionEvaluator = killCriterionEvaluator,
         status = status,
         clock = clock,
     )

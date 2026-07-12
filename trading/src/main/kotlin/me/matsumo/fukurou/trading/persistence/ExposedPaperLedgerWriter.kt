@@ -1,4 +1,4 @@
-@file:Suppress("ImportOrdering", "LongMethod", "LongParameterList")
+@file:Suppress("ImportOrdering")
 
 package me.matsumo.fukurou.trading.persistence
 
@@ -232,6 +232,7 @@ internal class ExposedPaperLedgerWriter(
     /**
      * position を close する。
      */
+    @Suppress("LongMethod")
     override suspend fun closePosition(
         command: ClosePositionCommand,
         positionId: UUID,
@@ -310,8 +311,7 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    resolvePaperWriteContext(command.auditContext)
-                        .intent(PaperWritePolicy.PROTECTION_MAINTENANCE)
+                    requirePaperWriteAllowed(PaperWritePolicy.PROTECTION_MAINTENANCE, command.auditContext)
                     val position = requireOpenPosition(command.positionId)
                     val newStopPrice = command.newStopPriceJpy
                     val newTakeProfitPrice = if (command.takeProfitPriceSpecified) {
@@ -347,8 +347,7 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    resolvePaperWriteContext(command.auditContext)
-                        .intent(PaperWritePolicy.RISK_REDUCING)
+                    requirePaperWriteAllowed(PaperWritePolicy.RISK_REDUCING, command.auditContext)
                     val order = requireOpenOrder(command.orderId)
                     val isProtectiveStop = order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.positionId != null
 
@@ -567,6 +566,7 @@ private fun JdbcTransaction.hasUnrecoveredGapBefore(sessionId: UUID): Boolean {
     }
 }
 
+@Suppress("LongParameterList")
 private fun JdbcTransaction.applyEventToRestingEntries(
     event: PaperMarketTradeEvent,
     simulator: PaperExecutionSimulator,
@@ -695,6 +695,7 @@ private fun JdbcTransaction.bindPositionToEvent(positionId: UUID, event: PaperMa
     }
 }
 
+@Suppress("LongParameterList")
 private fun JdbcTransaction.applyEventToPositionProtections(
     event: PaperMarketTradeEvent,
     simulator: PaperExecutionSimulator,
@@ -1137,6 +1138,7 @@ private fun JdbcTransaction.triggerPositionProtections(
     }
 }
 
+@Suppress("LongParameterList")
 private fun JdbcTransaction.triggerStopProtection(
     position: Position,
     stopPrice: BigDecimal,
@@ -1339,6 +1341,7 @@ private fun JdbcTransaction.verifyMarketEligibilitySession(eligibility: RestingO
     }
 }
 
+@Suppress("LongParameterList")
 private fun JdbcTransaction.insertProtectiveStopOrder(
     command: PlaceOrderCommand,
     stopOrderId: UUID,
@@ -1415,6 +1418,7 @@ private fun JdbcTransaction.insertCloseOrder(request: CloseOrderInsertRequest, c
     }
 }
 
+@Suppress("LongParameterList")
 private fun JdbcTransaction.insertPosition(
     command: PlaceOrderCommand,
     fill: SimulatedFill,
@@ -1564,12 +1568,20 @@ private data class PaperWriteContext(
     val baselineAligned: Boolean,
 ) {
     fun intent(policy: PaperWritePolicy): PaperWriteIntent {
-        require(policy != PaperWritePolicy.RISK_INCREASING || baselineAligned) {
-            "PAPER_ACCOUNT_BASELINE_MISMATCH: create, validate, and activate an operator runtime-config draft."
-        }
+        requireAllowed(policy)
 
         return PaperWriteIntent(lineage, policy)
     }
+
+    fun requireAllowed(policy: PaperWritePolicy) {
+        require(policy != PaperWritePolicy.RISK_INCREASING || baselineAligned) {
+            "PAPER_ACCOUNT_BASELINE_MISMATCH: create, validate, and activate an operator runtime-config draft."
+        }
+    }
+}
+
+private fun JdbcTransaction.requirePaperWriteAllowed(policy: PaperWritePolicy, auditContext: PaperTradeAuditContext) {
+    resolvePaperWriteContext(auditContext).requireAllowed(policy)
 }
 
 private data class PaperWriteIntent(
