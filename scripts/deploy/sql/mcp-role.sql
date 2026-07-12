@@ -136,6 +136,7 @@ FROM (VALUES
 
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_try_advisory_lock(bigint) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_advisory_unlock(bigint) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(bigint) FROM PUBLIC;
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_try_advisory_lock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_unlock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec

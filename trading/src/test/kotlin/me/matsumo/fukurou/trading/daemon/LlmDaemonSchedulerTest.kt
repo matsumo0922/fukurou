@@ -7,6 +7,8 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
@@ -165,6 +167,73 @@ class LlmDaemonSchedulerTest {
         assertEquals(2, fixture.launches.size)
         assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, firstResult.triggerKind)
         assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, secondResult.triggerKind)
+    }
+
+    @Test
+    fun launchThreadsSingleOpenRiskSnapshotThroughReservationRunAndAudit() = runBlocking {
+        var brokerReads = 0
+        val snapshot = LlmDaemonOpenRiskSnapshot(
+            openPositionCount = 0,
+            restingEntryOrders = emptyList(),
+            otherOpenOrderCount = 0,
+        )
+        val fixture = schedulerFixture(
+            openRiskReader = {
+                brokerReads += 1
+                Result.success(snapshot)
+            },
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(1, brokerReads)
+        assertEquals(1, fixture.launches.size)
+        val launched = fixture.eventLog.events().single { event ->
+            event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED
+        }
+        assertTrue(launched.payload.contains("\"restingOnly\":false"))
+        assertTrue(launched.payload.contains("\"openPositionCount\":0"))
+        assertTrue(launched.payload.contains("\"restingEntryOrderCount\":0"))
+    }
+
+    @Test
+    fun launchAuditFailureFinishesReservationWithoutRereadingBrokerOrRunningChild() = runBlocking {
+        var brokerReads = 0
+        val eventLog = InMemoryCommandEventLog()
+        val failingLaunchedAudit = object : CommandEventLog by eventLog {
+            override suspend fun append(event: CommandEvent): Result<Unit> {
+                return if (event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED) {
+                    Result.failure(IllegalStateException("launch audit unavailable"))
+                } else {
+                    eventLog.append(event)
+                }
+            }
+        }
+        val fixture = schedulerFixture(
+            eventLog = eventLog,
+            commandEventLog = failingLaunchedAudit,
+            openRiskReader = {
+                brokerReads += 1
+                Result.success(LlmDaemonOpenRiskSnapshot(0, emptyList(), 0))
+            },
+        )
+
+        val result = fixture.scheduler.tick()
+        val active = fixture.reservations.findBlockingRunningReservation(
+            requestTriggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+            activeSince = fixedInstant().minus(Duration.ofHours(1)),
+        ).getOrThrow()
+
+        assertEquals(LlmDaemonTickResult.Skipped("tick_failed", null), result)
+        assertEquals(1, brokerReads)
+        assertTrue(fixture.launches.isEmpty())
+        assertEquals(null, active)
+        assertTrue(
+            eventLog.events().any { event ->
+                event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED && event.payload.contains("tick_failed")
+            },
+        )
     }
 
     @Test
@@ -1186,6 +1255,7 @@ private fun schedulerFixture(
     clock: MutableClock = MutableClock(fixedInstant()),
     riskStateRepository: InMemoryRiskStateRepository = InMemoryRiskStateRepository(clock),
     eventLog: InMemoryCommandEventLog = InMemoryCommandEventLog(),
+    commandEventLog: CommandEventLog = eventLog,
     reservations: LlmLaunchReservationRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository),
     launches: MutableList<OneShotRunnerRequest> = mutableListOf(),
     idGenerator: () -> UUID = deterministicIds(),
@@ -1214,7 +1284,7 @@ private fun schedulerFixture(
         runtimeConfigSnapshot = runtimeConfigSnapshot,
         dependencies = LlmDaemonSchedulerDependencies(
             riskStateRepository = riskStateRepository,
-            commandEventLog = eventLog,
+            commandEventLog = commandEventLog,
             launchReservationRepository = reservations,
             openRiskReader = openRiskReader,
             tickerReader = tickerReader,

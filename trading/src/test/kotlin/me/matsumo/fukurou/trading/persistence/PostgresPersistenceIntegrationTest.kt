@@ -37,6 +37,7 @@ import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.daemon.LlmActiveLaunchReservation
 import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
@@ -51,6 +52,7 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
+import me.matsumo.fukurou.trading.daemon.RestingSuppressionReason
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -99,6 +101,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
+import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
@@ -5605,6 +5608,134 @@ class PostgresPersistenceIntegrationTest {
 
             assertTrue(throwable is SQLTimeoutException)
         }
+    }
+
+    @Test
+    fun restingMaintenancePersistsBaselineApproachAndTypedInvalidationWithoutQuoteFill() = runPostgresTest {
+        val config = TradingBotConfig.fromEnvironment(emptyMap())
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runtime = TradingRuntimeFactory.connectedPostgres(
+            dataSource = dataSource,
+            database = database,
+            clock = fixedClock(),
+            marketDataSource = PostgresFakeMarketDataSource,
+            tradingConfig = config,
+        )
+        val entryCommand = postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("9800000"),
+            protectiveStopPriceJpy = BigDecimal("9700000"),
+            takeProfitPriceJpy = BigDecimal("10500000"),
+        )
+        runtime.decisionMaterialStateRepository.append(
+            identityManifest("run-entry-${entryCommand.commandId}").copy(
+                lastPriceJpy = BigDecimal("10000000"),
+                priceMoveThresholdRatio = BigDecimal("0.01"),
+            ),
+        ).getOrThrow()
+        val approved = approvedPostgresEntryCommand(runtime.decisionRepository, entryCommand)
+        val restingOrderId = UUID.randomUUID()
+        exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                """INSERT INTO orders
+                    (id, intent_id, mode, symbol, side, order_type, status, size_btc, limit_price_jpy,
+                     protective_stop_price_jpy, take_profit_price_jpy, reason_ja, created_at, updated_at)
+                    VALUES (?, ?, 'PAPER', 'BTC', 'BUY', 'LIMIT', 'OPEN', ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, restingOrderId)
+                statement.setObject(2, requireNotNull(approved.intentId))
+                statement.setBigDecimal(3, approved.sizeBtc)
+                statement.setBigDecimal(4, approved.priceJpy)
+                statement.setBigDecimal(5, approved.protectiveStopPriceJpy)
+                statement.setBigDecimal(6, approved.takeProfitPriceJpy)
+                statement.setString(7, approved.reasonJa)
+                statement.setLong(8, fixedInstant().toEpochMilli())
+                statement.setLong(9, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+        }
+        val restingOrder = runtime.broker.getOpenOrders().getOrThrow().single()
+        val snapshot = LlmDaemonOpenRiskSnapshot(
+            openPositionCount = 0,
+            restingEntryOrders = listOf(restingOrder),
+            otherOpenOrderCount = 0,
+        )
+        val quoteStore = LatestMarketQuoteStore()
+        val service = ExposedRestingOrderMaintenanceService(
+            database = database,
+            broker = runtime.broker,
+            tradingLock = runtime.tradingLock,
+            latestMarketQuoteStore = quoteStore,
+        )
+        quoteStore.update(
+            LatestMarketQuote(
+                bidPriceJpy = BigDecimal("9990000"),
+                askPriceJpy = BigDecimal("10000000"),
+                observedAt = fixedInstant(),
+                lastPriceJpy = BigDecimal("9995000"),
+            ),
+        )
+
+        val firstReason = service.maintain(snapshot, fixedInstant()).getOrThrow()
+        quoteStore.update(
+            LatestMarketQuote(
+                bidPriceJpy = BigDecimal("9890000"),
+                askPriceJpy = BigDecimal("9900000"),
+                observedAt = fixedInstant().plusSeconds(1),
+                lastPriceJpy = BigDecimal("9600000"),
+            ),
+        )
+        val secondReason = service.maintain(snapshot, fixedInstant().plusSeconds(1)).getOrThrow()
+
+        assertEquals(RestingSuppressionReason.RESTING_ORDER_UNCHANGED, firstReason)
+        assertEquals(RestingSuppressionReason.RESTING_ORDER_INVALIDATED, secondReason)
+        val episodeId = requireNotNull(
+            runtime.decisionRepository.latestDecisionByInvocationId(
+                "run-entry-${entryCommand.commandId}",
+            ).getOrThrow(),
+        ).decision.identity!!.opportunityEpisodeId
+        val evidence = exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                """SELECT e.close_reason,
+                    COUNT(DISTINCT o.id), MIN(o.distance_jpy), MAX(o.distance_jpy),
+                    BOOL_OR(o.old_material_state_hash IS NOT NULL),
+                    BOOL_OR(o.suppression_reason='resting_order_invalidated'),
+                    BOOL_OR(o.invalidation_state='INVALIDATED'),
+                    COUNT(DISTINCT r.id) FILTER (WHERE r.resolution='FALSE_SUPPRESSION_PROXY'),
+                    (SELECT status FROM orders WHERE id=?),
+                    (SELECT COUNT(*) FROM executions x WHERE x.order_id=?)
+                    FROM opportunity_episodes e
+                    JOIN dedupe_shadow_observations o ON o.opportunity_episode_id=e.id
+                    LEFT JOIN dedupe_shadow_resolutions r ON r.observation_id=o.id
+                    WHERE e.id=? AND o.observation_kind='RESTING_MAINTENANCE' GROUP BY e.close_reason
+                """.trimIndent(),
+            ).use { statement ->
+                val orderId = UUID.fromString(restingOrder.orderId)
+                statement.setObject(1, orderId)
+                statement.setObject(2, orderId)
+                statement.setObject(3, episodeId)
+                statement.executeQuery().use { result ->
+                    require(result.next())
+                    listOf(
+                        result.getString(1), result.getInt(2), result.getBigDecimal(3), result.getBigDecimal(4),
+                        result.getBoolean(5), result.getBoolean(6), result.getBoolean(7), result.getInt(8),
+                        result.getString(9), result.getInt(10),
+                    )
+                }
+            }
+        }
+        assertEquals("TYPED_INVALIDATION", evidence[0])
+        assertEquals(2, evidence[1])
+        assertEquals(BigDecimal("100000.00000000"), evidence[2])
+        assertEquals(BigDecimal("200000.00000000"), evidence[3])
+        assertEquals(true, evidence[4])
+        assertEquals(true, evidence[5])
+        assertEquals(true, evidence[6])
+        assertTrue(evidence[7] as Int >= 1)
+        assertEquals("OPEN", evidence[8])
+        assertEquals(0, evidence[9])
+        runtime.close()
     }
 
     @Test

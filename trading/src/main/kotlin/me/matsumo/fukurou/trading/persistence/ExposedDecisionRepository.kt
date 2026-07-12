@@ -18,7 +18,6 @@ import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
-import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.TradePlanRecord
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentity
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
@@ -770,7 +769,8 @@ private fun JdbcTransaction.selectOpenIdentity(thesisId: String, symbol: String)
     return jdbcConnection().prepareStatement(
         """SELECT d.opportunity_episode_id, d.thesis_id, d.geometry_hash, d.material_state_hash,
             d.identity_schema_version FROM decisions d JOIN opportunity_episodes e ON e.id=d.opportunity_episode_id
-            WHERE d.thesis_id=? AND e.symbol=? AND e.closed_at IS NULL ORDER BY d.created_at DESC LIMIT 1
+            WHERE d.thesis_id=? AND e.symbol=? AND e.closed_at IS NULL
+            ORDER BY d.created_at DESC, d.id DESC LIMIT 1
         """.trimIndent(),
     ).use { statement ->
         statement.setString(1, thesisId)
@@ -797,7 +797,7 @@ private fun JdbcTransaction.selectEpisodeContext(episodeId: UUID): EpisodeIdenti
             EpisodeIdentityContext(
                 priceMoveThresholdRatio = result.getBigDecimal(1),
                 anchorPriceJpy = result.getBigDecimal(2),
-                predicates = result.getString(3).toPredicates(),
+                predicates = TradePlanInvalidationPredicateCodec.decode(result.getString(3)),
             )
         }
     }
@@ -887,21 +887,6 @@ private data class EpisodeIdentityContext(
     val predicates: List<TradePlanInvalidationPredicate>,
 )
 
-private fun String?.toPredicates(): List<TradePlanInvalidationPredicate> {
-    if (this.isNullOrBlank()) return emptyList()
-    return splitToSequence(';').mapNotNull { encoded ->
-        val fields = encoded.split('|')
-        val type = runCatching { TradePlanInvalidationType.valueOf(fields[0]) }.getOrNull() ?: return@mapNotNull null
-        TradePlanInvalidationPredicate(
-            type = type,
-            decimalThresholdJpy = fields.getOrNull(1)?.takeIf(String::isNotBlank)?.toBigDecimalOrNull(),
-            instantThreshold = fields.getOrNull(2)?.takeIf(String::isNotBlank)?.let {
-                runCatching { Instant.parse(it) }.getOrNull()
-            },
-        )
-    }.toList()
-}
-
 private fun JdbcTransaction.insertFalsificationSubmission(
     submission: FalsificationSubmission,
     now: Instant,
@@ -981,7 +966,7 @@ private fun JdbcTransaction.insertTradePlan(record: TradePlanRecord) {
         statement.setString(5, draft.symbol.apiSymbol)
         statement.setString(6, draft.thesisJa)
         statement.setString(7, draft.invalidationConditionsJa.toJsonText())
-        statement.setString(8, draft.invalidationPredicates.toStorageText())
+        statement.setString(8, TradePlanInvalidationPredicateCodec.toStorageText(draft.invalidationPredicates))
         statement.setNullableBigDecimal(9, draft.targetPriceJpy)
         statement.setNullableLong(10, draft.timeStopAt?.toEpochMilli())
         statement.setString(11, draft.setupTags.toJsonText())
@@ -1183,24 +1168,8 @@ private fun ResultSet.toDecisionRecord(): DecisionRecord {
     )
 }
 
-private fun List<TradePlanInvalidationPredicate>.toStorageText(): String = joinToString(";") { predicate ->
-    listOf(
-        predicate.type.name,
-        predicate.decimalThresholdJpy?.toPlainString().orEmpty(),
-        predicate.instantThreshold?.toString().orEmpty(),
-    ).joinToString("|")
-}
-
 private fun String.toInvalidationPredicates(): List<TradePlanInvalidationPredicate> {
-    if (isBlank()) return emptyList()
-    return split(';').map { encoded ->
-        val parts = encoded.split('|')
-        TradePlanInvalidationPredicate(
-            type = TradePlanInvalidationType.valueOf(parts[0]),
-            decimalThresholdJpy = parts.getOrNull(1)?.takeIf(String::isNotBlank)?.toBigDecimal(),
-            instantThreshold = parts.getOrNull(2)?.takeIf(String::isNotBlank)?.let(Instant::parse),
-        )
-    }
+    return TradePlanInvalidationPredicateCodec.decode(this)
 }
 
 private fun ResultSet.toTradePlanRecord(): TradePlanRecord {

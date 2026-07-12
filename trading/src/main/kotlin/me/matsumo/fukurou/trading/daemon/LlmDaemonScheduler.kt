@@ -22,6 +22,7 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.FreshnessDefaults
@@ -310,10 +311,14 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped("concurrent_invocation", trigger.kind)
         }
 
-        return reserveAndLaunch(trigger, observedAt)
+        return reserveAndLaunch(trigger, openRisk, observedAt)
     }
 
-    private suspend fun reserveAndLaunch(trigger: LlmDaemonTrigger, observedAt: Instant): LlmDaemonTickResult {
+    private suspend fun reserveAndLaunch(
+        trigger: LlmDaemonTrigger,
+        openRisk: LlmDaemonOpenRiskSnapshot,
+        observedAt: Instant,
+    ): LlmDaemonTickResult {
         val invocationId = idGenerator().toString()
         val reservationRequest = LlmLaunchReservationRequest(
             invocationId = invocationId,
@@ -364,9 +369,29 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped(DAEMON_SKIP_PRE_FILTER_NO_CHANGE, trigger.kind)
         }
 
-        appendLaunched(trigger, invocationId, observedAt).getOrThrow()
+        appendLaunchedOrFinishReservation(trigger, invocationId, openRisk, observedAt).getOrThrow()
 
         return runReservedInvocation(trigger, invocationId)
+    }
+
+    private suspend fun appendLaunchedOrFinishReservation(
+        trigger: LlmDaemonTrigger,
+        invocationId: String,
+        openRisk: LlmDaemonOpenRiskSnapshot,
+        observedAt: Instant,
+    ): Result<Unit> {
+        val appendResult = appendLaunched(trigger, invocationId, openRisk, observedAt)
+        if (appendResult.isFailure) {
+            finishReservedInvocation(
+                trigger = trigger,
+                invocationId = invocationId,
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = LlmRunTerminalCause.RUNNER_FAILED.name,
+                finishedAt = Instant.now(clock),
+            )
+        }
+
+        return appendResult
     }
 
     private suspend fun runReservedInvocation(trigger: LlmDaemonTrigger, invocationId: String): LlmDaemonTickResult {
@@ -808,9 +833,9 @@ class LlmDaemonScheduler(
     private suspend fun appendLaunched(
         trigger: LlmDaemonTrigger,
         invocationId: String,
+        openRisk: LlmDaemonOpenRiskSnapshot,
         observedAt: Instant,
     ): Result<Unit> {
-        val openRisk = openRiskReader.snapshot().getOrThrow()
         return commandEventLog.append(
             CommandEvent(
                 decisionRunContext = daemonDecisionRunContext(invocationId, runtimeConfigSnapshot),

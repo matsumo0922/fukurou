@@ -2241,6 +2241,12 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
                 (1..3).forEach { column -> assertEquals(false, rows.getBoolean(column)) }
             }
             assertSqlCount(statement, "SELECT count(*) FROM information_schema.role_table_grants WHERE grantee='PUBLIC' AND table_schema='public'", 0)
+            statement.executeQuery(
+                "SELECT has_function_privilege('public', 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE')",
+            ).use { rows ->
+                assertTrue(rows.next())
+                assertFalse(rows.getBoolean(1))
+            }
             assertSqlCount(
                 statement,
                 "SELECT count(*) FROM pg_attribute attribute " +
@@ -2276,15 +2282,16 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
     }
     mcpTestConnection(container).use { connection ->
         connection.createStatement().use { statement ->
-            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_table_privilege(current_user, 'orders', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP'), has_column_privilege(current_user, 'opportunity_episodes', 'closed_at', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'close_reason', 'UPDATE')").use { rows ->
+            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_table_privilege(current_user, 'orders', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_function_privilege(current_user, 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP'), has_column_privilege(current_user, 'opportunity_episodes', 'closed_at', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'close_reason', 'UPDATE')").use { rows ->
                 assertTrue(rows.next())
                 assertEquals(true, rows.getBoolean(1))
                 assertEquals(true, rows.getBoolean(2))
                 assertEquals(false, rows.getBoolean(3))
                 assertEquals(true, rows.getBoolean(4))
-                assertEquals(false, rows.getBoolean(5))
-                assertEquals(true, rows.getBoolean(6))
+                assertEquals(true, rows.getBoolean(5))
+                assertEquals(false, rows.getBoolean(6))
                 assertEquals(true, rows.getBoolean(7))
+                assertEquals(true, rows.getBoolean(8))
             }
         }
     }

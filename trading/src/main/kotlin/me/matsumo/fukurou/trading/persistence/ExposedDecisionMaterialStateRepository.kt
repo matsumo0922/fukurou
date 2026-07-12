@@ -11,8 +11,6 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
-import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjectionContext
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
@@ -72,7 +70,7 @@ class ExposedDecisionMaterialStateRepository(private val database: Database) : D
                             DecisionMaterialProjectionContext(
                                 anchorPriceJpy = result.getBigDecimal(2),
                                 priceMoveThresholdRatio = result.getBigDecimal(1),
-                                invalidationPredicates = result.getString(3).toPredicates(),
+                                invalidationPredicates = TradePlanInvalidationPredicateCodec.decode(result.getString(3)),
                             )
                         }
                     }
@@ -90,21 +88,6 @@ private val SELECT_OPEN_EPISODE_CONTEXT_SQL = """SELECT e.price_move_threshold_r
      WHERE ti.opportunity_episode_id=e.id ORDER BY d.created_at DESC, d.id DESC LIMIT 1)
     FROM opportunity_episodes e WHERE e.symbol=? AND e.closed_at IS NULL
 """.trimIndent()
-
-private fun String?.toPredicates(): List<TradePlanInvalidationPredicate> {
-    if (this.isNullOrBlank()) return emptyList()
-    return splitToSequence(';').mapNotNull { encoded ->
-        val fields = encoded.split('|')
-        val type = runCatching { TradePlanInvalidationType.valueOf(fields[0]) }.getOrNull() ?: return@mapNotNull null
-        TradePlanInvalidationPredicate(
-            type = type,
-            decimalThresholdJpy = fields.getOrNull(1)?.takeIf(String::isNotBlank)?.toBigDecimalOrNull(),
-            instantThreshold = fields.getOrNull(2)?.takeIf(String::isNotBlank)?.let {
-                runCatching { java.time.Instant.parse(it) }.getOrNull()
-            },
-        )
-    }.toList()
-}
 
 internal fun String.toMaterialManifest(): DecisionMaterialStateManifest {
     val value = Json.parseToJsonElement(this).jsonObject

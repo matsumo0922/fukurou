@@ -19,6 +19,7 @@ Step6 時点の `fukurou-mcp` runtime と Docker 配線の正本メモ。
 - request audit は request hot path で `command_event_log` へ同期保存する。5 秒周期の reconciler は通常 ticker / trades / candles の 3 attempt を行うため、retry と symbol cache miss を除いても 1 日約 51,840 event が下限目安になる。現在は `command_event_log` の retention / pruning を行わない。event type 限定 retention、専用 table、durable outbox による batch 化はいずれも未実装で、選択には production の event 量、保存時間、DB latency の観測値を必要とする。監査完了前に response を利用する非 durable async 化は行わない。
 - `ProtectionReconciler` は一般的な tick 取得失敗を従来どおり degraded tick として扱う一方、GMO rate-limit exhaustion と request audit failure は pass failure へ遷移させる。WebSocket periodic maintenance でも maintenance success を記録せず、readiness と failure audit に障害を反映する。`PaperBroker` の optional market-data fallback も同じ 2 種類を握りつぶさず、注文判断を fail closed にする。paper / live の設定値と注文状態遷移は変えない。
 - fukurou 埋め込み時の短期足 kline request 予算は `GMO_MAX_DAILY_KLINE_REQUESTS` で強制する。standalone 起動時はこの fukurou 固有予算を注入しない。
+- full run の material manifest capture は、5分足 ATR を固定するため GMO Public REST の kline request を run ごとに最大1回追加する。deploy 後は `GMO_PUBLIC_REST_REQUEST_COMPLETED` を operation / outcome 別に確認し、kline request 数、permit wait、`RATE_LIMITED` / `ERR-5003` の増加がないことを監視する。
 
 ## local smoke
 

@@ -9,7 +9,6 @@ import me.matsumo.fukurou.trading.daemon.RestingOrderMaintenanceService
 import me.matsumo.fukurou.trading.daemon.RestingSuppressionReason
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationState
-import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.evaluateInvalidationPredicates
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjection
@@ -192,7 +191,7 @@ class ExposedRestingOrderMaintenanceService(
                             RestingIdentity(
                                 episodeId = episodeId,
                                 materialStateHash = materialHash,
-                                predicates = result.getString(3).toPredicates(),
+                                predicates = TradePlanInvalidationPredicateCodec.decode(result.getString(3)),
                                 priceMoveThresholdRatio = result.getBigDecimal(4),
                                 anchorPriceJpy = result.getBigDecimal(5),
                             )
@@ -439,21 +438,6 @@ class ExposedRestingOrderMaintenanceService(
     }
 
     private fun String?.toUuidOrNull(): UUID? = this?.let { runCatching { UUID.fromString(it) }.getOrNull() }
-
-    private fun String?.toPredicates(): List<TradePlanInvalidationPredicate> {
-        if (this.isNullOrBlank()) return emptyList()
-        return splitToSequence(';').mapNotNull { encoded ->
-            val fields = encoded.split('|')
-            val type = runCatching { TradePlanInvalidationType.valueOf(fields[0]) }.getOrNull() ?: return@mapNotNull null
-            TradePlanInvalidationPredicate(
-                type = type,
-                decimalThresholdJpy = fields.getOrNull(1)?.takeIf(String::isNotBlank)?.toBigDecimalOrNull(),
-                instantThreshold = fields.getOrNull(2)?.takeIf(String::isNotBlank)?.let {
-                    runCatching { Instant.parse(it) }.getOrNull()
-                },
-            )
-        }.toList()
-    }
 
     private data class RestingIdentity(
         val episodeId: UUID,
