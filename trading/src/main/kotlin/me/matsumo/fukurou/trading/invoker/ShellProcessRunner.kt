@@ -90,16 +90,32 @@ class ShellProcessRunner : ProcessRunner {
 
     private suspend fun destroyProcessTree(process: Process) {
         withContext(Dispatchers.IO) {
-            val descendants = process.toHandle()
-                .descendants()
-                .toList()
-                .asReversed()
+            val descendants = runCatching {
+                process.toHandle()
+                    .descendants()
+                    .toList()
+                    .asReversed()
+            }.getOrElse {
+                killDirectChildrenWithPkill(process.pid())
+                emptyList()
+            }
 
             descendants.forEach { descendant -> descendant.destroyForcibly() }
             process.destroyForcibly()
 
             descendants.forEach { descendant -> descendant.awaitExitQuietly() }
             process.waitFor(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)
+        }
+    }
+
+    private fun killDirectChildrenWithPkill(parentPid: Long) {
+        val pkill = Path.of("/usr/bin/pkill")
+        if (!Files.isExecutable(pkill)) return
+
+        runCatching {
+            ProcessBuilder(pkill.toString(), "-KILL", "-P", parentPid.toString())
+                .start()
+                .waitFor(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)
         }
     }
 
