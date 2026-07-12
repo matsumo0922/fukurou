@@ -68,6 +68,9 @@ import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
+import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
+import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.Candle
@@ -116,6 +119,7 @@ import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.Container
 import org.testcontainers.containers.PostgreSQLContainer
 import org.testcontainers.utility.MountableFile
+import java.math.BigDecimal
 import java.net.InetSocketAddress
 import java.nio.file.Path
 import java.sql.DriverManager
@@ -2016,6 +2020,7 @@ class McpDatabaseRoleIntegrationTest {
             results["submit_decision"] = decision
             val intentId = assertNotNull(decision.structuredContent).getValue("intent_id").jsonPrimitive.contentOrNull
             results["get_trade_intent"] = callTool(server, "get_trade_intent", buildJsonObject { put("intent_id", intentId) })
+            assertIdentityDualWrite(container)
             runtime.close()
             val falsifierBootstrap = requiredMatrixBootstrap(container, clock, LlmInvocationPhase.FALSIFIER)
             val falsifierRequestAuditSink = DeferredGmoPublicRequestAuditSink()
@@ -2064,6 +2069,24 @@ class McpDatabaseRoleIntegrationTest {
             runtime?.close()
             marketFixture.close()
             container.stop()
+        }
+    }
+}
+
+private fun assertIdentityDualWrite(container: PostgreSQLContainer<*>) {
+    DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
+        connection.createStatement().use { statement ->
+            assertSqlCount(
+                statement,
+                """SELECT COUNT(*) FROM decisions d JOIN trade_intents ti ON ti.decision_id=d.id
+                    WHERE d.opportunity_episode_id=ti.opportunity_episode_id
+                    AND d.thesis_id=ti.thesis_id AND d.geometry_hash=ti.geometry_hash
+                    AND d.material_state_hash=ti.material_state_hash
+                    AND d.identity_schema_version=ti.identity_schema_version
+                    AND d.opportunity_episode_id IS NOT NULL
+                """.trimIndent(),
+                1,
+            )
         }
     }
 }
@@ -2135,6 +2158,32 @@ private suspend fun seedRequiredMatrixRun(container: PostgreSQLContainer<*>, clo
                 startedAt = Instant.now(clock),
             ),
         ).getOrThrow()
+        runtime.decisionMaterialStateRepository.append(
+            DecisionMaterialStateManifest(
+                invocationId = MCP_MATRIX_RUN_ID,
+                capturedAt = Instant.now(clock),
+                triggerKind = DecisionTriggerKind.MANUAL,
+                symbol = TradingSymbol.BTC.apiSymbol,
+                runtimeConfigVersion = null,
+                runtimeConfigHash = null,
+                riskState = "RUNNING",
+                bestBidJpy = BigDecimal("99"),
+                bestAskJpy = BigDecimal("101"),
+                lastPriceJpy = BigDecimal("100"),
+                sourceTimestamp = Instant.now(clock),
+                freshness = MaterialFreshness.FRESH,
+                atr14FiveMinutesJpy = BigDecimal("5"),
+                latestCandleOpenJpy = BigDecimal("100"),
+                latestCandleHighJpy = BigDecimal("110"),
+                latestCandleLowJpy = BigDecimal("90"),
+                latestCandleCloseJpy = BigDecimal("105"),
+                openPositionFacts = emptyList(),
+                openOrderFacts = emptyList(),
+                missingSources = emptyList(),
+                canonicalContentHash = "a".repeat(64),
+                materialProjection = "risk=RUNNING\npriceMoveBand=0",
+            ),
+        ).getOrThrow()
     } finally {
         runtime.close()
     }
@@ -2192,6 +2241,12 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
                 (1..3).forEach { column -> assertEquals(false, rows.getBoolean(column)) }
             }
             assertSqlCount(statement, "SELECT count(*) FROM information_schema.role_table_grants WHERE grantee='PUBLIC' AND table_schema='public'", 0)
+            statement.executeQuery(
+                "SELECT has_function_privilege('public', 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE')",
+            ).use { rows ->
+                assertTrue(rows.next())
+                assertFalse(rows.getBoolean(1))
+            }
             assertSqlCount(
                 statement,
                 "SELECT count(*) FROM pg_attribute attribute " +
@@ -2199,7 +2254,7 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
                     "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace " +
                     "CROSS JOIN LATERAL aclexplode(attribute.attacl) acl " +
                     "WHERE namespace.nspname='public' AND acl.grantee IN (0, (SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'))",
-                0,
+                2,
             )
             statement.executeQuery(
                 "SELECT " +
@@ -2227,13 +2282,16 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
     }
     mcpTestConnection(container).use { connection ->
         connection.createStatement().use { statement ->
-            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_table_privilege(current_user, 'orders', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP')").use { rows ->
+            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_table_privilege(current_user, 'orders', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_function_privilege(current_user, 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP'), has_column_privilege(current_user, 'opportunity_episodes', 'closed_at', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'close_reason', 'UPDATE')").use { rows ->
                 assertTrue(rows.next())
                 assertEquals(true, rows.getBoolean(1))
                 assertEquals(true, rows.getBoolean(2))
                 assertEquals(false, rows.getBoolean(3))
                 assertEquals(true, rows.getBoolean(4))
-                assertEquals(false, rows.getBoolean(5))
+                assertEquals(true, rows.getBoolean(5))
+                assertEquals(false, rows.getBoolean(6))
+                assertEquals(true, rows.getBoolean(7))
+                assertEquals(true, rows.getBoolean(8))
             }
         }
     }
@@ -2406,6 +2464,17 @@ private fun enterDecisionArguments(invocationId: String? = null) = buildJsonObje
     put("trade_plan_revision_count", 0)
     put("trade_plan_thesis_ja", "1時間足の上昇継続に乗る。")
     put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ", "出来高急減"))
+    put(
+        "trade_plan_invalidation_predicates",
+        buildJsonArray {
+            add(
+                buildJsonObject {
+                    put("type", "LAST_PRICE_AT_OR_BELOW")
+                    put("threshold_jpy", "9700000")
+                },
+            )
+        },
+    )
     put("trade_plan_target_price_jpy", "10500000")
     put("trade_plan_time_stop_at", "2026-07-02T01:00:00Z")
 }
@@ -2473,6 +2542,17 @@ private fun addLongDecisionArguments(
         put("trade_plan_revision_count", 1)
         put("trade_plan_thesis_ja", "既存仮説の継続に追加します。")
         put("trade_plan_invalidation_conditions_ja", stringArray("直近安値割れ"))
+        put(
+            "trade_plan_invalidation_predicates",
+            buildJsonArray {
+                add(
+                    buildJsonObject {
+                        put("type", "LAST_PRICE_AT_OR_BELOW")
+                        put("threshold_jpy", "9900000")
+                    },
+                )
+            },
+        )
         put("trade_plan_target_price_jpy", "10600000")
         put("trade_plan_time_stop_at", "2026-07-02T02:00:00Z")
     }

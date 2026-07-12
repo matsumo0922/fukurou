@@ -7,6 +7,8 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
@@ -15,7 +17,10 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
+import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderStatus
+import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
@@ -57,6 +62,96 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
+    fun restingEntryOnly_runsDeterministicMaintenanceWithoutLlmOrPreFilter() = runBlocking {
+        val preFilter = FakePreFilter()
+        val maintenanceCalls = mutableListOf<LlmDaemonOpenRiskSnapshot>()
+        val snapshot = LlmDaemonOpenRiskSnapshot(
+            openPositionCount = 0,
+            restingEntryOrders = listOf(restingEntryOrder("resting-order-1"), restingEntryOrder("resting-order-2")),
+            otherOpenOrderCount = 0,
+        )
+        val fixture = schedulerFixture(
+            openRiskReader = { Result.success(snapshot) },
+            preFilter = preFilter,
+            restingOrderMaintenanceService = RestingOrderMaintenanceService { observed, _ ->
+                maintenanceCalls += observed
+                Result.success(RestingSuppressionReason.RESTING_ORDER_UNCHANGED)
+            },
+        )
+
+        val result = fixture.scheduler.tick()
+        fixture.scheduler.tick()
+
+        assertEquals(
+            LlmDaemonTickResult.Skipped("resting_order_unchanged", null),
+            result,
+        )
+        assertEquals(listOf(snapshot, snapshot), maintenanceCalls)
+        assertTrue(fixture.launches.isEmpty())
+        assertTrue(preFilter.requests.isEmpty())
+        assertEquals(
+            1,
+            fixture.eventLog.events().count { event ->
+                event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED &&
+                    event.payload.contains("resting_order_unchanged")
+            },
+        )
+    }
+
+    @Test
+    fun leavingRestingState_resetsMirrorThrottleBeforeSameReasonReentry() = runBlocking {
+        val resting = LlmDaemonOpenRiskSnapshot(0, listOf(restingEntryOrder()), 0)
+        val flat = LlmDaemonOpenRiskSnapshot(0, emptyList(), 0)
+        var reads = 0
+        val fixture = schedulerFixture(
+            openRiskReader = {
+                val snapshot = when (reads++) {
+                    0 -> resting
+                    1 -> flat
+                    else -> resting
+                }
+                Result.success(snapshot)
+            },
+            restingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
+                Result.success(RestingSuppressionReason.RESTING_ORDER_UNCHANGED)
+            },
+        )
+
+        fixture.scheduler.tick()
+        fixture.scheduler.tick()
+        fixture.scheduler.tick()
+
+        assertEquals(
+            2,
+            fixture.eventLog.events().count { event ->
+                event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED &&
+                    event.payload.contains("resting_order_unchanged")
+            },
+        )
+    }
+
+    @Test
+    fun positionAppearingDuringRestingMaintenanceDoesNotSuppressSafetyFullRun() = runBlocking {
+        var reads = 0
+        val resting = LlmDaemonOpenRiskSnapshot(0, listOf(restingEntryOrder()), 0)
+        val holding = LlmDaemonOpenRiskSnapshot(1, emptyList(), 0)
+        val fixture = schedulerFixture(
+            openRiskReader = {
+                reads += 1
+                Result.success(if (reads == 1) resting else holding)
+            },
+            restingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
+                Result.success(RestingSuppressionReason.RESTING_ORDER_STATE_RACE)
+            },
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, result.triggerKind)
+    }
+
+    @Test
     fun flatState_launchesOnlyOnFifteenMinuteHeartbeatWhenNoEventExists() = runBlocking {
         val fixture = schedulerFixture()
 
@@ -72,6 +167,73 @@ class LlmDaemonSchedulerTest {
         assertEquals(2, fixture.launches.size)
         assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, firstResult.triggerKind)
         assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, secondResult.triggerKind)
+    }
+
+    @Test
+    fun launchThreadsSingleOpenRiskSnapshotThroughReservationRunAndAudit() = runBlocking {
+        var brokerReads = 0
+        val snapshot = LlmDaemonOpenRiskSnapshot(
+            openPositionCount = 0,
+            restingEntryOrders = emptyList(),
+            otherOpenOrderCount = 0,
+        )
+        val fixture = schedulerFixture(
+            openRiskReader = {
+                brokerReads += 1
+                Result.success(snapshot)
+            },
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(1, brokerReads)
+        assertEquals(1, fixture.launches.size)
+        val launched = fixture.eventLog.events().single { event ->
+            event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED
+        }
+        assertTrue(launched.payload.contains("\"restingOnly\":false"))
+        assertTrue(launched.payload.contains("\"openPositionCount\":0"))
+        assertTrue(launched.payload.contains("\"restingEntryOrderCount\":0"))
+    }
+
+    @Test
+    fun launchAuditFailureFinishesReservationWithoutRereadingBrokerOrRunningChild() = runBlocking {
+        var brokerReads = 0
+        val eventLog = InMemoryCommandEventLog()
+        val failingLaunchedAudit = object : CommandEventLog by eventLog {
+            override suspend fun append(event: CommandEvent): Result<Unit> {
+                return if (event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED) {
+                    Result.failure(IllegalStateException("launch audit unavailable"))
+                } else {
+                    eventLog.append(event)
+                }
+            }
+        }
+        val fixture = schedulerFixture(
+            eventLog = eventLog,
+            commandEventLog = failingLaunchedAudit,
+            openRiskReader = {
+                brokerReads += 1
+                Result.success(LlmDaemonOpenRiskSnapshot(0, emptyList(), 0))
+            },
+        )
+
+        val result = fixture.scheduler.tick()
+        val active = fixture.reservations.findBlockingRunningReservation(
+            requestTriggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+            activeSince = fixedInstant().minus(Duration.ofHours(1)),
+        ).getOrThrow()
+
+        assertEquals(LlmDaemonTickResult.Skipped("tick_failed", null), result)
+        assertEquals(1, brokerReads)
+        assertTrue(fixture.launches.isEmpty())
+        assertEquals(null, active)
+        assertTrue(
+            eventLog.events().any { event ->
+                event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED && event.payload.contains("tick_failed")
+            },
+        )
     }
 
     @Test
@@ -566,7 +728,7 @@ class LlmDaemonSchedulerTest {
                 if (readCount == 1) {
                     Result.failure(IllegalStateException("temporary broker read failure"))
                 } else {
-                    Result.success(false)
+                    Result.success(LlmDaemonOpenRiskSnapshot(0, emptyList(), 0))
                 }
             },
         )
@@ -1093,16 +1255,28 @@ private fun schedulerFixture(
     clock: MutableClock = MutableClock(fixedInstant()),
     riskStateRepository: InMemoryRiskStateRepository = InMemoryRiskStateRepository(clock),
     eventLog: InMemoryCommandEventLog = InMemoryCommandEventLog(),
+    commandEventLog: CommandEventLog = eventLog,
     reservations: LlmLaunchReservationRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository),
     launches: MutableList<OneShotRunnerRequest> = mutableListOf(),
     idGenerator: () -> UUID = deterministicIds(),
     hasOpenRisk: Boolean = false,
-    openRiskReader: LlmDaemonOpenRiskReader = { Result.success(hasOpenRisk) },
+    openRiskReader: LlmDaemonOpenRiskReader = {
+        Result.success(
+            LlmDaemonOpenRiskSnapshot(
+                openPositionCount = if (hasOpenRisk) 1 else 0,
+                restingEntryOrders = emptyList(),
+                otherOpenOrderCount = 0,
+            ),
+        )
+    },
     tickerReader: FakeTickerReader = FakeTickerReader(clock),
     positionsReader: FakePositionsReader = FakePositionsReader(),
     entryFillReader: FakeEntryFillReader = FakeEntryFillReader(),
     preFilter: FakePreFilter = FakePreFilter(),
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
+    restingOrderMaintenanceService: RestingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
+        Result.success(RestingSuppressionReason.RESTING_ORDER_IDENTITY_UNAVAILABLE)
+    },
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): SchedulerFixture {
     val scheduler = LlmDaemonScheduler(
@@ -1110,12 +1284,13 @@ private fun schedulerFixture(
         runtimeConfigSnapshot = runtimeConfigSnapshot,
         dependencies = LlmDaemonSchedulerDependencies(
             riskStateRepository = riskStateRepository,
-            commandEventLog = eventLog,
+            commandEventLog = commandEventLog,
             launchReservationRepository = reservations,
             openRiskReader = openRiskReader,
             tickerReader = tickerReader,
             positionsReader = positionsReader,
             entryFillReader = entryFillReader,
+            restingOrderMaintenanceService = restingOrderMaintenanceService,
         ),
         runtime = LlmDaemonSchedulerRuntime(
             requestBase = OneShotRunnerRequest(
@@ -1145,6 +1320,31 @@ private fun schedulerFixture(
         positionsReader = positionsReader,
         entryFillReader = entryFillReader,
         preFilter = preFilter,
+    )
+}
+
+private fun restingEntryOrder(orderId: String = "resting-order-1"): Order {
+    val now = fixedInstant().toString()
+
+    return Order(
+        orderId = orderId,
+        intentId = "intent-1",
+        positionId = null,
+        tradeGroupId = null,
+        symbol = TradingSymbol.BTC.apiSymbol,
+        mode = TradingMode.PAPER,
+        side = OrderSide.BUY,
+        orderType = OrderType.LIMIT,
+        status = OrderStatus.OPEN,
+        sizeBtc = "0.01",
+        limitPriceJpy = "10000000",
+        triggerPriceJpy = null,
+        protectiveStopPriceJpy = "9900000",
+        takeProfitPriceJpy = "10200000",
+        reasonJa = "押し目待ち",
+        clientRequestId = null,
+        createdAt = now,
+        updatedAt = now,
     )
 }
 

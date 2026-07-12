@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.decision
 
+import me.matsumo.fukurou.trading.decision.identity.DecisionIdentity
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -129,6 +130,7 @@ data class DecisionRecord(
     val decisionId: UUID,
     val submission: DecisionSubmission,
     val createdAt: Instant,
+    val identity: DecisionIdentity? = null,
 )
 
 /**
@@ -169,6 +171,7 @@ data class TradeIntentRecord(
     val draft: EntryIntentDraft,
     val estimatedWinProbability: BigDecimal,
     val createdAt: Instant,
+    val identity: DecisionIdentity? = null,
 )
 
 /**
@@ -192,7 +195,63 @@ data class TradePlanDraft(
     val targetPriceJpy: BigDecimal?,
     val timeStopAt: Instant?,
     val setupTags: List<String>,
+    val invalidationPredicates: List<TradePlanInvalidationPredicate> = emptyList(),
 )
+
+/** machine-evaluable TradePlan invalidation predicate。 */
+data class TradePlanInvalidationPredicate(
+    val type: TradePlanInvalidationType,
+    val decimalThresholdJpy: BigDecimal? = null,
+    val instantThreshold: Instant? = null,
+)
+
+/** bounded invalidation predicate type。 */
+enum class TradePlanInvalidationType {
+    LAST_PRICE_AT_OR_BELOW,
+    LAST_PRICE_AT_OR_ABOVE,
+    BEST_BID_AT_OR_BELOW,
+    BEST_ASK_AT_OR_ABOVE,
+    TIME_AT_OR_AFTER,
+    MATERIAL_STATE_CHANGED,
+}
+
+/** predicate evaluation result。 */
+enum class TradePlanInvalidationState { VALID, INVALIDATED, UNKNOWN_DATA }
+
+/** typed quote / time だけで invalidation predicate を評価する。 */
+@Suppress("LongParameterList", "CyclomaticComplexMethod")
+fun evaluateInvalidationPredicates(
+    predicates: List<TradePlanInvalidationPredicate>,
+    lastPriceJpy: BigDecimal?,
+    bestBidJpy: BigDecimal?,
+    bestAskJpy: BigDecimal?,
+    observedAt: Instant,
+    materialStateChanged: Boolean?,
+): TradePlanInvalidationState {
+    if (predicates.isEmpty()) return TradePlanInvalidationState.UNKNOWN_DATA
+    var unknown = false
+    predicates.forEach { predicate ->
+        val invalidated = when (predicate.type) {
+            TradePlanInvalidationType.LAST_PRICE_AT_OR_BELOW -> lastPriceJpy?.let {
+                it <= requireNotNull(predicate.decimalThresholdJpy)
+            }
+            TradePlanInvalidationType.LAST_PRICE_AT_OR_ABOVE -> lastPriceJpy?.let {
+                it >= requireNotNull(predicate.decimalThresholdJpy)
+            }
+            TradePlanInvalidationType.BEST_BID_AT_OR_BELOW -> bestBidJpy?.let {
+                it <= requireNotNull(predicate.decimalThresholdJpy)
+            }
+            TradePlanInvalidationType.BEST_ASK_AT_OR_ABOVE -> bestAskJpy?.let {
+                it >= requireNotNull(predicate.decimalThresholdJpy)
+            }
+            TradePlanInvalidationType.TIME_AT_OR_AFTER -> !observedAt.isBefore(requireNotNull(predicate.instantThreshold))
+            TradePlanInvalidationType.MATERIAL_STATE_CHANGED -> materialStateChanged
+        }
+        if (invalidated == true) return TradePlanInvalidationState.INVALIDATED
+        if (invalidated == null) unknown = true
+    }
+    return if (unknown) TradePlanInvalidationState.UNKNOWN_DATA else TradePlanInvalidationState.VALID
+}
 
 /**
  * 永続化済み TradePlan。

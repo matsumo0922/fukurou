@@ -1046,11 +1046,96 @@ object SafetyViolationsTable : Table("safety_violations") {
 /**
  * LLM の最終判断を append-only で保存する Exposed table。
  */
+/** full run 前に固定する immutable material-state manifest。 */
+object DecisionMaterialStateManifestsTable : Table("decision_material_state_manifests") {
+    val invocationId = varchar("invocation_id", 128)
+    val capturedAt = long("captured_at")
+    val schemaVersion = integer("schema_version")
+    val contentHash = varchar("content_hash", 64)
+    val materialProjection = text("material_projection").default("")
+    val manifestJson = text("manifest_json")
+    override val primaryKey = PrimaryKey(invocationId)
+}
+
+/** identity schema が production 集計対象になった明示 boundary。 */
+object DecisionIdentitySchemaBoundariesTable : Table("decision_identity_schema_boundaries") {
+    val schemaVersion = integer("schema_version")
+    val activatedAt = long("activated_at")
+    override val primaryKey = PrimaryKey(schemaVersion)
+}
+
+/** post-boundary identity generation の typed coverage failure。 */
+object DecisionIdentityGenerationFailuresTable : Table("decision_identity_generation_failures") {
+    val id = uuid("id")
+    val invocationId = varchar("invocation_id", 128).nullable()
+    val entityKind = varchar("entity_kind", 16)
+    val reason = varchar("reason", 64)
+    val occurredAt = long("occurred_at")
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** opportunity episode の明示 lifecycle。 */
+object OpportunityEpisodesTable : Table("opportunity_episodes") {
+    val id = uuid("id")
+    val symbol = varchar("symbol", 32)
+    val thesisId = varchar("thesis_id", 80)
+    val priceMoveThresholdRatio = decimal("price_move_threshold_ratio", 20, 12).default(BigDecimal("0.01"))
+    val openedAt = long("opened_at")
+    val closedAt = long("closed_at").nullable()
+    val closeReason = varchar("close_reason", 64).nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** dedupe shadow classifier の append-only observation。 */
+object DedupeShadowObservationsTable : Table("dedupe_shadow_observations") {
+    val id = uuid("id")
+    val observationKind = varchar("observation_kind", 32)
+    val decisionId = uuid("decision_id").nullable()
+    val opportunityEpisodeId = uuid("opportunity_episode_id").nullable()
+    val classification = varchar("classification", 32).nullable()
+    val suppressionReason = varchar("suppression_reason", 64).nullable()
+    val maintenanceTickId = uuid("maintenance_tick_id").nullable()
+    val referenceOrderId = uuid("reference_order_id").nullable()
+    val oldMaterialStateHash = varchar("old_material_state_hash", 80).nullable()
+    val newMaterialStateHash = varchar("new_material_state_hash", 80).nullable()
+    val invalidationState = varchar("invalidation_state", 32).nullable()
+    val distanceJpy = decimal("distance_jpy", 24, 8).nullable()
+    val signedDistanceBps = decimal("signed_distance_bps", 24, 8).nullable()
+    val atrPriceRatio = decimal("atr_price_ratio", 24, 12).nullable()
+    val dataQuality = varchar("data_quality", 32)
+    val observedAt = long("observed_at")
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** counterfactual label の append-only resolution。 */
+object DedupeShadowResolutionsTable : Table("dedupe_shadow_resolutions") {
+    val id = uuid("id")
+    val observationId = uuid("observation_id")
+    val resolution = varchar("resolution", 64)
+    val resolvedAt = long("resolved_at")
+    override val primaryKey = PrimaryKey(id)
+}
+
 object DecisionsTable : Table("decisions") {
     /**
      * decision ID。
      */
     val id = uuid("id")
+
+    /** server-owned opportunity episode ID。 */
+    val opportunityEpisodeId = uuid("opportunity_episode_id").nullable()
+
+    /** canonical thesis ID。 */
+    val thesisId = varchar("thesis_id", 80).nullable()
+
+    /** canonical order geometry hash。 */
+    val geometryHash = varchar("geometry_hash", 80).nullable()
+
+    /** versioned material state hash。 */
+    val materialStateHash = varchar("material_state_hash", 80).nullable()
+
+    /** identity schema version。 */
+    val identitySchemaVersion = integer("identity_schema_version").nullable()
 
     /**
      * daemon / CLI 起動単位の ID。
@@ -1183,6 +1268,7 @@ object TradePlansTable : Table("trade_plans") {
      * 否定条件一覧 JSON。
      */
     val invalidationConditionsJa = text("invalidation_conditions_ja")
+    val invalidationPredicates = text("invalidation_predicates").default("")
 
     /**
      * 目標価格。
@@ -1215,6 +1301,21 @@ object TradeIntentsTable : Table("trade_intents") {
      * intent ID。
      */
     val id = uuid("id")
+
+    /** server-owned opportunity episode ID。 */
+    val opportunityEpisodeId = uuid("opportunity_episode_id").nullable()
+
+    /** canonical thesis ID。 */
+    val thesisId = varchar("thesis_id", 80).nullable()
+
+    /** canonical order geometry hash。 */
+    val geometryHash = varchar("geometry_hash", 80).nullable()
+
+    /** versioned material state hash。 */
+    val materialStateHash = varchar("material_state_hash", 80).nullable()
+
+    /** identity schema version。 */
+    val identitySchemaVersion = integer("identity_schema_version").nullable()
 
     /**
      * 紐づく decision ID。

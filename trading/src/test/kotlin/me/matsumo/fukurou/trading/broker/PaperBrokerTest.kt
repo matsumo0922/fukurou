@@ -10,6 +10,8 @@ import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -2686,6 +2688,12 @@ private fun decisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
             targetPriceJpy = command.takeProfitPriceJpy,
             timeStopAt = null,
             setupTags = listOf("test-setup"),
+            invalidationPredicates = listOf(
+                TradePlanInvalidationPredicate(
+                    type = TradePlanInvalidationType.LAST_PRICE_AT_OR_BELOW,
+                    decimalThresholdJpy = requireNotNull(command.protectiveStopPriceJpy),
+                ),
+            ),
         ),
     )
 }

@@ -14,6 +14,7 @@ import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
 import me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT
+import me.matsumo.fukurou.trading.evaluation.DeduplicationMetrics
 import me.matsumo.fukurou.trading.evaluation.EvaluationExclusionSummary
 import me.matsumo.fukurou.trading.evaluation.EvaluationEpochOption
 import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
@@ -401,9 +402,15 @@ private const val SELECT_SCOPED_PNL_BEFORE_SQL = """
  *
  * @param database Exposed database
  */
+@Suppress("TooManyFunctions")
 class ExposedEvaluationRepository(
     private val database: ExposedDatabase,
 ) : EvaluationRepository {
+    override suspend fun fetchDeduplicationMetrics(period: EvaluationPeriod): Result<DeduplicationMetrics> {
+        return withContext(Dispatchers.IO) {
+            runCatching { exposedTransaction(database) { selectDeduplicationMetrics(period) } }
+        }
+    }
 
     override suspend fun listEpochs(): Result<List<EvaluationEpochOption>> = withContext(Dispatchers.IO) {
         runCatching {
@@ -924,6 +931,130 @@ private fun JdbcTransaction.selectLlmPhaseUsages(period: EvaluationPeriod, limit
                 facts = facts.take(limit),
                 truncated = truncated,
             )
+        }
+    }
+}
+
+private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod): DeduplicationMetrics {
+    val sql = """WITH boundary AS (
+        SELECT activated_at FROM decision_identity_schema_boundaries WHERE schema_version = 1
+      ) SELECT
+        (SELECT COUNT(*) FROM decisions, boundary WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at >= boundary.activated_at),
+        (SELECT COUNT(*) FROM decisions, boundary WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at >= boundary.activated_at AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
+        (SELECT COUNT(*) FROM trade_intents, boundary WHERE created_at>=? AND created_at<? AND created_at >= boundary.activated_at),
+        (SELECT COUNT(*) FROM trade_intents, boundary WHERE created_at>=? AND created_at<? AND created_at >= boundary.activated_at AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
+        (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<?),
+        (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<? AND classification IS NOT NULL AND opportunity_episode_id IS NOT NULL AND data_quality='COMPLETE'),
+        (SELECT COUNT(DISTINCT opportunity_episode_id) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<?),
+        (SELECT COUNT(DISTINCT maintenance_tick_id) FROM dedupe_shadow_observations WHERE observation_kind='RESTING_MAINTENANCE' AND observed_at>=? AND observed_at<? AND maintenance_tick_id IS NOT NULL),
+        (SELECT COUNT(DISTINCT (maintenance_tick_id, reference_order_id)) FROM dedupe_shadow_observations WHERE observation_kind='RESTING_MAINTENANCE' AND observed_at>=? AND observed_at<? AND maintenance_tick_id IS NOT NULL AND reference_order_id IS NOT NULL),
+        (SELECT COUNT(*) FROM decisions, boundary WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at < boundary.activated_at),
+        (SELECT COUNT(*) FROM trade_intents, boundary WHERE created_at>=? AND created_at<? AND created_at < boundary.activated_at)
+    """.trimIndent()
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        var index = 1
+        repeat(9) {
+            statement.setLong(index++, period.from.toEpochMilli())
+            statement.setLong(index++, period.toExclusive.toEpochMilli())
+        }
+        repeat(2) {
+            statement.setLong(index++, period.from.toEpochMilli())
+            statement.setLong(index++, period.toExclusive.toEpochMilli())
+        }
+        statement.executeQuery().use { result ->
+            check(result.next())
+            val classificationCounts = selectClassificationCounts(period)
+            val resolutionCounts = selectResolutionCounts(period)
+            val launchCounts = selectDedupeLaunchCounts(period)
+            DeduplicationMetrics(
+                decisionEligible = result.getInt(1),
+                decisionComplete = result.getInt(2),
+                intentEligible = result.getInt(3),
+                intentComplete = result.getInt(4),
+                shadowEligible = result.getInt(5),
+                shadowComplete = result.getInt(6),
+                uniqueEpisodeCount = result.getInt(7),
+                rawSuppressedHeartbeatCount = result.getInt(8),
+                restingMaintenanceObservationCount = result.getInt(9),
+                legacyExcludedCount = result.getInt(10) + result.getInt(11),
+                decisionLegacyExcludedCount = result.getInt(10),
+                decisionGenerationFailureCount = result.getInt(1) - result.getInt(2),
+                intentLegacyExcludedCount = result.getInt(11),
+                intentGenerationFailureCount = result.getInt(3) - result.getInt(4),
+                classificationCounts = classificationCounts,
+                falseSuppressionCount = resolutionCounts["FALSE_SUPPRESSION_PROXY"] ?: 0,
+                validSuppressionCount = resolutionCounts["VALID_SUPPRESSION_PROXY"] ?: 0,
+                pendingCount = resolutionCounts["PENDING"] ?: 0,
+                unknownCount = resolutionCounts["UNKNOWN_DATA"] ?: 0,
+                restingOnlyDaemonFullRunCount = launchCounts.restingOnlyDaemon,
+                manualFullRunCount = launchCounts.manual,
+            )
+        }
+    }
+}
+
+private fun JdbcTransaction.selectClassificationCounts(period: EvaluationPeriod): Map<String, Int> {
+    val sql = """SELECT classification, COUNT(*) FROM dedupe_shadow_observations
+        WHERE observed_at >= ? AND observed_at < ? AND classification IS NOT NULL GROUP BY classification
+    """.trimIndent()
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setLong(1, period.from.toEpochMilli())
+        statement.setLong(2, period.toExclusive.toEpochMilli())
+        statement.executeQuery().use { result ->
+            buildMap { while (result.next()) put(result.getString(1), result.getInt(2)) }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectResolutionCounts(period: EvaluationPeriod): Map<String, Int> {
+    val sql = """WITH episode_facts AS (
+        SELECT o.opportunity_episode_id,
+          BOOL_OR(o.invalidation_state = 'INVALIDATED' OR o.old_material_state_hash IS DISTINCT FROM o.new_material_state_hash) AS false_proxy,
+          BOOL_OR(o.data_quality <> 'COMPLETE' OR o.invalidation_state = 'UNKNOWN_DATA') AS unknown_data,
+          MAX(e.closed_at) FILTER (WHERE e.closed_at < ?) AS closed_at
+        FROM dedupe_shadow_observations o
+        LEFT JOIN opportunity_episodes e ON e.id = o.opportunity_episode_id
+        WHERE o.observed_at >= ? AND o.observed_at < ? AND o.opportunity_episode_id IS NOT NULL
+        GROUP BY o.opportunity_episode_id
+      ), folded AS (
+        SELECT CASE
+          WHEN false_proxy THEN 'FALSE_SUPPRESSION_PROXY'
+          WHEN unknown_data THEN 'UNKNOWN_DATA'
+          WHEN closed_at IS NULL THEN 'PENDING'
+          ELSE 'VALID_SUPPRESSION_PROXY'
+        END AS resolution FROM episode_facts
+      ) SELECT resolution, COUNT(*) FROM folded GROUP BY resolution
+    """.trimIndent()
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setLong(1, period.toExclusive.toEpochMilli())
+        statement.setLong(2, period.from.toEpochMilli())
+        statement.setLong(3, period.toExclusive.toEpochMilli())
+        statement.executeQuery().use { result ->
+            buildMap { while (result.next()) put(result.getString(1), result.getInt(2)) }
+        }
+    }
+}
+
+private data class DedupeLaunchCounts(val restingOnlyDaemon: Int, val manual: Int)
+
+private fun JdbcTransaction.selectDedupeLaunchCounts(period: EvaluationPeriod): DedupeLaunchCounts {
+    val sql = """SELECT
+      COUNT(*) FILTER (
+        WHERE payload LIKE '%\"triggerKind\":\"MANUAL\"%'
+        AND payload ~ '\"restingEntryOrderCount\":[1-9][0-9]*'
+      ),
+      COUNT(*) FILTER (
+        WHERE payload LIKE '%\"restingOnly\":true%'
+        AND payload NOT LIKE '%\"triggerKind\":\"MANUAL\"%'
+      ) FROM command_event_log
+      WHERE event_type = 'DAEMON_TRIGGER_LAUNCHED' AND occurred_at >= ? AND occurred_at < ?
+    """.trimIndent()
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setLong(1, period.from.toEpochMilli())
+        statement.setLong(2, period.toExclusive.toEpochMilli())
+        statement.executeQuery().use { result ->
+            check(result.next())
+            DedupeLaunchCounts(restingOnlyDaemon = result.getInt(2), manual = result.getInt(1))
         }
     }
 }

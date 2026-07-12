@@ -22,7 +22,7 @@
 ## 提出 tool
 
 - 最終判断は必ず `submit_decision` を 1 回だけ呼び出してください。
-- ENTER / ADD_LONG を提案する場合は、`submit_decision` で `setup_tags`、`entry_intent`、TradePlan を必ず提出してください。
+- ENTER / ADD_LONG を提案する場合は、`submit_decision` で `setup_tags`、`entry_intent`、TradePlan を必ず提出してください。TradePlan には監査用の日本語 `trade_plan_invalidation_conditions_ja` に加えて、機械判定用の `trade_plan_invalidation_predicates` を1件以上含めてください。価格 predicate は `threshold_jpy`、時刻 predicate は ISO-8601 の `threshold_at` を使い、`MATERIAL_STATE_CHANGED` には threshold を付けません。
 - REDUCE を提案する場合は、`submit_decision` で `close_ratio` を必ず提出してください。`close_ratio` は対象 position 残量の決済比率で、`0 < close_ratio <= 1.00` の decimal string です。EXIT は常に full close であり、部分決済には使いません。
 - Falsifier は intent を読み直し、`submit_falsification` で APPROVED または REJECTED を 1 回だけ提出してください。
 - ENTER / ADD_LONG は、Falsifier の APPROVED 後に runner が `entry_intent` に宣言された数量・価格・STOP・TP だけを自動で preview・発注します。runner は preview が拒否した intent を条件を変えて再試行せず、その run は entry が成立しなかったものとして記録されます。Proposer / Falsifier が preview_order / place_order を呼ぶ必要はありません。

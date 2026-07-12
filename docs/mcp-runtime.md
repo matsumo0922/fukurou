@@ -19,6 +19,7 @@ Step6 時点の `fukurou-mcp` runtime と Docker 配線の正本メモ。
 - request audit は request hot path で `command_event_log` へ同期保存する。5 秒周期の reconciler は通常 ticker / trades / candles の 3 attempt を行うため、retry と symbol cache miss を除いても 1 日約 51,840 event が下限目安になる。現在は `command_event_log` の retention / pruning を行わない。event type 限定 retention、専用 table、durable outbox による batch 化はいずれも未実装で、選択には production の event 量、保存時間、DB latency の観測値を必要とする。監査完了前に response を利用する非 durable async 化は行わない。
 - `ProtectionReconciler` は一般的な tick 取得失敗を従来どおり degraded tick として扱う一方、GMO rate-limit exhaustion と request audit failure は pass failure へ遷移させる。WebSocket periodic maintenance でも maintenance success を記録せず、readiness と failure audit に障害を反映する。`PaperBroker` の optional market-data fallback も同じ 2 種類を握りつぶさず、注文判断を fail closed にする。paper / live の設定値と注文状態遷移は変えない。
 - fukurou 埋め込み時の短期足 kline request 予算は `GMO_MAX_DAILY_KLINE_REQUESTS` で強制する。standalone 起動時はこの fukurou 固有予算を注入しない。
+- full run の material manifest capture は、5分足 ATR を固定するため GMO Public REST の kline request を run ごとに最大1回追加する。deploy 後は `GMO_PUBLIC_REST_REQUEST_COMPLETED` を operation / outcome 別に確認し、kline request 数、permit wait、`RATE_LIMITED` / `ERR-5003` の増加がないことを監視する。
 
 ## local smoke
 
@@ -55,6 +56,8 @@ production CLI が登録する command / args:
 ローカルの DB なし smoke は上記 Gradle task の test-only 二重 opt-in を使う。secret-bearing DB env へ fallback する one-shot 経路はなく、production launcher、manifest directory、root-only password file がない環境では fail closed する。
 
 ## one-shot runner
+
+新しい `ENTER` / `ADD_LONG` は `trade_plan_invalidation_predicates` を1件以上持つ。predicate は bounded enum と typed threshold で表現し、自然言語の `trade_plan_invalidation_conditions_ja` は人間向け監査情報として併存する。legacy decision の空 predicate は自然言語から推測せず、評価不能として扱う。
 
 手動の 1 回実行は production image 内の fixed launcher、manifest directory、root-only password file が揃う場合だけ起動する。`:trading:runOneShotLlm` は launcher 未導入のhost local checkoutではDB credentialへfallbackせずfail closedになる。runner coreは `:trading` の `me.matsumo.fukurou.trading.invoker` / `me.matsumo.fukurou.trading.runner` に置く。
 
@@ -135,6 +138,8 @@ Ktor process 内の daemon scheduler は active runtime config の `daemon.enabl
 `llm.launchEnabled` はscheduler、`POST /ops/trigger`、direct `OneShotRunnerMain`が共有するglobal launch gateで、DB active runtime configを正本とする。code defaultはfalseであり、fresh bootstrapと既存snapshotへの欠落キーbackfillもfalseになるため、operatorが明示的にtrueへactive化するまで起動しない。falseではschedulerが`LLM_LAUNCH_DISABLED`を監査してskipし、manual routeは同reasonの409、direct runnerはchild processやMCP credentialを使う前にnon-zeroで終了する。`daemon.enabled`はscheduler loopだけを制御し、このglobal gateの代用にはしない。
 
 - flat 状態: 経済イベント条件や価格急変条件がなければ 15 分 heartbeat。
+- open position がなく resting entry だけが生存する状態: scheduler は reservation、pre-filter、one-shot runner より前に決定論的 maintenance へ分岐し、full LLM run を起動しない。identity や監視データが不足していても full run へ fail-open せず、stable suppression reason を監査する。operator の manual run はこの daemon 抑止とは別経路である。
+- full run は Proposer 起動前に secret と raw orderbook を含まない immutable material-state manifest を invocation ID ごとに1件保存する。entry decision / intent の identity は MCP input から受け取らず、この manifest と提出済み TradePlan / geometry から server が生成する。
 - event 条件: `safety.economicEventBlackouts` の active window、価格急変、STOP 接近、paper entry fill を既存 reservation / cap 経路で評価する。経済イベントは同じ active window で 1 回だけ起動する。
 - holding 状態: open position / open order が DB にある場合も 15 分 cadence。paper entry fill は最新 execution を起点に `ENTRY_FILL` として 1 回だけ起動し、cooldown 内の fill burst は後追い発火しない。
 - pre-filter: `daemon.preFilterEnabled=true` のとき、flat heartbeat / holding dense check は full LLM 起動前に Claude Haiku で market snapshot の有意変化を判定する。NO の場合は `pre_filter_no_change` として full run を省略し、pre-filter 失敗時は full run へ進む。pre-filter 自体も LLM 呼び出しなので予約済み invocation と hourly / daily cap を消費し、full run だけを省略する。価格急変、STOP 接近、paper entry fill、経済イベントには適用しない。

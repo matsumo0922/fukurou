@@ -52,6 +52,11 @@ import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjectionContext
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
@@ -206,6 +211,89 @@ class OneShotLlmRunnerTest {
         assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION.name, record?.status)
         assertNull(record?.triggerKind)
         assertTrue(record?.finishedAt != null)
+    }
+
+    @Test
+    fun materialManifestCapturesExactMarketFactsBeforeThesisScopedProjection() = runBlocking {
+        val fixture = runnerFixture(marketDataSource = MaterialManifestMarketDataSource) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            }
+            cleanExit()
+        }
+        val request = defaultRequest().copy(invocationId = "material-facts-run")
+
+        fixture.runner.runOneShot(request).getOrThrow()
+
+        val manifest = assertNotNull(
+            fixture.runtime.decisionMaterialStateRepository.find("material-facts-run").getOrThrow(),
+        )
+        assertNotNull(manifest.bestBidJpy)
+        assertNotNull(manifest.bestAskJpy)
+        assertNotNull(manifest.lastPriceJpy)
+        assertNotNull(manifest.sourceTimestamp)
+        assertNotNull(manifest.atr14FiveMinutesJpy)
+        assertTrue(manifest.canonicalContentHash.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(manifest.materialProjection.isEmpty())
+        assertFalse(manifest.materialProjection.contains("sourceTimestamp"))
+    }
+
+    @Test
+    fun preProposerManifestIgnoresSymbolOnlyEpisodeContext() = runBlocking {
+        val config = TradingBotConfig(daemon = LlmDaemonConfig(priceMoveThresholdRatio = BigDecimal("0.50")))
+        val fixture = runnerFixture(
+            config = config,
+            marketDataSource = MaterialManifestMarketDataSource,
+            runtimeTransform = { runtime ->
+                val delegate = runtime.decisionMaterialStateRepository
+                runtime.copy(
+                    decisionMaterialStateRepository = object : DecisionMaterialStateRepository by delegate {
+                        override suspend fun findOpenEpisodeContext(symbol: String) = Result.success(
+                            DecisionMaterialProjectionContext(
+                                anchorPriceJpy = BigDecimal("9800000"),
+                                priceMoveThresholdRatio = BigDecimal("0.02"),
+                                invalidationPredicates = emptyList(),
+                            ),
+                        )
+                    },
+                )
+            },
+        ) { command ->
+            if (command.isProposerLaunch()) submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            cleanExit()
+        }
+
+        fixture.runner.runOneShot(defaultRequest().copy(invocationId = "fixed-threshold-run")).getOrThrow()
+
+        val manifest = assertNotNull(
+            fixture.runtime.decisionMaterialStateRepository.find("fixed-threshold-run").getOrThrow(),
+        )
+        assertEquals(BigDecimal("0.50"), manifest.priceMoveThresholdRatio)
+        assertTrue(manifest.materialProjection.isEmpty())
+    }
+
+    @Test
+    fun materialManifestPersistenceFailureRemainsTypedCoverageMiss() = runBlocking {
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                runtime.copy(
+                    decisionMaterialStateRepository = object : DecisionMaterialStateRepository {
+                        override suspend fun append(manifest: DecisionMaterialStateManifest): Result<Unit> {
+                            return Result.failure(IllegalStateException("manifest unavailable"))
+                        }
+                    },
+                )
+            },
+        ) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            }
+            cleanExit()
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
     }
 
     @Test
@@ -1764,7 +1852,11 @@ class OneShotLlmRunnerTest {
                 riskStateRepository = runtime.riskStateRepository,
                 commandEventLog = runtime.commandEventLog,
                 launchReservationRepository = InMemoryLlmLaunchReservationRepository(runtime.riskStateRepository),
-                openRiskReader = { Result.success(false) },
+                openRiskReader = {
+                    Result.success(
+                        me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskSnapshot(0, emptyList(), 0),
+                    )
+                },
                 tickerReader = {
                     Result.success(
                         LlmDaemonTickerSnapshot(
@@ -1870,6 +1962,7 @@ private fun runnerFixture(
     val runner = OneShotLlmRunner(
         tradingRuntime = runtime,
         tradingConfig = config,
+        materialMarketDataSource = marketDataSource,
         llmInvoker = ShellLlmInvoker(
             commandRenderer = DefaultLlmCommandRenderer(),
             processRunner = processRunner,
@@ -2426,6 +2519,12 @@ private fun tradePlanDraft(
         targetPriceJpy = targetPriceJpy,
         timeStopAt = null,
         setupTags = listOf("runner-test"),
+        invalidationPredicates = listOf(
+            TradePlanInvalidationPredicate(
+                type = TradePlanInvalidationType.LAST_PRICE_AT_OR_BELOW,
+                decimalThresholdJpy = BigDecimal("9700000"),
+            ),
+        ),
     )
 }
 
@@ -2806,6 +2905,29 @@ private object FakeMarketDataSource : MarketDataSource {
                 takerFee = "0.0005",
                 makerFee = "-0.0001",
             ),
+        )
+    }
+}
+
+private object MaterialManifestMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return Result.success(
+            (0 until 64).map { index ->
+                Candle(
+                    symbol = symbol.apiSymbol,
+                    interval = interval,
+                    openTime = fixedInstant().plusSeconds(index * 300L).toString(),
+                    open = "10000000",
+                    high = "10100000",
+                    low = "9900000",
+                    close = "10000000",
+                    volume = "1",
+                )
+            },
         )
     }
 }

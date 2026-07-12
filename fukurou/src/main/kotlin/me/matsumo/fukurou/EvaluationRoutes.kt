@@ -178,6 +178,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         val actionCounts = evaluationRepository.countDecisionsByAction(period, scope).getOrThrow()
         val exclusionSummary = evaluationRepository.fetchExclusionSummary(period, scope).getOrThrow()
         val performance = EvaluationMath.summarizeTrades(tradeResult.trades)
+        val deduplication = evaluationRepository.fetchDeduplicationMetrics(period, scope).getOrThrow()
         val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
         val riskState = evaluationRiskStateRepository.current().getOrThrow()
         val candles = call.fetchDailyCandlesOrEmpty(
@@ -202,6 +203,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
                 ),
                 runRates = EvaluationRunRatesResponse.fromStats(EvaluationMath.decisionRunRates(runCount, actionCounts)),
                 exclusions = exclusionSummary.toResponse(),
+                deduplication = DeduplicationResponse.from(deduplication),
                 marketRegimes = EvaluationMath.summarizeByMarketRegime(
                     trades = tradeResult.trades,
                     regimes = regimes,
@@ -211,7 +213,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         )
     }.describe {
         summary = "評価サマリーを取得する"
-        description = "market-data gap の評価除外を適用した PF、勝率、期待 R、行動率、相場局面別成績と除外理由を返します。"
+        description = "market-data gap の評価除外を適用した成績と、episode 単位の決定論的 false-suppression proxy を返します。proxy の率は false / (false + valid) で、pending / unknown は率から除外します。"
         tag(EVALUATION_TAG)
         parameters {
             query("epochId") {
@@ -752,8 +754,68 @@ data class EvaluationSummaryResponse(
     val killCriterion: EvaluationKillCriterionResponse,
     val runRates: EvaluationRunRatesResponse,
     val exclusions: EvaluationExclusionSummaryResponse = EvaluationExclusionSummaryResponse(),
+    val deduplication: DeduplicationResponse = DeduplicationResponse(),
     val marketRegimes: List<EvaluationMarketRegimeResponse>,
 )
+
+/** Phase 1 decision deduplication telemetry。 */
+@Serializable
+data class DeduplicationResponse(
+    val decisionIdentityCoverage: Double? = null,
+    val legacyExcludedCount: Int = 0,
+    val decisionLegacyExcludedCount: Int = 0,
+    val decisionGenerationFailureCount: Int = 0,
+    val intentIdentityCoverage: Double? = null,
+    val intentLegacyExcludedCount: Int = 0,
+    val intentGenerationFailureCount: Int = 0,
+    val shadowClassificationCoverage: Double? = null,
+    val classificationCounts: Map<String, Int> = emptyMap(),
+    val rawSuppressedHeartbeatCount: Int = 0,
+    val restingMaintenanceObservationCount: Int = 0,
+    val uniqueEpisodeCount: Int = 0,
+    val falseSuppressionRate: Double? = null,
+    val falseSuppressionCount: Int = 0,
+    val validSuppressionCount: Int = 0,
+    val resolvedCount: Int = 0,
+    val pendingCount: Int = 0,
+    val unknownCount: Int = 0,
+    val restingOnlyDaemonFullRunCount: Int = 0,
+    val manualFullRunCount: Int = 0,
+) {
+    companion object {
+        fun from(metrics: me.matsumo.fukurou.trading.evaluation.DeduplicationMetrics): DeduplicationResponse {
+            return DeduplicationResponse(
+                decisionIdentityCoverage = coverage(metrics.decisionComplete, metrics.decisionEligible),
+                legacyExcludedCount = metrics.legacyExcludedCount,
+                decisionLegacyExcludedCount = metrics.decisionLegacyExcludedCount,
+                decisionGenerationFailureCount = metrics.decisionGenerationFailureCount,
+                intentIdentityCoverage = coverage(metrics.intentComplete, metrics.intentEligible),
+                intentLegacyExcludedCount = metrics.intentLegacyExcludedCount,
+                intentGenerationFailureCount = metrics.intentGenerationFailureCount,
+                shadowClassificationCoverage = coverage(metrics.shadowComplete, metrics.shadowEligible),
+                classificationCounts = metrics.classificationCounts,
+                rawSuppressedHeartbeatCount = metrics.rawSuppressedHeartbeatCount,
+                restingMaintenanceObservationCount = metrics.restingMaintenanceObservationCount,
+                uniqueEpisodeCount = metrics.uniqueEpisodeCount,
+                falseSuppressionRate = coverage(
+                    metrics.falseSuppressionCount,
+                    metrics.falseSuppressionCount + metrics.validSuppressionCount,
+                ),
+                falseSuppressionCount = metrics.falseSuppressionCount,
+                validSuppressionCount = metrics.validSuppressionCount,
+                resolvedCount = metrics.falseSuppressionCount + metrics.validSuppressionCount,
+                pendingCount = metrics.pendingCount,
+                unknownCount = metrics.unknownCount,
+                restingOnlyDaemonFullRunCount = metrics.restingOnlyDaemonFullRunCount,
+                manualFullRunCount = metrics.manualFullRunCount,
+            )
+        }
+
+        private fun coverage(complete: Int, eligible: Int): Double? {
+            return if (eligible == 0) null else complete.toDouble() / eligible
+        }
+    }
+}
 
 /** market-data gap による評価除外 summary。 */
 @Serializable

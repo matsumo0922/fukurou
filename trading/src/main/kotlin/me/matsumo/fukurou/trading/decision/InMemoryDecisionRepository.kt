@@ -2,6 +2,10 @@ package me.matsumo.fukurou.trading.decision
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
+import me.matsumo.fukurou.trading.decision.identity.InMemoryDecisionMaterialStateRepository
+import me.matsumo.fukurou.trading.decision.identity.canonicalProjection
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import java.math.BigDecimal
@@ -19,6 +23,7 @@ import java.util.UUID
 class InMemoryDecisionRepository(
     private val clock: Clock = Clock.systemUTC(),
     private val maxTradePlanRevisions: Int = MAX_TRADE_PLAN_REVISIONS,
+    private val materialStateRepository: DecisionMaterialStateRepository = InMemoryDecisionMaterialStateRepository(),
 ) : AtomicIntentConsumptionRepository {
 
     private val mutex = Mutex()
@@ -27,6 +32,7 @@ class InMemoryDecisionRepository(
     private val tradeIntents = mutableListOf<TradeIntentRecord>()
     private val falsifications = mutableListOf<FalsificationRecord>()
     private val intentConsumptions = mutableListOf<TradeIntentConsumptionRecord>()
+    private val openEpisodesByThesis = mutableMapOf<String, InMemoryEpisodeContext>()
 
     /**
      * 保存済み record の snapshot 読み取り境界。
@@ -40,6 +46,7 @@ class InMemoryDecisionRepository(
         intentConsumptions = intentConsumptions,
     )
 
+    @Suppress("CyclomaticComplexMethod", "LongMethod")
     override suspend fun submitDecision(submission: DecisionSubmission): Result<DecisionSubmissionResult> {
         return runCatching {
             mutex.withLock {
@@ -54,10 +61,40 @@ class InMemoryDecisionRepository(
 
                 validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
 
+                val manifest = submission.invocationId?.let { invocationId ->
+                    materialStateRepository.find(invocationId).getOrThrow()
+                }
+                val identity = submission.entryIntent?.let { intent ->
+                    submission.tradePlan?.let { plan ->
+                        manifest?.let { exact ->
+                            val thesisId = DecisionIdentityGenerator.thesisId(plan)
+                            val context = openEpisodesByThesis[thesisId]
+                            val canonical = exact.canonicalProjection(
+                                anchorPriceJpy = context?.anchorPriceJpy ?: intent.priceJpy,
+                                thresholdRatio = context?.priceMoveThresholdRatio ?: exact.priceMoveThresholdRatio,
+                                predicates = context?.predicates ?: plan.invalidationPredicates,
+                                observedAt = now,
+                            )
+                            val episodeId = context?.episodeId ?: UUID.randomUUID()
+                            DecisionIdentityGenerator.generate(episodeId, plan, intent, canonical).also {
+                                if (context == null) {
+                                    openEpisodesByThesis.clear()
+                                    openEpisodesByThesis[thesisId] = InMemoryEpisodeContext(
+                                        episodeId = episodeId,
+                                        anchorPriceJpy = intent.priceJpy ?: exact.lastPriceJpy,
+                                        priceMoveThresholdRatio = exact.priceMoveThresholdRatio,
+                                        predicates = plan.invalidationPredicates,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
                 val decision = DecisionRecord(
                     decisionId = UUID.randomUUID(),
                     submission = submission,
                     createdAt = now,
+                    identity = identity,
                 )
                 val tradePlan = submission.tradePlan?.toRecord(decision.decisionId, now)
                 val tradeIntent = submission.entryIntent?.toRecord(
@@ -67,7 +104,7 @@ class InMemoryDecisionRepository(
                     },
                     estimatedWinProbability = submission.estimatedWinProbability,
                     createdAt = now,
-                )
+                )?.copy(identity = identity)
 
                 decisions += decision
                 tradePlan?.let { record -> tradePlans += record }
@@ -81,6 +118,13 @@ class InMemoryDecisionRepository(
             }
         }
     }
+
+    private data class InMemoryEpisodeContext(
+        val episodeId: UUID,
+        val anchorPriceJpy: BigDecimal?,
+        val priceMoveThresholdRatio: BigDecimal,
+        val predicates: List<TradePlanInvalidationPredicate>,
+    )
 
     override suspend fun submitFalsification(submission: FalsificationSubmission): Result<FalsificationRecord> {
         return runCatching {
@@ -427,12 +471,37 @@ fun validateDecisionSubmission(submission: DecisionSubmission, maxTradePlanRevis
         require(submission.setupTags.isNotEmpty()) {
             "${submission.action.name} decision requires setup_tags."
         }
+        val predicates = requireNotNull(submission.tradePlan).invalidationPredicates
+        val usesTypedInvalidationContract = submission.systemPromptVersion == SystemPromptV1.VERSION
+        require(predicates.isNotEmpty() || !usesTypedInvalidationContract) {
+            "${submission.action.name} decision requires trade_plan_invalidation_predicates."
+        }
+        predicates.forEach(::validateInvalidationPredicate)
     }
 
     if (submission.action == DecisionAction.REDUCE) {
         require(closeRatio != null) {
             "REDUCE decision requires close_ratio."
         }
+    }
+}
+
+private fun validateInvalidationPredicate(predicate: TradePlanInvalidationPredicate) {
+    val needsDecimal = predicate.type in setOf(
+        TradePlanInvalidationType.LAST_PRICE_AT_OR_BELOW,
+        TradePlanInvalidationType.LAST_PRICE_AT_OR_ABOVE,
+        TradePlanInvalidationType.BEST_BID_AT_OR_BELOW,
+        TradePlanInvalidationType.BEST_ASK_AT_OR_ABOVE,
+    )
+    require(!needsDecimal || predicate.decimalThresholdJpy != null) { "price predicate requires decimal threshold." }
+    require(predicate.type != TradePlanInvalidationType.TIME_AT_OR_AFTER || predicate.instantThreshold != null) {
+        "time predicate requires instant threshold."
+    }
+    require(predicate.type == TradePlanInvalidationType.TIME_AT_OR_AFTER || predicate.instantThreshold == null) {
+        "instant threshold is only supported for time predicate."
+    }
+    require(needsDecimal || predicate.decimalThresholdJpy == null) {
+        "decimal threshold is only supported for price predicate."
     }
 }
 

@@ -17,7 +17,12 @@ import me.matsumo.fukurou.trading.decision.TradeIntentConsumptionRecord
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanRecord
+import me.matsumo.fukurou.trading.decision.identity.DecisionIdentity
+import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
+import me.matsumo.fukurou.trading.decision.identity.canonicalProjection
+import me.matsumo.fukurou.trading.decision.identity.classifyShadow
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
 import me.matsumo.fukurou.trading.decision.validateDecisionSubmission
 import me.matsumo.fukurou.trading.decision.validateTradePlanLineage
@@ -27,6 +32,7 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import java.math.BigDecimal
 import java.sql.ResultSet
 import java.time.Clock
 import java.time.Duration
@@ -41,6 +47,11 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 private const val INSERT_DECISION_SQL = """
     INSERT INTO decisions (
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         invocation_id,
         llm_provider,
         prompt_hash,
@@ -60,7 +71,7 @@ private const val INSERT_DECISION_SQL = """
         no_trade_conditions_ja,
         created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 /**
@@ -75,12 +86,13 @@ private const val INSERT_TRADE_PLAN_SQL = """
         symbol,
         thesis_ja,
         invalidation_conditions_ja,
+        invalidation_predicates,
         target_price_jpy,
         time_stop_at,
         setup_tags,
         created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 /**
@@ -89,6 +101,11 @@ private const val INSERT_TRADE_PLAN_SQL = """
 private const val INSERT_TRADE_INTENT_SQL = """
     INSERT INTO trade_intents (
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         decision_id,
         trade_plan_id,
         symbol,
@@ -101,7 +118,7 @@ private const val INSERT_TRADE_INTENT_SQL = """
         estimated_win_probability,
         created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 /**
@@ -138,6 +155,11 @@ private const val INSERT_TRADE_INTENT_CONSUMPTION_SQL = """
 private const val SELECT_TRADE_INTENT_BY_ID_SQL = """
     SELECT
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         decision_id,
         trade_plan_id,
         symbol,
@@ -159,6 +181,11 @@ private const val SELECT_TRADE_INTENT_BY_ID_SQL = """
 private const val SELECT_TRADE_INTENT_BY_DECISION_ID_SQL = """
     SELECT
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         decision_id,
         trade_plan_id,
         symbol,
@@ -188,6 +215,7 @@ private const val SELECT_TRADE_PLAN_BY_ID_SQL = """
         symbol,
         thesis_ja,
         invalidation_conditions_ja,
+        invalidation_predicates,
         target_price_jpy,
         time_stop_at,
         setup_tags,
@@ -208,6 +236,7 @@ private const val SELECT_TRADE_PLAN_BY_DECISION_ID_SQL = """
         symbol,
         thesis_ja,
         invalidation_conditions_ja,
+        invalidation_predicates,
         target_price_jpy,
         time_stop_at,
         setup_tags,
@@ -224,6 +253,11 @@ private const val SELECT_TRADE_PLAN_BY_DECISION_ID_SQL = """
 private const val SELECT_LATEST_DECISION_BY_INVOCATION_ID_SQL = """
     SELECT
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         invocation_id,
         llm_provider,
         prompt_hash,
@@ -254,6 +288,11 @@ private const val SELECT_LATEST_DECISION_BY_INVOCATION_ID_SQL = """
 private const val SELECT_DECISIONS_CREATED_BETWEEN_SQL = """
     SELECT
         latest_decisions.id,
+        latest_decisions.opportunity_episode_id,
+        latest_decisions.thesis_id,
+        latest_decisions.geometry_hash,
+        latest_decisions.material_state_hash,
+        latest_decisions.identity_schema_version,
         latest_decisions.invocation_id,
         latest_decisions.llm_provider,
         latest_decisions.prompt_hash,
@@ -275,6 +314,11 @@ private const val SELECT_DECISIONS_CREATED_BETWEEN_SQL = """
     FROM (
         SELECT
             id,
+            opportunity_episode_id,
+            thesis_id,
+            geometry_hash,
+            material_state_hash,
+            identity_schema_version,
             invocation_id,
             llm_provider,
             prompt_hash,
@@ -308,6 +352,11 @@ private const val SELECT_DECISIONS_CREATED_BETWEEN_SQL = """
 private const val SELECT_DECISIONS_FOR_STABLE_FEED_SQL_PREFIX = """
     SELECT
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         invocation_id,
         llm_provider,
         prompt_hash,
@@ -545,6 +594,7 @@ class ExposedDecisionRepository(
     }
 }
 
+@Suppress("CyclomaticComplexMethod", "LongMethod")
 private fun JdbcTransaction.insertDecisionSubmission(
     submission: DecisionSubmission,
     now: Instant,
@@ -558,10 +608,61 @@ private fun JdbcTransaction.insertDecisionSubmission(
 
     validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
 
+    val materialLookup = selectMaterialManifest(submission.invocationId)
+    submission.entryIntent?.let { intent -> lockOpportunityEpisodeSymbol(intent.symbol.apiSymbol) }
+    val thesisId = submission.tradePlan?.let(DecisionIdentityGenerator::thesisId)
+    val symbol = submission.entryIntent?.symbol?.apiSymbol
+    val latestSameThesis = if (thesisId != null && symbol != null) selectOpenIdentity(thesisId, symbol) else null
+    val episodeContext = latestSameThesis?.let { previous -> selectEpisodeContext(previous.opportunityEpisodeId) }
+    val materialProjection = materialLookup.manifest?.let { manifest ->
+        submission.tradePlan?.let { plan ->
+            manifest.canonicalProjection(
+                anchorPriceJpy = episodeContext?.anchorPriceJpy ?: submission.entryIntent?.priceJpy,
+                thresholdRatio = episodeContext?.priceMoveThresholdRatio ?: manifest.priceMoveThresholdRatio,
+                predicates = episodeContext?.predicates ?: plan.invalidationPredicates,
+                observedAt = now,
+            )
+        }
+    }
+    val candidateIdentity = submission.entryIntent?.let { intent ->
+        submission.tradePlan?.let { plan ->
+            materialProjection?.let { canonical ->
+                DecisionIdentityGenerator.generate(
+                    episodeId = latestSameThesis?.opportunityEpisodeId ?: UUID.randomUUID(),
+                    tradePlan = plan,
+                    intent = intent,
+                    materialProjection = canonical,
+                )
+            }
+        }
+    }
+    val materialChangedAfterTtl = candidateIdentity != null && latestSameThesis != null &&
+        candidateIdentity.materialStateHash != latestSameThesis.materialStateHash &&
+        episodeHasTtlCancellation(latestSameThesis.opportunityEpisodeId)
+    if (materialChangedAfterTtl) {
+        closeOpportunityEpisode(
+            episodeId = requireNotNull(latestSameThesis).opportunityEpisodeId,
+            reason = "MATERIAL_STATE_CHANGED_AFTER_TTL",
+            now = now,
+        )
+    }
+    candidateIdentity?.let { candidate ->
+        closeOtherOpenEpisodes(candidate.thesisId, requireNotNull(submission.entryIntent).symbol.apiSymbol, now)
+    }
+    val previousIdentity = latestSameThesis?.takeIf { previous ->
+        !materialChangedAfterTtl && isOpportunityEpisodeOpen(previous.opportunityEpisodeId)
+    }
+    val identity = candidateIdentity?.let { candidate ->
+        candidate.copy(
+            opportunityEpisodeId = previousIdentity?.opportunityEpisodeId
+                ?: if (materialChangedAfterTtl) UUID.randomUUID() else candidate.opportunityEpisodeId,
+        )
+    }
     val decision = DecisionRecord(
         decisionId = UUID.randomUUID(),
         submission = submission,
         createdAt = now,
+        identity = identity,
     )
     val tradePlan = submission.tradePlan?.let { draft ->
         TradePlanRecord(
@@ -581,12 +682,22 @@ private fun JdbcTransaction.insertDecisionSubmission(
             draft = draft,
             estimatedWinProbability = submission.estimatedWinProbability,
             createdAt = now,
+            identity = identity,
         )
     }
 
     insertDecision(decision)
+    if (submission.entryIntent != null && identity == null) {
+        appendIdentityGenerationFailure(submission.invocationId, "DECISION", materialLookup.failureReason, now)
+        appendIdentityGenerationFailure(submission.invocationId, "INTENT", materialLookup.failureReason, now)
+    }
+    if (identity != null && previousIdentity == null) {
+        val threshold = episodeContext?.priceMoveThresholdRatio ?: materialLookup.manifest?.priceMoveThresholdRatio
+        insertOpportunityEpisode(identity, submission, threshold, now)
+    }
     tradePlan?.let { record -> insertTradePlan(record) }
     tradeIntent?.let { record -> insertTradeIntent(record) }
+    identity?.let { current -> insertShadowObservation(decision.decisionId, previousIdentity, current, now) }
 
     return DecisionSubmissionResult(
         decision = decision,
@@ -594,6 +705,187 @@ private fun JdbcTransaction.insertDecisionSubmission(
         tradePlan = tradePlan,
     )
 }
+
+private fun JdbcTransaction.lockOpportunityEpisodeSymbol(symbol: String) {
+    jdbcConnection().prepareStatement("SELECT pg_advisory_xact_lock(hashtext(?)::bigint)").use { statement ->
+        statement.setString(1, symbol)
+        statement.executeQuery().use { result -> check(result.next()) }
+    }
+}
+
+private fun JdbcTransaction.isOpportunityEpisodeOpen(episodeId: UUID): Boolean {
+    return jdbcConnection().prepareStatement(
+        "SELECT closed_at IS NULL FROM opportunity_episodes WHERE id = ?",
+    ).use { statement ->
+        statement.setObject(1, episodeId)
+        statement.executeQuery().use { result -> result.next() && result.getBoolean(1) }
+    }
+}
+
+private fun JdbcTransaction.episodeHasTtlCancellation(episodeId: UUID): Boolean {
+    val sql = """SELECT 1 FROM orders o JOIN trade_intents ti ON ti.id = o.intent_id
+        WHERE ti.opportunity_episode_id = ? AND o.status = 'CANCELED'
+        AND o.cancel_reason IN ('resting_entry_order_ttl_expired','legacy_ttl_sweep') LIMIT 1
+    """.trimIndent()
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setObject(1, episodeId)
+        statement.executeQuery().use { result -> result.next() }
+    }
+}
+
+private fun JdbcTransaction.closeOtherOpenEpisodes(
+    thesisId: String,
+    symbol: String,
+    now: Instant,
+) {
+    jdbcConnection().prepareStatement(
+        """UPDATE opportunity_episodes SET closed_at = ?, close_reason = 'THESIS_CHANGED'
+            WHERE symbol = ? AND thesis_id <> ? AND closed_at IS NULL
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setLong(1, now.toEpochMilli())
+        statement.setString(2, symbol)
+        statement.setString(3, thesisId)
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.closeOpportunityEpisode(
+    episodeId: UUID,
+    reason: String,
+    now: Instant,
+) {
+    jdbcConnection().prepareStatement(
+        "UPDATE opportunity_episodes SET closed_at = ?, close_reason = ? WHERE id = ? AND closed_at IS NULL",
+    ).use { statement ->
+        statement.setLong(1, now.toEpochMilli())
+        statement.setString(2, reason)
+        statement.setObject(3, episodeId)
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.selectOpenIdentity(thesisId: String, symbol: String): DecisionIdentity? {
+    return jdbcConnection().prepareStatement(
+        """SELECT d.opportunity_episode_id, d.thesis_id, d.geometry_hash, d.material_state_hash,
+            d.identity_schema_version FROM decisions d JOIN opportunity_episodes e ON e.id=d.opportunity_episode_id
+            WHERE d.thesis_id=? AND e.symbol=? AND e.closed_at IS NULL
+            ORDER BY d.created_at DESC, d.id DESC LIMIT 1
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setString(1, thesisId)
+        statement.setString(2, symbol)
+        statement.executeQuery().use { result -> if (result.next()) result.toDecisionIdentity() else null }
+    }
+}
+
+private fun JdbcTransaction.selectEpisodeContext(episodeId: UUID): EpisodeIdentityContext? {
+    return jdbcConnection().prepareStatement(
+        """SELECT e.price_move_threshold_ratio,
+            (SELECT ti.price_jpy FROM trade_intents ti JOIN decisions d ON d.id=ti.decision_id
+             WHERE ti.opportunity_episode_id=e.id AND ti.price_jpy IS NOT NULL
+             ORDER BY d.created_at, d.id LIMIT 1),
+            (SELECT tp.invalidation_predicates FROM trade_intents ti JOIN trade_plans tp ON tp.id=ti.trade_plan_id
+             JOIN decisions d ON d.id=ti.decision_id WHERE ti.opportunity_episode_id=e.id
+             ORDER BY d.created_at, d.id LIMIT 1)
+            FROM opportunity_episodes e WHERE e.id=?
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, episodeId)
+        statement.executeQuery().use { result ->
+            if (!result.next()) return@use null
+            EpisodeIdentityContext(
+                priceMoveThresholdRatio = result.getBigDecimal(1),
+                anchorPriceJpy = result.getBigDecimal(2),
+                predicates = TradePlanInvalidationPredicateCodec.decode(result.getString(3)),
+            )
+        }
+    }
+}
+
+private fun JdbcTransaction.insertOpportunityEpisode(
+    identity: DecisionIdentity,
+    submission: DecisionSubmission,
+    priceMoveThresholdRatio: BigDecimal?,
+    now: Instant,
+) {
+    jdbcConnection().prepareStatement(
+        """INSERT INTO opportunity_episodes
+            (id, symbol, thesis_id, price_move_threshold_ratio, opened_at) VALUES (?, ?, ?, ?, ?)
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, identity.opportunityEpisodeId)
+        statement.setString(2, requireNotNull(submission.entryIntent).symbol.apiSymbol)
+        statement.setString(3, identity.thesisId)
+        statement.setBigDecimal(4, requireNotNull(priceMoveThresholdRatio))
+        statement.setLong(5, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.insertShadowObservation(
+    decisionId: UUID,
+    previous: DecisionIdentity?,
+    current: DecisionIdentity,
+    now: Instant,
+) {
+    val classification = classifyShadow(previous, current, previousEpisodeOpen = previous != null)
+    jdbcConnection().prepareStatement(
+        "INSERT INTO dedupe_shadow_observations " +
+            "(id, observation_kind, decision_id, opportunity_episode_id, classification, data_quality, observed_at) " +
+            "VALUES (?, 'FULL_PROPOSAL', ?, ?, ?, 'COMPLETE', ?)",
+    ).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setObject(2, decisionId)
+        statement.setObject(3, current.opportunityEpisodeId)
+        statement.setString(4, classification.name)
+        statement.setLong(5, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.selectMaterialManifest(invocationId: String?): MaterialManifestLookup {
+    if (invocationId == null) return MaterialManifestLookup(null, "INVOCATION_ID_MISSING")
+    return jdbcConnection().prepareStatement(
+        "SELECT material_projection, manifest_json FROM decision_material_state_manifests WHERE invocation_id = ?",
+    ).use { statement ->
+        statement.setString(1, invocationId)
+        statement.executeQuery().use { result ->
+            if (!result.next()) return@use MaterialManifestLookup(null, "MANIFEST_MISSING")
+            MaterialManifestLookup(result.getString(2).toMaterialManifest(), null)
+        }
+    }
+}
+
+private fun JdbcTransaction.appendIdentityGenerationFailure(
+    invocationId: String?,
+    entityKind: String,
+    reason: String?,
+    now: Instant,
+) {
+    jdbcConnection().prepareStatement(
+        "INSERT INTO decision_identity_generation_failures " +
+            "(id, invocation_id, entity_kind, reason, occurred_at) VALUES (?, ?, ?, ?, ?)",
+    ).use { statement ->
+        statement.setObject(1, UUID.randomUUID())
+        statement.setNullableString(2, invocationId)
+        statement.setString(3, entityKind)
+        statement.setString(4, reason ?: "GENERATION_FAILED")
+        statement.setLong(5, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+private data class MaterialManifestLookup(
+    val manifest: me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest?,
+    val failureReason: String?,
+)
+
+private data class EpisodeIdentityContext(
+    val priceMoveThresholdRatio: BigDecimal,
+    val anchorPriceJpy: BigDecimal?,
+    val predicates: List<TradePlanInvalidationPredicate>,
+)
 
 private fun JdbcTransaction.insertFalsificationSubmission(
     submission: FalsificationSubmission,
@@ -633,26 +925,32 @@ private fun JdbcTransaction.insertFalsificationSubmission(
 private fun JdbcTransaction.insertDecision(record: DecisionRecord) {
     jdbcConnection().prepareStatement(INSERT_DECISION_SQL).use { statement ->
         val submission = record.submission
+        val identity = record.identity
 
         statement.setObject(1, record.decisionId)
-        statement.setNullableString(2, submission.invocationId)
-        statement.setNullableString(3, submission.llmProvider)
-        statement.setNullableString(4, submission.promptHash)
-        statement.setNullableString(5, submission.systemPromptVersion)
-        statement.setNullableString(6, submission.marketSnapshotId)
-        statement.setString(7, submission.action.name)
-        statement.setNullableBigDecimal(8, submission.closeRatio)
-        statement.setString(9, submission.setupTags.toJsonText())
-        statement.setBigDecimal(10, submission.estimatedWinProbability)
-        statement.setNullableBigDecimal(11, submission.expectedRMultiple)
-        statement.setNullableBigDecimal(12, submission.roundTripCostR)
-        statement.setString(13, submission.toolEvidenceIds.toJsonText())
-        statement.setString(14, submission.factCheckJson)
-        statement.setString(15, submission.selfReviewJson)
-        statement.setString(16, submission.reasonJa)
-        statement.setString(17, submission.missingDataJa.toJsonText())
-        statement.setString(18, submission.noTradeConditionsJa.toJsonText())
-        statement.setLong(19, record.createdAt.toEpochMilli())
+        statement.setObject(2, identity?.opportunityEpisodeId)
+        statement.setNullableString(3, identity?.thesisId)
+        statement.setNullableString(4, identity?.geometryHash)
+        statement.setNullableString(5, identity?.materialStateHash)
+        statement.setObject(6, identity?.schemaVersion)
+        statement.setNullableString(7, submission.invocationId)
+        statement.setNullableString(8, submission.llmProvider)
+        statement.setNullableString(9, submission.promptHash)
+        statement.setNullableString(10, submission.systemPromptVersion)
+        statement.setNullableString(11, submission.marketSnapshotId)
+        statement.setString(12, submission.action.name)
+        statement.setNullableBigDecimal(13, submission.closeRatio)
+        statement.setString(14, submission.setupTags.toJsonText())
+        statement.setBigDecimal(15, submission.estimatedWinProbability)
+        statement.setNullableBigDecimal(16, submission.expectedRMultiple)
+        statement.setNullableBigDecimal(17, submission.roundTripCostR)
+        statement.setString(18, submission.toolEvidenceIds.toJsonText())
+        statement.setString(19, submission.factCheckJson)
+        statement.setString(20, submission.selfReviewJson)
+        statement.setString(21, submission.reasonJa)
+        statement.setString(22, submission.missingDataJa.toJsonText())
+        statement.setString(23, submission.noTradeConditionsJa.toJsonText())
+        statement.setLong(24, record.createdAt.toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -668,10 +966,11 @@ private fun JdbcTransaction.insertTradePlan(record: TradePlanRecord) {
         statement.setString(5, draft.symbol.apiSymbol)
         statement.setString(6, draft.thesisJa)
         statement.setString(7, draft.invalidationConditionsJa.toJsonText())
-        statement.setNullableBigDecimal(8, draft.targetPriceJpy)
-        statement.setNullableLong(9, draft.timeStopAt?.toEpochMilli())
-        statement.setString(10, draft.setupTags.toJsonText())
-        statement.setLong(11, record.createdAt.toEpochMilli())
+        statement.setString(8, TradePlanInvalidationPredicateCodec.toStorageText(draft.invalidationPredicates))
+        statement.setNullableBigDecimal(9, draft.targetPriceJpy)
+        statement.setNullableLong(10, draft.timeStopAt?.toEpochMilli())
+        statement.setString(11, draft.setupTags.toJsonText())
+        statement.setLong(12, record.createdAt.toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -679,19 +978,25 @@ private fun JdbcTransaction.insertTradePlan(record: TradePlanRecord) {
 private fun JdbcTransaction.insertTradeIntent(record: TradeIntentRecord) {
     jdbcConnection().prepareStatement(INSERT_TRADE_INTENT_SQL).use { statement ->
         val draft = record.draft
+        val identity = record.identity
 
         statement.setObject(1, record.intentId)
-        statement.setObject(2, record.decisionId)
-        statement.setObject(3, record.tradePlanId)
-        statement.setString(4, draft.symbol.apiSymbol)
-        statement.setString(5, draft.side.name)
-        statement.setString(6, draft.orderType.name)
-        statement.setBigDecimal(7, draft.sizeBtc)
-        statement.setNullableBigDecimal(8, draft.priceJpy)
-        statement.setBigDecimal(9, draft.protectiveStopPriceJpy)
-        statement.setNullableBigDecimal(10, draft.takeProfitPriceJpy)
-        statement.setBigDecimal(11, record.estimatedWinProbability)
-        statement.setLong(12, record.createdAt.toEpochMilli())
+        statement.setObject(2, identity?.opportunityEpisodeId)
+        statement.setNullableString(3, identity?.thesisId)
+        statement.setNullableString(4, identity?.geometryHash)
+        statement.setNullableString(5, identity?.materialStateHash)
+        statement.setObject(6, identity?.schemaVersion)
+        statement.setObject(7, record.decisionId)
+        statement.setObject(8, record.tradePlanId)
+        statement.setString(9, draft.symbol.apiSymbol)
+        statement.setString(10, draft.side.name)
+        statement.setString(11, draft.orderType.name)
+        statement.setBigDecimal(12, draft.sizeBtc)
+        statement.setNullableBigDecimal(13, draft.priceJpy)
+        statement.setBigDecimal(14, draft.protectiveStopPriceJpy)
+        statement.setNullableBigDecimal(15, draft.takeProfitPriceJpy)
+        statement.setBigDecimal(16, record.estimatedWinProbability)
+        statement.setLong(17, record.createdAt.toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -859,7 +1164,12 @@ private fun ResultSet.toDecisionRecord(): DecisionRecord {
             tradePlan = null,
         ),
         createdAt = Instant.ofEpochMilli(getLong("created_at")),
+        identity = toDecisionIdentity(),
     )
+}
+
+private fun String.toInvalidationPredicates(): List<TradePlanInvalidationPredicate> {
+    return TradePlanInvalidationPredicateCodec.decode(this)
 }
 
 private fun ResultSet.toTradePlanRecord(): TradePlanRecord {
@@ -875,6 +1185,7 @@ private fun ResultSet.toTradePlanRecord(): TradePlanRecord {
             targetPriceJpy = getNullableBigDecimal("target_price_jpy"),
             timeStopAt = getNullableLong("time_stop_at")?.let { millis -> Instant.ofEpochMilli(millis) },
             setupTags = getString("setup_tags").toStringList(),
+            invalidationPredicates = getString("invalidation_predicates").toInvalidationPredicates(),
         ),
         createdAt = Instant.ofEpochMilli(getLong("created_at")),
     )
@@ -896,7 +1207,18 @@ private fun ResultSet.toTradeIntentRecord(): TradeIntentRecord {
         ),
         estimatedWinProbability = getBigDecimal("estimated_win_probability"),
         createdAt = Instant.ofEpochMilli(getLong("created_at")),
+        identity = toDecisionIdentity(),
     )
+}
+
+private fun ResultSet.toDecisionIdentity(): DecisionIdentity? {
+    val episodeId = getNullableUuid("opportunity_episode_id") ?: return null
+    val thesisId = getString("thesis_id") ?: return null
+    val geometryHash = getString("geometry_hash") ?: return null
+    val materialStateHash = getString("material_state_hash") ?: return null
+    val schemaVersion = getObject("identity_schema_version") as? Int ?: return null
+
+    return DecisionIdentity(episodeId, thesisId, geometryHash, materialStateHash, schemaVersion)
 }
 
 private fun ResultSet.toFalsificationRecord(): FalsificationRecord {

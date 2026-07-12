@@ -348,6 +348,13 @@ private const val ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
     WHERE state = 'CONNECTED'
 """
 
+/** symbol ごとの open opportunity episode を一意にする partial unique index。 */
+private const val ENSURE_OPEN_OPPORTUNITY_EPISODE_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunity_episodes_symbol_open_unique
+    ON opportunity_episodes (symbol)
+    WHERE closed_at IS NULL
+"""
+
 /** historical trade timestamp を新しい正本列へ一度だけ移す SQL。 */
 private const val BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL = """
     UPDATE market_data_sessions
@@ -857,6 +864,7 @@ private const val VERIFY_TRADE_PLANS_SCHEMA_SQL = """
         symbol,
         thesis_ja,
         invalidation_conditions_ja,
+        invalidation_predicates,
         target_price_jpy,
         time_stop_at,
         setup_tags,
@@ -944,6 +952,7 @@ class TradingPersistenceBootstrap(
     /**
      * Exposed table と risk_state single row を用意する。
      */
+    @Suppress("LongMethod")
     fun ensureSchema(): Result<Unit> {
         return runCatching {
             val recoveredCount = exposedTransaction(database) {
@@ -965,6 +974,12 @@ class TradingPersistenceBootstrap(
                     CommandEventLogTable,
                     LlmLaunchReservationsTable,
                     SafetyViolationsTable,
+                    DecisionMaterialStateManifestsTable,
+                    DecisionIdentitySchemaBoundariesTable,
+                    DecisionIdentityGenerationFailuresTable,
+                    OpportunityEpisodesTable,
+                    DedupeShadowObservationsTable,
+                    DedupeShadowResolutionsTable,
                     DecisionsTable,
                     TradePlansTable,
                     TradeIntentsTable,
@@ -974,6 +989,14 @@ class TradingPersistenceBootstrap(
                 )
                 ensureRuntimeSchemaObjects()
                 val now = Instant.now(clock)
+
+                jdbcConnection().prepareStatement(
+                    "INSERT INTO decision_identity_schema_boundaries (schema_version, activated_at) VALUES (1, ?) " +
+                        "ON CONFLICT (schema_version) DO NOTHING",
+                ).use { statement ->
+                    statement.setLong(1, now.toEpochMilli())
+                    statement.executeUpdate()
+                }
 
                 ensureActiveRuntimeConfigVersion(now)
                 ensureRiskStateRow(now, paperAccountConfig.initialCashJpy)
@@ -1144,6 +1167,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_EVALUATION_EXECUTION_POSITION_INDEX_SQL)
     executeUpdate(ENSURE_EVALUATION_ORDER_POSITION_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_OPEN_OPPORTUNITY_EPISODE_UNIQUE_INDEX_SQL)
     executeUpdate(BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_GAPS_SESSION_STARTED_INDEX_SQL)
