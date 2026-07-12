@@ -28,6 +28,7 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
+import me.matsumo.fukurou.trading.evaluation.DeduplicationMetrics
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
@@ -39,6 +40,7 @@ import me.matsumo.fukurou.trading.evaluation.LlmModelUsage
 import me.matsumo.fukurou.trading.evaluation.LlmPhaseUsageFact
 import me.matsumo.fukurou.trading.evaluation.LlmTokenUsage
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
+import me.matsumo.fukurou.trading.evaluation.intersectLifecycle
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import java.math.BigDecimal
@@ -54,6 +56,98 @@ import kotlin.test.assertTrue
  * evaluation route の HTTP contract を検証するテスト。
  */
 class EvaluationRouteTest {
+    @Test
+    fun summaryDeduplicationUsesEffectiveCurrentEpochLifecycle() = testApplication {
+        val queriedPeriods = mutableListOf<EvaluationPeriod>()
+        val lifecycleRepository = object : EvaluationRepository by FakeEvaluationRepository {
+            override suspend fun resolveScope(epochId: String?, cohort: String?): Result<EvaluationScope> =
+                Result.success(
+                    EvaluationScope(
+                        accountEpochId = UUID.fromString("00000000-0000-0000-0000-000000000185"),
+                        cohort = me.matsumo.fukurou.trading.domain.EvaluationCohort.CURRENT,
+                        executionSemanticsVersion = "PAPER_WS_V1",
+                        initialCashJpy = BigDecimal("1000000"),
+                        lifecycleFromInclusive = Instant.parse("2026-07-02T00:00:00Z"),
+                    ),
+                )
+
+            override suspend fun fetchDeduplicationMetrics(period: EvaluationPeriod): Result<DeduplicationMetrics> {
+                return Result.failure(AssertionError("route must use scope-aware deduplication API"))
+            }
+
+            override suspend fun fetchDeduplicationMetrics(
+                period: EvaluationPeriod,
+                scope: EvaluationScope,
+            ): Result<DeduplicationMetrics> {
+                val effectivePeriod = period.intersectLifecycle(scope)
+                if (effectivePeriod.from >= effectivePeriod.toExclusive) return Result.success(DeduplicationMetrics())
+                queriedPeriods += effectivePeriod
+                return Result.success(DeduplicationMetrics(decisionEligible = 1, decisionComplete = 1))
+            }
+        }
+        application {
+            module(
+                readinessProbe = { true }, clock = fixedClock(), evaluationRepository = lifecycleRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val partial = client.get("/evaluation/summary?from=2026-07-01&to=2026-07-03").bodyAsText()
+        val empty = client.get("/evaluation/summary?from=2026-06-01&to=2026-06-02").bodyAsText()
+
+        assertTrue(partial.contains("\"decisionIdentityCoverage\":1.0"))
+        assertTrue(empty.contains("\"decisionIdentityCoverage\":null"))
+        assertTrue(empty.contains("\"legacyExcludedCount\":0"))
+        assertEquals(
+            listOf(
+                EvaluationPeriod(
+                    from = Instant.parse("2026-07-02T00:00:00Z"),
+                    toExclusive = Instant.parse("2026-07-03T15:00:00Z"),
+                ),
+            ),
+            queriedPeriods,
+        )
+    }
+
+    @Test
+    fun summaryDeduplicationIsEmptyForNotAttributableCohort() = testApplication {
+        val lifecycleRepository = object : EvaluationRepository by FakeEvaluationRepository {
+            override suspend fun resolveScope(epochId: String?, cohort: String?): Result<EvaluationScope> =
+                Result.success(
+                    EvaluationScope(
+                        accountEpochId = UUID.fromString("00000000-0000-0000-0000-000000000185"),
+                        cohort = me.matsumo.fukurou.trading.domain.EvaluationCohort.UNSUPPORTED_EXECUTION_SEMANTICS,
+                        executionSemanticsVersion = null,
+                        initialCashJpy = BigDecimal("1000000"),
+                    ),
+                )
+
+            override suspend fun fetchDeduplicationMetrics(period: EvaluationPeriod): Result<DeduplicationMetrics> =
+                Result.failure(AssertionError("route must use scope-aware deduplication API"))
+
+            override suspend fun fetchDeduplicationMetrics(
+                period: EvaluationPeriod,
+                scope: EvaluationScope,
+            ): Result<DeduplicationMetrics> = Result.success(DeduplicationMetrics())
+        }
+        application {
+            module(
+                readinessProbe = { true }, clock = fixedClock(), evaluationRepository = lifecycleRepository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/evaluation/summary?from=2026-07-01&to=2026-07-03").bodyAsText()
+
+        assertTrue(response.contains("\"decisionIdentityCoverage\":null"))
+        assertTrue(response.contains("\"legacyExcludedCount\":0"))
+        assertTrue(!response.contains("\"decisionIdentityCoverage\":1.0"))
+    }
+
     @Test
     fun benchmarkReturnsStructuredStateForTruncatedPopulation() = testApplication {
         val truncatedRepository = object : EvaluationRepository by FakeEvaluationRepository {

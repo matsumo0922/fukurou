@@ -32,6 +32,19 @@ interface EvaluationRepository {
         return Result.success(DeduplicationMetrics())
     }
 
+    /** immutable epoch lifecycle に限定した decision deduplication telemetry。 */
+    suspend fun fetchDeduplicationMetrics(
+        period: EvaluationPeriod,
+        scope: EvaluationScope,
+    ): Result<DeduplicationMetrics> {
+        if (!scope.isCurrentPopulation()) return Result.success(DeduplicationMetrics())
+
+        val effectivePeriod = period.intersectLifecycle(scope)
+        if (effectivePeriod.from >= effectivePeriod.toExclusive) return Result.success(DeduplicationMetrics())
+
+        return fetchDeduplicationMetrics(effectivePeriod)
+    }
+
     /**
      * report 用 internal facts を単一 snapshot として取得する。
      */

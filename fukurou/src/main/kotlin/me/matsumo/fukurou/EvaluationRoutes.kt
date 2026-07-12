@@ -178,7 +178,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         val actionCounts = evaluationRepository.countDecisionsByAction(period, scope).getOrThrow()
         val exclusionSummary = evaluationRepository.fetchExclusionSummary(period, scope).getOrThrow()
         val performance = EvaluationMath.summarizeTrades(tradeResult.trades)
-        val deduplication = evaluationRepository.fetchDeduplicationMetrics(period).getOrThrow()
+        val deduplication = evaluationRepository.fetchDeduplicationMetrics(period, scope).getOrThrow()
         val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
         val riskState = evaluationRiskStateRepository.current().getOrThrow()
         val candles = call.fetchDailyCandlesOrEmpty(
