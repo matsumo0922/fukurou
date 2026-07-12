@@ -18,6 +18,8 @@ import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanRecord
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentity
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
 import me.matsumo.fukurou.trading.decision.identity.classifyShadow
@@ -83,12 +85,13 @@ private const val INSERT_TRADE_PLAN_SQL = """
         symbol,
         thesis_ja,
         invalidation_conditions_ja,
+        invalidation_predicates,
         target_price_jpy,
         time_stop_at,
         setup_tags,
         created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 /**
@@ -211,6 +214,7 @@ private const val SELECT_TRADE_PLAN_BY_ID_SQL = """
         symbol,
         thesis_ja,
         invalidation_conditions_ja,
+        invalidation_predicates,
         target_price_jpy,
         time_stop_at,
         setup_tags,
@@ -231,6 +235,7 @@ private const val SELECT_TRADE_PLAN_BY_DECISION_ID_SQL = """
         symbol,
         thesis_ja,
         invalidation_conditions_ja,
+        invalidation_predicates,
         target_price_jpy,
         time_stop_at,
         setup_tags,
@@ -790,10 +795,11 @@ private fun JdbcTransaction.insertTradePlan(record: TradePlanRecord) {
         statement.setString(5, draft.symbol.apiSymbol)
         statement.setString(6, draft.thesisJa)
         statement.setString(7, draft.invalidationConditionsJa.toJsonText())
-        statement.setNullableBigDecimal(8, draft.targetPriceJpy)
-        statement.setNullableLong(9, draft.timeStopAt?.toEpochMilli())
-        statement.setString(10, draft.setupTags.toJsonText())
-        statement.setLong(11, record.createdAt.toEpochMilli())
+        statement.setString(8, draft.invalidationPredicates.toStorageText())
+        statement.setNullableBigDecimal(9, draft.targetPriceJpy)
+        statement.setNullableLong(10, draft.timeStopAt?.toEpochMilli())
+        statement.setString(11, draft.setupTags.toJsonText())
+        statement.setLong(12, record.createdAt.toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -991,6 +997,26 @@ private fun ResultSet.toDecisionRecord(): DecisionRecord {
     )
 }
 
+private fun List<TradePlanInvalidationPredicate>.toStorageText(): String = joinToString(";") { predicate ->
+    listOf(
+        predicate.type.name,
+        predicate.decimalThresholdJpy?.toPlainString().orEmpty(),
+        predicate.instantThreshold?.toString().orEmpty(),
+    ).joinToString("|")
+}
+
+private fun String.toInvalidationPredicates(): List<TradePlanInvalidationPredicate> {
+    if (isBlank()) return emptyList()
+    return split(';').map { encoded ->
+        val parts = encoded.split('|')
+        TradePlanInvalidationPredicate(
+            type = TradePlanInvalidationType.valueOf(parts[0]),
+            decimalThresholdJpy = parts.getOrNull(1)?.takeIf(String::isNotBlank)?.toBigDecimal(),
+            instantThreshold = parts.getOrNull(2)?.takeIf(String::isNotBlank)?.let(Instant::parse),
+        )
+    }
+}
+
 private fun ResultSet.toTradePlanRecord(): TradePlanRecord {
     return TradePlanRecord(
         tradePlanId = getObject("id", UUID::class.java),
@@ -1004,6 +1030,7 @@ private fun ResultSet.toTradePlanRecord(): TradePlanRecord {
             targetPriceJpy = getNullableBigDecimal("target_price_jpy"),
             timeStopAt = getNullableLong("time_stop_at")?.let { millis -> Instant.ofEpochMilli(millis) },
             setupTags = getString("setup_tags").toStringList(),
+            invalidationPredicates = getString("invalidation_predicates").toInvalidationPredicates(),
         ),
         createdAt = Instant.ofEpochMilli(getLong("created_at")),
     )

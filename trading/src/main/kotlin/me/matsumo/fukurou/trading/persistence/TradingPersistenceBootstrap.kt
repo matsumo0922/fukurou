@@ -857,6 +857,7 @@ private const val VERIFY_TRADE_PLANS_SCHEMA_SQL = """
         symbol,
         thesis_ja,
         invalidation_conditions_ja,
+        invalidation_predicates,
         target_price_jpy,
         time_stop_at,
         setup_tags,

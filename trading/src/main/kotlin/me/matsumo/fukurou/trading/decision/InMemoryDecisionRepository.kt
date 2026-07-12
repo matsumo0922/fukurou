@@ -436,12 +436,36 @@ fun validateDecisionSubmission(submission: DecisionSubmission, maxTradePlanRevis
         require(submission.setupTags.isNotEmpty()) {
             "${submission.action.name} decision requires setup_tags."
         }
+        val predicates = requireNotNull(submission.tradePlan).invalidationPredicates
+        require(predicates.isNotEmpty()) {
+            "${submission.action.name} decision requires trade_plan_invalidation_predicates."
+        }
+        predicates.forEach(::validateInvalidationPredicate)
     }
 
     if (submission.action == DecisionAction.REDUCE) {
         require(closeRatio != null) {
             "REDUCE decision requires close_ratio."
         }
+    }
+}
+
+private fun validateInvalidationPredicate(predicate: TradePlanInvalidationPredicate) {
+    val needsDecimal = predicate.type in setOf(
+        TradePlanInvalidationType.LAST_PRICE_AT_OR_BELOW,
+        TradePlanInvalidationType.LAST_PRICE_AT_OR_ABOVE,
+        TradePlanInvalidationType.BEST_BID_AT_OR_BELOW,
+        TradePlanInvalidationType.BEST_ASK_AT_OR_ABOVE,
+    )
+    require(!needsDecimal || predicate.decimalThresholdJpy != null) { "price predicate requires decimal threshold." }
+    require(predicate.type != TradePlanInvalidationType.TIME_AT_OR_AFTER || predicate.instantThreshold != null) {
+        "time predicate requires instant threshold."
+    }
+    require(predicate.type == TradePlanInvalidationType.TIME_AT_OR_AFTER || predicate.instantThreshold == null) {
+        "instant threshold is only supported for time predicate."
+    }
+    require(needsDecimal || predicate.decimalThresholdJpy == null) {
+        "decimal threshold is only supported for price predicate."
     }
 }
 

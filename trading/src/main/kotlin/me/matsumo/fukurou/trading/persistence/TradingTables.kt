@@ -1241,6 +1241,7 @@ object TradePlansTable : Table("trade_plans") {
      * 否定条件一覧 JSON。
      */
     val invalidationConditionsJa = text("invalidation_conditions_ja")
+    val invalidationPredicates = text("invalidation_predicates").default("")
 
     /**
      * 目標価格。

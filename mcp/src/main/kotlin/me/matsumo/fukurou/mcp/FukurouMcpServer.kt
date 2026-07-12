@@ -57,6 +57,8 @@ import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
@@ -1686,6 +1688,22 @@ private fun JsonObjectBuilder.putTradePlanDecisionSchemas() {
         put("description", "TradePlan thesis in Japanese.")
     }
     putStringArraySchema("trade_plan_invalidation_conditions_ja", "TradePlan invalidation conditions.")
+    putJsonObject("trade_plan_invalidation_predicates") {
+        put("type", "array")
+        put("description", "Machine-evaluable invalidation predicates. Required for ENTER and ADD_LONG.")
+        putJsonObject("items") {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("type") {
+                    put("type", JSON_TYPE_STRING)
+                    put("enum", ToolJson.encodeToJsonElement(TradePlanInvalidationType.entries.map { it.name }))
+                }
+                putJsonObject("threshold_jpy") { put("type", JSON_TYPE_STRING) }
+                putJsonObject("threshold_at") { put("type", JSON_TYPE_STRING) }
+            }
+            put("required", ToolJson.encodeToJsonElement(listOf("type")))
+        }
+    }
     putDecimalStringSchema("trade_plan_target_price_jpy", "TradePlan target price.")
     putJsonObject("trade_plan_time_stop_at") {
         put("type", JSON_TYPE_STRING)
@@ -1810,6 +1828,7 @@ private fun parseTradePlanDraft(request: CallToolRequest, action: DecisionAction
             "trade_plan_revision_count",
             "trade_plan_thesis_ja",
             "trade_plan_invalidation_conditions_ja",
+            "trade_plan_invalidation_predicates",
             "trade_plan_target_price_jpy",
             "trade_plan_time_stop_at",
         )
@@ -1824,11 +1843,27 @@ private fun parseTradePlanDraft(request: CallToolRequest, action: DecisionAction
             symbol = parseTradingSymbol(request.stringArgument("symbol")).getOrThrow(),
             thesisJa = requiredStringArgument(request, "trade_plan_thesis_ja"),
             invalidationConditionsJa = request.stringListArgument("trade_plan_invalidation_conditions_ja"),
+            invalidationPredicates = parseInvalidationPredicates(request),
             targetPriceJpy = parseOptionalBigDecimalArgument(request, "trade_plan_target_price_jpy").getOrThrow(),
             timeStopAt = request.stringArgument("trade_plan_time_stop_at")?.let { value -> Instant.parse(value) },
             setupTags = request.stringListArgument("setup_tags"),
         )
     }
+}
+
+private fun parseInvalidationPredicates(request: CallToolRequest): List<TradePlanInvalidationPredicate> {
+    return request.arguments
+        ?.get("trade_plan_invalidation_predicates")
+        ?.jsonArray
+        ?.map { element ->
+            val value = element.jsonObject
+            TradePlanInvalidationPredicate(
+                type = TradePlanInvalidationType.valueOf(value.getValue("type").jsonPrimitive.content),
+                decimalThresholdJpy = value["threshold_jpy"]?.jsonPrimitive?.contentOrNull?.toBigDecimal(),
+                instantThreshold = value["threshold_at"]?.jsonPrimitive?.contentOrNull?.let(Instant::parse),
+            )
+        }
+        .orEmpty()
 }
 
 private fun parseDecisionCloseRatio(request: CallToolRequest, action: DecisionAction): Result<BigDecimal?> {
@@ -2203,6 +2238,15 @@ private fun tradeIntentResult(snapshot: TradeIntentReviewSnapshot): CallToolResu
                     put("symbol", tradePlan.draft.symbol.apiSymbol)
                     put("thesis_ja", tradePlan.draft.thesisJa)
                     put("invalidation_conditions_ja", ToolJson.encodeToJsonElement(tradePlan.draft.invalidationConditionsJa))
+                    putJsonArray("invalidation_predicates") {
+                        tradePlan.draft.invalidationPredicates.forEach { predicate ->
+                            add(buildJsonObject {
+                                put("type", predicate.type.name)
+                                predicate.decimalThresholdJpy?.let { put("threshold_jpy", it.toPlainString()) }
+                                predicate.instantThreshold?.let { put("threshold_at", it.toString()) }
+                            })
+                        }
+                    }
                     putNullableDecimal("target_price_jpy", tradePlan.draft.targetPriceJpy)
                     putNullableString("time_stop_at", tradePlan.draft.timeStopAt?.toString())
                     put("setup_tags", ToolJson.encodeToJsonElement(tradePlan.draft.setupTags))

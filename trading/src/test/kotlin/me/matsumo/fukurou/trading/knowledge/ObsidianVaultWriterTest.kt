@@ -10,6 +10,8 @@ import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -444,6 +446,12 @@ private suspend fun submitLinkedDecision(
                 symbol = TradingSymbol.BTC,
                 thesisJa = "1時間足の上昇継続に乗る。",
                 invalidationConditionsJa = listOf("直近安値割れ", "出来高急減"),
+                invalidationPredicates = listOf(
+                    TradePlanInvalidationPredicate(
+                        type = TradePlanInvalidationType.LAST_PRICE_AT_OR_BELOW,
+                        decimalThresholdJpy = BigDecimal("9700000"),
+                    ),
+                ),
                 targetPriceJpy = BigDecimal("10500000"),
                 timeStopAt = FIXED_INSTANT.plusSeconds(3600),
                 setupTags = listOf("breakout", "trend-follow"),
