@@ -748,7 +748,7 @@ const val DEFAULT_MAX_INVOCATIONS_PER_DAY = 120
  * LLM daemon scheduler 有効化の既定値。
  */
 const val DEFAULT_LLM_DAEMON_ENABLED = false
-const val DEFAULT_LLM_LAUNCH_ENABLED = true
+const val DEFAULT_LLM_LAUNCH_ENABLED = false
 
 /**
  * LLM daemon loop poll 間隔の既定値。

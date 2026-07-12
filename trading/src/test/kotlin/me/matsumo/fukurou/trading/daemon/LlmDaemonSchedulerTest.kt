@@ -47,10 +47,7 @@ class LlmDaemonSchedulerTest {
 
     @Test
     fun globalLaunchGateSkipsBeforeReservationOrChildLaunch() = runBlocking {
-        val config = tradingConfig().let { value ->
-            value.copy(daemon = value.daemon.copy(launchEnabled = false))
-        }
-        val fixture = schedulerFixture(tradingConfig = config)
+        val fixture = schedulerFixture(tradingConfig = TradingBotConfig())
 
         val result = fixture.scheduler.tick()
 
@@ -254,6 +251,7 @@ class LlmDaemonSchedulerTest {
             tradingConfig = tradingConfig(
                 daemon = LlmDaemonConfig(
                     enabled = true,
+                    launchEnabled = true,
                     priceMoveTriggerEnabled = false,
                     preFilterEnabled = true,
                     stopProximityTriggerEnabled = false,
@@ -278,6 +276,7 @@ class LlmDaemonSchedulerTest {
             tradingConfig = tradingConfig(
                 daemon = LlmDaemonConfig(
                     enabled = true,
+                    launchEnabled = true,
                     priceMoveTriggerEnabled = false,
                     preFilterEnabled = true,
                     stopProximityTriggerEnabled = false,
@@ -306,6 +305,7 @@ class LlmDaemonSchedulerTest {
             tradingConfig = tradingConfig(
                 daemon = LlmDaemonConfig(
                     enabled = true,
+                    launchEnabled = true,
                     priceMoveTriggerEnabled = false,
                     preFilterEnabled = true,
                     stopProximityTriggerEnabled = false,
@@ -331,6 +331,7 @@ class LlmDaemonSchedulerTest {
             tradingConfig = tradingConfig(
                 daemon = LlmDaemonConfig(
                     enabled = true,
+                    launchEnabled = true,
                     priceMoveTriggerEnabled = false,
                     preFilterEnabled = true,
                     stopProximityTriggerEnabled = false,
@@ -364,6 +365,7 @@ class LlmDaemonSchedulerTest {
             tradingConfig = tradingConfig(
                 daemon = LlmDaemonConfig(
                     enabled = true,
+                    launchEnabled = true,
                     priceMoveTriggerEnabled = false,
                     preFilterEnabled = false,
                     stopProximityTriggerEnabled = false,
@@ -807,6 +809,7 @@ class LlmDaemonSchedulerTest {
             tradingConfig = tradingConfig(
                 daemon = LlmDaemonConfig(
                     enabled = true,
+                    launchEnabled = true,
                     priceMoveTriggerEnabled = false,
                     stopProximityTriggerEnabled = true,
                 ),
@@ -980,6 +983,7 @@ class LlmDaemonSchedulerTest {
             tradingConfig = tradingConfig(
                 daemon = LlmDaemonConfig(
                     enabled = true,
+                    launchEnabled = true,
                     priceMoveTriggerEnabled = false,
                     stopProximityTriggerEnabled = false,
                 ),
@@ -1147,7 +1151,10 @@ private fun schedulerFixture(
 private fun tradingConfig(
     runner: LlmRunnerConfig = LlmRunnerConfig(),
     events: List<EconomicEventBlackout> = emptyList(),
-    daemon: LlmDaemonConfig = LlmDaemonConfig(enabled = true),
+    daemon: LlmDaemonConfig = LlmDaemonConfig(
+        enabled = true,
+        launchEnabled = true,
+    ),
 ): TradingBotConfig {
     return TradingBotConfig(
         runner = runner,

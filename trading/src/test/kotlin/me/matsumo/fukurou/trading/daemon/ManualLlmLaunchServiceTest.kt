@@ -57,10 +57,7 @@ class ManualLlmLaunchServiceTest {
 
     @Test
     fun globalLaunchGateRejectsBeforeReservationOrChildLaunch() = runBlocking {
-        val config = tradingConfig().let { value ->
-            value.copy(daemon = value.daemon.copy(launchEnabled = false))
-        }
-        val fixture = manualFixture(tradingConfig = config)
+        val fixture = manualFixture(tradingConfig = TradingBotConfig())
 
         val result = fixture.service.launch("maintenance").getOrThrow()
 
@@ -211,6 +208,7 @@ class ManualLlmLaunchServiceTest {
         val idGenerator = deterministicIds()
         val daemonConfig = LlmDaemonConfig(
             enabled = true,
+            launchEnabled = true,
             priceMoveTriggerEnabled = false,
         )
         val config = tradingConfig(daemon = daemonConfig)
@@ -504,7 +502,10 @@ class ManualLlmLaunchServiceTest {
     fun manualLaunch_worksWhenDaemonConfigIsDisabled() = runBlocking {
         val fixture = manualFixture(
             tradingConfig = tradingConfig(
-                daemon = LlmDaemonConfig(enabled = false),
+                daemon = LlmDaemonConfig(
+                    enabled = false,
+                    launchEnabled = true,
+                ),
             ),
         )
 
@@ -654,7 +655,10 @@ private class FailingLaunchedCommandEventLog : CommandEventLog {
 
 private fun tradingConfig(
     runner: LlmRunnerConfig = LlmRunnerConfig(),
-    daemon: LlmDaemonConfig = LlmDaemonConfig(enabled = true),
+    daemon: LlmDaemonConfig = LlmDaemonConfig(
+        enabled = true,
+        launchEnabled = true,
+    ),
 ): TradingBotConfig {
     return TradingBotConfig(
         runner = runner,

@@ -911,6 +911,7 @@ class PostgresPersistenceIntegrationTest {
         val snapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
 
         assertEquals(expectedValues, snapshot.values)
+        assertEquals("false", snapshot.values.getValue("llm.launchEnabled"))
         assertEquals(calculateRuntimeConfigHash(expectedValues), snapshot.hash)
     }
 
@@ -1185,6 +1186,7 @@ class PostgresPersistenceIntegrationTest {
         val missingKeys = mapOf(
             "safety.minExpectedMoveToCostRatio" to "FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO",
             "runner.maxInvocationsPerHour" to "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR",
+            "llm.launchEnabled" to "FUKUROU_LLM_LAUNCH_ENABLED",
         )
         val preservedKey = "runner.maxToolCallsPerRun"
         val preservedValue = "12"
@@ -1225,6 +1227,24 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(backfilledSnapshot.versionId, idempotentSnapshot.versionId)
         assertEquals(expectedValues, idempotentSnapshot.values)
+    }
+
+    @Test
+    fun runtimeConfigBootstrapPreservesExplicitlyEnabledLaunchGate() = runPostgresTest {
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        upsertActiveRuntimeConfigValue(
+            database = database,
+            configKey = "llm.launchEnabled",
+            configValue = "true",
+        )
+        val enabledSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+
+        RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val preservedSnapshot = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow()
+
+        assertEquals(enabledSnapshot.versionId, preservedSnapshot.versionId)
+        assertEquals("true", preservedSnapshot.values.getValue("llm.launchEnabled"))
     }
 
     @Test
@@ -3666,7 +3686,10 @@ class PostgresPersistenceIntegrationTest {
                         ),
                     ),
                 ),
-                daemon = LlmDaemonConfig(enabled = true),
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    launchEnabled = true,
+                ),
             ),
             dependencies = LlmDaemonSchedulerDependencies(
                 riskStateRepository = ExposedRiskStateRepository(database),
