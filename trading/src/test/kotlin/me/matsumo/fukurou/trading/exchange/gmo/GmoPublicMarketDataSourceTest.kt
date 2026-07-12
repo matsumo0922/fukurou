@@ -62,16 +62,20 @@ class GmoPublicMarketDataSourceTest {
 
     @Test
     fun parseTickerResponse_rejectsNonZeroStatus() {
-        assertFailsWith<GmoApiStatusException> {
+        val exception = assertFailsWith<GmoApiStatusException> {
             parseTickerResponse(ERROR_RESPONSE, TradingSymbol.BTC)
         }
+
+        assertTrue(exception.message.orEmpty().contains("sentinel-private-message").not())
     }
 
     @Test
     fun parseTickerResponse_mapsRateLimitMessage() {
-        assertFailsWith<GmoRateLimitException> {
+        val exception = assertFailsWith<GmoRateLimitException> {
             parseTickerResponse(RATE_LIMIT_RESPONSE, TradingSymbol.BTC)
         }
+
+        assertTrue(exception.message.orEmpty().contains("Requests are too many.").not())
     }
 
     @Test
@@ -548,6 +552,7 @@ private const val MISSING_SYMBOL_RESPONSE = """
 private const val ERROR_RESPONSE = """
 {
   "status": 1,
+  "messages": [{"message_code":"UNKNOWN-SENTINEL","message_string":"sentinel-private-message"}],
   "data": []
 }
 """

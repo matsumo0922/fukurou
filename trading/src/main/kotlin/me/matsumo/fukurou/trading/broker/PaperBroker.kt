@@ -30,6 +30,7 @@ import me.matsumo.fukurou.trading.market.IndicatorType
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
+import me.matsumo.fukurou.trading.market.isFailClosedGmoRequestFailure
 import me.matsumo.fukurou.trading.reconciler.NoReconcilerStatusProvider
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
@@ -465,6 +466,8 @@ private class PaperBrokerTradeDelegate(
         val orderbook = requireNotNull(runtime.market.marketDataSource)
             .getOrderbook(command.symbol, PAPER_EXECUTION_ORDERBOOK_DEPTH)
             .getOrElse { throwable ->
+                if (throwable.isFailClosedGmoRequestFailure()) throw throwable
+
                 throw IllegalStateException("QUEUE_SNAPSHOT_UNAVAILABLE: orderbook request failed.", throwable)
             }
         val bidPrices = orderbook.bids.mapNotNull { level -> level.price.toBigDecimalOrNull() }
@@ -1265,6 +1268,8 @@ private suspend fun PaperBrokerRuntime.orderbookFor(symbol: TradingSymbol): Orde
     return market.marketDataSource
         ?.getOrderbook(symbol, PAPER_EXECUTION_ORDERBOOK_DEPTH)
         ?.onFailure { throwable ->
+            if (throwable.isFailClosedGmoRequestFailure()) throw throwable
+
             market.warnLogger.warn(
                 key = PAPER_EXECUTION_ORDERBOOK_FETCH_LOG_KEY,
                 message = "PaperBroker could not fetch orderbook for paper execution; ticker fallback will be used.",
@@ -1309,6 +1314,8 @@ private suspend fun PaperBrokerRuntime.atr14JpyFor(symbol: TradingSymbol, warnOn
         limit = ATR_CANDLE_LIMIT,
     )
         .onFailure { throwable ->
+            if (throwable.isFailClosedGmoRequestFailure()) throw throwable
+
             if (warnOnFailure) {
                 market.warnLogger.warn(
                     key = PAPER_EXECUTION_ATR_FETCH_LOG_KEY,

@@ -1452,7 +1452,7 @@ private fun Route.registerOpsActivityRoute(dependencies: OpsRouteDependencies) {
                 schema = jsonSchema<String>()
             }
             query("auditEventType") {
-                description = "audit event_type の許可リストです。複数指定可。未指定の場合は RECONCILER_PASS_COMPLETED を既定除外します。"
+                description = "audit event_type の許可リストです。複数指定可。未指定の場合は RECONCILER_PASS_COMPLETED と GMO_PUBLIC_REST_REQUEST_COMPLETED を既定除外します。"
                 schema = jsonSchema<List<String>>()
                 style = "form"
                 explode = true

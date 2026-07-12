@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
@@ -59,6 +60,7 @@ import java.util.logging.LogRecord
 import java.util.logging.Logger
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -225,6 +227,28 @@ class PaperBrokerTest {
         assertTrue(result.accepted)
         assertEquals("10017406.00000000", positions.single().averageEntryPriceJpy)
         assertEquals("10017406.00000000", executions.single().priceJpy)
+    }
+
+    @Test
+    fun place_order_market_entry_failsClosedWhenOrderbookAuditFails() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val marketDataSource = AuditFailingOrderbookMarketDataSource()
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+        )
+
+        assertFailsWith<GmoRequestAuditException> {
+            broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+        }
+        assertEquals(1, marketDataSource.orderbookAttemptCount)
+        assertEquals(0, repository.getOpenOrders().getOrThrow().size)
+        assertEquals(0, repository.getExecutions().getOrThrow().size)
+        assertEquals(0, broker.getPositions().getOrThrow().size)
     }
 
     @Test
@@ -2016,6 +2040,17 @@ class PaperBrokerTest {
 
         assertEquals(1, result.closedPositionIds.size)
         assertEquals("9672761.00000000", executions.single().priceJpy)
+    }
+}
+
+private class AuditFailingOrderbookMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    var orderbookAttemptCount: Int = 0
+        private set
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        orderbookAttemptCount += 1
+
+        return Result.failure(GmoRequestAuditException())
     }
 }
 

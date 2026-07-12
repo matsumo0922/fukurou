@@ -66,6 +66,11 @@ class GmoRequestAuditException : MarketDataException(
     "GMO public request audit failed after execution.",
 )
 
+/** GMO transport / request audit failure を lossy fallback へ変換してはならないかを返す。 */
+fun Throwable.isFailClosedGmoRequestFailure(): Boolean {
+    return this is GmoRateLimitException || this is GmoRequestAuditException
+}
+
 /**
  * GMO Public API の `status` が成功以外だったときの例外。
  */

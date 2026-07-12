@@ -21,6 +21,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.PingRequest
 import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import io.modelcontextprotocol.kotlin.sdk.types.ResourceUpdatedNotification
 import io.modelcontextprotocol.kotlin.sdk.types.ServerNotification
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.JsonArray
@@ -86,12 +87,15 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.MCP_MANIFEST_VERSION
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifest
 import me.matsumo.fukurou.trading.knowledge.KnowledgeService
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
@@ -1206,6 +1210,35 @@ class FukurouMcpServerTest {
         assertEquals(0, runtime.broker.getPositions().getOrThrow().size)
         assertEquals(0, runtime.broker.getOpenOrders().getOrThrow().size)
         assertEquals(0, repository.snapshots.intentConsumptions().size)
+    }
+
+    @Test
+    fun previewOrderTool_propagatesCorrelationAndAuditFailureThroughProductionHandler() = runBlocking {
+        val marketDataSource = CorrelationAuditFailingMarketDataSource()
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = marketDataSource,
+        )
+        val server = FukurouMcpServer(
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+            decisionRunContext = DecisionRunContext.EMPTY.copy(decisionRunId = "decision-correlation"),
+        ).createServer()
+        val intentId = submitApprovedEnterIntent(server)
+
+        val result = callTool(server, "preview_order", placeOrderArguments(intentId))
+        val structuredContent = assertNotNull(result.structuredContent)
+        val correlation = assertNotNull(marketDataSource.correlation)
+
+        assertEquals(true, result.isError)
+        assertEquals("audit_failed_after_execution", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals("true", structuredContent.getValue("executed").jsonPrimitive.contentOrNull)
+        assertEquals("decision-correlation", correlation.decisionRunContext.decisionRunId)
+        assertTrue(correlation.toolCallId?.isNotBlank() == true)
+        assertEquals(GmoPublicClientRole.UNSPECIFIED, correlation.clientRole)
+        assertEquals(0, runtime.broker.getOpenOrders().getOrThrow().size)
+        assertEquals(0, runtime.broker.getPositions().getOrThrow().size)
     }
 
     @Test
@@ -2809,6 +2842,17 @@ private object PreviewMarketDataSource : MarketDataSource {
                 makerFee = "-0.0001",
             ),
         )
+    }
+}
+
+private class CorrelationAuditFailingMarketDataSource : MarketDataSource by PreviewMarketDataSource {
+    var correlation: GmoPublicRequestCorrelation? = null
+        private set
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        correlation = currentCoroutineContext()[GmoPublicRequestCorrelation]
+
+        return Result.failure(GmoRequestAuditException())
     }
 }
 

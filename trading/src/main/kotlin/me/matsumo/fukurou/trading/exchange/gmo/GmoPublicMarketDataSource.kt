@@ -194,6 +194,8 @@ private val GmoMarketZone = ZoneId.of("Asia/Tokyo")
  * @param requestRateLimiter request 前に呼び出す rate limiter
  * @param dailyKlineRequestBudget 短期足 stitching の request 予算
  * @param sleeper retry / rate-limit 待機に使う sleeper
+ * @param clientType request audit で識別する client 発生主体
+ * @param requestAuditSink 実 HTTP attempt を保存する監査境界
  */
 class GmoPublicMarketDataSource(
     connectTimeout: Duration = DEFAULT_CONNECT_TIMEOUT,
@@ -811,14 +813,13 @@ private fun validateGmoStatus(
         return
     }
 
-    val messageText = messages.toMessageText()
     val isRateLimit = messages.hasMessageCode(GMO_RATE_LIMIT_MESSAGE_CODE)
 
     if (isRateLimit) {
-        throw GmoRateLimitException("GMO $endpointName response was rate limited: $messageText")
+        throw GmoRateLimitException("GMO $endpointName response was rate limited by JSON_ERR_5003.")
     }
 
-    throw GmoApiStatusException(status, "GMO $endpointName response status was $status: $messageText")
+    throw GmoApiStatusException(status, "GMO $endpointName response returned a non-success status.")
 }
 
 private fun GmoKlinesResponse.isKlinesNotFound(): Boolean {
@@ -918,18 +919,7 @@ private fun parseTradeSide(side: String): TradeSide {
     return when (side.uppercase()) {
         "BUY" -> TradeSide.BUY
         "SELL" -> TradeSide.SELL
-        else -> throw MarketDataParseException("Unsupported GMO trade side: $side")
-    }
-}
-
-private fun List<GmoMessage>.toMessageText(): String {
-    if (isEmpty()) {
-        return "no message"
-    }
-
-    return joinToString(separator = "; ") { message ->
-        listOfNotNull(message.messageCode, message.messageString)
-            .joinToString(separator = " ")
+        else -> throw MarketDataParseException("GMO trade response contained an unsupported side.")
     }
 }
 

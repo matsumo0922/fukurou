@@ -46,6 +46,7 @@ import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.parseKlinesResponse
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.IndicatorType
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
@@ -409,6 +410,21 @@ class GmoCoinMcpServerTest {
         assertEquals(true, result.isError)
         assertEquals("market_data_parse_error", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertEquals("permanent", structuredContent.getValue("failure_kind").jsonPrimitive.contentOrNull)
+    }
+
+    @Test
+    fun getTicker_returnsSafeAuditFailureWithoutSentinel() = runBlocking {
+        val server = testServer()
+        server.registerGmoCoinMarketTools(AuditFailingMarketDataSource)
+
+        val result = callTool(server, "get_ticker")
+        val structuredContent = assertNotNull(result.structuredContent)
+        val rendered = structuredContent.toString()
+
+        assertEquals(true, result.isError)
+        assertEquals("audit_failed_after_execution", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals("true", structuredContent.getValue("executed").jsonPrimitive.contentOrNull)
+        assertTrue(rendered.contains("sentinel-private-message").not())
     }
 
     @Test
@@ -922,6 +938,12 @@ private class ParsedKlineMarketDataSource(
 /**
  * GMO Coin MCP test 用の fake market data source。
  */
+private object AuditFailingMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return Result.failure(GmoRequestAuditException())
+    }
+}
+
 private object FakeMarketDataSource : MarketDataSource {
     override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
         return Result.success(

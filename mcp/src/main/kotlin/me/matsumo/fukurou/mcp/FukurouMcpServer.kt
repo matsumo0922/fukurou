@@ -100,6 +100,7 @@ import me.matsumo.fukurou.trading.market.FreshnessSource
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoHttpException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataException
 import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketDataSource
@@ -350,6 +351,7 @@ private val ToolErrorTypes: List<Pair<KClass<out Throwable>, String>> = listOf(
     ToolCallLimitUnavailableException::class to "tool_call_limit_unavailable",
     ToolCallNotAllowedException::class to "tool_call_not_allowed",
     ToolCompletionAuditFailedException::class to "audit_failed_after_execution",
+    GmoRequestAuditException::class to "audit_failed_after_execution",
     MarketInvalidRequestException::class to "invalid_request",
     GmoRateLimitException::class to "rate_limited",
     GmoApiStatusException::class to "gmo_status_error",
@@ -616,14 +618,17 @@ private class AuditedGmoCoinMarketToolExecutor(
     }
 
     override fun errorResponse(throwable: Throwable): GmoCoinMarketToolErrorResponse? {
-        if (throwable !is ToolCompletionAuditFailedException) {
-            return null
+        return when (throwable) {
+            is ToolCompletionAuditFailedException -> GmoCoinMarketToolErrorResponse(
+                type = "audit_failed_after_execution",
+                executed = throwable.executed,
+            )
+            is GmoRequestAuditException -> GmoCoinMarketToolErrorResponse(
+                type = "audit_failed_after_execution",
+                executed = true,
+            )
+            else -> null
         }
-
-        return GmoCoinMarketToolErrorResponse(
-            type = "audit_failed_after_execution",
-            executed = throwable.executed,
-        )
     }
 }
 
@@ -1439,7 +1444,9 @@ private suspend fun handlePreviewOrder(
     val result = tradingRuntime.toolCallGuard.runReadOnlyTool(call) {
         val command = parsePlaceOrderCommand(request, call).getOrThrow()
 
-        tradingRuntime.broker.previewOrder(command).getOrThrow()
+        withMcpGmoRequestCorrelation(call) {
+            tradingRuntime.broker.previewOrder(command).getOrThrow()
+        }
     }
 
     return result.fold(
@@ -1456,7 +1463,9 @@ private suspend fun handlePlaceOrder(
     val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
         val command = parsePlaceOrderCommand(request, call).getOrThrow()
 
-        tradingRuntime.broker.placeOrder(command).getOrThrow()
+        withMcpGmoRequestCorrelation(call) {
+            tradingRuntime.broker.placeOrder(command).getOrThrow()
+        }
     }
 
     return result.fold(
@@ -1473,7 +1482,9 @@ private suspend fun handleClosePosition(
     val result = tradingRuntime.toolCallGuard.runRiskReducingTradeTool(call) {
         val command = parseClosePositionCommand(request, call).getOrThrow()
 
-        tradingRuntime.broker.closePosition(command).getOrThrow()
+        withMcpGmoRequestCorrelation(call) {
+            tradingRuntime.broker.closePosition(command).getOrThrow()
+        }
     }
 
     return result.fold(
@@ -1490,7 +1501,9 @@ private suspend fun handleUpdateProtection(
     val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
         val command = parseUpdateProtectionCommand(request, call).getOrThrow()
 
-        tradingRuntime.broker.updateProtection(command).getOrThrow()
+        withMcpGmoRequestCorrelation(call) {
+            tradingRuntime.broker.updateProtection(command).getOrThrow()
+        }
     }
 
     return result.fold(
@@ -1507,7 +1520,9 @@ private suspend fun handleCancelOrder(
     val result = tradingRuntime.toolCallGuard.runTradeTool(call) {
         val command = parseCancelOrderCommand(request, call).getOrThrow()
 
-        tradingRuntime.broker.cancelOrder(command).getOrThrow()
+        withMcpGmoRequestCorrelation(call) {
+            tradingRuntime.broker.cancelOrder(command).getOrThrow()
+        }
     }
 
     return result.fold(
@@ -2546,11 +2561,26 @@ private fun JsonObjectBuilder.putNullableString(name: String, value: String?) {
 
 private fun throwableResult(throwable: Throwable): CallToolResult {
     val type = toolErrorType(throwable)
-    val executed = if (throwable is ToolCompletionAuditFailedException) throwable.executed else null
+    val executed = when (throwable) {
+        is ToolCompletionAuditFailedException -> throwable.executed
+        is GmoRequestAuditException -> true
+        else -> null
+    }
 
     val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
 
     return mcpErrorResult(type, throwable.message.orEmpty(), executed, failureKind)
+}
+
+private suspend fun <T> withMcpGmoRequestCorrelation(call: GuardedToolCall, block: suspend () -> T): T {
+    return withGmoPublicRequestCorrelation(
+        GmoPublicRequestCorrelation(
+            decisionRunContext = call.decisionRunContext,
+            toolCallId = call.toolCallId,
+            clientRole = mcpClientRole(System.getenv()),
+        ),
+        block,
+    )
 }
 
 private fun toolErrorType(throwable: Throwable): String {
