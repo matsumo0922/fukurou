@@ -1006,7 +1006,11 @@ private fun throwableResult(throwable: Throwable, toolExecutor: GmoCoinMarketToo
         is IllegalArgumentException -> "invalid_request"
         else -> "tool_call_failed"
     }
-    val executed = mappedError?.executed ?: true.takeIf { throwable is GmoRequestAuditException }
+    val executed = when {
+        mappedError != null -> mappedError.executed
+        throwable is GmoRequestAuditException -> true
+        else -> null
+    }
 
     val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
 

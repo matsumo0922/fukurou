@@ -30,6 +30,7 @@ import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.market.UnavailableMarketDataIntegrityRepository
+import me.matsumo.fukurou.trading.market.isFailClosedGmoRequestFailure
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -536,8 +537,9 @@ class ProtectionReconciler(
             warnLogger.warn(
                 key = MARKET_DATA_FAILURE_LOG_KEY,
                 message = "ProtectionReconciler market data refresh failed.",
-                throwable = throwable,
+                throwable = throwable.toSafeReconcilerLogThrowable(),
             )
+            if (throwable.isFailClosedGmoRequestFailure()) throw throwable
         }
 
         return tickResult.getOrNull()
@@ -684,8 +686,18 @@ class ProtectionReconciler(
         warnLogger.warn(
             key = "$PASS_FAILURE_LOG_KEY-${passKind.payloadName()}",
             message = "ProtectionReconciler ${passKind.payloadName()} pass failed.",
-            throwable = throwable,
+            throwable = throwable.toSafeReconcilerLogThrowable(),
         )
+    }
+}
+
+private fun Throwable.toSafeReconcilerLogThrowable(): Throwable {
+    return when (this) {
+        is me.matsumo.fukurou.trading.market.GmoRateLimitException ->
+            me.matsumo.fukurou.trading.market.GmoRateLimitException("GMO public request was rate limited.")
+        is me.matsumo.fukurou.trading.market.GmoRequestAuditException ->
+            me.matsumo.fukurou.trading.market.GmoRequestAuditException()
+        else -> this
     }
 }
 
@@ -719,7 +731,9 @@ private fun buildPassFailurePayload(passKind: ReconcilePassKind, throwable: Thro
         put("pass", passKind.payloadName())
         put("state", "failed")
         put("cause", throwable.javaClass.simpleName)
-        put("message", throwable.message.orEmpty())
+        if (!throwable.isFailClosedGmoRequestFailure()) {
+            put("message", throwable.message.orEmpty())
+        }
     }.toString()
 }
 

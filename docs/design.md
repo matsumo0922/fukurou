@@ -3575,6 +3575,10 @@ LLM CLI:
 
 [確定] request audit は Proposer / Falsifier MCP、runner、LLM runtime、reconciler、evaluation、standalone MCP を client type / role と correlation ID で区別する。payload は allowlist の ID、enum、時刻、数値だけで、response body、message、URI、query、credential、raw exception、filesystem path を保存しない。共有 gateway、process 間 limiter、rate / burst / retry / cache TTL の変更は、同一 wall-clock 窓の audit event を観測してから別途選択する。
 
+[確定] request audit は実 HTTP attempt の hot path で同期保存する。5 秒周期の reconciler は通常 ticker / trades / candles の 3 attempt を行い、retry と symbol cache miss を除く下限目安は 1 日約 51,840 event になる。現在の `command_event_log` は retention / pruning を行わない。event type 限定 retention、専用 table、durable outbox による batch 化はいずれも未実装で、選択には production の event 量、保存時間、DB latency の観測値を必要とする。監査完了前に response を利用する非 durable async 化は採用しない。
+
+[確定] GMO rate-limit exhaustion と request audit failure は、optional market-data fallback や ATR の degraded `null` へ変換しない。`PaperBroker` の注文判断は fail closed にし、`ProtectionReconciler` は direct pass と WebSocket periodic maintenance の failure transitionへ流して maintenance success を記録しない。その他の市場データ失敗は既存の degraded tick semantics を維持する。paper / live の設定値と注文状態遷移は変えず、rate-limit / audit failure の伝播だけを fail closed にする。
+
 [設計提案] token bucketを3層で持つ。
 
 | bucket                 |                          既定 | 適用                                                          |

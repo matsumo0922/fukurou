@@ -42,6 +42,8 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecorder
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.lock.TradingLockLease
+import me.matsumo.fukurou.trading.market.GmoRateLimitException
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
@@ -255,6 +257,27 @@ class ProtectionReconcilerTest {
             ),
             eventTypes,
         )
+    }
+
+    @Test
+    fun failClosedTickFailure_recordsFailureTransitionWithoutAdvancingMaintenance() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val status = MutableReconcilerStatus()
+        val reconciler = createReconciler(
+            eventLog = eventLog,
+            status = status,
+            tickStream = SwitchableTickStream(Result.failure(GmoRateLimitException("rate limited"))),
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+
+        assertTrue(result.exceptionOrNull() is GmoRateLimitException)
+        assertEquals(null, status.snapshot().lastMaintenanceAt)
+        assertEquals(
+            listOf(CommandEventType.RECONCILER_PASS_FAILED),
+            eventLog.events().map { event -> event.eventType },
+        )
+        assertTrue(eventLog.events().single().payload.contains("rate limited").not())
     }
 
     @Test
@@ -875,6 +898,44 @@ class ProtectionReconcilerTest {
         assertFalse(eventLog.events().any { event -> event.eventType == CommandEventType.RECONCILER_PASS_FAILED })
         assertTrue(integrity.snapshotCount >= 3)
         assertEquals(fixedInstant(), status.snapshot().lastMaintenanceAt)
+    }
+
+    @Test
+    fun marketEventPeriodicAuditFailure_recordsFailureWithoutMaintenanceSuccess() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000183")
+        val eventLog = InMemoryCommandEventLog()
+        val integrity = RetryableMarketDataIntegrityRepository(0)
+        val status = MutableReconcilerStatus()
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            commandEventLog = eventLog,
+            tradingLock = CountingTradingLock(fixedClock()),
+            tickStream = SwitchableTickStream(Result.failure(GmoRequestAuditException())),
+            marketEventStream = SingleSessionMarketEventStream(
+                BurstThenIdleMarketEventSession(sessionId, fixedInstant(), emptyList()),
+            ),
+            marketDataIntegrityRepository = integrity,
+            status = status,
+            clock = fixedClock(),
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(10))
+        }
+
+        withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
+            while (eventLog.events().none { event -> event.eventType == CommandEventType.RECONCILER_PASS_FAILED }) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertEquals(0, integrity.markMaintenanceSucceededCount)
+        assertEquals(null, integrity.snapshot().getOrThrow().lastMaintenanceAt)
+        assertEquals(null, status.snapshot().lastMaintenanceAt)
+        assertEquals(
+            1,
+            eventLog.events().count { event -> event.eventType == CommandEventType.RECONCILER_PASS_FAILED },
+        )
     }
 
     @Test

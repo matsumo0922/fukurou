@@ -469,6 +469,8 @@ class FukurouMcpServer(
     ),
 ) {
 
+    private val clientRole = mcpClientRole(environment)
+
     init {
         requestAuditSink.bind(CommandEventLogGmoPublicRequestAuditSink(tradingRuntime.commandEventLog))
     }
@@ -519,7 +521,7 @@ class FukurouMcpServer(
                 toolCallGuard = tradingRuntime.toolCallGuard,
                 decisionRunContext = decisionRunContext,
                 toolCallLimiter = toolCallLimiter,
-                clientRole = mcpClientRole(environment),
+                clientRole = clientRole,
             ),
             klineRequestBudgetHook = DescribedGmoCoinKlineRequestBudgetHook(GMO_MAX_DAILY_KLINE_REQUESTS),
             clock = clock,
@@ -572,7 +574,6 @@ class FukurouMcpServer(
     }
 
     private fun registerTradeTools(server: Server) {
-        val clientRole = mcpClientRole(environment)
         server.registerPreviewOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter, clientRole)
         server.registerPlaceOrderTool(tradingRuntime, decisionRunContext, toolCallLimiter, clientRole)
         server.registerClosePositionTool(tradingRuntime, decisionRunContext, toolCallLimiter, clientRole)
@@ -596,7 +597,7 @@ private class AuditedGmoCoinMarketToolExecutor(
     private val toolCallGuard: ToolCallGuard,
     private val decisionRunContext: DecisionRunContext,
     private val toolCallLimiter: McpToolCallLimiter,
-    private val clientRole: GmoPublicClientRole = mcpClientRole(System.getenv()),
+    private val clientRole: GmoPublicClientRole,
 ) : GmoCoinMarketToolExecutor {
     override suspend fun <T> execute(
         toolName: String,

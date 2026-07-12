@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.exchange.gmo
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -198,6 +199,8 @@ private val GmoMarketZone = ZoneId.of("Asia/Tokyo")
  * @param requestAuditSink 実 HTTP attempt を保存する監査境界
  */
 class GmoPublicMarketDataSource(
+    private val clientType: GmoPublicClientType,
+    private val requestAuditSink: GmoPublicRequestAuditSink,
     connectTimeout: Duration = DEFAULT_CONNECT_TIMEOUT,
     private val requestTimeout: Duration = DEFAULT_REQUEST_TIMEOUT,
     private val httpClient: HttpClient = HttpClient.newBuilder()
@@ -218,8 +221,7 @@ class GmoPublicMarketDataSource(
         maxRequests = GMO_MAX_DAILY_KLINE_REQUESTS,
     ),
     private val sleeper: GmoSleeper = ThreadSleepingGmoSleeper,
-    private val clientType: GmoPublicClientType = GmoPublicClientType.STANDALONE_MCP,
-    private val requestAuditSink: GmoPublicRequestAuditSink = NoopGmoPublicRequestAuditSink,
+    private val monotonicTimeSource: GmoMonotonicTimeSource = SystemGmoMonotonicTimeSource,
 ) : MarketDataSource {
 
     private val clientInstanceId = newGmoAuditId()
@@ -362,23 +364,18 @@ class GmoPublicMarketDataSource(
     }
 
     private suspend fun GmoRequestScope.sendRequest(request: HttpRequest, endpoint: GmoPublicEndpoint): String {
-        val permitWait = requestRateLimiter.acquirePermit(endpoint.name.lowercase())
+        val permitWait = measurePermitWait(endpoint)
         val requestId = newGmoAuditId()
         val requestStartedAt = clock.instant()
         val startedNanos = System.nanoTime()
         requestSequence += 1
-
-        val response = try {
-            httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-        } catch (exception: IOException) {
-            appendAudit(requestId, endpoint, requestStartedAt, startedNanos, permitWait, GmoPublicRequestOutcome.NETWORK_ERROR)
-            throw MarketNetworkException("GMO ${endpoint.name} request failed by network error.", exception)
-        } catch (exception: InterruptedException) {
-            Thread.currentThread().interrupt()
-
-            appendAudit(requestId, endpoint, requestStartedAt, startedNanos, permitWait, GmoPublicRequestOutcome.INTERRUPTED)
-            throw MarketNetworkException("GMO ${endpoint.name} request was interrupted.", exception)
-        }
+        val attemptContext = GmoRequestAttemptContext(
+            requestId = requestId,
+            requestStartedAt = requestStartedAt,
+            startedNanos = startedNanos,
+            permitWait = permitWait,
+        )
+        val response = sendHttpRequest(request, endpoint, attemptContext)
 
         val statusCode = response.statusCode()
         val hasRateLimitMessage = statusCode == HTTP_OK && response.body().hasGmoRateLimitMessage()
@@ -418,6 +415,77 @@ class GmoPublicMarketDataSource(
         return response.body()
     }
 
+    private suspend fun GmoRequestScope.sendHttpRequest(
+        request: HttpRequest,
+        endpoint: GmoPublicEndpoint,
+        attemptContext: GmoRequestAttemptContext,
+    ): HttpResponse<String> {
+        return try {
+            httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+        } catch (exception: IOException) {
+            val networkException = MarketNetworkException(
+                "GMO ${endpoint.name} request failed by network error.",
+                exception,
+            )
+            appendAuditPreservingFailure(
+                requestId = attemptContext.requestId,
+                endpoint = endpoint,
+                requestStartedAt = attemptContext.requestStartedAt,
+                startedNanos = attemptContext.startedNanos,
+                permitWait = attemptContext.permitWait,
+                outcome = GmoPublicRequestOutcome.NETWORK_ERROR,
+                requestFailure = networkException,
+            )
+            throw networkException
+        } catch (exception: InterruptedException) {
+            Thread.currentThread().interrupt()
+
+            val networkException = MarketNetworkException("GMO ${endpoint.name} request was interrupted.", exception)
+            appendAuditPreservingFailure(
+                requestId = attemptContext.requestId,
+                endpoint = endpoint,
+                requestStartedAt = attemptContext.requestStartedAt,
+                startedNanos = attemptContext.startedNanos,
+                permitWait = attemptContext.permitWait,
+                outcome = GmoPublicRequestOutcome.INTERRUPTED,
+                requestFailure = networkException,
+            )
+            throw networkException
+        }
+    }
+
+    private fun measurePermitWait(endpoint: GmoPublicEndpoint): Duration {
+        val startedNanos = monotonicTimeSource.nanoTime()
+        requestRateLimiter.acquirePermit(endpoint.name.lowercase())
+
+        return Duration.ofNanos(monotonicTimeSource.nanoTime() - startedNanos)
+    }
+
+    @Suppress("LongParameterList")
+    private suspend fun GmoRequestScope.appendAuditPreservingFailure(
+        requestId: String,
+        endpoint: GmoPublicEndpoint,
+        requestStartedAt: Instant,
+        startedNanos: Long,
+        permitWait: Duration,
+        outcome: GmoPublicRequestOutcome,
+        requestFailure: MarketNetworkException,
+    ) {
+        try {
+            appendAudit(
+                requestId = requestId,
+                endpoint = endpoint,
+                requestStartedAt = requestStartedAt,
+                startedNanos = startedNanos,
+                permitWait = permitWait,
+                outcome = outcome,
+            )
+        } catch (auditException: GmoRequestAuditException) {
+            auditException.addSuppressed(requestFailure)
+            throw auditException
+        }
+    }
+
     @Suppress("LongParameterList")
     private suspend fun GmoRequestScope.appendAudit(
         requestId: String,
@@ -430,7 +498,7 @@ class GmoPublicMarketDataSource(
         gmoMessageCode: String? = null,
     ) {
         val completedAt = clock.instant()
-        val correlation = kotlinx.coroutines.currentCoroutineContext()[GmoPublicRequestCorrelation]
+        val correlation = currentCoroutineContext()[GmoPublicRequestCorrelation]
         val event = GmoPublicRequestAuditEvent(
             requestId = requestId,
             operationId = operationId,
@@ -570,12 +638,12 @@ class GmoPublicMarketDataSource(
          */
         fun fromConfig(
             config: GmoPublicClientConfig,
+            clientType: GmoPublicClientType,
+            requestAuditSink: GmoPublicRequestAuditSink,
             clock: Clock = Clock.systemUTC(),
             dailyKlineRequestBudget: GmoDailyKlineRequestBudget = GmoFixedDailyKlineRequestBudget(
                 maxRequests = GMO_MAX_DAILY_KLINE_REQUESTS,
             ),
-            clientType: GmoPublicClientType = GmoPublicClientType.STANDALONE_MCP,
-            requestAuditSink: GmoPublicRequestAuditSink = NoopGmoPublicRequestAuditSink,
         ): GmoPublicMarketDataSource {
             return GmoPublicMarketDataSource(
                 connectTimeout = config.connectTimeout,
@@ -597,9 +665,23 @@ class GmoPublicMarketDataSource(
         var attempt: Int = 1
         var requestSequence: Int = 0
     }
+
+    /** 1 回の HTTP attempt の監査計測値。 */
+    private data class GmoRequestAttemptContext(
+        val requestId: String,
+        val requestStartedAt: Instant,
+        val startedNanos: Long,
+        val permitWait: Duration,
+    )
 }
 
-private fun String.hasGmoRateLimitMessage(): Boolean {
+internal fun hasPotentialGmoRateLimitMessage(responseBody: String): Boolean {
+    return responseBody.contains(GMO_RATE_LIMIT_MESSAGE_CODE)
+}
+
+internal fun String.hasGmoRateLimitMessage(): Boolean {
+    if (!hasPotentialGmoRateLimitMessage(this)) return false
+
     return runCatching {
         GmoPublicApiJson.parseToJsonElement(this).jsonObject["messages"]?.jsonArray?.any { message ->
             message.jsonObject["message_code"]?.jsonPrimitive?.content == GMO_RATE_LIMIT_MESSAGE_CODE

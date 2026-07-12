@@ -11,6 +11,8 @@ import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataFailureKind
 import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
+import me.matsumo.fukurou.trading.market.MarketNetworkException
+import java.io.IOException
 import java.net.Authenticator
 import java.net.CookieHandler
 import java.net.ProxySelector
@@ -33,6 +35,7 @@ import javax.net.ssl.SSLSession
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -422,6 +425,7 @@ class GmoPublicMarketDataSourceTest {
             clock = clock,
             requestRateLimiter = rateLimiter,
             requestAuditSink = auditSink,
+            monotonicTimeSource = clock,
         )
 
         marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
@@ -487,8 +491,24 @@ class GmoPublicMarketDataSourceTest {
         assertEquals(1, auditSink.events.map { event -> event.operationId }.distinct().size)
         assertEquals(GmoPublicRequestOutcome.HTTP_429, auditSink.events.first().outcome)
         assertEquals(GmoPublicRequestOutcome.HTTP_RESPONSE, auditSink.events.last().outcome)
-        assertTrue(auditSink.events.all { event -> event.permitWaitMillis == 12L })
+        assertTrue(auditSink.events.all { event -> event.permitWaitMillis == 0L })
         assertTrue(auditSink.events.all { event -> event.decisionRunId == "decision-1" && event.toolCallId == "tool-1" })
+    }
+
+    @Test
+    fun requestAudit_recordsMeasuredPermitWaitIncludingOversleep() = runBlocking {
+        val monotonicTimeSource = MutableMonotonicTimeSource()
+        val auditSink = RecordingRequestAuditSink()
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(responses = mapOf("symbol=BTC" to TICKER_SUCCESS_RESPONSE)),
+            requestRateLimiter = AdvancingRateLimiter(monotonicTimeSource, Duration.ofMillis(17)),
+            requestAuditSink = auditSink,
+            monotonicTimeSource = monotonicTimeSource,
+        )
+
+        marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+
+        assertEquals(17L, auditSink.events.single().permitWaitMillis)
     }
 
     @Test
@@ -504,6 +524,35 @@ class GmoPublicMarketDataSourceTest {
             marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
         }
         assertEquals(listOf("symbol=BTC"), httpClient.requestQueries)
+    }
+
+    @Test
+    fun networkAndAuditFailure_keepsAuditFailurePrimaryAndNetworkFailureSuppressed() = runBlocking {
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(
+                responses = emptyMap(),
+                failure = IOException("sentinel-private-network-message"),
+            ),
+            retryConfig = GmoRetryConfig(maxAttempts = 3),
+            requestAuditSink = GmoPublicRequestAuditSink { Result.failure(IllegalStateException("secret")) },
+        )
+
+        val exception = assertFailsWith<GmoRequestAuditException> {
+            marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        }
+        val suppressed = exception.suppressed.single()
+
+        assertTrue(suppressed is MarketNetworkException)
+        assertTrue(suppressed.cause is IOException)
+        assertEquals("GMO public request audit failed after execution.", exception.message)
+        assertTrue(exception.message.orEmpty().contains("sentinel-private-network-message").not())
+    }
+
+    @Test
+    fun rateLimitMessageGuard_rejectsFalsePositiveAndSkipsNormalPayload() {
+        assertFalse(hasPotentialGmoRateLimitMessage(TICKER_SUCCESS_RESPONSE))
+        assertTrue(hasPotentialGmoRateLimitMessage("{\"note\":\"ERR-5003\"}"))
+        assertFalse("{\"note\":\"ERR-5003\"}".hasGmoRateLimitMessage())
     }
 
     @Test
@@ -768,6 +817,7 @@ private fun fakeMarketDataSource(
     ),
     sleeper: GmoSleeper = RecordingSleeper(),
     requestAuditSink: GmoPublicRequestAuditSink = NoopGmoPublicRequestAuditSink,
+    monotonicTimeSource: GmoMonotonicTimeSource = FixedMonotonicTimeSource,
 ): GmoPublicMarketDataSource {
     return GmoPublicMarketDataSource(
         httpClient = httpClient,
@@ -780,6 +830,7 @@ private fun fakeMarketDataSource(
         sleeper = sleeper,
         clientType = GmoPublicClientType.FUKUROU_MCP,
         requestAuditSink = requestAuditSink,
+        monotonicTimeSource = monotonicTimeSource,
     )
 }
 
@@ -802,6 +853,7 @@ private class RecordingRequestAuditSink : GmoPublicRequestAuditSink {
 private class FakeHttpClient(
     private val responses: Map<String, String>,
     private val statusCodes: Map<String, List<Int>> = emptyMap(),
+    private val failure: IOException? = null,
 ) : HttpClient() {
 
     /**
@@ -850,6 +902,8 @@ private class FakeHttpClient(
         request: HttpRequest,
         responseBodyHandler: HttpResponse.BodyHandler<ResponseBody>,
     ): HttpResponse<ResponseBody> {
+        failure?.let { throw it }
+
         val query = request.uri().rawQuery.orEmpty()
         val body = requireNotNull(responses[query]) {
             "No fake response for query: $query"
@@ -961,7 +1015,9 @@ private class RecordingSleeper : GmoSleeper {
 
 private class AdvancingClock(
     private var currentInstant: Instant,
-) : Clock() {
+) : Clock(), GmoMonotonicTimeSource {
+    private var elapsedNanos: Long = 0
+
     override fun getZone(): ZoneId = ZoneOffset.UTC
 
     override fun withZone(zone: ZoneId): Clock = this
@@ -970,7 +1026,10 @@ private class AdvancingClock(
 
     fun advance(duration: Duration) {
         currentInstant = currentInstant.plus(duration)
+        elapsedNanos += duration.toNanos()
     }
+
+    override fun nanoTime(): Long = elapsedNanos
 }
 
 private class AdvancingClockSleeper(
@@ -978,5 +1037,30 @@ private class AdvancingClockSleeper(
 ) : GmoSleeper {
     override fun sleep(duration: Duration) {
         clock.advance(duration)
+    }
+}
+
+private object FixedMonotonicTimeSource : GmoMonotonicTimeSource {
+    override fun nanoTime(): Long = 0
+}
+
+private class MutableMonotonicTimeSource : GmoMonotonicTimeSource {
+    private var currentNanos: Long = 0
+
+    override fun nanoTime(): Long = currentNanos
+
+    fun advance(duration: Duration) {
+        currentNanos += duration.toNanos()
+    }
+}
+
+private class AdvancingRateLimiter(
+    private val monotonicTimeSource: MutableMonotonicTimeSource,
+    private val elapsed: Duration,
+) : GmoRequestRateLimiter {
+    override fun acquirePermit(endpointName: String): Duration {
+        monotonicTimeSource.advance(elapsed)
+
+        return Duration.ofMillis(1)
     }
 }
