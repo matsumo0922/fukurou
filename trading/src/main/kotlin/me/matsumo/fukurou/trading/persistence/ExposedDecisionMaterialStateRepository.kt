@@ -106,7 +106,7 @@ private fun String?.toPredicates(): List<TradePlanInvalidationPredicate> {
     }.toList()
 }
 
-private fun String.toMaterialManifest(): DecisionMaterialStateManifest {
+internal fun String.toMaterialManifest(): DecisionMaterialStateManifest {
     val value = Json.parseToJsonElement(this).jsonObject
     fun text(name: String): String? = value[name]?.jsonPrimitive?.contentOrNull
     fun decimal(name: String) = text(name)?.toBigDecimalOrNull()

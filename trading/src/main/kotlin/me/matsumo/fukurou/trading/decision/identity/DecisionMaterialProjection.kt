@@ -1,6 +1,8 @@
 package me.matsumo.fukurou.trading.decision.identity
 
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationState
+import me.matsumo.fukurou.trading.decision.evaluateInvalidationPredicates
 import java.math.BigDecimal
 import java.math.RoundingMode
 
@@ -30,6 +32,35 @@ data class DecisionMaterialProjection(
             "invalidation=${invalidationState.name}",
         ).joinToString("\n")
     }
+}
+
+/** exact manifest を thesis 確定後の episode context で一度だけ canonicalize する。 */
+fun DecisionMaterialStateManifest.canonicalProjection(
+    anchorPriceJpy: BigDecimal?,
+    thresholdRatio: BigDecimal,
+    predicates: List<TradePlanInvalidationPredicate>,
+    observedAt: java.time.Instant,
+): String {
+    val invalidation = evaluateInvalidationPredicates(
+        predicates = predicates,
+        lastPriceJpy = lastPriceJpy,
+        bestBidJpy = bestBidJpy,
+        bestAskJpy = bestAskJpy,
+        observedAt = observedAt,
+        materialStateChanged = null,
+    )
+    return DecisionMaterialProjection(
+        riskState = riskState,
+        freshness = freshness,
+        hasOpenPosition = openPositionFacts.isNotEmpty(),
+        hasOpenOrder = openOrderFacts.isNotEmpty(),
+        anchorPriceJpy = anchorPriceJpy ?: lastPriceJpy,
+        currentPriceJpy = lastPriceJpy,
+        atr14Jpy = atr14FiveMinutesJpy,
+        bestBidJpy = bestBidJpy,
+        bestAskJpy = bestAskJpy,
+        invalidationState = invalidation,
+    ).canonical(thresholdRatio)
 }
 
 private fun relativeBand(

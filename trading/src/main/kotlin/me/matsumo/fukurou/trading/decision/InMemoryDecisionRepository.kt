@@ -2,11 +2,10 @@ package me.matsumo.fukurou.trading.decision
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import me.matsumo.fukurou.trading.decision.identity.DecisionIdentity
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
-import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjectionContext
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.decision.identity.InMemoryDecisionMaterialStateRepository
+import me.matsumo.fukurou.trading.decision.identity.canonicalProjection
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import java.math.BigDecimal
@@ -33,6 +32,7 @@ class InMemoryDecisionRepository(
     private val tradeIntents = mutableListOf<TradeIntentRecord>()
     private val falsifications = mutableListOf<FalsificationRecord>()
     private val intentConsumptions = mutableListOf<TradeIntentConsumptionRecord>()
+    private val openEpisodesByThesis = mutableMapOf<String, InMemoryEpisodeContext>()
 
     /**
      * 保存済み record の snapshot 読み取り境界。
@@ -46,6 +46,7 @@ class InMemoryDecisionRepository(
         intentConsumptions = intentConsumptions,
     )
 
+    @Suppress("CyclomaticComplexMethod", "LongMethod")
     override suspend fun submitDecision(submission: DecisionSubmission): Result<DecisionSubmissionResult> {
         return runCatching {
             mutex.withLock {
@@ -60,17 +61,35 @@ class InMemoryDecisionRepository(
 
                 validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
 
-                val materialProjection = submission.invocationId?.let { invocationId ->
-                    materialStateRepository.find(invocationId).getOrThrow()?.materialProjection?.takeIf(String::isNotBlank)
+                val manifest = submission.invocationId?.let { invocationId ->
+                    materialStateRepository.find(invocationId).getOrThrow()
                 }
                 val identity = submission.entryIntent?.let { intent ->
                     submission.tradePlan?.let { plan ->
-                        materialProjection?.let { canonical ->
-                            DecisionIdentityGenerator.generate(UUID.randomUUID(), plan, intent, canonical)
+                        manifest?.let { exact ->
+                            val thesisId = DecisionIdentityGenerator.thesisId(plan)
+                            val context = openEpisodesByThesis[thesisId]
+                            val canonical = exact.canonicalProjection(
+                                anchorPriceJpy = context?.anchorPriceJpy ?: intent.priceJpy,
+                                thresholdRatio = context?.priceMoveThresholdRatio ?: exact.priceMoveThresholdRatio,
+                                predicates = context?.predicates ?: plan.invalidationPredicates,
+                                observedAt = now,
+                            )
+                            val episodeId = context?.episodeId ?: UUID.randomUUID()
+                            DecisionIdentityGenerator.generate(episodeId, plan, intent, canonical).also {
+                                if (context == null) {
+                                    openEpisodesByThesis.clear()
+                                    openEpisodesByThesis[thesisId] = InMemoryEpisodeContext(
+                                        episodeId = episodeId,
+                                        anchorPriceJpy = intent.priceJpy ?: exact.lastPriceJpy,
+                                        priceMoveThresholdRatio = exact.priceMoveThresholdRatio,
+                                        predicates = plan.invalidationPredicates,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
-                recordEpisodeContext(submission, identity)
                 val decision = DecisionRecord(
                     decisionId = UUID.randomUUID(),
                     submission = submission,
@@ -100,22 +119,12 @@ class InMemoryDecisionRepository(
         }
     }
 
-    private suspend fun recordEpisodeContext(submission: DecisionSubmission, identity: DecisionIdentity?) {
-        if (identity == null) return
-        val intent = requireNotNull(submission.entryIntent)
-        val plan = requireNotNull(submission.tradePlan)
-        val manifest = requireNotNull(submission.invocationId).let { invocationId ->
-            requireNotNull(materialStateRepository.find(invocationId).getOrThrow())
-        }
-        materialStateRepository.recordOpenEpisodeContext(
-            symbol = intent.symbol.apiSymbol,
-            context = DecisionMaterialProjectionContext(
-                anchorPriceJpy = intent.priceJpy ?: manifest.lastPriceJpy,
-                priceMoveThresholdRatio = manifest.priceMoveThresholdRatio,
-                invalidationPredicates = plan.invalidationPredicates,
-            ),
-        ).getOrThrow()
-    }
+    private data class InMemoryEpisodeContext(
+        val episodeId: UUID,
+        val anchorPriceJpy: BigDecimal?,
+        val priceMoveThresholdRatio: BigDecimal,
+        val predicates: List<TradePlanInvalidationPredicate>,
+    )
 
     override suspend fun submitFalsification(submission: FalsificationSubmission): Result<FalsificationRecord> {
         return runCatching {

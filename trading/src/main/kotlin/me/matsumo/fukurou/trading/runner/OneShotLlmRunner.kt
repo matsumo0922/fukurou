@@ -38,10 +38,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationRecord
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
-import me.matsumo.fukurou.trading.decision.TradePlanInvalidationState
-import me.matsumo.fukurou.trading.decision.evaluateInvalidationPredicates
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
-import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjection
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
 import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
@@ -525,36 +522,7 @@ class OneShotLlmRunner(
             "freshness=${freshness.name}",
             "missing=${missingSources.joinToString(",") { "${it.source}:${it.reason}" }}",
         ).joinToString("\n")
-        val episodeContext = tradingRuntime.decisionMaterialStateRepository
-            .findOpenEpisodeContext(tradingConfig.symbol.apiSymbol)
-            .getOrThrow()
-        val anchorPrice = episodeContext?.anchorPriceJpy ?: orders.asSequence()
-            .mapNotNull { order -> order.limitPriceJpy?.toBigDecimalOrNull() }
-            .firstOrNull()
-        val thresholdRatio = episodeContext?.priceMoveThresholdRatio
-            ?: tradingConfig.daemon.priceMoveThresholdRatio
-        val invalidationState = episodeContext?.let { context ->
-            evaluateInvalidationPredicates(
-                predicates = context.invalidationPredicates,
-                lastPriceJpy = last,
-                bestBidJpy = bid,
-                bestAskJpy = ask,
-                observedAt = capturedAt,
-                materialStateChanged = null,
-            )
-        } ?: TradePlanInvalidationState.UNKNOWN_DATA
-        val materialProjection = DecisionMaterialProjection(
-            riskState = riskState.state.name,
-            freshness = freshness,
-            hasOpenPosition = positions.isNotEmpty(),
-            hasOpenOrder = orders.isNotEmpty(),
-            anchorPriceJpy = anchorPrice ?: last,
-            currentPriceJpy = last,
-            atr14Jpy = atr,
-            bestBidJpy = bid,
-            bestAskJpy = ask,
-            invalidationState = invalidationState,
-        ).canonical(thresholdRatio)
+        val thresholdRatio = tradingConfig.daemon.priceMoveThresholdRatio
         val manifest = DecisionMaterialStateManifest(
             invocationId = input.invocationId,
             capturedAt = capturedAt,
@@ -578,7 +546,7 @@ class OneShotLlmRunner(
             openOrderFacts = orderFacts,
             missingSources = missingSources,
             canonicalContentHash = DecisionIdentityGenerator.contentHash(canonical),
-            materialProjection = materialProjection,
+            materialProjection = "",
         )
 
         tradingRuntime.decisionMaterialStateRepository.append(manifest).getOrThrow()

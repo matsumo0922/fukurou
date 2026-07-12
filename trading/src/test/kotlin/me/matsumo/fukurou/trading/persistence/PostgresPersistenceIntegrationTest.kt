@@ -54,6 +54,7 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
@@ -5855,6 +5856,106 @@ class PostgresPersistenceIntegrationTest {
             }
         }
         assertEquals(listOf("DECISION" to "MANIFEST_MISSING", "INTENT" to "MANIFEST_MISSING"), failures)
+    }
+
+    @Test
+    fun thesisScopedEpisodeContextMatchesInMemoryAcrossAABSequence() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runtime = TradingRuntimeFactory.connectedPostgres(
+            dataSource = dataSource,
+            database = database,
+            clock = fixedClock(),
+            marketDataSource = PostgresFakeMarketDataSource,
+            tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+        )
+        val memoryManifests = InMemoryDecisionMaterialStateRepository()
+        val memoryDecisions = InMemoryDecisionRepository(fixedClock(), materialStateRepository = memoryManifests)
+        val initial = enterDecisionSubmission()
+        val base = initial.copy(
+            entryIntent = requireNotNull(initial.entryIntent).copy(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("10000000"),
+            ),
+        )
+        val cases = listOf(
+            Triple("a-first", "thesis A", identityManifest("a-first").copy(priceMoveThresholdRatio = BigDecimal("0.02"))),
+            Triple(
+                "a-repeat",
+                "thesis A",
+                identityManifest("a-repeat").copy(
+                    lastPriceJpy = BigDecimal("10100000"),
+                    priceMoveThresholdRatio = BigDecimal("0.50"),
+                ),
+            ),
+            Triple(
+                "b-first",
+                "thesis B",
+                identityManifest("b-first").copy(
+                    lastPriceJpy = BigDecimal("10100000"),
+                    priceMoveThresholdRatio = BigDecimal("0.50"),
+                ),
+            ),
+        )
+        val databaseResults = mutableListOf<DecisionSubmissionResult>()
+        val memoryResults = mutableListOf<DecisionSubmissionResult>()
+
+        cases.forEach { (invocationId, thesis, manifest) ->
+            runtime.decisionMaterialStateRepository.append(manifest).getOrThrow()
+            memoryManifests.append(manifest).getOrThrow()
+            val submission = base.copy(
+                invocationId = invocationId,
+                tradePlan = requireNotNull(base.tradePlan).copy(thesisJa = thesis),
+            )
+            databaseResults += runtime.decisionRepository.submitDecision(submission).getOrThrow()
+            memoryResults += memoryDecisions.submitDecision(submission).getOrThrow()
+        }
+
+        assertEquals(
+            databaseResults.map { it.decision.identity?.thesisId },
+            memoryResults.map { it.decision.identity?.thesisId },
+        )
+        assertEquals(
+            databaseResults.map { it.decision.identity?.materialStateHash },
+            memoryResults.map { it.decision.identity?.materialStateHash },
+        )
+        assertEquals(databaseResults[0].decision.identity?.opportunityEpisodeId, databaseResults[1].decision.identity?.opportunityEpisodeId)
+        assertTrue(databaseResults[1].decision.identity?.opportunityEpisodeId != databaseResults[2].decision.identity?.opportunityEpisodeId)
+        val episodes = exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                """SELECT e.price_move_threshold_ratio, e.close_reason,
+                    (SELECT ti.price_jpy FROM trade_intents ti JOIN decisions d ON d.id=ti.decision_id
+                     WHERE ti.opportunity_episode_id=e.id ORDER BY d.created_at, d.id LIMIT 1),
+                    (SELECT tp.invalidation_predicates FROM trade_intents ti JOIN trade_plans tp ON tp.id=ti.trade_plan_id
+                     JOIN decisions d ON d.id=ti.decision_id WHERE ti.opportunity_episode_id=e.id
+                     ORDER BY d.created_at, d.id LIMIT 1)
+                    FROM opportunity_episodes e ORDER BY e.opened_at, e.id
+                """.trimIndent(),
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    buildList {
+                        while (rows.next()) {
+                            add(listOf(rows.getBigDecimal(1), rows.getString(2), rows.getBigDecimal(3), rows.getString(4)))
+                        }
+                    }
+                }
+            }
+        }
+        assertTrue(episodes.any { row -> (row[0] as BigDecimal).compareTo(BigDecimal("0.02")) == 0 && row[1] == "THESIS_CHANGED" })
+        assertTrue(episodes.any { row -> (row[0] as BigDecimal).compareTo(BigDecimal("0.50")) == 0 && row[1] == null })
+        assertTrue(episodes.all { row -> (row[2] as BigDecimal).compareTo(BigDecimal("10000000")) == 0 })
+        assertTrue(episodes.all { row -> (row[3] as String).contains("LAST_PRICE_AT_OR_BELOW") })
+        val classifications = exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                "SELECT classification, COUNT(*) FROM dedupe_shadow_observations GROUP BY classification",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    buildMap { while (rows.next()) put(rows.getString(1), rows.getInt(2)) }
+                }
+            }
+        }
+        assertEquals(2, classifications["NEW_EPISODE"])
+        assertEquals(1, classifications["MAINTAIN_PENDING"])
+        runtime.close()
     }
 }
 

@@ -239,6 +239,7 @@ class LlmDaemonScheduler(
         }
     }
 
+    @Suppress("LongMethod")
     private suspend fun tickUnsafe(observedAt: Instant): LlmDaemonTickResult {
         if (!daemonConfig.launchEnabled) {
             appendSkip(

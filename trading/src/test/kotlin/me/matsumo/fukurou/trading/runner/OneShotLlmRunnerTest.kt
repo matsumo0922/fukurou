@@ -214,7 +214,7 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun materialManifestCapturesExactMarketFactsAndSeparateBandedProjection() = runBlocking {
+    fun materialManifestCapturesExactMarketFactsBeforeThesisScopedProjection() = runBlocking {
         val fixture = runnerFixture(marketDataSource = MaterialManifestMarketDataSource) { command ->
             if (command.isProposerLaunch()) {
                 submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
@@ -234,12 +234,12 @@ class OneShotLlmRunnerTest {
         assertNotNull(manifest.sourceTimestamp)
         assertNotNull(manifest.atr14FiveMinutesJpy)
         assertTrue(manifest.canonicalContentHash.matches(Regex("[0-9a-f]{64}")))
-        assertTrue(manifest.materialProjection.contains("priceMoveBand=0"))
+        assertTrue(manifest.materialProjection.isEmpty())
         assertFalse(manifest.materialProjection.contains("sourceTimestamp"))
     }
 
     @Test
-    fun openEpisodeThresholdOverridesChangedRuntimeConfig() = runBlocking {
+    fun preProposerManifestIgnoresSymbolOnlyEpisodeContext() = runBlocking {
         val config = TradingBotConfig(daemon = LlmDaemonConfig(priceMoveThresholdRatio = BigDecimal("0.50")))
         val fixture = runnerFixture(
             config = config,
@@ -268,8 +268,8 @@ class OneShotLlmRunnerTest {
         val manifest = assertNotNull(
             fixture.runtime.decisionMaterialStateRepository.find("fixed-threshold-run").getOrThrow(),
         )
-        assertEquals(BigDecimal("0.02"), manifest.priceMoveThresholdRatio)
-        assertTrue(manifest.materialProjection.contains("priceMoveBand=1"))
+        assertEquals(BigDecimal("0.50"), manifest.priceMoveThresholdRatio)
+        assertTrue(manifest.materialProjection.isEmpty())
     }
 
     @Test

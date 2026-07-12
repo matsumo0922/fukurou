@@ -935,29 +935,6 @@ private fun JdbcTransaction.selectLlmPhaseUsages(period: EvaluationPeriod, limit
     }
 }
 
-private fun JdbcTransaction.selectKillCriterionStats(): KillCriterionStats {
-    return jdbcConnection().prepareStatement(SELECT_KILL_CRITERION_STATS_SQL).use { statement ->
-        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
-        statement.executeQuery().use { resultSet ->
-            require(resultSet.next()) { "kill criterion stats aggregate did not return a row." }
-
-            val closedTrades = resultSet.getInt(1)
-            val winningPnl = resultSet.getBigDecimal(2) ?: BigDecimal.ZERO
-            val losingPnl = resultSet.getBigDecimal(3) ?: BigDecimal.ZERO
-            val profitFactor = if (losingPnl < BigDecimal.ZERO) {
-                winningPnl.divide(losingPnl.abs(), EVALUATION_SQL_SCALE, java.math.RoundingMode.HALF_UP)
-            } else {
-                null
-            }
-
-            KillCriterionStats(
-                closedTrades = closedTrades,
-                profitFactor = profitFactor,
-            )
-        }
-    }
-}
-
 private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod): DeduplicationMetrics {
     val sql = """WITH boundary AS (
         SELECT activated_at FROM decision_identity_schema_boundaries WHERE schema_version = 1
