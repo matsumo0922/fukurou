@@ -243,7 +243,7 @@ export interface paths {
         };
         /**
          * 評価サマリーを取得する
-         * @description market-data gap の評価除外を適用した PF、勝率、期待 R、行動率、相場局面別成績と除外理由を返します。
+         * @description market-data gap の評価除外を適用した成績と、episode 単位の決定論的 false-suppression proxy を返します。proxy の率は false / (false + valid) で、pending / unknown は率から除外します。
          */
         get: {
             parameters: {
@@ -2408,6 +2408,25 @@ export interface components {
                 [key: string]: number;
             };
         };
+        /** DeduplicationResponse */
+        DeduplicationResponse: {
+            decisionIdentityCoverage?: number | null;
+            intentIdentityCoverage?: number | null;
+            shadowClassificationCoverage?: number | null;
+            classificationCounts?: {
+                [key: string]: number;
+            };
+            rawSuppressedHeartbeatCount?: number;
+            uniqueEpisodeCount?: number;
+            falseSuppressionRate?: number | null;
+            falseSuppressionCount?: number;
+            validSuppressionCount?: number;
+            resolvedCount?: number;
+            pendingCount?: number;
+            unknownCount?: number;
+            restingOnlyDaemonFullRunCount?: number;
+            manualFullRunCount?: number;
+        };
         /** EvaluationMarketRegimeResponse */
         EvaluationMarketRegimeResponse: {
             trend: string;
@@ -2424,6 +2443,7 @@ export interface components {
             killCriterion: components["schemas"]["EvaluationKillCriterionResponse"];
             runRates: components["schemas"]["EvaluationRunRatesResponse"];
             exclusions?: components["schemas"]["EvaluationExclusionSummaryResponse"];
+            deduplication?: components["schemas"]["DeduplicationResponse"];
             marketRegimes: components["schemas"]["EvaluationMarketRegimeResponse"][];
         };
         /** EvaluationSetupResponse */

@@ -979,6 +979,7 @@ private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod)
             check(result.next())
             val classificationCounts = selectClassificationCounts(period)
             val resolutionCounts = selectResolutionCounts(period)
+            val launchCounts = selectDedupeLaunchCounts(period)
             DeduplicationMetrics(
                 decisionEligible = result.getInt(1),
                 decisionComplete = result.getInt(2),
@@ -993,6 +994,8 @@ private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod)
                 validSuppressionCount = resolutionCounts["VALID_SUPPRESSION_PROXY"] ?: 0,
                 pendingCount = resolutionCounts["PENDING"] ?: 0,
                 unknownCount = resolutionCounts["UNKNOWN_DATA"] ?: 0,
+                restingOnlyDaemonFullRunCount = launchCounts.restingOnlyDaemon,
+                manualFullRunCount = launchCounts.manual,
             )
         }
     }
@@ -1012,15 +1015,54 @@ private fun JdbcTransaction.selectClassificationCounts(period: EvaluationPeriod)
 }
 
 private fun JdbcTransaction.selectResolutionCounts(period: EvaluationPeriod): Map<String, Int> {
-    val sql = """SELECT resolution, COUNT(DISTINCT o.opportunity_episode_id)
-        FROM dedupe_shadow_resolutions r JOIN dedupe_shadow_observations o ON o.id = r.observation_id
-        WHERE r.resolved_at >= ? AND r.resolved_at < ? GROUP BY resolution
+    val sql = """WITH episode_facts AS (
+        SELECT o.opportunity_episode_id,
+          BOOL_OR(o.invalidation_state = 'INVALIDATED' OR o.old_material_state_hash IS DISTINCT FROM o.new_material_state_hash) AS false_proxy,
+          BOOL_OR(o.data_quality <> 'COMPLETE' OR o.invalidation_state = 'UNKNOWN_DATA') AS unknown_data,
+          MAX(e.closed_at) AS closed_at
+        FROM dedupe_shadow_observations o
+        LEFT JOIN opportunity_episodes e ON e.id = o.opportunity_episode_id
+        WHERE o.observed_at >= ? AND o.observed_at < ? AND o.opportunity_episode_id IS NOT NULL
+        GROUP BY o.opportunity_episode_id
+      ), folded AS (
+        SELECT CASE
+          WHEN false_proxy THEN 'FALSE_SUPPRESSION_PROXY'
+          WHEN unknown_data THEN 'UNKNOWN_DATA'
+          WHEN closed_at IS NULL THEN 'PENDING'
+          ELSE 'VALID_SUPPRESSION_PROXY'
+        END AS resolution FROM episode_facts
+      ) SELECT resolution, COUNT(*) FROM folded GROUP BY resolution
     """.trimIndent()
     return jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setLong(1, period.from.toEpochMilli())
         statement.setLong(2, period.toExclusive.toEpochMilli())
         statement.executeQuery().use { result ->
             buildMap { while (result.next()) put(result.getString(1), result.getInt(2)) }
+        }
+    }
+}
+
+private data class DedupeLaunchCounts(val restingOnlyDaemon: Int, val manual: Int)
+
+private fun JdbcTransaction.selectDedupeLaunchCounts(period: EvaluationPeriod): DedupeLaunchCounts {
+    val sql = """SELECT
+      COUNT(*) FILTER (WHERE payload LIKE '%\"triggerKind\":\"MANUAL\"%'),
+      COUNT(*) FILTER (
+        WHERE payload NOT LIKE '%\"triggerKind\":\"MANUAL\"%'
+        AND EXISTS (
+          SELECT 1 FROM dedupe_shadow_observations o
+          WHERE o.observation_kind = 'RESTING_MAINTENANCE'
+          AND ABS(o.observed_at - command_event_log.occurred_at) <= 1000
+        )
+      ) FROM command_event_log
+      WHERE event_type = 'DAEMON_TRIGGER_LAUNCHED' AND occurred_at >= ? AND occurred_at < ?
+    """.trimIndent()
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setLong(1, period.from.toEpochMilli())
+        statement.setLong(2, period.toExclusive.toEpochMilli())
+        statement.executeQuery().use { result ->
+            check(result.next())
+            DedupeLaunchCounts(restingOnlyDaemon = result.getInt(2), manual = result.getInt(1))
         }
     }
 }

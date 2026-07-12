@@ -213,7 +213,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         )
     }.describe {
         summary = "評価サマリーを取得する"
-        description = "market-data gap の評価除外を適用した PF、勝率、期待 R、行動率、相場局面別成績と除外理由を返します。"
+        description = "market-data gap の評価除外を適用した成績と、episode 単位の決定論的 false-suppression proxy を返します。proxy の率は false / (false + valid) で、pending / unknown は率から除外します。"
         tag(EVALUATION_TAG)
         parameters {
             query("epochId") {
@@ -774,6 +774,7 @@ data class DeduplicationResponse(
     val pendingCount: Int = 0,
     val unknownCount: Int = 0,
     val restingOnlyDaemonFullRunCount: Int = 0,
+    val manualFullRunCount: Int = 0,
 ) {
     companion object {
         fun from(metrics: me.matsumo.fukurou.trading.evaluation.DeduplicationMetrics): DeduplicationResponse {
@@ -794,6 +795,7 @@ data class DeduplicationResponse(
                 pendingCount = metrics.pendingCount,
                 unknownCount = metrics.unknownCount,
                 restingOnlyDaemonFullRunCount = metrics.restingOnlyDaemonFullRunCount,
+                manualFullRunCount = metrics.manualFullRunCount,
             )
         }
 

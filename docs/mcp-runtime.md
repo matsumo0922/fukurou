@@ -56,6 +56,8 @@ production CLI が登録する command / args:
 
 ## one-shot runner
 
+新しい `ENTER` / `ADD_LONG` は `trade_plan_invalidation_predicates` を1件以上持つ。predicate は bounded enum と typed threshold で表現し、自然言語の `trade_plan_invalidation_conditions_ja` は人間向け監査情報として併存する。legacy decision の空 predicate は自然言語から推測せず、評価不能として扱う。
+
 手動の 1 回実行は production image 内の fixed launcher、manifest directory、root-only password file が揃う場合だけ起動する。`:trading:runOneShotLlm` は launcher 未導入のhost local checkoutではDB credentialへfallbackせずfail closedになる。runner coreは `:trading` の `me.matsumo.fukurou.trading.invoker` / `me.matsumo.fukurou.trading.runner` に置く。
 
 `gradle.properties` で configuration cache が有効なため、env を変えて手動再実行する場合は `--no-configuration-cache` を付ける。Ktor 常駐 daemon は Gradle を経由せず、同一 process 内から runner core を直接呼ぶ。

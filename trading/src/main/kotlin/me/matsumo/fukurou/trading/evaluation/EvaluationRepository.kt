@@ -186,6 +186,7 @@ data class DeduplicationMetrics(
     val pendingCount: Int = 0,
     val unknownCount: Int = 0,
     val restingOnlyDaemonFullRunCount: Int = 0,
+    val manualFullRunCount: Int = 0,
 )
 
 /** immutable evaluation report の DB snapshot facts。 */

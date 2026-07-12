@@ -87,6 +87,7 @@ type DeduplicationTelemetry = {
   decisionIdentityCoverage: number | null;
   intentIdentityCoverage: number | null;
   shadowClassificationCoverage: number | null;
+  classificationCounts: Record<string, number>;
   falseSuppressionRate: number | null;
   falseSuppressionCount: number;
   validSuppressionCount: number;
@@ -94,6 +95,7 @@ type DeduplicationTelemetry = {
   pendingCount: number;
   unknownCount: number;
   restingOnlyDaemonFullRunCount: number;
+  manualFullRunCount: number;
 };
 
 function DeduplicationPanel({ evaluationQuery }: { evaluationQuery: UseQueryResult<EvaluationSummaryResponse, Error> }) {
@@ -115,7 +117,13 @@ function DeduplicationPanel({ evaluationQuery }: { evaluationQuery: UseQueryResu
         { label: t("overview.label.intentIdentityCoverage"), value: formatRatioAsPercent(deduplication.intentIdentityCoverage?.toString()) },
         { label: t("overview.label.shadowCoverage"), value: formatRatioAsPercent(deduplication.shadowClassificationCoverage?.toString()) },
         { label: t("overview.label.falseSuppression"), value: formatRatioAsPercent(deduplication.falseSuppressionRate?.toString()) },
+        { label: t("overview.label.falseValid"), value: `${deduplication.falseSuppressionCount} / ${deduplication.validSuppressionCount}` },
         { label: t("overview.label.pendingUnknown"), value: `${deduplication.pendingCount} / ${deduplication.unknownCount}` },
+        { label: t("overview.label.maintainPending"), value: String(deduplication.classificationCounts.MAINTAIN_PENDING ?? 0) },
+        { label: t("overview.label.revise"), value: String(deduplication.classificationCounts.REVISE ?? 0) },
+        { label: t("overview.label.cancelReplace"), value: String(deduplication.classificationCounts.CANCEL_REPLACE ?? 0) },
+        { label: t("overview.label.newEpisode"), value: String(deduplication.classificationCounts.NEW_EPISODE ?? 0) },
+        { label: t("overview.label.manualFullRuns"), value: String(deduplication.manualFullRunCount) },
       ]} />
     </Panel>
   );
