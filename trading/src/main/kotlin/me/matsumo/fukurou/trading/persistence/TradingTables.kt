@@ -1052,6 +1052,21 @@ object DecisionsTable : Table("decisions") {
      */
     val id = uuid("id")
 
+    /** server-owned opportunity episode ID。 */
+    val opportunityEpisodeId = uuid("opportunity_episode_id").nullable()
+
+    /** canonical thesis ID。 */
+    val thesisId = varchar("thesis_id", 80).nullable()
+
+    /** canonical order geometry hash。 */
+    val geometryHash = varchar("geometry_hash", 80).nullable()
+
+    /** versioned material state hash。 */
+    val materialStateHash = varchar("material_state_hash", 80).nullable()
+
+    /** identity schema version。 */
+    val identitySchemaVersion = integer("identity_schema_version").nullable()
+
     /**
      * daemon / CLI 起動単位の ID。
      */
@@ -1215,6 +1230,21 @@ object TradeIntentsTable : Table("trade_intents") {
      * intent ID。
      */
     val id = uuid("id")
+
+    /** server-owned opportunity episode ID。 */
+    val opportunityEpisodeId = uuid("opportunity_episode_id").nullable()
+
+    /** canonical thesis ID。 */
+    val thesisId = varchar("thesis_id", 80).nullable()
+
+    /** canonical order geometry hash。 */
+    val geometryHash = varchar("geometry_hash", 80).nullable()
+
+    /** versioned material state hash。 */
+    val materialStateHash = varchar("material_state_hash", 80).nullable()
+
+    /** identity schema version。 */
+    val identitySchemaVersion = integer("identity_schema_version").nullable()
 
     /**
      * 紐づく decision ID。

@@ -18,6 +18,8 @@ import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanRecord
+import me.matsumo.fukurou.trading.decision.identity.DecisionIdentity
+import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
 import me.matsumo.fukurou.trading.decision.validateDecisionSubmission
 import me.matsumo.fukurou.trading.decision.validateTradePlanLineage
@@ -41,6 +43,11 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 private const val INSERT_DECISION_SQL = """
     INSERT INTO decisions (
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         invocation_id,
         llm_provider,
         prompt_hash,
@@ -60,7 +67,7 @@ private const val INSERT_DECISION_SQL = """
         no_trade_conditions_ja,
         created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 /**
@@ -89,6 +96,11 @@ private const val INSERT_TRADE_PLAN_SQL = """
 private const val INSERT_TRADE_INTENT_SQL = """
     INSERT INTO trade_intents (
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         decision_id,
         trade_plan_id,
         symbol,
@@ -101,7 +113,7 @@ private const val INSERT_TRADE_INTENT_SQL = """
         estimated_win_probability,
         created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 /**
@@ -138,6 +150,11 @@ private const val INSERT_TRADE_INTENT_CONSUMPTION_SQL = """
 private const val SELECT_TRADE_INTENT_BY_ID_SQL = """
     SELECT
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         decision_id,
         trade_plan_id,
         symbol,
@@ -159,6 +176,11 @@ private const val SELECT_TRADE_INTENT_BY_ID_SQL = """
 private const val SELECT_TRADE_INTENT_BY_DECISION_ID_SQL = """
     SELECT
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         decision_id,
         trade_plan_id,
         symbol,
@@ -224,6 +246,11 @@ private const val SELECT_TRADE_PLAN_BY_DECISION_ID_SQL = """
 private const val SELECT_LATEST_DECISION_BY_INVOCATION_ID_SQL = """
     SELECT
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         invocation_id,
         llm_provider,
         prompt_hash,
@@ -254,6 +281,11 @@ private const val SELECT_LATEST_DECISION_BY_INVOCATION_ID_SQL = """
 private const val SELECT_DECISIONS_CREATED_BETWEEN_SQL = """
     SELECT
         latest_decisions.id,
+        latest_decisions.opportunity_episode_id,
+        latest_decisions.thesis_id,
+        latest_decisions.geometry_hash,
+        latest_decisions.material_state_hash,
+        latest_decisions.identity_schema_version,
         latest_decisions.invocation_id,
         latest_decisions.llm_provider,
         latest_decisions.prompt_hash,
@@ -275,6 +307,11 @@ private const val SELECT_DECISIONS_CREATED_BETWEEN_SQL = """
     FROM (
         SELECT
             id,
+            opportunity_episode_id,
+            thesis_id,
+            geometry_hash,
+            material_state_hash,
+            identity_schema_version,
             invocation_id,
             llm_provider,
             prompt_hash,
@@ -308,6 +345,11 @@ private const val SELECT_DECISIONS_CREATED_BETWEEN_SQL = """
 private const val SELECT_DECISIONS_FOR_STABLE_FEED_SQL_PREFIX = """
     SELECT
         id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
         invocation_id,
         llm_provider,
         prompt_hash,
@@ -558,10 +600,18 @@ private fun JdbcTransaction.insertDecisionSubmission(
 
     validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
 
+    val identity = submission.entryIntent?.let { intent ->
+        submission.tradePlan?.let { plan ->
+            submission.marketSnapshotId?.let { materialProjection ->
+                DecisionIdentityGenerator.generate(UUID.randomUUID(), plan, intent, materialProjection)
+            }
+        }
+    }
     val decision = DecisionRecord(
         decisionId = UUID.randomUUID(),
         submission = submission,
         createdAt = now,
+        identity = identity,
     )
     val tradePlan = submission.tradePlan?.let { draft ->
         TradePlanRecord(
@@ -581,6 +631,7 @@ private fun JdbcTransaction.insertDecisionSubmission(
             draft = draft,
             estimatedWinProbability = submission.estimatedWinProbability,
             createdAt = now,
+            identity = identity,
         )
     }
 
@@ -633,26 +684,32 @@ private fun JdbcTransaction.insertFalsificationSubmission(
 private fun JdbcTransaction.insertDecision(record: DecisionRecord) {
     jdbcConnection().prepareStatement(INSERT_DECISION_SQL).use { statement ->
         val submission = record.submission
+        val identity = record.identity
 
         statement.setObject(1, record.decisionId)
-        statement.setNullableString(2, submission.invocationId)
-        statement.setNullableString(3, submission.llmProvider)
-        statement.setNullableString(4, submission.promptHash)
-        statement.setNullableString(5, submission.systemPromptVersion)
-        statement.setNullableString(6, submission.marketSnapshotId)
-        statement.setString(7, submission.action.name)
-        statement.setNullableBigDecimal(8, submission.closeRatio)
-        statement.setString(9, submission.setupTags.toJsonText())
-        statement.setBigDecimal(10, submission.estimatedWinProbability)
-        statement.setNullableBigDecimal(11, submission.expectedRMultiple)
-        statement.setNullableBigDecimal(12, submission.roundTripCostR)
-        statement.setString(13, submission.toolEvidenceIds.toJsonText())
-        statement.setString(14, submission.factCheckJson)
-        statement.setString(15, submission.selfReviewJson)
-        statement.setString(16, submission.reasonJa)
-        statement.setString(17, submission.missingDataJa.toJsonText())
-        statement.setString(18, submission.noTradeConditionsJa.toJsonText())
-        statement.setLong(19, record.createdAt.toEpochMilli())
+        statement.setObject(2, identity?.opportunityEpisodeId)
+        statement.setNullableString(3, identity?.thesisId)
+        statement.setNullableString(4, identity?.geometryHash)
+        statement.setNullableString(5, identity?.materialStateHash)
+        statement.setObject(6, identity?.schemaVersion)
+        statement.setNullableString(7, submission.invocationId)
+        statement.setNullableString(8, submission.llmProvider)
+        statement.setNullableString(9, submission.promptHash)
+        statement.setNullableString(10, submission.systemPromptVersion)
+        statement.setNullableString(11, submission.marketSnapshotId)
+        statement.setString(12, submission.action.name)
+        statement.setNullableBigDecimal(13, submission.closeRatio)
+        statement.setString(14, submission.setupTags.toJsonText())
+        statement.setBigDecimal(15, submission.estimatedWinProbability)
+        statement.setNullableBigDecimal(16, submission.expectedRMultiple)
+        statement.setNullableBigDecimal(17, submission.roundTripCostR)
+        statement.setString(18, submission.toolEvidenceIds.toJsonText())
+        statement.setString(19, submission.factCheckJson)
+        statement.setString(20, submission.selfReviewJson)
+        statement.setString(21, submission.reasonJa)
+        statement.setString(22, submission.missingDataJa.toJsonText())
+        statement.setString(23, submission.noTradeConditionsJa.toJsonText())
+        statement.setLong(24, record.createdAt.toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -679,19 +736,25 @@ private fun JdbcTransaction.insertTradePlan(record: TradePlanRecord) {
 private fun JdbcTransaction.insertTradeIntent(record: TradeIntentRecord) {
     jdbcConnection().prepareStatement(INSERT_TRADE_INTENT_SQL).use { statement ->
         val draft = record.draft
+        val identity = record.identity
 
         statement.setObject(1, record.intentId)
-        statement.setObject(2, record.decisionId)
-        statement.setObject(3, record.tradePlanId)
-        statement.setString(4, draft.symbol.apiSymbol)
-        statement.setString(5, draft.side.name)
-        statement.setString(6, draft.orderType.name)
-        statement.setBigDecimal(7, draft.sizeBtc)
-        statement.setNullableBigDecimal(8, draft.priceJpy)
-        statement.setBigDecimal(9, draft.protectiveStopPriceJpy)
-        statement.setNullableBigDecimal(10, draft.takeProfitPriceJpy)
-        statement.setBigDecimal(11, record.estimatedWinProbability)
-        statement.setLong(12, record.createdAt.toEpochMilli())
+        statement.setObject(2, identity?.opportunityEpisodeId)
+        statement.setNullableString(3, identity?.thesisId)
+        statement.setNullableString(4, identity?.geometryHash)
+        statement.setNullableString(5, identity?.materialStateHash)
+        statement.setObject(6, identity?.schemaVersion)
+        statement.setObject(7, record.decisionId)
+        statement.setObject(8, record.tradePlanId)
+        statement.setString(9, draft.symbol.apiSymbol)
+        statement.setString(10, draft.side.name)
+        statement.setString(11, draft.orderType.name)
+        statement.setBigDecimal(12, draft.sizeBtc)
+        statement.setNullableBigDecimal(13, draft.priceJpy)
+        statement.setBigDecimal(14, draft.protectiveStopPriceJpy)
+        statement.setNullableBigDecimal(15, draft.takeProfitPriceJpy)
+        statement.setBigDecimal(16, record.estimatedWinProbability)
+        statement.setLong(17, record.createdAt.toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -859,6 +922,7 @@ private fun ResultSet.toDecisionRecord(): DecisionRecord {
             tradePlan = null,
         ),
         createdAt = Instant.ofEpochMilli(getLong("created_at")),
+        identity = toDecisionIdentity(),
     )
 }
 
@@ -896,7 +960,18 @@ private fun ResultSet.toTradeIntentRecord(): TradeIntentRecord {
         ),
         estimatedWinProbability = getBigDecimal("estimated_win_probability"),
         createdAt = Instant.ofEpochMilli(getLong("created_at")),
+        identity = toDecisionIdentity(),
     )
+}
+
+private fun ResultSet.toDecisionIdentity(): DecisionIdentity? {
+    val episodeId = getNullableUuid("opportunity_episode_id") ?: return null
+    val thesisId = getString("thesis_id") ?: return null
+    val geometryHash = getString("geometry_hash") ?: return null
+    val materialStateHash = getString("material_state_hash") ?: return null
+    val schemaVersion = getObject("identity_schema_version") as? Int ?: return null
+
+    return DecisionIdentity(episodeId, thesisId, geometryHash, materialStateHash, schemaVersion)
 }
 
 private fun ResultSet.toFalsificationRecord(): FalsificationRecord {

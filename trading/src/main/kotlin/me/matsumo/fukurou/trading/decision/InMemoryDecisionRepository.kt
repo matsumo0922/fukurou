@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.decision
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import java.math.BigDecimal
@@ -54,10 +55,18 @@ class InMemoryDecisionRepository(
 
                 validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
 
+                val identity = submission.entryIntent?.let { intent ->
+                    submission.tradePlan?.let { plan ->
+                        submission.marketSnapshotId?.let { materialProjection ->
+                            DecisionIdentityGenerator.generate(UUID.randomUUID(), plan, intent, materialProjection)
+                        }
+                    }
+                }
                 val decision = DecisionRecord(
                     decisionId = UUID.randomUUID(),
                     submission = submission,
                     createdAt = now,
+                    identity = identity,
                 )
                 val tradePlan = submission.tradePlan?.toRecord(decision.decisionId, now)
                 val tradeIntent = submission.entryIntent?.toRecord(
@@ -67,7 +76,7 @@ class InMemoryDecisionRepository(
                     },
                     estimatedWinProbability = submission.estimatedWinProbability,
                     createdAt = now,
-                )
+                )?.copy(identity = identity)
 
                 decisions += decision
                 tradePlan?.let { record -> tradePlans += record }

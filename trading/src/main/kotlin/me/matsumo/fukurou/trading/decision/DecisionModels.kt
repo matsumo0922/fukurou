@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.decision
 
+import me.matsumo.fukurou.trading.decision.identity.DecisionIdentity
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -129,6 +130,7 @@ data class DecisionRecord(
     val decisionId: UUID,
     val submission: DecisionSubmission,
     val createdAt: Instant,
+    val identity: DecisionIdentity? = null,
 )
 
 /**
@@ -169,6 +171,7 @@ data class TradeIntentRecord(
     val draft: EntryIntentDraft,
     val estimatedWinProbability: BigDecimal,
     val createdAt: Instant,
+    val identity: DecisionIdentity? = null,
 )
 
 /**
