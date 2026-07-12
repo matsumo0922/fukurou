@@ -275,22 +275,42 @@ scripts/prod-curl /ops/runtime-config
 
 ### Phase 0: 旧imageをquiescentにする
 
-1. WebUI `/app/config` で `daemon.enabled=false` のdraftを作成し、validateしてactive化する。Ktorを再起動し、`/ops/runtime-config`でeffective valueがfalseであることを確認する。旧imageは`llm.launchEnabled`を認識しないため、この段階でglobal gateを設定しようとしない。
-2. Phase 0開始後は`POST /ops/trigger`を呼ばず、`OneShotRunnerMain`も直接実行しない。運用上のlaunch禁止を維持したまま、`pgrep -fa OneShotRunnerMain`が空であることを確認する。
+1. WebUI `/app/config` で `daemon.enabled=false` のdraftを作成し、validateしてactive化する。Ktorを再起動し、`/ops/runtime-config`でeffective valueがfalseであることと、再起動後にscheduler workerが作成されず新しい`DAEMON_STARTED` auditが記録されないことを確認する。旧imageは`llm.launchEnabled`を認識しないため、この段階でglobal gateを設定しようとしない。
+2. Phase 0開始後は`POST /ops/trigger`を呼ばず、`OneShotRunnerMain`も直接実行しない。scheduler worker不在と運用上のlaunch禁止を維持したまま、`pgrep -fa OneShotRunnerMain`が空であることを確認する。
 3. maintenance connectionで `SELECT count(*) FROM llm_launch_reservations WHERE status='RUNNING';` と `SELECT count(*) FROM llm_runs WHERE status='RUNNING';` がどちらも0であることを確認する。0になるまでdeploy、role provision、credential rotationへ進まない。
 
 ### Phase 1: 新imageのglobal gate配下で移行する
 
 4. root:root 0400 の `/srv/fukurou/secrets/fukurou_mcp_db_password` を dummy ではない新規値で作成し、値を shell history、log、PR に出さない。provision時のpsql変数解釈を単純に保つため、十分な長さの英数字だけで生成する。
 5. 対象 SHA の新imageを `sudo /usr/local/sbin/deploy-fukurou <commit-sha>` でdeployする。欠落している`llm.launchEnabled`はbootstrapによってfalseでactive snapshotへ追加される。Ktor startupの`TradingPersistenceBootstrap`がMCP evaluation viewを作成するまでrole provisioningを実行しない。
-6. `sudo docker run --rm --network fukurou_edge curlimages/curl -fsS http://ktor:8080/health/ready` を実行し、maintenance connectionでrequired viewの存在を確認する。`/ops/runtime-config`で`llm.launchEnabled`のactive valueとeffective valueがともにfalseであることを確認する。
-7. scheduler auditが`LLM_LAUNCH_DISABLED`でskipすること、`POST /ops/trigger`が同reasonの409を返すこと、direct `OneShotRunnerMain`がchild processやMCP credentialを使う前にnon-zeroで終了することを確認する。その後、手順3のRUNNING 0 queryと`pgrep`を再実行する。
+6. `sudo docker run --rm --network fukurou_edge curlimages/curl -fsS http://ktor:8080/health/ready` を実行し、maintenance connectionでrequired viewの存在を確認する。`/ops/runtime-config`で`daemon.enabled`と`llm.launchEnabled`のactive valueとeffective valueがすべてfalseであることを確認する。`daemon.enabled=false`なのでscheduler workerは作成されず、新しい`DAEMON_STARTED` auditも記録されない。
+7. `POST /ops/trigger`が`LLM_LAUNCH_DISABLED`の409を返すこと、direct `OneShotRunnerMain`がchild processやMCP credentialを使う前にnon-zeroで終了することを確認する。scheduler workerは不在なので`LLM_LAUNCH_DISABLED`のscheduler skip auditを期待しない。その後、手順3のRUNNING 0 queryと`pgrep`を再実行する。
 8. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を実行し、`fukurou_mcp` roleをprovisionする。preflightまたは権限不足ではtransaction全体が失敗するため、gateをOFFのまま維持する。
 9. `scripts/mcp-credential-isolation-check <exact-image>`、paper smoke、knowledge toolsを含むrequired MCP call matrixを実行する。role flag、membership、ownership、effective grantも確認する。
 10. canary scan 完了後、旧 shared `config.toml` と session artifact を auth source から分離して削除する。
 11. running Ktor containerの`/run/fukurou/llm-homes`がtmpfsであることを`docker inspect`で確認する。旧`fukurou_llm-runs` volumeが残っている場合は、一時containerへread-only mountして残存per-run auth copy、session、quarantine artifactを監査し、必要な証跡を保存してから`fukurou_llm-runs`だけを削除する。永続auth sourceの`fukurou_llm-auth`とDBの`fukurou_pgdata`は削除しない。
 12. app の旧 credential を PostgreSQL と NAS `.env` で同時に rotateし、Ktor containerを再起動して新しい値を反映する。旧 credentialで接続できないことを確認する。
-13. credential rotation後にも手順3のRUNNING 0 queryと`pgrep`を実行する。証跡を保存してからWebUIで`llm.launchEnabled=true`をdraft、validate、active化し、Ktor再起動後にactive valueとeffective valueがともにtrueであることを確認する。必要なら`daemon.enabled=true`も別途active化し、全launch surfaceを再開する。
+13. credential rotation後にも手順3のRUNNING 0 queryと`pgrep`を実行する。証跡を保存してから、次のように`llm.launchEnabled=true`と`daemon.enabled=true`を同一draftで作成し、validateしてactive化する。この2キーはどちらも`NEXT_RESTART`なので、別々のactive化や途中の再起動を行わない。
+
+    ```sh
+    draft_id="$(scripts/prod-curl \
+      /ops/runtime-config/drafts \
+      --json '{
+        "baseVersionId": null,
+        "values": {
+          "llm.launchEnabled": "true",
+          "daemon.enabled": "true"
+        },
+        "note": "resume LLM launch surfaces after MCP credential isolation"
+      }' | jq -r '.version.id')"
+
+    scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/validate" \
+      --json '{"reason":"resume LLM launch surfaces after MCP credential isolation"}'
+    scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/activate" \
+      --json '{"reason":"resume LLM launch surfaces after MCP credential isolation"}'
+    ```
+
+14. Ktorを1回だけ再起動し、`/ops/runtime-config`で両キーのactive valueとeffective valueがすべてtrueであること、新しい`DAEMON_STARTED` auditによってscheduler workerの再開を確認する。承認済みのsmoke/canaryでmanualとdirectのlaunch surfaceが`LLM_LAUNCH_DISABLED`では拒否されず、reservation、起動上限、SafetyFloorなど通常の安全guardを通ることを確認する。
 
 role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolbypassrls` はすべて false、membership と object ownership は 0 であることを確認する。MCP の evaluation scope は `mcp_current_evaluation_scope` と `mcp_evaluation_epochs` view から account epoch、3つのbaseline、epoch kind、作成時刻だけを読み、secretを含み得る `runtime_config_versions` / `runtime_config_values` や `paper_account_epochs` への直接SELECTは許可しない。`llm_launch_reservations`、`equity_snapshots` と ledger の UPDATE/DELETE/TRUNCATE も拒否される。必要 call の permission failure は role SQL と inventory を修正して disposable test からやり直す。
 
