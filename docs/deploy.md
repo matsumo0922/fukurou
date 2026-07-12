@@ -310,7 +310,7 @@ scripts/prod-curl /ops/runtime-config
       --json '{"reason":"resume LLM launch surfaces after MCP credential isolation"}'
     ```
 
-14. Ktorを1回だけ再起動し、`/ops/runtime-config`で両キーのactive valueとeffective valueがすべてtrueであること、新しい`DAEMON_STARTED` auditによってscheduler workerの再開を確認する。承認済みのsmoke/canaryでmanualとdirectのlaunch surfaceが`LLM_LAUNCH_DISABLED`では拒否されず、reservation、起動上限、SafetyFloorなど通常の安全guardを通ることを確認する。
+14. Ktorを1回だけ再起動し、`/ops/runtime-config`で両キーのactive valueとeffective valueがすべてtrueであること、新しい`DAEMON_STARTED` auditと通常cycleによってscheduler workerの再開を確認する。production smokeはreservationを共有する`POST /ops/trigger`に限定し、`LLM_LAUNCH_DISABLED`では拒否されず、reservation、起動上限、SafetyFloorなど通常の安全guardを通ることを確認する。direct `OneShotRunnerMain`のgate ONは自動テストを正本とし、通常のmigration完了経路では実行しない。productionでdirect canaryが必要な場合だけ、`docs/mcp-runtime.md`のdirect runner maintenance境界に従ってschedulerと隔離する。
 
 role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolbypassrls` はすべて false、membership と object ownership は 0 であることを確認する。MCP の evaluation scope は `mcp_current_evaluation_scope` と `mcp_evaluation_epochs` view から account epoch、3つのbaseline、epoch kind、作成時刻だけを読み、secretを含み得る `runtime_config_versions` / `runtime_config_values` や `paper_account_epochs` への直接SELECTは許可しない。`llm_launch_reservations`、`equity_snapshots` と ledger の UPDATE/DELETE/TRUNCATE も拒否される。必要 call の permission failure は role SQL と inventory を修正して disposable test からやり直す。
 

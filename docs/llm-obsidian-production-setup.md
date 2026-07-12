@@ -154,6 +154,8 @@ LLM daemon を有効化する前に、少なくとも次を満たすこと。
 
 WebUI `/app/config` で `daemon.enabled=true` と `llm.launchEnabled=true` を同じ Runtime draft に設定し、validate / activate してからKtor processを1回再起動する。再起動後に両キーのeffective valueがtrueであることを確認し、その後、revisionとcontainer logを確認する。
 
+productionでの有効化確認はschedulerの通常cycleとreservationを共有する`POST /ops/trigger`に限定する。direct `OneShotRunnerMain`はschedulerと同時実行せず、必要な場合だけ`docs/mcp-runtime.md`のdirect runner maintenance境界で隔離して実行する。
+
 ```sh
 scripts/prod-curl "/revision" -fsS
 ssh dxp4800plus 'docker logs --since 10m fukurou-ktor | tail -200'
