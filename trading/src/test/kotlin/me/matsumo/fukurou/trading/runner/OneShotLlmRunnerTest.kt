@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -77,6 +78,8 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunRecord
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
@@ -90,6 +93,7 @@ import me.matsumo.fukurou.trading.invoker.ProcessRunner
 import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.safeCodexFailureOrNull
+import me.matsumo.fukurou.trading.market.GmoRateLimitException
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -126,6 +130,28 @@ import kotlin.test.assertTrue
  * OneShotLlmRunner の DB 正本 contract を検証するテスト。
  */
 class OneShotLlmRunnerTest {
+
+    @Test
+    fun runnerPreview_rateLimitExhaustionFailsClosedBeforePlaceOrder() = runBlocking {
+        val marketDataSource = RateLimitExhaustedOrderbookMarketDataSource()
+        val fixture = runnerFixture(marketDataSource = marketDataSource) { command ->
+            handleEnterAndApprovedFalsifier(fixtureRepository, command)
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val correlation = assertNotNull(marketDataSource.correlation)
+        val broker = fixture.runtime.broker as PaperBroker
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(GmoPublicClientRole.RUNNER, correlation.clientRole)
+        assertEquals(result.invocationId, correlation.decisionRunContext.decisionRunId)
+        assertTrue(correlation.toolCallId?.isNotBlank() == true)
+        assertEquals(1, marketDataSource.orderbookAttemptCount)
+        assertEquals(0, fixture.runtime.broker.getOpenOrders().getOrThrow().size)
+        assertEquals(0, fixture.runtime.broker.getPositions().getOrThrow().size)
+        assertEquals(0, broker.ledgerRepository.getExecutions().getOrThrow().size)
+        assertEquals(null, result.tradeResult)
+    }
 
     @Test
     fun cliConfigFromEnvironment_splitsQuotedMcpServerArgs() {
@@ -1827,11 +1853,12 @@ private fun runnerFixture(
     runtimeTransform: (TradingRuntime) -> TradingRuntime = { runtime -> runtime },
     logger: (String) -> Unit = {},
     clock: Clock = fixedClock(),
+    marketDataSource: MarketDataSource = FakeMarketDataSource,
     launchHandler: suspend (RenderedLlmCommand) -> ProcessRunResult,
 ): RunnerFixture {
     val baseRuntime = TradingRuntimeFactory.inMemory(
         clock = clock,
-        marketDataSource = FakeMarketDataSource,
+        marketDataSource = marketDataSource,
         tradingConfig = config,
     )
     val eventLog = baseRuntime.commandEventLog as InMemoryCommandEventLog
@@ -2778,6 +2805,20 @@ private object FakeMarketDataSource : MarketDataSource {
                 makerFee = "-0.0001",
             ),
         )
+    }
+}
+
+private class RateLimitExhaustedOrderbookMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    var correlation: GmoPublicRequestCorrelation? = null
+        private set
+    var orderbookAttemptCount: Int = 0
+        private set
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        orderbookAttemptCount += 1
+        correlation = currentCoroutineContext()[GmoPublicRequestCorrelation]
+
+        return Result.failure(GmoRateLimitException("GMO ORDERBOOK request was rate limited by HTTP_429."))
     }
 }
 

@@ -382,7 +382,6 @@ private data class LimitedToolDefinition(
  * MCP tool の上限制御で共有する実行文脈。
  *
  * @param decisionRunContext 呼び出し元の decision run context
- * @param environment MCP phase などの非 secret runtime environment
  * @param toolCallLimiter tool call 上限制御
  */
 private data class LimitedToolContext(
