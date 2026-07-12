@@ -65,7 +65,7 @@ class LlmDaemonSchedulerTest {
         val maintenanceCalls = mutableListOf<LlmDaemonOpenRiskSnapshot>()
         val snapshot = LlmDaemonOpenRiskSnapshot(
             openPositionCount = 0,
-            restingEntryOrders = listOf(restingEntryOrder()),
+            restingEntryOrders = listOf(restingEntryOrder(), restingEntryOrder()),
             otherOpenOrderCount = 0,
         )
         val fixture = schedulerFixture(
@@ -78,14 +78,43 @@ class LlmDaemonSchedulerTest {
         )
 
         val result = fixture.scheduler.tick()
+        fixture.scheduler.tick()
 
         assertEquals(
             LlmDaemonTickResult.Skipped("resting_order_unchanged", null),
             result,
         )
-        assertEquals(listOf(snapshot), maintenanceCalls)
+        assertEquals(listOf(snapshot, snapshot), maintenanceCalls)
         assertTrue(fixture.launches.isEmpty())
         assertTrue(preFilter.requests.isEmpty())
+        assertEquals(
+            1,
+            fixture.eventLog.events().count { event ->
+                event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED &&
+                    event.payload.contains("resting_order_unchanged")
+            },
+        )
+    }
+
+    @Test
+    fun positionAppearingDuringRestingMaintenanceDoesNotSuppressSafetyFullRun() = runBlocking {
+        var reads = 0
+        val resting = LlmDaemonOpenRiskSnapshot(0, listOf(restingEntryOrder()), 0)
+        val holding = LlmDaemonOpenRiskSnapshot(1, emptyList(), 0)
+        val fixture = schedulerFixture(
+            openRiskReader = {
+                reads += 1
+                Result.success(if (reads == 1) resting else holding)
+            },
+            restingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
+                Result.success(RestingSuppressionReason.RESTING_ORDER_STATE_RACE)
+            },
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, result.triggerKind)
     }
 
     @Test

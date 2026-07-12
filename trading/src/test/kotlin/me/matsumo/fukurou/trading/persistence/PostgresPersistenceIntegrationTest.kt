@@ -5678,6 +5678,87 @@ class PostgresPersistenceIntegrationTest {
         assertEquals("VALID_SUPPRESSION_PROXY", lifecycle.second)
         runtime.close()
     }
+
+    @Test
+    fun concurrent_entry_submissions_keep_one_open_episode_per_symbol() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runtime = TradingRuntimeFactory.connectedPostgres(
+            dataSource = dataSource,
+            database = database,
+            clock = fixedClock(),
+            marketDataSource = PostgresFakeMarketDataSource,
+            tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+        )
+        val repository = runtime.decisionRepository
+        listOf("same-a", "same-b", "other-a", "other-b").forEach { invocationId ->
+            appendIdentityManifest(runtime, invocationId)
+        }
+        val base = enterDecisionSubmission()
+
+        val sameResults = coroutineScope {
+            listOf("same-a", "same-b").map { invocationId ->
+                async { repository.submitDecision(base.copy(invocationId = invocationId)).getOrThrow() }
+            }.map { deferred -> deferred.await() }
+        }
+        assertEquals(
+            1,
+            sameResults.map { result -> requireNotNull(result.decision.identity).opportunityEpisodeId }.distinct().size,
+        )
+
+        coroutineScope {
+            listOf("other-a" to "breakout thesis", "other-b" to "reversal thesis").map { (invocationId, thesis) ->
+                async {
+                    repository.submitDecision(
+                        base.copy(
+                            invocationId = invocationId,
+                            tradePlan = requireNotNull(base.tradePlan).copy(thesisJa = thesis),
+                        ),
+                    ).getOrThrow()
+                }
+            }.map { deferred -> deferred.await() }
+        }
+        val openCount = exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                "SELECT COUNT(*) FROM opportunity_episodes WHERE symbol='BTC' AND closed_at IS NULL",
+            ).use { statement ->
+                statement.executeQuery().use { result ->
+                    result.next()
+                    result.getInt(1)
+                }
+            }
+        }
+        assertEquals(1, openCount)
+        runtime.close()
+    }
+}
+
+private suspend fun appendIdentityManifest(runtime: TradingRuntime, invocationId: String) {
+    runtime.decisionMaterialStateRepository.append(
+        DecisionMaterialStateManifest(
+            invocationId = invocationId,
+            capturedAt = fixedInstant(),
+            triggerKind = DecisionTriggerKind.DAEMON,
+            symbol = TradingSymbol.BTC.apiSymbol,
+            runtimeConfigVersion = null,
+            runtimeConfigHash = null,
+            riskState = "RUNNING",
+            bestBidJpy = BigDecimal("9999000"),
+            bestAskJpy = BigDecimal("10000000"),
+            lastPriceJpy = BigDecimal("10000000"),
+            sourceTimestamp = fixedInstant(),
+            freshness = MaterialFreshness.FRESH,
+            atr14FiveMinutesJpy = BigDecimal("100000"),
+            latestCandleOpenJpy = null,
+            latestCandleHighJpy = null,
+            latestCandleLowJpy = null,
+            latestCandleCloseJpy = null,
+            openPositionFacts = emptyList(),
+            openOrderFacts = emptyList(),
+            missingSources = emptyList(),
+            canonicalContentHash = "b".repeat(64),
+            materialProjection = "risk=RUNNING\npriceMoveBand=0",
+        ),
+    ).getOrThrow()
 }
 
 private fun assertLedgerLineage(database: ExposedDatabase, path: String) {

@@ -121,6 +121,8 @@ FROM (VALUES
     ('mcp_current_evaluation_scope'), ('mcp_evaluation_epochs')
 ) AS inventory(table_name) \gexec
 
+SELECT format('GRANT UPDATE (closed_at, close_reason) ON TABLE public.opportunity_episodes TO %I', :'mcp_role') \gexec
+
 SELECT format(
     'GRANT INSERT ON TABLE %s TO %I',
     string_agg(format('public.%I', table_name), ', '),
@@ -135,6 +137,7 @@ REVOKE EXECUTE ON FUNCTION pg_catalog.pg_try_advisory_lock(bigint) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_advisory_unlock(bigint) FROM PUBLIC;
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_try_advisory_lock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_unlock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
+SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
 
 SELECT format('REVOKE %I FROM %I', roleid::regrole, :'mcp_role')
 FROM pg_auth_members

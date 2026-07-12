@@ -36,4 +36,5 @@ data class DecisionMaterialStateManifest(
     val missingSources: List<MaterialMissingSource>,
     val schemaVersion: Int = 1,
     val canonicalContentHash: String,
+    val materialProjection: String = "",
 )

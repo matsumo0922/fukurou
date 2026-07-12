@@ -2411,6 +2411,7 @@ export interface components {
         /** DeduplicationResponse */
         DeduplicationResponse: {
             decisionIdentityCoverage?: number | null;
+            legacyExcludedCount?: number;
             intentIdentityCoverage?: number | null;
             shadowClassificationCoverage?: number | null;
             classificationCounts?: {

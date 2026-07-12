@@ -201,6 +201,8 @@ class LlmDaemonScheduler(
         warnLogger = warnLogger,
     )
     private val priceSamples = mutableListOf<LlmDaemonPriceSample>()
+    private var lastRestingSkipReason: RestingSuppressionReason? = null
+    private var lastRestingSkipMirroredAt: Instant? = null
 
     /**
      * daemon scheduler loop を開始する。
@@ -261,8 +263,8 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped(LLM_DAEMON_SKIP_HARD_HALT, null)
         }
 
-        val openRisk = openRiskReader.snapshot().getOrThrow()
-        val hasOpenRisk = openRisk.hasOpenRisk
+        var openRisk = openRiskReader.snapshot().getOrThrow()
+        var hasOpenRisk = openRisk.hasOpenRisk
 
         if (riskState.state == RiskHaltState.SOFT_HALT && !hasOpenRisk) {
             appendSkip(
@@ -279,13 +281,14 @@ class LlmDaemonScheduler(
                 .maintain(openRisk, observedAt)
                 .getOrThrow()
 
-            appendSkip(
-                reason = reason.wireCode,
-                trigger = null,
-                observedAt = observedAt,
-            ).getOrThrow()
-
-            return LlmDaemonTickResult.Skipped(reason.wireCode, null)
+            if (reason == RestingSuppressionReason.RESTING_ORDER_STATE_RACE) {
+                openRisk = openRiskReader.snapshot().getOrThrow()
+                hasOpenRisk = openRisk.hasOpenRisk
+            }
+            if (openRisk.openPositionCount == 0) {
+                appendRestingSkipIfDue(reason, observedAt).getOrThrow()
+                return LlmDaemonTickResult.Skipped(reason.wireCode, null)
+            }
         }
 
         val trigger = selectTrigger(hasOpenRisk, observedAt)
@@ -782,6 +785,19 @@ class LlmDaemonScheduler(
         )
     }
 
+    private suspend fun appendRestingSkipIfDue(reason: RestingSuppressionReason, observedAt: Instant): Result<Unit> {
+        val reasonChanged = reason != lastRestingSkipReason
+        val cadenceReached = lastRestingSkipMirroredAt?.let { previous ->
+            !observedAt.isBefore(previous.plus(daemonConfig.holdingCheckInterval))
+        } ?: true
+        if (!reasonChanged && !cadenceReached) return Result.success(Unit)
+
+        return appendSkip(reason.wireCode, null, observedAt).onSuccess {
+            lastRestingSkipReason = reason
+            lastRestingSkipMirroredAt = observedAt
+        }
+    }
+
     private suspend fun appendLaunched(
         trigger: LlmDaemonTrigger,
         invocationId: String,
@@ -799,6 +815,7 @@ class LlmDaemonScheduler(
                     put("triggerKey", trigger.key)
                     put("eventName", trigger.eventName)
                     put("invocationId", invocationId)
+                    put("restingOnly", false)
                     put("observedAt", observedAt.toString())
                     runtimeConfigSnapshot?.let { snapshot ->
                         put("runtimeConfigVersionId", snapshot.versionId)

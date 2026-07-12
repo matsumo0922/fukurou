@@ -960,18 +960,19 @@ private fun JdbcTransaction.selectKillCriterionStats(): KillCriterionStats {
 
 private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod): DeduplicationMetrics {
     val sql = """SELECT
-        (SELECT COUNT(*) FROM decisions WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<?),
-        (SELECT COUNT(*) FROM decisions WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
+        (SELECT COUNT(*) FROM decisions WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at >= COALESCE((SELECT MIN(captured_at) FROM decision_material_state_manifests), created_at)),
+        (SELECT COUNT(*) FROM decisions WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at >= COALESCE((SELECT MIN(captured_at) FROM decision_material_state_manifests), created_at) AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
         (SELECT COUNT(*) FROM trade_intents WHERE created_at>=? AND created_at<?),
         (SELECT COUNT(*) FROM trade_intents WHERE created_at>=? AND created_at<? AND opportunity_episode_id IS NOT NULL AND thesis_id IS NOT NULL AND geometry_hash IS NOT NULL AND material_state_hash IS NOT NULL AND identity_schema_version IS NOT NULL),
         (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<?),
-        (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<? AND classification IS NOT NULL),
+        (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<? AND classification IS NOT NULL AND opportunity_episode_id IS NOT NULL AND data_quality='COMPLETE'),
         (SELECT COUNT(DISTINCT opportunity_episode_id) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<?),
-        (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observation_kind='RESTING_MAINTENANCE' AND observed_at>=? AND observed_at<?)
+        (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observation_kind='RESTING_MAINTENANCE' AND observed_at>=? AND observed_at<?),
+        (SELECT COUNT(*) FROM decisions WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at < COALESCE((SELECT MIN(captured_at) FROM decision_material_state_manifests), created_at))
     """.trimIndent()
     return jdbcConnection().prepareStatement(sql).use { statement ->
         var index = 1
-        repeat(8) {
+        repeat(9) {
             statement.setLong(index++, period.from.toEpochMilli())
             statement.setLong(index++, period.toExclusive.toEpochMilli())
         }
@@ -989,6 +990,7 @@ private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod)
                 shadowComplete = result.getInt(6),
                 uniqueEpisodeCount = result.getInt(7),
                 rawSuppressedHeartbeatCount = result.getInt(8),
+                legacyExcludedCount = result.getInt(9),
                 classificationCounts = classificationCounts,
                 falseSuppressionCount = resolutionCounts["FALSE_SUPPRESSION_PROXY"] ?: 0,
                 validSuppressionCount = resolutionCounts["VALID_SUPPRESSION_PROXY"] ?: 0,
@@ -1019,7 +1021,7 @@ private fun JdbcTransaction.selectResolutionCounts(period: EvaluationPeriod): Ma
         SELECT o.opportunity_episode_id,
           BOOL_OR(o.invalidation_state = 'INVALIDATED' OR o.old_material_state_hash IS DISTINCT FROM o.new_material_state_hash) AS false_proxy,
           BOOL_OR(o.data_quality <> 'COMPLETE' OR o.invalidation_state = 'UNKNOWN_DATA') AS unknown_data,
-          MAX(e.closed_at) AS closed_at
+          MAX(e.closed_at) FILTER (WHERE e.closed_at < ?) AS closed_at
         FROM dedupe_shadow_observations o
         LEFT JOIN opportunity_episodes e ON e.id = o.opportunity_episode_id
         WHERE o.observed_at >= ? AND o.observed_at < ? AND o.opportunity_episode_id IS NOT NULL
@@ -1034,8 +1036,9 @@ private fun JdbcTransaction.selectResolutionCounts(period: EvaluationPeriod): Ma
       ) SELECT resolution, COUNT(*) FROM folded GROUP BY resolution
     """.trimIndent()
     return jdbcConnection().prepareStatement(sql).use { statement ->
-        statement.setLong(1, period.from.toEpochMilli())
-        statement.setLong(2, period.toExclusive.toEpochMilli())
+        statement.setLong(1, period.toExclusive.toEpochMilli())
+        statement.setLong(2, period.from.toEpochMilli())
+        statement.setLong(3, period.toExclusive.toEpochMilli())
         statement.executeQuery().use { result ->
             buildMap { while (result.next()) put(result.getString(1), result.getInt(2)) }
         }
@@ -1048,12 +1051,7 @@ private fun JdbcTransaction.selectDedupeLaunchCounts(period: EvaluationPeriod): 
     val sql = """SELECT
       COUNT(*) FILTER (WHERE payload LIKE '%\"triggerKind\":\"MANUAL\"%'),
       COUNT(*) FILTER (
-        WHERE payload NOT LIKE '%\"triggerKind\":\"MANUAL\"%'
-        AND EXISTS (
-          SELECT 1 FROM dedupe_shadow_observations o
-          WHERE o.observation_kind = 'RESTING_MAINTENANCE'
-          AND ABS(o.observed_at - command_event_log.occurred_at) <= 1000
-        )
+        WHERE payload LIKE '%\"restingOnly\":true%'
       ) FROM command_event_log
       WHERE event_type = 'DAEMON_TRIGGER_LAUNCHED' AND occurred_at >= ? AND occurred_at < ?
     """.trimIndent()

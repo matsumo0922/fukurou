@@ -1052,6 +1052,7 @@ object DecisionMaterialStateManifestsTable : Table("decision_material_state_mani
     val capturedAt = long("captured_at")
     val schemaVersion = integer("schema_version")
     val contentHash = varchar("content_hash", 64)
+    val materialProjection = text("material_projection").default("")
     val manifestJson = text("manifest_json")
     override val primaryKey = PrimaryKey(invocationId)
 }
@@ -1081,6 +1082,7 @@ object DedupeShadowObservationsTable : Table("dedupe_shadow_observations") {
     val invalidationState = varchar("invalidation_state", 32).nullable()
     val distanceJpy = decimal("distance_jpy", 24, 8).nullable()
     val signedDistanceBps = decimal("signed_distance_bps", 24, 8).nullable()
+    val atrPriceRatio = decimal("atr_price_ratio", 24, 12).nullable()
     val dataQuality = varchar("data_quality", 32)
     val observedAt = long("observed_at")
     override val primaryKey = PrimaryKey(id)

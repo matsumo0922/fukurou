@@ -66,8 +66,15 @@ import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.invoker.isCodexProvider
 import me.matsumo.fukurou.trading.invoker.readOptionalEnv
 import me.matsumo.fukurou.trading.invoker.splitCommandTemplate
+import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.market.IndicatorCalculator
+import me.matsumo.fukurou.trading.market.IndicatorParams
+import me.matsumo.fukurou.trading.market.IndicatorType
+import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.tool.CallerInvocation
+import java.math.BigDecimal
+import java.math.RoundingMode
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.withSuppressedFailure
 import java.nio.file.Files
@@ -276,6 +283,7 @@ class OneShotLlmRunner(
     private val tradingRuntime: TradingRuntime,
     private val tradingConfig: TradingBotConfig,
     private val llmInvoker: LlmInvoker,
+    private val materialMarketDataSource: MarketDataSource? = null,
     private val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     private val parentEnvironment: Map<String, String> = System.getenv(),
     private val clock: Clock = Clock.systemUTC(),
@@ -410,7 +418,10 @@ class OneShotLlmRunner(
     private suspend fun runOneShotBody(input: OneShotRunBodyInput): OneShotRunnerResult {
         runAuditRecorder.recordLlmRunStarted(input.llmRunStart)
 
-        captureMaterialManifest(input)
+        runCatching { captureMaterialManifest(input) }
+            .onFailure { throwable ->
+                logHuman("material manifest coverage miss invocation=${input.invocationId} cause=${throwable::class.simpleName}")
+            }
 
         val promptContent = requestFactory.readSystemPrompt(input.request.repositoryRoot)
         val promptHash = SystemPromptV1.calculateContentHash(promptContent)
@@ -458,6 +469,7 @@ class OneShotLlmRunner(
         )
     }
 
+    @Suppress("CyclomaticComplexMethod", "LongMethod")
     private suspend fun captureMaterialManifest(input: OneShotRunBodyInput) {
         val capturedAt = clock.instant()
         val riskState = tradingRuntime.riskStateRepository.current().getOrThrow()
@@ -469,13 +481,57 @@ class OneShotLlmRunner(
         val orderFacts = orders.map { order ->
             "${order.orderId}|${order.status}|${order.side}|${order.orderType}"
         }.distinct().sorted().take(64)
+        val ticker = materialMarketDataSource?.getTicker(tradingConfig.symbol)?.getOrNull()
+        val candles = materialMarketDataSource?.getCandles(
+            symbol = tradingConfig.symbol,
+            interval = CandleInterval.FIVE_MINUTES,
+            limit = 64,
+        )?.getOrNull()
+        val latestCandle = candles?.maxByOrNull { candle -> candle.openTime }
+        val atr = candles?.let { values ->
+            IndicatorCalculator.calculate(
+                candles = values,
+                indicator = IndicatorType.ATR,
+                params = IndicatorParams(period = 14),
+            ).getOrNull()?.values?.lastOrNull { value -> value.value != null }?.value?.let(BigDecimal::valueOf)
+        }
+        val sourceTimestamp = ticker?.timestamp?.let { value -> runCatching { Instant.parse(value) }.getOrNull() }
+        val freshness = when {
+            sourceTimestamp == null -> MaterialFreshness.UNKNOWN
+            Duration.between(sourceTimestamp, capturedAt) > MATERIAL_QUOTE_FRESHNESS -> MaterialFreshness.STALE
+            else -> MaterialFreshness.FRESH
+        }
+        val missingSources = buildList {
+            if (ticker == null) add(MaterialMissingSource("QUOTE", "FETCH_FAILED"))
+            if (sourceTimestamp == null) add(MaterialMissingSource("SOURCE_TIMESTAMP", "MISSING_OR_INVALID"))
+            if (candles == null) add(MaterialMissingSource("FIVE_MINUTE_CANDLES", "FETCH_FAILED"))
+            if (atr == null) add(MaterialMissingSource("ATR14", "UNAVAILABLE"))
+        }
+        val bid = ticker?.bid?.toBigDecimalOrNull()
+        val ask = ticker?.ask?.toBigDecimalOrNull()
+        val last = ticker?.last?.toBigDecimalOrNull()
         val canonical = listOf(
             "symbol=${tradingConfig.symbol.apiSymbol}",
             "risk=${riskState.state}",
+            "bid=${bid?.let(DecisionIdentityGenerator::canonicalDecimal) ?: "null"}",
+            "ask=${ask?.let(DecisionIdentityGenerator::canonicalDecimal) ?: "null"}",
+            "last=${last?.let(DecisionIdentityGenerator::canonicalDecimal) ?: "null"}",
+            "atr=${atr?.let(DecisionIdentityGenerator::canonicalDecimal) ?: "null"}",
+            "candle=${latestCandle?.let { "${it.open}|${it.high}|${it.low}|${it.close}" } ?: "null"}",
             "positions=${positionFacts.joinToString(",")}",
             "orders=${orderFacts.joinToString(",")}",
-            "freshness=UNKNOWN",
-            "missing=QUOTE:NOT_CAPTURED",
+            "freshness=${freshness.name}",
+            "missing=${missingSources.joinToString(",") { "${it.source}:${it.reason}" }}",
+        ).joinToString("\n")
+        val materialProjection = listOf(
+            "risk=${riskState.state}",
+            "freshness=${freshness.name}",
+            "openPosition=${positions.isNotEmpty()}",
+            "openOrder=${orders.isNotEmpty()}",
+            "priceMoveBand=0",
+            "atrPriceBand=${ratioBand(atr, last)}",
+            "spreadBand=${ratioBand(ask?.subtract(bid ?: ask), last)}",
+            "invalidation=UNKNOWN_DATA",
         ).joinToString("\n")
         val manifest = DecisionMaterialStateManifest(
             invocationId = input.invocationId,
@@ -485,23 +541,31 @@ class OneShotLlmRunner(
             runtimeConfigVersion = runtimeConfigSnapshot?.versionId,
             runtimeConfigHash = runtimeConfigSnapshot?.hash,
             riskState = riskState.state.name,
-            bestBidJpy = null,
-            bestAskJpy = null,
-            lastPriceJpy = null,
-            sourceTimestamp = null,
-            freshness = MaterialFreshness.UNKNOWN,
-            atr14FiveMinutesJpy = null,
-            latestCandleOpenJpy = null,
-            latestCandleHighJpy = null,
-            latestCandleLowJpy = null,
-            latestCandleCloseJpy = null,
+            bestBidJpy = bid,
+            bestAskJpy = ask,
+            lastPriceJpy = last,
+            sourceTimestamp = sourceTimestamp,
+            freshness = freshness,
+            atr14FiveMinutesJpy = atr,
+            latestCandleOpenJpy = latestCandle?.open?.toBigDecimalOrNull(),
+            latestCandleHighJpy = latestCandle?.high?.toBigDecimalOrNull(),
+            latestCandleLowJpy = latestCandle?.low?.toBigDecimalOrNull(),
+            latestCandleCloseJpy = latestCandle?.close?.toBigDecimalOrNull(),
             openPositionFacts = positionFacts,
             openOrderFacts = orderFacts,
-            missingSources = listOf(MaterialMissingSource("QUOTE", "NOT_CAPTURED")),
+            missingSources = missingSources,
             canonicalContentHash = DecisionIdentityGenerator.contentHash(canonical),
+            materialProjection = materialProjection,
         )
 
         tradingRuntime.decisionMaterialStateRepository.append(manifest).getOrThrow()
+    }
+
+    private fun ratioBand(numerator: BigDecimal?, denominator: BigDecimal?): String {
+        val unavailable = numerator == null || denominator == null
+        if (unavailable || requireNotNull(denominator).signum() == 0) return "UNKNOWN"
+        val ratio = numerator.abs().divide(denominator.abs(), 12, RoundingMode.HALF_UP)
+        return ratio.divide(tradingConfig.daemon.priceMoveThresholdRatio, 0, RoundingMode.FLOOR).toPlainString()
     }
 
     private suspend fun recordTtlSweepFailure(
@@ -1892,3 +1956,5 @@ private val SECRET_KEY_PATTERNS = listOf(
     "PASSWORD",
     "CREDENTIAL",
 )
+
+private val MATERIAL_QUOTE_FRESHNESS: Duration = Duration.ofMinutes(1)

@@ -67,6 +67,7 @@ class RestPollingTickStream(
             val bidPrice = ticker.bid.toBigDecimalOrNull()
             val askPrice = ticker.ask.toBigDecimalOrNull()
             val tickerObservedAt = runCatching { Instant.parse(ticker.timestamp) }.getOrNull()
+            val atr14Jpy = fetchAtr14Jpy()
             val quoteIsValid = bidPrice != null && askPrice != null && tickerObservedAt != null
 
             if (quoteIsValid) {
@@ -75,13 +76,14 @@ class RestPollingTickStream(
                         bidPriceJpy = checkNotNull(bidPrice),
                         askPriceJpy = checkNotNull(askPrice),
                         observedAt = checkNotNull(tickerObservedAt),
+                        lastPriceJpy = BigDecimal(ticker.last),
+                        atr14Jpy = atr14Jpy?.toBigDecimalOrNull(),
                     ),
                 )
             }
 
             val recentTrades = marketDataSource.getTrades(symbol, RECENT_TRADES_LIMIT).getOrThrow()
             val symbolRules = marketDataSource.getSymbolRules(symbol).getOrThrow()
-            val atr14Jpy = fetchAtr14Jpy()
 
             TickSnapshot(
                 symbol = symbol.apiSymbol,

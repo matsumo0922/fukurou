@@ -174,6 +174,7 @@ private fun EvaluationScope.isCurrentPopulation(): Boolean = cohort == Evaluatio
 data class DeduplicationMetrics(
     val decisionEligible: Int = 0,
     val decisionComplete: Int = 0,
+    val legacyExcludedCount: Int = 0,
     val intentEligible: Int = 0,
     val intentComplete: Int = 0,
     val shadowEligible: Int = 0,

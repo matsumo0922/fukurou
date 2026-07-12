@@ -318,6 +318,7 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
     val runner = OneShotLlmRunner(
         tradingRuntime = tradingRuntime,
         tradingConfig = inputs.tradingConfig,
+        materialMarketDataSource = marketDataSource,
         llmInvoker = ShellLlmInvoker(
             commandRenderer = DefaultLlmCommandRenderer(
                 config = commandRendererConfig,

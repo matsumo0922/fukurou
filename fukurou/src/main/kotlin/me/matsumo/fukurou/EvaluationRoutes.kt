@@ -762,6 +762,7 @@ data class EvaluationSummaryResponse(
 @Serializable
 data class DeduplicationResponse(
     val decisionIdentityCoverage: Double? = null,
+    val legacyExcludedCount: Int = 0,
     val intentIdentityCoverage: Double? = null,
     val shadowClassificationCoverage: Double? = null,
     val classificationCounts: Map<String, Int> = emptyMap(),
@@ -780,6 +781,7 @@ data class DeduplicationResponse(
         fun from(metrics: me.matsumo.fukurou.trading.evaluation.DeduplicationMetrics): DeduplicationResponse {
             return DeduplicationResponse(
                 decisionIdentityCoverage = coverage(metrics.decisionComplete, metrics.decisionEligible),
+                legacyExcludedCount = metrics.legacyExcludedCount,
                 intentIdentityCoverage = coverage(metrics.intentComplete, metrics.intentEligible),
                 shadowClassificationCoverage = coverage(metrics.shadowComplete, metrics.shadowEligible),
                 classificationCounts = metrics.classificationCounts,

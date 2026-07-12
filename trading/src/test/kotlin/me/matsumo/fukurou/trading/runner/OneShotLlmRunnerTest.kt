@@ -54,6 +54,8 @@ import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
@@ -208,6 +210,55 @@ class OneShotLlmRunnerTest {
         assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION.name, record?.status)
         assertNull(record?.triggerKind)
         assertTrue(record?.finishedAt != null)
+    }
+
+    @Test
+    fun materialManifestCapturesExactMarketFactsAndSeparateBandedProjection() = runBlocking {
+        val fixture = runnerFixture(marketDataSource = MaterialManifestMarketDataSource) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            }
+            cleanExit()
+        }
+        val request = defaultRequest().copy(invocationId = "material-facts-run")
+
+        fixture.runner.runOneShot(request).getOrThrow()
+
+        val manifest = assertNotNull(
+            fixture.runtime.decisionMaterialStateRepository.find("material-facts-run").getOrThrow(),
+        )
+        assertNotNull(manifest.bestBidJpy)
+        assertNotNull(manifest.bestAskJpy)
+        assertNotNull(manifest.lastPriceJpy)
+        assertNotNull(manifest.sourceTimestamp)
+        assertNotNull(manifest.atr14FiveMinutesJpy)
+        assertTrue(manifest.canonicalContentHash.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(manifest.materialProjection.contains("priceMoveBand=0"))
+        assertFalse(manifest.materialProjection.contains("sourceTimestamp"))
+    }
+
+    @Test
+    fun materialManifestPersistenceFailureRemainsTypedCoverageMiss() = runBlocking {
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                runtime.copy(
+                    decisionMaterialStateRepository = object : DecisionMaterialStateRepository {
+                        override suspend fun append(manifest: DecisionMaterialStateManifest): Result<Unit> {
+                            return Result.failure(IllegalStateException("manifest unavailable"))
+                        }
+                    },
+                )
+            },
+        ) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            }
+            cleanExit()
+        }
+
+        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
     }
 
     @Test
@@ -1876,6 +1927,7 @@ private fun runnerFixture(
     val runner = OneShotLlmRunner(
         tradingRuntime = runtime,
         tradingConfig = config,
+        materialMarketDataSource = marketDataSource,
         llmInvoker = ShellLlmInvoker(
             commandRenderer = DefaultLlmCommandRenderer(),
             processRunner = processRunner,
@@ -2818,6 +2870,29 @@ private object FakeMarketDataSource : MarketDataSource {
                 takerFee = "0.0005",
                 makerFee = "-0.0001",
             ),
+        )
+    }
+}
+
+private object MaterialManifestMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return Result.success(
+            (0 until 64).map { index ->
+                Candle(
+                    symbol = symbol.apiSymbol,
+                    interval = interval,
+                    openTime = fixedInstant().plusSeconds(index * 300L).toString(),
+                    open = "10000000",
+                    high = "10100000",
+                    low = "9900000",
+                    close = "10000000",
+                    volume = "1",
+                )
+            },
         )
     }
 }

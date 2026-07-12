@@ -15,6 +15,8 @@ data class LatestMarketQuote(
     val bidPriceJpy: BigDecimal,
     val askPriceJpy: BigDecimal,
     val observedAt: Instant,
+    val lastPriceJpy: BigDecimal? = null,
+    val atr14Jpy: BigDecimal? = null,
 )
 
 /** reconciler と read-only API が共有する thread-safe な最新気配値 store。 */

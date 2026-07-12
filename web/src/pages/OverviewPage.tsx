@@ -85,6 +85,7 @@ export function OverviewPage() {
 
 type DeduplicationTelemetry = {
   decisionIdentityCoverage: number | null;
+  legacyExcludedCount: number;
   intentIdentityCoverage: number | null;
   shadowClassificationCoverage: number | null;
   classificationCounts: Record<string, number>;

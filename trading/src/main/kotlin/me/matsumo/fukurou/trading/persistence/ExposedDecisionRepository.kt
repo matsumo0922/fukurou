@@ -615,6 +615,7 @@ private fun JdbcTransaction.insertDecisionSubmission(
             }
         }
     }
+    submission.entryIntent?.let { intent -> lockOpportunityEpisodeSymbol(intent.symbol.apiSymbol) }
     val latestSameThesis = candidateIdentity?.let { candidate -> selectLatestIdentity(candidate.thesisId) }
     val materialChangedAfterTtl = candidateIdentity != null && latestSameThesis != null &&
         candidateIdentity.materialStateHash != latestSameThesis.materialStateHash &&
@@ -674,6 +675,13 @@ private fun JdbcTransaction.insertDecisionSubmission(
         tradeIntent = tradeIntent,
         tradePlan = tradePlan,
     )
+}
+
+private fun JdbcTransaction.lockOpportunityEpisodeSymbol(symbol: String) {
+    jdbcConnection().prepareStatement("SELECT pg_advisory_xact_lock(hashtext(?)::bigint)").use { statement ->
+        statement.setString(1, symbol)
+        statement.executeQuery().use { result -> check(result.next()) }
+    }
 }
 
 private fun JdbcTransaction.isOpportunityEpisodeOpen(episodeId: UUID): Boolean {
@@ -777,7 +785,7 @@ private fun JdbcTransaction.insertShadowObservation(
 
 private fun JdbcTransaction.selectMaterialManifestHash(invocationId: String): String? {
     return jdbcConnection().prepareStatement(
-        "SELECT content_hash FROM decision_material_state_manifests WHERE invocation_id = ?",
+        "SELECT material_projection FROM decision_material_state_manifests WHERE invocation_id = ?",
     ).use { statement ->
         statement.setString(1, invocationId)
         statement.executeQuery().use { result -> if (result.next()) result.getString(1) else null }
