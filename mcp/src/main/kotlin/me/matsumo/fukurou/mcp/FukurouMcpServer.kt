@@ -35,6 +35,7 @@ import me.matsumo.fukurou.mcp.runtime.mcpErrorResult
 import me.matsumo.fukurou.mcp.runtime.redirectProcessStdoutToStderrForMcpStdio
 import me.matsumo.fukurou.mcp.runtime.runStdioMcpServer
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.FUKUROU_LLM_PHASE_ENV
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
@@ -61,8 +62,14 @@ import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.exchange.gmo.CommandEventLogGmoPublicRequestAuditSink
+import me.matsumo.fukurou.trading.exchange.gmo.DeferredGmoPublicRequestAuditSink
 import me.matsumo.fukurou.trading.exchange.gmo.GMO_MAX_DAILY_KLINE_REQUESTS
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
+import me.matsumo.fukurou.trading.exchange.gmo.withGmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_RECENT_LESSONS_LIMIT
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_RECENT_LESSONS_LOOKBACK_DAYS
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LIMIT
@@ -426,7 +433,12 @@ fun main() {
  */
 class FukurouMcpServer(
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
-    private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource.fromConfig(tradingConfig.gmoPublicClient),
+    private val requestAuditSink: DeferredGmoPublicRequestAuditSink = DeferredGmoPublicRequestAuditSink(),
+    private val marketDataSource: MarketDataSource = GmoPublicMarketDataSource.fromConfig(
+        config = tradingConfig.gmoPublicClient,
+        clientType = GmoPublicClientType.FUKUROU_MCP,
+        requestAuditSink = requestAuditSink,
+    ),
     private val clock: Clock = Clock.systemUTC(),
     private val tradingRuntime: TradingRuntime = defaultTradingRuntime(
         tradingConfig = tradingConfig,
@@ -453,6 +465,10 @@ class FukurouMcpServer(
         clock = clock,
     ),
 ) {
+
+    init {
+        requestAuditSink.bind(CommandEventLogGmoPublicRequestAuditSink(tradingRuntime.commandEventLog))
+    }
 
     /**
      * 標準入出力に MCP server を接続し、client から閉じられるまで待機する。
@@ -575,6 +591,7 @@ private class AuditedGmoCoinMarketToolExecutor(
     private val toolCallGuard: ToolCallGuard,
     private val decisionRunContext: DecisionRunContext,
     private val toolCallLimiter: McpToolCallLimiter,
+    private val clientRole: GmoPublicClientRole = mcpClientRole(System.getenv()),
 ) : GmoCoinMarketToolExecutor {
     override suspend fun <T> execute(
         toolName: String,
@@ -586,7 +603,16 @@ private class AuditedGmoCoinMarketToolExecutor(
             return Result.failure(throwable)
         }
 
-        return toolCallGuard.runReadOnlyTool(call, block)
+        return toolCallGuard.runReadOnlyTool(call) {
+            withGmoPublicRequestCorrelation(
+                GmoPublicRequestCorrelation(
+                    decisionRunContext = decisionRunContext,
+                    toolCallId = call.toolCallId,
+                    clientRole = clientRole,
+                ),
+                block,
+            )
+        }
     }
 
     override fun errorResponse(throwable: Throwable): GmoCoinMarketToolErrorResponse? {
@@ -598,6 +624,14 @@ private class AuditedGmoCoinMarketToolExecutor(
             type = "audit_failed_after_execution",
             executed = throwable.executed,
         )
+    }
+}
+
+private fun mcpClientRole(environment: Map<String, String>): GmoPublicClientRole {
+    return when (environment[FUKUROU_LLM_PHASE_ENV]?.lowercase()) {
+        "proposer" -> GmoPublicClientRole.PROPOSER
+        "falsifier" -> GmoPublicClientRole.FALSIFIER
+        else -> GmoPublicClientRole.UNSPECIFIED
     }
 }
 

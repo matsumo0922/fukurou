@@ -23,6 +23,11 @@
   ],
   "auditEventTypes": [
     {
+      "value": "GMO_PUBLIC_REST_REQUEST_COMPLETED",
+      "labelKey": "activity.catalog.audit.gmoPublicRestRequestCompleted.label",
+      "descriptionKey": "activity.catalog.audit.gmoPublicRestRequestCompleted.description"
+    },
+    {
       "value": "TOOL_CALL_COMPLETED",
       "labelKey": "activity.catalog.audit.toolCallCompleted.label",
       "descriptionKey": "activity.catalog.audit.toolCallCompleted.description"
@@ -171,6 +176,7 @@
     }
   ],
   "defaultExcludedAuditEventTypes": [
-    "RECONCILER_PASS_COMPLETED"
+    "RECONCILER_PASS_COMPLETED",
+    "GMO_PUBLIC_REST_REQUEST_COMPLETED"
   ]
 }

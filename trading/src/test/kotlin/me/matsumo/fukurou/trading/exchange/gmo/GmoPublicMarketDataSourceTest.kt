@@ -1,11 +1,13 @@
 package me.matsumo.fukurou.trading.exchange.gmo
 
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataFailureKind
 import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketInvalidRequestException
@@ -30,6 +32,7 @@ import javax.net.ssl.SSLSession
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 /**
  * GMO Public market data source の parser と stitching を検証するテスト。
@@ -424,6 +427,77 @@ class GmoPublicMarketDataSourceTest {
     }
 
     @Test
+    fun requestAudit_recordsEveryRetryWithCorrelationAndSafeClassification() = runBlocking {
+        val auditSink = RecordingRequestAuditSink()
+        val httpClient = FakeHttpClient(
+            responses = mapOf("symbol=BTC" to TICKER_SUCCESS_RESPONSE),
+            statusCodes = mapOf("symbol=BTC" to listOf(429, 200)),
+        )
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(maxAttempts = 2),
+            requestRateLimiter = RecordingRateLimiter(Duration.ofMillis(12)),
+            requestAuditSink = auditSink,
+        )
+        val correlation = GmoPublicRequestCorrelation(
+            decisionRunContext = DecisionRunContext.EMPTY.copy(decisionRunId = "decision-1"),
+            toolCallId = "tool-1",
+            clientRole = GmoPublicClientRole.PROPOSER,
+        )
+
+        withGmoPublicRequestCorrelation(correlation) {
+            marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        }
+
+        assertEquals(listOf(1, 2), auditSink.events.map { event -> event.attempt })
+        assertEquals(listOf(1, 2), auditSink.events.map { event -> event.requestSequence })
+        assertEquals(1, auditSink.events.map { event -> event.operationId }.distinct().size)
+        assertEquals(GmoPublicRequestOutcome.HTTP_429, auditSink.events.first().outcome)
+        assertEquals(GmoPublicRequestOutcome.HTTP_RESPONSE, auditSink.events.last().outcome)
+        assertTrue(auditSink.events.all { event -> event.permitWaitMillis == 12L })
+        assertTrue(auditSink.events.all { event -> event.decisionRunId == "decision-1" && event.toolCallId == "tool-1" })
+    }
+
+    @Test
+    fun requestAuditFailure_stopsWithoutAdditionalRetry() = runBlocking {
+        val httpClient = FakeHttpClient(responses = mapOf("symbol=BTC" to TICKER_SUCCESS_RESPONSE))
+        val marketDataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(maxAttempts = 3),
+            requestAuditSink = GmoPublicRequestAuditSink { Result.failure(IllegalStateException("secret")) },
+        )
+
+        assertFailsWith<GmoRequestAuditException> {
+            marketDataSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        }
+        assertEquals(listOf("symbol=BTC"), httpClient.requestQueries)
+    }
+
+    @Test
+    fun requestAudit_distinguishesJsonRateLimitAndClientInstances() = runBlocking {
+        val firstAuditSink = RecordingRequestAuditSink()
+        val secondAuditSink = RecordingRequestAuditSink()
+        val firstSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(responses = mapOf("symbol=BTC" to RATE_LIMIT_RESPONSE)),
+            retryConfig = GmoRetryConfig(maxAttempts = 1),
+            requestAuditSink = firstAuditSink,
+        )
+        val secondSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(responses = mapOf("symbol=BTC" to TICKER_SUCCESS_RESPONSE)),
+            requestAuditSink = secondAuditSink,
+        )
+
+        assertFailsWith<GmoRateLimitException> {
+            firstSource.getTicker(TradingSymbol.BTC).getOrThrow()
+        }
+        secondSource.getTicker(TradingSymbol.BTC).getOrThrow()
+
+        assertEquals(GmoPublicRequestOutcome.JSON_ERR_5003, firstAuditSink.events.single().outcome)
+        assertEquals("ERR-5003", firstAuditSink.events.single().gmoMessageCode)
+        assertTrue(firstAuditSink.events.single().clientInstanceId != secondAuditSink.events.single().clientInstanceId)
+    }
+
+    @Test
     fun getCandles_rejectsInvalidLimit() = runBlocking {
         val httpClient = FakeHttpClient(responses = emptyMap())
         val marketDataSource = fakeMarketDataSource(httpClient)
@@ -659,6 +733,7 @@ private fun fakeMarketDataSource(
         maxRequests = GMO_MAX_DAILY_KLINE_REQUESTS,
     ),
     sleeper: GmoSleeper = RecordingSleeper(),
+    requestAuditSink: GmoPublicRequestAuditSink = NoopGmoPublicRequestAuditSink,
 ): GmoPublicMarketDataSource {
     return GmoPublicMarketDataSource(
         httpClient = httpClient,
@@ -669,7 +744,19 @@ private fun fakeMarketDataSource(
         retryConfig = retryConfig,
         dailyKlineRequestBudget = dailyKlineRequestBudget,
         sleeper = sleeper,
+        clientType = GmoPublicClientType.FUKUROU_MCP,
+        requestAuditSink = requestAuditSink,
     )
+}
+
+private class RecordingRequestAuditSink : GmoPublicRequestAuditSink {
+    val events = mutableListOf<GmoPublicRequestAuditEvent>()
+
+    override suspend fun append(event: GmoPublicRequestAuditEvent): Result<Unit> {
+        events += event
+
+        return Result.success(Unit)
+    }
 }
 
 /**
@@ -809,14 +896,18 @@ private class FakeHttpResponse(
 /**
  * rate limiter 呼び出しを記録する fake。
  */
-private class RecordingRateLimiter : GmoRequestRateLimiter {
+private class RecordingRateLimiter(
+    private val permitWait: Duration = Duration.ZERO,
+) : GmoRequestRateLimiter {
     /**
      * permit を要求された endpoint 名。
      */
     val endpointNames = mutableListOf<String>()
 
-    override fun acquirePermit(endpointName: String) {
+    override fun acquirePermit(endpointName: String): Duration {
         endpointNames += endpointName
+
+        return permitWait
     }
 }
 

@@ -34,6 +34,8 @@ import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
+import me.matsumo.fukurou.trading.exchange.gmo.CommandEventLogGmoPublicRequestAuditSink
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
@@ -428,6 +430,8 @@ private fun createEvaluationRouteDependencies(
             GmoPublicMarketDataSource.fromConfig(
                 config = runtime.tradingConfig.gmoPublicClient,
                 clock = runtime.clock,
+                clientType = GmoPublicClientType.KTOR_EVALUATION,
+                requestAuditSink = CommandEventLogGmoPublicRequestAuditSink(ExposedCommandEventLog(it)),
             )
         }
 

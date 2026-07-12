@@ -36,6 +36,11 @@ const val FUKUROU_RUNTIME_CONFIG_VERSION_ID_ENV = "FUKUROU_RUNTIME_CONFIG_VERSIO
 const val FUKUROU_RUNTIME_CONFIG_HASH_ENV = "FUKUROU_RUNTIME_CONFIG_HASH"
 
 /**
+ * MCP 子 process の LLM phase を伝播する環境変数名。
+ */
+const val FUKUROU_LLM_PHASE_ENV = "FUKUROU_LLM_PHASE"
+
+/**
  * 1 回の LLM 起動に紐づく監査コンテキスト。
  *
  * @param decisionRunId daemon が `FUKUROU_INVOCATION_ID` として渡す起動 ID

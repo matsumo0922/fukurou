@@ -6,6 +6,9 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleDateRange
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -20,6 +23,7 @@ import me.matsumo.fukurou.trading.domain.unsafeOrderFeeRateReasonOrNull
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoHttpException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataException
 import me.matsumo.fukurou.trading.market.MarketDataFailureKind
 import me.matsumo.fukurou.trading.market.MarketDataParseException
@@ -212,23 +216,28 @@ class GmoPublicMarketDataSource(
         maxRequests = GMO_MAX_DAILY_KLINE_REQUESTS,
     ),
     private val sleeper: GmoSleeper = ThreadSleepingGmoSleeper,
+    private val clientType: GmoPublicClientType = GmoPublicClientType.STANDALONE_MCP,
+    private val requestAuditSink: GmoPublicRequestAuditSink = NoopGmoPublicRequestAuditSink,
 ) : MarketDataSource {
+
+    private val clientInstanceId = newGmoAuditId()
 
     @Volatile
     private var cachedSymbolRules: CachedSymbolRules? = null
 
-    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> = runMarketRequest {
-        val request = buildTickerRequest(symbol)
-        val responseBody = sendRequest(request, "ticker")
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> =
+        runMarketRequest(GmoPublicOperation.GET_TICKER) {
+            val request = buildTickerRequest(symbol)
+            val responseBody = sendRequest(request, GmoPublicEndpoint.TICKER)
 
-        parseTickerResponse(responseBody, symbol, json)
-    }
+            parseTickerResponse(responseBody, symbol, json)
+        }
 
     override suspend fun getCandles(
         symbol: TradingSymbol,
         interval: CandleInterval,
         limit: Int,
-    ): Result<List<Candle>> = runMarketRequest {
+    ): Result<List<Candle>> = runMarketRequest(GmoPublicOperation.GET_CANDLES) {
         validateLimit(limit, MAX_CANDLE_LIMIT, "limit")
 
         when (interval.dateRange) {
@@ -237,44 +246,53 @@ class GmoPublicMarketDataSource(
         }
     }
 
-    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> = runMarketRequest {
-        validateLimit(depth, MAX_ORDERBOOK_DEPTH, "depth")
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> =
+        runMarketRequest(GmoPublicOperation.GET_ORDERBOOK) {
+            validateLimit(depth, MAX_ORDERBOOK_DEPTH, "depth")
 
-        val request = buildOrderbookRequest(symbol)
-        val responseBody = sendRequest(request, "orderbook")
+            val request = buildOrderbookRequest(symbol)
+            val responseBody = sendRequest(request, GmoPublicEndpoint.ORDERBOOK)
 
-        parseOrderbookResponse(responseBody, symbol, depth, json)
-    }
+            parseOrderbookResponse(responseBody, symbol, depth, json)
+        }
 
-    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> = runMarketRequest {
-        validateLimit(limit, MAX_TRADES_LIMIT, "limit")
+    override suspend fun getTrades(symbol: TradingSymbol, limit: Int): Result<List<RecentTrade>> =
+        runMarketRequest(GmoPublicOperation.GET_TRADES) {
+            validateLimit(limit, MAX_TRADES_LIMIT, "limit")
 
-        val request = buildTradesRequest(symbol, limit)
-        val responseBody = sendRequest(request, "trades")
+            val request = buildTradesRequest(symbol, limit)
+            val responseBody = sendRequest(request, GmoPublicEndpoint.TRADES)
 
-        parseTradesResponse(responseBody, symbol, json).take(limit)
-    }
+            parseTradesResponse(responseBody, symbol, json).take(limit)
+        }
 
-    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> = runMarketRequest {
-        readCachedSymbolRules(symbol) ?: fetchAndCacheSymbolRules(symbol)
-    }
+    override suspend fun getSymbolRules(symbol: TradingSymbol): Result<SymbolRules> =
+        runMarketRequest(GmoPublicOperation.GET_SYMBOL_RULES) {
+            readCachedSymbolRules(symbol) ?: fetchAndCacheSymbolRules(symbol)
+        }
 
-    private suspend fun <T> runMarketRequest(block: () -> T): Result<T> = withContext(Dispatchers.IO) {
+    private suspend fun <T> runMarketRequest(
+        operation: GmoPublicOperation,
+        block: suspend GmoRequestScope.() -> T,
+    ): Result<T> = withContext(Dispatchers.IO) {
+        val scope = GmoRequestScope(operation)
+
         runCatching {
-            executeWithRetry(block)
+            executeWithRetry(scope, block)
         }.recoverCatching { throwable ->
             throw throwable.toMarketDataException()
         }
     }
 
-    private fun <T> executeWithRetry(block: () -> T): T {
+    private suspend fun <T> executeWithRetry(scope: GmoRequestScope, block: suspend GmoRequestScope.() -> T): T {
         var attemptNumber = 1
         var nextBackoff = retryConfig.initialBackoff
         var lastFailure: Throwable? = null
 
         while (attemptNumber <= retryConfig.maxAttempts) {
+            scope.attempt = attemptNumber
             try {
-                return block()
+                return scope.block()
             } catch (exception: MarketDataException) {
                 if (!shouldRetry(exception, attemptNumber)) {
                     throw exception
@@ -341,37 +359,103 @@ class GmoPublicMarketDataSource(
             .build()
     }
 
-    private fun sendRequest(request: HttpRequest, endpointName: String): String {
-        requestRateLimiter.acquirePermit(endpointName)
+    private suspend fun GmoRequestScope.sendRequest(request: HttpRequest, endpoint: GmoPublicEndpoint): String {
+        val permitWait = requestRateLimiter.acquirePermit(endpoint.name.lowercase())
+        val requestId = newGmoAuditId()
+        val requestStartedAt = clock.instant()
+        val startedNanos = System.nanoTime()
+        requestSequence += 1
 
         val response = try {
             httpClient.send(request, HttpResponse.BodyHandlers.ofString())
         } catch (exception: IOException) {
-            throw MarketNetworkException("GMO $endpointName request failed by network error.", exception)
+            appendAudit(requestId, endpoint, requestStartedAt, startedNanos, permitWait, GmoPublicRequestOutcome.NETWORK_ERROR)
+            throw MarketNetworkException("GMO ${endpoint.name} request failed by network error.", exception)
         } catch (exception: InterruptedException) {
             Thread.currentThread().interrupt()
 
-            throw MarketNetworkException("GMO $endpointName request was interrupted.", exception)
+            appendAudit(requestId, endpoint, requestStartedAt, startedNanos, permitWait, GmoPublicRequestOutcome.INTERRUPTED)
+            throw MarketNetworkException("GMO ${endpoint.name} request was interrupted.", exception)
         }
 
         val statusCode = response.statusCode()
+        val hasRateLimitMessage = statusCode == HTTP_OK && response.body().hasGmoRateLimitMessage()
+        val outcome = when {
+            statusCode == HTTP_TOO_MANY_REQUESTS -> GmoPublicRequestOutcome.HTTP_429
+            hasRateLimitMessage -> GmoPublicRequestOutcome.JSON_ERR_5003
+            else -> GmoPublicRequestOutcome.HTTP_RESPONSE
+        }
+
+        appendAudit(
+            requestId = requestId,
+            endpoint = endpoint,
+            requestStartedAt = requestStartedAt,
+            startedNanos = startedNanos,
+            permitWait = permitWait,
+            outcome = outcome,
+            statusCode = statusCode,
+            gmoMessageCode = GMO_RATE_LIMIT_MESSAGE_CODE.takeIf { hasRateLimitMessage },
+        )
 
         if (statusCode == HTTP_TOO_MANY_REQUESTS) {
-            throw GmoRateLimitException("GMO $endpointName request was rate limited.")
+            throw GmoRateLimitException("GMO ${endpoint.name} request was rate limited by HTTP_429.")
+        }
+
+        if (hasRateLimitMessage) {
+            throw GmoRateLimitException("GMO ${endpoint.name} request was rate limited by JSON_ERR_5003.")
         }
 
         if (statusCode != HTTP_OK) {
             throw GmoHttpException(
                 statusCode = statusCode,
                 kind = statusCode.toFailureKind(),
-                message = "GMO $endpointName request failed with HTTP $statusCode.",
+                message = "GMO ${endpoint.name} request failed with HTTP $statusCode.",
             )
         }
 
         return response.body()
     }
 
-    private fun fetchDayRangeCandles(
+    @Suppress("LongParameterList")
+    private suspend fun GmoRequestScope.appendAudit(
+        requestId: String,
+        endpoint: GmoPublicEndpoint,
+        requestStartedAt: Instant,
+        startedNanos: Long,
+        permitWait: Duration,
+        outcome: GmoPublicRequestOutcome,
+        statusCode: Int? = null,
+        gmoMessageCode: String? = null,
+    ) {
+        val completedAt = clock.instant()
+        val correlation = kotlinx.coroutines.currentCoroutineContext()[GmoPublicRequestCorrelation]
+        val event = GmoPublicRequestAuditEvent(
+            requestId = requestId,
+            operationId = operationId,
+            clientInstanceId = clientInstanceId,
+            processId = GmoProcessId,
+            decisionRunId = correlation?.decisionRunContext?.decisionRunId,
+            toolCallId = correlation?.toolCallId,
+            clientType = clientType,
+            clientRole = correlation?.clientRole ?: GmoPublicClientRole.UNSPECIFIED,
+            operation = operation,
+            endpoint = endpoint,
+            attempt = attempt,
+            maxAttempts = retryConfig.maxAttempts,
+            requestSequence = requestSequence,
+            requestStartedAt = requestStartedAt.toString(),
+            completedAt = completedAt.toString(),
+            requestDurationMillis = Duration.ofNanos(System.nanoTime() - startedNanos).toMillis(),
+            permitWaitMillis = permitWait.toMillis(),
+            outcome = outcome,
+            httpStatusCode = statusCode,
+            gmoMessageCode = gmoMessageCode,
+        )
+
+        requestAuditSink.append(event).getOrElse { throw GmoRequestAuditException() }
+    }
+
+    private suspend fun GmoRequestScope.fetchDayRangeCandles(
         symbol: TradingSymbol,
         interval: CandleInterval,
         limit: Int,
@@ -390,7 +474,7 @@ class GmoPublicMarketDataSource(
         return stitchCandles(candles, limit)
     }
 
-    private fun fetchYearRangeCandles(
+    private suspend fun GmoRequestScope.fetchYearRangeCandles(
         symbol: TradingSymbol,
         interval: CandleInterval,
         limit: Int,
@@ -440,13 +524,13 @@ class GmoPublicMarketDataSource(
             .toLocalDate()
     }
 
-    private fun fetchKlines(
+    private suspend fun GmoRequestScope.fetchKlines(
         symbol: TradingSymbol,
         interval: CandleInterval,
         date: String,
     ): List<Candle> {
         val request = buildKlinesRequest(symbol, interval, date)
-        val responseBody = sendRequest(request, "klines")
+        val responseBody = sendRequest(request, GmoPublicEndpoint.KLINES)
 
         return parseKlinesResponse(
             responseBody = responseBody,
@@ -465,9 +549,9 @@ class GmoPublicMarketDataSource(
         return if (isSameSymbol && isFresh) cachedRules.rules else null
     }
 
-    private fun fetchAndCacheSymbolRules(symbol: TradingSymbol): SymbolRules {
+    private suspend fun GmoRequestScope.fetchAndCacheSymbolRules(symbol: TradingSymbol): SymbolRules {
         val request = buildSymbolsRequest()
-        val responseBody = sendRequest(request, "symbols")
+        val responseBody = sendRequest(request, GmoPublicEndpoint.SYMBOLS)
         val rules = parseSymbolsResponse(responseBody, symbol, json)
 
         cachedSymbolRules = CachedSymbolRules(
@@ -488,6 +572,8 @@ class GmoPublicMarketDataSource(
             dailyKlineRequestBudget: GmoDailyKlineRequestBudget = GmoFixedDailyKlineRequestBudget(
                 maxRequests = GMO_MAX_DAILY_KLINE_REQUESTS,
             ),
+            clientType: GmoPublicClientType = GmoPublicClientType.STANDALONE_MCP,
+            requestAuditSink: GmoPublicRequestAuditSink = NoopGmoPublicRequestAuditSink,
         ): GmoPublicMarketDataSource {
             return GmoPublicMarketDataSource(
                 connectTimeout = config.connectTimeout,
@@ -498,9 +584,25 @@ class GmoPublicMarketDataSource(
                 rateLimitConfig = config.rateLimit,
                 retryConfig = config.retry,
                 dailyKlineRequestBudget = dailyKlineRequestBudget,
+                clientType = clientType,
+                requestAuditSink = requestAuditSink,
             )
         }
     }
+
+    private inner class GmoRequestScope(val operation: GmoPublicOperation) {
+        val operationId: String = newGmoAuditId()
+        var attempt: Int = 1
+        var requestSequence: Int = 0
+    }
+}
+
+private fun String.hasGmoRateLimitMessage(): Boolean {
+    return runCatching {
+        GmoPublicApiJson.parseToJsonElement(this).jsonObject["messages"]?.jsonArray?.any { message ->
+            message.jsonObject["message_code"]?.jsonPrimitive?.content == GMO_RATE_LIMIT_MESSAGE_CODE
+        } == true
+    }.getOrDefault(false)
 }
 
 /**

@@ -2144,6 +2144,7 @@ private fun OpsActivitySource.toActivitySourceDefinition(): OpsActivityCatalogIt
 @Suppress("CyclomaticComplexMethod")
 private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalogItemResponse {
     val keySuffix = when (this) {
+        CommandEventType.GMO_PUBLIC_REST_REQUEST_COMPLETED -> "gmoPublicRestRequestCompleted"
         CommandEventType.TOOL_CALL_COMPLETED -> "toolCallCompleted"
         CommandEventType.TOOL_CALL_REJECTED_BY_HARD_HALT -> "toolCallRejectedByHardHalt"
         CommandEventType.NO_TRADE_EXIT -> "noTradeExit"
@@ -2672,4 +2673,5 @@ private const val ACTIVITY_NO_VALUE = "none"
  */
 private val DEFAULT_ACTIVITY_EXCLUDED_AUDIT_EVENT_TYPES = setOf(
     CommandEventType.RECONCILER_PASS_COMPLETED,
+    CommandEventType.GMO_PUBLIC_REST_REQUEST_COMPLETED,
 )

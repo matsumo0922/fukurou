@@ -11,6 +11,9 @@ Step6 時点の `fukurou-mcp` runtime と Docker 配線の正本メモ。
 - container の entrypoint は Ktor のまま。production の MCP は `/usr/local/libexec/fukurou-mcp-launcher <manifest-id>` だけから起動する。`java -jar` と DB env を使う直接起動は production runner の対応経路ではない。
 - production runtime の MCP server process は `fukurou-mcp` 1 つだけ。`:mcp` は `:mcp-gmo-coin` の market tools を同一 `Server` に埋め込み、account / trade / test tools と一緒に公開する。
 - `:mcp-gmo-coin` は tool schema、引数 parse、`:trading` への委譲だけを持つ。rate-limit / retry / error 分類は `:trading.exchange.gmo` の GMO Public client 境界で行う。
+- GMO Public client は permit 取得後の実 `HttpClient.send` attempt ごとに `GMO_PUBLIC_REST_REQUEST_COMPLETED` を記録する。payload は request / operation / client instance / process / decision run / tool call の ID、client type / role、固定 operation / endpoint、attempt、request sequence、時刻、request duration、permit wait、結果分類、HTTP status、固定 `ERR-5003` code だけを含む。response body、message、URI、query、credential、例外 message、filesystem path は保存しない。
+- runner は MCP 子 process へ `FUKUROU_LLM_PHASE=proposer|falsifier` を渡し、埋め込み MCP は coroutine scope 内で decision run / tool call / role を request audit へ伝播する。standalone GMO Coin MCP は同じ allowlist payload を stderr に出し、DB audit を要求しない。
+- request audit の append に失敗した logical request は取得済み response を利用せず、追加 retry もしない。`GMO_PUBLIC_REST_REQUEST_COMPLETED` は Activity の既定 timeline から除外され、`/ops/audit?eventType=GMO_PUBLIC_REST_REQUEST_COMPLETED` の明示 filter で取得する。
 - fukurou 埋め込み時の短期足 kline request 予算は `GMO_MAX_DAILY_KLINE_REQUESTS` で強制する。standalone 起動時はこの fukurou 固有予算を注入しない。
 
 ## local smoke

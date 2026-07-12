@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.market.FreshnessSource
 import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.GmoHttpException
 import me.matsumo.fukurou.trading.market.GmoRateLimitException
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
 import me.matsumo.fukurou.trading.market.IndicatorResult
@@ -997,6 +998,7 @@ private fun throwableResult(throwable: Throwable, toolExecutor: GmoCoinMarketToo
     val type = mappedError?.type ?: when (throwable) {
         is MarketInvalidRequestException -> "invalid_request"
         is GmoRateLimitException -> "rate_limited"
+        is GmoRequestAuditException -> "audit_failed_after_execution"
         is GmoApiStatusException -> "gmo_status_error"
         is GmoHttpException -> "gmo_http_error"
         is MarketNetworkException -> "network_error"
@@ -1004,7 +1006,7 @@ private fun throwableResult(throwable: Throwable, toolExecutor: GmoCoinMarketToo
         is IllegalArgumentException -> "invalid_request"
         else -> "tool_call_failed"
     }
-    val executed = mappedError?.executed
+    val executed = mappedError?.executed ?: true.takeIf { throwable is GmoRequestAuditException }
 
     val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
 

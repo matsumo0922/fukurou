@@ -3571,6 +3571,10 @@ LLM CLI:
 
 ### 14.3 レート制限
 
+[確定] GMO Public REST は各 `GmoPublicMarketDataSource` instance の token bucket と symbol cache を維持し、permit 後の実 HTTP attempt を `GMO_PUBLIC_REST_REQUEST_COMPLETED` として監査する。同じ logical operation の retry と kline stitching は `operationId` を共有し、`attempt` と `requestSequence` で時系列を表す。429 と JSON `ERR-5003` は別 outcome とし、permit wait と request duration も分離する。監査保存に失敗した request は response を利用せず fail closed する。
+
+[確定] request audit は Proposer / Falsifier MCP、runner、LLM runtime、reconciler、evaluation、standalone MCP を client type / role と correlation ID で区別する。payload は allowlist の ID、enum、時刻、数値だけで、response body、message、URI、query、credential、raw exception、filesystem path を保存しない。共有 gateway、process 間 limiter、rate / burst / retry / cache TTL の変更は、同一 wall-clock 窓の audit event を観測してから別途選択する。
+
 [設計提案] token bucketを3層で持つ。
 
 | bucket                 |                          既定 | 適用                                                          |

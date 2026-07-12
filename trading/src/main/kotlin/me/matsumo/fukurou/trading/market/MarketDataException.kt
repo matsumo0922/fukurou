@@ -59,6 +59,14 @@ class GmoRateLimitException(
 ) : MarketDataException(MarketDataFailureKind.TEMPORARY, message)
 
 /**
+ * GMO Public request の監査保存に失敗したときの例外。
+ */
+class GmoRequestAuditException : MarketDataException(
+    MarketDataFailureKind.PERMANENT,
+    "GMO public request audit failed after execution.",
+)
+
+/**
  * GMO Public API の `status` が成功以外だったときの例外。
  */
 class GmoApiStatusException(

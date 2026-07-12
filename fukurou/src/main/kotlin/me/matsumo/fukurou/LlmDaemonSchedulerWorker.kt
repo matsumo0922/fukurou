@@ -28,6 +28,9 @@ import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceDependencies
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceRuntime
 import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
 import me.matsumo.fukurou.trading.daemon.toLlmDaemonEntryFillOrNull
+import me.matsumo.fukurou.trading.exchange.gmo.CommandEventLogGmoPublicRequestAuditSink
+import me.matsumo.fukurou.trading.exchange.gmo.DeferredGmoPublicRequestAuditSink
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
@@ -265,9 +268,12 @@ internal fun hasManualLlmLaunchServiceEnvironment(environment: Map<String, Strin
 }
 
 private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): LlmLaunchRuntimeComponents {
+    val requestAuditSink = DeferredGmoPublicRequestAuditSink()
     val marketDataSource = GmoPublicMarketDataSource.fromConfig(
         config = inputs.tradingConfig.gmoPublicClient,
         clock = inputs.clock,
+        clientType = GmoPublicClientType.KTOR_LLM_RUNTIME,
+        requestAuditSink = requestAuditSink,
     )
     val commandRendererConfig = LlmCommandRendererConfig.fromEnvironment(
         environment = inputs.environment,
@@ -279,6 +285,7 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         marketDataSource = marketDataSource,
         tradingConfig = inputs.tradingConfig,
     )
+    requestAuditSink.bind(CommandEventLogGmoPublicRequestAuditSink(tradingRuntime.commandEventLog))
     val runner = OneShotLlmRunner(
         tradingRuntime = tradingRuntime,
         tradingConfig = inputs.tradingConfig,
