@@ -5,6 +5,8 @@ import kotlinx.coroutines.sync.withLock
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
+import java.time.Clock
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -42,16 +44,21 @@ class McpToolCallLimiter(
     private val allowedToolNames: Set<String>? = null,
     private val countedToolNames: Set<String> = emptySet(),
     private val actToolNames: Set<String> = emptySet(),
+    private val expiresAt: Instant? = null,
+    private val clock: Clock = Clock.systemUTC(),
 ) {
     private val totalToolCallCount = AtomicInteger(0)
     private val actToolCallCount = AtomicInteger(0)
     private val initialCountMutex = Mutex()
+
+    @Volatile
     private var initialCounts: McpToolCallCounts? = null
 
     /**
      * tool call 予算を 1 回消費し、超過時は no-trade audit 付きの失敗を返す。
      */
     suspend fun acquire(call: GuardedToolCall, kind: McpToolCallKind): Result<Unit> {
+        rejectIfManifestExpired(call)?.let { result -> return result }
         rejectIfToolIsNotAllowed(call)?.let { result -> return result }
 
         val currentInitialCounts = loadInitialCounts(call).getOrElse { throwable ->
@@ -162,6 +169,22 @@ class McpToolCallLimiter(
             cause = exception,
         )
 
+        auditResult.exceptionOrNull()?.let { throwable -> exception.addSuppressed(throwable) }
+
+        return Result.failure(exception)
+    }
+
+    private suspend fun rejectIfManifestExpired(call: GuardedToolCall): Result<Unit>? {
+        val expiry = expiresAt ?: return null
+
+        if (Instant.now(clock).isBefore(expiry)) return null
+
+        val exception = ToolCallNotAllowedException("mcp_manifest_expired")
+        val auditResult = toolCallGuard.recordNoTradeExit(
+            call = call,
+            reason = "mcp_manifest_expired",
+            cause = exception,
+        )
         auditResult.exceptionOrNull()?.let { throwable -> exception.addSuppressed(throwable) }
 
         return Result.failure(exception)

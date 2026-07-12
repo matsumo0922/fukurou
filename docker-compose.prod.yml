@@ -9,6 +9,22 @@ services:
     image: ghcr.io/matsumo0922/fukurou:${FUKUROU_IMAGE_TAG:?FUKUROU_IMAGE_TAG is required}
     container_name: fukurou-ktor
     restart: unless-stopped
+    user: "10001:10004"
+    read_only: true
+    init: true
+    pids_limit: 512
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+      - SETGID
+      - SETUID
+      - SETPCAP
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777
+      - /run/fukurou/llm-homes:rw,noexec,nosuid,nodev,mode=2750,uid=10001,gid=10004
+      - /run/fukurou/mcp-manifests:rw,noexec,nosuid,nodev,mode=0700,uid=10001,gid=10004
     environment:
       DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
       DB_USER: ${POSTGRES_USER}
@@ -19,25 +35,25 @@ services:
       FUKUROU_GMO_PUBLIC_BASE_URL: ${FUKUROU_GMO_PUBLIC_BASE_URL:-https://api.coin.z.com/public}
       FUKUROU_GMO_PUBLIC_WEBSOCKET_URL: ${FUKUROU_GMO_PUBLIC_WEBSOCKET_URL:-wss://api.coin.z.com/ws/public/v1}
       FUKUROU_OBSIDIAN_VAULT_PATH: ${FUKUROU_OBSIDIAN_VAULT_PATH:-/vault}
-      FUKUROU_MCP_JAR_PATH: ${FUKUROU_MCP_JAR_PATH:-/app/fukurou-mcp-all.jar}
+      FUKUROU_MCP_JAR_PATH: /app/fukurou-mcp-all.jar
+      FUKUROU_MCP_DB_USER: ${FUKUROU_MCP_DB_USER:-fukurou_mcp}
+      FUKUROU_MCP_MANIFEST_DIRECTORY: /run/fukurou/mcp-manifests
       FUKUROU_MCP_SERVER_NAME: ${FUKUROU_MCP_SERVER_NAME:-fukurou-mcp}
-      FUKUROU_MCP_SERVER_COMMAND: ${FUKUROU_MCP_SERVER_COMMAND:-java}
-      FUKUROU_MCP_SERVER_ARGS: ${FUKUROU_MCP_SERVER_ARGS:-}
+      FUKUROU_MCP_SERVER_COMMAND: /usr/local/libexec/fukurou-mcp-launcher
       FUKUROU_REPOSITORY_ROOT: ${FUKUROU_REPOSITORY_ROOT:-/app}
       FUKUROU_LLM_WORKING_DIRECTORY: ${FUKUROU_LLM_WORKING_DIRECTORY:-/tmp/fukurou-llm}
-      FUKUROU_CLAUDE_COMMAND_TEMPLATE: ${FUKUROU_CLAUDE_COMMAND_TEMPLATE:-claude}
-      FUKUROU_CODEX_COMMAND_TEMPLATE: ${FUKUROU_CODEX_COMMAND_TEMPLATE:-codex}
-      FUKUROU_PROPOSER_ALLOWED_TOOLS: ${FUKUROU_PROPOSER_ALLOWED_TOOLS:-}
-      FUKUROU_FALSIFIER_ALLOWED_TOOLS: ${FUKUROU_FALSIFIER_ALLOWED_TOOLS:-}
+      FUKUROU_CLAUDE_COMMAND_TEMPLATE: /usr/local/libexec/fukurou-llm-agent-launcher claude
+      FUKUROU_CODEX_COMMAND_TEMPLATE: /usr/local/libexec/fukurou-llm-agent-launcher codex
       FUKUROU_CLAUDE_COMMON_ARGS: ${FUKUROU_CLAUDE_COMMON_ARGS:-}
       FUKUROU_CODEX_COMMON_ARGS: ${FUKUROU_CODEX_COMMON_ARGS:-}
       FUKUROU_CODEX_FALSIFIER_ARGS: ${FUKUROU_CODEX_FALSIFIER_ARGS:-}
-      FUKUROU_CODEX_PERSISTENT_HOME: /tmp/fukurou-cli-home/.codex
       HOME: /tmp/fukurou-cli-home
-      XDG_CACHE_HOME: /tmp/fukurou-cli-cache
     volumes:
-      - llm-home:/tmp/fukurou-cli-home
-      - llm-cache:/tmp/fukurou-cli-cache
+      - llm-auth:/tmp/fukurou-cli-home
+      - type: bind
+        source: ${FUKUROU_MCP_DB_PASSWORD_FILE:?FUKUROU_MCP_DB_PASSWORD_FILE is required}
+        target: /run/secrets/fukurou_mcp_db_password
+        read_only: true
       - type: bind
         source: ${FUKUROU_OBSIDIAN_VAULT_PATH_HOST:-/srv/fukurou/obsidian-vault}
         target: /vault
@@ -102,5 +118,4 @@ networks:
 
 volumes:
   pgdata:
-  llm-home:
-  llm-cache:
+  llm-auth:

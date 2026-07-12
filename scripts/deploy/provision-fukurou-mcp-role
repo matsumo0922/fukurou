@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 4 ]; then
+    echo "Usage: provision-fukurou-mcp-role <database-url> <database-name> <app-role> <root-only-password-file>" >&2
+    exit 64
+fi
+
+database_url=$1
+database_name=$2
+app_role=$3
+password_file=$4
+role_name=fukurou_mcp
+sql_source=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/sql/mcp-role.sql
+
+[ -f "$password_file" ] || { echo "MCP password file is unavailable." >&2; exit 66; }
+[ ! -L "$password_file" ] || { echo "MCP password file must not be a symlink." >&2; exit 66; }
+password=$(sed -e '1q' "$password_file")
+[ -n "$password" ] || { echo "MCP password file is empty." >&2; exit 65; }
+
+temporary_sql=$(mktemp)
+trap 'rm -f "$temporary_sql"' EXIT HUP INT TERM
+chmod 600 "$temporary_sql"
+{
+    printf '\\set mcp_role %s\n' "$role_name"
+    printf '\\set database_name %s\n' "$database_name"
+    printf '\\set app_role %s\n' "$app_role"
+    printf '\\set mcp_password '\''%s'\''\n' "$(printf '%s' "$password" | sed "s/'/''/g")"
+    cat "$sql_source"
+} >"$temporary_sql"
+
+psql "$database_url" --no-psqlrc --quiet --file "$temporary_sql"
+psql "$database_url" --no-psqlrc --tuples-only --no-align \
+    --command "SELECT rolname || ': flags=' || rolsuper || ',' || rolcreatedb || ',' || rolcreaterole || ',' || rolreplication || ',' || rolbypassrls FROM pg_roles WHERE rolname = '$role_name';"
+echo "MCP role provision completed; no fallback credential was configured."

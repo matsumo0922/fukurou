@@ -18,7 +18,6 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.DEFAULT_CODEX_HOME_DIRECTORY
-import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_PERSISTENT_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.HOME_ENV
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import java.io.BufferedReader
@@ -335,11 +334,7 @@ data class LlmAuthServiceConfig(
                 ?.takeIf { value -> value.isNotBlank() }
                 ?.let { value -> Path.of(value) }
                 ?: Path.of(DEFAULT_LLM_CLI_HOME_PATH)
-            val codexHome = rendererConfig.codexPersistentHome
-                ?: environment[FUKUROU_CODEX_PERSISTENT_HOME_ENV]
-                    ?.takeIf { value -> value.isNotBlank() }
-                    ?.let { value -> Path.of(value) }
-                ?: cliHome.resolve(DEFAULT_CODEX_HOME_DIRECTORY)
+            val codexHome = cliHome.resolve(DEFAULT_CODEX_HOME_DIRECTORY)
 
             return LlmAuthServiceConfig(
                 claudeCommandTemplate = rendererConfig.claudeCommandTemplate,
@@ -901,7 +896,6 @@ class DefaultLlmAuthService(
             LlmAuthProvider.CODEX -> mapOf(
                 HOME_ENV to config.cliHome.toString(),
                 CODEX_HOME_ENV to config.codexHome.toString(),
-                FUKUROU_CODEX_PERSISTENT_HOME_ENV to config.codexHome.toString(),
             )
         }
 

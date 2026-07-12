@@ -21,7 +21,6 @@ class RuntimeConfigCatalogTest {
             "FUKUROU_CLAUDE_MODEL" to "claude-runtime-test",
             "FUKUROU_CODEX_MODEL" to "codex-runtime-test",
             "FUKUROU_OBSIDIAN_VAULT_PATH" to "/vault",
-            "FUKUROU_PROPOSER_ALLOWED_TOOLS" to "mcp__fukurou-mcp__get_ticker",
             "DB_PASSWORD" to "super-secret-password",
         )
         val config = TradingBotConfig.fromEnvironment(environment)

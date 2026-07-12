@@ -23,7 +23,6 @@ import java.util.Comparator
  * @param claudeCommonArgs Claude CLI 共通引数
  * @param codexCommonArgs Codex CLI 共通引数
  * @param codexFalsifierArgs Codex Falsifier にだけ渡す強権実行引数
- * @param codexPersistentHome Codex CLI の永続 home。明示設定時だけ in-place 更新する。
  */
 data class LlmCommandRendererConfig(
     val claudeCommandTemplate: List<String> = DEFAULT_CLAUDE_COMMAND_TEMPLATE,
@@ -33,7 +32,6 @@ data class LlmCommandRendererConfig(
     val claudeCommonArgs: List<String> = DEFAULT_CLAUDE_COMMON_ARGS,
     val codexCommonArgs: List<String> = DEFAULT_CODEX_COMMON_ARGS,
     val codexFalsifierArgs: List<String> = DEFAULT_CODEX_FALSIFIER_ARGS,
-    val codexPersistentHome: Path? = null,
 ) {
     init {
         val unsafeClaudeArgs = claudeCommonArgs.filterUnsafeArgs(CLAUDE_COMMON_ARG_FORBIDDEN_FLAGS)
@@ -111,8 +109,6 @@ data class LlmCommandRendererConfig(
                 codexFalsifierArgs = environment.readOptionalEnv(FUKUROU_CODEX_FALSIFIER_ARGS_ENV)
                     ?.splitCommandTemplate()
                     ?: DEFAULT_CODEX_FALSIFIER_ARGS,
-                codexPersistentHome = environment.readOptionalEnv(FUKUROU_CODEX_PERSISTENT_HOME_ENV)
-                    ?.let { value -> Path.of(value) },
             )
         }
     }
@@ -125,6 +121,8 @@ data class LlmCommandRendererConfig(
  */
 class DefaultLlmCommandRenderer(
     private val config: LlmCommandRendererConfig = LlmCommandRendererConfig(),
+    private val claudeAuthCopy: (Path, Path) -> Unit = ::copyClaudeAuthFile,
+    private val artifactCleanup: (List<Path>) -> Unit = { paths -> paths.deleteGeneratedPaths() },
 ) : LlmCommandRenderer {
 
     override fun render(request: LlmInvocationRequest): Result<RenderedLlmCommand> {
@@ -133,6 +131,8 @@ class DefaultLlmCommandRenderer(
                 LlmProvider.CLAUDE -> renderClaude(request)
                 LlmProvider.CODEX -> renderCodex(request)
             }
+        }.onFailure {
+            request.mcpServer?.manifestPath?.deleteGeneratedPath()
         }
     }
 
@@ -142,6 +142,36 @@ class DefaultLlmCommandRenderer(
             suffix = ".json",
             content = request.mcpServer?.toClaudeMcpConfigJson() ?: EMPTY_CLAUDE_MCP_CONFIG_JSON,
         )
+        val generatedPaths = mcpConfigFile.cleanupPaths.toMutableList()
+
+        return try {
+            renderClaudeWithArtifacts(request, mcpConfigFile, generatedPaths)
+        } catch (throwable: Throwable) {
+            cleanupRenderArtifacts(generatedPaths, throwable)
+        }
+    }
+
+    private fun cleanupRenderArtifacts(paths: List<Path>, primaryFailure: Throwable): Nothing {
+        try {
+            artifactCleanup(paths)
+        } catch (cleanupFailure: LlmArtifactCleanupException) {
+            cleanupFailure.addSuppressed(primaryFailure)
+            throw cleanupFailure
+        }
+        throw primaryFailure
+    }
+
+    private fun renderClaudeWithArtifacts(
+        request: LlmInvocationRequest,
+        mcpConfigFile: PrivateConfigPath,
+        generatedPaths: MutableList<Path>,
+    ): RenderedLlmCommand {
+        val targetDirectory = requireNotNull(mcpConfigFile.path.parent)
+        request.environment.claudeAuthSourcePath()?.let { sourcePath ->
+            val targetPath = targetDirectory.resolve(sourcePath.fileName.toString())
+            generatedPaths.add(1, targetPath)
+            claudeAuthCopy(sourcePath, targetPath)
+        }
         val hasMcpServer = request.mcpServer != null
         val allowedTools = if (hasMcpServer) {
             request.allowedTools.joinToString(",")
@@ -159,37 +189,21 @@ class DefaultLlmCommandRenderer(
             "--allowedTools",
             allowedTools,
         )
-        val noMcpIsolationArgs = if (hasMcpServer) {
-            emptyList()
-        } else {
-            listOf(
-                "--bare",
-            )
-        }
-        val toolArgs = if (hasMcpServer) {
-            CLAUDE_MCP_ONLY_TOOL_ARGS
-        } else {
-            CLAUDE_NO_TOOL_ARGS
-        }
-        val args = baseArgs + noMcpIsolationArgs + mcpArgs + toolArgs +
+        val args = baseArgs + claudeBareArgs(hasMcpServer) + mcpArgs + claudeToolArgs(hasMcpServer) +
             ENFORCED_CLAUDE_COMMON_ARGS
+        val claudeHome = targetDirectory.toString()
+        val commandEnvironment = request.environment.withoutLlmSecrets().withClaudeHome(claudeHome)
 
-        return runCatching {
-            config.claudeCommandTemplate.toRenderedCommand(
-                RenderedCommandRequest(
-                    args = args,
-                    environment = request.environment,
-                    workingDirectory = request.workingDirectory,
-                    timeout = request.timeout,
-                    stdin = null,
-                    cleanupPaths = mcpConfigFile.cleanupPaths,
-                ),
-            )
-        }.getOrElse { throwable ->
-            mcpConfigFile.cleanupPaths.deleteGeneratedPaths()
-
-            throw throwable
-        }
+        return config.claudeCommandTemplate.toRenderedCommand(
+            RenderedCommandRequest(
+                args = args,
+                environment = commandEnvironment,
+                workingDirectory = request.workingDirectory,
+                timeout = request.timeout,
+                stdin = null,
+                cleanupPaths = generatedPaths + listOfNotNull(request.mcpServer?.manifestPath),
+            ),
+        )
     }
 
     private fun renderCodex(request: LlmInvocationRequest): RenderedLlmCommand {
@@ -201,10 +215,13 @@ class DefaultLlmCommandRenderer(
         val codexHome = writeCodexHome(
             mcpServer = request.mcpServer,
             environment = request.environment,
-            persistentHome = config.codexPersistentHome,
             effort = request.effort,
         )
-        val commandEnvironment = request.environment + (CODEX_HOME_ENV to codexHome.path.toString())
+        val commandEnvironment = request.environment.withoutLlmSecrets() + mapOf(
+            CODEX_HOME_ENV to codexHome.path.toString(),
+            HOME_ENV to codexHome.path.toString(),
+            XDG_CACHE_HOME_ENV to codexHome.path.resolve(".cache").toString(),
+        )
         val codexCommonArgs = config.codexCommonArgs.withoutDuplicatedEnforcedCodexArgs()
         val args = listOf("exec") +
             request.codexModelArgs(config.codexModel) +
@@ -221,7 +238,7 @@ class DefaultLlmCommandRenderer(
                     workingDirectory = request.workingDirectory,
                     timeout = request.timeout,
                     stdin = null,
-                    cleanupPaths = codexHome.cleanupPaths,
+                    cleanupPaths = codexHome.cleanupPaths + listOfNotNull(request.mcpServer?.manifestPath),
                 ),
             )
         }.getOrElse { throwable ->
@@ -230,6 +247,18 @@ class DefaultLlmCommandRenderer(
             throw throwable
         }
     }
+}
+
+private fun claudeBareArgs(hasMcpServer: Boolean) = if (hasMcpServer) emptyList() else listOf("--bare")
+
+private fun claudeToolArgs(hasMcpServer: Boolean) = if (hasMcpServer) CLAUDE_MCP_ONLY_TOOL_ARGS else CLAUDE_NO_TOOL_ARGS
+
+private fun Map<String, String>.withClaudeHome(claudeHome: String): Map<String, String> {
+    return this + mapOf(
+        CLAUDE_CONFIG_DIR_ENV to claudeHome,
+        HOME_ENV to claudeHome,
+        XDG_CACHE_HOME_ENV to "$claudeHome/.cache",
+    )
 }
 
 private fun LlmInvocationRequest.claudeModelArgs(fallbackModel: String?): List<String> {
@@ -272,6 +301,9 @@ private fun List<String>.toRenderedCommand(request: RenderedCommandRequest): Ren
     )
 }
 
+private fun Map<String, String>.withoutLlmSecrets(): Map<String, String> =
+    filterKeys { key -> key !in LLM_FORBIDDEN_ENVIRONMENT_KEYS }
+
 /**
  * CLI command template に追加する実行時情報。
  *
@@ -297,10 +329,7 @@ private fun LlmMcpServerConfig.toClaudeMcpConfigJson(): String {
             putJsonObject(name) {
                 put("command", command)
                 putJsonArray("args") {
-                    args.forEach { argument -> add(argument) }
-                }
-                putJsonObject("env") {
-                    environment.forEach { (key, value) -> put(key, value) }
+                    add(manifestId)
                 }
             }
         }
@@ -308,6 +337,12 @@ private fun LlmMcpServerConfig.toClaudeMcpConfigJson(): String {
 }
 
 private const val EMPTY_CLAUDE_MCP_CONFIG_JSON = """{"mcpServers":{}}"""
+private val LLM_FORBIDDEN_ENVIRONMENT_KEYS = setOf(
+    "DB_PASSWORD",
+    "FUKUROU_MCP_DB_PASSWORD_FILE",
+    "GMO_API_KEY",
+    "GMO_SECRET_KEY",
+)
 
 private fun LlmMcpServerConfig?.toCodexConfigToml(effort: LlmEffort): String {
     return buildString {
@@ -325,20 +360,8 @@ private fun LlmMcpServerConfig?.toCodexConfigToml(effort: LlmEffort): String {
         append(mcpServer.command.tomlQuoted())
         append("\n")
         append("args = ")
-        append(mcpServer.args.toTomlArray())
+        append(listOf(mcpServer.manifestId).toTomlArray())
         append("\n")
-
-        if (mcpServer.environment.isNotEmpty()) {
-            append("[mcp_servers.")
-            append(mcpServer.name.tomlKey())
-            append(".env]\n")
-            mcpServer.environment.forEach { (key, value) ->
-                append(key.tomlKey())
-                append(" = ")
-                append(value.tomlQuoted())
-                append("\n")
-            }
-        }
 
         mcpServer.autoApprovedTools.forEach { toolName ->
             append("[mcp_servers.")
@@ -369,38 +392,9 @@ private fun String.tomlKey(): String {
 private fun writeCodexHome(
     mcpServer: LlmMcpServerConfig?,
     environment: Map<String, String>,
-    persistentHome: Path?,
     effort: LlmEffort,
 ): PrivateConfigPath {
-    if (persistentHome != null) {
-        return writePersistentCodexHome(mcpServer, persistentHome, effort)
-    }
-
     return writeTemporaryCodexHome(mcpServer, environment, effort)
-}
-
-private fun writePersistentCodexHome(
-    mcpServer: LlmMcpServerConfig?,
-    directory: Path,
-    effort: LlmEffort,
-): PrivateConfigPath {
-    Files.createDirectories(directory)
-    directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
-
-    val configFile = directory.resolve(CODEX_CONFIG_FILE_NAME)
-    Files.writeString(
-        configFile,
-        mcpServer.toCodexConfigToml(effort),
-        StandardOpenOption.CREATE,
-        StandardOpenOption.TRUNCATE_EXISTING,
-        StandardOpenOption.WRITE,
-    )
-    configFile.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
-
-    return PrivateConfigPath(
-        path = directory,
-        cleanupPaths = emptyList(),
-    )
 }
 
 private fun writeTemporaryCodexHome(
@@ -445,6 +439,20 @@ private fun copyCodexAuthFile(environment: Map<String, String>, targetDirectory:
     targetPath.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
 
     return targetPath
+}
+
+private fun Map<String, String>.claudeAuthSourcePath(): Path? {
+    val configuredDirectory = readOptionalEnv(CLAUDE_CONFIG_DIR_ENV)?.let(Path::of)
+    val homeDirectory = readOptionalEnv(HOME_ENV)?.let { value -> Path.of(value).resolve(".claude") }
+    val sourceDirectory = configuredDirectory ?: homeDirectory ?: return null
+    return CLAUDE_CREDENTIAL_FILE_NAMES
+        .map(sourceDirectory::resolve)
+        .firstOrNull(Files::isRegularFile)
+}
+
+private fun copyClaudeAuthFile(sourcePath: Path, targetPath: Path) {
+    Files.copy(sourcePath, targetPath, StandardCopyOption.COPY_ATTRIBUTES)
+    targetPath.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
 }
 
 private fun Map<String, String>.codexAuthFilePath(): Path? {
@@ -493,11 +501,19 @@ private fun Path.setOwnerOnlyPermissions(permissions: Set<PosixFilePermission>) 
 }
 
 private fun List<Path>.deleteGeneratedPaths() {
-    forEach { path -> path.deleteGeneratedPath() }
+    var firstFailure: Throwable? = null
+    forEach { path ->
+        runCatching { path.deleteGeneratedPath() }
+            .onFailure { failure ->
+                firstFailure?.addSuppressed(failure) ?: run { firstFailure = failure }
+            }
+    }
+    firstFailure?.let { failure -> throw LlmArtifactCleanupException(failure) }
 }
 
+@Suppress("NestedBlockDepth")
 private fun Path.deleteGeneratedPath() {
-    runCatching {
+    try {
         val directory = Files.isDirectory(this)
 
         if (directory) {
@@ -509,6 +525,10 @@ private fun Path.deleteGeneratedPath() {
         } else {
             Files.deleteIfExists(this)
         }
+    } catch (throwable: LlmArtifactCleanupException) {
+        throw throwable
+    } catch (throwable: Throwable) {
+        throw LlmArtifactCleanupException(throwable)
     }
 }
 
@@ -676,6 +696,8 @@ const val CODEX_AUTH_FILE_NAME = "auth.json"
 private val PRIVATE_FILE_PERMISSIONS = setOf(
     PosixFilePermission.OWNER_READ,
     PosixFilePermission.OWNER_WRITE,
+    PosixFilePermission.GROUP_READ,
+    PosixFilePermission.GROUP_WRITE,
 )
 
 /**
@@ -685,7 +707,14 @@ private val PRIVATE_DIRECTORY_PERMISSIONS = setOf(
     PosixFilePermission.OWNER_READ,
     PosixFilePermission.OWNER_WRITE,
     PosixFilePermission.OWNER_EXECUTE,
+    PosixFilePermission.GROUP_READ,
+    PosixFilePermission.GROUP_WRITE,
+    PosixFilePermission.GROUP_EXECUTE,
 )
+
+private const val CLAUDE_CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+private const val XDG_CACHE_HOME_ENV = "XDG_CACHE_HOME"
+private val CLAUDE_CREDENTIAL_FILE_NAMES = listOf(".credentials.json", "credentials.json")
 
 /**
  * Claude CLI command template の環境変数名。
@@ -721,14 +750,6 @@ const val FUKUROU_CODEX_COMMON_ARGS_ENV = "FUKUROU_CODEX_COMMON_ARGS"
  * Codex Falsifier 引数の環境変数名。
  */
 const val FUKUROU_CODEX_FALSIFIER_ARGS_ENV = "FUKUROU_CODEX_FALSIFIER_ARGS"
-
-/**
- * Codex CLI の永続 home path を明示する Fukurou 専用環境変数名。
- *
- * local 開発者の実 `HOME/.codex/config.toml` を誤って上書きしないため、
- * 永続 in-place mode はこの値がある場合だけ有効にし、`HOME` からは推測しない。
- */
-const val FUKUROU_CODEX_PERSISTENT_HOME_ENV = "FUKUROU_CODEX_PERSISTENT_HOME"
 
 private fun List<String>.filterUnsafeArgs(forbiddenFlags: Set<String>): List<String> {
     return filter { argument ->

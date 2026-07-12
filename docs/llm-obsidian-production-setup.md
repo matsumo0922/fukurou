@@ -14,7 +14,7 @@ Obsidian Writer / Reflection Runner と LLM daemon は独立した worker であ
 
 ## NAS directory
 
-Ktor container は UID `10001` の `appuser` で動く。vault は `appuser` が書ける必要がある。CLI login state は production compose の `llm-home` volume に保存するため、NAS 側に Claude / Codex auth file 用 directory は作らない。
+Ktor container は UID `10001` の `appuser` で動く。vault は `appuser` が書ける必要がある。CLI login state は production compose の `llm-auth` volume に保存するため、NAS 側に Claude / Codex auth file 用 directory は作らない。
 
 ```sh
 sudo install -d -m 0750 -o 10001 -g 10001 /srv/fukurou/obsidian-vault
@@ -34,30 +34,30 @@ FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
 
 ## WebUI CLI login
 
-deploy 後、`llm-home` / `llm-cache` volume が root owner で作られている場合、CLI が login state / cache を書けずに失敗することがある。必要なら一度だけ owner を直す。
+deploy 後、`llm-auth` volume が root owner で作られている場合、auth copy を作れずに失敗することがある。必要なら一度だけ owner を直す。per-run artifact はcomposeがapp UID/shared groupで作る `/run/fukurou/llm-homes` tmpfsに置く。
 
 ```sh
 ssh dxp4800plus \
-  'sudo docker exec -u root fukurou-ktor sh -lc "chown -R 10001:999 /tmp/fukurou-cli-home /tmp/fukurou-cli-cache"'
+  'sudo docker exec -u root fukurou-ktor sh -lc "chown -R 10001:10004 /tmp/fukurou-cli-home /run/fukurou/llm-homes && chmod -R g+rwX /tmp/fukurou-cli-home /run/fukurou/llm-homes"'
 ```
 
 WebUI の System 画面は `/ops/llm-auth` を読み、Claude Code / Codex の login state を表示する。CLI auth は `/health` / `/health/ready` には混ぜないため、CLI が logged_out でも Ktor / DB / reconciler readiness の意味は変わらない。login state は非 secret の credential marker file で判定するため、CLI が keychain など marker file 以外へ credential を保存する構成では System が logged_out を示す場合がある。その場合は fallback 手順と smoke test で実際の CLI auth を確認する。
 
 WebUI の Controls 画面で `CLI Auth` を開き、Claude Code または Codex の login を reason 付きで開始する。Claude Code は表示された `authorizationUrl` を手元の browser で開き、browser flow が返した token/code を Claude Code session 専用の入力欄から 1 回だけ送信する。Codex は device auth flow のまま進め、WebUI に token/code 入力欄を出さない。WebUI / API / audit payload は access token、refresh token、API key、credential file content、送信した token/code を返さない。audit には provider、session ID、reason、status、secret を含まない detail だけを残す。
 
-CLI login state は production compose の `llm-home` volume が正本である。
+CLI login state は production compose の `llm-auth` volume が正本である。
 
 - Claude Code は `HOME=/tmp/fukurou-cli-home` の `~/.claude` を使う。
-- Codex は `CODEX_HOME=/tmp/fukurou-cli-home/.codex` を使い、`FUKUROU_CODEX_PERSISTENT_HOME=/tmp/fukurou-cli-home/.codex` と一致させる。
+- Codex login は auth source の `CODEX_HOME=/tmp/fukurou-cli-home/.codex` を使う。runner は auth file だけを per-run home へ copy し、config/session を永続 home に書かない。
 
 ## Container login fallback
 
-WebUI から login flow を開始できない場合だけ、SSH 越しの container login を fallback として使う。CLI の refresh token が失効または revoke された場合は、WebUI または fallback で再ログインする。通常の access token 更新は CLI が自動で行う。login state は `llm-home` volume に保存されるため、container restart / redeploy では残る。`docker volume rm fukurou_llm-home` のように volume を削除すると Claude / Codex の login state も消える。
+WebUI から login flow を開始できない場合だけ、SSH越しのcontainer loginをauth source更新専用の例外として使う。通常のprovider invocationをappuser direct CLIで実行しない。CLI の refresh token が失効または revoke された場合は、WebUI または fallback で再ログインする。login state は `llm-auth` volume に保存されるため、container restart / redeploy では残る。`docker volume rm fukurou_llm-auth` のように volume を削除すると Claude / Codex の login state も消える。
 
 Claude Code は container 内で対話ログインする。
 
 ```sh
-ssh -t dxp4800plus 'docker exec -it fukurou-ktor claude'
+ssh -t dxp4800plus 'docker exec -it -e HOME=/tmp/fukurou-cli-home fukurou-ktor claude auth login'
 ```
 
 Claude prompt が出たら `/login` を実行し、表示された URL を手元の browser で承認して code を貼り付ける。SSH 越しの paste がうまくいかない場合だけ、SSH port forward を一時的な fallback として使う。
@@ -84,21 +84,20 @@ ssh dxp4800plus '
 docker exec fukurou-ktor sh -lc "
   test -f /app/fukurou-mcp-all.jar && echo MCP_JAR_OK
   test -w /tmp/fukurou-cli-home && echo CLI_HOME_WRITABLE
-  test -w /tmp/fukurou-cli-cache && echo CLI_CACHE_WRITABLE
   test -w /vault && echo VAULT_WRITABLE
   codex login status
 "
 '
 ```
 
-Claude Code を低コスト model で叩く。応答は固定文字列にする。
+Claude auth sourceの実対応fileをread-onlyに確認する。provider invocationのsmokeはfixed launcherを通すproduction canaryで行う。
 
 ```sh
 ssh dxp4800plus \
-  'docker exec fukurou-ktor sh -lc "timeout 90 claude --print --model haiku --max-budget-usd 0.02 --no-session-persistence --output-format text '\''Reply exactly: FUKUROU_CLAUDE_OK'\''"'
+  'docker exec fukurou-ktor sh -lc "test -r /tmp/fukurou-cli-home/.claude/.credentials.json"'
 ```
 
-Codex は production renderer と同じ `FUKUROU_CODEX_PERSISTENT_HOME` を使い、`llm-home` volume 内の login state をそのまま使う。
+Codex smoke は `llm-auth` volume 内の auth source を明示して login state を確認する。production runner の config/session は per-run home に生成される。
 
 ```sh
 ssh dxp4800plus \
@@ -146,9 +145,9 @@ Reflection Runner の loop は `reflection.minInterval` と `obsidian.writeInter
 
 LLM daemon を有効化する前に、少なくとも次を満たすこと。
 
-- `claude --print --model haiku ...` の smoke test が成功している。
+- exact imageのfixed launcher canaryでClaude/Codexのprovider invocation経路が成功している。
 - `codex login status` と `codex exec ...` の smoke test が成功している。
-- `FUKUROU_MCP_JAR_PATH=/app/fukurou-mcp-all.jar` が running container に反映されている。
+- fixed MCP launcher、manifest directory、root-only password fileがrunning containerに反映されている。
 - `FUKUROU_TRADING_MODE=PAPER` のままになっている。
 - WebUI `/app/config` で `runner.maxInvocationsPerHour` / `runner.maxInvocationsPerDay` が意図した上限になっている。
 - Codex の model / cost 方針を確認している。

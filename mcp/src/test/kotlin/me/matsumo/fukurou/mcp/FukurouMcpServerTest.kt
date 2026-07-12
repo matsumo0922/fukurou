@@ -1,5 +1,7 @@
 package me.matsumo.fukurou.mcp
 
+import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
 import io.modelcontextprotocol.kotlin.sdk.server.ClientConnection
 import io.modelcontextprotocol.kotlin.sdk.shared.RequestOptions
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
@@ -20,6 +22,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import io.modelcontextprotocol.kotlin.sdk.types.ResourceUpdatedNotification
 import io.modelcontextprotocol.kotlin.sdk.types.ServerNotification
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
@@ -32,6 +35,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import me.matsumo.fukurou.trading.activity.DecisionRunDecision
 import me.matsumo.fukurou.trading.activity.DecisionRunFalsification
 import me.matsumo.fukurou.trading.activity.DecisionRunIntent
@@ -58,6 +62,7 @@ import me.matsumo.fukurou.trading.broker.PositionsWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.PreviewOrderResult
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
@@ -80,10 +85,18 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
+import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
+import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
+import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.MCP_MANIFEST_VERSION
+import me.matsumo.fukurou.trading.invoker.McpLaunchManifest
 import me.matsumo.fukurou.trading.knowledge.KnowledgeService
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.runner.CANONICAL_FALSIFIER_MCP_TOOL_NAMES
+import me.matsumo.fukurou.trading.runner.CANONICAL_PROPOSER_MCP_TOOL_NAMES
 import me.matsumo.fukurou.trading.runner.DEFAULT_RUNNER_MCP_SERVER_NAME
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import me.matsumo.fukurou.trading.runner.defaultFalsifierAllowedTools
@@ -96,13 +109,19 @@ import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
+import org.testcontainers.utility.MountableFile
+import java.net.InetSocketAddress
+import java.nio.file.Path
+import java.sql.DriverManager
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -1708,6 +1727,492 @@ class FukurouMcpServerTest {
         assertTrue(noTradeEvent.payload.contains("mcp_tool_not_allowed"))
     }
 }
+
+/** least-privilege PostgreSQL role と production bootstrap/server path の integration。 */
+class McpLaunchBootstrapPolicyTest {
+    @Test
+    fun bootstrapAndDatabaseConfig_redactPasswordFromToString() {
+        val bootstrap = decodeBootstrap(bootstrapManifest(LlmInvocationPhase.PROPOSER, fixedClock()), fixedClock())
+
+        assertFalse(bootstrap.toString().contains(MCP_TEST_PASSWORD))
+        assertFalse(bootstrap.databaseConfig.toString().contains(MCP_TEST_PASSWORD))
+        assertTrue(bootstrap.toString().contains("password=<redacted>"))
+    }
+
+    @Test
+    fun bothPhasesRejectUnknownTamperedExpiredEmptyAndBudgetExceed() {
+        val clock = fixedClock()
+        listOf(LlmInvocationPhase.PROPOSER, LlmInvocationPhase.FALSIFIER).forEach { phase ->
+            val canonical = bootstrapManifest(phase, clock)
+            assertNotNull(decodeBootstrap(canonical, clock))
+            listOf(
+                canonical.copy(phase = "UNKNOWN"),
+                canonical.copy(allowedTools = canonical.allowedTools + "place_order"),
+                canonical.copy(allowedTools = emptyList()),
+                canonical.copy(expiresAt = Instant.now(clock).minusSeconds(1).toString()),
+                canonical.copy(totalToolCallLimit = 49),
+                canonical.copy(actToolCallLimit = 4),
+                canonical.copy(totalToolCallLimit = 1, actToolCallLimit = 2),
+                canonical.copy(runtimeEnvironment = emptyMap()),
+                canonical.copy(runtimeEnvironment = canonical.runtimeEnvironment + ("UNKNOWN_RUNTIME_KEY" to "tampered")),
+                canonical.copy(systemPromptVersion = ""),
+            ).forEach { rejected ->
+                assertNotNull(runCatching { decodeBootstrap(rejected, clock) }.exceptionOrNull())
+            }
+        }
+    }
+
+    @Test
+    fun bootstrapSystemPromptVersion_isUsedBySubmitDecisionFallbackAndAudit() = runBlocking {
+        val clock = fixedClock()
+        val bootstrap = decodeBootstrap(bootstrapManifest(LlmInvocationPhase.PROPOSER, clock), clock)
+        val runtime = TradingRuntimeFactory.inMemory(clock = clock)
+        val server = FukurouMcpServer(
+            marketDataSource = FakeMarketDataSource,
+            clock = clock,
+            tradingRuntime = runtime,
+            decisionRunContext = bootstrap.decisionRunContext,
+            allowedToolNames = bootstrap.allowedTools,
+            expiresAt = bootstrap.expiresAt,
+        ).createServer()
+
+        val result = callTool(server, "submit_decision", enterDecisionArguments())
+        val repository = runtime.decisionRepository as InMemoryDecisionRepository
+        val submission = repository.snapshots.decisions().single().submission
+        val auditEvents = (runtime.commandEventLog as InMemoryCommandEventLog).events()
+            .filter { event -> event.toolName == "submit_decision" }
+
+        assertTrue(result.isError != true)
+        assertEquals("fixture-system-prompt-v1", bootstrap.decisionRunContext.systemPromptVersion)
+        assertEquals("fixture-system-prompt-v1", submission.systemPromptVersion)
+        assertTrue(auditEvents.isNotEmpty())
+        assertTrue(auditEvents.all { event -> event.decisionRunContext.systemPromptVersion == "fixture-system-prompt-v1" })
+    }
+}
+
+private fun bootstrapManifest(phase: LlmInvocationPhase, clock: Clock): McpLaunchManifest {
+    val allowedTools = when (phase) {
+        LlmInvocationPhase.PROPOSER -> CANONICAL_PROPOSER_MCP_TOOL_NAMES
+        LlmInvocationPhase.FALSIFIER -> CANONICAL_FALSIFIER_MCP_TOOL_NAMES
+        else -> error("unsupported test phase")
+    }
+    return McpLaunchManifest(
+        version = MCP_MANIFEST_VERSION,
+        invocationId = "policy-test",
+        phase = phase.name,
+        expiresAt = Instant.now(clock).plusSeconds(60).toString(),
+        allowedTools = allowedTools.sorted(),
+        decisionRunId = "policy-test",
+        llmProvider = "fixture",
+        promptHash = "fixture-hash",
+        systemPromptVersion = "fixture-system-prompt-v1",
+        marketSnapshotId = "fixture-snapshot",
+        dbUrl = "jdbc:postgresql://fixture/fukurou",
+        dbUser = MCP_TEST_ROLE,
+        gmoPublicBaseUrl = "http://127.0.0.1:1",
+        runtimeEnvironment = RuntimeConfigCatalog.runtimeEnvironment(TradingBotConfig()),
+        totalToolCallLimit = 48,
+        actToolCallLimit = 3,
+    )
+}
+
+private fun decodeBootstrap(manifest: McpLaunchManifest, clock: Clock): McpBootstrapConfig {
+    val bytes = kotlinx.serialization.json.Json.encodeToString(manifest).encodeToByteArray()
+    return McpLaunchBootstrap.decode(bytes, MCP_TEST_PASSWORD.encodeToByteArray(), clock)
+}
+
+/** least-privilege PostgreSQL role と production bootstrap/server path の integration。 */
+class McpDatabaseRoleIntegrationTest {
+    @Test
+    fun leastPrivilegeRole_supportsRequiredMatrixAndRejectsForbiddenWrites() = runBlocking {
+        if (!DockerClientFactory.instance().isDockerAvailable) return@runBlocking
+
+        val container = PostgreSQLContainer("postgres:16-alpine")
+        container.start()
+        val marketFixture = GmoRequiredMatrixFixture.start()
+        var runtime: me.matsumo.fukurou.trading.runtime.TradingRuntime? = null
+        try {
+            val clock = fixedClock()
+            val database = ExposedDatabase.connect(container.jdbcUrl, driver = "org.postgresql.Driver", user = container.username, password = container.password)
+            TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
+            seedRequiredMatrixRun(container, clock)
+            seedDirtyMcpPrivileges(container)
+            provisionMcpRole(container)
+            provisionMcpRole(container)
+            createFuturePrivilegeBoundaryObjects(container)
+            assertRoleBoundary(container)
+            TradingRuntimeFactory.postgres(
+                TradingDatabaseConfig(container.jdbcUrl, container.username, container.password),
+                clock = clock,
+            ).close()
+
+            val bootstrap = requiredMatrixBootstrap(container, clock, LlmInvocationPhase.PROPOSER)
+            val tradingConfig = TradingBotConfig(
+                gmoPublicClient = GmoPublicClientConfig(
+                    baseUrl = marketFixture.baseUrl,
+                    connectTimeout = Duration.ofSeconds(2),
+                    requestTimeout = Duration.ofSeconds(2),
+                    retry = GmoRetryConfig(maxAttempts = 1),
+                ),
+            )
+            val marketDataSource = GmoPublicMarketDataSource.fromConfig(tradingConfig.gmoPublicClient, clock)
+            val fixtureMarketDataSource = RequiredMatrixMarketDataSource(marketDataSource)
+            runtime = TradingRuntimeFactory.postgresForMcp(
+                config = bootstrap.databaseConfig,
+                clock = clock,
+                marketDataSource = fixtureMarketDataSource,
+                tradingConfig = tradingConfig,
+            )
+            var server = FukurouMcpServer(
+                tradingConfig = tradingConfig,
+                marketDataSource = fixtureMarketDataSource,
+                clock = clock,
+                tradingRuntime = runtime,
+                decisionRunContext = bootstrap.decisionRunContext,
+                allowedToolNames = bootstrap.allowedTools,
+                expiresAt = bootstrap.expiresAt,
+            ).createServer()
+            val results = linkedMapOf<String, CallToolResult>()
+            results["get_ticker"] = callTool(server, "get_ticker")
+            results["get_candles"] = callTool(
+                server = server,
+                toolName = "get_candles",
+                arguments = buildJsonObject {
+                    put("interval", "1hour")
+                    put("limit", 1)
+                },
+            )
+            results["get_orderbook"] = callTool(server, "get_orderbook")
+            results["get_trades"] = callTool(server, "get_trades")
+            results["get_symbol_rules"] = callTool(server, "get_symbol_rules")
+            results["calc_indicator"] = callTool(
+                server = server,
+                toolName = "calc_indicator",
+                arguments = buildJsonObject {
+                    put("interval", "1hour")
+                    put("indicator", "SMA")
+                    putJsonObject("params") {
+                        put("period", 1)
+                    }
+                },
+            )
+            results["get_balance"] = callTool(server, "get_balance")
+            results["get_positions"] = callTool(server, "get_positions")
+            results["get_open_orders"] = callTool(server, "get_open_orders")
+            results["get_account_status"] = callTool(server, "get_account_status")
+            results["knowledge_get_recent_lessons"] = callTool(server, "knowledge_get_recent_lessons")
+            results["knowledge_search_similar_setups"] = callTool(
+                server = server,
+                toolName = "knowledge_search_similar_setups",
+                arguments = buildJsonObject {
+                    put("signal_summary", "breakout")
+                    put("limit", 3)
+                },
+            )
+            val decision = callTool(server, "submit_decision", enterDecisionArguments(invocationId = MCP_MATRIX_RUN_ID))
+            results["submit_decision"] = decision
+            val intentId = assertNotNull(decision.structuredContent).getValue("intent_id").jsonPrimitive.contentOrNull
+            results["get_trade_intent"] = callTool(server, "get_trade_intent", buildJsonObject { put("intent_id", intentId) })
+            runtime.close()
+            val falsifierBootstrap = requiredMatrixBootstrap(container, clock, LlmInvocationPhase.FALSIFIER)
+            runtime = TradingRuntimeFactory.postgresForMcp(
+                config = falsifierBootstrap.databaseConfig,
+                clock = clock,
+                marketDataSource = fixtureMarketDataSource,
+                tradingConfig = tradingConfig,
+            )
+            server = FukurouMcpServer(
+                tradingConfig = tradingConfig,
+                marketDataSource = fixtureMarketDataSource,
+                clock = clock,
+                tradingRuntime = runtime,
+                decisionRunContext = falsifierBootstrap.decisionRunContext,
+                allowedToolNames = falsifierBootstrap.allowedTools,
+                expiresAt = falsifierBootstrap.expiresAt,
+            ).createServer()
+            results["submit_falsification"] = callTool(
+                server,
+                "submit_falsification",
+                buildJsonObject {
+                    put("intent_id", intentId)
+                    put("verdict", FalsificationVerdict.APPROVED.name)
+                    put("llm_provider", "codex")
+                    put("reason_ja", "fixture data の反証を完了しました。")
+                },
+            )
+            results["preview_order"] = callTool(server, "preview_order", placeOrderArguments(assertNotNull(intentId)))
+
+            assertEquals(MCP_REQUIRED_CALL_COUNT, results.size)
+            assertTrue(results.none { (_, result) -> result.isError == true }, "Required MCP call failures: ${results.filterValues { it.isError == true }.keys}")
+            assertForbiddenDml(container)
+            assertNoFallback(container, clock)
+        } finally {
+            runtime?.close()
+            marketFixture.close()
+            container.stop()
+        }
+    }
+}
+
+private fun seedDirtyMcpPrivileges(container: PostgreSQLContainer<*>) {
+    val sql = """
+        CREATE ROLE $MCP_TEST_ROLE LOGIN PASSWORD '$MCP_TEST_PASSWORD' SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS INHERIT;
+        CREATE ROLE mcp_dirty_parent;
+        CREATE ROLE mcp_dirty_child;
+        CREATE ROLE mcp_dirty_grantor;
+        GRANT mcp_dirty_parent TO $MCP_TEST_ROLE;
+        GRANT $MCP_TEST_ROLE TO mcp_dirty_child;
+        CREATE TABLE mcp_dirty_owned(id bigint generated always as identity, value text);
+        ALTER TABLE mcp_dirty_owned OWNER TO $MCP_TEST_ROLE;
+        CREATE FUNCTION mcp_dirty_function() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+        ALTER FUNCTION mcp_dirty_function() OWNER TO $MCP_TEST_ROLE;
+        GRANT ALL ON ALL TABLES IN SCHEMA public TO $MCP_TEST_ROLE;
+        REVOKE UPDATE ON orders FROM $MCP_TEST_ROLE;
+        GRANT UPDATE (status) ON orders TO $MCP_TEST_ROLE;
+        GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $MCP_TEST_ROLE;
+        GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO $MCP_TEST_ROLE;
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO PUBLIC;
+        REVOKE UPDATE ON orders FROM PUBLIC;
+        GRANT UPDATE (status) ON orders TO PUBLIC;
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES FOR ROLE ${container.username} IN SCHEMA public GRANT ALL ON TABLES TO $MCP_TEST_ROLE;
+        ALTER DEFAULT PRIVILEGES FOR ROLE ${container.username} IN SCHEMA public GRANT ALL ON SEQUENCES TO $MCP_TEST_ROLE;
+        ALTER DEFAULT PRIVILEGES FOR ROLE ${container.username} IN SCHEMA public GRANT ALL ON FUNCTIONS TO $MCP_TEST_ROLE;
+        ALTER DEFAULT PRIVILEGES FOR ROLE ${container.username} IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES FOR ROLE ${container.username} IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor IN SCHEMA public GRANT SELECT ON TABLES TO $MCP_TEST_ROLE;
+        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor GRANT SELECT ON TABLES TO $MCP_TEST_ROLE;
+        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor GRANT SELECT ON TABLES TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor GRANT EXECUTE ON FUNCTIONS TO $MCP_TEST_ROLE;
+        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+    """.trimIndent()
+    val result = container.execInContainer(
+        "psql", "-U", container.username, "-d", container.databaseName,
+        "-v", "ON_ERROR_STOP=1", "-c", sql,
+    )
+    check(result.exitCode == 0) { "dirty MCP fixture failed: ${result.stderr}" }
+}
+
+private fun createFuturePrivilegeBoundaryObjects(container: PostgreSQLContainer<*>) {
+    val sql = """
+        CREATE TABLE mcp_future_boundary(id bigint);
+        CREATE FUNCTION mcp_future_boundary_function() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+    """.trimIndent()
+    val result = container.execInContainer(
+        "psql", "-U", container.username, "-d", container.databaseName,
+        "-v", "ON_ERROR_STOP=1", "-c", sql,
+    )
+    check(result.exitCode == 0) { "future privilege boundary fixture failed: ${result.stderr}" }
+}
+
+private suspend fun seedRequiredMatrixRun(container: PostgreSQLContainer<*>, clock: Clock) {
+    val runtime = TradingRuntimeFactory.postgres(
+        TradingDatabaseConfig(container.jdbcUrl, container.username, container.password),
+        clock = clock,
+    )
+    try {
+        runtime.llmRunRepository.insertRunning(
+            LlmRunStart(
+                invocationId = MCP_MATRIX_RUN_ID,
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = null,
+                startedAt = Instant.now(clock),
+            ),
+        ).getOrThrow()
+    } finally {
+        runtime.close()
+    }
+}
+
+private fun provisionMcpRole(container: PostgreSQLContainer<*>) {
+    val sqlPath = generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { path -> path.parent }
+        .map { path -> path.resolve("scripts/deploy/sql/mcp-role.sql") }
+        .first { path -> java.nio.file.Files.isRegularFile(path) }
+    container.copyFileToContainer(MountableFile.forHostPath(sqlPath), "/tmp/mcp-role.sql")
+    val result = container.execInContainer(
+        "psql", "-U", container.username, "-d", container.databaseName,
+        "-v", "mcp_role=$MCP_TEST_ROLE", "-v", "mcp_password=$MCP_TEST_PASSWORD",
+        "-v", "database_name=${container.databaseName}", "-v", "app_role=${container.username}",
+        "-f", "/tmp/mcp-role.sql",
+    )
+    check(result.exitCode == 0) { "MCP role SQL failed: ${result.stderr}" }
+    val roleCheck = container.execInContainer(
+        "psql", "-U", container.username, "-d", container.databaseName,
+        "-Atc", "SELECT rolname FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'",
+    )
+    check(roleCheck.stdout.trim() == MCP_TEST_ROLE) { "MCP role was not created; SQL output=${result.stdout}" }
+}
+
+@Suppress("NestedBlockDepth")
+private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
+    DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
+        connection.createStatement().use { statement ->
+            statement.executeQuery("SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolinherit FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'").use { rows ->
+                assertTrue(rows.next())
+                (1..6).forEach { column -> assertEquals(false, rows.getBoolean(column)) }
+            }
+            assertSqlCount(statement, "SELECT count(*) FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')", 0)
+            assertSqlCount(statement, "SELECT count(*) FROM pg_auth_members WHERE roleid=(SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')", 0)
+            assertSqlCount(statement, "SELECT count(*) FROM pg_class WHERE relowner=(SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')", 0)
+            assertSqlCount(statement, "SELECT count(*) FROM pg_proc WHERE proowner=(SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')", 0)
+            statement.executeQuery("SELECT has_database_privilege('public', current_database(), 'CREATE'), has_database_privilege('public', current_database(), 'TEMP'), has_schema_privilege('public', 'public', 'CREATE')").use { rows ->
+                assertTrue(rows.next())
+                (1..3).forEach { column -> assertEquals(false, rows.getBoolean(column)) }
+            }
+            assertSqlCount(statement, "SELECT count(*) FROM information_schema.role_table_grants WHERE grantee='PUBLIC' AND table_schema='public'", 0)
+            assertSqlCount(
+                statement,
+                "SELECT count(*) FROM pg_attribute attribute " +
+                    "JOIN pg_class relation ON relation.oid=attribute.attrelid " +
+                    "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace " +
+                    "CROSS JOIN LATERAL aclexplode(attribute.attacl) acl " +
+                    "WHERE namespace.nspname='public' AND acl.grantee IN (0, (SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'))",
+                0,
+            )
+            statement.executeQuery(
+                "SELECT " +
+                    "has_table_privilege('public', 'mcp_future_boundary', 'SELECT'), " +
+                    "has_table_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary', 'SELECT'), " +
+                    "has_function_privilege('public', 'mcp_future_boundary_function()', 'EXECUTE'), " +
+                    "has_function_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary_function()', 'EXECUTE')",
+            ).use { rows ->
+                assertTrue(rows.next())
+                (1..4).forEach { column -> assertFalse(rows.getBoolean(column)) }
+            }
+            assertSqlCount(
+                statement,
+                "SELECT count(*) FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(COALESCE(d.defaclacl, acldefault(d.defaclobjtype, d.defaclrole))) a " +
+                    "WHERE d.defaclnamespace IN (0, 'public'::regnamespace) " +
+                    "AND a.grantee IN (0, (SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'))",
+                0,
+            )
+            assertSqlCount(
+                statement,
+                "SELECT count(*) FROM information_schema.role_usage_grants WHERE grantee='$MCP_TEST_ROLE' AND object_schema='public'",
+                0,
+            )
+        }
+    }
+    mcpTestConnection(container).use { connection ->
+        connection.createStatement().use { statement ->
+            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_table_privilege(current_user, 'orders', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP')").use { rows ->
+                assertTrue(rows.next())
+                assertEquals(true, rows.getBoolean(1))
+                assertEquals(true, rows.getBoolean(2))
+                assertEquals(false, rows.getBoolean(3))
+                assertEquals(true, rows.getBoolean(4))
+                assertEquals(false, rows.getBoolean(5))
+            }
+        }
+    }
+}
+
+private fun requiredMatrixBootstrap(
+    container: PostgreSQLContainer<*>,
+    clock: Clock,
+    phase: LlmInvocationPhase,
+): McpBootstrapConfig {
+    val allowedTools = when (phase) {
+        LlmInvocationPhase.PROPOSER -> CANONICAL_PROPOSER_MCP_TOOL_NAMES
+        LlmInvocationPhase.FALSIFIER -> CANONICAL_FALSIFIER_MCP_TOOL_NAMES
+        else -> error("unsupported test phase")
+    }
+    val manifest = McpLaunchManifest(
+        version = MCP_MANIFEST_VERSION,
+        invocationId = MCP_MATRIX_RUN_ID,
+        phase = phase.name,
+        expiresAt = Instant.now(clock).plusSeconds(300).toString(),
+        allowedTools = allowedTools.sorted(),
+        decisionRunId = MCP_MATRIX_RUN_ID,
+        llmProvider = "fixture",
+        promptHash = "fixture-hash",
+        systemPromptVersion = "fixture-system-prompt-v1",
+        marketSnapshotId = "fixture-snapshot",
+        dbUrl = container.jdbcUrl,
+        dbUser = MCP_TEST_ROLE,
+        gmoPublicBaseUrl = "http://127.0.0.1:1",
+        runtimeEnvironment = RuntimeConfigCatalog.runtimeEnvironment(TradingBotConfig()),
+        totalToolCallLimit = 48,
+        actToolCallLimit = 3,
+    )
+    val manifestBytes = kotlinx.serialization.json.Json.encodeToString(manifest).encodeToByteArray()
+    return McpLaunchBootstrap.decode(manifestBytes, MCP_TEST_PASSWORD.encodeToByteArray(), clock)
+}
+
+private fun assertForbiddenDml(container: PostgreSQLContainer<*>) {
+    mcpTestConnection(container).use { connection ->
+        listOf("UPDATE orders SET status=status", "DELETE FROM executions", "TRUNCATE positions", "INSERT INTO orders DEFAULT VALUES").forEach { sql ->
+            assertNotNull(runCatching { connection.createStatement().use { it.execute(sql) } }.exceptionOrNull())
+        }
+    }
+}
+
+private fun assertNoFallback(container: PostgreSQLContainer<*>, clock: Clock) {
+    assertNotNull(
+        runCatching {
+            TradingRuntimeFactory.postgresForMcp(
+                TradingDatabaseConfig("${container.jdbcUrl}?connectTimeout=2&socketTimeout=2", MCP_TEST_ROLE, "wrong-dummy-password"),
+                clock = clock,
+            )
+        }.exceptionOrNull(),
+    )
+}
+
+private fun mcpTestConnection(container: PostgreSQLContainer<*>) =
+    DriverManager.getConnection(container.jdbcUrl, MCP_TEST_ROLE, MCP_TEST_PASSWORD)
+
+private fun assertSqlCount(
+    statement: java.sql.Statement,
+    sql: String,
+    expected: Int,
+) {
+    statement.executeQuery(sql).use { rows ->
+        assertTrue(rows.next())
+        assertEquals(expected, rows.getInt(1))
+    }
+}
+
+private class GmoRequiredMatrixFixture private constructor(private val server: HttpServer) : AutoCloseable {
+    val baseUrl = "http://127.0.0.1:${server.address.port}/public"
+
+    override fun close() = server.stop(0)
+
+    companion object {
+        fun start(): GmoRequiredMatrixFixture {
+            val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+            server.createContext("/public/v1/") { exchange -> exchange.respondRequiredMatrixFixture() }
+            server.start()
+            return GmoRequiredMatrixFixture(server)
+        }
+    }
+}
+
+private class RequiredMatrixMarketDataSource(
+    private val fixtureHttpSource: GmoPublicMarketDataSource,
+) : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> = fixtureHttpSource.getTicker(symbol)
+}
+
+private fun HttpExchange.respondRequiredMatrixFixture() {
+    val body = when (requestURI.path.substringAfterLast('/')) {
+        "ticker" -> """{"status":0,"data":[{"symbol":"BTC","ask":"101","bid":"99","high":"110","last":"100","low":"90","volume":"1.0","timestamp":"2026-07-01T00:00:00.000Z"}]}"""
+        "orderbooks" -> """{"status":0,"data":{"asks":[{"price":"101","size":"0.1"}],"bids":[{"price":"99","size":"0.1"}],"symbol":"BTC"}}"""
+        "trades" -> """{"status":0,"data":{"list":[{"price":"100","side":"BUY","size":"0.01","timestamp":"2026-07-01T00:00:00.000Z"}]}}"""
+        "symbols" -> """{"status":0,"data":[{"symbol":"BTC","minOrderSize":"0.0001","maxOrderSize":"5","sizeStep":"0.0001","tickSize":"1","takerFee":"0.0005","makerFee":"-0.0001"}]}"""
+        "klines" -> """{"status":0,"data":[{"openTime":"1751328000000","open":"100","high":"110","low":"90","close":"105","volume":"1.0"}]}"""
+        else -> """{"status":1,"messages":[{"message_code":"ERR","message_string":"unknown fixture path"}]}"""
+    }.encodeToByteArray()
+    responseHeaders.add("Content-Type", "application/json")
+    sendResponseHeaders(200, body.size.toLong())
+    responseBody.use { output -> output.write(body) }
+}
+
+private const val MCP_TEST_ROLE = "fukurou_mcp"
+private const val MCP_TEST_PASSWORD = "FUKUROU_CANARY_DB_ROLE_DUMMY_ONLY"
+private const val MCP_MATRIX_RUN_ID = "mcp-required-matrix-run"
+private const val MCP_REQUIRED_CALL_COUNT = 16
 
 /**
  * #19 で観測した Proposer tool call 数。

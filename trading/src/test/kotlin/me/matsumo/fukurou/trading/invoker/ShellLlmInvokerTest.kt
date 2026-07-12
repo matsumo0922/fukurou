@@ -9,10 +9,13 @@ import java.nio.file.Path
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
@@ -20,6 +23,21 @@ import kotlin.test.assertTrue
  * ShellLlmInvoker の parse-before-cleanup lifecycle を検証するテスト。
  */
 class ShellLlmInvokerTest {
+    private lateinit var quarantinePath: Path
+
+    @BeforeTest
+    fun prepareQuarantine() {
+        quarantinePath = Files.createTempDirectory("llm-quarantine-test").resolve("marker")
+        System.setProperty("fukurou.llm.cleanupQuarantinePath", quarantinePath.toString())
+        LlmArtifactCleanupQuarantine.resetForTest()
+    }
+
+    @AfterTest
+    fun clearQuarantine() {
+        LlmArtifactCleanupQuarantine.resetForTest()
+        System.clearProperty("fukurou.llm.cleanupQuarantinePath")
+        Files.deleteIfExists(quarantinePath.parent)
+    }
 
     @Test
     fun invoke_parsesArtifactsBeforeCleanupAndReturnsSemanticOutput() = runBlocking {
@@ -120,6 +138,69 @@ class ShellLlmInvokerTest {
         assertEquals(0, invocationResult.processResult.exitCode)
         assertTrue(processRunner.runCalled)
         assertTrue(processRunner.cleanupCalled)
+        assertTrue(Files.exists(quarantinePath))
+        assertTrue(invoker.invoke(request()).isFailure)
+    }
+
+    @Test
+    fun cleanupMarkerWriteFailure_remainsFailClosedInCurrentProcess() = runBlocking {
+        val artifact = Files.createTempFile("shell-llm-marker-write-failure", ".jsonl")
+        val processRunner = RecordingProcessRunner(
+            result = Result.success(cleanProcess()),
+            cleanupAction = {
+                Files.createDirectory(quarantinePath)
+                throw FileSystemException(artifact.toString(), null, "cleanup fixture")
+            },
+        )
+        val invoker = ShellLlmInvoker(
+            commandRenderer = StaticCommandRenderer(renderedCommand(artifact)),
+            processRunner = processRunner,
+        )
+
+        assertNotNull(invoker.invoke(request()).getOrThrow().cleanupFailure)
+        assertTrue(invoker.invoke(request()).isFailure)
+    }
+
+    @Test
+    fun claudePartialAuthCopyCleanupFailure_quarantinesAcrossRestartWithoutMutatingSource() = runBlocking {
+        val sourceHome = Files.createTempDirectory("claude-render-source")
+        val sourceDirectory = Files.createDirectories(sourceHome.resolve(".claude"))
+        val sourceFile = sourceDirectory.resolve(".credentials.json")
+        val sourceContent = "immutable-auth-source".toByteArray()
+        Files.write(sourceFile, sourceContent)
+        var partialTarget: Path? = null
+        val renderer = DefaultLlmCommandRenderer(
+            claudeAuthCopy = { _, target ->
+                partialTarget = target
+                Files.writeString(target, "partial")
+                throw FileSystemException(target.toString(), null, "synthetic partial copy")
+            },
+            artifactCleanup = {
+                throw LlmArtifactCleanupException(
+                    FileSystemException(partialTarget.toString(), null, "synthetic delete failure"),
+                )
+            },
+        )
+        val invoker = ShellLlmInvoker(
+            commandRenderer = renderer,
+            processRunner = RecordingProcessRunner(Result.success(cleanProcess()), cleanupAction = {}),
+        )
+        val request = request(
+            provider = LlmProvider.CLAUDE,
+            environment = mapOf("HOME" to sourceHome.toString()),
+        )
+
+        assertTrue(invoker.invoke(request).isFailure)
+        assertTrue(Files.exists(quarantinePath))
+        assertTrue(sourceContent.contentEquals(Files.readAllBytes(sourceFile)))
+        LlmArtifactCleanupQuarantine.simulateRestartForTest()
+        assertTrue(invoker.invoke(request).isFailure)
+
+        partialTarget?.parent?.toFile()?.deleteRecursively()
+        Files.deleteIfExists(sourceFile)
+        Files.deleteIfExists(sourceDirectory)
+        Files.deleteIfExists(sourceHome)
+        Unit
     }
 
     @Test
@@ -288,17 +369,20 @@ private fun renderedCommand(artifact: Path): RenderedLlmCommand {
     )
 }
 
-private fun request(): LlmInvocationRequest {
+private fun request(
+    provider: LlmProvider = LlmProvider.CODEX,
+    environment: Map<String, String> = emptyMap(),
+): LlmInvocationRequest {
     return LlmInvocationRequest(
         invocationId = "invocation-157",
-        provider = LlmProvider.CODEX,
+        provider = provider,
         phase = LlmInvocationPhase.FALSIFIER,
         prompt = "synthetic prompt",
         timeout = Duration.ofSeconds(1),
         workingDirectory = Path.of("."),
         decisionRunContext = DecisionRunContext.EMPTY,
         mcpServer = null,
-        environment = emptyMap(),
+        environment = environment,
         allowedTools = emptyList(),
     )
 }

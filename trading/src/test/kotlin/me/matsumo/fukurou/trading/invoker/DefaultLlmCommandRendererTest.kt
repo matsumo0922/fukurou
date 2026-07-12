@@ -33,22 +33,6 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
-    fun configFromEnvironment_readsPersistentCodexHomeOnlyWhenExplicitlySet() {
-        val persistentCodexHome = Files.createTempDirectory("fukurou-persistent-codex-home")
-        val explicitConfig = LlmCommandRendererConfig.fromEnvironment(
-            mapOf(
-                FUKUROU_CODEX_PERSISTENT_HOME_ENV to persistentCodexHome.toString(),
-            ),
-        )
-        val unsetConfig = LlmCommandRendererConfig.fromEnvironment(emptyMap())
-
-        assertEquals(persistentCodexHome, explicitConfig.codexPersistentHome)
-        assertNull(unsetConfig.codexPersistentHome)
-
-        Files.deleteIfExists(persistentCodexHome)
-    }
-
-    @Test
     fun configFromEnvironment_usesRuntimeModelsAheadOfLegacyEnvironment() {
         val environment = mapOf(
             FUKUROU_CLAUDE_MODEL_ENV to "claude-legacy-env-model",
@@ -128,7 +112,7 @@ class DefaultLlmCommandRendererTest {
         assertTrue(userArgIndex < sandboxArgIndex)
         assertFalse(joinedArgs.contains("mcp_servers.fukurou-mcp.command"))
         assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\"]"))
-        assertTrue(configContent.contains("command = \"java\""))
+        assertTrue(configContent.contains("command = \"/usr/local/libexec/fukurou-mcp-launcher\""))
 
         command.deleteCleanupPaths()
     }
@@ -338,7 +322,6 @@ class DefaultLlmCommandRendererTest {
             provider = LlmProvider.CODEX,
             phase = LlmInvocationPhase.FALSIFIER,
             mcpServerName = "custom-mcp",
-            mcpEnvironment = emptyMap(),
             autoApprovedTools = emptyList(),
         )
 
@@ -347,8 +330,8 @@ class DefaultLlmCommandRendererTest {
         val configContent = Files.readString(codexHome.resolve(CODEX_CONFIG_FILE_NAME))
         val expectedConfigContent = """
             |[mcp_servers."custom-mcp"]
-            |command = "java"
-            |args = ["-jar", "mcp.jar"]
+            |command = "/usr/local/libexec/fukurou-mcp-launcher"
+            |args = ["0123456789abcdef0123456789abcdef0123456789abcdef"]
             |
         """.trimMargin()
 
@@ -364,7 +347,6 @@ class DefaultLlmCommandRendererTest {
             provider = LlmProvider.CODEX,
             phase = LlmInvocationPhase.FALSIFIER,
             mcpServerName = "custom-mcp",
-            mcpEnvironment = emptyMap(),
             autoApprovedTools = listOf("submit_falsification"),
         )
 
@@ -380,60 +362,49 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
-    fun renderCodex_persistentHomeWritesConfigInPlaceAndPreservesAuthJson() {
-        val persistentCodexHome = Files.createTempDirectory("fukurou-persistent-codex-home")
-        val authFile = persistentCodexHome.resolve(CODEX_AUTH_FILE_NAME)
+    fun renderCodex_createsUniquePerRunHomeAndCopiesOnlyAuthJson() {
+        val authSourceHome = Files.createTempDirectory("fukurou-codex-auth-source")
+        val authFile = authSourceHome.resolve(CODEX_AUTH_FILE_NAME)
         Files.writeString(authFile, """{"token":"persistent-auth-token"}""")
-        val renderer = DefaultLlmCommandRenderer(
-            config = LlmCommandRendererConfig(
-                codexPersistentHome = persistentCodexHome,
-            ),
-        )
+        val renderer = DefaultLlmCommandRenderer()
         val request = request(
             provider = LlmProvider.CODEX,
             phase = LlmInvocationPhase.FALSIFIER,
             mcpServerName = "custom-mcp",
+            environment = mapOf(CODEX_HOME_ENV to authSourceHome.toString()),
             autoApprovedTools = listOf("submit_falsification"),
         )
 
         val firstCommand = renderer.render(request).getOrThrow()
         val secondCommand = renderer.render(request).getOrThrow()
-        val configPath = persistentCodexHome.resolve(CODEX_CONFIG_FILE_NAME)
+        val firstHome = Path.of(assertNotNull(firstCommand.environment[CODEX_HOME_ENV]))
+        val secondHome = Path.of(assertNotNull(secondCommand.environment[CODEX_HOME_ENV]))
+        val configPath = firstHome.resolve(CODEX_CONFIG_FILE_NAME)
         val configContent = Files.readString(configPath)
 
-        assertEquals(persistentCodexHome.toString(), firstCommand.environment[CODEX_HOME_ENV])
-        assertEquals(persistentCodexHome.toString(), secondCommand.environment[CODEX_HOME_ENV])
+        assertNotEquals(firstHome, secondHome)
+        assertNotEquals(authSourceHome, firstHome)
         assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\"]"))
         assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\".tools.\"submit_falsification\"]"))
-        assertTrue(Files.exists(configPath))
-        assertEquals("""{"token":"persistent-auth-token"}""", Files.readString(authFile))
-        assertFalse(firstCommand.cleanupPaths.contains(authFile))
-        assertFalse(firstCommand.cleanupPaths.contains(configPath))
-        assertFalse(firstCommand.cleanupPaths.contains(persistentCodexHome))
+        assertEquals("""{"token":"persistent-auth-token"}""", Files.readString(firstHome.resolve(CODEX_AUTH_FILE_NAME)))
 
         firstCommand.deleteCleanupPaths()
         secondCommand.deleteCleanupPaths()
 
         assertEquals("""{"token":"persistent-auth-token"}""", Files.readString(authFile))
-        assertTrue(Files.exists(configPath))
-        assertTrue(Files.exists(persistentCodexHome))
-
-        Files.deleteIfExists(configPath)
         Files.deleteIfExists(authFile)
-        Files.deleteIfExists(persistentCodexHome)
+        Files.deleteIfExists(authSourceHome)
     }
 
     @Test
     fun renderClaude_writesMcpConfigToPrivateFileWithoutArgvSecret() {
+        val secretValue = "renderer-db-password-fixture"
         val renderer = DefaultLlmCommandRenderer()
         val request = request(
             provider = LlmProvider.CLAUDE,
             phase = LlmInvocationPhase.PROPOSER,
             mcpServerName = "custom-mcp",
-            mcpEnvironment = mapOf(
-                "DB_URL" to "jdbc:postgresql://localhost:5432/fukurou",
-                "DB_PASSWORD" to "secret-password",
-            ),
+            environment = mapOf("DB_PASSWORD" to secretValue),
         )
 
         val command = renderer.render(request).getOrThrow()
@@ -442,23 +413,85 @@ class DefaultLlmCommandRendererTest {
         val configContent = Files.readString(configPath)
 
         assertFalse(joinedArgs.contains("secret-password"))
-        assertTrue(configContent.contains("secret-password"))
+        assertFalse(configContent.contains("secret-password"))
+        assertFalse(configContent.contains("DB_PASSWORD"))
+        assertFalse(command.executable.contains(secretValue))
+        assertFalse(command.args.any { argument -> argument.contains(secretValue) })
+        assertFalse(command.environment.any { (key, value) -> key.contains(secretValue) || value.contains(secretValue) })
+        assertFalse(configContent.contains(secretValue))
         assertTrue(Files.exists(configPath))
 
         command.deleteCleanupPaths()
     }
 
     @Test
+    fun renderClaude_copiesCredentialsToPerRunConfigWithoutMutatingSource() {
+        val sourceHome = Files.createTempDirectory("fukurou-claude-auth-source")
+        val sourceDirectory = Files.createDirectories(sourceHome.resolve(".claude"))
+        val sourceFile = sourceDirectory.resolve(".credentials.json")
+        val sourceContent = """{"claudeAiOauth":{"accessToken":"fixture"}}"""
+        Files.writeString(sourceFile, sourceContent)
+        val command = DefaultLlmCommandRenderer().render(
+            request(
+                provider = LlmProvider.CLAUDE,
+                phase = LlmInvocationPhase.PROPOSER,
+                mcpServerName = "custom-mcp",
+                environment = mapOf("HOME" to sourceHome.toString()),
+            ),
+        ).getOrThrow()
+        val perRunDirectory = Path.of(assertNotNull(command.environment["CLAUDE_CONFIG_DIR"]))
+        val copiedFile = perRunDirectory.resolve(".credentials.json")
+
+        assertEquals(sourceContent, Files.readString(copiedFile))
+        assertTrue(command.cleanupPaths.contains(copiedFile))
+        command.deleteCleanupPaths()
+        assertEquals(sourceContent, Files.readString(sourceFile))
+        assertFalse(Files.exists(perRunDirectory))
+
+        Files.deleteIfExists(sourceFile)
+        Files.deleteIfExists(sourceDirectory)
+        Files.deleteIfExists(sourceHome)
+    }
+
+    @Test
+    fun renderClaude_copyFailureRemovesEveryGeneratedArtifactAndPreservesSource() {
+        val sourceHome = Files.createTempDirectory("fukurou-claude-auth-failure")
+        val sourceDirectory = Files.createDirectories(sourceHome.resolve(".claude"))
+        val sourceFile = sourceDirectory.resolve(".credentials.json")
+        val sourceContent = "fixture-source-content".toByteArray()
+        Files.write(sourceFile, sourceContent)
+        val directoriesBefore = claudeTemporaryDirectories()
+        val renderer = DefaultLlmCommandRenderer(
+            claudeAuthCopy = { _, _ -> throw java.nio.file.AccessDeniedException("synthetic-copy-target") },
+        )
+
+        val result = renderer.render(
+            request(
+                provider = LlmProvider.CLAUDE,
+                phase = LlmInvocationPhase.PROPOSER,
+                mcpServerName = null,
+                environment = mapOf("HOME" to sourceHome.toString()),
+            ),
+        )
+
+        assertTrue(result.isFailure)
+        assertEquals(directoriesBefore, claudeTemporaryDirectories())
+        assertTrue(sourceContent.contentEquals(Files.readAllBytes(sourceFile)))
+
+        Files.deleteIfExists(sourceFile)
+        Files.deleteIfExists(sourceDirectory)
+        Files.deleteIfExists(sourceHome)
+    }
+
+    @Test
     fun renderCodex_writesMcpConfigToPrivateCodexHomeWithoutArgvSecret() {
+        val secretValue = "renderer-db-password-fixture"
         val renderer = DefaultLlmCommandRenderer()
         val request = request(
             provider = LlmProvider.CODEX,
             phase = LlmInvocationPhase.FALSIFIER,
             mcpServerName = "custom-mcp",
-            mcpEnvironment = mapOf(
-                "DB_URL" to "jdbc:postgresql://localhost:5432/fukurou",
-                "DB_PASSWORD" to "secret-password",
-            ),
+            environment = mapOf("DB_PASSWORD" to secretValue),
         )
 
         val command = renderer.render(request).getOrThrow()
@@ -468,7 +501,12 @@ class DefaultLlmCommandRendererTest {
 
         assertFalse(joinedArgs.contains("secret-password"))
         assertFalse(command.environment.containsKey("DB_PASSWORD"))
-        assertTrue(configContent.contains("secret-password"))
+        assertFalse(configContent.contains("secret-password"))
+        assertFalse(configContent.contains("DB_PASSWORD"))
+        assertFalse(command.executable.contains(secretValue))
+        assertFalse(command.args.any { argument -> argument.contains(secretValue) })
+        assertFalse(command.environment.any { (key, value) -> key.contains(secretValue) || value.contains(secretValue) })
+        assertFalse(configContent.contains(secretValue))
 
         command.deleteCleanupPaths()
     }
@@ -631,7 +669,6 @@ class DefaultLlmCommandRendererTest {
         phase: LlmInvocationPhase,
         mcpServerName: String?,
         allowedTools: List<String> = emptyList(),
-        mcpEnvironment: Map<String, String> = mapOf("FUKUROU_INVOCATION_ID" to "invocation-test"),
         environment: Map<String, String> = emptyMap(),
         autoApprovedTools: List<String> = emptyList(),
     ): LlmInvocationRequest {
@@ -652,9 +689,9 @@ class DefaultLlmCommandRendererTest {
             mcpServer = mcpServerName?.let { serverName ->
                 LlmMcpServerConfig(
                     name = serverName,
-                    command = "java",
-                    args = listOf("-jar", "mcp.jar"),
-                    environment = mcpEnvironment,
+                    command = "/usr/local/libexec/fukurou-mcp-launcher",
+                    manifestId = "0123456789abcdef0123456789abcdef0123456789abcdef",
+                    manifestPath = Files.createTempFile("fukurou-test-manifest-", ".json"),
                     autoApprovedTools = autoApprovedTools,
                 )
             },
@@ -666,4 +703,13 @@ class DefaultLlmCommandRendererTest {
 
 private fun RenderedLlmCommand.deleteCleanupPaths() {
     cleanupPaths.forEach { path -> Files.deleteIfExists(path) }
+}
+
+private fun claudeTemporaryDirectories(): Set<Path> {
+    return Files.list(Path.of(System.getProperty("java.io.tmpdir"))).use { paths ->
+        paths
+            .filter { path -> path.fileName.toString().startsWith("fukurou-llm-config-") }
+            .toList()
+            .toSet()
+    }
 }
