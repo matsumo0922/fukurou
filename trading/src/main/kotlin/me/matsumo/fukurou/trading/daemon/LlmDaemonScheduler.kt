@@ -181,6 +181,7 @@ class LlmDaemonScheduler(
     private val positionsReader = dependencies.positionsReader
     private val entryFillReader = dependencies.entryFillReader
     private val restingOrderMaintenanceService = dependencies.restingOrderMaintenanceService
+    private val episodeLifecycleObserver = dependencies.episodeLifecycleObserver
     private val requestBase = runtime.requestBase
     private val launchOneShot = runtime.launchOneShot
     private val clock = runtime.clock
@@ -247,6 +248,7 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped(LLM_LAUNCH_DISABLED, null)
         }
 
+        episodeLifecycleObserver.observe(observedAt).getOrThrow()
         val riskState = riskStateRepository.current().getOrThrow()
 
         if (riskState.state == RiskHaltState.HARD_HALT) {
@@ -909,6 +911,9 @@ data class LlmDaemonSchedulerDependencies(
     val entryFillReader: LlmDaemonEntryFillReader,
     val restingOrderMaintenanceService: RestingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
         Result.success(RestingSuppressionReason.RESTING_ORDER_IDENTITY_UNAVAILABLE)
+    },
+    val episodeLifecycleObserver: OpportunityEpisodeLifecycleObserver = OpportunityEpisodeLifecycleObserver {
+        Result.success(Unit)
     },
 )
 

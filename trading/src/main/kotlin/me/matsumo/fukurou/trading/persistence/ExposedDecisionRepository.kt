@@ -593,7 +593,7 @@ class ExposedDecisionRepository(
     }
 }
 
-@Suppress("CyclomaticComplexMethod")
+@Suppress("CyclomaticComplexMethod", "LongMethod")
 private fun JdbcTransaction.insertDecisionSubmission(
     submission: DecisionSubmission,
     now: Instant,
@@ -615,7 +615,23 @@ private fun JdbcTransaction.insertDecisionSubmission(
             }
         }
     }
-    val previousIdentity = candidateIdentity?.let { candidate -> selectLatestIdentity(candidate.thesisId) }
+    val latestSameThesis = candidateIdentity?.let { candidate -> selectLatestIdentity(candidate.thesisId) }
+    val materialChangedAfterTtl = candidateIdentity != null && latestSameThesis != null &&
+        candidateIdentity.materialStateHash != latestSameThesis.materialStateHash &&
+        episodeHasTtlCancellation(latestSameThesis.opportunityEpisodeId)
+    if (materialChangedAfterTtl) {
+        closeOpportunityEpisode(
+            episodeId = requireNotNull(latestSameThesis).opportunityEpisodeId,
+            reason = "MATERIAL_STATE_CHANGED_AFTER_TTL",
+            now = now,
+        )
+    }
+    candidateIdentity?.let { candidate ->
+        closeOtherOpenEpisodes(candidate.thesisId, requireNotNull(submission.entryIntent).symbol.apiSymbol, now)
+    }
+    val previousIdentity = latestSameThesis?.takeIf { previous ->
+        !materialChangedAfterTtl && isOpportunityEpisodeOpen(previous.opportunityEpisodeId)
+    }
     val identity = candidateIdentity?.let { candidate ->
         candidate.copy(opportunityEpisodeId = previousIdentity?.opportunityEpisodeId ?: candidate.opportunityEpisodeId)
     }
@@ -658,6 +674,58 @@ private fun JdbcTransaction.insertDecisionSubmission(
         tradeIntent = tradeIntent,
         tradePlan = tradePlan,
     )
+}
+
+private fun JdbcTransaction.isOpportunityEpisodeOpen(episodeId: UUID): Boolean {
+    return jdbcConnection().prepareStatement(
+        "SELECT closed_at IS NULL FROM opportunity_episodes WHERE id = ?",
+    ).use { statement ->
+        statement.setObject(1, episodeId)
+        statement.executeQuery().use { result -> result.next() && result.getBoolean(1) }
+    }
+}
+
+private fun JdbcTransaction.episodeHasTtlCancellation(episodeId: UUID): Boolean {
+    val sql = """SELECT 1 FROM orders o JOIN trade_intents ti ON ti.id = o.intent_id
+        WHERE ti.opportunity_episode_id = ? AND o.status = 'CANCELED'
+        AND o.cancel_reason IN ('ttl_expiry','legacy_ttl_sweep') LIMIT 1
+    """.trimIndent()
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setObject(1, episodeId)
+        statement.executeQuery().use { result -> result.next() }
+    }
+}
+
+private fun JdbcTransaction.closeOtherOpenEpisodes(
+    thesisId: String,
+    symbol: String,
+    now: Instant,
+) {
+    jdbcConnection().prepareStatement(
+        """UPDATE opportunity_episodes SET closed_at = ?, close_reason = 'THESIS_CHANGED'
+            WHERE symbol = ? AND thesis_id <> ? AND closed_at IS NULL
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setLong(1, now.toEpochMilli())
+        statement.setString(2, symbol)
+        statement.setString(3, thesisId)
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.closeOpportunityEpisode(
+    episodeId: UUID,
+    reason: String,
+    now: Instant,
+) {
+    jdbcConnection().prepareStatement(
+        "UPDATE opportunity_episodes SET closed_at = ?, close_reason = ? WHERE id = ? AND closed_at IS NULL",
+    ).use { statement ->
+        statement.setLong(1, now.toEpochMilli())
+        statement.setString(2, reason)
+        statement.setObject(3, episodeId)
+        statement.executeUpdate()
+    }
 }
 
 private fun JdbcTransaction.selectLatestIdentity(thesisId: String): DecisionIdentity? {

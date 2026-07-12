@@ -61,6 +61,9 @@ import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
+import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
+import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -94,6 +97,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
+import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -5599,6 +5603,80 @@ class PostgresPersistenceIntegrationTest {
 
             assertTrue(throwable is SQLTimeoutException)
         }
+    }
+
+    @Test
+    fun resting_maintenance_closes_filled_episode_and_appends_valid_resolution() = runPostgresTest {
+        val config = TradingBotConfig.fromEnvironment(emptyMap())
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runtime = TradingRuntimeFactory.connectedPostgres(
+            dataSource = dataSource,
+            database = database,
+            clock = fixedClock(),
+            marketDataSource = PostgresFakeMarketDataSource,
+            tradingConfig = config,
+        )
+        val entryCommand = postgresEntryCommand(
+            orderType = OrderType.MARKET,
+            takeProfitPriceJpy = BigDecimal("10500000"),
+        )
+        runtime.decisionMaterialStateRepository.append(
+            DecisionMaterialStateManifest(
+                invocationId = "run-entry-${entryCommand.commandId}",
+                capturedAt = fixedInstant(),
+                triggerKind = DecisionTriggerKind.DAEMON,
+                symbol = TradingSymbol.BTC.apiSymbol,
+                runtimeConfigVersion = null,
+                runtimeConfigHash = null,
+                riskState = "RUNNING",
+                bestBidJpy = BigDecimal("9999000"),
+                bestAskJpy = BigDecimal("10000000"),
+                lastPriceJpy = BigDecimal("10000000"),
+                sourceTimestamp = fixedInstant(),
+                freshness = MaterialFreshness.FRESH,
+                atr14FiveMinutesJpy = BigDecimal("100000"),
+                latestCandleOpenJpy = null,
+                latestCandleHighJpy = null,
+                latestCandleLowJpy = null,
+                latestCandleCloseJpy = null,
+                openPositionFacts = emptyList(),
+                openOrderFacts = emptyList(),
+                missingSources = emptyList(),
+                canonicalContentHash = "a".repeat(64),
+            ),
+        ).getOrThrow()
+        val command = approvedPostgresEntryCommand(
+            repository = runtime.decisionRepository,
+            command = entryCommand,
+        )
+        runtime.broker.placeOrder(command).getOrThrow()
+        val service = ExposedRestingOrderMaintenanceService(
+            database = database,
+            broker = runtime.broker,
+            tradingLock = runtime.tradingLock,
+            latestMarketQuoteStore = LatestMarketQuoteStore(),
+            priceMoveThresholdRatio = config.daemon.priceMoveThresholdRatio,
+        )
+
+        service.observe(fixedInstant().plusSeconds(1)).getOrThrow()
+
+        val lifecycle = exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                """SELECT e.close_reason, r.resolution FROM opportunity_episodes e
+                    JOIN dedupe_shadow_observations o ON o.opportunity_episode_id=e.id
+                    JOIN dedupe_shadow_resolutions r ON r.observation_id=o.id
+                    WHERE e.closed_at IS NOT NULL ORDER BY r.resolved_at DESC LIMIT 1
+                """.trimIndent(),
+            ).use { statement ->
+                statement.executeQuery().use { result ->
+                    require(result.next())
+                    result.getString(1) to result.getString(2)
+                }
+            }
+        }
+        assertEquals("ENTRY_FILL", lifecycle.first)
+        assertEquals("VALID_SUPPRESSION_PROXY", lifecycle.second)
+        runtime.close()
     }
 }
 

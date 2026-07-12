@@ -38,6 +38,12 @@ fun interface RestingOrderMaintenanceService {
     suspend fun maintain(snapshot: LlmDaemonOpenRiskSnapshot, observedAt: Instant): Result<RestingSuppressionReason>
 }
 
+/** persisted order lifecycle から episode terminal を冪等に反映する境界。 */
+fun interface OpportunityEpisodeLifecycleObserver {
+    /** fill / non-TTL cancel を因果的な ledger fact から反映する。 */
+    suspend fun observe(observedAt: Instant): Result<Unit>
+}
+
 /** resting entry 中に full run を抑止した理由。 */
 enum class RestingSuppressionReason(val wireCode: String) {
     RESTING_ORDER_UNCHANGED("resting_order_unchanged"),

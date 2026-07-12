@@ -202,6 +202,12 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
     val components = createLlmLaunchRuntimeComponents(
         inputs = inputs,
     )
+    val restingMaintenance = createRestingOrderMaintenanceService(
+        database = inputs.database,
+        tradingRuntime = components.tradingRuntime,
+        latestMarketQuoteStore = inputs.latestMarketQuoteStore,
+        tradingConfig = inputs.tradingConfig,
+    )
 
     return LlmDaemonScheduler(
         tradingConfig = inputs.tradingConfig,
@@ -214,12 +220,8 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
             tickerReader = components.marketDataSource.tickerReader(inputs.tradingConfig),
             positionsReader = components.tradingRuntime.positionsReader(),
             entryFillReader = components.paperLedgerRepository.entryFillReader(),
-            restingOrderMaintenanceService = ExposedRestingOrderMaintenanceService(
-                database = inputs.database,
-                broker = components.tradingRuntime.broker,
-                tradingLock = components.tradingRuntime.tradingLock,
-                latestMarketQuoteStore = inputs.latestMarketQuoteStore,
-            ),
+            restingOrderMaintenanceService = restingMaintenance,
+            episodeLifecycleObserver = restingMaintenance,
         ),
         runtime = LlmDaemonSchedulerRuntime(
             requestBase = components.requestBase,
@@ -227,6 +229,22 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
             preFilter = components.preFilter,
             clock = inputs.clock,
         ),
+    )
+}
+
+/** production scheduler と test が共有する resting maintenance composition。 */
+internal fun createRestingOrderMaintenanceService(
+    database: ExposedDatabase,
+    tradingRuntime: TradingRuntime,
+    latestMarketQuoteStore: LatestMarketQuoteStore,
+    tradingConfig: TradingBotConfig,
+): ExposedRestingOrderMaintenanceService {
+    return ExposedRestingOrderMaintenanceService(
+        database = database,
+        broker = tradingRuntime.broker,
+        tradingLock = tradingRuntime.tradingLock,
+        latestMarketQuoteStore = latestMarketQuoteStore,
+        priceMoveThresholdRatio = tradingConfig.daemon.priceMoveThresholdRatio,
     )
 }
 
