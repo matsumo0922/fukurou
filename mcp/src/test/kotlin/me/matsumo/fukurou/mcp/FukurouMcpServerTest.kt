@@ -49,7 +49,6 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
-import me.matsumo.fukurou.trading.audit.FUKUROU_LLM_PHASE_ENV
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
@@ -89,8 +88,6 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.exchange.gmo.DeferredGmoPublicRequestAuditSink
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
-import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
-import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
@@ -1217,21 +1214,20 @@ class FukurouMcpServerTest {
 
     @Test
     fun previewOrderTool_propagatesCorrelationAndAuditFailureThroughProductionHandler() = runBlocking {
-        mapOf(
-            "proposer" to GmoPublicClientRole.PROPOSER,
-            "falsifier" to GmoPublicClientRole.FALSIFIER,
-        ).forEach { (phase, expectedRole) ->
+        listOf(LlmInvocationPhase.PROPOSER, LlmInvocationPhase.FALSIFIER).forEach { phase ->
+            val clock = fixedClock()
+            val bootstrap = decodeBootstrap(bootstrapManifest(phase, clock), clock)
             val marketDataSource = CorrelationAuditFailingMarketDataSource()
             val runtime = TradingRuntimeFactory.inMemory(
-                clock = fixedClock(),
+                clock = clock,
                 marketDataSource = marketDataSource,
             )
             val server = FukurouMcpServer(
                 marketDataSource = marketDataSource,
-                clock = fixedClock(),
+                clock = clock,
                 tradingRuntime = runtime,
-                decisionRunContext = DecisionRunContext.EMPTY.copy(decisionRunId = "decision-$phase"),
-                environment = mapOf(FUKUROU_LLM_PHASE_ENV to phase),
+                decisionRunContext = bootstrap.decisionRunContext,
+                clientRole = bootstrap.phase.toGmoPublicClientRole(),
             ).createServer()
             val intentId = submitApprovedEnterIntent(server)
 
@@ -1242,9 +1238,9 @@ class FukurouMcpServerTest {
             assertEquals(true, result.isError)
             assertEquals("audit_failed_after_execution", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
             assertEquals("true", structuredContent.getValue("executed").jsonPrimitive.contentOrNull)
-            assertEquals("decision-$phase", correlation.decisionRunContext.decisionRunId)
+            assertEquals(bootstrap.decisionRunContext.decisionRunId, correlation.decisionRunContext.decisionRunId)
             assertTrue(correlation.toolCallId?.isNotBlank() == true)
-            assertEquals(expectedRole, correlation.clientRole)
+            assertEquals(phase.toGmoPublicClientRole(), correlation.clientRole)
             assertEquals(0, runtime.broker.getOpenOrders().getOrThrow().size)
             assertEquals(0, runtime.broker.getPositions().getOrThrow().size)
         }

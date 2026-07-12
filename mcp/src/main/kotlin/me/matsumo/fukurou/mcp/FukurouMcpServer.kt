@@ -35,7 +35,6 @@ import me.matsumo.fukurou.mcp.runtime.mcpErrorResult
 import me.matsumo.fukurou.mcp.runtime.redirectProcessStdoutToStderrForMcpStdio
 import me.matsumo.fukurou.mcp.runtime.runStdioMcpServer
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
-import me.matsumo.fukurou.trading.audit.FUKUROU_LLM_PHASE_ENV
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
@@ -465,8 +464,7 @@ class FukurouMcpServer(
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
     allowedToolNames: Set<String>? = mcpAllowedToolNamesFromEnvironment(),
     expiresAt: Instant? = null,
-    private val environment: Map<String, String> = System.getenv(),
-    private val clientRole: GmoPublicClientRole = mcpClientRole(environment),
+    private val clientRole: GmoPublicClientRole = GmoPublicClientRole.UNSPECIFIED,
     private val toolCallLimiter: McpToolCallLimiter = McpToolCallLimiter(
         config = tradingConfig.runner,
         toolCallGuard = tradingRuntime.toolCallGuard,
@@ -640,14 +638,6 @@ private class AuditedGmoCoinMarketToolExecutor(
             )
             else -> null
         }
-    }
-}
-
-private fun mcpClientRole(environment: Map<String, String>): GmoPublicClientRole {
-    return when (environment[FUKUROU_LLM_PHASE_ENV]?.lowercase()) {
-        "proposer" -> GmoPublicClientRole.PROPOSER
-        "falsifier" -> GmoPublicClientRole.FALSIFIER
-        else -> GmoPublicClientRole.UNSPECIFIED
     }
 }
 
