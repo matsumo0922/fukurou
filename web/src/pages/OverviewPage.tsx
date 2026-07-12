@@ -88,6 +88,9 @@ type DeduplicationTelemetry = {
   intentIdentityCoverage: number | null;
   shadowClassificationCoverage: number | null;
   falseSuppressionRate: number | null;
+  falseSuppressionCount: number;
+  validSuppressionCount: number;
+  resolvedCount: number;
   pendingCount: number;
   unknownCount: number;
   restingOnlyDaemonFullRunCount: number;
@@ -99,6 +102,7 @@ function DeduplicationPanel({ evaluationQuery }: { evaluationQuery: UseQueryResu
   if (evaluationQuery.isError) return <PanelError title={t("overview.error.evaluationSummary")} error={evaluationQuery.error} retried={() => void evaluationQuery.refetch()} />;
 
   const deduplication = (evaluationQuery.data as EvaluationSummaryResponse & { deduplication: DeduplicationTelemetry }).deduplication;
+  if (!deduplication) return null;
   return (
     <Panel>
       <div className="panel-heading">

@@ -845,6 +845,7 @@ private fun startApplicationBackgroundWorkers(
             runtimeConfigSnapshot = runtime.runtimeConfigSnapshot,
             clock = runtime.clock,
             onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
+            latestMarketQuoteStore = runtime.latestMarketQuoteStore,
         ),
         obsidianWriterWorker = startObsidianWriterWorker(
             database = database,

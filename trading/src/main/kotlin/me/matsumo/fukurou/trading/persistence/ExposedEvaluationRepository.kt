@@ -977,6 +977,8 @@ private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod)
         }
         statement.executeQuery().use { result ->
             check(result.next())
+            val classificationCounts = selectClassificationCounts(period)
+            val resolutionCounts = selectResolutionCounts(period)
             DeduplicationMetrics(
                 decisionEligible = result.getInt(1),
                 decisionComplete = result.getInt(2),
@@ -986,7 +988,39 @@ private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod)
                 shadowComplete = result.getInt(6),
                 uniqueEpisodeCount = result.getInt(7),
                 rawSuppressedHeartbeatCount = result.getInt(8),
+                classificationCounts = classificationCounts,
+                falseSuppressionCount = resolutionCounts["FALSE_SUPPRESSION_PROXY"] ?: 0,
+                validSuppressionCount = resolutionCounts["VALID_SUPPRESSION_PROXY"] ?: 0,
+                pendingCount = resolutionCounts["PENDING"] ?: 0,
+                unknownCount = resolutionCounts["UNKNOWN_DATA"] ?: 0,
             )
+        }
+    }
+}
+
+private fun JdbcTransaction.selectClassificationCounts(period: EvaluationPeriod): Map<String, Int> {
+    val sql = """SELECT classification, COUNT(*) FROM dedupe_shadow_observations
+        WHERE observed_at >= ? AND observed_at < ? AND classification IS NOT NULL GROUP BY classification
+    """.trimIndent()
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setLong(1, period.from.toEpochMilli())
+        statement.setLong(2, period.toExclusive.toEpochMilli())
+        statement.executeQuery().use { result ->
+            buildMap { while (result.next()) put(result.getString(1), result.getInt(2)) }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectResolutionCounts(period: EvaluationPeriod): Map<String, Int> {
+    val sql = """SELECT resolution, COUNT(DISTINCT o.opportunity_episode_id)
+        FROM dedupe_shadow_resolutions r JOIN dedupe_shadow_observations o ON o.id = r.observation_id
+        WHERE r.resolved_at >= ? AND r.resolved_at < ? GROUP BY resolution
+    """.trimIndent()
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setLong(1, period.from.toEpochMilli())
+        statement.setLong(2, period.toExclusive.toEpochMilli())
+        statement.executeQuery().use { result ->
+            buildMap { while (result.next()) put(result.getString(1), result.getInt(2)) }
         }
     }
 }

@@ -40,8 +40,10 @@ import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
+import me.matsumo.fukurou.trading.persistence.ExposedRestingOrderMaintenanceService
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
+import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_JAR_PATH_ENV
 import me.matsumo.fukurou.trading.runner.LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
@@ -157,6 +159,7 @@ internal fun startLlmDaemonSchedulerWorker(
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     clock: Clock = Clock.systemUTC(),
     onStaleLlmRunsRecovered: (Int) -> Unit = {},
+    latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
 ): LlmDaemonSchedulerWorker? {
     val environment = System.getenv()
 
@@ -176,6 +179,7 @@ internal fun startLlmDaemonSchedulerWorker(
                         tradingConfig = tradingConfig,
                         runtimeConfigSnapshot = runtimeConfigSnapshot,
                         requestBase = oneShotRequestFromEnvironment(environment),
+                        latestMarketQuoteStore = latestMarketQuoteStore,
                     ),
                 )
             }
@@ -210,6 +214,12 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
             tickerReader = components.marketDataSource.tickerReader(inputs.tradingConfig),
             positionsReader = components.tradingRuntime.positionsReader(),
             entryFillReader = components.paperLedgerRepository.entryFillReader(),
+            restingOrderMaintenanceService = ExposedRestingOrderMaintenanceService(
+                database = inputs.database,
+                broker = components.tradingRuntime.broker,
+                tradingLock = components.tradingRuntime.tradingLock,
+                latestMarketQuoteStore = inputs.latestMarketQuoteStore,
+            ),
         ),
         runtime = LlmDaemonSchedulerRuntime(
             requestBase = components.requestBase,
@@ -462,6 +472,7 @@ private data class LlmLaunchRuntimeInputs(
     val tradingConfig: TradingBotConfig,
     val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
     val requestBase: OneShotRunnerRequest,
+    val latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
 )
 
 /**
