@@ -1896,7 +1896,7 @@ class McpDatabaseRoleIntegrationTest {
             val requestAuditSink = DeferredGmoPublicRequestAuditSink()
             val marketDataSource = GmoPublicMarketDataSource.fromConfig(
                 config = tradingConfig.gmoPublicClient,
-                clientType = GmoPublicClientType.FUKUROU_MCP,
+                clientType = me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType.FUKUROU_MCP,
                 requestAuditSink = requestAuditSink,
                 clock = clock,
             )
@@ -1965,7 +1965,7 @@ class McpDatabaseRoleIntegrationTest {
             val falsifierMarketDataSource = RequiredMatrixMarketDataSource(
                 GmoPublicMarketDataSource.fromConfig(
                     config = tradingConfig.gmoPublicClient,
-                    clientType = GmoPublicClientType.FUKUROU_MCP,
+                    clientType = me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType.FUKUROU_MCP,
                     requestAuditSink = falsifierRequestAuditSink,
                     clock = clock,
                 ),
