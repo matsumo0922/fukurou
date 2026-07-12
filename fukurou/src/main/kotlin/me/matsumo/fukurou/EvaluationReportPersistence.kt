@@ -127,6 +127,7 @@ internal class EvaluationReportPersistence(
                 statement.setObject(1, UUID.fromString(jobId))
                 statement.executeQuery().use { result ->
                     if (!result.next()) return@use null
+                    val scopeIdentity = EvaluationReportScopeKey.decode(result.getString(9))
 
                     EvaluationReportJobResponse(
                         jobId = jobId,
@@ -138,8 +139,8 @@ internal class EvaluationReportPersistence(
                         failureMessage = result.getString(6),
                         activeInvocationId = result.getString(7),
                         retryAfterSeconds = result.getLong(8).takeUnless { result.wasNull() },
-                        epochId = result.getString(9).substringAfter("|EPOCH:", "").substringBefore("|COHORT:").ifBlank { null },
-                        cohort = result.getString(9).substringAfter("|COHORT:", "").ifBlank { null },
+                        epochId = scopeIdentity.epochId,
+                        cohort = scopeIdentity.cohort,
                     )
                 }
             }
@@ -230,6 +231,7 @@ internal class EvaluationReportPersistence(
     }
 
     fun history(scopeKey: String): Result<List<EvaluationReportHistoryItemResponse>> = runCatching {
+        val scopeIdentity = EvaluationReportScopeKey.decode(scopeKey)
         exposedTransaction(database) {
             jdbcConnection().prepareStatement(
                 """
@@ -253,8 +255,8 @@ internal class EvaluationReportPersistence(
                                     status = result.getString(4),
                                     requestedAt = java.time.Instant.ofEpochMilli(result.getLong(5)).toString(),
                                     pinned = result.getBoolean(6),
-                                    epochId = EvaluationReportScopeKey.decode(scopeKey).epochId,
-                                    cohort = EvaluationReportScopeKey.decode(scopeKey).cohort,
+                                    epochId = scopeIdentity.epochId,
+                                    cohort = scopeIdentity.cohort,
                                     scopeKey = scopeKey,
                                 ),
                             )

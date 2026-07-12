@@ -545,7 +545,18 @@ private fun JdbcTransaction.switchPaperAccountEpochIfRequired(
     if (hasOpenRisk) {
         appendEpochAudit(
             eventType = "PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED",
-            payload = EpochAuditPayload(account.first, null, account.second, requestedBaseline, targetHash, reason, actor, openPositions, openOrders, account.third).encode(),
+            payload = EpochAuditPayload(
+                oldEpochId = account.first,
+                newEpochId = null,
+                oldBaseline = account.second,
+                newBaseline = requestedBaseline,
+                hash = targetHash,
+                reason = reason,
+                actor = actor,
+                openPositions = openPositions,
+                openOrders = openOrders,
+                btc = account.third,
+            ).encode(),
             now = now,
             runtimeConfigHash = targetHash,
         )
@@ -596,7 +607,18 @@ private fun JdbcTransaction.switchPaperAccountEpochIfRequired(
     }
     appendEpochAudit(
         "PAPER_ACCOUNT_EPOCH_SWITCHED",
-        EpochAuditPayload(account.first, epochId, account.second, requestedBaseline, targetHash, reason, actor, 0, 0, account.third).encode(),
+        EpochAuditPayload(
+            oldEpochId = account.first,
+            newEpochId = epochId,
+            oldBaseline = account.second,
+            newBaseline = requestedBaseline,
+            hash = targetHash,
+            reason = reason,
+            actor = actor,
+            openPositions = 0,
+            openOrders = 0,
+            btc = account.third,
+        ).encode(),
         now,
         targetHash,
     )

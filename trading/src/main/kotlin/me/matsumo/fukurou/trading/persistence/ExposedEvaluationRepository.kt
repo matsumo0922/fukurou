@@ -13,6 +13,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
+import me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT
 import me.matsumo.fukurou.trading.evaluation.EvaluationExclusionSummary
 import me.matsumo.fukurou.trading.evaluation.EvaluationEpochOption
 import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
@@ -40,7 +41,7 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
  * closed trade fact を取得する SQL。
  */
 private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
-    WITH closed_positions AS (
+    WITH closed_positions AS MATERIALIZED (
         SELECT
             p.id,
             p.opened_at,
@@ -54,6 +55,10 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
                 FROM paper_account
                 WHERE id = ?
             )
+            AND (
+                ?::uuid IS NULL OR p.account_epoch_id = ?::uuid OR
+                (p.account_epoch_id IS NULL AND ?::text = 'LEGACY_PRE_WS')
+            )
             AND p.closed_at >= ?
             AND p.closed_at < ?
             AND NOT EXISTS (
@@ -61,7 +66,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
     ),
-    initial_buy_executions AS (
+    initial_buy_executions AS MATERIALIZED (
         SELECT DISTINCT ON (e.position_id)
             e.position_id,
             e.order_id
@@ -82,7 +87,8 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         SELECT
             e.position_id,
             COALESCE(
-                MIN(e.account_epoch_id::text) FILTER (WHERE e.id = initial.id),
+                (ARRAY_AGG(e.account_epoch_id::text ORDER BY e.executed_at, e.id)
+                    FILTER (WHERE e.side = 'BUY'))[1],
                 (SELECT id::text FROM paper_account_epochs WHERE kind='LEGACY_IMPORTED' ORDER BY created_at ASC LIMIT 1)
             ) AS account_epoch_id,
             CASE
@@ -110,14 +116,16 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         FROM executions e
         LEFT JOIN orders o ON o.id = e.order_id
         JOIN closed_positions p ON p.id = e.position_id
-        JOIN LATERAL (
-            SELECT entry.id
-            FROM executions entry
-            WHERE entry.position_id = e.position_id AND entry.side = 'BUY'
-            ORDER BY entry.executed_at ASC, entry.id ASC
-            LIMIT 1
-        ) initial ON TRUE
         GROUP BY e.position_id
+    ),
+    scoped_positions AS MATERIALIZED (
+        SELECT p.id
+        FROM closed_positions p
+        LEFT JOIN execution_lineage el ON el.position_id = p.id
+        WHERE (?::uuid IS NULL OR el.account_epoch_id::uuid = ?::uuid)
+            AND (?::text IS NULL OR el.cohort = ?::text)
+        ORDER BY p.closed_at ASC, p.id ASC
+        LIMIT ?
     ),
     entry_fills AS (
         SELECT
@@ -127,7 +135,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
             SUM(o.protective_stop_price_jpy * e.size_btc) / NULLIF(SUM(e.size_btc), 0) AS protective_stop_price_jpy
         FROM executions e
         JOIN orders o ON o.id = e.order_id
-        JOIN closed_positions p ON p.id = e.position_id
+        JOIN scoped_positions p ON p.id = e.position_id
         WHERE e.side = 'BUY'
         GROUP BY e.position_id
     ),
@@ -137,7 +145,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
             COALESCE(SUM(CASE WHEN e.side = 'SELL' THEN e.realized_pnl_jpy ELSE 0 END), 0) AS sell_realized_pnl_jpy,
             COALESCE(SUM(CASE WHEN e.side = 'BUY' THEN e.fee_jpy ELSE 0 END), 0) AS entry_fee_jpy
         FROM executions e
-        JOIN closed_positions p ON p.id = e.position_id
+        JOIN scoped_positions p ON p.id = e.position_id
         GROUP BY e.position_id
     )
     SELECT
@@ -158,6 +166,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         el.execution_semantics_version,
         CASE WHEN d.id IS NULL THEN 'MISSING' ELSE 'ATTRIBUTED' END AS attribution_status
     FROM closed_positions p
+    JOIN scoped_positions scoped ON scoped.id = p.id
     LEFT JOIN entry_orders eo ON eo.position_id = p.id
     LEFT JOIN entry_fills ef ON ef.position_id = p.id
     LEFT JOIN position_pnl ON position_pnl.position_id = p.id
@@ -165,10 +174,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
     LEFT JOIN trade_intents ti ON ti.id = eo.intent_id
     LEFT JOIN decisions d ON d.id = ti.decision_id
     LEFT JOIN trade_plans tp ON tp.id = ti.trade_plan_id
-    WHERE (?::uuid IS NULL OR el.account_epoch_id::uuid = ?::uuid)
-        AND (?::text IS NULL OR el.cohort = ?::text)
     ORDER BY p.closed_at ASC
-    LIMIT ?
 """
 
 /**
@@ -340,6 +346,51 @@ private const val SELECT_KILL_CRITERION_STATS_SQL = """
         AND current_semantics
 """
 
+/** epoch/cohort に限定した期間開始前 realized PnL を DB で完全集計する SQL。 */
+private const val SELECT_SCOPED_PNL_BEFORE_SQL = """
+    WITH trade_stats AS (
+        SELECT
+            p.id,
+            COALESCE(
+                MIN(e.account_epoch_id::text),
+                (SELECT id::text FROM paper_account_epochs WHERE kind='LEGACY_IMPORTED' ORDER BY created_at ASC LIMIT 1)
+            ) AS account_epoch_id,
+            CASE
+                WHEN COUNT(*) FILTER (WHERE
+                    COALESCE(e.execution_semantics_version, '') NOT IN ('', 'PAPER_WS_V1') OR
+                    COALESCE(o.execution_semantics_version, '') NOT IN ('', 'PAPER_WS_V1')
+                ) > 0 THEN 'UNSUPPORTED_EXECUTION_SEMANTICS'
+                WHEN COUNT(*) FILTER (WHERE
+                    e.execution_semantics_version IS NULL OR o.id IS NULL OR
+                    o.execution_semantics_version IS NULL OR e.account_epoch_id IS NULL OR
+                    o.account_epoch_id IS NULL
+                ) = 0
+                    AND COUNT(DISTINCT e.account_epoch_id) = 1
+                    AND COUNT(DISTINCT o.account_epoch_id) = 1
+                    AND MIN(e.account_epoch_id::text) = MIN(o.account_epoch_id::text)
+                    AND BOOL_AND(e.execution_semantics_version = 'PAPER_WS_V1')
+                    AND BOOL_AND(o.execution_semantics_version = 'PAPER_WS_V1') THEN 'CURRENT'
+                ELSE 'LEGACY_PRE_WS'
+            END AS cohort,
+            COALESCE(SUM(CASE WHEN e.side = 'SELL' THEN e.realized_pnl_jpy ELSE 0 END), 0) -
+                COALESCE(SUM(CASE WHEN e.side = 'BUY' THEN e.fee_jpy ELSE 0 END), 0) AS trade_pnl_jpy
+        FROM positions p
+        JOIN executions e ON e.position_id = p.id
+        LEFT JOIN orders o ON o.id = e.order_id
+        WHERE p.status = 'CLOSED'
+            AND p.mode = (SELECT mode FROM paper_account WHERE id = ?)
+            AND p.closed_at < ?
+            AND NOT EXISTS (
+                SELECT 1 FROM evaluation_exclusions x
+                WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
+            )
+        GROUP BY p.id
+    )
+    SELECT COALESCE(SUM(trade_pnl_jpy), 0)
+    FROM trade_stats
+    WHERE account_epoch_id = ? AND cohort = ?
+"""
+
 /**
  * Exposed/JDBC で評価系読み取りを行う repository。
  *
@@ -388,9 +439,6 @@ class ExposedEvaluationRepository(
             runCatching {
                 exposedTransaction(database) {
                     val requestedCohort = cohort?.let(EvaluationCohort::valueOf) ?: EvaluationCohort.CURRENT
-                    if (epochId == null && requestedCohort == EvaluationCohort.CURRENT) {
-                        requireCurrentAccountBaselineMatchesRuntimeConfig()
-                    }
                     val sql = if (epochId == null) {
                         "SELECT epoch.id, epoch.kind, epoch.initial_cash_jpy, epoch.created_at, NULL::bigint AS next_created_at FROM paper_account account JOIN paper_account_epochs epoch ON epoch.id=account.current_epoch_id WHERE account.id=?"
                     } else {
@@ -400,7 +448,7 @@ class ExposedEvaluationRepository(
                         if (epochId == null) statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID) else statement.setObject(1, UUID.fromString(epochId))
                         statement.executeQuery().use { resultSet ->
                             require(resultSet.next()) { "evaluation epoch was not found" }
-                            EvaluationScope(
+                            val scope = EvaluationScope(
                                 accountEpochId = resultSet.getObject("id", UUID::class.java),
                                 cohort = requestedCohort,
                                 executionSemanticsVersion = if (requestedCohort == EvaluationCohort.CURRENT) "PAPER_WS_V1" else null,
@@ -409,6 +457,11 @@ class ExposedEvaluationRepository(
                                 toExclusive = resultSet.getLong("next_created_at").takeUnless { resultSet.wasNull() }
                                     ?.let(Instant::ofEpochMilli),
                             )
+                            val activeEpochId = selectCurrentPaperAccountEpochId()
+                            if (scope.cohort == EvaluationCohort.CURRENT && scope.accountEpochId == activeEpochId) {
+                                requireCurrentAccountBaselineMatchesRuntimeConfig()
+                            }
+                            scope
                         }
                     }
                 }
@@ -424,11 +477,11 @@ class ExposedEvaluationRepository(
                     db = database,
                 ) {
                     EvaluationReportSnapshotFacts(
-                        trades = selectClosedTrades(period, me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT),
+                        trades = selectClosedTrades(period, DEFAULT_EVALUATION_QUERY_LIMIT),
                         dailyPnl = selectDailyTradePnl(period),
                         priorPnlJpy = sumTradePnlBeforeInstant(period.from),
                         initialCashJpy = selectInitialCashJpy(),
-                        usages = selectLlmPhaseUsages(period, me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT),
+                        usages = selectLlmPhaseUsages(period, DEFAULT_EVALUATION_QUERY_LIMIT),
                         exclusions = selectEvaluationExclusionSummary(period),
                     )
                 }
@@ -452,26 +505,21 @@ class ExposedEvaluationRepository(
                     )
                     val trades = selectClosedTrades(
                         period,
-                        me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT,
+                        DEFAULT_EVALUATION_QUERY_LIMIT,
                         scope,
                     )
-                    val priorTrades = selectClosedTrades(
-                        EvaluationPeriod(Instant.EPOCH, period.from),
-                        Int.MAX_VALUE,
-                        scope,
-                    ).trades
 
                     EvaluationReportSnapshotFacts(
                         trades = trades,
                         dailyPnl = trades.trades.map { trade ->
                             DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
                         },
-                        priorPnlJpy = priorTrades.sumOf(ClosedTradeFact::tradePnlJpy),
+                        priorPnlJpy = sumScopedTradePnlBefore(period.from, scope),
                         initialCashJpy = scope.initialCashJpy,
                         usages = if (scope.cohort == EvaluationCohort.CURRENT) {
                             selectLlmPhaseUsages(
                                 scopedPeriod,
-                                me.matsumo.fukurou.trading.evaluation.DEFAULT_EVALUATION_QUERY_LIMIT,
+                                DEFAULT_EVALUATION_QUERY_LIMIT,
                             )
                         } else {
                             EvaluationLlmUsageQueryResult(emptyList(), truncated = false)
@@ -564,6 +612,14 @@ class ExposedEvaluationRepository(
         }
     }
 
+    override suspend fun sumTradePnlBefore(instant: Instant, scope: EvaluationScope): Result<BigDecimal> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) { sumScopedTradePnlBefore(instant, scope) }
+            }
+        }
+    }
+
     override suspend fun fetchInitialCashJpy(): Result<BigDecimal> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -617,6 +673,19 @@ private fun JdbcTransaction.selectKillCriterionStats(): KillCriterionStats {
     }
 }
 
+private fun JdbcTransaction.sumScopedTradePnlBefore(instant: Instant, scope: EvaluationScope): BigDecimal {
+    return prepare(SELECT_SCOPED_PNL_BEFORE_SQL).use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.setLong(2, instant.toEpochMilli())
+        statement.setString(3, scope.accountEpochId.toString())
+        statement.setString(4, scope.cohort.name)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) { "scoped prior PnL did not return a row" }
+            resultSet.getBigDecimal(1) ?: BigDecimal.ZERO
+        }
+    }
+}
+
 private fun JdbcTransaction.selectCurrentEvaluationScope(): EvaluationScope {
     requireCurrentAccountBaselineMatchesRuntimeConfig()
 
@@ -646,24 +715,40 @@ private fun JdbcTransaction.selectCurrentEvaluationScope(): EvaluationScope {
 private fun JdbcTransaction.requireCurrentAccountBaselineMatchesRuntimeConfig() {
     val baselines = prepare(
         """
-            SELECT account.initial_cash_jpy,
+            SELECT account.initial_cash_jpy, epoch.initial_cash_jpy AS epoch_baseline,
                 (SELECT value.config_value
                  FROM runtime_config_values value
                  JOIN runtime_config_versions version ON version.id = value.version_id
                  WHERE version.status = 'ACTIVE' AND value.config_key = 'paper.initialCashJpy') AS config_baseline
             FROM paper_account account
+            JOIN paper_account_epochs epoch ON epoch.id = account.current_epoch_id
             WHERE account.id = ?
         """.trimIndent(),
     ).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
             require(resultSet.next()) { "PAPER_ACCOUNT_BASELINE_MISMATCH: paper account is missing." }
-            resultSet.getBigDecimal("initial_cash_jpy") to
-                resultSet.getString("config_baseline")?.let(::BigDecimal)
+            Triple(
+                resultSet.getBigDecimal("initial_cash_jpy"),
+                resultSet.getBigDecimal("epoch_baseline"),
+                resultSet.getString("config_baseline")?.let(::BigDecimal),
+            )
         }
     }
-    require(baselines.second != null && baselines.first.compareTo(baselines.second) == 0) {
+    val accountMatchesEpoch = baselines.first.compareTo(baselines.second) == 0
+    val accountMatchesConfig = baselines.third != null && baselines.first.compareTo(baselines.third) == 0
+    require(accountMatchesEpoch && accountMatchesConfig) {
         "PAPER_ACCOUNT_BASELINE_MISMATCH: create, validate, and activate an operator runtime-config draft."
+    }
+}
+
+private fun JdbcTransaction.selectCurrentPaperAccountEpochId(): UUID {
+    return prepare("SELECT current_epoch_id FROM paper_account WHERE id = ?").use { statement ->
+        statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next()) { "current paper account epoch was not found" }
+            requireNotNull(resultSet.getObject("current_epoch_id", UUID::class.java))
+        }
     }
 }
 
@@ -707,17 +792,21 @@ private fun JdbcTransaction.selectClosedTrades(
     limit: Int,
     scope: EvaluationScope? = null,
 ): EvaluationTradeQueryResult {
+    require(limit in 1 until Int.MAX_VALUE) { "limit must be finite and greater than zero" }
     val fetchLimit = limit + 1
 
     return jdbcConnection().prepareStatement(SELECT_CLOSED_TRADE_FACTS_SQL).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
-        statement.setLong(2, period.from.toEpochMilli())
-        statement.setLong(3, period.toExclusive.toEpochMilli())
-        statement.setObject(4, scope?.accountEpochId)
-        statement.setObject(5, scope?.accountEpochId)
-        statement.setString(6, scope?.cohort?.name)
-        statement.setString(7, scope?.cohort?.name)
-        statement.setInt(8, fetchLimit)
+        statement.setObject(2, scope?.accountEpochId)
+        statement.setObject(3, scope?.accountEpochId)
+        statement.setString(4, scope?.cohort?.name)
+        statement.setLong(5, period.from.toEpochMilli())
+        statement.setLong(6, period.toExclusive.toEpochMilli())
+        statement.setObject(7, scope?.accountEpochId)
+        statement.setObject(8, scope?.accountEpochId)
+        statement.setString(9, scope?.cohort?.name)
+        statement.setString(10, scope?.cohort?.name)
+        statement.setInt(11, fetchLimit)
         statement.executeQuery().use { resultSet ->
             val trades = buildList {
                 while (resultSet.next()) {

@@ -42,16 +42,10 @@ interface EvaluationRepository {
         scope: EvaluationScope,
     ): Result<EvaluationReportSnapshotFacts> = runCatching {
         val tradeResult = fetchClosedTrades(period, scope = scope).getOrThrow()
-        val priorTrades = fetchClosedTrades(
-            period = EvaluationPeriod(Instant.EPOCH, period.from),
-            limit = Int.MAX_VALUE,
-            scope = scope,
-        ).getOrThrow().trades
-
         fetchReportSnapshot(period).getOrThrow().copy(
             trades = tradeResult,
             dailyPnl = tradeResult.trades.map { trade -> DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy) },
-            priorPnlJpy = priorTrades.sumOf(ClosedTradeFact::tradePnlJpy),
+            priorPnlJpy = sumTradePnlBefore(period.from, scope).getOrThrow(),
             initialCashJpy = scope.initialCashJpy,
         )
     }
@@ -121,6 +115,11 @@ interface EvaluationRepository {
      * 指定時刻より前の realized PnL 合計を取得する。
      */
     suspend fun sumTradePnlBefore(instant: Instant): Result<BigDecimal>
+
+    /** epoch/cohort に限定した期間開始前 realized PnL の DB aggregate。 */
+    suspend fun sumTradePnlBefore(instant: Instant, scope: EvaluationScope): Result<BigDecimal> = Result.failure(
+        IllegalStateException("EVALUATION_SCOPE_UNSUPPORTED: repository must implement scoped prior-PnL aggregation."),
+    )
 
     /**
      * paper account の初期資金を取得する。
@@ -212,6 +211,9 @@ class InMemoryEvaluationRepository : EvaluationRepository {
     override suspend fun sumTradePnlBefore(instant: Instant): Result<BigDecimal> {
         return Result.success(BigDecimal.ZERO)
     }
+
+    override suspend fun sumTradePnlBefore(instant: Instant, scope: EvaluationScope): Result<BigDecimal> =
+        Result.success(BigDecimal.ZERO)
 
     override suspend fun fetchInitialCashJpy(): Result<BigDecimal> {
         return Result.success(BigDecimal.ZERO)

@@ -298,6 +298,24 @@ private const val ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL = """
         AND trade_group_id IS NOT NULL
 """
 
+/** scoped closed-trade projection の bounded read 用 index。 */
+private const val ENSURE_EVALUATION_POSITION_SCOPE_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_positions_evaluation_scope
+    ON positions (mode, status, account_epoch_id, closed_at, id)
+"""
+
+/** position 単位の execution lineage/PnL 集計用 index。 */
+private const val ENSURE_EVALUATION_EXECUTION_POSITION_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_executions_evaluation_position
+    ON executions (position_id, executed_at, id)
+"""
+
+/** position 単位の entry order 解決用 index。 */
+private const val ENSURE_EVALUATION_ORDER_POSITION_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_orders_evaluation_position
+    ON orders (position_id, id)
+"""
+
 /** CONNECTED market-data session を一意にする partial unique index を作る SQL。 */
 private const val ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_market_data_sessions_connected_unique
@@ -1095,6 +1113,9 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_COMMAND_EVENT_LOG_RUN_EVENT_TOOL_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_CLIENT_REQUEST_ID_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_ORDERS_ACTIVITY_CONTEXT_ENTRY_INDEX_SQL)
+    executeUpdate(ENSURE_EVALUATION_POSITION_SCOPE_INDEX_SQL)
+    executeUpdate(ENSURE_EVALUATION_EXECUTION_POSITION_INDEX_SQL)
+    executeUpdate(ENSURE_EVALUATION_ORDER_POSITION_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
     executeUpdate(BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)

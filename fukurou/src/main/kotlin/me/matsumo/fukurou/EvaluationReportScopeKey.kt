@@ -23,7 +23,10 @@ internal data class EvaluationReportScopeKey(
             val parts = value.split("|EPOCH:", limit = 2)
             if (parts.size == 1) return EvaluationReportScopeKey(parts.single())
             val version = parts[1].split("|COHORT:", limit = 2)
-            require(version.size == 2 && version.all(String::isNotBlank)) {
+            require(
+                version.size == 2 && version.all(String::isNotBlank) &&
+                    version.none { component -> "|" in component },
+            ) {
                 "REPORT_SCOPE_INVALID: malformed versioned scope."
             }
             return EvaluationReportScopeKey(parts[0], version[0], version[1])

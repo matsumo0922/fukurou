@@ -1475,6 +1475,9 @@ class PostgresPersistenceIntegrationTest {
         assertEquals("1000000.00000000", account.initialCashJpy)
         assertEquals("100000", active.values.getValue("paper.initialCashJpy"))
         assertTrue(ExposedEvaluationRepository(database).resolveScope(null, null).isFailure)
+        assertTrue(
+            ExposedEvaluationRepository(database).resolveScope(account.accountEpochId, "CURRENT").isFailure,
+        )
 
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
@@ -4376,6 +4379,109 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
         assertEquals(1, killStats.closedTrades)
         assertNull(killStats.profitFactor)
+    }
+
+    @Test
+    fun evaluation_repository_bounds_large_scoped_populations_and_aggregates_prior_pnl() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedEvaluationRepository(database)
+        val scope = repository.resolveScope(null, "CURRENT").getOrThrow()
+        val runtimeHash = ExposedRuntimeConfigRepository(database).activeSnapshot().getOrThrow().hash
+        val period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1))
+
+        exposedTransaction(database) {
+            prepare(
+                """
+                    INSERT INTO positions (
+                        id, account_epoch_id, trade_group_id, mode, symbol, side, status,
+                        opened_at, closed_at, size_btc, average_entry_price_jpy,
+                        current_price_jpy, highest_price_since_entry_jpy, lowest_price_since_entry_jpy
+                    )
+                    SELECT md5('bulk-position:' || series)::uuid,
+                        CASE WHEN series=0 THEN ?::uuid ELSE NULL END,
+                        md5('bulk-group:' || series)::uuid, 'PAPER', 'BTC_JPY', 'LONG', 'CLOSED',
+                        ?, ?, 0, 10000000, 10000000, 10000000, 10000000
+                    FROM generate_series(0, 20001) series
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.setLong(2, fixedInstant().toEpochMilli())
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+            prepare(
+                """
+                    INSERT INTO orders (
+                        id, account_epoch_id, execution_semantics_version, runtime_config_hash,
+                        position_id, trade_group_id, mode, symbol, side, order_type, status,
+                        size_btc, protective_stop_price_jpy, created_at, updated_at
+                    )
+                    SELECT md5('bulk-order:' || series)::uuid,
+                        CASE WHEN series=0 THEN ?::uuid ELSE NULL END,
+                        CASE WHEN series=0 THEN 'PAPER_WS_V1' ELSE NULL END,
+                        CASE WHEN series=0 THEN ? ELSE NULL END,
+                        md5('bulk-position:' || series)::uuid, md5('bulk-group:' || series)::uuid,
+                        'PAPER', 'BTC_JPY', 'BUY', 'MARKET', 'FILLED', 0.001, 9700000, ?, ?
+                    FROM generate_series(0, 20001) series
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.setString(2, runtimeHash)
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.setLong(4, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+            prepare(
+                """
+                    INSERT INTO executions (
+                        id, account_epoch_id, execution_semantics_version, runtime_config_hash,
+                        order_id, position_id, mode, symbol, side, price_jpy, size_btc,
+                        fee_jpy, realized_pnl_jpy, liquidity, executed_at
+                    )
+                    SELECT md5('bulk-execution:' || series)::uuid,
+                        CASE WHEN series=0 THEN ?::uuid ELSE NULL END,
+                        CASE WHEN series=0 THEN 'PAPER_WS_V1' ELSE NULL END,
+                        CASE WHEN series=0 THEN ? ELSE NULL END,
+                        md5('bulk-order:' || series)::uuid, md5('bulk-position:' || series)::uuid,
+                        'PAPER', 'BTC_JPY', 'BUY', 10000000, 0.001, 1, 0, 'TAKER', ?
+                    FROM generate_series(0, 20001) series
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.setString(2, runtimeHash)
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+        }
+
+        val current = repository.fetchClosedTrades(period, scope = scope).getOrThrow()
+        val snapshot = repository.fetchReportSnapshot(
+            EvaluationPeriod(fixedInstant().plusSeconds(1), fixedInstant().plusSeconds(2)),
+            scope,
+        ).getOrThrow()
+        assertEquals(1, current.trades.size)
+        assertFalse(current.truncated)
+        assertEquals(0, snapshot.priorPnlJpy.compareTo(BigDecimal("-1.00000000")))
+
+        exposedTransaction(database) {
+            prepare("UPDATE positions SET account_epoch_id=?").use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.executeUpdate()
+            }
+            prepare("UPDATE orders SET account_epoch_id=?, execution_semantics_version='PAPER_WS_V1', runtime_config_hash=?").use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.setString(2, runtimeHash)
+                statement.executeUpdate()
+            }
+            prepare("UPDATE executions SET account_epoch_id=?, execution_semantics_version='PAPER_WS_V1', runtime_config_hash=?").use { statement ->
+                statement.setObject(1, scope.accountEpochId)
+                statement.setString(2, runtimeHash)
+                statement.executeUpdate()
+            }
+        }
+        val oversizedSnapshot = repository.fetchReportSnapshot(period, scope).getOrThrow()
+        assertEquals(20_000, oversizedSnapshot.trades.trades.size)
+        assertTrue(oversizedSnapshot.trades.truncated)
     }
 
     @Test
