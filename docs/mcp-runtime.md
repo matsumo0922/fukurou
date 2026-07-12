@@ -107,6 +107,8 @@ merge 前の exact-image gate は LLM/MCP の process identity、capability、FD
 
 manifest IDはexpiryまでMCP launcherを再実行できるbearer capabilityである。tool call limiterは`command_event_log`のinitial countを復元してrun budgetを共有するが、複数MCP processが同時にloadしてinsertする間の競合では上限を少数call超える可能性がある。各act toolは同じSafetyFloorとcaller guardを通り、manifestのphase allowlist外のtoolは起動時とcall時の両方で拒否する。
 
+cleanup helperの各passは、validated directory inodeを`openat`で独立して開いたoffset 0のstreamを完走する。empty passの後に行う最終削除が同時作成と競合した場合はbounded retryし、収束しなければfail closedになる。
+
 Claude/Codex config と session は `/run/fukurou/llm-homes` tmpfs の per-run home に app UID・shared group・0770/0660 で生成する。別 UID の launcher process はumask `0007`でproviderを起動し、読取・session書込ができる一方、world accessはない。providerがgroup writeやowner traversalを付けずに作成したnested treeは、通常削除の権限失敗時だけfixed launcherのpath限定cleanup modeがsymlinkを追跡せず削除する。helperはvalidated rootから`openat(O_NOFOLLOW)`で開いたdirectory FDだけを辿り、同じinodeへ`fchown` / `fchmod`してreal directoryのowner `rwx`だけを回復する。regular fileのread modeとsymlink targetは変更しない。永続`llm-auth`はauth sourceだけに使い、必要なauth fileだけをper-run homeへcopyする。normal、非0終了、timeout、cancel、parse/start/request/render failureの全経路でconfig/home/manifestを削除する。helperを含むcleanup failureはinfrastructure failureとしてcurrent processをquarantineし、markerと残存artifactを同じtmpfsに保持する。operatorが監査・解消するかcontainer restartでtmpfs全体を破棄するまでmanual/daemonの次runを拒否する。CLI に見える設定は次の形になる。
 
 ```json

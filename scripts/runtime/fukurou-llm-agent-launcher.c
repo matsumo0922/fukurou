@@ -153,8 +153,20 @@ static int cleanup_directory_contents(int directory_fd) {
     if (fchown(directory_fd, APP_UID, LLM_GID) != 0) return -1;
 
     for (int pass = 0; pass < 128; pass++) {
-        int scan_fd = dup(directory_fd);
+        int scan_fd = openat(directory_fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (scan_fd < 0) return -1;
+        struct stat scan_metadata;
+        if (fstat(scan_fd, &scan_metadata) != 0) {
+            int operation_errno = errno;
+            close(scan_fd);
+            errno = operation_errno;
+            return -1;
+        }
+        if (metadata.st_dev != scan_metadata.st_dev || metadata.st_ino != scan_metadata.st_ino) {
+            close(scan_fd);
+            errno = ESTALE;
+            return -1;
+        }
         DIR *directory = fdopendir(scan_fd);
         if (directory == NULL) {
             int operation_errno = errno;
@@ -230,22 +242,25 @@ static void cleanup_per_run_home(const char *path) {
         close(root_fd);
         fail_errno("cleanup cannot clear supplementary groups");
     }
-    if (cleanup_directory_contents(home_fd) != 0) {
-        int operation_errno = errno;
-        close(home_fd);
+    int removal_result = -1;
+    for (int attempt = 0; attempt < 128; attempt++) {
+        if (cleanup_directory_contents(home_fd) != 0) break;
+        if (unlink_as_appuser(root_fd, name, AT_REMOVEDIR) == 0 || errno == ENOENT) {
+            removal_result = 0;
+            break;
+        }
+        if (errno != ENOTEMPTY && errno != EEXIST) break;
+    }
+    int operation_errno = errno;
+    if (removal_result != 0 && operation_errno == 0) operation_errno = EBUSY;
+    if (close(home_fd) != 0 && removal_result == 0) {
+        operation_errno = errno;
+        removal_result = -1;
+    }
+    if (removal_result != 0) {
         close(root_fd);
         errno = operation_errno;
-        fail_errno("cleanup traversal failed");
-    }
-    if (close(home_fd) != 0) {
-        close(root_fd);
-        fail_errno("cleanup home descriptor close failed");
-    }
-    if (unlink_as_appuser(root_fd, name, AT_REMOVEDIR) != 0) {
-        int operation_errno = errno;
-        close(root_fd);
-        errno = operation_errno;
-        fail_errno("cleanup home removal failed");
+        fail_errno("cleanup traversal or home removal failed");
     }
     if (close(root_fd) != 0) fail_errno("cleanup root descriptor close failed");
     _exit(0);
