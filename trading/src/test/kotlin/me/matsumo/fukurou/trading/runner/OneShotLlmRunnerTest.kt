@@ -54,6 +54,7 @@ import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjectionContext
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
@@ -235,6 +236,40 @@ class OneShotLlmRunnerTest {
         assertTrue(manifest.canonicalContentHash.matches(Regex("[0-9a-f]{64}")))
         assertTrue(manifest.materialProjection.contains("priceMoveBand=0"))
         assertFalse(manifest.materialProjection.contains("sourceTimestamp"))
+    }
+
+    @Test
+    fun openEpisodeThresholdOverridesChangedRuntimeConfig() = runBlocking {
+        val config = TradingBotConfig(daemon = LlmDaemonConfig(priceMoveThresholdRatio = BigDecimal("0.50")))
+        val fixture = runnerFixture(
+            config = config,
+            marketDataSource = MaterialManifestMarketDataSource,
+            runtimeTransform = { runtime ->
+                val delegate = runtime.decisionMaterialStateRepository
+                runtime.copy(
+                    decisionMaterialStateRepository = object : DecisionMaterialStateRepository by delegate {
+                        override suspend fun findOpenEpisodeContext(symbol: String) = Result.success(
+                            DecisionMaterialProjectionContext(
+                                anchorPriceJpy = BigDecimal("9800000"),
+                                priceMoveThresholdRatio = BigDecimal("0.02"),
+                                invalidationPredicates = emptyList(),
+                            ),
+                        )
+                    },
+                )
+            },
+        ) { command ->
+            if (command.isProposerLaunch()) submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            cleanExit()
+        }
+
+        fixture.runner.runOneShot(defaultRequest().copy(invocationId = "fixed-threshold-run")).getOrThrow()
+
+        val manifest = assertNotNull(
+            fixture.runtime.decisionMaterialStateRepository.find("fixed-threshold-run").getOrThrow(),
+        )
+        assertEquals(BigDecimal("0.02"), manifest.priceMoveThresholdRatio)
+        assertTrue(manifest.materialProjection.contains("priceMoveBand=1"))
     }
 
     @Test

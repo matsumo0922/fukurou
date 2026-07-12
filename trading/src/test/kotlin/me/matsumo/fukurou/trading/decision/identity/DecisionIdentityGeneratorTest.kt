@@ -56,7 +56,7 @@ class DecisionIdentityGeneratorTest {
     }
 
     @Test
-    fun freeTextOnlyChange_keepsTypedThesisIdentity() {
+    fun differentNormalizedThesisText_changesThesisIdentity() {
         val episodeId = UUID.randomUUID()
         val first = DecisionIdentityGenerator.generate(
             episodeId,
@@ -71,7 +71,7 @@ class DecisionIdentityGeneratorTest {
             "priceBand=0",
         )
 
-        assertEquals(first.thesisId, second.thesisId)
+        assertNotEquals(first.thesisId, second.thesisId)
     }
 
     private fun tradePlan(thesis: String, tags: List<String>) = TradePlanDraft(

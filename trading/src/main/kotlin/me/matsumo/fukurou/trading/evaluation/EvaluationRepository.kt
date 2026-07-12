@@ -185,6 +185,7 @@ data class DeduplicationMetrics(
     val shadowComplete: Int = 0,
     val classificationCounts: Map<String, Int> = emptyMap(),
     val rawSuppressedHeartbeatCount: Int = 0,
+    val restingMaintenanceObservationCount: Int = 0,
     val uniqueEpisodeCount: Int = 0,
     val falseSuppressionCount: Int = 0,
     val validSuppressionCount: Int = 0,

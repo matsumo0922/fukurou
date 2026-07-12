@@ -2422,6 +2422,7 @@ export interface components {
                 [key: string]: number;
             };
             rawSuppressedHeartbeatCount?: number;
+            restingMaintenanceObservationCount?: number;
             uniqueEpisodeCount?: number;
             falseSuppressionRate?: number | null;
             falseSuppressionCount?: number;

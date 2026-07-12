@@ -5656,7 +5656,6 @@ class PostgresPersistenceIntegrationTest {
             broker = runtime.broker,
             tradingLock = runtime.tradingLock,
             latestMarketQuoteStore = LatestMarketQuoteStore(),
-            priceMoveThresholdRatio = config.daemon.priceMoveThresholdRatio,
         )
 
         service.observe(fixedInstant().plusSeconds(1)).getOrThrow()
@@ -5749,6 +5748,15 @@ class PostgresPersistenceIntegrationTest {
         runtime.decisionMaterialStateRepository.append(expected).getOrThrow()
 
         assertEquals(memory.find(expected.invocationId).getOrThrow(), runtime.decisionMaterialStateRepository.find(expected.invocationId).getOrThrow())
+        val submission = enterDecisionSubmission().copy(invocationId = expected.invocationId)
+        val memoryIdentity = InMemoryDecisionRepository(
+            clock = fixedClock(),
+            materialStateRepository = memory,
+        ).submitDecision(submission).getOrThrow().decision.identity
+        val databaseIdentity = runtime.decisionRepository.submitDecision(submission).getOrThrow().decision.identity
+        assertEquals(memoryIdentity?.thesisId, databaseIdentity?.thesisId)
+        assertEquals(memoryIdentity?.geometryHash, databaseIdentity?.geometryHash)
+        assertEquals(memoryIdentity?.materialStateHash, databaseIdentity?.materialStateHash)
         runtime.close()
     }
 
@@ -5767,10 +5775,16 @@ class PostgresPersistenceIntegrationTest {
             priceJpy = BigDecimal("10000000"),
             takeProfitPriceJpy = BigDecimal("10500000"),
         )
-        appendIdentityManifest(runtime, "run-entry-${command.commandId}")
+        runtime.decisionMaterialStateRepository.append(
+            identityManifest("run-entry-${command.commandId}").copy(priceMoveThresholdRatio = BigDecimal("0.02")),
+        ).getOrThrow()
         val approved = approvedPostgresEntryCommand(runtime.decisionRepository, command)
         val firstEpisode = requireNotNull(runtime.decisionRepository.latestDecisionByInvocationId("run-entry-${command.commandId}").getOrThrow())
             .decision.identity!!.opportunityEpisodeId
+        assertEquals(
+            BigDecimal("0.020000000000"),
+            runtime.decisionMaterialStateRepository.findOpenEpisodeContext("BTC").getOrThrow()?.priceMoveThresholdRatio,
+        )
         exposedTransaction(database) {
             jdbcConnection().prepareStatement(
                 """INSERT INTO orders
@@ -5788,14 +5802,20 @@ class PostgresPersistenceIntegrationTest {
             }
         }
 
-        appendIdentityManifest(runtime, "ttl-same")
+        runtime.decisionMaterialStateRepository.append(
+            identityManifest("ttl-same").copy(priceMoveThresholdRatio = BigDecimal("0.02")),
+        ).getOrThrow()
         val same = runtime.decisionRepository.submitDecision(
             entryDecisionSubmission(command).copy(invocationId = "ttl-same"),
         ).getOrThrow()
         assertEquals(firstEpisode, same.decision.identity!!.opportunityEpisodeId)
 
         runtime.decisionMaterialStateRepository.append(
-            identityManifest("ttl-changed").copy(lastPriceJpy = BigDecimal("10200000")),
+            identityManifest("ttl-changed").copy(
+                lastPriceJpy = BigDecimal("10200000"),
+                priceMoveThresholdRatio = BigDecimal("0.02"),
+                materialProjection = "risk=RUNNING\npriceMoveBand=1",
+            ),
         ).getOrThrow()
         val changed = runtime.decisionRepository.submitDecision(
             entryDecisionSubmission(command).copy(invocationId = "ttl-changed"),

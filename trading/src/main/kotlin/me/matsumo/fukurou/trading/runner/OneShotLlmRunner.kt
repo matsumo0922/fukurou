@@ -39,6 +39,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationState
+import me.matsumo.fukurou.trading.decision.evaluateInvalidationPredicates
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjection
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
@@ -524,9 +525,24 @@ class OneShotLlmRunner(
             "freshness=${freshness.name}",
             "missing=${missingSources.joinToString(",") { "${it.source}:${it.reason}" }}",
         ).joinToString("\n")
-        val anchorPrice = orders.asSequence()
+        val episodeContext = tradingRuntime.decisionMaterialStateRepository
+            .findOpenEpisodeContext(tradingConfig.symbol.apiSymbol)
+            .getOrThrow()
+        val anchorPrice = episodeContext?.anchorPriceJpy ?: orders.asSequence()
             .mapNotNull { order -> order.limitPriceJpy?.toBigDecimalOrNull() }
             .firstOrNull()
+        val thresholdRatio = episodeContext?.priceMoveThresholdRatio
+            ?: tradingConfig.daemon.priceMoveThresholdRatio
+        val invalidationState = episodeContext?.let { context ->
+            evaluateInvalidationPredicates(
+                predicates = context.invalidationPredicates,
+                lastPriceJpy = last,
+                bestBidJpy = bid,
+                bestAskJpy = ask,
+                observedAt = capturedAt,
+                materialStateChanged = null,
+            )
+        } ?: TradePlanInvalidationState.UNKNOWN_DATA
         val materialProjection = DecisionMaterialProjection(
             riskState = riskState.state.name,
             freshness = freshness,
@@ -537,8 +553,8 @@ class OneShotLlmRunner(
             atr14Jpy = atr,
             bestBidJpy = bid,
             bestAskJpy = ask,
-            invalidationState = TradePlanInvalidationState.UNKNOWN_DATA,
-        ).canonical(tradingConfig.daemon.priceMoveThresholdRatio)
+            invalidationState = invalidationState,
+        ).canonical(thresholdRatio)
         val manifest = DecisionMaterialStateManifest(
             invocationId = input.invocationId,
             capturedAt = capturedAt,
@@ -547,6 +563,7 @@ class OneShotLlmRunner(
             runtimeConfigVersion = runtimeConfigSnapshot?.versionId,
             runtimeConfigHash = runtimeConfigSnapshot?.hash,
             riskState = riskState.state.name,
+            priceMoveThresholdRatio = thresholdRatio,
             bestBidJpy = bid,
             bestAskJpy = ask,
             lastPriceJpy = last,

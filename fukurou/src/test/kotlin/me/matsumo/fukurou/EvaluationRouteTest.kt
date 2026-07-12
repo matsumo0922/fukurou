@@ -292,6 +292,8 @@ class EvaluationRouteTest {
         assertTrue(summaryBody.contains("\"validSuppressionCount\":0"))
         assertTrue(summaryBody.contains("\"resolvedCount\":0"))
         assertTrue(summaryBody.contains("\"manualFullRunCount\":0"))
+        assertTrue(summaryBody.contains("\"rawSuppressedHeartbeatCount\":0"))
+        assertTrue(summaryBody.contains("\"restingMaintenanceObservationCount\":0"))
         assertTrue(costsBody.contains("\"truncated\""))
         assertTrue(costsBody.contains("\"knownCostUsd\":\"0.01\""))
         assertTrue(costsBody.contains("\"knownCostUsd\":null"))

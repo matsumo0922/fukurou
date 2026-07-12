@@ -771,6 +771,7 @@ data class DeduplicationResponse(
     val shadowClassificationCoverage: Double? = null,
     val classificationCounts: Map<String, Int> = emptyMap(),
     val rawSuppressedHeartbeatCount: Int = 0,
+    val restingMaintenanceObservationCount: Int = 0,
     val uniqueEpisodeCount: Int = 0,
     val falseSuppressionRate: Double? = null,
     val falseSuppressionCount: Int = 0,
@@ -794,6 +795,7 @@ data class DeduplicationResponse(
                 shadowClassificationCoverage = coverage(metrics.shadowComplete, metrics.shadowEligible),
                 classificationCounts = metrics.classificationCounts,
                 rawSuppressedHeartbeatCount = metrics.rawSuppressedHeartbeatCount,
+                restingMaintenanceObservationCount = metrics.restingMaintenanceObservationCount,
                 uniqueEpisodeCount = metrics.uniqueEpisodeCount,
                 falseSuppressionRate = coverage(
                     metrics.falseSuppressionCount,

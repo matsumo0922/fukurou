@@ -61,6 +61,7 @@ object DecisionIdentityGenerator {
 
         return listOf(
             "symbol=${tradePlan.symbol.apiSymbol}",
+            "thesis=${canonicalText(tradePlan.thesisJa)}",
             "tags=${tags.joinToString("|")}",
             "invalidations=${invalidations.joinToString("|")}",
         ).joinToString("\n")

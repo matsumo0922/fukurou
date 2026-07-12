@@ -11,6 +11,9 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
+import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjectionContext
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
@@ -57,6 +60,50 @@ class ExposedDecisionMaterialStateRepository(private val database: Database) : D
                 }
             }
         }
+
+    override suspend fun findOpenEpisodeContext(symbol: String): Result<DecisionMaterialProjectionContext?> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                transaction(database) {
+                    jdbcConnection().prepareStatement(SELECT_OPEN_EPISODE_CONTEXT_SQL).use { statement ->
+                        statement.setString(1, symbol)
+                        statement.executeQuery().use { result ->
+                            if (!result.next()) return@use null
+                            DecisionMaterialProjectionContext(
+                                anchorPriceJpy = result.getBigDecimal(2),
+                                priceMoveThresholdRatio = result.getBigDecimal(1),
+                                invalidationPredicates = result.getString(3).toPredicates(),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+}
+
+private val SELECT_OPEN_EPISODE_CONTEXT_SQL = """SELECT e.price_move_threshold_ratio,
+    (SELECT ti.price_jpy FROM trade_intents ti JOIN decisions d ON d.id=ti.decision_id
+     WHERE ti.opportunity_episode_id=e.id AND ti.price_jpy IS NOT NULL
+     ORDER BY d.created_at, d.id LIMIT 1),
+    (SELECT tp.invalidation_predicates FROM trade_intents ti
+     JOIN trade_plans tp ON tp.id=ti.trade_plan_id JOIN decisions d ON d.id=ti.decision_id
+     WHERE ti.opportunity_episode_id=e.id ORDER BY d.created_at DESC, d.id DESC LIMIT 1)
+    FROM opportunity_episodes e WHERE e.symbol=? AND e.closed_at IS NULL
+""".trimIndent()
+
+private fun String?.toPredicates(): List<TradePlanInvalidationPredicate> {
+    if (this.isNullOrBlank()) return emptyList()
+    return splitToSequence(';').mapNotNull { encoded ->
+        val fields = encoded.split('|')
+        val type = runCatching { TradePlanInvalidationType.valueOf(fields[0]) }.getOrNull() ?: return@mapNotNull null
+        TradePlanInvalidationPredicate(
+            type = type,
+            decimalThresholdJpy = fields.getOrNull(1)?.takeIf(String::isNotBlank)?.toBigDecimalOrNull(),
+            instantThreshold = fields.getOrNull(2)?.takeIf(String::isNotBlank)?.let {
+                runCatching { java.time.Instant.parse(it) }.getOrNull()
+            },
+        )
+    }.toList()
 }
 
 private fun String.toMaterialManifest(): DecisionMaterialStateManifest {
@@ -72,6 +119,7 @@ private fun String.toMaterialManifest(): DecisionMaterialStateManifest {
         runtimeConfigVersion = text("runtimeConfigVersion"),
         runtimeConfigHash = text("runtimeConfigHash"),
         riskState = requireNotNull(text("riskState")),
+        priceMoveThresholdRatio = decimal("priceMoveThresholdRatio") ?: java.math.BigDecimal("0.01"),
         bestBidJpy = decimal("bestBidJpy"),
         bestAskJpy = decimal("bestAskJpy"),
         lastPriceJpy = decimal("lastPriceJpy"),
@@ -105,6 +153,7 @@ private fun DecisionMaterialStateManifest.toJson(): String = buildJsonObject {
     put("runtimeConfigVersion", runtimeConfigVersion)
     put("runtimeConfigHash", runtimeConfigHash)
     put("riskState", riskState)
+    put("priceMoveThresholdRatio", priceMoveThresholdRatio.toPlainString())
     put("bestBidJpy", bestBidJpy?.toPlainString())
     put("bestAskJpy", bestAskJpy?.toPlainString())
     put("lastPriceJpy", lastPriceJpy?.toPlainString())

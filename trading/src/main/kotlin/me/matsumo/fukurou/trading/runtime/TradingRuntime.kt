@@ -221,6 +221,7 @@ object TradingRuntimeFactory {
     /**
      * in-memory runtime を構築する。
      */
+    @Suppress("LongMethod")
     fun inMemory(
         clock: Clock = Clock.systemUTC(),
         reconcilerStatusProvider: ReconcilerStatusProvider = NoReconcilerStatusProvider,
@@ -231,7 +232,11 @@ object TradingRuntimeFactory {
         val commandEventLog = InMemoryCommandEventLog()
         val llmRunRepository = InMemoryLlmRunRepository()
         val evaluationRepository = InMemoryEvaluationRepository()
-        val decisionRepository = InMemoryDecisionRepository(clock)
+        val materialStateRepository = InMemoryDecisionMaterialStateRepository()
+        val decisionRepository = InMemoryDecisionRepository(
+            clock = clock,
+            materialStateRepository = materialStateRepository,
+        )
         val safetyViolationRepository = InMemorySafetyViolationRepository()
         val riskStateCommandService = InMemoryRiskStateCommandService(
             riskStateRepository = riskStateRepository,
@@ -274,7 +279,7 @@ object TradingRuntimeFactory {
             equitySnapshotRepository = ledgerRepository.equitySnapshotRepository,
             evaluationRepository = evaluationRepository,
             decisionRepository = decisionRepository,
-            decisionMaterialStateRepository = InMemoryDecisionMaterialStateRepository(),
+            decisionMaterialStateRepository = materialStateRepository,
             safetyViolationRepository = safetyViolationRepository,
             safetyDenialReader = EmptyDecisionRunSafetyDenialReader,
             broker = broker,

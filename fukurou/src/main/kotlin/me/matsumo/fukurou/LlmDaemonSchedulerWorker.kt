@@ -206,7 +206,6 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
         database = inputs.database,
         tradingRuntime = components.tradingRuntime,
         latestMarketQuoteStore = inputs.latestMarketQuoteStore,
-        tradingConfig = inputs.tradingConfig,
     )
 
     return LlmDaemonScheduler(
@@ -237,14 +236,12 @@ internal fun createRestingOrderMaintenanceService(
     database: ExposedDatabase,
     tradingRuntime: TradingRuntime,
     latestMarketQuoteStore: LatestMarketQuoteStore,
-    tradingConfig: TradingBotConfig,
 ): ExposedRestingOrderMaintenanceService {
     return ExposedRestingOrderMaintenanceService(
         database = database,
         broker = tradingRuntime.broker,
         tradingLock = tradingRuntime.tradingLock,
         latestMarketQuoteStore = latestMarketQuoteStore,
-        priceMoveThresholdRatio = tradingConfig.daemon.priceMoveThresholdRatio,
     )
 }
 

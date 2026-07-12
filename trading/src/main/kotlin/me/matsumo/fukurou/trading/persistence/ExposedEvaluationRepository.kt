@@ -969,13 +969,14 @@ private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod)
         (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<?),
         (SELECT COUNT(*) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<? AND classification IS NOT NULL AND opportunity_episode_id IS NOT NULL AND data_quality='COMPLETE'),
         (SELECT COUNT(DISTINCT opportunity_episode_id) FROM dedupe_shadow_observations WHERE observed_at>=? AND observed_at<?),
+        (SELECT COUNT(DISTINCT maintenance_tick_id) FROM dedupe_shadow_observations WHERE observation_kind='RESTING_MAINTENANCE' AND observed_at>=? AND observed_at<? AND maintenance_tick_id IS NOT NULL),
         (SELECT COUNT(DISTINCT (maintenance_tick_id, reference_order_id)) FROM dedupe_shadow_observations WHERE observation_kind='RESTING_MAINTENANCE' AND observed_at>=? AND observed_at<? AND maintenance_tick_id IS NOT NULL AND reference_order_id IS NOT NULL),
         (SELECT COUNT(*) FROM decisions, boundary WHERE action IN ('ENTER','ADD_LONG') AND created_at>=? AND created_at<? AND created_at < boundary.activated_at),
         (SELECT COUNT(*) FROM trade_intents, boundary WHERE created_at>=? AND created_at<? AND created_at < boundary.activated_at)
     """.trimIndent()
     return jdbcConnection().prepareStatement(sql).use { statement ->
         var index = 1
-        repeat(8) {
+        repeat(9) {
             statement.setLong(index++, period.from.toEpochMilli())
             statement.setLong(index++, period.toExclusive.toEpochMilli())
         }
@@ -997,10 +998,11 @@ private fun JdbcTransaction.selectDeduplicationMetrics(period: EvaluationPeriod)
                 shadowComplete = result.getInt(6),
                 uniqueEpisodeCount = result.getInt(7),
                 rawSuppressedHeartbeatCount = result.getInt(8),
-                legacyExcludedCount = result.getInt(9) + result.getInt(10),
-                decisionLegacyExcludedCount = result.getInt(9),
+                restingMaintenanceObservationCount = result.getInt(9),
+                legacyExcludedCount = result.getInt(10) + result.getInt(11),
+                decisionLegacyExcludedCount = result.getInt(10),
                 decisionGenerationFailureCount = result.getInt(1) - result.getInt(2),
-                intentLegacyExcludedCount = result.getInt(10),
+                intentLegacyExcludedCount = result.getInt(11),
                 intentGenerationFailureCount = result.getInt(3) - result.getInt(4),
                 classificationCounts = classificationCounts,
                 falseSuppressionCount = resolutionCounts["FALSE_SUPPRESSION_PROXY"] ?: 0,
@@ -1066,6 +1068,7 @@ private fun JdbcTransaction.selectDedupeLaunchCounts(period: EvaluationPeriod): 
       ),
       COUNT(*) FILTER (
         WHERE payload LIKE '%\"restingOnly\":true%'
+        AND payload NOT LIKE '%\"triggerKind\":\"MANUAL\"%'
       ) FROM command_event_log
       WHERE event_type = 'DAEMON_TRIGGER_LAUNCHED' AND occurred_at >= ? AND occurred_at < ?
     """.trimIndent()

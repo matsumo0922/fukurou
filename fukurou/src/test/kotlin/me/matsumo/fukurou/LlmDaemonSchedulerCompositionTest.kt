@@ -20,7 +20,6 @@ class LlmDaemonSchedulerCompositionTest {
             database = Database.connect("jdbc:postgresql://127.0.0.1:1/not-used"),
             tradingRuntime = runtime,
             latestMarketQuoteStore = LatestMarketQuoteStore(),
-            tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
         )
 
         assertIs<RestingOrderMaintenanceService>(service)

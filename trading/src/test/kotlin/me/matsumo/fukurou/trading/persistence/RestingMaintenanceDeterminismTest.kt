@@ -23,6 +23,15 @@ class RestingMaintenanceDeterminismTest {
                 thresholdRatio = BigDecimal("0.01"),
             ),
         )
+        assertEquals(
+            true,
+            hasPriceApproached(
+                entryPrice = BigDecimal("10000000"),
+                baselineDistance = BigDecimal("200000"),
+                currentDistance = BigDecimal("100000"),
+                thresholdRatio = BigDecimal("0.01"),
+            ),
+        )
         assertNull(
             hasPriceApproached(
                 entryPrice = BigDecimal("10000000"),
@@ -71,6 +80,14 @@ class RestingMaintenanceDeterminismTest {
             hasVolatilityChanged(
                 baselineAtrRatio = BigDecimal("0.0100"),
                 currentAtrRatio = BigDecimal("0.0111"),
+                thresholdRatio = BigDecimal("0.10"),
+            ),
+        )
+        assertEquals(
+            true,
+            hasVolatilityChanged(
+                baselineAtrRatio = BigDecimal("0.0100"),
+                currentAtrRatio = BigDecimal("0.0110"),
                 thresholdRatio = BigDecimal("0.10"),
             ),
         )

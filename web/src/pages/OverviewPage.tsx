@@ -91,6 +91,8 @@ type DeduplicationTelemetry = {
   intentGenerationFailureCount: number;
   shadowClassificationCoverage: number | null;
   classificationCounts: Record<string, number>;
+  rawSuppressedHeartbeatCount: number;
+  restingMaintenanceObservationCount: number;
   falseSuppressionRate: number | null;
   falseSuppressionCount: number;
   validSuppressionCount: number;
@@ -119,6 +121,7 @@ function DeduplicationPanel({ evaluationQuery }: { evaluationQuery: UseQueryResu
         { label: t("overview.label.decisionIdentityCoverage"), value: formatRatioAsPercent(deduplication.decisionIdentityCoverage?.toString()) },
         { label: t("overview.label.legacyExcluded"), value: String(deduplication.legacyExcludedCount) },
         { label: t("overview.label.identityFailures"), value: `${deduplication.decisionGenerationFailureCount} / ${deduplication.intentGenerationFailureCount}` },
+        { label: t("overview.label.maintenanceTicks"), value: `${deduplication.rawSuppressedHeartbeatCount} / ${deduplication.restingMaintenanceObservationCount}` },
         { label: t("overview.label.intentIdentityCoverage"), value: formatRatioAsPercent(deduplication.intentIdentityCoverage?.toString()) },
         { label: t("overview.label.shadowCoverage"), value: formatRatioAsPercent(deduplication.shadowClassificationCoverage?.toString()) },
         { label: t("overview.label.falseSuppression"), value: formatRatioAsPercent(deduplication.falseSuppressionRate?.toString()) },

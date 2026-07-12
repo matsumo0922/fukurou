@@ -1079,6 +1079,7 @@ object OpportunityEpisodesTable : Table("opportunity_episodes") {
     val id = uuid("id")
     val symbol = varchar("symbol", 32)
     val thesisId = varchar("thesis_id", 80)
+    val priceMoveThresholdRatio = decimal("price_move_threshold_ratio", 20, 12).default(BigDecimal("0.01"))
     val openedAt = long("opened_at")
     val closedAt = long("closed_at").nullable()
     val closeReason = varchar("close_reason", 64).nullable()

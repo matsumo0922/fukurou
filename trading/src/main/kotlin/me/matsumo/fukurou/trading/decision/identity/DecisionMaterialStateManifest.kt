@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.decision.identity
 
+import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import java.math.BigDecimal
 import java.time.Instant
 
@@ -21,6 +22,7 @@ data class DecisionMaterialStateManifest(
     val runtimeConfigVersion: String?,
     val runtimeConfigHash: String?,
     val riskState: String,
+    val priceMoveThresholdRatio: BigDecimal = BigDecimal("0.01"),
     val bestBidJpy: BigDecimal?,
     val bestAskJpy: BigDecimal?,
     val lastPriceJpy: BigDecimal?,
@@ -37,4 +39,11 @@ data class DecisionMaterialStateManifest(
     val schemaVersion: Int = 1,
     val canonicalContentHash: String,
     val materialProjection: String = "",
+)
+
+/** runner が既存 episode の fixed identity context を読むための値。 */
+data class DecisionMaterialProjectionContext(
+    val anchorPriceJpy: BigDecimal?,
+    val priceMoveThresholdRatio: BigDecimal,
+    val invalidationPredicates: List<TradePlanInvalidationPredicate>,
 )
