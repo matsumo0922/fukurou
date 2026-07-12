@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.runner
 
+import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -10,6 +11,8 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifestWriter
+import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
+import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import java.nio.file.Path
 import java.time.Duration
 
@@ -18,10 +21,30 @@ fun main(args: Array<String>) {
     require(System.getenv(CANARY_ARTIFACT_ENV)?.toBooleanStrictOrNull() == true) {
         "MCP isolation canary artifact generation is disabled."
     }
+    if (args.firstOrNull() == CLEANUP_COMMAND) {
+        cleanupArtifacts(args.drop(1).map(Path::of))
+
+        return
+    }
     val phase = LlmInvocationPhase.valueOf(requireNotNull(args.getOrNull(0)))
     val provider = LlmProvider.valueOf(requireNotNull(args.getOrNull(1)))
     require(phase == LlmInvocationPhase.PROPOSER || phase == LlmInvocationPhase.FALSIFIER)
     generateArtifacts(phase, provider)
+}
+
+private fun cleanupArtifacts(paths: List<Path>) = runBlocking {
+    require(paths.isNotEmpty()) { "At least one canary artifact is required." }
+    val command = RenderedLlmCommand(
+        executable = "/bin/true",
+        args = emptyList(),
+        environment = emptyMap(),
+        workingDirectory = Path.of("/tmp"),
+        timeout = Duration.ofSeconds(1),
+        stdin = null,
+        cleanupPaths = paths,
+    )
+
+    ShellProcessRunner().cleanup(command).getOrThrow()
 }
 
 private fun generateArtifacts(phase: LlmInvocationPhase, provider: LlmProvider) {
@@ -82,4 +105,5 @@ private fun generateArtifacts(phase: LlmInvocationPhase, provider: LlmProvider) 
 }
 
 private const val CANARY_ARTIFACT_ENV = "FUKUROU_MCP_CANARY_ARTIFACT_GENERATOR"
+private const val CLEANUP_COMMAND = "CLEANUP"
 private const val CANARY_INVOCATION_ID = "mcp-canary-run"

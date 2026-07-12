@@ -107,7 +107,7 @@ merge 前の exact-image gate は LLM/MCP の process identity、capability、FD
 
 manifest IDはexpiryまでMCP launcherを再実行できるbearer capabilityである。tool call limiterは`command_event_log`のinitial countを復元してrun budgetを共有するが、複数MCP processが同時にloadしてinsertする間の競合では上限を少数call超える可能性がある。各act toolは同じSafetyFloorとcaller guardを通り、manifestのphase allowlist外のtoolは起動時とcall時の両方で拒否する。
 
-Claude/Codex config と session は `/run/fukurou/llm-homes` tmpfs の per-run home に app UID・shared group・0770/0660 で生成する。別 UID の launcher process は読取・session 書込ができる一方、world access はない。永続 `llm-auth` は auth source だけに使い、必要な auth file だけを per-run home へ copy する。normal、非0終了、timeout、cancel、parse/start/request/render failure の全経路で config/home/manifest を削除する。cleanup failure は infrastructure failureとしてcurrent processをquarantineし、markerと残存artifactを同じtmpfsに保持する。operatorが監査・解消するかcontainer restartでtmpfs全体を破棄するまでmanual/daemonの次runを拒否する。CLI に見える設定は次の形になる。
+Claude/Codex config と session は `/run/fukurou/llm-homes` tmpfs の per-run home に app UID・shared group・0770/0660 で生成する。別 UID の launcher process はumask `0007`でproviderを起動し、読取・session書込ができる一方、world accessはない。providerがgroup writeを付けずに作成したnested treeは、通常削除の権限失敗時だけfixed launcherのpath限定cleanup modeがsymlinkを追跡せず削除する。永続`llm-auth`はauth sourceだけに使い、必要なauth fileだけをper-run homeへcopyする。normal、非0終了、timeout、cancel、parse/start/request/render failureの全経路でconfig/home/manifestを削除する。helperを含むcleanup failureはinfrastructure failureとしてcurrent processをquarantineし、markerと残存artifactを同じtmpfsに保持する。operatorが監査・解消するかcontainer restartでtmpfs全体を破棄するまでmanual/daemonの次runを拒否する。CLI に見える設定は次の形になる。
 
 ```json
 {
@@ -178,7 +178,7 @@ Cloudflare Access は `/app/*` と `/ops/*` を保護し、runtime config draft 
 
 `McpDatabaseRoleIntegrationTest` は disposable PostgreSQL に production role SQL を適用し、dangerous role flags、`NOINHERIT`、membership、ownership、PUBLIC/database/schema/table/function の effective privilege を検証する。同じ test は `McpLaunchBootstrap`、`TradingRuntimeFactory.postgresForMcp`、実 `FukurouMcpServer` tool handler を通して Proposer/Falsifier union の 16 required call を全件実行する。GMO ticker は localhost fixture HTTP server に固定し、外部 API や実 credential を使わない。forbidden ledger DML と wrong credential は permission/auth failure になり、app/superuser へ fallback しない。
 
-`scripts/mcp-credential-isolation-check` は exact production image の fixed LLM/MCP launcher、FD bootstrap、local GMO fixture、least-privilege role を通して Proposer/Falsifier の required 16 calls を実行する。UID/setuid/capability/secret read 境界に加え、raw provider stdout/stderr、application/container log、per-run manifest、tool audit export、data-only dump を cleanup 前に取得する。raw marker、独立 segment、JSON/TOML escape、URL percent encode、base64/base64url、hex を全 artifact で検査する。coverage 不足、readiness failure、空 audit、空 dump、scan failure は pass にしない。
+`scripts/mcp-credential-isolation-check` は exact production image の fixed LLM/MCP launcher、FD bootstrap、local GMO fixture、least-privilege role を通して Proposer/Falsifier の required 16 calls を実行する。`--reuse-image <exact-image>`はbuildxなしで既存imageを検査し、省略時は指定tagへlocal buildする。macOS/GNU statを判別し、Docker capabilityは`CAP_` prefixと配列順を正規化した集合で比較する。`llm_runs`とrequired MCP viewsのreadiness後にrole SQLを適用し、llm-agentが作成したnested treeをproduction cleanup配線で削除できることも検証する。UID/setuid/capability/secret read境界に加え、raw provider stdout/stderr、application/container log、per-run manifest、tool audit export、data-only dumpをcleanup前に取得する。raw marker、独立segment、JSON/TOML escape、URL percent encode、base64/base64url、hexを全artifactで検査する。coverage不足、readiness failure、空audit、空dump、scan failureはpassにしない。
 
 ## paper / live の構造的乖離
 

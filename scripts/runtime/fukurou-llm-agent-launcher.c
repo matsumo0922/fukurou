@@ -9,11 +9,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <sys/stat.h>
 #include <linux/capability.h>
 
 #define LLM_UID 10002
+#define APP_UID 10001
 #define LLM_GID 10004
+#define LLM_HOME_ROOT "/run/fukurou/llm-homes/"
 #define CANARY_FLAG "/run/secrets/fukurou_canary_enabled"
 #define CANARY_CLIENT "/usr/local/libexec/fukurou-mcp-canary-client.mjs"
 
@@ -82,8 +85,56 @@ static void verify_canary_security_state(void) {
     }
 }
 
+static int transfer_cleanup_entry(const char *path, const struct stat *metadata, int type, struct FTW *state) {
+    (void)metadata;
+    (void)type;
+    (void)state;
+    return lchown(path, APP_UID, LLM_GID);
+}
+
+static int delete_cleanup_entry(const char *path, const struct stat *metadata, int type, struct FTW *state) {
+    (void)metadata;
+    (void)state;
+    if (type == FTW_DP) return rmdir(path);
+    return unlink(path);
+}
+
+static int decimal_suffix(const char *value) {
+    if (*value == '\0') return 0;
+    for (; *value != '\0'; value++) {
+        if (*value < '0' || *value > '9') return 0;
+    }
+    return 1;
+}
+
+static void cleanup_per_run_home(const char *path) {
+    if (getuid() != APP_UID) fail("cleanup caller rejected");
+    size_t root_length = strlen(LLM_HOME_ROOT);
+    if (strncmp(path, LLM_HOME_ROOT, root_length) != 0) fail("cleanup path root rejected");
+    const char *name = path + root_length;
+    const char *suffix = NULL;
+    if (strncmp(name, "fukurou-codex-home-", 19) == 0) suffix = name + 19;
+    if (strncmp(name, "fukurou-llm-config-", 19) == 0) suffix = name + 19;
+    if (strchr(name, '/') != NULL || suffix == NULL || !decimal_suffix(suffix)) {
+        fail("cleanup path name rejected");
+    }
+    struct stat metadata;
+    if (lstat(path, &metadata) != 0 || !S_ISDIR(metadata.st_mode) ||
+        metadata.st_uid != APP_UID || metadata.st_gid != LLM_GID) fail("cleanup root metadata rejected");
+    if (nftw(path, transfer_cleanup_entry, 32, FTW_PHYS) != 0) fail("cleanup ownership transfer failed");
+    if (setgroups(0, NULL) != 0) fail("cleanup cannot clear supplementary groups");
+    if (setresgid(LLM_GID, LLM_GID, LLM_GID) != 0) fail("cleanup cannot drop gid");
+    if (setresuid(APP_UID, APP_UID, APP_UID) != 0) fail("cleanup cannot drop uid");
+    if (nftw(path, delete_cleanup_entry, 32, FTW_DEPTH | FTW_PHYS) != 0) fail("cleanup traversal failed");
+    _exit(0);
+}
+
 int main(int argc, char **argv, char **envp) {
     if (argc < 2) fail("provider selector is required");
+    if (strcmp(argv[1], "cleanup") == 0) {
+        if (argc != 3) fail("cleanup mode requires one per-run home path");
+        cleanup_per_run_home(argv[2]);
+    }
     const char *executable = NULL;
     if (strcmp(argv[1], "claude") == 0) executable = "/usr/local/bin/claude";
     if (strcmp(argv[1], "codex") == 0) executable = "/usr/local/bin/codex";
@@ -97,6 +148,7 @@ int main(int argc, char **argv, char **envp) {
 
     struct rlimit core = {0, 0};
     if (setrlimit(RLIMIT_CORE, &core) != 0) fail("cannot disable core dumps");
+    umask(0007);
     if (prctl(PR_SET_SECUREBITS, SECBIT_KEEP_CAPS_LOCKED) != 0) fail("cannot lock capability retention");
     restrict_capability_bounding_set();
     if (setgroups(0, NULL) != 0) fail("cannot clear supplementary groups");

@@ -34,11 +34,11 @@ FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
 
 ## WebUI CLI login
 
-deploy 後、`llm-auth` volume が root owner で作られている場合、auth copy を作れずに失敗することがある。必要なら一度だけ owner を直す。per-run artifact はcomposeがapp UID/shared groupで作る `/run/fukurou/llm-homes` tmpfsに置く。
+deploy 後、`llm-auth` volume が root owner で作られている場合、auth copy を作れずに失敗することがある。必要ならauth sourceだけ一度ownerを直す。per-run artifactはcomposeがapp UID/shared groupで作る`/run/fukurou/llm-homes` tmpfsに置き、provider所有のnested treeもfixed cleanup helperが回収するため、運用手順でchownしない。
 
 ```sh
 ssh dxp4800plus \
-  'sudo docker exec -u root fukurou-ktor sh -lc "chown -R 10001:10004 /tmp/fukurou-cli-home /run/fukurou/llm-homes && chmod -R g+rwX /tmp/fukurou-cli-home /run/fukurou/llm-homes"'
+  'sudo docker exec -u root fukurou-ktor sh -lc "chown -R 10001:10004 /tmp/fukurou-cli-home && chmod -R g+rwX /tmp/fukurou-cli-home"'
 ```
 
 WebUI の System 画面は `/ops/llm-auth` を読み、Claude Code / Codex の login state を表示する。CLI auth は `/health` / `/health/ready` には混ぜないため、CLI が logged_out でも Ktor / DB / reconciler readiness の意味は変わらない。login state は非 secret の credential marker file で判定するため、CLI が keychain など marker file 以外へ credential を保存する構成では System が logged_out を示す場合がある。その場合は fallback 手順と smoke test で実際の CLI auth を確認する。

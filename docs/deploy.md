@@ -286,7 +286,7 @@ scripts/prod-curl /ops/runtime-config
 6. `sudo docker run --rm --network fukurou_edge curlimages/curl -fsS http://ktor:8080/health/ready` を実行し、maintenance connectionでrequired viewの存在を確認する。`/ops/runtime-config`で`daemon.enabled`と`llm.launchEnabled`のactive valueとeffective valueがすべてfalseであることを確認する。`daemon.enabled=false`なのでscheduler workerは作成されず、新しい`DAEMON_STARTED` auditも記録されない。
 7. `POST /ops/trigger`が`LLM_LAUNCH_DISABLED`の409を返すこと、direct `OneShotRunnerMain`がchild processやMCP credentialを使う前にnon-zeroで終了することを確認する。scheduler workerは不在なので`LLM_LAUNCH_DISABLED`のscheduler skip auditを期待しない。その後、手順3のRUNNING 0 queryと`pgrep`を再実行する。
 8. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を実行し、`fukurou_mcp` roleをprovisionする。preflightまたは権限不足ではtransaction全体が失敗するため、gateをOFFのまま維持する。
-9. `scripts/mcp-credential-isolation-check <exact-image>`、paper smoke、knowledge toolsを含むrequired MCP call matrixを実行する。role flag、membership、ownership、effective grantも確認する。
+9. deploy済みimageを再利用する場合は`scripts/mcp-credential-isolation-check --reuse-image <exact-image>`を実行し、paper smoke、knowledge toolsを含むrequired MCP call matrixを確認する。local buildを検査する場合は`--reuse-image`を外す。role flag、membership、ownership、effective grantも確認する。
 10. canary scan 完了後、旧 shared `config.toml` と session artifact を auth source から分離して削除する。
 11. running Ktor containerの`/run/fukurou/llm-homes`がtmpfsであることを`docker inspect`で確認する。旧`fukurou_llm-runs` volumeが残っている場合は、一時containerへread-only mountして残存per-run auth copy、session、quarantine artifactを監査し、必要な証跡を保存してから`fukurou_llm-runs`だけを削除する。永続auth sourceの`fukurou_llm-auth`とDBの`fukurou_pgdata`は削除しない。
 12. app の旧 credential を PostgreSQL と NAS `.env` で同時に rotateし、Ktor containerを再起動して新しい値を反映する。旧 credentialで接続できないことを確認する。
@@ -316,7 +316,7 @@ role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolb
 
 merge 前の自動証跡は `McpDatabaseRoleIntegrationTest` の role/effective privilege/required-call matrix と、`scripts/mcp-credential-isolation-check` の tool audit export・DB data-only dump・encoding scan を含む。scan coverage や dump が欠けた run は無効とし、再実行する。real provider model output probe は operator auth を必要とする別の human check として記録し、自動 check 成功へ読み替えない。
 
-cleanup failure では `/run/fukurou/llm-homes/.cleanup-quarantine` が残り、manual/daemon の次 run は current container process 内で fail closed になる。marker と per-run artifact は同じtmpfsにあり、container restartでは両方が同時に破棄される。operatorはdaemonを無効のまま残存per-run homeとmanifestを監査し、filesystem原因を解消してからmarkerを削除するか、監査後にcontainerを再起動する。markerだけを先に消したり、strategy NO_TRADEとして成績へ混ぜたりしない。
+providerがper-run home内へshared groupから通常削除できないmodeのnested artifactを作成した場合、cleanupはfixed LLM launcherのpath限定cleanup modeへ委譲する。対象は`/run/fukurou/llm-homes`直下にappuserが作成したcanonical per-run homeだけで、symlinkを追跡せずtreeを削除する。helperを含むcleanup failureでは`/run/fukurou/llm-homes/.cleanup-quarantine`が残り、manual/daemonの次runはcurrent container process内でfail closedになる。markerとper-run artifactは同じtmpfsにあり、container restartでは両方が同時に破棄される。operatorはdaemonを無効のまま残存per-run homeとmanifestを監査し、filesystem原因を解消してからmarkerを削除するか、監査後にcontainerを再起動する。markerだけを先に消したり、strategy NO_TRADEとして成績へ混ぜたりしない。
 
 rotation 後は旧 image で LLM phase を再有効化しない。障害時は daemon disabled のまま現 image を維持するか、修正版へ roll-forward する。
 

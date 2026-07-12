@@ -11,7 +11,7 @@ if (probes.length !== 1) throw new Error(`expected exactly one launcher probe, g
 const probe = probes[0];
 const expectedKeys = [
   "capAmb", "capBnd", "capEff", "capInh", "capPrm", "coreLimit", "dumpable", "env", "event",
-  "gid", "groups", "launchFds", "liveFds", "noNewPrivs", "uid",
+  "gid", "groups", "launchFds", "liveFds", "noNewPrivs", "uid", "umask",
 ].sort();
 if (JSON.stringify(Object.keys(probe).sort()) !== JSON.stringify(expectedKeys)) throw new Error("launcher probe fields mismatch");
 const expectedEnvironment = [
@@ -36,6 +36,7 @@ const expected = {
   dumpable: "0",
   coreLimit: "0:0",
   launchFds: "0,1,2",
+  umask: "0007",
   liveFds: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "23"],
   env: expectedEnvironment,
 };
