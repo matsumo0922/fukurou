@@ -370,8 +370,9 @@ private class EvaluationReportStore(
             )?.getOrThrow() ?: error("market data source is unavailable")
         }
         val regimes = EvaluationMath.classifyMarketRegimes(candles, ReportZone)
-        val stats = EvaluationMath.summarizeTrades(queryResult.trades)
-        val ridge = EvaluationMath.historicalOutcomeRidges(queryResult.trades, ReportZone, regimes)
+        val eligibleTrades = queryResult.strategyEligibleTrades
+        val stats = EvaluationMath.summarizeTrades(eligibleTrades)
+        val ridge = EvaluationMath.historicalOutcomeRidges(eligibleTrades, ReportZone, regimes)
         val baselineEquity = snapshot.initialCashJpy.add(snapshot.priorPnlJpy)
         val effectiveFromDate = effectivePeriod.from.atZone(ReportZone).toLocalDate()
         val effectiveToDate = if (emptyLifecycle) {
@@ -392,11 +393,11 @@ private class EvaluationReportStore(
         val benchmarkComparable = scope.evaluationScope.cohort !=
             EvaluationCohort.LEGACY_PRE_WS
         val benchmarkAvailable = benchmarkComparable && !emptyLifecycle
-        val calibration = buildCalibrationResponse(queryResult.trades)
-        val performanceLattice = buildPerformanceLattice(queryResult.trades, regimes)
+        val calibration = buildCalibrationResponse(eligibleTrades)
+        val performanceLattice = buildPerformanceLattice(eligibleTrades, regimes)
         val usageResult = snapshot.usages
         require(!usageResult.truncated) { "USAGE_SNAPSHOT_TRUNCATED" }
-        val costStats = EvaluationMath.summarizeLlmCosts(usageResult.facts)
+        val costStats = EvaluationMath.summarizeLlmCosts(usageResult.strategyEligibleFacts)
         val exclusions = snapshot.exclusions
         val benchmarkPoints = benchmark.points.takeIf { benchmarkAvailable }.orEmpty()
         val benchmarkFacts = benchmarkPoints.flatMap { point ->

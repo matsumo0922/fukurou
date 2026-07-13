@@ -16,8 +16,10 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
+import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionStatus
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
+import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationStatus
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationScope
 import me.matsumo.fukurou.trading.evaluation.EvaluationTradeQueryResult
@@ -605,6 +607,7 @@ private fun closedTrade(
         estimatedWinProbability = BigDecimal("0.73"),
         setupTags = setupTags,
         llmProvider = "claude",
+        attributionStatus = EvaluationAttributionStatus.ATTRIBUTED,
     )
 }
 
@@ -653,6 +656,7 @@ private fun llmUsageFact(): LlmPhaseUsageFact {
             usage = null,
             modelUsages = emptyList(),
         ),
+        populationStatus = EvaluationPopulationStatus.ELIGIBLE,
     )
 }
 

@@ -87,7 +87,11 @@ enum class EvaluationAttributionStatus {
 data class EvaluationLlmUsageQueryResult(
     val facts: List<LlmPhaseUsageFact>,
     val truncated: Boolean,
-)
+) {
+    /** strategy cost/KPI に含める causal attribution 済み usage。 */
+    val strategyEligibleFacts: List<LlmPhaseUsageFact>
+        get() = facts.filter { fact -> fact.populationStatus == EvaluationPopulationStatus.ELIGIBLE }
+}
 
 /**
  * market-data gap により評価から外れた entity の summary。

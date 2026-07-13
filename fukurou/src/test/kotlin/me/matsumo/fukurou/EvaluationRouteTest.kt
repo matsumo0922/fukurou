@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.evaluation.DeduplicationMetrics
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
+import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationStatus
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationScope
 import me.matsumo.fukurou.trading.evaluation.EvaluationTradeQueryResult
@@ -56,6 +57,42 @@ import kotlin.test.assertTrue
  * evaluation route の HTTP contract を検証するテスト。
  */
 class EvaluationRouteTest {
+    @Test
+    fun costsExcludeInfrastructureGapUsageFromStrategyPopulation() = testApplication {
+        val repository = object : EvaluationRepository by FakeEvaluationRepository {
+            override suspend fun fetchLlmPhaseUsages(
+                period: EvaluationPeriod,
+                limit: Int,
+                scope: EvaluationScope,
+            ): Result<EvaluationLlmUsageQueryResult> = Result.success(
+                EvaluationLlmUsageQueryResult(
+                    facts = listOf(
+                        testUsageFact("eligible", EvaluationPopulationStatus.ELIGIBLE),
+                        testUsageFact("gap", EvaluationPopulationStatus.INFRASTRUCTURE_GAP),
+                    ),
+                    truncated = false,
+                ),
+            )
+        }
+        application {
+            module(
+                readinessProbe = { true },
+                clock = fixedClock(),
+                evaluationRepository = repository,
+                evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+                evaluationMarketDataSource = FakeEvaluationMarketDataSource,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/evaluation/costs?from=2026-07-01&to=2026-07-03")
+        val body = response.bodyAsText()
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(body.contains("\"phaseCount\":1"))
+        assertTrue(body.contains("\"knownCostUsd\":\"0.01\""))
+    }
+
     @Test
     fun summaryDeduplicationUsesEffectiveCurrentEpochLifecycle() = testApplication {
         val queriedPeriods = mutableListOf<EvaluationPeriod>()
@@ -682,6 +719,7 @@ private object FakeEvaluationRepository : EvaluationRepository {
                                 ),
                             ),
                         ),
+                        populationStatus = EvaluationPopulationStatus.ELIGIBLE,
                     ),
                     LlmPhaseUsageFact(
                         decisionRunId = "codex-run",
@@ -712,6 +750,7 @@ private object FakeEvaluationRepository : EvaluationRepository {
                                 ),
                             ),
                         ),
+                        populationStatus = EvaluationPopulationStatus.ELIGIBLE,
                     ),
                     LlmPhaseUsageFact(
                         decisionRunId = "unattributed-run",
@@ -730,6 +769,7 @@ private object FakeEvaluationRepository : EvaluationRepository {
                             ),
                             modelUsages = emptyList(),
                         ),
+                        populationStatus = EvaluationPopulationStatus.ELIGIBLE,
                     ),
                 ),
                 truncated = false,
@@ -865,6 +905,24 @@ private fun testTrade(): ClosedTradeFact {
         estimatedWinProbability = BigDecimal("0.7"),
         setupTags = listOf("route-test"),
         llmProvider = "claude",
+        attributionStatus = me.matsumo.fukurou.trading.evaluation.EvaluationAttributionStatus.ATTRIBUTED,
+    )
+}
+
+private fun testUsageFact(id: String, status: EvaluationPopulationStatus): LlmPhaseUsageFact {
+    return LlmPhaseUsageFact(
+        decisionRunId = id,
+        provider = "claude",
+        phase = "proposer",
+        occurredAt = Instant.parse("2026-07-02T00:00:00Z"),
+        usage = LlmUsageDetails(
+            totalCostUsd = BigDecimal("0.01"),
+            numTurns = 1,
+            durationMs = 100,
+            usage = null,
+            modelUsages = emptyList(),
+        ),
+        populationStatus = status,
     )
 }
 

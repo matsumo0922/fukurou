@@ -8,6 +8,7 @@
 #include <grp.h>
 #include <poll.h>
 #include <openssl/sha.h>
+#include <openssl/evp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -93,6 +94,25 @@ static int read_process_start_ticks(pid_t pid, unsigned long long *start_ticks) 
     return -1;
 }
 
+static int deterministic_uuid(const char *namespace_prefix, const char *invocation_id, const char *role, char output[37]) {
+    char identity[384];
+    int identity_length = role == NULL
+        ? snprintf(identity, sizeof(identity), "%s%s", namespace_prefix, invocation_id)
+        : snprintf(identity, sizeof(identity), "%s%s:%s", namespace_prefix, invocation_id, role);
+    if (identity_length <= 0 || (size_t)identity_length >= sizeof(identity)) return -1;
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned digest_length = 0;
+    if (EVP_Digest(identity, (size_t)identity_length, digest, &digest_length, EVP_md5(), NULL) != 1 || digest_length != 16) return -1;
+    int written = snprintf(
+        output,
+        37,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+        digest[8], digest[9], digest[10], digest[11], digest[12], digest[13], digest[14], digest[15]
+    );
+    return written == 36 ? 0 : -1;
+}
+
 static int register_spawn_receipt(const char *role, const char *invocation_id, pid_t pid) {
     const char *container_instance = getenv("HOSTNAME");
     if (container_instance == NULL || invocation_id == NULL) return -1;
@@ -103,6 +123,9 @@ static int register_spawn_receipt(const char *role, const char *invocation_id, p
     if (stat(namespace_path, &namespace_metadata) != 0 || namespace_metadata.st_ino == 0 ||
         read_process_start_ticks(pid, &start_ticks) != 0) return -1;
 
+    char registration_id[37], reservation_id[37];
+    if (deterministic_uuid("fukurou-pid-registration-v1:", invocation_id, role, registration_id) != 0 ||
+        deterministic_uuid("fukurou-launch-reservation-v1:", invocation_id, NULL, reservation_id) != 0) return -1;
     char namespace_value[32], pid_value[32], start_value[32];
     snprintf(namespace_value, sizeof(namespace_value), "%llu", (unsigned long long)namespace_metadata.st_ino);
     snprintf(pid_value, sizeof(pid_value), "%ld", (long)pid);
@@ -115,7 +138,7 @@ static int register_spawn_receipt(const char *role, const char *invocation_id, p
         close_range(3, ~0U, 0);
         char *const arguments[] = {
             "java", "-cp", "/app/app.jar", "me.matsumo.fukurou.PidRegistrationReceiptMain",
-            (char *)role, (char *)invocation_id, (char *)container_instance,
+            (char *)role, registration_id, reservation_id, (char *)invocation_id, (char *)container_instance,
             namespace_value, pid_value, start_value, NULL,
         };
         extern char **environ;
@@ -294,6 +317,9 @@ static int environment_name_allowed(uint16_t profile, const char *entry) {
         return strcmp(entry, "PATH=/opt/java/openjdk/bin:/usr/bin:/bin") == 0 ||
             strncmp(entry, "FUKUROU_INVOCATION_ID=", 22) == 0;
     }
+    if (strncmp(entry, "HOME=/root", 10) == 0 || strncmp(entry, "CODEX_HOME=/root", 16) == 0 ||
+        strncmp(entry, "CLAUDE_CONFIG_DIR=/root", 24) == 0 || strncmp(entry, "TMPDIR=/root", 12) == 0 ||
+        strncmp(entry, "XDG_CACHE_HOME=/root", 20) == 0) return 0;
     for (size_t index = 0; index < sizeof(llm_names) / sizeof(llm_names[0]); index++) {
         if (strncmp(entry, llm_names[index], strlen(llm_names[index])) == 0) return 1;
     }
@@ -368,6 +394,20 @@ static int descriptors_allowed(struct launch_request *request) {
     return 1;
 }
 
+static int environment_entries_allowed(uint16_t profile, char **environment, uint16_t environment_count) {
+    for (size_t index = 0; index < environment_count; index++) {
+        if (!environment_name_allowed(profile, environment[index])) return 0;
+        const char *separator = strchr(environment[index], '=');
+        if (separator == NULL || separator == environment[index] || !bounded_text(separator + 1, 1024)) return 0;
+        size_t name_length = (size_t)(separator - environment[index]);
+        for (size_t previous = 0; previous < index; previous++) {
+            if (strncmp(environment[previous], environment[index], name_length) == 0 &&
+                environment[previous][name_length] == '=') return 0;
+        }
+    }
+    return 1;
+}
+
 static int request_shape_allowed(struct launch_request *request, char **arguments, char **environment) {
     if ((request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 || request->header.profile == FUKUROU_PROFILE_CODEX_CURRENT_V1) &&
         request->header.fd_role_bitmap == 0x7U &&
@@ -384,15 +424,7 @@ static int request_shape_allowed(struct launch_request *request, char **argument
     } else {
         return 0;
     }
-    for (size_t index = 0; index < request->header.envc; index++) {
-        if (!environment_name_allowed(request->header.profile, environment[index])) return 0;
-        const char *separator = strchr(environment[index], '=');
-        if (separator == NULL || separator == environment[index] || !bounded_text(separator + 1, 1024)) return 0;
-        size_t name_length = (size_t)(separator - environment[index]);
-        for (size_t previous = 0; previous < index; previous++) {
-            if (strncmp(environment[previous], environment[index], name_length) == 0 && environment[previous][name_length] == '=') return 0;
-        }
-    }
+    if (!environment_entries_allowed(request->header.profile, environment, request->header.envc)) return 0;
     return descriptors_allowed(request);
 }
 
@@ -412,6 +444,19 @@ static int consume_request_nonce(const unsigned char nonce[FUKUROU_PROTOCOL_NONC
     memcpy(recent_nonces[recent_nonce_cursor], nonce, FUKUROU_PROTOCOL_NONCE_SIZE);
     recent_nonce_cursor = (recent_nonce_cursor + 1) % 128;
     return 1;
+}
+
+static size_t available_job_slot(void) {
+    size_t slot = 0;
+    while (slot < MAX_JOBS && jobs[slot].pid != 0) slot++;
+    return slot;
+}
+
+static void reject_spawned_child(pid_t child, int start_gate, struct launch_request *request) {
+    close(start_gate);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    close_request_descriptors(request);
 }
 
 static void accept_launch(int listener) {
@@ -441,8 +486,7 @@ static void accept_launch(int listener) {
         close(connection);
         return;
     }
-    size_t slot = 0;
-    while (slot < MAX_JOBS && jobs[slot].pid != 0) slot++;
+    size_t slot = available_job_slot();
     if (slot == MAX_JOBS) {
         close_request_descriptors(&request);
         close(connection);
@@ -481,10 +525,7 @@ static void accept_launch(int listener) {
     int receipt_result = request.header.profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1
         ? 0 : register_spawn_receipt(registration_role, invocation_id, child);
     if (receipt_result != 0 || write(start_gate[1], "1", 1) != 1) {
-        close(start_gate[1]);
-        kill(child, SIGKILL);
-        waitpid(child, NULL, 0);
-        close_request_descriptors(&request);
+        reject_spawned_child(child, start_gate[1], &request);
         int status = 125;
         send(connection, &status, sizeof(status), MSG_NOSIGNAL);
         close(connection);
@@ -673,29 +714,112 @@ static int count_open_descriptors(void) {
     return count;
 }
 
+static int protocol_reject_case(unsigned case_id) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) != 0) return -1;
+    struct fukurou_launch_header header = {
+        .magic = FUKUROU_PROTOCOL_MAGIC,
+        .version = FUKUROU_PROTOCOL_VERSION,
+        .header_size = sizeof(struct fukurou_launch_header),
+        .total_length = sizeof(struct fukurou_launch_header),
+        .profile = FUKUROU_PROFILE_MCP_CURRENT_V1,
+        .argc = 1,
+    };
+    uint16_t descriptor_count = 0;
+    switch (case_id) {
+        case 0: header.magic = 0; break;
+        case 1: header.version++; break;
+        case 2: header.header_size--; break;
+        case 3: header.total_length--; break;
+        case 4: header.argc = 0; break;
+        case 5: header.argc = FUKUROU_PROTOCOL_MAX_ITEMS + 1; break;
+        case 6: header.envc = FUKUROU_PROTOCOL_MAX_ITEMS + 1; break;
+        case 7: header.fd_role_bitmap = FUKUROU_FD_STDIN; break;
+        case 8: descriptor_count = 17; header.fd_role_bitmap = 0x1fU; break;
+        default: close(pair[0]); close(pair[1]); return -1;
+    }
+    int descriptors[17];
+    char control[CMSG_SPACE(sizeof(descriptors))];
+    memset(control, 0, sizeof(control));
+    struct iovec vector = {.iov_base = &header, .iov_len = sizeof(header)};
+    struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1};
+    if (descriptor_count > 0) {
+        for (size_t index = 0; index < descriptor_count; index++) {
+            descriptors[index] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (descriptors[index] < 0) return -1;
+        }
+        message.msg_control = control;
+        message.msg_controllen = CMSG_SPACE(sizeof(int) * descriptor_count);
+        struct cmsghdr *control_header = CMSG_FIRSTHDR(&message);
+        control_header->cmsg_level = SOL_SOCKET;
+        control_header->cmsg_type = SCM_RIGHTS;
+        control_header->cmsg_len = CMSG_LEN(sizeof(int) * descriptor_count);
+        memcpy(CMSG_DATA(control_header), descriptors, sizeof(int) * descriptor_count);
+    }
+    ssize_t sent = sendmsg(pair[0], &message, MSG_NOSIGNAL);
+    for (size_t index = 0; index < descriptor_count; index++) close(descriptors[index]);
+    close(pair[0]);
+    if (sent != (ssize_t)sizeof(header)) { close(pair[1]); return -1; }
+    struct launch_request request;
+    int rejected = receive_request(pair[1], &request) != 0;
+    close_request_descriptors(&request);
+    close(pair[1]);
+    return rejected ? 0 : -1;
+}
+
 static int protocol_selftest(void) {
     int before = count_open_descriptors();
     if (before < 0) return 125;
     for (size_t attempt = 0; attempt < 1000; attempt++) {
-        int pair[2];
-        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) != 0) return 125;
-        struct fukurou_launch_header malformed = {.magic = 0, .total_length = sizeof(malformed)};
-        int source = open("/dev/null", O_RDONLY | O_CLOEXEC);
-        char control[CMSG_SPACE(sizeof(int))] = {0};
-        struct iovec vector = {.iov_base = &malformed, .iov_len = sizeof(malformed)};
-        struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
-        struct cmsghdr *header = CMSG_FIRSTHDR(&message);
-        header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(header), &source, sizeof(source));
-        if (sendmsg(pair[0], &message, MSG_NOSIGNAL) != sizeof(malformed)) return 125;
-        close(source); close(pair[0]);
-        struct launch_request request;
-        if (receive_request(pair[1], &request) == 0) return 125;
-        close_request_descriptors(&request); close(pair[1]);
+        if (protocol_reject_case((unsigned)(attempt % 9)) != 0) return 125;
     }
+    struct launch_request malformed_payload = {0};
+    malformed_payload.header.argc = 1;
+    malformed_payload.header.total_length = sizeof(malformed_payload.header) + 3;
+    uint16_t impossible_length = 32;
+    memcpy(malformed_payload.payload, &impossible_length, sizeof(impossible_length));
+    char *arguments[2] = {0};
+    char *environment[3] = {0};
+    if (split_payload(&malformed_payload, arguments, environment) == 0) return 125;
+    char *duplicate_environment[] = {"PATH=/opt/java/openjdk/bin:/usr/bin:/bin", "PATH=/bin", NULL};
+    char *root_environment[] = {"HOME=/root", NULL};
+    char *bad_value_environment[] = {"PATH=\x01", NULL};
+    char *missing_invocation_environment[] = {"FUKUROU_INVOCATION_ID=", NULL};
+    if (environment_entries_allowed(FUKUROU_PROFILE_MCP_CURRENT_V1, duplicate_environment, 2) ||
+        environment_entries_allowed(FUKUROU_PROFILE_CLAUDE_CURRENT_V1, root_environment, 1) ||
+        environment_entries_allowed(FUKUROU_PROFILE_CLAUDE_CURRENT_V1, bad_value_environment, 1) ||
+        environment_entries_allowed(FUKUROU_PROFILE_MCP_CURRENT_V1, missing_invocation_environment, 1) ||
+        executable_for(FUKUROU_PROFILE_CLAUDE_CURRENT_V1, APP_UID, APP_GID) != NULL ||
+        executable_for(0xffffU, LLM_UID, LLM_GID) != NULL) return 125;
+    struct launch_request duplicate_descriptors = {.descriptor_count = 2};
+    duplicate_descriptors.descriptors[0] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    duplicate_descriptors.descriptors[1] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (descriptors_allowed(&duplicate_descriptors)) return 125;
+    close_request_descriptors(&duplicate_descriptors);
+    struct launch_request unexpected_descriptor = {.descriptor_count = 1};
+    unexpected_descriptor.descriptors[0] = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (descriptors_allowed(&unexpected_descriptor)) return 125;
+    close_request_descriptors(&unexpected_descriptor);
+    for (size_t index = 0; index < MAX_JOBS; index++) jobs[index].pid = 1;
+    if (available_job_slot() != MAX_JOBS) return 125;
+    memset(jobs, 0, sizeof(jobs));
+    int gate[2];
+    if (pipe2(gate, O_CLOEXEC) != 0) return 125;
+    struct launch_request failed_receipt = {.descriptor_count = 1};
+    failed_receipt.descriptors[0] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    pid_t child = fork();
+    if (child < 0) return 125;
+    if (child == 0) {
+        close(gate[1]);
+        char permission;
+        read(gate[0], &permission, 1);
+        _exit(0);
+    }
+    close(gate[0]);
+    reject_spawned_child(child, gate[1], &failed_receipt);
     int after = count_open_descriptors();
     if (after != before) return 125;
-    printf("PROTOCOL_SELFTEST_OK fd_delta=0 attempts=1000\n");
+    printf("PROTOCOL_SELFTEST_OK fd_delta=0 attempts=1000 cases=bad-magic,bad-version,bad-header,bad-length,bad-count,missing-fd,msg-ctrunc,duplicate-fd,unexpected-fd,bad-peer,bad-role,duplicate-env,root-env,bad-env-value,missing-invocation,payload-length,job-full,receipt-failure\n");
     return 0;
 }
 

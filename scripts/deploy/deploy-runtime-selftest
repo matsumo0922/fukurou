@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SELFTEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "${SELFTEST_ROOT}"' EXIT
+
+export FUKUROU_DEPLOY_ROOT="${SELFTEST_ROOT}/deploy"
+export FUKUROU_DEPLOY_DB_HELPER=/bin/false
+mkdir -p "${FUKUROU_DEPLOY_ROOT}/deploy-state/fixture"
+
+# shellcheck source=deploy-fukurou
+source "$(dirname "$0")/deploy-fukurou"
+ROLLBACK_STATE_DIR="${FUKUROU_DEPLOY_ROOT}/deploy-state/fixture"
+DEPLOYMENT_ID=fixture
+
+journal_state CAPTURED '{"fixture":true}'
+journal_state LAUNCHES_DISABLED
+validate_journal_history "${ROLLBACK_STATE_DIR}/journal.jsonl"
+jq -e -s '
+  length == 2 and
+  .[0].sequence == 1 and .[0].previousState == "" and
+  .[1].sequence == 2 and .[1].previousState == "CAPTURED"
+' "${ROLLBACK_STATE_DIR}/journal.jsonl" >/dev/null
+cp "${ROLLBACK_STATE_DIR}/journal.jsonl" "${ROLLBACK_STATE_DIR}/journal-corrupt.jsonl"
+jq -c '.sequence=9' "${ROLLBACK_STATE_DIR}/journal-corrupt.jsonl" > "${ROLLBACK_STATE_DIR}/journal-corrupt.tmp"
+mv "${ROLLBACK_STATE_DIR}/journal-corrupt.tmp" "${ROLLBACK_STATE_DIR}/journal-corrupt.jsonl"
+if validate_journal_history "${ROLLBACK_STATE_DIR}/journal-corrupt.jsonl" >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: corrupt journal was accepted" >&2
+  exit 1
+fi
+cat > "${ROLLBACK_STATE_DIR}/state.json" <<'JSON'
+{"deploymentId":"fixture","installKind":"FOUNDATION_V1","previousRepoSha":"0000000000000000000000000000000000000000","runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture","launchMaintenance":{"generation":6}}
+JSON
+rollback_on_error() {
+  journal_state ROLLED_BACK
+  return 1
+}
+recover_unfinished_deployments
+[[ "$(tail -n 1 "${ROLLBACK_STATE_DIR}/journal.jsonl" | jq -r '.state')" == ROLLED_BACK ]]
+
+CANARY_TOKEN_HASH="$(printf fixture | sha256sum | awk '{print $1}')"
+canary_transition "" ISSUED
+canary_transition ISSUED CONSUMED
+canary_transition CONSUMED REVOKED success
+jq -e -s '
+  map(.state) == ["ISSUED","CONSUMED","REVOKED"] and
+  .[2].previousState == "CONSUMED" and .[2].result == "success"
+' "${ROLLBACK_STATE_DIR}/canary-audit.jsonl" >/dev/null
+if (canary_transition ISSUED CONSUMED replay >/dev/null 2>&1); then
+  echo "deploy-runtime-selftest: replay was accepted" >&2
+  exit 1
+fi
+
+OBSERVATION_MODE=absent
+DB_CALLS="${SELFTEST_ROOT}/db-calls"
+DB_MODE=success
+timeout() {
+  shift
+  if [[ "$1" == "${DB_HELPER}" ]]; then
+    shift
+    printf '%s\n' "$*" >> "${DB_CALLS}"
+    [[ "${DB_MODE}" == success ]]
+    return
+  fi
+  "$@"
+}
+docker() {
+  case "${OBSERVATION_MODE}:$1:$2" in
+    absent:inspect:*) return 1 ;;
+    absent:container:*) return 0 ;;
+    stopped:inspect:*) printf 'false|0\n' ;;
+    running:inspect:*) printf 'true|42\n' ;;
+    failed:inspect:*) return 1 ;;
+    failed:container:*) return 1 ;;
+    children:top:*) printf '10001\n10002\n10003\n' ;;
+    top-failed:top:*) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+assert_application_pid_zero
+OBSERVATION_MODE=stopped
+assert_application_pid_zero
+OBSERVATION_MODE=running
+if (assert_application_pid_zero >/dev/null 2>&1); then
+  echo "deploy-runtime-selftest: running application was accepted as PID zero" >&2
+  exit 1
+fi
+OBSERVATION_MODE=failed
+if (assert_application_pid_zero >/dev/null 2>&1); then
+  echo "deploy-runtime-selftest: failed observation was accepted as PID zero" >&2
+  exit 1
+fi
+OBSERVATION_MODE=children
+[[ "$(observe_runtime_children)" == "2" ]]
+OBSERVATION_MODE=top-failed
+if (observe_runtime_children >/dev/null 2>&1); then
+  echo "deploy-runtime-selftest: failed process observation was accepted" >&2
+  exit 1
+fi
+
+TARGET_GENERATION=7
+DEPLOYMENT_ID=fixture
+SUPERVISOR_MODE=enable-failure
+GAP_MODE=success
+request_supervisor() {
+  [[ ! ("${SUPERVISOR_MODE}" == enable-failure && "$1" == ENABLE) ]]
+}
+prepare_gap_event() {
+  GAP_EVENT_BOUNDARY="$1"
+  GAP_EVENT_OCCURRED_AT=fixture
+  GAP_EVENT_PAYLOAD_HASH="$(printf 'a%.0s' {1..64})"
+}
+append_prepared_gap_event() { [[ "${GAP_MODE}" == success ]]; }
+
+if (resume_launches >/dev/null 2>&1); then
+  echo "deploy-runtime-selftest: enable failure resumed launches" >&2
+  exit 1
+fi
+grep -Fq 'maintenance-cas 7 true fixture 7 false fixture' "${DB_CALLS}"
+grep -Fq 'maintenance-cas 7 false fixture 7 true fixture' "${DB_CALLS}"
+
+: > "${DB_CALLS}"
+SUPERVISOR_MODE=success
+GAP_MODE=failure
+if (resume_launches >/dev/null 2>&1); then
+  echo "deploy-runtime-selftest: gap close failure resumed launches" >&2
+  exit 1
+fi
+grep -Fq 'maintenance-cas 7 false fixture 7 true fixture' "${DB_CALLS}"
+
+echo "DEPLOY_RUNTIME_SELFTEST_OK journal=append-cas startup=crash-recovered canary=issued-consumed-revoked-replay-rejected pid0=absent-stopped observation=fail-closed resume=enable-gap-failure-restored"

@@ -81,8 +81,8 @@ class ReleaseDeployFoundationContractTest {
         val supervisor = Files.readString(root.resolve("scripts/runtime/fukurou-runtime-supervisor.c"))
 
         assertTrue(executor.contains("--canary-preflight"))
-        assertTrue(executor.contains("docker compose -p"))
-        assertTrue(executor.contains("internal:true"))
+        assertTrue(executor.contains("docker compose --env-file"))
+        assertTrue(executor.contains("internal: true"))
         assertFalse(executor.contains("docker run --rm --read-only --network none"))
         assertTrue(executor.contains("FUKUROU_CANDIDATE_DIGEST"))
         assertFalse(executor.contains("--entrypoint java"))
@@ -103,7 +103,7 @@ class ReleaseDeployFoundationContractTest {
         assertFalse(compose.contains("FUKUROU_IMAGE_TAG"))
         assertTrue(executor.contains("MANUAL_RECOVERY_REQUIRED"))
         assertTrue(executor.contains("maintenance-cas"))
-        assertTrue(executor.contains("CAPABILITY_CATALOG_PARENT_FORK"))
+        assertTrue(executor.contains("CAPABILITY_CATALOG_REDEFINITION_OR_FORK"))
     }
 }
 

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIRECTORY}/deploy-fukurou"
+
+fail_selftest() {
+  echo "deploy-contract-selftest: $*" >&2
+  exit 1
+}
+
+expect_rejected() {
+  local name="$1"
+  shift
+  if "$@"; then fail_selftest "${name} was accepted"; fi
+}
+
+installed_catalog="$(jq -cS . "${SCRIPT_DIRECTORY}/deploy-capability-catalog-v1.json")"
+installed_hash="$(printf '%s' "${installed_catalog}" | sha256sum | awk '{print $1}')"
+baseline_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
+  {minimumContractVersion:1,
+   requiredCapabilities:[$catalog.builtInCapabilities[].capabilityId],
+   requiredHooks:[$catalog.hooks[].hookId],
+   operations:[$catalog.operations[]|{capability:.capabilityId,operationId:.operationId}]}
+')"
+validate_typed_operation_set "${baseline_bundle}" "${installed_catalog}" || fail_selftest "baseline rejected"
+
+superset_catalog="$(jq -cS --arg parent "${installed_hash}" '
+  .catalogVersion=2 | .parentCatalogHash=$parent |
+  .hooks += [{hookId:"FOUNDATION_RECOVERY_PROBE_V2",profile:"FOUNDATION_CANARY_V1",entrypoint:["--canary-preflight","recovery-v2"]}] |
+  .operations += [{capabilityId:"SMOKE_HOOK_V1",operationId:"FOUNDATION_RECOVERY_PROBE_V2",parameterSchemaId:"SMOKE_HOOK_FOUNDATION_V1"}]
+' <<<"${installed_catalog}")"
+superset_bundle="$(jq -cS '
+  .requiredHooks += ["FOUNDATION_RECOVERY_PROBE_V2"] |
+  .operations += [{capability:"SMOKE_HOOK_V1",operationId:"FOUNDATION_RECOVERY_PROBE_V2"}]
+' <<<"${baseline_bundle}")"
+validate_catalog_extension "${installed_catalog}" "${superset_catalog}" "${installed_hash}" || fail_selftest "superset catalog rejected"
+validate_typed_operation_set "${superset_bundle}" "${superset_catalog}" || fail_selftest "superset bundle rejected"
+
+deleted_bundle="$(jq -cS '.operations |= map(select(.operationId != "CLEAR_LAUNCH_MAINTENANCE"))' <<<"${baseline_bundle}")"
+expect_rejected bundle-deletion validate_typed_operation_set "${deleted_bundle}" "${installed_catalog}"
+deleted_catalog="$(jq -cS --arg parent "${installed_hash}" '.catalogVersion=2|.parentCatalogHash=$parent|.operations|=map(select(.operationId!="CLEAR_LAUNCH_MAINTENANCE"))' <<<"${installed_catalog}")"
+expect_rejected catalog-deletion validate_catalog_extension "${installed_catalog}" "${deleted_catalog}" "${installed_hash}"
+redefined_catalog="$(jq -cS --arg parent "${installed_hash}" '.catalogVersion=2|.parentCatalogHash=$parent|(.operations[]|select(.operationId=="PRODUCTION").capabilityId)="SMOKE_HOOK_V1"' <<<"${installed_catalog}")"
+expect_rejected catalog-redefinition validate_catalog_extension "${installed_catalog}" "${redefined_catalog}" "${installed_hash}"
+forked_catalog="$(jq -cS '.catalogVersion=2|.parentCatalogHash=("0" * 64)' <<<"${installed_catalog}")"
+expect_rejected catalog-fork validate_catalog_extension "${installed_catalog}" "${forked_catalog}" "${installed_hash}"
+downgraded_catalog="$(jq -cS --arg parent "${installed_hash}" '.catalogVersion=1|.parentCatalogHash=$parent' <<<"${installed_catalog}")"
+expect_rejected catalog-downgrade validate_catalog_extension "${installed_catalog}" "${downgraded_catalog}" "${installed_hash}"
+
+echo "DEPLOY_CONTRACT_SELFTEST_OK superset=accepted deletion=rejected redefinition=rejected fork=rejected downgrade=rejected"

@@ -113,6 +113,7 @@ import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.reflection.ReflectionDataCollector
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -6373,6 +6374,82 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun llm_launch_finish_terminalizesProviderRegistrationIdempotently() = runPostgresTest {
+        assertLlmLaunchTerminalLifecycle(database, includeMcp = false)
+    }
+
+    @Test
+    fun llm_launch_finish_terminalizesProviderAndMcpRegistrationsIdempotently() = runPostgresTest {
+        assertLlmLaunchTerminalLifecycle(database, includeMcp = true)
+    }
+
+    private suspend fun assertLlmLaunchTerminalLifecycle(database: ExposedDatabase, includeMcp: Boolean) {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val invocationId = if (includeMcp) "terminal-provider-mcp" else "terminal-provider-only"
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        repository.tryReserve(llmLaunchReservationRequest(invocationId, LlmRunnerConfig())).getOrThrow()
+        exposedTransaction(database) {
+            exec(
+                """
+                    UPDATE llm_pid_registrations
+                    SET state='ACTIVE', pid_namespace_inode=42, process_id=4242,
+                        process_start_ticks=99, updated_at=clock_timestamp()
+                    WHERE invocation_id='$invocationId' AND role='PROVIDER'
+                """.trimIndent(),
+            )
+            if (includeMcp) {
+                exec(
+                    """
+                        INSERT INTO llm_pid_registrations(
+                            registration_id, invocation_id, reservation_id, role, container_instance_id,
+                            pid_namespace_inode, process_id, process_start_ticks, state
+                        )
+                        SELECT md5('fukurou-pid-registration-v1:' || invocation_id || ':MCP')::uuid,
+                            invocation_id, reservation_id, 'MCP', container_instance_id,
+                            42, 4343, 100, 'ACTIVE'
+                        FROM llm_pid_registrations
+                        WHERE invocation_id='$invocationId' AND role='PROVIDER'
+                    """.trimIndent(),
+                )
+            }
+        }
+        val finish = LlmLaunchReservationFinish(
+            invocationId = invocationId,
+            status = LlmLaunchReservationStatus.FINISHED,
+            reason = "NO_TRADE_DECISION",
+            finishedAt = fixedInstant().plusSeconds(1),
+        )
+
+        repository.finish(finish).getOrThrow()
+        repository.finish(finish).getOrThrow()
+
+        exposedTransaction(database) {
+            prepare(
+                """
+                    SELECT reservation.status,
+                        COUNT(registration.registration_id) AS registration_count,
+                        COUNT(*) FILTER (WHERE registration.state='TERMINAL') AS terminal_count,
+                        COUNT(*) FILTER (WHERE registration.state IN ('SPAWN_RESERVED','ACTIVE')) AS active_count
+                    FROM llm_launch_reservations reservation
+                    JOIN llm_pid_registrations registration ON registration.reservation_id=reservation.id
+                    WHERE reservation.invocation_id=?
+                    GROUP BY reservation.status
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, invocationId)
+                statement.executeQuery().use { resultSet ->
+                    assertTrue(resultSet.next())
+                    val expectedRegistrations = if (includeMcp) 2 else 1
+                    assertEquals(LlmLaunchReservationStatus.FINISHED.name, resultSet.getString("status"))
+                    assertEquals(expectedRegistrations, resultSet.getInt("registration_count"))
+                    assertEquals(expectedRegistrations, resultSet.getInt("terminal_count"))
+                    assertEquals(0, resultSet.getInt("active_count"))
+                }
+            }
+        }
+    }
+
+    @Test
     fun schedulerAuditsHighPriorityTriggerBlockedByAtomicReservationRaceInPostgresPath() = runPostgresTest {
         val clock = Clock.fixed(fixedInstant(), ZoneOffset.UTC)
         TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
@@ -7295,6 +7372,7 @@ class PostgresPersistenceIntegrationTest {
             repository = decisionRepository,
             command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
         )
+        insertFinishedLlmRun(database, "run-entry-${command.commandId}")
 
         broker.placeOrder(command).getOrThrow()
         repository.reconcile(
@@ -7332,6 +7410,88 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun causal_population_excludesGapDecisionAcrossRepositoryAndReflection() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val ledger = ExposedPaperLedgerRepository(database)
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledger,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisions,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        )
+        val invocationId = "run-entry-${command.commandId}"
+        insertFinishedLlmRun(
+            database = database,
+            invocationId = invocationId,
+            startedAt = fixedInstant().minusSeconds(10),
+            finishedAt = fixedInstant().plusSeconds(1),
+        )
+        insertInfrastructureGap(
+            database = database,
+            deploymentId = "causal-gap-counterexample",
+            openedAt = fixedInstant().minusSeconds(5),
+            closedAt = fixedInstant().minusSeconds(1),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+        ledger.reconcile(takeProfitTickSnapshot(), FillSimulator(clock = fixedClock())).getOrThrow()
+
+        val repository = ExposedEvaluationRepository(database)
+        val period = EvaluationPeriod(fixedInstant().minusSeconds(20), fixedInstant().plusSeconds(2))
+        val scope = repository.resolveScope(null, "CURRENT").getOrThrow()
+        val trades = repository.fetchClosedTrades(period, scope = scope).getOrThrow()
+        val report = repository.fetchReportSnapshot(period, scope).getOrThrow()
+        val killStats = repository.fetchKillCriterionStats().getOrThrow()
+        val reflection = ReflectionDataCollector(
+            decisionRepository = decisions,
+            llmRunRepository = ExposedLlmRunRepository(database),
+            evaluationRepository = repository,
+            clock = fixedClock(),
+        ).collect().getOrThrow()
+
+        assertEquals(1, trades.trades.size)
+        assertTrue(trades.trades.single().openedAt > fixedInstant().minusSeconds(1))
+        assertEquals(1, trades.trades.single().infrastructureGapIds.size)
+        assertEquals(0, trades.strategyEligibleTrades.size)
+        assertEquals(0, report.dailyPnl.size)
+        assertEquals(0, report.priorPnlJpy.compareTo(BigDecimal.ZERO))
+        assertEquals(0, killStats.closedTrades)
+        assertEquals(0, repository.countDecisionsByAction(period, scope).getOrThrow().sumOf { it.count })
+        assertTrue(reflection.daily.decisions.none { it.decision.submission.invocationId == invocationId })
+        assertTrue(reflection.daily.llmRuns.none { it.invocationId == invocationId })
+        assertTrue(reflection.daily.closedTrades.isEmpty())
+    }
+
+    @Test
+    fun evaluation_population_rejectsOneThousandAndOneInfrastructureGaps() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            exec(
+                """
+                    INSERT INTO infrastructure_gap_events(
+                        event_id,gap_id,deployment_id,boundary,reason,occurred_at,payload_hash
+                    )
+                    SELECT md5('gap-event:' || series)::uuid, md5('gap:' || series)::uuid,
+                        'gap-bound-' || series, 'OPEN', 'DEPLOY_MAINTENANCE', clock_timestamp(), repeat('a',64)
+                    FROM generate_series(1,1001) series
+                """.trimIndent(),
+            )
+        }
+
+        val result = ExposedEvaluationRepository(database).fetchExclusionSummary(
+            EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1)),
+        )
+
+        assertTrue(result.isFailure)
+    }
+
+    @Test
     fun evaluation_repository_bounds_large_scoped_populations_and_aggregates_prior_pnl() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedEvaluationRepository(database)
@@ -7352,15 +7512,15 @@ class PostgresPersistenceIntegrationTest {
         ).getOrThrow()
         assertEquals(1, current.trades.size)
         assertFalse(current.truncated)
-        assertEquals(0, snapshot.priorPnlJpy.compareTo(BigDecimal("-1.00000000")))
+        assertEquals(0, snapshot.priorPnlJpy.compareTo(BigDecimal.ZERO))
 
         exposedTransaction(database) {
             val populationScope = acquireFixtureGapPopulationGenerationToken(TradingMode.PAPER.name)
             insertEvaluationPopulationRows(populationScope, runtimeHash, from = 1, to = 20_001)
         }
-        val oversizedSnapshot = repository.fetchReportSnapshot(period, scope).getOrThrow()
-        assertEquals(20_000, oversizedSnapshot.trades.trades.size)
-        assertTrue(oversizedSnapshot.trades.truncated)
+        val oversizedSnapshot = repository.fetchReportSnapshot(period, scope)
+        assertTrue(oversizedSnapshot.isFailure)
+        assertTrue(oversizedSnapshot.exceptionOrNull()?.message.orEmpty().contains("EVALUATION_POPULATION_UNAVAILABLE:ENTITY_LIMIT"))
     }
 
     @Test
@@ -7381,6 +7541,7 @@ class PostgresPersistenceIntegrationTest {
                 repository = decisions,
                 command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
             )
+            insertFinishedLlmRun(database, "run-entry-${command.commandId}")
             val placed = broker.placeOrder(command).getOrThrow()
             entryOrderIds += UUID.fromString(placed.orderIds.first())
             ledger.reconcile(takeProfitTickSnapshot(), FillSimulator(clock = fixedClock())).getOrThrow()
@@ -7437,6 +7598,12 @@ class PostgresPersistenceIntegrationTest {
         val command = approvedPostgresEntryCommand(
             decisions,
             postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
+        )
+        insertFinishedLlmRun(
+            database = database,
+            invocationId = "run-entry-${command.commandId}",
+            startedAt = fixedInstant().minusSeconds(1),
+            finishedAt = fixedInstant(),
         )
         val entryOrderId = UUID.fromString(broker.placeOrder(command).getOrThrow().orderIds.first())
         ledger.reconcile(takeProfitTickSnapshot(), FillSimulator(clock = fixedClock())).getOrThrow()
@@ -7559,6 +7726,7 @@ class PostgresPersistenceIntegrationTest {
                 takeProfitPriceJpy = BigDecimal("11000000"),
             ),
         )
+        insertFinishedLlmRun(database, "run-entry-${firstEntry.commandId}")
 
         broker.placeOrder(firstEntry).getOrThrow()
         repository.reconcile(
@@ -9172,6 +9340,58 @@ private fun tradePlanRevisionSubmission(parentTradePlanId: UUID?, revisionCount:
             setupTags = listOf("breakout", "trend-follow"),
         ),
     )
+}
+
+private fun insertFinishedLlmRun(
+    database: ExposedDatabase,
+    invocationId: String,
+    startedAt: Instant = fixedInstant().minusSeconds(1),
+    finishedAt: Instant = fixedInstant(),
+) {
+    exposedTransaction(database) {
+        prepare(
+            """
+                INSERT INTO llm_runs(invocation_id,mode,symbol,status,started_at,finished_at)
+                VALUES (?,'PAPER','BTC_JPY','FINISHED',?,?)
+                ON CONFLICT (invocation_id) DO UPDATE
+                SET status='FINISHED',started_at=EXCLUDED.started_at,finished_at=EXCLUDED.finished_at
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.setLong(2, startedAt.toEpochMilli())
+            statement.setLong(3, finishedAt.toEpochMilli())
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun insertInfrastructureGap(
+    database: ExposedDatabase,
+    deploymentId: String,
+    openedAt: Instant,
+    closedAt: Instant,
+) {
+    val gapId = UUID.randomUUID()
+    exposedTransaction(database) {
+        listOf("OPEN" to openedAt, "CLOSE" to closedAt).forEach { (boundary, occurredAt) ->
+            prepare(
+                """
+                    INSERT INTO infrastructure_gap_events(
+                        event_id,gap_id,deployment_id,boundary,reason,occurred_at,payload_hash
+                    ) VALUES (?,?,?,?,?,?,?)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, UUID.randomUUID())
+                statement.setObject(2, gapId)
+                statement.setString(3, deploymentId)
+                statement.setString(4, boundary)
+                statement.setString(5, "DEPLOY_MAINTENANCE")
+                statement.setTimestamp(6, java.sql.Timestamp.from(occurredAt))
+                statement.setString(7, "a".repeat(64))
+                statement.executeUpdate()
+            }
+        }
+    }
 }
 
 private suspend fun approvedPostgresEntryCommand(

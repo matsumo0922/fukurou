@@ -478,7 +478,7 @@ private fun Route.registerEvaluationCostsRoute(dependencies: EvaluationRouteDepe
         val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
         val scope = call.resolveEvaluationScope(evaluationRepository) ?: return@get
         val usageResult = evaluationRepository.fetchLlmPhaseUsages(dateRange.toPeriod(), scope = scope).getOrThrow()
-        val costs = EvaluationMath.summarizeLlmCosts(usageResult.facts)
+        val costs = EvaluationMath.summarizeLlmCosts(usageResult.strategyEligibleFacts)
 
         call.respond(
             EvaluationCostsResponse(

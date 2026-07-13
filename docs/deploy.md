@@ -182,7 +182,20 @@ deploy maintenance は durable disable ACK、同generationのDB maintenance comm
 
 candidate hookはproduction fenceを開かない。`CANARY_ONLY` tokenをcandidate SHA/image digest/catalog hashへ固定し、root-generated Compose projectのinternal fixture networkで同じimage、PID 1、read-only、tmpfs、capability条件を使う。production DB credential、endpoint、mutation toolは渡さない。tokenはdurableな`ISSUED`→`CONSUMED`→`REVOKED`の一方向状態を取り、再利用しない。
 
-maintenance intervalはroot DB helperがappend-only `infrastructure_gap_events`へimmutableなOPEN/CLOSE factを直接記録する。decision/run/order/position/execution/tradeは共通causal projectionで`ELIGIBLE` / `INFRASTRUCTURE_GAP` / `ATTRIBUTION_MISSING`に分類する。summary、setup、calibration、benchmark、prior PnL、kill criterion、run rate、report、reflection、knowledge、usageは同じeligible境界を使い、APIはentity type別件数とgap catalogを返す。1,000件超、integrity不整合、timeoutは部分値を返さない。
+deploy journal と canary audit は sequence、previous state、現在の末尾 sequence に対するCASを持つappend historyである。executor 起動時はlock取得後、新しいrollback captureより前に既存journalの全chainを検証する。未完了の`FOUNDATION_V1` deployは保存済みstateからrecoveryを再開し、`ROLLED_BACK`を永続化できた場合だけ次のdeployへ進む。chain破損、state欠損、`FRESH` / `PRE_FOUNDATION`の未完了、rollback不成立はmanual recoveryとしてfail closedする。deadlineは`/proc/uptime`のboot timeを使い、Docker、Git、DB helperのforward/recovery callにも個別timeoutを設ける。
+
+maintenance intervalはroot DB helperがappend-only `infrastructure_gap_events`へimmutableなOPEN/CLOSE factを直接記録する。decision/run/order/position/execution/tradeは共通causal projectionで`ELIGIBLE` / `INFRASTRUCTURE_GAP` / `ATTRIBUTION_MISSING`に分類する。summary、setup、calibration、benchmark、prior PnL、kill criterion、run rate、report、reflection、knowledge、usageは同じeligible境界を使い、APIはentity type別件数とgap catalogを返す。gap 1,000件超、entity 20,000件超、integrity不整合、timeoutは部分値を返さない。
+
+deploy foundation のlocal semantic fixtureは次を実行する。`canary-compose-selftest`はproduction composeへdeny overlayを合成した実効JSONを検証するため、Docker Composeが必要である。
+
+```sh
+scripts/deploy/deploy-contract-selftest
+scripts/deploy/deploy-runtime-selftest
+scripts/deploy/deploy-db-selftest
+scripts/deploy/canary-compose-selftest
+docker build --target launcher-build -t fukurou-launcher-build:selftest .
+docker run --rm fukurou-launcher-build:selftest ./fukurou-runtime-supervisor --protocol-selftest
+```
 
 production cutoverのimage referenceはcandidate digestだけである。commit tagは表示用で、pull、create、health後にconfigured reference、image ID/repo digest、`/revision`を照合する。executorはforward 20分、recovery 5分のabsolute budgetを持ち、TERM/INT/HUP/deadlineでもjournalからrecoveryへ入る。`FRESH` / `PRE_FOUNDATION`は旧serviceを自動再開せず、maintenance/fence/gapを閉じない。
 

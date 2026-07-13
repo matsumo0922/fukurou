@@ -5,13 +5,14 @@ readonly POSTGRES_CONTAINER="${FUKUROU_POSTGRES_CONTAINER:-fukurou-postgres}"
 readonly APPLICATION_CONTAINER="${FUKUROU_APPLICATION_CONTAINER:-fukurou-ktor}"
 readonly FOUNDATION_SQL="${FUKUROU_FOUNDATION_SQL:-/usr/local/share/fukurou/deploy-foundation-v1.sql}"
 readonly FOUNDATION_INDEX_SQL="${FUKUROU_FOUNDATION_INDEX_SQL:-/usr/local/share/fukurou/deploy-foundation-v1-indexes.sql}"
+readonly MCP_DATABASE_ROLE="${FUKUROU_MCP_DB_USER:-fukurou_mcp}"
 
 fail() { echo "fukurou-deploy-db: $*" >&2; exit 1; }
 require_root() { [[ "$(id -u)" == "0" ]] || fail "root is required"; }
 postgres_env() { docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${POSTGRES_CONTAINER}"; }
 postgres_value() { postgres_env | awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'; }
 application_value() {
-  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${APPLICATION_CONTAINER}" 2>/dev/null \
+  { docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${APPLICATION_CONTAINER}" 2>/dev/null || true; } \
     | awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'
 }
 psql_exec() {
@@ -26,7 +27,7 @@ validate_hash() { [[ "$1" =~ ^[0-9a-f]{64}$ ]] || fail "invalid payload hash"; }
 
 install_foundation() {
   [[ -f "${FOUNDATION_SQL}" ]] || fail "foundation migration is missing"
-  local mcp_role; mcp_role="$(application_value FUKUROU_MCP_DB_USER)"; [[ -n "${mcp_role}" ]] || mcp_role="fukurou_mcp"
+  local mcp_role; mcp_role="$(application_value FUKUROU_MCP_DB_USER)"; [[ -n "${mcp_role}" ]] || mcp_role="${MCP_DATABASE_ROLE}"
   timeout 60 psql_exec --set=mcp_role="${mcp_role}" < "${FOUNDATION_SQL}"
 }
 install_indexes() {
@@ -211,4 +212,6 @@ main() {
     *) fail "unsupported operation" ;;
   esac
 }
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

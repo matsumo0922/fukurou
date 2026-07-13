@@ -23,6 +23,7 @@ import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
 import me.matsumo.fukurou.trading.evaluation.EvaluationInfrastructureGap
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationCounts
+import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationEntityType
 import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationStatus
 import me.matsumo.fukurou.trading.evaluation.EvaluationReportSnapshotFacts
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
@@ -90,6 +91,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         SELECT
             initial.position_id,
             o.intent_id,
+            o.decision_run_id,
             o.protective_stop_price_jpy
         FROM initial_buy_executions initial
         LEFT JOIN orders o ON o.id = initial.order_id
@@ -174,11 +176,13 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         el.account_epoch_id,
         el.cohort,
         el.execution_semantics_version,
-        CASE WHEN d.id IS NULL THEN 'MISSING' ELSE 'ATTRIBUTED' END AS attribution_status,
+        CASE WHEN eo.position_id IS NULL OR eo.intent_id IS NULL OR ti.id IS NULL OR d.id IS NULL OR
+            d.invocation_id IS NULL OR run.invocation_id IS NULL
+            THEN 'MISSING' ELSE 'ATTRIBUTED' END AS attribution_status,
         ARRAY(
             SELECT gap.gap_id::text
             FROM infrastructure_gap_intervals gap
-            WHERE p.opened_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at
+            WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at
             ORDER BY gap.opened_at, gap.gap_id
             LIMIT 1
         ) AS infrastructure_gap_ids
@@ -190,6 +194,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
     LEFT JOIN execution_lineage el ON el.position_id = p.id
     LEFT JOIN trade_intents ti ON ti.id = eo.intent_id
     LEFT JOIN decisions d ON d.id = ti.decision_id
+    LEFT JOIN llm_runs run ON run.invocation_id = d.invocation_id
     LEFT JOIN trade_plans tp ON tp.id = ti.trade_plan_id
     ORDER BY p.closed_at ASC
 """
@@ -239,22 +244,31 @@ private const val COUNT_DECISIONS_BY_ACTION_SQL = """
 private const val SELECT_DAILY_TRADE_PNL_SQL = """
     WITH $EVALUATION_GAP_INTERVAL_CTE_V1,
     closed_positions AS (
-        SELECT id, closed_at
-        FROM positions
-        WHERE status = 'CLOSED'
-            AND mode = (
+        SELECT p.id, p.closed_at
+        FROM positions p
+        JOIN LATERAL (
+            SELECT entry.order_id FROM executions entry
+            WHERE entry.position_id = p.id AND entry.side = 'BUY'
+            ORDER BY entry.executed_at, entry.id LIMIT 1
+        ) initial ON TRUE
+        JOIN orders entry_order ON entry_order.id = initial.order_id
+        JOIN trade_intents intent ON intent.id = entry_order.intent_id
+        JOIN decisions decision ON decision.id = intent.decision_id
+        JOIN llm_runs run ON run.invocation_id = decision.invocation_id
+        WHERE p.status = 'CLOSED'
+            AND p.mode = (
                 SELECT mode
                 FROM paper_account
                 WHERE id = ?
             )
-            AND closed_at >= ?
-            AND closed_at < ?
+            AND p.closed_at >= ?
+            AND p.closed_at < ?
             AND NOT EXISTS (
                 SELECT 1 FROM evaluation_exclusions x
-                WHERE x.entity_type = 'POSITION' AND x.entity_id = positions.id::text
+                WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
-                WHERE positions.opened_at < gap.closed_at_ms AND gap.opened_at_ms < positions.closed_at)
+                WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
     ),
     position_pnl AS (
         SELECT
@@ -277,21 +291,30 @@ private const val SELECT_DAILY_TRADE_PNL_SQL = """
 private const val SUM_TRADE_PNL_BEFORE_SQL = """
     WITH $EVALUATION_GAP_INTERVAL_CTE_V1,
     closed_positions AS (
-        SELECT id
-        FROM positions
-        WHERE status = 'CLOSED'
-            AND mode = (
+        SELECT p.id
+        FROM positions p
+        JOIN LATERAL (
+            SELECT entry.order_id FROM executions entry
+            WHERE entry.position_id = p.id AND entry.side = 'BUY'
+            ORDER BY entry.executed_at, entry.id LIMIT 1
+        ) initial ON TRUE
+        JOIN orders entry_order ON entry_order.id = initial.order_id
+        JOIN trade_intents intent ON intent.id = entry_order.intent_id
+        JOIN decisions decision ON decision.id = intent.decision_id
+        JOIN llm_runs run ON run.invocation_id = decision.invocation_id
+        WHERE p.status = 'CLOSED'
+            AND p.mode = (
                 SELECT mode
                 FROM paper_account
                 WHERE id = ?
             )
-            AND closed_at < ?
+            AND p.closed_at < ?
             AND NOT EXISTS (
                 SELECT 1 FROM evaluation_exclusions x
-                WHERE x.entity_type = 'POSITION' AND x.entity_id = positions.id::text
+                WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
-                WHERE positions.opened_at < gap.closed_at_ms AND gap.opened_at_ms < positions.closed_at)
+                WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
     ),
     position_pnl AS (
         SELECT
@@ -367,6 +390,15 @@ private const val SELECT_KILL_CRITERION_STATS_SQL = """
                 AND BOOL_AND(e.execution_semantics_version = 'PAPER_WS_V1')
                 AND BOOL_AND(o.execution_semantics_version = 'PAPER_WS_V1') AS current_semantics
         FROM positions p
+        JOIN LATERAL (
+            SELECT entry.order_id FROM executions entry
+            WHERE entry.position_id = p.id AND entry.side = 'BUY'
+            ORDER BY entry.executed_at, entry.id LIMIT 1
+        ) initial ON TRUE
+        JOIN orders entry_order ON entry_order.id = initial.order_id
+        JOIN trade_intents intent ON intent.id = entry_order.intent_id
+        JOIN decisions decision ON decision.id = intent.decision_id
+        JOIN llm_runs run ON run.invocation_id = decision.invocation_id
         JOIN executions e ON e.position_id = p.id
         LEFT JOIN orders o ON o.id = e.order_id
         WHERE p.status = 'CLOSED'
@@ -376,7 +408,7 @@ private const val SELECT_KILL_CRITERION_STATS_SQL = """
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
-                WHERE p.opened_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
+                WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
         GROUP BY p.id
     )
     SELECT
@@ -418,6 +450,15 @@ private const val SELECT_SCOPED_PNL_BEFORE_SQL = """
             COALESCE(SUM(CASE WHEN e.side = 'SELL' THEN e.realized_pnl_jpy ELSE 0 END), 0) -
                 COALESCE(SUM(CASE WHEN e.side = 'BUY' THEN e.fee_jpy ELSE 0 END), 0) AS trade_pnl_jpy
         FROM positions p
+        JOIN LATERAL (
+            SELECT entry.order_id FROM executions entry
+            WHERE entry.position_id = p.id AND entry.side = 'BUY'
+            ORDER BY entry.executed_at, entry.id LIMIT 1
+        ) initial ON TRUE
+        JOIN orders entry_order ON entry_order.id = initial.order_id
+        JOIN trade_intents intent ON intent.id = entry_order.intent_id
+        JOIN decisions decision ON decision.id = intent.decision_id
+        JOIN llm_runs run ON run.invocation_id = decision.invocation_id
         JOIN executions e ON e.position_id = p.id
         LEFT JOIN orders o ON o.id = e.order_id
         WHERE p.status = 'CLOSED'
@@ -428,7 +469,7 @@ private const val SELECT_SCOPED_PNL_BEFORE_SQL = """
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
-                WHERE p.opened_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
+                WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
         GROUP BY p.id
     )
     SELECT COALESCE(SUM(trade_pnl_jpy), 0)
@@ -694,6 +735,25 @@ class ExposedEvaluationRepository(
         }
     }
 
+    override suspend fun classifyPopulationEntities(
+        period: EvaluationPeriod,
+        entityType: EvaluationPopulationEntityType,
+        entityIds: Set<String>,
+    ): Result<Map<String, EvaluationPopulationStatus>> {
+        if (entityIds.isEmpty()) return Result.success(emptyMap())
+        require(entityIds.size <= DEFAULT_EVALUATION_QUERY_LIMIT + 1) {
+            "EVALUATION_POPULATION_UNAVAILABLE:ENTITY_LIMIT"
+        }
+
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    selectPopulationEntityStatuses(period, entityType, entityIds)
+                }
+            }
+        }
+    }
+
     override suspend fun fetchKillCriterionStats(): Result<KillCriterionStats> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -703,6 +763,85 @@ class ExposedEvaluationRepository(
                 }
             }
         }
+    }
+}
+
+private fun JdbcTransaction.selectPopulationEntityStatuses(
+    period: EvaluationPeriod,
+    entityType: EvaluationPopulationEntityType,
+    entityIds: Set<String>,
+): Map<String, EvaluationPopulationStatus> {
+    val entityProjection = populationEntityProjectionSql(entityType)
+    return prepare(
+        """
+            WITH $EVALUATION_GAP_INTERVAL_CTE_V1,
+            requested AS (SELECT unnest(?::text[]) AS entity_id),
+            entities AS ($entityProjection)
+            SELECT entity_id,
+                CASE
+                    WHEN missing THEN 'ATTRIBUTION_MISSING'
+                    WHEN EXISTS (
+                        SELECT 1 FROM infrastructure_gap_intervals gap
+                        WHERE entities.cause_at < gap.closed_at_ms AND gap.opened_at_ms < entities.terminal_at
+                    ) THEN 'INFRASTRUCTURE_GAP'
+                    ELSE 'ELIGIBLE'
+                END AS population_status
+            FROM entities
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setArray(1, jdbcConnection().createArrayOf("text", entityIds.toTypedArray()))
+        when (entityType) {
+            EvaluationPopulationEntityType.RUN -> {
+                statement.setLong(2, period.toExclusive.toEpochMilli())
+                statement.setLong(3, period.toExclusive.toEpochMilli())
+                statement.setLong(4, period.from.toEpochMilli())
+            }
+
+            EvaluationPopulationEntityType.DECISION -> {
+                statement.setLong(2, period.from.toEpochMilli())
+                statement.setLong(3, period.toExclusive.toEpochMilli())
+            }
+        }
+        statement.executeQuery().use { resultSet ->
+            buildMap {
+                while (resultSet.next()) {
+                    put(
+                        resultSet.getString("entity_id"),
+                        EvaluationPopulationStatus.valueOf(resultSet.getString("population_status")),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun populationEntityProjectionSql(entityType: EvaluationPopulationEntityType): String {
+    return when (entityType) {
+        EvaluationPopulationEntityType.RUN -> """
+            SELECT requested.entity_id,
+                run.started_at AS cause_at,
+                COALESCE(run.finished_at, (extract(epoch FROM query_clock.query_now) * 1000)::bigint) AS terminal_at,
+                run.invocation_id IS NULL OR
+                    (run.status = 'RUNNING' AND run.finished_at IS NOT NULL) OR
+                    (run.status <> 'RUNNING' AND run.finished_at IS NULL) AS missing
+            FROM requested
+            CROSS JOIN query_clock
+            LEFT JOIN llm_runs run ON run.invocation_id = requested.entity_id
+                AND run.started_at < ? AND COALESCE(run.finished_at, ?) >= ?
+        """.trimIndent()
+
+        EvaluationPopulationEntityType.DECISION -> """
+            SELECT requested.entity_id,
+                run.started_at AS cause_at,
+                GREATEST(decision.created_at, COALESCE(run.finished_at, decision.created_at)) AS terminal_at,
+                decision.id IS NULL OR decision.invocation_id IS NULL OR run.invocation_id IS NULL OR
+                    (run.status = 'RUNNING' AND run.finished_at IS NOT NULL) OR
+                    (run.status <> 'RUNNING' AND run.finished_at IS NULL) AS missing
+            FROM requested
+            LEFT JOIN decisions decision ON decision.id::text = requested.entity_id
+                AND decision.created_at >= ? AND decision.created_at < ?
+            LEFT JOIN llm_runs run ON run.invocation_id = decision.invocation_id
+        """.trimIndent()
     }
 }
 
@@ -833,28 +972,40 @@ private fun JdbcTransaction.selectPopulationCounts(period: EvaluationPeriod): Ma
                 WHERE d.created_at >= ? AND d.created_at < ?
                 UNION ALL
                 SELECT 'ORDER', o.id::text, r.started_at, COALESCE(o.canceled_at,o.expired_at,o.updated_at,?),
-                    o.decision_run_id IS NULL OR r.invocation_id IS NULL
-                FROM orders o LEFT JOIN llm_runs r ON r.invocation_id=o.decision_run_id
+                    o.intent_id IS NULL OR i.id IS NULL OR d.id IS NULL OR r.invocation_id IS NULL
+                FROM orders o
+                LEFT JOIN trade_intents i ON i.id=o.intent_id
+                LEFT JOIN decisions d ON d.id=i.decision_id
+                LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
                 WHERE o.created_at < ? AND o.updated_at >= ?
                 UNION ALL
                 SELECT 'POSITION', p.id::text, COALESCE(r.started_at,p.opened_at), COALESCE(p.closed_at,?),
-                    entry.id IS NULL OR entry.order_id IS NULL OR r.invocation_id IS NULL
+                    entry.id IS NULL OR entry.order_id IS NULL OR i.id IS NULL OR d.id IS NULL OR r.invocation_id IS NULL
                 FROM positions p
                 LEFT JOIN LATERAL (SELECT e.id,e.order_id FROM executions e WHERE e.position_id=p.id AND e.side='BUY' ORDER BY e.executed_at,e.id LIMIT 1) entry ON TRUE
-                LEFT JOIN orders o ON o.id=entry.order_id LEFT JOIN llm_runs r ON r.invocation_id=o.decision_run_id
+                LEFT JOIN orders o ON o.id=entry.order_id
+                LEFT JOIN trade_intents i ON i.id=o.intent_id
+                LEFT JOIN decisions d ON d.id=i.decision_id
+                LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
                 WHERE p.opened_at < ? AND COALESCE(p.closed_at,?) >= ?
                 UNION ALL
                 SELECT 'EXECUTION', e.id::text, r.started_at, e.executed_at+1,
-                    e.order_id IS NULL OR o.id IS NULL OR o.decision_run_id IS NULL OR r.invocation_id IS NULL OR
-                    (e.decision_run_id IS NOT NULL AND e.decision_run_id<>o.decision_run_id)
-                FROM executions e LEFT JOIN orders o ON o.id=e.order_id LEFT JOIN llm_runs r ON r.invocation_id=o.decision_run_id
+                    e.order_id IS NULL OR o.id IS NULL OR i.id IS NULL OR d.id IS NULL OR r.invocation_id IS NULL
+                FROM executions e
+                LEFT JOIN orders o ON o.id=e.order_id
+                LEFT JOIN trade_intents i ON i.id=o.intent_id
+                LEFT JOIN decisions d ON d.id=i.decision_id
+                LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
                 WHERE e.executed_at >= ? AND e.executed_at < ?
                 UNION ALL
                 SELECT 'TRADE', p.id::text, COALESCE(r.started_at,p.opened_at), p.closed_at,
-                    entry.id IS NULL OR entry.order_id IS NULL OR r.invocation_id IS NULL
+                    entry.id IS NULL OR entry.order_id IS NULL OR i.id IS NULL OR d.id IS NULL OR r.invocation_id IS NULL
                 FROM positions p
                 LEFT JOIN LATERAL (SELECT e.id,e.order_id FROM executions e WHERE e.position_id=p.id AND e.side='BUY' ORDER BY e.executed_at,e.id LIMIT 1) entry ON TRUE
-                LEFT JOIN orders o ON o.id=entry.order_id LEFT JOIN llm_runs r ON r.invocation_id=o.decision_run_id
+                LEFT JOIN orders o ON o.id=entry.order_id
+                LEFT JOIN trade_intents i ON i.id=o.intent_id
+                LEFT JOIN decisions d ON d.id=i.decision_id
+                LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
                 WHERE p.status='CLOSED' AND p.closed_at >= ? AND p.closed_at < ?
             ), projected AS (
                 SELECT entity_type, missing,
@@ -877,10 +1028,14 @@ private fun JdbcTransaction.selectPopulationCounts(period: EvaluationPeriod): Ma
         statement.executeQuery().use { result ->
             buildMap {
                 while (result.next()) {
+                    val total = result.getInt("total")
+                    check(total <= DEFAULT_EVALUATION_QUERY_LIMIT) {
+                        "EVALUATION_POPULATION_UNAVAILABLE:ENTITY_LIMIT:${result.getString("entity_type")}:$total"
+                    }
                     put(
                         result.getString("entity_type"),
                         EvaluationPopulationCounts(
-                            total = result.getInt("total"),
+                            total = total,
                             eligible = result.getInt("eligible"),
                             infrastructureGap = result.getInt("infrastructure_gap"),
                             attributionMissing = result.getInt("attribution_missing"),
