@@ -391,7 +391,12 @@ class OneShotLlmRunner(
         }
         when (claimOutcome) {
             is LlmExecutionClaimOutcome.Rejected -> {
-                appendClaimPreflightAudit(invocationId, triggerKind, claimOutcome.reason.wireCode, false)
+                appendClaimPreflightAudit(
+                    invocationId = invocationId,
+                    triggerKind = triggerKind,
+                    reason = claimOutcome.reason.wireCode,
+                    canLaunch = false,
+                )
                 return Result.failure(IllegalStateException(claimOutcome.reason.wireCode))
             }
             is LlmExecutionClaimOutcome.OutcomeUnknown -> {
@@ -406,7 +411,12 @@ class OneShotLlmRunner(
             is LlmExecutionClaimOutcome.Claimed -> {
                 runCatching {
                     currentCoroutineContext().ensureActive()
-                    appendClaimPreflightAudit(invocationId, triggerKind, "claimed", true)
+                    appendClaimPreflightAudit(
+                        invocationId = invocationId,
+                        triggerKind = triggerKind,
+                        reason = "claimed",
+                        canLaunch = true,
+                    )
                 }
                     .getOrElse { auditFailure ->
                         withContext(NonCancellable) {

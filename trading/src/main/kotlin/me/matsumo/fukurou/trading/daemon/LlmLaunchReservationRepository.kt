@@ -769,8 +769,14 @@ private data class LlmLaunchReservationRecord(
     val claimedAt: Instant?,
     val heartbeatAt: Instant?,
 ) {
-    fun toActive(): LlmActiveLaunchReservation =
-        LlmActiveLaunchReservation(invocationId, triggerKind, triggerKey, reservedAt)
+    fun toActive(): LlmActiveLaunchReservation {
+        return LlmActiveLaunchReservation(
+            invocationId = invocationId,
+            triggerKind = triggerKind,
+            triggerKey = triggerKey,
+            reservedAt = reservedAt,
+        )
+    }
 
     /**
      * stale 判定込みで RUNNING か返す。
