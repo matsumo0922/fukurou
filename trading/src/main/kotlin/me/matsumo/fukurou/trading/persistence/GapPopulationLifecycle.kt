@@ -2272,7 +2272,7 @@ BEGIN
         IF decision_run_id_value IS NULL AND TG_ARGV[3]='POSITION' THEN
             SELECT entry.decision_run_id INTO decision_run_id_value
             FROM orders entry
-            WHERE entry.trade_group_id=to_jsonb(NEW)->>'trade_group_id'
+            WHERE entry.trade_group_id=(to_jsonb(NEW)->>'trade_group_id')::uuid
               AND entry.status='FILLED' AND entry.side='BUY' AND entry.decision_run_id IS NOT NULL
             ORDER BY entry.created_at,entry.id LIMIT 1;
         END IF;
