@@ -103,15 +103,17 @@ fun JdbcTransaction.requireFullGapPopulationAdmission(operation: String) {
 fun JdbcTransaction.selectGapPopulationResumeMode(): GapPopulationResumeMode {
     if (!relationExistsForGapPopulation("gap_population_unattributed_containments")) return GapPopulationResumeMode.FULL
     return prepare(
-        "SELECT EXISTS(SELECT 1 FROM gap_population_unattributed_containments WHERE state='QUARANTINED')," +
+        "SELECT EXISTS(SELECT 1 FROM market_data_gap_recovery_progress " +
+            "WHERE phase IN ('UNATTRIBUTED_SCANNING','UNATTRIBUTED_TERMINATING'))," +
+            "EXISTS(SELECT 1 FROM gap_population_unattributed_containments WHERE state='QUARANTINED')," +
             "EXISTS(SELECT 1 FROM gap_population_unattributed_containments WHERE state IN ('DISCOVERED','TERMINALIZING'))," +
             "EXISTS(SELECT 1 FROM gap_population_unattributed_containment_works WHERE consumed_at IS NULL)",
     ).use { statement ->
         statement.executeQuery().use { rows ->
             require(rows.next())
             when {
-                rows.getBoolean(2) || rows.getBoolean(3) -> GapPopulationResumeMode.STOPPED
-                rows.getBoolean(1) -> GapPopulationResumeMode.PROTECTION_ONLY
+                rows.getBoolean(1) || rows.getBoolean(3) || rows.getBoolean(4) -> GapPopulationResumeMode.STOPPED
+                rows.getBoolean(2) -> GapPopulationResumeMode.PROTECTION_ONLY
                 else -> GapPopulationResumeMode.FULL
             }
         }
@@ -611,10 +613,27 @@ private fun JdbcTransaction.advanceGapWork(workId: UUID, now: Instant): String {
 }
 
 private fun JdbcTransaction.captureWorkPage(work: GapWorkRow, now: Instant): String {
-    if (discoverUnattributedPopulation(work, now) > 0) {
+    val unattributedProgress = selectUnattributedProgress(work.id)
+    if (unattributedProgress.phase == "UNATTRIBUTED_TERMINATING") {
+        val contained = containUnattributedPopulation(work.id, now, GAP_POPULATION_PASS_SIZE)
+        if (contained >= GAP_POPULATION_PASS_SIZE) return "CAPTURING"
+
         markWorkUnknown(work.id, "UNKNOWN_SCOPE_UNATTRIBUTED", now)
-        containUnattributedPopulation(work.id, now)
         return "UNKNOWN"
+    }
+
+    val unattributedScan = discoverUnattributedPopulation(work, unattributedProgress, now)
+    if (!unattributedScan.exhausted) return "CAPTURING"
+    if (hasUnconsumedUnattributedAttachments(work.id)) {
+        updateUnattributedProgress(
+            workId = work.id,
+            phase = "UNATTRIBUTED_TERMINATING",
+            entityType = null,
+            lastEntityId = null,
+            processedCount = unattributedScan.processedCount,
+            now = now,
+        )
+        return "CAPTURING"
     }
     val currentInserted = captureCurrentPopulation(work)
     val inserted = currentInserted + captureJournalPopulation(work, GAP_POPULATION_PASS_SIZE - currentInserted)
@@ -643,26 +662,118 @@ private fun JdbcTransaction.captureWorkPage(work: GapWorkRow, now: Instant): Str
     return applyWorkPage(work.copy(state = "SEALED"), now)
 }
 
-private fun JdbcTransaction.discoverUnattributedPopulation(work: GapWorkRow, now: Instant): Int {
+private data class UnattributedProgress(
+    val phase: String,
+    val entityType: String?,
+    val lastEntityId: String?,
+    val processedCount: Int,
+)
+
+private data class UnattributedScanResult(val exhausted: Boolean, val processedCount: Int)
+
+private fun JdbcTransaction.discoverUnattributedPopulation(
+    work: GapWorkRow,
+    progress: UnattributedProgress,
+    now: Instant,
+): UnattributedScanResult {
     var discovered = 0
-    CURRENT_POPULATION_QUERIES.forEach { population ->
-        if (!relationExistsForGapPopulation(population.table) || discovered >= GAP_POPULATION_PASS_SIZE) return@forEach
+    var processedCount = progress.processedCount
+    val initialIndex = progress.entityType?.let { type ->
+        CURRENT_POPULATION_QUERIES.indexOfFirst { population -> population.type == type }
+            .takeIf { index -> index >= 0 }
+    } ?: 0
+    var populationIndex = initialIndex
+    var lastEntityId = progress.lastEntityId
+
+    while (populationIndex < CURRENT_POPULATION_QUERIES.size) {
+        val population = CURRENT_POPULATION_QUERIES[populationIndex]
+        if (!relationExistsForGapPopulation(population.table)) {
+            populationIndex += 1
+            lastEntityId = null
+            continue
+        }
+        val remaining = GAP_POPULATION_PASS_SIZE - discovered
         val entityIds = prepare(
             "SELECT population.entity_id FROM (${population.query}) population " +
                 "WHERE (population.birth_sequence IS NULL OR population.birth_sequence <= ?) " +
+                "AND (? IS NULL OR population.entity_id > ?) " +
                 "AND NOT EXISTS (SELECT 1 FROM gap_population_entity_scopes scope " +
                 "WHERE scope.entity_type=? AND scope.entity_id=population.entity_id) " +
-                "ORDER BY population.birth_sequence NULLS FIRST,population.entity_id LIMIT ?",
+                "ORDER BY population.entity_id LIMIT ?",
         ).use { statement ->
             statement.setLong(1, work.birthUpper)
-            statement.setString(2, population.type)
-            statement.setInt(3, GAP_POPULATION_PASS_SIZE - discovered)
+            statement.setString(2, lastEntityId)
+            statement.setString(3, lastEntityId)
+            statement.setString(4, population.type)
+            statement.setInt(5, remaining)
             statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
         }
         entityIds.forEach { entityId -> attachUnattributedContainment(work.id, population.type, entityId, now) }
         discovered += entityIds.size
+        processedCount += entityIds.size
+
+        if (entityIds.size >= remaining) {
+            updateUnattributedProgress(
+                workId = work.id,
+                phase = "UNATTRIBUTED_SCANNING",
+                entityType = population.type,
+                lastEntityId = entityIds.last(),
+                processedCount = processedCount,
+                now = now,
+            )
+            return UnattributedScanResult(exhausted = false, processedCount = processedCount)
+        }
+        populationIndex += 1
+        lastEntityId = null
     }
-    return discovered
+    updateUnattributedProgress(
+        workId = work.id,
+        phase = "UNATTRIBUTED_EXHAUSTED",
+        entityType = null,
+        lastEntityId = null,
+        processedCount = processedCount,
+        now = now,
+    )
+    return UnattributedScanResult(exhausted = true, processedCount = processedCount)
+}
+
+private fun JdbcTransaction.selectUnattributedProgress(workId: UUID): UnattributedProgress = prepare(
+    "SELECT phase,entity_type,last_entity_id,processed_count FROM market_data_gap_recovery_progress WHERE work_id=?",
+).use { statement ->
+    statement.setObject(1, workId)
+    statement.executeQuery().use { rows ->
+        require(rows.next())
+        UnattributedProgress(rows.getString(1), rows.getString(2), rows.getString(3), rows.getInt(4))
+    }
+}
+
+private fun JdbcTransaction.updateUnattributedProgress(
+    workId: UUID,
+    phase: String,
+    entityType: String?,
+    lastEntityId: String?,
+    processedCount: Int,
+    now: Instant,
+) {
+    prepare(
+        "UPDATE market_data_gap_recovery_progress SET phase=?,entity_type=?,last_entity_id=?," +
+            "processed_count=?,updated_at=? WHERE work_id=?",
+    ).use { statement ->
+        statement.setString(1, phase)
+        statement.setString(2, entityType)
+        statement.setString(3, lastEntityId)
+        statement.setInt(4, processedCount)
+        statement.setLong(5, now.toEpochMilli())
+        statement.setObject(6, workId)
+        require(statement.executeUpdate() == 1)
+    }
+}
+
+private fun JdbcTransaction.hasUnconsumedUnattributedAttachments(workId: UUID): Boolean = prepare(
+    "SELECT EXISTS(SELECT 1 FROM gap_population_unattributed_containment_works WHERE work_id=? AND consumed_at IS NULL)",
+).use { statement ->
+    statement.setObject(1, workId)
+    statement.executeQuery().use { rows -> rows.next() && rows.getBoolean(1) }
 }
 
 internal fun JdbcTransaction.attachUnattributedContainment(
@@ -710,15 +821,20 @@ private fun unattributedContainmentTransition(entityType: String): String = when
     else -> error("Unsupported unattributed population: $entityType")
 }
 
-internal fun JdbcTransaction.containUnattributedPopulation(workId: UUID, now: Instant) {
+internal fun JdbcTransaction.containUnattributedPopulation(
+    workId: UUID,
+    now: Instant,
+    limit: Int = GAP_POPULATION_PASS_SIZE,
+): Int {
     val owners = prepare(
         "SELECT containment.owner_id,containment.entity_type,containment.entity_id,containment.state " +
             "FROM gap_population_unattributed_containments containment " +
             "JOIN gap_population_unattributed_containment_works attached ON attached.owner_id=containment.owner_id " +
             "WHERE attached.work_id=? AND attached.consumed_at IS NULL ORDER BY containment.entity_type,containment.entity_id " +
-            "FOR UPDATE OF containment,attached",
+            "LIMIT ? FOR UPDATE OF containment,attached",
     ).use { statement ->
         statement.setObject(1, workId)
+        statement.setInt(2, limit)
         statement.executeQuery().use { rows ->
             buildList {
                 while (rows.next()) {
@@ -749,6 +865,7 @@ internal fun JdbcTransaction.containUnattributedPopulation(workId: UUID, now: In
             completeUnattributedAttachments(owner, "CONTAINED", now)
         }
     }
+    return owners.size
 }
 
 private data class UnattributedOwner(
@@ -807,7 +924,7 @@ private fun JdbcTransaction.completeUnattributedAttachments(owner: UnattributedO
         appendGapWorkEvidence(
             attachedWorkId,
             "UNATTRIBUTED_TERMINAL_$result",
-            sha256("${owner.ownerId}:${owner.entityType}:${owner.entityId}"),
+            sha256("${owner.entityType}:$result"),
             now,
         )
     }
@@ -2072,8 +2189,12 @@ BEGIN
         IF containment IS NULL OR NOT EXISTS (
             SELECT 1 FROM gap_population_unattributed_containment_works attached
             JOIN market_data_gap_work work ON work.id=attached.work_id
+            LEFT JOIN market_data_gap_recovery_progress progress ON progress.work_id=work.id
             WHERE attached.owner_id=containment.owner_id AND attached.consumed_at IS NULL
-              AND work.state='UNKNOWN' AND work.unknown_code='UNKNOWN_SCOPE_UNATTRIBUTED'
+              AND (
+                  (work.state='UNKNOWN' AND work.unknown_code='UNKNOWN_SCOPE_UNATTRIBUTED')
+                  OR progress.phase='UNATTRIBUTED_TERMINATING'
+              )
         ) THEN RAISE EXCEPTION 'gap population entity scope is missing'; END IF;
         IF TG_ARGV[3]='ORDER' AND NOT (
             to_jsonb(OLD)->>'status' IN ('OPEN','PENDING_CANCEL')

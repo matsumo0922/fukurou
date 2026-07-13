@@ -1075,6 +1075,7 @@ class PostgresPersistenceIntegrationTest {
         val sessionId = UUID.randomUUID()
         repository.beginSession(sessionId, fixedInstant()).getOrThrow()
         repository.recordGap(sessionId, MarketDataGapReason.PROCESS_RESTART, fixedInstant().plusSeconds(1)).getOrThrow()
+        repository.recoverStaleSession(fixedInstant().plusSeconds(2)).getOrThrow()
 
         exposedTransaction(database) {
             assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE entity_type='LLM_RUN' AND entity_id='unattributed-pre-c-run' AND state='CONTAINED'", 1)
@@ -1097,6 +1098,7 @@ class PostgresPersistenceIntegrationTest {
         val sessionId = UUID.randomUUID()
         repository.beginSession(sessionId, fixedInstant()).getOrThrow()
         repository.recordGap(sessionId, MarketDataGapReason.PROCESS_RESTART, fixedInstant().plusSeconds(1)).getOrThrow()
+        repository.recoverStaleSession(fixedInstant().plusSeconds(2)).getOrThrow()
 
         exposedTransaction(database) {
             assertSqlCount(
@@ -1182,6 +1184,95 @@ class PostgresPersistenceIntegrationTest {
             )
         }
     }
+
+    @Test
+    fun unattributedDistinctOneThousandAndOneUsesDurablePopulationCursorAndContainsAcrossBoundedRetries() =
+        runPostgresTest {
+            TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+            val positionId = insertOneThousandOrdersAndNextPopulationPositionWithoutScopes(database)
+            val integrity = ExposedMarketDataIntegrityRepository(database)
+            val sessionId = UUID.randomUUID()
+            integrity.beginSession(sessionId, fixedInstant()).getOrThrow()
+            integrity.markDisconnected(
+                sessionId,
+                MarketDataGapReason.PROCESS_RESTART,
+                fixedInstant().plusSeconds(1),
+            ).getOrThrow()
+
+            assertTrue(
+                runCatching {
+                    exposedTransaction(database) {
+                        recoverGapPopulationPass(fixedInstant().plusSeconds(2))
+                        error("injected crash after first unattributed scan page")
+                    }
+                }.isFailure,
+            )
+            exposedTransaction(database) {
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments", 0)
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containment_works", 0)
+                assertSqlCount(
+                    "SELECT COUNT(*) FROM market_data_gap_recovery_progress progress " +
+                        "JOIN market_data_gap_work work ON work.id=progress.work_id " +
+                        "WHERE work.session_id='$sessionId' AND progress.phase='CAPTURING' " +
+                        "AND progress.entity_type IS NULL AND progress.last_entity_id IS NULL",
+                    1,
+                )
+            }
+
+            integrity.recoverStaleSession(fixedInstant().plusSeconds(3)).getOrThrow()
+            exposedTransaction(database) {
+                assertEquals(GapPopulationResumeMode.STOPPED, selectGapPopulationResumeMode())
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE entity_type='ORDER'", 1_000)
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE entity_type='POSITION'", 0)
+                assertSqlCount(
+                    "SELECT COUNT(*) FROM market_data_gap_recovery_progress progress " +
+                        "JOIN market_data_gap_work work ON work.id=progress.work_id " +
+                        "WHERE work.session_id='$sessionId' AND progress.phase='UNATTRIBUTED_SCANNING' " +
+                        "AND progress.entity_type='ORDER' AND progress.last_entity_id IS NOT NULL " +
+                        "AND progress.processed_count=1000",
+                    1,
+                )
+            }
+
+            integrity.recoverStaleSession(fixedInstant().plusSeconds(4)).getOrThrow()
+            exposedTransaction(database) {
+                assertEquals(GapPopulationResumeMode.STOPPED, selectGapPopulationResumeMode())
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments", 1_001)
+                assertSqlCount(
+                    "SELECT COUNT(*) FROM market_data_gap_recovery_progress progress " +
+                        "JOIN market_data_gap_work work ON work.id=progress.work_id " +
+                        "WHERE work.session_id='$sessionId' AND progress.phase='UNATTRIBUTED_TERMINATING' " +
+                        "AND progress.processed_count=1001",
+                    1,
+                )
+            }
+
+            integrity.recoverStaleSession(fixedInstant().plusSeconds(5)).getOrThrow()
+            exposedTransaction(database) {
+                assertEquals(GapPopulationResumeMode.STOPPED, selectGapPopulationResumeMode())
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE state='CONTAINED'", 1_000)
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE state='QUARANTINED'", 1)
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containment_works WHERE consumed_at IS NULL", 1)
+            }
+
+            integrity.recoverStaleSession(fixedInstant().plusSeconds(6)).getOrThrow()
+            integrity.recoverStaleSession(fixedInstant().plusSeconds(7)).getOrThrow()
+            exposedTransaction(database) {
+                assertEquals(GapPopulationResumeMode.PROTECTION_ONLY, selectGapPopulationResumeMode())
+                assertSqlCount("SELECT COUNT(*) FROM orders WHERE status='CANCELED' AND cancel_reason='gap_scope_unattributed'", 1_000)
+                assertSqlCount("SELECT COUNT(*) FROM positions WHERE id='$positionId' AND status='OPEN'", 1)
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE attempt_count=1", 1_000)
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containment_works WHERE consumed_at IS NOT NULL", 1_001)
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containment_works", 1_001)
+                assertSqlCount("SELECT COUNT(DISTINCT owner_id) FROM gap_population_unattributed_containment_works", 1_001)
+                assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE state='QUARANTINED' AND attempt_count=0", 1)
+                assertSqlCount(
+                    "SELECT COUNT(*) FROM market_data_gap_work WHERE session_id='$sessionId' " +
+                        "AND state='UNKNOWN' AND unknown_code='UNKNOWN_SCOPE_UNATTRIBUTED'",
+                    1,
+                )
+            }
+        }
 
     @Test
     fun unattributedMissingOwnerAndForbiddenTerminalTransitionsAreRejectedForAllSixPopulations() = runPostgresTest {
@@ -7810,6 +7901,56 @@ private fun insertUnattributedContainmentWorks(database: ExposedDatabase, count:
         }
     }
     return workIds
+}
+
+private fun insertOneThousandOrdersAndNextPopulationPositionWithoutScopes(database: ExposedDatabase): UUID {
+    val positionId = UUID.randomUUID()
+    exposedTransaction(database) {
+        acquireGapPopulationGenerationToken()
+        val epochId = prepare("SELECT current_epoch_id FROM paper_account WHERE id=1").use { statement ->
+            statement.executeQuery().use { rows ->
+                assertTrue(rows.next())
+                rows.getObject(1, UUID::class.java)
+            }
+        }
+        prepare(
+            """
+            INSERT INTO orders(
+                id,account_epoch_id,execution_semantics_version,trade_group_id,mode,symbol,side,
+                order_type,status,size_btc,reason_ja,created_at,updated_at
+            )
+            SELECT gen_random_uuid(),?,'PAPER_WS_V1',gen_random_uuid(),'PAPER','BTC','BUY',
+                'LIMIT','OPEN',0.01,'pagination fixture',?,?
+            FROM generate_series(1,1000)
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, epochId)
+            statement.setLong(2, fixedInstant().toEpochMilli())
+            statement.setLong(3, fixedInstant().toEpochMilli())
+            assertEquals(1_000, statement.executeUpdate())
+        }
+        prepare(
+            "INSERT INTO positions(id,account_epoch_id,trade_group_id,mode,symbol,side,status,opened_at,size_btc," +
+                "average_entry_price_jpy,current_price_jpy,current_stop_loss_jpy,unrealized_pnl_jpy,unrealized_r," +
+                "pyramid_add_count,highest_price_since_entry_jpy,lowest_price_since_entry_jpy) " +
+                "VALUES (?,?,?,'PAPER','BTC','LONG','OPEN',?,0.01,10000000,10000000,9800000,0,0,0,10000000,10000000)",
+        ).use { statement ->
+            statement.setObject(1, positionId)
+            statement.setObject(2, epochId)
+            statement.setObject(3, UUID.randomUUID())
+            statement.setLong(4, fixedInstant().toEpochMilli())
+            assertEquals(1, statement.executeUpdate())
+        }
+        executeUpdate("ALTER TABLE gap_population_entity_scopes DISABLE TRIGGER gap_population_entity_scope_immutable")
+        executeUpdate(
+            "DELETE FROM gap_population_entity_scopes WHERE entity_type='ORDER' " +
+                "OR (entity_type='POSITION' AND entity_id='$positionId')",
+        )
+        executeUpdate("ALTER TABLE gap_population_entity_scopes ENABLE TRIGGER gap_population_entity_scope_immutable")
+        executeUpdate("UPDATE orders SET birth_sequence=NULL")
+        executeUpdate("UPDATE positions SET birth_sequence=NULL WHERE id='$positionId'")
+    }
+    return positionId
 }
 
 private data class UnattributedEconomicSnapshot(
