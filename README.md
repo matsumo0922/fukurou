@@ -13,6 +13,7 @@ paper trading の基準資金は immutable な account epoch で管理する。f
 - LLM は CLI（`claude` / `codex`）シェルアウトで実行（サブスク利用）
 - 取引・監査ログは PostgreSQL を正本にし、Obsidian Writer / Reflection Runner が人間向けノートを生成する
 - LLM run の終了理由は stable な terminal cause で記録し、daemon は in-flight invocation を supersede せず blocker を監査する
+- LLM daemon の automatic launch は、毎週土曜日 09:00〜11:00 JST の GMO 定期メンテナンス窓と Public status が `OPEN` でない期間を reservation 前に抑止する。reservation 成功直後と child 呼び出し直前にも定期窓を再確認し、窓へ入った場合は reservation を terminal にして child を起動しない。status timeout・不正 response・transport failure も fail closed とし、`DAEMON_LAUNCH_SUPPRESSED` を strategy の `NO_TRADE` と分離して記録する
 
 ## 安全床
 
@@ -110,6 +111,8 @@ current-context WebSocket は `.env` の `FUKUROU_PUBLIC_ORIGIN=http://localhost
 WebUI の `Config` 画面（`/app/config`）は `/ops/runtime-config` を表示します。Runtime group は Proposer / Falsifier ごとの provider、model、reasoning effort を含む draft 編集、diff preview、validation、activate、rollback を扱います。provider と effort は catalog 候補から選択し、model が空なら CLI 側の既定を使います。Deployment group は read-only で表示し、Secrets group は設定有無だけを表示します。warning がある場合は validation error を i18n 表示し、復旧操作の入口を維持します。secret 値は API response と画面のどちらにも出しません。
 
 WebUI の `Activity` 画面（`/app/activity`）は `/ops/runs` の decision run 一覧を新しい順に cursor pagination で表示し、server-side の `filter` query で outcome を目的別に絞り込みます。正常な未約定 BUY LIMIT/STOP は「約定待ち」、期限到達から reconciler の通常処理猶予内は「期限到達・取消処理中」、猶予を超えても `OPEN` の order は「期限超過・未取消」、TTL 取消済み order は「期限切れ・取消済み」、通常取消は「取消済み」と表示し、protective SELL order や process failure と区別します。process failure は outcome と独立した marker で表示し、`ACTION_REQUIRED` filter でも取得できます。SafetyFloor 拒否、RUNNING、TTL 取消、通常取消はそれぞれ専用 filter を持ちます。一覧と詳細の top-level `latestMarketQuote` は `ProtectionReconciler` が取得した ticker の best bid/ask と取引所時刻を共有 store から返し、API request は市場データを再取得しません。参考気配は現在の表示用であり、run 時点の価格や paper fill の根拠ではありません。filter 指定時の API は 1 request あたり最大 1,000 raw run を走査し、上限到達時は最後に走査した raw run の `nextBefore` を返します。run 詳細の FILLED は、run が作成した order の保存済み entry execution と同じ position の後続 execution だけを時刻順に表示し、execution 証跡がない約定を推定しません。後続 execution は side を含めて分類し、別 run の BUY による add-long は決済ではなく position 追加 entry として表示します。未約定詳細は注文条件、期限、安全性、処理経路の通常区画で表示します。run ID は完全一致検索でき、検索結果は現在の filter / pagination に依存しません。通常取消は対象 order の run と取消を実行した actor run を `canceledByDecisionRunId` で追跡します。TTL 取消の監視遅延が通常処理猶予を超えた order は「監視遅延・評価対象外」とし、勝率、EV、profit factor などの strategy metrics へ含めません。`expiresAt` がない legacy order は期限を推定せず「期限記録なし」と表示します。raw/debug projection は保存済み JSON payload をそのまま公開せず、公開可能な識別子・event type・状態だけを返します。既存の `/ops/activity` と `/ops/activity/catalog` は互換 API として残ります。
+
+`/ops/activity` と Activity catalog は `DAEMON_LAUNCH_SUPPRESSED` と typed infrastructure reason を公開し、日英の label / description を持ちます。この event は evaluation report の `NO_TRADE` 母集団へ含めません。
 
 Activity は Proposer / Falsifier ごとの phase audit から configured model / effort、rendered effort、observed model を別々に表示し、configured model を usage や cost attribution に使いません。
 

@@ -25,6 +25,7 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
+import me.matsumo.fukurou.trading.daemon.GmoLlmDaemonLaunchAvailability
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
@@ -35,6 +36,7 @@ import me.matsumo.fukurou.trading.daemon.toLlmDaemonEntryFillOrNull
 import me.matsumo.fukurou.trading.exchange.gmo.CommandEventLogGmoPublicRequestAuditSink
 import me.matsumo.fukurou.trading.exchange.gmo.DeferredGmoPublicRequestAuditSink
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
+import me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatusReader
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
@@ -223,6 +225,7 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
             entryFillReader = components.paperLedgerRepository.entryFillReader(),
             restingOrderMaintenanceService = restingMaintenance,
             episodeLifecycleObserver = restingMaintenance,
+            launchAvailability = createLlmDaemonLaunchAvailability(components.marketDataSource),
         ),
         runtime = LlmDaemonSchedulerRuntime(
             requestBase = components.requestBase,
@@ -231,6 +234,11 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
             clock = inputs.clock,
         ),
     )
+}
+
+/** production scheduler だけへ GMO availability gate を構成する。 */
+internal fun createLlmDaemonLaunchAvailability(statusReader: GmoExchangeStatusReader): GmoLlmDaemonLaunchAvailability {
+    return GmoLlmDaemonLaunchAvailability(statusReader)
 }
 
 /** production scheduler と test が共有する resting maintenance composition。 */

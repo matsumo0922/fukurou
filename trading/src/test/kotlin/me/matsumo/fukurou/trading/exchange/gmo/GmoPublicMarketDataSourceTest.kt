@@ -2,6 +2,8 @@ package me.matsumo.fukurou.trading.exchange.gmo
 
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.daemon.GmoLlmDaemonLaunchAvailability
+import me.matsumo.fukurou.trading.daemon.LlmDaemonLaunchSuppressionReason
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -21,6 +23,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpHeaders
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.net.http.HttpTimeoutException
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -36,12 +39,169 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 /**
  * GMO Public market data source の parser と stitching を検証するテスト。
  */
 class GmoPublicMarketDataSourceTest {
+
+    @Test
+    fun parseStatusResponse_returnsAllDocumentedStatuses() {
+        assertEquals(GmoExchangeStatus.OPEN, parseStatusResponse(statusResponse("OPEN")))
+        assertEquals(GmoExchangeStatus.MAINTENANCE, parseStatusResponse(statusResponse("MAINTENANCE")))
+        assertEquals(GmoExchangeStatus.PREOPEN, parseStatusResponse(statusResponse("PREOPEN")))
+    }
+
+    @Test
+    fun parseStatusResponse_rejectsMalformedOrUnknownStatus() {
+        assertFailsWith<MarketDataParseException> {
+            parseStatusResponse("{not-json")
+        }
+        assertFailsWith<MarketDataParseException> {
+            parseStatusResponse(statusResponse("UNKNOWN"))
+        }
+    }
+
+    @Test
+    fun readStatus_usesTypedAuditOperationAndEndpoint() = runBlocking {
+        val auditSink = RecordingRequestAuditSink()
+        val dataSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(mapOf("" to statusResponse("OPEN"))),
+            requestAuditSink = auditSink,
+        )
+
+        assertEquals(GmoExchangeStatus.OPEN, dataSource.readStatus().getOrThrow())
+        assertEquals(GmoPublicOperation.GET_STATUS, auditSink.events.single().operation)
+        assertEquals(GmoPublicEndpoint.STATUS, auditSink.events.single().endpoint)
+        assertEquals(1, auditSink.events.single().maxAttempts)
+    }
+
+    @Test
+    fun readStatus_preservesTimeoutAndTransportFailures() = runBlocking {
+        val timeout = fakeMarketDataSource(
+            FakeHttpClient(
+                responses = emptyMap(),
+                failure = HttpTimeoutException("timeout"),
+            ),
+        ).readStatus().exceptionOrNull()
+        val transport = fakeMarketDataSource(
+            FakeHttpClient(
+                responses = emptyMap(),
+                failure = IOException("connection reset"),
+            ),
+        ).readStatus().exceptionOrNull()
+
+        assertIs<MarketNetworkException>(timeout)
+        assertIs<HttpTimeoutException>(timeout.cause)
+        assertIs<MarketNetworkException>(transport)
+        assertIs<IOException>(transport.cause)
+        Unit
+    }
+
+    @Test
+    fun readStatus_nonSuccessGmoStatusIsDeterministicAndUsesOneHttpAttempt() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf("" to statusErrorResponse("ERR-5201")),
+        )
+        val dataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(maxAttempts = 3),
+        )
+
+        val failure = dataSource.readStatus().exceptionOrNull()
+
+        assertIs<GmoApiStatusException>(failure)
+        assertEquals(1, failure.status)
+        assertEquals(1, httpClient.requestCount)
+    }
+
+    @Test
+    fun readStatus_temporaryFailureUsesOneHttpAttempt() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = emptyMap(),
+            failure = IOException("connection reset"),
+        )
+        val dataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(maxAttempts = 2),
+        )
+
+        assertIs<MarketNetworkException>(dataSource.readStatus().exceptionOrNull())
+        assertEquals(1, httpClient.requestCount)
+    }
+
+    @Test
+    fun readStatus_requestAuditFailureStopsAfterOneHttpAttempt() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf("" to statusResponse("OPEN")),
+        )
+        val dataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(maxAttempts = 3),
+            requestAuditSink = GmoPublicRequestAuditSink { Result.failure(IllegalStateException("secret")) },
+        )
+
+        assertIs<GmoRequestAuditException>(dataSource.readStatus().exceptionOrNull())
+        assertEquals(1, httpClient.requestCount)
+    }
+
+    @Test
+    fun readStatus_failuresUseOneAttemptPerCacheMissAndRetryAtSixtySeconds() = runBlocking {
+        assertStatusFailureCache(
+            responses = emptyMap(),
+            failure = IOException("connection reset"),
+            requestAuditSink = NoopGmoPublicRequestAuditSink,
+            expectedReason = LlmDaemonLaunchSuppressionReason.STATUS_TRANSPORT_FAILURE,
+        )
+        assertStatusFailureCache(
+            responses = emptyMap(),
+            failure = HttpTimeoutException("timeout"),
+            requestAuditSink = NoopGmoPublicRequestAuditSink,
+            expectedReason = LlmDaemonLaunchSuppressionReason.STATUS_TIMEOUT,
+        )
+        assertStatusFailureCache(
+            responses = mapOf("" to statusErrorResponse("ERR-5201")),
+            failure = null,
+            requestAuditSink = NoopGmoPublicRequestAuditSink,
+            expectedReason = LlmDaemonLaunchSuppressionReason.STATUS_MALFORMED,
+        )
+        assertStatusFailureCache(
+            responses = mapOf("" to statusResponse("OPEN")),
+            failure = null,
+            requestAuditSink = GmoPublicRequestAuditSink { Result.failure(IllegalStateException("secret")) },
+            expectedReason = LlmDaemonLaunchSuppressionReason.STATUS_TRANSPORT_FAILURE,
+        )
+    }
+
+    private suspend fun assertStatusFailureCache(
+        responses: Map<String, String>,
+        failure: IOException?,
+        requestAuditSink: GmoPublicRequestAuditSink,
+        expectedReason: LlmDaemonLaunchSuppressionReason,
+    ) {
+        val httpClient = FakeHttpClient(responses, failure = failure)
+        val monotonicTimeSource = MutableMonotonicTimeSource()
+        val availability = GmoLlmDaemonLaunchAvailability(
+            statusReader = fakeMarketDataSource(
+                httpClient = httpClient,
+                retryConfig = GmoRetryConfig(maxAttempts = 4),
+                requestAuditSink = requestAuditSink,
+            ),
+            monotonicTimeSource = monotonicTimeSource,
+        )
+        val observedAt = Instant.parse("2026-07-13T00:00:00Z")
+
+        assertEquals(expectedReason, availability.statusSuppressionAt(observedAt))
+        assertEquals(1, httpClient.requestCount)
+        monotonicTimeSource.advance(Duration.ofSeconds(59))
+        assertEquals(expectedReason, availability.statusSuppressionAt(observedAt))
+        assertEquals(1, httpClient.requestCount)
+        monotonicTimeSource.advance(Duration.ofSeconds(1))
+        assertEquals(expectedReason, availability.statusSuppressionAt(observedAt))
+        assertEquals(2, httpClient.requestCount)
+    }
 
     @Test
     fun parseTickerResponse_returnsTicker() {
@@ -807,6 +967,31 @@ private fun klineResponse(vararg openTimes: String): String {
     """.trimIndent()
 }
 
+private fun statusResponse(status: String): String {
+    return """
+    {
+      "status": 0,
+      "data": {
+        "status": "$status"
+      }
+    }
+    """.trimIndent()
+}
+
+private fun statusErrorResponse(messageCode: String): String {
+    return """
+    {
+      "status": 1,
+      "messages": [
+        {
+          "message_code": "$messageCode",
+          "message_string": "status unavailable"
+        }
+      ]
+    }
+    """.trimIndent()
+}
+
 private fun fakeMarketDataSource(
     httpClient: FakeHttpClient,
     clock: Clock = Clock.fixed(Instant.parse("2026-01-02T00:00:00Z"), ZoneOffset.UTC),
@@ -860,6 +1045,7 @@ private class FakeHttpClient(
      * 呼び出された query の一覧。
      */
     val requestQueries = mutableListOf<String>()
+    var requestCount: Int = 0
     private val responseIndexes = mutableMapOf<String, Int>()
 
     override fun cookieHandler(): Optional<CookieHandler> {
@@ -902,6 +1088,7 @@ private class FakeHttpClient(
         request: HttpRequest,
         responseBodyHandler: HttpResponse.BodyHandler<ResponseBody>,
     ): HttpResponse<ResponseBody> {
+        requestCount += 1
         failure?.let { throw it }
 
         val query = request.uri().rawQuery.orEmpty()

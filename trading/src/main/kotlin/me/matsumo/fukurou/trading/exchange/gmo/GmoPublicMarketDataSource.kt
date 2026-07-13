@@ -75,6 +75,11 @@ private const val GMO_KLINES_PATH = "/v1/klines"
 private const val GMO_SYMBOLS_PATH = "/v1/symbols"
 
 /**
+ * GMO コイン Public status endpoint。
+ */
+private const val GMO_STATUS_PATH = "/v1/status"
+
+/**
  * GMO trades request の既定 page。
  */
 private const val DEFAULT_TRADES_PAGE = 1
@@ -222,7 +227,7 @@ class GmoPublicMarketDataSource(
     ),
     private val sleeper: GmoSleeper = ThreadSleepingGmoSleeper,
     private val monotonicTimeSource: GmoMonotonicTimeSource = SystemGmoMonotonicTimeSource,
-) : MarketDataSource {
+) : MarketDataSource, GmoExchangeStatusReader {
 
     private val clientInstanceId = newGmoAuditId()
 
@@ -275,11 +280,22 @@ class GmoPublicMarketDataSource(
             readCachedSymbolRules(symbol) ?: fetchAndCacheSymbolRules(symbol)
         }
 
+    override suspend fun readStatus(): Result<GmoExchangeStatus> = runMarketRequest(
+        operation = GmoPublicOperation.GET_STATUS,
+        maxAttempts = 1,
+    ) {
+        val request = buildStatusRequest()
+        val responseBody = sendRequest(request, GmoPublicEndpoint.STATUS)
+
+        parseStatusResponse(responseBody, json)
+    }
+
     private suspend fun <T> runMarketRequest(
         operation: GmoPublicOperation,
+        maxAttempts: Int = retryConfig.maxAttempts,
         block: suspend GmoRequestScope.() -> T,
     ): Result<T> = withContext(Dispatchers.IO) {
-        val scope = GmoRequestScope(operation)
+        val scope = GmoRequestScope(operation, maxAttempts)
 
         runCatching {
             executeWithRetry(scope, block)
@@ -293,12 +309,12 @@ class GmoPublicMarketDataSource(
         var nextBackoff = retryConfig.initialBackoff
         var lastFailure: Throwable? = null
 
-        while (attemptNumber <= retryConfig.maxAttempts) {
+        while (attemptNumber <= scope.maxAttempts) {
             scope.attempt = attemptNumber
             try {
                 return scope.block()
             } catch (exception: MarketDataException) {
-                if (!shouldRetry(exception, attemptNumber)) {
+                if (!shouldRetry(exception, attemptNumber, scope.maxAttempts)) {
                     throw exception
                 }
 
@@ -316,8 +332,12 @@ class GmoPublicMarketDataSource(
         }
     }
 
-    private fun shouldRetry(throwable: Throwable, attemptNumber: Int): Boolean {
-        val hasAttemptLeft = attemptNumber < retryConfig.maxAttempts
+    private fun shouldRetry(
+        throwable: Throwable,
+        attemptNumber: Int,
+        maxAttempts: Int,
+    ): Boolean {
+        val hasAttemptLeft = attemptNumber < maxAttempts
         val isTemporary = throwable is MarketDataException && throwable.kind == MarketDataFailureKind.TEMPORARY
 
         return hasAttemptLeft && isTemporary
@@ -352,6 +372,10 @@ class GmoPublicMarketDataSource(
 
     private fun buildSymbolsRequest(): HttpRequest {
         return buildGetRequest(GMO_SYMBOLS_PATH)
+    }
+
+    private fun buildStatusRequest(): HttpRequest {
+        return buildGetRequest(GMO_STATUS_PATH)
     }
 
     private fun buildGetRequest(pathAndQuery: String): HttpRequest {
@@ -511,7 +535,7 @@ class GmoPublicMarketDataSource(
             operation = operation,
             endpoint = endpoint,
             attempt = attempt,
-            maxAttempts = retryConfig.maxAttempts,
+            maxAttempts = maxAttempts,
             requestSequence = requestSequence,
             requestStartedAt = requestStartedAt.toString(),
             completedAt = completedAt.toString(),
@@ -660,7 +684,7 @@ class GmoPublicMarketDataSource(
         }
     }
 
-    private inner class GmoRequestScope(val operation: GmoPublicOperation) {
+    private inner class GmoRequestScope(val operation: GmoPublicOperation, val maxAttempts: Int) {
         val operationId: String = newGmoAuditId()
         var attempt: Int = 1
         var requestSequence: Int = 0
@@ -874,6 +898,34 @@ fun parseSymbolsResponse(
     return symbolRules
 }
 
+/** GMO Public API が返す取引所 status。 */
+enum class GmoExchangeStatus {
+    /** 通常稼働中。 */
+    OPEN,
+
+    /** メンテナンス中。 */
+    MAINTENANCE,
+
+    /** メンテナンス後の注文取消だけを受け付ける状態。 */
+    PREOPEN,
+}
+
+/** GMO status を読み取る境界。 */
+fun interface GmoExchangeStatusReader {
+    /** 現在の取引所 status を返す。 */
+    suspend fun readStatus(): Result<GmoExchangeStatus>
+}
+
+/** GMO status response を typed status へ変換する。 */
+fun parseStatusResponse(responseBody: String, json: Json = GmoPublicApiJson): GmoExchangeStatus {
+    val response = decodeResponse<GmoStatusResponse>(responseBody, "status", json)
+
+    validateGmoStatus(response.status, response.messages, "status")
+
+    return GmoExchangeStatus.entries.firstOrNull { status -> status.name == response.data.status }
+        ?: throw MarketDataParseException("GMO status response included an unknown exchange status.")
+}
+
 private inline fun <reified T> decodeResponse(
     responseBody: String,
     endpointName: String,
@@ -1028,6 +1080,20 @@ private data class GmoMessage(
     val messageCode: String? = null,
     @SerialName("message_string")
     val messageString: String? = null,
+)
+
+/** GMO status response。 */
+@Serializable
+private data class GmoStatusResponse(
+    val status: Int,
+    val data: GmoStatusData = GmoStatusData(),
+    val messages: List<GmoMessage> = emptyList(),
+)
+
+/** GMO status response の data。 */
+@Serializable
+private data class GmoStatusData(
+    val status: String = "",
 )
 
 /**

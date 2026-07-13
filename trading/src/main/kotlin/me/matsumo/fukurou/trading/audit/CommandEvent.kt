@@ -89,6 +89,11 @@ enum class CommandEventType {
     DAEMON_TRIGGER_SKIPPED,
 
     /**
+     * LLM daemon scheduler が取引所 infrastructure により自動起動を抑止した。
+     */
+    DAEMON_LAUNCH_SUPPRESSED,
+
+    /**
      * LLM daemon scheduler が one-shot 起動予約を取得した。
      */
     DAEMON_TRIGGER_LAUNCHED,

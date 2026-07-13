@@ -103,6 +103,11 @@
       "descriptionKey": "activity.catalog.audit.daemonTriggerSkipped.description"
     },
     {
+      "value": "DAEMON_LAUNCH_SUPPRESSED",
+      "labelKey": "activity.catalog.audit.daemonLaunchSuppressed.label",
+      "descriptionKey": "activity.catalog.audit.daemonLaunchSuppressed.description"
+    },
+    {
       "value": "DAEMON_TRIGGER_LAUNCHED",
       "labelKey": "activity.catalog.audit.daemonTriggerLaunched.label",
       "descriptionKey": "activity.catalog.audit.daemonTriggerLaunched.description"
