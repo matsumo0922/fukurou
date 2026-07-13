@@ -341,7 +341,51 @@ static int model_value_allowed(const char *value) {
     return 1;
 }
 
-static int claude_arguments_allowed(struct launch_request *request, char **arguments) {
+static int canonical_identifier(const char *value, size_t maximum) {
+    size_t length = strlen(value);
+    if (length == 0 || length > maximum) return 0;
+    for (size_t index = 0; index < length; index++) {
+        unsigned char current = (unsigned char)value[index];
+        if (!(isalnum(current) || current == '.' || current == '_' || current == ':' || current == '-')) return 0;
+    }
+    return 1;
+}
+
+static int canonical_run_directory(const char *value, const char *prefix) {
+    static const char *root = "/run/fukurou/llm-homes/";
+    size_t root_length = strlen(root), prefix_length = strlen(prefix);
+    if (strncmp(value, root, root_length) != 0 || strncmp(value + root_length, prefix, prefix_length) != 0) return 0;
+    const char *suffix = value + root_length + prefix_length;
+    if (*suffix == '\0' || strstr(suffix, "..") != NULL || strchr(suffix, '/') != NULL) return 0;
+    for (const char *cursor = suffix; *cursor != '\0'; cursor++) {
+        if (!(isalnum((unsigned char)*cursor) || *cursor == '-' || *cursor == '_')) return 0;
+    }
+    return strlen(value) <= 256;
+}
+
+static int canonical_claude_config_path(const char *path, const char *home) {
+    if (path == NULL || home == NULL) return 0;
+    size_t home_length = strlen(home);
+    if (!canonical_run_directory(home, "fukurou-llm-config-") || strncmp(path, home, home_length) != 0 ||
+        path[home_length] != '/' || strstr(path, "..") != NULL) return 0;
+    const char *name = path + home_length + 1;
+    static const char *prefix = "claude-mcp-config";
+    size_t length = strlen(name), prefix_length = strlen(prefix);
+    if (length <= prefix_length + 5 || strcmp(name + length - 5, ".json") != 0 ||
+        strncmp(name, prefix, prefix_length) != 0) return 0;
+    for (size_t index = prefix_length; index < length - 5; index++) {
+        if (!(isalnum((unsigned char)name[index]) || name[index] == '-' || name[index] == '_')) return 0;
+    }
+    return 1;
+}
+
+static int exact_mcp_tool_allowlist(const char *value) {
+    static const char *proposer = "mcp__fukurou-mcp__get_trade_intent,mcp__fukurou-mcp__get_ticker,mcp__fukurou-mcp__get_candles,mcp__fukurou-mcp__get_orderbook,mcp__fukurou-mcp__get_trades,mcp__fukurou-mcp__get_symbol_rules,mcp__fukurou-mcp__calc_indicator,mcp__fukurou-mcp__get_balance,mcp__fukurou-mcp__get_positions,mcp__fukurou-mcp__get_open_orders,mcp__fukurou-mcp__get_account_status,mcp__fukurou-mcp__knowledge_get_recent_lessons,mcp__fukurou-mcp__knowledge_search_similar_setups,mcp__fukurou-mcp__submit_decision";
+    static const char *falsifier = "mcp__fukurou-mcp__get_trade_intent,mcp__fukurou-mcp__preview_order,mcp__fukurou-mcp__get_ticker,mcp__fukurou-mcp__get_candles,mcp__fukurou-mcp__get_orderbook,mcp__fukurou-mcp__get_trades,mcp__fukurou-mcp__get_symbol_rules,mcp__fukurou-mcp__calc_indicator,mcp__fukurou-mcp__get_balance,mcp__fukurou-mcp__get_positions,mcp__fukurou-mcp__get_open_orders,mcp__fukurou-mcp__get_account_status,mcp__fukurou-mcp__knowledge_get_recent_lessons,mcp__fukurou-mcp__knowledge_search_similar_setups,mcp__fukurou-mcp__submit_falsification";
+    return *value == '\0' || strcmp(value, proposer) == 0 || strcmp(value, falsifier) == 0;
+}
+
+static int claude_arguments_allowed(struct launch_request *request, char **arguments, char **environment) {
     size_t index = 0;
     if (request->header.argc < 15 || strcmp(arguments[index++], "claude") != 0 || strcmp(arguments[index++], "-p") != 0 ||
         !bounded_text(arguments[index++], 32768)) return 0;
@@ -355,10 +399,13 @@ static int claude_arguments_allowed(struct launch_request *request, char **argum
     }
     if (index < request->header.argc && strcmp(arguments[index], "--bare") == 0) index++;
     if (index + 12 != request->header.argc || strcmp(arguments[index++], "--mcp-config") != 0 ||
-        strncmp(arguments[index], "/run/fukurou/llm-homes/", 24) != 0 || !bounded_text(arguments[index++], 256) ||
+        !canonical_claude_config_path(arguments[index], environment_value(environment, "CLAUDE_CONFIG_DIR")) ||
+        !bounded_text(arguments[index++], 256) ||
         strcmp(arguments[index++], "--strict-mcp-config") != 0 || strcmp(arguments[index++], "--allowedTools") != 0 ||
-        strlen(arguments[index++]) > 512 || strcmp(arguments[index++], "--tools") != 0 || strlen(arguments[index++]) > 64 ||
-        strcmp(arguments[index++], "--permission-mode") != 0 || strcmp(arguments[index++], "dontAsk") != 0 ||
+        !exact_mcp_tool_allowlist(arguments[index++]) || strcmp(arguments[index++], "--tools") != 0) return 0;
+    if (strcmp(arguments[index], "ToolSearch") != 0 && strcmp(arguments[index], "") != 0) return 0;
+    index++;
+    if (strcmp(arguments[index++], "--permission-mode") != 0 || strcmp(arguments[index++], "dontAsk") != 0 ||
         strcmp(arguments[index++], "--output-format") != 0 || strcmp(arguments[index++], "json") != 0 ||
         strcmp(arguments[index++], "--no-session-persistence") != 0) return 0;
     return index == request->header.argc;
@@ -405,6 +452,21 @@ static int environment_entries_allowed(uint16_t profile, char **environment, uin
                 environment[previous][name_length] == '=') return 0;
         }
     }
+    const char *invocation_id = environment_value(environment, "FUKUROU_INVOCATION_ID");
+    if (!canonical_identifier(invocation_id == NULL ? "" : invocation_id, 128)) return 0;
+    if (profile == FUKUROU_PROFILE_MCP_CURRENT_V1) {
+        return environment_count == 2 &&
+            strcmp(environment[0], "PATH=/opt/java/openjdk/bin:/usr/bin:/bin") == 0 &&
+            strncmp(environment[1], "FUKUROU_INVOCATION_ID=", 22) == 0;
+    }
+    if (profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1) {
+        const char *home = environment_value(environment, "CLAUDE_CONFIG_DIR");
+        if (home == NULL || !canonical_run_directory(home, "fukurou-llm-config-")) return 0;
+    }
+    if (profile == FUKUROU_PROFILE_CODEX_CURRENT_V1) {
+        const char *home = environment_value(environment, "CODEX_HOME");
+        if (home == NULL || !canonical_run_directory(home, "fukurou-codex-home-")) return 0;
+    }
     return 1;
 }
 
@@ -412,7 +474,7 @@ static int request_shape_allowed(struct launch_request *request, char **argument
     if ((request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 || request->header.profile == FUKUROU_PROFILE_CODEX_CURRENT_V1) &&
         request->header.fd_role_bitmap == 0x7U &&
         strcmp(arguments[0], request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 ? "claude" : "codex") == 0) {
-        if (request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 ? !claude_arguments_allowed(request, arguments) : !codex_arguments_allowed(request, arguments)) return 0;
+        if (request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 ? !claude_arguments_allowed(request, arguments, environment) : !codex_arguments_allowed(request, arguments)) return 0;
     } else if (request->header.profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1 && request->header.fd_role_bitmap == 0x7U &&
         request->header.argc == 4 && strcmp(arguments[0], "node") == 0 &&
         strcmp(arguments[1], "/usr/local/libexec/fukurou-mcp-canary-client.mjs") == 0) {
@@ -515,6 +577,7 @@ static void accept_launch(int listener) {
         }
         if (setgroups(0, NULL) != 0 || setresgid(credentials.gid, credentials.gid, credentials.gid) != 0 ||
             setresuid(credentials.uid, credentials.uid, credentials.uid) != 0) _exit(126);
+        umask(0007);
         close_range(request.descriptor_count, ~0U, 0);
         execve(executable, arguments, environment);
         _exit(126);
@@ -767,6 +830,159 @@ static int protocol_reject_case(unsigned case_id) {
     return rejected ? 0 : -1;
 }
 
+enum accept_selftest_case {
+    ACCEPT_BASELINE,
+    ACCEPT_PATH_TRAVERSAL,
+    ACCEPT_ROOT_HOME,
+    ACCEPT_UNKNOWN_OPTION,
+    ACCEPT_ARGUMENT_PERMUTATION,
+    ACCEPT_DUPLICATE_ARGUMENT,
+    ACCEPT_TRAILING_PAYLOAD,
+    ACCEPT_UNKNOWN_ANCILLARY,
+    ACCEPT_NONCE_REPLAY,
+    ACCEPT_JOB_FULL,
+    ACCEPT_RECEIPT_FAILURE,
+};
+
+static int append_launch_item(char *payload, size_t *offset, const char *value) {
+    size_t length = strlen(value);
+    if (length > UINT16_MAX || *offset + sizeof(uint16_t) + length + 1 > FUKUROU_PROTOCOL_MAX_PAYLOAD) return -1;
+    uint16_t encoded_length = (uint16_t)length;
+    memcpy(payload + *offset, &encoded_length, sizeof(encoded_length));
+    *offset += sizeof(encoded_length);
+    memcpy(payload + *offset, value, length + 1);
+    *offset += length + 1;
+    return 0;
+}
+
+static int send_accept_selftest_request(const char *path, enum accept_selftest_case test_case, unsigned nonce_seed) {
+    uid_t uid = test_case == ACCEPT_RECEIPT_FAILURE ? MCP_UID : LLM_UID;
+    gid_t gid = test_case == ACCEPT_RECEIPT_FAILURE ? MCP_GID : LLM_GID;
+    if (setgroups(0, NULL) != 0 || setresgid(gid, gid, gid) != 0 || setresuid(uid, uid, uid) != 0) return 125;
+    int connection = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
+    if (connection < 0 || connect(connection, (struct sockaddr *)&address, sizeof(address)) != 0) return 125;
+
+    const char *canary_arguments[] = {
+        "node", "/usr/local/libexec/fukurou-mcp-canary-client.mjs",
+        "0123456789abcdef0123456789abcdef0123456789abcdef", "PROPOSER",
+    };
+    const char *mcp_arguments[] = {"java", "-jar", "/app/fukurou-mcp-all.jar"};
+    const char *canary_environment[] = {"FUKUROU_INVOCATION_ID=accept-fixture"};
+    const char *root_environment[] = {"FUKUROU_INVOCATION_ID=accept-fixture", "HOME=/root"};
+    const char *mcp_environment[] = {
+        "PATH=/opt/java/openjdk/bin:/usr/bin:/bin", "FUKUROU_INVOCATION_ID=receipt-failure-fixture",
+    };
+    const char **arguments = test_case == ACCEPT_RECEIPT_FAILURE ? mcp_arguments : canary_arguments;
+    const char **environment = test_case == ACCEPT_RECEIPT_FAILURE ? mcp_environment : canary_environment;
+    uint16_t argument_count = test_case == ACCEPT_RECEIPT_FAILURE ? 3 : 4;
+    uint16_t environment_count = test_case == ACCEPT_RECEIPT_FAILURE ? 2 : 1;
+    const char *mutated_arguments[5];
+    memcpy(mutated_arguments, canary_arguments, sizeof(canary_arguments));
+    if (test_case == ACCEPT_PATH_TRAVERSAL) mutated_arguments[1] = "/usr/local/libexec/../fukurou-mcp-canary-client.mjs";
+    if (test_case == ACCEPT_UNKNOWN_OPTION) mutated_arguments[1] = "--unknown-option";
+    if (test_case == ACCEPT_ARGUMENT_PERMUTATION) {
+        mutated_arguments[1] = canary_arguments[2];
+        mutated_arguments[2] = canary_arguments[1];
+    }
+    if (test_case == ACCEPT_DUPLICATE_ARGUMENT) {
+        mutated_arguments[4] = canary_arguments[3];
+        argument_count = 5;
+    }
+    if (test_case >= ACCEPT_PATH_TRAVERSAL && test_case <= ACCEPT_DUPLICATE_ARGUMENT) arguments = mutated_arguments;
+    if (test_case == ACCEPT_ROOT_HOME) {
+        environment = root_environment;
+        environment_count = 2;
+    }
+
+    struct fukurou_launch_header header = {
+        .magic = FUKUROU_PROTOCOL_MAGIC,
+        .version = FUKUROU_PROTOCOL_VERSION,
+        .header_size = sizeof(struct fukurou_launch_header),
+        .profile = test_case == ACCEPT_RECEIPT_FAILURE ? FUKUROU_PROFILE_MCP_CURRENT_V1 : FUKUROU_PROFILE_FOUNDATION_CANARY_V1,
+        .argc = argument_count,
+        .envc = environment_count,
+        .fd_role_bitmap = test_case == ACCEPT_RECEIPT_FAILURE ? 0x1fU : 0x7U,
+    };
+    header.request_nonce[0] = (unsigned char)(nonce_seed + 1U);
+    char payload[FUKUROU_PROTOCOL_MAX_PAYLOAD];
+    size_t payload_length = 0;
+    for (size_t index = 0; index < argument_count; index++) {
+        if (append_launch_item(payload, &payload_length, arguments[index]) != 0) return 125;
+    }
+    for (size_t index = 0; index < environment_count; index++) {
+        if (append_launch_item(payload, &payload_length, environment[index]) != 0) return 125;
+    }
+    if (test_case == ACCEPT_TRAILING_PAYLOAD) payload[payload_length++] = 'x';
+    header.total_length = sizeof(header) + (uint32_t)payload_length;
+
+    uint16_t descriptor_count = test_case == ACCEPT_RECEIPT_FAILURE ? 5 : 3;
+    int descriptors[5];
+    for (size_t index = 0; index < descriptor_count; index++) {
+        char template[] = "/tmp/fukurou-accept-selftest-XXXXXX";
+        descriptors[index] = mkstemp(template);
+        if (descriptors[index] < 0) return 125;
+        unlink(template);
+    }
+    char control[CMSG_SPACE(sizeof(descriptors))] = {0};
+    struct iovec vectors[2] = {
+        {.iov_base = &header, .iov_len = sizeof(header)},
+        {.iov_base = payload, .iov_len = payload_length},
+    };
+    struct msghdr message = {
+        .msg_iov = vectors, .msg_iovlen = 2, .msg_control = control,
+        .msg_controllen = CMSG_SPACE(sizeof(int) * descriptor_count),
+    };
+    struct cmsghdr *control_header = CMSG_FIRSTHDR(&message);
+    control_header->cmsg_level = SOL_SOCKET;
+    control_header->cmsg_type = SCM_RIGHTS;
+    control_header->cmsg_len = CMSG_LEN(sizeof(int) * descriptor_count);
+    memcpy(CMSG_DATA(control_header), descriptors, sizeof(int) * descriptor_count);
+    ssize_t sent = sendmsg(connection, &message, MSG_NOSIGNAL);
+    for (size_t index = 0; index < descriptor_count; index++) close(descriptors[index]);
+    if (sent != (ssize_t)header.total_length) return 125;
+    int status = -1;
+    ssize_t received = recv(connection, &status, sizeof(status), 0);
+    close(connection);
+    int expects_close = (test_case >= ACCEPT_PATH_TRAVERSAL && test_case <= ACCEPT_UNKNOWN_ANCILLARY) ||
+        test_case == ACCEPT_JOB_FULL;
+    if (expects_close) return received == 0 ? 0 : 125;
+    if (test_case == ACCEPT_NONCE_REPLAY || test_case == ACCEPT_RECEIPT_FAILURE) {
+        return received == (ssize_t)sizeof(status) && status == 125 ? 0 : 125;
+    }
+    return received == (ssize_t)sizeof(status) && status != 125 ? 0 : 125;
+}
+
+static int accept_selftest_case(enum accept_selftest_case test_case, unsigned nonce_seed) {
+    char path[96];
+    snprintf(path, sizeof(path), "/tmp/fukurou-accept-selftest-%ld.sock", (long)getpid());
+    int listener = create_socket(path, 0600);
+    if (chmod(path, 0666) != 0) return -1;
+    if (test_case == ACCEPT_UNKNOWN_ANCILLARY) {
+        int enabled = 1;
+        if (setsockopt(listener, SOL_SOCKET, SO_PASSCRED, &enabled, sizeof(enabled)) != 0) return -1;
+    }
+    if (test_case == ACCEPT_JOB_FULL) {
+        for (size_t index = 0; index < MAX_JOBS; index++) jobs[index].pid = 1;
+    }
+    pid_t sender = fork();
+    if (sender < 0) return -1;
+    if (sender == 0) _exit(send_accept_selftest_request(path, test_case, nonce_seed));
+    accept_launch(listener);
+    for (size_t attempt = 0; attempt < 200; attempt++) {
+        reap_jobs();
+        if (available_job_slot() == 0 || test_case == ACCEPT_JOB_FULL) break;
+        usleep(10000);
+    }
+    int status = 0;
+    if (waitpid(sender, &status, 0) != sender) status = 0;
+    close(listener);
+    unlink(path);
+    if (test_case == ACCEPT_JOB_FULL) memset(jobs, 0, sizeof(jobs));
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
 static int protocol_selftest(void) {
     int before = count_open_descriptors();
     if (before < 0) return 125;
@@ -817,14 +1033,34 @@ static int protocol_selftest(void) {
     }
     close(gate[0]);
     reject_spawned_child(child, gate[1], &failed_receipt);
+    launches_enabled = 1;
+    for (enum accept_selftest_case test_case = ACCEPT_BASELINE; test_case <= ACCEPT_RECEIPT_FAILURE; test_case++) {
+        unsigned nonce_seed = test_case == ACCEPT_NONCE_REPLAY ? ACCEPT_BASELINE : (unsigned)test_case;
+        if (accept_selftest_case(test_case, nonce_seed) != 0) return 125;
+    }
+    char fixture_reservation[37], fixture_provider[37], fixture_mcp[37];
+    if (deterministic_uuid("fukurou-launch-reservation-v1:", "receipt-e2e-fixture", NULL, fixture_reservation) != 0 ||
+        deterministic_uuid("fukurou-pid-registration-v1:", "receipt-e2e-fixture", "PROVIDER", fixture_provider) != 0 ||
+        deterministic_uuid("fukurou-pid-registration-v1:", "receipt-e2e-fixture", "MCP", fixture_mcp) != 0 ||
+        strcmp(fixture_reservation, "02729bd6-add4-67a2-6790-6e36ad77cb00") != 0 ||
+        strcmp(fixture_provider, "d168f815-9f99-90ef-15fa-3853e0742173") != 0 ||
+        strcmp(fixture_mcp, "f02b4431-a53e-e39d-8d42-d7dba634db87") != 0) return 125;
     int after = count_open_descriptors();
     if (after != before) return 125;
-    printf("PROTOCOL_SELFTEST_OK fd_delta=0 attempts=1000 cases=bad-magic,bad-version,bad-header,bad-length,bad-count,missing-fd,msg-ctrunc,duplicate-fd,unexpected-fd,bad-peer,bad-role,duplicate-env,root-env,bad-env-value,missing-invocation,payload-length,job-full,receipt-failure\n");
+    printf("PROTOCOL_SELFTEST_OK fd_delta=0 attempts=1000 boundary=real-accept cases=baseline,path-traversal,root-env,unknown-option,permutation,duplicate,trailing-bytes,unknown-ancillary,nonce-replay,job-full,receipt-failure,bad-magic,bad-version,bad-header,bad-length,bad-count,missing-fd,msg-ctrunc,duplicate-fd,unexpected-fd,bad-peer,bad-role,duplicate-env,bad-env-value,missing-invocation,payload-length\n");
     return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--protocol-selftest") == 0) return protocol_selftest();
+    if (argc == 4 && strcmp(argv[1], "--receipt-ids") == 0) {
+        char reservation[37], registration[37];
+        if ((strcmp(argv[3], "PROVIDER") != 0 && strcmp(argv[3], "MCP") != 0) ||
+            deterministic_uuid("fukurou-launch-reservation-v1:", argv[2], NULL, reservation) != 0 ||
+            deterministic_uuid("fukurou-pid-registration-v1:", argv[2], argv[3], registration) != 0) return 2;
+        printf("%s %s\n", reservation, registration);
+        return 0;
+    }
     if (argc == 4 && strcmp(argv[1], "--control") == 0) return control_client(argv[2], argv[3]);
     if (argc == 4 && strcmp(argv[1], "--fence-write") == 0 && getuid() == 0) {
         char *end = NULL; errno = 0; unsigned long long generation = strtoull(argv[3], &end, 10);

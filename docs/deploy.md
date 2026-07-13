@@ -32,7 +32,7 @@ docker compose pull && docker compose up -d
 - GitHub 管理の deploy script source は `scripts/deploy/` に置くが、NAS root への反映は手動
 - production compose は `docker-compose.prod.yml` で管理し、deploy script が指定 SHA のものだけを使う
 
-`.github/workflows/deploy.yml` の `build` job（GitHub-hosted）は commit SHA 単位の concurrency group（`cancel-in-progress: true`）で並列 build 同士の重複トリガーだけをキャンセルする。`deploy` job（self-hosted）は `fukurou-production-deploy` group（`cancel-in-progress: false`）で直列化し、production deploy が同時実行されないようにする。異なる SHA の `build` job は並列実行できるため、1 件の `deploy` job が runner 割り当て待ちで滞留しても後続 push の `build` job 開始を塞がない。`deploy` job には `timeout-minutes: 15` を設定し、runner 上で開始後にハングした場合の安全網とする。
+`.github/workflows/deploy.yml` の `build` job（GitHub-hosted）は commit SHA 単位の concurrency group（`cancel-in-progress: true`）で並列 build 同士の重複トリガーだけをキャンセルする。`deploy` job（self-hosted）は `fukurou-production-deploy` group（`cancel-in-progress: false`）で直列化し、production deploy が同時実行されないようにする。異なる SHA の `build` job は並列実行できるため、1 件の `deploy` job が runner 割り当て待ちで滞留しても後続 push の `build` job 開始を塞がない。`deploy` job には `timeout-minutes: 35` を設定し、25分のexecutor watchdogとrecoveryを収容しつつrunner上のハングを停止する。
 
 異なる SHA の `build` job が並列に走ると、古い commit の build が新しい commit の build より遅れて完了し、`deploy` job が一時的に古い commit へ後退する場合がある。この場合は次の通常 push、または対象 SHA を明示指定した `workflow_dispatch` の再実行でロールフォワードする。
 
@@ -170,7 +170,7 @@ GitHub Actions の `DEPLOY_SIGNING_PRIVATE_KEY` secret は、repository の `dep
 
 ## release / deploy safety foundation
 
-deploy workflow は candidate SHA/image digest、contract version、versioned capability catalog、executor/public-key hashを canonical JSON bundle に固定し、Ed25519 署名を付ける。catalog は親hashを指し、既存entryをbyte-identicalに保つ単調なsupersetだけを受理する。削除、再定義、version downgrade、parent forkではmutationを開始しない。
+deploy workflow は candidate SHA/image digest、contract version、versioned capability catalog、executor/public-key hashを canonical JSON bundle に固定し、Ed25519 署名を付ける。catalog は各operationのprofile、entrypoint、parameter schemaと親hashを持ち、既存entryをbyte-identicalに保つ単調なsupersetだけを受理する。executorはcatalogから実行planを組み立て、productionで実際にdispatchしたoperation IDを記録し、required operation全件との一致をmutation完了前に確認する。削除、再定義、version downgrade、parent fork、duplicate ID、未知schema/profile/entrypointではmutationを開始しない。
 
 検証後の最初の deploy state mutation は `/srv/fukurou/deploy-state/<deployment-id>/` の rollback bundle capture である。bundle は `FRESH` / `PRE_FOUNDATION` / `FOUNDATION_V1`、previous repository SHA、全compose source/hash、configured image reference/image ID/repo digest/revision、runtime config、maintenance tuple、raw fence hash、foundation fingerprint、PID registration summary、installed artifact hash、DB capture時刻をroot-onlyで保持する。render済み compose、`.env`、credential、key bytesは保持しない。
 
@@ -180,11 +180,11 @@ production container の PID 1 は `fukurou-runtime-supervisor` であり、全L
 
 deploy maintenance は durable disable ACK、同generationのDB maintenance commit、active process drainの順で進む。PID 1が利用できない場合は application containerのPID 0を確認してからDB maintenanceへ進む。再開はDB maintenance clear後に同generationのenable ACKを取得する。startup時はDB maintenanceとhost fenceを照合するまでspawnを許可せず、欠損、破損、generation不一致、DB failureではlaunchを閉じたままApplication/opsを起動する。
 
-candidate hookはproduction fenceを開かない。`CANARY_ONLY` tokenをcandidate SHA/image digest/catalog hashへ固定し、root-generated Compose projectのinternal fixture networkで同じimage、PID 1、read-only、tmpfs、capability条件を使う。production DB credential、endpoint、mutation toolは渡さない。tokenはdurableな`ISSUED`→`CONSUMED`→`REVOKED`の一方向状態を取り、再利用しない。
+candidate hookはproduction fenceを開かない。`CANARY_ONLY` tokenをcandidate SHA/image digest/catalog hashへ固定し、root-generated Compose projectのinternal fixture networkで同じimage、PID 1、read-only、tmpfs、capability条件を使う。foundation hookは同じdigestの一時PID 1に対してproviderとMCPのtyped launch、fixture auth、required tool/output schema、failure cleanupを実行する。終了時は一時container、network、volumeが0件であることを確認する。production DB credential、endpoint、mutation toolは渡さない。tokenはdurableな`ISSUED`→`CONSUMED`→`REVOKED`の一方向状態を取り、署名、期限、SHA/digest/catalog bindingを検証して再利用しない。
 
-deploy journal と canary audit は sequence、previous state、現在の末尾 sequence に対するCASを持つappend historyである。executor 起動時はlock取得後、新しいrollback captureより前に既存journalの全chainを検証する。未完了の`FOUNDATION_V1` deployは保存済みstateからrecoveryを再開し、`ROLLED_BACK`を永続化できた場合だけ次のdeployへ進む。chain破損、state欠損、`FRESH` / `PRE_FOUNDATION`の未完了、rollback不成立はmanual recoveryとしてfail closedする。deadlineは`/proc/uptime`のboot timeを使い、Docker、Git、DB helperのforward/recovery callにも個別timeoutを設ける。
+deploy journal と canary audit は sequence、previous state、previous hash、canonical payload hash、現在の末尾 sequence に対するCASを持つappend historyである。executor 起動時はlock取得後、新しいrollback captureより前に既存journalの全chainと許可されたstate遷移を検証する。recoveryは`DB_MAINTENANCE_CLEARED`、`ENABLE_ACKED`、`GAP_CLOSED`を区別し、maintenance再確立、active reservation 0、disable fence、OPEN gapを再確認してから保存済みrollbackを実行する。CLOSE済みならrecovery専用のOPEN/CLOSE gapを追加する。`ROLLED_BACK`を永続化できた場合だけ次のdeployへ進む。chain破損、state欠損、`FRESH` / `PRE_FOUNDATION`の未完了、rollback不成立はmanual recoveryとしてfail closedする。deadlineは`/proc/uptime`のboot timeを使い、Docker、Git、DB helperのforward/recovery callにも個別timeoutを設ける。
 
-maintenance intervalはroot DB helperがappend-only `infrastructure_gap_events`へimmutableなOPEN/CLOSE factを直接記録する。decision/run/order/position/execution/tradeは共通causal projectionで`ELIGIBLE` / `INFRASTRUCTURE_GAP` / `ATTRIBUTION_MISSING`に分類する。summary、setup、calibration、benchmark、prior PnL、kill criterion、run rate、report、reflection、knowledge、usageは同じeligible境界を使い、APIはentity type別件数とgap catalogを返す。gap 1,000件超、entity 20,000件超、integrity不整合、timeoutは部分値を返さない。
+maintenance intervalはroot DB helperがappend-only `infrastructure_gap_events`へimmutableなOPEN/CLOSE factを直接記録する。decision/run/order/position/execution/tradeはrun開始からexposure終了までの共通causal projectionで`ELIGIBLE` / `INFRASTRUCTURE_GAP` / `ATTRIBUTION_MISSING`に分類し、非terminal run、order/intent/decision/runの不一致、position内execution orderの不一致もmissingにする。summary、setup、calibration、benchmark、prior PnL、kill criterion、run rate、report、reflection、knowledge、usageは同じeligible境界を使い、APIはentity type別件数とgap catalogを返す。依頼期間と交差するgapだけを上限判定し、gap 1,000件超、entity 20,000件超、integrity不整合、timeoutは部分値を返さない。
 
 deploy foundation のlocal semantic fixtureは次を実行する。`canary-compose-selftest`はproduction composeへdeny overlayを合成した実効JSONを検証するため、Docker Composeが必要である。
 

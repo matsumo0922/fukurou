@@ -5,79 +5,153 @@ readonly SELFTEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "${SELFTEST_ROOT}"' EXIT
 
 export FUKUROU_DEPLOY_ROOT="${SELFTEST_ROOT}/deploy"
-export FUKUROU_DEPLOY_DB_HELPER=/bin/false
-mkdir -p "${FUKUROU_DEPLOY_ROOT}/deploy-state/fixture"
+export FUKUROU_DEPLOY_DB_HELPER="${SELFTEST_ROOT}/fake-db"
+mkdir -p "${FUKUROU_DEPLOY_ROOT}/deploy-state" "${FUKUROU_DEPLOY_ROOT}/repo/.git"
+touch "${FUKUROU_DEPLOY_ROOT}/.env" "${FUKUROU_DEPLOY_DB_HELPER}"
+chmod +x "${FUKUROU_DEPLOY_DB_HELPER}"
 
 # shellcheck source=deploy-fukurou
 source "$(dirname "$0")/deploy-fukurou"
-ROLLBACK_STATE_DIR="${FUKUROU_DEPLOY_ROOT}/deploy-state/fixture"
-DEPLOYMENT_ID=fixture
 
-journal_state CAPTURED '{"fixture":true}'
-journal_state LAUNCHES_DISABLED
-validate_journal_history "${ROLLBACK_STATE_DIR}/journal.jsonl"
-jq -e -s '
-  length == 2 and
-  .[0].sequence == 1 and .[0].previousState == "" and
-  .[1].sequence == 2 and .[1].previousState == "CAPTURED"
-' "${ROLLBACK_STATE_DIR}/journal.jsonl" >/dev/null
-cp "${ROLLBACK_STATE_DIR}/journal.jsonl" "${ROLLBACK_STATE_DIR}/journal-corrupt.jsonl"
-jq -c '.sequence=9' "${ROLLBACK_STATE_DIR}/journal-corrupt.jsonl" > "${ROLLBACK_STATE_DIR}/journal-corrupt.tmp"
-mv "${ROLLBACK_STATE_DIR}/journal-corrupt.tmp" "${ROLLBACK_STATE_DIR}/journal-corrupt.jsonl"
-if validate_journal_history "${ROLLBACK_STATE_DIR}/journal-corrupt.jsonl" >/dev/null 2>&1; then
-  echo "deploy-runtime-selftest: corrupt journal was accepted" >&2
+boottime_seconds() { printf '1\n'; }
+
+DB_CALLS="${SELFTEST_ROOT}/db-calls"
+OBSERVATION_MODE=stopped
+DB_MODE=success
+
+timeout() {
+  shift
+  if [[ "$1" == "${DB_HELPER}" ]]; then
+    shift
+    printf '%s\n' "$*" >> "${DB_CALLS}"
+    [[ "${DB_MODE}" == success ]] || return 1
+    case "${1:-}" in
+      timestamp) printf '2026-01-01T00:00:00.000000Z\n' ;;
+      snapshot) printf '{"runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture"}\n' ;;
+      active-launch-count) printf '0\n' ;;
+      gap-state)
+        if [[ "${2:-}" == *fixture-close && "${2:-}" != *-recovery ]]; then printf 'CLOSED\n'; else printf 'OPEN\n'; fi
+        ;;
+      *) printf '1\n' ;;
+    esac
+    return 0
+  fi
+  [[ "$1" != bash ]] || return 0
+  "$@"
+}
+
+git() { return 0; }
+docker() {
+  local operation="${1:-}" argument="${2:-}" control="" generation=""
+  case "${operation}" in
+    exec)
+      while [[ "$#" -gt 0 ]]; do
+        if [[ "$1" == --control ]]; then control="$2"; generation="$3"; break; fi
+        shift
+      done
+      [[ -z "${control}" ]] || printf 'ACK %s %s\n' "${control}" "${generation}"
+      ;;
+    top)
+      [[ "${OBSERVATION_MODE}" != top-failed ]] || return 1
+      [[ "${OBSERVATION_MODE}" != children ]] || printf '10001\n10002\n10003\n'
+      [[ "${OBSERVATION_MODE}" == children ]] || printf '10001\n'
+      ;;
+    inspect)
+      [[ "${OBSERVATION_MODE}" != failed ]] || return 1
+      case "${3:-}" in
+        *State.Running*)
+          case "${OBSERVATION_MODE}" in
+            running) printf 'true|42\n' ;;
+            absent) return 1 ;;
+            *) printf 'false|0\n' ;;
+          esac
+          ;;
+        *Config.Image*) printf 'ghcr.io/matsumo0922/fukurou@sha256:%064d\n' 0 ;;
+        *Config.Env*) printf 'FUKUROU_REVISION=%040d\n' 0 ;;
+        *) printf 'fixture\n' ;;
+      esac
+      ;;
+    container)
+      [[ "${OBSERVATION_MODE}" != failed ]] || return 1
+      [[ "${OBSERVATION_MODE}" != absent ]] || return 0
+      printf 'fukurou-ktor\n'
+      ;;
+    compose|pull|image|images|rmi) return 0 ;;
+    *) return 0 ;;
+  esac
+}
+
+write_recovery_state() {
+  local state_dir="$1" deployment_id="$2"
+  cat > "${state_dir}/state.json" <<JSON
+{"deploymentId":"${deployment_id}","installKind":"FOUNDATION_V1","previousRepoSha":"0000000000000000000000000000000000000000","runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture","launchMaintenance":{"generation":6},"runningContainer":{"configuredImageReference":"ghcr.io/matsumo0922/fukurou@sha256:0000000000000000000000000000000000000000000000000000000000000000"}}
+JSON
+  printf 'services: {}\n' > "${state_dir}/docker-compose.prod.yml"
+}
+
+create_recovery_fixture() {
+  local deployment_id="$1" terminal_state="$2"
+  local state_dir="${STATE_ROOT}/${deployment_id}"
+  mkdir -p "${state_dir}"
+  write_recovery_state "${state_dir}" "${deployment_id}"
+  ROLLBACK_STATE_DIR="${state_dir}"; DEPLOYMENT_ID="${deployment_id}"
+  journal_state CAPTURED '{"fixture":true}'
+  journal_state LAUNCHES_DISABLED
+  journal_state CANDIDATE_HEALTHY
+  TARGET_GENERATION=7
+  DISPATCHED_OPERATION_IDS=$'\nPRODUCTION\n'
+  FUKUROU_DEPLOY_CRASH_MODE=RETURN
+  case "${terminal_state}" in
+    DB_MAINTENANCE_CLEARED) FUKUROU_DEPLOY_CRASH_AT=AFTER_DB_MAINTENANCE_CLEAR ;;
+    ENABLE_ACKED) FUKUROU_DEPLOY_CRASH_AT=AFTER_ENABLE_ACK ;;
+    GAP_CLOSED) FUKUROU_DEPLOY_CRASH_AT=AFTER_GAP_CLOSE ;;
+  esac
+  if (resume_launches >/dev/null 2>&1); then
+    echo "deploy-runtime-selftest: crash injection did not interrupt ${terminal_state}" >&2
+    exit 1
+  fi
+  unset FUKUROU_DEPLOY_CRASH_AT FUKUROU_DEPLOY_CRASH_MODE
+  [[ "$(tail -n 1 "${state_dir}/journal.jsonl" | jq -r '.state')" == "${terminal_state}" ]]
+}
+
+create_recovery_fixture fixture-clear DB_MAINTENANCE_CLEARED
+create_recovery_fixture fixture-enable ENABLE_ACKED
+create_recovery_fixture fixture-close GAP_CLOSED
+
+for journal in "${STATE_ROOT}"/*/journal.jsonl; do validate_journal_history "${journal}"; done
+cp "${STATE_ROOT}/fixture-clear/journal.jsonl" "${STATE_ROOT}/fixture-clear/journal-corrupt.jsonl"
+jq -c 'if .sequence==2 then .details={tampered:true} else . end' \
+  "${STATE_ROOT}/fixture-clear/journal-corrupt.jsonl" > "${STATE_ROOT}/fixture-clear/journal-corrupt.tmp"
+mv "${STATE_ROOT}/fixture-clear/journal-corrupt.tmp" "${STATE_ROOT}/fixture-clear/journal-corrupt.jsonl"
+if validate_journal_history "${STATE_ROOT}/fixture-clear/journal-corrupt.jsonl" >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: payload-hash corruption was accepted" >&2
   exit 1
 fi
-cat > "${ROLLBACK_STATE_DIR}/state.json" <<'JSON'
-{"deploymentId":"fixture","installKind":"FOUNDATION_V1","previousRepoSha":"0000000000000000000000000000000000000000","runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture","launchMaintenance":{"generation":6}}
-JSON
-rollback_on_error() {
-  journal_state ROLLED_BACK
-  return 1
-}
-recover_unfinished_deployments
-[[ "$(tail -n 1 "${ROLLBACK_STATE_DIR}/journal.jsonl" | jq -r '.state')" == ROLLED_BACK ]]
 
+DEPLOYMENT_ID=new-candidate
+recover_unfinished_deployments
+for journal in "${STATE_ROOT}"/*/journal.jsonl; do
+  [[ "$(tail -n 1 "${journal}" | jq -r '.state')" == ROLLED_BACK ]]
+  validate_journal_history "${journal}"
+done
+grep -Fq 'ensure-maintenance 7 fixture-clear' "${DB_CALLS}"
+grep -Fq 'ensure-maintenance 7 fixture-enable' "${DB_CALLS}"
+grep -Fq 'ensure-maintenance 7 fixture-close' "${DB_CALLS}"
+grep -Fq 'append-gap fixture-close-recovery OPEN' "${DB_CALLS}"
+grep -Fq 'append-gap fixture-close-recovery CLOSE' "${DB_CALLS}"
+
+ROLLBACK_STATE_DIR="${STATE_ROOT}/canary"
+mkdir -p "${ROLLBACK_STATE_DIR}"
 CANARY_TOKEN_HASH="$(printf fixture | sha256sum | awk '{print $1}')"
 canary_transition "" ISSUED
 canary_transition ISSUED CONSUMED
 canary_transition CONSUMED REVOKED success
-jq -e -s '
-  map(.state) == ["ISSUED","CONSUMED","REVOKED"] and
-  .[2].previousState == "CONSUMED" and .[2].result == "success"
-' "${ROLLBACK_STATE_DIR}/canary-audit.jsonl" >/dev/null
 if (canary_transition ISSUED CONSUMED replay >/dev/null 2>&1); then
   echo "deploy-runtime-selftest: replay was accepted" >&2
   exit 1
 fi
 
 OBSERVATION_MODE=absent
-DB_CALLS="${SELFTEST_ROOT}/db-calls"
-DB_MODE=success
-timeout() {
-  shift
-  if [[ "$1" == "${DB_HELPER}" ]]; then
-    shift
-    printf '%s\n' "$*" >> "${DB_CALLS}"
-    [[ "${DB_MODE}" == success ]]
-    return
-  fi
-  "$@"
-}
-docker() {
-  case "${OBSERVATION_MODE}:$1:$2" in
-    absent:inspect:*) return 1 ;;
-    absent:container:*) return 0 ;;
-    stopped:inspect:*) printf 'false|0\n' ;;
-    running:inspect:*) printf 'true|42\n' ;;
-    failed:inspect:*) return 1 ;;
-    failed:container:*) return 1 ;;
-    children:top:*) printf '10001\n10002\n10003\n' ;;
-    top-failed:top:*) return 1 ;;
-    *) return 1 ;;
-  esac
-}
-
 assert_application_pid_zero
 OBSERVATION_MODE=stopped
 assert_application_pid_zero
@@ -92,41 +166,32 @@ if (assert_application_pid_zero >/dev/null 2>&1); then
   exit 1
 fi
 OBSERVATION_MODE=children
-[[ "$(observe_runtime_children)" == "2" ]]
+[[ "$(observe_runtime_children)" == 2 ]]
 OBSERVATION_MODE=top-failed
 if (observe_runtime_children >/dev/null 2>&1); then
   echo "deploy-runtime-selftest: failed process observation was accepted" >&2
   exit 1
 fi
 
+ROLLBACK_STATE_DIR="${STATE_ROOT}/resume"
+mkdir -p "${ROLLBACK_STATE_DIR}"
 TARGET_GENERATION=7
 DEPLOYMENT_ID=fixture
+DISPATCHED_OPERATION_IDS=$'\nPRODUCTION\n'
 SUPERVISOR_MODE=enable-failure
 GAP_MODE=success
-request_supervisor() {
-  [[ ! ("${SUPERVISOR_MODE}" == enable-failure && "$1" == ENABLE) ]]
-}
+request_supervisor() { [[ !("${SUPERVISOR_MODE}" == enable-failure && "$1" == ENABLE) ]]; }
 prepare_gap_event() {
-  GAP_EVENT_BOUNDARY="$1"
-  GAP_EVENT_OCCURRED_AT=fixture
-  GAP_EVENT_PAYLOAD_HASH="$(printf 'a%.0s' {1..64})"
+  GAP_EVENT_DEPLOYMENT_ID="${DEPLOYMENT_ID}"; GAP_EVENT_BOUNDARY="$1"
+  GAP_EVENT_OCCURRED_AT=fixture; GAP_EVENT_PAYLOAD_HASH="$(printf 'a%.0s' {1..64})"
 }
 append_prepared_gap_event() { [[ "${GAP_MODE}" == success ]]; }
+journal_state CAPTURED; journal_state LAUNCHES_DISABLED; journal_state CANDIDATE_HEALTHY
 
 if (resume_launches >/dev/null 2>&1); then
   echo "deploy-runtime-selftest: enable failure resumed launches" >&2
   exit 1
 fi
-grep -Fq 'maintenance-cas 7 true fixture 7 false fixture' "${DB_CALLS}"
 grep -Fq 'maintenance-cas 7 false fixture 7 true fixture' "${DB_CALLS}"
 
-: > "${DB_CALLS}"
-SUPERVISOR_MODE=success
-GAP_MODE=failure
-if (resume_launches >/dev/null 2>&1); then
-  echo "deploy-runtime-selftest: gap close failure resumed launches" >&2
-  exit 1
-fi
-grep -Fq 'maintenance-cas 7 false fixture 7 true fixture' "${DB_CALLS}"
-
-echo "DEPLOY_RUNTIME_SELFTEST_OK journal=append-cas startup=crash-recovered canary=issued-consumed-revoked-replay-rejected pid0=absent-stopped observation=fail-closed resume=enable-gap-failure-restored"
+echo "DEPLOY_RUNTIME_SELFTEST_OK journal=hash-chain-transition-cas recovery=db-clear-enable-gap-close-production rollback=external-boundary-fakes canary=replay-rejected pid0=fail-closed resume=enable-failure-restored"

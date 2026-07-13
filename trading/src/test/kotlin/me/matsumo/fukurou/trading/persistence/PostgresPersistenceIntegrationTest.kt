@@ -96,6 +96,8 @@ import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
+import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationEntityType
+import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationStatus
 import me.matsumo.fukurou.trading.evaluation.KillCriterionEvaluator
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
@@ -7411,7 +7413,8 @@ class PostgresPersistenceIntegrationTest {
 
     @Test
     fun causal_population_excludesGapDecisionAcrossRepositoryAndReflection() = runPostgresTest {
-        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val bootstrapClock = Clock.fixed(fixedInstant().minusSeconds(20), ZoneOffset.UTC)
+        TradingPersistenceBootstrap(database, bootstrapClock).ensureSchema().getOrThrow()
         val ledger = ExposedPaperLedgerRepository(database)
         val decisions = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
@@ -7432,6 +7435,23 @@ class PostgresPersistenceIntegrationTest {
             startedAt = fixedInstant().minusSeconds(10),
             finishedAt = fixedInstant().plusSeconds(1),
         )
+        ExposedCommandEventLog(database).append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = invocationId,
+                    llmProvider = "claude",
+                    promptHash = null,
+                    systemPromptVersion = null,
+                    marketSnapshotId = null,
+                ),
+                toolName = "one-shot-runner",
+                toolCallId = null,
+                clientRequestId = null,
+                eventType = CommandEventType.RUNNER_PHASE_COMPLETED,
+                payload = """{"phase":"proposer","usage":{"inputTokens":1,"outputTokens":1}}""",
+                occurredAt = fixedInstant(),
+            ),
+        ).getOrThrow()
         insertInfrastructureGap(
             database = database,
             deploymentId = "causal-gap-counterexample",
@@ -7447,6 +7467,8 @@ class PostgresPersistenceIntegrationTest {
         val scope = repository.resolveScope(null, "CURRENT").getOrThrow()
         val trades = repository.fetchClosedTrades(period, scope = scope).getOrThrow()
         val report = repository.fetchReportSnapshot(period, scope).getOrThrow()
+        val usages = repository.fetchLlmPhaseUsages(period).getOrThrow()
+        val exclusions = repository.fetchExclusionSummary(period).getOrThrow()
         val killStats = repository.fetchKillCriterionStats().getOrThrow()
         val reflection = ReflectionDataCollector(
             decisionRepository = decisions,
@@ -7461,34 +7483,107 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(0, trades.strategyEligibleTrades.size)
         assertEquals(0, report.dailyPnl.size)
         assertEquals(0, report.priorPnlJpy.compareTo(BigDecimal.ZERO))
+        assertEquals(1, report.usages.facts.size)
+        assertEquals(0, report.usages.strategyEligibleFacts.size)
+        assertEquals(1, usages.facts.size)
+        assertEquals(0, usages.strategyEligibleFacts.size)
+        assertEquals(1, exclusions.infrastructureAffectedTradeCount)
         assertEquals(0, killStats.closedTrades)
         assertEquals(0, repository.countDecisionsByAction(period, scope).getOrThrow().sumOf { it.count })
         assertTrue(reflection.daily.decisions.none { it.decision.submission.invocationId == invocationId })
         assertTrue(reflection.daily.llmRuns.none { it.invocationId == invocationId })
         assertTrue(reflection.daily.closedTrades.isEmpty())
+        assertTrue(reflection.daily.llmPhaseUsages.isEmpty())
+
+        val decisionId = requireNotNull(decisions.latestDecisionByInvocationId(invocationId).getOrThrow())
+            .decision.decisionId.toString()
+        val conflictingRunId = "causal-conflicting-run"
+        insertFinishedLlmRun(
+            database = database,
+            invocationId = conflictingRunId,
+            startedAt = fixedInstant().minusSeconds(10),
+            finishedAt = fixedInstant().plusSeconds(1),
+        )
+        exposedTransaction(database) {
+            prepare("UPDATE orders SET decision_run_id=? WHERE intent_id=?").use { statement ->
+                statement.setString(1, conflictingRunId)
+                statement.setObject(2, requireNotNull(command.intentId))
+                statement.executeUpdate()
+            }
+        }
+        val conflictingDecisionPopulation = repository.classifyPopulationEntities(
+            period = period,
+            entityType = EvaluationPopulationEntityType.DECISION,
+            entityIds = setOf(decisionId),
+        ).getOrThrow()
+        assertEquals(EvaluationPopulationStatus.ATTRIBUTION_MISSING, conflictingDecisionPopulation[decisionId])
+        exposedTransaction(database) {
+            prepare("UPDATE orders SET decision_run_id=? WHERE intent_id=?").use { statement ->
+                statement.setString(1, invocationId)
+                statement.setObject(2, requireNotNull(command.intentId))
+                statement.executeUpdate()
+            }
+            prepare("UPDATE llm_runs SET status='FINISHED', finished_at=NULL WHERE invocation_id=?").use { statement ->
+                statement.setString(1, invocationId)
+                statement.executeUpdate()
+            }
+        }
+        val invalidRunPopulation = repository.classifyPopulationEntities(
+            period = period,
+            entityType = EvaluationPopulationEntityType.RUN,
+            entityIds = setOf(invocationId),
+        ).getOrThrow()
+        val invalidDecisionPopulation = repository.classifyPopulationEntities(
+            period = period,
+            entityType = EvaluationPopulationEntityType.DECISION,
+            entityIds = setOf(decisionId),
+        ).getOrThrow()
+        assertEquals(EvaluationPopulationStatus.ATTRIBUTION_MISSING, invalidRunPopulation[invocationId])
+        assertEquals(EvaluationPopulationStatus.ATTRIBUTION_MISSING, invalidDecisionPopulation[decisionId])
     }
 
     @Test
-    fun evaluation_population_rejectsOneThousandAndOneInfrastructureGaps() = runPostgresTest {
+    fun evaluation_population_boundsOnlyInfrastructureGapsIntersectingRequestPeriod() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1))
         exposedTransaction(database) {
-            exec(
+            prepare(
                 """
                     INSERT INTO infrastructure_gap_events(
                         event_id,gap_id,deployment_id,boundary,reason,occurred_at,payload_hash
                     )
-                    SELECT md5('gap-event:' || series)::uuid, md5('gap:' || series)::uuid,
-                        'gap-bound-' || series, 'OPEN', 'DEPLOY_MAINTENANCE', clock_timestamp(), repeat('a',64)
-                    FROM generate_series(1,1001) series
+                    SELECT md5(boundary || ':old-gap-event:' || series)::uuid, md5('old-gap:' || series)::uuid,
+                        'old-gap-bound-' || series, boundary, 'DEPLOY_MAINTENANCE',
+                        CASE boundary WHEN 'OPEN' THEN ?::timestamptz ELSE ?::timestamptz END, repeat('a',64)
+                    FROM generate_series(1,1001) series CROSS JOIN (VALUES ('OPEN'),('CLOSE')) events(boundary)
                 """.trimIndent(),
-            )
+            ).use { statement ->
+                statement.setTimestamp(1, java.sql.Timestamp.from(fixedInstant().minusSeconds(100)))
+                statement.setTimestamp(2, java.sql.Timestamp.from(fixedInstant().minusSeconds(90)))
+                statement.executeUpdate()
+            }
         }
 
-        val result = ExposedEvaluationRepository(database).fetchExclusionSummary(
-            EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1)),
-        )
+        val repository = ExposedEvaluationRepository(database)
+        assertTrue(repository.fetchExclusionSummary(period).isSuccess)
 
-        assertTrue(result.isFailure)
+        exposedTransaction(database) {
+            prepare(
+                """
+                    INSERT INTO infrastructure_gap_events(
+                        event_id,gap_id,deployment_id,boundary,reason,occurred_at,payload_hash
+                    )
+                    SELECT md5('current-gap-event:' || series)::uuid, md5('current-gap:' || series)::uuid,
+                        'current-gap-bound-' || series, 'OPEN', 'DEPLOY_MAINTENANCE', ?, repeat('b',64)
+                    FROM generate_series(1,1001) series
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setTimestamp(1, java.sql.Timestamp.from(fixedInstant()))
+                statement.executeUpdate()
+            }
+        }
+
+        assertTrue(repository.fetchExclusionSummary(period).isFailure)
     }
 
     @Test
@@ -7743,6 +7838,7 @@ class PostgresPersistenceIntegrationTest {
                 protectiveStopPriceJpy = BigDecimal("9990000"),
             ),
         )
+        insertFinishedLlmRun(database, "run-entry-${addEntry.commandId}")
 
         broker.placeOrder(addEntry).getOrThrow()
         val positionAfterAdd = broker.getPositions().getOrThrow().single()
@@ -9352,7 +9448,7 @@ private fun insertFinishedLlmRun(
         prepare(
             """
                 INSERT INTO llm_runs(invocation_id,mode,symbol,status,started_at,finished_at)
-                VALUES (?,'PAPER','BTC_JPY','FINISHED',?,?)
+                VALUES (?,'PAPER','BTC','FINISHED',?,?)
                 ON CONFLICT (invocation_id) DO UPDATE
                 SET status='FINISHED',started_at=EXCLUDED.started_at,finished_at=EXCLUDED.finished_at
             """.trimIndent(),
@@ -9410,7 +9506,18 @@ private suspend fun approvedPostgresEntryCommand(
         ),
     ).getOrThrow()
 
-    return command.copy(intentId = intentId)
+    return command.copy(
+        intentId = intentId,
+        auditContext = command.auditContext.copy(
+            decisionRunContext = DecisionRunContext(
+                decisionRunId = "run-entry-${command.commandId}",
+                llmProvider = "claude",
+                promptHash = "prompt-hash",
+                systemPromptVersion = "system-prompt-v1",
+                marketSnapshotId = "snapshot-entry-${command.commandId}",
+            ),
+        ),
+    )
 }
 
 private fun entryDecisionSubmission(command: PlaceOrderCommand): DecisionSubmission {

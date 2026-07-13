@@ -51,7 +51,7 @@ private const val INITIAL_BUY_EPOCH_SQL = """
 /**
  * closed trade fact を取得する SQL。
  */
-private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
+private val SELECT_CLOSED_TRADE_FACTS_SQL = """
     WITH $EVALUATION_GAP_INTERVAL_CTE_V1,
     closed_positions AS MATERIALIZED (
         SELECT
@@ -90,6 +90,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
     entry_orders AS (
         SELECT
             initial.position_id,
+            o.id,
             o.intent_id,
             o.decision_run_id,
             o.protective_stop_price_jpy
@@ -176,8 +177,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         el.account_epoch_id,
         el.cohort,
         el.execution_semantics_version,
-        CASE WHEN eo.position_id IS NULL OR eo.intent_id IS NULL OR ti.id IS NULL OR d.id IS NULL OR
-            d.invocation_id IS NULL OR run.invocation_id IS NULL
+        CASE WHEN ${evaluationOrderLineageMissingSql("eo", "ti", "d", "run")}
             THEN 'MISSING' ELSE 'ATTRIBUTED' END AS attribution_status,
         ARRAY(
             SELECT gap.gap_id::text
@@ -202,7 +202,7 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
 /**
  * decision run 数を集計する SQL。
  */
-private const val COUNT_EVALUATION_DECISION_RUNS_SQL = """
+private val COUNT_EVALUATION_DECISION_RUNS_SQL = """
     WITH $EVALUATION_GAP_INTERVAL_CTE_V1
     SELECT COUNT(DISTINCT events.decision_run_id)
     FROM command_event_log events
@@ -210,7 +210,14 @@ private const val COUNT_EVALUATION_DECISION_RUNS_SQL = """
     WHERE events.decision_run_id IS NOT NULL
         AND events.event_type IN ('RUNNER_PHASE_COMPLETED', 'NO_TRADE_EXIT')
         AND events.ts >= ? AND events.ts < ?
-        AND NOT ((run.status = 'RUNNING' AND run.finished_at IS NOT NULL) OR (run.status <> 'RUNNING' AND run.finished_at IS NULL))
+        AND NOT ${evaluationRunMissingSql("run")}
+        AND NOT EXISTS (
+            SELECT 1 FROM decisions decision
+            JOIN trade_intents intent ON intent.decision_id=decision.id
+            JOIN orders causal_order ON causal_order.intent_id=intent.id
+            WHERE decision.invocation_id=events.decision_run_id
+                AND causal_order.decision_run_id IS DISTINCT FROM decision.invocation_id
+        )
         AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
             WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < COALESCE(run.finished_at, events.ts + 1))
         AND NOT EXISTS (
@@ -222,12 +229,19 @@ private const val COUNT_EVALUATION_DECISION_RUNS_SQL = """
 /**
  * decision action 別件数を集計する SQL。
  */
-private const val COUNT_DECISIONS_BY_ACTION_SQL = """
+private val COUNT_DECISIONS_BY_ACTION_SQL = """
     WITH $EVALUATION_GAP_INTERVAL_CTE_V1
     SELECT decision.action, COUNT(*)
     FROM decisions decision
     JOIN llm_runs run ON run.invocation_id = decision.invocation_id
     WHERE decision.created_at >= ? AND decision.created_at < ?
+        AND NOT ${evaluationRunMissingSql("run")}
+        AND NOT EXISTS (
+            SELECT 1 FROM trade_intents intent
+            JOIN orders causal_order ON causal_order.intent_id=intent.id
+            WHERE intent.decision_id=decision.id
+                AND causal_order.decision_run_id IS DISTINCT FROM decision.invocation_id
+        )
         AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
             WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < GREATEST(decision.created_at, COALESCE(run.finished_at, decision.created_at)))
         AND NOT EXISTS (
@@ -241,7 +255,7 @@ private const val COUNT_DECISIONS_BY_ACTION_SQL = """
 /**
  * benchmark 用の trade PnL を取得する SQL。
  */
-private const val SELECT_DAILY_TRADE_PNL_SQL = """
+private val SELECT_DAILY_TRADE_PNL_SQL = """
     WITH $EVALUATION_GAP_INTERVAL_CTE_V1,
     closed_positions AS (
         SELECT p.id, p.closed_at
@@ -267,6 +281,7 @@ private const val SELECT_DAILY_TRADE_PNL_SQL = """
                 SELECT 1 FROM evaluation_exclusions x
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
+            AND NOT ${evaluationOrderLineageMissingSql("entry_order", "intent", "decision", "run")}
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
                 WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
     ),
@@ -288,7 +303,7 @@ private const val SELECT_DAILY_TRADE_PNL_SQL = """
 /**
  * 指定時刻より前の realized PnL を合計する SQL。
  */
-private const val SUM_TRADE_PNL_BEFORE_SQL = """
+private val SUM_TRADE_PNL_BEFORE_SQL = """
     WITH $EVALUATION_GAP_INTERVAL_CTE_V1,
     closed_positions AS (
         SELECT p.id
@@ -313,6 +328,7 @@ private const val SUM_TRADE_PNL_BEFORE_SQL = """
                 SELECT 1 FROM evaluation_exclusions x
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
+            AND NOT ${evaluationOrderLineageMissingSql("entry_order", "intent", "decision", "run")}
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
                 WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
     ),
@@ -341,14 +357,20 @@ private const val SELECT_INITIAL_CASH_JPY_SQL = """
 /**
  * runner phase usage payload を読む SQL。
  */
-private const val SELECT_LLM_PHASE_USAGE_SQL = """
+private val SELECT_LLM_PHASE_USAGE_SQL = """
     WITH $EVALUATION_GAP_INTERVAL_CTE_V1
     SELECT
         event.decision_run_id,
         event.llm_provider,
         event.payload,
         event.ts,
-        CASE WHEN run.invocation_id IS NULL THEN 'ATTRIBUTION_MISSING'
+        CASE WHEN ${evaluationRunMissingSql("run")} OR EXISTS (
+            SELECT 1 FROM decisions decision
+            JOIN trade_intents intent ON intent.decision_id=decision.id
+            JOIN orders causal_order ON causal_order.intent_id=intent.id
+            WHERE decision.invocation_id=event.decision_run_id
+                AND causal_order.decision_run_id IS DISTINCT FROM decision.invocation_id
+        ) THEN 'ATTRIBUTION_MISSING'
              WHEN gap.gap_id IS NOT NULL THEN 'INFRASTRUCTURE_GAP' ELSE 'ELIGIBLE' END population_status,
         gap.gap_id::text representative_gap_id
     FROM command_event_log event
@@ -366,7 +388,7 @@ private const val SELECT_LLM_PHASE_USAGE_SQL = """
 """
 
 /** active epoch + CURRENT の kill criterion を DB 内で完全集計する SQL。 */
-private const val SELECT_KILL_CRITERION_STATS_SQL = """
+private val SELECT_KILL_CRITERION_STATS_SQL = """
     WITH $EVALUATION_GAP_INTERVAL_CTE_V1,
     current_scope AS (
         SELECT account.current_epoch_id
@@ -407,6 +429,7 @@ private const val SELECT_KILL_CRITERION_STATS_SQL = """
                 SELECT 1 FROM evaluation_exclusions x
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
+            AND NOT ${evaluationOrderLineageMissingSql("entry_order", "intent", "decision", "run")}
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
                 WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
         GROUP BY p.id
@@ -421,7 +444,7 @@ private const val SELECT_KILL_CRITERION_STATS_SQL = """
 """
 
 /** epoch/cohort に限定した期間開始前 realized PnL を DB で完全集計する SQL。 */
-private const val SELECT_SCOPED_PNL_BEFORE_SQL = """
+private val SELECT_SCOPED_PNL_BEFORE_SQL = """
     WITH $EVALUATION_GAP_INTERVAL_CTE_V1,
     trade_stats AS (
         SELECT
@@ -468,6 +491,7 @@ private const val SELECT_SCOPED_PNL_BEFORE_SQL = """
                 SELECT 1 FROM evaluation_exclusions x
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
+            AND NOT ${evaluationOrderLineageMissingSql("entry_order", "intent", "decision", "run")}
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
                 WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
         GROUP BY p.id
@@ -759,6 +783,8 @@ class ExposedEvaluationRepository(
             runCatching {
                 exposedTransaction(database) {
                     requireCurrentAccountBaselineMatchesRuntimeConfig()
+                    val scope = selectCurrentEvaluationScope()
+                    setEvaluationRequestBounds(EvaluationPeriod(scope.lifecycleFromInclusive, Instant.now()))
                     selectKillCriterionStats()
                 }
             }
@@ -771,6 +797,7 @@ private fun JdbcTransaction.selectPopulationEntityStatuses(
     entityType: EvaluationPopulationEntityType,
     entityIds: Set<String>,
 ): Map<String, EvaluationPopulationStatus> {
+    setEvaluationRequestBounds(period)
     val entityProjection = populationEntityProjectionSql(entityType)
     return prepare(
         """
@@ -821,9 +848,13 @@ private fun populationEntityProjectionSql(entityType: EvaluationPopulationEntity
             SELECT requested.entity_id,
                 run.started_at AS cause_at,
                 COALESCE(run.finished_at, (extract(epoch FROM query_clock.query_now) * 1000)::bigint) AS terminal_at,
-                run.invocation_id IS NULL OR
-                    (run.status = 'RUNNING' AND run.finished_at IS NOT NULL) OR
-                    (run.status <> 'RUNNING' AND run.finished_at IS NULL) AS missing
+                ${evaluationRunMissingSql("run")} OR EXISTS (
+                    SELECT 1 FROM decisions d
+                    JOIN trade_intents i ON i.decision_id=d.id
+                    JOIN orders o ON o.intent_id=i.id
+                    WHERE d.invocation_id=run.invocation_id
+                        AND o.decision_run_id IS DISTINCT FROM d.invocation_id
+                ) AS missing
             FROM requested
             CROSS JOIN query_clock
             LEFT JOIN llm_runs run ON run.invocation_id = requested.entity_id
@@ -834,9 +865,13 @@ private fun populationEntityProjectionSql(entityType: EvaluationPopulationEntity
             SELECT requested.entity_id,
                 run.started_at AS cause_at,
                 GREATEST(decision.created_at, COALESCE(run.finished_at, decision.created_at)) AS terminal_at,
-                decision.id IS NULL OR decision.invocation_id IS NULL OR run.invocation_id IS NULL OR
-                    (run.status = 'RUNNING' AND run.finished_at IS NOT NULL) OR
-                    (run.status <> 'RUNNING' AND run.finished_at IS NULL) AS missing
+                decision.id IS NULL OR decision.invocation_id IS NULL OR
+                    ${evaluationRunMissingSql("run")} OR EXISTS (
+                        SELECT 1 FROM trade_intents i
+                        JOIN orders o ON o.intent_id=i.id
+                        WHERE i.decision_id=decision.id
+                            AND o.decision_run_id IS DISTINCT FROM decision.invocation_id
+                    ) AS missing
             FROM requested
             LEFT JOIN decisions decision ON decision.id::text = requested.entity_id
                 AND decision.created_at >= ? AND decision.created_at < ?
@@ -864,6 +899,7 @@ private fun JdbcTransaction.selectKillCriterionStats(): KillCriterionStats {
 }
 
 private fun JdbcTransaction.sumScopedTradePnlBefore(instant: Instant, scope: EvaluationScope): BigDecimal {
+    setEvaluationRequestBounds(EvaluationPeriod(scope.lifecycleFromInclusive, instant))
     return prepare(SELECT_SCOPED_PNL_BEFORE_SQL).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.setLong(2, instant.toEpochMilli())
@@ -940,6 +976,7 @@ private fun JdbcTransaction.selectCurrentPaperAccountEpochId(): UUID {
 }
 
 private fun JdbcTransaction.selectEvaluationExclusionSummary(period: EvaluationPeriod): EvaluationExclusionSummary {
+    setEvaluationRequestBounds(period)
     exec("SET LOCAL statement_timeout = '2s'")
     val existingSummary = selectExistingEvaluationExclusionSummary(period)
     val infrastructureGaps = selectInfrastructureGaps(period)
@@ -957,30 +994,46 @@ private fun JdbcTransaction.selectEvaluationExclusionSummary(period: EvaluationP
 
 @Suppress("LongMethod")
 private fun JdbcTransaction.selectPopulationCounts(period: EvaluationPeriod): Map<String, EvaluationPopulationCounts> {
+    setEvaluationRequestBounds(period)
     return prepare(
         """
             WITH $EVALUATION_GAP_INTERVAL_CTE_V1,
             entities AS (
-                SELECT 'RUN' entity_type, r.invocation_id entity_id, r.started_at cause_at,
+                (SELECT 'RUN' entity_type, r.invocation_id entity_id, r.started_at cause_at,
                     COALESCE(r.finished_at, (extract(epoch FROM (SELECT query_now FROM query_clock))*1000)::bigint) terminal_at,
-                    (r.status = 'RUNNING' AND r.finished_at IS NOT NULL) OR (r.status <> 'RUNNING' AND r.finished_at IS NULL) missing
-                FROM llm_runs r WHERE r.started_at < ? AND COALESCE(r.finished_at, ?) >= ?
+                    ${evaluationRunMissingSql("r")} OR EXISTS (
+                        SELECT 1 FROM decisions rd
+                        JOIN trade_intents ri ON ri.decision_id=rd.id
+                        JOIN orders ro ON ro.intent_id=ri.id
+                        WHERE rd.invocation_id=r.invocation_id
+                            AND ro.decision_run_id IS DISTINCT FROM rd.invocation_id
+                    ) missing
+                FROM llm_runs r
+                WHERE r.started_at < ? AND COALESCE(r.finished_at, ?) >= ?
+                ORDER BY r.started_at,r.invocation_id LIMIT 20001)
                 UNION ALL
-                SELECT 'DECISION', d.id::text, r.started_at, GREATEST(d.created_at, COALESCE(r.finished_at, d.created_at)),
-                    d.invocation_id IS NULL OR r.invocation_id IS NULL
+                (SELECT 'DECISION', d.id::text, r.started_at, GREATEST(d.created_at, COALESCE(r.finished_at, d.created_at)),
+                    d.invocation_id IS NULL OR ${evaluationRunMissingSql("r")} OR EXISTS (
+                        SELECT 1 FROM trade_intents di
+                        JOIN orders causal_order ON causal_order.intent_id=di.id
+                        WHERE di.decision_id=d.id
+                            AND causal_order.decision_run_id IS DISTINCT FROM d.invocation_id
+                    )
                 FROM decisions d LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
                 WHERE d.created_at >= ? AND d.created_at < ?
+                ORDER BY d.created_at,d.id LIMIT 20001)
                 UNION ALL
-                SELECT 'ORDER', o.id::text, r.started_at, COALESCE(o.canceled_at,o.expired_at,o.updated_at,?),
-                    o.intent_id IS NULL OR i.id IS NULL OR d.id IS NULL OR r.invocation_id IS NULL
+                (SELECT 'ORDER', o.id::text, r.started_at, COALESCE(o.canceled_at,o.expired_at,o.updated_at,?),
+                    ${evaluationOrderLineageMissingSql("o", "i", "d", "r")}
                 FROM orders o
                 LEFT JOIN trade_intents i ON i.id=o.intent_id
                 LEFT JOIN decisions d ON d.id=i.decision_id
                 LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
                 WHERE o.created_at < ? AND o.updated_at >= ?
+                ORDER BY o.created_at,o.id LIMIT 20001)
                 UNION ALL
-                SELECT 'POSITION', p.id::text, COALESCE(r.started_at,p.opened_at), COALESCE(p.closed_at,?),
-                    entry.id IS NULL OR entry.order_id IS NULL OR i.id IS NULL OR d.id IS NULL OR r.invocation_id IS NULL
+                (SELECT 'POSITION', p.id::text, r.started_at, COALESCE(p.closed_at,?),
+                    entry.id IS NULL OR ${evaluationOrderLineageMissingSql("o", "i", "d", "r")}
                 FROM positions p
                 LEFT JOIN LATERAL (SELECT e.id,e.order_id FROM executions e WHERE e.position_id=p.id AND e.side='BUY' ORDER BY e.executed_at,e.id LIMIT 1) entry ON TRUE
                 LEFT JOIN orders o ON o.id=entry.order_id
@@ -988,18 +1041,20 @@ private fun JdbcTransaction.selectPopulationCounts(period: EvaluationPeriod): Ma
                 LEFT JOIN decisions d ON d.id=i.decision_id
                 LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
                 WHERE p.opened_at < ? AND COALESCE(p.closed_at,?) >= ?
+                ORDER BY p.opened_at,p.id LIMIT 20001)
                 UNION ALL
-                SELECT 'EXECUTION', e.id::text, r.started_at, e.executed_at+1,
-                    e.order_id IS NULL OR o.id IS NULL OR i.id IS NULL OR d.id IS NULL OR r.invocation_id IS NULL
+                (SELECT 'EXECUTION', e.id::text, r.started_at, e.executed_at+1,
+                    e.order_id IS NULL OR ${evaluationOrderLineageMissingSql("o", "i", "d", "r")}
                 FROM executions e
                 LEFT JOIN orders o ON o.id=e.order_id
                 LEFT JOIN trade_intents i ON i.id=o.intent_id
                 LEFT JOIN decisions d ON d.id=i.decision_id
                 LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
                 WHERE e.executed_at >= ? AND e.executed_at < ?
+                ORDER BY e.executed_at,e.id LIMIT 20001)
                 UNION ALL
-                SELECT 'TRADE', p.id::text, COALESCE(r.started_at,p.opened_at), p.closed_at,
-                    entry.id IS NULL OR entry.order_id IS NULL OR i.id IS NULL OR d.id IS NULL OR r.invocation_id IS NULL
+                (SELECT 'TRADE', p.id::text, r.started_at, p.closed_at,
+                    entry.id IS NULL OR ${evaluationOrderLineageMissingSql("o", "i", "d", "r")}
                 FROM positions p
                 LEFT JOIN LATERAL (SELECT e.id,e.order_id FROM executions e WHERE e.position_id=p.id AND e.side='BUY' ORDER BY e.executed_at,e.id LIMIT 1) entry ON TRUE
                 LEFT JOIN orders o ON o.id=entry.order_id
@@ -1007,6 +1062,7 @@ private fun JdbcTransaction.selectPopulationCounts(period: EvaluationPeriod): Ma
                 LEFT JOIN decisions d ON d.id=i.decision_id
                 LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
                 WHERE p.status='CLOSED' AND p.closed_at >= ? AND p.closed_at < ?
+                ORDER BY p.closed_at,p.id LIMIT 20001)
             ), projected AS (
                 SELECT entity_type, missing,
                     NOT missing AND EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap WHERE entities.cause_at < gap.closed_at_ms AND gap.opened_at_ms < entities.terminal_at) affected
@@ -1065,6 +1121,7 @@ private fun JdbcTransaction.selectExistingEvaluationExclusionSummary(
 }
 
 private fun JdbcTransaction.selectInfrastructureGaps(period: EvaluationPeriod): List<EvaluationInfrastructureGap> {
+    setEvaluationRequestBounds(period)
     return prepare(
         """
             WITH $EVALUATION_GAP_INTERVAL_CTE_V1,
@@ -1113,22 +1170,25 @@ private fun JdbcTransaction.selectInfrastructureGaps(period: EvaluationPeriod): 
 }
 
 private fun JdbcTransaction.selectInfrastructureAffectedCounts(period: EvaluationPeriod): Pair<Int, Int> {
+    setEvaluationRequestBounds(period)
     return prepare(
         """
             WITH $EVALUATION_GAP_INTERVAL_CTE_V1
             SELECT
                 COUNT(DISTINCT p.id) AS affected_count,
-                COUNT(DISTINCT p.id) FILTER (WHERE d.id IS NULL) AS attribution_missing_count
+                COUNT(DISTINCT p.id) FILTER (WHERE ${evaluationOrderLineageMissingSql("o", "ti", "d", "run")})
+                    AS attribution_missing_count
             FROM positions p
             LEFT JOIN executions e ON e.position_id = p.id AND e.side = 'BUY'
             LEFT JOIN orders o ON o.id = e.order_id
             LEFT JOIN trade_intents ti ON ti.id = o.intent_id
             LEFT JOIN decisions d ON d.id = ti.decision_id
+            LEFT JOIN llm_runs run ON run.invocation_id = d.invocation_id
             WHERE p.status = 'CLOSED'
                 AND p.closed_at >= ? AND p.closed_at < ?
                 AND EXISTS (
                     SELECT 1 FROM infrastructure_gap_intervals gap
-                    WHERE p.opened_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at
+                    WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at
                 )
         """.trimIndent(),
     ).use { statement ->
@@ -1167,6 +1227,7 @@ private fun JdbcTransaction.selectClosedTrades(
     scope: EvaluationScope? = null,
 ): EvaluationTradeQueryResult {
     require(limit in 1 until Int.MAX_VALUE) { "limit must be finite and greater than zero" }
+    setEvaluationRequestBounds(period)
     val fetchLimit = limit + 1
 
     return jdbcConnection().prepareStatement(SELECT_CLOSED_TRADE_FACTS_SQL).use { statement ->
@@ -1210,6 +1271,7 @@ private fun JdbcTransaction.selectClosedTrades(
 }
 
 private fun JdbcTransaction.countDecisionRunsForPeriod(period: EvaluationPeriod): Int {
+    setEvaluationRequestBounds(period)
     return jdbcConnection().prepareStatement(COUNT_EVALUATION_DECISION_RUNS_SQL).use { statement ->
         statement.setLong(1, period.from.toEpochMilli())
         statement.setLong(2, period.toExclusive.toEpochMilli())
@@ -1220,6 +1282,7 @@ private fun JdbcTransaction.countDecisionRunsForPeriod(period: EvaluationPeriod)
 }
 
 private fun JdbcTransaction.countDecisionsByActionForPeriod(period: EvaluationPeriod): List<DecisionActionCount> {
+    setEvaluationRequestBounds(period)
     return jdbcConnection().prepareStatement(COUNT_DECISIONS_BY_ACTION_SQL).use { statement ->
         statement.setLong(1, period.from.toEpochMilli())
         statement.setLong(2, period.toExclusive.toEpochMilli())
@@ -1239,6 +1302,7 @@ private fun JdbcTransaction.countDecisionsByActionForPeriod(period: EvaluationPe
 }
 
 private fun JdbcTransaction.selectDailyTradePnl(period: EvaluationPeriod): List<DailyTradePnlFact> {
+    setEvaluationRequestBounds(period)
     return jdbcConnection().prepareStatement(SELECT_DAILY_TRADE_PNL_SQL).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.setLong(2, period.from.toEpochMilli())
@@ -1259,6 +1323,7 @@ private fun JdbcTransaction.selectDailyTradePnl(period: EvaluationPeriod): List<
 }
 
 private fun JdbcTransaction.sumTradePnlBeforeInstant(instant: Instant): BigDecimal {
+    setEvaluationRequestBounds(EvaluationPeriod(Instant.EPOCH, instant))
     return jdbcConnection().prepareStatement(SUM_TRADE_PNL_BEFORE_SQL).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.setLong(2, instant.toEpochMilli())
@@ -1280,6 +1345,7 @@ private fun JdbcTransaction.selectInitialCashJpy(): BigDecimal {
 }
 
 private fun JdbcTransaction.selectLlmPhaseUsages(period: EvaluationPeriod, limit: Int): EvaluationLlmUsageQueryResult {
+    setEvaluationRequestBounds(period)
     val fetchLimit = limit + 1
 
     return jdbcConnection().prepareStatement(SELECT_LLM_PHASE_USAGE_SQL).use { statement ->

@@ -18,6 +18,16 @@ private data class SpawnReceipt(
 object PidRegistrationReceiptMain {
     @JvmStatic
     fun main(args: Array<String>) {
+        applyReceipt(args) {
+            val url = requireNotNull(System.getenv("DB_URL")) { "DB_URL is required" }
+            val user = requireNotNull(System.getenv("DB_USER")) { "DB_USER is required" }
+            val password = requireNotNull(System.getenv("DB_PASSWORD")) { "DB_PASSWORD is required" }
+            DriverManager.getConnection(url, user, password)
+        }
+    }
+
+    /** final 8-argument CLI parser と exact CAS SQL を同じ production 関数で実行する。 */
+    internal fun applyReceipt(args: Array<String>, connectionProvider: () -> java.sql.Connection) {
         require(args.size == 8) {
             "role, registration, reservation, invocation, container, namespace, pid and start ticks are required"
         }
@@ -43,10 +53,7 @@ object PidRegistrationReceiptMain {
             processStartTicks = processStartTicks,
         )
 
-        val url = requireNotNull(System.getenv("DB_URL")) { "DB_URL is required" }
-        val user = requireNotNull(System.getenv("DB_USER")) { "DB_USER is required" }
-        val password = requireNotNull(System.getenv("DB_PASSWORD")) { "DB_PASSWORD is required" }
-        DriverManager.getConnection(url, user, password).use { connection ->
+        connectionProvider().use { connection ->
             connection.autoCommit = false
             connection.createStatement().use { statement ->
                 statement.execute("SET LOCAL lock_timeout = '250ms'")

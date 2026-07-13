@@ -65,6 +65,28 @@ COMMIT;
 SQL
 }
 
+ensure_maintenance() {
+  local generation="$1" deployment_id="$2"
+  validate_generation "${generation}"; validate_deployment_id "${deployment_id}"
+  psql_exec -At --set=generation="${generation}" --set=deployment_id="${deployment_id}" <<'SQL'
+BEGIN;
+SET LOCAL lock_timeout = '500ms';
+SET LOCAL statement_timeout = '2s';
+WITH locked AS (
+    SELECT generation, enabled, COALESCE(deployment_id, '') AS deployment_id
+    FROM llm_launch_maintenance WHERE singleton=TRUE FOR UPDATE
+), changed AS (
+    UPDATE llm_launch_maintenance
+    SET enabled=TRUE, deployment_id=:'deployment_id', updated_at=clock_timestamp()
+    WHERE singleton=TRUE AND generation=:'generation'::bigint
+      AND (COALESCE(deployment_id, '') IN ('', :'deployment_id'))
+    RETURNING 1
+)
+SELECT CASE WHEN COUNT(*)=1 THEN 1 ELSE 1/0 END FROM changed;
+COMMIT;
+SQL
+}
+
 append_gap() {
   local deployment_id="$1" boundary="$2" occurred_at="$3" payload_hash="$4"
   validate_deployment_id "${deployment_id}"; validate_hash "${payload_hash}"
@@ -94,6 +116,19 @@ WITH identity AS (
 )
 SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 1/0 END FROM verified;
 COMMIT;
+SQL
+}
+
+gap_state() {
+  local deployment_id="$1"; validate_deployment_id "${deployment_id}"
+  psql_exec -At --set=deployment_id="${deployment_id}" <<'SQL'
+SELECT CASE
+  WHEN COUNT(*) FILTER (WHERE boundary='OPEN') = 0 THEN 'MISSING'
+  WHEN COUNT(*) FILTER (WHERE boundary='OPEN') = 1 AND COUNT(*) FILTER (WHERE boundary='CLOSE') = 0 THEN 'OPEN'
+  WHEN COUNT(*) FILTER (WHERE boundary='OPEN') = 1 AND COUNT(*) FILTER (WHERE boundary='CLOSE') = 1 THEN 'CLOSED'
+  ELSE 'INVALID'
+END
+FROM infrastructure_gap_events WHERE deployment_id=:'deployment_id';
 SQL
 }
 
@@ -204,7 +239,9 @@ main() {
     install-indexes) [[ "$#" == 0 ]] || fail "unexpected arguments"; install_indexes ;;
     timestamp) [[ "$#" == 0 ]] || fail "unexpected arguments"; database_timestamp ;;
     maintenance-cas) [[ "$#" == 6 ]] || fail "expected old/new tuples"; maintenance_cas "$@" ;;
+    ensure-maintenance) [[ "$#" == 2 ]] || fail "expected generation and deployment id"; ensure_maintenance "$@" ;;
     append-gap) [[ "$#" == 4 ]] || fail "expected deployment id, boundary, timestamp, hash"; append_gap "$@" ;;
+    gap-state) [[ "$#" == 1 ]] || fail "expected deployment id"; gap_state "$1" ;;
     active-launch-count) [[ "$#" == 0 ]] || fail "unexpected arguments"; active_launch_count ;;
     interrupt-active-launches) [[ "$#" == 1 ]] || fail "expected deployment id"; interrupt_active_launches "$1" ;;
     cleanup-terminal-pids) [[ "$#" == 0 ]] || fail "unexpected arguments"; cleanup_terminal_pid_registrations ;;

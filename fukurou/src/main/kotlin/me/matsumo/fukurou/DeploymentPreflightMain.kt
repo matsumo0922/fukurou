@@ -28,7 +28,7 @@ object DeploymentPreflightMain {
             signatureBytes = Files.readAllBytes(Path.of(args[2])),
             publicKeyPem = Files.readString(Path.of(args[3])),
         )
-        verifyToken(tokenBytes)
+        verifyToken(tokenBytes, System.getenv(), Instant.now().epochSecond)
         check(!LlmLaunchReleaseBarrier.PREFILTER_ACTIVATION_RELEASED) {
             "PREFILTER_RELEASE_BARRIER_OPEN"
         }
@@ -39,7 +39,7 @@ object DeploymentPreflightMain {
         println("FOUNDATION_PREFLIGHT_V1 OK")
     }
 
-    private fun verifySignature(
+    internal fun verifySignature(
         tokenBytes: ByteArray,
         signatureBytes: ByteArray,
         publicKeyPem: String,
@@ -57,7 +57,11 @@ object DeploymentPreflightMain {
         require(verifier.verify(signatureBytes)) { "INVALID_CANARY_TOKEN_SIGNATURE" }
     }
 
-    private fun verifyToken(tokenBytes: ByteArray) {
+    internal fun verifyToken(
+        tokenBytes: ByteArray,
+        environment: Map<String, String>,
+        nowEpochSecond: Long,
+    ) {
         val token = Json.parseToJsonElement(tokenBytes.decodeToString()).jsonObject
         require(token.getValue("profile").jsonPrimitive.content == "CANARY_ONLY") {
             "INVALID_CANARY_PROFILE"
@@ -67,14 +71,14 @@ object DeploymentPreflightMain {
         require(allowedHookIds == listOf("FOUNDATION_PREFLIGHT_V1")) {
             "INVALID_CANARY_HOOK_SET"
         }
-        require(token.getValue("contractHash").jsonPrimitive.content == System.getenv("FUKUROU_CANDIDATE_CATALOG_HASH")) {
+        require(token.getValue("contractHash").jsonPrimitive.content == environment["FUKUROU_CANDIDATE_CATALOG_HASH"]) {
             "INVALID_CANARY_CONTRACT_BINDING"
         }
-        require(token.getValue("candidateSha").jsonPrimitive.content == System.getenv("FUKUROU_REVISION")) {
+        require(token.getValue("candidateSha").jsonPrimitive.content == environment["FUKUROU_REVISION"]) {
             "INVALID_CANARY_SHA_BINDING"
         }
         val candidateDigest = token.getValue("candidateDigest").jsonPrimitive.content
-        require(candidateDigest.matches(IMAGE_DIGEST_PATTERN) && candidateDigest == System.getenv("FUKUROU_CANDIDATE_DIGEST")) {
+        require(candidateDigest.matches(IMAGE_DIGEST_PATTERN) && candidateDigest == environment["FUKUROU_CANDIDATE_DIGEST"]) {
             "INVALID_CANARY_DIGEST_BINDING"
         }
         require(token.getValue("namespaceId").jsonPrimitive.content.matches(NAMESPACE_PATTERN)) {
@@ -88,8 +92,9 @@ object DeploymentPreflightMain {
         }
         val issuedAt = token.getValue("issuedAt").jsonPrimitive.long
         val expiresAt = token.getValue("expiresAt").jsonPrimitive.long
-        val now = Instant.now().epochSecond
-        require(issuedAt <= now && expiresAt > now && expiresAt - issuedAt <= MAX_TOKEN_LIFETIME_SECONDS) {
+        val validLifetime = issuedAt <= nowEpochSecond && expiresAt > nowEpochSecond
+        val validMaximumLifetime = expiresAt - issuedAt <= MAX_TOKEN_LIFETIME_SECONDS
+        require(validLifetime && validMaximumLifetime) {
             "EXPIRED_CANARY_TOKEN"
         }
     }

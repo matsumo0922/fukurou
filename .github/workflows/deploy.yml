@@ -170,7 +170,7 @@ jobs:
     concurrency:
       group: fukurou-production-deploy
       cancel-in-progress: false
-    timeout-minutes: 15
+    timeout-minutes: 35
     runs-on:
       - self-hosted
       - fukurou-prod

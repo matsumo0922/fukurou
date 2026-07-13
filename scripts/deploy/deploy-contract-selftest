@@ -20,15 +20,17 @@ installed_hash="$(printf '%s' "${installed_catalog}" | sha256sum | awk '{print $
 baseline_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
   {minimumContractVersion:1,
    requiredCapabilities:[$catalog.builtInCapabilities[].capabilityId],
-   requiredHooks:[$catalog.hooks[].hookId],
-   operations:[$catalog.operations[]|{capability:.capabilityId,operationId:.operationId}]}
+   requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
+   operations:[$catalog.operations[] |
+     select(.profile=="EXECUTOR_STAGE_V1" or .operationId=="FOUNDATION_PREFLIGHT_V1") |
+     {capability:.capabilityId,operationId:.operationId}]}
 ')"
 validate_typed_operation_set "${baseline_bundle}" "${installed_catalog}" || fail_selftest "baseline rejected"
 
 superset_catalog="$(jq -cS --arg parent "${installed_hash}" '
   .catalogVersion=2 | .parentCatalogHash=$parent |
-  .hooks += [{hookId:"FOUNDATION_RECOVERY_PROBE_V2",profile:"FOUNDATION_CANARY_V1",entrypoint:["--canary-preflight","recovery-v2"]}] |
-  .operations += [{capabilityId:"SMOKE_HOOK_V1",operationId:"FOUNDATION_RECOVERY_PROBE_V2",parameterSchemaId:"SMOKE_HOOK_FOUNDATION_V1"}]
+  .hooks += [{hookId:"FOUNDATION_RECOVERY_PROBE_V2",profile:"CANDIDATE_HOOK_V1",entrypoint:["--canary-preflight","recovery-v2"]}] |
+  .operations += [{capabilityId:"SMOKE_HOOK_V1",operationId:"FOUNDATION_RECOVERY_PROBE_V2",parameterSchemaId:"SMOKE_HOOK_FOUNDATION_V1",profile:"CANDIDATE_HOOK_V1",entrypoint:["--canary-preflight","recovery-v2"]}]
 ' <<<"${installed_catalog}")"
 superset_bundle="$(jq -cS '
   .requiredHooks += ["FOUNDATION_RECOVERY_PROBE_V2"] |
@@ -36,6 +38,9 @@ superset_bundle="$(jq -cS '
 ' <<<"${baseline_bundle}")"
 validate_catalog_extension "${installed_catalog}" "${superset_catalog}" "${installed_hash}" || fail_selftest "superset catalog rejected"
 validate_typed_operation_set "${superset_bundle}" "${superset_catalog}" || fail_selftest "superset bundle rejected"
+CANDIDATE_CATALOG="${superset_catalog}"
+SIGNED_BUNDLE_JSON="${superset_bundle}"
+[[ "$(required_operation_plan CANDIDATE_HOOK_V1 | jq -s 'length')" == "2" ]] || fail_selftest "accepted required hook missing from dispatch plan"
 
 deleted_bundle="$(jq -cS '.operations |= map(select(.operationId != "CLEAR_LAUNCH_MAINTENANCE"))' <<<"${baseline_bundle}")"
 expect_rejected bundle-deletion validate_typed_operation_set "${deleted_bundle}" "${installed_catalog}"
@@ -47,5 +52,13 @@ forked_catalog="$(jq -cS '.catalogVersion=2|.parentCatalogHash=("0" * 64)' <<<"$
 expect_rejected catalog-fork validate_catalog_extension "${installed_catalog}" "${forked_catalog}" "${installed_hash}"
 downgraded_catalog="$(jq -cS --arg parent "${installed_hash}" '.catalogVersion=1|.parentCatalogHash=$parent' <<<"${installed_catalog}")"
 expect_rejected catalog-downgrade validate_catalog_extension "${installed_catalog}" "${downgraded_catalog}" "${installed_hash}"
+duplicate_catalog="$(jq -cS '.operations += [.operations[0]]' <<<"${installed_catalog}")"
+expect_rejected duplicate-operation validate_catalog_dispatchability "${duplicate_catalog}"
+unsupported_schema_catalog="$(jq -cS '(.operations[]|select(.operationId=="FOUNDATION_PREFLIGHT_V1").parameterSchemaId)="UNKNOWN_V2"' <<<"${installed_catalog}")"
+expect_rejected unsupported-schema validate_catalog_dispatchability "${unsupported_schema_catalog}"
+unsupported_profile_catalog="$(jq -cS '(.operations[]|select(.operationId=="FOUNDATION_PREFLIGHT_V1").profile)="UNSUPPORTED_V2"' <<<"${installed_catalog}")"
+expect_rejected unsupported-profile validate_catalog_dispatchability "${unsupported_profile_catalog}"
+bad_entrypoint_catalog="$(jq -cS '(.operations[]|select(.operationId=="FOUNDATION_PREFLIGHT_V1").entrypoint)=["/bin/sh","-c"]' <<<"${installed_catalog}")"
+expect_rejected unsupported-entrypoint validate_catalog_dispatchability "${bad_entrypoint_catalog}"
 
-echo "DEPLOY_CONTRACT_SELFTEST_OK superset=accepted deletion=rejected redefinition=rejected fork=rejected downgrade=rejected"
+echo "DEPLOY_CONTRACT_SELFTEST_OK superset=accepted-dispatched deletion=rejected redefinition=rejected fork=rejected downgrade=rejected schema-profile-entrypoint-duplicates=rejected"
