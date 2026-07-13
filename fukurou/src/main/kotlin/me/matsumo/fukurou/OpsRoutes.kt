@@ -14,6 +14,9 @@ import io.ktor.server.routing.post
 import io.ktor.utils.io.ExperimentalKtorApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -2216,6 +2219,7 @@ private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalo
         CommandEventType.DECISION_LIFECYCLE_COMPLETED -> "decisionLifecycleCompleted"
         CommandEventType.DAEMON_STARTED -> "daemonStarted"
         CommandEventType.DAEMON_TRIGGER_SKIPPED -> "daemonTriggerSkipped"
+        CommandEventType.DAEMON_LAUNCH_SUPPRESSED -> "daemonLaunchSuppressed"
         CommandEventType.DAEMON_TRIGGER_LAUNCHED -> "daemonTriggerLaunched"
         CommandEventType.DAEMON_INVOCATION_COMPLETED -> "daemonInvocationCompleted"
         CommandEventType.LLM_INVOCATION_RECOVERED -> "llmInvocationRecovered"
@@ -2362,20 +2366,36 @@ private fun CommandEvent.toOpsAuditEventResponse(): OpsAuditEventResponse {
 }
 
 private fun CommandEvent.toOpsActivityEventResponse(): OpsActivityEventResponse {
+    val suppressionReason = infrastructureSuppressionReasonOrNull()
+
     return OpsActivityEventResponse(
         id = "audit:$id",
         source = OpsActivitySource.AUDIT.wireName,
         kind = eventType.name,
         title = eventType.name,
-        detail = toolName,
+        detail = suppressionReason ?: toolName,
         occurredAt = occurredAt.toString(),
-        metadata = listOf(
+        metadata = listOfNotNull(
             OpsActivityMetadataResponse(
                 label = "tool",
                 value = toolName,
             ),
+            suppressionReason?.let { reason ->
+                OpsActivityMetadataResponse(
+                    label = "infrastructure reason",
+                    value = reason,
+                )
+            },
         ),
     )
+}
+
+private fun CommandEvent.infrastructureSuppressionReasonOrNull(): String? {
+    if (eventType != CommandEventType.DAEMON_LAUNCH_SUPPRESSED) return null
+
+    return runCatching {
+        Json.parseToJsonElement(payload).jsonObject["reason"]?.jsonPrimitive?.content
+    }.getOrNull()
 }
 
 private fun AccountSnapshotWithUpdatedAt.toOpsAccountResponse(): OpsAccountResponse {

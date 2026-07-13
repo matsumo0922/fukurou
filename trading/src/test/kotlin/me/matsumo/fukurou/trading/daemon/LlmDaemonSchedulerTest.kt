@@ -51,6 +51,89 @@ import kotlin.test.assertTrue
 class LlmDaemonSchedulerTest {
 
     @Test
+    fun scheduledMaintenance_suppressesAfterEpisodeAndRestingMaintenanceWithoutReservationOrNoTrade() = runBlocking {
+        val observedAt = Instant.parse("2026-07-11T00:00:00Z")
+        val availability = RecordingLaunchAvailability(
+            scheduledReason = LlmDaemonLaunchSuppressionReason.SCHEDULED_MAINTENANCE,
+        )
+        val deterministicCalls = mutableListOf<String>()
+        val resting = LlmDaemonOpenRiskSnapshot(0, listOf(restingEntryOrder()), 0)
+        val holding = LlmDaemonOpenRiskSnapshot(1, emptyList(), 0)
+        var openRiskReads = 0
+        val fixture = schedulerFixture(
+            clock = MutableClock(observedAt),
+            openRiskReader = {
+                openRiskReads += 1
+                Result.success(if (openRiskReads == 1) resting else holding)
+            },
+            restingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
+                deterministicCalls += "resting"
+                Result.success(RestingSuppressionReason.RESTING_ORDER_STATE_RACE)
+            },
+            episodeLifecycleObserver = OpportunityEpisodeLifecycleObserver {
+                deterministicCalls += "episode"
+                Result.success(Unit)
+            },
+            launchAvailability = availability,
+        )
+
+        val result = fixture.scheduler.tick()
+        val eventTypes = fixture.eventLog.events().map { event -> event.eventType }
+
+        assertEquals(
+            LlmDaemonTickResult.InfrastructureSuppressed(
+                LlmDaemonLaunchSuppressionReason.SCHEDULED_MAINTENANCE,
+                null,
+            ),
+            result,
+        )
+        assertEquals(listOf("episode", "resting"), deterministicCalls)
+        assertEquals(0, availability.statusCallCount)
+        assertTrue(fixture.launches.isEmpty())
+        assertEquals(0, eventTypes.count { type -> type == CommandEventType.DAEMON_TRIGGER_LAUNCHED })
+        assertEquals(0, eventTypes.count { type -> type == CommandEventType.NO_TRADE_EXIT })
+        assertEquals(1, eventTypes.count { type -> type == CommandEventType.DAEMON_LAUNCH_SUPPRESSED })
+    }
+
+    @Test
+    fun statusMaintenance_suppressesSelectedCandidateBeforeReservationAndUsesTypedAudit() = runBlocking {
+        val availability = RecordingLaunchAvailability(
+            statusReason = LlmDaemonLaunchSuppressionReason.STATUS_MAINTENANCE,
+        )
+        val fixture = schedulerFixture(launchAvailability = availability)
+
+        val result = fixture.scheduler.tick()
+        val suppressionEvent = fixture.eventLog.events().single { event ->
+            event.eventType == CommandEventType.DAEMON_LAUNCH_SUPPRESSED
+        }
+
+        assertEquals(
+            LlmDaemonTickResult.InfrastructureSuppressed(
+                LlmDaemonLaunchSuppressionReason.STATUS_MAINTENANCE,
+                LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+            ),
+            result,
+        )
+        assertEquals(1, availability.statusCallCount)
+        assertTrue(fixture.launches.isEmpty())
+        assertTrue(suppressionEvent.payload.contains("\"reason\":\"STATUS_MAINTENANCE\""))
+        assertTrue(suppressionEvent.payload.contains("\"triggerKind\":\"FLAT_HEARTBEAT\""))
+        assertEquals(0, fixture.eventLog.events().count { event -> event.eventType == CommandEventType.NO_TRADE_EXIT })
+    }
+
+    @Test
+    fun openStatus_allowsAutomaticCandidateLaunch() = runBlocking {
+        val availability = RecordingLaunchAvailability()
+        val fixture = schedulerFixture(launchAvailability = availability)
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(1, availability.statusCallCount)
+        assertEquals(1, fixture.launches.size)
+    }
+
+    @Test
     fun globalLaunchGateSkipsBeforeReservationOrChildLaunch() = runBlocking {
         val fixture = schedulerFixture(tradingConfig = TradingBotConfig())
 
@@ -1277,6 +1360,10 @@ private fun schedulerFixture(
     restingOrderMaintenanceService: RestingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
         Result.success(RestingSuppressionReason.RESTING_ORDER_IDENTITY_UNAVAILABLE)
     },
+    episodeLifecycleObserver: OpportunityEpisodeLifecycleObserver = OpportunityEpisodeLifecycleObserver {
+        Result.success(Unit)
+    },
+    launchAvailability: LlmDaemonLaunchAvailability = AlwaysAvailableLlmDaemonLaunchAvailability,
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): SchedulerFixture {
     val scheduler = LlmDaemonScheduler(
@@ -1291,6 +1378,8 @@ private fun schedulerFixture(
             positionsReader = positionsReader,
             entryFillReader = entryFillReader,
             restingOrderMaintenanceService = restingOrderMaintenanceService,
+            episodeLifecycleObserver = episodeLifecycleObserver,
+            launchAvailability = launchAvailability,
         ),
         runtime = LlmDaemonSchedulerRuntime(
             requestBase = OneShotRunnerRequest(
@@ -1561,6 +1650,24 @@ private class FakePreFilter : LlmDaemonPreFilter {
         forcedThrowable?.let { throwable -> return Result.failure(throwable) }
 
         return Result.success(decision)
+    }
+}
+
+/** scheduler gate の呼び出し位置を記録する availability。 */
+private class RecordingLaunchAvailability(
+    private val scheduledReason: LlmDaemonLaunchSuppressionReason? = null,
+    private val statusReason: LlmDaemonLaunchSuppressionReason? = null,
+) : LlmDaemonLaunchAvailability {
+    var statusCallCount: Int = 0
+
+    override fun scheduledSuppressionAt(observedAt: Instant): LlmDaemonLaunchSuppressionReason? {
+        return scheduledReason
+    }
+
+    override suspend fun statusSuppressionAt(observedAt: Instant): LlmDaemonLaunchSuppressionReason? {
+        statusCallCount += 1
+
+        return statusReason
     }
 }
 

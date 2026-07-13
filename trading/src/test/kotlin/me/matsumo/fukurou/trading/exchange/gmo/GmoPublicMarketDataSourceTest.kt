@@ -21,6 +21,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpHeaders
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.net.http.HttpTimeoutException
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -36,12 +37,65 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 /**
  * GMO Public market data source の parser と stitching を検証するテスト。
  */
 class GmoPublicMarketDataSourceTest {
+
+    @Test
+    fun parseStatusResponse_returnsAllDocumentedStatuses() {
+        assertEquals(GmoExchangeStatus.OPEN, parseStatusResponse(statusResponse("OPEN")))
+        assertEquals(GmoExchangeStatus.MAINTENANCE, parseStatusResponse(statusResponse("MAINTENANCE")))
+        assertEquals(GmoExchangeStatus.PREOPEN, parseStatusResponse(statusResponse("PREOPEN")))
+    }
+
+    @Test
+    fun parseStatusResponse_rejectsMalformedOrUnknownStatus() {
+        assertFailsWith<MarketDataParseException> {
+            parseStatusResponse("{not-json")
+        }
+        assertFailsWith<MarketDataParseException> {
+            parseStatusResponse(statusResponse("UNKNOWN"))
+        }
+    }
+
+    @Test
+    fun readStatus_usesTypedAuditOperationAndEndpoint() = runBlocking {
+        val auditSink = RecordingRequestAuditSink()
+        val dataSource = fakeMarketDataSource(
+            httpClient = FakeHttpClient(mapOf("" to statusResponse("OPEN"))),
+            requestAuditSink = auditSink,
+        )
+
+        assertEquals(GmoExchangeStatus.OPEN, dataSource.readStatus().getOrThrow())
+        assertEquals(GmoPublicOperation.GET_STATUS, auditSink.events.single().operation)
+        assertEquals(GmoPublicEndpoint.STATUS, auditSink.events.single().endpoint)
+    }
+
+    @Test
+    fun readStatus_preservesTimeoutAndTransportFailures() = runBlocking {
+        val timeout = fakeMarketDataSource(
+            FakeHttpClient(
+                responses = emptyMap(),
+                failure = HttpTimeoutException("timeout"),
+            ),
+        ).readStatus().exceptionOrNull()
+        val transport = fakeMarketDataSource(
+            FakeHttpClient(
+                responses = emptyMap(),
+                failure = IOException("connection reset"),
+            ),
+        ).readStatus().exceptionOrNull()
+
+        assertIs<MarketNetworkException>(timeout)
+        assertIs<HttpTimeoutException>(timeout.cause)
+        assertIs<MarketNetworkException>(transport)
+        assertIs<IOException>(transport.cause)
+        Unit
+    }
 
     @Test
     fun parseTickerResponse_returnsTicker() {
@@ -803,6 +857,17 @@ private fun klineResponse(vararg openTimes: String): String {
       "data": [
         $candles
       ]
+    }
+    """.trimIndent()
+}
+
+private fun statusResponse(status: String): String {
+    return """
+    {
+      "status": 0,
+      "data": {
+        "status": "$status"
+      }
     }
     """.trimIndent()
 }

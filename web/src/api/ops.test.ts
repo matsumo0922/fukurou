@@ -61,6 +61,28 @@ describe("ops activity timeline helpers", () => {
     });
   });
 
+  it("provides bilingual infrastructure suppression reason terminology", () => {
+    const enMessages = messages.en as Record<string, string | undefined>;
+    const jaMessages = messages.ja as Record<string, string | undefined>;
+    const reasonKeys = [
+      "scheduledMaintenance",
+      "statusMaintenance",
+      "statusPreopen",
+      "statusTimeout",
+      "statusMalformed",
+      "statusTransportFailure",
+    ];
+
+    reasonKeys.forEach((reason) => {
+      expect(enMessages[`activity.suppression.${reason}.label`]).toBeTypeOf("string");
+      expect(enMessages[`activity.suppression.${reason}.description`]).toBeTypeOf("string");
+      expect(jaMessages[`activity.suppression.${reason}.label`]).toBeTypeOf("string");
+      expect(jaMessages[`activity.suppression.${reason}.description`]).toBeTypeOf("string");
+    });
+    expect(enMessages["activity.catalog.audit.daemonLaunchSuppressed.description"]).toContain("not a NO_TRADE");
+    expect(jaMessages["activity.catalog.audit.daemonLaunchSuppressed.description"]).toContain("NO_TRADE");
+  });
+
   it("omits saved audit filters from requests until the catalog is available", () => {
     const filters: ActivityTimelineFilters = {
       source: "audit",

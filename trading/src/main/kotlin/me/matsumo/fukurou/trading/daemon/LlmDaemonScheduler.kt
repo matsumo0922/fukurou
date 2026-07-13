@@ -155,6 +155,17 @@ sealed interface LlmDaemonTickResult {
         val reason: String,
         val triggerKind: LlmDaemonTriggerKind?,
     ) : LlmDaemonTickResult
+
+    /**
+     * 取引所 infrastructure の状態により automatic one-shot 起動を抑止した。
+     *
+     * @param reason typed infrastructure reason
+     * @param triggerKind status 確認前に選択済みの起動候補。定期窓では null
+     */
+    data class InfrastructureSuppressed(
+        val reason: LlmDaemonLaunchSuppressionReason,
+        val triggerKind: LlmDaemonTriggerKind?,
+    ) : LlmDaemonTickResult
 }
 
 /**
@@ -181,6 +192,7 @@ class LlmDaemonScheduler(
     private val entryFillReader = dependencies.entryFillReader
     private val restingOrderMaintenanceService = dependencies.restingOrderMaintenanceService
     private val episodeLifecycleObserver = dependencies.episodeLifecycleObserver
+    private val launchAvailability = dependencies.launchAvailability
     private val requestBase = runtime.requestBase
     private val launchOneShot = runtime.launchOneShot
     private val clock = runtime.clock
@@ -202,6 +214,8 @@ class LlmDaemonScheduler(
     private val priceSamples = mutableListOf<LlmDaemonPriceSample>()
     private var lastRestingSkipReason: RestingSuppressionReason? = null
     private var lastRestingSkipMirroredAt: Instant? = null
+    private var lastInfrastructureSuppressionReason: LlmDaemonLaunchSuppressionReason? = null
+    private var lastInfrastructureSuppressionMirroredAt: Instant? = null
 
     /**
      * daemon scheduler loop を開始する。
@@ -292,8 +306,31 @@ class LlmDaemonScheduler(
             }
         }
 
+        val scheduledSuppression = launchAvailability.scheduledSuppressionAt(observedAt)
+        if (scheduledSuppression != null) {
+            appendInfrastructureSuppressionIfDue(
+                reason = scheduledSuppression,
+                trigger = null,
+                observedAt = observedAt,
+            ).getOrThrow()
+
+            return LlmDaemonTickResult.InfrastructureSuppressed(scheduledSuppression, null)
+        }
+
         val trigger = selectTrigger(hasOpenRisk, observedAt)
             ?: return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
+
+        val statusSuppression = launchAvailability.statusSuppressionAt(observedAt)
+        if (statusSuppression != null) {
+            appendInfrastructureSuppressionIfDue(
+                reason = statusSuppression,
+                trigger = trigger,
+                observedAt = observedAt,
+            ).getOrThrow()
+
+            return LlmDaemonTickResult.InfrastructureSuppressed(statusSuppression, trigger.kind)
+        }
+        resetInfrastructureSuppressionMirror()
 
         val activeReservation = launchReservationRepository.findBlockingRunningReservation(
             requestTriggerKind = trigger.kind,
@@ -801,6 +838,47 @@ class LlmDaemonScheduler(
         lastRestingSkipMirroredAt = null
     }
 
+    private suspend fun appendInfrastructureSuppressionIfDue(
+        reason: LlmDaemonLaunchSuppressionReason,
+        trigger: LlmDaemonTrigger?,
+        observedAt: Instant,
+    ): Result<Unit> {
+        val reasonChanged = reason != lastInfrastructureSuppressionReason
+        val cadenceReached = lastInfrastructureSuppressionMirroredAt?.let { previous ->
+            !observedAt.isBefore(previous.plus(daemonConfig.holdingCheckInterval))
+        } ?: true
+        if (!reasonChanged && !cadenceReached) return Result.success(Unit)
+
+        return commandEventLog.append(
+            CommandEvent(
+                decisionRunContext = DecisionRunContext.EMPTY,
+                toolName = DAEMON_TOOL_NAME,
+                toolCallId = null,
+                clientRequestId = trigger?.key,
+                eventType = CommandEventType.DAEMON_LAUNCH_SUPPRESSED,
+                payload = buildJsonObject {
+                    put("reason", reason.name)
+                    put("triggerKind", trigger?.kind?.name)
+                    put("triggerKey", trigger?.key)
+                    put("observedAt", observedAt.toString())
+                    runtimeConfigSnapshot?.let { snapshot ->
+                        put("runtimeConfigVersionId", snapshot.versionId)
+                        put("runtimeConfigHash", snapshot.hash)
+                    }
+                }.toString(),
+                occurredAt = observedAt,
+            ),
+        ).onSuccess {
+            lastInfrastructureSuppressionReason = reason
+            lastInfrastructureSuppressionMirroredAt = observedAt
+        }
+    }
+
+    private fun resetInfrastructureSuppressionMirror() {
+        lastInfrastructureSuppressionReason = null
+        lastInfrastructureSuppressionMirroredAt = null
+    }
+
     private suspend fun appendLaunched(
         trigger: LlmDaemonTrigger,
         invocationId: String,
@@ -923,6 +1001,7 @@ class LlmDaemonScheduler(
  * @param tickerReader 価格 trigger 用 ticker 読み取り境界
  * @param positionsReader STOP 接近 trigger 用 position 読み取り境界
  * @param entryFillReader entry fill trigger 用 execution 読み取り境界
+ * @param launchAvailability scheduler automatic launch 専用の取引所 availability gate
  */
 data class LlmDaemonSchedulerDependencies(
     val riskStateRepository: RiskStateRepository,
@@ -938,6 +1017,7 @@ data class LlmDaemonSchedulerDependencies(
     val episodeLifecycleObserver: OpportunityEpisodeLifecycleObserver = OpportunityEpisodeLifecycleObserver {
         Result.success(Unit)
     },
+    val launchAvailability: LlmDaemonLaunchAvailability = AlwaysAvailableLlmDaemonLaunchAvailability,
 )
 
 /**

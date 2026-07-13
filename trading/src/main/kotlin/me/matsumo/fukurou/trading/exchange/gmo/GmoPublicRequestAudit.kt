@@ -23,10 +23,10 @@ enum class GmoPublicClientType { FUKUROU_MCP, KTOR_LLM_RUNTIME, KTOR_RECONCILER,
 enum class GmoPublicClientRole { PROPOSER, FALSIFIER, RUNNER, UNSPECIFIED }
 
 /** 監査対象の論理 operation。 */
-enum class GmoPublicOperation { GET_TICKER, GET_CANDLES, GET_ORDERBOOK, GET_TRADES, GET_SYMBOL_RULES }
+enum class GmoPublicOperation { GET_TICKER, GET_CANDLES, GET_ORDERBOOK, GET_TRADES, GET_SYMBOL_RULES, GET_STATUS }
 
 /** URI を保存せず識別する固定 endpoint。 */
-enum class GmoPublicEndpoint { TICKER, KLINES, ORDERBOOK, TRADES, SYMBOLS }
+enum class GmoPublicEndpoint { TICKER, KLINES, ORDERBOOK, TRADES, SYMBOLS, STATUS }
 
 /** 実 HTTP attempt の安全な結果分類。 */
 enum class GmoPublicRequestOutcome { HTTP_RESPONSE, HTTP_429, JSON_ERR_5003, NETWORK_ERROR, INTERRUPTED }

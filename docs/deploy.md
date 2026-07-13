@@ -79,6 +79,8 @@ LLM daemon / Obsidian Writer の有効化、Claude Code / Codex の container lo
 
 `llm_launch_reservations` の execution claim migration は nullable な state / token / claimed / heartbeat の4列と、CLAIMED recovery用・non-CLAIMED active判定用の2つのpartial indexだけをadditiveに追加し、既存rowをbackfillしない。bootstrapのschema verification、旧generation recovery、startup recovery audit、periodic DB scanのいずれかが失敗したcontainerはreadyにならず、daemon / manual / direct admissionからchildを開始しない。CLAIMED bootstrap recoveryはsingle-instanceの旧container/process generation終了を確認したstop/startだけで有効になり、rolling coexistence中には実行しない。rollbackでも列とindexを削除しない。旧binaryへ戻す前にglobal launch gateをOFFにし、evaluation / reflectionをdrainして、RUNNING reservation、RUNNING `llm_runs`、direct runner、未解決claimがすべて0であることを確認する。旧binaryではone-shot claim invariantを有効と扱わない。
 
+GMO maintenance availability gate は runtime key と schema を追加しない。rollback 対象時刻が土曜日 09:00〜11:00 JST、公式 status が `OPEN` 以外、または status を確認できない場合は、先に `daemon.enabled=false` を active 化して restart し、scheduler worker が停止した状態を維持する。修正版へ戻すか、定期窓外かつ公式 status `OPEN` を確認するまで daemon を再開しない。ProtectionReconciler は別 worker のまま継続する。runtime config 操作の許可がない場合は rollback せず availability gate を維持する。
+
 root checkout を作成する。private repository の場合は read-only deploy key を先に登録しておく。
 
 ```sh

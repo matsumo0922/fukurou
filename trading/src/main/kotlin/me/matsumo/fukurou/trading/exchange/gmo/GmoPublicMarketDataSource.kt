@@ -75,6 +75,11 @@ private const val GMO_KLINES_PATH = "/v1/klines"
 private const val GMO_SYMBOLS_PATH = "/v1/symbols"
 
 /**
+ * GMO コイン Public status endpoint。
+ */
+private const val GMO_STATUS_PATH = "/v1/status"
+
+/**
  * GMO trades request の既定 page。
  */
 private const val DEFAULT_TRADES_PAGE = 1
@@ -222,7 +227,7 @@ class GmoPublicMarketDataSource(
     ),
     private val sleeper: GmoSleeper = ThreadSleepingGmoSleeper,
     private val monotonicTimeSource: GmoMonotonicTimeSource = SystemGmoMonotonicTimeSource,
-) : MarketDataSource {
+) : MarketDataSource, GmoExchangeStatusReader {
 
     private val clientInstanceId = newGmoAuditId()
 
@@ -274,6 +279,13 @@ class GmoPublicMarketDataSource(
         runMarketRequest(GmoPublicOperation.GET_SYMBOL_RULES) {
             readCachedSymbolRules(symbol) ?: fetchAndCacheSymbolRules(symbol)
         }
+
+    override suspend fun readStatus(): Result<GmoExchangeStatus> = runMarketRequest(GmoPublicOperation.GET_STATUS) {
+        val request = buildStatusRequest()
+        val responseBody = sendRequest(request, GmoPublicEndpoint.STATUS)
+
+        parseStatusResponse(responseBody, json)
+    }
 
     private suspend fun <T> runMarketRequest(
         operation: GmoPublicOperation,
@@ -352,6 +364,10 @@ class GmoPublicMarketDataSource(
 
     private fun buildSymbolsRequest(): HttpRequest {
         return buildGetRequest(GMO_SYMBOLS_PATH)
+    }
+
+    private fun buildStatusRequest(): HttpRequest {
+        return buildGetRequest(GMO_STATUS_PATH)
     }
 
     private fun buildGetRequest(pathAndQuery: String): HttpRequest {
@@ -874,6 +890,34 @@ fun parseSymbolsResponse(
     return symbolRules
 }
 
+/** GMO Public API が返す取引所 status。 */
+enum class GmoExchangeStatus {
+    /** 通常稼働中。 */
+    OPEN,
+
+    /** メンテナンス中。 */
+    MAINTENANCE,
+
+    /** メンテナンス後の注文取消だけを受け付ける状態。 */
+    PREOPEN,
+}
+
+/** GMO status を読み取る境界。 */
+fun interface GmoExchangeStatusReader {
+    /** 現在の取引所 status を返す。 */
+    suspend fun readStatus(): Result<GmoExchangeStatus>
+}
+
+/** GMO status response を typed status へ変換する。 */
+fun parseStatusResponse(responseBody: String, json: Json = GmoPublicApiJson): GmoExchangeStatus {
+    val response = decodeResponse<GmoStatusResponse>(responseBody, "status", json)
+
+    validateGmoStatus(response.status, response.messages, "status")
+
+    return GmoExchangeStatus.entries.firstOrNull { status -> status.name == response.data.status }
+        ?: throw MarketDataParseException("GMO status response included an unknown exchange status.")
+}
+
 private inline fun <reified T> decodeResponse(
     responseBody: String,
     endpointName: String,
@@ -1028,6 +1072,20 @@ private data class GmoMessage(
     val messageCode: String? = null,
     @SerialName("message_string")
     val messageString: String? = null,
+)
+
+/** GMO status response。 */
+@Serializable
+private data class GmoStatusResponse(
+    val status: Int,
+    val data: GmoStatusData = GmoStatusData(),
+    val messages: List<GmoMessage> = emptyList(),
+)
+
+/** GMO status response の data。 */
+@Serializable
+private data class GmoStatusData(
+    val status: String = "",
 )
 
 /**

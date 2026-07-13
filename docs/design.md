@@ -1376,6 +1376,8 @@ LLM cost / usage は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し p
 
 [確定] daemonの定義は「マクロ発火スケジューラ + 常駐ProtectionReconciler」である。前者はLLMをいつ起動するかを決め、後者はLLM起動中かどうかに依存せず、保護STOP、virtual TP、paper約定、HARD_HALT掃引を短い周期で決定的に進める。
 
+[確定] マクロ発火スケジューラだけは GMO の毎週土曜日 09:00〜11:00（Asia/Tokyo）と Public status を reservation 前に確認する。定期窓では network request を行わず、窓外では 60 秒の単一 cache entry を使い `OPEN` だけを許可する。`MAINTENANCE`、`PREOPEN`、timeout、不正 response、transport failure は `InfrastructureSuppressed` / `DAEMON_LAUNCH_SUPPRESSED` として fail closed にし、strategy の `NO_TRADE` と分離する。episode lifecycle、resting-order maintenance、ProtectionReconciler、manual recovery、evaluation report、runtime config administration は継続する。
+
 [設計提案] daemonは次の状態機械で動く。
 
 ```text

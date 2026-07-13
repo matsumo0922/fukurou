@@ -1,8 +1,11 @@
 package me.matsumo.fukurou
 
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.GmoLlmDaemonLaunchAvailability
 import me.matsumo.fukurou.trading.daemon.OpportunityEpisodeLifecycleObserver
 import me.matsumo.fukurou.trading.daemon.RestingOrderMaintenanceService
+import me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatus
+import me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatusReader
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import org.jetbrains.exposed.v1.jdbc.Database
@@ -24,5 +27,14 @@ class LlmDaemonSchedulerCompositionTest {
 
         assertIs<RestingOrderMaintenanceService>(service)
         assertIs<OpportunityEpisodeLifecycleObserver>(service)
+    }
+
+    @Test
+    fun productionSchedulerCompositionUsesGmoAvailabilityWithoutAddingGlobalGate() {
+        val availability = createLlmDaemonLaunchAvailability(
+            GmoExchangeStatusReader { Result.success(GmoExchangeStatus.OPEN) },
+        )
+
+        assertIs<GmoLlmDaemonLaunchAvailability>(availability)
     }
 }

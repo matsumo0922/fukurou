@@ -1400,6 +1400,45 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_activityProjectsTypedInfrastructureSuppressionReason() = testApplication {
+        val eventLog = InMemoryCommandEventLog()
+        eventLog.append(
+            auditEvent(
+                eventType = CommandEventType.DAEMON_LAUNCH_SUPPRESSED,
+                occurredAt = fixedInstant(),
+                toolName = "llm_daemon_scheduler",
+                payload = """{"reason":"STATUS_PREOPEN","triggerKind":"FLAT_HEARTBEAT"}""",
+            ),
+        ).getOrThrow()
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsCommandEventFeedReader = eventLog,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get(
+            "/ops/activity?source=audit&auditEventType=DAEMON_LAUNCH_SUPPRESSED&limit=10",
+        )
+        val event = Json.parseToJsonElement(response.bodyAsText())
+            .jsonObject
+            .getValue("events")
+            .jsonArray
+            .single()
+            .jsonObject
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertEquals("DAEMON_LAUNCH_SUPPRESSED", event.getValue("kind").jsonPrimitive.content)
+        assertEquals("STATUS_PREOPEN", event.getValue("detail").jsonPrimitive.content)
+        assertEquals(
+            "STATUS_PREOPEN",
+            metadataValue(event, "infrastructure reason"),
+        )
+    }
+
+    @Test
     fun opsRoutes_auditDoesNotExposeCodexRawOutputAndKeepsStructuredUsage() = testApplication {
         val eventLog = InMemoryCommandEventLog()
         val request = codexAuditRequest()
