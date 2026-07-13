@@ -100,7 +100,7 @@ class ShellProcessRunner(
         withContext(Dispatchers.IO) {
             val descendants = process.descendantsDeepestFirst()
 
-            descendants.forEach { descendant -> descendant.destroy() }
+            descendants.forEach { descendant -> runCatching { descendant.destroy() } }
             awaitProcessHandles(descendants, terminationGrace)
 
             val remainingDescendants = (descendants + process.descendantsDeepestFirst())
