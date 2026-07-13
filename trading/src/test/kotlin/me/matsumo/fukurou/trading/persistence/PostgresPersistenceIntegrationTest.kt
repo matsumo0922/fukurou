@@ -538,6 +538,7 @@ private const val TEST_RECONCILER_COMPLETED_PAYLOAD = """
 private const val INSERT_TEST_POSITION_SQL = """
     INSERT INTO positions (
         id,
+        account_epoch_id,
         trade_group_id,
         mode,
         symbol,
@@ -557,6 +558,7 @@ private const val INSERT_TEST_POSITION_SQL = """
         lowest_price_since_entry_jpy
     )
     VALUES (
+        ?,
         ?,
         ?,
         ?,
@@ -584,6 +586,8 @@ private const val INSERT_TEST_POSITION_SQL = """
 private const val INSERT_TEST_ORDER_SQL = """
     INSERT INTO orders (
         id,
+        account_epoch_id,
+        execution_semantics_version,
         position_id,
         trade_group_id,
         mode,
@@ -602,6 +606,8 @@ private const val INSERT_TEST_ORDER_SQL = """
         updated_at
     )
     VALUES (
+        ?,
+        ?,
         ?,
         ?,
         ?,
@@ -628,6 +634,8 @@ private const val INSERT_TEST_ORDER_SQL = """
 private const val INSERT_TEST_EXECUTION_SQL = """
     INSERT INTO executions (
         id,
+        account_epoch_id,
+        execution_semantics_version,
         order_id,
         position_id,
         mode,
@@ -641,6 +649,8 @@ private const val INSERT_TEST_EXECUTION_SQL = """
         executed_at
     )
     VALUES (
+        ?,
+        ?,
         ?,
         NULL,
         ?,
@@ -662,6 +672,8 @@ private const val INSERT_TEST_EXECUTION_SQL = """
 private const val INSERT_ACTIVITY_CONTEXT_ORDER_SQL = """
     INSERT INTO orders (
         id,
+        account_epoch_id,
+        execution_semantics_version,
         intent_id,
         position_id,
         trade_group_id,
@@ -682,6 +694,8 @@ private const val INSERT_ACTIVITY_CONTEXT_ORDER_SQL = """
         updated_at
     )
     VALUES (
+        ?,
+        ?,
         ?,
         ?,
         ?,
@@ -5038,11 +5052,13 @@ class PostgresPersistenceIntegrationTest {
             mode = "PAPER",
             realizedPnlJpy = "10.00000000",
         )
-        insertLedgerRows(
-            database = database,
-            mode = "LIVE",
-            realizedPnlJpy = "20.00000000",
-        )
+        val liveFixtureRejected = runCatching {
+            insertLedgerRows(
+                database = database,
+                mode = "LIVE",
+                realizedPnlJpy = "20.00000000",
+            )
+        }.isFailure
 
         val repository = ExposedPaperLedgerRepository(database)
         val positions = repository.getOpenPositions().getOrThrow()
@@ -5054,6 +5070,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf(TradingMode.PAPER), orders.map { order -> order.mode })
         assertEquals(listOf(TradingMode.PAPER), executions.map { execution -> execution.mode })
         assertEquals("10.00000000", realizedPnl.toPlainString())
+        assertTrue(liveFixtureRejected)
     }
 
     @Test
@@ -5066,12 +5083,14 @@ class PostgresPersistenceIntegrationTest {
             realizedPnlJpy = "10.00000000",
             executedAt = fixedInstant().plusSeconds(60),
         )
-        val newestLivePositionId = insertLedgerRows(
-            database = database,
-            mode = "LIVE",
-            realizedPnlJpy = "99.00000000",
-            executedAt = fixedInstant().plusSeconds(240),
-        )
+        val liveFixtureRejected = runCatching {
+            insertLedgerRows(
+                database = database,
+                mode = "LIVE",
+                realizedPnlJpy = "99.00000000",
+                executedAt = fixedInstant().plusSeconds(240),
+            )
+        }.isFailure
         val middlePaperPositionId = insertLedgerRows(
             database = database,
             mode = "PAPER",
@@ -5111,9 +5130,7 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(
             executions.none { execution -> execution.positionId == oldestPaperPositionId.toString() },
         )
-        assertTrue(
-            executions.none { execution -> execution.positionId == newestLivePositionId.toString() },
-        )
+        assertTrue(liveFixtureRejected)
     }
 
     @Test
@@ -5516,69 +5533,9 @@ class PostgresPersistenceIntegrationTest {
         val period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1))
 
         exposedTransaction(database) {
-            acquireGapPopulationGenerationToken()
-            prepare(
-                """
-                    INSERT INTO positions (
-                        id, account_epoch_id, trade_group_id, mode, symbol, side, status,
-                        opened_at, closed_at, size_btc, average_entry_price_jpy,
-                        current_price_jpy, highest_price_since_entry_jpy, lowest_price_since_entry_jpy
-                    )
-                    SELECT md5('bulk-position:' || series)::uuid,
-                        CASE WHEN series=0 THEN ?::uuid ELSE NULL END,
-                        md5('bulk-group:' || series)::uuid, 'PAPER', 'BTC_JPY', 'LONG', 'CLOSED',
-                        ?, ?, 0, 10000000, 10000000, 10000000, 10000000
-                    FROM generate_series(0, 20001) series
-                """.trimIndent(),
-            ).use { statement ->
-                statement.setObject(1, scope.accountEpochId)
-                statement.setLong(2, fixedInstant().toEpochMilli())
-                statement.setLong(3, fixedInstant().toEpochMilli())
-                statement.executeUpdate()
-            }
-            prepare(
-                """
-                    INSERT INTO orders (
-                        id, account_epoch_id, execution_semantics_version, runtime_config_hash,
-                        position_id, trade_group_id, mode, symbol, side, order_type, status,
-                        size_btc, protective_stop_price_jpy, created_at, updated_at
-                    )
-                    SELECT md5('bulk-order:' || series)::uuid,
-                        CASE WHEN series=0 THEN ?::uuid ELSE NULL END,
-                        CASE WHEN series=0 THEN 'PAPER_WS_V1' ELSE NULL END,
-                        CASE WHEN series=0 THEN ? ELSE NULL END,
-                        md5('bulk-position:' || series)::uuid, md5('bulk-group:' || series)::uuid,
-                        'PAPER', 'BTC_JPY', 'BUY', 'MARKET', 'FILLED', 0.001, 9700000, ?, ?
-                    FROM generate_series(0, 20001) series
-                """.trimIndent(),
-            ).use { statement ->
-                statement.setObject(1, scope.accountEpochId)
-                statement.setString(2, runtimeHash)
-                statement.setLong(3, fixedInstant().toEpochMilli())
-                statement.setLong(4, fixedInstant().toEpochMilli())
-                statement.executeUpdate()
-            }
-            prepare(
-                """
-                    INSERT INTO executions (
-                        id, account_epoch_id, execution_semantics_version, runtime_config_hash,
-                        order_id, position_id, mode, symbol, side, price_jpy, size_btc,
-                        fee_jpy, realized_pnl_jpy, liquidity, executed_at
-                    )
-                    SELECT md5('bulk-execution:' || series)::uuid,
-                        CASE WHEN series=0 THEN ?::uuid ELSE NULL END,
-                        CASE WHEN series=0 THEN 'PAPER_WS_V1' ELSE NULL END,
-                        CASE WHEN series=0 THEN ? ELSE NULL END,
-                        md5('bulk-order:' || series)::uuid, md5('bulk-position:' || series)::uuid,
-                        'PAPER', 'BTC_JPY', 'BUY', 10000000, 0.001, 1, 0, 'TAKER', ?
-                    FROM generate_series(0, 20001) series
-                """.trimIndent(),
-            ).use { statement ->
-                statement.setObject(1, scope.accountEpochId)
-                statement.setString(2, runtimeHash)
-                statement.setLong(3, fixedInstant().toEpochMilli())
-                statement.executeUpdate()
-            }
+            val populationScope = acquireFixtureGapPopulationGenerationToken(TradingMode.PAPER.name)
+            assertEquals(scope.accountEpochId, populationScope.accountEpochId)
+            insertEvaluationPopulationRows(populationScope, runtimeHash, from = 0, to = 0)
         }
 
         val current = repository.fetchClosedTrades(period, scope = scope).getOrThrow()
@@ -5591,20 +5548,8 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(0, snapshot.priorPnlJpy.compareTo(BigDecimal("-1.00000000")))
 
         exposedTransaction(database) {
-            prepare("UPDATE positions SET account_epoch_id=?").use { statement ->
-                statement.setObject(1, scope.accountEpochId)
-                statement.executeUpdate()
-            }
-            prepare("UPDATE orders SET account_epoch_id=?, execution_semantics_version='PAPER_WS_V1', runtime_config_hash=?").use { statement ->
-                statement.setObject(1, scope.accountEpochId)
-                statement.setString(2, runtimeHash)
-                statement.executeUpdate()
-            }
-            prepare("UPDATE executions SET account_epoch_id=?, execution_semantics_version='PAPER_WS_V1', runtime_config_hash=?").use { statement ->
-                statement.setObject(1, scope.accountEpochId)
-                statement.setString(2, runtimeHash)
-                statement.executeUpdate()
-            }
+            val populationScope = acquireFixtureGapPopulationGenerationToken(TradingMode.PAPER.name)
+            insertEvaluationPopulationRows(populationScope, runtimeHash, from = 1, to = 20_001)
         }
         val oversizedSnapshot = repository.fetchReportSnapshot(period, scope).getOrThrow()
         assertEquals(20_000, oversizedSnapshot.trades.trades.size)
@@ -6592,23 +6537,26 @@ class PostgresPersistenceIntegrationTest {
         val approved = approvedPostgresEntryCommand(runtime.decisionRepository, entryCommand)
         val restingOrderId = UUID.randomUUID()
         exposedTransaction(database) {
-            acquireGapPopulationGenerationToken()
+            val scope = acquireFixtureGapPopulationGenerationToken(TradingMode.PAPER.name)
             jdbcConnection().prepareStatement(
                 """INSERT INTO orders
-                    (id, intent_id, mode, symbol, side, order_type, status, size_btc, limit_price_jpy,
+                    (id, account_epoch_id, execution_semantics_version, intent_id,
+                     mode, symbol, side, order_type, status, size_btc, limit_price_jpy,
                      protective_stop_price_jpy, take_profit_price_jpy, reason_ja, created_at, updated_at)
-                    VALUES (?, ?, 'PAPER', 'BTC', 'BUY', 'LIMIT', 'OPEN', ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, 'PAPER', 'BTC', 'BUY', 'LIMIT', 'OPEN', ?, ?, ?, ?, ?, ?, ?)
                 """.trimIndent(),
             ).use { statement ->
                 statement.setObject(1, restingOrderId)
-                statement.setObject(2, requireNotNull(approved.intentId))
-                statement.setBigDecimal(3, approved.sizeBtc)
-                statement.setBigDecimal(4, approved.priceJpy)
-                statement.setBigDecimal(5, approved.protectiveStopPriceJpy)
-                statement.setBigDecimal(6, approved.takeProfitPriceJpy)
-                statement.setString(7, approved.reasonJa)
-                statement.setLong(8, fixedInstant().toEpochMilli())
-                statement.setLong(9, fixedInstant().toEpochMilli())
+                statement.setObject(2, scope.accountEpochId)
+                statement.setString(3, scope.executionSemanticsVersion)
+                statement.setObject(4, requireNotNull(approved.intentId))
+                statement.setBigDecimal(5, approved.sizeBtc)
+                statement.setBigDecimal(6, approved.priceJpy)
+                statement.setBigDecimal(7, approved.protectiveStopPriceJpy)
+                statement.setBigDecimal(8, approved.takeProfitPriceJpy)
+                statement.setString(9, approved.reasonJa)
+                statement.setLong(10, fixedInstant().toEpochMilli())
+                statement.setLong(11, fixedInstant().toEpochMilli())
                 statement.executeUpdate()
             }
         }
@@ -6875,19 +6823,22 @@ class PostgresPersistenceIntegrationTest {
             runtime.decisionMaterialStateRepository.findOpenEpisodeContext("BTC").getOrThrow()?.priceMoveThresholdRatio,
         )
         exposedTransaction(database) {
-            acquireGapPopulationGenerationToken()
+            val scope = acquireFixtureGapPopulationGenerationToken(TradingMode.PAPER.name)
             jdbcConnection().prepareStatement(
                 """INSERT INTO orders
-                    (id, intent_id, mode, symbol, side, order_type, status, size_btc, limit_price_jpy,
+                    (id, account_epoch_id, execution_semantics_version, intent_id,
+                     mode, symbol, side, order_type, status, size_btc, limit_price_jpy,
                      cancel_reason, created_at, updated_at)
-                    VALUES (?, ?, 'PAPER', 'BTC', 'BUY', 'LIMIT', 'CANCELED', 0.005, 10000000,
+                    VALUES (?, ?, ?, ?, 'PAPER', 'BTC', 'BUY', 'LIMIT', 'CANCELED', 0.005, 10000000,
                      'resting_entry_order_ttl_expired', ?, ?)
                 """.trimIndent(),
             ).use { statement ->
                 statement.setObject(1, UUID.randomUUID())
-                statement.setObject(2, approved.intentId)
-                statement.setLong(3, fixedInstant().toEpochMilli())
-                statement.setLong(4, fixedInstant().toEpochMilli())
+                statement.setObject(2, scope.accountEpochId)
+                statement.setString(3, scope.executionSemanticsVersion)
+                statement.setObject(4, approved.intentId)
+                statement.setLong(5, fixedInstant().toEpochMilli())
+                statement.setLong(6, fixedInstant().toEpochMilli())
                 statement.executeUpdate()
             }
         }
@@ -8903,12 +8854,13 @@ private fun JdbcTransaction.insertTestPosition(
     tradeGroupId: UUID,
     mode: String,
 ) {
-    acquireGapPopulationGenerationToken()
+    val scope = acquireFixtureGapPopulationGenerationToken(mode)
     jdbcConnection().prepareStatement(INSERT_TEST_POSITION_SQL).use { statement ->
         statement.setObject(1, positionId)
-        statement.setObject(2, tradeGroupId)
-        statement.setString(3, mode)
-        statement.setLong(4, fixedInstant().toEpochMilli())
+        statement.setObject(2, scope.accountEpochId)
+        statement.setObject(3, tradeGroupId)
+        statement.setString(4, mode)
+        statement.setLong(5, fixedInstant().toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -8921,14 +8873,16 @@ private fun JdbcTransaction.insertTestOrder(
     tradeGroupId: UUID,
     mode: String,
 ) {
-    acquireGapPopulationGenerationToken()
+    val scope = acquireFixtureGapPopulationGenerationToken(mode)
     jdbcConnection().prepareStatement(INSERT_TEST_ORDER_SQL).use { statement ->
         statement.setObject(1, UUID.randomUUID())
-        statement.setObject(2, positionId)
-        statement.setObject(3, tradeGroupId)
-        statement.setString(4, mode)
-        statement.setLong(5, fixedInstant().toEpochMilli())
-        statement.setLong(6, fixedInstant().toEpochMilli())
+        statement.setObject(2, scope.accountEpochId)
+        statement.setString(3, scope.executionSemanticsVersion)
+        statement.setObject(4, positionId)
+        statement.setObject(5, tradeGroupId)
+        statement.setString(6, mode)
+        statement.setLong(7, fixedInstant().toEpochMilli())
+        statement.setLong(8, fixedInstant().toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -8942,12 +8896,15 @@ private fun JdbcTransaction.insertTestExecution(
     realizedPnlJpy: String,
     executedAt: Instant = fixedInstant(),
 ) {
+    val scope = fixtureGapPopulationScope(mode)
     jdbcConnection().prepareStatement(INSERT_TEST_EXECUTION_SQL).use { statement ->
         statement.setObject(1, UUID.randomUUID())
-        statement.setObject(2, positionId)
-        statement.setString(3, mode)
-        statement.setBigDecimal(4, realizedPnlJpy.toBigDecimal())
-        statement.setLong(5, executedAt.toEpochMilli())
+        statement.setObject(2, scope.accountEpochId)
+        statement.setString(3, scope.executionSemanticsVersion)
+        statement.setObject(4, positionId)
+        statement.setString(5, mode)
+        statement.setBigDecimal(6, realizedPnlJpy.toBigDecimal())
+        statement.setLong(7, executedAt.toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -8969,22 +8926,113 @@ private fun JdbcTransaction.insertActivityContextOrder(
     reasonJa: String,
     decisionRunId: String?,
 ) {
-    acquireGapPopulationGenerationToken()
+    val scope = acquireFixtureGapPopulationGenerationToken(TradingMode.PAPER.name)
     jdbcConnection().prepareStatement(INSERT_ACTIVITY_CONTEXT_ORDER_SQL).use { statement ->
         statement.setObject(1, orderId)
-        statement.setObject(2, intentId)
-        statement.setObject(3, positionId)
-        statement.setObject(4, tradeGroupId)
-        statement.setString(5, side.name)
-        statement.setString(6, orderType.name)
-        statement.setString(7, status.name)
-        statement.setNullableBigDecimal(8, limitPriceJpy)
-        statement.setNullableBigDecimal(9, triggerPriceJpy)
-        statement.setNullableBigDecimal(10, takeProfitPriceJpy)
-        statement.setString(11, reasonJa)
-        statement.setString(12, decisionRunId)
-        statement.setLong(13, fixedInstant().toEpochMilli())
-        statement.setLong(14, fixedInstant().toEpochMilli())
+        statement.setObject(2, scope.accountEpochId)
+        statement.setString(3, scope.executionSemanticsVersion)
+        statement.setObject(4, intentId)
+        statement.setObject(5, positionId)
+        statement.setObject(6, tradeGroupId)
+        statement.setString(7, side.name)
+        statement.setString(8, orderType.name)
+        statement.setString(9, status.name)
+        statement.setNullableBigDecimal(10, limitPriceJpy)
+        statement.setNullableBigDecimal(11, triggerPriceJpy)
+        statement.setNullableBigDecimal(12, takeProfitPriceJpy)
+        statement.setString(13, reasonJa)
+        statement.setString(14, decisionRunId)
+        statement.setLong(15, fixedInstant().toEpochMilli())
+        statement.setLong(16, fixedInstant().toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.acquireFixtureGapPopulationGenerationToken(mode: String): GapPopulationScope {
+    val scope = fixtureGapPopulationScope(mode)
+    acquireGapPopulationGenerationToken(scope)
+
+    return scope
+}
+
+private fun JdbcTransaction.fixtureGapPopulationScope(mode: String): GapPopulationScope {
+    val epochId = prepare("SELECT current_epoch_id FROM paper_account WHERE id=1").use { statement ->
+        statement.executeQuery().use { rows ->
+            require(rows.next())
+            rows.getObject(1, UUID::class.java)
+        }
+    }
+    return GapPopulationScope(
+        kind = "SYMBOL",
+        mode = mode,
+        symbol = "BTC",
+        accountEpochId = epochId,
+        cohort = "CURRENT",
+        executionSemanticsVersion = if (mode == TradingMode.PAPER.name) "PAPER_WS_V1" else null,
+    )
+}
+
+private fun JdbcTransaction.insertEvaluationPopulationRows(
+    scope: GapPopulationScope,
+    runtimeHash: String,
+    from: Int,
+    to: Int,
+) {
+    prepare(
+        """
+        INSERT INTO positions (
+            id,account_epoch_id,trade_group_id,mode,symbol,side,status,opened_at,closed_at,size_btc,
+            average_entry_price_jpy,current_price_jpy,highest_price_since_entry_jpy,lowest_price_since_entry_jpy
+        )
+        SELECT md5('bulk-position:' || series)::uuid,?,md5('bulk-group:' || series)::uuid,
+            'PAPER','BTC','LONG','CLOSED',?,?,0,10000000,10000000,10000000,10000000
+        FROM generate_series(?,?) series
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, scope.accountEpochId)
+        statement.setLong(2, fixedInstant().toEpochMilli())
+        statement.setLong(3, fixedInstant().toEpochMilli())
+        statement.setInt(4, from)
+        statement.setInt(5, to)
+        statement.executeUpdate()
+    }
+    prepare(
+        """
+        INSERT INTO orders (
+            id,account_epoch_id,execution_semantics_version,runtime_config_hash,position_id,trade_group_id,
+            mode,symbol,side,order_type,status,size_btc,protective_stop_price_jpy,created_at,updated_at
+        )
+        SELECT md5('bulk-order:' || series)::uuid,?,?,?,md5('bulk-position:' || series)::uuid,
+            md5('bulk-group:' || series)::uuid,'PAPER','BTC','BUY','MARKET','FILLED',0.001,9700000,?,?
+        FROM generate_series(?,?) series
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, scope.accountEpochId)
+        statement.setString(2, scope.executionSemanticsVersion)
+        statement.setString(3, runtimeHash)
+        statement.setLong(4, fixedInstant().toEpochMilli())
+        statement.setLong(5, fixedInstant().toEpochMilli())
+        statement.setInt(6, from)
+        statement.setInt(7, to)
+        statement.executeUpdate()
+    }
+    prepare(
+        """
+        INSERT INTO executions (
+            id,account_epoch_id,execution_semantics_version,runtime_config_hash,order_id,position_id,
+            mode,symbol,side,price_jpy,size_btc,fee_jpy,realized_pnl_jpy,liquidity,executed_at
+        )
+        SELECT md5('bulk-execution:' || series)::uuid,?,?,?,md5('bulk-order:' || series)::uuid,
+            md5('bulk-position:' || series)::uuid,'PAPER','BTC','BUY',10000000,0.001,1,0,'TAKER',?
+        FROM generate_series(?,?) series
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, scope.accountEpochId)
+        statement.setString(2, scope.executionSemanticsVersion)
+        statement.setString(3, runtimeHash)
+        statement.setLong(4, fixedInstant().toEpochMilli())
+        statement.setInt(5, from)
+        statement.setInt(6, to)
         statement.executeUpdate()
     }
 }
