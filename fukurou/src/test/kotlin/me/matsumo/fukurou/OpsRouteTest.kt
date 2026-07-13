@@ -69,10 +69,12 @@ import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
 import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
+import me.matsumo.fukurou.trading.reconciler.ReconcilerStatus
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
@@ -646,6 +648,45 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_runtimeConfigDerivesExpiryWarningFromCachedCalendarAtResponseTime() = testApplication {
+        val validThrough = Instant.parse("2026-07-13T01:00:00Z")
+        val clock = MutableClock(validThrough)
+        val calendarRaw =
+            """[{"eventId":"fomc-boundary","eventName":"FOMC","eventAt":"2026-07-13T00:00:00Z","blackoutBeforeSeconds":3600,"blackoutAfterSeconds":3600}]"""
+        val tradingConfig = TradingBotConfig.fromEnvironment(
+            mapOf("FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC" to calendarRaw),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                clock = clock,
+                tradingConfig = tradingConfig,
+            )
+        }
+
+        val boundaryResponse = client.get("/ops/runtime-config")
+        val boundaryReadyResponse = client.get("/health/ready")
+        clock.advance(Duration.ofMillis(1))
+        val expiredResponse = client.get("/ops/runtime-config")
+        val expiredReadyResponse = client.get("/health/ready")
+        val boundaryWarnings = Json.parseToJsonElement(boundaryResponse.bodyAsText()).jsonObject
+            .getValue("warnings").jsonArray
+        val expiredWarnings = Json.parseToJsonElement(expiredResponse.bodyAsText()).jsonObject
+            .getValue("warnings").jsonArray
+
+        assertEquals(HttpStatusCode.OK, boundaryResponse.status)
+        assertEquals(emptyList(), boundaryWarnings)
+        assertEquals(HttpStatusCode.OK, boundaryReadyResponse.status)
+        assertEquals(HttpStatusCode.OK, expiredResponse.status)
+        assertEquals(
+            "runtimeConfig.warning.fomcCalendarExpired",
+            expiredWarnings.single().jsonObject.getValue("code").jsonPrimitive.content,
+        )
+        assertEquals(HttpStatusCode.OK, expiredReadyResponse.status)
+    }
+
+    @Test
     fun opsRoutes_runtimeConfigDraftActivationReturnsMachineReadableValidationErrors() = testApplication {
         val adminService = FakeRuntimeConfigAdminService()
 
@@ -812,6 +853,86 @@ class OpsRouteTest {
             assertEquals(HttpStatusCode.Accepted, recoveredTriggerResponse.status)
             assertEquals(HttpStatusCode.OK, recoveredReadyResponse.status)
             assertEquals(listOf("operator restored runtime config"), manualService.reasons)
+        } finally {
+            container.stop()
+        }
+    }
+
+    @Test
+    fun moduleKeepsReadinessAndManualRecoveryAvailableWhenActiveFomcCalendarIsMissing() = testApplication {
+        if (!isDockerAvailable()) {
+            println("Skipping FOMC calendar composition test because Docker is unavailable.")
+            return@testApplication
+        }
+
+        val container = FukurouPostgresContainer()
+        container.start()
+
+        try {
+            val databaseConfig = DatabaseConfig(
+                url = container.jdbcUrl,
+                user = container.username,
+                password = container.password,
+            )
+            val database = ExposedDatabase.connect(
+                url = databaseConfig.url,
+                driver = "org.postgresql.Driver",
+                user = databaseConfig.user,
+                password = databaseConfig.password,
+            )
+            RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+            updateRuntimeConfigValue(
+                database = database,
+                key = "safety.economicEventBlackouts",
+                value = "[]",
+            )
+            val manualService = CapturingManualLlmLaunchService(
+                ManualLlmLaunchResult.Accepted(
+                    invocationId = "manual-calendar-recovery",
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                ),
+            )
+            val reconcilerStatus = MutableReconcilerStatus()
+            reconcilerStatus.markReconciled(
+                startupFullReconcileCompleted = true,
+                lastMaintenanceAt = fixedInstant(),
+            )
+
+            reconcilerStatus.updateMarketData(
+                ReconcilerStatus(
+                    startupFullReconcileCompleted = true,
+                    startupRecoveryCompleted = true,
+                    marketDataState = MarketDataConnectionState.CONNECTED,
+                    lastTransportActivityAt = fixedInstant(),
+                    lastMaintenanceAt = fixedInstant(),
+                ),
+            )
+
+            application {
+                module(
+                    clock = fixedClock(),
+                    reconcilerStatus = reconcilerStatus,
+                    opsManualLlmLaunchService = manualService,
+                    databaseConfig = databaseConfig,
+                )
+            }
+
+            val configResponse = client.get("/ops/runtime-config")
+            val readyResponse = client.get("/health/ready")
+            val triggerResponse = client.post("/ops/trigger") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"reason":"calendar recovery"}""")
+            }
+            val warningCodes = Json.parseToJsonElement(configResponse.bodyAsText()).jsonObject
+                .getValue("warnings").jsonArray.map { warning ->
+                    warning.jsonObject.getValue("code").jsonPrimitive.content
+                }
+
+            assertEquals(HttpStatusCode.OK, configResponse.status)
+            assertTrue(warningCodes.contains("runtimeConfig.warning.fomcCalendarMissing"))
+            assertEquals(HttpStatusCode.OK, readyResponse.status, readyResponse.bodyAsText())
+            assertEquals(HttpStatusCode.Accepted, triggerResponse.status, triggerResponse.bodyAsText())
+            assertEquals(listOf("calendar recovery"), manualService.reasons)
         } finally {
             container.stop()
         }

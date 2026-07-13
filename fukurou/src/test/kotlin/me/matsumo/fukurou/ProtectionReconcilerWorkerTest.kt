@@ -11,6 +11,9 @@ import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
+import me.matsumo.fukurou.trading.config.FomcBlackoutCalendarState
+import me.matsumo.fukurou.trading.config.RuntimeConfigCandidateValidator
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -31,6 +34,7 @@ import me.matsumo.fukurou.trading.reconciler.ProtectionReconciler
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.TickStream
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import me.matsumo.fukurou.trading.safety.SafetyFloor
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
@@ -86,6 +90,57 @@ class ProtectionReconcilerWorkerTest {
         }
 
         assertTrue(status.snapshot().startupFullReconcileCompleted)
+    }
+
+    @Test
+    fun worker_runsRealReconcilerPassWithInvalidActiveCalendar() = runBlocking {
+        val clock = Clock.fixed(Instant.parse("2026-07-13T00:00:00Z"), ZoneOffset.UTC)
+        val calendarRaw =
+            """[{"eventId":"fomc-end-overflow","eventName":"FOMC","eventAt":"+1000000000-12-31T23:59:59.999999999Z","blackoutBeforeSeconds":0,"blackoutAfterSeconds":1}]"""
+        val config = requireNotNull(
+            RuntimeConfigCandidateValidator.validate(
+                values = RuntimeConfigCatalog.runtimeDefaultValues() +
+                    ("safety.economicEventBlackouts" to calendarRaw),
+                environment = emptyMap(),
+                tolerateActiveCalendarCorruption = true,
+            ).tradingConfig,
+        )
+        assertEquals(FomcBlackoutCalendarState.INVALID, config.safetyFloor.fomcBlackoutCalendar.state)
+        assertEquals(emptyList(), config.safetyFloor.fomcBlackoutCalendar.events)
+        val riskStateRepository = InMemoryRiskStateRepository(clock = clock)
+        val status = MutableReconcilerStatus()
+        val broker = PaperBroker(
+            ledgerRepository = InMemoryPaperLedgerRepository(clock = clock),
+            riskStateRepository = riskStateRepository,
+            decisionRepository = InMemoryDecisionRepository(clock),
+            safetyFloor = SafetyFloor(config.safetyFloor, clock),
+            clock = clock,
+        )
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = riskStateRepository,
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = InMemoryTradingLock(clock),
+            tickStream = FixedTickStream(clock),
+            broker = broker,
+            status = status,
+            clock = clock,
+        )
+        val worker = ProtectionReconcilerWorker(
+            reconciler = reconciler,
+            interval = Duration.ofMillis(10),
+        )
+
+        worker.use {
+            worker.start()
+            withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
+                while (!status.snapshot().startupFullReconcileCompleted) {
+                    delay(10.toDuration(DurationUnit.MILLISECONDS))
+                }
+            }
+        }
+
+        assertTrue(status.snapshot().startupFullReconcileCompleted)
+        assertEquals(clock.instant(), status.snapshot().lastMaintenanceAt)
     }
 
     @Test

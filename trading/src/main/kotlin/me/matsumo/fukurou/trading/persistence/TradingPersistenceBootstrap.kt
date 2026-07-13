@@ -28,6 +28,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import java.util.logging.Logger
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
@@ -35,6 +36,118 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
  * stale な llm_runs を回収するまでの per-run timeout 乗数。
  */
 private const val STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER = 3L
+
+/** economic-event migration の table lock 待機上限。既存 bounded recovery と同じ値を使う。 */
+internal val ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT: Duration = Duration.ofSeconds(2)
+
+/** economic-event migration の SQL 実行上限。既存 bounded recovery と同じ値を使う。 */
+internal val ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT: Duration = Duration.ofSeconds(5)
+
+/** economic-event migration の partial unique index step 結果。 */
+internal enum class EconomicEventAttemptMigrationIndexOutcome {
+    /** index を新規作成し、定義を検証した。 */
+    CREATED_AND_VERIFIED,
+
+    /** 既存 index の定義を検証した。 */
+    EXISTING_AND_VERIFIED,
+
+    /** index step の前に migration が失敗した。 */
+    NOT_ATTEMPTED,
+
+    /** index 作成または検証が失敗した。 */
+    FAILED,
+}
+
+/**
+ * economic-event single-attempt migration の bounded audit。
+ *
+ * @param candidateRowCount migration 前に数えた ECONOMIC_EVENT row 数
+ * @param affectedCanonicalRowCount canonical key を付与した row 数
+ * @param elapsed count / backfill / index verification に要した時間
+ * @param lockTimeout transaction-local lock timeout
+ * @param statementTimeout transaction-local statement timeout
+ * @param indexOutcome partial unique index step 結果
+ * @param transactionCommitted migration を含む schema transaction の commit 成否
+ * @param failureType bootstrap failure の例外型。成功時は null
+ */
+internal data class EconomicEventAttemptMigrationAudit(
+    val candidateRowCount: Long?,
+    val affectedCanonicalRowCount: Int?,
+    val elapsed: Duration,
+    val lockTimeout: Duration,
+    val statementTimeout: Duration,
+    val indexOutcome: EconomicEventAttemptMigrationIndexOutcome,
+    val transactionCommitted: Boolean,
+    val failureType: String?,
+)
+
+/** economic-event migration の運用 log。 */
+private val ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOGGER =
+    Logger.getLogger("me.matsumo.fukurou.trading.persistence.EconomicEventAttemptMigration")
+
+/** integration test が structured migration audit を観測する module-internal sink。 */
+internal object EconomicEventAttemptMigrationAuditSink {
+    @Volatile
+    var observer: ((EconomicEventAttemptMigrationAudit) -> Unit)? = null
+}
+
+/** economic-event migration の transaction 内観測値。 */
+private class EconomicEventAttemptMigrationObservation {
+    private var startedAtNanos: Long? = null
+    private var finishedAtNanos: Long? = null
+    var candidateRowCount: Long? = null
+    var affectedCanonicalRowCount: Int? = null
+    var indexOutcome: EconomicEventAttemptMigrationIndexOutcome =
+        EconomicEventAttemptMigrationIndexOutcome.NOT_ATTEMPTED
+
+    fun start() {
+        startedAtNanos = System.nanoTime()
+    }
+
+    fun finish() {
+        finishedAtNanos = System.nanoTime()
+    }
+
+    fun toAudit(transactionCommitted: Boolean, failure: Throwable?): EconomicEventAttemptMigrationAudit? {
+        val startedAt = startedAtNanos ?: return null
+        val finishedAt = finishedAtNanos ?: System.nanoTime()
+
+        return EconomicEventAttemptMigrationAudit(
+            candidateRowCount = candidateRowCount,
+            affectedCanonicalRowCount = affectedCanonicalRowCount,
+            elapsed = Duration.ofNanos(finishedAt - startedAt),
+            lockTimeout = ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT,
+            statementTimeout = ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT,
+            indexOutcome = indexOutcome,
+            transactionCommitted = transactionCommitted,
+            failureType = failure?.javaClass?.simpleName,
+        )
+    }
+}
+
+private fun logEconomicEventAttemptMigrationAudit(audit: EconomicEventAttemptMigrationAudit) {
+    val message = "Economic-event attempt migration: " +
+        "candidates=${audit.candidateRowCount}, " +
+        "affectedCanonical=${audit.affectedCanonicalRowCount}, " +
+        "elapsedMillis=${audit.elapsed.toMillis()}, " +
+        "lockTimeoutMillis=${audit.lockTimeout.toMillis()}, " +
+        "statementTimeoutMillis=${audit.statementTimeout.toMillis()}, " +
+        "indexOutcome=${audit.indexOutcome}, " +
+        "transactionCommitted=${audit.transactionCommitted}, " +
+        "failureType=${audit.failureType}"
+
+    if (audit.transactionCommitted) {
+        ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOGGER.info(message)
+    } else {
+        ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOGGER.warning(message)
+    }
+}
+
+private fun emitEconomicEventAttemptMigrationAudit(audit: EconomicEventAttemptMigrationAudit) {
+    logEconomicEventAttemptMigrationAudit(audit)
+    runCatching { EconomicEventAttemptMigrationAuditSink.observer?.invoke(audit) }
+        .onFailure { ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOGGER.warning("Migration audit observer failed.") }
+}
 
 /**
  * persistence bootstrap で stale な llm_runs を FAILED へ回収するときの固定 error_message。
@@ -415,6 +528,58 @@ private const val ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL = """
     ON llm_launch_reservations (status, reserved_at)
 """
 
+/** single-attempt migration 対象の既存 ECONOMIC_EVENT row を数える SQL。 */
+private const val COUNT_LLM_LAUNCH_ECONOMIC_EVENT_CANDIDATES_SQL = """
+    SELECT COUNT(*)
+    FROM llm_launch_reservations
+    WHERE trigger_kind = 'ECONOMIC_EVENT'
+"""
+
+/** legacy table の single-attempt key column を bounded DDL で追加する SQL。 */
+private const val ENSURE_LLM_LAUNCH_SINGLE_ATTEMPT_KEY_COLUMN_SQL = """
+    ALTER TABLE IF EXISTS llm_launch_reservations
+    ADD COLUMN IF NOT EXISTS single_attempt_key TEXT NULL
+"""
+
+/** 既存 ECONOMIC_EVENT history の canonical 1 row だけへ single-attempt key を付与する SQL。 */
+private const val BACKFILL_LLM_LAUNCH_SINGLE_ATTEMPT_KEY_SQL = """
+    WITH ranked AS (
+        SELECT invocation_id, trigger_key,
+            ROW_NUMBER() OVER (PARTITION BY trigger_key ORDER BY reserved_at ASC, invocation_id ASC) AS row_number
+        FROM llm_launch_reservations
+        WHERE trigger_kind = 'ECONOMIC_EVENT'
+    )
+    UPDATE llm_launch_reservations AS reservation
+    SET single_attempt_key = 'ECONOMIC_EVENT:' || ranked.trigger_key
+    FROM ranked
+    WHERE reservation.invocation_id = ranked.invocation_id
+        AND ranked.row_number = 1
+        AND reservation.single_attempt_key IS NULL
+        AND NOT EXISTS (
+            SELECT 1
+            FROM llm_launch_reservations AS canonical
+            WHERE canonical.single_attempt_key = 'ECONOMIC_EVENT:' || ranked.trigger_key
+        )
+"""
+
+/** single-attempt key の non-null rowだけを一意にする partial index。 */
+private const val ENSURE_LLM_LAUNCH_SINGLE_ATTEMPT_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_launch_reservations_single_attempt_key_unique
+    ON llm_launch_reservations (single_attempt_key)
+    WHERE single_attempt_key IS NOT NULL
+"""
+
+/** single-attempt partial unique index の名前が既に存在するか確認する SQL。 */
+private const val SELECT_LLM_LAUNCH_SINGLE_ATTEMPT_INDEX_EXISTS_SQL = """
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+            AND tablename = 'llm_launch_reservations'
+            AND indexname = 'idx_llm_launch_reservations_single_attempt_key_unique'
+    )
+"""
+
 /** stale claim recovery の bounded scan index を作る SQL。 */
 private const val ENSURE_LLM_LAUNCH_CLAIM_RECOVERY_INDEX_SQL = """
     CREATE INDEX IF NOT EXISTS idx_llm_res_running_claimed_recovery
@@ -587,10 +752,48 @@ private const val VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL = """
             'idx_llm_launch_reservations_invocation_id_unique',
             'idx_llm_launch_reservations_trigger_key_reserved_at',
             'idx_llm_launch_reservations_status_reserved_at',
+            'idx_llm_launch_reservations_single_attempt_key_unique',
             'idx_llm_res_running_claimed_recovery',
             'idx_llm_res_running_nonclaimed_recent'
         )
-    HAVING COUNT(*) = 5
+    HAVING COUNT(*) = 6
+"""
+
+/** single-attempt unique index の state / table / column / predicate を確認する SQL。 */
+private const val VERIFY_LLM_LAUNCH_SINGLE_ATTEMPT_UNIQUE_INDEX_SQL = """
+    SELECT 1
+    FROM pg_index index_state
+    JOIN pg_class index_relation ON index_relation.oid = index_state.indexrelid
+    JOIN pg_namespace index_namespace ON index_namespace.oid = index_relation.relnamespace
+    JOIN pg_class table_relation ON table_relation.oid = index_state.indrelid
+    JOIN pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace
+    JOIN pg_am access_method ON access_method.oid = index_relation.relam
+    WHERE index_namespace.nspname = current_schema()
+        AND table_namespace.nspname = current_schema()
+        AND table_relation.relname = 'llm_launch_reservations'
+        AND index_relation.relname = 'idx_llm_launch_reservations_single_attempt_key_unique'
+        AND access_method.amname = 'btree'
+        AND index_state.indisunique
+        AND index_state.indisvalid
+        AND index_state.indisready
+        AND index_state.indislive
+        AND index_state.indimmediate
+        AND index_state.indnatts = 1
+        AND index_state.indnkeyatts = 1
+        AND index_state.indexprs IS NULL
+        AND index_state.indkey[0] = (
+            SELECT attribute.attnum
+            FROM pg_attribute attribute
+            WHERE attribute.attrelid = table_relation.oid
+                AND attribute.attname = 'single_attempt_key'
+                AND NOT attribute.attisdropped
+        )
+        AND REGEXP_REPLACE(
+            PG_GET_EXPR(index_state.indpred, index_state.indrelid, TRUE),
+            '[() ]',
+            '',
+            'g'
+        ) = 'single_attempt_keyISNOTNULL'
 """
 
 /**
@@ -750,6 +953,7 @@ private const val VERIFY_LLM_LAUNCH_RESERVATIONS_SCHEMA_SQL = """
         invocation_id,
         trigger_kind,
         trigger_key,
+        single_attempt_key,
         status,
         reserved_at,
         finished_at,
@@ -980,8 +1184,22 @@ class TradingPersistenceBootstrap(
      */
     @Suppress("LongMethod")
     fun ensureSchema(): Result<Unit> {
-        return runCatching {
+        val migrationObservation = EconomicEventAttemptMigrationObservation()
+        val schemaResult = runCatching {
             exposedTransaction(database) {
+                maxAttempts = 1
+                migrationObservation.start()
+                val previousLockTimeout = currentPostgresSetting("lock_timeout")
+                val previousStatementTimeout = currentPostgresSetting("statement_timeout")
+                setLocalPostgresSetting(
+                    name = "lock_timeout",
+                    value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT.toPostgresTimeout(),
+                )
+                setLocalPostgresSetting(
+                    name = "statement_timeout",
+                    value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT.toPostgresTimeout(),
+                )
+                executeUpdate(ENSURE_LLM_LAUNCH_SINGLE_ATTEMPT_KEY_COLUMN_SQL)
                 @Suppress("DEPRECATION")
                 SchemaUtils.createMissingTablesAndColumns(
                     RuntimeConfigVersionsTable,
@@ -1013,7 +1231,17 @@ class TradingPersistenceBootstrap(
                     TradeIntentConsumptionsTable,
                     withLogs = false,
                 )
-                ensureRuntimeSchemaObjects()
+                setLocalPostgresSetting(
+                    name = "lock_timeout",
+                    value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT.toPostgresTimeout(),
+                )
+                setLocalPostgresSetting(
+                    name = "statement_timeout",
+                    value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT.toPostgresTimeout(),
+                )
+                ensureRuntimeSchemaObjects(migrationObservation)
+                setLocalPostgresSetting("lock_timeout", previousLockTimeout)
+                setLocalPostgresSetting("statement_timeout", previousStatementTimeout)
                 ensureGapPopulationLifecycleSchema()
                 val now = Instant.now(clock)
 
@@ -1049,6 +1277,16 @@ class TradingPersistenceBootstrap(
                     statement.executeUpdate()
                 }
             }
+
+            Unit
+        }
+        migrationObservation.toAudit(
+            transactionCommitted = schemaResult.isSuccess,
+            failure = schemaResult.exceptionOrNull(),
+        )?.let(::emitEconomicEventAttemptMigrationAudit)
+        if (schemaResult.isFailure) return schemaResult
+
+        return runCatching {
             val recoveredCount = recoverStaleLlmRunLifecycles(
                 now = Instant.now(clock),
                 previousGenerationTerminated = false,
@@ -1210,7 +1448,9 @@ fun TradingBotConfig.staleLlmRunRecoveryThreshold(): Duration {
 /**
  * runtime schema の補助 index / backfill を適用する。
  */
-private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
+private fun JdbcTransaction.ensureRuntimeSchemaObjects(
+    economicEventMigration: EconomicEventAttemptMigrationObservation,
+) {
     ensureRuntimeConfigIndexes()
     executeUpdate(ENSURE_MCP_EVALUATION_EPOCHS_VIEW_SQL)
     executeUpdate(ENSURE_MCP_CURRENT_EVALUATION_SCOPE_VIEW_SQL)
@@ -1232,6 +1472,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
+    ensureEconomicEventAttemptMigration(economicEventMigration)
     executeUpdate(ENSURE_LLM_LAUNCH_CLAIM_RECOVERY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_NONCLAIMED_RECENT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL)
@@ -1242,6 +1483,76 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_BOOTSTRAP_UNIQUE_INDEX_SQL)
     executeUpdate(BACKFILL_OPEN_POSITION_LOWEST_PRICE_SQL)
 }
+
+private fun JdbcTransaction.ensureEconomicEventAttemptMigration(
+    observation: EconomicEventAttemptMigrationObservation,
+) {
+    try {
+        observation.candidateRowCount = selectLong(COUNT_LLM_LAUNCH_ECONOMIC_EVENT_CANDIDATES_SQL)
+        observation.affectedCanonicalRowCount = executeUpdateReturningCount(
+            BACKFILL_LLM_LAUNCH_SINGLE_ATTEMPT_KEY_SQL,
+        )
+
+        val indexAlreadyExisted = selectBoolean(SELECT_LLM_LAUNCH_SINGLE_ATTEMPT_INDEX_EXISTS_SQL)
+        observation.indexOutcome = EconomicEventAttemptMigrationIndexOutcome.FAILED
+        executeUpdate(ENSURE_LLM_LAUNCH_SINGLE_ATTEMPT_UNIQUE_INDEX_SQL)
+        verifyExistsBySql(
+            sql = VERIFY_LLM_LAUNCH_SINGLE_ATTEMPT_UNIQUE_INDEX_SQL,
+            missingMessage = "llm_launch_reservations single-attempt unique index was not initialized.",
+        )
+        observation.indexOutcome = if (indexAlreadyExisted) {
+            EconomicEventAttemptMigrationIndexOutcome.EXISTING_AND_VERIFIED
+        } else {
+            EconomicEventAttemptMigrationIndexOutcome.CREATED_AND_VERIFIED
+        }
+    } finally {
+        observation.finish()
+    }
+}
+
+private fun JdbcTransaction.currentPostgresSetting(name: String): String {
+    return jdbcConnection().prepareStatement("SELECT current_setting(?)").use { statement ->
+        statement.setString(1, name)
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "PostgreSQL setting was not returned: $name" }
+            resultSet.getString(1)
+        }
+    }
+}
+
+private fun JdbcTransaction.setLocalPostgresSetting(name: String, value: String) {
+    jdbcConnection().prepareStatement("SELECT set_config(?, ?, TRUE)").use { statement ->
+        statement.setString(1, name)
+        statement.setString(2, value)
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "PostgreSQL setting was not applied: $name" }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectLong(sql: String): Long {
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "Expected one long result row." }
+            resultSet.getLong(1)
+        }
+    }
+}
+
+private fun JdbcTransaction.selectBoolean(sql: String): Boolean {
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "Expected one boolean result row." }
+            resultSet.getBoolean(1)
+        }
+    }
+}
+
+private fun JdbcTransaction.executeUpdateReturningCount(sql: String): Int {
+    return jdbcConnection().prepareStatement(sql).use { statement -> statement.executeUpdate() }
+}
+
+private fun Duration.toPostgresTimeout(): String = "${toMillis()}ms"
 
 /**
  * runtime schema と補助 index が存在することを確認する。
@@ -1321,6 +1632,10 @@ private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
     verifyExistsBySql(
         sql = VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL,
         missingMessage = "llm_launch_reservations indexes were not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_LLM_LAUNCH_SINGLE_ATTEMPT_UNIQUE_INDEX_SQL,
+        missingMessage = "llm_launch_reservations single-attempt unique index was not initialized.",
     )
     verifySchemaBySql(
         sql = VERIFY_EXECUTIONS_SCHEMA_SQL,

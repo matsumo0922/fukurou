@@ -5,6 +5,8 @@ import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
+import me.matsumo.fukurou.trading.config.FomcBlackoutCalendar
+import me.matsumo.fukurou.trading.config.FomcBlackoutCalendarState
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.EntryIntentSafetySnapshot
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
@@ -134,6 +136,15 @@ enum class SafetyFloorRule {
      */
     ECONOMIC_EVENT_BLACKOUT,
 
+    /** FOMC calendar が空のため新規 entry を fail closed にした。 */
+    FOMC_CALENDAR_MISSING,
+
+    /** FOMC calendar が不正なため新規 entry を fail closed にした。 */
+    FOMC_CALENDAR_INVALID,
+
+    /** FOMC calendar の有効期限が切れたため新規 entry を fail closed にした。 */
+    FOMC_CALENDAR_EXPIRED,
+
     /**
      * SOFT_HALT 中に新規 entry しようとした。
      */
@@ -175,13 +186,30 @@ data class EconomicEventBlackout(
      * 指定時刻が blackout window 内なら true を返す。
      */
     fun contains(observedAt: Instant): Boolean {
-        val startsAt = eventAt.minus(blackoutBefore)
-        val endsAt = eventAt.plus(blackoutAfter)
-        val beforeStart = observedAt.isBefore(startsAt)
-        val afterEnd = observedAt.isAfter(endsAt)
+        val window = toSafeWindow() ?: return false
+        val beforeStart = observedAt.isBefore(window.startsAt)
+        val afterEnd = observedAt.isAfter(window.endsAt)
 
         return !beforeStart && !afterEnd
     }
+}
+
+/** overflow を起こさず導出できた economic event window。 */
+internal data class EconomicEventBlackoutWindow(
+    val event: EconomicEventBlackout,
+    val startsAt: Instant,
+    val endsAt: Instant,
+)
+
+/** event window の両端を overflow-safe に導出する。 */
+internal fun EconomicEventBlackout.toSafeWindow(): EconomicEventBlackoutWindow? {
+    return runCatching {
+        EconomicEventBlackoutWindow(
+            event = this,
+            startsAt = eventAt.minus(blackoutBefore),
+            endsAt = eventAt.plus(blackoutAfter),
+        )
+    }.getOrNull()
 }
 
 /**
@@ -195,6 +223,8 @@ data class EconomicEventBlackout(
  * @param dataQualityCap 市場データ鮮度劣化時の p cap 設定
  * @param maxTakerFeeRatio 環境変数互換の名称。実際には order fee / maker rebate の絶対値上限
  * @param economicEventBlackouts 高影響経済イベントの新規 entry blackout 一覧
+ * @param economicEventBlackoutsRaw active runtime config から読んだ未加工 JSON
+ * @param fomcBlackoutCalendar FOMC event 群から導出した tolerant calendar projection
  * @param marketSlippageReserveBps MARKET / STOP の片道 slippage reserve
  */
 data class SafetyFloorConfig(
@@ -205,7 +235,13 @@ data class SafetyFloorConfig(
     val minExpectedMoveToCostRatio: BigDecimal = SafetyFloorDefaults.minExpectedMoveToCostRatio,
     val dataQualityCap: DataQualityCapConfig = DataQualityCapConfig(),
     val maxTakerFeeRatio: BigDecimal = DEFAULT_MAX_TAKER_FEE_RATIO,
-    val economicEventBlackouts: List<EconomicEventBlackout> = emptyList(),
+    val economicEventBlackouts: List<EconomicEventBlackout> = FomcBlackoutCalendar.candidateEvents(),
+    val economicEventBlackoutsRaw: String? = null,
+    val fomcBlackoutCalendar: FomcBlackoutCalendar = if (economicEventBlackoutsRaw != null) {
+        FomcBlackoutCalendar.fromRaw(economicEventBlackoutsRaw)
+    } else {
+        FomcBlackoutCalendar.fromEvents(economicEventBlackouts)
+    },
     val marketSlippageReserveBps: BigDecimal = DEFAULT_MARKET_SLIPPAGE_RESERVE_BPS,
 ) {
     init {
@@ -1075,8 +1111,30 @@ class SafetyFloor(
 
     private fun validateEconomicEventBlackout(command: PlaceOrderCommand): SafetyViolation? {
         val observedAt = Instant.now(clock)
-        val activeEvent = config.economicEventBlackouts.firstOrNull { event -> event.contains(observedAt) }
+        val calendarState = config.fomcBlackoutCalendar.stateAt(observedAt)
+        val calendarRule = when (calendarState) {
+            FomcBlackoutCalendarState.ACTIVE -> null
+            FomcBlackoutCalendarState.MISSING -> SafetyFloorRule.FOMC_CALENDAR_MISSING
+            FomcBlackoutCalendarState.INVALID -> SafetyFloorRule.FOMC_CALENDAR_INVALID
+            FomcBlackoutCalendarState.EXPIRED -> SafetyFloorRule.FOMC_CALENDAR_EXPIRED
+        }
+        if (calendarRule != null) {
+            return violation(
+                commandName = "place_order",
+                command = command,
+                details = SafetyViolationDetails(
+                    rule = calendarRule,
+                    messageJa = "FOMC calendar が ${calendarState.name} のため、新規 entry は拒否します。",
+                    measuredValue = calendarState.name,
+                    limitValue = config.fomcBlackoutCalendar.validThrough?.toString() ?: "valid FOMC calendar required",
+                ),
+            )
+        }
+
+        val activeEvent = config.fomcBlackoutCalendar.events.firstOrNull { event -> event.contains(observedAt) }
             ?: return null
+
+        val activeWindow = requireNotNull(activeEvent.toSafeWindow())
 
         return violation(
             commandName = "place_order",
@@ -1085,7 +1143,7 @@ class SafetyFloor(
                 rule = SafetyFloorRule.ECONOMIC_EVENT_BLACKOUT,
                 messageJa = "高影響経済イベント ${activeEvent.eventName} の blackout window 中のため、新規 entry は拒否します。",
                 measuredValue = observedAt.toString(),
-                limitValue = "${activeEvent.eventAt.minus(activeEvent.blackoutBefore)}..${activeEvent.eventAt.plus(activeEvent.blackoutAfter)}",
+                limitValue = "${activeWindow.startsAt}..${activeWindow.endsAt}",
             ),
         )
     }

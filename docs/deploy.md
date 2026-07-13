@@ -278,6 +278,10 @@ sudo git -C /srv/fukurou/repo rev-parse HEAD
 
 code-owned catalog default の変更は、active runtime config に同じ key が明示保存済みの場合は実効値を上書きしない。runtime config の runtime group は applyMode `NEXT_RESTART` のため、deploy 後に `/ops/runtime-config` または WebUI `/app/config` で現在の `effectiveValue` を確認し、必要な key を draft / validate / activate で active 化する。
 
+`safety.economicEventBlackouts` の code-owned candidate は Federal Reserve 公式 calendar の 2026 年残り FOMC 会合を `America/New_York` 14:00 から UTC へ変換し、前後 60 分で保持する。draft は code-owned candidate と同じ日程に固定せず、安全な window と future FOMC を持つ operator 更新を受け入れる。全 event の window 両端が導出可能であり、`FOMC` と名付けた event が `fomc-` ID を持つことを検証する。active 値が空、不正、期限切れの場合、実行対象 event を空にし、`/ops/runtime-config` は response 時点の専用 warning を返し、SafetyFloor は新規 entry だけを停止する。readiness、ProtectionReconciler、close、cancel、protection update は継続する。calendar 更新は通常の draft / validate / activate 手順を使い、公式 source と UTC 変換結果を確認する。deploy や rollback の一部として production active 値を暗黙に切り替えない。
+
+`llm_launch_reservations` の economic-event migration はnullable `single_attempt_key TEXT`をadditiveに追加する。既存`ECONOMIC_EVENT`はtrigger keyごとに`reserved_at, invocation_id`が最小の1行だけへcanonical keyをbackfillし、重複historyは`NULL`のまま保持して削除しない。その後non-null rowだけのpartial unique indexを作成・検証する。bootstrapは同じschema transaction内で対象row数を事前計測し、backfillとindex stepをtransaction-local `lock_timeout=2s` / `statement_timeout=5s`、transaction retryなしで実行する。候補row数、canonical更新件数、経過時間、index step結果、transaction commit成否をstructured logへ記録する。timeout、migration、verificationのいずれかが失敗するとtransaction全体をrollbackし、readinessをfalse、worker開始数を0に保つ。rollbackでもcolumn、canonical backfill、indexを削除しない。旧binaryへ戻す場合は新binary上でglobal launch gateをOFFにし、RUNNING tradingとrisk-increasing pending workを0にして、修正版へ戻るまでentry経路を再開しない。
+
 例: `safety.minExpectedMoveToCostRatio` と runner の hourly / daily cap を active config に反映する。
 
 ```sh

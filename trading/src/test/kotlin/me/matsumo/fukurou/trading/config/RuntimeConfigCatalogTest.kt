@@ -126,5 +126,13 @@ class RuntimeConfigCatalogTest {
         assertEquals("1", defaultEnvironment.getValue("FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_HOUR"))
         assertEquals("4", defaultEnvironment.getValue("FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_DAY"))
         assertEquals("900", defaultEnvironment.getValue("FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS"))
+        assertEquals(
+            FomcBlackoutCalendar.candidateEvents(),
+            decodeEconomicEventBlackouts(defaultValues.getValue("safety.economicEventBlackouts")).getOrThrow(),
+        )
+        assertEquals(
+            defaultValues.getValue("safety.economicEventBlackouts"),
+            defaultEnvironment.getValue("FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC"),
+        )
     }
 }

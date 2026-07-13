@@ -4,10 +4,6 @@ package me.matsumo.fukurou.trading.config
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CLAUDE_MODEL_ENV
 import me.matsumo.fukurou.trading.invoker.FUKUROU_CODEX_MODEL_ENV
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
@@ -20,7 +16,6 @@ import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_SERVER_COMMAND_ENV
 import me.matsumo.fukurou.trading.runner.FUKUROU_MCP_SERVER_NAME_ENV
 import me.matsumo.fukurou.trading.runner.FUKUROU_PROPOSER_ALLOWED_TOOLS_ENV
 import me.matsumo.fukurou.trading.runner.OneShotRunnerCliConfig
-import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
 
 /**
  * catalog から明示的に退役し、bootstrap 時に旧 active snapshot から除去する runtime key。
@@ -256,8 +251,9 @@ object RuntimeConfigCatalog {
                     key = "safety.economicEventBlackouts",
                     legacyEnvName = FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC_ENV,
                     valueType = RuntimeConfigValueType.STRUCTURED_JSON_LIST,
-                    defaultValue = "[]",
-                    effectiveValue = config.safetyFloor.economicEventBlackouts.toCatalogJson(),
+                    defaultValue = FomcBlackoutCalendar.candidateEvents().encodeEconomicEventBlackouts(),
+                    effectiveValue = config.safetyFloor.economicEventBlackoutsRaw
+                        ?: config.safetyFloor.economicEventBlackouts.encodeEconomicEventBlackouts(),
                     unit = null,
                     safetyTier = RuntimeConfigSafetyTier.SAFETY_CRITICAL,
                 ),
@@ -1278,24 +1274,6 @@ private fun Map<String, String>.readOptional(name: String): String? {
     return this[name]
         ?.trim()
         ?.takeIf { value -> value.isNotBlank() }
-}
-
-private fun List<EconomicEventBlackout>.toCatalogJson(): String {
-    val payload = buildJsonArray {
-        forEach { blackout ->
-            add(
-                buildJsonObject {
-                    put("eventId", blackout.eventId)
-                    put("eventName", blackout.eventName)
-                    put("eventAt", blackout.eventAt.toString())
-                    put("blackoutBeforeSeconds", blackout.blackoutBefore.seconds)
-                    put("blackoutAfterSeconds", blackout.blackoutAfter.seconds)
-                },
-            )
-        }
-    }
-
-    return Json.encodeToString(payload)
 }
 
 private const val FUKUROU_TRADING_SYMBOL_ENV = "FUKUROU_TRADING_SYMBOL"

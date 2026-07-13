@@ -329,6 +329,8 @@ private class ApplicationRuntimeConfigState(
             ?.let { repository -> RuntimeConfigResolver(repository).resolve(databaseResources.environment) }
         val runtimeConfigResolution = runtimeConfigResolutionResult?.getOrNull()
 
+        runtimeConfigResolution?.warnings?.let { warnings -> runtimeConfigWarnings += warnings }
+
         runtimeConfigResolutionResult?.exceptionOrNull()
             ?.let { error -> runtimeConfigWarnings += runtimeConfigResolveWarning(error) }
         if (runtimeConfigBootstrapResult.isFailure && runtimeConfigResolutionResult?.isFailure != true) {

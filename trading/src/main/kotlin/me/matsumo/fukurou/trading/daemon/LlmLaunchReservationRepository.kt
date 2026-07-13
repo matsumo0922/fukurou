@@ -183,6 +183,7 @@ data class LlmExecutionRecoveryRequest(
  * @param invocationId runner と audit に使う起動 ID
  * @param triggerKind 起動理由の種別
  * @param triggerKey cadence 判定に使う trigger 固有 key
+ * @param singleAttemptKey 1 trigger につき reservation を1回だけ取得するための一意 key
  * @param reservedAt 予約時刻
  * @param runnerConfig 起動上限設定
  * @param hourlyWindow 1 時間上限の集計 window
@@ -199,7 +200,20 @@ data class LlmLaunchReservationRequest(
     val dailyWindow: Duration,
     val activeReservationStaleAfter: Duration,
     val populationScope: LlmLaunchReservationPopulationScope,
-)
+    val singleAttemptKey: String? = null,
+) {
+    init {
+        val expectedSingleAttemptKey = if (triggerKind == LlmDaemonTriggerKind.ECONOMIC_EVENT) {
+            "${LlmDaemonTriggerKind.ECONOMIC_EVENT.name}:$triggerKey"
+        } else {
+            null
+        }
+
+        require(singleAttemptKey == expectedSingleAttemptKey) {
+            "singleAttemptKey must identify ECONOMIC_EVENT only."
+        }
+    }
+}
 
 /** reservation creationに必須のtyped population provenance。 */
 data class LlmLaunchReservationPopulationScope(
@@ -264,6 +278,9 @@ sealed interface LlmLaunchReservationOutcome {
  * LLM 起動予約を拒否した理由。
  */
 enum class LlmLaunchReservationRejectionReason {
+    /** 同じ single-attempt trigger の予約を既に取得済みだった。 */
+    TRIGGER_ALREADY_ATTEMPTED,
+
     /**
      * Evaluation report 固有の 1 時間 request rate を超過した。
      */
@@ -686,6 +703,14 @@ class InMemoryLlmLaunchReservationRepository(
         }
 
         return LlmExecutionAdmissionHealth.withHealthyAdmission {
+            val alreadyAttempted = request.singleAttemptKey != null &&
+                reservations.any { reservation -> reservation.singleAttemptKey == request.singleAttemptKey }
+            if (alreadyAttempted) {
+                return@withHealthyAdmission LlmLaunchReservationOutcome.Rejected(
+                    LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED,
+                )
+            }
+
             activeReservation(request)?.let { active ->
                 return@withHealthyAdmission LlmLaunchReservationOutcome.Rejected(
                     LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION,
@@ -704,6 +729,7 @@ class InMemoryLlmLaunchReservationRepository(
                 invocationId = request.invocationId,
                 triggerKind = request.triggerKind,
                 triggerKey = request.triggerKey,
+                singleAttemptKey = request.singleAttemptKey,
                 status = LlmLaunchReservationStatus.RUNNING,
                 reservedAt = request.reservedAt,
                 finishedAt = null,
@@ -773,6 +799,7 @@ private data class LlmLaunchReservationRecord(
     val invocationId: String,
     val triggerKind: LlmDaemonTriggerKind,
     val triggerKey: String,
+    val singleAttemptKey: String?,
     val status: LlmLaunchReservationStatus,
     val reservedAt: Instant,
     val finishedAt: Instant?,

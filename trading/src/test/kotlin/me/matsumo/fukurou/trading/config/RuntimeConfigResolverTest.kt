@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.config
 
+import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
 import java.math.BigDecimal
 import java.time.Duration
 import java.time.Instant
@@ -205,6 +206,148 @@ class RuntimeConfigResolverTest {
         assertEquals("runtimeConfig.validation.typedOneOf", validationError.code)
         assertEquals("reflection.promptCandidateProvider", validationError.key)
         assertEquals("CLAUDE, CODEX", validationError.params.getValue("values"))
+    }
+
+    @Test
+    fun resolve_keepsRuntimeAvailableAndWarnsForCorruptActiveFomcCalendar() {
+        val overflowRaw = listOf(
+            FomcBlackoutCalendar.candidateEvents().first().copy(
+                eventId = "fomc-end-overflow",
+                eventAt = Instant.MAX,
+                blackoutAfter = Duration.ofSeconds(1),
+            ),
+        ).encodeEconomicEventBlackouts()
+        val corruptValues = listOf(
+            "[]" to "runtimeConfig.warning.fomcCalendarMissing",
+            "not-json" to "runtimeConfig.warning.fomcCalendarInvalid",
+            overflowRaw to "runtimeConfig.warning.fomcCalendarInvalid",
+            """[{"eventId":"fomc-past","eventName":"FOMC","eventAt":"2026-01-01T19:00:00Z","blackoutBeforeSeconds":3600,"blackoutAfterSeconds":3600}]""" to
+                "runtimeConfig.warning.fomcCalendarExpired",
+        )
+
+        corruptValues.forEach { (raw, warningCode) ->
+            val values = RuntimeConfigCatalog.runtimeDefaultValues() +
+                ("safety.economicEventBlackouts" to raw)
+            val result = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values)).resolve(emptyMap()).getOrThrow()
+
+            assertEquals(warningCode, result.warnings.single().code)
+            assertEquals(raw, result.catalogEnvironment.getValue("FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC"))
+            if (warningCode != "runtimeConfig.warning.fomcCalendarExpired") {
+                assertEquals(emptyList(), result.tradingConfig.safetyFloor.fomcBlackoutCalendar.events)
+            }
+        }
+    }
+
+    @Test
+    fun validate_rejectsMissingInvalidDuplicateAndPastOnlyFomcCandidates() {
+        val invalidCandidates = listOf(
+            "[]" to "runtimeConfig.validation.fomcCalendarMissing",
+            "not-json" to "runtimeConfig.validation.invalidJsonList",
+            """[{"eventId":"fomc-duplicate","eventName":"FOMC","eventAt":"2026-12-09T19:00:00Z","blackoutBeforeSeconds":3600,"blackoutAfterSeconds":3600},{"eventId":"fomc-duplicate","eventName":"FOMC","eventAt":"2026-12-09T19:00:00Z","blackoutBeforeSeconds":3600,"blackoutAfterSeconds":3600}]""" to
+                "runtimeConfig.validation.fomcCalendarDuplicateId",
+            """[{"eventId":"fomc-past","eventName":"FOMC","eventAt":"2026-01-01T19:00:00Z","blackoutBeforeSeconds":3600,"blackoutAfterSeconds":3600}]""" to
+                "runtimeConfig.validation.fomcCalendarNoFutureWindow",
+        )
+
+        invalidCandidates.forEach { (raw, code) ->
+            val candidate = RuntimeConfigCandidateValidator.validate(
+                values = RuntimeConfigCatalog.runtimeDefaultValues() +
+                    ("safety.economicEventBlackouts" to raw),
+                environment = emptyMap(),
+            )
+
+            assertFalse(candidate.validation.valid)
+            assertEquals(code, candidate.validation.errors.single().code)
+        }
+    }
+
+    @Test
+    fun validate_rejectsOverflowingEventWindowsWithTypedFomcError() {
+        val validFomc = FomcBlackoutCalendar.candidateEvents().first()
+        val invalidEvents = listOf(
+            validFomc.copy(
+                eventId = "fomc-end-overflow",
+                eventAt = Instant.MAX,
+                blackoutAfter = Duration.ofSeconds(1),
+            ),
+            validFomc.copy(
+                eventId = "generic-start-overflow",
+                eventName = "Employment report",
+                eventAt = Instant.MIN,
+                blackoutBefore = Duration.ofSeconds(1),
+            ),
+            validFomc.copy(
+                eventId = "generic-end-overflow",
+                eventName = "Inflation report",
+                eventAt = Instant.MAX,
+                blackoutAfter = Duration.ofSeconds(1),
+            ),
+        )
+
+        invalidEvents.forEach { invalidEvent ->
+            val raw = listOf(validFomc, invalidEvent).encodeEconomicEventBlackouts()
+            val candidate = RuntimeConfigCandidateValidator.validate(
+                values = RuntimeConfigCatalog.runtimeDefaultValues() +
+                    ("safety.economicEventBlackouts" to raw),
+                environment = emptyMap(),
+            )
+
+            assertFalse(candidate.validation.valid)
+            assertEquals("runtimeConfig.validation.fomcCalendarInvalid", candidate.validation.errors.single().code)
+        }
+    }
+
+    @Test
+    fun validateAndResolve_enforceFomcNameAndIdInvariant() {
+        val mixedEvents = FomcBlackoutCalendar.candidateEvents() + EconomicEventBlackout(
+            eventId = "central-bank-meeting",
+            eventName = "FOMC press conference",
+            eventAt = Instant.parse("2099-01-01T19:00:00Z"),
+            blackoutBefore = Duration.ofMinutes(60),
+            blackoutAfter = Duration.ofMinutes(60),
+        )
+        val raw = mixedEvents.encodeEconomicEventBlackouts()
+        val values = RuntimeConfigCatalog.runtimeDefaultValues() +
+            ("safety.economicEventBlackouts" to raw)
+
+        val candidate = RuntimeConfigCandidateValidator.validate(values = values, environment = emptyMap())
+        val active = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values)).resolve(emptyMap()).getOrThrow()
+
+        assertFalse(candidate.validation.valid)
+        assertEquals("runtimeConfig.validation.fomcCalendarInvalidId", candidate.validation.errors.single().code)
+        assertEquals(FomcBlackoutCalendarState.INVALID, active.tradingConfig.safetyFloor.fomcBlackoutCalendar.state)
+        assertEquals(emptyList(), active.tradingConfig.safetyFloor.fomcBlackoutCalendar.events)
+        assertEquals("runtimeConfig.warning.fomcCalendarInvalid", active.warnings.single().code)
+    }
+
+    @Test
+    fun validate_acceptsSafeFutureOperatorCalendarWithoutMatchingCandidateEvents() {
+        val operatorEvents = listOf(
+            EconomicEventBlackout(
+                eventId = "fomc-20990127",
+                eventName = "FOMC meeting statement",
+                eventAt = Instant.parse("2099-01-27T19:00:00Z"),
+                blackoutBefore = Duration.ofMinutes(90),
+                blackoutAfter = Duration.ofMinutes(75),
+            ),
+            EconomicEventBlackout(
+                eventId = "employment-20990206",
+                eventName = "Employment report",
+                eventAt = Instant.parse("2099-02-06T13:30:00Z"),
+                blackoutBefore = Duration.ofMinutes(30),
+                blackoutAfter = Duration.ofMinutes(45),
+            ),
+        )
+        val raw = operatorEvents.encodeEconomicEventBlackouts()
+
+        val candidate = RuntimeConfigCandidateValidator.validate(
+            values = RuntimeConfigCatalog.runtimeDefaultValues() +
+                ("safety.economicEventBlackouts" to raw),
+            environment = emptyMap(),
+        )
+
+        assertTrue(candidate.validation.valid)
+        assertEquals(operatorEvents, candidate.tradingConfig?.safetyFloor?.fomcBlackoutCalendar?.events)
     }
 }
 
