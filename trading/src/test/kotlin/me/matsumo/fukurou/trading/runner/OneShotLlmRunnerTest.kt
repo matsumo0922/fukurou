@@ -1998,6 +1998,35 @@ class OneShotLlmRunnerTest {
             LlmLaunchReservationStatus.FAILED,
             fixture.runtime.launchReservationRepository.findExecutionClaim(invocationId).getOrThrow()?.status,
         )
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun claimAuditFailure_terminalizesAndCleansClaimRegistries() = runBlocking {
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                runtime.copy(commandEventLog = FailFirstAppendCommandEventLog(runtime.commandEventLog))
+            },
+        ) { cleanExit() }
+        val invocationId = "claim-audit-failure"
+        val result = fixture.runOneShot(
+            request = defaultRequest().copy(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+            ),
+        )
+
+        assertTrue(result.isFailure)
+        assertTrue(fixture.processRunner.launches.isEmpty())
+        assertEquals(
+            LlmLaunchReservationStatus.FAILED,
+            fixture.runtime.launchReservationRepository.findExecutionClaim(invocationId).getOrThrow()?.status,
+        )
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
     }
 
     @Test
@@ -2250,6 +2279,21 @@ private class ClaimBoundaryRepository(
         allowClaimCommit.await()
 
         return delegate.claimForExecution(request)
+    }
+}
+
+private class FailFirstAppendCommandEventLog(
+    private val delegate: CommandEventLog,
+) : CommandEventLog by delegate {
+    private var failAppend = true
+
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        if (failAppend) {
+            failAppend = false
+            return Result.failure(IllegalStateException("claim audit append failed"))
+        }
+
+        return delegate.append(event)
     }
 }
 

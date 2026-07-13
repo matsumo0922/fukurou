@@ -422,6 +422,8 @@ class OneShotLlmRunner(
                                 ).getOrThrow()
                             }
                         }
+                        LlmExecutionAdmissionHealth.resolveClaim(invocationId, claimantToken)
+                        LlmExecutionTerminationFenceRegistry.resolve(invocationId, claimantToken)
                         return Result.failure(auditFailure)
                     }
             }

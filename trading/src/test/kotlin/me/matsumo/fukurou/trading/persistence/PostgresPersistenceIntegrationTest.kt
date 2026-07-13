@@ -113,6 +113,7 @@ import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.runner.LlmExecutionRecoveryService
+import me.matsumo.fukurou.trading.runner.LlmExecutionTerminationFenceRegistry
 import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
@@ -3447,40 +3448,58 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedLlmLaunchReservationRepository(database)
         val config = LlmRunnerConfig(
-            maxInvocationsPerHour = 2,
+            maxInvocationsPerHour = 7,
             entryFillReservePerHour = 0,
             stopProximityReservePerHour = 0,
         )
-        reserveAndFinishLlmLaunch(
-            repository = repository,
-            invocationId = "quota-prefill",
-            config = config,
-            reservedAt = fixedInstant(),
-        )
-        val startBarrier = CompletableDeferred<Unit>()
-        val readyCount = AtomicInteger()
-
-        val outcomes = coroutineScope {
-            val contenders = (1..2).map { index ->
-                async(Dispatchers.IO) {
-                    readyCount.incrementAndGet()
-                    startBarrier.await()
-                    repository.tryReserve(
-                        llmLaunchReservationRequest(
-                            invocationId = "quota-contender-$index",
-                            config = config,
-                            reservedAt = fixedInstant().plusSeconds(1),
-                        ),
-                    ).getOrThrow()
-                }
-            }
-            while (readyCount.get() < contenders.size) kotlinx.coroutines.delay(1)
-            startBarrier.complete(Unit)
-            contenders.map { contender -> contender.await() }
+        repeat(6) { index ->
+            reserveAndFinishLlmLaunch(
+                repository = repository,
+                invocationId = "quota-prefill-$index",
+                config = config,
+                reservedAt = fixedInstant().minusSeconds(index.toLong()),
+            )
+        }
+        installQuotaBarrierTerminalTrigger(database)
+        val riskLockConnection = dataSource.connection
+        riskLockConnection.autoCommit = false
+        riskLockConnection.prepareStatement("SELECT id FROM risk_state WHERE id = 1 FOR UPDATE").use { statement ->
+            statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
         }
 
-        assertEquals(1, outcomes.count { outcome -> outcome is LlmLaunchReservationOutcome.Reserved })
-        assertEquals(1, outcomes.count { outcome -> outcome is LlmLaunchReservationOutcome.Rejected })
+        try {
+            val outcomes = coroutineScope {
+                val contenders = (1..2).map { index ->
+                    async(Dispatchers.IO) {
+                        repository.tryReserve(
+                            llmLaunchReservationRequest(
+                                invocationId = "quota-contender-$index",
+                                config = config,
+                                reservedAt = fixedInstant().plusSeconds(1),
+                            ),
+                        ).getOrThrow()
+                    }
+                }
+                try {
+                    awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
+                } finally {
+                    riskLockConnection.commit()
+                    riskLockConnection.close()
+                }
+                contenders.map { contender -> contender.await() }
+            }
+
+            val reserved = outcomes.filterIsInstance<LlmLaunchReservationOutcome.Reserved>().single()
+            val rejected = outcomes.filterIsInstance<LlmLaunchReservationOutcome.Rejected>().single()
+            assertEquals(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR, rejected.reason)
+            assertEquals(
+                LlmLaunchReservationStatus.FINISHED,
+                repository.findExecutionClaim(reserved.invocationId).getOrThrow()?.status,
+            )
+        } finally {
+            if (!riskLockConnection.isClosed) riskLockConnection.close()
+            removeQuotaBarrierTerminalTrigger(database)
+        }
     }
 
     @Test
@@ -3898,7 +3917,11 @@ class PostgresPersistenceIntegrationTest {
         val statementCount = AtomicInteger()
         val queryTimeouts = mutableListOf<Int>()
         val instrumentedDatabase = ExposedDatabase.connect(
-            instrumentedDataSource(dataSource, statementCount, queryTimeouts),
+            instrumentedDataSource(
+                dataSource = dataSource,
+                statementCount = statementCount,
+                queryTimeouts = queryTimeouts,
+            ),
         )
         val repository = ExposedLlmLaunchReservationRepository(instrumentedDatabase)
         val now = fixedInstant()
@@ -3954,6 +3977,37 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, recoveryService.tick().getOrThrow())
         assertEquals(2, statementCount.get())
         assertEquals(listOf(2, 2), queryTimeouts)
+    }
+
+    @Test
+    fun hundredCandidateRecoveryUsesOneSelectAndOneBatchUpdate() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val now = fixedInstant()
+        insertRecoverableAvailableReservations(
+            database = database,
+            rowCount = 100,
+            reservedAt = now.minusSeconds(1_800),
+        )
+        val statementCount = AtomicInteger()
+        val queryTimeouts = mutableListOf<Int>()
+        val instrumentedDatabase = ExposedDatabase.connect(
+            instrumentedDataSource(
+                dataSource = dataSource,
+                statementCount = statementCount,
+                queryTimeouts = queryTimeouts,
+            ),
+        )
+        val service = LlmExecutionRecoveryService(
+            repository = ExposedLlmLaunchReservationRepository(instrumentedDatabase),
+            policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+            clock = Clock.fixed(now, ZoneOffset.UTC),
+        )
+
+        assertEquals(100, service.tick().getOrThrow())
+        assertEquals(2, statementCount.get())
+        assertEquals(listOf(2, 2), queryTimeouts)
+        assertEquals(100, countTerminalBatchRecoveryReservations(database))
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
     }
 
     @Test
@@ -8257,6 +8311,99 @@ private fun installClaimCommitBarrier(database: ExposedDatabase) {
                     EXECUTE FUNCTION wait_for_claim_commit_barrier()
                 """.trimIndent(),
             )
+        }
+    }
+}
+
+private fun installQuotaBarrierTerminalTrigger(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().createStatement().use { statement ->
+            statement.execute(
+                """
+                    CREATE OR REPLACE FUNCTION terminalize_quota_barrier_reservation() RETURNS trigger AS ${'$'}${'$'}
+                    BEGIN
+                        UPDATE llm_launch_reservations
+                        SET status = 'FINISHED', finished_at = NEW.reserved_at + 1,
+                            reason = 'quota_barrier_test_terminal'
+                        WHERE id = NEW.id;
+                        RETURN NEW;
+                    END;
+                    ${'$'}${'$'} LANGUAGE plpgsql
+                """.trimIndent(),
+            )
+            statement.execute(
+                """
+                    CREATE TRIGGER llm_quota_barrier_terminal
+                    AFTER INSERT ON llm_launch_reservations
+                    FOR EACH ROW
+                    EXECUTE FUNCTION terminalize_quota_barrier_reservation()
+                """.trimIndent(),
+            )
+        }
+    }
+}
+
+private fun removeQuotaBarrierTerminalTrigger(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().createStatement().use { statement ->
+            statement.execute("DROP TRIGGER IF EXISTS llm_quota_barrier_terminal ON llm_launch_reservations")
+            statement.execute("DROP FUNCTION IF EXISTS terminalize_quota_barrier_reservation()")
+        }
+    }
+}
+
+private suspend fun awaitDatabaseLockWaiters(dataSource: DataSource, expectedCount: Int) {
+    repeat(100) {
+        val waiterCount = dataSource.connection.use { connection ->
+            connection.createStatement().use { statement ->
+                statement.executeQuery("SELECT COUNT(*) FROM pg_locks WHERE NOT granted").use { resultSet ->
+                    check(resultSet.next())
+                    resultSet.getInt(1)
+                }
+            }
+        }
+        if (waiterCount >= expectedCount) return
+        kotlinx.coroutines.delay(10)
+    }
+    error("$expectedCount reservation transactions did not reach the risk_state row lock")
+}
+
+private fun insertRecoverableAvailableReservations(
+    database: ExposedDatabase,
+    rowCount: Int,
+    reservedAt: Instant,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                INSERT INTO llm_launch_reservations (
+                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at,
+                    finished_at, reason, execution_claim_state
+                )
+                SELECT gen_random_uuid(), 'batch-recovery-' || value, 'FLAT_HEARTBEAT',
+                    'batch-recovery:' || value, 'RUNNING', ? - value, NULL, NULL, 'AVAILABLE'
+                FROM generate_series(1, ?) AS value
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setLong(1, reservedAt.toEpochMilli())
+            statement.setInt(2, rowCount)
+            assertEquals(rowCount, statement.executeUpdate())
+        }
+    }
+}
+
+private fun countTerminalBatchRecoveryReservations(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                SELECT COUNT(*) FROM llm_launch_reservations
+                WHERE invocation_id LIKE 'batch-recovery-%' AND status = 'FAILED'
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getInt(1)
+            }
         }
     }
 }

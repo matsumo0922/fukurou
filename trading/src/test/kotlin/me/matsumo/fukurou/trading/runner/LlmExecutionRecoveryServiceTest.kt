@@ -48,6 +48,11 @@ class LlmExecutionRecoveryServiceTest {
         reserve(delegate, "available", now)
         val repository = FaultingRecoveryRepository(delegate, failedScans = 1)
         val service = recoveryService(repository, now.plusSeconds(1_800))
+        LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+            invocationId = "available",
+            claimantToken = MISSING_CLAIMANT_TOKEN,
+            observedAt = now,
+        )
 
         assertTrue(service.tick().isFailure)
         assertFalse(LlmExecutionAdmissionHealth.isHealthy())
@@ -58,6 +63,8 @@ class LlmExecutionRecoveryServiceTest {
             LlmLaunchReservationStatus.FAILED,
             delegate.findExecutionClaim("available").getOrThrow()?.status,
         )
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
     }
 
     @Test
@@ -168,8 +175,62 @@ class LlmExecutionRecoveryServiceTest {
         val service = recoveryService(repository, now)
 
         assertEquals(100, service.tick().getOrThrow())
+        assertEquals(1, repository.scanCount)
+        assertEquals(1, repository.recoveryBatchCount)
         assertEquals(1, service.tick().getOrThrow())
         assertEquals(101, repository.recovered.size)
+        assertEquals(2, repository.scanCount)
+        assertEquals(2, repository.recoveryBatchCount)
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
+    }
+
+    @Test
+    fun hundredCandidateBatchHoldsEveryTransitionLockUntilSingleCommit() = runBlocking {
+        val now = RECOVERY_INSTANT.plus(Duration.ofHours(1))
+        val snapshots = (0 until 100).map { index ->
+            val invocationId = "batch-${index.toString().padStart(3, '0')}"
+            val claimantToken = "claim-token-${index.toString().padStart(3, '0')}"
+            LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+                invocationId = invocationId,
+                claimantToken = claimantToken,
+                observedAt = RECOVERY_INSTANT,
+            )
+            LlmExecutionClaimSnapshot(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                status = LlmLaunchReservationStatus.RUNNING,
+                claimState = me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState.CLAIMED,
+                claimantToken = claimantToken,
+                claimedAt = RECOVERY_INSTANT,
+                heartbeatAt = RECOVERY_INSTANT,
+                reservedAt = RECOVERY_INSTANT,
+            )
+        }
+        val repository = BlockingBatchRecoveryRepository(snapshots)
+        val recovery = async { recoveryService(repository, now).tick().getOrThrow() }
+        repository.batchEntered.await()
+        val childTransitionEntered = CompletableDeferred<Unit>()
+        val childTransition = async {
+            LlmExecutionTerminationFenceRegistry.withClaimTransition(
+                invocationId = "batch-050",
+                claimantToken = "claim-token-050",
+            ) {
+                childTransitionEntered.complete(Unit)
+            }
+        }
+
+        delay(50)
+        assertFalse(childTransitionEntered.isCompleted)
+        repository.allowBatchCommit.complete(Unit)
+
+        assertEquals(100, recovery.await())
+        childTransition.await()
+        assertTrue(childTransitionEntered.isCompleted)
+        assertEquals(1, repository.scanCount)
+        assertEquals(1, repository.recoveryBatchCount)
+        assertEquals(100, repository.recovered.size)
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
     }
 
     @Test
@@ -234,7 +295,10 @@ class LlmExecutionRecoveryServiceTest {
         val leaseAcquired = CompletableDeferred<Unit>()
         val allowChildStart = CompletableDeferred<Unit>()
         val runnerTransition = async {
-            LlmExecutionTerminationFenceRegistry.withClaimTransition("child-start-lease", CLAIM_TOKEN) {
+            LlmExecutionTerminationFenceRegistry.withClaimTransition(
+                invocationId = "child-start-lease",
+                claimantToken = CLAIM_TOKEN,
+            ) {
                 leaseAcquired.complete(Unit)
                 allowChildStart.await()
                 LlmExecutionTerminationFenceRegistry.markChildMayBeRunning("child-start-lease", CLAIM_TOKEN)
@@ -309,8 +373,11 @@ private class KeysetRecoveryRepository(
 ) : LlmLaunchReservationRepository by InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
     private val remaining = snapshots.toMutableList()
     val recovered = mutableSetOf<String>()
+    var scanCount = 0
+    var recoveryBatchCount = 0
 
     override suspend fun scanStaleExecutionClaims(scan: LlmExecutionRecoveryScan): Result<RecoverySnapshots> {
+        scanCount += 1
         return Result.success(
             remaining.asSequence()
                 .filter { snapshot ->
@@ -325,10 +392,38 @@ private class KeysetRecoveryRepository(
     override suspend fun recoverStaleExecutionClaims(
         requests: List<LlmExecutionRecoveryRequest>,
     ): Result<Set<String>> {
+        recoveryBatchCount += 1
         val invocationIds = requests.mapTo(mutableSetOf(), LlmExecutionRecoveryRequest::invocationId)
         remaining.removeAll { snapshot -> snapshot.invocationId in invocationIds }
         recovered += invocationIds
         return Result.success(invocationIds)
+    }
+}
+
+private class BlockingBatchRecoveryRepository(
+    private val snapshots: List<LlmExecutionClaimSnapshot>,
+) : LlmLaunchReservationRepository by InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
+    val batchEntered = CompletableDeferred<Unit>()
+    val allowBatchCommit = CompletableDeferred<Unit>()
+    val recovered = mutableSetOf<String>()
+    var scanCount = 0
+    var recoveryBatchCount = 0
+
+    override suspend fun scanStaleExecutionClaims(scan: LlmExecutionRecoveryScan): Result<RecoverySnapshots> {
+        scanCount += 1
+        return Result.success(snapshots.take(scan.limit))
+    }
+
+    override suspend fun recoverStaleExecutionClaims(
+        requests: List<LlmExecutionRecoveryRequest>,
+    ): Result<Set<String>> {
+        recoveryBatchCount += 1
+        batchEntered.complete(Unit)
+        allowBatchCommit.await()
+
+        return Result.success(
+            requests.mapTo(recovered, LlmExecutionRecoveryRequest::invocationId),
+        )
     }
 }
 

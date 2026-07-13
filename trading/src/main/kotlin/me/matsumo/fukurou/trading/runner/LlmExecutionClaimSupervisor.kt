@@ -44,18 +44,54 @@ data class LlmExecutionTerminationFence(
 /** current process が観測した child lifecycle fence registry。 */
 object LlmExecutionTerminationFenceRegistry {
     private val fences = ConcurrentHashMap<String, LlmExecutionTerminationFence?>()
-    private val transitionLocks = ConcurrentHashMap<ClaimTransitionKey, Mutex>()
+    private val transitionLocks = mutableMapOf<ClaimTransitionKey, ClaimTransitionLock>()
+    private val transitionLocksGuard = Any()
 
     /** child start と recovery terminal decision を claimant token 単位で直列化する。 */
     suspend fun <T> withClaimTransition(
         invocationId: String,
         claimantToken: String,
         block: suspend () -> T,
-    ): T {
-        val key = ClaimTransitionKey(invocationId, claimantToken)
-        val mutex = transitionLocks.computeIfAbsent(key) { Mutex() }
+    ): T = withClaimTransitions(
+        transitions = listOf(
+            LlmExecutionClaimTransition(
+                invocationId = invocationId,
+                claimantToken = claimantToken,
+            ),
+        ),
+        block = block,
+    )
 
-        return mutex.withLock { block() }
+    /** 複数claimのchild startとbatch recoveryをstable orderで直列化する。 */
+    suspend fun <T> withClaimTransitions(
+        transitions: Collection<LlmExecutionClaimTransition>,
+        block: suspend () -> T,
+    ): T {
+        val keys = transitions
+            .map { transition -> ClaimTransitionKey(transition.invocationId, transition.claimantToken) }
+            .distinct()
+            .sortedWith(compareBy(ClaimTransitionKey::invocationId, ClaimTransitionKey::claimantToken))
+        val locks = synchronized(transitionLocksGuard) {
+            keys.map { key ->
+                transitionLocks.getOrPut(key) { ClaimTransitionLock(Mutex()) }
+                    .also { lock -> lock.referenceCount += 1 }
+            }
+        }
+
+        return try {
+            withTransitionLocks(
+                locks = locks,
+                index = 0,
+                block = block,
+            )
+        } finally {
+            synchronized(transitionLocksGuard) {
+                keys.zip(locks).forEach { (key, lock) ->
+                    lock.referenceCount -= 1
+                    if (lock.referenceCount == 0) transitionLocks.remove(key, lock)
+                }
+            }
+        }
     }
 
     /** claim 直後の child 0 状態を登録する。 */
@@ -101,14 +137,23 @@ object LlmExecutionTerminationFenceRegistry {
         fences.computeIfPresent(invocationId) { _, current ->
             current.takeUnless { fence -> fence.claimantToken == claimantToken }
         }
-        transitionLocks.remove(ClaimTransitionKey(invocationId, claimantToken))
     }
+
+    internal fun fenceCountForTest(): Int = fences.size
+
+    internal fun transitionLockCountForTest(): Int = synchronized(transitionLocksGuard) { transitionLocks.size }
 
     internal fun resetForTest() {
         fences.clear()
-        transitionLocks.clear()
+        synchronized(transitionLocksGuard) { transitionLocks.clear() }
     }
 }
+
+/** claimant transition lockを一意に識別する。 */
+data class LlmExecutionClaimTransition(
+    val invocationId: String,
+    val claimantToken: String,
+)
 
 /** bounded DB scan と termination fence を結合する current-process recovery。 */
 class LlmExecutionRecoveryService(
@@ -155,23 +200,35 @@ class LlmExecutionRecoveryService(
             candidates.last().toRecoveryCursor()
         }
 
-        var recoveredCount = 0
-        candidates.forEach { candidate ->
-            val claimantToken = candidate.claimantToken ?: MISSING_CLAIMANT_TOKEN
-            LlmExecutionTerminationFenceRegistry.withClaimTransition(candidate.invocationId, claimantToken) {
-                val request = toRecoveryRequestOrNull(candidate, now) ?: return@withClaimTransition
-                val recoveredInvocationIds = repository.recoverStaleExecutionClaims(listOf(request))
+        val transitions = candidates.map { candidate ->
+            LlmExecutionClaimTransition(
+                invocationId = candidate.invocationId,
+                claimantToken = candidate.claimantToken ?: MISSING_CLAIMANT_TOKEN,
+            )
+        }
+        return LlmExecutionTerminationFenceRegistry.withClaimTransitions(
+            transitions = transitions,
+        ) {
+            val candidatesByInvocationId = candidates.associateBy(LlmExecutionClaimSnapshot::invocationId)
+            val requestsByInvocationId = candidates.mapNotNull { candidate ->
+                toRecoveryRequestOrNull(candidate, now)?.let { request -> candidate.invocationId to request }
+            }
+            val recoveredInvocationIds = if (requestsByInvocationId.isEmpty()) {
+                emptySet()
+            } else {
+                repository.recoverStaleExecutionClaims(requestsByInvocationId.map { (_, request) -> request })
                     .getOrElse { throwable ->
                         LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
                         throw throwable
                     }
-                val recovered = candidate.invocationId in recoveredInvocationIds
-                completeRecoveryHealth(candidate, recovered)
-                if (recovered) recoveredCount += 1
             }
-        }
+            requestsByInvocationId.forEach { (invocationId, _) ->
+                val candidate = requireNotNull(candidatesByInvocationId[invocationId])
+                completeRecoveryHealth(candidate, invocationId in recoveredInvocationIds)
+            }
 
-        return recoveredCount
+            recoveredInvocationIds.size
+        }
     }
 
     private fun toRecoveryRequestOrNull(
@@ -230,9 +287,10 @@ class LlmExecutionRecoveryService(
             candidate.invocationId,
             MISSING_CLAIMANT_TOKEN,
         )
-        candidate.claimantToken?.let { token ->
-            LlmExecutionTerminationFenceRegistry.resolve(candidate.invocationId, token)
-        }
+        LlmExecutionTerminationFenceRegistry.resolve(
+            invocationId = candidate.invocationId,
+            claimantToken = candidate.claimantToken ?: MISSING_CLAIMANT_TOKEN,
+        )
     }
 }
 
@@ -243,6 +301,27 @@ private data class LlmExecutionRecoveryCursor(
 )
 
 private data class ClaimTransitionKey(val invocationId: String, val claimantToken: String)
+
+private data class ClaimTransitionLock(
+    val mutex: Mutex,
+    var referenceCount: Int = 0,
+)
+
+private suspend fun <T> withTransitionLocks(
+    locks: List<ClaimTransitionLock>,
+    index: Int,
+    block: suspend () -> T,
+): T {
+    if (index == locks.size) return block()
+
+    return locks[index].mutex.withLock {
+        withTransitionLocks(
+            locks = locks,
+            index = index + 1,
+            block = block,
+        )
+    }
+}
 
 private fun LlmExecutionClaimSnapshot.toRecoveryCursor(): LlmExecutionRecoveryCursor {
     return LlmExecutionRecoveryCursor(
@@ -323,5 +402,5 @@ const val STALE_AVAILABLE_RESERVATION_RECOVERED = "launch_reservation_available_
 const val STALE_CLAIMED_RESERVATION_RECOVERED = "launch_reservation_claimed_stale_recovered"
 
 private const val EXECUTION_RECOVERY_SCAN_LIMIT = 100
-private const val MISSING_CLAIMANT_TOKEN = "<missing-claimant-token>"
+internal const val MISSING_CLAIMANT_TOKEN = "<missing-claimant-token>"
 private val EXECUTION_RECOVERY_TICK_TIMEOUT: Duration = Duration.ofSeconds(5)
