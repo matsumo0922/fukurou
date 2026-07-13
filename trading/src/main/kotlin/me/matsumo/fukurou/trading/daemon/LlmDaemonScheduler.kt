@@ -306,12 +306,13 @@ class LlmDaemonScheduler(
             }
         }
 
-        val scheduledSuppression = launchAvailability.scheduledSuppressionAt(observedAt)
+        val availabilityObservedAt = Instant.now(clock)
+        val scheduledSuppression = launchAvailability.scheduledSuppressionAt(availabilityObservedAt)
         if (scheduledSuppression != null) {
             appendInfrastructureSuppressionIfDue(
                 reason = scheduledSuppression,
                 trigger = null,
-                observedAt = observedAt,
+                observedAt = availabilityObservedAt,
             ).getOrThrow()
 
             return LlmDaemonTickResult.InfrastructureSuppressed(scheduledSuppression, null)
@@ -320,33 +321,45 @@ class LlmDaemonScheduler(
         val trigger = selectTrigger(hasOpenRisk, observedAt)
             ?: return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
 
-        val statusSuppression = launchAvailability.statusSuppressionAt(observedAt)
+        val statusSuppression = launchAvailability.statusSuppressionAt(availabilityObservedAt)
         if (statusSuppression != null) {
             appendInfrastructureSuppressionIfDue(
                 reason = statusSuppression,
                 trigger = trigger,
-                observedAt = observedAt,
+                observedAt = availabilityObservedAt,
             ).getOrThrow()
 
             return LlmDaemonTickResult.InfrastructureSuppressed(statusSuppression, trigger.kind)
+        }
+
+        val admissionObservedAt = Instant.now(clock)
+        val admissionSuppression = launchAvailability.scheduledSuppressionAt(admissionObservedAt)
+        if (admissionSuppression != null) {
+            appendInfrastructureSuppressionIfDue(
+                reason = admissionSuppression,
+                trigger = trigger,
+                observedAt = admissionObservedAt,
+            ).getOrThrow()
+
+            return LlmDaemonTickResult.InfrastructureSuppressed(admissionSuppression, trigger.kind)
         }
         resetInfrastructureSuppressionMirror()
 
         val activeReservation = launchReservationRepository.findBlockingRunningReservation(
             requestTriggerKind = trigger.kind,
-            activeSince = observedAt.minus(daemonConfig.launchReservationStaleAfter),
+            activeSince = admissionObservedAt.minus(daemonConfig.launchReservationStaleAfter),
         ).getOrThrow()
         if (activeReservation != null) {
             appendSkip(
                 reason = "concurrent_invocation",
                 trigger = trigger,
-                observedAt = observedAt,
+                observedAt = admissionObservedAt,
                 activeReservation = activeReservation,
             ).getOrThrow()
             return LlmDaemonTickResult.Skipped("concurrent_invocation", trigger.kind)
         }
 
-        return reserveAndLaunch(trigger, openRisk, observedAt)
+        return reserveAndLaunch(trigger, openRisk, admissionObservedAt)
     }
 
     private suspend fun reserveAndLaunch(

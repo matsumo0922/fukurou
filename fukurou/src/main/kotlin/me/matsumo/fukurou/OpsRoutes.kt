@@ -38,6 +38,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigValidationError
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.LlmDaemonLaunchSuppressionReason
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -2373,7 +2374,7 @@ private fun CommandEvent.toOpsActivityEventResponse(): OpsActivityEventResponse 
         source = OpsActivitySource.AUDIT.wireName,
         kind = eventType.name,
         title = eventType.name,
-        detail = suppressionReason ?: toolName,
+        detail = suppressionReason?.name ?: toolName,
         occurredAt = occurredAt.toString(),
         metadata = listOfNotNull(
             OpsActivityMetadataResponse(
@@ -2383,18 +2384,20 @@ private fun CommandEvent.toOpsActivityEventResponse(): OpsActivityEventResponse 
             suppressionReason?.let { reason ->
                 OpsActivityMetadataResponse(
                     label = "infrastructure reason",
-                    value = reason,
+                    value = reason.name,
                 )
             },
         ),
     )
 }
 
-private fun CommandEvent.infrastructureSuppressionReasonOrNull(): String? {
+private fun CommandEvent.infrastructureSuppressionReasonOrNull(): LlmDaemonLaunchSuppressionReason? {
     if (eventType != CommandEventType.DAEMON_LAUNCH_SUPPRESSED) return null
 
     return runCatching {
-        Json.parseToJsonElement(payload).jsonObject["reason"]?.jsonPrimitive?.content
+        val rawReason = Json.parseToJsonElement(payload).jsonObject["reason"]?.jsonPrimitive?.content
+
+        LlmDaemonLaunchSuppressionReason.entries.single { reason -> reason.name == rawReason }
     }.getOrNull()
 }
 

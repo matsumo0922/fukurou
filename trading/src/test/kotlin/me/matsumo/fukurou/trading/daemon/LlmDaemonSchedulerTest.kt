@@ -96,6 +96,92 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
+    fun scheduledGate_refreshesWallTimeAfterDeterministicWorkAtWindowStart() = runBlocking {
+        val clock = MutableClock(Instant.parse("2026-07-10T23:59:59.999Z"))
+        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val reservations = RecordingReservationRepository(
+            InMemoryLlmLaunchReservationRepository(riskStateRepository),
+        )
+        val statusReader = SchedulerStatusReader()
+        val fixture = schedulerFixture(
+            clock = clock,
+            riskStateRepository = riskStateRepository,
+            reservations = reservations,
+            episodeLifecycleObserver = OpportunityEpisodeLifecycleObserver {
+                clock.advance(Duration.ofMillis(1))
+                Result.success(Unit)
+            },
+            launchAvailability = GmoLlmDaemonLaunchAvailability(statusReader),
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertEquals(
+            LlmDaemonTickResult.InfrastructureSuppressed(
+                LlmDaemonLaunchSuppressionReason.SCHEDULED_MAINTENANCE,
+                null,
+            ),
+            result,
+        )
+        assertEquals(0, statusReader.callCount)
+        assertEquals(0, reservations.admissionCallCount)
+        assertTrue(fixture.launches.isEmpty())
+        assertEquals(0, fixture.eventLog.events().count { event -> event.eventType == CommandEventType.NO_TRADE_EXIT })
+    }
+
+    @Test
+    fun scheduledGate_refreshesWallTimeAfterDeterministicWorkAtWindowEnd() = runBlocking {
+        val clock = MutableClock(Instant.parse("2026-07-11T01:59:59.999Z"))
+        val statusReader = SchedulerStatusReader()
+        val fixture = schedulerFixture(
+            clock = clock,
+            episodeLifecycleObserver = OpportunityEpisodeLifecycleObserver {
+                clock.advance(Duration.ofMillis(1))
+                Result.success(Unit)
+            },
+            launchAvailability = GmoLlmDaemonLaunchAvailability(statusReader),
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(1, statusReader.callCount)
+        assertEquals(1, fixture.launches.size)
+    }
+
+    @Test
+    fun statusRequestCrossingIntoScheduledWindowSuppressesBeforeReservationOrChild() = runBlocking {
+        val clock = MutableClock(Instant.parse("2026-07-10T23:59:59.999Z"))
+        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val reservations = RecordingReservationRepository(
+            InMemoryLlmLaunchReservationRepository(riskStateRepository),
+        )
+        val statusReader = SchedulerStatusReader(
+            onRead = { clock.advance(Duration.ofMillis(1)) },
+        )
+        val fixture = schedulerFixture(
+            clock = clock,
+            riskStateRepository = riskStateRepository,
+            reservations = reservations,
+            launchAvailability = GmoLlmDaemonLaunchAvailability(statusReader),
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertEquals(
+            LlmDaemonTickResult.InfrastructureSuppressed(
+                LlmDaemonLaunchSuppressionReason.SCHEDULED_MAINTENANCE,
+                LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+            ),
+            result,
+        )
+        assertEquals(1, statusReader.callCount)
+        assertEquals(0, reservations.admissionCallCount)
+        assertTrue(fixture.launches.isEmpty())
+        assertEquals(0, fixture.eventLog.events().count { event -> event.eventType == CommandEventType.NO_TRADE_EXIT })
+    }
+
+    @Test
     fun statusMaintenance_suppressesSelectedCandidateBeforeReservationAndUsesTypedAudit() = runBlocking {
         val availability = RecordingLaunchAvailability(
             statusReason = LlmDaemonLaunchSuppressionReason.STATUS_MAINTENANCE,
@@ -1668,6 +1754,42 @@ private class RecordingLaunchAvailability(
         statusCallCount += 1
 
         return statusReason
+    }
+}
+
+/** scheduler 時刻境界 test 用 status reader。 */
+private class SchedulerStatusReader(
+    private val onRead: () -> Unit = {},
+) : me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatusReader {
+    var callCount: Int = 0
+
+    override suspend fun readStatus(): Result<me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatus> {
+        callCount += 1
+        onRead()
+
+        return Result.success(me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatus.OPEN)
+    }
+}
+
+/** reservation admission の呼び出し有無を記録する repository。 */
+private class RecordingReservationRepository(
+    private val delegate: LlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+    var admissionCallCount: Int = 0
+
+    override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
+        admissionCallCount += 1
+
+        return delegate.tryReserve(request)
+    }
+
+    override suspend fun findBlockingRunningReservation(
+        requestTriggerKind: LlmDaemonTriggerKind,
+        activeSince: Instant,
+    ): Result<LlmActiveLaunchReservation?> {
+        admissionCallCount += 1
+
+        return delegate.findBlockingRunningReservation(requestTriggerKind, activeSince)
     }
 }
 

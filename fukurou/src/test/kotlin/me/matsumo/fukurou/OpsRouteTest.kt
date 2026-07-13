@@ -38,6 +38,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.daemon.LLM_LAUNCH_DISABLED
+import me.matsumo.fukurou.trading.daemon.LlmDaemonLaunchSuppressionReason
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -1402,14 +1403,16 @@ class OpsRouteTest {
     @Test
     fun opsRoutes_activityProjectsTypedInfrastructureSuppressionReason() = testApplication {
         val eventLog = InMemoryCommandEventLog()
-        eventLog.append(
-            auditEvent(
-                eventType = CommandEventType.DAEMON_LAUNCH_SUPPRESSED,
-                occurredAt = fixedInstant(),
-                toolName = "llm_daemon_scheduler",
-                payload = """{"reason":"STATUS_PREOPEN","triggerKind":"FLAT_HEARTBEAT"}""",
-            ),
-        ).getOrThrow()
+        LlmDaemonLaunchSuppressionReason.entries.forEachIndexed { index, reason ->
+            eventLog.append(
+                auditEvent(
+                    eventType = CommandEventType.DAEMON_LAUNCH_SUPPRESSED,
+                    occurredAt = fixedInstant().plusSeconds(index.toLong()),
+                    toolName = "llm_daemon_scheduler",
+                    payload = """{"reason":"${reason.name}","triggerKind":"FLAT_HEARTBEAT"}""",
+                ),
+            ).getOrThrow()
+        }
 
         application {
             module(
@@ -1426,16 +1429,20 @@ class OpsRouteTest {
             .jsonObject
             .getValue("events")
             .jsonArray
-            .single()
-            .jsonObject
+            .map { element -> element.jsonObject }
 
         assertEquals(HttpStatusCode.OK, response.status)
-        assertEquals("DAEMON_LAUNCH_SUPPRESSED", event.getValue("kind").jsonPrimitive.content)
-        assertEquals("STATUS_PREOPEN", event.getValue("detail").jsonPrimitive.content)
         assertEquals(
-            "STATUS_PREOPEN",
-            metadataValue(event, "infrastructure reason"),
+            LlmDaemonLaunchSuppressionReason.entries.map { reason -> reason.name }.toSet(),
+            event.map { item -> item.getValue("detail").jsonPrimitive.content }.toSet(),
         )
+        event.forEach { item ->
+            assertEquals("DAEMON_LAUNCH_SUPPRESSED", item.getValue("kind").jsonPrimitive.content)
+            assertEquals(
+                item.getValue("detail").jsonPrimitive.content,
+                metadataValue(item, "infrastructure reason"),
+            )
+        }
     }
 
     @Test

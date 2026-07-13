@@ -10,9 +10,11 @@ import X from "lucide-react/dist/esm/icons/x.mjs";
 import {
   DECISION_RUN_FILTER_STORAGE_KEY,
   DECISION_RUN_FILTERS,
+  activityTimelineQuery,
   decisionRunRefetchInterval,
   fetchDecisionRuns,
   opsDecisionRunDetailQuery,
+  type ActivityTimelineEvent,
   type DecisionRunFilterOption,
   type OpsDecisionRunDetailResponse,
   type OpsDecisionRunSummaryResponse,
@@ -29,6 +31,10 @@ export function ActivityPage() {
   const [searchedRunId, setSearchedRunId] = useState<string | null>(null);
   const [runIdQuery, setRunIdQuery] = useState("");
   const selectedRunButtonRef = useRef<HTMLButtonElement | null>(null);
+  const infrastructureSuppressionsQuery = useQuery(activityTimelineQuery({
+    source: "audit",
+    auditEventTypes: ["DAEMON_LAUNCH_SUPPRESSED"],
+  }));
   const runsQuery = useInfiniteQuery({
     queryKey: ["ops", "decision-runs", filter],
     queryFn: ({ pageParam }) => fetchDecisionRuns({
@@ -100,13 +106,19 @@ export function ActivityPage() {
           <button
             className="icon-text-button icon-text-button--prominent"
             type="button"
-            onClick={() => void runsQuery.refetch()}
-            disabled={runsQuery.isFetching}
+            onClick={() => void Promise.all([runsQuery.refetch(), infrastructureSuppressionsQuery.refetch()])}
+            disabled={runsQuery.isFetching || infrastructureSuppressionsQuery.isFetching}
           >
             <RefreshCw size={16} aria-hidden="true" />
-            {runsQuery.isFetching ? t("common.refreshing") : t("common.refresh")}
+            {runsQuery.isFetching || infrastructureSuppressionsQuery.isFetching
+              ? t("common.refreshing")
+              : t("common.refresh")}
           </button>
         </div>}
+      />
+
+      <InfrastructureSuppressionFeed
+        events={infrastructureSuppressionsQuery.data?.events ?? []}
       />
 
       <div className="run-filterbar" role="group" aria-label={t("activity.runs.filters.aria")}>
@@ -184,6 +196,65 @@ export function ActivityPage() {
       ) : null}
     </div>
   );
+}
+
+function InfrastructureSuppressionFeed({ events }: { events: ActivityTimelineEvent[] }) {
+  const { locale, t } = useI18n();
+
+  if (events.length === 0) return null;
+
+  return (
+    <section className="run-detail-section" aria-label={t("activity.suppression.section.aria")}>
+      <div className="run-detail-section__heading">
+        <span>!</span>
+        <h2>{t("activity.suppression.section.title")}</h2>
+      </div>
+      {events.map((event) => {
+        const reason = infrastructureSuppressionReason(event);
+        const copy = infrastructureSuppressionCopy(reason, t);
+
+        return (
+          <article className="run-detail-notice run-detail-notice--warning" key={event.id}>
+            <strong>{copy.label}</strong>
+            <time>{formatDateTime(event.occurredAt, locale)}</time>
+            <p>{copy.description}</p>
+          </article>
+        );
+      })}
+    </section>
+  );
+}
+
+function infrastructureSuppressionReason(event: ActivityTimelineEvent): string {
+  const typedMetadata = event.metadata.find((item) => item.label === "infrastructure reason")?.value;
+
+  return typedMetadata ?? event.detail;
+}
+
+function infrastructureSuppressionCopy(reason: string, t: Translator): { label: string; description: string } {
+  const key = (() => {
+    switch (reason) {
+      case "SCHEDULED_MAINTENANCE": return "scheduledMaintenance";
+      case "STATUS_MAINTENANCE": return "statusMaintenance";
+      case "STATUS_PREOPEN": return "statusPreopen";
+      case "STATUS_TIMEOUT": return "statusTimeout";
+      case "STATUS_MALFORMED": return "statusMalformed";
+      case "STATUS_TRANSPORT_FAILURE": return "statusTransportFailure";
+      default: return null;
+    }
+  })();
+
+  if (key === null) {
+    return {
+      label: `${t("activity.suppression.unknown.label")}: ${reason}`,
+      description: t("activity.suppression.unknown.description"),
+    };
+  }
+
+  return {
+    label: t(`activity.suppression.${key}.label`),
+    description: t(`activity.suppression.${key}.description`),
+  };
 }
 
 function RunRow({

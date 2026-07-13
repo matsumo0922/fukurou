@@ -1,8 +1,15 @@
 package me.matsumo.fukurou.trading.daemon
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatus
 import me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatusReader
+import me.matsumo.fukurou.trading.exchange.gmo.GmoMonotonicTimeSource
+import me.matsumo.fukurou.trading.market.GmoApiStatusException
+import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataParseException
 import me.matsumo.fukurou.trading.market.MarketNetworkException
 import java.net.http.HttpTimeoutException
@@ -10,6 +17,7 @@ import java.time.Duration
 import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 
 /** GMO maintenance availability の時刻境界・status・cache contract を検証する。 */
 class LlmDaemonLaunchAvailabilityTest {
@@ -69,6 +77,8 @@ class LlmDaemonLaunchAvailabilityTest {
             MarketNetworkException("timeout", HttpTimeoutException("timeout")) to
                 LlmDaemonLaunchSuppressionReason.STATUS_TIMEOUT,
             MarketDataParseException("malformed") to LlmDaemonLaunchSuppressionReason.STATUS_MALFORMED,
+            GmoApiStatusException(1, "ERR-5201") to LlmDaemonLaunchSuppressionReason.STATUS_MALFORMED,
+            GmoRequestAuditException() to LlmDaemonLaunchSuppressionReason.STATUS_TRANSPORT_FAILURE,
             MarketNetworkException("connection reset") to
                 LlmDaemonLaunchSuppressionReason.STATUS_TRANSPORT_FAILURE,
         )
@@ -83,7 +93,12 @@ class LlmDaemonLaunchAvailabilityTest {
     @Test
     fun statusGate_cachesSingleSuccessOrFailureEntryForSixtySeconds() = runBlocking {
         val reader = FakeStatusReader(Result.success(GmoExchangeStatus.MAINTENANCE))
-        val availability = GmoLlmDaemonLaunchAvailability(reader, Duration.ofSeconds(60))
+        val monotonicTimeSource = MutableMonotonicTimeSource()
+        val availability = GmoLlmDaemonLaunchAvailability(
+            statusReader = reader,
+            cacheTtl = Duration.ofSeconds(60),
+            monotonicTimeSource = monotonicTimeSource,
+        )
         val firstAt = Instant.parse("2026-07-13T00:00:00Z")
 
         assertEquals(
@@ -91,13 +106,15 @@ class LlmDaemonLaunchAvailabilityTest {
             availability.statusSuppressionAt(firstAt),
         )
         reader.result = Result.failure(MarketDataParseException("malformed"))
+        monotonicTimeSource.advance(Duration.ofSeconds(59))
         assertEquals(
             LlmDaemonLaunchSuppressionReason.STATUS_MAINTENANCE,
-            availability.statusSuppressionAt(firstAt.plusSeconds(59)),
+            availability.statusSuppressionAt(firstAt.minusSeconds(3_600)),
         )
+        monotonicTimeSource.advance(Duration.ofSeconds(1))
         assertEquals(
             LlmDaemonLaunchSuppressionReason.STATUS_MALFORMED,
-            availability.statusSuppressionAt(firstAt.plusSeconds(60)),
+            availability.statusSuppressionAt(firstAt.minusSeconds(7_200)),
         )
         assertEquals(2, reader.callCount)
     }
@@ -105,17 +122,76 @@ class LlmDaemonLaunchAvailabilityTest {
     @Test
     fun statusGate_cachesOpenForSixtySeconds() = runBlocking {
         val reader = FakeStatusReader(Result.success(GmoExchangeStatus.OPEN))
-        val availability = GmoLlmDaemonLaunchAvailability(reader, Duration.ofSeconds(60))
+        val monotonicTimeSource = MutableMonotonicTimeSource()
+        val availability = GmoLlmDaemonLaunchAvailability(
+            statusReader = reader,
+            cacheTtl = Duration.ofSeconds(60),
+            monotonicTimeSource = monotonicTimeSource,
+        )
         val firstAt = Instant.parse("2026-07-13T00:00:00Z")
 
         assertEquals(null, availability.statusSuppressionAt(firstAt))
         reader.result = Result.success(GmoExchangeStatus.MAINTENANCE)
-        assertEquals(null, availability.statusSuppressionAt(firstAt.plusSeconds(59)))
+        monotonicTimeSource.advance(Duration.ofSeconds(59))
+        assertEquals(null, availability.statusSuppressionAt(firstAt.minusSeconds(1)))
+        monotonicTimeSource.advance(Duration.ofSeconds(1))
         assertEquals(
             LlmDaemonLaunchSuppressionReason.STATUS_MAINTENANCE,
-            availability.statusSuppressionAt(firstAt.plusSeconds(60)),
+            availability.statusSuppressionAt(firstAt.minusSeconds(2)),
         )
         assertEquals(2, reader.callCount)
+    }
+
+    @Test
+    fun statusGate_concurrentCallersShareOneRequestAndCacheEntry() = runBlocking {
+        val requestStarted = CompletableDeferred<Unit>()
+        val releaseRequest = CompletableDeferred<Unit>()
+        var callCount = 0
+        val availability = GmoLlmDaemonLaunchAvailability(
+            statusReader = GmoExchangeStatusReader {
+                callCount += 1
+                requestStarted.complete(Unit)
+                releaseRequest.await()
+                Result.success(GmoExchangeStatus.OPEN)
+            },
+            monotonicTimeSource = MutableMonotonicTimeSource(),
+        )
+        val observedAt = Instant.parse("2026-07-13T00:00:00Z")
+        val callers = List(8) {
+            async { availability.statusSuppressionAt(observedAt) }
+        }
+
+        requestStarted.await()
+        releaseRequest.complete(Unit)
+
+        assertEquals(List(8) { null }, callers.awaitAll())
+        assertEquals(1, callCount)
+    }
+
+    @Test
+    fun statusGate_rethrowsThrownOrReturnedCancellationWithoutCaching() = runBlocking {
+        val cancellations = listOf(
+            GmoExchangeStatusReader { throw CancellationException("thrown") },
+            GmoExchangeStatusReader { Result.failure(CancellationException("returned")) },
+        )
+        val observedAt = Instant.parse("2026-07-13T00:00:00Z")
+
+        cancellations.forEach { cancellingReader ->
+            var callCount = 0
+            val availability = GmoLlmDaemonLaunchAvailability(
+                statusReader = GmoExchangeStatusReader {
+                    callCount += 1
+                    if (callCount == 1) cancellingReader.readStatus() else Result.success(GmoExchangeStatus.OPEN)
+                },
+                monotonicTimeSource = MutableMonotonicTimeSource(),
+            )
+
+            assertFailsWith<CancellationException> {
+                availability.statusSuppressionAt(observedAt)
+            }
+            assertEquals(null, availability.statusSuppressionAt(observedAt))
+            assertEquals(2, callCount)
+        }
     }
 }
 
@@ -129,5 +205,16 @@ private class FakeStatusReader(
         callCount += 1
 
         return result
+    }
+}
+
+/** cache TTL test 用 monotonic time source。 */
+private class MutableMonotonicTimeSource : GmoMonotonicTimeSource {
+    private var currentNanos: Long = 0
+
+    override fun nanoTime(): Long = currentNanos
+
+    fun advance(duration: Duration) {
+        currentNanos += duration.toNanos()
     }
 }

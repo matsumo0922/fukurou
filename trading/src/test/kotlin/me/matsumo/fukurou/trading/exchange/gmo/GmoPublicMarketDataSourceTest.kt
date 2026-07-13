@@ -98,6 +98,53 @@ class GmoPublicMarketDataSourceTest {
     }
 
     @Test
+    fun readStatus_nonSuccessGmoStatusIsDeterministicAndUsesOneHttpAttempt() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf("" to statusErrorResponse("ERR-5201")),
+        )
+        val dataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(maxAttempts = 3),
+        )
+
+        val failure = dataSource.readStatus().exceptionOrNull()
+
+        assertIs<GmoApiStatusException>(failure)
+        assertEquals(1, failure.status)
+        assertEquals(1, httpClient.requestCount)
+    }
+
+    @Test
+    fun readStatus_temporaryFailureHonorsConfiguredHttpAttemptCeiling() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = emptyMap(),
+            failure = IOException("connection reset"),
+        )
+        val dataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(maxAttempts = 2),
+        )
+
+        assertIs<MarketNetworkException>(dataSource.readStatus().exceptionOrNull())
+        assertEquals(2, httpClient.requestCount)
+    }
+
+    @Test
+    fun readStatus_requestAuditFailureStopsAfterOneHttpAttempt() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf("" to statusResponse("OPEN")),
+        )
+        val dataSource = fakeMarketDataSource(
+            httpClient = httpClient,
+            retryConfig = GmoRetryConfig(maxAttempts = 3),
+            requestAuditSink = GmoPublicRequestAuditSink { Result.failure(IllegalStateException("secret")) },
+        )
+
+        assertIs<GmoRequestAuditException>(dataSource.readStatus().exceptionOrNull())
+        assertEquals(1, httpClient.requestCount)
+    }
+
+    @Test
     fun parseTickerResponse_returnsTicker() {
         val ticker = parseTickerResponse(TICKER_SUCCESS_RESPONSE, TradingSymbol.BTC)
 
@@ -872,6 +919,20 @@ private fun statusResponse(status: String): String {
     """.trimIndent()
 }
 
+private fun statusErrorResponse(messageCode: String): String {
+    return """
+    {
+      "status": 1,
+      "messages": [
+        {
+          "message_code": "$messageCode",
+          "message_string": "status unavailable"
+        }
+      ]
+    }
+    """.trimIndent()
+}
+
 private fun fakeMarketDataSource(
     httpClient: FakeHttpClient,
     clock: Clock = Clock.fixed(Instant.parse("2026-01-02T00:00:00Z"), ZoneOffset.UTC),
@@ -925,6 +986,7 @@ private class FakeHttpClient(
      * 呼び出された query の一覧。
      */
     val requestQueries = mutableListOf<String>()
+    var requestCount: Int = 0
     private val responseIndexes = mutableMapOf<String, Int>()
 
     override fun cookieHandler(): Optional<CookieHandler> {
@@ -967,6 +1029,7 @@ private class FakeHttpClient(
         request: HttpRequest,
         responseBodyHandler: HttpResponse.BodyHandler<ResponseBody>,
     ): HttpResponse<ResponseBody> {
+        requestCount += 1
         failure?.let { throw it }
 
         val query = request.uri().rawQuery.orEmpty()

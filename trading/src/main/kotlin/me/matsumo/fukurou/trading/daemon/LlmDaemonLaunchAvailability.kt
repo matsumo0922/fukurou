@@ -1,9 +1,13 @@
 package me.matsumo.fukurou.trading.daemon
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatus
 import me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatusReader
+import me.matsumo.fukurou.trading.exchange.gmo.GmoMonotonicTimeSource
+import me.matsumo.fukurou.trading.exchange.gmo.SystemGmoMonotonicTimeSource
+import me.matsumo.fukurou.trading.market.GmoApiStatusException
 import me.matsumo.fukurou.trading.market.MarketDataParseException
 import java.net.http.HttpTimeoutException
 import java.time.DayOfWeek
@@ -63,6 +67,7 @@ class GmoLlmDaemonLaunchAvailability(
     private val statusReader: GmoExchangeStatusReader,
     private val cacheTtl: Duration = DEFAULT_GMO_STATUS_CACHE_TTL,
     private val marketZone: ZoneId = GMO_MAINTENANCE_ZONE,
+    private val monotonicTimeSource: GmoMonotonicTimeSource = SystemGmoMonotonicTimeSource,
 ) : LlmDaemonLaunchAvailability {
 
     private val cacheMutex = Mutex()
@@ -89,21 +94,26 @@ class GmoLlmDaemonLaunchAvailability(
         scheduledSuppressionAt(observedAt)?.let { reason -> return reason }
 
         return cacheMutex.withLock {
-            val cached = cachedResult?.takeIf { entry -> observedAt.isBefore(entry.expiresAt) }
+            val currentNanos = monotonicTimeSource.nanoTime()
+            val cached = cachedResult?.takeIf { entry ->
+                val elapsedNanos = currentNanos - entry.cachedAtNanos
+
+                elapsedNanos >= 0 && elapsedNanos < cacheTtl.toNanos()
+            }
             if (cached != null) return@withLock cached.reason
 
-            readAndCacheStatus(observedAt)
+            readAndCacheStatus()
         }
     }
 
-    private suspend fun readAndCacheStatus(observedAt: Instant): LlmDaemonLaunchSuppressionReason? {
+    private suspend fun readAndCacheStatus(): LlmDaemonLaunchSuppressionReason? {
         val reason = statusReader.readStatus().fold(
             onSuccess = { status -> status.toSuppressionReason() },
             onFailure = { throwable -> throwable.toSuppressionReason() },
         )
         cachedResult = CachedStatusResult(
             reason = reason,
-            expiresAt = observedAt.plus(cacheTtl),
+            cachedAtNanos = monotonicTimeSource.nanoTime(),
         )
 
         return reason
@@ -112,7 +122,7 @@ class GmoLlmDaemonLaunchAvailability(
     /** status 取得結果の単一 cache entry。 */
     private data class CachedStatusResult(
         val reason: LlmDaemonLaunchSuppressionReason?,
-        val expiresAt: Instant,
+        val cachedAtNanos: Long,
     )
 }
 
@@ -125,22 +135,29 @@ private fun GmoExchangeStatus.toSuppressionReason(): LlmDaemonLaunchSuppressionR
 }
 
 private fun Throwable.toSuppressionReason(): LlmDaemonLaunchSuppressionReason {
+    causeChain<CancellationException>()?.let { cancellation -> throw cancellation }
+
     return when {
-        this is MarketDataParseException -> LlmDaemonLaunchSuppressionReason.STATUS_MALFORMED
+        this is MarketDataParseException || this is GmoApiStatusException ->
+            LlmDaemonLaunchSuppressionReason.STATUS_MALFORMED
         causeChainContains<HttpTimeoutException>() -> LlmDaemonLaunchSuppressionReason.STATUS_TIMEOUT
         else -> LlmDaemonLaunchSuppressionReason.STATUS_TRANSPORT_FAILURE
     }
 }
 
 private inline fun <reified T : Throwable> Throwable.causeChainContains(): Boolean {
+    return causeChain<T>() != null
+}
+
+private inline fun <reified T : Throwable> Throwable.causeChain(): T? {
     var current: Throwable? = this
 
     while (current != null) {
-        if (current is T) return true
+        if (current is T) return current
         current = current.cause
     }
 
-    return false
+    return null
 }
 
 /** GMO status cache の既定 TTL。 */

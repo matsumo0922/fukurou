@@ -390,6 +390,48 @@ describe("App", () => {
     selection.removeAllRanges();
   });
 
+  it("retrieves and renders every daemon infrastructure suppression reason with an unknown fallback", async () => {
+    const fetchMock = stubSystemFetch({
+      activityResponse: suppressionActivityResponse(),
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Automatic launch suppressions" })).toBeInTheDocument();
+    expect(screen.getByText("Scheduled GMO maintenance")).toBeInTheDocument();
+    expect(screen.getByText("GMO status: maintenance")).toBeInTheDocument();
+    expect(screen.getByText("GMO status: pre-open")).toBeInTheDocument();
+    expect(screen.getByText("GMO status timeout")).toBeInTheDocument();
+    expect(screen.getByText("Malformed GMO status")).toBeInTheDocument();
+    expect(screen.getByText("GMO status transport failure")).toBeInTheDocument();
+    expect(screen.getByText("Unknown infrastructure suppression: STATUS_FUTURE")).toBeInTheDocument();
+    expect(
+      hasGetCall(
+        fetchMock,
+        "/ops/activity",
+        (params) => params.get("source") === "audit"
+          && params.getAll("auditEventType").includes("DAEMON_LAUNCH_SUPPRESSED"),
+      ),
+    ).toBe(true);
+  });
+
+  it("renders daemon infrastructure suppression reasons in Japanese", async () => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, "ja");
+    stubSystemFetch({
+      activityResponse: suppressionActivityResponse(),
+    });
+    window.history.pushState({}, "", "/app/activity");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Automatic 起動抑止" })).toBeInTheDocument();
+    expect(screen.getByText("GMO 定期メンテナンス")).toBeInTheDocument();
+    expect(screen.getByText("GMO status 不正 response")).toBeInTheDocument();
+    expect(screen.getByText("GMO status transport 失敗")).toBeInTheDocument();
+    expect(screen.getByText("未知の infrastructure 抑止: STATUS_FUTURE")).toBeInTheDocument();
+  });
+
   it("recalculates the decision run pane for surrounding layout changes and scrolling", async () => {
     const observe = vi.fn();
     const disconnect = vi.fn();
@@ -1118,6 +1160,7 @@ type SystemFetchFixture = {
     status: number;
     body: unknown;
   };
+  activityResponse?: unknown;
   activityOlderResponse?: Promise<Response>;
   decisionRunsResponse?: Promise<Response> | {
     status: number;
@@ -1332,6 +1375,10 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
 
           if (unknownAuditEventTypes(searchParams).length > 0) {
             return jsonResponse({ message: "Unknown auditEventType" }, { status: 400 });
+          }
+
+          if (fixture.activityResponse) {
+            return jsonResponse(fixture.activityResponse);
           }
 
           if (searchParams.has("before") && fixture.activityOlderResponse) {
@@ -2186,6 +2233,41 @@ function activityTimelineResponse(searchParams: URLSearchParams) {
   return {
     events,
     nextBefore: before ? null : "2026-07-05T12:02:00.000Z|decision|decision:decision-1",
+    limit: 50,
+  };
+}
+
+function suppressionActivityResponse() {
+  const reasons = [
+    "SCHEDULED_MAINTENANCE",
+    "STATUS_MAINTENANCE",
+    "STATUS_PREOPEN",
+    "STATUS_TIMEOUT",
+    "STATUS_MALFORMED",
+    "STATUS_TRANSPORT_FAILURE",
+    "STATUS_FUTURE",
+  ];
+
+  return {
+    events: reasons.map((reason, index) => ({
+      id: `audit:suppression-${index}`,
+      source: "audit",
+      kind: "DAEMON_LAUNCH_SUPPRESSED",
+      title: "DAEMON_LAUNCH_SUPPRESSED",
+      detail: reason,
+      occurredAt: `2026-07-05T12:0${index}:00.000Z`,
+      metadata: [
+        {
+          label: "tool",
+          value: "llm_daemon_scheduler",
+        },
+        {
+          label: "infrastructure reason",
+          value: reason,
+        },
+      ],
+    })),
+    nextBefore: null,
     limit: 50,
   };
 }
