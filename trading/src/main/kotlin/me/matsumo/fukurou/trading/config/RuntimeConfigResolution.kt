@@ -60,12 +60,14 @@ data class RuntimeConfigAuditSnapshot(
  * @param auditSnapshot 監査に残す snapshot 識別子
  * @param typedEnvironment typed config と等価な env map
  * @param catalogEnvironment catalog API 表示用の env map
+ * @param warnings active calendar の安全 warning
  */
 data class RuntimeConfigResolution(
     val tradingConfig: TradingBotConfig,
     val auditSnapshot: RuntimeConfigAuditSnapshot,
     val typedEnvironment: Map<String, String>,
     val catalogEnvironment: Map<String, String>,
+    val warnings: List<RuntimeConfigSnapshotWarning> = emptyList(),
 )
 
 /**
@@ -283,6 +285,7 @@ object RuntimeConfigCandidateValidator {
     fun validate(
         values: Map<String, String>,
         environment: Map<String, String> = System.getenv(),
+        tolerateActiveCalendarCorruption: Boolean = false,
     ): RuntimeConfigValidatedCandidate {
         val runtimeItems = RuntimeConfigCatalog.runtimeItems()
         val runtimeItemsByKey = runtimeItems.associateBy { item -> item.key }
@@ -297,7 +300,11 @@ object RuntimeConfigCandidateValidator {
         val canonicalValues = buildMap {
             values.forEach { (key, value) ->
                 val item = runtimeItemsByKey[key] ?: return@forEach
-                val validationResult = validateRuntimeValue(item, value)
+                val validationResult = if (tolerateActiveCalendarCorruption && key == ECONOMIC_EVENT_BLACKOUTS_KEY) {
+                    Result.success(value.trim())
+                } else {
+                    validateRuntimeValue(item, value)
+                }
                 val canonicalValue = validationResult.getOrNull()
 
                 if (canonicalValue != null) {
@@ -307,6 +314,19 @@ object RuntimeConfigCandidateValidator {
                     errors += failure.error
                 }
             }
+        }
+
+        if (errors.isNotEmpty()) {
+            return RuntimeConfigValidatedCandidate(
+                validation = RuntimeConfigValidationResult(valid = false, errors = errors),
+                tradingConfig = null,
+                typedEnvironment = emptyMap(),
+                catalogEnvironment = emptyMap(),
+            )
+        }
+
+        if (!tolerateActiveCalendarCorruption) {
+            errors += validateFomcCalendarCandidate(canonicalValues.getValue(ECONOMIC_EVENT_BLACKOUTS_KEY))
         }
 
         if (errors.isNotEmpty()) {
@@ -343,7 +363,11 @@ object RuntimeConfigCandidateValidator {
         }
 
         val tradingConfigResult = runCatching {
-            TradingBotConfig.fromEnvironment(typedEnvironment)
+            if (tolerateActiveCalendarCorruption) {
+                TradingBotConfig.fromActiveRuntimeEnvironment(typedEnvironment)
+            } else {
+                TradingBotConfig.fromEnvironment(typedEnvironment)
+            }
         }
 
         return tradingConfigResult.fold(
@@ -772,6 +796,7 @@ class RuntimeConfigResolver(
             val validation = RuntimeConfigCandidateValidator.validate(
                 values = activeSnapshot.values,
                 environment = environment,
+                tolerateActiveCalendarCorruption = true,
             )
             validation.validation.requireValid()
 
@@ -783,10 +808,58 @@ class RuntimeConfigResolver(
                 ),
                 typedEnvironment = validation.typedEnvironment,
                 catalogEnvironment = validation.catalogEnvironment,
+                warnings = requireNotNull(validation.tradingConfig).safetyFloor.fomcBlackoutCalendar
+                    .toRuntimeConfigWarnings(Instant.now()),
             )
         }
     }
 }
+
+private fun validateFomcCalendarCandidate(raw: String): List<RuntimeConfigValidationError> {
+    val events = decodeEconomicEventBlackouts(raw).getOrElse {
+        return listOf(fomcValidationError("runtimeConfig.validation.fomcCalendarInvalid"))
+    }
+    val duplicateIds = events.groupingBy { event -> event.eventId }.eachCount().filterValues { count -> count > 1 }
+    if (duplicateIds.isNotEmpty()) {
+        return listOf(fomcValidationError("runtimeConfig.validation.fomcCalendarDuplicateId"))
+    }
+
+    val hasNonPrefixedFomc = events.any { event ->
+        !event.eventId.startsWith("fomc-") && event.eventName.contains("FOMC", ignoreCase = true)
+    }
+    if (hasNonPrefixedFomc) {
+        return listOf(fomcValidationError("runtimeConfig.validation.fomcCalendarInvalidId"))
+    }
+
+    val fomcEvents = events.filter { event -> event.eventId.startsWith("fomc-") }
+    if (fomcEvents.isEmpty()) {
+        return listOf(fomcValidationError("runtimeConfig.validation.fomcCalendarMissing"))
+    }
+
+    val now = Instant.now()
+    if (fomcEvents.none { event -> event.eventAt.plus(event.blackoutAfter) >= now }) {
+        return listOf(fomcValidationError("runtimeConfig.validation.fomcCalendarNoFutureWindow"))
+    }
+
+    return emptyList()
+}
+
+private fun fomcValidationError(code: String): RuntimeConfigValidationError {
+    return RuntimeConfigValidationError(code = code, key = ECONOMIC_EVENT_BLACKOUTS_KEY)
+}
+
+private fun FomcBlackoutCalendar.toRuntimeConfigWarnings(now: Instant): List<RuntimeConfigSnapshotWarning> {
+    val code = when (stateAt(now)) {
+        FomcBlackoutCalendarState.ACTIVE -> return emptyList()
+        FomcBlackoutCalendarState.MISSING -> "runtimeConfig.warning.fomcCalendarMissing"
+        FomcBlackoutCalendarState.INVALID -> "runtimeConfig.warning.fomcCalendarInvalid"
+        FomcBlackoutCalendarState.EXPIRED -> "runtimeConfig.warning.fomcCalendarExpired"
+    }
+
+    return listOf(RuntimeConfigSnapshotWarning(code = code))
+}
+
+private const val ECONOMIC_EVENT_BLACKOUTS_KEY = "safety.economicEventBlackouts"
 
 internal fun RuntimeConfigValidationResult.requireValid() {
     if (!valid) {

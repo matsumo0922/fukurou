@@ -278,6 +278,8 @@ sudo git -C /srv/fukurou/repo rev-parse HEAD
 
 code-owned catalog default の変更は、active runtime config に同じ key が明示保存済みの場合は実効値を上書きしない。runtime config の runtime group は applyMode `NEXT_RESTART` のため、deploy 後に `/ops/runtime-config` または WebUI `/app/config` で現在の `effectiveValue` を確認し、必要な key を draft / validate / activate で active 化する。
 
+`safety.economicEventBlackouts` の code-owned candidate は Federal Reserve 公式 calendar の 2026 年残り FOMC 会合を `America/New_York` 14:00 から UTC へ変換し、前後 60 分で保持する。active 値が空、不正、期限切れの場合、`/ops/runtime-config` は専用 warning を返し、SafetyFloor は新規 entry だけを停止する。readiness、ProtectionReconciler、close、cancel、protection update は継続する。calendar 更新は通常の draft / validate / activate 手順を使い、公式 source と UTC 変換結果を確認する。deploy や rollback の一部として production active 値を暗黙に切り替えない。
+
 例: `safety.minExpectedMoveToCostRatio` と runner の hourly / daily cap を active config に反映する。
 
 ```sh

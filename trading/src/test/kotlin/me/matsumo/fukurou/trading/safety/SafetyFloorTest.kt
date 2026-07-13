@@ -54,6 +54,13 @@ class SafetyFloorTest {
                         blackoutBefore = Duration.ofMinutes(30),
                         blackoutAfter = Duration.ofMinutes(30),
                     ),
+                    EconomicEventBlackout(
+                        eventId = "fomc-20261209",
+                        eventName = "FOMC",
+                        eventAt = Instant.parse("2026-12-09T19:00:00Z"),
+                        blackoutBefore = Duration.ofMinutes(60),
+                        blackoutAfter = Duration.ofMinutes(60),
+                    ),
                 ),
             ),
             clock = Clock.fixed(Instant.parse("2026-07-03T13:00:00Z"), ZoneOffset.UTC),
@@ -134,6 +141,57 @@ class SafetyFloorTest {
 
         assertIs<SafetyFloorVerdict.Accepted>(protectionVerdict)
         assertIs<SafetyFloorVerdict.Accepted>(closeVerdict)
+    }
+
+    @Test
+    fun fomcCalendar_missingInvalidAndExpiredBlockOnlyNewEntry() {
+        val observedAt = Instant.parse("2026-07-13T00:00:00Z")
+        val configs = listOf(
+            SafetyFloorConfig(economicEventBlackouts = emptyList()),
+            SafetyFloorConfig(
+                economicEventBlackouts = emptyList(),
+                economicEventBlackoutsRaw = "not-json",
+            ),
+            SafetyFloorConfig(
+                economicEventBlackouts = listOf(
+                    EconomicEventBlackout(
+                        eventId = "fomc-past",
+                        eventName = "FOMC",
+                        eventAt = Instant.parse("2026-01-01T19:00:00Z"),
+                        blackoutBefore = Duration.ofMinutes(60),
+                        blackoutAfter = Duration.ofMinutes(60),
+                    ),
+                ),
+            ),
+        )
+        val expectedRules = listOf(
+            SafetyFloorRule.FOMC_CALENDAR_MISSING,
+            SafetyFloorRule.FOMC_CALENDAR_INVALID,
+            SafetyFloorRule.FOMC_CALENDAR_EXPIRED,
+        )
+
+        configs.zip(expectedRules).forEach { (config, expectedRule) ->
+            val floor = SafetyFloor(
+                config = config,
+                clock = Clock.fixed(observedAt, ZoneOffset.UTC),
+            )
+            val context = safetyContext(positions = emptyList(), atr14Jpy = null)
+            val entryVerdict = floor.evaluatePlaceOrder(entryCommand(), context)
+
+            assertEquals(expectedRule, assertIs<SafetyFloorVerdict.Rejected>(entryVerdict).violation.rule)
+            assertIs<SafetyFloorVerdict.Accepted>(
+                floor.evaluateClosePosition(
+                    command = ClosePositionCommand(
+                        commandId = UUID.randomUUID(),
+                        positionId = UUID.randomUUID(),
+                        closeAll = true,
+                        reasonJa = "calendar fail-closed does not block close",
+                        auditContext = PaperTradeAuditContext.EMPTY,
+                    ),
+                    context = context,
+                ),
+            )
+        }
     }
 
     @Test

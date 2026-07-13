@@ -152,6 +152,9 @@ describe("App", () => {
               ],
             },
           },
+          {
+            code: "runtimeConfig.warning.fomcCalendarExpired",
+          },
         ],
       },
     });
@@ -167,6 +170,11 @@ describe("App", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("Missing keys: runner.maxToolCallsPerRun.")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "The active FOMC calendar has expired. New entries are blocked; risk-reducing operations continue.",
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByText("No records")).toBeInTheDocument();
   });
 

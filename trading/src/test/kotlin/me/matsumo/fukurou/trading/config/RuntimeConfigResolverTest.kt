@@ -206,6 +206,48 @@ class RuntimeConfigResolverTest {
         assertEquals("reflection.promptCandidateProvider", validationError.key)
         assertEquals("CLAUDE, CODEX", validationError.params.getValue("values"))
     }
+
+    @Test
+    fun resolve_keepsRuntimeAvailableAndWarnsForCorruptActiveFomcCalendar() {
+        val corruptValues = listOf(
+            "[]" to "runtimeConfig.warning.fomcCalendarMissing",
+            "not-json" to "runtimeConfig.warning.fomcCalendarInvalid",
+            """[{"eventId":"fomc-past","eventName":"FOMC","eventAt":"2026-01-01T19:00:00Z","blackoutBeforeSeconds":3600,"blackoutAfterSeconds":3600}]""" to
+                "runtimeConfig.warning.fomcCalendarExpired",
+        )
+
+        corruptValues.forEach { (raw, warningCode) ->
+            val values = RuntimeConfigCatalog.runtimeDefaultValues() +
+                ("safety.economicEventBlackouts" to raw)
+            val result = RuntimeConfigResolver(FakeActiveRuntimeConfigSource(values)).resolve(emptyMap()).getOrThrow()
+
+            assertEquals(warningCode, result.warnings.single().code)
+            assertEquals(raw, result.catalogEnvironment.getValue("FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC"))
+        }
+    }
+
+    @Test
+    fun validate_rejectsMissingInvalidDuplicateAndPastOnlyFomcCandidates() {
+        val invalidCandidates = listOf(
+            "[]" to "runtimeConfig.validation.fomcCalendarMissing",
+            "not-json" to "runtimeConfig.validation.invalidJsonList",
+            """[{"eventId":"fomc-duplicate","eventName":"FOMC","eventAt":"2026-12-09T19:00:00Z","blackoutBeforeSeconds":3600,"blackoutAfterSeconds":3600},{"eventId":"fomc-duplicate","eventName":"FOMC","eventAt":"2026-12-09T19:00:00Z","blackoutBeforeSeconds":3600,"blackoutAfterSeconds":3600}]""" to
+                "runtimeConfig.validation.fomcCalendarDuplicateId",
+            """[{"eventId":"fomc-past","eventName":"FOMC","eventAt":"2026-01-01T19:00:00Z","blackoutBeforeSeconds":3600,"blackoutAfterSeconds":3600}]""" to
+                "runtimeConfig.validation.fomcCalendarNoFutureWindow",
+        )
+
+        invalidCandidates.forEach { (raw, code) ->
+            val candidate = RuntimeConfigCandidateValidator.validate(
+                values = RuntimeConfigCatalog.runtimeDefaultValues() +
+                    ("safety.economicEventBlackouts" to raw),
+                environment = emptyMap(),
+            )
+
+            assertFalse(candidate.validation.valid)
+            assertEquals(code, candidate.validation.errors.single().code)
+        }
+    }
 }
 
 private data class ConservativeBoundaryCase(
