@@ -561,6 +561,11 @@ private fun launchBudgetRequest(
         hourlyWindow = Duration.ofHours(1),
         dailyWindow = Duration.ofHours(24),
         activeReservationStaleAfter = Duration.ofMinutes(30),
+        populationScope = LlmLaunchReservationPopulationScope(
+            kind = "SYMBOL",
+            mode = me.matsumo.fukurou.trading.domain.TradingMode.PAPER,
+            symbol = me.matsumo.fukurou.trading.domain.TradingSymbol.BTC,
+        ),
     )
 }
 

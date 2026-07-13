@@ -112,15 +112,20 @@ SELECT format(
     :'mcp_role'
 )
 FROM (VALUES
-    ('command_event_log'), ('paper_account'), ('positions'), ('orders'), ('risk_state'),
+    ('command_event_log'), ('paper_account'), ('risk_state'),
     ('executions'), ('market_data_sessions'), ('market_data_gaps'), ('trade_intents'),
     ('trade_plans'), ('falsifications'), ('trade_intent_consumptions'), ('decisions'),
-    ('llm_runs'), ('evaluation_exclusions'), ('safety_violations'),
+    ('evaluation_exclusions'), ('safety_violations'),
     ('decision_material_state_manifests'), ('decision_identity_schema_boundaries'),
     ('decision_identity_generation_failures'),
-    ('opportunity_episodes'), ('dedupe_shadow_observations'), ('dedupe_shadow_resolutions'),
+    ('dedupe_shadow_observations'), ('dedupe_shadow_resolutions'),
     ('mcp_current_evaluation_scope'), ('mcp_evaluation_epochs')
 ) AS inventory(table_name) \gexec
+
+SELECT format('GRANT SELECT (invocation_id,mode,symbol,trigger_kind,status,started_at,finished_at,error_message,terminal_cause,runtime_config_version_id,runtime_config_hash) ON TABLE public.llm_runs TO %I', :'mcp_role') \gexec
+SELECT format('GRANT SELECT (id,account_epoch_id,trade_group_id,mode,symbol,side,status,opened_at,closed_at,size_btc,average_entry_price_jpy,current_price_jpy,current_stop_loss_jpy,current_take_profit_jpy,unrealized_pnl_jpy,unrealized_r,pyramid_add_count,highest_price_since_entry_jpy,lowest_price_since_entry_jpy,decision_run_id,tool_call_id,client_request_id,llm_provider,prompt_hash,system_prompt_version,market_snapshot_id,market_data_session_id,market_eligible_after_sequence) ON TABLE public.positions TO %I', :'mcp_role') \gexec
+SELECT format('GRANT SELECT (id,account_epoch_id,execution_semantics_version,runtime_config_hash,intent_id,position_id,trade_group_id,mode,symbol,side,order_type,status,size_btc,limit_price_jpy,trigger_price_jpy,protective_stop_price_jpy,take_profit_price_jpy,estimated_win_probability,reason_ja,decision_run_id,tool_call_id,client_request_id,llm_provider,prompt_hash,system_prompt_version,market_snapshot_id,expires_at,expiry_source,effective_ttl_seconds,expired_at,canceled_at,cancel_reason,canceled_by_decision_run_id,queue_ahead_btc,queue_consumed_btc,queue_snapshot_at,market_data_session_id,market_eligible_after_sequence,market_eligible_from,created_at,updated_at) ON TABLE public.orders TO %I', :'mcp_role') \gexec
+SELECT format('GRANT SELECT (id,symbol,thesis_id,price_move_threshold_ratio,opened_at,closed_at,close_reason) ON TABLE public.opportunity_episodes TO %I', :'mcp_role') \gexec
 
 SELECT format('GRANT UPDATE (closed_at, close_reason) ON TABLE public.opportunity_episodes TO %I', :'mcp_role') \gexec
 
@@ -131,8 +136,10 @@ SELECT format(
 )
 FROM (VALUES
     ('command_event_log'), ('decisions'), ('trade_plans'), ('trade_intents'), ('falsifications'),
-    ('opportunity_episodes'), ('dedupe_shadow_observations'), ('decision_identity_generation_failures')
+    ('dedupe_shadow_observations'), ('decision_identity_generation_failures')
 ) AS inventory(table_name) \gexec
+
+SELECT format('GRANT INSERT (id,symbol,thesis_id,price_move_threshold_ratio,opened_at,closed_at,close_reason) ON TABLE public.opportunity_episodes TO %I', :'mcp_role') \gexec
 
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_try_advisory_lock(bigint) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_advisory_unlock(bigint) FROM PUBLIC;
@@ -140,6 +147,12 @@ REVOKE EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(bigint) FROM PUBLIC;
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_try_advisory_lock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_unlock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
+SELECT format('REVOKE EXECUTE ON FUNCTION public.acquire_gap_population_generation_token() FROM %I', :'mcp_role') \gexec
+SELECT format('GRANT EXECUTE ON FUNCTION public.acquire_gap_population_generation_token() TO %I', :'app_role') \gexec
+SELECT format('REVOKE EXECUTE ON FUNCTION public.acquire_gap_population_generation_token(text,text,text,uuid,text,text) FROM %I', :'mcp_role') \gexec
+SELECT format('GRANT EXECUTE ON FUNCTION public.acquire_gap_population_generation_token(text,text,text,uuid,text,text) TO %I', :'app_role') \gexec
+SELECT format('GRANT EXECUTE ON FUNCTION public.acquire_opportunity_episode_gap_population_token(text) TO %I, %I', :'app_role', :'mcp_role') \gexec
+SELECT format('REVOKE ALL ON gap_population_control, gap_population_entity_scopes, market_data_gap_population_members, market_data_gap_terminal_journal, market_data_gap_work_evidence, gap_population_unattributed_containments, gap_population_unattributed_containment_works FROM %I', :'mcp_role') \gexec
 
 SELECT format('REVOKE %I FROM %I', roleid::regrole, :'mcp_role')
 FROM pg_auth_members

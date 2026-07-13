@@ -377,6 +377,11 @@ class LlmDaemonScheduler(
             hourlyWindow = MAX_INVOCATION_COUNT_WINDOW,
             dailyWindow = MAX_DAILY_INVOCATION_COUNT_WINDOW,
             activeReservationStaleAfter = daemonConfig.launchReservationStaleAfter,
+            populationScope = LlmLaunchReservationPopulationScope(
+                kind = "SYMBOL",
+                mode = tradingConfig.mode,
+                symbol = tradingConfig.symbol,
+            ),
         )
         val reservationSuppression = launchAvailability.scheduledSuppressionAt(observedAt)
         if (reservationSuppression != null) {

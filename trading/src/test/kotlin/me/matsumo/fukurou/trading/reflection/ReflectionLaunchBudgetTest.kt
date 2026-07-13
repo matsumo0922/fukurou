@@ -279,6 +279,11 @@ private fun reflectionReservationRequest(
         hourlyWindow = Duration.ofHours(1),
         dailyWindow = Duration.ofDays(1),
         activeReservationStaleAfter = Duration.ofMinutes(30),
+        populationScope = me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope(
+            kind = "SYMBOL",
+            mode = me.matsumo.fukurou.trading.domain.TradingMode.PAPER,
+            symbol = me.matsumo.fukurou.trading.domain.TradingSymbol.BTC,
+        ),
     )
 }
 

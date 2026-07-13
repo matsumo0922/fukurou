@@ -13,9 +13,12 @@ import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryScan
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
+import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProof
 import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
@@ -445,6 +448,15 @@ private fun launchRequest(invocationId: String, now: Instant): LlmLaunchReservat
         hourlyWindow = Duration.ofHours(1),
         dailyWindow = Duration.ofDays(1),
         activeReservationStaleAfter = Duration.ofMinutes(30),
+        populationScope = recoveryPopulationScope(),
+    )
+}
+
+private fun recoveryPopulationScope(): LlmLaunchReservationPopulationScope {
+    return LlmLaunchReservationPopulationScope(
+        kind = "SYMBOL",
+        mode = TradingMode.PAPER,
+        symbol = TradingSymbol.BTC,
     )
 }
 
@@ -468,6 +480,7 @@ private suspend fun reserve(
             hourlyWindow = Duration.ofHours(1),
             dailyWindow = Duration.ofDays(1),
             activeReservationStaleAfter = Duration.ofMinutes(10),
+            populationScope = recoveryPopulationScope(),
         ),
     ).getOrThrow()
     require(outcome is LlmLaunchReservationOutcome.Reserved)

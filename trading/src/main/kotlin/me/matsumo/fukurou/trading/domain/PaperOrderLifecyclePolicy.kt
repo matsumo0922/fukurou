@@ -23,6 +23,9 @@ enum class PaperOrderCancelReason(val wireCode: String) {
     /** market-data gap により未約定 entry を評価除外して取消。 */
     MARKET_DATA_GAP("market_data_gap"),
 
+    /** population scope を帰属できない未約定 entry を封じ込めて取消。 */
+    GAP_SCOPE_UNATTRIBUTED("gap_scope_unattributed"),
+
     /** enum 導入前の自由記述値で理由を確定できない取消。 */
     LEGACY_UNCLASSIFIED("legacy_unclassified"),
     ;

@@ -48,6 +48,7 @@ import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
@@ -164,6 +165,7 @@ class OneShotLlmRunnerTest {
                 hourlyWindow = Duration.ofHours(1),
                 dailyWindow = Duration.ofHours(24),
                 activeReservationStaleAfter = Duration.ofMinutes(30),
+                populationScope = testPopulationScope(),
             ),
         ).getOrThrow()
 
@@ -207,6 +209,7 @@ class OneShotLlmRunnerTest {
                 hourlyWindow = Duration.ofHours(1),
                 dailyWindow = Duration.ofHours(24),
                 activeReservationStaleAfter = Duration.ofMinutes(30),
+                populationScope = testPopulationScope(),
             ),
         ).getOrThrow()
         val result = fixture.runner.runOneShot(
@@ -1912,6 +1915,7 @@ class OneShotLlmRunnerTest {
                 hourlyWindow = Duration.ofHours(1),
                 dailyWindow = Duration.ofHours(24),
                 activeReservationStaleAfter = Duration.ofMinutes(30),
+                populationScope = testPopulationScope(),
             ),
         ).getOrThrow()
 
@@ -1977,6 +1981,7 @@ class OneShotLlmRunnerTest {
                 hourlyWindow = Duration.ofHours(1),
                 dailyWindow = Duration.ofDays(1),
                 activeReservationStaleAfter = Duration.ofMinutes(30),
+                populationScope = testPopulationScope(),
             ),
         ).getOrThrow()
         val run = async {
@@ -2171,6 +2176,7 @@ private suspend fun runReservedOneShot(
             hourlyWindow = Duration.ofHours(1),
             dailyWindow = Duration.ofHours(24),
             activeReservationStaleAfter = Duration.ofMinutes(30),
+            populationScope = testPopulationScope(),
         ),
     ).getOrThrow()
     assertIs<LlmLaunchReservationOutcome.Reserved>(reservation)
@@ -2182,6 +2188,14 @@ private suspend fun runReservedOneShot(
             LlmLaunchReservationFinish(invocationId, LlmLaunchReservationStatus.FINISHED, null, fixedClock().instant()),
         ).getOrThrow()
     }
+}
+
+private fun testPopulationScope(): LlmLaunchReservationPopulationScope {
+    return LlmLaunchReservationPopulationScope(
+        kind = "SYMBOL",
+        mode = TradingMode.PAPER,
+        symbol = TradingSymbol.BTC,
+    )
 }
 
 /**
