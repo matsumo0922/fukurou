@@ -1498,9 +1498,36 @@ internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(
 
 private fun JdbcTransaction.selectLlmLifecycleInvocationIds(): List<String> {
     val sql = """
-        SELECT invocation_id FROM llm_runs WHERE status = ?
+        SELECT run.invocation_id
+        FROM llm_runs AS run
+        WHERE run.status = ?
+            AND (
+                EXISTS (
+                    SELECT 1
+                    FROM llm_launch_reservations AS reservation
+                    JOIN gap_population_entity_scopes AS scope
+                        ON scope.entity_type = 'LLM_RESERVATION' AND scope.entity_id = reservation.id::text
+                    WHERE reservation.invocation_id = run.invocation_id
+                )
+                OR (
+                    NOT EXISTS (
+                        SELECT 1 FROM llm_launch_reservations AS reservation
+                        WHERE reservation.invocation_id = run.invocation_id
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM gap_population_entity_scopes AS scope
+                        WHERE scope.entity_type = 'LLM_RUN' AND scope.entity_id = run.invocation_id
+                    )
+                )
+            )
         UNION
-        SELECT invocation_id FROM llm_launch_reservations WHERE status = ?
+        SELECT reservation.invocation_id
+        FROM llm_launch_reservations AS reservation
+        WHERE reservation.status = ?
+            AND EXISTS (
+                SELECT 1 FROM gap_population_entity_scopes AS scope
+                WHERE scope.entity_type = 'LLM_RESERVATION' AND scope.entity_id = reservation.id::text
+            )
         ORDER BY invocation_id ASC
     """.trimIndent()
 

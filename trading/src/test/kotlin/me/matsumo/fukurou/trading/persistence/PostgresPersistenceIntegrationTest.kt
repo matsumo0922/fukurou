@@ -1104,11 +1104,34 @@ class PostgresPersistenceIntegrationTest {
                 executeUpdate("UPDATE llm_runs SET birth_sequence=NULL WHERE invocation_id='unattributed-pre-c-run'")
             }
 
+            val staleBootstrap = TradingPersistenceBootstrap(
+                database = database,
+                clock = Clock.fixed(fixedInstant().plusSeconds(600), ZoneOffset.UTC),
+                staleLlmRunRecoveryThreshold = Duration.ofMinutes(1),
+            )
+            staleBootstrap.ensureSchema().getOrThrow()
+            exposedTransaction(database) {
+                assertSqlCount(
+                    "SELECT COUNT(*) FROM llm_runs " +
+                        "WHERE invocation_id='unattributed-pre-c-run' AND status='RUNNING' AND terminal_cause IS NULL",
+                    1,
+                )
+                assertSqlCount(
+                    "SELECT COUNT(*) FROM gap_population_entity_scopes " +
+                        "WHERE entity_type='LLM_RUN' AND entity_id='unattributed-pre-c-run'",
+                    0,
+                )
+            }
+
             val repository = ExposedMarketDataIntegrityRepository(database)
             val sessionId = UUID.randomUUID()
-            repository.beginSession(sessionId, fixedInstant()).getOrThrow()
-            repository.recordGap(sessionId, MarketDataGapReason.PROCESS_RESTART, fixedInstant().plusSeconds(1)).getOrThrow()
-            repository.recoverStaleSession(fixedInstant().plusSeconds(2)).getOrThrow()
+            repository.beginSession(sessionId, fixedInstant().plusSeconds(600)).getOrThrow()
+            repository.recordGap(
+                sessionId,
+                MarketDataGapReason.PROCESS_RESTART,
+                fixedInstant().plusSeconds(601),
+            ).getOrThrow()
+            repository.recoverStaleSession(fixedInstant().plusSeconds(602)).getOrThrow()
 
             exposedTransaction(database) {
                 assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE entity_type='LLM_RUN' AND entity_id='unattributed-pre-c-run' AND state='CONTAINED'", 1)
@@ -1119,6 +1142,54 @@ class PostgresPersistenceIntegrationTest {
                 assertSqlCount("SELECT COUNT(*) FROM market_data_gap_work WHERE session_id='$sessionId' AND state='UNKNOWN' AND unknown_code='UNKNOWN_SCOPE_UNATTRIBUTED'", 1)
             }
         }
+
+    @Test
+    fun bootstrap_skipsFreshUnattributedPreCRunWithoutScopeInferenceOrMutation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        ExposedLlmRunRepository(database).insertRunning(
+            LlmRunStart(
+                invocationId = "fresh-unattributed-pre-c-run",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                startedAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("ALTER TABLE gap_population_entity_scopes DISABLE TRIGGER gap_population_entity_scope_immutable")
+            executeUpdate(
+                "DELETE FROM gap_population_entity_scopes " +
+                    "WHERE entity_type='LLM_RUN' AND entity_id='fresh-unattributed-pre-c-run'",
+            )
+            executeUpdate("ALTER TABLE gap_population_entity_scopes ENABLE TRIGGER gap_population_entity_scope_immutable")
+            executeUpdate("UPDATE llm_runs SET birth_sequence=NULL WHERE invocation_id='fresh-unattributed-pre-c-run'")
+        }
+
+        TradingPersistenceBootstrap(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(30), ZoneOffset.UTC),
+            staleLlmRunRecoveryThreshold = Duration.ofMinutes(1),
+        ).ensureSchema().getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount(
+                "SELECT COUNT(*) FROM llm_runs " +
+                    "WHERE invocation_id='fresh-unattributed-pre-c-run' AND status='RUNNING' " +
+                    "AND finished_at IS NULL AND terminal_cause IS NULL AND birth_sequence IS NULL",
+                1,
+            )
+            assertSqlCount(
+                "SELECT COUNT(*) FROM gap_population_entity_scopes " +
+                    "WHERE entity_type='LLM_RUN' AND entity_id='fresh-unattributed-pre-c-run'",
+                0,
+            )
+            assertSqlCount(
+                "SELECT COUNT(*) FROM command_event_log " +
+                    "WHERE event_type='LLM_INVOCATION_RECOVERED' AND decision_run_id='fresh-unattributed-pre-c-run'",
+                0,
+            )
+        }
+    }
 
     @Test
     fun unattributed_allSixPopulationsUseExactSafeTerminalOrPositionQuarantineWithoutEconomicMutation() =
