@@ -101,21 +101,19 @@ class ShellProcessRunner(
             val descendants = process.descendantsDeepestFirst()
 
             descendants.forEach { descendant -> descendant.destroy() }
-            process.destroy()
-            process.waitFor(terminationGrace.toMillis(), TimeUnit.MILLISECONDS)
+            awaitProcessHandles(descendants, terminationGrace)
 
             val remainingDescendants = (descendants + process.descendantsDeepestFirst())
                 .distinctBy(ProcessHandle::pid)
-            val requiresForce = process.isAlive || remainingDescendants.any(ProcessHandle::isAlive)
-            if (requiresForce) {
-                remainingDescendants.filter(ProcessHandle::isAlive)
-                    .forEach { descendant -> descendant.destroyForcibly() }
-                if (process.isAlive) process.destroyForcibly()
-            }
+            remainingDescendants.filter(ProcessHandle::isAlive)
+                .forEach { descendant -> descendant.destroyForcibly() }
             remainingDescendants.forEach { descendant -> descendant.awaitExitQuietly() }
 
+            process.destroy()
+            val processExitedGracefully = process.waitFor(terminationGrace.toMillis(), TimeUnit.MILLISECONDS)
+            if (!processExitedGracefully && process.isAlive) process.destroyForcibly()
             val processExited = process.waitFor(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)
-            val processTreeExited = remainingDescendants.none(ProcessHandle::isAlive)
+            val processTreeExited = remainingDescendants.none { descendant -> descendant.pid().isProcessAlive() }
             check(processExited && processTreeExited) {
                 "LLM process tree did not exit after TERM/KILL sequence."
             }
@@ -212,6 +210,17 @@ private fun Process.descendantsDeepestFirst(): List<ProcessHandle> {
         .getOrDefault(emptyList())
 }
 
+private fun awaitProcessHandles(processHandles: List<ProcessHandle>, timeout: Duration) {
+    val deadline = System.nanoTime() + timeout.toNanos()
+    while (processHandles.any(ProcessHandle::isAlive) && System.nanoTime() < deadline) {
+        Thread.sleep(PROCESS_TREE_EXIT_POLL_MILLIS)
+    }
+}
+
+private fun Long.isProcessAlive(): Boolean {
+    return ProcessHandle.of(this).map(ProcessHandle::isAlive).orElse(false)
+}
+
 private fun Path.isProductionPerRunHome(): Boolean {
     val normalized = toAbsolutePath().normalize()
     val parent = normalized.parent ?: return false
@@ -231,6 +240,7 @@ private fun ProcessHandle.awaitExitQuietly() {
  * process tree kill 後に exit を待つ秒数。
  */
 private const val PROCESS_TREE_KILL_WAIT_SECONDS = 2L
+private const val PROCESS_TREE_EXIT_POLL_MILLIS = 10L
 private const val PRODUCTION_LLM_LAUNCHER = "/usr/local/libexec/fukurou-llm-agent-launcher"
 private const val CLEANUP_MODE = "cleanup"
 private const val CODEX_HOME_PREFIX = "fukurou-codex-home-"
