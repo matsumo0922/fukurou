@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.persistence
 import java.math.BigDecimal
 import java.sql.PreparedStatement
 import java.sql.ResultSet
+import java.sql.Types
 import java.time.Instant
 import java.util.UUID
 
@@ -23,7 +24,7 @@ internal fun PreparedStatement.setNullableString(index: Int, value: String?) {
  */
 internal fun PreparedStatement.setNullableBigDecimal(index: Int, value: BigDecimal?) {
     if (value == null) {
-        setObject(index, null)
+        setNull(index, Types.NUMERIC)
         return
     }
 
@@ -35,7 +36,7 @@ internal fun PreparedStatement.setNullableBigDecimal(index: Int, value: BigDecim
  */
 internal fun PreparedStatement.setNullableLong(index: Int, value: Long?) {
     if (value == null) {
-        setObject(index, null)
+        setNull(index, Types.BIGINT)
         return
     }
 

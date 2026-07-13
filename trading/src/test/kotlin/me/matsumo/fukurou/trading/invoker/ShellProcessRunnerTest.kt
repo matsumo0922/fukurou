@@ -94,7 +94,7 @@ class ShellProcessRunnerTest {
         val childPid = waitForChildPid(childPidFile)
 
         assertEquals(ProcessRunStatus.TIMED_OUT, result.status)
-        assertFalse(ProcessHandle.of(childPid).map { processHandle -> processHandle.isAlive }.orElse(false))
+        assertFalse(waitForProcessExit(childPid))
     }
 
     @Test
@@ -118,7 +118,7 @@ class ShellProcessRunnerTest {
         val childPid = waitForChildPid(childPidFile)
 
         assertEquals(ProcessRunStatus.TIMED_OUT, result.status)
-        assertFalse(ProcessHandle.of(childPid).map { handle -> handle.isAlive }.orElse(false))
+        assertFalse(waitForProcessExit(childPid))
     }
 
     @Test
@@ -186,7 +186,7 @@ class ShellProcessRunnerTest {
         assertFailsWith<CancellationException> {
             runnerDeferred.await()
         }
-        assertFalse(ProcessHandle.of(childPid).map { processHandle -> processHandle.isAlive }.orElse(false))
+        assertFalse(waitForProcessExit(childPid))
         assertTrue(Files.exists(cleanupFile))
 
         processRunner.cleanup(command).getOrThrow()
@@ -205,6 +205,19 @@ class ShellProcessRunnerTest {
         }
 
         error("child pid file was not written: $childPidFile")
+    }
+
+    private suspend fun waitForProcessExit(processId: Long): Boolean {
+        repeat(CHILD_PID_FILE_WAIT_ATTEMPTS) {
+            val processIsAlive = ProcessHandle.of(processId)
+                .map { handle -> handle.isAlive }
+                .orElse(false)
+            if (!processIsAlive) return false
+
+            delay(CHILD_PID_FILE_WAIT_DELAY_MS.toDuration(DurationUnit.MILLISECONDS))
+        }
+
+        return ProcessHandle.of(processId).map { handle -> handle.isAlive }.orElse(false)
     }
 }
 

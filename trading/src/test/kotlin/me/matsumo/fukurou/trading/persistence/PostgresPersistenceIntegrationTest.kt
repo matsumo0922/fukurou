@@ -849,7 +849,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, selectMarketDataConnectedSessionIndexCount(database))
         assertEquals(3, selectMarketDataIntegrityIndexCount(database))
         assertEquals(1, selectDecisionsInvocationIdIndexCount(database))
-        assertEquals(3, selectLlmLaunchReservationIndexCount(database))
+        assertEquals(4, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))
         assertEquals(1, selectRecentSafetyDenialIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
