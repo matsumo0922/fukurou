@@ -6,6 +6,9 @@ import java.time.Duration
 
 /** one-shot claim の heartbeat と hard deadline を表す policy。 */
 data class OneShotExecutionPolicy(
+    val phaseTimeout: Duration,
+    val phaseSubtotal: Duration,
+    val finalizationGrace: Duration,
     val hardTimeout: Duration,
     val heartbeatInterval: Duration,
     val heartbeatMissAllowance: Duration,
@@ -26,6 +29,9 @@ data class OneShotExecutionPolicy(
                 MAX_HEARTBEAT_INTERVAL,
             )
             return OneShotExecutionPolicy(
+                phaseTimeout = config.perRunTimeout,
+                phaseSubtotal = phaseSubtotal,
+                finalizationGrace = finalizationGrace,
                 hardTimeout = hardTimeout,
                 heartbeatInterval = heartbeatInterval,
                 heartbeatMissAllowance = heartbeatInterval.checkedMultiply(3),

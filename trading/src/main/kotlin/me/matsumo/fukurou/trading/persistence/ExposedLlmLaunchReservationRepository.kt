@@ -4,6 +4,11 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventType
+import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.daemon.LlmActiveLaunchReservation
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
@@ -12,6 +17,8 @@ import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRequest
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryScan
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
@@ -20,6 +27,9 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.daemon.executionClaimState
 import me.matsumo.fukurou.trading.daemon.launchBudgetRejection
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Instant
@@ -90,9 +100,39 @@ private const val CLAIM_LLM_LAUNCH_RESERVATION_SQL = """
 /** claim rejection / reconciliation 用 snapshot SQL。 */
 private const val SELECT_LLM_EXECUTION_CLAIM_SQL = """
     SELECT invocation_id, trigger_kind, status, execution_claim_state, execution_claim_token,
-        execution_claimed_at, execution_claim_heartbeat_at
+        execution_claimed_at, execution_claim_heartbeat_at, reserved_at
     FROM llm_launch_reservations
     WHERE invocation_id = ?
+"""
+
+/** stale AVAILABLE / CLAIMED reservation の bounded scan SQL。 */
+private const val SELECT_STALE_LLM_EXECUTION_CLAIMS_SQL = """
+    SELECT invocation_id, trigger_kind, status, execution_claim_state, execution_claim_token,
+        execution_claimed_at, execution_claim_heartbeat_at, reserved_at
+    FROM llm_launch_reservations
+    WHERE status = 'RUNNING'
+        AND (
+            (execution_claim_state = 'AVAILABLE' AND reserved_at <= ?)
+            OR (
+                execution_claim_state = 'CLAIMED'
+                AND execution_claimed_at <= ?
+                AND execution_claim_heartbeat_at <= ?
+            )
+        )
+    ORDER BY reserved_at ASC, invocation_id ASC
+    LIMIT ?
+"""
+
+/** scan で観測した state / token / heartbeat が変わっていない場合だけ FAILED にする SQL。 */
+private const val RECOVER_STALE_LLM_EXECUTION_CLAIM_SQL = """
+    UPDATE llm_launch_reservations
+    SET status = 'FAILED', finished_at = ?, reason = ?
+    WHERE invocation_id = ?
+        AND status = 'RUNNING'
+        AND execution_claim_state = ?
+        AND reserved_at = ?
+        AND execution_claim_token IS NOT DISTINCT FROM ?
+        AND execution_claim_heartbeat_at IS NOT DISTINCT FROM ?
 """
 
 /** live claimant の heartbeat を更新する SQL。 */
@@ -132,6 +172,7 @@ private const val SELECT_LLM_LAUNCH_TRIGGER_KIND_SQL = """
  *
  * @param database Exposed database
  */
+@Suppress("TooManyFunctions")
 class ExposedLlmLaunchReservationRepository(
     private val database: ExposedDatabase,
 ) : LlmLaunchReservationRepository {
@@ -190,6 +231,50 @@ class ExposedLlmLaunchReservationRepository(
         }
     }
 
+    override suspend fun scanStaleExecutionClaims(
+        scan: LlmExecutionRecoveryScan,
+    ): Result<List<LlmExecutionClaimSnapshot>> = withContext(Dispatchers.IO) {
+        runCatching {
+            exposedTransaction(database) {
+                jdbcConnection().prepareStatement(SELECT_STALE_LLM_EXECUTION_CLAIMS_SQL).use { statement ->
+                    statement.setLong(1, scan.availableReservedBefore.toEpochMilli())
+                    statement.setLong(2, scan.claimedBefore.toEpochMilli())
+                    statement.setLong(3, scan.heartbeatBefore.toEpochMilli())
+                    statement.setInt(4, scan.limit)
+                    statement.executeQuery().use { resultSet ->
+                        buildList {
+                            while (resultSet.next()) add(resultSet.toExecutionClaimSnapshot())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    override suspend fun recoverStaleExecutionClaim(request: LlmExecutionRecoveryRequest): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    jdbcConnection().prepareStatement(RECOVER_STALE_LLM_EXECUTION_CLAIM_SQL).use { statement ->
+                        statement.setLong(1, request.finishedAt.toEpochMilli())
+                        statement.setString(2, request.reason)
+                        statement.setString(3, request.invocationId)
+                        statement.setString(4, request.claimState.name)
+                        statement.setLong(5, request.observedReservedAt.toEpochMilli())
+                        statement.setNullableString(6, request.claimantToken)
+                        statement.setNullableLong(7, request.observedHeartbeatAt?.toEpochMilli())
+                        val recovered = statement.executeUpdate() == 1
+                        if (recovered) {
+                            val runRecovered = recoverCurrentProcessLlmRun(request)
+                            insertRecoveryEvent(request, runRecovered)
+                        }
+                        recovered
+                    }
+                }
+            }
+        }
+    }
+
     override suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -236,6 +321,67 @@ class ExposedLlmLaunchReservationRepository(
             }
         }
     }
+}
+
+private fun JdbcTransaction.recoverCurrentProcessLlmRun(request: LlmExecutionRecoveryRequest): Boolean {
+    if (request.claimState != LlmExecutionClaimState.CLAIMED) return false
+
+    val sql = """
+        UPDATE llm_runs
+        SET status = ?, finished_at = ?, error_message = ?, terminal_cause = ?
+        WHERE invocation_id = ? AND status = ? AND finished_at IS NULL
+    """.trimIndent()
+
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setString(1, LLM_RUN_STATUS_FAILED)
+        statement.setLong(2, request.finishedAt.toEpochMilli())
+        statement.setString(3, request.reason)
+        statement.setString(4, LlmRunTerminalCause.RUNNER_FAILED.name)
+        statement.setString(5, request.invocationId)
+        statement.setString(6, LLM_RUN_STATUS_RUNNING)
+        statement.executeUpdate() == 1
+    }
+}
+
+private fun JdbcTransaction.insertRecoveryEvent(request: LlmExecutionRecoveryRequest, runRecovered: Boolean) {
+    val llmRunExists = jdbcConnection().prepareStatement(
+        "SELECT EXISTS (SELECT 1 FROM llm_runs WHERE invocation_id = ?)",
+    ).use { statement ->
+        statement.setString(1, request.invocationId)
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next())
+            resultSet.getBoolean(1)
+        }
+    }
+    insertEvent(
+        CommandEvent(
+            decisionRunContext = DecisionRunContext(
+                decisionRunId = request.invocationId,
+                llmProvider = null,
+                promptHash = null,
+                systemPromptVersion = null,
+                marketSnapshotId = null,
+            ),
+            toolName = "llm_execution_recovery",
+            toolCallId = null,
+            clientRequestId = request.invocationId,
+            eventType = CommandEventType.LLM_INVOCATION_RECOVERED,
+            payload = buildJsonObject {
+                put("source", "current_process_periodic_scan")
+                put("invocationId", request.invocationId)
+                put("executionClaimState", request.claimState.name)
+                put("claimantTokenFingerprint", request.claimantToken?.takeLast(8))
+                put("observedHeartbeatAt", request.observedHeartbeatAt?.toString())
+                put("terminationFence", request.terminationFence)
+                put("llmRunExists", llmRunExists)
+                put("runRecovered", runRecovered)
+                put("reservationRecovered", true)
+                put("terminalCause", LlmRunTerminalCause.RUNNER_FAILED.name)
+                put("recoveredAt", request.finishedAt.toString())
+            }.toString(),
+            occurredAt = request.finishedAt,
+        ),
+    )
 }
 
 /** risk_state row lock と共通 quota policy を使って LLM 起動を予約する。 */
@@ -358,19 +504,22 @@ private fun JdbcTransaction.selectExecutionClaim(invocationId: String): LlmExecu
         statement.setString(1, invocationId)
         statement.executeQuery().use { resultSet ->
             if (!resultSet.next()) return@use null
-            LlmExecutionClaimSnapshot(
-                invocationId = resultSet.getString("invocation_id"),
-                triggerKind = LlmDaemonTriggerKind.valueOf(resultSet.getString("trigger_kind")),
-                status = LlmLaunchReservationStatus.valueOf(resultSet.getString("status")),
-                claimState = resultSet.getString("execution_claim_state")?.let(LlmExecutionClaimState::valueOf),
-                claimantToken = resultSet.getString("execution_claim_token"),
-                claimedAt = resultSet.getLong("execution_claimed_at").takeUnless { resultSet.wasNull() }
-                    ?.let(Instant::ofEpochMilli),
-                heartbeatAt = resultSet.getLong("execution_claim_heartbeat_at").takeUnless { resultSet.wasNull() }
-                    ?.let(Instant::ofEpochMilli),
-            )
+            resultSet.toExecutionClaimSnapshot()
         }
     }
+}
+
+private fun java.sql.ResultSet.toExecutionClaimSnapshot(): LlmExecutionClaimSnapshot {
+    return LlmExecutionClaimSnapshot(
+        invocationId = getString("invocation_id"),
+        triggerKind = LlmDaemonTriggerKind.valueOf(getString("trigger_kind")),
+        status = LlmLaunchReservationStatus.valueOf(getString("status")),
+        claimState = getString("execution_claim_state")?.let(LlmExecutionClaimState::valueOf),
+        claimantToken = getString("execution_claim_token"),
+        claimedAt = getLong("execution_claimed_at").takeUnless { wasNull() }?.let(Instant::ofEpochMilli),
+        heartbeatAt = getLong("execution_claim_heartbeat_at").takeUnless { wasNull() }?.let(Instant::ofEpochMilli),
+        reservedAt = Instant.ofEpochMilli(getLong("reserved_at")),
+    )
 }
 
 private fun JdbcTransaction.latestReservedAtInTransaction(triggerKey: String): Instant? {

@@ -50,6 +50,7 @@ import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
@@ -3457,6 +3458,174 @@ class PostgresPersistenceIntegrationTest {
         val snapshot = requireNotNull(repository.findExecutionClaim("claim-race").getOrThrow())
         assertEquals(LlmExecutionClaimState.CLAIMED, snapshot.claimState)
         assertEquals(LlmLaunchReservationStatus.RUNNING, snapshot.status)
+    }
+
+    @Test
+    fun bootstrap_claimedRecoveryRequiresPreviousGenerationFenceAndPreservesTerminalReason() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, Clock.fixed(now, ZoneOffset.UTC)).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        repository.tryReserve(llmLaunchReservationRequest("bootstrap-claim", LlmRunnerConfig(), now)).getOrThrow()
+        assertIs<LlmExecutionClaimOutcome.Claimed>(
+            repository.claimForExecution(
+                LlmExecutionClaimRequest(
+                    invocationId = "bootstrap-claim",
+                    triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                    claimantToken = "previous-generation-token",
+                    claimedAt = now,
+                ),
+            ),
+        )
+        val recoveryClock = Clock.fixed(now.plusSeconds(600), ZoneOffset.UTC)
+        val bootstrap = TradingPersistenceBootstrap(
+            database = database,
+            clock = recoveryClock,
+            staleLlmRunRecoveryThreshold = Duration.ofMinutes(1),
+        )
+
+        bootstrap.ensureSchema().getOrThrow()
+        assertEquals(
+            LlmLaunchReservationStatus.RUNNING,
+            repository.findExecutionClaim("bootstrap-claim").getOrThrow()?.status,
+        )
+
+        assertEquals(0, bootstrap.recoverPreviousGeneration().getOrThrow())
+        val terminalSnapshot = requireNotNull(repository.findExecutionClaim("bootstrap-claim").getOrThrow())
+        assertEquals(LlmLaunchReservationStatus.FAILED, terminalSnapshot.status)
+        assertEquals(
+            LlmExecutionClaimOutcome.Rejected(LlmExecutionClaimRejectionReason.TERMINAL),
+            repository.claimForExecution(
+                LlmExecutionClaimRequest(
+                    invocationId = "bootstrap-claim",
+                    triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                    claimantToken = "replay-token",
+                    claimedAt = now.plusSeconds(601),
+                ),
+            ),
+        )
+        assertEquals(
+            LlmRunTerminalCause.RESTART_INTERRUPTED.name,
+            selectReservationReason(database, "bootstrap-claim"),
+        )
+        assertTrue(selectRecoveryAuditPayload(database, "bootstrap-claim").contains("previous_process_generation_ended"))
+    }
+
+    @Test
+    fun currentProcessRecovery_failsRunAndPersistsFenceAuditInSameTransaction() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val reservationRepository = ExposedLlmLaunchReservationRepository(database)
+        val runRepository = ExposedLlmRunRepository(database)
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest("current-process-recovery", LlmRunnerConfig(), now),
+        ).getOrThrow()
+        assertIs<LlmExecutionClaimOutcome.Claimed>(
+            reservationRepository.claimForExecution(
+                LlmExecutionClaimRequest(
+                    invocationId = "current-process-recovery",
+                    triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                    claimantToken = "recovery-token-12345678",
+                    claimedAt = now,
+                ),
+            ),
+        )
+        runRepository.insertRunning(llmRunStart("current-process-recovery", now)).getOrThrow()
+        val snapshot = requireNotNull(
+            reservationRepository.findExecutionClaim("current-process-recovery").getOrThrow(),
+        )
+
+        assertTrue(
+            reservationRepository.recoverStaleExecutionClaim(
+                LlmExecutionRecoveryRequest(
+                    invocationId = "current-process-recovery",
+                    claimState = LlmExecutionClaimState.CLAIMED,
+                    claimantToken = "recovery-token-12345678",
+                    observedHeartbeatAt = snapshot.heartbeatAt,
+                    observedReservedAt = snapshot.reservedAt,
+                    finishedAt = now.plusSeconds(600),
+                    reason = "STALE_CLAIMED_RESERVATION_RECOVERED",
+                    terminationFence = "PROCESS_TREE_EXITED",
+                ),
+            ).getOrThrow(),
+        )
+
+        val recoveredRun = requireNotNull(runRepository.findByInvocationId("current-process-recovery").getOrThrow())
+        assertEquals(LLM_RUN_STATUS_FAILED, recoveredRun.status)
+        assertEquals(LlmRunTerminalCause.RUNNER_FAILED, recoveredRun.terminalCause)
+        val auditPayload = selectRecoveryAuditPayload(database, "current-process-recovery")
+        assertTrue(auditPayload.contains("current_process_periodic_scan"))
+        assertTrue(auditPayload.contains("PROCESS_TREE_EXITED"))
+        assertTrue(auditPayload.contains("12345678"))
+        assertTrue(auditPayload.contains("\"runRecovered\":true"))
+        assertTrue(auditPayload.contains("\"reservationRecovered\":true"))
+    }
+
+    @Test
+    fun runnerSweeperAndBootstrapRaceHasOneTerminalReasonAndNoOverwrite() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        repository.tryReserve(llmLaunchReservationRequest("terminal-race", LlmRunnerConfig(), now)).getOrThrow()
+        repository.claimForExecution(
+            LlmExecutionClaimRequest(
+                invocationId = "terminal-race",
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                claimantToken = "race-token",
+                claimedAt = now,
+            ),
+        )
+        val snapshot = requireNotNull(repository.findExecutionClaim("terminal-race").getOrThrow())
+        val recoveryRequest = LlmExecutionRecoveryRequest(
+            invocationId = "terminal-race",
+            claimState = LlmExecutionClaimState.CLAIMED,
+            claimantToken = "race-token",
+            observedHeartbeatAt = snapshot.heartbeatAt,
+            observedReservedAt = snapshot.reservedAt,
+            finishedAt = now.plusSeconds(600),
+            reason = "sweeper",
+            terminationFence = "NO_CHILD_STARTED",
+        )
+        val bootstrap = TradingPersistenceBootstrap(
+            database = database,
+            clock = Clock.fixed(now.plusSeconds(600), ZoneOffset.UTC),
+            staleLlmRunRecoveryThreshold = Duration.ofMinutes(1),
+        )
+
+        coroutineScope {
+            listOf(
+                async(Dispatchers.IO) {
+                    repository.finish(
+                        LlmLaunchReservationFinish(
+                            invocationId = "terminal-race",
+                            status = LlmLaunchReservationStatus.FINISHED,
+                            reason = "runner",
+                            finishedAt = now.plusSeconds(600),
+                            claimantToken = "race-token",
+                        ),
+                    ).getOrThrow()
+                },
+                async(Dispatchers.IO) { repository.recoverStaleExecutionClaim(recoveryRequest).getOrThrow() },
+                async(Dispatchers.IO) { bootstrap.recoverPreviousGeneration().getOrThrow() },
+            ).map { it.await() }
+        }
+        val winningReason = requireNotNull(selectReservationReason(database, "terminal-race"))
+        assertTrue(
+            winningReason == "runner" ||
+                winningReason == "sweeper" ||
+                winningReason == LlmRunTerminalCause.RESTART_INTERRUPTED.name,
+        )
+
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "terminal-race",
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = "overwrite",
+                finishedAt = now.plusSeconds(601),
+                claimantToken = "race-token",
+            ),
+        ).getOrThrow()
+        assertFalse(repository.recoverStaleExecutionClaim(recoveryRequest).getOrThrow())
+        assertEquals(winningReason, selectReservationReason(database, "terminal-race"))
     }
 
     @Test
@@ -8256,4 +8425,36 @@ private fun updateOpenPositionDecisionRun(database: ExposedDatabase, decisionRun
  */
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+private fun selectReservationReason(database: ExposedDatabase, invocationId: String): String? {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "SELECT reason FROM llm_launch_reservations WHERE invocation_id = ?",
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getString("reason")
+            }
+        }
+    }
+}
+
+private fun selectRecoveryAuditPayload(database: ExposedDatabase, invocationId: String): String {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                SELECT payload FROM command_event_log
+                WHERE decision_run_id = ? AND event_type = 'LLM_INVOCATION_RECOVERED'
+                ORDER BY ts DESC LIMIT 1
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getString("payload")
+            }
+        }
+    }
 }

@@ -140,6 +140,31 @@ data class LlmExecutionClaimSnapshot(
     val claimantToken: String?,
     val claimedAt: Instant?,
     val heartbeatAt: Instant?,
+    val reservedAt: Instant,
+)
+
+/** stale execution claim の bounded scan 条件。 */
+data class LlmExecutionRecoveryScan(
+    val availableReservedBefore: Instant,
+    val claimedBefore: Instant,
+    val heartbeatBefore: Instant,
+    val limit: Int,
+) {
+    init {
+        require(limit > 0) { "execution recovery scan limit must be positive." }
+    }
+}
+
+/** stale execution claim を競合安全に FAILED へ遷移させる要求。 */
+data class LlmExecutionRecoveryRequest(
+    val invocationId: String,
+    val claimState: LlmExecutionClaimState,
+    val claimantToken: String?,
+    val observedHeartbeatAt: Instant?,
+    val observedReservedAt: Instant,
+    val finishedAt: Instant,
+    val reason: String,
+    val terminationFence: String,
 )
 
 /**
@@ -279,6 +304,7 @@ enum class LlmLaunchReservationRejectionReason {
  * 予約のない legacy run だけ runner 完了 audit の時刻へ fallback する。
  * runner preflight は手動 one-shot も含む最後の防衛線として残す。
  */
+@Suppress("TooManyFunctions")
 interface LlmLaunchReservationRepository {
     /**
      * HARD_HALT / 同時起動 / 起動予算を見て、起動予約を原子的に確保する。
@@ -308,6 +334,16 @@ interface LlmLaunchReservationRepository {
         claimantToken: String,
         heartbeatAt: Instant,
     ): Result<Boolean> = Result.failure(UnsupportedOperationException("Execution claim heartbeat is not implemented."))
+
+    /** stale AVAILABLE / CLAIMED reservation を bounded scan する。 */
+    suspend fun scanStaleExecutionClaims(scan: LlmExecutionRecoveryScan): Result<List<LlmExecutionClaimSnapshot>> {
+        return Result.failure(UnsupportedOperationException("Execution recovery scan is not implemented."))
+    }
+
+    /** scan 時点の state / token / heartbeat を fence に conditional FAILED へ遷移させる。 */
+    suspend fun recoverStaleExecutionClaim(request: LlmExecutionRecoveryRequest): Result<Boolean> {
+        return Result.failure(UnsupportedOperationException("Execution claim recovery is not implemented."))
+    }
 
     /** runner preflight 用に予約の trigger identity を返す。 */
     suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> {
@@ -344,6 +380,7 @@ interface LlmLaunchReservationRepository {
  *
  * @param riskStateRepository HARD_HALT 判定に使う repository
  */
+@Suppress("TooManyFunctions")
 class InMemoryLlmLaunchReservationRepository(
     private val riskStateRepository: RiskStateRepository,
 ) : LlmLaunchReservationRepository {
@@ -435,6 +472,58 @@ class InMemoryLlmLaunchReservationRepository(
             }
             reservations[index] = reservation.copy(heartbeatAt = heartbeatAt)
             true
+        }
+    }
+
+    override suspend fun scanStaleExecutionClaims(
+        scan: LlmExecutionRecoveryScan,
+    ): Result<List<LlmExecutionClaimSnapshot>> = runCatching {
+        mutex.withLock {
+            reservations.asSequence()
+                .filter { reservation -> reservation.status == LlmLaunchReservationStatus.RUNNING }
+                .filter { reservation ->
+                    when (reservation.claimState) {
+                        LlmExecutionClaimState.AVAILABLE -> !reservation.reservedAt.isAfter(scan.availableReservedBefore)
+                        LlmExecutionClaimState.CLAIMED -> {
+                            val claimedAt = reservation.claimedAt
+                            val heartbeatAt = reservation.heartbeatAt
+                            claimedAt != null && heartbeatAt != null &&
+                                !claimedAt.isAfter(scan.claimedBefore) &&
+                                !heartbeatAt.isAfter(scan.heartbeatBefore)
+                        }
+                        LlmExecutionClaimState.NOT_REQUIRED,
+                        null,
+                        -> false
+                    }
+                }
+                .sortedWith(compareBy<LlmLaunchReservationRecord> { it.reservedAt }.thenBy { it.invocationId })
+                .take(scan.limit)
+                .map(LlmLaunchReservationRecord::toClaimSnapshot)
+                .toList()
+        }
+    }
+
+    override suspend fun recoverStaleExecutionClaim(request: LlmExecutionRecoveryRequest): Result<Boolean> {
+        return runCatching {
+            mutex.withLock {
+                val index = reservations.indexOfFirst { reservation -> reservation.invocationId == request.invocationId }
+                if (index < 0) return@withLock false
+
+                val reservation = reservations[index]
+                val ownsObservedState = reservation.status == LlmLaunchReservationStatus.RUNNING &&
+                    reservation.claimState == request.claimState &&
+                    reservation.reservedAt == request.observedReservedAt &&
+                    reservation.claimantToken == request.claimantToken &&
+                    reservation.heartbeatAt == request.observedHeartbeatAt
+                if (!ownsObservedState) return@withLock false
+
+                reservations[index] = reservation.copy(
+                    status = LlmLaunchReservationStatus.FAILED,
+                    finishedAt = request.finishedAt,
+                    reason = request.reason,
+                )
+                true
+            }
         }
     }
 
@@ -606,6 +695,7 @@ private data class LlmLaunchReservationRecord(
         claimantToken = claimantToken,
         claimedAt = claimedAt,
         heartbeatAt = heartbeatAt,
+        reservedAt = reservedAt,
     )
 }
 

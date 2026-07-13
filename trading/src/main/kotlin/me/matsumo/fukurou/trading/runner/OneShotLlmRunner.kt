@@ -370,6 +370,11 @@ class OneShotLlmRunner(
                 return handleClaimOutcomeUnknown(invocationId, triggerKind, claimantToken, claimOutcome.cause)
             }
             is LlmExecutionClaimOutcome.Claimed -> {
+                LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+                    invocationId = invocationId,
+                    claimantToken = claimantToken,
+                    observedAt = claimedAt,
+                )
                 runCatching { appendClaimPreflightAudit(invocationId, triggerKind, "claimed", true) }
                     .getOrElse { auditFailure ->
                         withContext(NonCancellable) {
@@ -425,6 +430,7 @@ class OneShotLlmRunner(
         var llmRunStarted = false
 
         return try {
+            LlmExecutionTerminationFenceRegistry.markChildMayBeRunning(invocationId, claimantToken)
             val bodyResult = try {
                 withTimeout(executionPolicy.hardTimeout.toMillis()) {
                     runCatching {
@@ -488,6 +494,11 @@ class OneShotLlmRunner(
             Result.success(result)
         } finally {
             heartbeatJob.cancelAndJoin()
+            LlmExecutionTerminationFenceRegistry.markProcessTreeExited(
+                invocationId = invocationId,
+                claimantToken = claimantToken,
+                observedAt = clock.instant(),
+            )
             withContext(NonCancellable) {
                 withTimeout(executionPolicy.persistenceTerminalTimeout.toMillis()) {
                     tradingRuntime.launchReservationRepository.finish(
@@ -501,6 +512,8 @@ class OneShotLlmRunner(
                     ).getOrThrow()
                 }
             }
+            LlmExecutionAdmissionHealth.resolveRecoveryBlocker(invocationId)
+            LlmExecutionTerminationFenceRegistry.resolve(invocationId, claimantToken)
         }
     }
 
@@ -524,6 +537,7 @@ class OneShotLlmRunner(
         claimantToken: String,
         cause: Throwable,
     ): Result<OneShotRunnerResult> {
+        registerNoChildStartedFence(invocationId, claimantToken, clock.instant())
         appendClaimPreflightAudit(
             invocationId,
             triggerKind,
@@ -556,6 +570,11 @@ class OneShotLlmRunner(
         val sameTokenClaim = snapshot?.claimState == LlmExecutionClaimState.CLAIMED &&
             snapshot.claimantToken == claimantToken
         if (sameTokenClaim && snapshot.status == LlmLaunchReservationStatus.RUNNING) {
+            LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+                invocationId = invocationId,
+                claimantToken = claimantToken,
+                observedAt = snapshot.claimedAt ?: clock.instant(),
+            )
             withContext(NonCancellable) {
                 tradingRuntime.launchReservationRepository.finish(
                     LlmLaunchReservationFinish(
@@ -572,6 +591,18 @@ class OneShotLlmRunner(
             claimSupervisor.register(invocationId, claimantToken)
         }
         return Result.failure(IllegalStateException(LAUNCH_RESERVATION_CLAIM_OUTCOME_UNKNOWN, cause))
+    }
+
+    private fun registerNoChildStartedFence(
+        invocationId: String,
+        claimantToken: String,
+        observedAt: java.time.Instant,
+    ) {
+        LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+            invocationId = invocationId,
+            claimantToken = claimantToken,
+            observedAt = observedAt,
+        )
     }
 
     private suspend fun appendClaimPreflightAudit(

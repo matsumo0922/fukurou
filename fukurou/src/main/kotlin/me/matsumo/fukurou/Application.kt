@@ -41,6 +41,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
@@ -58,6 +59,7 @@ import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
+import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.io.File
 import java.time.Clock
@@ -828,8 +830,17 @@ private fun startApplicationBackgroundWorkers(
         clock = runtime.clock,
         onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
     )
+    if (!recoverPreviousLlmExecutionGeneration(database, runtime)) return ApplicationBackgroundWorkers()
 
     return ApplicationBackgroundWorkers(
+        llmExecutionRecoveryWorker = LlmExecutionRecoveryWorker(
+            repository = ExposedLlmLaunchReservationRepository(database),
+            commandEventLog = ExposedCommandEventLog(database),
+            policy = OneShotExecutionPolicy.from(runtime.tradingConfig.runner),
+            clock = runtime.clock,
+        ).also {
+            LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+        }.start(),
         reconcilerWorker = startProtectionReconcilerWorker(
             dataSource = dataSource,
             database = database,
@@ -863,6 +874,28 @@ private fun startApplicationBackgroundWorkers(
     )
 }
 
+/** exclusive application startup 後に旧 LLM process generation を補助回収する。 */
+private fun recoverPreviousLlmExecutionGeneration(
+    database: ExposedDatabase,
+    runtime: ApplicationRuntimeResources,
+): Boolean {
+    val result = TradingPersistenceBootstrap(
+        database = database,
+        clock = runtime.clock,
+        paperAccountConfig = runtime.tradingConfig.paperAccount,
+        staleLlmRunRecoveryThreshold = runtime.tradingConfig.staleLlmRunRecoveryThreshold(),
+        onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
+    ).recoverPreviousGeneration()
+    if (result.isFailure) {
+        LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+        return false
+    }
+
+    result.getOrThrow().takeIf { recoveredCount -> recoveredCount > 0 }
+        ?.let(runtime.onStaleLlmRunsRecovered)
+    return true
+}
+
 private fun Application.subscribeApplicationShutdown(
     databaseResources: ApplicationDatabaseResources,
     opsResources: ApplicationOpsRouteResources,
@@ -881,6 +914,7 @@ private fun Application.subscribeApplicationShutdown(
         backgroundWorkers.reflectionRunnerWorker?.close()
         backgroundWorkers.obsidianWriterWorker?.close()
         backgroundWorkers.llmDaemonWorker?.close()
+        backgroundWorkers.llmExecutionRecoveryWorker?.close()
         opsResources.createdLlmAuthService?.close()
         opsResources.createdManualLlmLaunchService?.close?.invoke()
         backgroundWorkers.reconcilerWorker?.close()
@@ -1079,12 +1113,14 @@ private data class ApplicationOpsRouteResources(
  * @param reflectionRunnerWorker reflection report worker
  */
 private data class ApplicationBackgroundWorkers(
+    val llmExecutionRecoveryWorker: LlmExecutionRecoveryWorker? = null,
     val reconcilerWorker: ProtectionReconcilerWorker? = null,
     val llmDaemonWorker: LlmDaemonSchedulerWorker? = null,
     val obsidianWriterWorker: ObsidianWriterWorker? = null,
     val reflectionRunnerWorker: ReflectionRunnerWorker? = null,
 ) {
-    val hasWorker: Boolean = reconcilerWorker != null ||
+    val hasWorker: Boolean = llmExecutionRecoveryWorker != null ||
+        reconcilerWorker != null ||
         llmDaemonWorker != null ||
         obsidianWriterWorker != null ||
         reflectionRunnerWorker != null

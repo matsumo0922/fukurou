@@ -1033,7 +1033,11 @@ class TradingPersistenceBootstrap(
                     statement.setString(2, LLM_RUN_STATUS_RUNNING)
                     statement.executeUpdate()
                 }
-                recoverStaleLlmRunLifecycle(now, staleLlmRunRecoveryThreshold)
+                recoverStaleLlmRunLifecycle(
+                    now = now,
+                    threshold = staleLlmRunRecoveryThreshold,
+                    previousGenerationTerminated = false,
+                )
             }
 
             if (recoveredCount > 0) {
@@ -1052,6 +1056,17 @@ class TradingPersistenceBootstrap(
                 selectRiskState(forUpdate = false)
                 selectPaperAccount()
             }
+        }
+    }
+
+    /** single-instance の旧 process generation 終了確認後だけ CLAIMED stale lifecycle を回収する。 */
+    fun recoverPreviousGeneration(): Result<Int> = runCatching {
+        exposedTransaction(database) {
+            recoverStaleLlmRunLifecycle(
+                now = Instant.now(clock),
+                threshold = staleLlmRunRecoveryThreshold,
+                previousGenerationTerminated = true,
+            )
         }
     }
 }
@@ -1426,11 +1441,15 @@ internal fun JdbcTransaction.ensureBootstrapEquitySnapshot(now: Instant) {
  * stale な RUNNING llm_runs を FAILED へ回収する。
  */
 internal fun JdbcTransaction.recoverStaleLlmRuns(now: Instant, threshold: Duration): Int {
-    return recoverStaleLlmRunLifecycle(now, threshold)
+    return recoverStaleLlmRunLifecycle(now, threshold, previousGenerationTerminated = false)
 }
 
 /** stale run と対応する RUNNING reservation を bootstrap transaction 内で回収する。 */
-internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(now: Instant, threshold: Duration): Int {
+internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(
+    now: Instant,
+    threshold: Duration,
+    previousGenerationTerminated: Boolean = false,
+): Int {
     val cutoff = now.minus(threshold)
     val reservations = selectRunningLlmReservationsForUpdate()
     val runs = selectLifecycleRunsForUpdate()
@@ -1444,6 +1463,7 @@ internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(now: Instant, threshold
                 reservation = reservationsByInvocationId[invocationId],
                 now = now,
                 cutoff = cutoff,
+                previousGenerationTerminated = previousGenerationTerminated,
             )
         }
 
@@ -1553,11 +1573,13 @@ private fun JdbcTransaction.selectRunningLlmReservationsForUpdate(): List<Locked
     }
 }
 
+@Suppress("CyclomaticComplexMethod")
 private fun JdbcTransaction.recoverLockedLlmInvocation(
     run: LockedLlmRun?,
     reservation: LockedLlmReservation?,
     now: Instant,
     cutoff: Instant,
+    previousGenerationTerminated: Boolean,
 ): StaleLlmInvocationRecovery? {
     val staleRun = run?.status == LLM_RUN_STATUS_RUNNING && run.startedAt?.let { startedAt ->
         Instant.ofEpochMilli(startedAt).isBefore(cutoff)
@@ -1565,8 +1587,11 @@ private fun JdbcTransaction.recoverLockedLlmInvocation(
     val staleReservation = reservation?.reservedAt?.let { reservedAt ->
         Instant.ofEpochMilli(reservedAt).isBefore(cutoff)
     } == true
-    val recoverRun = staleRun
+    val claimedLifecycle = reservation?.claimState == "CLAIMED"
+    val claimRecoveryAllowed = !claimedLifecycle || previousGenerationTerminated
+    val recoverRun = staleRun && claimRecoveryAllowed
     val recoverReservation = when {
+        !claimRecoveryAllowed -> false
         run?.status == LLM_RUN_STATUS_RUNNING -> staleRun
         else -> staleReservation
     }
