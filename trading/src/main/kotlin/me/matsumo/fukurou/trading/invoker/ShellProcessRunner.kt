@@ -104,7 +104,7 @@ class ShellProcessRunner(
             awaitProcessHandles(descendants, terminationGrace)
 
             val remainingDescendants = (descendants + process.descendantsDeepestFirst())
-                .distinctBy(ProcessHandle::pid)
+                .distinctBy(ProcessHandle::pidSafely)
             remainingDescendants.filter(ProcessHandle::isAliveSafely)
                 .forEach { descendant -> runCatching { descendant.destroyForcibly() } }
             remainingDescendants.forEach { descendant -> descendant.awaitExitQuietly() }
@@ -113,7 +113,9 @@ class ShellProcessRunner(
             val processExitedGracefully = process.waitFor(terminationGrace.toMillis(), TimeUnit.MILLISECONDS)
             if (!processExitedGracefully && process.isAlive) process.destroyForcibly()
             val processExited = process.waitFor(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)
-            val processTreeExited = remainingDescendants.none { descendant -> descendant.pid().isProcessAlive() }
+            val processTreeExited = remainingDescendants.none { descendant ->
+                descendant.pidSafely()?.isProcessAlive() ?: true
+            }
             check(processExited && processTreeExited) {
                 "LLM process tree did not exit after TERM/KILL sequence."
             }
@@ -234,6 +236,10 @@ private fun Long.isProcessAlive(): Boolean {
 
 private fun ProcessHandle.isAliveSafely(): Boolean {
     return runCatching { isAlive }.getOrDefault(true)
+}
+
+private fun ProcessHandle.pidSafely(): Long? {
+    return runCatching { pid() }.getOrNull()
 }
 
 private fun Path.isProductionPerRunHome(): Boolean {
