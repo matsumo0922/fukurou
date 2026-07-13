@@ -2,6 +2,8 @@ package me.matsumo.fukurou.trading.exchange.gmo
 
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.daemon.GmoLlmDaemonLaunchAvailability
+import me.matsumo.fukurou.trading.daemon.LlmDaemonLaunchSuppressionReason
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.TradeSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -73,6 +75,7 @@ class GmoPublicMarketDataSourceTest {
         assertEquals(GmoExchangeStatus.OPEN, dataSource.readStatus().getOrThrow())
         assertEquals(GmoPublicOperation.GET_STATUS, auditSink.events.single().operation)
         assertEquals(GmoPublicEndpoint.STATUS, auditSink.events.single().endpoint)
+        assertEquals(1, auditSink.events.single().maxAttempts)
     }
 
     @Test
@@ -115,7 +118,7 @@ class GmoPublicMarketDataSourceTest {
     }
 
     @Test
-    fun readStatus_temporaryFailureHonorsConfiguredHttpAttemptCeiling() = runBlocking {
+    fun readStatus_temporaryFailureUsesOneHttpAttempt() = runBlocking {
         val httpClient = FakeHttpClient(
             responses = emptyMap(),
             failure = IOException("connection reset"),
@@ -126,7 +129,7 @@ class GmoPublicMarketDataSourceTest {
         )
 
         assertIs<MarketNetworkException>(dataSource.readStatus().exceptionOrNull())
-        assertEquals(2, httpClient.requestCount)
+        assertEquals(1, httpClient.requestCount)
     }
 
     @Test
@@ -142,6 +145,62 @@ class GmoPublicMarketDataSourceTest {
 
         assertIs<GmoRequestAuditException>(dataSource.readStatus().exceptionOrNull())
         assertEquals(1, httpClient.requestCount)
+    }
+
+    @Test
+    fun readStatus_failuresUseOneAttemptPerCacheMissAndRetryAtSixtySeconds() = runBlocking {
+        assertStatusFailureCache(
+            responses = emptyMap(),
+            failure = IOException("connection reset"),
+            requestAuditSink = NoopGmoPublicRequestAuditSink,
+            expectedReason = LlmDaemonLaunchSuppressionReason.STATUS_TRANSPORT_FAILURE,
+        )
+        assertStatusFailureCache(
+            responses = emptyMap(),
+            failure = HttpTimeoutException("timeout"),
+            requestAuditSink = NoopGmoPublicRequestAuditSink,
+            expectedReason = LlmDaemonLaunchSuppressionReason.STATUS_TIMEOUT,
+        )
+        assertStatusFailureCache(
+            responses = mapOf("" to statusErrorResponse("ERR-5201")),
+            failure = null,
+            requestAuditSink = NoopGmoPublicRequestAuditSink,
+            expectedReason = LlmDaemonLaunchSuppressionReason.STATUS_MALFORMED,
+        )
+        assertStatusFailureCache(
+            responses = mapOf("" to statusResponse("OPEN")),
+            failure = null,
+            requestAuditSink = GmoPublicRequestAuditSink { Result.failure(IllegalStateException("secret")) },
+            expectedReason = LlmDaemonLaunchSuppressionReason.STATUS_TRANSPORT_FAILURE,
+        )
+    }
+
+    private suspend fun assertStatusFailureCache(
+        responses: Map<String, String>,
+        failure: IOException?,
+        requestAuditSink: GmoPublicRequestAuditSink,
+        expectedReason: LlmDaemonLaunchSuppressionReason,
+    ) {
+        val httpClient = FakeHttpClient(responses, failure = failure)
+        val monotonicTimeSource = MutableMonotonicTimeSource()
+        val availability = GmoLlmDaemonLaunchAvailability(
+            statusReader = fakeMarketDataSource(
+                httpClient = httpClient,
+                retryConfig = GmoRetryConfig(maxAttempts = 4),
+                requestAuditSink = requestAuditSink,
+            ),
+            monotonicTimeSource = monotonicTimeSource,
+        )
+        val observedAt = Instant.parse("2026-07-13T00:00:00Z")
+
+        assertEquals(expectedReason, availability.statusSuppressionAt(observedAt))
+        assertEquals(1, httpClient.requestCount)
+        monotonicTimeSource.advance(Duration.ofSeconds(59))
+        assertEquals(expectedReason, availability.statusSuppressionAt(observedAt))
+        assertEquals(1, httpClient.requestCount)
+        monotonicTimeSource.advance(Duration.ofSeconds(1))
+        assertEquals(expectedReason, availability.statusSuppressionAt(observedAt))
+        assertEquals(2, httpClient.requestCount)
     }
 
     @Test

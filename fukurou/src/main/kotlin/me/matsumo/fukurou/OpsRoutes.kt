@@ -2367,14 +2367,14 @@ private fun CommandEvent.toOpsAuditEventResponse(): OpsAuditEventResponse {
 }
 
 private fun CommandEvent.toOpsActivityEventResponse(): OpsActivityEventResponse {
-    val suppressionReason = infrastructureSuppressionReasonOrNull()
+    val suppressionReason = infrastructureSuppressionReasonNameOrNull()
 
     return OpsActivityEventResponse(
         id = "audit:$id",
         source = OpsActivitySource.AUDIT.wireName,
         kind = eventType.name,
         title = eventType.name,
-        detail = suppressionReason?.name ?: toolName,
+        detail = suppressionReason ?: toolName,
         occurredAt = occurredAt.toString(),
         metadata = listOfNotNull(
             OpsActivityMetadataResponse(
@@ -2384,20 +2384,20 @@ private fun CommandEvent.toOpsActivityEventResponse(): OpsActivityEventResponse 
             suppressionReason?.let { reason ->
                 OpsActivityMetadataResponse(
                     label = "infrastructure reason",
-                    value = reason.name,
+                    value = reason,
                 )
             },
         ),
     )
 }
 
-private fun CommandEvent.infrastructureSuppressionReasonOrNull(): LlmDaemonLaunchSuppressionReason? {
+private fun CommandEvent.infrastructureSuppressionReasonNameOrNull(): String? {
     if (eventType != CommandEventType.DAEMON_LAUNCH_SUPPRESSED) return null
 
     return runCatching {
         val rawReason = Json.parseToJsonElement(payload).jsonObject["reason"]?.jsonPrimitive?.content
 
-        LlmDaemonLaunchSuppressionReason.entries.single { reason -> reason.name == rawReason }
+        LlmDaemonLaunchSuppressionReason.entries.singleOrNull { reason -> reason.name == rawReason }?.name ?: rawReason
     }.getOrNull()
 }
 

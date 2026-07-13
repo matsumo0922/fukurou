@@ -359,15 +359,15 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped("concurrent_invocation", trigger.kind)
         }
 
-        return reserveAndLaunch(trigger, openRisk, admissionObservedAt)
+        return reserveAndLaunch(trigger, openRisk)
     }
 
     private suspend fun reserveAndLaunch(
         trigger: LlmDaemonTrigger,
         openRisk: LlmDaemonOpenRiskSnapshot,
-        observedAt: Instant,
     ): LlmDaemonTickResult {
         val invocationId = idGenerator().toString()
+        val observedAt = Instant.now(clock)
         val reservationRequest = LlmLaunchReservationRequest(
             invocationId = invocationId,
             triggerKind = trigger.kind,
@@ -378,6 +378,17 @@ class LlmDaemonScheduler(
             dailyWindow = MAX_DAILY_INVOCATION_COUNT_WINDOW,
             activeReservationStaleAfter = daemonConfig.launchReservationStaleAfter,
         )
+        val reservationSuppression = launchAvailability.scheduledSuppressionAt(observedAt)
+        if (reservationSuppression != null) {
+            appendInfrastructureSuppressionIfDue(
+                reason = reservationSuppression,
+                trigger = trigger,
+                observedAt = observedAt,
+            ).getOrThrow()
+
+            return LlmDaemonTickResult.InfrastructureSuppressed(reservationSuppression, trigger.kind)
+        }
+
         val reservationOutcome = launchReservationRepository.tryReserve(reservationRequest).getOrThrow()
 
         if (reservationOutcome is LlmLaunchReservationOutcome.Rejected) {
@@ -391,6 +402,26 @@ class LlmDaemonScheduler(
             ).getOrThrow()
 
             return LlmDaemonTickResult.Skipped(reason, trigger.kind)
+        }
+
+        val launchObservedAt = Instant.now(clock)
+        val launchSuppression = launchAvailability.scheduledSuppressionAt(launchObservedAt)
+        if (launchSuppression != null) {
+            launchReservationRepository.finish(
+                LlmLaunchReservationFinish(
+                    invocationId = invocationId,
+                    status = LlmLaunchReservationStatus.FINISHED,
+                    reason = launchSuppression.name,
+                    finishedAt = launchObservedAt,
+                ),
+            ).getOrThrow()
+            appendInfrastructureSuppressionIfDue(
+                reason = launchSuppression,
+                trigger = trigger,
+                observedAt = launchObservedAt,
+            ).getOrThrow()
+
+            return LlmDaemonTickResult.InfrastructureSuppressed(launchSuppression, trigger.kind)
         }
 
         appendLaunchedOrFinishReservation(trigger, invocationId, openRisk, observedAt).getOrThrow()

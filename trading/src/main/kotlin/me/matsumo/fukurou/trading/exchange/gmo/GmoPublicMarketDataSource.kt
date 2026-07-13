@@ -280,7 +280,10 @@ class GmoPublicMarketDataSource(
             readCachedSymbolRules(symbol) ?: fetchAndCacheSymbolRules(symbol)
         }
 
-    override suspend fun readStatus(): Result<GmoExchangeStatus> = runMarketRequest(GmoPublicOperation.GET_STATUS) {
+    override suspend fun readStatus(): Result<GmoExchangeStatus> = runMarketRequest(
+        operation = GmoPublicOperation.GET_STATUS,
+        maxAttempts = 1,
+    ) {
         val request = buildStatusRequest()
         val responseBody = sendRequest(request, GmoPublicEndpoint.STATUS)
 
@@ -289,9 +292,10 @@ class GmoPublicMarketDataSource(
 
     private suspend fun <T> runMarketRequest(
         operation: GmoPublicOperation,
+        maxAttempts: Int = retryConfig.maxAttempts,
         block: suspend GmoRequestScope.() -> T,
     ): Result<T> = withContext(Dispatchers.IO) {
-        val scope = GmoRequestScope(operation)
+        val scope = GmoRequestScope(operation, maxAttempts)
 
         runCatching {
             executeWithRetry(scope, block)
@@ -305,12 +309,12 @@ class GmoPublicMarketDataSource(
         var nextBackoff = retryConfig.initialBackoff
         var lastFailure: Throwable? = null
 
-        while (attemptNumber <= retryConfig.maxAttempts) {
+        while (attemptNumber <= scope.maxAttempts) {
             scope.attempt = attemptNumber
             try {
                 return scope.block()
             } catch (exception: MarketDataException) {
-                if (!shouldRetry(exception, attemptNumber)) {
+                if (!shouldRetry(exception, attemptNumber, scope.maxAttempts)) {
                     throw exception
                 }
 
@@ -328,8 +332,12 @@ class GmoPublicMarketDataSource(
         }
     }
 
-    private fun shouldRetry(throwable: Throwable, attemptNumber: Int): Boolean {
-        val hasAttemptLeft = attemptNumber < retryConfig.maxAttempts
+    private fun shouldRetry(
+        throwable: Throwable,
+        attemptNumber: Int,
+        maxAttempts: Int,
+    ): Boolean {
+        val hasAttemptLeft = attemptNumber < maxAttempts
         val isTemporary = throwable is MarketDataException && throwable.kind == MarketDataFailureKind.TEMPORARY
 
         return hasAttemptLeft && isTemporary
@@ -527,7 +535,7 @@ class GmoPublicMarketDataSource(
             operation = operation,
             endpoint = endpoint,
             attempt = attempt,
-            maxAttempts = retryConfig.maxAttempts,
+            maxAttempts = maxAttempts,
             requestSequence = requestSequence,
             requestStartedAt = requestStartedAt.toString(),
             completedAt = completedAt.toString(),
@@ -676,7 +684,7 @@ class GmoPublicMarketDataSource(
         }
     }
 
-    private inner class GmoRequestScope(val operation: GmoPublicOperation) {
+    private inner class GmoRequestScope(val operation: GmoPublicOperation, val maxAttempts: Int) {
         val operationId: String = newGmoAuditId()
         var attempt: Int = 1
         var requestSequence: Int = 0

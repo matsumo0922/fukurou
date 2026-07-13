@@ -427,6 +427,9 @@ describe("App", () => {
 
     expect(await screen.findByRole("heading", { name: "Automatic 起動抑止" })).toBeInTheDocument();
     expect(screen.getByText("GMO 定期メンテナンス")).toBeInTheDocument();
+    expect(screen.getByText("GMO status: maintenance")).toBeInTheDocument();
+    expect(screen.getByText("GMO status: pre-open")).toBeInTheDocument();
+    expect(screen.getByText("GMO status timeout")).toBeInTheDocument();
     expect(screen.getByText("GMO status 不正 response")).toBeInTheDocument();
     expect(screen.getByText("GMO status transport 失敗")).toBeInTheDocument();
     expect(screen.getByText("未知の infrastructure 抑止: STATUS_FUTURE")).toBeInTheDocument();

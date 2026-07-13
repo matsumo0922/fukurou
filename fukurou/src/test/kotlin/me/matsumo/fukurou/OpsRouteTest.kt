@@ -1413,6 +1413,14 @@ class OpsRouteTest {
                 ),
             ).getOrThrow()
         }
+        eventLog.append(
+            auditEvent(
+                eventType = CommandEventType.DAEMON_LAUNCH_SUPPRESSED,
+                occurredAt = fixedInstant().plusSeconds(LlmDaemonLaunchSuppressionReason.entries.size.toLong()),
+                toolName = "llm_daemon_scheduler",
+                payload = """{"reason":"STATUS_FUTURE","triggerKind":"FLAT_HEARTBEAT"}""",
+            ),
+        ).getOrThrow()
 
         application {
             module(
@@ -1433,7 +1441,7 @@ class OpsRouteTest {
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertEquals(
-            LlmDaemonLaunchSuppressionReason.entries.map { reason -> reason.name }.toSet(),
+            LlmDaemonLaunchSuppressionReason.entries.map { reason -> reason.name }.toSet() + "STATUS_FUTURE",
             event.map { item -> item.getValue("detail").jsonPrimitive.content }.toSet(),
         )
         event.forEach { item ->
