@@ -5042,7 +5042,11 @@ class PostgresPersistenceIntegrationTest {
         assertIs<LlmLaunchReservationOutcome.Reserved>(
             repository.tryReserve(llmLaunchReservationRequest("statement-budget", LlmRunnerConfig(), now)).getOrThrow(),
         )
-        assertEquals(4, statementCount.get())
+        assertEquals(
+            11,
+            statementCount.get(),
+            "two admission checks, token acquisition, risk/active/usage reads, and reservation insert",
+        )
 
         val lockConnection = dataSource.connection
         lockConnection.autoCommit = false
@@ -5065,7 +5069,11 @@ class PostgresPersistenceIntegrationTest {
             Duration.ofNanos(System.nanoTime() - startedAt)
         }
         assertTrue(lockElapsed >= Duration.ofMillis(250), "risk row lock elapsed=$lockElapsed")
-        assertEquals(2, statementCount.get())
+        assertEquals(
+            9,
+            statementCount.get(),
+            "two admission checks, token acquisition, risk lock, and active reservation read",
+        )
 
         repository.finish(
             LlmLaunchReservationFinish(
@@ -5087,12 +5095,12 @@ class PostgresPersistenceIntegrationTest {
         )
 
         assertEquals(1, recoveryService.tick().getOrThrow())
-        assertEquals(2, statementCount.get())
+        assertEquals(9, statementCount.get(), "one scan plus eight entity-scope recovery statements")
         assertEquals(listOf(2, 2), queryTimeouts)
     }
 
     @Test
-    fun hundredCandidateRecoveryUsesOneSelectAndOneBatchUpdate() = runPostgresTest {
+    fun hundredCandidateRecoveryUsesBoundedSequentialEntityScopeTransactions() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val now = fixedInstant()
         insertRecoverableAvailableReservations(
@@ -5116,8 +5124,8 @@ class PostgresPersistenceIntegrationTest {
         )
 
         assertEquals(100, service.tick().getOrThrow())
-        assertEquals(2, statementCount.get())
-        assertEquals(listOf(2, 2), queryTimeouts)
+        assertEquals(801, statementCount.get(), "one scan plus eight statements per fixed-page candidate")
+        assertEquals(List(101) { 2 }, queryTimeouts, "scan and each candidate recovery use the two-second timeout")
         assertEquals(100, countTerminalBatchRecoveryReservations(database))
         assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
     }
@@ -9667,14 +9675,21 @@ private fun assertExecutionClaimIndexDefinitions(definitions: Map<String, String
 
 private fun insertTerminalReservationHistory(database: ExposedDatabase, rowCount: Int) {
     exposedTransaction(database) {
+        acquireGapPopulationGenerationToken()
         jdbcConnection().prepareStatement(
             """
                 INSERT INTO llm_launch_reservations (
-                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason
+                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason,
+                    execution_claim_state, population_scope_kind, population_mode, population_symbol,
+                    population_account_epoch_id, population_cohort, population_execution_semantics_version
                 )
                 SELECT gen_random_uuid(), 'terminal-history-' || value, 'FLAT_HEARTBEAT',
-                    'terminal-history:' || value, 'FINISHED', value, value, 'fixture'
+                    'terminal-history:' || value, 'FINISHED', value, value, 'fixture', NULL,
+                    control.scope_kind, control.scope_mode, control.scope_symbol, control.scope_account_epoch_id,
+                    control.scope_cohort, control.scope_execution_semantics_version
                 FROM generate_series(1, ?) AS value
+                CROSS JOIN gap_population_control AS control
+                WHERE control.id = 1 AND control.token_txid = txid_current()
             """.trimIndent(),
         ).use { statement ->
             statement.setInt(1, rowCount)
@@ -9689,14 +9704,21 @@ private fun insertStaleLegacyRunningReservationHistory(
     now: Instant,
 ) {
     exposedTransaction(database) {
+        acquireGapPopulationGenerationToken()
         jdbcConnection().prepareStatement(
             """
                 INSERT INTO llm_launch_reservations (
-                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason
+                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason,
+                    execution_claim_state, population_scope_kind, population_mode, population_symbol,
+                    population_account_epoch_id, population_cohort, population_execution_semantics_version
                 )
                 SELECT gen_random_uuid(), 'stale-legacy-running-' || value, 'FLAT_HEARTBEAT',
-                    'stale-legacy-running:' || value, 'RUNNING', ? - value, NULL, NULL
+                    'stale-legacy-running:' || value, 'RUNNING', ? - value, NULL, NULL, NULL,
+                    control.scope_kind, control.scope_mode, control.scope_symbol, control.scope_account_epoch_id,
+                    control.scope_cohort, control.scope_execution_semantics_version
                 FROM generate_series(1, ?) AS value
+                CROSS JOIN gap_population_control AS control
+                WHERE control.id = 1 AND control.token_txid = txid_current()
             """.trimIndent(),
         ).use { statement ->
             statement.setLong(1, now.minus(Duration.ofDays(1)).toEpochMilli())
@@ -9832,15 +9854,22 @@ private fun insertRecoverableAvailableReservations(
     reservedAt: Instant,
 ) {
     exposedTransaction(database) {
+        acquireGapPopulationGenerationToken()
         jdbcConnection().prepareStatement(
             """
                 INSERT INTO llm_launch_reservations (
                     id, invocation_id, trigger_kind, trigger_key, status, reserved_at,
-                    finished_at, reason, execution_claim_state
+                    finished_at, reason, execution_claim_state,
+                    population_scope_kind, population_mode, population_symbol, population_account_epoch_id,
+                    population_cohort, population_execution_semantics_version
                 )
                 SELECT gen_random_uuid(), 'batch-recovery-' || value, 'FLAT_HEARTBEAT',
-                    'batch-recovery:' || value, 'RUNNING', ? - value, NULL, NULL, 'AVAILABLE'
+                    'batch-recovery:' || value, 'RUNNING', ? - value, NULL, NULL, 'AVAILABLE',
+                    control.scope_kind, control.scope_mode, control.scope_symbol, control.scope_account_epoch_id,
+                    control.scope_cohort, control.scope_execution_semantics_version
                 FROM generate_series(1, ?) AS value
+                CROSS JOIN gap_population_control AS control
+                WHERE control.id = 1 AND control.token_txid = txid_current()
             """.trimIndent(),
         ).use { statement ->
             statement.setLong(1, reservedAt.toEpochMilli())
