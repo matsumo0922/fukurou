@@ -13,7 +13,7 @@ paper trading の基準資金は immutable な account epoch で管理する。f
 - LLM は CLI（`claude` / `codex`）シェルアウトで実行（サブスク利用）
 - 取引・監査ログは PostgreSQL を正本にし、Obsidian Writer / Reflection Runner が人間向けノートを生成する
 - LLM run の終了理由は stable な terminal cause で記録し、daemon は in-flight invocation を supersede せず blocker を監査する
-- LLM daemon の automatic launch は、毎週土曜日 09:00〜11:00 JST の GMO 定期メンテナンス窓と Public status が `OPEN` でない期間を reservation 前に抑止する。reservation 成功直後にも定期窓を再確認し、窓へ入った場合は reservation を terminal にして child を起動しない。status timeout・不正 response・transport failure も fail closed とし、`DAEMON_LAUNCH_SUPPRESSED` を strategy の `NO_TRADE` と分離して記録する
+- LLM daemon の automatic launch は、毎週土曜日 09:00〜11:00 JST の GMO 定期メンテナンス窓と Public status が `OPEN` でない期間を reservation 前に抑止する。reservation 成功直後と child 呼び出し直前にも定期窓を再確認し、窓へ入った場合は reservation を terminal にして child を起動しない。status timeout・不正 response・transport failure も fail closed とし、`DAEMON_LAUNCH_SUPPRESSED` を strategy の `NO_TRADE` と分離して記録する
 
 ## 安全床
 

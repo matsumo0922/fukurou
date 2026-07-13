@@ -262,6 +262,58 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
+    fun finalLaunchBoundarySuppressesClockChangeAfterPostReservationAdmission() = runBlocking {
+        val clock = MutableClock(Instant.parse("2026-07-10T23:59:59.999Z"))
+        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val repository = InMemoryLlmLaunchReservationRepository(riskStateRepository)
+        val reservations = RecordingReservationRepository(repository)
+        val delegate = GmoLlmDaemonLaunchAvailability(SchedulerStatusReader())
+        var scheduledCheckCount = 0
+        val availability = object : LlmDaemonLaunchAvailability {
+            override fun scheduledSuppressionAt(observedAt: Instant): LlmDaemonLaunchSuppressionReason? {
+                scheduledCheckCount += 1
+                val reason = delegate.scheduledSuppressionAt(observedAt)
+                if (scheduledCheckCount == 4) clock.advance(Duration.ofMillis(1))
+
+                return reason
+            }
+
+            override suspend fun statusSuppressionAt(observedAt: Instant): LlmDaemonLaunchSuppressionReason? {
+                return delegate.statusSuppressionAt(observedAt)
+            }
+        }
+        val fixture = schedulerFixture(
+            clock = clock,
+            riskStateRepository = riskStateRepository,
+            reservations = reservations,
+            launchAvailability = availability,
+        )
+
+        val result = fixture.scheduler.tick()
+        val finish = reservations.finishRequests.single()
+        val eventTypes = fixture.eventLog.events().map { event -> event.eventType }
+        val activeReservation = repository.findBlockingRunningReservation(
+            requestTriggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+            activeSince = clock.instant().minusSeconds(60),
+        ).getOrThrow()
+
+        assertEquals(
+            LlmDaemonTickResult.InfrastructureSuppressed(
+                LlmDaemonLaunchSuppressionReason.SCHEDULED_MAINTENANCE,
+                LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+            ),
+            result,
+        )
+        assertEquals(LlmLaunchReservationStatus.FINISHED, finish.status)
+        assertEquals(LlmDaemonLaunchSuppressionReason.SCHEDULED_MAINTENANCE.name, finish.reason)
+        assertEquals(null, activeReservation)
+        assertTrue(fixture.launches.isEmpty())
+        assertEquals(0, eventTypes.count { type -> type == CommandEventType.DAEMON_TRIGGER_LAUNCHED })
+        assertEquals(0, eventTypes.count { type -> type == CommandEventType.NO_TRADE_EXIT })
+        assertEquals(1, eventTypes.count { type -> type == CommandEventType.DAEMON_LAUNCH_SUPPRESSED })
+    }
+
+    @Test
     fun statusMaintenance_suppressesSelectedCandidateBeforeReservationAndUsesTypedAudit() = runBlocking {
         val availability = RecordingLaunchAvailability(
             statusReason = LlmDaemonLaunchSuppressionReason.STATUS_MAINTENANCE,
@@ -447,7 +499,7 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun launchAuditFailureFinishesReservationWithoutRereadingBrokerOrRunningChild() = runBlocking {
+    fun postSpawnLaunchAuditFailureFinishesReservationWithoutRereadingBroker() = runBlocking {
         var brokerReads = 0
         val eventLog = InMemoryCommandEventLog()
         val failingLaunchedAudit = object : CommandEventLog by eventLog {
@@ -476,7 +528,7 @@ class LlmDaemonSchedulerTest {
 
         assertEquals(LlmDaemonTickResult.Skipped("tick_failed", null), result)
         assertEquals(1, brokerReads)
-        assertTrue(fixture.launches.isEmpty())
+        assertEquals(1, fixture.launches.size)
         assertEquals(null, active)
         assertTrue(
             eventLog.events().any { event ->
