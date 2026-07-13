@@ -39,8 +39,14 @@ object GapPopulationSymbolCanonicalizer {
     private val mappings = mapOf(Triple("GMO_COIN", "BTC_JPY", "TRADES") to "BTC")
 
     /** 未登録tupleを推定せずnullにする。 */
-    fun canonicalize(provider: String, transportSymbol: String, channel: String): String? {
-        if (provider.isBlank() || transportSymbol.isBlank() || channel.isBlank()) return null
+    fun canonicalize(
+        provider: String,
+        transportSymbol: String,
+        channel: String,
+    ): String? {
+        val hasBlankTransportTuple = provider.isBlank() || transportSymbol.isBlank() || channel.isBlank()
+        if (hasBlankTransportTuple) return null
+
         return mappings[Triple(provider, transportSymbol, channel)]
     }
 
@@ -75,11 +81,15 @@ internal const val GAP_POPULATION_MEMBER_LIMIT = 100_000
 internal const val GAP_POPULATION_JOURNAL_LIMIT = 100_000
 internal const val GAP_POPULATION_JOURNAL_BYTES_LIMIT = 256L * 1024L * 1024L
 
-internal fun gapPopulationQueueCapacityExceeded(pendingCount: Int, limit: Int = GAP_POPULATION_PENDING_WORK_LIMIT): Boolean =
-    pendingCount >= limit
+internal fun gapPopulationQueueCapacityExceeded(
+    pendingCount: Int,
+    limit: Int = GAP_POPULATION_PENDING_WORK_LIMIT,
+): Boolean = pendingCount >= limit
 
-internal fun gapPopulationEvidenceCapacityExceeded(currentCount: Int, limit: Int = GAP_POPULATION_EVIDENCE_LIMIT): Boolean =
-    currentCount >= limit
+internal fun gapPopulationEvidenceCapacityExceeded(
+    currentCount: Int,
+    limit: Int = GAP_POPULATION_EVIDENCE_LIMIT,
+): Boolean = currentCount >= limit
 
 internal fun gapPopulationJournalCapacityExceeded(
     unconsumedRows: Long,
@@ -364,7 +374,7 @@ internal fun JdbcTransaction.verifyGapPopulationLifecycleSchema() {
 }
 
 private fun JdbcTransaction.verifyGapPopulationSchemaContract() {
-    val missingColumns = prepare(
+    val missingColumns = selectStringList(
         """
         SELECT expected.table_name || '.' || expected.column_name
         FROM (VALUES
@@ -383,12 +393,10 @@ private fun JdbcTransaction.verifyGapPopulationSchemaContract() {
          AND actual.column_name=expected.column_name AND actual.data_type=expected.data_type
         WHERE actual.column_name IS NULL
         """.trimIndent(),
-    ).use { statement ->
-        statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
-    }
+    )
     check(missingColumns.isEmpty()) { "gap population lifecycle columns differ: ${missingColumns.joinToString()}" }
 
-    val missingObjects = prepare(
+    val missingObjects = selectStringList(
         """
         SELECT expected.name FROM (VALUES
             ('gap_population_entity_scope_scan_idx'),
@@ -409,12 +417,10 @@ private fun JdbcTransaction.verifyGapPopulationSchemaContract() {
         WHERE NOT EXISTS (SELECT 1 FROM pg_class WHERE relname=expected.name)
           AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname=expected.name AND NOT tgisinternal)
         """.trimIndent(),
-    ).use { statement ->
-        statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
-    }
+    )
     check(missingObjects.isEmpty()) { "gap population lifecycle objects differ: ${missingObjects.joinToString()}" }
 
-    val invalidIndexes = prepare(
+    val invalidIndexes = selectStringList(
         """
         SELECT expected.name FROM (VALUES
             ('gap_population_entity_scope_scan_idx','scope_kind, mode, symbol, account_epoch_id, cohort, execution_semantics_version, birth_sequence, entity_type, entity_id'),
@@ -425,12 +431,10 @@ private fun JdbcTransaction.verifyGapPopulationSchemaContract() {
         WHERE index_relation.oid IS NULL OR NOT index_metadata.indisvalid OR NOT index_metadata.indisready
           OR position(expected.columns in pg_get_indexdef(index_relation.oid))=0
         """.trimIndent(),
-    ).use { statement ->
-        statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
-    }
+    )
     check(invalidIndexes.isEmpty()) { "gap population lifecycle indexes differ: ${invalidIndexes.joinToString()}" }
 
-    val invalidTriggers = prepare(
+    val invalidTriggers = selectStringList(
         """
         SELECT expected.name FROM (VALUES
             ('gap_population_entity_scope_immutable','reject_gap_population_entity_scope_mutation'),
@@ -450,12 +454,10 @@ private fun JdbcTransaction.verifyGapPopulationSchemaContract() {
         LEFT JOIN pg_proc function ON function.oid=trigger.tgfoid
         WHERE trigger.oid IS NULL OR trigger.tgenabled<>'O' OR function.proname<>expected.function_name
         """.trimIndent(),
-    ).use { statement ->
-        statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
-    }
+    )
     check(invalidTriggers.isEmpty()) { "gap population lifecycle triggers differ: ${invalidTriggers.joinToString()}" }
 
-    val invalidFunctions = prepare(
+    val invalidFunctions = selectStringList(
         """
         SELECT expected.signature FROM (VALUES
             ('acquire_gap_population_generation_token()'),
@@ -473,10 +475,12 @@ private fun JdbcTransaction.verifyGapPopulationSchemaContract() {
           OR NOT ('search_path=pg_catalog, public'=ANY(function.proconfig))
           OR has_function_privilege('public',expected.signature,'EXECUTE')
         """.trimIndent(),
-    ).use { statement ->
-        statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
-    }
+    )
     check(invalidFunctions.isEmpty()) { "gap population lifecycle functions differ: ${invalidFunctions.joinToString()}" }
+}
+
+private fun JdbcTransaction.selectStringList(sql: String): List<String> = prepare(sql).use { statement ->
+    statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
 }
 
 /** canonical source を同じ work ID へ coalesce し、active generation または FIFO queue へ載せる。 */
@@ -627,10 +631,12 @@ private fun JdbcTransaction.captureWorkPage(work: GapWorkRow, now: Instant): Str
     if (hasUnconsumedUnattributedAttachments(work.id)) {
         updateUnattributedProgress(
             workId = work.id,
-            phase = "UNATTRIBUTED_TERMINATING",
-            entityType = null,
-            lastEntityId = null,
-            processedCount = unattributedScan.processedCount,
+            progress = UnattributedProgress(
+                phase = "UNATTRIBUTED_TERMINATING",
+                entityType = null,
+                lastEntityId = null,
+                processedCount = unattributedScan.processedCount,
+            ),
             now = now,
         )
         return "CAPTURING"
@@ -715,10 +721,12 @@ private fun JdbcTransaction.discoverUnattributedPopulation(
         if (entityIds.size >= remaining) {
             updateUnattributedProgress(
                 workId = work.id,
-                phase = "UNATTRIBUTED_SCANNING",
-                entityType = population.type,
-                lastEntityId = entityIds.last(),
-                processedCount = processedCount,
+                progress = UnattributedProgress(
+                    phase = "UNATTRIBUTED_SCANNING",
+                    entityType = population.type,
+                    lastEntityId = entityIds.last(),
+                    processedCount = processedCount,
+                ),
                 now = now,
             )
             return UnattributedScanResult(exhausted = false, processedCount = processedCount)
@@ -728,10 +736,12 @@ private fun JdbcTransaction.discoverUnattributedPopulation(
     }
     updateUnattributedProgress(
         workId = work.id,
-        phase = "UNATTRIBUTED_EXHAUSTED",
-        entityType = null,
-        lastEntityId = null,
-        processedCount = processedCount,
+        progress = UnattributedProgress(
+            phase = "UNATTRIBUTED_EXHAUSTED",
+            entityType = null,
+            lastEntityId = null,
+            processedCount = processedCount,
+        ),
         now = now,
     )
     return UnattributedScanResult(exhausted = true, processedCount = processedCount)
@@ -749,20 +759,17 @@ private fun JdbcTransaction.selectUnattributedProgress(workId: UUID): Unattribut
 
 private fun JdbcTransaction.updateUnattributedProgress(
     workId: UUID,
-    phase: String,
-    entityType: String?,
-    lastEntityId: String?,
-    processedCount: Int,
+    progress: UnattributedProgress,
     now: Instant,
 ) {
     prepare(
         "UPDATE market_data_gap_recovery_progress SET phase=?,entity_type=?,last_entity_id=?," +
             "processed_count=?,updated_at=? WHERE work_id=?",
     ).use { statement ->
-        statement.setString(1, phase)
-        statement.setString(2, entityType)
-        statement.setString(3, lastEntityId)
-        statement.setInt(4, processedCount)
+        statement.setString(1, progress.phase)
+        statement.setString(2, progress.entityType)
+        statement.setString(3, progress.lastEntityId)
+        statement.setInt(4, progress.processedCount)
         statement.setLong(5, now.toEpochMilli())
         statement.setObject(6, workId)
         require(statement.executeUpdate() == 1)
@@ -826,7 +833,14 @@ internal fun JdbcTransaction.containUnattributedPopulation(
     now: Instant,
     limit: Int = GAP_POPULATION_PASS_SIZE,
 ): Int {
-    val owners = prepare(
+    val owners = selectUnattributedOwners(workId, limit)
+    owners.forEach { owner -> containUnattributedOwner(owner, now) }
+
+    return owners.size
+}
+
+private fun JdbcTransaction.selectUnattributedOwners(workId: UUID, limit: Int): List<UnattributedOwner> {
+    return prepare(
         "SELECT containment.owner_id,containment.entity_type,containment.entity_id,containment.state " +
             "FROM gap_population_unattributed_containments containment " +
             "JOIN gap_population_unattributed_containment_works attached ON attached.owner_id=containment.owner_id " +
@@ -843,29 +857,36 @@ internal fun JdbcTransaction.containUnattributedPopulation(
             }
         }
     }
-    owners.forEach { owner ->
-        if (owner.state in setOf("QUARANTINED", "CONTAINED")) {
-            completeUnattributedAttachments(owner, owner.state, now)
-        } else {
-            prepare("SELECT set_config('fukurou.gap_population_unattributed_owner',?,true)").use { statement ->
-                statement.setString(1, owner.ownerId.toString())
-                statement.executeQuery().use { rows -> require(rows.next()) }
-            }
-            val changed = terminalizeUnattributedOwner(owner, now)
-            require(changed == 1) { "unattributed entity is not in its allowed active state." }
-            prepare(
-                "UPDATE gap_population_unattributed_containments SET state='CONTAINED',terminal_at=?,updated_at=?," +
-                    "attempt_count=attempt_count+1 WHERE owner_id=? AND state IN ('DISCOVERED','TERMINALIZING')",
-            ).use { statement ->
-                statement.setLong(1, now.toEpochMilli())
-                statement.setLong(2, now.toEpochMilli())
-                statement.setObject(3, owner.ownerId)
-                require(statement.executeUpdate() == 1)
-            }
-            completeUnattributedAttachments(owner, "CONTAINED", now)
-        }
+}
+
+private fun JdbcTransaction.containUnattributedOwner(owner: UnattributedOwner, now: Instant) {
+    val isAlreadyContained = owner.state in setOf("QUARANTINED", "CONTAINED")
+    if (isAlreadyContained) {
+        completeUnattributedAttachments(owner, owner.state, now)
+        return
     }
-    return owners.size
+
+    prepare("SELECT set_config('fukurou.gap_population_unattributed_owner',?,true)").use { statement ->
+        statement.setString(1, owner.ownerId.toString())
+        statement.executeQuery().use { rows -> require(rows.next()) }
+    }
+    val changed = terminalizeUnattributedOwner(owner, now)
+    require(changed == 1) { "unattributed entity is not in its allowed active state." }
+
+    markUnattributedOwnerContained(owner.ownerId, now)
+    completeUnattributedAttachments(owner, "CONTAINED", now)
+}
+
+private fun JdbcTransaction.markUnattributedOwnerContained(ownerId: UUID, now: Instant) {
+    prepare(
+        "UPDATE gap_population_unattributed_containments SET state='CONTAINED',terminal_at=?,updated_at=?," +
+            "attempt_count=attempt_count+1 WHERE owner_id=? AND state IN ('DISCOVERED','TERMINALIZING')",
+    ).use { statement ->
+        statement.setLong(1, now.toEpochMilli())
+        statement.setLong(2, now.toEpochMilli())
+        statement.setObject(3, ownerId)
+        require(statement.executeUpdate() == 1)
+    }
 }
 
 private data class UnattributedOwner(
@@ -875,49 +896,66 @@ private data class UnattributedOwner(
     val state: String,
 )
 
-private fun JdbcTransaction.terminalizeUnattributedOwner(owner: UnattributedOwner, now: Instant): Int = when (owner.entityType) {
-    "ORDER" -> prepare(
-        "UPDATE orders SET status='CANCELED',reason_ja='market-data gap: scope unattributed'," +
-            "canceled_at=?,cancel_reason='gap_scope_unattributed',updated_at=? " +
-            "WHERE id=?::uuid AND status IN ('OPEN','PENDING_CANCEL') AND side='BUY' AND position_id IS NULL",
-    ).use { statement ->
-        statement.setLong(1, now.toEpochMilli()); statement.setLong(2, now.toEpochMilli())
-        statement.setString(3, owner.entityId); statement.executeUpdate()
+private fun JdbcTransaction.terminalizeUnattributedOwner(owner: UnattributedOwner, now: Instant): Int =
+    when (owner.entityType) {
+        "ORDER" -> prepare(
+            "UPDATE orders SET status='CANCELED',reason_ja='market-data gap: scope unattributed'," +
+                "canceled_at=?,cancel_reason='gap_scope_unattributed',updated_at=? " +
+                "WHERE id=?::uuid AND status IN ('OPEN','PENDING_CANCEL') AND side='BUY' AND position_id IS NULL",
+        ).use { statement ->
+            statement.setLong(1, now.toEpochMilli())
+            statement.setLong(2, now.toEpochMilli())
+            statement.setString(3, owner.entityId)
+            statement.executeUpdate()
+        }
+        "LLM_RUN" -> prepare(
+            "UPDATE llm_runs SET status='FAILED',finished_at=?,error_message='GAP_SCOPE_UNATTRIBUTED'," +
+                "terminal_cause='GAP_SCOPE_UNATTRIBUTED' WHERE invocation_id=? AND status='RUNNING'",
+        ).use { statement ->
+            statement.setLong(1, now.toEpochMilli())
+            statement.setString(2, owner.entityId)
+            statement.executeUpdate()
+        }
+        "LLM_RESERVATION" -> prepare(
+            "UPDATE llm_launch_reservations SET status='FAILED',reason='GAP_SCOPE_UNATTRIBUTED',finished_at=? " +
+                "WHERE id=?::uuid AND status='RUNNING'",
+        ).use { statement ->
+            statement.setLong(1, now.toEpochMilli())
+            statement.setString(2, owner.entityId)
+            statement.executeUpdate()
+        }
+        "OPPORTUNITY_EPISODE" -> prepare(
+            "UPDATE opportunity_episodes SET closed_at=?,close_reason='GAP_SCOPE_UNATTRIBUTED' " +
+                "WHERE id=?::uuid AND closed_at IS NULL",
+        ).use { statement ->
+            statement.setLong(1, now.toEpochMilli())
+            statement.setString(2, owner.entityId)
+            statement.executeUpdate()
+        }
+        "EVALUATION_REPORT_JOB" -> prepare(
+            "UPDATE evaluation_report_jobs SET status='FAILED',stage='FAILED',failure_code='GAP_SCOPE_UNATTRIBUTED'," +
+                "failure_message='Population scope is unattributed.',updated_at=? " +
+                "WHERE job_id=?::uuid AND status IN ('REQUESTED','RUNNING')",
+        ).use { statement ->
+            statement.setLong(1, now.toEpochMilli())
+            statement.setString(2, owner.entityId)
+            statement.executeUpdate()
+        }
+        else -> error("Unsupported terminalizable unattributed population: ${owner.entityType}")
     }
-    "LLM_RUN" -> prepare(
-        "UPDATE llm_runs SET status='FAILED',finished_at=?,error_message='GAP_SCOPE_UNATTRIBUTED'," +
-            "terminal_cause='GAP_SCOPE_UNATTRIBUTED' WHERE invocation_id=? AND status='RUNNING'",
-    ).use { statement ->
-        statement.setLong(1, now.toEpochMilli()); statement.setString(2, owner.entityId); statement.executeUpdate()
-    }
-    "LLM_RESERVATION" -> prepare(
-        "UPDATE llm_launch_reservations SET status='FAILED',reason='GAP_SCOPE_UNATTRIBUTED',finished_at=? " +
-            "WHERE id=?::uuid AND status='RUNNING'",
-    ).use { statement ->
-        statement.setLong(1, now.toEpochMilli()); statement.setString(2, owner.entityId); statement.executeUpdate()
-    }
-    "OPPORTUNITY_EPISODE" -> prepare(
-        "UPDATE opportunity_episodes SET closed_at=?,close_reason='GAP_SCOPE_UNATTRIBUTED' " +
-            "WHERE id=?::uuid AND closed_at IS NULL",
-    ).use { statement ->
-        statement.setLong(1, now.toEpochMilli()); statement.setString(2, owner.entityId); statement.executeUpdate()
-    }
-    "EVALUATION_REPORT_JOB" -> prepare(
-        "UPDATE evaluation_report_jobs SET status='FAILED',stage='FAILED',failure_code='GAP_SCOPE_UNATTRIBUTED'," +
-            "failure_message='Population scope is unattributed.',updated_at=? " +
-            "WHERE job_id=?::uuid AND status IN ('REQUESTED','RUNNING')",
-    ).use { statement ->
-        statement.setLong(1, now.toEpochMilli()); statement.setString(2, owner.entityId); statement.executeUpdate()
-    }
-    else -> error("Unsupported terminalizable unattributed population: ${owner.entityType}")
-}
 
-private fun JdbcTransaction.completeUnattributedAttachments(owner: UnattributedOwner, result: String, now: Instant) {
+private fun JdbcTransaction.completeUnattributedAttachments(
+    owner: UnattributedOwner,
+    result: String,
+    now: Instant,
+) {
     val workIds = prepare(
         "UPDATE gap_population_unattributed_containment_works SET consumed_at=?,result=? " +
             "WHERE owner_id=? AND consumed_at IS NULL RETURNING work_id",
     ).use { statement ->
-        statement.setLong(1, now.toEpochMilli()); statement.setString(2, result); statement.setObject(3, owner.ownerId)
+        statement.setLong(1, now.toEpochMilli())
+        statement.setString(2, result)
+        statement.setObject(3, owner.ownerId)
         statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getObject(1, UUID::class.java)) } }
     }
     workIds.forEach { attachedWorkId ->
