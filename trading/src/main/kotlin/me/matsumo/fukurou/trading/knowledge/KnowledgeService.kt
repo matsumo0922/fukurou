@@ -137,7 +137,7 @@ class KnowledgeService(
                 ),
             ).getOrThrow()
             val setupPerformance = setupPerformanceSummaries(
-                trades = tradeResult.trades,
+                trades = tradeResult.strategyEligibleTrades,
                 queryTags = emptyList(),
             )
             val lessons = decisionRecords
@@ -200,7 +200,7 @@ class KnowledgeService(
                 scope = scope,
             ).getOrThrow()
             val setupPerformance = setupPerformanceSummaries(
-                trades = tradeResult.trades,
+                trades = tradeResult.strategyEligibleTrades,
                 queryTags = normalizedTags,
             )
 

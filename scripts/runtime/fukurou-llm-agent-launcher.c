@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <linux/capability.h>
+#include "fukurou-runtime-proxy.h"
 
 #define LLM_UID 10002
 #define APP_UID 10001
@@ -317,9 +318,11 @@ int main(int argc, char **argv, char **envp) {
         clean_env[output++] = "FUKUROU_CANARY_LLM_LAUNCH_FDS=0,1,2";
         clean_env[output] = NULL;
         char *const canary_args[] = {"node", CANARY_CLIENT, argv[2], argv[3], argc == 5 ? argv[4] : NULL, NULL};
-        execve(executable, canary_args, clean_env);
+        _exit(fukurou_supervisor_proxy(FUKUROU_LAUNCH_CANARY, canary_args, clean_env, 3));
     } else {
-        execve(executable, &argv[1], clean_env);
+        enum fukurou_launch_kind kind = strcmp(argv[1], "claude") == 0
+            ? FUKUROU_LAUNCH_CLAUDE : FUKUROU_LAUNCH_CODEX;
+        _exit(fukurou_supervisor_proxy(kind, &argv[1], clean_env, 3));
     }
     fail(strerror(errno));
 }

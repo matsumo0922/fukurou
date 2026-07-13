@@ -1247,6 +1247,7 @@ class TradingPersistenceBootstrap(
                 setLocalPostgresSetting("lock_timeout", previousLockTimeout)
                 setLocalPostgresSetting("statement_timeout", previousStatementTimeout)
                 ensureGapPopulationLifecycleSchema()
+                ensureLaunchFoundationSchema()
                 val now = Instant.now(clock)
 
                 jdbcConnection().prepareStatement(
@@ -1300,6 +1301,40 @@ class TradingPersistenceBootstrap(
                 onStaleLlmRunsRecovered(recoveredCount)
             }
         }
+    }
+
+    private fun org.jetbrains.exposed.v1.jdbc.JdbcTransaction.ensureLaunchFoundationSchema() {
+        exec(
+            """
+                CREATE TABLE IF NOT EXISTS llm_launch_maintenance (
+                    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+                    generation BIGINT NOT NULL,
+                    enabled BOOLEAN NOT NULL,
+                    deployment_id VARCHAR(96),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+                )
+            """.trimIndent(),
+        )
+        exec(
+            """
+                INSERT INTO llm_launch_maintenance(singleton, generation, enabled)
+                VALUES (TRUE, 0, FALSE)
+                ON CONFLICT (singleton) DO NOTHING
+            """.trimIndent(),
+        )
+        exec(
+            """
+                CREATE TABLE IF NOT EXISTS infrastructure_gaps (
+                    id UUID PRIMARY KEY,
+                    deployment_id VARCHAR(96) NOT NULL UNIQUE,
+                    reason VARCHAR(64) NOT NULL,
+                    opened_at TIMESTAMPTZ NOT NULL,
+                    closed_at TIMESTAMPTZ,
+                    payload_hash CHAR(64) NOT NULL,
+                    CHECK (closed_at IS NULL OR closed_at >= opened_at)
+                )
+            """.trimIndent(),
+        )
     }
 
     /**

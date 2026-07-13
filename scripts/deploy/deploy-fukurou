@@ -1,117 +1,422 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+readonly CONTRACT_VERSION=1
 readonly DEPLOY_ROOT="${FUKUROU_DEPLOY_ROOT:-/srv/fukurou}"
 readonly REPO_DIR="${DEPLOY_ROOT}/repo"
 readonly ENV_FILE="${DEPLOY_ROOT}/.env"
+readonly STATE_ROOT="${DEPLOY_ROOT}/deploy-state"
+readonly FENCE_ROOT="${DEPLOY_ROOT}/runtime/launch-fence"
 readonly LOCK_FILE="${FUKUROU_DEPLOY_LOCK:-/var/lock/fukurou-deploy.lock}"
 readonly COMPOSE_FILE="${REPO_DIR}/docker-compose.prod.yml"
 readonly MAIN_REF="${FUKUROU_MAIN_REF:-origin/main}"
 readonly IMAGE_REPOSITORY="ghcr.io/matsumo0922/fukurou"
+readonly PUBLIC_KEY="${FUKUROU_DEPLOY_PUBLIC_KEY:-/usr/local/share/fukurou/deploy-public-key.pem}"
+readonly DB_HELPER="${FUKUROU_DEPLOY_DB_HELPER:-/usr/local/libexec/fukurou-deploy-db}"
+readonly SUPERVISOR_BINARY="/usr/local/libexec/fukurou-runtime-supervisor"
+readonly CANARY_PRIVATE_KEY="${DEPLOY_ROOT}/secrets/llm-launch-ed25519"
+readonly CANARY_PUBLIC_KEY="${DEPLOY_ROOT}/secrets/llm-launch-ed25519.pub"
+readonly CAPABILITY_HASH="84812e517a2d5de63abb713b0846c0a3583f21a6dd22f5d93f9f86fdc4291b6c"
 readonly IMAGE_RETENTION_COUNT="${FUKUROU_IMAGE_RETENTION_COUNT:-10}"
-
-usage() {
-  echo "Usage: deploy-fukurou <40-character commit sha>" >&2
-}
+readonly APPLICATION_UID=10001
+readonly APPLICATION_GID=10001
 
 fail() {
   echo "deploy-fukurou: $*" >&2
-  exit 1
+  return 1
+}
+
+usage() {
+  echo "Usage: deploy-fukurou --bundle <path> --signature <path> <40-character commit sha>" >&2
 }
 
 require_root() {
-  if [[ "$(id -u)" != "0" ]]; then
-    fail "this script must run as root via sudo"
-  fi
+  [[ "$(id -u)" == "0" ]] || fail "this script must run as root via sudo"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command is unavailable: $1"
 }
 
 normalize_sha() {
-  local raw_sha="$1"
+  [[ "$1" =~ ^[0-9a-fA-F]{40}$ ]] || fail "commit sha must be a 40-character hexadecimal string"
+  printf '%s' "$1" | tr 'A-F' 'a-f'
+}
 
-  if [[ ! "${raw_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+parse_arguments() {
+  [[ "${1:-}" == "--bundle" && -n "${2:-}" && "${3:-}" == "--signature" && -n "${4:-}" && -n "${5:-}" && -z "${6:-}" ]] || {
     usage
-    fail "commit sha must be a 40-character hexadecimal string"
+    exit 2
+  }
+  BUNDLE_PATH="$2"
+  SIGNATURE_PATH="$4"
+  DEPLOY_SHA="$(normalize_sha "$5")"
+}
+
+validate_signed_bundle() {
+  [[ -f "${BUNDLE_PATH}" && -f "${SIGNATURE_PATH}" ]] || fail "bundle or signature is missing"
+  [[ -f "${PUBLIC_KEY}" ]] || fail "installed deploy public key is missing"
+  [[ ! -L "${BUNDLE_PATH}" && ! -L "${SIGNATURE_PATH}" ]] || fail "bundle inputs must not be symlinks"
+  [[ "$(stat -c '%s' "${BUNDLE_PATH}")" -le 65536 && "$(stat -c '%s' "${SIGNATURE_PATH}")" -le 1024 ]] || \
+    fail "bundle inputs exceed size limit"
+
+  local bundle_json signature_base64
+  bundle_json="$(cat "${BUNDLE_PATH}"; printf x)"
+  bundle_json="${bundle_json%x}"
+  signature_base64="$(base64 -w 0 "${SIGNATURE_PATH}")"
+
+  openssl pkeyutl -verify -pubin -inkey "${PUBLIC_KEY}" -rawin \
+    -in <(printf '%s' "${bundle_json}") \
+    -sigfile <(printf '%s' "${signature_base64}" | base64 -d) >/dev/null 2>&1 || fail "INVALID_BUNDLE_SIGNATURE"
+
+  local candidate_sha minimum_version capability_hash executor_hash public_key_hash self_hash installed_key_hash
+  candidate_sha="$(jq -er '.candidateSha' <<<"${bundle_json}")"
+  minimum_version="$(jq -er '.minimumContractVersion' <<<"${bundle_json}")"
+  capability_hash="$(jq -er '.capabilityHash' <<<"${bundle_json}")"
+  executor_hash="$(jq -er '.executorSha256' <<<"${bundle_json}")"
+  public_key_hash="$(jq -er '.publicKeySha256' <<<"${bundle_json}")"
+  DEPLOYMENT_ID="$(jq -er '.deploymentId' <<<"${bundle_json}")"
+  CANDIDATE_DIGEST="$(jq -er '.candidateImageDigest' <<<"${bundle_json}")"
+
+  [[ "${candidate_sha}" == "${DEPLOY_SHA}" ]] || fail "BUNDLE_SHA_MISMATCH"
+  [[ "${minimum_version}" == "${CONTRACT_VERSION}" ]] || fail "CONTRACT_VERSION_MISMATCH"
+  [[ "${capability_hash}" == "${CAPABILITY_HASH}" ]] || fail "CAPABILITY_HASH_MISMATCH"
+  [[ "${DEPLOYMENT_ID}" =~ ^[a-zA-Z0-9._-]{1,96}$ ]] || fail "INVALID_DEPLOYMENT_ID"
+  [[ "${CANDIDATE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "INVALID_CANDIDATE_DIGEST"
+
+  self_hash="$(sha256sum "$(readlink -f "$0")" | awk '{print $1}')"
+  installed_key_hash="$(sha256sum "${PUBLIC_KEY}" | awk '{print $1}')"
+  [[ "${executor_hash}" == "${self_hash}" ]] || fail "INSTALLED_EXECUTOR_HASH_MISMATCH"
+  [[ "${public_key_hash}" == "${installed_key_hash}" ]] || fail "INSTALLED_PUBLIC_KEY_HASH_MISMATCH"
+
+  jq -e --arg hash "${CAPABILITY_HASH}" '
+    .minimumContractVersion == 1 and
+    .capabilityHash == $hash and
+    (.requiredCapabilities | sort) == ([
+      "CREATE_DIR_V1", "DB_MAINTENANCE_V1", "DB_MIGRATION_V1",
+      "INSTALL_SECRET_REF_V1", "RUN_COMPOSE_PROJECT_V1", "SMOKE_HOOK_V1"
+    ] | sort) and
+    (.requiredHooks | sort) == ["FOUNDATION_PREFLIGHT_V1"] and
+    (.operations == [
+      {"capability":"CREATE_DIR_V1","operationId":"LAUNCH_FENCE_ROOT"},
+      {"capability":"INSTALL_SECRET_REF_V1","operationId":"LLM_LAUNCH_SIGNING_KEY_V1"},
+      {"capability":"DB_MIGRATION_V1","operationId":"INSTALL_FOUNDATION_V1"},
+      {"capability":"DB_MAINTENANCE_V1","operationId":"SET_LAUNCH_MAINTENANCE"},
+      {"capability":"DB_MAINTENANCE_V1","operationId":"OPEN_INFRASTRUCTURE_GAP"},
+      {"capability":"SMOKE_HOOK_V1","operationId":"FOUNDATION_PREFLIGHT_V1"},
+      {"capability":"RUN_COMPOSE_PROJECT_V1","operationId":"PRODUCTION"},
+      {"capability":"DB_MAINTENANCE_V1","operationId":"CLOSE_INFRASTRUCTURE_GAP"},
+      {"capability":"DB_MAINTENANCE_V1","operationId":"CLEAR_LAUNCH_MAINTENANCE"}
+    ])
+  ' <<<"${bundle_json}" >/dev/null || fail "INVALID_TYPED_OPERATION_SET"
+}
+
+require_initial_state() {
+  [[ -d "${REPO_DIR}/.git" ]] || fail "repository checkout is missing"
+  [[ -f "${ENV_FILE}" ]] || fail "production environment file is missing"
+  [[ -d "${STATE_ROOT}" ]] || fail "deploy state root must be provisioned before executor installation"
+  [[ -x "${DB_HELPER}" ]] || fail "installed DB helper is missing"
+}
+
+capture_rollback_state() {
+  local state_dir="${STATE_ROOT}/${DEPLOYMENT_ID}"
+  local temporary_dir="${STATE_ROOT}/.${DEPLOYMENT_ID}.tmp.$$"
+  [[ ! -e "${state_dir}" && ! -e "${temporary_dir}" ]] || fail "deployment state already exists"
+
+  install -d -o root -g root -m 0700 "${temporary_dir}"
+
+  local previous_sha image_digest compose_hash runtime_snapshot
+  previous_sha="$(git -C "${REPO_DIR}" rev-parse HEAD)"
+  image_digest="$(docker inspect --format '{{index .RepoDigests 0}}' fukurou-ktor 2>/dev/null || true)"
+  compose_hash="$(sha256sum "${COMPOSE_FILE}" | awk '{print $1}')"
+  runtime_snapshot="$(${DB_HELPER} snapshot)"
+  IFS='|' read -r RUNTIME_CONFIG_VERSION RUNTIME_CONFIG_HASH PREFILTER_ACTIVE FENCE_GENERATION MAINTENANCE_ACTIVE <<<"${runtime_snapshot}"
+  TARGET_GENERATION="$((FENCE_GENERATION + 1))"
+  PREVIOUS_REPO_SHA="${previous_sha}"
+  PREVIOUS_IMAGE_DIGEST="${image_digest}"
+  DEPLOY_OPENED_AT="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+  GAP_PAYLOAD_HASH="$(printf '%s|%s|OPEN_INFRASTRUCTURE_GAP' "${DEPLOYMENT_ID}" "${DEPLOY_OPENED_AT}" | sha256sum | awk '{print $1}')"
+
+  install -o root -g root -m 0600 "${COMPOSE_FILE}" "${temporary_dir}/docker-compose.prod.yml"
+  jq -n \
+    --arg deploymentId "${DEPLOYMENT_ID}" \
+    --arg capturedAt "${DEPLOY_OPENED_AT}" \
+    --arg previousRepoSha "${previous_sha}" \
+    --arg composeSourceCommit "${previous_sha}" \
+    --arg composeSha256 "${compose_hash}" \
+    --arg imageDigest "${image_digest}" \
+    --arg runtimeConfigVersion "${RUNTIME_CONFIG_VERSION}" \
+    --arg runtimeConfigHash "${RUNTIME_CONFIG_HASH}" \
+    --arg preFilterActive "${PREFILTER_ACTIVE}" \
+    --arg generation "${FENCE_GENERATION}" \
+    --arg maintenanceActive "${MAINTENANCE_ACTIVE}" \
+    '{deploymentId:$deploymentId,capturedAt:$capturedAt,previousRepoSha:$previousRepoSha,
+      composeSourceCommit:$composeSourceCommit,composeSources:{"docker-compose.prod.yml":$composeSha256},
+      runningImageRepoDigest:$imageDigest,runtimeConfigVersion:$runtimeConfigVersion,
+      runtimeConfigHash:$runtimeConfigHash,preFilterActive:$preFilterActive,
+      launchFenceGeneration:$generation,launchMaintenanceActive:$maintenanceActive}' \
+    > "${temporary_dir}/state.json"
+  chmod 0600 "${temporary_dir}/state.json"
+
+  sync -f "${temporary_dir}/docker-compose.prod.yml"
+  sync -f "${temporary_dir}/state.json"
+  mv "${temporary_dir}" "${state_dir}"
+  sync -f "${STATE_ROOT}"
+  ROLLBACK_STATE_DIR="${state_dir}"
+}
+
+rollback_on_error() {
+  local exit_code="$?"
+  trap - ERR
+  echo "deploy-fukurou: deployment failed; restoring captured state" >&2
+
+  local current_snapshot current_version
+  current_snapshot="$(${DB_HELPER} snapshot 2>/dev/null || true)"
+  IFS='|' read -r current_version _ <<<"${current_snapshot}"
+  if [[ -n "${RUNTIME_CONFIG_VERSION:-}" && "${current_version}" != "${RUNTIME_CONFIG_VERSION}" ]]; then
+    echo "deploy-fukurou: RUNTIME_CONFIG_CAS_MISMATCH; maintenance remains closed" >&2
+    exit "${exit_code}"
   fi
 
-  printf '%s' "${raw_sha}" | tr 'A-F' 'a-f'
+  git -C "${REPO_DIR}" checkout --detach "${PREVIOUS_REPO_SHA}" >/dev/null 2>&1 || true
+  if [[ "${PREVIOUS_IMAGE_DIGEST}" == *"@sha256:"* ]]; then
+    docker pull "${PREVIOUS_IMAGE_DIGEST}" >/dev/null 2>&1 || true
+    docker tag "${PREVIOUS_IMAGE_DIGEST}" "${IMAGE_REPOSITORY}:${PREVIOUS_REPO_SHA}" >/dev/null 2>&1 || true
+  fi
+  export FUKUROU_IMAGE_TAG="${PREVIOUS_REPO_SHA}"
+  docker compose --env-file "${ENV_FILE}" -f "${ROLLBACK_STATE_DIR}/docker-compose.prod.yml" up -d >/dev/null 2>&1 || true
+
+  local closed_at
+  closed_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+  "${DB_HELPER}" close-gap "${DEPLOYMENT_ID}" "${closed_at}" "${GAP_PAYLOAD_HASH}" >/dev/null 2>&1 || true
+  "${DB_HELPER}" clear-maintenance "${DEPLOYMENT_ID}" "${TARGET_GENERATION}" >/dev/null 2>&1 || true
+  request_supervisor ENABLE "${TARGET_GENERATION}" >/dev/null 2>&1 || true
+  exit "${exit_code}"
 }
 
-require_initial_paths() {
-  [[ -d "${REPO_DIR}/.git" ]] || fail "${REPO_DIR} is not a Git checkout"
-  [[ -f "${ENV_FILE}" ]] || fail "${ENV_FILE} is missing"
+provision_fence_root() {
+  if [[ -e "${FENCE_ROOT}" ]]; then
+    [[ -d "${FENCE_ROOT}" && ! -L "${FENCE_ROOT}" ]] || fail "invalid launch fence root"
+  else
+    install -d -o root -g root -m 0700 "${FENCE_ROOT}"
+    sync -f "$(dirname "${FENCE_ROOT}")"
+  fi
+  chown root:root "${FENCE_ROOT}"
+  chmod 0700 "${FENCE_ROOT}"
 }
 
-require_compose_file() {
-  [[ -f "${COMPOSE_FILE}" ]] || fail "${COMPOSE_FILE} is missing"
+provision_named_secret() {
+  install -d -o root -g root -m 0700 "$(dirname "${CANARY_PRIVATE_KEY}")"
+  if [[ ! -e "${CANARY_PRIVATE_KEY}" ]]; then
+    local temporary_key="${CANARY_PRIVATE_KEY}.tmp.$$"
+    openssl genpkey -algorithm ED25519 -out "${temporary_key}"
+    chown "${APPLICATION_UID}:${APPLICATION_GID}" "${temporary_key}"
+    chmod 0400 "${temporary_key}"
+    sync -f "${temporary_key}"
+    mv "${temporary_key}" "${CANARY_PRIVATE_KEY}"
+    sync -f "$(dirname "${CANARY_PRIVATE_KEY}")"
+  fi
+  [[ -f "${CANARY_PRIVATE_KEY}" && ! -L "${CANARY_PRIVATE_KEY}" ]] || fail "invalid named signing secret"
+  [[ "$(stat -c '%u:%g:%a' "${CANARY_PRIVATE_KEY}")" == "${APPLICATION_UID}:${APPLICATION_GID}:400" ]] || \
+    fail "invalid signing secret metadata"
+
+  local temporary_public="${CANARY_PUBLIC_KEY}.tmp.$$"
+  openssl pkey -in "${CANARY_PRIVATE_KEY}" -pubout -out "${temporary_public}"
+  chown root:root "${temporary_public}"
+  chmod 0444 "${temporary_public}"
+  sync -f "${temporary_public}"
+  mv "${temporary_public}" "${CANARY_PUBLIC_KEY}"
+  sync -f "$(dirname "${CANARY_PUBLIC_KEY}")"
+}
+
+request_supervisor() {
+  local operation="$1" generation="$2"
+  timeout 30 docker exec --user 0 fukurou-ktor "${SUPERVISOR_BINARY}" --control "${operation}" "${generation}" \
+    | grep -Fx "ACK ${operation} ${generation}"
+}
+
+disable_launches() {
+  if ! request_supervisor DISABLE "${TARGET_GENERATION}"; then
+    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop -t 30 ktor
+    local container_running container_pid
+    container_running="$(docker inspect --format '{{.State.Running}}' fukurou-ktor 2>/dev/null || printf 'false')"
+    container_pid="$(docker inspect --format '{{.State.Pid}}' fukurou-ktor 2>/dev/null || printf '0')"
+    [[ "${container_running}" == "false" && "${container_pid}" == "0" ]] || fail "PID_ZERO_FALLBACK_FAILED"
+    printf 'version=1\ngeneration=%s\nstate=DISABLED_PENDING_DB\n' "${TARGET_GENERATION}" \
+      > "${FENCE_ROOT}/.fence.tmp.$$"
+    sync -f "${FENCE_ROOT}/.fence.tmp.$$"
+    mv "${FENCE_ROOT}/.fence.tmp.$$" "${FENCE_ROOT}/fence-v1"
+    chmod 0600 "${FENCE_ROOT}/fence-v1"
+    sync -f "${FENCE_ROOT}"
+  fi
+
+  "${DB_HELPER}" install-foundation
+  "${DB_HELPER}" set-maintenance "${DEPLOYMENT_ID}" "${TARGET_GENERATION}"
+  if ! request_supervisor COMMIT "${TARGET_GENERATION}"; then
+    printf 'version=1\ngeneration=%s\nstate=DISABLED_COMMITTED\n' "${TARGET_GENERATION}" \
+      > "${FENCE_ROOT}/.fence.tmp.$$"
+    sync -f "${FENCE_ROOT}/.fence.tmp.$$"
+    mv "${FENCE_ROOT}/.fence.tmp.$$" "${FENCE_ROOT}/fence-v1"
+    chmod 0600 "${FENCE_ROOT}/fence-v1"
+    sync -f "${FENCE_ROOT}"
+  fi
+  "${DB_HELPER}" open-gap "${DEPLOYMENT_ID}" "${DEPLOY_OPENED_AT}" "${GAP_PAYLOAD_HASH}"
+}
+
+drain_launches() {
+  local natural_deadline=$((SECONDS + 30))
+  local absolute_deadline=$((SECONDS + 120))
+  while (( SECONDS < natural_deadline )); do
+    local child_count reservation_count
+    child_count="$(docker top fukurou-ktor -eo uid= 2>/dev/null | awk '$1 == "10002" || $1 == "10003" { count++ } END { print count + 0 }' || true)"
+    reservation_count="$("${DB_HELPER}" active-launch-count)"
+    [[ "${child_count:-0}" == "0" && "${reservation_count:-0}" == "0" ]] && return 0
+    sleep 5
+  done
+
+  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop -t 30 ktor
+  local container_running container_pid
+  container_running="$(docker inspect --format '{{.State.Running}}' fukurou-ktor 2>/dev/null || printf 'false')"
+  container_pid="$(docker inspect --format '{{.State.Pid}}' fukurou-ktor 2>/dev/null || printf '0')"
+  [[ "${container_running}" == "false" && "${container_pid}" == "0" ]] || fail "DRAIN_PID_ZERO_FAILED"
+  "${DB_HELPER}" interrupt-active-launches "${DEPLOYMENT_ID}"
+
+  while (( SECONDS < absolute_deadline )); do
+    [[ "$("${DB_HELPER}" active-launch-count)" == "0" ]] && return 0
+    sleep 5
+  done
+  fail "LLM_DRAIN_TIMEOUT"
+}
+
+run_candidate_preflight() {
+  docker pull "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" >/dev/null
+  local resolved_digest
+  resolved_digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}")"
+  [[ "${resolved_digest}" == "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" ]] || fail "CANDIDATE_DIGEST_MISMATCH"
+
+  local token="${ROLLBACK_STATE_DIR}/canary-token.json"
+  local signature="${ROLLBACK_STATE_DIR}/canary-token.sig"
+  local audit="${ROLLBACK_STATE_DIR}/canary-audit.json"
+  local nonce issued_at expires_at
+  nonce="$(openssl rand -hex 32)"
+  issued_at="$(date +%s)"
+  expires_at="$((issued_at + 900))"
+  jq -cS -n \
+    --arg namespaceId "canary-${DEPLOYMENT_ID}" \
+    --arg candidateSha "${DEPLOY_SHA}" \
+    --arg candidateDigest "${CANDIDATE_DIGEST}" \
+    --arg contractHash "${CAPABILITY_HASH}" \
+    --arg nonce "${nonce}" \
+    --argjson generation "${TARGET_GENERATION}" \
+    --argjson issuedAt "${issued_at}" \
+    --argjson expiresAt "${expires_at}" \
+    '{profile:"CANARY_ONLY",namespaceId:$namespaceId,generation:$generation,
+      allowedHookIds:["FOUNDATION_PREFLIGHT_V1"],candidateSha:$candidateSha,
+      candidateDigest:$candidateDigest,contractHash:$contractHash,nonce:$nonce,
+      issuedAt:$issuedAt,expiresAt:$expiresAt}' > "${token}"
+  chown "${APPLICATION_UID}:${APPLICATION_GID}" "${token}"
+  chmod 0400 "${token}"
+  openssl pkeyutl -sign -rawin -inkey "${CANARY_PRIVATE_KEY}" -in "${token}" -out "${signature}"
+  chown "${APPLICATION_UID}:${APPLICATION_GID}" "${signature}"
+  chmod 0400 "${signature}"
+  local token_hash
+  token_hash="$(sha256sum "${token}" | awk '{print $1}')"
+  jq -n --arg tokenHash "${token_hash}" --argjson issuedAt "${issued_at}" \
+    '{tokenHash:$tokenHash,issuedAt:$issuedAt,consumedAt:null,result:null,revokedAt:null}' > "${audit}"
+  chmod 0600 "${audit}"
+
+  local consumed_at
+  consumed_at="$(date +%s)"
+  jq --argjson consumedAt "${consumed_at}" '.consumedAt=$consumedAt' "${audit}" > "${audit}.tmp"
+  chmod 0600 "${audit}.tmp"
+  sync -f "${audit}.tmp"
+  mv "${audit}.tmp" "${audit}"
+  sync -f "${ROLLBACK_STATE_DIR}"
+
+  local result="failure"
+  if docker run --rm --read-only --network none --cap-drop ALL --pids-limit 64 \
+    --cap-add SETGID --cap-add SETUID \
+    --env "FUKUROU_CANDIDATE_DIGEST=${CANDIDATE_DIGEST}" \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
+    --mount "type=bind,source=${token},target=/canary-token.json,readonly" \
+    --mount "type=bind,source=${signature},target=/canary-token.sig,readonly" \
+    --mount "type=bind,source=${CANARY_PUBLIC_KEY},target=/canary-public.pem,readonly" \
+    "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" \
+    --canary-preflight \
+    foundation /canary-token.json /canary-token.sig /canary-public.pem; then
+    result="success"
+  fi
+  local completed_at
+  completed_at="$(date +%s)"
+  jq --arg result "${result}" --argjson completedAt "${completed_at}" \
+    '.result=$result | .revokedAt=$completedAt' "${audit}" > "${audit}.tmp"
+  chmod 0600 "${audit}.tmp"
+  sync -f "${audit}.tmp"
+  mv "${audit}.tmp" "${audit}"
+  sync -f "${ROLLBACK_STATE_DIR}"
+  rm -f "${token}" "${signature}"
+  [[ "${result}" == "success" ]] || fail "FOUNDATION_PREFLIGHT_FAILED"
 }
 
 checkout_deploy_sha() {
-  local deploy_sha="$1"
-
   git -C "${REPO_DIR}" fetch --prune origin +refs/heads/main:refs/remotes/origin/main
-  git -C "${REPO_DIR}" cat-file -e "${deploy_sha}^{commit}"
-
-  if ! git -C "${REPO_DIR}" merge-base --is-ancestor "${deploy_sha}" "${MAIN_REF}"; then
-    fail "${deploy_sha} is not reachable from ${MAIN_REF}"
-  fi
-
-  git -C "${REPO_DIR}" cat-file -e "${deploy_sha}:docker-compose.prod.yml" ||
-    fail "${deploy_sha} does not contain docker-compose.prod.yml"
-
-  git -C "${REPO_DIR}" checkout --detach "${deploy_sha}"
-  require_compose_file
+  git -C "${REPO_DIR}" cat-file -e "${DEPLOY_SHA}^{commit}"
+  git -C "${REPO_DIR}" merge-base --is-ancestor "${DEPLOY_SHA}" "${MAIN_REF}" || fail "candidate is not on main"
+  git -C "${REPO_DIR}" checkout --detach "${DEPLOY_SHA}"
 }
 
 deploy_compose() {
-  local deploy_sha="$1"
-
-  export FUKUROU_IMAGE_TAG="${deploy_sha}"
-
+  export FUKUROU_IMAGE_TAG="${DEPLOY_SHA}"
   docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" pull
   docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
+}
+
+resume_launches() {
+  local closed_at close_hash
+  closed_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+  close_hash="${GAP_PAYLOAD_HASH}"
+  "${DB_HELPER}" close-gap "${DEPLOYMENT_ID}" "${closed_at}" "${close_hash}"
+  "${DB_HELPER}" clear-maintenance "${DEPLOYMENT_ID}" "${TARGET_GENERATION}"
+  request_supervisor ENABLE "${TARGET_GENERATION}" || fail "ENABLE_ACK_FAILED"
 }
 
 prune_old_images() {
   local running_image_id
   running_image_id="$(docker inspect --format '{{.Image}}' fukurou-ktor 2>/dev/null || true)"
-
-  local -a image_ids
-  # CreatedAt 降順で列挙し、同一 digest（:main と :<sha> が同じ image を指す行）を除去する。
-  # --no-trunc でフル ID にし、docker inspect の {{.Image}} と同じ形式（sha256:<64hex>）に揃える。
-  mapfile -t image_ids < <(
-    docker images "${IMAGE_REPOSITORY}" --no-trunc --format '{{.CreatedAt}}|{{.ID}}' \
-      | sort -r \
-      | awk -F'|' '!seen[$2]++ { print $2 }'
-  )
-
-  local index=0
-  local image_id
+  mapfile -t image_ids < <(docker images "${IMAGE_REPOSITORY}" --no-trunc --format '{{.CreatedAt}}|{{.ID}}' | sort -r | awk -F'|' '!seen[$2]++ { print $2 }')
+  local index=0 image_id
   for image_id in "${image_ids[@]}"; do
     index=$((index + 1))
-    [[ "${index}" -le "${IMAGE_RETENTION_COUNT}" ]] && continue
-    [[ "${image_id}" == "${running_image_id}" ]] && continue
-
-    if ! docker rmi "${image_id}" >/dev/null 2>&1; then
-      echo "deploy-fukurou: skip pruning image ${image_id} (in use or already removed)" >&2
-    fi
+    [[ "${index}" -le "${IMAGE_RETENTION_COUNT}" || "${image_id}" == "${running_image_id}" ]] && continue
+    docker rmi "${image_id}" >/dev/null 2>&1 || true
   done
 }
 
 main() {
-  require_root
-
-  local deploy_sha
-  deploy_sha="$(normalize_sha "${1:-}")"
-
-  require_initial_paths
-
-  exec 9>"${LOCK_FILE}"
-  if ! flock -n 9; then
-    fail "another deployment is already running"
+  if [[ "${1:-}" == "--print-contract-version" && -z "${2:-}" ]]; then
+    printf '%s\n' "${CONTRACT_VERSION}"
+    exit 0
   fi
 
-  checkout_deploy_sha "${deploy_sha}"
-  deploy_compose "${deploy_sha}"
+  require_root
+  for command in base64 cat docker flock git jq openssl sha256sum sync timeout; do require_command "${command}"; done
+  parse_arguments "$@"
+  validate_signed_bundle
+  require_initial_state
+
+  exec 9>"${LOCK_FILE}"
+  flock -n 9 || fail "another deployment is already running"
+
+  capture_rollback_state
+  trap rollback_on_error ERR
+  provision_fence_root
+  provision_named_secret
+  disable_launches
+  drain_launches
+  run_candidate_preflight
+  checkout_deploy_sha
+  deploy_compose
+  resume_launches
   prune_old_images
 }
 

@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.evaluation.EvaluationEpochOption
 import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
 import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionStatus
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
+import me.matsumo.fukurou.trading.evaluation.EvaluationInfrastructureGap
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationReportSnapshotFacts
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
@@ -170,7 +171,14 @@ private const val SELECT_CLOSED_TRADE_FACTS_SQL = """
         el.account_epoch_id,
         el.cohort,
         el.execution_semantics_version,
-        CASE WHEN d.id IS NULL THEN 'MISSING' ELSE 'ATTRIBUTED' END AS attribution_status
+        CASE WHEN d.id IS NULL THEN 'MISSING' ELSE 'ATTRIBUTED' END AS attribution_status,
+        ARRAY(
+            SELECT gap.id::text
+            FROM infrastructure_gaps gap
+            WHERE to_timestamp(p.opened_at / 1000.0) < COALESCE(gap.closed_at, clock_timestamp())
+                AND gap.opened_at < to_timestamp(p.closed_at / 1000.0)
+            ORDER BY gap.opened_at, gap.id
+        ) AS infrastructure_gap_ids
     FROM closed_positions p
     JOIN scoped_positions scoped ON scoped.id = p.id
     LEFT JOIN entry_orders eo ON eo.position_id = p.id
@@ -523,7 +531,7 @@ class ExposedEvaluationRepository(
 
                     EvaluationReportSnapshotFacts(
                         trades = trades,
-                        dailyPnl = trades.trades.map { trade ->
+                        dailyPnl = trades.strategyEligibleTrades.map { trade ->
                             DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
                         },
                         priorPnlJpy = sumScopedTradePnlBefore(period.from, scope),
@@ -762,6 +770,21 @@ private fun JdbcTransaction.selectCurrentPaperAccountEpochId(): UUID {
 }
 
 private fun JdbcTransaction.selectEvaluationExclusionSummary(period: EvaluationPeriod): EvaluationExclusionSummary {
+    val existingSummary = selectExistingEvaluationExclusionSummary(period)
+    val infrastructureGaps = selectInfrastructureGaps(period)
+    val affectedCounts = selectInfrastructureAffectedCounts(period)
+
+    return existingSummary.copy(
+        infrastructureGaps = infrastructureGaps,
+        infrastructureAffectedTradeCount = affectedCounts.first,
+        infrastructureAttributionMissingCount = affectedCounts.second,
+        reasons = existingSummary.reasons + mapOf("INFRASTRUCTURE_GAP" to affectedCounts.first),
+    )
+}
+
+private fun JdbcTransaction.selectExistingEvaluationExclusionSummary(
+    period: EvaluationPeriod,
+): EvaluationExclusionSummary {
     return prepare(
         """
             SELECT entity_type, reason, COUNT(DISTINCT entity_id) AS entity_count
@@ -773,6 +796,64 @@ private fun JdbcTransaction.selectEvaluationExclusionSummary(period: EvaluationP
         statement.setLong(1, period.from.toEpochMilli())
         statement.setLong(2, period.toExclusive.toEpochMilli())
         statement.executeQuery().use(ResultSet::toEvaluationExclusionSummary)
+    }
+}
+
+private fun JdbcTransaction.selectInfrastructureGaps(period: EvaluationPeriod): List<EvaluationInfrastructureGap> {
+    return prepare(
+        """
+            SELECT id, reason, opened_at, closed_at
+            FROM infrastructure_gaps
+            WHERE opened_at < to_timestamp(? / 1000.0)
+                AND COALESCE(closed_at, clock_timestamp()) > to_timestamp(? / 1000.0)
+            ORDER BY opened_at, id
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setLong(1, period.toExclusive.toEpochMilli())
+        statement.setLong(2, period.from.toEpochMilli())
+        statement.executeQuery().use { result ->
+            buildList {
+                while (result.next()) {
+                    add(
+                        EvaluationInfrastructureGap(
+                            id = result.getString("id"),
+                            reason = result.getString("reason"),
+                            startedAt = result.getTimestamp("opened_at").toInstant(),
+                            endedAt = result.getTimestamp("closed_at")?.toInstant(),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectInfrastructureAffectedCounts(period: EvaluationPeriod): Pair<Int, Int> {
+    return prepare(
+        """
+            SELECT
+                COUNT(DISTINCT p.id) AS affected_count,
+                COUNT(DISTINCT p.id) FILTER (WHERE d.id IS NULL) AS attribution_missing_count
+            FROM positions p
+            LEFT JOIN executions e ON e.position_id = p.id AND e.side = 'BUY'
+            LEFT JOIN orders o ON o.id = e.order_id
+            LEFT JOIN trade_intents ti ON ti.id = o.intent_id
+            LEFT JOIN decisions d ON d.id = ti.decision_id
+            WHERE p.status = 'CLOSED'
+                AND p.closed_at >= ? AND p.closed_at < ?
+                AND EXISTS (
+                    SELECT 1 FROM infrastructure_gaps gap
+                    WHERE to_timestamp(p.opened_at / 1000.0) < COALESCE(gap.closed_at, clock_timestamp())
+                        AND gap.opened_at < to_timestamp(p.closed_at / 1000.0)
+                )
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setLong(1, period.from.toEpochMilli())
+        statement.setLong(2, period.toExclusive.toEpochMilli())
+        statement.executeQuery().use { result ->
+            check(result.next())
+            result.getInt("affected_count") to result.getInt("attribution_missing_count")
+        }
     }
 }
 
@@ -830,10 +911,12 @@ private fun JdbcTransaction.selectClosedTrades(
                 truncated = truncated,
                 attributionCoverage = EvaluationAttributionCoverage(
                     attributed = page.count { trade ->
-                        trade.attributionStatus == EvaluationAttributionStatus.ATTRIBUTED
+                        trade.attributionStatus == EvaluationAttributionStatus.ATTRIBUTED &&
+                            trade.infrastructureGapIds.isEmpty()
                     },
                     missing = page.count { trade ->
-                        trade.attributionStatus == EvaluationAttributionStatus.MISSING
+                        trade.attributionStatus == EvaluationAttributionStatus.MISSING ||
+                            trade.infrastructureGapIds.isNotEmpty()
                     },
                     total = page.size,
                 ),
@@ -1077,6 +1160,9 @@ private fun ResultSet.toClosedTradeFact(): ClosedTradeFact {
         cohort = EvaluationCohort.valueOf(getString("cohort") ?: EvaluationCohort.LEGACY_PRE_WS.name),
         executionSemanticsVersion = getNullableString("execution_semantics_version"),
         attributionStatus = EvaluationAttributionStatus.valueOf(getString("attribution_status")),
+        infrastructureGapIds = getArray("infrastructure_gap_ids")
+            .array
+            .let { values -> (values as Array<*>).filterIsInstance<String>().toSet() },
     )
 }
 

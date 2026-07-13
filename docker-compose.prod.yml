@@ -9,9 +9,7 @@ services:
     image: ghcr.io/matsumo0922/fukurou:${FUKUROU_IMAGE_TAG:?FUKUROU_IMAGE_TAG is required}
     container_name: fukurou-ktor
     restart: unless-stopped
-    user: "10001:10004"
     read_only: true
-    init: true
     pids_limit: 512
     cap_drop:
       - ALL
@@ -25,6 +23,7 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,mode=1777
       - /run/fukurou/llm-homes:rw,noexec,nosuid,nodev,mode=2750,uid=10001,gid=10004
       - /run/fukurou/mcp-manifests:rw,noexec,nosuid,nodev,mode=0700,uid=10001,gid=10004
+      - /run/fukurou/control:rw,noexec,nosuid,nodev,mode=0711,uid=0,gid=0
     environment:
       DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
       DB_USER: ${POSTGRES_USER}
@@ -58,6 +57,9 @@ services:
       - type: bind
         source: ${FUKUROU_OBSIDIAN_VAULT_PATH_HOST:-/srv/fukurou/obsidian-vault}
         target: /vault
+      - type: bind
+        source: ${FUKUROU_LAUNCH_FENCE_ROOT_HOST:-/srv/fukurou/runtime/launch-fence}
+        target: /var/lib/fukurou/launch-fence
     networks:
       - edge
       - data

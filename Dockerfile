@@ -35,8 +35,10 @@ FROM debian:bookworm-slim AS launcher-build
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY scripts/runtime/*.c ./
+COPY scripts/runtime/*.h ./
 RUN gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-llm-agent-launcher fukurou-llm-agent-launcher.c \
-    && gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-mcp-launcher fukurou-mcp-launcher.c
+    && gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-mcp-launcher fukurou-mcp-launcher.c \
+    && gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-runtime-supervisor fukurou-runtime-supervisor.c
 
 # ---- runtime stage: 実行は軽量 JRE のみ ----
 FROM eclipse-temurin:21-jre AS runtime
@@ -56,10 +58,13 @@ RUN apt-get update \
     && useradd --system --uid 10003 --gid 10003 mcp-runtime \
     && install -d -o appuser -g llm-runtime -m 2750 /run/fukurou/llm-homes \
     && install -d -o appuser -g llm-runtime -m 0700 /run/fukurou/mcp-manifests \
+    && install -d -o root -g root -m 0711 /run/fukurou/control \
+    && install -d -o root -g root -m 0700 /var/lib/fukurou/launch-fence \
     && install -d -o root -g root -m 0700 /run/secrets
 
 COPY --from=launcher-build --chown=root:root --chmod=4755 /src/fukurou-llm-agent-launcher /usr/local/libexec/fukurou-llm-agent-launcher
 COPY --from=launcher-build --chown=root:root --chmod=4755 /src/fukurou-mcp-launcher /usr/local/libexec/fukurou-mcp-launcher
+COPY --from=launcher-build --chown=root:root --chmod=0555 /src/fukurou-runtime-supervisor /usr/local/libexec/fukurou-runtime-supervisor
 COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-mcp-canary-client.mjs /usr/local/libexec/fukurou-mcp-canary-client.mjs
 COPY --chown=root:root --chmod=0555 scripts/runtime/validate-llm-launcher-probe.mjs /usr/local/libexec/validate-llm-launcher-probe.mjs
 
@@ -73,8 +78,6 @@ COPY --from=build /src/mcp-gmo-coin/build/libs/gmo-coin-mcp-all.jar gmo-coin-mcp
 COPY prompts ./prompts
 # Vite SPA の production build output を Ktor から配信する。
 COPY --from=web-build /src/web/dist ./web
-USER appuser
-
 # ARG は実際に参照する ENV の直前で宣言し、commit SHA だけが変わる build で
 # 上記の重い RUN / COPY layer のキャッシュを壊さないようにする。
 ARG FUKUROU_REVISION=unknown
@@ -84,4 +87,4 @@ ENV FUKUROU_REVISION=$FUKUROU_REVISION
 ENV FUKUROU_WEB_ROOT=/app/web
 ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Djava.io.tmpdir=/run/fukurou/llm-homes -Dfukurou.llm.cleanupQuarantinePath=/run/fukurou/llm-homes/.cleanup-quarantine"
 EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "app.jar"]
+ENTRYPOINT ["/usr/local/libexec/fukurou-runtime-supervisor"]

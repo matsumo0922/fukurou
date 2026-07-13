@@ -17,6 +17,7 @@
 #include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include "fukurou-runtime-proxy.h"
 
 #define APP_UID 10001
 #define MCP_UID 10003
@@ -198,6 +199,5 @@ int main(int argc, char **argv) {
         NULL
     };
     char *const environment[] = {"PATH=/opt/java/openjdk/bin:/usr/bin:/bin", NULL};
-    execve("/opt/java/openjdk/bin/java", args, environment);
-    fail(strerror(errno));
+    _exit(fukurou_supervisor_proxy(FUKUROU_LAUNCH_MCP, args, environment, 5));
 }

@@ -67,7 +67,9 @@ interface EvaluationRepository {
         val tradeResult = fetchClosedTrades(period, scope = scope).getOrThrow()
         fetchReportSnapshot(period).getOrThrow().copy(
             trades = tradeResult,
-            dailyPnl = tradeResult.trades.map { trade -> DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy) },
+            dailyPnl = tradeResult.strategyEligibleTrades.map { trade ->
+                DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
+            },
             priorPnlJpy = sumTradePnlBefore(period.from, scope).getOrThrow(),
             initialCashJpy = scope.initialCashJpy,
         )

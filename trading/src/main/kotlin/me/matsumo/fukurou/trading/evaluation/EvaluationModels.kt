@@ -51,7 +51,11 @@ data class EvaluationTradeQueryResult(
     val trades: List<ClosedTradeFact>,
     val truncated: Boolean,
     val attributionCoverage: EvaluationAttributionCoverage = EvaluationAttributionCoverage.EMPTY,
-)
+) {
+    /** strategy KPI に含める causal attribution 済みかつ infrastructure gap 非該当 trade。 */
+    val strategyEligibleTrades: List<ClosedTradeFact>
+        get() = EvaluationPopulationFilter.strategyEligibleTrades(trades)
+}
 
 /** execution-based evaluation attribution の coverage。 */
 data class EvaluationAttributionCoverage(
@@ -98,6 +102,17 @@ data class EvaluationExclusionSummary(
     val decisionRunCount: Int = 0,
     val positionCount: Int = 0,
     val reasons: Map<String, Int> = emptyMap(),
+    val infrastructureGaps: List<EvaluationInfrastructureGap> = emptyList(),
+    val infrastructureAffectedTradeCount: Int = 0,
+    val infrastructureAttributionMissingCount: Int = 0,
+)
+
+/** evaluation API に加算する root-owned infrastructure gap。 */
+data class EvaluationInfrastructureGap(
+    val id: String,
+    val reason: String,
+    val startedAt: Instant,
+    val endedAt: Instant?,
 )
 
 /**
@@ -135,6 +150,7 @@ data class ClosedTradeFact(
     val cohort: EvaluationCohort = EvaluationCohort.LEGACY_PRE_WS,
     val executionSemanticsVersion: String? = null,
     val attributionStatus: EvaluationAttributionStatus = EvaluationAttributionStatus.MISSING,
+    val infrastructureGapIds: Set<String> = emptySet(),
 )
 
 /**

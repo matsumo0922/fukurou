@@ -210,6 +210,7 @@ class LlmDaemonScheduler(
         preFilter = runtime.preFilter,
         requestBase = requestBase,
         warnLogger = warnLogger,
+        releaseBarrier = runtime.preFilterReleaseBarrier,
     )
     private val entryFillTrigger = LlmDaemonEntryFillTrigger(
         daemonConfig = daemonConfig,
@@ -1133,6 +1134,7 @@ data class LlmDaemonSchedulerDependencies(
  * @param requestBase one-shot runner に渡す固定 request
  * @param launchOneShot one-shot runner 起動境界
  * @param preFilter heartbeat 系 trigger の full run 要否を判定する pre-filter
+ * @param preFilterReleaseBarrier pre-filter release 判定。production は code-owned barrier を使う
  * @param clock cadence と監査時刻に使う clock
  * @param idGenerator invocation ID generator
  * @param warnLogger tick 失敗の rate-limited warning logger
@@ -1143,6 +1145,7 @@ data class LlmDaemonSchedulerRuntime(
     val preFilter: LlmDaemonPreFilter = LlmDaemonPreFilter {
         Result.success(LlmDaemonPreFilterDecision.RUN_FULL)
     },
+    val preFilterReleaseBarrier: (Boolean) -> Boolean = LlmLaunchReleaseBarrier::isPreFilterAllowed,
     val clock: Clock = Clock.systemUTC(),
     val idGenerator: () -> UUID = { UUID.randomUUID() },
     val warnLogger: RateLimitedWarnLogger = RateLimitedWarnLogger(

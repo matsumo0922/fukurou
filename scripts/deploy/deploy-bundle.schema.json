@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Fukurou signed deploy bundle v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "deploymentId",
+    "candidateSha",
+    "candidateImageDigest",
+    "minimumContractVersion",
+    "requiredCapabilities",
+    "requiredHooks",
+    "capabilityHash",
+    "executorSha256",
+    "publicKeySha256",
+    "operations"
+  ],
+  "properties": {
+    "deploymentId": { "type": "string", "pattern": "^[a-zA-Z0-9._-]{1,96}$" },
+    "candidateSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "candidateImageDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "minimumContractVersion": { "const": 1 },
+    "requiredCapabilities": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "requiredHooks": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "capabilityHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "executorSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "publicKeySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["capability", "operationId"],
+        "properties": {
+          "capability": { "enum": ["CREATE_DIR_V1", "INSTALL_SECRET_REF_V1", "DB_MIGRATION_V1", "DB_MAINTENANCE_V1", "SMOKE_HOOK_V1", "RUN_COMPOSE_PROJECT_V1"] },
+          "operationId": { "type": "string", "pattern": "^[A-Z0-9_]+$" }
+        }
+      }
+    }
+  }
+}

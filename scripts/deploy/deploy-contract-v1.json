@@ -1,0 +1,32 @@
+{
+  "contractVersion": 1,
+  "requiredCapabilities": [
+    "CREATE_DIR_V1",
+    "DB_MAINTENANCE_V1",
+    "DB_MIGRATION_V1",
+    "INSTALL_SECRET_REF_V1",
+    "RUN_COMPOSE_PROJECT_V1",
+    "SMOKE_HOOK_V1"
+  ],
+  "requiredHooks": [
+    "FOUNDATION_PREFLIGHT_V1"
+  ],
+  "capabilityHash": "84812e517a2d5de63abb713b0846c0a3583f21a6dd22f5d93f9f86fdc4291b6c",
+  "createDirectoryIds": [
+    "LAUNCH_FENCE_ROOT"
+  ],
+  "secretReferenceIds": [
+    "LLM_LAUNCH_SIGNING_KEY_V1"
+  ],
+  "databaseOperationIds": [
+    "INSTALL_FOUNDATION_V1",
+    "OPEN_INFRASTRUCTURE_GAP",
+    "CLOSE_INFRASTRUCTURE_GAP",
+    "SET_LAUNCH_MAINTENANCE",
+    "CLEAR_LAUNCH_MAINTENANCE"
+  ],
+  "composeProjectIds": [
+    "PRODUCTION",
+    "CANARY_ONLY"
+  ]
+}
