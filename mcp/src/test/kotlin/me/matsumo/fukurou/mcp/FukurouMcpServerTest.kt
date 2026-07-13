@@ -2252,7 +2252,7 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
                 "SELECT count(*) FROM pg_attribute attribute " +
                     "JOIN pg_class relation ON relation.oid=attribute.attrelid " +
                     "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace " +
-                "CROSS JOIN LATERAL aclexplode(attribute.attacl) acl " +
+                    "CROSS JOIN LATERAL aclexplode(attribute.attacl) acl " +
                     "WHERE namespace.nspname='public' AND acl.grantee IN (0, (SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')) " +
                     "AND attribute.attname IN ('birth_sequence','population_scope_kind','population_mode'," +
                     "'population_symbol','population_account_epoch_id','population_cohort'," +

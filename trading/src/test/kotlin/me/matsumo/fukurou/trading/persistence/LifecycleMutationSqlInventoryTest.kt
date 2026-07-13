@@ -220,7 +220,12 @@ private fun normalizedMutationTuples(source: String): Set<LifecycleMutationTuple
             kind = match.groupValues[1].uppercase().substringBefore(' '),
             population = match.groupValues[2].lowercase(),
         )
-        val statementTail = source.substring(match.range.first, source.indexOf(';', match.range.last).takeIf { it >= 0 } ?: source.length)
+        val statementTail = source.substring(
+            match.range.first,
+            source.indexOf(';', match.range.last).takeIf {
+                it >= 0
+            } ?: source.length,
+        )
         if (mutation.kind == "INSERT" && UPSERT_UPDATE.containsMatchIn(statementTail)) {
             sequenceOf(mutation, mutation.copy(kind = "UPDATE"))
         } else {

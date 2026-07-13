@@ -167,8 +167,12 @@ class EvaluationReportPersistenceTest {
                 config.symbol,
             )
             val admissions = listOf(
-                async(Dispatchers.IO) { persistence.admit(testJob("00000000-0000-0000-0000-000000000001"), "PRESET:30D|EPOCH:$epochId|COHORT:CURRENT").getOrThrow() },
-                async(Dispatchers.IO) { persistence.admit(testJob("00000000-0000-0000-0000-000000000002"), "PRESET:30D|EPOCH:$epochId|COHORT:CURRENT").getOrThrow() },
+                async(Dispatchers.IO) {
+                    persistence.admit(testJob("00000000-0000-0000-0000-000000000001"), "PRESET:30D|EPOCH:$epochId|COHORT:CURRENT").getOrThrow()
+                },
+                async(Dispatchers.IO) {
+                    persistence.admit(testJob("00000000-0000-0000-0000-000000000002"), "PRESET:30D|EPOCH:$epochId|COHORT:CURRENT").getOrThrow()
+                },
             ).awaitAll()
             val first = admissions.single { admission -> admission.reservationOutcome is LlmLaunchReservationOutcome.Reserved }
             val second = admissions.single { admission -> admission.reservationOutcome is LlmLaunchReservationOutcome.Rejected }
@@ -240,12 +244,19 @@ class EvaluationReportPersistenceTest {
 private fun currentReportEpoch(container: ReportPostgresContainer): String {
     return java.sql.DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
         connection.prepareStatement("SELECT current_epoch_id::text FROM paper_account WHERE id=1").use { statement ->
-            statement.executeQuery().use { rows -> check(rows.next()); rows.getString(1) }
+            statement.executeQuery().use { rows ->
+                check(rows.next())
+                rows.getString(1)
+            }
         }
     }
 }
 
-private fun assertReportPublicationCount(container: ReportPostgresContainer, revisions: Int, pins: Int) {
+private fun assertReportPublicationCount(
+    container: ReportPostgresContainer,
+    revisions: Int,
+    pins: Int,
+) {
     java.sql.DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
         connection.createStatement().executeQuery("SELECT COUNT(*) FROM evaluation_report_revisions").use { rows ->
             kotlin.test.assertTrue(rows.next())
