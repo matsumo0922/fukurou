@@ -101,6 +101,9 @@ enum class CommandEventType {
     /** bootstrap が deploy/restart で取り残された LLM invocation を回収した。 */
     LLM_INVOCATION_RECOVERED,
 
+    /** one-shot execution recovery policy と worker 起動を記録した。 */
+    LLM_EXECUTION_RECOVERY_STARTED,
+
     /**
      * CLI auth login process を開始した。
      */

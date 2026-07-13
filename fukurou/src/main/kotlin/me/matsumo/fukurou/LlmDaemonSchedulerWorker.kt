@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou
 
 import com.zaxxer.hikari.HikariDataSource
@@ -25,6 +27,7 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceDependencies
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceRuntime
 import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
@@ -38,7 +41,6 @@ import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
-import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRestingOrderMaintenanceService
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
@@ -320,7 +322,7 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
             commandRenderer = DefaultLlmCommandRenderer(
                 config = commandRendererConfig,
             ),
-            processRunner = ShellProcessRunner(),
+            processRunner = ShellProcessRunner(inputs.tradingConfig.runner.processTerminationGrace),
         ),
         runtimeConfigSnapshot = inputs.runtimeConfigSnapshot,
         parentEnvironment = inputs.environment,
@@ -341,7 +343,7 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         tradingRuntime = tradingRuntime,
         marketDataSource = marketDataSource,
         paperLedgerRepository = paperLedgerRepository,
-        launchReservationRepository = ExposedLlmLaunchReservationRepository(inputs.database),
+        launchReservationRepository = tradingRuntime.launchReservationRepository,
         requestBase = inputs.requestBase.copy(
             proposerAssignment = inputs.tradingConfig.llmRoleAssignments.proposer,
             falsifierAssignment = inputs.tradingConfig.llmRoleAssignments.falsifier,
@@ -367,7 +369,7 @@ private fun createLlmDaemonPreFilter(
                 commandRenderer = DefaultLlmCommandRenderer(
                     config = commandRendererConfig.copy(claudeModel = HAIKU_PRE_FILTER_MODEL),
                 ),
-                processRunner = ShellProcessRunner(),
+                processRunner = ShellProcessRunner(inputs.tradingConfig.runner.processTerminationGrace),
             ),
             invocationAuditor = LlmInvocationAuditor(
                 commandEventLog = tradingRuntime.commandEventLog,
@@ -506,7 +508,7 @@ private data class LlmLaunchRuntimeComponents(
     val tradingRuntime: TradingRuntime,
     val marketDataSource: GmoPublicMarketDataSource,
     val paperLedgerRepository: ExposedPaperLedgerRepository,
-    val launchReservationRepository: ExposedLlmLaunchReservationRepository,
+    val launchReservationRepository: LlmLaunchReservationRepository,
     val requestBase: OneShotRunnerRequest,
     val launchOneShot: suspend (OneShotRunnerRequest) -> Result<OneShotRunnerResult>,
     val preFilter: DefaultLlmDaemonPreFilter,

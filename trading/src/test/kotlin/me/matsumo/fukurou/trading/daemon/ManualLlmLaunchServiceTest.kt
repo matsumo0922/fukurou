@@ -1,3 +1,5 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.daemon
 
 import kotlinx.coroutines.CancellationException
@@ -5,9 +7,11 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import me.matsumo.fukurou.trading.audit.CommandEvent
@@ -20,6 +24,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.evaluation.LlmInvocationTimedOutException
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
+import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
@@ -124,7 +129,7 @@ class ManualLlmLaunchServiceTest {
     fun manualLaunch_usesReservationBudgetAndAuditsSkipWhenDailyCapIsConsumed() = runBlocking {
         val fixture = manualFixture(
             tradingConfig = tradingConfig(
-                runner = LlmRunnerConfig(maxInvocationsPerDay = 1),
+                runner = LlmRunnerConfig(maxInvocationsPerDay = 1, entryFillReservePerDay = 0, stopProximityReservePerDay = 0),
             ),
         )
 
@@ -238,7 +243,29 @@ class ManualLlmLaunchServiceTest {
                 requestBase = defaultRequest(),
                 launchOneShot = { request ->
                     launchRequests += request
-                    Result.success(successfulRunnerResult(request))
+                    val invocationId = requireNotNull(request.invocationId)
+                    val claimantToken = "scheduler-test:$invocationId"
+                    assertIs<LlmExecutionClaimOutcome.Claimed>(
+                        reservations.claimForExecution(
+                            LlmExecutionClaimRequest(
+                                invocationId = invocationId,
+                                triggerKind = requireNotNull(request.triggerKind),
+                                claimantToken = claimantToken,
+                                claimedAt = clock.instant(),
+                            ),
+                        ),
+                    )
+                    val result = successfulRunnerResult(request)
+                    reservations.finish(
+                        LlmLaunchReservationFinish(
+                            invocationId = invocationId,
+                            status = LlmLaunchReservationStatus.FINISHED,
+                            reason = result.terminalCause.name,
+                            finishedAt = clock.instant(),
+                            claimantToken = claimantToken,
+                        ),
+                    ).getOrThrow()
+                    Result.success(result)
                 },
                 clock = clock,
                 idGenerator = idGenerator,
@@ -606,7 +633,44 @@ private fun manualService(
             requestBase = defaultRequest(),
             launchOneShot = { request ->
                 launches += request
-                Result.success(launchHandler(request))
+                val invocationId = requireNotNull(request.invocationId)
+                val triggerKind = requireNotNull(request.triggerKind)
+                val claimantToken = "manual-test:$invocationId"
+                val claim = reservations.claimForExecution(
+                    LlmExecutionClaimRequest(
+                        invocationId = invocationId,
+                        triggerKind = triggerKind,
+                        claimantToken = claimantToken,
+                        claimedAt = clock.instant(),
+                    ),
+                )
+                assertIs<LlmExecutionClaimOutcome.Claimed>(claim)
+                try {
+                    val result = launchHandler(request)
+                    reservations.finish(
+                        LlmLaunchReservationFinish(
+                            invocationId = invocationId,
+                            status = LlmLaunchReservationStatus.FINISHED,
+                            reason = result.terminalCause.name,
+                            finishedAt = clock.instant(),
+                            claimantToken = claimantToken,
+                        ),
+                    ).getOrThrow()
+                    Result.success(result)
+                } catch (throwable: Throwable) {
+                    withContext(NonCancellable) {
+                        reservations.finish(
+                            LlmLaunchReservationFinish(
+                                invocationId = invocationId,
+                                status = LlmLaunchReservationStatus.FAILED,
+                                reason = terminalCauseForInvocationFailure(throwable).name,
+                                finishedAt = clock.instant(),
+                                claimantToken = claimantToken,
+                            ),
+                        ).getOrThrow()
+                    }
+                    throw throwable
+                }
             },
             clock = clock,
             idGenerator = idGenerator,
@@ -751,6 +815,20 @@ private class RecordingLlmLaunchReservationRepository(
 
         return result
     }
+
+    override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
+        return delegate.claimForExecution(request)
+    }
+
+    override suspend fun findExecutionClaim(invocationId: String): Result<LlmExecutionClaimSnapshot?> {
+        return delegate.findExecutionClaim(invocationId)
+    }
+
+    override suspend fun heartbeatExecutionClaim(
+        invocationId: String,
+        claimantToken: String,
+        heartbeatAt: Instant,
+    ): Result<Boolean> = delegate.heartbeatExecutionClaim(invocationId, claimantToken, heartbeatAt)
 
     override suspend fun latestReservedAt(triggerKey: String): Result<Instant?> {
         return delegate.latestReservedAt(triggerKey)

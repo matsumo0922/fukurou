@@ -149,6 +149,15 @@ enum class ProcessRunStatus {
     TIMED_OUT,
 }
 
+/** root と全 descendant の終了を証明できたかを表す。 */
+enum class ProcessTreeTerminationProof {
+    /** TERM/KILL/wait と再列挙により全 process の終了を確認した。 */
+    PROVEN_EXITED,
+
+    /** late fork、列挙、signal、wait のいずれかに不確実性が残る。 */
+    UNCERTAIN,
+}
+
 /**
  * ProcessRunner が返す process 実行結果。
  *
@@ -162,6 +171,7 @@ data class ProcessRunResult(
     val exitCode: Int?,
     val stdout: String,
     val stderr: String,
+    val processTreeTerminationProof: ProcessTreeTerminationProof = ProcessTreeTerminationProof.PROVEN_EXITED,
 )
 
 /**

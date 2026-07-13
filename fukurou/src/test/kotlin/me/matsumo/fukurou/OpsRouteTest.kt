@@ -1255,13 +1255,26 @@ class OpsRouteTest {
         val recoveryEvent = auditEventTypes.single { element ->
             element.jsonObject.getValue("value").jsonPrimitive.content == "LLM_INVOCATION_RECOVERED"
         }
+        val recoveryStartedEvent = auditEventTypes.single { element ->
+            element.jsonObject.getValue("value").jsonPrimitive.content == "LLM_EXECUTION_RECOVERY_STARTED"
+        }
         val normalizedActual = JsonObject(
-            actualJson + ("auditEventTypes" to JsonArray(auditEventTypes.filter { it != recoveryEvent })),
+            actualJson + mapOf(
+                "auditEventTypes" to JsonArray(
+                    auditEventTypes.filter { element ->
+                        element != recoveryEvent && element != recoveryStartedEvent
+                    },
+                ),
+            ),
         )
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertNoSecretLikeText(responseText)
         assertEquals("activity.catalog.audit.llmInvocationRecovered.label", recoveryEvent.jsonObject.getValue("labelKey").jsonPrimitive.content)
+        assertEquals(
+            "activity.catalog.audit.llmExecutionRecoveryStarted.label",
+            recoveryStartedEvent.jsonObject.getValue("labelKey").jsonPrimitive.content,
+        )
         assertEquals(expectedJson, normalizedActual)
     }
 

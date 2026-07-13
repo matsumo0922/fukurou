@@ -24,6 +24,7 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.InMemoryLlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.math.BigDecimal
 import java.nio.file.Files
@@ -64,14 +65,14 @@ class ObsidianVaultWriterTest {
         submitLinkedDecision(decisionRepository, "run-linked", "最初の判断です。")
         mutableClock.currentInstant = FIXED_INSTANT.plusSeconds(60)
         submitNoTradeDecision(decisionRepository)
-        llmRunRepository.finish(failedLlmRun()).getOrThrow()
-        llmRunRepository.finish(
+        llmRunRepository.seedFinished(failedLlmRun())
+        llmRunRepository.seedFinished(
             failedLlmRun().copy(
                 invocationId = "failed-run-2",
                 startedAt = FIXED_INSTANT.plusSeconds(60),
                 finishedAt = FIXED_INSTANT.plusSeconds(62),
             ),
-        ).getOrThrow()
+        )
 
         val decisions = decisionRepository.findDecisionsCreatedBetween(
             from = FIXED_INSTANT.minusSeconds(1),
@@ -391,7 +392,7 @@ private suspend fun writerFixture(
         submitLinkedDecision(decisionRepository, requireNotNull(decisionRunId), decisionReason)
         submitNoTradeDecision(decisionRepository)
     }
-    llmRunRepository.finish(failedLlmRun()).getOrThrow()
+    llmRunRepository.seedFinished(failedLlmRun())
 
     return ObsidianWriterFixture(
         writer = ObsidianVaultWriter(
@@ -561,6 +562,19 @@ private fun failedLlmRun(): LlmRunFinish {
         finishedAt = FIXED_INSTANT.plusSeconds(2),
         errorMessage = "redacted failure",
     )
+}
+
+private suspend fun InMemoryLlmRunRepository.seedFinished(finish: LlmRunFinish) {
+    insertRunning(
+        LlmRunStart(
+            invocationId = finish.invocationId,
+            mode = finish.mode,
+            symbol = finish.symbol,
+            triggerKind = finish.triggerKind,
+            startedAt = finish.startedAt,
+        ),
+    ).getOrThrow()
+    finish(finish).getOrThrow()
 }
 
 private fun deleteRecursively(path: Path) {

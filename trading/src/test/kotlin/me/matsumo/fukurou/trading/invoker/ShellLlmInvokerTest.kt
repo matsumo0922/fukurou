@@ -35,6 +35,7 @@ class ShellLlmInvokerTest {
     @AfterTest
     fun clearQuarantine() {
         LlmArtifactCleanupQuarantine.resetForTest()
+        LlmProcessTreeTerminationRegistry.resolve("invocation-157")
         System.clearProperty("fukurou.llm.cleanupQuarantinePath")
         Files.deleteIfExists(quarantinePath.parent)
     }
@@ -273,6 +274,10 @@ class ShellLlmInvokerTest {
         }
         assertTrue(processRunner.cleanupCalled)
         assertFalse(Files.exists(artifact))
+        assertEquals(
+            ProcessTreeTerminationProof.UNCERTAIN,
+            LlmProcessTreeTerminationRegistry.find("invocation-157"),
+        )
     }
 
     @Test

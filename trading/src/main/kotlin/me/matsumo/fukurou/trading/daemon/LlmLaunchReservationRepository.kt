@@ -78,6 +78,103 @@ enum class LlmLaunchReservationStatus {
     FAILED,
 }
 
+/** LLM 起動予約の実行権 claim 状態。 */
+enum class LlmExecutionClaimState {
+    /** one-shot runner が実行権を取得できる。 */
+    AVAILABLE,
+
+    /** one-shot runner が実行権を取得済みである。 */
+    CLAIMED,
+
+    /** reflection / evaluation の caller-owned lifecycle で claim を使わない。 */
+    NOT_REQUIRED,
+}
+
+/** 実行権 claim の拒否理由。 */
+enum class LlmExecutionClaimRejectionReason(val wireCode: String) {
+    /** invocation ID に対応する予約が存在しない。 */
+    RESERVATION_MISSING("launch_reservation_missing"),
+
+    /** 予約と request の trigger が一致しない。 */
+    TRIGGER_MISMATCH("launch_reservation_trigger_mismatch"),
+
+    /** 予約が既に terminal である。 */
+    TERMINAL("launch_reservation_terminal"),
+
+    /** 別 runner または replay が実行権を取得済みである。 */
+    ALREADY_CLAIMED("launch_reservation_already_claimed"),
+
+    /** migration 前の NULL claim state なので実行できない。 */
+    LEGACY_UNCLAIMABLE("launch_reservation_legacy_unclaimable"),
+
+    /** caller-owned lifecycle なので one-shot claim を許可しない。 */
+    CLAIM_NOT_REQUIRED("launch_reservation_claim_not_required"),
+}
+
+/** one-shot runner の実行権 claim 要求。 */
+data class LlmExecutionClaimRequest(
+    val invocationId: String,
+    val triggerKind: LlmDaemonTriggerKind,
+    val claimantToken: String,
+    val claimedAt: Instant,
+    val activeSince: Instant = Instant.ofEpochMilli(Long.MIN_VALUE),
+)
+
+/** 実行権 claim の結果。 */
+sealed interface LlmExecutionClaimOutcome {
+    /** conditional update の commit により実行権を取得した。 */
+    data class Claimed(val claimedAt: Instant) : LlmExecutionClaimOutcome
+
+    /** stable reason で claim を拒否した。 */
+    data class Rejected(val reason: LlmExecutionClaimRejectionReason) : LlmExecutionClaimOutcome
+
+    /** commit 成否を応答から確定できない。 */
+    data class OutcomeUnknown(val cause: Throwable) : LlmExecutionClaimOutcome
+}
+
+/** outcome-unknown reconciliation に使う予約 snapshot。 */
+data class LlmExecutionClaimSnapshot(
+    val invocationId: String,
+    val triggerKind: LlmDaemonTriggerKind,
+    val status: LlmLaunchReservationStatus,
+    val claimState: LlmExecutionClaimState?,
+    val claimantToken: String?,
+    val claimedAt: Instant?,
+    val heartbeatAt: Instant?,
+    val reservedAt: Instant,
+)
+
+/** stale execution claim の bounded scan 条件。 */
+data class LlmExecutionRecoveryScan(
+    val availableReservedBefore: Instant,
+    val claimedBefore: Instant,
+    val heartbeatBefore: Instant,
+    val limit: Int,
+    val afterHeartbeatAt: Instant? = null,
+    val afterClaimedAt: Instant? = null,
+    val afterInvocationId: String? = null,
+) {
+    init {
+        require(limit > 0) { "execution recovery scan limit must be positive." }
+        val cursorParts = listOf(afterHeartbeatAt, afterClaimedAt, afterInvocationId)
+        require(cursorParts.all { it == null } || cursorParts.all { it != null }) {
+            "execution recovery cursor must be complete."
+        }
+    }
+}
+
+/** stale execution claim を競合安全に FAILED へ遷移させる要求。 */
+data class LlmExecutionRecoveryRequest(
+    val invocationId: String,
+    val claimState: LlmExecutionClaimState,
+    val claimantToken: String?,
+    val observedHeartbeatAt: Instant?,
+    val observedReservedAt: Instant,
+    val finishedAt: Instant,
+    val reason: String,
+    val terminationFence: String,
+)
+
 /**
  * LLM 起動予約要求。
  *
@@ -114,6 +211,8 @@ data class LlmLaunchReservationFinish(
     val status: LlmLaunchReservationStatus,
     val reason: String?,
     val finishedAt: Instant,
+    val claimantToken: String? = null,
+    val observedHeartbeatAt: Instant? = null,
 )
 
 /** 同時起動を阻止している RUNNING reservation の監査用 identity。 */
@@ -177,6 +276,18 @@ enum class LlmLaunchReservationRejectionReason {
      */
     MAX_INVOCATIONS_PER_DAY,
 
+    /** ENTRY_FILL の未使用 1 時間 reserve を保護した。 */
+    ENTRY_FILL_HOURLY_RESERVE,
+
+    /** ENTRY_FILL の未使用 24 時間 reserve を保護した。 */
+    ENTRY_FILL_DAILY_RESERVE,
+
+    /** STOP_PROXIMITY の未使用 1 時間 reserve を保護した。 */
+    STOP_PROXIMITY_HOURLY_RESERVE,
+
+    /** STOP_PROXIMITY の未使用 24 時間 reserve を保護した。 */
+    STOP_PROXIMITY_DAILY_RESERVE,
+
     /**
      * reflection 用に残すべき 1 時間 headroom を下回っていた。
      */
@@ -201,6 +312,7 @@ enum class LlmLaunchReservationRejectionReason {
  * 予約のない legacy run だけ runner 完了 audit の時刻へ fallback する。
  * runner preflight は手動 one-shot も含む最後の防衛線として残す。
  */
+@Suppress("TooManyFunctions")
 interface LlmLaunchReservationRepository {
     /**
      * HARD_HALT / 同時起動 / 起動予算を見て、起動予約を原子的に確保する。
@@ -211,6 +323,54 @@ interface LlmLaunchReservationRepository {
      * 起動予約を完了状態へ更新する。
      */
     suspend fun finish(finish: LlmLaunchReservationFinish): Result<Unit>
+
+    /** AVAILABLE / RUNNING reservation を一度だけ CLAIMED へ遷移させる。 */
+    suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
+        return LlmExecutionClaimOutcome.OutcomeUnknown(
+            UnsupportedOperationException("Execution claim is not implemented."),
+        )
+    }
+
+    /** outcome unknown を claimant token で照合する。 */
+    suspend fun findExecutionClaim(invocationId: String): Result<LlmExecutionClaimSnapshot?> {
+        return Result.failure(UnsupportedOperationException("Execution claim lookup is not implemented."))
+    }
+
+    /** health gate と reservation ownership を同じ repository boundary で検証する。 */
+    suspend fun validateExecutionAdmission(invocationId: String, claimantToken: String?): Result<Boolean> {
+        return findExecutionClaim(invocationId).map { snapshot -> snapshot.isLiveAdmissionFor(claimantToken) }
+    }
+
+    /** live owner の lease heartbeat を conditional update する。 */
+    suspend fun heartbeatExecutionClaim(
+        invocationId: String,
+        claimantToken: String,
+        heartbeatAt: Instant,
+    ): Result<Boolean> = Result.failure(UnsupportedOperationException("Execution claim heartbeat is not implemented."))
+
+    /** stale AVAILABLE / CLAIMED reservation を bounded scan する。 */
+    suspend fun scanStaleExecutionClaims(scan: LlmExecutionRecoveryScan): Result<List<LlmExecutionClaimSnapshot>> {
+        return Result.failure(UnsupportedOperationException("Execution recovery scan is not implemented."))
+    }
+
+    /** scan 時点の state / token / heartbeat を fence に conditional FAILED へ遷移させる。 */
+    suspend fun recoverStaleExecutionClaim(request: LlmExecutionRecoveryRequest): Result<Boolean> {
+        return Result.failure(UnsupportedOperationException("Execution claim recovery is not implemented."))
+    }
+
+    /** scan page を一括 recovery し、conditional update に成功した invocation ID を返す。 */
+    suspend fun recoverStaleExecutionClaims(requests: List<LlmExecutionRecoveryRequest>): Result<Set<String>> {
+        return runCatching {
+            requests.mapNotNullTo(mutableSetOf()) { request ->
+                request.invocationId.takeIf { recoverStaleExecutionClaim(request).getOrThrow() }
+            }
+        }
+    }
+
+    /** runner preflight 用に予約の trigger identity を返す。 */
+    suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> {
+        return Result.failure(UnsupportedOperationException("Reservation identity lookup is not implemented."))
+    }
 
     /**
      * trigger key ごとの最後の予約時刻を返す。
@@ -242,6 +402,7 @@ interface LlmLaunchReservationRepository {
  *
  * @param riskStateRepository HARD_HALT 判定に使う repository
  */
+@Suppress("TooManyFunctions")
 class InMemoryLlmLaunchReservationRepository(
     private val riskStateRepository: RiskStateRepository,
 ) : LlmLaunchReservationRepository {
@@ -267,6 +428,25 @@ class InMemoryLlmLaunchReservationRepository(
                 }
 
                 val currentReservation = reservations[index]
+                val tokenMatches = when (currentReservation.claimState) {
+                    LlmExecutionClaimState.CLAIMED -> {
+                        finish.claimantToken != null && currentReservation.claimantToken == finish.claimantToken
+                    }
+                    LlmExecutionClaimState.AVAILABLE,
+                    LlmExecutionClaimState.NOT_REQUIRED,
+                    null,
+                    -> {
+                        finish.claimantToken == null || currentReservation.claimantToken == finish.claimantToken
+                    }
+                }
+                val heartbeatMatches = finish.observedHeartbeatAt == null ||
+                    currentReservation.heartbeatAt == finish.observedHeartbeatAt
+                val finishOwnsRunningReservation = currentReservation.status == LlmLaunchReservationStatus.RUNNING &&
+                    tokenMatches && heartbeatMatches
+                if (!finishOwnsRunningReservation) {
+                    return@withLock
+                }
+
                 reservations[index] = currentReservation.copy(
                     status = finish.status,
                     finishedAt = finish.finishedAt,
@@ -274,6 +454,162 @@ class InMemoryLlmLaunchReservationRepository(
                 )
             }
         }
+    }
+
+    override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
+        return try {
+            mutex.withLock {
+                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                    val index = reservations.indexOfFirst { it.invocationId == request.invocationId }
+                    if (index < 0) {
+                        return@withHealthyAdmission LlmExecutionClaimOutcome.Rejected(
+                            LlmExecutionClaimRejectionReason.RESERVATION_MISSING,
+                        )
+                    }
+                    val reservation = reservations[index]
+                    val rejection = reservation.claimRejection(request.triggerKind)
+                        ?: LlmExecutionClaimRejectionReason.TERMINAL.takeIf {
+                            reservation.reservedAt.isBefore(request.activeSince)
+                        }
+                    if (rejection != null) {
+                        return@withHealthyAdmission LlmExecutionClaimOutcome.Rejected(rejection)
+                    }
+
+                    reservations[index] = reservation.copy(
+                        claimState = LlmExecutionClaimState.CLAIMED,
+                        claimantToken = request.claimantToken,
+                        claimedAt = request.claimedAt,
+                        heartbeatAt = request.claimedAt,
+                    )
+                    LlmExecutionClaimOutcome.Claimed(request.claimedAt)
+                }
+            }
+        } catch (throwable: Throwable) {
+            LlmExecutionClaimOutcome.OutcomeUnknown(throwable)
+        }
+    }
+
+    override suspend fun findExecutionClaim(invocationId: String): Result<LlmExecutionClaimSnapshot?> = runCatching {
+        mutex.withLock { reservations.firstOrNull { it.invocationId == invocationId }?.toClaimSnapshot() }
+    }
+
+    override suspend fun validateExecutionAdmission(invocationId: String, claimantToken: String?): Result<Boolean> {
+        return runCatching {
+            mutex.withLock {
+                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                    reservations.firstOrNull { it.invocationId == invocationId }
+                        ?.toClaimSnapshot()
+                        .isLiveAdmissionFor(claimantToken)
+                }
+            }
+        }
+    }
+
+    override suspend fun heartbeatExecutionClaim(
+        invocationId: String,
+        claimantToken: String,
+        heartbeatAt: Instant,
+    ): Result<Boolean> = runCatching {
+        mutex.withLock {
+            val index = reservations.indexOfFirst { it.invocationId == invocationId }
+            if (index < 0) return@withLock false
+            val reservation = reservations[index]
+            val heartbeatOwnsRunningClaim = reservation.status == LlmLaunchReservationStatus.RUNNING &&
+                reservation.claimState == LlmExecutionClaimState.CLAIMED &&
+                reservation.claimantToken == claimantToken
+            if (!heartbeatOwnsRunningClaim) {
+                return@withLock false
+            }
+            reservations[index] = reservation.copy(heartbeatAt = heartbeatAt)
+            true
+        }
+    }
+
+    override suspend fun scanStaleExecutionClaims(
+        scan: LlmExecutionRecoveryScan,
+    ): Result<List<LlmExecutionClaimSnapshot>> = runCatching {
+        mutex.withLock {
+            reservations.asSequence()
+                .filter { reservation -> reservation.status == LlmLaunchReservationStatus.RUNNING }
+                .filter { reservation ->
+                    when (reservation.claimState) {
+                        LlmExecutionClaimState.AVAILABLE -> !reservation.reservedAt.isAfter(scan.availableReservedBefore)
+                        LlmExecutionClaimState.CLAIMED -> {
+                            val claimedAt = reservation.claimedAt
+                            val heartbeatAt = reservation.heartbeatAt
+                            claimedAt != null && heartbeatAt != null &&
+                                !claimedAt.isAfter(scan.claimedBefore) &&
+                                !heartbeatAt.isAfter(scan.heartbeatBefore)
+                        }
+                        LlmExecutionClaimState.NOT_REQUIRED,
+                        null,
+                        -> false
+                    }
+                }
+                .filter { reservation -> reservation.isAfterRecoveryCursor(scan) }
+                .sortedWith(
+                    compareBy<LlmLaunchReservationRecord> { it.recoverySortHeartbeatAt() }
+                        .thenBy { it.recoverySortClaimedAt() }
+                        .thenBy { it.invocationId },
+                )
+                .take(scan.limit)
+                .map(LlmLaunchReservationRecord::toClaimSnapshot)
+                .toList()
+        }
+    }
+
+    override suspend fun recoverStaleExecutionClaim(request: LlmExecutionRecoveryRequest): Result<Boolean> {
+        return runCatching {
+            mutex.withLock {
+                val index = reservations.indexOfFirst { reservation -> reservation.invocationId == request.invocationId }
+                if (index < 0) return@withLock false
+
+                val reservation = reservations[index]
+                val ownsObservedState = reservation.status == LlmLaunchReservationStatus.RUNNING &&
+                    reservation.claimState == request.claimState &&
+                    reservation.reservedAt == request.observedReservedAt &&
+                    reservation.claimantToken == request.claimantToken &&
+                    reservation.heartbeatAt == request.observedHeartbeatAt
+                if (!ownsObservedState) return@withLock false
+
+                reservations[index] = reservation.copy(
+                    status = LlmLaunchReservationStatus.FAILED,
+                    finishedAt = request.finishedAt,
+                    reason = request.reason,
+                )
+                true
+            }
+        }
+    }
+
+    override suspend fun recoverStaleExecutionClaims(
+        requests: List<LlmExecutionRecoveryRequest>,
+    ): Result<Set<String>> = runCatching {
+        mutex.withLock {
+            requests.mapNotNullTo(mutableSetOf()) { request ->
+                val index = reservations.indexOfFirst { reservation -> reservation.invocationId == request.invocationId }
+                if (index < 0) return@mapNotNullTo null
+
+                val reservation = reservations[index]
+                val ownsObservedState = reservation.status == LlmLaunchReservationStatus.RUNNING &&
+                    reservation.claimState == request.claimState &&
+                    reservation.reservedAt == request.observedReservedAt &&
+                    reservation.claimantToken == request.claimantToken &&
+                    reservation.heartbeatAt == request.observedHeartbeatAt
+                if (!ownsObservedState) return@mapNotNullTo null
+
+                reservations[index] = reservation.copy(
+                    status = LlmLaunchReservationStatus.FAILED,
+                    finishedAt = request.finishedAt,
+                    reason = request.reason,
+                )
+                request.invocationId
+            }
+        }
+    }
+
+    override suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> = runCatching {
+        mutex.withLock { reservations.firstOrNull { it.invocationId == invocationId }?.triggerKind }
     }
 
     override suspend fun latestReservedAt(triggerKey: String): Result<Instant?> {
@@ -336,39 +672,76 @@ class InMemoryLlmLaunchReservationRepository(
             return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.HARD_HALT)
         }
 
-        activeReservation(request)?.let { active ->
-            return LlmLaunchReservationOutcome.Rejected(
-                LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION,
-                active.toActive(),
+        return LlmExecutionAdmissionHealth.withHealthyAdmission {
+            activeReservation(request)?.let { active ->
+                return@withHealthyAdmission LlmLaunchReservationOutcome.Rejected(
+                    LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION,
+                    active.toActive(),
+                )
+            }
+
+            val hourlyUsage = usageSince(request.reservedAt.minus(request.hourlyWindow))
+            val dailyUsage = usageSince(request.reservedAt.minus(request.dailyWindow))
+
+            launchBudgetRejection(request, hourlyUsage, dailyUsage)?.let { rejectionReason ->
+                return@withHealthyAdmission LlmLaunchReservationOutcome.Rejected(rejectionReason)
+            }
+
+            reservations += LlmLaunchReservationRecord(
+                invocationId = request.invocationId,
+                triggerKind = request.triggerKind,
+                triggerKey = request.triggerKey,
+                status = LlmLaunchReservationStatus.RUNNING,
+                reservedAt = request.reservedAt,
+                finishedAt = null,
+                reason = null,
+                claimState = request.triggerKind.executionClaimState(),
+                claimantToken = null,
+                claimedAt = null,
+                heartbeatAt = null,
             )
+
+            LlmLaunchReservationOutcome.Reserved(request.invocationId)
         }
-
-        val hourlyCount = countReservationsSince(request.reservedAt.minus(request.hourlyWindow))
-        val dailyCount = countReservationsSince(request.reservedAt.minus(request.dailyWindow))
-
-        launchBudgetRejection(request, hourlyCount, dailyCount)?.let { rejectionReason ->
-            return LlmLaunchReservationOutcome.Rejected(rejectionReason)
-        }
-
-        reservations += LlmLaunchReservationRecord(
-            invocationId = request.invocationId,
-            triggerKind = request.triggerKind,
-            triggerKey = request.triggerKey,
-            status = LlmLaunchReservationStatus.RUNNING,
-            reservedAt = request.reservedAt,
-            finishedAt = null,
-            reason = null,
-        )
-
-        return LlmLaunchReservationOutcome.Reserved(request.invocationId)
     }
 
-    private fun countReservationsSince(since: Instant): Int {
-        return reservations
-            .filter { reservation -> !reservation.reservedAt.isBefore(since) }
-            .map { reservation -> reservation.invocationId }
-            .distinct()
-            .size
+    private fun usageSince(since: Instant): LlmLaunchUsage {
+        val current = reservations.filter { reservation -> !reservation.reservedAt.isBefore(since) }
+        return LlmLaunchUsage(
+            total = current.distinctBy { it.invocationId }.size,
+            entryFill = current.filter { it.triggerKind == LlmDaemonTriggerKind.ENTRY_FILL }.distinctBy { it.invocationId }.size,
+            stopProximity = current.filter {
+                it.triggerKind == LlmDaemonTriggerKind.STOP_PROXIMITY
+            }.distinctBy { it.invocationId }.size,
+        )
+    }
+}
+
+private fun LlmExecutionClaimSnapshot?.isLiveAdmissionFor(claimantToken: String?): Boolean {
+    if (this?.status != LlmLaunchReservationStatus.RUNNING) return false
+
+    return if (claimantToken == null) {
+        claimState == LlmExecutionClaimState.NOT_REQUIRED
+    } else {
+        claimState == LlmExecutionClaimState.CLAIMED && this.claimantToken == claimantToken
+    }
+}
+
+private fun LlmLaunchReservationRecord.recoverySortHeartbeatAt(): Instant = heartbeatAt ?: claimedAt ?: reservedAt
+
+private fun LlmLaunchReservationRecord.recoverySortClaimedAt(): Instant = claimedAt ?: reservedAt
+
+private fun LlmLaunchReservationRecord.isAfterRecoveryCursor(scan: LlmExecutionRecoveryScan): Boolean {
+    val cursorHeartbeat = scan.afterHeartbeatAt ?: return true
+    val cursorClaimed = requireNotNull(scan.afterClaimedAt)
+    val cursorInvocationId = requireNotNull(scan.afterInvocationId)
+    val sortHeartbeat = recoverySortHeartbeatAt()
+    val sortClaimed = recoverySortClaimedAt()
+
+    return when {
+        sortHeartbeat != cursorHeartbeat -> sortHeartbeat > cursorHeartbeat
+        sortClaimed != cursorClaimed -> sortClaimed > cursorClaimed
+        else -> invocationId > cursorInvocationId
     }
 }
 
@@ -391,16 +764,26 @@ private data class LlmLaunchReservationRecord(
     val reservedAt: Instant,
     val finishedAt: Instant?,
     val reason: String?,
+    val claimState: LlmExecutionClaimState?,
+    val claimantToken: String?,
+    val claimedAt: Instant?,
+    val heartbeatAt: Instant?,
 ) {
-    fun toActive(): LlmActiveLaunchReservation =
-        LlmActiveLaunchReservation(invocationId, triggerKind, triggerKey, reservedAt)
+    fun toActive(): LlmActiveLaunchReservation {
+        return LlmActiveLaunchReservation(
+            invocationId = invocationId,
+            triggerKind = triggerKind,
+            triggerKey = triggerKey,
+            reservedAt = reservedAt,
+        )
+    }
 
     /**
      * stale 判定込みで RUNNING か返す。
      */
     fun isFreshRunning(activeSince: Instant): Boolean {
         val activeStatus = status == LlmLaunchReservationStatus.RUNNING
-        val freshEnough = !reservedAt.isBefore(activeSince)
+        val freshEnough = claimState == LlmExecutionClaimState.CLAIMED || !reservedAt.isBefore(activeSince)
 
         return activeStatus && freshEnough
     }
@@ -411,6 +794,41 @@ private data class LlmLaunchReservationRecord(
     fun isFreshTradingRunning(activeSince: Instant): Boolean {
         return triggerKind != LlmDaemonTriggerKind.REFLECTION && isFreshRunning(activeSince)
     }
+
+    fun claimRejection(requestTriggerKind: LlmDaemonTriggerKind): LlmExecutionClaimRejectionReason? = when {
+        triggerKind != requestTriggerKind -> LlmExecutionClaimRejectionReason.TRIGGER_MISMATCH
+        status != LlmLaunchReservationStatus.RUNNING -> LlmExecutionClaimRejectionReason.TERMINAL
+        claimState == null -> LlmExecutionClaimRejectionReason.LEGACY_UNCLAIMABLE
+        claimState == LlmExecutionClaimState.NOT_REQUIRED -> LlmExecutionClaimRejectionReason.CLAIM_NOT_REQUIRED
+        claimState == LlmExecutionClaimState.CLAIMED -> LlmExecutionClaimRejectionReason.ALREADY_CLAIMED
+        else -> null
+    }
+
+    fun toClaimSnapshot(): LlmExecutionClaimSnapshot = LlmExecutionClaimSnapshot(
+        invocationId = invocationId,
+        triggerKind = triggerKind,
+        status = status,
+        claimState = claimState,
+        claimantToken = claimantToken,
+        claimedAt = claimedAt,
+        heartbeatAt = heartbeatAt,
+        reservedAt = reservedAt,
+    )
+}
+
+/** trigger の lifecycle ownership に対応する初期 claim state。 */
+fun LlmDaemonTriggerKind.executionClaimState(): LlmExecutionClaimState = when (this) {
+    LlmDaemonTriggerKind.REFLECTION,
+    LlmDaemonTriggerKind.EVALUATION_REPORT,
+    -> LlmExecutionClaimState.NOT_REQUIRED
+    LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+    LlmDaemonTriggerKind.ECONOMIC_EVENT,
+    LlmDaemonTriggerKind.PRICE_MOVE,
+    LlmDaemonTriggerKind.STOP_PROXIMITY,
+    LlmDaemonTriggerKind.ENTRY_FILL,
+    LlmDaemonTriggerKind.HOLDING_DENSE_CHECK,
+    LlmDaemonTriggerKind.MANUAL,
+    -> LlmExecutionClaimState.AVAILABLE
 }
 
 /**
@@ -425,15 +843,21 @@ const val REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS = 4
 
 internal fun launchBudgetRejection(
     request: LlmLaunchReservationRequest,
-    hourlyCount: Int,
-    dailyCount: Int,
+    hourlyUsage: LlmLaunchUsage,
+    dailyUsage: LlmLaunchUsage,
 ): LlmLaunchReservationRejectionReason? {
-    val hourlyRemaining = request.runnerConfig.maxInvocationsPerHour - hourlyCount
-    val dailyRemaining = request.runnerConfig.maxInvocationsPerDay - dailyCount
+    val hourlyRemaining = request.runnerConfig.maxInvocationsPerHour.toLong() - hourlyUsage.total.toLong()
+    val dailyRemaining = request.runnerConfig.maxInvocationsPerDay.toLong() - dailyUsage.total.toLong()
     val reflectionRequest = request.triggerKind == LlmDaemonTriggerKind.REFLECTION
     val evaluationRequest = request.triggerKind == LlmDaemonTriggerKind.EVALUATION_REPORT
     val hourlyExceeded = hourlyRemaining <= 0
     val dailyExceeded = dailyRemaining <= 0
+
+    if (hourlyExceeded) return LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR
+    if (dailyExceeded) return LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY
+
+    reserveRejection(request, hourlyUsage, hourly = true)?.let { return it }
+    reserveRejection(request, dailyUsage, hourly = false)?.let { return it }
 
     if (reflectionRequest && hourlyRemaining <= REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS) {
         return LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM
@@ -448,12 +872,39 @@ internal fun launchBudgetRejection(
         return LlmLaunchReservationRejectionReason.INSUFFICIENT_EVALUATION_DAILY_HEADROOM
     }
 
-    if (hourlyExceeded) {
-        return LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR
-    }
-    if (dailyExceeded) {
-        return LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY
-    }
-
     return null
+}
+
+/** rolling window 内の total と critical trigger 別 usage。 */
+data class LlmLaunchUsage(val total: Int, val entryFill: Int, val stopProximity: Int)
+
+@Suppress("CyclomaticComplexMethod")
+private fun reserveRejection(
+    request: LlmLaunchReservationRequest,
+    usage: LlmLaunchUsage,
+    hourly: Boolean,
+): LlmLaunchReservationRejectionReason? {
+    val config = request.runnerConfig
+    val hardCap = (if (hourly) config.maxInvocationsPerHour else config.maxInvocationsPerDay).toLong()
+    val entryReserve = (if (hourly) config.entryFillReservePerHour else config.entryFillReservePerDay).toLong()
+    val stopReserve = (if (hourly) config.stopProximityReservePerHour else config.stopProximityReservePerDay).toLong()
+    val totalUsage = usage.total.toLong()
+    val unusedEntry = (entryReserve - usage.entryFill.toLong()).coerceAtLeast(0L)
+    val unusedStop = (stopReserve - usage.stopProximity.toLong()).coerceAtLeast(0L)
+    val entryLimit = hardCap - unusedEntry - if (request.triggerKind == LlmDaemonTriggerKind.STOP_PROXIMITY) 0L else unusedStop
+    val stopLimit = hardCap - unusedStop - if (request.triggerKind == LlmDaemonTriggerKind.ENTRY_FILL) 0L else unusedEntry
+    val protectedEntry = unusedEntry > 0L &&
+        request.triggerKind != LlmDaemonTriggerKind.ENTRY_FILL &&
+        totalUsage >= entryLimit
+    val protectedStop = unusedStop > 0L &&
+        request.triggerKind != LlmDaemonTriggerKind.STOP_PROXIMITY &&
+        totalUsage >= stopLimit
+
+    return when {
+        protectedEntry && hourly -> LlmLaunchReservationRejectionReason.ENTRY_FILL_HOURLY_RESERVE
+        protectedEntry -> LlmLaunchReservationRejectionReason.ENTRY_FILL_DAILY_RESERVE
+        protectedStop && hourly -> LlmLaunchReservationRejectionReason.STOP_PROXIMITY_HOURLY_RESERVE
+        protectedStop -> LlmLaunchReservationRejectionReason.STOP_PROXIMITY_DAILY_RESERVE
+        else -> null
+    }
 }

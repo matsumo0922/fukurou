@@ -8,6 +8,7 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.time.Clock
 import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -77,6 +78,7 @@ class ShellLlmInvoker(
     private val clock: Clock = Clock.systemUTC(),
 ) : LlmInvoker {
 
+    @Suppress("CyclomaticComplexMethod", "LongMethod")
     override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
         LlmArtifactCleanupQuarantine.requireClear()
             .exceptionOrNull()
@@ -94,7 +96,12 @@ class ShellLlmInvoker(
 
         return try {
             val startedAt = clock.instant()
+            LlmProcessTreeTerminationRegistry.markChildStarted(request.invocationId)
             val processResult = processRunner.run(command).getOrThrow()
+            LlmProcessTreeTerminationRegistry.record(
+                request.invocationId,
+                processResult.processTreeTerminationProof,
+            )
             val completedAt = clock.instant()
             val parsedOutput = outputParser.parse(
                 request = request,
@@ -116,13 +123,31 @@ class ShellLlmInvoker(
             )
 
             Result.success(invocationResult)
+        } catch (throwable: ProcessTreeTerminationProvenCancellationException) {
+            LlmProcessTreeTerminationRegistry.record(
+                request.invocationId,
+                ProcessTreeTerminationProof.PROVEN_EXITED,
+            )
+            val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
+            cleanupFailure?.let { failure -> LlmArtifactCleanupQuarantine.activate(failure) }
+            cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }
+
+            throw throwable.classifyLlmFailure(request.provider)
         } catch (throwable: CancellationException) {
+            LlmProcessTreeTerminationRegistry.record(
+                request.invocationId,
+                ProcessTreeTerminationProof.UNCERTAIN,
+            )
             val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
             cleanupFailure?.let { failure -> LlmArtifactCleanupQuarantine.activate(failure) }
             cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }
 
             throw throwable.classifyLlmFailure(request.provider)
         } catch (throwable: Throwable) {
+            LlmProcessTreeTerminationRegistry.record(
+                request.invocationId,
+                ProcessTreeTerminationProof.UNCERTAIN,
+            )
             val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
             cleanupFailure?.let { failure -> LlmArtifactCleanupQuarantine.activate(failure) }
             cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }
@@ -139,6 +164,60 @@ class ShellLlmInvoker(
                 Result.failure(throwable)
             }
         }
+    }
+}
+
+/** invocation単位のtyped process-tree termination proof registry。 */
+object LlmProcessTreeTerminationRegistry {
+    private val proofs = ConcurrentHashMap<String, ProcessTreeProofState>()
+
+    /** child start 境界でproofを未確定にする。 */
+    fun markChildStarted(invocationId: String) {
+        proofs.compute(invocationId) { _, current ->
+            (current ?: ProcessTreeProofState()).copy(childUnresolved = true)
+        }
+    }
+
+    /** ProcessRunnerが返したtyped proofを保存する。 */
+    fun record(invocationId: String, proof: ProcessTreeTerminationProof) {
+        proofs.compute(invocationId) { _, current ->
+            ProcessTreeProofState(
+                anyUncertain = current?.anyUncertain == true || proof == ProcessTreeTerminationProof.UNCERTAIN,
+                childUnresolved = false,
+                childCompleted = true,
+            )
+        }
+    }
+
+    /** 現在のproofを返す。child未開始はnull。 */
+    fun find(invocationId: String): ProcessTreeTerminationProof? {
+        val state = proofs[invocationId] ?: return null
+        return if (state.childUnresolved || state.anyUncertain) {
+            ProcessTreeTerminationProof.UNCERTAIN
+        } else if (state.childCompleted) {
+            ProcessTreeTerminationProof.PROVEN_EXITED
+        } else {
+            null
+        }
+    }
+
+    /** terminal persistence確認後にentryを削除する。 */
+    fun resolve(invocationId: String) {
+        proofs.remove(invocationId)
+    }
+}
+
+private data class ProcessTreeProofState(
+    val anyUncertain: Boolean = false,
+    val childUnresolved: Boolean = false,
+    val childCompleted: Boolean = false,
+)
+
+/** cancellation時もprocess-tree exitを証明済みであることを伝えるtyped cancellation。 */
+class ProcessTreeTerminationProvenCancellationException(cause: CancellationException) :
+    CancellationException(cause.message) {
+    init {
+        initCause(cause)
     }
 }
 

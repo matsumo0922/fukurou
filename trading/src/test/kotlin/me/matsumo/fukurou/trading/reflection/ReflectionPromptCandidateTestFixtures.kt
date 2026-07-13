@@ -4,9 +4,11 @@ import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
 import me.matsumo.fukurou.trading.evaluation.InMemoryLlmRunRepository
+import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
@@ -84,6 +86,9 @@ internal fun reflectionPromptCandidateGeneratorFixture(
     clock: MutableReflectionClock = MutableReflectionClock(REFLECTION_TEST_INSTANT),
     thrownFailure: Throwable? = null,
     responseText: String? = null,
+    llmRunRepositoryTransform: (LlmRunRepository) -> LlmRunRepository = ::identityLlmRunRepository,
+    reservationRepositoryTransform: (LlmLaunchReservationRepository) -> LlmLaunchReservationRepository =
+        ::identityReservationRepository,
 ): ReflectionPromptCandidateGeneratorFixture {
     val riskStateRepository = InMemoryRiskStateRepository(clock)
     val reservationRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository)
@@ -117,8 +122,8 @@ internal fun reflectionPromptCandidateGeneratorFixture(
                     redactor = SecretRedactor(setOf("reflection-secret-token")),
                 ),
                 persistence = ReflectionPromptCandidatePersistence(
-                    llmRunRepository = llmRunRepository,
-                    launchReservationRepository = reservationRepository,
+                    llmRunRepository = llmRunRepositoryTransform(llmRunRepository),
+                    launchReservationRepository = reservationRepositoryTransform(reservationRepository),
                 ),
                 clock = clock,
                 logger = {},
@@ -126,6 +131,11 @@ internal fun reflectionPromptCandidateGeneratorFixture(
         ),
     )
 }
+
+private fun identityLlmRunRepository(repository: LlmRunRepository): LlmRunRepository = repository
+
+private fun identityReservationRepository(repository: LlmLaunchReservationRepository): LlmLaunchReservationRepository =
+    repository
 
 internal fun promptCandidateTradingConfig(
     runnerConfig: LlmRunnerConfig = LlmRunnerConfig(),

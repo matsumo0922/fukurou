@@ -963,6 +963,18 @@ object LlmLaunchReservationsTable : Table("llm_launch_reservations") {
      */
     val reason = text("reason").nullable()
 
+    /** one-shot 実行権の状態。legacy row は NULL のまま保持する。 */
+    val executionClaimState = varchar("execution_claim_state", length = 32).nullable()
+
+    /** claim owner を fence する UUID token。 */
+    val executionClaimToken = varchar("execution_claim_token", length = 64).nullable()
+
+    /** claim commit 時刻。epoch millis で保存する。 */
+    val executionClaimedAt = long("execution_claimed_at").nullable()
+
+    /** live owner が最後に更新した heartbeat。epoch millis で保存する。 */
+    val executionClaimHeartbeatAt = long("execution_claim_heartbeat_at").nullable()
+
     override val primaryKey = PrimaryKey(id)
 }
 

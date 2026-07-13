@@ -1,11 +1,9 @@
 package me.matsumo.fukurou.trading.daemon
 
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -345,33 +343,9 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped(reason, trigger.kind)
         }
 
-        val preFilterDecision = preFilterGate.decisionIfNeeded(
-            triggerKind = trigger.kind,
-            triggerKey = trigger.key,
-            invocationId = invocationId,
-            observedAt = observedAt,
-        )
-
-        if (preFilterDecision == LlmDaemonPreFilterDecision.SKIP_NO_CHANGE) {
-            appendSkip(
-                reason = DAEMON_SKIP_PRE_FILTER_NO_CHANGE,
-                trigger = trigger,
-                observedAt = observedAt,
-            ).getOrThrow()
-            finishReservedInvocation(
-                trigger = trigger,
-                invocationId = invocationId,
-                status = LlmLaunchReservationStatus.FINISHED,
-                reason = DAEMON_SKIP_PRE_FILTER_NO_CHANGE,
-                finishedAt = observedAt,
-            )
-
-            return LlmDaemonTickResult.Skipped(DAEMON_SKIP_PRE_FILTER_NO_CHANGE, trigger.kind)
-        }
-
         appendLaunchedOrFinishReservation(trigger, invocationId, openRisk, observedAt).getOrThrow()
 
-        return runReservedInvocation(trigger, invocationId)
+        return runReservedInvocation(trigger, invocationId, observedAt)
     }
 
     private suspend fun appendLaunchedOrFinishReservation(
@@ -394,11 +368,23 @@ class LlmDaemonScheduler(
         return appendResult
     }
 
-    private suspend fun runReservedInvocation(trigger: LlmDaemonTrigger, invocationId: String): LlmDaemonTickResult {
+    private suspend fun runReservedInvocation(
+        trigger: LlmDaemonTrigger,
+        invocationId: String,
+        observedAt: Instant,
+    ): LlmDaemonTickResult {
         val request = requestBase.copy(
             invocationId = invocationId,
             marketSnapshotId = "daemon-${trigger.key}-$invocationId",
             triggerKind = trigger.kind,
+            preFilter = {
+                preFilterGate.decisionIfNeeded(
+                    triggerKind = trigger.kind,
+                    triggerKey = trigger.key,
+                    invocationId = invocationId,
+                    observedAt = observedAt,
+                )
+            },
         )
         val result = runCatching {
             launchOneShot(request).getOrThrow()
@@ -407,37 +393,22 @@ class LlmDaemonScheduler(
         val failure = result.exceptionOrNull()
 
         if (failure is CancellationException) {
-            withContext(NonCancellable) {
-                runCatching {
-                    finishReservedInvocation(
-                        trigger = trigger,
-                        invocationId = invocationId,
-                        status = LlmLaunchReservationStatus.FAILED,
-                        reason = terminalCauseForInvocationFailure(failure).name,
-                        finishedAt = Instant.now(clock),
-                    )
-                }.onFailure { finishFailure ->
-                    warnLogger.warn(
-                        key = DAEMON_CANCELLATION_FINISH_FAILURE_LOG_KEY,
-                        message = "LlmDaemonScheduler failed to finish cancelled invocation.",
-                        throwable = finishFailure,
-                    )
-                }
-            }
-
             throw failure
         }
 
         val finishedAt = Instant.now(clock)
-        val status = if (failure == null) {
-            LlmLaunchReservationStatus.FINISHED
-        } else {
-            LlmLaunchReservationStatus.FAILED
-        }
         val terminalCause = runnerResult?.terminalCause ?: terminalCauseForInvocationFailure(failure)
         val reason = terminalCause.name
-
-        finishReservedInvocation(trigger, invocationId, status, reason, finishedAt)
+        if (runnerResult?.status == me.matsumo.fukurou.trading.runner.OneShotRunnerStatus.PRE_FILTER_SKIPPED) {
+            appendSkip(
+                reason = DAEMON_SKIP_PRE_FILTER_NO_CHANGE,
+                trigger = trigger,
+                observedAt = observedAt,
+            ).getOrThrow()
+            appendCompleted(trigger, invocationId, DAEMON_SKIP_PRE_FILTER_NO_CHANGE, finishedAt).getOrThrow()
+            return LlmDaemonTickResult.Skipped(DAEMON_SKIP_PRE_FILTER_NO_CHANGE, trigger.kind)
+        }
+        appendCompleted(trigger, invocationId, reason, finishedAt).getOrThrow()
 
         if (failure != null) {
             return LlmDaemonTickResult.Failed(
@@ -1227,11 +1198,6 @@ private const val DAEMON_TICK_FAILURE_LOG_KEY = "llm-daemon-scheduler-tick-failu
  * daemon tick failure audit failure log の rate limit key。
  */
 private const val DAEMON_TICK_AUDIT_FAILURE_LOG_KEY = "llm-daemon-scheduler-tick-audit-failure"
-
-/**
- * daemon cancellation finish failure log の rate limit key。
- */
-private const val DAEMON_CANCELLATION_FINISH_FAILURE_LOG_KEY = "llm-daemon-scheduler-cancellation-finish-failure"
 
 /**
  * ticker fetch failure log の rate limit key。
