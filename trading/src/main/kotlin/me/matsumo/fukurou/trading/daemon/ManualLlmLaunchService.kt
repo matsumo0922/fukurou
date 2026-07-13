@@ -154,6 +154,11 @@ class DefaultManualLlmLaunchService(
             hourlyWindow = MAX_INVOCATION_COUNT_WINDOW,
             dailyWindow = MAX_DAILY_INVOCATION_COUNT_WINDOW,
             activeReservationStaleAfter = tradingConfig.daemon.launchReservationStaleAfter,
+            populationScope = LlmLaunchReservationPopulationScope(
+                kind = "SYMBOL",
+                mode = tradingConfig.mode,
+                symbol = tradingConfig.symbol,
+            ),
         )
         val reservationOutcome = launchReservationRepository.tryReserve(reservationRequest).getOrThrow()
 

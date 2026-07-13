@@ -30,9 +30,16 @@ private const val INSERT_LLM_LAUNCH_RESERVATION_SQL = """
         status,
         reserved_at,
         finished_at,
-        reason
+        reason,
+        population_scope_kind,
+        population_mode,
+        population_symbol,
+        population_account_epoch_id,
+        population_cohort,
+        population_execution_semantics_version
     )
-    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?,
+        COALESCE(?::uuid,(SELECT scope_account_epoch_id FROM gap_population_control WHERE id=1)), ?, ?)
 """
 
 /**
@@ -92,7 +99,22 @@ class ExposedLlmLaunchReservationRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    acquireGapPopulationGenerationToken()
+                    val scope = request.populationScope
+                    val epochId = scope.accountEpochId
+                    if (epochId == null) {
+                        acquireGapPopulationGenerationToken()
+                    } else {
+                        acquireGapPopulationGenerationToken(
+                            GapPopulationScope(
+                                kind = scope.kind,
+                                mode = scope.mode.name,
+                                symbol = scope.symbol?.apiSymbol,
+                                accountEpochId = UUID.fromString(epochId),
+                                cohort = scope.cohort,
+                                executionSemanticsVersion = scope.executionSemanticsVersion,
+                            ),
+                        )
+                    }
                     tryReserveLlmLaunchInTransaction(request)
                 }
             }
@@ -103,7 +125,7 @@ class ExposedLlmLaunchReservationRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    acquireGapPopulationGenerationToken()
+                    acquireGapPopulationGenerationTokenForEntity("LLM_RESERVATION", reservationId(finish.invocationId))
                     finishLlmLaunchInTransaction(finish)
                 }
             }
@@ -209,7 +231,25 @@ private fun JdbcTransaction.insertReservation(request: LlmLaunchReservationReque
         statement.setString(4, request.triggerKey)
         statement.setString(5, LlmLaunchReservationStatus.RUNNING.name)
         statement.setLong(6, request.reservedAt.toEpochMilli())
+        statement.setString(7, request.populationScope.kind)
+        statement.setString(8, request.populationScope.mode.name)
+        statement.setString(9, request.populationScope.symbol?.apiSymbol)
+        statement.setString(10, request.populationScope.accountEpochId)
+        statement.setString(11, request.populationScope.cohort)
+        statement.setString(12, request.populationScope.executionSemanticsVersion)
         statement.executeUpdate()
+    }
+}
+
+private fun JdbcTransaction.reservationId(invocationId: String): String {
+    return jdbcConnection().prepareStatement(
+        "SELECT id::text FROM llm_launch_reservations WHERE invocation_id=?",
+    ).use { statement ->
+        statement.setString(1, invocationId)
+        statement.executeQuery().use { rows ->
+            require(rows.next()) { "LLM launch reservation was not found." }
+            rows.getString(1)
+        }
     }
 }
 

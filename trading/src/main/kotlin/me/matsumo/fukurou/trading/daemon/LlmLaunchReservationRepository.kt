@@ -3,6 +3,8 @@ package me.matsumo.fukurou.trading.daemon
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Duration
@@ -99,6 +101,17 @@ data class LlmLaunchReservationRequest(
     val hourlyWindow: Duration,
     val dailyWindow: Duration,
     val activeReservationStaleAfter: Duration,
+    val populationScope: LlmLaunchReservationPopulationScope,
+)
+
+/** reservation creationに必須のtyped population provenance。 */
+data class LlmLaunchReservationPopulationScope(
+    val kind: String,
+    val mode: TradingMode,
+    val symbol: TradingSymbol?,
+    val accountEpochId: String? = null,
+    val cohort: String = "CURRENT",
+    val executionSemanticsVersion: String? = "PAPER_WS_V1",
 )
 
 /**

@@ -215,13 +215,13 @@ Access policy は `/app/*` と `/ops/*` を対象にし、runtime config draft /
 
 ## Market-data gap recovery の確認
 
-deploy 前の停止中 DB または disposable canary DB では、network listener を起動しない standalone command で stale session と durable gap work を収束させる。
+deploy 前の停止中 DB または disposable canary DB では、network listener を起動しない standalone command で stale session と durable gap work を1回最大1,000件ずつ前進させる。`status=MORE` は同じimageで再実行し、`status=ALL_APPLIED`だけをresume可とする。`EXPLICIT_UNKNOWN`は成功に読み替えない。
 
 ```sh
 DB_URL="$DB_URL" DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" scripts/recover-paper-market
 ```
 
-production image と同じ classpath を使う場合は、対象 image を one-shot container として起動し `PaperMarketRecoveryMainKt RECOVER` を実行する。出力は operation、status、count だけを保持し、work identity、entity ID、projection、credential をログへ出さない。終了 code 0 は全 work が `APPLIED` または明示的な `UNKNOWN` に到達したことを表す。`UNKNOWN` が残る場合は Ktor を停止したまま同じ image で原因を修復し、token 非対応の旧 image を起動しない。
+production image と同じ classpath を使う場合は、対象 image を one-shot container として起動し `PaperMarketRecoveryMainKt RECOVER` を実行する。出力は operation、status、applied、unknown、remainingだけを保持し、work identity、entity ID、projection、credential をログへ出さない。終了 code 0 は`ALL_APPLIED`だけを表す。`UNKNOWN_SCOPE_UNATTRIBUTED`のPOSITION ownerが存在する場合は`PROTECTION_ONLY`を維持し、economic close、entry、LLM、decision、report生成/pinを行わない。
 
 ```sh
 sudo docker run --rm --network fukurou_edge --env-file /srv/fukurou/.env \

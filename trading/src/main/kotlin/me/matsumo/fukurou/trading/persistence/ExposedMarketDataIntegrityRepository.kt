@@ -14,8 +14,6 @@ import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
-private const val MAX_GAP_RECOVERY_PASSES = 10_000
-
 /** PostgreSQL を正本とする market-data integrity repository。 */
 class ExposedMarketDataIntegrityRepository(
     private val database: ExposedDatabase,
@@ -74,6 +72,7 @@ class ExposedMarketDataIntegrityRepository(
                         statement.executeUpdate()
                     }
                     require(updated == 1) { "Connected market-data session was not found." }
+                    Unit
                 }
             }
         }
@@ -95,6 +94,8 @@ class ExposedMarketDataIntegrityRepository(
                         statement.executeUpdate()
                     }
                     require(updated == 1) { "Connected market-data session was not found." }
+                    recoverGapPopulationPass(succeededAt)
+                    Unit
                 }
             }
         }
@@ -152,6 +153,14 @@ class ExposedMarketDataIntegrityRepository(
     }
 
     override suspend fun recoverStaleSession(recoveredAt: Instant): Result<Unit> {
+        return recoverStaleSessionWithSummary(recoveredAt).fold(
+            onSuccess = { Result.success(Unit) },
+            onFailure = { cause -> Result.failure(cause) },
+        )
+    }
+
+    /** standalone/deploy gate向けに実際のterminal state集計を返す。 */
+    suspend fun recoverStaleSessionWithSummary(recoveredAt: Instant): Result<GapPopulationRecoverySummary> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
@@ -169,14 +178,7 @@ class ExposedMarketDataIntegrityRepository(
                         ensureGapWork(sessionId, gap.id, gap.reason, recoveredAt, null)
                     }
                 }
-                var summary: GapPopulationRecoverySummary
-                var passes = 0
-                do {
-                    summary = exposedTransaction(database) { recoverGapPopulationPass(recoveredAt) }
-                    passes += 1
-                    check(passes <= MAX_GAP_RECOVERY_PASSES) { "gap population recovery did not converge." }
-                } while (summary.remaining > 0)
-                Unit
+                exposedTransaction(database) { recoverGapPopulationPass(recoveredAt) }
             }
         }
     }

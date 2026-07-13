@@ -989,7 +989,6 @@ class TradingPersistenceBootstrap(
                 )
                 ensureRuntimeSchemaObjects()
                 ensureGapPopulationLifecycleSchema()
-                acquireGapPopulationGenerationToken()
                 val now = Instant.now(clock)
 
                 jdbcConnection().prepareStatement(
@@ -1009,6 +1008,7 @@ class TradingPersistenceBootstrap(
                 }
                 ensurePaperAccount(now, paperAccountConfig)
                 ensureLegacyPaperAccountEpoch(now)
+                acquireGapPopulationGenerationToken()
                 ensureRiskStateEquityPeak(now, paperAccountConfig.initialCashJpy)
                 ensureBootstrapEquitySnapshot(now)
                 jdbcConnection().prepareStatement(

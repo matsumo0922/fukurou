@@ -915,6 +915,9 @@ class PostgresPersistenceIntegrationTest {
             reason = MarketDataGapReason.PROCESS_RESTART,
             detectedAt = fixedInstant().plusSeconds(1),
         ).getOrThrow()
+        repeat(2) { pass ->
+            repository.recoverStaleSession(fixedInstant().plusSeconds(2 + pass.toLong())).getOrThrow()
+        }
 
         exposedTransaction(database) {
             val memberCount = prepare(
@@ -944,6 +947,90 @@ class PostgresPersistenceIntegrationTest {
             assertEquals(1, memberCount)
             assertEquals(MarketDataGapReason.PROCESS_RESTART.name, reason)
             assertEquals("APPLIED", workState)
+        }
+    }
+
+    @Test
+    fun unattributed_pre_c_run_is_owned_globally_and_failed_without_scope_backfill_or_success_terminal() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        ExposedLlmRunRepository(database).insertRunning(
+            LlmRunStart(
+                invocationId = "unattributed-pre-c-run",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                startedAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("ALTER TABLE gap_population_entity_scopes DISABLE TRIGGER gap_population_entity_scope_immutable")
+            executeUpdate("DELETE FROM gap_population_entity_scopes WHERE entity_type='LLM_RUN' AND entity_id='unattributed-pre-c-run'")
+            executeUpdate("ALTER TABLE gap_population_entity_scopes ENABLE TRIGGER gap_population_entity_scope_immutable")
+            executeUpdate("UPDATE llm_runs SET birth_sequence=NULL WHERE invocation_id='unattributed-pre-c-run'")
+        }
+
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        repository.recordGap(sessionId, MarketDataGapReason.PROCESS_RESTART, fixedInstant().plusSeconds(1)).getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE entity_type='LLM_RUN' AND entity_id='unattributed-pre-c-run' AND state='CONTAINED'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containment_works WHERE consumed_at IS NOT NULL AND result='CONTAINED'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM market_data_gap_population_members WHERE entity_id='unattributed-pre-c-run'", 0)
+            assertSqlCount("SELECT COUNT(*) FROM gap_population_entity_scopes WHERE entity_type='LLM_RUN' AND entity_id='unattributed-pre-c-run'", 0)
+            assertSqlCount("SELECT COUNT(*) FROM llm_runs WHERE invocation_id='unattributed-pre-c-run' AND status='FAILED' AND terminal_cause='GAP_SCOPE_UNATTRIBUTED'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM market_data_gap_work WHERE session_id='$sessionId' AND state='UNKNOWN' AND unknown_code='UNKNOWN_SCOPE_UNATTRIBUTED'", 1)
+        }
+    }
+
+    @Test
+    fun decision_run_projection_hash_is_canonical_and_independent_of_related_entity_birth() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            prepare(
+                "SELECT gap_population_projection_hash('DECISION_RUN','run-1',repeat('a',64))," +
+                    "gap_population_projection_hash('DECISION_RUN','run-1',repeat('a',64))",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    assertTrue(rows.next())
+                    assertEquals(rows.getString(1), rows.getString(2))
+                    assertEquals(64, rows.getString(1).length)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun gap_work_evidence_limit_appends_one_typed_sentinel_without_silent_truncation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        repository.markDisconnected(sessionId, MarketDataGapReason.DISCONNECTED, fixedInstant().plusSeconds(1)).getOrThrow()
+        exposedTransaction(database) {
+            val gapId = prepare("SELECT id FROM market_data_gaps WHERE session_id=?").use { statement ->
+                statement.setObject(1, sessionId)
+                statement.executeQuery().use { rows -> assertTrue(rows.next()); rows.getObject(1, UUID::class.java) }
+            }
+            val identity = GapSourceWorkIdentity(
+                "GMO_COIN", "BTC_JPY", "TRADES", sessionId, "EVENT_SEQUENCE", "evidence-cap",
+            )
+            repeat(GAP_POPULATION_EVIDENCE_LIMIT + 2) { index ->
+                enqueueGapPopulationWork(
+                    identity, gapId, MarketDataGapReason.DATABASE_FAILURE.name, "distinct-$index", fixedInstant(),
+                )
+            }
+            assertSqlCount(
+                "SELECT COUNT(*) FROM market_data_gap_work_evidence evidence JOIN market_data_gap_work work " +
+                    "ON work.id=evidence.work_id WHERE work.source_episode='evidence-cap' AND evidence.reason='UNKNOWN_OVERFLOW'",
+                1,
+            )
+            assertSqlCount(
+                "SELECT COUNT(*) FROM market_data_gap_work WHERE source_episode='evidence-cap' " +
+                    "AND state='UNKNOWN' AND unknown_code='UNKNOWN_OVERFLOW'",
+                1,
+            )
         }
     }
 
@@ -1003,6 +1090,21 @@ class PostgresPersistenceIntegrationTest {
                 detectedAt = fixedInstant().plusSeconds(3),
             )
             assertEquals(first, retry)
+            val sameTimestampSecond = enqueueGapPopulationWork(
+                identity = identity.copy(sourceEpisode = "3"),
+                gapId = gapId,
+                reason = MarketDataGapReason.SEQUENCE_GAP.name,
+                detail = "same timestamp FIFO fixture",
+                detectedAt = fixedInstant().plusSeconds(2),
+            )
+            prepare(
+                "SELECT first.enqueue_sequence < second.enqueue_sequence FROM market_data_gap_work first," +
+                    "market_data_gap_work second WHERE first.id=? AND second.id=?",
+            ).use { statement ->
+                statement.setObject(1, first)
+                statement.setObject(2, sameTimestampSecond)
+                statement.executeQuery().use { rows -> assertTrue(rows.next() && rows.getBoolean(1)) }
+            }
             first
         }
 
@@ -1019,7 +1121,9 @@ class PostgresPersistenceIntegrationTest {
             ),
         ).getOrThrow()
 
-        repository.recoverStaleSession(fixedInstant().plusSeconds(5)).getOrThrow()
+        repeat(6) { pass ->
+            repository.recoverStaleSession(fixedInstant().plusSeconds(5 + pass.toLong())).getOrThrow()
+        }
 
         exposedTransaction(database) {
             val activeMemberCount = prepare(
@@ -1119,10 +1223,10 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun gap_population_control_lock_stress_preserves_one_thousand_members() = runPostgresTest {
+    fun gap_population_control_lock_stress_preserves_one_thousand_and_one_members_across_bounded_passes() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val llmRepository = ExposedLlmRunRepository(database)
-        repeat(1_000) { index ->
+        repeat(1_001) { index ->
             llmRepository.insertRunning(
                 LlmRunStart(
                     invocationId = "gap-lock-stress-$index",
@@ -1147,7 +1251,7 @@ class PostgresPersistenceIntegrationTest {
             val start = CompletableDeferred<Unit>()
             val terminalWriter = async(Dispatchers.IO) {
                 start.await()
-                repeat(1_000) { index ->
+                repeat(1_001) { index ->
                     llmRepository.finish(
                         LlmRunFinish(
                             invocationId = "gap-lock-stress-$index",
@@ -1171,7 +1275,9 @@ class PostgresPersistenceIntegrationTest {
             recoveryWriter.await()
         }
 
-        repository.recoverStaleSession(fixedInstant().plusSeconds(4)).getOrThrow()
+        repeat(5) { pass ->
+            repository.recoverStaleSession(fixedInstant().plusSeconds(4 + pass.toLong())).getOrThrow()
+        }
         exposedTransaction(database) {
             val memberCount = prepare(
                 "SELECT COUNT(*) FROM market_data_gap_population_members " +
@@ -1192,8 +1298,8 @@ class PostgresPersistenceIntegrationTest {
                 }
             }
 
-            assertEquals(1_000, memberCount)
-            assertEquals(1_000, terminalCount)
+            assertEquals(1_001, memberCount)
+            assertEquals(1_001, terminalCount)
         }
     }
 
@@ -1217,15 +1323,28 @@ class PostgresPersistenceIntegrationTest {
 
         val repository = ExposedMarketDataIntegrityRepository(database)
         repository.beginSession(UUID.randomUUID(), fixedInstant()).getOrThrow()
-        val recoveryExitCode = runPaperMarketRecoveryCommand(
+        val firstRecoveryExitCode = runPaperMarketRecoveryCommand(
             arguments = arrayOf("RECOVER"),
             environment = environment,
             stdout = output::add,
             stderr = output::add,
         )
 
+        assertEquals(2, firstRecoveryExitCode)
+        assertTrue(output.any { line -> "\"status\":\"MORE\"" in line })
+        var recoveryExitCode = firstRecoveryExitCode
+        repeat(4) {
+            if (recoveryExitCode != 0) {
+                recoveryExitCode = runPaperMarketRecoveryCommand(
+                    arguments = arrayOf("RECOVER"),
+                    environment = environment,
+                    stdout = output::add,
+                    stderr = output::add,
+                )
+            }
+        }
         assertEquals(0, recoveryExitCode)
-        assertTrue(output.any { line -> "APPLIED_OR_EXPLICIT_UNKNOWN" in line })
+        assertTrue(output.any { line -> "\"status\":\"ALL_APPLIED\"" in line })
         exposedTransaction(database) {
             val fixtureBirth = prepare(
                 "SELECT birth_sequence FROM llm_runs WHERE invocation_id='standalone-recovery-fixture'",
@@ -7100,6 +7219,11 @@ private fun llmLaunchReservationRequest(
         hourlyWindow = Duration.ofHours(1),
         dailyWindow = Duration.ofHours(24),
         activeReservationStaleAfter = Duration.ofMinutes(30),
+        populationScope = me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope(
+            kind = "SYMBOL",
+            mode = TradingMode.PAPER,
+            symbol = TradingSymbol.BTC,
+        ),
     )
 }
 
@@ -7323,6 +7447,15 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
         }
     } finally {
         container.stop()
+    }
+}
+
+private fun JdbcTransaction.assertSqlCount(sql: String, expected: Int) {
+    prepare(sql).use { statement ->
+        statement.executeQuery().use { rows ->
+            assertTrue(rows.next())
+            assertEquals(expected, rows.getInt(1))
+        }
     }
 }
 

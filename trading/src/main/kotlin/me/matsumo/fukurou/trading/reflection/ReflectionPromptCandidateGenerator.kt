@@ -13,6 +13,7 @@ import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
@@ -297,6 +298,11 @@ class ReflectionPromptCandidateGenerator(
                 hourlyWindow = MAX_INVOCATION_COUNT_WINDOW,
                 dailyWindow = MAX_DAILY_INVOCATION_COUNT_WINDOW,
                 activeReservationStaleAfter = tradingConfig.daemon.launchReservationStaleAfter,
+                populationScope = LlmLaunchReservationPopulationScope(
+                    kind = "SYMBOL",
+                    mode = tradingConfig.mode,
+                    symbol = tradingConfig.symbol,
+                ),
             ),
         ).getOrThrow()
     }

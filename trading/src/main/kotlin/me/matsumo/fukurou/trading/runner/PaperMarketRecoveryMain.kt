@@ -28,6 +28,9 @@ private data class RecoveryOutput(
     val operation: String,
     val status: String,
     val count: Int,
+    val applied: Int = 0,
+    val unknown: Int = 0,
+    val remaining: Int = 0,
 )
 
 internal suspend fun runPaperMarketRecoveryCommand(
@@ -41,8 +44,17 @@ internal suspend fun runPaperMarketRecoveryCommand(
         TradingPersistenceBootstrap(database).ensureSchema().getOrThrow()
         when (arguments.firstOrNull()?.uppercase()) {
             "RECOVER" -> {
-                ExposedMarketDataIntegrityRepository(database).recoverStaleSession(Instant.now()).getOrThrow()
-                RecoveryOutput("RECOVER", "APPLIED_OR_EXPLICIT_UNKNOWN", 1)
+                val summary = ExposedMarketDataIntegrityRepository(database)
+                    .recoverStaleSessionWithSummary(Instant.now())
+                    .getOrThrow()
+                RecoveryOutput(
+                    operation = "RECOVER",
+                    status = summary.state,
+                    count = summary.processed,
+                    applied = summary.applied,
+                    unknown = summary.unknown,
+                    remaining = summary.remaining,
+                )
             }
             "FIXTURE_CREATE" -> {
                 requireFixtureDatabase(environment)
@@ -65,7 +77,7 @@ internal suspend fun runPaperMarketRecoveryCommand(
     }.fold(
         onSuccess = { output ->
             stdout(Json.encodeToString(output))
-            0
+            if (output.status in setOf("ALL_APPLIED", "CREATED")) 0 else 2
         },
         onFailure = { failure ->
             stderr(Json.encodeToString(RecoveryOutput("UNKNOWN", failure::class.simpleName ?: "ERROR", 0)))

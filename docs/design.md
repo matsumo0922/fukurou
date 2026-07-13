@@ -3630,13 +3630,13 @@ Private POSTは取引所上限より安全側に、bot内部の実効上限を `
 
 [確定] `ProtectionReconciler` は起動時に必ずfull reconcile passを実行する。これはクラッシュ復元と同じ経路にし、main pushごとのdeploy方針は変えない。`/health/ready` はDB接続だけでなく `lastTransportActivityAt` と `lastMaintenanceAt` の鮮度、接続状態、未回復gapを確認し、保護ループが止まっている状態をreadyにしない。`lastTradeAt` は正常無音を許容するため readiness の必須条件にしない。
 
-[確定] market-data gap の recovery population は `gap_population_control` を transaction 入口で lock して取得する sealed token で直列化する。order、position、LLM run、LLM reservation、opportunity episode、evaluation report job の creation と terminal mutation は同じ token を先に取得し、trigger は lock を後から取得せず token の transaction ID と control version だけを検証する。token がない raw mutation と stale token は拒否する。
+[確定] market-data gap の recovery population は `gap_population_control` を transaction 入口で lock して取得する sealed token で直列化する。app role の generic token は mode、domain symbol、account epoch、cohort、execution semantics を固定する。MCP role は opportunity episode 専用 token だけを取得でき、generic token、birth sequence、private scope/evidenceへアクセスできない。order、position、LLM run、LLM reservation、opportunity episode、evaluation report job の creation と terminal mutation は token を先に取得し、trigger は transaction ID、control version、allowed population、immutable scopeを検証する。
 
 gap source は provider、symbol、channel、session、source kind、source episode の canonical identity で `market_data_gap_work` に exactly-once で保存する。同一 stream には active generation を1件だけ置き、重複 source は同じ work ID へ coalesce し、重なる source は FIFO queue へ置く。enqueue 時点で `population_as_of`、birth sequence upper、journal lower を固定し、queued work の journal upper は active generation の終了時に固定する。
 
-population capture は current row と terminal journal を union し、`(work, entity type, entity ID)` で deduplicate する。`birth_sequence IS NULL OR birth_sequence <= upper` を使用し、NULL は `PRE_C` として最古に扱い、履歴を backfill しない。同一 entity の projection hash が一致しない場合は上書きせず `UNKNOWN_DATA_CONFLICT` へ終端する。member は immutable な影響対象として残り、現在状態が変わっても infrastructure outcome を strategy KPI に混ぜない。
+population capture は current row と terminal journal を exact scope で union し、`(work, entity type, entity ID)` で deduplicate する。`birth_sequence IS NULL OR birth_sequence <= upper` を使用するが、immutable scope rowを持たないPRE_C active entityはcurrent cohortへ推定せず`UNKNOWN_SCOPE_UNATTRIBUTED`へ終端する。同一entityはentity-global containment ownerへcoalesceする。ORDER、LLM run、LLM reservation、opportunity episode、evaluation report jobはownerと全UNKNOWN workをlockして安全な失敗終端へ更新し、member、journal、scopeを作らない。POSITIONとderived decision runはeconomic closeせず`QUARANTINED`とする。同一 entity の projection hash が一致しない場合は上書きせず `UNKNOWN_DATA_CONFLICT` へ終端する。
 
-capture と impact は page 100、1 pass 1,000件で進む。queue、evidence、member、terminal journal には hard cap を持ち、切り捨てず `UNKNOWN_OVERFLOW` と evidence を残す。standalone recovery command は network listener を起動せず stale `CONNECTED` session を `PROCESS_RESTART` gap へ変換し、work が `APPLIED` または明示的な `UNKNOWN` へ収束するまで bounded pass を繰り返す。paper fill の遡及作成、既存履歴の rescale、destructive backfill は行わない。
+capture と impact は page 100、1 invocation 1,000件で進み、phaseとcursorをDBへ保存する。通常runtimeはmaintenance tickで残件をredriveする。queue、evidence、member、未消費terminal journalにはhard capを持ち、切り捨てず一意な`UNKNOWN_OVERFLOW` sentinelとtyped evidenceを残す。standalone recovery commandはnetwork listenerを起動せず1 bounded invocationを実行し、`ALL_APPLIED`だけを成功、`MORE`または明示的な`UNKNOWN`を非成功として機械判定できる形で返す。paper fillの遡及作成、既存履歴のrescale、destructive backfillは行わない。
 
 重大不一致例:
 

@@ -20,7 +20,11 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
+import me.matsumo.fukurou.trading.domain.TradingMode
+import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.persistence.GapPopulationScope
 import me.matsumo.fukurou.trading.persistence.finishLlmLaunchInTransaction
 import me.matsumo.fukurou.trading.persistence.acquireGapPopulationGenerationToken
 import me.matsumo.fukurou.trading.persistence.ensureEvaluationReportGapPopulationLifecycleSchema
@@ -32,8 +36,10 @@ import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
-private fun JdbcTransaction.acquireEvaluationGapPopulationToken() {
-    if (ensureEvaluationReportGapPopulationLifecycleSchema()) acquireGapPopulationGenerationToken()
+private fun JdbcTransaction.acquireEvaluationGapPopulationToken(scope: GapPopulationScope? = null) {
+    if (ensureEvaluationReportGapPopulationLifecycleSchema()) {
+        if (scope == null) acquireGapPopulationGenerationToken() else acquireGapPopulationGenerationToken(scope)
+    }
 }
 
 /** Evaluation report job/revision/pin と LLM reservation を同じ PostgreSQL transaction で扱う。 */
@@ -42,6 +48,8 @@ internal class EvaluationReportPersistence(
     private val runnerConfig: LlmRunnerConfig,
     private val staleAfter: Duration,
     private val clock: Clock,
+    private val mode: TradingMode,
+    private val symbol: TradingSymbol,
 ) {
     init {
         exposedTransaction(database) {
@@ -54,7 +62,8 @@ internal class EvaluationReportPersistence(
     /** request identity、revision number、共通 LLM reservation または rejection を atomic に保存する。 */
     fun admit(job: EvaluationReportJobResponse, scopeKey: String): Result<EvaluationReportAdmission> = runCatching {
         exposedTransaction(database) {
-            acquireEvaluationGapPopulationToken()
+            val populationScope = reportPopulationScope(scopeKey)
+            acquireEvaluationGapPopulationToken(populationScope)
             val now = clock.instant()
             val numberedJob = job.copy(revisionNumber = nextRevisionNumberInTransaction())
             val reportRateExceeded = count(
@@ -74,6 +83,14 @@ internal class EvaluationReportPersistence(
                         hourlyWindow = Duration.ofHours(1),
                         dailyWindow = Duration.ofDays(1),
                         activeReservationStaleAfter = staleAfter,
+                        populationScope = LlmLaunchReservationPopulationScope(
+                            kind = populationScope.kind,
+                            mode = mode,
+                            symbol = symbol,
+                            accountEpochId = populationScope.accountEpochId.toString(),
+                            cohort = populationScope.cohort,
+                            executionSemanticsVersion = populationScope.executionSemanticsVersion,
+                        ),
                     ),
                 )
             }
@@ -88,7 +105,7 @@ internal class EvaluationReportPersistence(
                     retryAfterSeconds = retryAfterSeconds(outcome.reason),
                 )
             }
-            insertJob(persistedJob, scopeKey, now.toEpochMilli())
+            insertJob(persistedJob, scopeKey, populationScope, now.toEpochMilli())
             insertJobEvent(persistedJob, now.toEpochMilli())
 
             EvaluationReportAdmission(persistedJob, outcome)
@@ -173,8 +190,21 @@ internal class EvaluationReportPersistence(
 
     fun complete(report: EvaluationReportResponse, job: EvaluationReportJobResponse): Result<Unit> = runCatching {
         exposedTransaction(database) {
-            acquireEvaluationGapPopulationToken()
+            val populationScope = reportPopulationScope(report.scopeKey)
+            acquireEvaluationGapPopulationToken(populationScope)
             val now = clock.instant().toEpochMilli()
+            check(!reportPublicationBlocked(job.jobId, populationScope)) {
+                "evaluation report publication is blocked by gap population."
+            }
+            val completed = jdbcConnection().prepareStatement(
+                "UPDATE evaluation_report_jobs SET status='SUCCEEDED',stage='COMPLETE',failure_code=NULL," +
+                    "failure_message=NULL,updated_at=? WHERE job_id=? AND status IN ('REQUESTED','RUNNING')",
+            ).use { statement ->
+                statement.setLong(1, now)
+                statement.setObject(2, UUID.fromString(job.jobId))
+                statement.executeUpdate()
+            }
+            check(completed == 1) { "evaluation report job is already terminal." }
             jdbcConnection().prepareStatement(
                 """
                 INSERT INTO evaluation_report_revisions (revision_id, job_id, scope_key, revision_number, report_json, generated_at)
@@ -201,7 +231,6 @@ internal class EvaluationReportPersistence(
                 statement.setLong(3, clock.instant().toEpochMilli())
                 statement.executeUpdate()
             }
-            updateJobInTransaction(job.copy(status = "SUCCEEDED", stage = "COMPLETE"))
             insertJobEvent(job.copy(status = "SUCCEEDED", stage = "COMPLETE"), now)
             finishLlmLaunchInTransaction(
                 LlmLaunchReservationFinish(job.jobId, LlmLaunchReservationStatus.FINISHED, null, clock.instant()),
@@ -366,10 +395,15 @@ internal class EvaluationReportPersistence(
     private fun JdbcTransaction.insertJob(
         job: EvaluationReportJobResponse,
         scopeKey: String,
+        populationScope: GapPopulationScope,
         now: Long,
     ) {
         jdbcConnection().prepareStatement(
-            "INSERT INTO evaluation_report_jobs (job_id, revision_id, scope_key, revision_number, status, stage, failure_code, failure_message, active_invocation_id, retry_after_seconds, requested_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO evaluation_report_jobs (job_id,revision_id,scope_key,revision_number,status,stage," +
+                "failure_code,failure_message,active_invocation_id,retry_after_seconds,requested_at,updated_at," +
+                "population_scope_kind,population_mode,population_symbol,population_account_epoch_id," +
+                "population_cohort,population_execution_semantics_version) " +
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         ).use { statement ->
             statement.setObject(1, UUID.fromString(job.jobId))
             statement.setObject(2, UUID.fromString(job.revisionId))
@@ -384,6 +418,12 @@ internal class EvaluationReportPersistence(
                 ?: statement.setNull(10, java.sql.Types.BIGINT)
             statement.setLong(11, now)
             statement.setLong(12, now)
+            statement.setString(13, populationScope.kind)
+            statement.setString(14, populationScope.mode)
+            statement.setString(15, populationScope.symbol)
+            statement.setObject(16, populationScope.accountEpochId)
+            statement.setString(17, populationScope.cohort)
+            statement.setString(18, populationScope.executionSemanticsVersion)
             statement.executeUpdate()
         }
     }
@@ -437,6 +477,42 @@ internal class EvaluationReportPersistence(
                 "UPDATE llm_launch_reservations SET status='FAILED', reason='FAILED_PROCESS_INTERRUPTED', finished_at=" +
                     now + " WHERE trigger_kind='EVALUATION_REPORT' AND status='RUNNING'",
             )
+        }
+    }
+
+    private fun reportPopulationScope(scopeKey: String): GapPopulationScope {
+        val identity = EvaluationReportScopeKey.decode(scopeKey)
+        val epochId = requireNotNull(identity.epochId) { "REPORT_SCOPE_INVALID: unversioned scope." }
+        val cohort = requireNotNull(identity.cohort) { "REPORT_SCOPE_INVALID: cohort is missing." }
+        return GapPopulationScope(
+            kind = "SYMBOL",
+            mode = mode.name,
+            symbol = symbol.apiSymbol,
+            accountEpochId = UUID.fromString(epochId),
+            cohort = cohort,
+            executionSemanticsVersion = if (cohort == "CURRENT") "PAPER_WS_V1" else null,
+        )
+    }
+
+    private fun JdbcTransaction.reportPublicationBlocked(jobId: String, scope: GapPopulationScope): Boolean {
+        return jdbcConnection().prepareStatement(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM evaluation_report_jobs job
+                JOIN market_data_gap_work work ON work.scope_hash=?
+                WHERE job.job_id=?::uuid AND job.birth_sequence<=work.birth_sequence_upper
+                  AND work.state IN ('QUEUED','CAPTURING','SEALED','APPLYING','UNKNOWN')
+            ) OR EXISTS (
+                SELECT 1 FROM market_data_gap_population_members member
+                WHERE member.entity_type='EVALUATION_REPORT_JOB' AND member.entity_id=? AND member.scope_hash=?
+            )
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, scope.hash)
+            statement.setString(2, jobId)
+            statement.setString(3, jobId)
+            statement.setString(4, scope.hash)
+            statement.executeQuery().use { rows -> rows.next() && rows.getBoolean(1) }
         }
     }
 
