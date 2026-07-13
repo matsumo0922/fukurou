@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.config
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
+import me.matsumo.fukurou.trading.safety.toSafeWindow
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
@@ -70,6 +71,13 @@ data class FomcBlackoutCalendar(
                 return invalid("duplicate eventId: ${duplicateIds.keys.sorted().joinToString()}")
             }
 
+            val hasNonPrefixedFomc = events.any { event -> event.hasNonPrefixedFomcId() }
+            if (hasNonPrefixedFomc) {
+                return invalid("FOMC eventId must start with $FOMC_EVENT_ID_PREFIX")
+            }
+
+            val windows = events.map { event -> event.toSafeWindow() ?: return invalid("event window overflow") }
+
             val fomcEvents = events.filter { event -> event.eventId.startsWith(FOMC_EVENT_ID_PREFIX) }
             if (fomcEvents.isEmpty()) {
                 return FomcBlackoutCalendar(
@@ -82,7 +90,9 @@ data class FomcBlackoutCalendar(
             return FomcBlackoutCalendar(
                 state = FomcBlackoutCalendarState.ACTIVE,
                 events = events,
-                validThrough = fomcEvents.maxOf { event -> event.eventAt.plus(event.blackoutAfter) },
+                validThrough = windows
+                    .filter { window -> window.event.eventId.startsWith(FOMC_EVENT_ID_PREFIX) }
+                    .maxOf { window -> window.endsAt },
             )
         }
 
@@ -118,6 +128,11 @@ data class FomcBlackoutCalendar(
             )
         }
     }
+}
+
+/** FOMC と名付けた event が FOMC ID invariant に違反しているか返す。 */
+internal fun EconomicEventBlackout.hasNonPrefixedFomcId(): Boolean {
+    return eventName.contains("FOMC", ignoreCase = true) && !eventId.startsWith(FOMC_EVENT_ID_PREFIX)
 }
 
 /** economic event JSON を厳格に domain へ変換する。 */
@@ -166,7 +181,7 @@ private data class EconomicEventBlackoutJson(
     }
 }
 
-private const val FOMC_EVENT_ID_PREFIX = "fomc-"
+internal const val FOMC_EVENT_ID_PREFIX = "fomc-"
 private val FOMC_TIME_ZONE: ZoneId = ZoneId.of("America/New_York")
 private val FOMC_ANNOUNCEMENT_LOCAL_TIME: LocalTime = LocalTime.of(14, 0)
 private val FOMC_BLACKOUT_WIDTH: Duration = Duration.ofMinutes(60)

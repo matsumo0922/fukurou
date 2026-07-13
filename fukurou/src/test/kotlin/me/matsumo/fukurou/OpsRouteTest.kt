@@ -648,6 +648,45 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_runtimeConfigDerivesExpiryWarningFromCachedCalendarAtResponseTime() = testApplication {
+        val validThrough = Instant.parse("2026-07-13T01:00:00Z")
+        val clock = MutableClock(validThrough)
+        val calendarRaw =
+            """[{"eventId":"fomc-boundary","eventName":"FOMC","eventAt":"2026-07-13T00:00:00Z","blackoutBeforeSeconds":3600,"blackoutAfterSeconds":3600}]"""
+        val tradingConfig = TradingBotConfig.fromEnvironment(
+            mapOf("FUKUROU_ECONOMIC_EVENT_BLACKOUTS_UTC" to calendarRaw),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                clock = clock,
+                tradingConfig = tradingConfig,
+            )
+        }
+
+        val boundaryResponse = client.get("/ops/runtime-config")
+        val boundaryReadyResponse = client.get("/health/ready")
+        clock.advance(Duration.ofMillis(1))
+        val expiredResponse = client.get("/ops/runtime-config")
+        val expiredReadyResponse = client.get("/health/ready")
+        val boundaryWarnings = Json.parseToJsonElement(boundaryResponse.bodyAsText()).jsonObject
+            .getValue("warnings").jsonArray
+        val expiredWarnings = Json.parseToJsonElement(expiredResponse.bodyAsText()).jsonObject
+            .getValue("warnings").jsonArray
+
+        assertEquals(HttpStatusCode.OK, boundaryResponse.status)
+        assertEquals(emptyList(), boundaryWarnings)
+        assertEquals(HttpStatusCode.OK, boundaryReadyResponse.status)
+        assertEquals(HttpStatusCode.OK, expiredResponse.status)
+        assertEquals(
+            "runtimeConfig.warning.fomcCalendarExpired",
+            expiredWarnings.single().jsonObject.getValue("code").jsonPrimitive.content,
+        )
+        assertEquals(HttpStatusCode.OK, expiredReadyResponse.status)
+    }
+
+    @Test
     fun opsRoutes_runtimeConfigDraftActivationReturnsMachineReadableValidationErrors() = testApplication {
         val adminService = FakeRuntimeConfigAdminService()
 

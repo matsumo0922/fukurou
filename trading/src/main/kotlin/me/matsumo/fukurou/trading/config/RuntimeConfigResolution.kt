@@ -824,20 +824,21 @@ private fun validateFomcCalendarCandidate(raw: String): List<RuntimeConfigValida
         return listOf(fomcValidationError("runtimeConfig.validation.fomcCalendarDuplicateId"))
     }
 
-    val hasNonPrefixedFomc = events.any { event ->
-        !event.eventId.startsWith("fomc-") && event.eventName.contains("FOMC", ignoreCase = true)
-    }
+    val hasNonPrefixedFomc = events.any { event -> event.hasNonPrefixedFomcId() }
     if (hasNonPrefixedFomc) {
         return listOf(fomcValidationError("runtimeConfig.validation.fomcCalendarInvalidId"))
     }
 
-    val fomcEvents = events.filter { event -> event.eventId.startsWith("fomc-") }
-    if (fomcEvents.isEmpty()) {
+    val calendar = FomcBlackoutCalendar.fromEvents(events)
+    if (calendar.state == FomcBlackoutCalendarState.INVALID) {
+        return listOf(fomcValidationError("runtimeConfig.validation.fomcCalendarInvalid"))
+    }
+    if (calendar.state == FomcBlackoutCalendarState.MISSING) {
         return listOf(fomcValidationError("runtimeConfig.validation.fomcCalendarMissing"))
     }
 
     val now = Instant.now()
-    if (fomcEvents.none { event -> event.eventAt.plus(event.blackoutAfter) >= now }) {
+    if (requireNotNull(calendar.validThrough) < now) {
         return listOf(fomcValidationError("runtimeConfig.validation.fomcCalendarNoFutureWindow"))
     }
 
@@ -848,7 +849,7 @@ private fun fomcValidationError(code: String): RuntimeConfigValidationError {
     return RuntimeConfigValidationError(code = code, key = ECONOMIC_EVENT_BLACKOUTS_KEY)
 }
 
-private fun FomcBlackoutCalendar.toRuntimeConfigWarnings(now: Instant): List<RuntimeConfigSnapshotWarning> {
+internal fun FomcBlackoutCalendar.toRuntimeConfigWarnings(now: Instant): List<RuntimeConfigSnapshotWarning> {
     val code = when (stateAt(now)) {
         FomcBlackoutCalendarState.ACTIVE -> return emptyList()
         FomcBlackoutCalendarState.MISSING -> "runtimeConfig.warning.fomcCalendarMissing"
@@ -859,7 +860,21 @@ private fun FomcBlackoutCalendar.toRuntimeConfigWarnings(now: Instant): List<Run
     return listOf(RuntimeConfigSnapshotWarning(code = code))
 }
 
+/** snapshot に保存された FOMC warning を現在時刻の calendar state で置き換える。 */
+fun List<RuntimeConfigSnapshotWarning>.withCurrentFomcCalendarWarning(
+    calendar: FomcBlackoutCalendar,
+    now: Instant,
+): List<RuntimeConfigSnapshotWarning> {
+    return filterNot { warning -> warning.code in FOMC_CALENDAR_WARNING_CODES } +
+        calendar.toRuntimeConfigWarnings(now)
+}
+
 private const val ECONOMIC_EVENT_BLACKOUTS_KEY = "safety.economicEventBlackouts"
+private val FOMC_CALENDAR_WARNING_CODES = setOf(
+    "runtimeConfig.warning.fomcCalendarMissing",
+    "runtimeConfig.warning.fomcCalendarInvalid",
+    "runtimeConfig.warning.fomcCalendarExpired",
+)
 
 internal fun RuntimeConfigValidationResult.requireValid() {
     if (!valid) {

@@ -195,6 +195,58 @@ class SafetyFloorTest {
     }
 
     @Test
+    fun fomcCalendar_invalidOverflowBlocksEntryButKeepsRiskReducingOperationsAvailable() {
+        val observedAt = Instant.parse("2026-07-13T00:00:00Z")
+        val invalidEvent = EconomicEventBlackout(
+            eventId = "fomc-end-overflow",
+            eventName = "FOMC",
+            eventAt = Instant.MAX,
+            blackoutBefore = Duration.ZERO,
+            blackoutAfter = Duration.ofSeconds(1),
+        )
+        val floor = SafetyFloor(
+            config = SafetyFloorConfig(economicEventBlackouts = listOf(invalidEvent)),
+            clock = Clock.fixed(observedAt, ZoneOffset.UTC),
+        )
+        val positionId = UUID.randomUUID()
+        val context = safetyContext(
+            positions = listOf(protectedPosition(positionId)),
+            atr14Jpy = BigDecimal("20000"),
+        )
+
+        val entryVerdict = floor.evaluatePlaceOrder(entryCommand(), context)
+        val closeVerdict = floor.evaluateClosePosition(
+            command = ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = positionId,
+                closeAll = true,
+                reasonJa = "invalid calendar recovery close",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+            context = context,
+        )
+        val protectionVerdict = floor.evaluateUpdateProtection(
+            command = UpdateProtectionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = positionId,
+                newStopPriceJpy = BigDecimal("10040000"),
+                takeProfitPriceSpecified = false,
+                newTakeProfitPriceJpy = null,
+                reasonJa = "invalid calendar protection update",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+            context = context,
+        )
+
+        assertEquals(
+            SafetyFloorRule.FOMC_CALENDAR_INVALID,
+            assertIs<SafetyFloorVerdict.Rejected>(entryVerdict).violation.rule,
+        )
+        assertIs<SafetyFloorVerdict.Accepted>(closeVerdict)
+        assertIs<SafetyFloorVerdict.Accepted>(protectionVerdict)
+    }
+
+    @Test
     fun update_protection_rejects_stop_below_atr_trailing_floor() {
         val positionId = UUID.fromString("00000000-0000-0000-0000-000000000001")
         val verdict = SafetyFloor(clock = fixedClock()).evaluateUpdateProtection(

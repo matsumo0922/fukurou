@@ -186,13 +186,30 @@ data class EconomicEventBlackout(
      * 指定時刻が blackout window 内なら true を返す。
      */
     fun contains(observedAt: Instant): Boolean {
-        val startsAt = eventAt.minus(blackoutBefore)
-        val endsAt = eventAt.plus(blackoutAfter)
-        val beforeStart = observedAt.isBefore(startsAt)
-        val afterEnd = observedAt.isAfter(endsAt)
+        val window = toSafeWindow() ?: return false
+        val beforeStart = observedAt.isBefore(window.startsAt)
+        val afterEnd = observedAt.isAfter(window.endsAt)
 
         return !beforeStart && !afterEnd
     }
+}
+
+/** overflow を起こさず導出できた economic event window。 */
+internal data class EconomicEventBlackoutWindow(
+    val event: EconomicEventBlackout,
+    val startsAt: Instant,
+    val endsAt: Instant,
+)
+
+/** event window の両端を overflow-safe に導出する。 */
+internal fun EconomicEventBlackout.toSafeWindow(): EconomicEventBlackoutWindow? {
+    return runCatching {
+        EconomicEventBlackoutWindow(
+            event = this,
+            startsAt = eventAt.minus(blackoutBefore),
+            endsAt = eventAt.plus(blackoutAfter),
+        )
+    }.getOrNull()
 }
 
 /**
@@ -1114,8 +1131,10 @@ class SafetyFloor(
             )
         }
 
-        val activeEvent = config.economicEventBlackouts.firstOrNull { event -> event.contains(observedAt) }
+        val activeEvent = config.fomcBlackoutCalendar.events.firstOrNull { event -> event.contains(observedAt) }
             ?: return null
+
+        val activeWindow = requireNotNull(activeEvent.toSafeWindow())
 
         return violation(
             commandName = "place_order",
@@ -1124,7 +1143,7 @@ class SafetyFloor(
                 rule = SafetyFloorRule.ECONOMIC_EVENT_BLACKOUT,
                 messageJa = "高影響経済イベント ${activeEvent.eventName} の blackout window 中のため、新規 entry は拒否します。",
                 measuredValue = observedAt.toString(),
-                limitValue = "${activeEvent.eventAt.minus(activeEvent.blackoutBefore)}..${activeEvent.eventAt.plus(activeEvent.blackoutAfter)}",
+                limitValue = "${activeWindow.startsAt}..${activeWindow.endsAt}",
             ),
         )
     }

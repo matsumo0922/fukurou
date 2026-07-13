@@ -37,6 +37,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedExceptio
 import me.matsumo.fukurou.trading.config.RuntimeConfigValidationError
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
+import me.matsumo.fukurou.trading.config.withCurrentFomcCalendarWarning
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonLaunchSuppressionReason
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
@@ -761,7 +762,10 @@ private fun Route.registerOpsRuntimeConfigRoute(dependencies: OpsRouteDependenci
         val runtimeConfigSnapshot = runtimeConfig.snapshotProvider.snapshot()
         val versionsResult = adminService?.listVersions()
         val versions = versionsResult?.getOrNull().orEmpty()
-        val warnings = runtimeConfigSnapshot.warnings + versionHistoryWarning(versionsResult)
+        val warnings = runtimeConfigSnapshot.warnings.withCurrentFomcCalendarWarning(
+            calendar = runtimeConfigSnapshot.tradingConfig.safetyFloor.fomcBlackoutCalendar,
+            now = dependencies.clock.instant(),
+        ) + versionHistoryWarning(versionsResult)
 
         call.respond(
             RuntimeConfigCatalog.snapshot(
