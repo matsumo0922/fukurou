@@ -208,7 +208,8 @@ class ShellProcessRunner(
 }
 
 private fun Process.descendantsDeepestFirst(): List<ProcessHandle> {
-    return toHandle().descendants().toList().asReversed()
+    return runCatching { toHandle().descendants().toList().asReversed() }
+        .getOrDefault(emptyList())
 }
 
 private fun Path.isProductionPerRunHome(): Boolean {
