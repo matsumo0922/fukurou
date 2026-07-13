@@ -113,10 +113,18 @@ class RuntimeConfigCatalogTest {
         assertEquals("2.5", defaultValues.getValue("safety.minExpectedMoveToCostRatio"))
         assertEquals("7", defaultValues.getValue("runner.maxInvocationsPerHour"))
         assertEquals("120", defaultValues.getValue("runner.maxInvocationsPerDay"))
+        assertEquals("1", defaultValues.getValue("runner.entryFillReservePerHour"))
+        assertEquals("4", defaultValues.getValue("runner.entryFillReservePerDay"))
+        assertEquals("1", defaultValues.getValue("runner.stopProximityReservePerHour"))
+        assertEquals("4", defaultValues.getValue("runner.stopProximityReservePerDay"))
         assertEquals("900", defaultValues.getValue("daemon.flatHeartbeatInterval"))
         assertEquals("2.5", defaultEnvironment.getValue("FUKUROU_MIN_EXPECTED_MOVE_TO_COST_RATIO"))
         assertEquals("7", defaultEnvironment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"))
         assertEquals("120", defaultEnvironment.getValue("FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY"))
+        assertEquals("1", defaultEnvironment.getValue("FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_HOUR"))
+        assertEquals("4", defaultEnvironment.getValue("FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_DAY"))
+        assertEquals("1", defaultEnvironment.getValue("FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_HOUR"))
+        assertEquals("4", defaultEnvironment.getValue("FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_DAY"))
         assertEquals("900", defaultEnvironment.getValue("FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS"))
     }
 }

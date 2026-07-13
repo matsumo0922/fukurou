@@ -3,8 +3,16 @@
 package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -32,6 +40,13 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmDaemonPreFilterDecision
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
 import me.matsumo.fukurou.trading.decision.FalsificationRecord
@@ -59,9 +74,11 @@ import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupQuarantine
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.invoker.LlmProcessTreeTerminationRegistry
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifestWriter
+import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProof
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.invoker.isCodexProvider
 import me.matsumo.fukurou.trading.invoker.readOptionalEnv
@@ -82,6 +99,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 手動 one-shot runner の実行要求。
@@ -97,6 +115,7 @@ import java.util.UUID
  * @param falsifierProvider Falsifier provider
  * @param proposerAssignment Proposer の provider / model / effort snapshot
  * @param falsifierAssignment Falsifier の provider / model / effort snapshot
+ * @param preFilter claim 後かつ llm_runs / material I/O 前に実行する daemon pre-filter
  */
 data class OneShotRunnerRequest(
     val repositoryRoot: Path,
@@ -110,6 +129,7 @@ data class OneShotRunnerRequest(
     val falsifierProvider: LlmProvider = LlmProvider.CODEX,
     val proposerAssignment: LlmRoleAssignment? = null,
     val falsifierAssignment: LlmRoleAssignment? = null,
+    val preFilter: (suspend () -> LlmDaemonPreFilterDecision)? = null,
 )
 
 private fun OneShotRunnerRequest.effectiveProposerAssignment(): LlmRoleAssignment {
@@ -245,6 +265,9 @@ enum class OneShotRunnerStatus {
      * 直近 1 時間の起動上限で launch を拒否した。
      */
     LAUNCH_REJECTED,
+
+    /** daemon pre-filter が full one-shot を不要と判定した。 */
+    PRE_FILTER_SKIPPED,
 }
 
 /**
@@ -317,13 +340,123 @@ class OneShotLlmRunner(
     private val phaseInvoker = OneShotPhaseInvoker(
         llmInvoker = llmInvoker,
         invocationAuditor = invocationAuditor,
+        beforeInvoke = { request ->
+            val claimantToken = requireNotNull(activeClaimantTokens[request.invocationId])
+            LlmExecutionTerminationFenceRegistry.withClaimTransition(request.invocationId, claimantToken) {
+                requireLiveClaim(request.invocationId, claimantToken)
+                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                    LlmExecutionTerminationFenceRegistry.markChildMayBeRunning(request.invocationId, claimantToken)
+                }
+            }
+        },
     )
+    private val executionPolicy = OneShotExecutionPolicy.from(tradingConfig.runner)
+    private val claimSupervisor = LlmExecutionClaimSupervisor(
+        repository = tradingRuntime.launchReservationRepository,
+        clock = clock,
+        interval = executionPolicy.heartbeatInterval,
+    )
+    private val activeClaimantTokens = ConcurrentHashMap<String, String>()
 
     /**
      * one-shot runner を 1 回実行する。
      */
+    @Suppress("LongMethod")
     suspend fun runOneShot(request: OneShotRunnerRequest): Result<OneShotRunnerResult> {
         val invocationId = request.invocationId ?: idGenerator().toString()
+        val triggerKind = request.triggerKind
+            ?: return Result.failure(IllegalStateException(LAUNCH_RESERVATION_MISSING))
+        val claimantToken = idGenerator().toString()
+        val claimedAt = clock.instant()
+        val claimOutcome = withContext(NonCancellable) {
+            tradingRuntime.launchReservationRepository.claimForExecution(
+                LlmExecutionClaimRequest(
+                    invocationId = invocationId,
+                    triggerKind = triggerKind,
+                    claimantToken = claimantToken,
+                    claimedAt = claimedAt,
+                    activeSince = claimedAt.minus(tradingConfig.daemon.launchReservationStaleAfter),
+                ),
+            ).also { outcome ->
+                when (outcome) {
+                    is LlmExecutionClaimOutcome.OutcomeUnknown -> claimSupervisor.register(invocationId, claimantToken)
+                    is LlmExecutionClaimOutcome.Claimed -> LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+                        invocationId = invocationId,
+                        claimantToken = claimantToken,
+                        observedAt = outcome.claimedAt,
+                    )
+                    is LlmExecutionClaimOutcome.Rejected -> Unit
+                }
+            }
+        }
+        when (claimOutcome) {
+            is LlmExecutionClaimOutcome.Rejected -> {
+                appendClaimPreflightAudit(
+                    invocationId = invocationId,
+                    triggerKind = triggerKind,
+                    reason = claimOutcome.reason.wireCode,
+                    canLaunch = false,
+                )
+                return Result.failure(IllegalStateException(claimOutcome.reason.wireCode))
+            }
+            is LlmExecutionClaimOutcome.OutcomeUnknown -> {
+                return handleClaimOutcomeUnknown(
+                    invocationId = invocationId,
+                    triggerKind = triggerKind,
+                    claimantToken = claimantToken,
+                    activeSince = claimedAt.minus(tradingConfig.daemon.launchReservationStaleAfter),
+                    cause = claimOutcome.cause,
+                )
+            }
+            is LlmExecutionClaimOutcome.Claimed -> {
+                runCatching {
+                    currentCoroutineContext().ensureActive()
+                    appendClaimPreflightAudit(
+                        invocationId = invocationId,
+                        triggerKind = triggerKind,
+                        reason = "claimed",
+                        canLaunch = true,
+                    )
+                }
+                    .getOrElse { auditFailure ->
+                        withContext(NonCancellable) {
+                            withTimeout(executionPolicy.persistenceTerminalTimeout.toMillis()) {
+                                tradingRuntime.launchReservationRepository.finish(
+                                    LlmLaunchReservationFinish(
+                                        invocationId = invocationId,
+                                        status = LlmLaunchReservationStatus.FAILED,
+                                        reason = RUN_START_AUDIT_FAILED_AFTER_CLAIM,
+                                        finishedAt = clock.instant(),
+                                        claimantToken = claimantToken,
+                                    ),
+                                ).getOrThrow()
+                            }
+                        }
+                        LlmExecutionAdmissionHealth.resolveClaim(invocationId, claimantToken)
+                        LlmExecutionTerminationFenceRegistry.resolve(invocationId, claimantToken)
+                        return Result.failure(auditFailure)
+                    }
+            }
+        }
+
+        activeClaimantTokens[invocationId] = claimantToken
+        return runClaimedOneShot(
+            request = request,
+            invocationId = invocationId,
+            triggerKind = triggerKind,
+            claimantToken = claimantToken,
+            claimedAt = claimOutcome.claimedAt,
+        )
+    }
+
+    @Suppress("CyclomaticComplexMethod", "LongMethod")
+    private suspend fun runClaimedOneShot(
+        request: OneShotRunnerRequest,
+        invocationId: String,
+        triggerKind: LlmDaemonTriggerKind,
+        claimantToken: String,
+        claimedAt: java.time.Instant,
+    ): Result<OneShotRunnerResult> {
         val marketSnapshotId = request.marketSnapshotId ?: "manual-$invocationId"
         val llmRunStart = LlmRunStart(
             invocationId = invocationId,
@@ -341,31 +474,262 @@ class OneShotLlmRunner(
             marketSnapshotId = marketSnapshotId,
         )
 
-        return try {
-            val result = runOneShotBody(
-                OneShotRunBodyInput(
-                    request = request,
-                    invocationId = invocationId,
-                    marketSnapshotId = marketSnapshotId,
-                    llmRunStart = llmRunStart,
-                    failureContextUpdated = { context -> failureContext = context },
-                ),
-            )
-
-            runAuditRecorder.finalizeLlmRun(
-                start = llmRunStart,
-                status = result.status.name,
-                cause = null,
-                terminalCause = result.terminalCause,
-            )
-
-            Result.success(result)
-        } catch (throwable: CancellationException) {
-            handleCancelledRun(failureContext, llmRunStart, throwable)
-            throw throwable.classifyLlmFailure(failureContext.llmProvider)
-        } catch (throwable: Throwable) {
-            Result.failure(handleFailedRun(failureContext, llmRunStart, throwable))
+        val heartbeatJob = CoroutineScope(currentCoroutineContext()).launch {
+            heartbeatClaim(invocationId, claimantToken)
         }
+        var reservationStatus = LlmLaunchReservationStatus.FAILED
+        var reservationReason = LlmRunTerminalCause.RUNNER_FAILED.name
+        var llmRunStarted = false
+
+        return try {
+            requireLiveClaim(invocationId, claimantToken)
+            runAuditRecorder.recordLlmRunStarted(llmRunStart).getOrThrow()
+            llmRunStarted = true
+            val deadlineRemaining = java.time.Duration.between(clock.instant(), claimedAt.plus(executionPolicy.hardTimeout))
+            check(!deadlineRemaining.isNegative && !deadlineRemaining.isZero) { "LLM execution deadline expired." }
+            val bodyResult = try {
+                withTimeout(deadlineRemaining.toMillis()) {
+                    runCatching {
+                        val preFilterDecision = request.preFilter?.let { preFilter ->
+                            LlmExecutionTerminationFenceRegistry.withClaimTransition(invocationId, claimantToken) {
+                                requireLiveClaim(invocationId, claimantToken)
+                                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                                    LlmExecutionTerminationFenceRegistry.markChildMayBeRunning(invocationId, claimantToken)
+                                }
+                            }
+                            preFilter.invoke()
+                        }
+                        if (preFilterDecision == LlmDaemonPreFilterDecision.SKIP_NO_CHANGE) {
+                            OneShotRunnerResult(
+                                invocationId = invocationId,
+                                status = OneShotRunnerStatus.PRE_FILTER_SKIPPED,
+                                decision = null,
+                                intent = null,
+                                tradeResult = null,
+                            )
+                        } else {
+                            runOneShotBody(
+                                OneShotRunBodyInput(
+                                    request = request,
+                                    invocationId = invocationId,
+                                    marketSnapshotId = marketSnapshotId,
+                                    llmRunStart = llmRunStart,
+                                    failureContextUpdated = { context -> failureContext = context },
+                                ),
+                            )
+                        }
+                    }
+                }
+            } catch (throwable: CancellationException) {
+                Result.failure(throwable)
+            }
+            val throwable = bodyResult.exceptionOrNull()
+            if (throwable is CancellationException) {
+                if (llmRunStarted) handleCancelledRun(failureContext, llmRunStart, throwable)
+                reservationReason = terminalCauseForInvocationFailure(throwable).name
+                val classified = throwable.classifyLlmFailure(failureContext.llmProvider)
+                if (classified !== throwable) {
+                    throwable.suppressed.forEach(classified::addSuppressed)
+                }
+                throw classified
+            }
+            if (throwable != null) {
+                reservationReason = terminalCauseForInvocationFailure(throwable).name
+                val persistedFailure = if (llmRunStarted) {
+                    handleFailedRun(failureContext, llmRunStart, throwable)
+                } else {
+                    throwable
+                }
+                return Result.failure(persistedFailure)
+            }
+            val result = bodyResult.getOrThrow()
+
+            if (llmRunStarted) {
+                runAuditRecorder.finalizeLlmRun(
+                    start = llmRunStart,
+                    status = result.status.name,
+                    cause = null,
+                    terminalCause = result.terminalCause,
+                ).getOrThrow()
+            }
+
+            reservationStatus = LlmLaunchReservationStatus.FINISHED
+            reservationReason = result.terminalCause.name
+            Result.success(result)
+        } finally {
+            heartbeatJob.cancelAndJoin()
+            val processTreeTerminationProof = LlmProcessTreeTerminationRegistry.find(invocationId)
+            when (processTreeTerminationProof) {
+                ProcessTreeTerminationProof.PROVEN_EXITED ->
+                    LlmExecutionTerminationFenceRegistry.markProcessTreeExited(
+                        invocationId = invocationId,
+                        claimantToken = claimantToken,
+                        observedAt = clock.instant(),
+                    )
+                ProcessTreeTerminationProof.UNCERTAIN ->
+                    LlmExecutionAdmissionHealth.registerRecoveryBlocker(invocationId, claimantToken)
+                null -> Unit
+            }
+            withContext(NonCancellable) {
+                withTimeout(executionPolicy.persistenceTerminalTimeout.toMillis()) {
+                    if (llmRunStarted) requireTerminalLlmRun(invocationId)
+                    tradingRuntime.launchReservationRepository.finish(
+                        LlmLaunchReservationFinish(
+                            invocationId = invocationId,
+                            status = reservationStatus,
+                            reason = reservationReason,
+                            finishedAt = clock.instant(),
+                            claimantToken = claimantToken,
+                        ),
+                    ).getOrThrow()
+                }
+            }
+            if (processTreeTerminationProof != ProcessTreeTerminationProof.UNCERTAIN) {
+                LlmExecutionAdmissionHealth.resolveClaim(invocationId, claimantToken)
+                LlmExecutionTerminationFenceRegistry.resolve(invocationId, claimantToken)
+                LlmProcessTreeTerminationRegistry.resolve(invocationId)
+            }
+            activeClaimantTokens.remove(invocationId, claimantToken)
+        }
+    }
+
+    private suspend fun requireLiveClaim(invocationId: String, claimantToken: String) {
+        check(
+            tradingRuntime.launchReservationRepository.validateExecutionAdmission(invocationId, claimantToken)
+                .getOrThrow(),
+        ) { "LLM execution claim is no longer admitted." }
+    }
+
+    private suspend fun requireTerminalLlmRun(invocationId: String) {
+        val run = tradingRuntime.llmRunRepository.findByInvocationId(invocationId).getOrThrow()
+        check(run != null && run.status != me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING) {
+            "LLM run terminal persistence is incomplete."
+        }
+    }
+
+    private suspend fun heartbeatClaim(invocationId: String, claimantToken: String) {
+        while (currentCoroutineContext().isActive) {
+            delay(executionPolicy.heartbeatInterval.toMillis())
+            val heartbeatResult = tradingRuntime.launchReservationRepository.heartbeatExecutionClaim(
+                invocationId = invocationId,
+                claimantToken = claimantToken,
+                heartbeatAt = clock.instant(),
+            )
+            val healthy = heartbeatResult.getOrNull() == true
+            LlmExecutionAdmissionHealth.recordHeartbeatResult(invocationId, claimantToken, healthy)
+            if (!healthy) return
+        }
+    }
+
+    private suspend fun handleClaimOutcomeUnknown(
+        invocationId: String,
+        triggerKind: LlmDaemonTriggerKind,
+        claimantToken: String,
+        activeSince: java.time.Instant,
+        cause: Throwable,
+    ): Result<OneShotRunnerResult> {
+        registerNoChildStartedFence(invocationId, claimantToken, clock.instant())
+        runCatching {
+            appendClaimPreflightAudit(
+                invocationId = invocationId,
+                triggerKind = triggerKind,
+                reason = LAUNCH_RESERVATION_CLAIM_OUTCOME_UNKNOWN,
+                canLaunch = false,
+            )
+        }
+        val snapshotResult = tradingRuntime.launchReservationRepository.findExecutionClaim(invocationId)
+        var snapshot = snapshotResult.getOrNull()
+        var reconciliationRequired = snapshotResult.isFailure
+        if (snapshot?.claimState == LlmExecutionClaimState.AVAILABLE) {
+            when (
+                tradingRuntime.launchReservationRepository.claimForExecution(
+                    LlmExecutionClaimRequest(
+                        invocationId = invocationId,
+                        triggerKind = triggerKind,
+                        claimantToken = claimantToken,
+                        claimedAt = clock.instant(),
+                        activeSince = activeSince,
+                    ),
+                )
+            ) {
+                is LlmExecutionClaimOutcome.Claimed -> {
+                    val updatedSnapshot = tradingRuntime.launchReservationRepository.findExecutionClaim(invocationId)
+                    snapshot = updatedSnapshot.getOrNull()
+                    reconciliationRequired = updatedSnapshot.isFailure
+                }
+                is LlmExecutionClaimOutcome.OutcomeUnknown -> reconciliationRequired = true
+                is LlmExecutionClaimOutcome.Rejected -> Unit
+            }
+        }
+        val sameTokenClaim = snapshot?.claimState == LlmExecutionClaimState.CLAIMED &&
+            snapshot.claimantToken == claimantToken
+        if (sameTokenClaim && snapshot.status == LlmLaunchReservationStatus.RUNNING) {
+            LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+                invocationId = invocationId,
+                claimantToken = claimantToken,
+                observedAt = snapshot.claimedAt ?: clock.instant(),
+            )
+            withContext(NonCancellable) {
+                tradingRuntime.launchReservationRepository.finish(
+                    LlmLaunchReservationFinish(
+                        invocationId = invocationId,
+                        status = LlmLaunchReservationStatus.FAILED,
+                        reason = LAUNCH_RESERVATION_CLAIM_OUTCOME_UNKNOWN,
+                        finishedAt = clock.instant(),
+                        claimantToken = claimantToken,
+                        observedHeartbeatAt = snapshot.heartbeatAt,
+                    ),
+                ).getOrThrow()
+            }
+        } else if (!reconciliationRequired && snapshot?.status != LlmLaunchReservationStatus.RUNNING) {
+            LlmExecutionAdmissionHealth.resolveClaim(invocationId, claimantToken)
+        }
+        return Result.failure(IllegalStateException(LAUNCH_RESERVATION_CLAIM_OUTCOME_UNKNOWN, cause))
+    }
+
+    private fun registerNoChildStartedFence(
+        invocationId: String,
+        claimantToken: String,
+        observedAt: java.time.Instant,
+    ) {
+        LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+            invocationId = invocationId,
+            claimantToken = claimantToken,
+            observedAt = observedAt,
+        )
+    }
+
+    private suspend fun appendClaimPreflightAudit(
+        invocationId: String,
+        triggerKind: LlmDaemonTriggerKind,
+        reason: String,
+        canLaunch: Boolean,
+    ) {
+        runAuditRecorder.appendRunnerPhase(
+            context = DecisionRunContext(
+                decisionRunId = invocationId,
+                llmProvider = null,
+                promptHash = null,
+                systemPromptVersion = null,
+                marketSnapshotId = null,
+                runtimeConfigVersionId = runtimeConfigSnapshot?.versionId,
+                runtimeConfigHash = runtimeConfigSnapshot?.hash,
+            ),
+            phase = "reservation_claim",
+            duration = Duration.ZERO,
+            details = buildJsonObject {
+                put("invocationId", invocationId)
+                put("requestTriggerKind", triggerKind.name)
+                put("reason", reason)
+                put("canLaunch", canLaunch)
+                put("hardTimeoutSeconds", executionPolicy.hardTimeout.seconds)
+                put("heartbeatIntervalSeconds", executionPolicy.heartbeatInterval.seconds)
+                put("heartbeatMissAllowanceSeconds", executionPolicy.heartbeatMissAllowance.seconds)
+                put("processTerminationGraceSeconds", executionPolicy.processTerminationGrace.seconds)
+                put("persistenceTerminalTimeoutSeconds", executionPolicy.persistenceTerminalTimeout.seconds)
+                put("claimedPhaseCount", 3)
+            },
+        ).getOrThrow()
     }
 
     private suspend fun handleCancelledRun(
@@ -415,13 +779,17 @@ class OneShotLlmRunner(
     }
 
     private suspend fun runOneShotBody(input: OneShotRunBodyInput): OneShotRunnerResult {
-        runAuditRecorder.recordLlmRunStarted(input.llmRunStart)
+        requireLiveClaim(
+            input.invocationId,
+            requireNotNull(activeClaimantTokens[input.invocationId]),
+        )
 
         runCatching { captureMaterialManifest(input) }
             .onFailure { throwable ->
                 logHuman("material manifest coverage miss invocation=${input.invocationId} cause=${throwable::class.simpleName}")
             }
 
+        requireLiveClaimForInvocation(input.invocationId)
         val promptContent = requestFactory.readSystemPrompt(input.request.repositoryRoot)
         val promptHash = SystemPromptV1.calculateContentHash(promptContent)
         val proposerContext = requestFactory.decisionRunContext(
@@ -432,27 +800,10 @@ class OneShotLlmRunner(
         )
         input.failureContextUpdated(proposerContext)
 
+        requireLiveClaimForInvocation(input.invocationId)
         val ttlSweepResult = decisionExecutionLifecycle.cancelExpiredRestingEntryOrders(proposerContext)
         if (ttlSweepResult.isFailure) {
             return recordTtlSweepFailure(input.invocationId, proposerContext, ttlSweepResult.exceptionOrNull())
-        }
-
-        val launchEligibility = launchEligibility(input.invocationId, proposerContext)
-        if (!launchEligibility.canLaunch) {
-            runAuditRecorder.recordNoTrade(
-                context = proposerContext,
-                reason = launchEligibility.rejectionReason,
-                cause = null,
-            ).getOrThrow()
-            logHuman("launch rejected invocation=${input.invocationId} reason=${launchEligibility.rejectionReason}")
-
-            return OneShotRunnerResult(
-                invocationId = input.invocationId,
-                status = OneShotRunnerStatus.LAUNCH_REJECTED,
-                decision = null,
-                intent = null,
-                tradeResult = null,
-            )
         }
 
         return runOneShotAfterPreflight(
@@ -471,8 +822,11 @@ class OneShotLlmRunner(
     @Suppress("CyclomaticComplexMethod", "LongMethod")
     private suspend fun captureMaterialManifest(input: OneShotRunBodyInput) {
         val capturedAt = clock.instant()
+        requireLiveClaimForInvocation(input.invocationId)
         val riskState = tradingRuntime.riskStateRepository.current().getOrThrow()
+        requireLiveClaimForInvocation(input.invocationId)
         val positions = tradingRuntime.broker.getPositions().getOrThrow()
+        requireLiveClaimForInvocation(input.invocationId)
         val orders = tradingRuntime.broker.getOpenOrders().getOrThrow()
         val positionFacts = positions.map { position ->
             "${position.positionId}|${position.status}|${position.side}"
@@ -480,7 +834,9 @@ class OneShotLlmRunner(
         val orderFacts = orders.map { order ->
             "${order.orderId}|${order.status}|${order.side}|${order.orderType}"
         }.distinct().sorted().take(64)
+        requireLiveClaimForInvocation(input.invocationId)
         val ticker = materialMarketDataSource?.getTicker(tradingConfig.symbol)?.getOrNull()
+        requireLiveClaimForInvocation(input.invocationId)
         val candles = materialMarketDataSource?.getCandles(
             symbol = tradingConfig.symbol,
             interval = CandleInterval.FIVE_MINUTES,
@@ -627,6 +983,7 @@ class OneShotLlmRunner(
         )
         val proposerAudit = phaseInvoker
             .invokePhase("proposer", proposerContext, proposerRequest)
+        requireLiveClaimForInvocation(input.invocationId)
         val decision = tradingRuntime.decisionRepository
             .latestDecisionByInvocationId(input.invocationId)
             .getOrThrow()
@@ -645,6 +1002,7 @@ class OneShotLlmRunner(
     ): OneShotRunnerResult {
         logHuman("decision saved invocation=${input.invocationId} action=${decision.decision.submission.action}")
 
+        requireLiveClaimForInvocation(input.invocationId)
         val lifecycleResult = when (decision.decision.submission.action) {
             DecisionAction.EXIT -> decisionExecutionLifecycle.executeExitDecision(input.proposerContext, decision)
             DecisionAction.REDUCE -> decisionExecutionLifecycle.executeReduceDecision(input.proposerContext, decision)
@@ -714,6 +1072,7 @@ class OneShotLlmRunner(
 
         input.failureContextUpdated(proposerContext)
         if (decision.decision.submission.action == DecisionAction.ADD_LONG) {
+            requireLiveClaimForInvocation(invocationId)
             decisionExecutionLifecycle.ensureAddLongTargetPosition(proposerContext)?.let { lifecycleResult ->
                 return entryFlowResult(invocationId, decision, intent, lifecycleResult.status, lifecycleResult.tradeResult)
             }
@@ -805,40 +1164,6 @@ class OneShotLlmRunner(
         )
     }
 
-    private suspend fun launchEligibility(invocationId: String, context: DecisionRunContext): RunnerLaunchEligibility {
-        val hourlySince = clock.instant().minus(MAX_INVOCATION_COUNT_WINDOW)
-        val dailySince = clock.instant().minus(MAX_DAILY_INVOCATION_COUNT_WINDOW)
-        val currentHourlyCount = tradingRuntime.commandEventLog.countLlmLaunchesSince(hourlySince, invocationId)
-        val currentDailyCount = tradingRuntime.commandEventLog.countLlmLaunchesSince(dailySince, invocationId)
-        val hourlyLimitExceeded = currentHourlyCount >= tradingConfig.runner.maxInvocationsPerHour
-        val dailyLimitExceeded = currentDailyCount >= tradingConfig.runner.maxInvocationsPerDay
-        val canLaunch = !hourlyLimitExceeded && !dailyLimitExceeded
-        val rejectionReason = when {
-            hourlyLimitExceeded -> "max_invocations_per_hour_exceeded"
-            dailyLimitExceeded -> "max_invocations_per_day_exceeded"
-            else -> ""
-        }
-
-        runAuditRecorder.appendRunnerPhase(
-            context = context,
-            phase = "preflight",
-            duration = Duration.ZERO,
-            details = buildJsonObject {
-                put("invocationId", invocationId)
-                put("currentHourlyInvocationCount", currentHourlyCount)
-                put("currentDailyInvocationCount", currentDailyCount)
-                put("maxInvocationsPerHour", tradingConfig.runner.maxInvocationsPerHour)
-                put("maxInvocationsPerDay", tradingConfig.runner.maxInvocationsPerDay)
-                put("canLaunch", canLaunch)
-            },
-        ).getOrThrow()
-
-        return RunnerLaunchEligibility(
-            canLaunch = canLaunch,
-            rejectionReason = rejectionReason,
-        )
-    }
-
     private suspend fun placeApprovedEntry(
         context: DecisionRunContext,
         intent: TradeIntentRecord,
@@ -881,6 +1206,7 @@ class OneShotLlmRunner(
         intent: TradeIntentRecord,
         timeStopAt: Instant?,
     ): EntryPreviewResult {
+        requireLiveClaimForContext(context)
         val previewStartedAt = System.nanoTime()
         val previewCall = GuardedToolCall(
             toolName = "preview_order",
@@ -984,6 +1310,7 @@ class OneShotLlmRunner(
         call: GuardedToolCall,
         command: PlaceOrderCommand,
     ): PaperTradeResult {
+        requireLiveClaimForContext(context)
         return withGmoPublicRequestCorrelation(
             GmoPublicRequestCorrelation(
                 decisionRunContext = context,
@@ -993,6 +1320,17 @@ class OneShotLlmRunner(
         ) {
             tradingRuntime.broker.placeOrder(command).getOrThrow()
         }
+    }
+
+    private suspend fun requireLiveClaimForContext(context: DecisionRunContext) {
+        requireLiveClaimForInvocation(requireNotNull(context.decisionRunId))
+    }
+
+    private suspend fun requireLiveClaimForInvocation(invocationId: String) {
+        requireLiveClaim(
+            invocationId = invocationId,
+            claimantToken = requireNotNull(activeClaimantTokens[invocationId]),
+        )
     }
 
     private fun runnerIntentPayload(intent: TradeIntentRecord): String {
@@ -1075,6 +1413,12 @@ class OneShotLlmRunner(
     }
 }
 
+internal const val LAUNCH_RESERVATION_MISSING = "launch_reservation_missing"
+internal const val LAUNCH_RESERVATION_TRIGGER_MISMATCH = "launch_reservation_trigger_mismatch"
+internal const val LAUNCH_RESERVATION_QUERY_FAILED = "launch_reservation_query_failed"
+internal const val LAUNCH_RESERVATION_CLAIM_OUTCOME_UNKNOWN = "launch_reservation_claim_outcome_unknown"
+internal const val RUN_START_AUDIT_FAILED_AFTER_CLAIM = "run_start_audit_failed_after_claim"
+
 private fun TradeIntentRecord.toPlaceOrderCommand(
     call: GuardedToolCall,
     timeStopAt: Instant?,
@@ -1098,10 +1442,6 @@ private fun TradeIntentRecord.toPlaceOrderCommand(
     )
 }
 
-private suspend fun CommandEventLog.countLlmLaunchesSince(since: Instant, excludedInvocationId: String): Int {
-    return countDistinctLlmLaunchesSince(since, excludedInvocationId).getOrThrow()
-}
-
 /**
  * OneShot runner の監査 record 保存を担当する helper。
  *
@@ -1116,8 +1456,8 @@ private class OneShotRunAuditRecorder(
     private val clock: Clock,
     private val logHuman: (String) -> Unit,
 ) {
-    suspend fun recordLlmRunStarted(start: LlmRunStart) {
-        tradingRuntime.llmRunRepository.insertRunning(start)
+    suspend fun recordLlmRunStarted(start: LlmRunStart): Result<Unit> {
+        return tradingRuntime.llmRunRepository.insertRunning(start)
             .onFailure { throwable ->
                 logRunRecordFailure(
                     operation = "start",
@@ -1237,6 +1577,7 @@ private class OneShotRunAuditRecorder(
 private class OneShotPhaseInvoker(
     private val llmInvoker: LlmInvoker,
     private val invocationAuditor: LlmInvocationAuditor,
+    private val beforeInvoke: suspend (LlmInvocationRequest) -> Unit,
 ) {
     suspend fun invokePhase(
         phaseName: String,
@@ -1244,6 +1585,7 @@ private class OneShotPhaseInvoker(
         request: LlmInvocationRequest,
     ): Result<LlmPhaseAuditResult> {
         return try {
+            beforeInvoke(request)
             invocationAuditor.invokeAndAudit(
                 phaseName = phaseName,
                 context = context,
@@ -1667,11 +2009,6 @@ private data class EntryPreviewResult(
  * @param canLaunch 起動可能なら true
  * @param rejectionReason 起動できない場合に no-trade audit へ保存する理由
  */
-private data class RunnerLaunchEligibility(
-    val canLaunch: Boolean,
-    val rejectionReason: String,
-)
-
 /**
  * LLM child process へ渡せる非 secret env 名。
  */
@@ -1876,6 +2213,7 @@ private fun classifyOneShotTerminalCause(
         OneShotRunnerStatus.NO_TRADE_DECISION,
         OneShotRunnerStatus.NO_TRADE_AUDITED,
         OneShotRunnerStatus.LAUNCH_REJECTED,
+        OneShotRunnerStatus.PRE_FILTER_SKIPPED,
         -> LlmRunTerminalCause.NO_TRADE
         else -> LlmRunTerminalCause.NORMAL_COMPLETION
     }

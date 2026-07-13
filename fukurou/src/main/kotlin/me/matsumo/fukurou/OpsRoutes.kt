@@ -14,6 +14,9 @@ import io.ktor.server.routing.post
 import io.ktor.utils.io.ExperimentalKtorApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -35,6 +38,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigValidationError
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.LlmDaemonLaunchSuppressionReason
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -2216,9 +2220,11 @@ private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalo
         CommandEventType.DECISION_LIFECYCLE_COMPLETED -> "decisionLifecycleCompleted"
         CommandEventType.DAEMON_STARTED -> "daemonStarted"
         CommandEventType.DAEMON_TRIGGER_SKIPPED -> "daemonTriggerSkipped"
+        CommandEventType.DAEMON_LAUNCH_SUPPRESSED -> "daemonLaunchSuppressed"
         CommandEventType.DAEMON_TRIGGER_LAUNCHED -> "daemonTriggerLaunched"
         CommandEventType.DAEMON_INVOCATION_COMPLETED -> "daemonInvocationCompleted"
         CommandEventType.LLM_INVOCATION_RECOVERED -> "llmInvocationRecovered"
+        CommandEventType.LLM_EXECUTION_RECOVERY_STARTED -> "llmExecutionRecoveryStarted"
         CommandEventType.CLI_AUTH_LOGIN_STARTED -> "cliAuthLoginStarted"
         CommandEventType.CLI_AUTH_LOGIN_TOKEN_SUBMITTED -> "cliAuthLoginTokenSubmitted"
         CommandEventType.CLI_AUTH_LOGIN_COMPLETED -> "cliAuthLoginCompleted"
@@ -2361,20 +2367,38 @@ private fun CommandEvent.toOpsAuditEventResponse(): OpsAuditEventResponse {
 }
 
 private fun CommandEvent.toOpsActivityEventResponse(): OpsActivityEventResponse {
+    val suppressionReason = infrastructureSuppressionReasonNameOrNull()
+
     return OpsActivityEventResponse(
         id = "audit:$id",
         source = OpsActivitySource.AUDIT.wireName,
         kind = eventType.name,
         title = eventType.name,
-        detail = toolName,
+        detail = suppressionReason ?: toolName,
         occurredAt = occurredAt.toString(),
-        metadata = listOf(
+        metadata = listOfNotNull(
             OpsActivityMetadataResponse(
                 label = "tool",
                 value = toolName,
             ),
+            suppressionReason?.let { reason ->
+                OpsActivityMetadataResponse(
+                    label = "infrastructure reason",
+                    value = reason,
+                )
+            },
         ),
     )
+}
+
+private fun CommandEvent.infrastructureSuppressionReasonNameOrNull(): String? {
+    if (eventType != CommandEventType.DAEMON_LAUNCH_SUPPRESSED) return null
+
+    return runCatching {
+        val rawReason = Json.parseToJsonElement(payload).jsonObject["reason"]?.jsonPrimitive?.content
+
+        LlmDaemonLaunchSuppressionReason.entries.singleOrNull { reason -> reason.name == rawReason }?.name ?: rawReason
+    }.getOrNull()
 }
 
 private fun AccountSnapshotWithUpdatedAt.toOpsAccountResponse(): OpsAccountResponse {

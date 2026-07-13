@@ -88,6 +88,7 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.exchange.gmo.DeferredGmoPublicRequestAuditSink
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
@@ -847,7 +848,7 @@ class FukurouMcpServerTest {
     fun knowledgeRecentLessonsTool_returnsBoundedReadOnlySummaries() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
         val longInvocationId = "recent-run-" + "x".repeat(140)
-        runtime.llmRunRepository.finish(failedLlmRun(longInvocationId)).getOrThrow()
+        insertFailedLlmRun(runtime.llmRunRepository, longInvocationId)
         val server = FukurouMcpServer(
             clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
@@ -1138,7 +1139,7 @@ class FukurouMcpServerTest {
     @Test
     fun knowledgeSimilarSetupsTool_returnsMatchedDecisionOutcome() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
-        runtime.llmRunRepository.finish(failedLlmRun("similar-run")).getOrThrow()
+        insertFailedLlmRun(runtime.llmRunRepository, "similar-run")
         val server = FukurouMcpServer(
             clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
@@ -2652,6 +2653,20 @@ private fun failedLlmRun(invocationId: String): LlmRunFinish {
         finishedAt = fixedInstant(),
         errorMessage = "redacted failure",
     )
+}
+
+private suspend fun insertFailedLlmRun(repository: LlmRunRepository, invocationId: String) {
+    val finish = failedLlmRun(invocationId)
+    repository.insertRunning(
+        LlmRunStart(
+            invocationId = finish.invocationId,
+            mode = finish.mode,
+            symbol = finish.symbol,
+            triggerKind = finish.triggerKind,
+            startedAt = finish.startedAt,
+        ),
+    ).getOrThrow()
+    repository.finish(finish).getOrThrow()
 }
 
 private suspend fun callTool(

@@ -16,6 +16,23 @@ import kotlin.test.assertFailsWith
 class TradingBotConfigTest {
 
     @Test
+    fun runnerConfig_rejectsReserveOverflowAndTimeoutsOutsideGuard() {
+        assertFailsWith<IllegalArgumentException> {
+            LlmRunnerConfig(
+                maxInvocationsPerHour = 7,
+                entryFillReservePerHour = Int.MAX_VALUE,
+                stopProximityReservePerHour = Int.MAX_VALUE,
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmRunnerConfig(processTerminationGrace = Duration.ofSeconds(31))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmRunnerConfig(persistenceTerminalTimeout = Duration.ZERO)
+        }
+    }
+
+    @Test
     fun fromEnvironment_usesDefaultsWhenEnvironmentIsEmpty() {
         val config = TradingBotConfig.fromEnvironment(emptyMap())
 
@@ -102,6 +119,10 @@ class TradingBotConfigTest {
                 "FUKUROU_LLM_RUN_TIMEOUT_SECONDS" to "120",
                 "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR" to "1",
                 "FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY" to "3",
+                "FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_HOUR" to "0",
+                "FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_DAY" to "1",
+                "FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_HOUR" to "0",
+                "FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_DAY" to "1",
                 "FUKUROU_CLAUDE_MODEL" to "claude-runtime-test",
                 "FUKUROU_CODEX_MODEL" to "codex-runtime-test",
                 "FUKUROU_LLM_DAEMON_ENABLED" to "true",

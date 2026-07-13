@@ -1,9 +1,12 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -31,7 +34,6 @@ import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
-import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
@@ -40,6 +42,16 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRejectionReason
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
@@ -128,7 +140,6 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
-import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -137,13 +148,86 @@ import kotlin.test.assertTrue
 class OneShotLlmRunnerTest {
 
     @Test
+    fun parallelReplay_hasOneClaimWinnerAndAtMostOneChild() = runBlocking {
+        val fixture = runnerFixture { cleanExit() }
+        val invocationId = "parallel-replay"
+        val request = defaultRequest().copy(
+            invocationId = invocationId,
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+        )
+        fixture.runtime.launchReservationRepository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                triggerKey = "test:$invocationId",
+                reservedAt = fixedInstant(),
+                runnerConfig = LlmRunnerConfig(),
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofHours(24),
+                activeReservationStaleAfter = Duration.ofMinutes(30),
+                populationScope = testPopulationScope(),
+            ),
+        ).getOrThrow()
+
+        val results = coroutineScope {
+            listOf(
+                async { fixture.runner.runOneShot(request) },
+                async { fixture.runner.runOneShot(request) },
+            ).map { it.await() }
+        }
+
+        assertEquals(1, results.count(Result<OneShotRunnerResult>::isSuccess))
+        assertEquals(1, results.count { it.exceptionOrNull()?.message == "launch_reservation_already_claimed" })
+        assertEquals(1, fixture.processRunner.launches.size)
+
+        val terminalReplay = fixture.runner.runOneShot(request)
+        assertEquals("launch_reservation_terminal", terminalReplay.exceptionOrNull()?.message)
+        assertEquals(1, fixture.processRunner.launches.size)
+    }
+
+    @Test
+    fun reservationMissing_failsBeforeChildProcess() = runBlocking {
+        val fixture = runnerFixture { cleanExit() }
+        val result = fixture.runner.runOneShot(
+            defaultRequest().copy(invocationId = "missing-reservation", triggerKind = LlmDaemonTriggerKind.MANUAL),
+        )
+
+        assertEquals(LAUNCH_RESERVATION_MISSING, result.exceptionOrNull()?.message)
+        assertEquals(0, fixture.processRunner.launches.size)
+    }
+
+    @Test
+    fun reservationTriggerMismatch_failsBeforeChildProcess() = runBlocking {
+        val fixture = runnerFixture { cleanExit() }
+        fixture.runtime.launchReservationRepository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = "mismatch",
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                triggerKey = "test:mismatch",
+                reservedAt = fixedInstant(),
+                runnerConfig = LlmRunnerConfig(),
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofHours(24),
+                activeReservationStaleAfter = Duration.ofMinutes(30),
+                populationScope = testPopulationScope(),
+            ),
+        ).getOrThrow()
+        val result = fixture.runner.runOneShot(
+            defaultRequest().copy(invocationId = "mismatch", triggerKind = LlmDaemonTriggerKind.ENTRY_FILL),
+        )
+
+        assertEquals(LAUNCH_RESERVATION_TRIGGER_MISMATCH, result.exceptionOrNull()?.message)
+        assertEquals(0, fixture.processRunner.launches.size)
+    }
+
+    @Test
     fun runnerPreview_rateLimitExhaustionFailsClosedBeforePlaceOrder() = runBlocking {
         val marketDataSource = RateLimitExhaustedOrderbookMarketDataSource()
         val fixture = runnerFixture(marketDataSource = marketDataSource) { command ->
             handleEnterAndApprovedFalsifier(fixtureRepository, command)
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val correlation = assertNotNull(marketDataSource.correlation)
         val broker = fixture.runtime.broker as PaperBroker
 
@@ -179,7 +263,7 @@ class OneShotLlmRunnerTest {
             cleanExit()
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val decisions = fixture.decisionRepository.snapshots.decisions()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
@@ -200,7 +284,7 @@ class OneShotLlmRunnerTest {
         }
         val request = defaultRequest().copy(invocationId = "manual-run")
 
-        val result = fixture.runner.runOneShot(request).getOrThrow()
+        val result = fixture.runOneShot(request).getOrThrow()
         val repository = fixture.runtime.llmRunRepository as InMemoryLlmRunRepository
         val record = repository.findByInvocationId(result.invocationId).getOrThrow()
 
@@ -209,7 +293,7 @@ class OneShotLlmRunnerTest {
             repository.statusHistory(result.invocationId),
         )
         assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION.name, record?.status)
-        assertNull(record?.triggerKind)
+        assertEquals(LlmDaemonTriggerKind.MANUAL, record?.triggerKind)
         assertTrue(record?.finishedAt != null)
     }
 
@@ -223,7 +307,7 @@ class OneShotLlmRunnerTest {
         }
         val request = defaultRequest().copy(invocationId = "material-facts-run")
 
-        fixture.runner.runOneShot(request).getOrThrow()
+        fixture.runOneShot(request).getOrThrow()
 
         val manifest = assertNotNull(
             fixture.runtime.decisionMaterialStateRepository.find("material-facts-run").getOrThrow(),
@@ -263,7 +347,7 @@ class OneShotLlmRunnerTest {
             cleanExit()
         }
 
-        fixture.runner.runOneShot(defaultRequest().copy(invocationId = "fixed-threshold-run")).getOrThrow()
+        fixture.runOneShot(defaultRequest().copy(invocationId = "fixed-threshold-run")).getOrThrow()
 
         val manifest = assertNotNull(
             fixture.runtime.decisionMaterialStateRepository.find("fixed-threshold-run").getOrThrow(),
@@ -291,7 +375,7 @@ class OneShotLlmRunnerTest {
             cleanExit()
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
     }
@@ -302,7 +386,7 @@ class OneShotLlmRunnerTest {
             handleEnterAndApprovedFalsifier(fixtureRepository, command)
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val positions = fixture.runtime.broker.getPositions().getOrThrow()
         val consumptions = fixture.decisionRepository.snapshots.intentConsumptions()
 
@@ -342,7 +426,7 @@ class OneShotLlmRunnerTest {
             cleanExit()
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val placeOrderDetails = fixture.eventLog.events().singleRunnerPhaseDetails("decision_to_place_order")
         val memo = placeOrderDetails
             .getValue("paperExecutionDivergenceMemos")
@@ -377,7 +461,7 @@ class OneShotLlmRunnerTest {
                 .tradePlan,
         ).tradePlanId
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val position = fixture.runtime.broker.getPositions().getOrThrow().single()
         val stopOrder = fixture.runtime.broker.getOpenOrders().getOrThrow().single()
         val violations = (fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository).violations()
@@ -417,7 +501,7 @@ class OneShotLlmRunnerTest {
                 .tradePlan,
         ).tradePlanId
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val tradeResult = assertNotNull(result.tradeResult)
         val position = fixture.runtime.broker.getPositions().getOrThrow().single()
         val violationRepository = fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository
@@ -460,7 +544,7 @@ class OneShotLlmRunnerTest {
                 .tradePlan,
         ).tradePlanId
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val violations = (fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository).violations()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
@@ -497,7 +581,10 @@ class OneShotLlmRunnerTest {
         }
         clock.advance(Duration.ofMinutes(31))
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(
+            request = defaultRequest(),
+            reservedAt = clock.instant(),
+        ).getOrThrow()
         val openOrders = fixture.runtime.broker.getOpenOrders().getOrThrow()
         val cancelEvents = fixture.eventLog.events().filter { event ->
             event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "cancel_order"
@@ -531,7 +618,7 @@ class OneShotLlmRunnerTest {
             cleanExit()
         }
 
-        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        fixture.runOneShot(defaultRequest()).getOrThrow()
         val lifecyclePayload = fixture.eventLog.events()
             .singleLifecyclePayload("stale_resting_entry_ttl_sweep")
         val durationMillis = lifecyclePayload.stringValue("durationMillis").toLong()
@@ -550,7 +637,7 @@ class OneShotLlmRunnerTest {
         }
         seedApprovedEntry(fixture)
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
         val closeEvents = fixture.eventLog.events().filter { event ->
             event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "close_position"
@@ -576,7 +663,7 @@ class OneShotLlmRunnerTest {
         seedApprovedEntry(fixture)
         fixture.runtime.riskStateRepository.setHardHalt("test hard halt", fixedInstant()).getOrThrow()
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = runCatching { fixture.runOneShot(defaultRequest()).getOrThrow() }
         val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
         val closeEvents = fixture.eventLog.events().filter { event ->
             event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "close_position"
@@ -585,9 +672,9 @@ class OneShotLlmRunnerTest {
             event.eventType == CommandEventType.TOOL_CALL_REJECTED_BY_HARD_HALT
         }
 
-        assertEquals(OneShotRunnerStatus.PAPER_EXIT_EXECUTED, result.status)
-        assertEquals(0, openPositions.size)
-        assertEquals(1, closeEvents.size)
+        assertTrue(result.isFailure)
+        assertEquals(1, openPositions.size)
+        assertEquals(0, closeEvents.size)
         assertEquals(0, hardHaltRejections.size)
     }
 
@@ -607,7 +694,7 @@ class OneShotLlmRunnerTest {
         }
         seedApprovedEntry(fixture)
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val remainingPosition = fixture.runtime.broker.getPositions().getOrThrow().single()
         val stopOrder = fixture.runtime.broker.getOpenOrders().getOrThrow().single()
         val closeEvents = fixture.eventLog.events().filter { event ->
@@ -650,7 +737,7 @@ class OneShotLlmRunnerTest {
             tradeGroupId = UUID.randomUUID(),
         )
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
         val openOrders = fixture.runtime.broker.getOpenOrders().getOrThrow()
         val closeEvents = fixture.eventLog.events().filter { event ->
@@ -680,7 +767,7 @@ class OneShotLlmRunnerTest {
             ),
         )
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val openOrders = fixture.runtime.broker.getOpenOrders().getOrThrow()
         val cancelEvents = fixture.eventLog.events().filter { event ->
             event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "cancel_order"
@@ -715,7 +802,7 @@ class OneShotLlmRunnerTest {
             tradeGroupId = UUID.randomUUID(),
         )
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
         val closeEvents = fixture.eventLog.events().filter { event ->
             event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "close_position"
@@ -750,7 +837,7 @@ class OneShotLlmRunnerTest {
         parentTradePlanId = requireNotNull(seedDecision.tradePlan).tradePlanId
         val stopBefore = fixture.runtime.broker.getPositions().getOrThrow().single().currentStopLossJpy
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val position = fixture.runtime.broker.getPositions().getOrThrow().single()
         val updateEvents = fixture.eventLog.events().filter { event ->
             event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "update_protection"
@@ -788,7 +875,7 @@ class OneShotLlmRunnerTest {
         val seedDecision = seedApprovedEntry(fixture)
         parentTradePlanId = requireNotNull(seedDecision.tradePlan).tradePlanId
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val updateEvents = fixture.eventLog.events().filter { event ->
             event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "update_protection"
         }
@@ -831,7 +918,7 @@ class OneShotLlmRunnerTest {
         ).getOrThrow()
         parentTradePlanId = requireNotNull(seedDecision.tradePlan).tradePlanId
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val updateEvents = fixture.eventLog.events().filter { event ->
             event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "update_protection"
         }
@@ -863,7 +950,7 @@ class OneShotLlmRunnerTest {
         val seedDecision = seedApprovedEntry(fixture)
         parentTradePlanId = requireNotNull(seedDecision.tradePlan).tradePlanId
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val position = fixture.runtime.broker.getPositions().getOrThrow().single()
         val updateEvents = fixture.eventLog.events().filter { event ->
             event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "update_protection"
@@ -882,7 +969,7 @@ class OneShotLlmRunnerTest {
             handleEnterAndRejectedFalsifier(fixtureRepository, command)
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val positions = fixture.runtime.broker.getPositions().getOrThrow()
         val events = fixture.eventLog.events()
 
@@ -903,7 +990,7 @@ class OneShotLlmRunnerTest {
             timeoutExit()
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val positions = fixture.runtime.broker.getPositions().getOrThrow()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
@@ -921,7 +1008,7 @@ class OneShotLlmRunnerTest {
         cases.forEach { failureCase ->
             val fixture = runnerFixture { failureCase.second }
 
-            val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+            val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
             assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status, failureCase.first)
             assertNull(result.decision, failureCase.first)
@@ -933,7 +1020,7 @@ class OneShotLlmRunnerTest {
     fun proposerNormalExitWithoutToolCalls_recordsNoToolCallsReason() = runBlocking {
         val fixture = runnerFixture { cleanExit() }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertNull(result.decision)
@@ -952,7 +1039,7 @@ class OneShotLlmRunnerTest {
             )
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
@@ -981,7 +1068,7 @@ class OneShotLlmRunnerTest {
             cleanExit()
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertNull(result.decision)
@@ -997,7 +1084,7 @@ class OneShotLlmRunnerTest {
             },
         ) { cleanExit() }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertNull(result.decision)
@@ -1016,7 +1103,7 @@ class OneShotLlmRunnerTest {
             )
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
@@ -1036,7 +1123,7 @@ class OneShotLlmRunnerTest {
             nonZeroExit(stdout = "network retry exhausted")
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
         val authFailureLogFound = humanLogs.any { message -> message.contains("LLM CLI authentication failure suspected.") }
 
@@ -1056,7 +1143,7 @@ class OneShotLlmRunnerTest {
             cleanExit(stdout = """{"type":"result","is_error":true,"result":"Not logged in"}""")
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
@@ -1074,7 +1161,7 @@ class OneShotLlmRunnerTest {
             cleanExit(stdout = """{"type":"result","is_error":false,"result":"Not logged in"}""")
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
@@ -1103,7 +1190,7 @@ class OneShotLlmRunnerTest {
             logger = {},
         )
 
-        val result = runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = runReservedOneShot(runtime, runner, defaultRequest()).getOrThrow()
         val events = (runtime.commandEventLog as InMemoryCommandEventLog).events()
         val proposerDetails = events.singleRunnerPhaseDetails("proposer")
         val auditError = proposerDetails.stringValue("error")
@@ -1124,9 +1211,9 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun maxInvocationsPerHourExceeded_rejectsLaunchAndAuditsNoTrade() = runBlocking {
+    fun reservationBackedRunner_doesNotRecountLegacyHourlyAuditAfterAdmission() = runBlocking {
         val config = TradingBotConfig(
-            runner = LlmRunnerConfig(maxInvocationsPerHour = 1),
+            runner = LlmRunnerConfig(maxInvocationsPerHour = 1, entryFillReservePerHour = 0, stopProximityReservePerHour = 0),
         )
         val fixture = runnerFixture(config = config) { cleanExit() }
         fixture.eventLog.append(
@@ -1147,13 +1234,12 @@ class OneShotLlmRunnerTest {
             ),
         ).getOrThrow()
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
-        assertEquals(OneShotRunnerStatus.LAUNCH_REJECTED, result.status)
-        assertEquals(0, fixture.processRunner.launches.size)
-        assertTrue(fixture.eventLog.events().containsNoTradeReason("max_invocations_per_hour_exceeded"))
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(1, fixture.processRunner.launches.size)
         assertEquals(
-            OneShotRunnerStatus.LAUNCH_REJECTED.name,
+            OneShotRunnerStatus.NO_TRADE_AUDITED.name,
             fixture.runtime.llmRunRepository.findByInvocationId(result.invocationId).getOrThrow()?.status,
         )
     }
@@ -1161,7 +1247,7 @@ class OneShotLlmRunnerTest {
     @Test
     fun daemonLaunchAuditDoesNotCountAgainstRunnerInvocationCap() = runBlocking {
         val config = TradingBotConfig(
-            runner = LlmRunnerConfig(maxInvocationsPerHour = 1),
+            runner = LlmRunnerConfig(maxInvocationsPerHour = 1, entryFillReservePerHour = 0, stopProximityReservePerHour = 0),
         )
         val fixture = runnerFixture(config = config) { cleanExit() }
         fixture.eventLog.append(
@@ -1182,7 +1268,7 @@ class OneShotLlmRunnerTest {
             ),
         ).getOrThrow()
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertEquals(1, fixture.processRunner.launches.size)
@@ -1196,12 +1282,12 @@ class OneShotLlmRunnerTest {
         )
         val fixture = runnerFixture(runtimeConfigSnapshot = runtimeConfigSnapshot) { cleanExit() }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val llmRun = requireNotNull(
             fixture.runtime.llmRunRepository.findByInvocationId(result.invocationId).getOrThrow(),
         )
         val preflightPayload = fixture.eventLog.events()
-            .single { event -> event.isRunnerPhaseCompleted("preflight") }
+            .single { event -> event.isRunnerPhaseCompleted("reservation_claim") }
             .payloadJsonObject()
 
         assertEquals("runtime-version-1", llmRun.runtimeConfigVersionId)
@@ -1211,11 +1297,15 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun maxInvocationsPerDayExceeded_rejectsLaunchAndAuditsNoTrade() = runBlocking {
+    fun reservationBackedRunner_doesNotRecountLegacyDailyAuditAfterAdmission() = runBlocking {
         val config = TradingBotConfig(
             runner = LlmRunnerConfig(
                 maxInvocationsPerHour = 1,
                 maxInvocationsPerDay = 1,
+                entryFillReservePerHour = 0,
+                entryFillReservePerDay = 0,
+                stopProximityReservePerHour = 0,
+                stopProximityReservePerDay = 0,
             ),
         )
         val fixture = runnerFixture(config = config) { cleanExit() }
@@ -1237,11 +1327,10 @@ class OneShotLlmRunnerTest {
             ),
         ).getOrThrow()
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
-        assertEquals(OneShotRunnerStatus.LAUNCH_REJECTED, result.status)
-        assertEquals(0, fixture.processRunner.launches.size)
-        assertTrue(fixture.eventLog.events().containsNoTradeReason("max_invocations_per_day_exceeded"))
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(1, fixture.processRunner.launches.size)
     }
 
     @Test
@@ -1250,7 +1339,7 @@ class OneShotLlmRunnerTest {
             handleEnterAndApprovedFalsifier(fixtureRepository, command)
         }
 
-        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        fixture.runOneShot(defaultRequest()).getOrThrow()
 
         val decision = fixture.decisionRepository.snapshots.decisions().single()
         val auditEvent = fixture.eventLog.events().first { event ->
@@ -1283,7 +1372,7 @@ class OneShotLlmRunnerTest {
             cleanExit()
         }
 
-        fixture.runner.runOneShot(
+        fixture.runOneShot(
             defaultRequest().copy(
                 cliConfig = OneShotRunnerCliConfig(
                     mcpServerName = customServerName,
@@ -1311,7 +1400,7 @@ class OneShotLlmRunnerTest {
             handleEnterAndApprovedFalsifier(fixtureRepository, command)
         }
 
-        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        fixture.runOneShot(defaultRequest()).getOrThrow()
 
         val toolCompletionOrder = fixture.eventLog.events()
             .filter { event -> event.eventType == CommandEventType.TOOL_CALL_COMPLETED }
@@ -1345,7 +1434,7 @@ class OneShotLlmRunnerTest {
             handleEnterAndApprovedFalsifier(fixtureRepository, command)
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val tradeResult = assertNotNull(result.tradeResult)
         val positions = fixture.runtime.broker.getPositions().getOrThrow()
         val riskState = fixture.runtime.riskStateRepository.current().getOrThrow()
@@ -1382,7 +1471,7 @@ class OneShotLlmRunnerTest {
             )
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val tradeResult = assertNotNull(result.tradeResult)
         val positions = fixture.runtime.broker.getPositions().getOrThrow()
         val violationRepository = fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository
@@ -1413,7 +1502,7 @@ class OneShotLlmRunnerTest {
             handleEnterAndApprovedFalsifier(fixtureRepository, command)
         }
 
-        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        fixture.runOneShot(defaultRequest()).getOrThrow()
 
         val falsifierCommand = fixture.processRunner.launches.single { command -> command.isFalsifierLaunch() }
         val allowedToolsConfig = falsifierCommand.codexConfigContent()
@@ -1432,7 +1521,7 @@ class OneShotLlmRunnerTest {
     fun runnerAutoApprovesOnlyCodexFalsifierWriteTool() = runBlocking {
         val fixture = requestCapturingRunnerFixture()
 
-        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        fixture.runOneShot(defaultRequest()).getOrThrow()
 
         val proposerRequest = fixture.invoker.requests.single { request ->
             request.phase == LlmInvocationPhase.PROPOSER
@@ -1461,7 +1550,7 @@ class OneShotLlmRunnerTest {
             ),
         )
 
-        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        fixture.runOneShot(defaultRequest()).getOrThrow()
 
         assertTrue(fixture.invoker.requests.all { request -> !request.useConfiguredModelFallback })
         assertTrue(fixture.invoker.requests.all { request -> request.model == null })
@@ -1473,7 +1562,7 @@ class OneShotLlmRunnerTest {
             proposerAction = DecisionAction.NO_TRADE,
         )
 
-        fixture.runner.runOneShot(
+        fixture.runOneShot(
             defaultRequest().copy(
                 proposerProvider = LlmProvider.CODEX,
             ),
@@ -1561,7 +1650,7 @@ class OneShotLlmRunnerTest {
             handleEnterAndApprovedFalsifier(fixtureRepository, command)
         }
 
-        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        fixture.runOneShot(defaultRequest()).getOrThrow()
 
         val falsifierCommand = fixture.processRunner.launches.single { command -> command.isFalsifierLaunch() }
         val proposerCommand = fixture.processRunner.launches.single { command -> command.isProposerLaunch() }
@@ -1612,7 +1701,7 @@ class OneShotLlmRunnerTest {
             cleanExit()
         }
 
-        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        fixture.runOneShot(defaultRequest()).getOrThrow()
 
         val phaseEvents = fixture.eventLog.events()
             .filter { event -> event.eventType == CommandEventType.RUNNER_PHASE_COMPLETED }
@@ -1657,7 +1746,7 @@ class OneShotLlmRunnerTest {
             cleanExit(stdout = codexUsageStdout)
         }
 
-        fixture.runner.runOneShot(defaultRequest()).getOrThrow()
+        fixture.runOneShot(defaultRequest()).getOrThrow()
 
         val phaseEvents = fixture.eventLog.events()
             .filter { event -> event.eventType == CommandEventType.RUNNER_PHASE_COMPLETED }
@@ -1680,7 +1769,7 @@ class OneShotLlmRunnerTest {
             repositoryRoot = missingPromptRoot,
         )
 
-        val result = fixture.runner.runOneShot(request)
+        val result = fixture.runOneShot(request)
 
         assertTrue(result.isFailure)
         assertTrue(fixture.eventLog.events().containsNoTradeReason("caller_failed"))
@@ -1706,7 +1795,7 @@ class OneShotLlmRunnerTest {
             logger = {},
         )
 
-        val result = runner.runOneShot(defaultRequest().copy(invocationId = "failed-run"))
+        val result = runReservedOneShot(runtime, runner, defaultRequest().copy(invocationId = "failed-run"))
         val record = runtime.llmRunRepository.findByInvocationId("failed-run").getOrThrow()
         val errorMessage = requireNotNull(record?.errorMessage)
 
@@ -1740,7 +1829,7 @@ class OneShotLlmRunnerTest {
             proposerProvider = LlmProvider.CODEX,
         )
 
-        val result = runner.runOneShot(request)
+        val result = runReservedOneShot(runtime, runner, request)
         val record = runtime.llmRunRepository.findByInvocationId("codex-failed-run").getOrThrow()
         val eventLog = runtime.commandEventLog as InMemoryCommandEventLog
         val noTradeEvent = eventLog.events()
@@ -1783,14 +1872,14 @@ class OneShotLlmRunnerTest {
         )
 
         val propagated = assertFailsWith<CancellationException> {
-            runner.runOneShot(request)
+            runReservedOneShot(runtime, runner, request)
         }
         val record = runtime.llmRunRepository.findByInvocationId("codex-cancelled-run").getOrThrow()
         val noTradeEvent = (runtime.commandEventLog as InMemoryCommandEventLog).events()
             .single { event -> event.eventType == CommandEventType.NO_TRADE_EXIT }
 
-        assertSame(cancellation, propagated)
-        assertTrue(propagated.suppressed.contains(cleanupFailure))
+        assertEquals(cancellation.message, propagated.message)
+        assertTrue(propagated.suppressed.any { it.message == cleanupFailure.message })
         assertEquals("CancellationException", propagated.safeCodexFailureOrNull()?.type)
         assertEquals("Codex invocation failure details omitted.", record?.errorMessage)
         assertFalse(noTradeEvent.payload.contains("auth-path-marker"))
@@ -1799,7 +1888,7 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun llmRunRecordFailure_doesNotPreventRunnerCompletion() = runBlocking {
+    fun llmRunRecordFailure_preventsMaterialExecutionAndTerminalizesReservation() = runBlocking {
         val fixture = runnerFixture(
             runtimeTransform = { runtime ->
                 runtime.copy(llmRunRepository = FailingLlmRunRepository)
@@ -1812,10 +1901,137 @@ class OneShotLlmRunnerTest {
             cleanExit()
         }
 
-        val result = fixture.runner.runOneShot(defaultRequest().copy(invocationId = "record-failure-run"))
+        val request = defaultRequest().copy(
+            invocationId = "record-failure-run",
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+        )
+        fixture.runtime.launchReservationRepository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = "record-failure-run",
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                triggerKey = "test:record-failure-run",
+                reservedAt = fixedClock().instant(),
+                runnerConfig = LlmRunnerConfig(),
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofHours(24),
+                activeReservationStaleAfter = Duration.ofMinutes(30),
+                populationScope = testPopulationScope(),
+            ),
+        ).getOrThrow()
 
-        assertTrue(result.isSuccess)
-        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.getOrThrow().status)
+        val result = runCatching { fixture.runner.runOneShot(request) }
+        val reservation = fixture.runtime.launchReservationRepository
+            .findExecutionClaim("record-failure-run")
+            .getOrThrow()
+
+        assertTrue(result.isFailure)
+        assertTrue(fixture.processRunner.launches.isEmpty())
+        assertEquals(LlmLaunchReservationStatus.FAILED, reservation?.status)
+    }
+
+    @Test
+    fun claimOutcomeUnknownRetry_retainsOriginalActiveSinceAndDoesNotLaunchStaleReservation() = runBlocking {
+        val expectedActiveSince = fixedInstant().minus(Duration.ofMinutes(30))
+        lateinit var claimRepository: OutcomeUnknownClaimRepository
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                claimRepository = OutcomeUnknownClaimRepository(runtime.launchReservationRepository)
+                runtime.copy(launchReservationRepository = claimRepository)
+            },
+        ) { cleanExit() }
+        val request = defaultRequest().copy(
+            invocationId = "claim-outcome-unknown-stale",
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+        )
+
+        try {
+            val result = fixture.runOneShot(
+                request = request,
+                reservedAt = expectedActiveSince.minusMillis(1),
+            )
+
+            assertTrue(result.isFailure)
+            assertEquals(2, claimRepository.requests.size)
+            assertEquals(expectedActiveSince, claimRepository.requests[0].activeSince)
+            assertEquals(expectedActiveSince, claimRepository.requests[1].activeSince)
+            assertTrue(fixture.processRunner.launches.isEmpty())
+        } finally {
+            LlmExecutionAdmissionHealth.resetForTest()
+            LlmExecutionTerminationFenceRegistry.resetForTest()
+        }
+    }
+
+    @Test
+    fun cancellationAtClaimCommitBoundary_terminalizesReservationWithoutChildLaunch() = runBlocking {
+        lateinit var claimRepository: ClaimBoundaryRepository
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                claimRepository = ClaimBoundaryRepository(runtime.launchReservationRepository)
+                runtime.copy(launchReservationRepository = claimRepository)
+            },
+        ) { cleanExit() }
+        val invocationId = "cancel-at-claim-boundary"
+        fixture.runtime.launchReservationRepository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                triggerKey = "test:$invocationId",
+                reservedAt = fixedInstant(),
+                runnerConfig = LlmRunnerConfig(),
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofDays(1),
+                activeReservationStaleAfter = Duration.ofMinutes(30),
+                populationScope = testPopulationScope(),
+            ),
+        ).getOrThrow()
+        val run = async {
+            fixture.runner.runOneShot(
+                defaultRequest().copy(
+                    invocationId = invocationId,
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                ),
+            )
+        }
+        claimRepository.claimEntered.await()
+
+        run.cancel()
+        claimRepository.allowClaimCommit.complete(Unit)
+
+        assertFailsWith<CancellationException> { run.await() }
+        assertTrue(fixture.processRunner.launches.isEmpty())
+        assertEquals(
+            LlmLaunchReservationStatus.FAILED,
+            fixture.runtime.launchReservationRepository.findExecutionClaim(invocationId).getOrThrow()?.status,
+        )
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun claimAuditFailure_terminalizesAndCleansClaimRegistries() = runBlocking {
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                runtime.copy(commandEventLog = FailFirstAppendCommandEventLog(runtime.commandEventLog))
+            },
+        ) { cleanExit() }
+        val invocationId = "claim-audit-failure"
+        val result = fixture.runOneShot(
+            request = defaultRequest().copy(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+            ),
+        )
+
+        assertTrue(result.isFailure)
+        assertTrue(fixture.processRunner.launches.isEmpty())
+        assertEquals(
+            LlmLaunchReservationStatus.FAILED,
+            fixture.runtime.launchReservationRepository.findExecutionClaim(invocationId).getOrThrow()?.status,
+        )
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
     }
 
     @Test
@@ -1851,7 +2067,7 @@ class OneShotLlmRunnerTest {
             dependencies = LlmDaemonSchedulerDependencies(
                 riskStateRepository = runtime.riskStateRepository,
                 commandEventLog = runtime.commandEventLog,
-                launchReservationRepository = InMemoryLlmLaunchReservationRepository(runtime.riskStateRepository),
+                launchReservationRepository = runtime.launchReservationRepository,
                 openRiskReader = {
                     Result.success(
                         me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskSnapshot(0, emptyList(), 0),
@@ -1893,7 +2109,7 @@ class OneShotLlmRunnerTest {
         }
         val request = defaultRequest().copy(invocationId = "cancelled-run")
         val runnerDeferred = async {
-            fixture.runner.runOneShot(request).getOrThrow()
+            fixture.runOneShot(request).getOrThrow()
         }
 
         launchStarted.await()
@@ -1929,6 +2145,59 @@ private data class RunnerFixture(
     val runner: OneShotLlmRunner,
 )
 
+private suspend fun RunnerFixture.runOneShot(
+    request: OneShotRunnerRequest,
+    reservedAt: Instant = fixedClock().instant(),
+): Result<OneShotRunnerResult> {
+    return runReservedOneShot(
+        runtime = runtime,
+        runner = runner,
+        request = request,
+        reservedAt = reservedAt,
+    )
+}
+
+private suspend fun runReservedOneShot(
+    runtime: TradingRuntime,
+    runner: OneShotLlmRunner,
+    request: OneShotRunnerRequest,
+    reservedAt: Instant = fixedClock().instant(),
+): Result<OneShotRunnerResult> {
+    val invocationId = request.invocationId ?: UUID.randomUUID().toString()
+    val triggerKind = request.triggerKind ?: LlmDaemonTriggerKind.MANUAL
+    val reservedRequest = request.copy(invocationId = invocationId, triggerKind = triggerKind)
+    val reservation = runtime.launchReservationRepository.tryReserve(
+        LlmLaunchReservationRequest(
+            invocationId = invocationId,
+            triggerKind = triggerKind,
+            triggerKey = "test:$invocationId",
+            reservedAt = reservedAt,
+            runnerConfig = LlmRunnerConfig(),
+            hourlyWindow = Duration.ofHours(1),
+            dailyWindow = Duration.ofHours(24),
+            activeReservationStaleAfter = Duration.ofMinutes(30),
+            populationScope = testPopulationScope(),
+        ),
+    ).getOrThrow()
+    assertIs<LlmLaunchReservationOutcome.Reserved>(reservation)
+
+    return try {
+        runner.runOneShot(reservedRequest)
+    } finally {
+        runtime.launchReservationRepository.finish(
+            LlmLaunchReservationFinish(invocationId, LlmLaunchReservationStatus.FINISHED, null, fixedClock().instant()),
+        ).getOrThrow()
+    }
+}
+
+private fun testPopulationScope(): LlmLaunchReservationPopulationScope {
+    return LlmLaunchReservationPopulationScope(
+        kind = "SYMBOL",
+        mode = TradingMode.PAPER,
+        symbol = TradingSymbol.BTC,
+    )
+}
+
 /**
  * request capture 用 runner fixture。
  *
@@ -1938,7 +2207,21 @@ private data class RunnerFixture(
 private data class RequestCapturingRunnerFixture(
     val invoker: RequestCapturingLlmInvoker,
     val runner: OneShotLlmRunner,
+    val runtime: TradingRuntime,
 )
+
+private suspend fun RequestCapturingRunnerFixture.runOneShot(
+    request: OneShotRunnerRequest,
+): Result<OneShotRunnerResult> {
+    val delegate = RunnerFixture(
+        runtime = runtime,
+        decisionRepository = runtime.decisionRepository as InMemoryDecisionRepository,
+        eventLog = runtime.commandEventLog as InMemoryCommandEventLog,
+        processRunner = FakeProcessRunner { cleanExit() },
+        runner = runner,
+    )
+    return delegate.runOneShot(request)
+}
 
 private fun runnerFixture(
     config: TradingBotConfig = TradingBotConfig(),
@@ -1981,6 +2264,51 @@ private fun runnerFixture(
         processRunner = processRunner,
         runner = runner,
     )
+}
+
+private class OutcomeUnknownClaimRepository(
+    private val delegate: LlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+    val requests = mutableListOf<LlmExecutionClaimRequest>()
+
+    override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
+        requests += request
+
+        return if (requests.size == 1) {
+            LlmExecutionClaimOutcome.OutcomeUnknown(IllegalStateException("claim commit outcome unknown"))
+        } else {
+            LlmExecutionClaimOutcome.Rejected(LlmExecutionClaimRejectionReason.TERMINAL)
+        }
+    }
+}
+
+private class ClaimBoundaryRepository(
+    private val delegate: LlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+    val claimEntered = CompletableDeferred<Unit>()
+    val allowClaimCommit = CompletableDeferred<Unit>()
+
+    override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
+        claimEntered.complete(Unit)
+        allowClaimCommit.await()
+
+        return delegate.claimForExecution(request)
+    }
+}
+
+private class FailFirstAppendCommandEventLog(
+    private val delegate: CommandEventLog,
+) : CommandEventLog by delegate {
+    private var failAppend = true
+
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        if (failAppend) {
+            failAppend = false
+            return Result.failure(IllegalStateException("claim audit append failed"))
+        }
+
+        return delegate.append(event)
+    }
 }
 
 /**
@@ -2174,6 +2502,7 @@ private fun requestCapturingRunnerFixture(
     return RequestCapturingRunnerFixture(
         invoker = invoker,
         runner = runner,
+        runtime = runtime,
     )
 }
 

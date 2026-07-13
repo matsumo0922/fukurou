@@ -48,7 +48,7 @@
 
 [確定事項の改訂: 2026-07-03] 2026-07-02 の「flat時15分定期発火廃止」は、サブスク枠の実数が未確定な段階で token 消費を抑えるための保守運用案だった。Claude Max / Codex Pro 20x の Usage UI と #28 の token / cost 集計で消費を別途監視する前提で、学習データ収集を優先し、daemon 学習期は flat / 保有中とも 15分 cadence を暫定採用する。
 
-- 既定値は flat heartbeat 15分、保有中 check 15分、hard cap 7/hour・120/day とする。routine cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。
+- 既定値は flat heartbeat 15分、保有中 check 15分、hard cap 7/hour・120/day とする。`ENTRY_FILL` と `STOP_PROXIMITY` にそれぞれ 1/hour・4/day を保証し、normal trigger は両方の未使用 reserve を侵食しない。
 - 経済イベント trigger も同じ hourly / daily 予算を消費し、heartbeat とは別枠にしない。
 - open position が 0 件で position 未紐付けの BUY resting entry だけが生存する tick は、trigger reservation より前に決定論的 maintenance へ分岐する。データ欠損時も full LLM へ fail-openせず typed suppression reason を残し、注文の TTL、価格、種別、fill 判定は変更しない。open position が併存する場合は position safety 用 trigger を優先する。
 - Proposer 起動前の material-state manifest は invocation ID を主キーに append-only で保存する。decision と intent の episode / thesis / geometry / material-state identity は同一 transaction で dual-writeし、proposal の関係を append-only shadow observation として記録する。
@@ -57,7 +57,7 @@
 
 ### 1.2.2 paper trading 週次反省会による runtime / prompt 改訂
 
-[確定] `safety.minExpectedMoveToCostRatio` の既定値は 2.5、`runner.maxInvocationsPerHour` の既定値は 7、`runner.maxInvocationsPerDay` は 120、flat / holding cadence は 15分とする。routine cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。production の active runtime config に明示値が保存済みの場合、catalog default 変更では上書きされないため、`/ops/runtime-config` の draft / activate で active 値を更新する。
+[確定] `safety.minExpectedMoveToCostRatio` の既定値は 2.5、runner hard cap は 7/hour・120/day、`ENTRY_FILL` と `STOP_PROXIMITY` の reserve はそれぞれ 1/hour・4/day とする。normal trigger の保証枠は 5/hour・112/day である。production active 値は catalog default で上書きせず、明示的な runtime config operation でだけ変更する。
 
 system prompt v1.13 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。`knowledge_get_recent_lessons` の SafetyFloor 拒否は Falsifier verdict と別 layer として読み、同一 setup / thesis を再提案する場合は現在の MCP evidence と prior intent の客観差分を示す。申告勝率・expected R・TP・STOP を threshold に合わせるだけの変更は改善と扱わず、差分を示せない場合は NO_TRADE とする。EV gate は resting LIMIT entry を maker fee(rebate) と保護 exit 側 taker fee / slippage reserve で評価し、板を跨ぐ LIMIT / MARKET / STOP entry を taker fee と entry / exit 両側の market slippage reserve で評価する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
 
@@ -1304,7 +1304,7 @@ entry EV の計算直前に、データ鮮度劣化時の probability cap を適
 
 `llm_runs` は `invocation_id` を primary key とし、`mode`、`symbol`、nullable な daemon `trigger_kind`、`status`、epoch millis の `started_at` / `finished_at`、`error_message`、`terminal_cause`、開始時 runtime config の `runtime_config_version_id` / `runtime_config_hash` を保存する。`terminal_cause` は `NORMAL_COMPLETION`、`NO_TRADE`、`SAFETY_DENIED`、`TIMED_OUT`、`RUNNER_FAILED`、`CALLER_CANCELLED`、`RESTART_INTERRUPTED`、`LEGACY_UNCLASSIFIED` の安定 code を持ち、RUNNING 行だけ null とする。LLM provider は phase ごとの `command_event_log` に残すため run-level には持たない。`stdout_path` / `stderr_path` も持たない。Claude の `error_message` と stdout / stderr は redaction と truncate 後に保存し、stdout / stderr は historical usage fallback に使う。Codex は raw JSONL / stderr と起動境界の例外 message / path を永続化せず、`llm_runs.error_message` は固定文言、runner phase audit は固定 category と安全な例外 class 名だけを保存する。Codex の `NO_TRADE_EXIT` payload も例外 message を省略する。manual launch warning と standalone runner stderr でも元例外の message、path、stack trace は出さず、固定 category と安全な例外 class 名だけを出す。
 
-persistence bootstrap は、`status = RUNNING` かつ `finished_at IS NULL` の `llm_runs` のうち、`started_at` が `runner.perRunTimeout` と reflection PromptCandidates の timeout 上限の大きい方の3倍より古い行を `FAILED` に回収する。回収時は `finished_at` に bootstrap 時刻を保存し、`error_message` には前回プロセスまたは container shutdown で中断された run を bootstrap で回収したことを示す固定 message を保存する。閾値以内の新しい `RUNNING` 行と終了済みの行は変更しない。
+persistence bootstrap は、`status = RUNNING` かつ `finished_at IS NULL` の stale `llm_runs` と対応reservationを同一transactionで回収する。`CLAIMED` reservationを含むlifecycleはsingle-instanceの旧container/process generation終了を確認した起動時だけ回収し、通常のschema ensureやrolling coexistence中は変更しない。回収時は `finished_at` に bootstrap 時刻を保存し、`error_message` には前回processまたはcontainer shutdownで中断されたrunを示す固定messageを保存し、claim metadataとtermination fenceを`LLM_INVOCATION_RECOVERED`へ残す。current processではbounded periodic scanを別に維持し、DB復旧後にrestartなしで収束する。
 
 `equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP` / `EPOCH_START`）、nullable な `account_epoch_id`、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。日次重複防止のため `reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置き、BOOTSTRAP は `(mode, reason)` partial unique index で防御する。FILL は paper account 更新、EPOCH_START は account reset と同一 transaction で追加する。legacy row の epoch は捏造して backfill しない。
 
@@ -1376,6 +1376,8 @@ LLM cost / usage は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し p
 
 [確定] daemonの定義は「マクロ発火スケジューラ + 常駐ProtectionReconciler」である。前者はLLMをいつ起動するかを決め、後者はLLM起動中かどうかに依存せず、保護STOP、virtual TP、paper約定、HARD_HALT掃引を短い周期で決定的に進める。
 
+[確定] マクロ発火スケジューラだけは GMO の毎週土曜日 09:00〜11:00（Asia/Tokyo）と Public status を reservation 前に確認する。定期窓では network request を行わず、窓外では 60 秒の単一 cache entry と cache miss ごとに 1 回の HTTP attempt を使い `OPEN` だけを許可する。reservation 直前、reservation 成功直後、child 呼び出し直前に定期窓を再確認し、reservation 後に窓へ入った場合は reservation を terminal にして child を起動しない。`DAEMON_TRIGGER_LAUNCHED` は child 呼び出し後にだけ記録する。`MAINTENANCE`、`PREOPEN`、timeout、不正 response、transport failure は `InfrastructureSuppressed` / `DAEMON_LAUNCH_SUPPRESSED` として fail closed にし、strategy の `NO_TRADE` と分離する。episode lifecycle、resting-order maintenance、ProtectionReconciler、manual recovery、evaluation report、runtime config administration は継続する。
+
 [設計提案] daemonは次の状態機械で動く。
 
 ```text
@@ -1445,9 +1447,11 @@ suspend fun handleTrigger(
 
 [確定] daemonはCLI起動時に `FUKUROU_INVOCATION_ID`（= `decisionRunId`）を環境変数へ注入する。MCPは全tool callへこのIDを自動付与し、`decision_run_id` / `tool_call_id` / `client_request_id` / `llm_provider` / `prompt_hash` / `system_prompt_version` / `market_snapshot_id` をauditとして保存する。
 
-[確定] 学習期は flat / 保有中とも15分 cadence を採用する。routine cadence は最大 4/hour・96/day を使い、hard cap は 7/hour・120/day とする。Step1スパイクと #19 の実測値を入力にしつつ、#28 で実運用 token・所要時間・tool call数・サブスク枠消費を集計する。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
+[確定] 学習期は flat / 保有中とも15分 cadence を採用し、hard cap は 7/hour・120/day とする。normal trigger は `ENTRY_FILL` と `STOP_PROXIMITY` の未使用 reserve を侵食しない。Step1スパイクと #19 の実測値を入力にしつつ、#28 で実運用 token・所要時間・tool call数・サブスク枠消費を集計する。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
 
-[確定] runtime catalog default の `runner.maxInvocationsPerHour` は 7/hour、`runner.maxInvocationsPerDay` は 120/day とする。flat / holding の15分 cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。既存 production active config の明示値は catalog default 変更で上書きされないため、deploy 後に `/ops/runtime-config` の draft / activate で active 値を更新する。
+[確定] runtime catalog default の hard cap は 7/hour・120/day で、`ENTRY_FILL` と `STOP_PROXIMITY` にそれぞれ 1/hour・4/day の対称 reserve を持つ。critical trigger は他方の未使用 reserve を侵食せず、自分の保証量を超える場合は normal 余力を使う。direct runner も `MANUAL` として予約する。one-shot reservation は `AVAILABLE` で作成され、runner は invocation ID / trigger kind に一致する `RUNNING` rowを claimant token 付きの単一 conditional update で `CLAIMED` にし、`llm_runs` のRUNNING永続化が成功した後だけpre-filter、material I/O、LLM / MCP processへ進む。並列 replay、terminal row、stale cutoffより古い`AVAILABLE` row、migration 前の claim state が `NULL` の row、`NOT_REQUIRED` row は child process を起動しない。reflection と evaluation report は `NOT_REQUIRED` として caller-owned lifecycle を維持し、共通のatomic admission health gateを通る。
+
+runner は claim 後の reservation lifecycle を所有し、success、failure、cancellationを claimant token 付き conditional finish で terminal にする。claim commit の応答が不明な場合は child process を起動せず、独立supervisorへ登録してから同じ token で read-after-unknown を行い、未解決中は readiness と新規 admission を fail closed にする。claim heartbeat と100件keysetのbounded current-process DB scanはbootstrapに依存せず継続し、DB復旧後もrestartを待たずに回収する。`CLAIMED`は時刻にかかわらずactive blockerであり、recoveryは`claimedAt + H + G`到達、heartbeat `3I` miss、同tokenの`NO_CHILD_STARTED`またはrootと全descendantの終了を証明した`PROCESS_TREE_EXITED` fenceのANDとし、観測heartbeatをWHEREへ含める。終了証明が不確実な場合はfenceを設定せずadmissionを閉じる。回収対象pageはreservation、対応するRUNNING `llm_runs`、fence metadata付きauditを単一statement・同一transactionで終端・記録する。runner finish、sweeper、bootstrapは`status=RUNNING`のconditional transitionを共有してterminal reasonを上書きしない。whole-run hard timeout はclaim commitを絶対deadlineの起点とし、PRE_FILTER / PROPOSER / FALSIFIER の各1回、TERM/KILL grace、terminal persistence timeoutから checked arithmetic で導出し、起動時auditに各componentとH/I/3Iをsecretなしで保存する。各material/child境界では同tokenのRUNNING状態とhealthを再確認する。
 
 ### 6.4 1起動内で許可すること/禁止すること
 
@@ -3611,7 +3615,7 @@ LLM CLI:
 | LLM calls (trading)    |             7/hour, 120/day | サブスク/ToS/制限対策                                               |
 | LLM calls (reflection) | 完了済み前週の PromptCandidates のみ | trading と同じ cap を消費し、1時間で1回分・24時間で4回分の headroom がない場合は起動しない |
 
-flat / holding の15分 cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。hard cap 到達後は後続 heartbeat が skip されうる。
+flat / holding、manual、direct、legacy fallback は normal usage として、`ENTRY_FILL` と `STOP_PROXIMITY` の未使用 reserve を侵食しない。critical trigger は他方の未使用 reserve を侵食せず、normal 側に余力があれば自分の最低保証量を超えて起動できる。
 
 Private POSTは取引所上限より安全側に、bot内部の実効上限を `5 req/s` 程度へ下げてもよい。設定は上の既定を上限として、実運用で調整する。
 

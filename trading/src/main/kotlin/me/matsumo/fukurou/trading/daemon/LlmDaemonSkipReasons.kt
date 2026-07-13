@@ -20,6 +20,10 @@ internal fun LlmLaunchReservationRejectionReason.toDaemonSkipReason(): String {
         LlmLaunchReservationRejectionReason.REPORT_RATE_LIMIT -> "report_rate_limit"
         LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR -> "max_invocations_per_hour_exceeded"
         LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY -> "max_invocations_per_day_exceeded"
+        LlmLaunchReservationRejectionReason.ENTRY_FILL_HOURLY_RESERVE -> "entry_fill_hourly_reserve_protected"
+        LlmLaunchReservationRejectionReason.ENTRY_FILL_DAILY_RESERVE -> "entry_fill_daily_reserve_protected"
+        LlmLaunchReservationRejectionReason.STOP_PROXIMITY_HOURLY_RESERVE -> "stop_proximity_hourly_reserve_protected"
+        LlmLaunchReservationRejectionReason.STOP_PROXIMITY_DAILY_RESERVE -> "stop_proximity_daily_reserve_protected"
         LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM ->
             "reflection_hourly_headroom_insufficient"
         LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM ->

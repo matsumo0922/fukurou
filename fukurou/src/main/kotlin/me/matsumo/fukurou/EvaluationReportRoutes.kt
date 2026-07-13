@@ -626,6 +626,9 @@ private class EvaluationReportStore(
         val workingDirectory = Files.createTempDirectory("fukurou-evaluation-report-")
         val safeEnvironment = environment.filterKeys { key -> key in REPORT_CHILD_ENV_ALLOWLIST }
         val audited = try {
+            check(persistence?.validateExecutionAdmission(invocationId)?.getOrThrow() != false) {
+                "Evaluation report LLM execution is no longer admitted."
+            }
             auditor.invokeAndAudit(
                 phaseName = "evaluation_report",
                 context = DecisionRunContext(

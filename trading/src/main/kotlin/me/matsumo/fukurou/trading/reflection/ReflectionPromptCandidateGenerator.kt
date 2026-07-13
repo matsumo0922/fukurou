@@ -1,6 +1,8 @@
 package me.matsumo.fukurou.trading.reflection
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -19,6 +21,7 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
+import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
@@ -197,14 +200,15 @@ class ReflectionPromptCandidateGenerator(
             startedAt = startedAt,
         )
 
-        recordLlmRunStarted(start)
-
         return try {
+            requireNotRequiredAdmission(start.invocationId)
+            recordLlmRunStarted(start)
             val request = llmRequest(
                 dataset = dataset,
                 invocationId = invocationId,
                 startedAt = startedAt,
             )
+            requireNotRequiredAdmission(start.invocationId)
             val auditResult = auditor.invokeAndAudit(
                 phaseName = REFLECTION_PHASE_NAME,
                 context = request.decisionRunContext,
@@ -229,13 +233,21 @@ class ReflectionPromptCandidateGenerator(
                 validation = validation,
             )
         } catch (throwable: CancellationException) {
-            finishFailedRun(start, throwable)
+            withContext(NonCancellable) {
+                terminalizeFailedInvocation(start, throwable)
+            }
 
             throw throwable
         } catch (throwable: Throwable) {
-            finishFailedRun(start, throwable)
+            terminalizeFailedInvocation(start, throwable)
 
             failedAttemptFile(dataset, attemptCount, throwable)
+        }
+    }
+
+    private suspend fun requireNotRequiredAdmission(invocationId: String) {
+        check(launchReservationRepository.validateExecutionAdmission(invocationId, claimantToken = null).getOrThrow()) {
+            "Reflection LLM execution is no longer admitted."
         }
     }
 
@@ -308,13 +320,7 @@ class ReflectionPromptCandidateGenerator(
     }
 
     private suspend fun recordLlmRunStarted(start: LlmRunStart) {
-        llmRunRepository.insertRunning(start)
-            .onFailure { throwable ->
-                logger(
-                    "reflection llm run start record failed invocation=${start.invocationId} " +
-                        "error=${throwable.javaClass.simpleName}",
-                )
-            }
+        llmRunRepository.insertRunning(start).getOrThrow()
     }
 
     private suspend fun finishSucceededRun(start: LlmRunStart) {
@@ -355,37 +361,51 @@ class ReflectionPromptCandidateGenerator(
             }
         }
 
-        llmRunRepository.finish(
-            LlmRunFinish(
-                invocationId = start.invocationId,
-                mode = start.mode,
-                symbol = start.symbol,
-                triggerKind = start.triggerKind,
-                status = status,
-                startedAt = start.startedAt,
-                finishedAt = finishedAt,
-                errorMessage = redactedMessage,
-                terminalCause = cause?.let(::terminalCauseFor) ?: LlmRunTerminalCause.NORMAL_COMPLETION,
-            ),
-        ).onFailure { throwable ->
-            logger(
-                "reflection llm run finish record failed invocation=${start.invocationId} " +
-                    "error=${throwable.javaClass.simpleName}",
-            )
+        val run = llmRunRepository.findByInvocationId(start.invocationId).getOrThrow()
+        if (run?.status == LLM_RUN_STATUS_RUNNING) {
+            llmRunRepository.finish(
+                LlmRunFinish(
+                    invocationId = start.invocationId,
+                    mode = start.mode,
+                    symbol = start.symbol,
+                    triggerKind = start.triggerKind,
+                    status = status,
+                    startedAt = start.startedAt,
+                    finishedAt = finishedAt,
+                    errorMessage = redactedMessage,
+                    terminalCause = cause?.let(::terminalCauseFor) ?: LlmRunTerminalCause.NORMAL_COMPLETION,
+                ),
+            ).getOrThrow()
         }
-        launchReservationRepository.finish(
+        finishReservationWithRetry(
             LlmLaunchReservationFinish(
                 invocationId = start.invocationId,
                 status = reservationStatus,
                 reason = reason,
                 finishedAt = finishedAt,
             ),
-        ).onFailure { throwable ->
-            logger(
-                "reflection reservation finish failed invocation=${start.invocationId} " +
-                    "error=${throwable.javaClass.simpleName}",
-            )
+        )
+    }
+
+    private suspend fun terminalizeFailedInvocation(start: LlmRunStart, cause: Throwable) {
+        var terminalFailure: Throwable? = null
+        repeat(REFLECTION_TERMINAL_INLINE_ATTEMPTS) {
+            val result = runCatching { finishFailedRun(start, cause) }
+            if (result.isSuccess) return
+            terminalFailure = result.exceptionOrNull()
         }
+
+        ReflectionTerminalPersistenceSupervisor.register(start.invocationId) {
+            finishFailedRun(start, cause)
+        }
+        throw requireNotNull(terminalFailure)
+    }
+
+    private suspend fun finishReservationWithRetry(finish: LlmLaunchReservationFinish) {
+        val firstResult = launchReservationRepository.finish(finish)
+        if (firstResult.isSuccess) return
+
+        launchReservationRepository.finish(finish).getOrThrow()
     }
 
     private fun terminalCauseFor(cause: Throwable): LlmRunTerminalCause = terminalCauseForInvocationFailure(cause)
@@ -954,4 +974,5 @@ private val SUSPICIOUS_SECRET_PATTERNS = listOf(
 
 private const val REFLECTION_PHASE_NAME = "reflection"
 private const val REFLECTION_PROMPT_VERSION = "reflection-prompt-candidates-v1"
+private const val REFLECTION_TERMINAL_INLINE_ATTEMPTS = 3
 private const val REFLECTION_LLM_RUN_STATUS_SUCCEEDED = "SUCCEEDED"

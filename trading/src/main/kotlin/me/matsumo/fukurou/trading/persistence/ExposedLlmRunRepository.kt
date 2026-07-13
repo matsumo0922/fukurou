@@ -39,31 +39,13 @@ private const val INSERT_LLM_RUN_RUNNING_SQL = """
 """
 
 /**
- * llm_runs の終了状態を upsert する SQL。
+ * RUNNING llm_runs を終了状態へ conditional update する SQL。
  */
-private const val UPSERT_LLM_RUN_FINISH_SQL = """
-    INSERT INTO llm_runs (
-        invocation_id,
-        mode,
-        symbol,
-        trigger_kind,
-        status,
-        started_at,
-        finished_at,
-        error_message,
-        terminal_cause,
-        runtime_config_version_id,
-        runtime_config_hash
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT (invocation_id) DO UPDATE
-    SET
-        status = EXCLUDED.status,
-        finished_at = EXCLUDED.finished_at,
-        error_message = EXCLUDED.error_message,
-        terminal_cause = EXCLUDED.terminal_cause,
-        runtime_config_version_id = EXCLUDED.runtime_config_version_id,
-        runtime_config_hash = EXCLUDED.runtime_config_hash
+private const val FINISH_LLM_RUN_SQL = """
+    UPDATE llm_runs
+    SET status = ?, finished_at = ?, error_message = ?, terminal_cause = ?,
+        runtime_config_version_id = ?, runtime_config_hash = ?
+    WHERE invocation_id = ? AND status = 'RUNNING' AND finished_at IS NULL
 """
 
 /**
@@ -198,24 +180,20 @@ private fun JdbcTransaction.insertRunningLlmRun(start: LlmRunStart) {
         statement.setLong(6, start.startedAt.toEpochMilli())
         statement.setString(7, start.runtimeConfigVersionId)
         statement.setString(8, start.runtimeConfigHash)
-        statement.executeUpdate()
+        check(statement.executeUpdate() == 1) { "llm_runs RUNNING insert did not create exactly one row." }
     }
 }
 
 private fun JdbcTransaction.finishLlmRun(finish: LlmRunFinish) {
-    jdbcConnection().prepareStatement(UPSERT_LLM_RUN_FINISH_SQL).use { statement ->
-        statement.setString(1, finish.invocationId)
-        statement.setString(2, finish.mode.name)
-        statement.setString(3, finish.symbol.apiSymbol)
-        statement.setString(4, finish.triggerKind?.name)
-        statement.setString(5, finish.status)
-        statement.setLong(6, finish.startedAt.toEpochMilli())
-        statement.setLong(7, finish.finishedAt.toEpochMilli())
-        statement.setString(8, finish.errorMessage)
-        statement.setString(9, finish.terminalCause.name)
-        statement.setString(10, finish.runtimeConfigVersionId)
-        statement.setString(11, finish.runtimeConfigHash)
-        statement.executeUpdate()
+    jdbcConnection().prepareStatement(FINISH_LLM_RUN_SQL).use { statement ->
+        statement.setString(1, finish.status)
+        statement.setLong(2, finish.finishedAt.toEpochMilli())
+        statement.setString(3, finish.errorMessage)
+        statement.setString(4, finish.terminalCause.name)
+        statement.setString(5, finish.runtimeConfigVersionId)
+        statement.setString(6, finish.runtimeConfigHash)
+        statement.setString(7, finish.invocationId)
+        check(statement.executeUpdate() == 1) { "llm_runs terminal update did not affect exactly one RUNNING row." }
     }
 }
 

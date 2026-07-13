@@ -138,21 +138,19 @@ class InMemoryLlmRunRepository : LlmRunRepository {
     override suspend fun insertRunning(start: LlmRunStart): Result<Unit> {
         return runCatching<Unit> {
             synchronized(lock) {
-                records.putIfAbsent(
-                    start.invocationId,
-                    LlmRunRecord(
-                        invocationId = start.invocationId,
-                        mode = start.mode,
-                        symbol = start.symbol,
-                        triggerKind = start.triggerKind,
-                        status = LLM_RUN_STATUS_RUNNING,
-                        startedAt = start.startedAt,
-                        finishedAt = null,
-                        errorMessage = null,
-                        terminalCause = null,
-                        runtimeConfigVersionId = start.runtimeConfigVersionId,
-                        runtimeConfigHash = start.runtimeConfigHash,
-                    ),
+                check(start.invocationId !in records) { "llm_runs RUNNING row already exists." }
+                records[start.invocationId] = LlmRunRecord(
+                    invocationId = start.invocationId,
+                    mode = start.mode,
+                    symbol = start.symbol,
+                    triggerKind = start.triggerKind,
+                    status = LLM_RUN_STATUS_RUNNING,
+                    startedAt = start.startedAt,
+                    finishedAt = null,
+                    errorMessage = null,
+                    terminalCause = null,
+                    runtimeConfigVersionId = start.runtimeConfigVersionId,
+                    runtimeConfigHash = start.runtimeConfigHash,
                 )
                 statusHistory.getOrPut(start.invocationId) { mutableListOf() }.add(LLM_RUN_STATUS_RUNNING)
             }
@@ -163,31 +161,17 @@ class InMemoryLlmRunRepository : LlmRunRepository {
         return runCatching<Unit> {
             synchronized(lock) {
                 val currentRecord = records[finish.invocationId]
-
-                if (currentRecord != null) {
-                    records[finish.invocationId] = currentRecord.copy(
-                        status = finish.status,
-                        finishedAt = finish.finishedAt,
-                        errorMessage = finish.errorMessage,
-                        terminalCause = finish.terminalCause,
-                        runtimeConfigVersionId = finish.runtimeConfigVersionId,
-                        runtimeConfigHash = finish.runtimeConfigHash,
-                    )
-                } else {
-                    records[finish.invocationId] = LlmRunRecord(
-                        invocationId = finish.invocationId,
-                        mode = finish.mode,
-                        symbol = finish.symbol,
-                        triggerKind = finish.triggerKind,
-                        status = finish.status,
-                        startedAt = finish.startedAt,
-                        finishedAt = finish.finishedAt,
-                        errorMessage = finish.errorMessage,
-                        terminalCause = finish.terminalCause,
-                        runtimeConfigVersionId = finish.runtimeConfigVersionId,
-                        runtimeConfigHash = finish.runtimeConfigHash,
-                    )
+                check(currentRecord?.status == LLM_RUN_STATUS_RUNNING && currentRecord.finishedAt == null) {
+                    "llm_runs terminal update requires one RUNNING row."
                 }
+                records[finish.invocationId] = currentRecord.copy(
+                    status = finish.status,
+                    finishedAt = finish.finishedAt,
+                    errorMessage = finish.errorMessage,
+                    terminalCause = finish.terminalCause,
+                    runtimeConfigVersionId = finish.runtimeConfigVersionId,
+                    runtimeConfigHash = finish.runtimeConfigHash,
+                )
                 statusHistory.getOrPut(finish.invocationId) { mutableListOf() }.add(finish.status)
             }
         }

@@ -89,6 +89,11 @@ enum class CommandEventType {
     DAEMON_TRIGGER_SKIPPED,
 
     /**
+     * LLM daemon scheduler が取引所 infrastructure により自動起動を抑止した。
+     */
+    DAEMON_LAUNCH_SUPPRESSED,
+
+    /**
      * LLM daemon scheduler が one-shot 起動予約を取得した。
      */
     DAEMON_TRIGGER_LAUNCHED,
@@ -100,6 +105,9 @@ enum class CommandEventType {
 
     /** bootstrap が deploy/restart で取り残された LLM invocation を回収した。 */
     LLM_INVOCATION_RECOVERED,
+
+    /** one-shot execution recovery policy と worker 起動を記録した。 */
+    LLM_EXECUTION_RECOVERY_STARTED,
 
     /**
      * CLI auth login process を開始した。

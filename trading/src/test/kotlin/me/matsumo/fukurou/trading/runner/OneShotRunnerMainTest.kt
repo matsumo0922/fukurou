@@ -2,9 +2,27 @@ package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
+import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmRunRecord
+import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
+import me.matsumo.fukurou.trading.evaluation.LlmRunStart
+import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
+import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
+import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
+import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import java.nio.file.FileSystemException
+import java.time.Clock
+import java.time.Instant
+import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -33,6 +51,42 @@ class OneShotRunnerMainTest {
 
         assertFalse(launched)
         assertTrue(result.exceptionOrNull()?.message?.contains("LLM_LAUNCH_DISABLED") == true)
+    }
+
+    @Test
+    fun productionCompositionReservesManualIdentityAndPassesItToActualRunnerClaim() = runBlocking {
+        val invocationId = "production-composition-manual"
+        val config = TradingBotConfig()
+        val baseRuntime = TradingRuntimeFactory.inMemory(tradingConfig = config)
+        val reservationRepository = CapturingReservationRepository(baseRuntime.launchReservationRepository)
+        val invoker = RecordingFailureLlmInvoker()
+        val runtime = baseRuntime.copy(
+            launchReservationRepository = reservationRepository,
+            llmRunRepository = StartFailingLlmRunRepository,
+        )
+
+        val result = runCatching {
+            launchOneShotRunnerWithRuntime(
+                environment = emptyMap(),
+                tradingConfig = config,
+                tradingRuntime = runtime,
+                runtimeConfigSnapshot = null,
+                llmInvoker = invoker,
+                invocationId = invocationId,
+                clock = Clock.fixed(Instant.parse("2026-07-13T00:00:00Z"), ZoneOffset.UTC),
+            )
+        }
+
+        assertTrue(result.isFailure)
+        assertEquals(invocationId, reservationRepository.reserveRequests.single().invocationId)
+        assertEquals(LlmDaemonTriggerKind.MANUAL, reservationRepository.reserveRequests.single().triggerKind)
+        assertEquals(invocationId, reservationRepository.claimRequests.single().invocationId)
+        assertEquals(LlmDaemonTriggerKind.MANUAL, reservationRepository.claimRequests.single().triggerKind)
+        assertEquals(
+            LlmLaunchReservationStatus.FAILED,
+            reservationRepository.findExecutionClaim(invocationId).getOrThrow()?.status,
+        )
+        assertEquals(0, invoker.invocationCount)
     }
 
     @Test
@@ -138,5 +192,48 @@ class OneShotRunnerMainTest {
         assertFalse(output.contains("auth-path-marker"))
         assertFalse(output.contains("path-message-marker"))
         assertFalse(output.contains("at me.matsumo"))
+    }
+}
+
+private class CapturingReservationRepository(
+    private val delegate: LlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+    val reserveRequests = mutableListOf<LlmLaunchReservationRequest>()
+    val claimRequests = mutableListOf<LlmExecutionClaimRequest>()
+
+    override suspend fun tryReserve(request: LlmLaunchReservationRequest) = delegate.tryReserve(request).also {
+        reserveRequests += request
+    }
+
+    override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
+        claimRequests += request
+
+        return delegate.claimForExecution(request)
+    }
+}
+
+private object StartFailingLlmRunRepository : LlmRunRepository {
+    override suspend fun insertRunning(start: LlmRunStart): Result<Unit> {
+        return Result.failure(IllegalStateException("start persistence failed"))
+    }
+
+    override suspend fun finish(finish: LlmRunFinish): Result<Unit> = Result.failure(IllegalStateException("unused"))
+
+    override suspend fun findByInvocationId(invocationId: String): Result<LlmRunRecord?> = Result.success(null)
+
+    override suspend fun findRunsStartedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<LlmRunRecord>> = Result.success(emptyList())
+}
+
+private class RecordingFailureLlmInvoker : LlmInvoker {
+    var invocationCount: Int = 0
+        private set
+
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        invocationCount += 1
+        return Result.failure(IllegalStateException("must not invoke"))
     }
 }

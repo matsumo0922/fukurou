@@ -1,4 +1,4 @@
-@file:Suppress("TooManyFunctions")
+@file:Suppress("ImportOrdering", "TooManyFunctions")
 
 package me.matsumo.fukurou.trading.persistence
 
@@ -19,6 +19,7 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.reflection.MAX_REFLECTION_LLM_TIMEOUT
 import me.matsumo.fukurou.trading.risk.RiskHaltState
+import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import java.math.BigDecimal
@@ -414,6 +415,25 @@ private const val ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL = """
     ON llm_launch_reservations (status, reserved_at)
 """
 
+/** stale claim recovery の bounded scan index を作る SQL。 */
+private const val ENSURE_LLM_LAUNCH_CLAIM_RECOVERY_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_llm_res_running_claimed_recovery
+    ON llm_launch_reservations (
+        COALESCE(execution_claim_heartbeat_at, execution_claimed_at),
+        execution_claimed_at,
+        invocation_id
+    )
+    WHERE status = 'RUNNING' AND execution_claim_state = 'CLAIMED'
+"""
+
+/** non-CLAIMED concurrency lookup の partial index を作る SQL。 */
+private const val ENSURE_LLM_LAUNCH_NONCLAIMED_RECENT_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_llm_res_running_nonclaimed_recent
+    ON llm_launch_reservations (reserved_at DESC, invocation_id)
+    WHERE status = 'RUNNING'
+        AND (execution_claim_state IS NULL OR execution_claim_state IN ('AVAILABLE', 'NOT_REQUIRED'))
+"""
+
 /**
  * llm_runs.started_at index を作る SQL。
  */
@@ -566,9 +586,11 @@ private const val VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL = """
         AND indexname IN (
             'idx_llm_launch_reservations_invocation_id_unique',
             'idx_llm_launch_reservations_trigger_key_reserved_at',
-            'idx_llm_launch_reservations_status_reserved_at'
+            'idx_llm_launch_reservations_status_reserved_at',
+            'idx_llm_res_running_claimed_recovery',
+            'idx_llm_res_running_nonclaimed_recent'
         )
-    HAVING COUNT(*) = 3
+    HAVING COUNT(*) = 5
 """
 
 /**
@@ -731,7 +753,11 @@ private const val VERIFY_LLM_LAUNCH_RESERVATIONS_SCHEMA_SQL = """
         status,
         reserved_at,
         finished_at,
-        reason
+        reason,
+        execution_claim_state,
+        execution_claim_token,
+        execution_claimed_at,
+        execution_claim_heartbeat_at
     FROM llm_launch_reservations
     LIMIT 0
 """
@@ -1022,7 +1048,11 @@ class TradingPersistenceBootstrap(
                     statement.setString(2, LLM_RUN_STATUS_RUNNING)
                     statement.executeUpdate()
                 }
-                recoverStaleLlmRunLifecycle(now, staleLlmRunRecoveryThreshold)
+                recoverStaleLlmRunLifecycle(
+                    now = now,
+                    threshold = staleLlmRunRecoveryThreshold,
+                    previousGenerationTerminated = false,
+                )
             }
 
             if (recoveredCount > 0) {
@@ -1041,6 +1071,17 @@ class TradingPersistenceBootstrap(
                 selectRiskState(forUpdate = false)
                 selectPaperAccount()
             }
+        }
+    }
+
+    /** single-instance の旧 process generation 終了確認後だけ CLAIMED stale lifecycle を回収する。 */
+    fun recoverPreviousGeneration(): Result<Int> = runCatching {
+        exposedTransaction(database) {
+            recoverStaleLlmRunLifecycle(
+                now = Instant.now(clock),
+                threshold = staleLlmRunRecoveryThreshold,
+                previousGenerationTerminated = true,
+            )
         }
     }
 }
@@ -1147,7 +1188,8 @@ private fun JdbcTransaction.insertPaperAccountEpochImportedEvent(
  * stale な RUNNING llm_runs の回収閾値を取引設定から算出する。
  */
 fun TradingBotConfig.staleLlmRunRecoveryThreshold(): Duration {
-    val runnerThreshold = runner.perRunTimeout.multipliedBy(STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER)
+    val executionPolicy = OneShotExecutionPolicy.from(runner)
+    val runnerThreshold = executionPolicy.hardTimeout.plus(executionPolicy.processTerminationGrace)
     val reflectionThreshold = MAX_REFLECTION_LLM_TIMEOUT.multipliedBy(STALE_LLM_RUN_RECOVERY_TIMEOUT_MULTIPLIER)
 
     return runnerThreshold.coerceAtLeast(reflectionThreshold)
@@ -1178,6 +1220,8 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
+    executeUpdate(ENSURE_LLM_LAUNCH_CLAIM_RECOVERY_INDEX_SQL)
+    executeUpdate(ENSURE_LLM_LAUNCH_NONCLAIMED_RECENT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL)
     executeUpdate(ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL)
     executeUpdate(ENSURE_ORDER_CANCEL_REASON_DOMAIN_SQL)
@@ -1414,11 +1458,15 @@ internal fun JdbcTransaction.ensureBootstrapEquitySnapshot(now: Instant) {
  * stale な RUNNING llm_runs を FAILED へ回収する。
  */
 internal fun JdbcTransaction.recoverStaleLlmRuns(now: Instant, threshold: Duration): Int {
-    return recoverStaleLlmRunLifecycle(now, threshold)
+    return recoverStaleLlmRunLifecycle(now, threshold, previousGenerationTerminated = false)
 }
 
 /** stale run と対応する RUNNING reservation を bootstrap transaction 内で回収する。 */
-internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(now: Instant, threshold: Duration): Int {
+internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(
+    now: Instant,
+    threshold: Duration,
+    previousGenerationTerminated: Boolean = false,
+): Int {
     acquireGapPopulationGenerationToken()
     val cutoff = now.minus(threshold)
     val reservations = selectRunningLlmReservationsForUpdate()
@@ -1433,6 +1481,7 @@ internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(now: Instant, threshold
                 reservation = reservationsByInvocationId[invocationId],
                 now = now,
                 cutoff = cutoff,
+                previousGenerationTerminated = previousGenerationTerminated,
             )
         }
 
@@ -1455,6 +1504,10 @@ private data class LockedLlmReservation(
     val triggerKind: String?,
     val triggerKey: String?,
     val reservedAt: Long?,
+    val claimState: String?,
+    val claimantToken: String?,
+    val claimedAt: Long?,
+    val heartbeatAt: Long?,
 )
 
 private data class StaleLlmInvocationRecovery(
@@ -1463,6 +1516,10 @@ private data class StaleLlmInvocationRecovery(
     val triggerKey: String?,
     val startedAt: Long?,
     val reservedAt: Long?,
+    val claimState: String?,
+    val claimantTokenFingerprint: String?,
+    val claimedAt: Long?,
+    val heartbeatAt: Long?,
     val runRecovered: Boolean,
     val reservationRecovered: Boolean,
     val runtimeConfigVersionId: String?,
@@ -1503,7 +1560,8 @@ private fun JdbcTransaction.selectLifecycleRunsForUpdate(): List<LockedLlmRun> {
 
 private fun JdbcTransaction.selectRunningLlmReservationsForUpdate(): List<LockedLlmReservation> {
     val sql = """
-        SELECT invocation_id, trigger_kind, trigger_key, reserved_at
+        SELECT invocation_id, trigger_kind, trigger_key, reserved_at, execution_claim_state,
+            execution_claim_token, execution_claimed_at, execution_claim_heartbeat_at
         FROM llm_launch_reservations
         WHERE status = ?
         ORDER BY invocation_id ASC
@@ -1521,6 +1579,10 @@ private fun JdbcTransaction.selectRunningLlmReservationsForUpdate(): List<Locked
                             triggerKind = resultSet.getString("trigger_kind"),
                             triggerKey = resultSet.getString("trigger_key"),
                             reservedAt = resultSet.getLong("reserved_at").takeUnless { resultSet.wasNull() },
+                            claimState = resultSet.getString("execution_claim_state"),
+                            claimantToken = resultSet.getString("execution_claim_token"),
+                            claimedAt = resultSet.getLong("execution_claimed_at").takeUnless { resultSet.wasNull() },
+                            heartbeatAt = resultSet.getLong("execution_claim_heartbeat_at").takeUnless { resultSet.wasNull() },
                         ),
                     )
                 }
@@ -1529,11 +1591,13 @@ private fun JdbcTransaction.selectRunningLlmReservationsForUpdate(): List<Locked
     }
 }
 
+@Suppress("CyclomaticComplexMethod")
 private fun JdbcTransaction.recoverLockedLlmInvocation(
     run: LockedLlmRun?,
     reservation: LockedLlmReservation?,
     now: Instant,
     cutoff: Instant,
+    previousGenerationTerminated: Boolean,
 ): StaleLlmInvocationRecovery? {
     val staleRun = run?.status == LLM_RUN_STATUS_RUNNING && run.startedAt?.let { startedAt ->
         Instant.ofEpochMilli(startedAt).isBefore(cutoff)
@@ -1541,8 +1605,11 @@ private fun JdbcTransaction.recoverLockedLlmInvocation(
     val staleReservation = reservation?.reservedAt?.let { reservedAt ->
         Instant.ofEpochMilli(reservedAt).isBefore(cutoff)
     } == true
-    val recoverRun = staleRun
+    val claimedLifecycle = reservation?.claimState == "CLAIMED"
+    val claimRecoveryAllowed = !claimedLifecycle || previousGenerationTerminated
+    val recoverRun = staleRun && claimRecoveryAllowed
     val recoverReservation = when {
+        !claimRecoveryAllowed -> false
         run?.status == LLM_RUN_STATUS_RUNNING -> staleRun
         else -> staleReservation
     }
@@ -1559,6 +1626,10 @@ private fun JdbcTransaction.recoverLockedLlmInvocation(
         triggerKey = reservation?.triggerKey,
         startedAt = run?.startedAt,
         reservedAt = reservation?.reservedAt,
+        claimState = reservation?.claimState,
+        claimantTokenFingerprint = reservation?.claimantToken?.takeLast(8),
+        claimedAt = reservation?.claimedAt,
+        heartbeatAt = reservation?.heartbeatAt,
         runRecovered = runRecovered,
         reservationRecovered = reservationRecovered,
         runtimeConfigVersionId = run?.runtimeConfigVersionId,
@@ -1628,6 +1699,11 @@ private fun JdbcTransaction.insertLlmInvocationRecoveryEvent(
                 put("reservationRecovered", recovery.reservationRecovered)
                 put("startedAt", recovery.startedAt?.let(Instant::ofEpochMilli)?.toString())
                 put("reservedAt", recovery.reservedAt?.let(Instant::ofEpochMilli)?.toString())
+                put("executionClaimState", recovery.claimState)
+                put("claimantTokenFingerprint", recovery.claimantTokenFingerprint)
+                put("claimedAt", recovery.claimedAt?.let(Instant::ofEpochMilli)?.toString())
+                put("heartbeatAt", recovery.heartbeatAt?.let(Instant::ofEpochMilli)?.toString())
+                put("terminationFence", "previous_process_generation_ended")
                 put("recoveredAt", recoveredAt.toString())
             }.toString(),
             occurredAt = recoveredAt,

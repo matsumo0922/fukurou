@@ -46,6 +46,11 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRejectionReason
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
@@ -107,6 +112,9 @@ import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
+import me.matsumo.fukurou.trading.runner.LlmExecutionRecoveryService
+import me.matsumo.fukurou.trading.runner.LlmExecutionTerminationFenceRegistry
+import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
 import me.matsumo.fukurou.trading.runner.OneShotRunnerStatus
@@ -125,6 +133,8 @@ import java.lang.reflect.Proxy
 import java.math.BigDecimal
 import java.nio.file.Files
 import java.nio.file.Path
+import java.sql.Connection
+import java.sql.PreparedStatement
 import java.sql.SQLTimeoutException
 import java.sql.Types
 import java.time.Clock
@@ -375,7 +385,9 @@ private const val SELECT_LLM_LAUNCH_RESERVATION_INDEX_COUNT_SQL = """
         AND indexname IN (
             'idx_llm_launch_reservations_invocation_id_unique',
             'idx_llm_launch_reservations_trigger_key_reserved_at',
-            'idx_llm_launch_reservations_status_reserved_at'
+            'idx_llm_launch_reservations_status_reserved_at',
+            'idx_llm_res_running_claimed_recovery',
+            'idx_llm_res_running_nonclaimed_recent'
         )
 """
 
@@ -865,7 +877,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, selectMarketDataConnectedSessionIndexCount(database))
         assertEquals(3, selectMarketDataIntegrityIndexCount(database))
         assertEquals(1, selectDecisionsInvocationIdIndexCount(database))
-        assertEquals(3, selectLlmLaunchReservationIndexCount(database))
+        assertEquals(5, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))
         assertEquals(1, selectRecentSafetyDenialIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
@@ -3958,6 +3970,15 @@ class PostgresPersistenceIntegrationTest {
                 startedAt = freshStartedAt,
             ),
         ).getOrThrow()
+        repository.insertRunning(
+            LlmRunStart(
+                invocationId = "already-finished-run",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                startedAt = staleStartedAt,
+            ),
+        ).getOrThrow()
         repository.finish(
             LlmRunFinish(
                 invocationId = "already-finished-run",
@@ -4142,6 +4163,7 @@ class PostgresPersistenceIntegrationTest {
             .submitDecision(noTradeDecisionSubmission().copy(invocationId = "range-run-2"))
             .getOrThrow()
         val llmRunRepository = ExposedLlmRunRepository(database)
+        llmRunRepository.insertRunning(llmRunStart("range-llm-1", fixedInstant())).getOrThrow()
         llmRunRepository.finish(
             LlmRunFinish(
                 invocationId = "range-llm-1",
@@ -4152,6 +4174,11 @@ class PostgresPersistenceIntegrationTest {
                 startedAt = fixedInstant(),
                 finishedAt = fixedInstant().plusSeconds(1),
                 errorMessage = "failure 1",
+            ),
+        ).getOrThrow()
+        llmRunRepository.insertRunning(
+            llmRunStart("range-llm-2", fixedInstant().plusSeconds(60)).copy(
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
             ),
         ).getOrThrow()
         llmRunRepository.finish(
@@ -4365,11 +4392,579 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun llmLaunchQuotaSaturationBarrierAllowsExactlyOneFinalHourlySlot() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig(
+            maxInvocationsPerHour = 7,
+            entryFillReservePerHour = 0,
+            stopProximityReservePerHour = 0,
+        )
+        repeat(6) { index ->
+            reserveAndFinishLlmLaunch(
+                repository = repository,
+                invocationId = "quota-prefill-$index",
+                config = config,
+                reservedAt = fixedInstant().minusSeconds(index.toLong()),
+            )
+        }
+        installQuotaBarrierTerminalTrigger(database)
+        val riskLockConnection = dataSource.connection
+        riskLockConnection.autoCommit = false
+        riskLockConnection.prepareStatement("SELECT id FROM risk_state WHERE id = 1 FOR UPDATE").use { statement ->
+            statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+        }
+
+        try {
+            val outcomes = coroutineScope {
+                val contenders = (1..2).map { index ->
+                    async(Dispatchers.IO) {
+                        repository.tryReserve(
+                            llmLaunchReservationRequest(
+                                invocationId = "quota-contender-$index",
+                                config = config,
+                                reservedAt = fixedInstant().plusSeconds(1),
+                            ),
+                        ).getOrThrow()
+                    }
+                }
+                try {
+                    awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
+                } finally {
+                    riskLockConnection.commit()
+                    riskLockConnection.close()
+                }
+                contenders.map { contender -> contender.await() }
+            }
+
+            val reserved = outcomes.filterIsInstance<LlmLaunchReservationOutcome.Reserved>().single()
+            val rejected = outcomes.filterIsInstance<LlmLaunchReservationOutcome.Rejected>().single()
+            assertEquals(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR, rejected.reason)
+            assertEquals(
+                LlmLaunchReservationStatus.FINISHED,
+                repository.findExecutionClaim(reserved.invocationId).getOrThrow()?.status,
+            )
+        } finally {
+            if (!riskLockConnection.isClosed) riskLockConnection.close()
+            removeQuotaBarrierTerminalTrigger(database)
+        }
+    }
+
+    @Test
+    fun llm_launch_reservation_atomicClaimHasOneWinnerAcrossOneHundredContenders() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val now = fixedClock().instant()
+        assertIs<LlmLaunchReservationOutcome.Reserved>(
+            repository.tryReserve(llmLaunchReservationRequest("claim-race", LlmRunnerConfig())).getOrThrow(),
+        )
+
+        val outcomes = coroutineScope {
+            (0 until 100).map { index ->
+                async(Dispatchers.IO) {
+                    repository.claimForExecution(
+                        LlmExecutionClaimRequest(
+                            invocationId = "claim-race",
+                            triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                            claimantToken = "claim-token-$index",
+                            claimedAt = now.plusMillis(index.toLong()),
+                        ),
+                    )
+                }
+            }.map { it.await() }
+        }
+
+        assertEquals(1, outcomes.count { it is LlmExecutionClaimOutcome.Claimed })
+        assertEquals(
+            99,
+            outcomes.count { outcome ->
+                outcome == LlmExecutionClaimOutcome.Rejected(
+                    LlmExecutionClaimRejectionReason.ALREADY_CLAIMED,
+                )
+            },
+        )
+        val snapshot = requireNotNull(repository.findExecutionClaim("claim-race").getOrThrow())
+        assertEquals(LlmExecutionClaimState.CLAIMED, snapshot.claimState)
+        assertEquals(LlmLaunchReservationStatus.RUNNING, snapshot.status)
+    }
+
+    @Test
+    fun bootstrap_claimedRecoveryRequiresPreviousGenerationFenceAndPreservesTerminalReason() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, Clock.fixed(now, ZoneOffset.UTC)).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        repository.tryReserve(llmLaunchReservationRequest("bootstrap-claim", LlmRunnerConfig(), now)).getOrThrow()
+        assertIs<LlmExecutionClaimOutcome.Claimed>(
+            repository.claimForExecution(
+                LlmExecutionClaimRequest(
+                    invocationId = "bootstrap-claim",
+                    triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                    claimantToken = "previous-generation-token",
+                    claimedAt = now,
+                ),
+            ),
+        )
+        val recoveryClock = Clock.fixed(now.plusSeconds(600), ZoneOffset.UTC)
+        val bootstrap = TradingPersistenceBootstrap(
+            database = database,
+            clock = recoveryClock,
+            staleLlmRunRecoveryThreshold = Duration.ofMinutes(1),
+        )
+
+        bootstrap.ensureSchema().getOrThrow()
+        assertEquals(
+            LlmLaunchReservationStatus.RUNNING,
+            repository.findExecutionClaim("bootstrap-claim").getOrThrow()?.status,
+        )
+
+        assertEquals(0, bootstrap.recoverPreviousGeneration().getOrThrow())
+        val terminalSnapshot = requireNotNull(repository.findExecutionClaim("bootstrap-claim").getOrThrow())
+        assertEquals(LlmLaunchReservationStatus.FAILED, terminalSnapshot.status)
+        assertEquals(
+            LlmExecutionClaimOutcome.Rejected(LlmExecutionClaimRejectionReason.TERMINAL),
+            repository.claimForExecution(
+                LlmExecutionClaimRequest(
+                    invocationId = "bootstrap-claim",
+                    triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                    claimantToken = "replay-token",
+                    claimedAt = now.plusSeconds(601),
+                ),
+            ),
+        )
+        assertEquals(
+            LlmRunTerminalCause.RESTART_INTERRUPTED.name,
+            selectReservationReason(database, "bootstrap-claim"),
+        )
+        assertTrue(selectRecoveryAuditPayload(database, "bootstrap-claim").contains("previous_process_generation_ended"))
+    }
+
+    @Test
+    fun currentProcessRecovery_failsRunAndPersistsFenceAuditInSameTransaction() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val reservationRepository = ExposedLlmLaunchReservationRepository(database)
+        val runRepository = ExposedLlmRunRepository(database)
+        reservationRepository.tryReserve(
+            llmLaunchReservationRequest("current-process-recovery", LlmRunnerConfig(), now),
+        ).getOrThrow()
+        assertIs<LlmExecutionClaimOutcome.Claimed>(
+            reservationRepository.claimForExecution(
+                LlmExecutionClaimRequest(
+                    invocationId = "current-process-recovery",
+                    triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                    claimantToken = "recovery-token-12345678",
+                    claimedAt = now,
+                ),
+            ),
+        )
+        runRepository.insertRunning(llmRunStart("current-process-recovery", now)).getOrThrow()
+        val snapshot = requireNotNull(
+            reservationRepository.findExecutionClaim("current-process-recovery").getOrThrow(),
+        )
+
+        assertEquals(
+            setOf("current-process-recovery"),
+            reservationRepository.recoverStaleExecutionClaims(
+                listOf(
+                    LlmExecutionRecoveryRequest(
+                        invocationId = "current-process-recovery",
+                        claimState = LlmExecutionClaimState.CLAIMED,
+                        claimantToken = "recovery-token-12345678",
+                        observedHeartbeatAt = snapshot.heartbeatAt,
+                        observedReservedAt = snapshot.reservedAt,
+                        finishedAt = now.plusSeconds(600),
+                        reason = "STALE_CLAIMED_RESERVATION_RECOVERED",
+                        terminationFence = "PROCESS_TREE_EXITED",
+                    ),
+                ),
+            ).getOrThrow(),
+        )
+
+        val recoveredRun = requireNotNull(runRepository.findByInvocationId("current-process-recovery").getOrThrow())
+        assertEquals(LLM_RUN_STATUS_FAILED, recoveredRun.status)
+        assertEquals(LlmRunTerminalCause.RUNNER_FAILED, recoveredRun.terminalCause)
+        val auditPayload = selectRecoveryAuditPayload(database, "current-process-recovery")
+        assertTrue(auditPayload.contains("current_process_periodic_scan"))
+        assertTrue(auditPayload.contains("PROCESS_TREE_EXITED"))
+        assertTrue(auditPayload.contains("12345678"))
+        assertTrue(auditPayload.contains(Regex("\"runRecovered\"\\s*:\\s*true")))
+        assertTrue(auditPayload.contains(Regex("\"reservationRecovered\"\\s*:\\s*true")))
+    }
+
+    @Test
+    fun llmRunFinish_nonexistentRunFailsWithoutCreatingTerminalRow() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmRunRepository(database)
+
+        val result = repository.finish(
+            LlmRunFinish(
+                invocationId = "nonexistent-run-finish",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                status = LLM_RUN_STATUS_FAILED,
+                startedAt = now,
+                finishedAt = now.plusSeconds(1),
+                errorMessage = "must-not-upsert",
+                terminalCause = LlmRunTerminalCause.RUNNER_FAILED,
+            ),
+        )
+
+        assertTrue(result.isFailure)
+        assertEquals(null, repository.findByInvocationId("nonexistent-run-finish").getOrThrow())
+    }
+
+    @Test
+    fun runnerSweeperAndBootstrapRaceHasOneTerminalReasonAndNoOverwrite() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        repository.tryReserve(llmLaunchReservationRequest("terminal-race", LlmRunnerConfig(), now)).getOrThrow()
+        repository.claimForExecution(
+            LlmExecutionClaimRequest(
+                invocationId = "terminal-race",
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                claimantToken = "race-token",
+                claimedAt = now,
+            ),
+        )
+        val snapshot = requireNotNull(repository.findExecutionClaim("terminal-race").getOrThrow())
+        val recoveryRequest = LlmExecutionRecoveryRequest(
+            invocationId = "terminal-race",
+            claimState = LlmExecutionClaimState.CLAIMED,
+            claimantToken = "race-token",
+            observedHeartbeatAt = snapshot.heartbeatAt,
+            observedReservedAt = snapshot.reservedAt,
+            finishedAt = now.plusSeconds(600),
+            reason = "sweeper",
+            terminationFence = "NO_CHILD_STARTED",
+        )
+        val bootstrap = TradingPersistenceBootstrap(
+            database = database,
+            clock = Clock.fixed(now.plusSeconds(600), ZoneOffset.UTC),
+            staleLlmRunRecoveryThreshold = Duration.ofMinutes(1),
+        )
+
+        coroutineScope {
+            listOf(
+                async(Dispatchers.IO) {
+                    repository.finish(
+                        LlmLaunchReservationFinish(
+                            invocationId = "terminal-race",
+                            status = LlmLaunchReservationStatus.FINISHED,
+                            reason = "runner",
+                            finishedAt = now.plusSeconds(600),
+                            claimantToken = "race-token",
+                        ),
+                    ).getOrThrow()
+                },
+                async(Dispatchers.IO) { repository.recoverStaleExecutionClaim(recoveryRequest).getOrThrow() },
+                async(Dispatchers.IO) { bootstrap.recoverPreviousGeneration().getOrThrow() },
+            ).map { it.await() }
+        }
+        val winningReason = requireNotNull(selectReservationReason(database, "terminal-race"))
+        assertTrue(
+            winningReason == "runner" ||
+                winningReason == "sweeper" ||
+                winningReason == LlmRunTerminalCause.RESTART_INTERRUPTED.name,
+        )
+
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "terminal-race",
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = "overwrite",
+                finishedAt = now.plusSeconds(601),
+                claimantToken = "race-token",
+            ),
+        ).getOrThrow()
+        assertFalse(repository.recoverStaleExecutionClaim(recoveryRequest).getOrThrow())
+        assertEquals(winningReason, selectReservationReason(database, "terminal-race"))
+    }
+
+    @Test
+    fun bootstrap_addsNullableClaimColumnsWithoutBackfillOrTableRewrite() = runPostgresTest {
+        exposedTransaction(database) {
+            executeUpdate(
+                """
+                    CREATE TABLE llm_launch_reservations (
+                        id UUID PRIMARY KEY, invocation_id VARCHAR(128) NOT NULL, trigger_kind VARCHAR(64) NOT NULL,
+                        trigger_key VARCHAR(256) NOT NULL, status VARCHAR(32) NOT NULL, reserved_at BIGINT NOT NULL,
+                        finished_at BIGINT NULL, reason TEXT NULL
+                    )
+                """.trimIndent(),
+            )
+            executeUpdate(
+                """
+                    INSERT INTO llm_launch_reservations
+                    SELECT gen_random_uuid(), 'legacy-' || value, 'MANUAL', 'legacy:' || value,
+                        'FINISHED', value, value, NULL
+                    FROM generate_series(1, 50000) AS value
+                """.trimIndent(),
+            )
+        }
+        val before = selectClaimMigrationEvidence(database)
+        enableDdlStatementLogging(dataSource)
+        val logOffset = postgresLogs().length
+        val lockConnection = dataSource.connection
+        lockConnection.autoCommit = false
+        lockConnection.createStatement().use { statement ->
+            statement.execute("LOCK TABLE llm_launch_reservations IN ACCESS SHARE MODE")
+        }
+        val lockElapsed = coroutineScope {
+            val startedAt = System.nanoTime()
+            val migration = async(Dispatchers.IO) {
+                TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+            }
+            kotlinx.coroutines.delay(250)
+            assertFalse(migration.isCompleted)
+            lockConnection.commit()
+            lockConnection.close()
+            migration.await()
+            Duration.ofNanos(System.nanoTime() - startedAt)
+        }
+
+        val after = selectClaimMigrationEvidence(database)
+        assertEquals(before.relationFileNode, after.relationFileNode)
+        assertEquals(before.rowCount, after.rowCount)
+        assertEquals(before.invocationChecksum, after.invocationChecksum)
+        assertEquals(0, after.claimedRowCount)
+        assertEquals(5, selectLlmLaunchReservationIndexCount(database))
+        assertEquals(4, selectNullableExecutionClaimColumnCount(database))
+        assertExecutionClaimIndexDefinitions(selectExecutionClaimIndexDefinitions(database))
+        assertTrue(lockElapsed >= Duration.ofMillis(250), "DDL lock elapsed=$lockElapsed")
+        val migrationLogs = postgresLogs().drop(logOffset)
+        assertEquals(6, countExecutionClaimDdlStatements(migrationLogs), migrationLogs)
+    }
+
+    @Test
+    fun claimMigrationLockTimeoutLeavesSchemaUnverifiedAndRuntimeUnavailable() = runPostgresTest {
+        exposedTransaction(database) {
+            executeUpdate(
+                """
+                    CREATE TABLE llm_launch_reservations (
+                        id UUID PRIMARY KEY, invocation_id VARCHAR(128) NOT NULL, trigger_kind VARCHAR(64) NOT NULL,
+                        trigger_key VARCHAR(256) NOT NULL, status VARCHAR(32) NOT NULL, reserved_at BIGINT NOT NULL,
+                        finished_at BIGINT NULL, reason TEXT NULL
+                    )
+                """.trimIndent(),
+            )
+        }
+        val lockConnection = dataSource.connection
+        lockConnection.autoCommit = false
+        lockConnection.createStatement().use { statement ->
+            statement.execute("LOCK TABLE llm_launch_reservations IN ACCESS SHARE MODE")
+        }
+
+        createDataSource("SET lock_timeout = '100ms'").use { timeoutDataSource ->
+            val timeoutDatabase = ExposedDatabase.connect(timeoutDataSource)
+            val bootstrap = TradingPersistenceBootstrap(timeoutDatabase, fixedClock())
+
+            assertTrue(bootstrap.ensureSchema().isFailure)
+            assertTrue(bootstrap.verifySchema().isFailure)
+            val runtimeResult = runCatching {
+                TradingRuntimeFactory.connectedPostgres(
+                    dataSource = timeoutDataSource,
+                    database = timeoutDatabase,
+                    clock = fixedClock(),
+                )
+            }
+            assertTrue(runtimeResult.isFailure)
+        }
+        lockConnection.rollback()
+        lockConnection.close()
+    }
+
+    @Test
+    fun activeReservationQueryUsesBothPartialIndexesWithLargeTerminalHistory() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        insertTerminalReservationHistory(database, rowCount = 100_000)
+        insertStaleLegacyRunningReservationHistory(database, rowCount = 100_000, now = fixedInstant())
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val now = fixedInstant()
+        repository.tryReserve(llmLaunchReservationRequest("plan-claimed", LlmRunnerConfig(), now)).getOrThrow()
+        assertIs<LlmExecutionClaimOutcome.Claimed>(
+            repository.claimForExecution(
+                LlmExecutionClaimRequest(
+                    invocationId = "plan-claimed",
+                    triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                    claimantToken = "plan-token",
+                    claimedAt = now,
+                ),
+            ),
+        )
+        analyzeLlmLaunchReservations(database)
+
+        val claimedPlan = explainActiveReservationQuery(database, now.minusSeconds(600))
+        assertBoundedActiveReservationPlan(claimedPlan, "idx_llm_res_running_claimed_recovery")
+
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "plan-claimed",
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = "test",
+                finishedAt = now.plusSeconds(1),
+                claimantToken = "plan-token",
+            ),
+        ).getOrThrow()
+        repository.tryReserve(
+            llmLaunchReservationRequest("plan-available", LlmRunnerConfig(), now.plusSeconds(2)),
+        ).getOrThrow()
+        analyzeLlmLaunchReservations(database)
+
+        val availablePlan = explainActiveReservationQuery(database, now.minusSeconds(600))
+        assertBoundedActiveReservationPlan(availablePlan, "idx_llm_res_running_nonclaimed_recent")
+    }
+
+    @Test
+    fun activeReservationSnapshotBlocksAdmissionBeforeAndAfterClaimCommit() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val now = fixedInstant()
+        repository.tryReserve(llmLaunchReservationRequest("claim-barrier", LlmRunnerConfig(), now)).getOrThrow()
+        installClaimCommitBarrier(database)
+        val barrierConnection = dataSource.connection
+        barrierConnection.autoCommit = false
+        barrierConnection.createStatement().use { statement ->
+            statement.execute("SELECT pg_advisory_xact_lock(18650)")
+        }
+
+        coroutineScope {
+            val claim = async(Dispatchers.IO) {
+                repository.claimForExecution(
+                    LlmExecutionClaimRequest(
+                        invocationId = "claim-barrier",
+                        triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                        claimantToken = "barrier-token",
+                        claimedAt = now.plusSeconds(1),
+                    ),
+                )
+            }
+            awaitAdvisoryLockWait(dataSource)
+
+            val beforeCommit = repository.tryReserve(
+                llmLaunchReservationRequest("blocked-before-claim-commit", LlmRunnerConfig(), now.plusSeconds(2)),
+            ).getOrThrow()
+            assertConcurrentReservation("claim-barrier", beforeCommit)
+
+            barrierConnection.commit()
+            barrierConnection.close()
+            assertIs<LlmExecutionClaimOutcome.Claimed>(claim.await())
+
+            val afterCommit = repository.tryReserve(
+                llmLaunchReservationRequest("blocked-after-claim-commit", LlmRunnerConfig(), now.plusSeconds(3)),
+            ).getOrThrow()
+            assertConcurrentReservation("claim-barrier", afterCommit)
+        }
+    }
+
+    @Test
+    fun admissionAndRecoveryStayWithinStatementLockAndTimeoutBudgets() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val statementCount = AtomicInteger()
+        val queryTimeouts = mutableListOf<Int>()
+        val instrumentedDatabase = ExposedDatabase.connect(
+            instrumentedDataSource(
+                dataSource = dataSource,
+                statementCount = statementCount,
+                queryTimeouts = queryTimeouts,
+            ),
+        )
+        val repository = ExposedLlmLaunchReservationRepository(instrumentedDatabase)
+        val now = fixedInstant()
+
+        statementCount.set(0)
+        assertIs<LlmLaunchReservationOutcome.Reserved>(
+            repository.tryReserve(llmLaunchReservationRequest("statement-budget", LlmRunnerConfig(), now)).getOrThrow(),
+        )
+        assertEquals(4, statementCount.get())
+
+        val lockConnection = dataSource.connection
+        lockConnection.autoCommit = false
+        lockConnection.prepareStatement("SELECT id FROM risk_state WHERE id = 1 FOR UPDATE").use { statement ->
+            statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+        }
+        val lockElapsed = coroutineScope {
+            statementCount.set(0)
+            val startedAt = System.nanoTime()
+            val blockedAdmission = async(Dispatchers.IO) {
+                repository.tryReserve(
+                    llmLaunchReservationRequest("risk-lock-budget", LlmRunnerConfig(), now.plusSeconds(1)),
+                ).getOrThrow()
+            }
+            kotlinx.coroutines.delay(250)
+            assertFalse(blockedAdmission.isCompleted)
+            lockConnection.commit()
+            lockConnection.close()
+            assertConcurrentReservation("statement-budget", blockedAdmission.await())
+            Duration.ofNanos(System.nanoTime() - startedAt)
+        }
+        assertTrue(lockElapsed >= Duration.ofMillis(250), "risk row lock elapsed=$lockElapsed")
+        assertEquals(2, statementCount.get())
+
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "statement-budget",
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = "test",
+                finishedAt = now.plusSeconds(2),
+            ),
+        ).getOrThrow()
+        repository.tryReserve(
+            llmLaunchReservationRequest("recovery-statement-budget", LlmRunnerConfig(), now.minusSeconds(1_800)),
+        ).getOrThrow()
+        statementCount.set(0)
+        queryTimeouts.clear()
+        val recoveryService = LlmExecutionRecoveryService(
+            repository = repository,
+            policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+            clock = Clock.fixed(now, ZoneOffset.UTC),
+        )
+
+        assertEquals(1, recoveryService.tick().getOrThrow())
+        assertEquals(2, statementCount.get())
+        assertEquals(listOf(2, 2), queryTimeouts)
+    }
+
+    @Test
+    fun hundredCandidateRecoveryUsesOneSelectAndOneBatchUpdate() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val now = fixedInstant()
+        insertRecoverableAvailableReservations(
+            database = database,
+            rowCount = 100,
+            reservedAt = now.minusSeconds(1_800),
+        )
+        val statementCount = AtomicInteger()
+        val queryTimeouts = mutableListOf<Int>()
+        val instrumentedDatabase = ExposedDatabase.connect(
+            instrumentedDataSource(
+                dataSource = dataSource,
+                statementCount = statementCount,
+                queryTimeouts = queryTimeouts,
+            ),
+        )
+        val service = LlmExecutionRecoveryService(
+            repository = ExposedLlmLaunchReservationRepository(instrumentedDatabase),
+            policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+            clock = Clock.fixed(now, ZoneOffset.UTC),
+        )
+
+        assertEquals(100, service.tick().getOrThrow())
+        assertEquals(2, statementCount.get())
+        assertEquals(listOf(2, 2), queryTimeouts)
+        assertEquals(100, countTerminalBatchRecoveryReservations(database))
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
+    }
+
+    @Test
     fun llm_launch_reservation_usesInWindowReservationWhenPhaseIsOutsideWindow() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedLlmLaunchReservationRepository(database)
-        val config = LlmRunnerConfig(maxInvocationsPerDay = 1)
+        val config =
+            LlmRunnerConfig(maxInvocationsPerDay = 1, entryFillReservePerDay = 0, stopProximityReservePerDay = 0)
 
         reserveAndFinishLlmLaunch(
             repository = repository,
@@ -4402,7 +4997,8 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedLlmLaunchReservationRepository(database)
-        val config = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1)
+        val config =
+            LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1, entryFillReservePerHour = 0, entryFillReservePerDay = 0, stopProximityReservePerHour = 0, stopProximityReservePerDay = 0)
         val nextReservedAt = fixedInstant().plus(Duration.ofHours(25))
 
         reserveAndFinishLlmLaunch(
@@ -4433,7 +5029,14 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedLlmLaunchReservationRepository(database)
-        val config = LlmRunnerConfig(maxInvocationsPerHour = 2, maxInvocationsPerDay = 2)
+        val config = LlmRunnerConfig(
+            maxInvocationsPerHour = 2,
+            maxInvocationsPerDay = 2,
+            entryFillReservePerHour = 0,
+            entryFillReservePerDay = 0,
+            stopProximityReservePerHour = 0,
+            stopProximityReservePerDay = 0,
+        )
 
         appendLlmLaunchAudit(
             database = database,
@@ -4472,7 +5075,8 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedLlmLaunchReservationRepository(database)
-        val config = LlmRunnerConfig(maxInvocationsPerHour = 2, maxInvocationsPerDay = 2)
+        val config =
+            LlmRunnerConfig(maxInvocationsPerHour = 2, maxInvocationsPerDay = 2, entryFillReservePerHour = 0, entryFillReservePerDay = 0, stopProximityReservePerHour = 0, stopProximityReservePerDay = 0)
 
         reserveAndFinishLlmLaunch(
             repository = repository,
@@ -4517,7 +5121,14 @@ class PostgresPersistenceIntegrationTest {
         val observedAt = fixedInstant().plus(Duration.ofHours(25))
         val clock = Clock.fixed(observedAt, ZoneOffset.UTC)
         val config = TradingBotConfig(
-            runner = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1),
+            runner = LlmRunnerConfig(
+                maxInvocationsPerHour = 1,
+                maxInvocationsPerDay = 1,
+                entryFillReservePerHour = 0,
+                entryFillReservePerDay = 0,
+                stopProximityReservePerHour = 0,
+                stopProximityReservePerDay = 0,
+            ),
         )
 
         TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
@@ -4565,7 +5176,14 @@ class PostgresPersistenceIntegrationTest {
         val observedAt = fixedInstant().plus(Duration.ofHours(1))
         val clock = Clock.fixed(observedAt, ZoneOffset.UTC)
         val config = TradingBotConfig(
-            runner = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1),
+            runner = LlmRunnerConfig(
+                maxInvocationsPerHour = 1,
+                maxInvocationsPerDay = 1,
+                entryFillReservePerHour = 0,
+                entryFillReservePerDay = 0,
+                stopProximityReservePerHour = 0,
+                stopProximityReservePerDay = 0,
+            ),
         )
 
         TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
@@ -4576,21 +5194,14 @@ class PostgresPersistenceIntegrationTest {
             config = config.runner,
             reservedAt = observedAt.minus(Duration.ofMinutes(1)),
         )
-        val fixture = postgresOneShotFixture(config, clock)
+        val outcome = ExposedLlmLaunchReservationRepository(database).tryReserve(
+            llmLaunchReservationRequest("direct-run-current", config.runner, observedAt),
+        ).getOrThrow()
 
-        try {
-            val result = fixture.runner.runOneShot(postgresOneShotRequest("direct-run-current")).getOrThrow()
-            val noTradeEvents = fixture.eventLog.findEvents(
-                limit = 100,
-                eventType = CommandEventType.NO_TRADE_EXIT,
-            ).getOrThrow()
-
-            assertEquals(OneShotRunnerStatus.LAUNCH_REJECTED, result.status)
-            assertEquals(0, fixture.invoker.requests.size)
-            assertTrue(noTradeEvents.any { event -> event.payload.contains("max_invocations_per_hour_exceeded") })
-        } finally {
-            fixture.runtime.close()
-        }
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR),
+            outcome,
+        )
     }
 
     @Test
@@ -4746,7 +5357,8 @@ class PostgresPersistenceIntegrationTest {
             ),
         ).getOrThrow()
         val repository = ExposedLlmLaunchReservationRepository(database)
-        val config = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 10)
+        val config =
+            LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 10, entryFillReservePerHour = 0, stopProximityReservePerHour = 0)
         val outcome = repository.tryReserve(llmLaunchReservationRequest("daemon-run-1", config)).getOrThrow()
 
         assertEquals(LlmLaunchReservationOutcome.Reserved("daemon-run-1"), outcome)
@@ -7154,6 +7766,12 @@ private class PostgresTestContext(
     val dataSource: HikariDataSource,
     val database: ExposedDatabase,
 ) {
+    fun postgresLogs(): String = container.logs
+
+    fun createDataSource(connectionInitSql: String): HikariDataSource {
+        return createDataSource(container, connectionInitSql)
+    }
+
     /**
      * container の接続情報を runtime config に変換する。
      */
@@ -8166,6 +8784,56 @@ private fun countingDataSource(
     } as DataSource
 }
 
+private fun instrumentedDataSource(
+    dataSource: DataSource,
+    statementCount: AtomicInteger,
+    queryTimeouts: MutableList<Int>,
+): DataSource {
+    return Proxy.newProxyInstance(
+        DataSource::class.java.classLoader,
+        arrayOf(DataSource::class.java),
+    ) { _, method, arguments ->
+        val result = method.invoke(dataSource, *(arguments ?: emptyArray()))
+        if (method.name != "getConnection") return@newProxyInstance result
+
+        instrumentedConnection(result as Connection, statementCount, queryTimeouts)
+    } as DataSource
+}
+
+private fun instrumentedConnection(
+    connection: Connection,
+    statementCount: AtomicInteger,
+    queryTimeouts: MutableList<Int>,
+): Connection {
+    return Proxy.newProxyInstance(
+        Connection::class.java.classLoader,
+        arrayOf(Connection::class.java),
+    ) { _, method, arguments ->
+        val result = method.invoke(connection, *(arguments ?: emptyArray()))
+        if (method.name != "prepareStatement") return@newProxyInstance result
+
+        statementCount.incrementAndGet()
+        instrumentedPreparedStatement(result as PreparedStatement, queryTimeouts)
+    } as Connection
+}
+
+private fun instrumentedPreparedStatement(
+    statement: PreparedStatement,
+    queryTimeouts: MutableList<Int>,
+): PreparedStatement {
+    return Proxy.newProxyInstance(
+        PreparedStatement::class.java.classLoader,
+        arrayOf(PreparedStatement::class.java),
+    ) { _, method, arguments ->
+        if (method.name == "setQueryTimeout") {
+            synchronized(queryTimeouts) {
+                queryTimeouts += arguments?.single() as Int
+            }
+        }
+        method.invoke(statement, *(arguments ?: emptyArray()))
+    } as PreparedStatement
+}
+
 /**
  * order の cancel reason を直接更新する。
  */
@@ -8217,12 +8885,16 @@ private fun isDockerAvailable(): Boolean {
 /**
  * test container 用 DataSource を作る。
  */
-private fun createDataSource(container: FukurouPostgresContainer): HikariDataSource {
+private fun createDataSource(
+    container: FukurouPostgresContainer,
+    connectionInitSql: String? = null,
+): HikariDataSource {
     val hikariConfig = HikariConfig().apply {
         jdbcUrl = container.jdbcUrl
         username = container.username
         password = container.password
         maximumPoolSize = HIKARI_POOL_SIZE
+        this.connectionInitSql = connectionInitSql
     }
 
     return HikariDataSource(hikariConfig)
@@ -8592,6 +9264,375 @@ private fun selectLlmLaunchReservationIndexCount(database: ExposedDatabase): Int
             }
         }
     }
+}
+
+private data class ClaimMigrationEvidence(
+    val relationFileNode: Long,
+    val rowCount: Int,
+    val invocationChecksum: String,
+    val claimedRowCount: Int?,
+)
+
+/** claim migration 前後の table identity と legacy row 不変性を読む。 */
+private fun selectClaimMigrationEvidence(database: ExposedDatabase): ClaimMigrationEvidence {
+    return exposedTransaction(database) {
+        val hasClaimColumn = jdbcConnection().prepareStatement(
+            """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                        AND table_name = 'llm_launch_reservations'
+                        AND column_name = 'execution_claim_state'
+                )
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getBoolean(1)
+            }
+        }
+        val claimedRowCount = if (hasClaimColumn) {
+            jdbcConnection().prepareStatement(
+                "SELECT COUNT(*) FROM llm_launch_reservations WHERE execution_claim_state IS NOT NULL",
+            ).use { statement ->
+                statement.executeQuery().use { resultSet ->
+                    check(resultSet.next())
+                    resultSet.getInt(1)
+                }
+            }
+        } else {
+            null
+        }
+        jdbcConnection().prepareStatement(
+            """
+                SELECT c.relfilenode,
+                    (SELECT COUNT(*) FROM llm_launch_reservations) AS row_count,
+                    (SELECT md5(string_agg(invocation_id, ',' ORDER BY invocation_id))
+                     FROM llm_launch_reservations) AS invocation_checksum
+                FROM pg_class c
+                WHERE c.oid = 'llm_launch_reservations'::regclass
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "claim migration evidence query returned no row." }
+                ClaimMigrationEvidence(
+                    relationFileNode = resultSet.getLong("relfilenode"),
+                    rowCount = resultSet.getInt("row_count"),
+                    invocationChecksum = resultSet.getString("invocation_checksum"),
+                    claimedRowCount = claimedRowCount,
+                )
+            }
+        }
+    }
+}
+
+private fun enableDdlStatementLogging(dataSource: DataSource) {
+    dataSource.connection.use { connection ->
+        connection.createStatement().use { statement ->
+            statement.execute("ALTER SYSTEM SET log_statement = 'ddl'")
+            statement.execute("SELECT pg_reload_conf()")
+        }
+    }
+}
+
+private fun countExecutionClaimDdlStatements(logs: String): Int {
+    val normalized = logs.lowercase()
+    val claimColumnStatements = listOf(
+        "execution_claim_state",
+        "execution_claim_token",
+        "execution_claimed_at",
+        "execution_claim_heartbeat_at",
+    ).count { columnName ->
+        normalized.contains("alter table llm_launch_reservations add $columnName")
+    }
+    val claimedIndexStatements = if (normalized.contains("create index if not exists idx_llm_res_running_claimed_recovery")) 1 else 0
+    val nonClaimedIndexStatements = if (normalized.contains("create index if not exists idx_llm_res_running_nonclaimed_recent")) 1 else 0
+
+    return claimColumnStatements + claimedIndexStatements + nonClaimedIndexStatements
+}
+
+private fun selectNullableExecutionClaimColumnCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                    AND table_name = 'llm_launch_reservations'
+                    AND column_name IN (
+                        'execution_claim_state', 'execution_claim_token',
+                        'execution_claimed_at', 'execution_claim_heartbeat_at'
+                    )
+                    AND is_nullable = 'YES'
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+private fun selectExecutionClaimIndexDefinitions(database: ExposedDatabase): Map<String, String> {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                SELECT indexname, indexdef FROM pg_indexes
+                WHERE schemaname = current_schema()
+                    AND indexname IN (
+                        'idx_llm_res_running_claimed_recovery',
+                        'idx_llm_res_running_nonclaimed_recent'
+                    )
+                ORDER BY indexname
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                buildMap {
+                    while (resultSet.next()) put(resultSet.getString(1), resultSet.getString(2))
+                }
+            }
+        }
+    }
+}
+
+private fun assertExecutionClaimIndexDefinitions(definitions: Map<String, String>) {
+    assertEquals(
+        setOf("idx_llm_res_running_claimed_recovery", "idx_llm_res_running_nonclaimed_recent"),
+        definitions.keys,
+    )
+    val claimed = requireNotNull(definitions["idx_llm_res_running_claimed_recovery"])
+    assertTrue(claimed.contains("COALESCE(execution_claim_heartbeat_at, execution_claimed_at)"))
+    assertTrue(claimed.contains("execution_claimed_at, invocation_id"))
+    assertTrue(claimed.contains("execution_claim_state") && claimed.contains("CLAIMED"))
+    val nonClaimed = requireNotNull(definitions["idx_llm_res_running_nonclaimed_recent"])
+    assertTrue(nonClaimed.contains("reserved_at DESC, invocation_id"))
+    assertTrue(nonClaimed.contains("AVAILABLE") && nonClaimed.contains("NOT_REQUIRED"))
+    assertTrue(nonClaimed.contains("status") && nonClaimed.contains("RUNNING"))
+}
+
+private fun insertTerminalReservationHistory(database: ExposedDatabase, rowCount: Int) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                INSERT INTO llm_launch_reservations (
+                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason
+                )
+                SELECT gen_random_uuid(), 'terminal-history-' || value, 'FLAT_HEARTBEAT',
+                    'terminal-history:' || value, 'FINISHED', value, value, 'fixture'
+                FROM generate_series(1, ?) AS value
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setInt(1, rowCount)
+            assertEquals(rowCount, statement.executeUpdate())
+        }
+    }
+}
+
+private fun insertStaleLegacyRunningReservationHistory(
+    database: ExposedDatabase,
+    rowCount: Int,
+    now: Instant,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                INSERT INTO llm_launch_reservations (
+                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason
+                )
+                SELECT gen_random_uuid(), 'stale-legacy-running-' || value, 'FLAT_HEARTBEAT',
+                    'stale-legacy-running:' || value, 'RUNNING', ? - value, NULL, NULL
+                FROM generate_series(1, ?) AS value
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setLong(1, now.minus(Duration.ofDays(1)).toEpochMilli())
+            statement.setInt(2, rowCount)
+            assertEquals(rowCount, statement.executeUpdate())
+        }
+    }
+}
+
+private fun analyzeLlmLaunchReservations(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().createStatement().use { statement ->
+            statement.execute("ANALYZE llm_launch_reservations")
+        }
+    }
+}
+
+private fun explainActiveReservationQuery(database: ExposedDatabase, activeSince: Instant): String {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement("EXPLAIN (ANALYZE, BUFFERS) $SELECT_ACTIVE_LLM_LAUNCH_RESERVATION_SQL").use { statement ->
+            statement.setBoolean(1, false)
+            statement.setString(2, LlmDaemonTriggerKind.REFLECTION.name)
+            statement.setLong(3, activeSince.toEpochMilli())
+            statement.setBoolean(4, false)
+            statement.setString(5, LlmDaemonTriggerKind.REFLECTION.name)
+            statement.setLong(6, activeSince.toEpochMilli())
+            statement.setBoolean(7, false)
+            statement.setString(8, LlmDaemonTriggerKind.REFLECTION.name)
+            statement.executeQuery().use { resultSet ->
+                buildList {
+                    while (resultSet.next()) add(resultSet.getString(1))
+                }.joinToString("\n")
+            }
+        }
+    }
+}
+
+private fun assertBoundedActiveReservationPlan(plan: String, expectedIndex: String) {
+    assertTrue(plan.contains(expectedIndex), plan)
+    assertFalse(plan.contains("Seq Scan on llm_launch_reservations"), plan)
+    val removedRows = Regex("Rows Removed by Filter: (\\d+)")
+        .findAll(plan)
+        .sumOf { match -> match.groupValues[1].toInt() }
+    assertTrue(removedRows <= 10, "rows removed by filter=$removedRows\n$plan")
+    val executionTimeMillis = requireNotNull(
+        Regex("Execution Time: ([0-9.]+) ms").find(plan)?.groupValues?.get(1)?.toDouble(),
+    )
+    assertTrue(executionTimeMillis < 1_000, "execution time=$executionTimeMillis ms\n$plan")
+}
+
+private fun installClaimCommitBarrier(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().createStatement().use { statement ->
+            statement.execute(
+                """
+                    CREATE OR REPLACE FUNCTION wait_for_claim_commit_barrier() RETURNS trigger AS ${'$'}${'$'}
+                    BEGIN
+                        PERFORM pg_advisory_xact_lock(18650);
+                        RETURN NEW;
+                    END;
+                    ${'$'}${'$'} LANGUAGE plpgsql
+                """.trimIndent(),
+            )
+            statement.execute(
+                """
+                    CREATE TRIGGER llm_claim_commit_barrier
+                    BEFORE UPDATE OF execution_claim_state ON llm_launch_reservations
+                    FOR EACH ROW
+                    WHEN (OLD.execution_claim_state = 'AVAILABLE' AND NEW.execution_claim_state = 'CLAIMED')
+                    EXECUTE FUNCTION wait_for_claim_commit_barrier()
+                """.trimIndent(),
+            )
+        }
+    }
+}
+
+private fun installQuotaBarrierTerminalTrigger(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().createStatement().use { statement ->
+            statement.execute(
+                """
+                    CREATE OR REPLACE FUNCTION terminalize_quota_barrier_reservation() RETURNS trigger AS ${'$'}${'$'}
+                    BEGIN
+                        UPDATE llm_launch_reservations
+                        SET status = 'FINISHED', finished_at = NEW.reserved_at + 1,
+                            reason = 'quota_barrier_test_terminal'
+                        WHERE id = NEW.id;
+                        RETURN NEW;
+                    END;
+                    ${'$'}${'$'} LANGUAGE plpgsql
+                """.trimIndent(),
+            )
+            statement.execute(
+                """
+                    CREATE TRIGGER llm_quota_barrier_terminal
+                    AFTER INSERT ON llm_launch_reservations
+                    FOR EACH ROW
+                    EXECUTE FUNCTION terminalize_quota_barrier_reservation()
+                """.trimIndent(),
+            )
+        }
+    }
+}
+
+private fun removeQuotaBarrierTerminalTrigger(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        jdbcConnection().createStatement().use { statement ->
+            statement.execute("DROP TRIGGER IF EXISTS llm_quota_barrier_terminal ON llm_launch_reservations")
+            statement.execute("DROP FUNCTION IF EXISTS terminalize_quota_barrier_reservation()")
+        }
+    }
+}
+
+private suspend fun awaitDatabaseLockWaiters(dataSource: DataSource, expectedCount: Int) {
+    repeat(100) {
+        val waiterCount = dataSource.connection.use { connection ->
+            connection.createStatement().use { statement ->
+                statement.executeQuery("SELECT COUNT(*) FROM pg_locks WHERE NOT granted").use { resultSet ->
+                    check(resultSet.next())
+                    resultSet.getInt(1)
+                }
+            }
+        }
+        if (waiterCount >= expectedCount) return
+        kotlinx.coroutines.delay(10)
+    }
+    error("$expectedCount reservation transactions did not reach the risk_state row lock")
+}
+
+private fun insertRecoverableAvailableReservations(
+    database: ExposedDatabase,
+    rowCount: Int,
+    reservedAt: Instant,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                INSERT INTO llm_launch_reservations (
+                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at,
+                    finished_at, reason, execution_claim_state
+                )
+                SELECT gen_random_uuid(), 'batch-recovery-' || value, 'FLAT_HEARTBEAT',
+                    'batch-recovery:' || value, 'RUNNING', ? - value, NULL, NULL, 'AVAILABLE'
+                FROM generate_series(1, ?) AS value
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setLong(1, reservedAt.toEpochMilli())
+            statement.setInt(2, rowCount)
+            assertEquals(rowCount, statement.executeUpdate())
+        }
+    }
+}
+
+private fun countTerminalBatchRecoveryReservations(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                SELECT COUNT(*) FROM llm_launch_reservations
+                WHERE invocation_id LIKE 'batch-recovery-%' AND status = 'FAILED'
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+private suspend fun awaitAdvisoryLockWait(dataSource: DataSource) {
+    repeat(100) {
+        val isWaiting = dataSource.connection.use { connection ->
+            connection.createStatement().use { statement ->
+                statement.executeQuery(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+                ).use { resultSet ->
+                    check(resultSet.next())
+                    resultSet.getBoolean(1)
+                }
+            }
+        }
+        if (isWaiting) return
+        kotlinx.coroutines.delay(10)
+    }
+    error("claim transaction did not reach advisory lock barrier")
+}
+
+private fun assertConcurrentReservation(expectedInvocationId: String, outcome: LlmLaunchReservationOutcome) {
+    val rejected = assertIs<LlmLaunchReservationOutcome.Rejected>(outcome)
+    assertEquals(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION, rejected.reason)
+    assertEquals(expectedInvocationId, rejected.activeReservation?.invocationId)
 }
 
 /**
@@ -9504,4 +10545,36 @@ private fun JdbcTransaction.insertDecisionRunScope(
  */
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+private fun selectReservationReason(database: ExposedDatabase, invocationId: String): String? {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "SELECT reason FROM llm_launch_reservations WHERE invocation_id = ?",
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getString("reason")
+            }
+        }
+    }
+}
+
+private fun selectRecoveryAuditPayload(database: ExposedDatabase, invocationId: String): String {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                SELECT payload FROM command_event_log
+                WHERE decision_run_id = ? AND event_type = 'LLM_INVOCATION_RECOVERED'
+                ORDER BY ts DESC LIMIT 1
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getString("payload")
+            }
+        }
+    }
 }

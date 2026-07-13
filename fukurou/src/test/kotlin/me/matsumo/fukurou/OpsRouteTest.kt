@@ -38,6 +38,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.daemon.LLM_LAUNCH_DISABLED
+import me.matsumo.fukurou.trading.daemon.LlmDaemonLaunchSuppressionReason
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -1255,13 +1256,26 @@ class OpsRouteTest {
         val recoveryEvent = auditEventTypes.single { element ->
             element.jsonObject.getValue("value").jsonPrimitive.content == "LLM_INVOCATION_RECOVERED"
         }
+        val recoveryStartedEvent = auditEventTypes.single { element ->
+            element.jsonObject.getValue("value").jsonPrimitive.content == "LLM_EXECUTION_RECOVERY_STARTED"
+        }
         val normalizedActual = JsonObject(
-            actualJson + ("auditEventTypes" to JsonArray(auditEventTypes.filter { it != recoveryEvent })),
+            actualJson + mapOf(
+                "auditEventTypes" to JsonArray(
+                    auditEventTypes.filter { element ->
+                        element != recoveryEvent && element != recoveryStartedEvent
+                    },
+                ),
+            ),
         )
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertNoSecretLikeText(responseText)
         assertEquals("activity.catalog.audit.llmInvocationRecovered.label", recoveryEvent.jsonObject.getValue("labelKey").jsonPrimitive.content)
+        assertEquals(
+            "activity.catalog.audit.llmExecutionRecoveryStarted.label",
+            recoveryStartedEvent.jsonObject.getValue("labelKey").jsonPrimitive.content,
+        )
         assertEquals(expectedJson, normalizedActual)
     }
 
@@ -1384,6 +1398,59 @@ class OpsRouteTest {
         assertEquals("DAEMON_TRIGGER_LAUNCHED", event.getValue("eventType").jsonPrimitive.content)
         assertEquals("daemon-latest", event.getValue("toolName").jsonPrimitive.content)
         assertEquals(HttpStatusCode.BadRequest, invalidEventTypeResponse.status)
+    }
+
+    @Test
+    fun opsRoutes_activityProjectsTypedInfrastructureSuppressionReason() = testApplication {
+        val eventLog = InMemoryCommandEventLog()
+        LlmDaemonLaunchSuppressionReason.entries.forEachIndexed { index, reason ->
+            eventLog.append(
+                auditEvent(
+                    eventType = CommandEventType.DAEMON_LAUNCH_SUPPRESSED,
+                    occurredAt = fixedInstant().plusSeconds(index.toLong()),
+                    toolName = "llm_daemon_scheduler",
+                    payload = """{"reason":"${reason.name}","triggerKind":"FLAT_HEARTBEAT"}""",
+                ),
+            ).getOrThrow()
+        }
+        eventLog.append(
+            auditEvent(
+                eventType = CommandEventType.DAEMON_LAUNCH_SUPPRESSED,
+                occurredAt = fixedInstant().plusSeconds(LlmDaemonLaunchSuppressionReason.entries.size.toLong()),
+                toolName = "llm_daemon_scheduler",
+                payload = """{"reason":"STATUS_FUTURE","triggerKind":"FLAT_HEARTBEAT"}""",
+            ),
+        ).getOrThrow()
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsCommandEventFeedReader = eventLog,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get(
+            "/ops/activity?source=audit&auditEventType=DAEMON_LAUNCH_SUPPRESSED&limit=10",
+        )
+        val event = Json.parseToJsonElement(response.bodyAsText())
+            .jsonObject
+            .getValue("events")
+            .jsonArray
+            .map { element -> element.jsonObject }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertEquals(
+            LlmDaemonLaunchSuppressionReason.entries.map { reason -> reason.name }.toSet() + "STATUS_FUTURE",
+            event.map { item -> item.getValue("detail").jsonPrimitive.content }.toSet(),
+        )
+        event.forEach { item ->
+            assertEquals("DAEMON_LAUNCH_SUPPRESSED", item.getValue("kind").jsonPrimitive.content)
+            assertEquals(
+                item.getValue("detail").jsonPrimitive.content,
+                metadataValue(item, "infrastructure reason"),
+            )
+        }
     }
 
     @Test
