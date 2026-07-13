@@ -206,8 +206,18 @@ class ShellProcessRunner(
 }
 
 private fun Process.descendantsDeepestFirst(): List<ProcessHandle> {
-    return runCatching { toHandle().descendants().toList().asReversed() }
-        .getOrDefault(emptyList())
+    var lastFailure: Throwable? = null
+    repeat(PROCESS_TREE_ENUMERATION_ATTEMPTS) {
+        val descendants = runCatching { toHandle().descendants().toList().asReversed() }
+            .onFailure { throwable -> lastFailure = throwable }
+            .getOrNull()
+        if (descendants != null) return descendants
+
+        Thread.sleep(PROCESS_TREE_EXIT_POLL_MILLIS)
+    }
+    if (isAlive) throw requireNotNull(lastFailure)
+
+    return emptyList()
 }
 
 private fun awaitProcessHandles(processHandles: List<ProcessHandle>, timeout: Duration) {
@@ -240,6 +250,7 @@ private fun ProcessHandle.awaitExitQuietly() {
  * process tree kill 後に exit を待つ秒数。
  */
 private const val PROCESS_TREE_KILL_WAIT_SECONDS = 2L
+private const val PROCESS_TREE_ENUMERATION_ATTEMPTS = 20
 private const val PROCESS_TREE_EXIT_POLL_MILLIS = 10L
 private const val PRODUCTION_LLM_LAUNCHER = "/usr/local/libexec/fukurou-llm-agent-launcher"
 private const val CLEANUP_MODE = "cleanup"
