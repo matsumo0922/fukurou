@@ -32,6 +32,10 @@ import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
+private fun JdbcTransaction.acquireEvaluationGapPopulationToken() {
+    if (ensureEvaluationReportGapPopulationLifecycleSchema()) acquireGapPopulationGenerationToken()
+}
+
 /** Evaluation report job/revision/pin と LLM reservation を同じ PostgreSQL transaction で扱う。 */
 internal class EvaluationReportPersistence(
     private val database: ExposedDatabase,
@@ -42,8 +46,7 @@ internal class EvaluationReportPersistence(
     init {
         exposedTransaction(database) {
             ensureSchema()
-            ensureEvaluationReportGapPopulationLifecycleSchema()
-            acquireGapPopulationGenerationToken()
+            acquireEvaluationGapPopulationToken()
             recoverInterruptedJobs()
         }
     }
@@ -51,7 +54,7 @@ internal class EvaluationReportPersistence(
     /** request identity、revision number、共通 LLM reservation または rejection を atomic に保存する。 */
     fun admit(job: EvaluationReportJobResponse, scopeKey: String): Result<EvaluationReportAdmission> = runCatching {
         exposedTransaction(database) {
-            acquireGapPopulationGenerationToken()
+            acquireEvaluationGapPopulationToken()
             val now = clock.instant()
             val numberedJob = job.copy(revisionNumber = nextRevisionNumberInTransaction())
             val reportRateExceeded = count(
@@ -94,7 +97,7 @@ internal class EvaluationReportPersistence(
 
     fun updateJob(job: EvaluationReportJobResponse): Result<Unit> = runCatching {
         exposedTransaction(database) {
-            acquireGapPopulationGenerationToken()
+            acquireEvaluationGapPopulationToken()
             jdbcConnection().prepareStatement(
                 "UPDATE evaluation_report_jobs SET status=?, stage=?, failure_code=?, failure_message=?, updated_at=? WHERE job_id=?",
             ).use { statement ->
@@ -170,7 +173,7 @@ internal class EvaluationReportPersistence(
 
     fun complete(report: EvaluationReportResponse, job: EvaluationReportJobResponse): Result<Unit> = runCatching {
         exposedTransaction(database) {
-            acquireGapPopulationGenerationToken()
+            acquireEvaluationGapPopulationToken()
             val now = clock.instant().toEpochMilli()
             jdbcConnection().prepareStatement(
                 """
@@ -208,7 +211,7 @@ internal class EvaluationReportPersistence(
 
     fun fail(job: EvaluationReportJobResponse): Result<Unit> = runCatching {
         exposedTransaction(database) {
-            acquireGapPopulationGenerationToken()
+            acquireEvaluationGapPopulationToken()
             updateJobInTransaction(job)
             insertJobEvent(job, clock.instant().toEpochMilli())
             finishLlmLaunchInTransaction(

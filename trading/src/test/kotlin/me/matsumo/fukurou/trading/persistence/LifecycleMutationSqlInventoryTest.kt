@@ -115,12 +115,12 @@ private val LIFECYCLE_MUTATION_SOURCE_ALLOWLIST = listOf(
     ),
     LifecycleMutationSourceEntry(
         file = "trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/GapPopulationLifecycle.kt",
-        sha256 = "17c98263a8a83624a14b00e68e92361c0d765e8d39c735d6e34b0afc4336e1ef",
+        sha256 = "72c5960021909c9f274d1dada4bc00064d71c05e01502ede47c64e2e2eeefe13",
         callers = setOf("enqueueGapPopulationWork", "recoverGapPopulationPass", "fence_gap_population_terminal_mutation"),
     ),
     LifecycleMutationSourceEntry(
         file = "fukurou/src/main/kotlin/me/matsumo/fukurou/EvaluationReportPersistence.kt",
-        sha256 = "5a8d2f3ad8db4a535bdb7837e64f3eb390efc2666567d47a836858d22143fb48",
+        sha256 = "ec5d1280307300888db68b13c2b7eb6f7d6cd4a865d75ea9c210cdb4d55fc218",
         callers = setOf("admit", "updateJob", "complete", "fail", "recoverInterruptedJobs"),
     ),
     LifecycleMutationSourceEntry(

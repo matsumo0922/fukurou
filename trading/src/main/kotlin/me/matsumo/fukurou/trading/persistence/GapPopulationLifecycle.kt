@@ -52,6 +52,17 @@ private val GAP_EXCLUSION_ENTITY_TYPES = setOf(
     "EVALUATION_REPORT_JOB",
 )
 
+private val GAP_POPULATION_REQUIRED_RELATIONS = setOf(
+    "market_data_sessions",
+    "market_data_gaps",
+    "evaluation_exclusions",
+    "orders",
+    "positions",
+    "llm_runs",
+    "llm_launch_reservations",
+    "opportunity_episodes",
+)
+
 /**
  * control row を最初に lock し、現在 transaction だけで有効な token を発行する。
  *
@@ -97,8 +108,21 @@ internal fun JdbcTransaction.ensureGapPopulationLifecycleSchema() {
 }
 
 /** evaluation report の route-local schema 作成後に同じ lifecycle fence を接続する。 */
-fun JdbcTransaction.ensureEvaluationReportGapPopulationLifecycleSchema() {
-    EVALUATION_REPORT_GAP_POPULATION_SCHEMA_SQL.forEach(::executeUpdate)
+fun JdbcTransaction.ensureEvaluationReportGapPopulationLifecycleSchema(): Boolean {
+    val lifecycleSchemaAvailable = GAP_POPULATION_REQUIRED_RELATIONS.all(::relationExistsForGapPopulation)
+    if (!lifecycleSchemaAvailable) return false
+
+    val tokenFunctionExists = prepare(
+        "SELECT to_regprocedure('acquire_gap_population_generation_token()') IS NOT NULL",
+    ).use { statement -> statement.executeQuery().use { rows -> rows.next() && rows.getBoolean(1) } }
+    if (!tokenFunctionExists) ensureGapPopulationLifecycleSchema()
+
+    val evaluationTriggerExists = prepare(
+        "SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname='evaluation_report_jobs_gap_population_create'",
+    ).use { statement -> statement.executeQuery().use { rows -> rows.next() } }
+    if (!evaluationTriggerExists) EVALUATION_REPORT_GAP_POPULATION_SCHEMA_SQL.forEach(::executeUpdate)
+
+    return true
 }
 
 /** C0 schema と enforcement trigger の存在を検証する。 */
