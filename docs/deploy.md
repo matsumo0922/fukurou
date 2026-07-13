@@ -77,7 +77,7 @@ sudo install -d -m 0750 -o 10001 -g 10001 /srv/fukurou/obsidian-vault
 
 LLM daemon / Obsidian Writer の有効化、Claude Code / Codex の container login、container 内 smoke test は [LLM daemon / Obsidian Writer production setup](llm-obsidian-production-setup.md) に従う。
 
-`llm_launch_reservations` の execution claim migration は nullable な state / token / claimed / heartbeat の4列と partial recovery indexだけをadditiveに追加し、既存rowをbackfillしない。bootstrapのschema verification、旧generation recovery、startup recovery audit、periodic DB scanのいずれかが失敗したcontainerはreadyにならず、daemon / manual / direct admissionからchildを開始しない。CLAIMED bootstrap recoveryはsingle-instanceの旧container/process generation終了を確認したstop/startだけで有効になり、rolling coexistence中には実行しない。rollbackでも列とindexを削除しない。旧binaryへ戻す前にglobal launch gateをOFFにし、evaluation / reflectionをdrainして、RUNNING reservation、RUNNING `llm_runs`、direct runner、未解決claimがすべて0であることを確認する。旧binaryではone-shot claim invariantを有効と扱わない。
+`llm_launch_reservations` の execution claim migration は nullable な state / token / claimed / heartbeat の4列と、CLAIMED recovery用・non-CLAIMED active判定用の2つのpartial indexだけをadditiveに追加し、既存rowをbackfillしない。bootstrapのschema verification、旧generation recovery、startup recovery audit、periodic DB scanのいずれかが失敗したcontainerはreadyにならず、daemon / manual / direct admissionからchildを開始しない。CLAIMED bootstrap recoveryはsingle-instanceの旧container/process generation終了を確認したstop/startだけで有効になり、rolling coexistence中には実行しない。rollbackでも列とindexを削除しない。旧binaryへ戻す前にglobal launch gateをOFFにし、evaluation / reflectionをdrainして、RUNNING reservation、RUNNING `llm_runs`、direct runner、未解決claimがすべて0であることを確認する。旧binaryではone-shot claim invariantを有効と扱わない。
 
 root checkout を作成する。private repository の場合は read-only deploy key を先に登録しておく。
 

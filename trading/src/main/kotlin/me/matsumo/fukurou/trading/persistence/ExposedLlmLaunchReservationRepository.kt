@@ -37,6 +37,8 @@ import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
+private const val RECOVERY_SELECT_TIMEOUT_SECONDS = 2
+
 /**
  * LLM 起動予約を追加する SQL。
  */
@@ -59,13 +61,34 @@ private const val INSERT_LLM_LAUNCH_RESERVATION_SQL = """
  * RUNNING の LLM 起動予約数を数える SQL。
  */
 private const val SELECT_ACTIVE_LLM_LAUNCH_RESERVATION_SQL = """
-    SELECT invocation_id, trigger_kind, trigger_key, reserved_at
-    FROM llm_launch_reservations
-    WHERE status = ?
-        AND reserved_at >= ?
-        AND (? OR trigger_kind <> ?)
-    ORDER BY reserved_at ASC, invocation_id ASC
-    LIMIT 1
+    SELECT candidate.invocation_id, candidate.trigger_kind, candidate.trigger_key, candidate.reserved_at,
+        EXISTS (
+            SELECT 1 FROM llm_launch_reservations
+            WHERE status = 'RUNNING' AND execution_claim_state = 'CLAIMED'
+                AND (? OR trigger_kind <> ?)
+        ) OR EXISTS (
+            SELECT 1 FROM llm_launch_reservations
+            WHERE status = 'RUNNING'
+                AND (execution_claim_state IS NULL OR execution_claim_state IN ('AVAILABLE', 'NOT_REQUIRED'))
+                AND reserved_at >= ?
+                AND (? OR trigger_kind <> ?)
+        ) AS has_active_reservation
+    FROM (SELECT 1) AS anchor
+    LEFT JOIN LATERAL (
+        SELECT invocation_id, trigger_kind, trigger_key, reserved_at
+        FROM llm_launch_reservations
+        WHERE status = 'RUNNING'
+            AND (
+                execution_claim_state = 'CLAIMED'
+                OR (
+                    (execution_claim_state IS NULL OR execution_claim_state IN ('AVAILABLE', 'NOT_REQUIRED'))
+                    AND reserved_at >= ?
+                )
+            )
+            AND (? OR trigger_kind <> ?)
+        ORDER BY (execution_claim_state = 'CLAIMED') DESC, reserved_at ASC, invocation_id ASC
+        LIMIT 1
+    ) candidate ON TRUE
 """
 
 /**
@@ -79,7 +102,13 @@ private const val FINISH_LLM_LAUNCH_RESERVATION_SQL = """
         reason = ?
     WHERE invocation_id = ?
         AND status = 'RUNNING'
-        AND (? IS NULL OR execution_claim_token = ?)
+        AND (
+            (execution_claim_state = 'CLAIMED' AND ? IS NOT NULL AND execution_claim_token = ?)
+            OR (
+                execution_claim_state IS DISTINCT FROM 'CLAIMED'
+                AND (? IS NULL OR execution_claim_token = ?)
+            )
+        )
         AND (? IS NULL OR execution_claim_heartbeat_at = ?)
 """
 
@@ -94,6 +123,7 @@ private const val CLAIM_LLM_LAUNCH_RESERVATION_SQL = """
         AND trigger_kind = ?
         AND status = 'RUNNING'
         AND execution_claim_state = 'AVAILABLE'
+        AND reserved_at >= ?
     RETURNING execution_claimed_at
 """
 
@@ -107,19 +137,30 @@ private const val SELECT_LLM_EXECUTION_CLAIM_SQL = """
 
 /** stale AVAILABLE / CLAIMED reservation の bounded scan SQL。 */
 private const val SELECT_STALE_LLM_EXECUTION_CLAIMS_SQL = """
+    WITH candidates AS (
+        SELECT invocation_id, trigger_kind, status, execution_claim_state, execution_claim_token,
+            execution_claimed_at, execution_claim_heartbeat_at, reserved_at,
+            COALESCE(execution_claim_heartbeat_at, execution_claimed_at) AS sort_heartbeat_at,
+            execution_claimed_at AS sort_claimed_at
+        FROM llm_launch_reservations
+        WHERE status = 'RUNNING'
+            AND execution_claim_state = 'CLAIMED'
+            AND execution_claimed_at <= ?
+            AND COALESCE(execution_claim_heartbeat_at, execution_claimed_at) <= ?
+        UNION ALL
+        SELECT invocation_id, trigger_kind, status, execution_claim_state, execution_claim_token,
+            execution_claimed_at, execution_claim_heartbeat_at, reserved_at,
+            reserved_at AS sort_heartbeat_at, reserved_at AS sort_claimed_at
+        FROM llm_launch_reservations
+        WHERE status = 'RUNNING'
+            AND execution_claim_state = 'AVAILABLE'
+            AND reserved_at <= ?
+    )
     SELECT invocation_id, trigger_kind, status, execution_claim_state, execution_claim_token,
         execution_claimed_at, execution_claim_heartbeat_at, reserved_at
-    FROM llm_launch_reservations
-    WHERE status = 'RUNNING'
-        AND (
-            (execution_claim_state = 'AVAILABLE' AND reserved_at <= ?)
-            OR (
-                execution_claim_state = 'CLAIMED'
-                AND execution_claimed_at <= ?
-                AND execution_claim_heartbeat_at <= ?
-            )
-        )
-    ORDER BY reserved_at ASC, invocation_id ASC
+    FROM candidates
+    WHERE ? OR (sort_heartbeat_at, sort_claimed_at, invocation_id) > (?, ?, ?)
+    ORDER BY sort_heartbeat_at ASC, sort_claimed_at ASC, invocation_id ASC
     LIMIT ?
 """
 
@@ -201,6 +242,7 @@ class ExposedLlmLaunchReservationRepository(
     override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
         return withContext(Dispatchers.IO) {
             try {
+                check(LlmExecutionAdmissionHealth.isHealthy()) { "LLM execution claim is fail-closed." }
                 exposedTransaction(database) { claimLlmLaunchInTransaction(request) }
             } catch (throwable: Throwable) {
                 LlmExecutionClaimOutcome.OutcomeUnknown(throwable)
@@ -237,10 +279,15 @@ class ExposedLlmLaunchReservationRepository(
         runCatching {
             exposedTransaction(database) {
                 jdbcConnection().prepareStatement(SELECT_STALE_LLM_EXECUTION_CLAIMS_SQL).use { statement ->
-                    statement.setLong(1, scan.availableReservedBefore.toEpochMilli())
-                    statement.setLong(2, scan.claimedBefore.toEpochMilli())
-                    statement.setLong(3, scan.heartbeatBefore.toEpochMilli())
-                    statement.setInt(4, scan.limit)
+                    statement.queryTimeout = RECOVERY_SELECT_TIMEOUT_SECONDS
+                    statement.setLong(1, scan.claimedBefore.toEpochMilli())
+                    statement.setLong(2, scan.heartbeatBefore.toEpochMilli())
+                    statement.setLong(3, scan.availableReservedBefore.toEpochMilli())
+                    statement.setBoolean(4, scan.afterHeartbeatAt == null)
+                    statement.setNullableLong(5, scan.afterHeartbeatAt?.toEpochMilli())
+                    statement.setNullableLong(6, scan.afterClaimedAt?.toEpochMilli())
+                    statement.setNullableString(7, scan.afterInvocationId)
+                    statement.setInt(8, scan.limit)
                     statement.executeQuery().use { resultSet ->
                         buildList {
                             while (resultSet.next()) add(resultSet.toExecutionClaimSnapshot())
@@ -269,6 +316,39 @@ class ExposedLlmLaunchReservationRepository(
                             insertRecoveryEvent(request, runRecovered)
                         }
                         recovered
+                    }
+                }
+            }
+        }
+    }
+
+    override suspend fun recoverStaleExecutionClaims(
+        requests: List<LlmExecutionRecoveryRequest>,
+    ): Result<Set<String>> {
+        if (requests.isEmpty()) return Result.success(emptySet())
+
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    jdbcConnection().prepareStatement(batchRecoverySql(requests.size)).use { statement ->
+                        statement.queryTimeout = RECOVERY_SELECT_TIMEOUT_SECONDS
+                        var parameterIndex = 1
+                        requests.forEach { request ->
+                            statement.setString(parameterIndex++, request.invocationId)
+                            statement.setString(parameterIndex++, request.claimState.name)
+                            statement.setLong(parameterIndex++, request.observedReservedAt.toEpochMilli())
+                            statement.setNullableString(parameterIndex++, request.claimantToken)
+                            statement.setNullableLong(parameterIndex++, request.observedHeartbeatAt?.toEpochMilli())
+                            statement.setLong(parameterIndex++, request.finishedAt.toEpochMilli())
+                            statement.setString(parameterIndex++, request.reason)
+                            statement.setString(parameterIndex++, request.terminationFence)
+                            statement.setObject(parameterIndex++, UUID.randomUUID())
+                        }
+                        statement.executeQuery().use { resultSet ->
+                            buildSet {
+                                while (resultSet.next()) add(resultSet.getString(1))
+                            }
+                        }
                     }
                 }
             }
@@ -321,6 +401,75 @@ class ExposedLlmLaunchReservationRepository(
             }
         }
     }
+}
+
+@Suppress("LongMethod")
+private fun batchRecoverySql(requestCount: Int): String {
+    require(requestCount > 0) { "batch recovery requires at least one request." }
+    val rows = List(requestCount) { "(?, ?, ?, ?, ?, ?, ?, ?, ?)" }.joinToString(", ")
+
+    return """
+        WITH candidates (
+            invocation_id, claim_state, observed_reserved_at, claimant_token,
+            observed_heartbeat_at, finished_at, reason, termination_fence, event_id
+        ) AS (VALUES $rows),
+        recovered_reservations AS (
+            UPDATE llm_launch_reservations AS reservation
+            SET status = 'FAILED', finished_at = candidate.finished_at, reason = candidate.reason
+            FROM candidates AS candidate
+            WHERE reservation.invocation_id = candidate.invocation_id
+                AND reservation.status = 'RUNNING'
+                AND reservation.execution_claim_state = candidate.claim_state
+                AND reservation.reserved_at = candidate.observed_reserved_at
+                AND reservation.execution_claim_token IS NOT DISTINCT FROM candidate.claimant_token
+                AND reservation.execution_claim_heartbeat_at IS NOT DISTINCT FROM candidate.observed_heartbeat_at
+            RETURNING reservation.invocation_id, candidate.claim_state, candidate.claimant_token,
+                candidate.observed_heartbeat_at, candidate.finished_at, candidate.reason,
+                candidate.termination_fence, candidate.event_id
+        ),
+        recovered_runs AS (
+            UPDATE llm_runs AS run
+            SET status = '$LLM_RUN_STATUS_FAILED',
+                finished_at = recovered.finished_at,
+                error_message = recovered.reason,
+                terminal_cause = '${LlmRunTerminalCause.RUNNER_FAILED.name}'
+            FROM recovered_reservations AS recovered
+            WHERE run.invocation_id = recovered.invocation_id
+                AND run.status = '$LLM_RUN_STATUS_RUNNING'
+                AND run.finished_at IS NULL
+            RETURNING run.invocation_id
+        ),
+        recovery_events AS (
+            INSERT INTO command_event_log (
+                id, decision_run_id, tool_call_id, client_request_id, tool_name, event_type,
+                payload, ts, llm_provider, prompt_hash, system_prompt_version, market_snapshot_id,
+                runtime_config_version_id, runtime_config_hash
+            )
+            SELECT recovered.event_id, recovered.invocation_id, NULL, recovered.invocation_id,
+                'llm_execution_recovery', '${CommandEventType.LLM_INVOCATION_RECOVERED.name}',
+                jsonb_build_object(
+                    'source', 'current_process_periodic_scan',
+                    'invocationId', recovered.invocation_id,
+                    'executionClaimState', recovered.claim_state,
+                    'claimantTokenFingerprint', RIGHT(recovered.claimant_token, 8),
+                    'observedHeartbeatAt', recovered.observed_heartbeat_at,
+                    'terminationFence', recovered.termination_fence,
+                    'llmRunExists', EXISTS (
+                        SELECT 1 FROM llm_runs WHERE invocation_id = recovered.invocation_id
+                    ),
+                    'runRecovered', EXISTS (
+                        SELECT 1 FROM recovered_runs WHERE invocation_id = recovered.invocation_id
+                    ),
+                    'reservationRecovered', TRUE,
+                    'terminalCause', '${LlmRunTerminalCause.RUNNER_FAILED.name}',
+                    'recoveredAt', recovered.finished_at
+                )::text,
+                recovered.finished_at, NULL, NULL, NULL, NULL, NULL, NULL
+            FROM recovered_reservations AS recovered
+            RETURNING decision_run_id
+        )
+        SELECT invocation_id FROM recovered_reservations
+    """.trimIndent()
 }
 
 private fun JdbcTransaction.recoverCurrentProcessLlmRun(request: LlmExecutionRecoveryRequest): Boolean {
@@ -388,6 +537,7 @@ private fun JdbcTransaction.insertRecoveryEvent(request: LlmExecutionRecoveryReq
 fun JdbcTransaction.tryReserveLlmLaunchInTransaction(
     request: LlmLaunchReservationRequest,
 ): LlmLaunchReservationOutcome {
+    check(LlmExecutionAdmissionHealth.isHealthy()) { "LLM execution admission is fail-closed." }
     val riskState = selectRiskState(forUpdate = true)
 
     if (riskState.state == RiskHaltState.HARD_HALT) {
@@ -427,12 +577,17 @@ private fun JdbcTransaction.selectBlockingActiveReservation(
         LlmDaemonTriggerKind.EVALUATION_REPORT,
     )
     return jdbcConnection().prepareStatement(SELECT_ACTIVE_LLM_LAUNCH_RESERVATION_SQL).use { statement ->
-        statement.setString(1, LlmLaunchReservationStatus.RUNNING.name)
-        statement.setLong(2, activeSince.toEpochMilli())
-        statement.setBoolean(3, includeReflection)
-        statement.setString(4, LlmDaemonTriggerKind.REFLECTION.name)
+        statement.setBoolean(1, includeReflection)
+        statement.setString(2, LlmDaemonTriggerKind.REFLECTION.name)
+        statement.setLong(3, activeSince.toEpochMilli())
+        statement.setBoolean(4, includeReflection)
+        statement.setString(5, LlmDaemonTriggerKind.REFLECTION.name)
+        statement.setLong(6, activeSince.toEpochMilli())
+        statement.setBoolean(7, includeReflection)
+        statement.setString(8, LlmDaemonTriggerKind.REFLECTION.name)
         statement.executeQuery().use { resultSet ->
-            if (!resultSet.next()) return@use null
+            check(resultSet.next())
+            if (!resultSet.getBoolean("has_active_reservation")) return@use null
             LlmActiveLaunchReservation(
                 invocationId = resultSet.getString("invocation_id"),
                 triggerKind = LlmDaemonTriggerKind.valueOf(resultSet.getString("trigger_kind")),
@@ -465,8 +620,10 @@ fun JdbcTransaction.finishLlmLaunchInTransaction(finish: LlmLaunchReservationFin
         statement.setString(4, finish.invocationId)
         statement.setNullableString(5, finish.claimantToken)
         statement.setNullableString(6, finish.claimantToken)
-        statement.setNullableLong(7, finish.observedHeartbeatAt?.toEpochMilli())
-        statement.setNullableLong(8, finish.observedHeartbeatAt?.toEpochMilli())
+        statement.setNullableString(7, finish.claimantToken)
+        statement.setNullableString(8, finish.claimantToken)
+        statement.setNullableLong(9, finish.observedHeartbeatAt?.toEpochMilli())
+        statement.setNullableLong(10, finish.observedHeartbeatAt?.toEpochMilli())
         statement.executeUpdate()
     }
 
@@ -481,6 +638,7 @@ internal fun JdbcTransaction.claimLlmLaunchInTransaction(request: LlmExecutionCl
         statement.setLong(3, request.claimedAt.toEpochMilli())
         statement.setString(4, request.invocationId)
         statement.setString(5, request.triggerKind.name)
+        statement.setLong(6, request.activeSince.toEpochMilli())
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) Instant.ofEpochMilli(resultSet.getLong("execution_claimed_at")) else null
         }

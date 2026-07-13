@@ -81,6 +81,58 @@ class LlmLaunchReservationRepositoryTest {
     }
 
     @Test
+    fun claimedReservation_nullTokenCannotFinishWinner() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val now = launchBudgetFixedInstant()
+        repository.tryReserve(launchBudgetRequest("null-token-winner", LlmRunnerConfig(), now)).getOrThrow()
+        repository.claimForExecution(
+            LlmExecutionClaimRequest(
+                invocationId = "null-token-winner",
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                claimantToken = "winner-token",
+                claimedAt = now,
+            ),
+        )
+
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "null-token-winner",
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = "null-token-loser",
+                finishedAt = now.plusSeconds(1),
+                claimantToken = null,
+            ),
+        ).getOrThrow()
+
+        assertEquals(
+            LlmLaunchReservationStatus.RUNNING,
+            repository.findExecutionClaim("null-token-winner").getOrThrow()?.status,
+        )
+    }
+
+    @Test
+    fun staleAvailableReservationRejectsClaimBeforeInclusiveActiveCutoff() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val now = launchBudgetFixedInstant()
+        repository.tryReserve(launchBudgetRequest("stale-available", LlmRunnerConfig(), now)).getOrThrow()
+
+        val outcome = repository.claimForExecution(
+            LlmExecutionClaimRequest(
+                invocationId = "stale-available",
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                claimantToken = "claim-token",
+                claimedAt = now.plus(Duration.ofMinutes(30)),
+                activeSince = now.plusMillis(1),
+            ),
+        )
+
+        assertEquals(
+            LlmExecutionClaimOutcome.Rejected(LlmExecutionClaimRejectionReason.TERMINAL),
+            outcome,
+        )
+    }
+
+    @Test
     fun terminalAndNotRequiredReservationsRejectExecutionClaim() = runBlocking {
         val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         val now = launchBudgetFixedInstant()
@@ -197,6 +249,30 @@ class LlmLaunchReservationRepositoryTest {
     }
 
     @Test
+    fun normalHourlyRejection_namesTheOnlyUnusedCriticalReserve() = runBlocking {
+        assertOnlyUnusedHourlyReserve(
+            usedCritical = LlmDaemonTriggerKind.STOP_PROXIMITY,
+            expected = LlmLaunchReservationRejectionReason.ENTRY_FILL_HOURLY_RESERVE,
+        )
+        assertOnlyUnusedHourlyReserve(
+            usedCritical = LlmDaemonTriggerKind.ENTRY_FILL,
+            expected = LlmLaunchReservationRejectionReason.STOP_PROXIMITY_HOURLY_RESERVE,
+        )
+    }
+
+    @Test
+    fun normalDailyRejection_namesTheOnlyUnusedCriticalReserve() = runBlocking {
+        assertOnlyUnusedDailyReserve(
+            usedCritical = LlmDaemonTriggerKind.STOP_PROXIMITY,
+            expected = LlmLaunchReservationRejectionReason.ENTRY_FILL_DAILY_RESERVE,
+        )
+        assertOnlyUnusedDailyReserve(
+            usedCritical = LlmDaemonTriggerKind.ENTRY_FILL,
+            expected = LlmLaunchReservationRejectionReason.STOP_PROXIMITY_DAILY_RESERVE,
+        )
+    }
+
+    @Test
     fun defaultDailyCap_preservesBothCriticalReserves() = runBlocking {
         val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         val config = LlmRunnerConfig()
@@ -247,6 +323,51 @@ class LlmLaunchReservationRepositoryTest {
         assertEquals("active", assertNotNull(blocker).invocationId)
         assertEquals(true, active)
     }
+}
+
+private suspend fun assertOnlyUnusedHourlyReserve(
+    usedCritical: LlmDaemonTriggerKind,
+    expected: LlmLaunchReservationRejectionReason,
+) {
+    val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+    val config = LlmRunnerConfig()
+    val now = launchBudgetFixedInstant()
+    reserveAndFinishLaunchBudget(repository, "hour-critical-$usedCritical", config, now, usedCritical)
+    repeat(5) { index ->
+        reserveAndFinishLaunchBudget(repository, "hour-normal-$usedCritical-$index", config, now.plusSeconds(index + 1L))
+    }
+
+    val outcome = repository.tryReserve(
+        launchBudgetRequest("hour-rejected-$usedCritical", config, now.plusSeconds(10)),
+    ).getOrThrow()
+    assertEquals(expected, assertIs<LlmLaunchReservationOutcome.Rejected>(outcome).reason)
+}
+
+private suspend fun assertOnlyUnusedDailyReserve(
+    usedCritical: LlmDaemonTriggerKind,
+    expected: LlmLaunchReservationRejectionReason,
+) {
+    val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+    val config = LlmRunnerConfig(
+        maxInvocationsPerDay = 10,
+        entryFillReservePerDay = 1,
+        stopProximityReservePerDay = 1,
+    )
+    val now = launchBudgetFixedInstant()
+    reserveAndFinishLaunchBudget(repository, "day-critical-$usedCritical", config, now, usedCritical)
+    repeat(8) { index ->
+        reserveAndFinishLaunchBudget(
+            repository = repository,
+            invocationId = "day-normal-$usedCritical-$index",
+            config = config,
+            reservedAt = now.plus(Duration.ofHours(index + 1L)),
+        )
+    }
+
+    val outcome = repository.tryReserve(
+        launchBudgetRequest("day-rejected-$usedCritical", config, now.plus(Duration.ofHours(10))),
+    ).getOrThrow()
+    assertEquals(expected, assertIs<LlmLaunchReservationOutcome.Rejected>(outcome).reason)
 }
 
 private suspend fun reserveAndFinishLaunchBudget(

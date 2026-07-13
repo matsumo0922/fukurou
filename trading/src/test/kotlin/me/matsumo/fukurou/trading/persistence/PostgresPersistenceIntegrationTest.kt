@@ -380,7 +380,8 @@ private const val SELECT_LLM_LAUNCH_RESERVATION_INDEX_COUNT_SQL = """
             'idx_llm_launch_reservations_invocation_id_unique',
             'idx_llm_launch_reservations_trigger_key_reserved_at',
             'idx_llm_launch_reservations_status_reserved_at',
-            'idx_llm_launch_reservations_claim_recovery'
+            'idx_llm_res_running_claimed_recovery',
+            'idx_llm_res_running_nonclaimed_recent'
         )
 """
 
@@ -850,7 +851,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, selectMarketDataConnectedSessionIndexCount(database))
         assertEquals(3, selectMarketDataIntegrityIndexCount(database))
         assertEquals(1, selectDecisionsInvocationIdIndexCount(database))
-        assertEquals(4, selectLlmLaunchReservationIndexCount(database))
+        assertEquals(5, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))
         assertEquals(1, selectRecentSafetyDenialIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
@@ -3205,6 +3206,7 @@ class PostgresPersistenceIntegrationTest {
             .submitDecision(noTradeDecisionSubmission().copy(invocationId = "range-run-2"))
             .getOrThrow()
         val llmRunRepository = ExposedLlmRunRepository(database)
+        llmRunRepository.insertRunning(llmRunStart("range-llm-1", fixedInstant())).getOrThrow()
         llmRunRepository.finish(
             LlmRunFinish(
                 invocationId = "range-llm-1",
@@ -3215,6 +3217,11 @@ class PostgresPersistenceIntegrationTest {
                 startedAt = fixedInstant(),
                 finishedAt = fixedInstant().plusSeconds(1),
                 errorMessage = "failure 1",
+            ),
+        ).getOrThrow()
+        llmRunRepository.insertRunning(
+            llmRunStart("range-llm-2", fixedInstant().plusSeconds(60)).copy(
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
             ),
         ).getOrThrow()
         llmRunRepository.finish(
@@ -3534,17 +3541,20 @@ class PostgresPersistenceIntegrationTest {
             reservationRepository.findExecutionClaim("current-process-recovery").getOrThrow(),
         )
 
-        assertTrue(
-            reservationRepository.recoverStaleExecutionClaim(
-                LlmExecutionRecoveryRequest(
-                    invocationId = "current-process-recovery",
-                    claimState = LlmExecutionClaimState.CLAIMED,
-                    claimantToken = "recovery-token-12345678",
-                    observedHeartbeatAt = snapshot.heartbeatAt,
-                    observedReservedAt = snapshot.reservedAt,
-                    finishedAt = now.plusSeconds(600),
-                    reason = "STALE_CLAIMED_RESERVATION_RECOVERED",
-                    terminationFence = "PROCESS_TREE_EXITED",
+        assertEquals(
+            setOf("current-process-recovery"),
+            reservationRepository.recoverStaleExecutionClaims(
+                listOf(
+                    LlmExecutionRecoveryRequest(
+                        invocationId = "current-process-recovery",
+                        claimState = LlmExecutionClaimState.CLAIMED,
+                        claimantToken = "recovery-token-12345678",
+                        observedHeartbeatAt = snapshot.heartbeatAt,
+                        observedReservedAt = snapshot.reservedAt,
+                        finishedAt = now.plusSeconds(600),
+                        reason = "STALE_CLAIMED_RESERVATION_RECOVERED",
+                        terminationFence = "PROCESS_TREE_EXITED",
+                    ),
                 ),
             ).getOrThrow(),
         )
@@ -3556,8 +3566,32 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(auditPayload.contains("current_process_periodic_scan"))
         assertTrue(auditPayload.contains("PROCESS_TREE_EXITED"))
         assertTrue(auditPayload.contains("12345678"))
-        assertTrue(auditPayload.contains("\"runRecovered\":true"))
-        assertTrue(auditPayload.contains("\"reservationRecovered\":true"))
+        assertTrue(auditPayload.contains(Regex("\"runRecovered\"\\s*:\\s*true")))
+        assertTrue(auditPayload.contains(Regex("\"reservationRecovered\"\\s*:\\s*true")))
+    }
+
+    @Test
+    fun llmRunFinish_nonexistentRunFailsWithoutCreatingTerminalRow() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmRunRepository(database)
+
+        val result = repository.finish(
+            LlmRunFinish(
+                invocationId = "nonexistent-run-finish",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                status = LLM_RUN_STATUS_FAILED,
+                startedAt = now,
+                finishedAt = now.plusSeconds(1),
+                errorMessage = "must-not-upsert",
+                terminalCause = LlmRunTerminalCause.RUNNER_FAILED,
+            ),
+        )
+
+        assertTrue(result.isFailure)
+        assertEquals(null, repository.findByInvocationId("nonexistent-run-finish").getOrThrow())
     }
 
     @Test
@@ -3662,7 +3696,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(before.rowCount, after.rowCount)
         assertEquals(before.invocationChecksum, after.invocationChecksum)
         assertEquals(0, after.claimedRowCount)
-        assertEquals(4, selectLlmLaunchReservationIndexCount(database))
+        assertEquals(5, selectLlmLaunchReservationIndexCount(database))
     }
 
     @Test

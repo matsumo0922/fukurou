@@ -32,6 +32,7 @@ class LlmExecutionRecoveryWorker(
     private val commandEventLog: CommandEventLog,
     private val policy: OneShotExecutionPolicy,
     private val clock: Clock,
+    availableStaleAfter: Duration = Duration.ofMinutes(30),
     private val interval: Duration = policy.heartbeatInterval,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) : AutoCloseable {
@@ -39,6 +40,7 @@ class LlmExecutionRecoveryWorker(
         repository = repository,
         policy = policy,
         clock = clock,
+        availableStaleAfter = availableStaleAfter,
     )
     private var job: Job? = null
 

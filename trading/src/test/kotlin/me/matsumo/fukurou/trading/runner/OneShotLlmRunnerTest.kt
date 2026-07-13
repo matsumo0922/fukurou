@@ -573,7 +573,10 @@ class OneShotLlmRunnerTest {
         }
         clock.advance(Duration.ofMinutes(31))
 
-        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
+        val result = fixture.runOneShot(
+            request = defaultRequest(),
+            reservedAt = clock.instant(),
+        ).getOrThrow()
         val openOrders = fixture.runtime.broker.getOpenOrders().getOrThrow()
         val cancelEvents = fixture.eventLog.events().filter { event ->
             event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "cancel_order"
@@ -1877,7 +1880,7 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun llmRunRecordFailure_doesNotPreventRunnerCompletion() = runBlocking {
+    fun llmRunRecordFailure_preventsMaterialExecutionAndTerminalizesReservation() = runBlocking {
         val fixture = runnerFixture(
             runtimeTransform = { runtime ->
                 runtime.copy(llmRunRepository = FailingLlmRunRepository)
@@ -1890,10 +1893,31 @@ class OneShotLlmRunnerTest {
             cleanExit()
         }
 
-        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "record-failure-run"))
+        val request = defaultRequest().copy(
+            invocationId = "record-failure-run",
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+        )
+        fixture.runtime.launchReservationRepository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = "record-failure-run",
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                triggerKey = "test:record-failure-run",
+                reservedAt = fixedClock().instant(),
+                runnerConfig = LlmRunnerConfig(),
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofHours(24),
+                activeReservationStaleAfter = Duration.ofMinutes(30),
+            ),
+        ).getOrThrow()
 
-        assertTrue(result.isSuccess)
-        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.getOrThrow().status)
+        val result = runCatching { fixture.runner.runOneShot(request) }
+        val reservation = fixture.runtime.launchReservationRepository
+            .findExecutionClaim("record-failure-run")
+            .getOrThrow()
+
+        assertTrue(result.isFailure)
+        assertTrue(fixture.processRunner.launches.isEmpty())
+        assertEquals(LlmLaunchReservationStatus.FAILED, reservation?.status)
     }
 
     @Test
@@ -2007,14 +2031,23 @@ private data class RunnerFixture(
     val runner: OneShotLlmRunner,
 )
 
-private suspend fun RunnerFixture.runOneShot(request: OneShotRunnerRequest): Result<OneShotRunnerResult> {
-    return runReservedOneShot(runtime, runner, request)
+private suspend fun RunnerFixture.runOneShot(
+    request: OneShotRunnerRequest,
+    reservedAt: Instant = fixedClock().instant(),
+): Result<OneShotRunnerResult> {
+    return runReservedOneShot(
+        runtime = runtime,
+        runner = runner,
+        request = request,
+        reservedAt = reservedAt,
+    )
 }
 
 private suspend fun runReservedOneShot(
     runtime: TradingRuntime,
     runner: OneShotLlmRunner,
     request: OneShotRunnerRequest,
+    reservedAt: Instant = fixedClock().instant(),
 ): Result<OneShotRunnerResult> {
     val invocationId = request.invocationId ?: UUID.randomUUID().toString()
     val triggerKind = request.triggerKind ?: LlmDaemonTriggerKind.MANUAL
@@ -2024,7 +2057,7 @@ private suspend fun runReservedOneShot(
             invocationId = invocationId,
             triggerKind = triggerKind,
             triggerKey = "test:$invocationId",
-            reservedAt = fixedClock().instant(),
+            reservedAt = reservedAt,
             runnerConfig = LlmRunnerConfig(),
             hourlyWindow = Duration.ofHours(1),
             dailyWindow = Duration.ofHours(24),

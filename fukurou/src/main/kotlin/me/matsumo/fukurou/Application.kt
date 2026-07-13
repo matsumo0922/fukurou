@@ -838,6 +838,7 @@ private fun startApplicationBackgroundWorkers(
             commandEventLog = ExposedCommandEventLog(database),
             policy = OneShotExecutionPolicy.from(runtime.tradingConfig.runner),
             clock = runtime.clock,
+            availableStaleAfter = runtime.tradingConfig.daemon.launchReservationStaleAfter,
         ).also {
             LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
         }.start(),

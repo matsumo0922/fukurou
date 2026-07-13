@@ -65,6 +65,7 @@ class ShellProcessRunner(
                         exitCode = null,
                         stdout = stdout.await(),
                         stderr = stderr.await(),
+                        processTreeTerminationProof = ProcessTreeTerminationProof.PROVEN_EXITED,
                     )
                 }
 
@@ -73,11 +74,13 @@ class ShellProcessRunner(
                     exitCode = exitCode,
                     stdout = stdout.await(),
                     stderr = stderr.await(),
+                    processTreeTerminationProof = ProcessTreeTerminationProof.UNCERTAIN,
                 )
             } catch (throwable: CancellationException) {
                 val destroyResult = destroyProcessTreeNonCancellable(process)
                 destroyResult.exceptionOrNull()?.let { destroyFailure -> throwable.addSuppressed(destroyFailure) }
 
+                if (destroyResult.isSuccess) throw ProcessTreeTerminationProvenCancellationException(throwable)
                 throw throwable
             }
         }

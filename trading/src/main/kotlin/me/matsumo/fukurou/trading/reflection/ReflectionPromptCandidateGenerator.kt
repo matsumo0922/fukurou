@@ -306,13 +306,7 @@ class ReflectionPromptCandidateGenerator(
     }
 
     private suspend fun recordLlmRunStarted(start: LlmRunStart) {
-        llmRunRepository.insertRunning(start)
-            .onFailure { throwable ->
-                logger(
-                    "reflection llm run start record failed invocation=${start.invocationId} " +
-                        "error=${throwable.javaClass.simpleName}",
-                )
-            }
+        llmRunRepository.insertRunning(start).getOrThrow()
     }
 
     private suspend fun finishSucceededRun(start: LlmRunStart) {
@@ -365,12 +359,7 @@ class ReflectionPromptCandidateGenerator(
                 errorMessage = redactedMessage,
                 terminalCause = cause?.let(::terminalCauseFor) ?: LlmRunTerminalCause.NORMAL_COMPLETION,
             ),
-        ).onFailure { throwable ->
-            logger(
-                "reflection llm run finish record failed invocation=${start.invocationId} " +
-                    "error=${throwable.javaClass.simpleName}",
-            )
-        }
+        ).getOrThrow()
         launchReservationRepository.finish(
             LlmLaunchReservationFinish(
                 invocationId = start.invocationId,
@@ -378,12 +367,7 @@ class ReflectionPromptCandidateGenerator(
                 reason = reason,
                 finishedAt = finishedAt,
             ),
-        ).onFailure { throwable ->
-            logger(
-                "reflection reservation finish failed invocation=${start.invocationId} " +
-                    "error=${throwable.javaClass.simpleName}",
-            )
-        }
+        ).getOrThrow()
     }
 
     private fun terminalCauseFor(cause: Throwable): LlmRunTerminalCause = terminalCauseForInvocationFailure(cause)

@@ -21,6 +21,21 @@ import kotlin.time.toDuration
 class ShellProcessRunnerTest {
 
     @Test
+    fun processTreeProofRegistry_doesNotOverwriteEarlierUncertainty() {
+        val invocationId = "multi-child-proof"
+        LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+        LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.UNCERTAIN)
+        LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+        LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.PROVEN_EXITED)
+
+        assertEquals(
+            ProcessTreeTerminationProof.UNCERTAIN,
+            LlmProcessTreeTerminationRegistry.find(invocationId),
+        )
+        LlmProcessTreeTerminationRegistry.resolve(invocationId)
+    }
+
+    @Test
     fun run_createsMissingNestedWorkingDirectoryBeforeLaunch() = runBlocking {
         val echoPath = Path.of("/bin/echo")
         if (!Files.isExecutable(echoPath)) {
@@ -41,6 +56,7 @@ class ShellProcessRunnerTest {
         val result = ShellProcessRunner().run(command).getOrThrow()
 
         assertEquals(ProcessRunStatus.EXITED, result.status)
+        assertEquals(ProcessTreeTerminationProof.UNCERTAIN, result.processTreeTerminationProof)
         assertEquals(0, result.exitCode)
         assertEquals("created\n", result.stdout)
         assertTrue(Files.isDirectory(workingDirectory))
@@ -66,6 +82,7 @@ class ShellProcessRunnerTest {
         val result = ShellProcessRunner().run(command).getOrThrow()
 
         assertEquals(ProcessRunStatus.EXITED, result.status)
+        assertEquals(ProcessTreeTerminationProof.UNCERTAIN, result.processTreeTerminationProof)
         assertEquals(0, result.exitCode)
         assertEquals("existing\n", result.stdout)
         assertTrue(Files.isDirectory(workingDirectory))
@@ -95,6 +112,7 @@ class ShellProcessRunnerTest {
         val childPid = waitForChildPid(childPidFile)
 
         assertEquals(ProcessRunStatus.TIMED_OUT, result.status)
+        assertEquals(ProcessTreeTerminationProof.PROVEN_EXITED, result.processTreeTerminationProof)
         assertFalse(waitForProcessExit(childPid))
     }
 
@@ -120,6 +138,7 @@ class ShellProcessRunnerTest {
         val childPid = waitForChildPid(childPidFile)
 
         assertEquals(ProcessRunStatus.TIMED_OUT, result.status)
+        assertEquals(ProcessTreeTerminationProof.PROVEN_EXITED, result.processTreeTerminationProof)
         assertFalse(waitForProcessExit(childPid))
     }
 
@@ -195,6 +214,36 @@ class ShellProcessRunnerTest {
 
         assertFalse(Files.exists(cleanupFile))
         assertFalse(Files.exists(tempDirectory))
+    }
+
+    @Test
+    fun run_normalRootExitWithLiveDescendantLeavesTerminationProofUncertain() = runBlocking {
+        val shellPath = Path.of("/bin/sh")
+        if (!Files.isExecutable(shellPath)) return@runBlocking
+        if (!canInspectProcessTrees()) return@runBlocking
+
+        val tempDirectory = Files.createTempDirectory("fukurou-process-runner-live-descendant-test")
+        val childPidFile = tempDirectory.resolve("child.pid")
+        val script = $$"(/bin/sleep 30) >/dev/null 2>&1 & echo $! > $${childPidFile.shellQuoted()}"
+        val command = RenderedLlmCommand(
+            executable = shellPath.toString(),
+            args = listOf("-c", script),
+            environment = emptyMap(),
+            workingDirectory = tempDirectory,
+            timeout = Duration.ofSeconds(2),
+            stdin = null,
+        )
+
+        val result = ShellProcessRunner().run(command).getOrThrow()
+        val childPid = waitForChildPid(childPidFile)
+
+        try {
+            assertEquals(ProcessRunStatus.EXITED, result.status)
+            assertEquals(ProcessTreeTerminationProof.UNCERTAIN, result.processTreeTerminationProof)
+            assertTrue(isProcessAlive(childPid))
+        } finally {
+            ProcessHandle.of(childPid).ifPresent(ProcessHandle::destroyForcibly)
+        }
     }
 
     private suspend fun waitForChildPid(childPidFile: Path): Long {

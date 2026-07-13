@@ -38,7 +38,7 @@ class LlmExecutionRecoveryServiceTest {
         val delegate = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         reserve(delegate, "available", now)
         val repository = FaultingRecoveryRepository(delegate, failedScans = 1)
-        val service = recoveryService(repository, now.plusSeconds(600))
+        val service = recoveryService(repository, now.plusSeconds(1_800))
 
         assertTrue(service.tick().isFailure)
         assertFalse(LlmExecutionAdmissionHealth.isHealthy())
@@ -92,7 +92,7 @@ class LlmExecutionRecoveryServiceTest {
             repository.findExecutionClaim("claimed").getOrThrow()?.status,
         )
 
-        LlmExecutionAdmissionHealth.setHeartbeatHealthy(false)
+        LlmExecutionAdmissionHealth.recordHeartbeatResult("claimed", CLAIM_TOKEN, healthy = false)
         LlmExecutionTerminationFenceRegistry.registerNoChildStarted("claimed", CLAIM_TOKEN, now)
         assertEquals(1, service.tick().getOrThrow())
         assertTrue(LlmExecutionAdmissionHealth.isHealthy())
@@ -123,6 +123,30 @@ class LlmExecutionRecoveryServiceTest {
             delegate.findExecutionClaim("heartbeat-race").getOrThrow()?.heartbeatAt,
         )
     }
+
+    @Test
+    fun keysetRecovery_recoversHundredThenRemainingOneWithoutSkipping() = runBlocking {
+        val now = RECOVERY_INSTANT.plus(Duration.ofHours(1))
+        val repository = KeysetRecoveryRepository(
+            snapshots = (0..100).map { index ->
+                LlmExecutionClaimSnapshot(
+                    invocationId = "keyset-${index.toString().padStart(3, '0')}",
+                    triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                    status = LlmLaunchReservationStatus.RUNNING,
+                    claimState = me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState.AVAILABLE,
+                    claimantToken = null,
+                    claimedAt = null,
+                    heartbeatAt = null,
+                    reservedAt = RECOVERY_INSTANT.plusMillis(index.toLong()),
+                )
+            },
+        )
+        val service = recoveryService(repository, now)
+
+        assertEquals(100, service.tick().getOrThrow())
+        assertEquals(1, service.tick().getOrThrow())
+        assertEquals(101, repository.recovered.size)
+    }
 }
 
 private class MutableClock(var current: Instant) : Clock() {
@@ -152,6 +176,42 @@ private class HeartbeatRaceRepository(
         delegate.heartbeatExecutionClaim(request.invocationId, requireNotNull(request.claimantToken), newHeartbeat)
             .getOrThrow()
         return delegate.recoverStaleExecutionClaim(request)
+    }
+
+    override suspend fun recoverStaleExecutionClaims(
+        requests: List<LlmExecutionRecoveryRequest>,
+    ): Result<Set<String>> = runCatching {
+        requests.mapNotNullTo(mutableSetOf()) { request ->
+            request.invocationId.takeIf { recoverStaleExecutionClaim(request).getOrThrow() }
+        }
+    }
+}
+
+private class KeysetRecoveryRepository(
+    snapshots: List<LlmExecutionClaimSnapshot>,
+) : LlmLaunchReservationRepository by InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
+    private val remaining = snapshots.toMutableList()
+    val recovered = mutableSetOf<String>()
+
+    override suspend fun scanStaleExecutionClaims(scan: LlmExecutionRecoveryScan): Result<RecoverySnapshots> {
+        return Result.success(
+            remaining.asSequence()
+                .filter { snapshot ->
+                    val cursorId = scan.afterInvocationId
+                    cursorId == null || snapshot.invocationId > cursorId
+                }
+                .take(scan.limit)
+                .toList(),
+        )
+    }
+
+    override suspend fun recoverStaleExecutionClaims(
+        requests: List<LlmExecutionRecoveryRequest>,
+    ): Result<Set<String>> {
+        val invocationIds = requests.mapTo(mutableSetOf(), LlmExecutionRecoveryRequest::invocationId)
+        remaining.removeAll { snapshot -> snapshot.invocationId in invocationIds }
+        recovered += invocationIds
+        return Result.success(invocationIds)
     }
 }
 

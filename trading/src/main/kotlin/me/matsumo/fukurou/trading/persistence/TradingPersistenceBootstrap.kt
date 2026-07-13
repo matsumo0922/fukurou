@@ -417,9 +417,21 @@ private const val ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL = """
 
 /** stale claim recovery の bounded scan index を作る SQL。 */
 private const val ENSURE_LLM_LAUNCH_CLAIM_RECOVERY_INDEX_SQL = """
-    CREATE INDEX IF NOT EXISTS idx_llm_launch_reservations_claim_recovery
-    ON llm_launch_reservations (execution_claim_state, execution_claim_heartbeat_at, execution_claimed_at)
+    CREATE INDEX IF NOT EXISTS idx_llm_res_running_claimed_recovery
+    ON llm_launch_reservations (
+        COALESCE(execution_claim_heartbeat_at, execution_claimed_at),
+        execution_claimed_at,
+        invocation_id
+    )
+    WHERE status = 'RUNNING' AND execution_claim_state = 'CLAIMED'
+"""
+
+/** non-CLAIMED concurrency lookup の partial index を作る SQL。 */
+private const val ENSURE_LLM_LAUNCH_NONCLAIMED_RECENT_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_llm_res_running_nonclaimed_recent
+    ON llm_launch_reservations (reserved_at DESC, invocation_id)
     WHERE status = 'RUNNING'
+        AND (execution_claim_state IS NULL OR execution_claim_state IN ('AVAILABLE', 'NOT_REQUIRED'))
 """
 
 /**
@@ -575,9 +587,10 @@ private const val VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL = """
             'idx_llm_launch_reservations_invocation_id_unique',
             'idx_llm_launch_reservations_trigger_key_reserved_at',
             'idx_llm_launch_reservations_status_reserved_at',
-            'idx_llm_launch_reservations_claim_recovery'
+            'idx_llm_res_running_claimed_recovery',
+            'idx_llm_res_running_nonclaimed_recent'
         )
-    HAVING COUNT(*) = 4
+    HAVING COUNT(*) = 5
 """
 
 /**
@@ -1206,6 +1219,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_CLAIM_RECOVERY_INDEX_SQL)
+    executeUpdate(ENSURE_LLM_LAUNCH_NONCLAIMED_RECENT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL)
     executeUpdate(ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL)
     executeUpdate(ENSURE_ORDER_CANCEL_REASON_DOMAIN_SQL)

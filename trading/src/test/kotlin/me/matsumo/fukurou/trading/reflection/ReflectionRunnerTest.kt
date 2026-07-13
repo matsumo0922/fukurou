@@ -26,6 +26,7 @@ import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LlmPhaseUsageFact
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
+import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.math.BigDecimal
@@ -482,9 +483,9 @@ private suspend fun reflectionRunner(
     if (secondDecision) {
         submitNoTradeDecision(decisionRepository)
     }
-    llmRunRepository.finish(failedLlmRun()).getOrThrow()
+    llmRunRepository.seedFinished(failedLlmRun())
     if (secondLlmRun) {
-        llmRunRepository.finish(failedLlmRun("failed-run-2", FIXED_INSTANT.plusSeconds(60))).getOrThrow()
+        llmRunRepository.seedFinished(failedLlmRun("failed-run-2", FIXED_INSTANT.plusSeconds(60)))
     }
 
     return ReflectionRunner(
@@ -624,6 +625,19 @@ private fun failedLlmRun(invocationId: String = "failed-run", startedAt: Instant
         finishedAt = startedAt.plusSeconds(2),
         errorMessage = "redacted failure",
     )
+}
+
+private suspend fun InMemoryLlmRunRepository.seedFinished(finish: LlmRunFinish) {
+    insertRunning(
+        LlmRunStart(
+            invocationId = finish.invocationId,
+            mode = finish.mode,
+            symbol = finish.symbol,
+            triggerKind = finish.triggerKind,
+            startedAt = finish.startedAt,
+        ),
+    ).getOrThrow()
+    finish(finish).getOrThrow()
 }
 
 private fun llmUsageFact(): LlmPhaseUsageFact {

@@ -10,6 +10,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimSnapshot
@@ -97,29 +98,60 @@ class LlmExecutionRecoveryService(
     private val repository: LlmLaunchReservationRepository,
     private val policy: OneShotExecutionPolicy,
     private val clock: Clock,
+    private val availableStaleAfter: Duration = Duration.ofMinutes(30),
 ) {
+    private var cursor: LlmExecutionRecoveryCursor? = null
+
     /** 1 bounded scan を実行し、競合安全に stale claim を回収する。 */
     suspend fun tick(): Result<Int> = runCatching {
+        withTimeout(EXECUTION_RECOVERY_TICK_TIMEOUT.toMillis()) { tickWithinBudget() }
+    }
+
+    private suspend fun tickWithinBudget(): Int {
         val now = clock.instant()
         val hardDeadlineCutoff = now.minus(policy.hardTimeout).minus(policy.processTerminationGrace)
         val heartbeatCutoff = now.minus(policy.heartbeatMissAllowance)
+        val currentCursor = cursor
         val candidates = repository.scanStaleExecutionClaims(
             LlmExecutionRecoveryScan(
-                availableReservedBefore = hardDeadlineCutoff,
+                availableReservedBefore = now.minus(availableStaleAfter),
                 claimedBefore = hardDeadlineCutoff,
                 heartbeatBefore = heartbeatCutoff,
                 limit = EXECUTION_RECOVERY_SCAN_LIMIT,
+                afterHeartbeatAt = currentCursor?.heartbeatAt,
+                afterClaimedAt = currentCursor?.claimedAt,
+                afterInvocationId = currentCursor?.invocationId,
             ),
         ).getOrElse { throwable ->
             LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
             throw throwable
         }
         LlmExecutionAdmissionHealth.setRecoveryScanHealthy(true)
+        cursor = if (candidates.size < EXECUTION_RECOVERY_SCAN_LIMIT) {
+            null
+        } else {
+            candidates.last().toRecoveryCursor()
+        }
 
-        candidates.count { candidate -> recoverCandidate(candidate, now) }
+        val recoveryRequests = candidates.mapNotNull { candidate ->
+            toRecoveryRequestOrNull(candidate, now)
+        }
+        val recoveredInvocationIds = repository.recoverStaleExecutionClaims(recoveryRequests)
+            .getOrElse { throwable ->
+                LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+                throw throwable
+            }
+        candidates.forEach { candidate ->
+            completeRecoveryHealth(candidate, candidate.invocationId in recoveredInvocationIds)
+        }
+
+        return recoveredInvocationIds.size
     }
 
-    private suspend fun recoverCandidate(candidate: LlmExecutionClaimSnapshot, now: java.time.Instant): Boolean {
+    private fun toRecoveryRequestOrNull(
+        candidate: LlmExecutionClaimSnapshot,
+        now: java.time.Instant,
+    ): LlmExecutionRecoveryRequest? {
         val fenceKind = when (candidate.claimState) {
             LlmExecutionClaimState.AVAILABLE -> LlmExecutionTerminationFenceKind.NO_CHILD_STARTED
             LlmExecutionClaimState.CLAIMED -> {
@@ -128,48 +160,68 @@ class LlmExecutionRecoveryService(
                     LlmExecutionTerminationFenceRegistry.find(candidate.invocationId, token)
                 }
                 if (fence == null) {
-                    LlmExecutionAdmissionHealth.registerRecoveryBlocker(candidate.invocationId)
-                    return false
+                    LlmExecutionAdmissionHealth.registerRecoveryBlocker(
+                        candidate.invocationId,
+                        claimantToken ?: MISSING_CLAIMANT_TOKEN,
+                    )
+                    return null
                 }
                 fence.kind
             }
             LlmExecutionClaimState.NOT_REQUIRED,
             null,
-            -> return false
-        }
-        val recovered = repository.recoverStaleExecutionClaim(
-            LlmExecutionRecoveryRequest(
-                invocationId = candidate.invocationId,
-                claimState = candidate.claimState,
-                claimantToken = candidate.claimantToken,
-                observedHeartbeatAt = candidate.heartbeatAt,
-                observedReservedAt = candidate.reservedAt,
-                finishedAt = now,
-                reason = when (candidate.claimState) {
-                    LlmExecutionClaimState.AVAILABLE -> STALE_AVAILABLE_RESERVATION_RECOVERED
-                    LlmExecutionClaimState.CLAIMED -> STALE_CLAIMED_RESERVATION_RECOVERED
-                    LlmExecutionClaimState.NOT_REQUIRED -> error("NOT_REQUIRED is not recoverable.")
-                },
-                terminationFence = fenceKind.name,
-            ),
-        ).getOrElse { throwable ->
-            LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
-            throw throwable
-        }
-        if (!recovered) {
-            LlmExecutionAdmissionHealth.registerRecoveryBlocker(candidate.invocationId)
-            return false
+            -> return null
         }
 
-        LlmExecutionAdmissionHealth.resolveRecoveryBlocker(candidate.invocationId)
-        if (candidate.claimState == LlmExecutionClaimState.CLAIMED) {
-            LlmExecutionAdmissionHealth.setHeartbeatHealthy(true)
+        return LlmExecutionRecoveryRequest(
+            invocationId = candidate.invocationId,
+            claimState = candidate.claimState,
+            claimantToken = candidate.claimantToken,
+            observedHeartbeatAt = candidate.heartbeatAt,
+            observedReservedAt = candidate.reservedAt,
+            finishedAt = now,
+            reason = when (candidate.claimState) {
+                LlmExecutionClaimState.AVAILABLE -> STALE_AVAILABLE_RESERVATION_RECOVERED
+                LlmExecutionClaimState.CLAIMED -> STALE_CLAIMED_RESERVATION_RECOVERED
+                LlmExecutionClaimState.NOT_REQUIRED -> error("NOT_REQUIRED is not recoverable.")
+            },
+            terminationFence = fenceKind.name,
+        )
+    }
+
+    private fun completeRecoveryHealth(candidate: LlmExecutionClaimSnapshot, recovered: Boolean) {
+        if (!recovered) {
+            LlmExecutionAdmissionHealth.registerRecoveryBlocker(
+                candidate.invocationId,
+                candidate.claimantToken ?: MISSING_CLAIMANT_TOKEN,
+            )
+            return
         }
+
+        candidate.claimantToken?.let { token ->
+            LlmExecutionAdmissionHealth.resolveClaim(candidate.invocationId, token)
+        } ?: LlmExecutionAdmissionHealth.resolveRecoveryBlocker(
+            candidate.invocationId,
+            MISSING_CLAIMANT_TOKEN,
+        )
         candidate.claimantToken?.let { token ->
             LlmExecutionTerminationFenceRegistry.resolve(candidate.invocationId, token)
         }
-        return true
     }
+}
+
+private data class LlmExecutionRecoveryCursor(
+    val heartbeatAt: java.time.Instant,
+    val claimedAt: java.time.Instant,
+    val invocationId: String,
+)
+
+private fun LlmExecutionClaimSnapshot.toRecoveryCursor(): LlmExecutionRecoveryCursor {
+    return LlmExecutionRecoveryCursor(
+        heartbeatAt = heartbeatAt ?: claimedAt ?: reservedAt,
+        claimedAt = claimedAt ?: reservedAt,
+        invocationId = invocationId,
+    )
 }
 
 /** commit outcome unknown を current process 内で DB 復旧後まで照合する supervisor。 */
@@ -180,23 +232,36 @@ class LlmExecutionClaimSupervisor(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) {
     private val ambiguousClaims = ConcurrentHashMap<String, String>()
+    private val lifecycleLock = Any()
     private var reconciliationJob: Job? = null
 
     /** unresolved claim を登録し、bounded periodic reconciliation を開始する。 */
     fun register(invocationId: String, claimantToken: String) {
         ambiguousClaims[invocationId] = claimantToken
-        LlmExecutionAdmissionHealth.registerAmbiguous(invocationId)
-        if (reconciliationJob?.isActive == true) return
-        reconciliationJob = scope.launch { reconcileLoop() }
+        LlmExecutionAdmissionHealth.registerAmbiguous(invocationId, claimantToken)
+        synchronized(lifecycleLock) {
+            if (reconciliationJob?.isActive != true) startReconciliationLocked()
+        }
     }
 
     private suspend fun reconcileLoop() {
-        while (currentCoroutineContext().isActive && ambiguousClaims.isNotEmpty()) {
-            ambiguousClaims.entries.toList().forEach { (invocationId, claimantToken) ->
-                reconcile(invocationId, claimantToken)
+        try {
+            while (currentCoroutineContext().isActive && ambiguousClaims.isNotEmpty()) {
+                ambiguousClaims.entries.toList().forEach { (invocationId, claimantToken) ->
+                    reconcile(invocationId, claimantToken)
+                }
+                if (ambiguousClaims.isNotEmpty()) delay(interval.toMillis())
             }
-            if (ambiguousClaims.isNotEmpty()) delay(interval.toMillis())
+        } finally {
+            synchronized(lifecycleLock) {
+                reconciliationJob = null
+                if (ambiguousClaims.isNotEmpty()) startReconciliationLocked()
+            }
         }
+    }
+
+    private fun startReconciliationLocked() {
+        reconciliationJob = scope.launch { reconcileLoop() }
     }
 
     private suspend fun reconcile(invocationId: String, claimantToken: String) {
@@ -219,7 +284,7 @@ class LlmExecutionClaimSupervisor(
         if (terminalSnapshot.status == LlmLaunchReservationStatus.RUNNING) return
 
         ambiguousClaims.remove(invocationId, claimantToken)
-        LlmExecutionAdmissionHealth.resolveAmbiguous(invocationId)
+        LlmExecutionAdmissionHealth.resolveAmbiguous(invocationId, claimantToken)
     }
 }
 
@@ -230,3 +295,5 @@ const val STALE_AVAILABLE_RESERVATION_RECOVERED = "launch_reservation_available_
 const val STALE_CLAIMED_RESERVATION_RECOVERED = "launch_reservation_claimed_stale_recovered"
 
 private const val EXECUTION_RECOVERY_SCAN_LIMIT = 100
+private const val MISSING_CLAIMANT_TOKEN = "<missing-claimant-token>"
+private val EXECUTION_RECOVERY_TICK_TIMEOUT: Duration = Duration.ofSeconds(5)
