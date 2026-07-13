@@ -853,6 +853,108 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun gap_schema_upgrade_repairs_missing_column_index_trigger_function_security_searchPathAndAcl() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("ALTER TABLE llm_launch_reservations DROP COLUMN population_cohort")
+            executeUpdate("DROP INDEX gap_population_entity_scope_scan_idx")
+            executeUpdate("DROP TRIGGER orders_gap_population_terminal ON orders")
+            executeUpdate("ALTER FUNCTION gap_population_projection_hash(text,text,text) SECURITY INVOKER")
+            executeUpdate("ALTER FUNCTION gap_population_projection_hash(text,text,text) SET search_path=public")
+            executeUpdate("GRANT EXECUTE ON FUNCTION gap_population_projection_hash(text,text,text) TO PUBLIC")
+        }
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            assertSqlCount(
+                "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='llm_launch_reservations' " +
+                    "AND column_name='population_cohort' AND data_type='character varying'",
+                1,
+            )
+            assertSqlCount("SELECT COUNT(*) FROM pg_class WHERE relname='gap_population_entity_scope_scan_idx'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM pg_trigger WHERE tgname='orders_gap_population_terminal' AND tgenabled='O'", 1)
+            assertSqlCount(
+                "SELECT COUNT(*) FROM pg_proc WHERE oid='gap_population_projection_hash(text,text,text)'::regprocedure " +
+                    "AND prosecdef AND 'search_path=pg_catalog, public'=ANY(proconfig) " +
+                    "AND NOT has_function_privilege('public','gap_population_projection_hash(text,text,text)','EXECUTE')",
+                1,
+            )
+        }
+    }
+
+    @Test
+    fun gap_schema_upgrade_failsClosedOnWrongColumnType() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("ALTER TABLE market_data_gap_work ALTER COLUMN population_symbol TYPE TEXT")
+        }
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
+    fun gap_schema_upgrade_failsClosedOnWrongExistingIndexDefinition() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("DROP INDEX market_data_gap_work_fifo_idx")
+            executeUpdate("CREATE INDEX market_data_gap_work_fifo_idx ON market_data_gap_work(id)")
+        }
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
+    fun gap_schema_upgrade_failsClosedOnForeignFunctionOwner() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("CREATE ROLE gap_foreign_owner")
+            executeUpdate("ALTER FUNCTION gap_population_projection_hash(text,text,text) OWNER TO gap_foreign_owner")
+        }
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
+    fun gap_schema_verifier_rejectsWrongTriggerBindingDisabledTriggerSecuritySearchPathAndPublicAclIndividually() =
+        runPostgresTest {
+            val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+            bootstrap.ensureSchema().getOrThrow()
+
+            exposedTransaction(database) {
+                executeUpdate("ALTER TABLE orders DISABLE TRIGGER orders_gap_population_terminal")
+            }
+            assertTrue(bootstrap.verifySchema().isFailure)
+            exposedTransaction(database) {
+                executeUpdate("ALTER TABLE orders ENABLE TRIGGER orders_gap_population_terminal")
+                executeUpdate("DROP TRIGGER orders_gap_population_terminal ON orders")
+                executeUpdate(
+                    "CREATE TRIGGER orders_gap_population_terminal BEFORE UPDATE ON orders FOR EACH ROW " +
+                        "EXECUTE FUNCTION enforce_gap_population_creation_token('id','mode','symbol','ORDER','account_epoch_id','execution_semantics_version')",
+                )
+            }
+            assertTrue(bootstrap.verifySchema().isFailure)
+            exposedTransaction(database) {
+                executeUpdate("DROP TRIGGER orders_gap_population_terminal ON orders")
+                ensureGapPopulationLifecycleSchema()
+                executeUpdate("ALTER FUNCTION gap_population_projection_hash(text,text,text) SECURITY INVOKER")
+            }
+            assertTrue(bootstrap.verifySchema().isFailure)
+            exposedTransaction(database) {
+                executeUpdate("ALTER FUNCTION gap_population_projection_hash(text,text,text) SECURITY DEFINER")
+                executeUpdate("ALTER FUNCTION gap_population_projection_hash(text,text,text) SET search_path=public")
+            }
+            assertTrue(bootstrap.verifySchema().isFailure)
+            exposedTransaction(database) {
+                executeUpdate("ALTER FUNCTION gap_population_projection_hash(text,text,text) SET search_path=pg_catalog,public")
+                executeUpdate("GRANT EXECUTE ON FUNCTION gap_population_projection_hash(text,text,text) TO PUBLIC")
+            }
+            assertTrue(bootstrap.verifySchema().isFailure)
+        }
+
+    @Test
     fun gap_population_trigger_rejects_raw_creation_and_production_repository_assigns_birth() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -985,6 +1087,161 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun unattributed_allSixPopulationsUseExactSafeTerminalOrPositionQuarantineWithoutEconomicMutation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        createEvaluationReportJobFixtureTable(database)
+        val fixture = insertAllUnattributedPopulationFixtures(database)
+        val before = unattributedEconomicSnapshot(database)
+
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        repository.recordGap(sessionId, MarketDataGapReason.PROCESS_RESTART, fixedInstant().plusSeconds(1)).getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount(
+                "SELECT COUNT(*) FROM orders WHERE id='${fixture.orderId}' AND status='CANCELED' " +
+                    "AND cancel_reason='gap_scope_unattributed'",
+                1,
+            )
+            assertSqlCount("SELECT COUNT(*) FROM positions WHERE id='${fixture.positionId}' AND status='OPEN'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_runs WHERE invocation_id='${fixture.runId}' AND status='FAILED' AND terminal_cause='GAP_SCOPE_UNATTRIBUTED'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_launch_reservations WHERE id='${fixture.reservationId}' AND status='FAILED' AND reason='GAP_SCOPE_UNATTRIBUTED'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM opportunity_episodes WHERE id='${fixture.episodeId}' AND closed_at IS NOT NULL AND close_reason='GAP_SCOPE_UNATTRIBUTED'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM evaluation_report_jobs WHERE job_id='${fixture.reportJobId}' AND status='FAILED' AND failure_code='GAP_SCOPE_UNATTRIBUTED'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE state='CONTAINED'", 5)
+            assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments WHERE entity_type='POSITION' AND state='QUARANTINED'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containment_works WHERE consumed_at IS NOT NULL", 6)
+            assertSqlCount("SELECT COUNT(*) FROM market_data_gap_population_members", 0)
+            assertSqlCount("SELECT COUNT(*) FROM market_data_gap_terminal_journal", 0)
+            assertEquals(GapPopulationResumeMode.PROTECTION_ONLY, selectGapPopulationResumeMode())
+        }
+        assertEquals(before, unattributedEconomicSnapshot(database))
+    }
+
+    @Test
+    fun unattributedOneOwnerAttachedToOneThousandWorksRollsBackOnCrashAndConvergesExactlyOnceOnRetry() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val runId = "unattributed-multi-work-run"
+        ExposedLlmRunRepository(database).insertRunning(
+            LlmRunStart(
+                invocationId = runId,
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                startedAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+        val workIds = insertUnattributedContainmentWorks(database, count = 1_000)
+        exposedTransaction(database) {
+            executeUpdate("ALTER TABLE gap_population_entity_scopes DISABLE TRIGGER gap_population_entity_scope_immutable")
+            executeUpdate("DELETE FROM gap_population_entity_scopes WHERE entity_type='LLM_RUN' AND entity_id='$runId'")
+            executeUpdate("ALTER TABLE gap_population_entity_scopes ENABLE TRIGGER gap_population_entity_scope_immutable")
+            executeUpdate("UPDATE llm_runs SET birth_sequence=NULL WHERE invocation_id='$runId'")
+        }
+
+        assertTrue(
+            runCatching {
+                exposedTransaction(database) {
+                    workIds.forEach { workId ->
+                        attachUnattributedContainment(workId, "LLM_RUN", runId, fixedInstant())
+                    }
+                    error("injected crash after all attachments")
+                }
+            }.isFailure,
+        )
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments", 0)
+            assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containment_works", 0)
+            assertSqlCount("SELECT COUNT(*) FROM llm_runs WHERE invocation_id='$runId' AND status='RUNNING'", 1)
+        }
+
+        exposedTransaction(database) {
+            workIds.forEach { workId -> attachUnattributedContainment(workId, "LLM_RUN", runId, fixedInstant()) }
+            acquireGapPopulationGenerationToken()
+            containUnattributedPopulation(workIds.first(), fixedInstant().plusSeconds(1))
+        }
+        exposedTransaction(database) {
+            acquireGapPopulationGenerationToken()
+            containUnattributedPopulation(workIds.last(), fixedInstant().plusSeconds(2))
+            assertSqlCount(
+                "SELECT COUNT(*) FROM gap_population_unattributed_containments " +
+                    "WHERE entity_type='LLM_RUN' AND entity_id='$runId' AND state='CONTAINED' AND attempt_count=1",
+                1,
+            )
+            assertSqlCount(
+                "SELECT COUNT(*) FROM gap_population_unattributed_containment_works " +
+                    "WHERE consumed_at IS NOT NULL AND result='CONTAINED'",
+                1_000,
+            )
+            assertSqlCount("SELECT COUNT(*) FROM market_data_gap_work_evidence", 1_000)
+            assertSqlCount(
+                "SELECT COUNT(*) FROM llm_runs WHERE invocation_id='$runId' " +
+                    "AND status='FAILED' AND terminal_cause='GAP_SCOPE_UNATTRIBUTED'",
+                1,
+            )
+        }
+    }
+
+    @Test
+    fun unattributedMissingOwnerAndForbiddenTerminalTransitionsAreRejectedForAllSixPopulations() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        createEvaluationReportJobFixtureTable(database)
+        val fixture = insertAllUnattributedPopulationFixtures(database)
+
+        val rejectedSql = listOf(
+            "UPDATE orders SET status='FILLED' WHERE id='${fixture.orderId}'",
+            "UPDATE positions SET status='CLOSED',closed_at=0 WHERE id='${fixture.positionId}'",
+            "UPDATE llm_runs SET status='SUCCEEDED',finished_at=0 WHERE invocation_id='${fixture.runId}'",
+            "UPDATE llm_launch_reservations SET status='FINISHED',finished_at=0 WHERE id='${fixture.reservationId}'",
+            "UPDATE opportunity_episodes SET closed_at=0,close_reason='OTHER' WHERE id='${fixture.episodeId}'",
+            "UPDATE evaluation_report_jobs SET status='SUCCEEDED' WHERE job_id='${fixture.reportJobId}'",
+        )
+        rejectedSql.forEach { sql ->
+            assertTrue(
+                runCatching {
+                    exposedTransaction(database) {
+                        acquireGapPopulationGenerationToken()
+                        executeUpdate(sql)
+                    }
+                }.isFailure,
+                sql,
+            )
+        }
+    }
+
+    @Test
+    fun protectionOnlyBlocksEntryLlmDecisionAndReportAdmissionWhileGapRecoveryRemainsPermitted() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            prepare(
+                "INSERT INTO gap_population_unattributed_containments " +
+                    "(entity_type,entity_id,owner_id,state,allowed_transition,created_at,updated_at) " +
+                    "VALUES ('POSITION','quarantined-position',?,'QUARANTINED','QUARANTINED',?,?)",
+            ).use { statement ->
+                statement.setObject(1, UUID.randomUUID())
+                statement.setLong(2, fixedInstant().toEpochMilli())
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+            assertEquals(GapPopulationResumeMode.PROTECTION_ONLY, selectGapPopulationResumeMode())
+            listOf("entry order", "LLM launch", "decision entry intent", "evaluation report admission").forEach { operation ->
+                assertTrue(runCatching { requireFullGapPopulationAdmission(operation) }.isFailure, operation)
+            }
+        }
+
+        val integrity = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        integrity.beginSession(sessionId, fixedInstant()).getOrThrow()
+        integrity.recordGap(sessionId, MarketDataGapReason.PROCESS_RESTART, fixedInstant().plusSeconds(1)).getOrThrow()
+        integrity.recoverStaleSession(fixedInstant().plusSeconds(2)).getOrThrow()
+        exposedTransaction(database) {
+            assertEquals(GapPopulationResumeMode.PROTECTION_ONLY, selectGapPopulationResumeMode())
+            assertSqlCount("SELECT COUNT(*) FROM market_data_gap_work WHERE session_id='$sessionId' AND state='APPLIED'", 1)
+        }
+    }
+
+    @Test
     fun decision_run_projection_hash_is_canonical_and_independent_of_related_entity_birth() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         exposedTransaction(database) {
@@ -1031,6 +1288,38 @@ class PostgresPersistenceIntegrationTest {
                     "AND state='UNKNOWN' AND unknown_code='UNKNOWN_OVERFLOW'",
                 1,
             )
+        }
+    }
+
+    @Test
+    fun journal_capacity_counts_only_rows_after_oldest_queued_lower_bound() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        repository.markDisconnected(sessionId, MarketDataGapReason.DISCONNECTED, fixedInstant().plusSeconds(1)).getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("UPDATE market_data_gap_work SET state='QUEUED',journal_sequence_lower=1 WHERE session_id='$sessionId'")
+            repeat(2) { index ->
+                prepare(
+                    "INSERT INTO market_data_gap_terminal_journal(journal_sequence,entity_type,entity_id,birth_sequence," +
+                        "projection_hash,terminal_at) VALUES (?,?,?,?,?,?)",
+                ).use { statement ->
+                    statement.setLong(1, index + 1L)
+                    statement.setString(2, "LLM_RUN")
+                    statement.setString(3, "journal-boundary-$index")
+                    statement.setLong(4, index + 1L)
+                    statement.setString(5, "a".repeat(64))
+                    statement.setLong(6, fixedInstant().toEpochMilli())
+                    statement.executeUpdate()
+                }
+            }
+            assertEquals(false, journalCapacityExceeded(rowLimit = 1, byteLimit = Long.MAX_VALUE))
+            executeUpdate(
+                "INSERT INTO market_data_gap_terminal_journal(journal_sequence,entity_type,entity_id,birth_sequence," +
+                    "projection_hash,terminal_at) VALUES (3,'LLM_RUN','journal-boundary-2',3,repeat('b',64),0)",
+            )
+            assertEquals(true, journalCapacityExceeded(rowLimit = 1, byteLimit = Long.MAX_VALUE))
         }
     }
 
@@ -7455,6 +7744,185 @@ private fun JdbcTransaction.assertSqlCount(sql: String, expected: Int) {
         statement.executeQuery().use { rows ->
             assertTrue(rows.next())
             assertEquals(expected, rows.getInt(1))
+        }
+    }
+}
+
+private data class UnattributedPopulationFixture(
+    val orderId: UUID,
+    val positionId: UUID,
+    val runId: String,
+    val reservationId: UUID,
+    val episodeId: UUID,
+    val reportJobId: UUID,
+)
+
+private fun insertUnattributedContainmentWorks(database: ExposedDatabase, count: Int): List<UUID> {
+    val sessionId = UUID.randomUUID()
+    val gapId = UUID.randomUUID()
+    val workIds = List(count) { UUID.randomUUID() }
+    exposedTransaction(database) {
+        prepare(
+            "INSERT INTO market_data_sessions(id,state,connected_at,last_processed_sequence) " +
+                "VALUES (?,'DISCONNECTED',?,0)",
+        ).use { statement ->
+            statement.setObject(1, sessionId)
+            statement.setLong(2, fixedInstant().toEpochMilli())
+            statement.executeUpdate()
+        }
+        prepare(
+            "INSERT INTO market_data_gaps(id,session_id,reason,started_at) VALUES (?,?,'PROCESS_RESTART',?)",
+        ).use { statement ->
+            statement.setObject(1, gapId)
+            statement.setObject(2, sessionId)
+            statement.setLong(3, fixedInstant().toEpochMilli())
+            statement.executeUpdate()
+        }
+        prepare(
+            """
+            INSERT INTO market_data_gap_work(
+                id,gap_id,provider,transport_symbol,population_symbol,symbol,channel,session_id,
+                source_kind,source_episode,identity_hash,state,population_as_of,birth_sequence_upper,
+                journal_sequence_lower,unknown_code,created_at,updated_at,enqueue_sequence
+            ) VALUES (?,?,'GMO_COIN','BTC_JPY','BTC','BTC_JPY','TRADES',?,
+                'EVENT_SEQUENCE',?,?, 'UNKNOWN',?,9223372036854775807,0,
+                'UNKNOWN_SCOPE_UNATTRIBUTED',?,?,?)
+            """.trimIndent(),
+        ).use { statement ->
+            workIds.forEachIndexed { index, workId ->
+                statement.setObject(1, workId)
+                statement.setObject(2, gapId)
+                statement.setObject(3, sessionId)
+                statement.setString(4, "multi-$index")
+                statement.setString(5, "%064x".format(index + 1))
+                statement.setLong(6, fixedInstant().toEpochMilli())
+                statement.setLong(7, fixedInstant().toEpochMilli())
+                statement.setLong(8, fixedInstant().toEpochMilli())
+                statement.setLong(9, (index + 1).toLong())
+                statement.addBatch()
+            }
+            statement.executeBatch()
+        }
+    }
+    return workIds
+}
+
+private data class UnattributedEconomicSnapshot(
+    val cashJpy: BigDecimal,
+    val btcQuantity: BigDecimal,
+    val orderCount: Int,
+    val executionCount: Int,
+    val positionStatus: String,
+    val positionSize: BigDecimal,
+    val positionPnl: BigDecimal,
+)
+
+private fun createEvaluationReportJobFixtureTable(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        executeUpdate(
+            "CREATE TABLE evaluation_report_jobs(" +
+                "job_id UUID PRIMARY KEY,status VARCHAR(32) NOT NULL,stage VARCHAR(32) NOT NULL," +
+                "failure_code VARCHAR(64),failure_message TEXT,updated_at BIGINT NOT NULL)",
+        )
+        assertTrue(ensureEvaluationReportGapPopulationLifecycleSchema())
+    }
+}
+
+private fun insertAllUnattributedPopulationFixtures(database: ExposedDatabase): UnattributedPopulationFixture {
+    val fixture = UnattributedPopulationFixture(
+        orderId = UUID.randomUUID(),
+        positionId = UUID.randomUUID(),
+        runId = "unattributed-all-six-run",
+        reservationId = UUID.randomUUID(),
+        episodeId = UUID.randomUUID(),
+        reportJobId = UUID.randomUUID(),
+    )
+    exposedTransaction(database) {
+        acquireGapPopulationGenerationToken()
+        val epochId = prepare("SELECT current_epoch_id FROM paper_account WHERE id=1").use { statement ->
+            statement.executeQuery().use { rows -> assertTrue(rows.next()); rows.getObject(1, UUID::class.java) }
+        }
+        val tradeGroupId = UUID.randomUUID()
+        prepare(
+            "INSERT INTO orders(id,account_epoch_id,execution_semantics_version,trade_group_id,mode,symbol,side," +
+                "order_type,status,size_btc,reason_ja,created_at,updated_at) " +
+                "VALUES (?,?, 'PAPER_WS_V1',?,'PAPER','BTC','BUY','LIMIT','OPEN',0.01,'fixture',?,?)",
+        ).use { statement ->
+            statement.setObject(1, fixture.orderId); statement.setObject(2, epochId); statement.setObject(3, tradeGroupId)
+            statement.setLong(4, fixedInstant().toEpochMilli()); statement.setLong(5, fixedInstant().toEpochMilli())
+            statement.executeUpdate()
+        }
+        prepare(
+            "INSERT INTO positions(id,account_epoch_id,trade_group_id,mode,symbol,side,status,opened_at,size_btc," +
+                "average_entry_price_jpy,current_price_jpy,current_stop_loss_jpy,unrealized_pnl_jpy,unrealized_r," +
+                "pyramid_add_count,highest_price_since_entry_jpy,lowest_price_since_entry_jpy) " +
+                "VALUES (?,?,?,'PAPER','BTC','LONG','OPEN',?,0.01,10000000,10000000,9800000,0,0,0,10000000,10000000)",
+        ).use { statement ->
+            statement.setObject(1, fixture.positionId); statement.setObject(2, epochId); statement.setObject(3, tradeGroupId)
+            statement.setLong(4, fixedInstant().toEpochMilli()); statement.executeUpdate()
+        }
+        prepare(
+            "INSERT INTO llm_runs(invocation_id,mode,symbol,trigger_kind,status,started_at) " +
+                "VALUES (?,'PAPER','BTC','MANUAL','RUNNING',?)",
+        ).use { statement ->
+            statement.setString(1, fixture.runId); statement.setLong(2, fixedInstant().toEpochMilli()); statement.executeUpdate()
+        }
+        prepare(
+            "INSERT INTO llm_launch_reservations(id,invocation_id,trigger_kind,trigger_key,status,reserved_at," +
+                "population_scope_kind,population_mode,population_symbol,population_account_epoch_id,population_cohort," +
+                "population_execution_semantics_version) VALUES (?,?,'MANUAL','fixture','RUNNING',?,'SYMBOL','PAPER','BTC',?,'CURRENT','PAPER_WS_V1')",
+        ).use { statement ->
+            statement.setObject(1, fixture.reservationId); statement.setString(2, "reservation-all-six")
+            statement.setLong(3, fixedInstant().toEpochMilli()); statement.setObject(4, epochId); statement.executeUpdate()
+        }
+        prepare(
+            "INSERT INTO opportunity_episodes(id,symbol,thesis_id,price_move_threshold_ratio,opened_at) " +
+                "VALUES (?,'BTC','fixture',0.01,?)",
+        ).use { statement ->
+            statement.setObject(1, fixture.episodeId); statement.setLong(2, fixedInstant().toEpochMilli()); statement.executeUpdate()
+        }
+        prepare(
+            "INSERT INTO evaluation_report_jobs(job_id,status,stage,updated_at,population_scope_kind,population_mode," +
+                "population_symbol,population_account_epoch_id,population_cohort,population_execution_semantics_version) " +
+                "VALUES (?,'RUNNING','GENERATING',?,'SYMBOL','PAPER','BTC',?,'CURRENT','PAPER_WS_V1')",
+        ).use { statement ->
+            statement.setObject(1, fixture.reportJobId); statement.setLong(2, fixedInstant().toEpochMilli())
+            statement.setObject(3, epochId); statement.executeUpdate()
+        }
+        executeUpdate("ALTER TABLE gap_population_entity_scopes DISABLE TRIGGER gap_population_entity_scope_immutable")
+        executeUpdate(
+            "DELETE FROM gap_population_entity_scopes WHERE " +
+                "(entity_type='ORDER' AND entity_id='${fixture.orderId}') OR " +
+                "(entity_type='POSITION' AND entity_id='${fixture.positionId}') OR " +
+                "(entity_type='LLM_RUN' AND entity_id='${fixture.runId}') OR " +
+                "(entity_type='LLM_RESERVATION' AND entity_id='${fixture.reservationId}') OR " +
+                "(entity_type='OPPORTUNITY_EPISODE' AND entity_id='${fixture.episodeId}') OR " +
+                "(entity_type='EVALUATION_REPORT_JOB' AND entity_id='${fixture.reportJobId}')",
+        )
+        executeUpdate("ALTER TABLE gap_population_entity_scopes ENABLE TRIGGER gap_population_entity_scope_immutable")
+        executeUpdate("UPDATE orders SET birth_sequence=NULL WHERE id='${fixture.orderId}'")
+        executeUpdate("UPDATE positions SET birth_sequence=NULL WHERE id='${fixture.positionId}'")
+        executeUpdate("UPDATE llm_runs SET birth_sequence=NULL WHERE invocation_id='${fixture.runId}'")
+        executeUpdate("UPDATE llm_launch_reservations SET birth_sequence=NULL WHERE id='${fixture.reservationId}'")
+        executeUpdate("UPDATE opportunity_episodes SET birth_sequence=NULL WHERE id='${fixture.episodeId}'")
+        executeUpdate("UPDATE evaluation_report_jobs SET birth_sequence=NULL WHERE job_id='${fixture.reportJobId}'")
+    }
+    return fixture
+}
+
+private fun unattributedEconomicSnapshot(database: ExposedDatabase): UnattributedEconomicSnapshot = exposedTransaction(database) {
+    prepare(
+        "SELECT account.cash_jpy,account.btc_quantity,(SELECT COUNT(*) FROM orders)," +
+            "(SELECT COUNT(*) FROM executions),position.status,position.size_btc,position.unrealized_pnl_jpy " +
+            "FROM paper_account account JOIN positions position ON position.status='OPEN' WHERE account.id=1 " +
+            "ORDER BY position.opened_at DESC LIMIT 1",
+    ).use { statement ->
+        statement.executeQuery().use { rows ->
+            assertTrue(rows.next())
+            UnattributedEconomicSnapshot(
+                rows.getBigDecimal(1), rows.getBigDecimal(2), rows.getInt(3), rows.getInt(4),
+                rows.getString(5), rows.getBigDecimal(6), rows.getBigDecimal(7),
+            )
         }
     }
 }

@@ -20,18 +20,21 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 
 /** evaluation report と shared LLM reservation の persistence contract を検証する。 */
 class EvaluationReportPersistenceTest {
 
     @Test
-    fun exactScopeGapFailsReportAndSharedReservationWithoutPublishing() = runBlocking {
+    fun gapFirstAndRecoveryFirstBarriersPreventPublicationAndFailJobWithReservationAtomically() = runBlocking {
         if (!reportDockerAvailable()) return@runBlocking
         val container = ReportPostgresContainer().also { it.start() }
         try {
@@ -51,7 +54,21 @@ class EvaluationReportPersistenceTest {
             val integrity = ExposedMarketDataIntegrityRepository(database)
             val sessionId = java.util.UUID.randomUUID()
             integrity.beginSession(sessionId, clock.instant()).getOrThrow()
-            integrity.recordGap(sessionId, MarketDataGapReason.PROCESS_RESTART, clock.instant().plusSeconds(1)).getOrThrow()
+            integrity.markDisconnected(sessionId, MarketDataGapReason.PROCESS_RESTART, clock.instant().plusSeconds(1)).getOrThrow()
+            kotlin.test.assertTrue(
+                persistence.complete(
+                    terminalRaceReport(job, "PRESET:30D|EPOCH:$epochId|COHORT:CURRENT"),
+                    job,
+                ).isFailure,
+            )
+            assertEquals("REQUESTED", persistence.job(job.jobId).getOrThrow()?.status)
+            assertNotNull(
+                ExposedLlmLaunchReservationRepository(database)
+                    .findBlockingRunningReservation(LlmDaemonTriggerKind.MANUAL, clock.instant().minus(Duration.ofMinutes(30)))
+                    .getOrThrow(),
+            )
+            assertReportPublicationCount(container, revisions = 0, pins = 0)
+
             repeat(2) { pass -> integrity.recoverStaleSession(clock.instant().plusSeconds(2 + pass.toLong())).getOrThrow() }
 
             assertEquals("FAILED", persistence.job(job.jobId).getOrThrow()?.status)
@@ -67,16 +84,58 @@ class EvaluationReportPersistenceTest {
                     .findBlockingRunningReservation(LlmDaemonTriggerKind.MANUAL, clock.instant().minus(Duration.ofMinutes(30)))
                     .getOrThrow(),
             )
-            java.sql.DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
-                connection.createStatement().executeQuery("SELECT COUNT(*) FROM evaluation_report_revisions").use { rows ->
-                    kotlin.test.assertTrue(rows.next())
-                    assertEquals(0, rows.getInt(1))
-                }
-                connection.createStatement().executeQuery("SELECT COUNT(*) FROM evaluation_report_pins").use { rows ->
-                    kotlin.test.assertTrue(rows.next())
-                    assertEquals(0, rows.getInt(1))
-                }
-            }
+            assertReportPublicationCount(container, revisions = 0, pins = 0)
+        } finally {
+            container.stop()
+        }
+    }
+
+    @Test
+    fun completeFirstAttemptPausedBeforeTransactionLosesToGapBarrierWithoutRevisionPinOrResurrection() = runBlocking {
+        if (!reportDockerAvailable()) return@runBlocking
+        val container = ReportPostgresContainer().also { it.start() }
+        try {
+            val database = ExposedDatabase.connect(container.jdbcUrl, "org.postgresql.Driver", container.username, container.password)
+            val clock = Clock.fixed(Instant.parse("2026-07-12T00:00:00Z"), ZoneOffset.UTC)
+            TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
+            val epochId = currentReportEpoch(container)
+            val config = TradingBotConfig.fromEnvironment(emptyMap())
+            val completeStarted = CountDownLatch(1)
+            val allowCompleteTransaction = CountDownLatch(1)
+            val persistence = EvaluationReportPersistence(
+                database = database,
+                runnerConfig = config.runner,
+                staleAfter = config.daemon.launchReservationStaleAfter,
+                clock = clock,
+                mode = config.mode,
+                symbol = config.symbol,
+                beforeCompleteTransaction = {
+                    completeStarted.countDown()
+                    check(allowCompleteTransaction.await(30, TimeUnit.SECONDS))
+                },
+            )
+            val scopeKey = "PRESET:30D|EPOCH:$epochId|COHORT:CURRENT"
+            val job = testJob("00000000-0000-0000-0000-000000000011")
+            assertIs<LlmLaunchReservationOutcome.Reserved>(persistence.admit(job, scopeKey).getOrThrow().reservationOutcome)
+
+            val completion = async(Dispatchers.IO) { persistence.complete(terminalRaceReport(job, scopeKey), job) }
+            kotlin.test.assertTrue(completeStarted.await(30, TimeUnit.SECONDS))
+            val integrity = ExposedMarketDataIntegrityRepository(database)
+            val sessionId = java.util.UUID.randomUUID()
+            integrity.beginSession(sessionId, clock.instant()).getOrThrow()
+            integrity.recordGap(sessionId, MarketDataGapReason.PROCESS_RESTART, clock.instant().plusSeconds(1)).getOrThrow()
+            repeat(2) { pass -> integrity.recoverStaleSession(clock.instant().plusSeconds(2 + pass.toLong())).getOrThrow() }
+            allowCompleteTransaction.countDown()
+
+            kotlin.test.assertTrue(completion.await().isFailure)
+            assertEquals("FAILED", persistence.job(job.jobId).getOrThrow()?.status)
+            assertEquals("MARKET_DATA_GAP", persistence.job(job.jobId).getOrThrow()?.failureCode)
+            assertNull(
+                ExposedLlmLaunchReservationRepository(database)
+                    .findBlockingRunningReservation(LlmDaemonTriggerKind.MANUAL, clock.instant().minus(Duration.ofMinutes(30)))
+                    .getOrThrow(),
+            )
+            assertReportPublicationCount(container, revisions = 0, pins = 0)
         } finally {
             container.stop()
         }
@@ -186,43 +245,54 @@ private fun currentReportEpoch(container: ReportPostgresContainer): String {
     }
 }
 
-private fun terminalRaceReport(job: EvaluationReportJobResponse, scopeKey: String): EvaluationReportResponse {
-    val constructor = EvaluationReportResponse::class.java.declaredConstructors.single { candidate ->
-        candidate.parameterCount == 30
+private fun assertReportPublicationCount(container: ReportPostgresContainer, revisions: Int, pins: Int) {
+    java.sql.DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
+        connection.createStatement().executeQuery("SELECT COUNT(*) FROM evaluation_report_revisions").use { rows ->
+            kotlin.test.assertTrue(rows.next())
+            assertEquals(revisions, rows.getInt(1))
+        }
+        connection.createStatement().executeQuery("SELECT COUNT(*) FROM evaluation_report_pins").use { rows ->
+            kotlin.test.assertTrue(rows.next())
+            assertEquals(pins, rows.getInt(1))
+        }
     }
-    constructor.isAccessible = true
-    return constructor.newInstance(
-        job.jobId,
-        job.revisionId,
-        1L,
-        scopeKey,
-        "SUCCEEDED",
-        null,
-        "2026-07-12T00:00:00Z",
-        "input-hash",
-        java.util.UUID.randomUUID().toString(),
-        "2026-07-12T00:00:00Z",
-        "fixture",
-        "fixture",
-        null,
-        "fixture",
-        emptyList<Any>(),
-        emptyList<Any>(),
-        emptyList<Any>(),
-        emptyList<Any>(),
-        emptyList<Any>(),
-        emptyList<Any>(),
-        null,
-        null,
-        null,
-        null,
-        null,
-        false,
-        null,
-        null,
-        null,
-        null,
-    ) as EvaluationReportResponse
+}
+
+private fun terminalRaceReport(job: EvaluationReportJobResponse, scopeKey: String): EvaluationReportResponse {
+    return EvaluationReportResponse(
+        jobId = job.jobId,
+        revisionId = job.revisionId,
+        revisionNumber = 1,
+        scopeKey = scopeKey,
+        status = "SUCCEEDED",
+        period = EvaluationReportPeriodResponse("2026-07-01", "2026-07-12", "UTC"),
+        inputAsOf = "2026-07-12T00:00:00Z",
+        inputHash = "input-hash",
+        snapshotId = java.util.UUID.randomUUID().toString(),
+        generatedAt = "2026-07-12T00:00:00Z",
+        provider = "fixture",
+        model = "fixture",
+        generation = EvaluationReportGenerationMetadataResponse("fixture", "fixture", null, null, null),
+        title = "fixture",
+        segments = emptyList(),
+        claims = emptyList(),
+        validation = emptyList(),
+        facts = emptyList(),
+        sources = emptyList(),
+        chartIndex = emptyList(),
+        outcomeRidge = OutcomeRidgeResponse(
+            "fixture",
+            "R_MULTIPLE",
+            OutcomeRidgeDomainResponse("-1", "1", "1"),
+            emptyList(),
+            emptyList(),
+        ),
+        benchmark = ReportBenchmarkChartResponse(null, emptyList(), null, null, "EMPTY"),
+        calibration = ReportCalibrationChartResponse("PROBABILITY", "fixture", emptyList(), "EMPTY"),
+        performanceLattice = ReportPerformanceLatticeResponse("JPY", "fixture", emptyList(), "EMPTY"),
+        integrity = EvaluationIntegrityResponse(0, 0, 0, 0, 0, emptyMap(), 0, 0, 0, null, false),
+        truncated = false,
+    )
 }
 
 private fun testJob(jobId: String) = EvaluationReportJobResponse(

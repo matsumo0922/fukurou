@@ -98,6 +98,7 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    requireFullGapPopulationAdmission("paper entry fill")
                     acquireGapPopulationGenerationToken()
                     val writeIntent = resolvePaperWriteContext(request.command.auditContext)
                         .intent(PaperWritePolicy.RISK_INCREASING)
@@ -122,6 +123,7 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    requireFullGapPopulationAdmission("resting entry order")
                     acquireGapPopulationGenerationToken()
                     val writeIntent = resolvePaperWriteContext(request.command.auditContext)
                         .intent(PaperWritePolicy.RISK_INCREASING)
@@ -164,6 +166,7 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    requireFullGapPopulationAdmission("paper entry fill with intent")
                     acquireGapPopulationGenerationToken()
                     val writeIntent = resolvePaperWriteContext(request.entry.command.auditContext)
                         .intent(PaperWritePolicy.RISK_INCREASING)
@@ -195,6 +198,7 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    requireFullGapPopulationAdmission("resting entry order with intent")
                     acquireGapPopulationGenerationToken()
                     val writeIntent = resolvePaperWriteContext(request.order.command.auditContext)
                         .intent(PaperWritePolicy.RISK_INCREASING)

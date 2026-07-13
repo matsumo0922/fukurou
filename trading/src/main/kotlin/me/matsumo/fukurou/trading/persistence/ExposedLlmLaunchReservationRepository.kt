@@ -99,6 +99,7 @@ class ExposedLlmLaunchReservationRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    requireFullGapPopulationAdmission("LLM launch reservation")
                     val scope = request.populationScope
                     val epochId = scope.accountEpochId
                     if (epochId == null) {
@@ -170,6 +171,7 @@ class ExposedLlmLaunchReservationRepository(
 fun JdbcTransaction.tryReserveLlmLaunchInTransaction(
     request: LlmLaunchReservationRequest,
 ): LlmLaunchReservationOutcome {
+    requireFullGapPopulationAdmission("LLM launch reservation")
     val riskState = selectRiskState(forUpdate = true)
 
     if (riskState.state == RiskHaltState.HARD_HALT) {

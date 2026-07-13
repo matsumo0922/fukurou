@@ -75,6 +75,49 @@ internal const val GAP_POPULATION_MEMBER_LIMIT = 100_000
 internal const val GAP_POPULATION_JOURNAL_LIMIT = 100_000
 internal const val GAP_POPULATION_JOURNAL_BYTES_LIMIT = 256L * 1024L * 1024L
 
+internal fun gapPopulationQueueCapacityExceeded(pendingCount: Int, limit: Int = GAP_POPULATION_PENDING_WORK_LIMIT): Boolean =
+    pendingCount >= limit
+
+internal fun gapPopulationEvidenceCapacityExceeded(currentCount: Int, limit: Int = GAP_POPULATION_EVIDENCE_LIMIT): Boolean =
+    currentCount >= limit
+
+internal fun gapPopulationJournalCapacityExceeded(
+    unconsumedRows: Long,
+    unconsumedBytes: Long,
+    rowLimit: Long = GAP_POPULATION_JOURNAL_LIMIT.toLong(),
+    byteLimit: Long = GAP_POPULATION_JOURNAL_BYTES_LIMIT,
+): Boolean = unconsumedRows > rowLimit || unconsumedBytes > byteLimit
+
+/** unattributed containmentに基づくruntime admission mode。 */
+enum class GapPopulationResumeMode { FULL, PROTECTION_ONLY, STOPPED }
+
+/** risk-increasing admissionはFULLだけで許可する。 */
+fun JdbcTransaction.requireFullGapPopulationAdmission(operation: String) {
+    val mode = selectGapPopulationResumeMode()
+    require(mode == GapPopulationResumeMode.FULL) {
+        "gap population containment blocks $operation in ${mode.name} mode."
+    }
+}
+
+/** containment owner/attachから現在のresume modeを導出する。 */
+fun JdbcTransaction.selectGapPopulationResumeMode(): GapPopulationResumeMode {
+    if (!relationExistsForGapPopulation("gap_population_unattributed_containments")) return GapPopulationResumeMode.FULL
+    return prepare(
+        "SELECT EXISTS(SELECT 1 FROM gap_population_unattributed_containments WHERE state='QUARANTINED')," +
+            "EXISTS(SELECT 1 FROM gap_population_unattributed_containments WHERE state IN ('DISCOVERED','TERMINALIZING'))," +
+            "EXISTS(SELECT 1 FROM gap_population_unattributed_containment_works WHERE consumed_at IS NULL)",
+    ).use { statement ->
+        statement.executeQuery().use { rows ->
+            require(rows.next())
+            when {
+                rows.getBoolean(2) || rows.getBoolean(3) -> GapPopulationResumeMode.STOPPED
+                rows.getBoolean(1) -> GapPopulationResumeMode.PROTECTION_ONLY
+                else -> GapPopulationResumeMode.FULL
+            }
+        }
+    }
+}
+
 private val GAP_EXCLUSION_ENTITY_TYPES = setOf(
     "ORDER",
     "POSITION",
@@ -369,6 +412,47 @@ private fun JdbcTransaction.verifyGapPopulationSchemaContract() {
     }
     check(missingObjects.isEmpty()) { "gap population lifecycle objects differ: ${missingObjects.joinToString()}" }
 
+    val invalidIndexes = prepare(
+        """
+        SELECT expected.name FROM (VALUES
+            ('gap_population_entity_scope_scan_idx','scope_kind, mode, symbol, account_epoch_id, cohort, execution_semantics_version, birth_sequence, entity_type, entity_id'),
+            ('market_data_gap_work_fifo_idx','provider, transport_symbol, channel, enqueue_sequence')
+        ) expected(name,columns)
+        LEFT JOIN pg_class index_relation ON index_relation.relname=expected.name
+        LEFT JOIN pg_index index_metadata ON index_metadata.indexrelid=index_relation.oid
+        WHERE index_relation.oid IS NULL OR NOT index_metadata.indisvalid OR NOT index_metadata.indisready
+          OR position(expected.columns in pg_get_indexdef(index_relation.oid))=0
+        """.trimIndent(),
+    ).use { statement ->
+        statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
+    }
+    check(invalidIndexes.isEmpty()) { "gap population lifecycle indexes differ: ${invalidIndexes.joinToString()}" }
+
+    val invalidTriggers = prepare(
+        """
+        SELECT expected.name FROM (VALUES
+            ('gap_population_entity_scope_immutable','reject_gap_population_entity_scope_mutation'),
+            ('market_data_gap_work_transport_mapping','enforce_gap_population_transport_mapping'),
+            ('orders_gap_population_create','enforce_gap_population_creation_token'),
+            ('orders_gap_population_terminal','fence_gap_population_terminal_mutation'),
+            ('positions_gap_population_create','enforce_gap_population_creation_token'),
+            ('positions_gap_population_terminal','fence_gap_population_terminal_mutation'),
+            ('llm_runs_gap_population_create','enforce_gap_population_creation_token'),
+            ('llm_runs_gap_population_terminal','fence_gap_population_terminal_mutation'),
+            ('llm_launch_reservations_gap_population_create','enforce_gap_population_creation_token'),
+            ('llm_launch_reservations_gap_population_terminal','fence_gap_population_terminal_mutation'),
+            ('opportunity_episodes_gap_population_create','enforce_gap_population_creation_token'),
+            ('opportunity_episodes_gap_population_terminal','fence_gap_population_terminal_mutation')
+        ) expected(name,function_name)
+        LEFT JOIN pg_trigger trigger ON trigger.tgname=expected.name AND NOT trigger.tgisinternal
+        LEFT JOIN pg_proc function ON function.oid=trigger.tgfoid
+        WHERE trigger.oid IS NULL OR trigger.tgenabled<>'O' OR function.proname<>expected.function_name
+        """.trimIndent(),
+    ).use { statement ->
+        statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
+    }
+    check(invalidTriggers.isEmpty()) { "gap population lifecycle triggers differ: ${invalidTriggers.joinToString()}" }
+
     val invalidFunctions = prepare(
         """
         SELECT expected.signature FROM (VALUES
@@ -378,11 +462,14 @@ private fun JdbcTransaction.verifyGapPopulationSchemaContract() {
             ('enforce_gap_population_creation_token()'),
             ('fence_gap_population_terminal_mutation()'),
             ('enforce_gap_population_transport_mapping()'),
-            ('gap_population_projection_hash(text,text,text)')
+            ('gap_population_projection_hash(text,text,text)'),
+            ('reject_gap_population_entity_scope_mutation()')
         ) expected(signature)
         LEFT JOIN pg_proc function ON function.oid=to_regprocedure(expected.signature)
         WHERE function.oid IS NULL OR NOT function.prosecdef
+          OR function.proowner <> (SELECT oid FROM pg_roles WHERE rolname=current_user)
           OR NOT ('search_path=pg_catalog, public'=ANY(function.proconfig))
+          OR has_function_privilege('public',expected.signature,'EXECUTE')
         """.trimIndent(),
     ).use { statement ->
         statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
@@ -410,7 +497,7 @@ internal fun JdbcTransaction.enqueueGapPopulationWork(
     }
 
     val pendingCount = countPendingGapWork(identity)
-    if (pendingCount >= GAP_POPULATION_PENDING_WORK_LIMIT) {
+    if (gapPopulationQueueCapacityExceeded(pendingCount)) {
         return insertOverflowWork(identity, scope, gapId, detectedAt, pendingCount)
     }
 
@@ -572,14 +659,14 @@ private fun JdbcTransaction.discoverUnattributedPopulation(work: GapWorkRow, now
             statement.setInt(3, GAP_POPULATION_PASS_SIZE - discovered)
             statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getString(1)) } }
         }
-        entityIds.forEach { entityId -> attachUnattributedContainment(work, population.type, entityId, now) }
+        entityIds.forEach { entityId -> attachUnattributedContainment(work.id, population.type, entityId, now) }
         discovered += entityIds.size
     }
     return discovered
 }
 
-private fun JdbcTransaction.attachUnattributedContainment(
-    work: GapWorkRow,
+internal fun JdbcTransaction.attachUnattributedContainment(
+    workId: UUID,
     entityType: String,
     entityId: String,
     now: Instant,
@@ -609,7 +696,7 @@ private fun JdbcTransaction.attachUnattributedContainment(
             "VALUES (?,?,?) ON CONFLICT(owner_id,work_id) DO NOTHING",
     ).use { statement ->
         statement.setObject(1, ownerId)
-        statement.setObject(2, work.id)
+        statement.setObject(2, workId)
         statement.setLong(3, now.toEpochMilli())
         statement.executeUpdate()
     }
@@ -623,7 +710,7 @@ private fun unattributedContainmentTransition(entityType: String): String = when
     else -> error("Unsupported unattributed population: $entityType")
 }
 
-private fun JdbcTransaction.containUnattributedPopulation(workId: UUID, now: Instant) {
+internal fun JdbcTransaction.containUnattributedPopulation(workId: UUID, now: Instant) {
     val owners = prepare(
         "SELECT containment.owner_id,containment.entity_type,containment.entity_id,containment.state " +
             "FROM gap_population_unattributed_containments containment " +
@@ -674,7 +761,7 @@ private data class UnattributedOwner(
 private fun JdbcTransaction.terminalizeUnattributedOwner(owner: UnattributedOwner, now: Instant): Int = when (owner.entityType) {
     "ORDER" -> prepare(
         "UPDATE orders SET status='CANCELED',reason_ja='market-data gap: scope unattributed'," +
-            "canceled_at=?,cancel_reason='GAP_SCOPE_UNATTRIBUTED',updated_at=? " +
+            "canceled_at=?,cancel_reason='gap_scope_unattributed',updated_at=? " +
             "WHERE id=?::uuid AND status IN ('OPEN','PENDING_CANCEL') AND side='BUY' AND position_id IS NULL",
     ).use { statement ->
         statement.setLong(1, now.toEpochMilli()); statement.setLong(2, now.toEpochMilli())
@@ -1125,7 +1212,7 @@ private fun JdbcTransaction.appendGapWorkEvidence(
             rows.getInt(1)
         }
     }
-    if (count >= GAP_POPULATION_EVIDENCE_LIMIT) {
+    if (gapPopulationEvidenceCapacityExceeded(count)) {
         prepare(
             """
             INSERT INTO market_data_gap_work_evidence (id,work_id,reason,detail_hash,observed_at,created_at)
@@ -1390,16 +1477,19 @@ private fun JdbcTransaction.hasPopulationHashMismatch(workId: UUID): Boolean {
     }
 }
 
-private fun JdbcTransaction.journalCapacityExceeded(): Boolean {
+internal fun JdbcTransaction.journalCapacityExceeded(
+    rowLimit: Long = GAP_POPULATION_JOURNAL_LIMIT.toLong(),
+    byteLimit: Long = GAP_POPULATION_JOURNAL_BYTES_LIMIT,
+): Boolean {
     return prepare(
-        "SELECT COUNT(*) > ? OR COALESCE(SUM(octet_length(projection_hash) + octet_length(entity_id)), 0) > ? " +
+        "SELECT COUNT(*),COALESCE(SUM(octet_length(projection_hash) + octet_length(entity_id)), 0) " +
             "FROM market_data_gap_terminal_journal journal WHERE journal_sequence > COALESCE(" +
             "(SELECT MIN(journal_sequence_lower) FROM market_data_gap_work WHERE state='QUEUED')," +
             "(SELECT COALESCE(MAX(journal_sequence),0) FROM market_data_gap_terminal_journal))",
     ).use { statement ->
-        statement.setInt(1, GAP_POPULATION_JOURNAL_LIMIT)
-        statement.setLong(2, GAP_POPULATION_JOURNAL_BYTES_LIMIT)
-        statement.executeQuery().use { rows -> rows.next() && rows.getBoolean(1) }
+        statement.executeQuery().use { rows ->
+            rows.next() && gapPopulationJournalCapacityExceeded(rows.getLong(1), rows.getLong(2), rowLimit, byteLimit)
+        }
     }
 }
 
@@ -1717,6 +1807,7 @@ BEGIN
     RETURN NEW;
 END
 ${'$'}fn${'$'} LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public;
+REVOKE ALL ON FUNCTION enforce_gap_population_transport_mapping() FROM PUBLIC;
 DROP TRIGGER IF EXISTS market_data_gap_work_transport_mapping ON market_data_gap_work;
 CREATE TRIGGER market_data_gap_work_transport_mapping BEFORE INSERT OR UPDATE
 ON market_data_gap_work FOR EACH ROW EXECUTE FUNCTION enforce_gap_population_transport_mapping()
@@ -1834,7 +1925,8 @@ BEGIN
     END IF;
     RETURN NEW;
 END
-${'$'}fn${'$'} LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public
+${'$'}fn${'$'} LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
+REVOKE ALL ON FUNCTION enforce_gap_population_creation_token() FROM PUBLIC
 """
 
 private const val GAP_POPULATION_ACQUIRE_FUNCTION_SQL = """
@@ -1917,6 +2009,7 @@ private const val GAP_POPULATION_ENTITY_SCOPE_IMMUTABLE_SQL = """
 CREATE OR REPLACE FUNCTION reject_gap_population_entity_scope_mutation() RETURNS trigger AS ${'$'}fn${'$'}
 BEGIN RAISE EXCEPTION 'gap population entity scope is immutable'; END
 ${'$'}fn${'$'} LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public;
+REVOKE ALL ON FUNCTION reject_gap_population_entity_scope_mutation() FROM PUBLIC;
 DROP TRIGGER IF EXISTS gap_population_entity_scope_immutable ON gap_population_entity_scopes;
 CREATE TRIGGER gap_population_entity_scope_immutable BEFORE UPDATE OR DELETE ON gap_population_entity_scopes
 FOR EACH ROW EXECUTE FUNCTION reject_gap_population_entity_scope_mutation()
@@ -2100,7 +2193,8 @@ BEGIN
 
     RETURN NEW;
 END
-${'$'}fn${'$'} LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public
+${'$'}fn${'$'} LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
+REVOKE ALL ON FUNCTION fence_gap_population_terminal_mutation() FROM PUBLIC
 """
 
 private val GAP_POPULATION_TRIGGER_SQL = listOf(

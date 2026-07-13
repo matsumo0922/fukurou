@@ -66,6 +66,78 @@ class LifecycleMutationSqlInventoryTest {
         assertTrue("MCP role gained llm_runs INSERT" in script)
         assertEquals(2, Regex("INSERT INTO llm_runs").findAll(script).count())
     }
+
+    @Test
+    fun productionCallersAcquireLifecycleTokenBeforeSingleBulkUpsertAndEmbeddedMutationEntrypoints() {
+        val root = repositoryRoot()
+        val cases = listOf(
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedPaperLedgerWriter.kt", "override suspend fun fillMarketEntry(", "acquireGapPopulationGenerationToken", "insertEntryFill("),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedPaperLedgerWriter.kt", "override suspend fun createRestingEntryOrder(", "acquireGapPopulationGenerationToken", "insertEntryOrder("),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedPaperLedgerWriter.kt", "suspend fun fillMarketEntryAndConsumeIntent(", "acquireGapPopulationGenerationToken", "insertEntryFill("),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedPaperLedgerWriter.kt", "suspend fun createRestingEntryOrderAndConsumeIntent(", "acquireGapPopulationGenerationToken", "insertEntryOrder("),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmRunRepository.kt", "override suspend fun insertRunning(", "acquireGapPopulationGenerationToken", "insertRunningLlmRun("),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmRunRepository.kt", "override suspend fun finish(", "acquireGapPopulationGenerationToken", "finishLlmRun("),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmLaunchReservationRepository.kt", "override suspend fun tryReserve(", "acquireGapPopulationGenerationToken", "tryReserveLlmLaunchInTransaction("),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmLaunchReservationRepository.kt", "override suspend fun finish(", "acquireGapPopulationGenerationTokenForEntity", "finishLlmLaunchInTransaction("),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedDecisionRepository.kt", "override suspend fun submitDecision(", "acquireOpportunityEpisodeGapPopulationToken", "insertDecisionSubmission("),
+            OrderedLifecycleCall("fukurou/src/main/kotlin/me/matsumo/fukurou/EvaluationReportPersistence.kt", "fun admit(", "acquireEvaluationGapPopulationToken", "insertJob("),
+            OrderedLifecycleCall("fukurou/src/main/kotlin/me/matsumo/fukurou/EvaluationReportPersistence.kt", "fun complete(", "acquireEvaluationGapPopulationToken", "UPDATE evaluation_report_jobs"),
+        )
+
+        cases.forEach { case -> assertOrderedLifecycleCall(Files.readString(root.resolve(case.file)), case) }
+    }
+
+    @Test
+    fun productionAdmissionCallersCheckProtectionOnlyBeforeEntryLlmDecisionAndReportMutationTokens() {
+        val root = repositoryRoot()
+        val cases = listOf(
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedPaperLedgerWriter.kt", "override suspend fun fillMarketEntry(", "requireFullGapPopulationAdmission", "acquireGapPopulationGenerationToken"),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedPaperLedgerWriter.kt", "override suspend fun createRestingEntryOrder(", "requireFullGapPopulationAdmission", "acquireGapPopulationGenerationToken"),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmLaunchReservationRepository.kt", "override suspend fun tryReserve(", "requireFullGapPopulationAdmission", "acquireGapPopulationGenerationToken"),
+            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedDecisionRepository.kt", "override suspend fun submitDecision(", "requireFullGapPopulationAdmission", "acquireOpportunityEpisodeGapPopulationToken"),
+            OrderedLifecycleCall("fukurou/src/main/kotlin/me/matsumo/fukurou/EvaluationReportPersistence.kt", "fun admit(", "requireFullGapPopulationAdmission", "acquireEvaluationGapPopulationToken"),
+        )
+
+        cases.forEach { case -> assertOrderedLifecycleCall(Files.readString(root.resolve(case.file)), case) }
+    }
+
+    @Test
+    fun normalizedInventoryRecognizesSingleBulkUpsertAndEmbeddedLifecycleMutations() {
+        assertEquals(
+            setOf(LifecycleMutationTuple("INSERT", "orders")),
+            normalizedMutationTuples("INSERT INTO orders(id) VALUES (?),(?)"),
+        )
+        assertEquals(
+            setOf(LifecycleMutationTuple("INSERT", "llm_runs"), LifecycleMutationTuple("UPDATE", "llm_runs")),
+            normalizedMutationTuples("INSERT INTO llm_runs(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET status='FAILED'"),
+        )
+        assertEquals(
+            setOf(LifecycleMutationTuple("UPDATE", "positions")),
+            normalizedMutationTuples("WITH changed AS (UPDATE positions SET status='CLOSED' RETURNING id) SELECT * FROM changed"),
+        )
+    }
+}
+
+/** production capacity predicatesのexact boundary。 */
+class GapPopulationCapacityBoundaryTest {
+    @Test
+    fun evidenceThirtyTwoIsAcceptedAndThirtyThirdUsesOverflowSentinel() {
+        assertEquals(false, gapPopulationEvidenceCapacityExceeded(31))
+        assertEquals(true, gapPopulationEvidenceCapacityExceeded(32))
+    }
+
+    @Test
+    fun queueOneThousandIsAcceptedAndOneThousandAndFirstUsesOverflowWork() {
+        assertEquals(false, gapPopulationQueueCapacityExceeded(999))
+        assertEquals(true, gapPopulationQueueCapacityExceeded(1_000))
+    }
+
+    @Test
+    fun journalOneHundredThousandAndTwoHundredFiftySixMibAreInclusiveBoundaries() {
+        assertEquals(false, gapPopulationJournalCapacityExceeded(100_000, 256L * 1024L * 1024L))
+        assertEquals(true, gapPopulationJournalCapacityExceeded(100_001, 0))
+        assertEquals(true, gapPopulationJournalCapacityExceeded(0, 256L * 1024L * 1024L + 1))
+    }
 }
 
 private data class LifecycleMutationSourceEntry(
@@ -76,6 +148,21 @@ private data class LifecycleMutationSourceEntry(
 )
 
 private data class LifecycleMutationTuple(val kind: String, val population: String)
+
+private data class OrderedLifecycleCall(
+    val file: String,
+    val entrypoint: String,
+    val tokenAcquisition: String,
+    val mutation: String,
+)
+
+private fun assertOrderedLifecycleCall(source: String, case: OrderedLifecycleCall) {
+    val entrypointIndex = source.indexOf(case.entrypoint)
+    assertTrue(entrypointIndex >= 0, "Missing entrypoint ${case.file}#${case.entrypoint}")
+    val tokenIndex = source.indexOf(case.tokenAcquisition, entrypointIndex)
+    val mutationIndex = source.indexOf(case.mutation, entrypointIndex)
+    assertTrue(tokenIndex in (entrypointIndex + 1)..<mutationIndex, "Token is not acquired before mutation: ${case.file}#${case.entrypoint}")
+}
 
 private val APPROVED_LIFECYCLE_MUTATIONS = setOf(
     LifecycleMutationTuple("INSERT", "orders"),
@@ -93,11 +180,17 @@ private val APPROVED_LIFECYCLE_MUTATIONS = setOf(
 )
 
 private fun normalizedMutationTuples(source: String): Set<LifecycleMutationTuple> {
-    return LIFECYCLE_MUTATION_SQL.findAll(source).map { match ->
-        LifecycleMutationTuple(
+    return LIFECYCLE_MUTATION_SQL.findAll(source).flatMap { match ->
+        val mutation = LifecycleMutationTuple(
             kind = match.groupValues[1].uppercase().substringBefore(' '),
             population = match.groupValues[2].lowercase(),
         )
+        val statementTail = source.substring(match.range.first, source.indexOf(';', match.range.last).takeIf { it >= 0 } ?: source.length)
+        if (mutation.kind == "INSERT" && UPSERT_UPDATE.containsMatchIn(statementTail)) {
+            sequenceOf(mutation, mutation.copy(kind = "UPDATE"))
+        } else {
+            sequenceOf(mutation)
+        }
     }.toSet()
 }
 
@@ -105,7 +198,10 @@ private val LIFECYCLE_SCAN_ROOTS = listOf(
     "trading/src/main",
     "fukurou/src/main",
     "mcp/src/main",
+    "scripts/deploy",
 )
+
+private val UPSERT_UPDATE = Regex("(?is)\\bON\\s+CONFLICT\\b.*\\bDO\\s+UPDATE\\b")
 
 private val LIFECYCLE_MUTATION_SQL = Regex(
     pattern = """(?is)\b(INSERT\s+INTO|UPDATE)\s+(orders|positions|llm_runs|llm_launch_reservations|opportunity_episodes|evaluation_report_jobs)\b""",
@@ -130,7 +226,10 @@ private val LIFECYCLE_MUTATION_SOURCE_ALLOWLIST = listOf(
     ),
     LifecycleMutationSourceEntry(
         file = "trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmRunRepository.kt",
-        mutations = setOf(LifecycleMutationTuple("INSERT", "llm_runs")),
+        mutations = setOf(
+            LifecycleMutationTuple("INSERT", "llm_runs"),
+            LifecycleMutationTuple("UPDATE", "llm_runs"),
+        ),
         callers = setOf("insertRunning", "finish", "INSERT_LLM_RUN_RUNNING_SQL", "UPSERT_LLM_RUN_FINISH_SQL"),
     ),
     LifecycleMutationSourceEntry(

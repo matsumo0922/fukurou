@@ -28,6 +28,7 @@ import me.matsumo.fukurou.trading.persistence.GapPopulationScope
 import me.matsumo.fukurou.trading.persistence.finishLlmLaunchInTransaction
 import me.matsumo.fukurou.trading.persistence.acquireGapPopulationGenerationToken
 import me.matsumo.fukurou.trading.persistence.ensureEvaluationReportGapPopulationLifecycleSchema
+import me.matsumo.fukurou.trading.persistence.requireFullGapPopulationAdmission
 import me.matsumo.fukurou.trading.persistence.tryReserveLlmLaunchInTransaction
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Clock
@@ -50,6 +51,7 @@ internal class EvaluationReportPersistence(
     private val clock: Clock,
     private val mode: TradingMode,
     private val symbol: TradingSymbol,
+    private val beforeCompleteTransaction: () -> Unit = {},
 ) {
     init {
         exposedTransaction(database) {
@@ -62,6 +64,7 @@ internal class EvaluationReportPersistence(
     /** request identity、revision number、共通 LLM reservation または rejection を atomic に保存する。 */
     fun admit(job: EvaluationReportJobResponse, scopeKey: String): Result<EvaluationReportAdmission> = runCatching {
         exposedTransaction(database) {
+            requireFullGapPopulationAdmission("evaluation report admission")
             val populationScope = reportPopulationScope(scopeKey)
             acquireEvaluationGapPopulationToken(populationScope)
             val now = clock.instant()
@@ -189,6 +192,7 @@ internal class EvaluationReportPersistence(
     }
 
     fun complete(report: EvaluationReportResponse, job: EvaluationReportJobResponse): Result<Unit> = runCatching {
+        beforeCompleteTransaction()
         exposedTransaction(database) {
             val populationScope = reportPopulationScope(report.scopeKey)
             acquireEvaluationGapPopulationToken(populationScope)
