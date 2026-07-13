@@ -1969,6 +1969,16 @@ BEGIN
     WHERE id=1 AND (SELECT current_epoch_id FROM public.paper_account WHERE id=1 AND mode='PAPER') IS NOT NULL
     RETURNING token_version INTO current_version;
     IF current_version IS NULL THEN RAISE EXCEPTION 'current paper scope is unavailable'; END IF;
+    IF EXISTS (
+        SELECT 1 FROM public.gap_population_unattributed_containments containment
+        WHERE containment.state IN ('DISCOVERED','TERMINALIZING','QUARANTINED')
+           OR EXISTS (
+               SELECT 1 FROM public.gap_population_unattributed_containment_works attached
+               WHERE attached.owner_id=containment.owner_id AND attached.consumed_at IS NULL
+           )
+    ) THEN
+        RAISE EXCEPTION 'decision entry intent is blocked by gap population recovery';
+    END IF;
     PERFORM set_config('fukurou.gap_population_token',txid_current()::text || ':' || current_version::text,true);
 END
 ${'$'}fn${'$'} LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public;

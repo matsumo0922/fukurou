@@ -94,11 +94,20 @@ class LifecycleMutationSqlInventoryTest {
             OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedPaperLedgerWriter.kt", "override suspend fun fillMarketEntry(", "requireFullGapPopulationAdmission", "acquireGapPopulationGenerationToken"),
             OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedPaperLedgerWriter.kt", "override suspend fun createRestingEntryOrder(", "requireFullGapPopulationAdmission", "acquireGapPopulationGenerationToken"),
             OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmLaunchReservationRepository.kt", "override suspend fun tryReserve(", "requireFullGapPopulationAdmission", "acquireGapPopulationGenerationToken"),
-            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedDecisionRepository.kt", "override suspend fun submitDecision(", "requireFullGapPopulationAdmission", "acquireOpportunityEpisodeGapPopulationToken"),
             OrderedLifecycleCall("fukurou/src/main/kotlin/me/matsumo/fukurou/EvaluationReportPersistence.kt", "fun admit(", "requireFullGapPopulationAdmission", "acquireEvaluationGapPopulationToken"),
         )
 
         cases.forEach { case -> assertOrderedLifecycleCall(Files.readString(root.resolve(case.file)), case) }
+
+        val lifecycleSource = Files.readString(
+            root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/GapPopulationLifecycle.kt"),
+        )
+        val mcpRoleSql = Files.readString(root.resolve("scripts/deploy/sql/mcp-role.sql"))
+        assertTrue("decision entry intent is blocked by gap population recovery" in lifecycleSource)
+        assertTrue("gap_population_unattributed_containments containment" in lifecycleSource)
+        assertTrue("GRANT EXECUTE ON FUNCTION public.acquire_opportunity_episode_gap_population_token(text)" in mcpRoleSql)
+        assertTrue("REVOKE ALL ON gap_population_control, gap_population_entity_scopes" in mcpRoleSql)
+        assertTrue("GRANT SELECT ON gap_population_unattributed_containments" !in mcpRoleSql)
     }
 
     @Test

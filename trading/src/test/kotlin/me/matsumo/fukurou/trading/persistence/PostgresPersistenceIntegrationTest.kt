@@ -1229,6 +1229,11 @@ class PostgresPersistenceIntegrationTest {
                 assertTrue(runCatching { requireFullGapPopulationAdmission(operation) }.isFailure, operation)
             }
         }
+        assertTrue(
+            runCatching {
+                exposedTransaction(database) { acquireOpportunityEpisodeGapPopulationToken("BTC") }
+            }.isFailure,
+        )
 
         val integrity = ExposedMarketDataIntegrityRepository(database)
         val sessionId = UUID.randomUUID()

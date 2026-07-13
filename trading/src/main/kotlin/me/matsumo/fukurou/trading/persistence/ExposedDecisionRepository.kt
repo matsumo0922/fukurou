@@ -444,7 +444,6 @@ class ExposedDecisionRepository(
             runCatching {
                 exposedTransaction(database) {
                     submission.entryIntent?.let { intent ->
-                        requireFullGapPopulationAdmission("decision entry intent")
                         acquireOpportunityEpisodeGapPopulationToken(intent.symbol.apiSymbol)
                     }
                     insertDecisionSubmission(submission, clock.instant(), maxTradePlanRevisions)
