@@ -9,6 +9,10 @@ import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.time.Duration
 import java.time.Instant
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+
+private const val RECOVERY_REPOSITORY_START_RESERVE_MILLIS = 750L
 
 /**
  * LLM daemon scheduler が起動する trigger 種別。
@@ -167,6 +171,7 @@ data class LlmExecutionRecoveryScan(
 
 /** stale execution claim を競合安全に FAILED へ遷移させる要求。 */
 data class LlmExecutionRecoveryRequest(
+    val recoveryAttemptId: UUID = UUID.randomUUID(),
     val invocationId: String,
     val claimState: LlmExecutionClaimState,
     val claimantToken: String?,
@@ -176,6 +181,32 @@ data class LlmExecutionRecoveryRequest(
     val reason: String,
     val terminationFence: String,
 )
+
+/** 同じ recovery attempt UUID の明示 mutation retry を一度だけ許可するprocess-local permit。 */
+class LlmExecutionRecoveryRetryPermit {
+    private val available = AtomicBoolean(true)
+
+    /** 明示 mutation retry を開始できる。 */
+    val isAvailable: Boolean get() = available.get()
+
+    /** 明示 mutation retry の開始権を不可逆に1回だけ取得する。 */
+    fun tryConsume(): Boolean = available.compareAndSet(true, false)
+}
+
+/** stale execution recovery mutation または exact readback の確定結果。 */
+sealed interface LlmExecutionRecoveryOutcome {
+    /** reservation と audit が request どおりに commit 済み。 */
+    data object Recovered : LlmExecutionRecoveryOutcome
+
+    /** 別の terminal transition が先に確定した。 */
+    data object TerminalObserved : LlmExecutionRecoveryOutcome
+
+    /** RUNNING row の identity が scan 時点から変化した。 */
+    data object PreconditionChanged : LlmExecutionRecoveryOutcome
+
+    /** DB 状態から mutation outcome を一意に確定できない。 */
+    data class OutcomeUnknown(val cause: Throwable) : LlmExecutionRecoveryOutcome
+}
 
 /**
  * LLM 起動予約要求。
@@ -379,22 +410,29 @@ interface LlmLaunchReservationRepository {
     ): Result<Boolean> = Result.failure(UnsupportedOperationException("Execution claim heartbeat is not implemented."))
 
     /** stale AVAILABLE / CLAIMED reservation を bounded scan する。 */
-    suspend fun scanStaleExecutionClaims(scan: LlmExecutionRecoveryScan): Result<List<LlmExecutionClaimSnapshot>> {
+    suspend fun scanStaleExecutionClaims(
+        scan: LlmExecutionRecoveryScan,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<List<LlmExecutionClaimSnapshot>> {
         return Result.failure(UnsupportedOperationException("Execution recovery scan is not implemented."))
     }
 
-    /** scan 時点の state / token / heartbeat を fence に conditional FAILED へ遷移させる。 */
-    suspend fun recoverStaleExecutionClaim(request: LlmExecutionRecoveryRequest): Result<Boolean> {
+    /** scan時点のstate/token/heartbeatをfenceにFAILEDへ遷移し、明示retryだけ共有permitを消費する。 */
+    suspend fun recoverStaleExecutionClaim(
+        request: LlmExecutionRecoveryRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+        retryPermit: LlmExecutionRecoveryRetryPermit,
+    ): Result<LlmExecutionRecoveryOutcome> {
         return Result.failure(UnsupportedOperationException("Execution claim recovery is not implemented."))
     }
 
-    /** scan page を一括 recovery し、conditional update に成功した invocation ID を返す。 */
-    suspend fun recoverStaleExecutionClaims(requests: List<LlmExecutionRecoveryRequest>): Result<Set<String>> {
-        return runCatching {
-            requests.mapNotNullTo(mutableSetOf()) { request ->
-                request.invocationId.takeIf { recoverStaleExecutionClaim(request).getOrThrow() }
-            }
-        }
+    /** recovery attempt UUID でreservationとauditを照合し、共有permitを取得できる場合だけ明示retryする。 */
+    suspend fun reconcileStaleExecutionRecovery(
+        request: LlmExecutionRecoveryRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+        retryPermit: LlmExecutionRecoveryRetryPermit,
+    ): Result<LlmExecutionRecoveryOutcome> {
+        return Result.failure(UnsupportedOperationException("Execution recovery reconciliation is not implemented."))
     }
 
     /** runner preflight 用に予約の trigger identity を返す。 */
@@ -435,6 +473,7 @@ interface LlmLaunchReservationRepository {
 @Suppress("TooManyFunctions")
 class InMemoryLlmLaunchReservationRepository(
     private val riskStateRepository: RiskStateRepository,
+    private val nanoTime: () -> Long = System::nanoTime,
 ) : LlmLaunchReservationRepository {
 
     private val mutex = Mutex()
@@ -557,7 +596,9 @@ class InMemoryLlmLaunchReservationRepository(
 
     override suspend fun scanStaleExecutionClaims(
         scan: LlmExecutionRecoveryScan,
+        deadline: LlmExecutionRecoveryDeadline,
     ): Result<List<LlmExecutionClaimSnapshot>> = runCatching {
+        deadline.requireStartReserve(nanoTime, RECOVERY_REPOSITORY_START_RESERVE_MILLIS)
         mutex.withLock {
             reservations.asSequence()
                 .filter { reservation -> reservation.status == LlmLaunchReservationStatus.RUNNING }
@@ -588,11 +629,20 @@ class InMemoryLlmLaunchReservationRepository(
         }
     }
 
-    override suspend fun recoverStaleExecutionClaim(request: LlmExecutionRecoveryRequest): Result<Boolean> {
+    override suspend fun recoverStaleExecutionClaim(
+        request: LlmExecutionRecoveryRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+        retryPermit: LlmExecutionRecoveryRetryPermit,
+    ): Result<LlmExecutionRecoveryOutcome> {
         return runCatching {
+            deadline.requireStartReserve(nanoTime, RECOVERY_REPOSITORY_START_RESERVE_MILLIS)
             mutex.withLock {
                 val index = reservations.indexOfFirst { reservation -> reservation.invocationId == request.invocationId }
-                if (index < 0) return@withLock false
+                if (index < 0) {
+                    return@withLock LlmExecutionRecoveryOutcome.OutcomeUnknown(
+                        IllegalStateException("Recovery reservation is missing."),
+                    )
+                }
 
                 val reservation = reservations[index]
                 val ownsObservedState = reservation.status == LlmLaunchReservationStatus.RUNNING &&
@@ -600,41 +650,34 @@ class InMemoryLlmLaunchReservationRepository(
                     reservation.reservedAt == request.observedReservedAt &&
                     reservation.claimantToken == request.claimantToken &&
                     reservation.heartbeatAt == request.observedHeartbeatAt
-                if (!ownsObservedState) return@withLock false
+                if (!ownsObservedState) {
+                    return@withLock reservation.toRecoveryOutcome(
+                        request,
+                    )
+                }
 
                 reservations[index] = reservation.copy(
                     status = LlmLaunchReservationStatus.FAILED,
                     finishedAt = request.finishedAt,
                     reason = request.reason,
                 )
-                true
+                LlmExecutionRecoveryOutcome.Recovered
             }
         }
     }
 
-    override suspend fun recoverStaleExecutionClaims(
-        requests: List<LlmExecutionRecoveryRequest>,
-    ): Result<Set<String>> = runCatching {
+    override suspend fun reconcileStaleExecutionRecovery(
+        request: LlmExecutionRecoveryRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+        retryPermit: LlmExecutionRecoveryRetryPermit,
+    ): Result<LlmExecutionRecoveryOutcome> = runCatching {
+        deadline.requireStartReserve(nanoTime, RECOVERY_REPOSITORY_START_RESERVE_MILLIS)
         mutex.withLock {
-            requests.mapNotNullTo(mutableSetOf()) { request ->
-                val index = reservations.indexOfFirst { reservation -> reservation.invocationId == request.invocationId }
-                if (index < 0) return@mapNotNullTo null
-
-                val reservation = reservations[index]
-                val ownsObservedState = reservation.status == LlmLaunchReservationStatus.RUNNING &&
-                    reservation.claimState == request.claimState &&
-                    reservation.reservedAt == request.observedReservedAt &&
-                    reservation.claimantToken == request.claimantToken &&
-                    reservation.heartbeatAt == request.observedHeartbeatAt
-                if (!ownsObservedState) return@mapNotNullTo null
-
-                reservations[index] = reservation.copy(
-                    status = LlmLaunchReservationStatus.FAILED,
-                    finishedAt = request.finishedAt,
-                    reason = request.reason,
+            reservations.firstOrNull { reservation -> reservation.invocationId == request.invocationId }
+                ?.toRecoveryOutcome(request)
+                ?: LlmExecutionRecoveryOutcome.OutcomeUnknown(
+                    IllegalStateException("Recovery reservation is missing."),
                 )
-                request.invocationId
-            }
         }
     }
 
@@ -767,6 +810,32 @@ private fun LlmExecutionClaimSnapshot?.isLiveAdmissionFor(claimantToken: String?
 }
 
 private fun LlmLaunchReservationRecord.recoverySortHeartbeatAt(): Instant = heartbeatAt ?: claimedAt ?: reservedAt
+
+private fun LlmLaunchReservationRecord.toRecoveryOutcome(
+    request: LlmExecutionRecoveryRequest,
+): LlmExecutionRecoveryOutcome {
+    val exactRecovered = status == LlmLaunchReservationStatus.FAILED &&
+        claimState == request.claimState &&
+        claimantToken == request.claimantToken &&
+        reservedAt == request.observedReservedAt &&
+        heartbeatAt == request.observedHeartbeatAt &&
+        finishedAt == request.finishedAt &&
+        reason == request.reason
+    if (exactRecovered) return LlmExecutionRecoveryOutcome.Recovered
+    if (status != LlmLaunchReservationStatus.RUNNING) return LlmExecutionRecoveryOutcome.TerminalObserved
+
+    val exactPrecondition = claimState == request.claimState &&
+        claimantToken == request.claimantToken &&
+        reservedAt == request.observedReservedAt &&
+        heartbeatAt == request.observedHeartbeatAt
+    return if (exactPrecondition) {
+        LlmExecutionRecoveryOutcome.OutcomeUnknown(
+            IllegalStateException("Recovery mutation outcome is not observable in memory."),
+        )
+    } else {
+        LlmExecutionRecoveryOutcome.PreconditionChanged
+    }
+}
 
 private fun LlmLaunchReservationRecord.recoverySortClaimedAt(): Instant = claimedAt ?: reservedAt
 

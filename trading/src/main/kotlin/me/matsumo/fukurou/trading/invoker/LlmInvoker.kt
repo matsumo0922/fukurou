@@ -47,6 +47,11 @@ interface ProcessRunner {
     suspend fun cleanup(command: RenderedLlmCommand): Result<Unit> = Result.success(Unit)
 }
 
+/** ProcessBuilder.start 成功時点を invocation lifecycle へ通知できる runner。 */
+internal interface ProcessStartAwareRunner : ProcessRunner {
+    suspend fun run(command: RenderedLlmCommand, onStarted: () -> Unit): Result<ProcessRunResult>
+}
+
 /**
  * provider 固有 output を semantic response と usage に正規化する境界。
  */
@@ -94,10 +99,19 @@ class ShellLlmInvoker(
             return Result.failure(throwable.classifyLlmFailure(request.provider))
         }
 
+        var processStarted = false
+
         return try {
             val startedAt = clock.instant()
-            LlmProcessTreeTerminationRegistry.markChildStarted(request.invocationId)
-            val processResult = processRunner.run(command).getOrThrow()
+            val processResult = if (processRunner is ProcessStartAwareRunner) {
+                processRunner.run(command) {
+                    processStarted = true
+                    LlmProcessTreeTerminationRegistry.markChildStarted(request.invocationId)
+                }.getOrThrow()
+            } else {
+                LlmProcessTreeTerminationRegistry.markChildStarted(request.invocationId)
+                processRunner.run(command).getOrThrow()
+            }
             LlmProcessTreeTerminationRegistry.record(
                 request.invocationId,
                 processResult.processTreeTerminationProof,
@@ -129,6 +143,7 @@ class ShellLlmInvoker(
                 ProcessTreeTerminationProof.PROVEN_EXITED,
             )
             val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
+            if (processStarted) throwable.addSuppressed(LlmProcessStartedMarker)
             cleanupFailure?.let { failure -> LlmArtifactCleanupQuarantine.activate(failure) }
             cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }
 
@@ -139,6 +154,7 @@ class ShellLlmInvoker(
                 ProcessTreeTerminationProof.UNCERTAIN,
             )
             val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
+            if (processStarted) throwable.addSuppressed(LlmProcessStartedMarker)
             cleanupFailure?.let { failure -> LlmArtifactCleanupQuarantine.activate(failure) }
             cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }
 
@@ -149,6 +165,7 @@ class ShellLlmInvoker(
                 ProcessTreeTerminationProof.UNCERTAIN,
             )
             val cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()
+            if (processStarted) throwable.addSuppressed(LlmProcessStartedMarker)
             cleanupFailure?.let { failure -> LlmArtifactCleanupQuarantine.activate(failure) }
             cleanupFailure?.let { failure -> throwable.addSuppressed(failure) }
 
@@ -178,11 +195,13 @@ object LlmProcessTreeTerminationRegistry {
         }
     }
 
-    /** ProcessRunnerが返したtyped proofを保存する。 */
+    /** 未解決のstarted childがある場合だけ、ProcessRunnerが返したtyped proofを消費する。 */
     fun record(invocationId: String, proof: ProcessTreeTerminationProof) {
-        proofs.compute(invocationId) { _, current ->
-            ProcessTreeProofState(
-                anyUncertain = current?.anyUncertain == true || proof == ProcessTreeTerminationProof.UNCERTAIN,
+        proofs.computeIfPresent(invocationId) { _, current ->
+            if (!current.childUnresolved) return@computeIfPresent current
+
+            current.copy(
+                anyUncertain = current.anyUncertain || proof == ProcessTreeTerminationProof.UNCERTAIN,
                 childUnresolved = false,
                 childCompleted = true,
             )
@@ -220,6 +239,14 @@ class ProcessTreeTerminationProvenCancellationException(cause: CancellationExcep
         initCause(cause)
     }
 }
+
+/** cancellation が child process 起動後に発生したことを observation 境界へ伝える marker。 */
+internal object LlmProcessStartedMarker : Throwable(
+    "LLM child process started.",
+    null,
+    false,
+    false,
+)
 
 /** request/render 中に生成済み artifact を回収できなかった failure。 */
 internal class LlmArtifactCleanupException(cause: Throwable) : IllegalStateException(

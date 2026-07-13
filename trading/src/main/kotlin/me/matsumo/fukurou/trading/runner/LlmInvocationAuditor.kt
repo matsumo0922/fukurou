@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.runner
 
-import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -8,19 +9,30 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.LlmPhaseInputCaptureException
+import me.matsumo.fukurou.trading.audit.LlmPhaseInputManifest
+import me.matsumo.fukurou.trading.audit.LlmPhaseManifestRecorder
+import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.evaluation.LlmInvocationTimedOutException
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
 import me.matsumo.fukurou.trading.invoker.CODEX_INVOCATION_RESULT_UNAVAILABLE
+import me.matsumo.fukurou.trading.invoker.DEFAULT_MCP_MANIFEST_DIRECTORY
+import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupQuarantine
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.invoker.LlmProcessStartedMarker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.McpLaunchManifestWriter
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.invoker.renderedEffortOrNull
 import me.matsumo.fukurou.trading.invoker.safeExceptionType
+import java.nio.file.Files
+import java.nio.file.Path
 import java.time.Clock
 import java.time.Duration
 
@@ -33,6 +45,7 @@ import java.time.Duration
  * @param toolName audit event の tool 名
  * @param humanLogger 運用ログ出力
  * @param authFailureMessage 認証失敗疑いを検出したときに出す運用ログ。null なら出さない
+ * @param unstartedManifestCleanup child process 起動前に残った MCP manifest の cleanup 境界
  */
 class LlmInvocationAuditor(
     private val commandEventLog: CommandEventLog,
@@ -41,12 +54,15 @@ class LlmInvocationAuditor(
     private val toolName: String = DEFAULT_LLM_PHASE_AUDIT_TOOL_NAME,
     private val humanLogger: (String) -> Unit = {},
     private val authFailureMessage: String? = null,
+    private val phaseManifestRecorder: LlmPhaseManifestRecorder? = null,
+    private val decisionRepository: DecisionRepository? = null,
+    private val unstartedManifestCleanup: (Path) -> Unit = { path -> Files.deleteIfExists(path) },
 ) {
 
     /**
      * LLM phase を起動し、完了または起動失敗を audit へ保存する。
      */
-    @Suppress("LongMethod")
+    @Suppress("CyclomaticComplexMethod", "LongMethod")
     suspend fun invokeAndAudit(
         phaseName: String,
         context: DecisionRunContext,
@@ -54,37 +70,81 @@ class LlmInvocationAuditor(
         llmInvoker: LlmInvoker,
     ): Result<LlmPhaseAuditResult> {
         val startedAt = System.nanoTime()
-        val result = try {
-            llmInvoker.invoke(request)
-        } catch (throwable: CancellationException) {
-            throw throwable.classifyLlmFailure(request.provider)
+        var phaseManifest: LlmPhaseInputManifest? = null
+        var submissionGateway: LlmDecisionSubmissionGateway? = null
+        var result: Result<LlmInvocationResult>? = null
+        var invocationAttempted = false
+        var invocationThrowable: Throwable? = null
+        try {
+            phaseManifestRecorder?.let { recorder ->
+                phaseManifest = recorder.appendInput(request)
+                recorder.bindInput(request, requireNotNull(phaseManifest))
+            }
+            submissionGateway = createSubmissionGateway(request, phaseManifest)
+            invocationAttempted = true
+            result = llmInvoker.invoke(request)
         } catch (throwable: Throwable) {
-            throw throwable.classifyLlmFailure(request.provider)
+            invocationThrowable = throwable.asPreLaunchCaptureFailure(request, invocationAttempted)
+        }
+
+        val completedResult = result
+        val invocationResult = completedResult?.getOrNull()
+        val processResult = invocationResult?.processResult
+        val resultFailure = completedResult?.exceptionOrNull()
+        val processStarted = processResult != null ||
+            invocationThrowable.hasSuppressedProcessStartedMarker() ||
+            resultFailure.hasSuppressedProcessStartedMarker()
+        val processCleanupFailure = invocationResult?.cleanupFailure
+        val gatewayCleanupFailure = withContext(NonCancellable) {
+            runCatching { submissionGateway?.close() }.exceptionOrNull()
+        }
+        val manifestCleanupFailure = cleanupUnstartedManifest(request, processStarted)
+        val observationFailure = phaseManifest?.let { manifest ->
+            withContext(NonCancellable) {
+                runCatching {
+                    requireNotNull(phaseManifestRecorder).appendObservation(
+                        manifest = manifest,
+                        observedModels = invocationResult?.usage?.modelUsages
+                            ?.map { modelUsage -> modelUsage.model }
+                            .orEmpty(),
+                        started = processStarted,
+                    )
+                }.exceptionOrNull()
+            }
         }
         val duration = Duration.ofNanos(System.nanoTime() - startedAt)
-        val invocationResult = result.getOrNull()
-        val processResult = invocationResult?.processResult
-        val cleanupFailure = invocationResult?.cleanupFailure
-        val startFailure = result.exceptionOrNull()
-            ?.takeIf { processResult == null }
+        val cleanupFailures = listOf(processCleanupFailure, gatewayCleanupFailure, manifestCleanupFailure)
+        val startFailure = (invocationThrowable ?: resultFailure).takeIf { processResult == null }
         val usage = invocationResult?.usage
         val auditSignals = (processResult?.auditSignals() ?: LlmPhaseAuditSignals()).copy(
-            cleanupFailed = cleanupFailure != null,
+            cleanupFailed = cleanupFailures.any { failure -> failure != null },
         )
+        val appendFailure = withContext(NonCancellable) {
+            runCatching {
+                appendPhase(
+                    context = context,
+                    phaseName = phaseName,
+                    duration = duration,
+                    details = phaseDetails(
+                        request = request,
+                        processResult = processResult,
+                        startFailure = startFailure,
+                        usage = usage,
+                        auditSignals = auditSignals,
+                    ),
+                ).getOrThrow()
+            }.exceptionOrNull()
+        }
+        val terminalFailures = cleanupFailures + listOf(observationFailure, appendFailure)
 
-        val appendFailure = appendPhase(
-            context = context,
-            phaseName = phaseName,
-            duration = duration,
-            details = phaseDetails(
-                request = request,
-                processResult = processResult,
-                startFailure = startFailure,
-                usage = usage,
-                auditSignals = auditSignals,
-            ),
-        ).exceptionOrNull()
-        appendFailure?.let { failure -> throw failure.classifyLlmFailure(request.provider) }
+        invocationThrowable?.let { throwable ->
+            throwable.suppressInOrder(terminalFailures)
+            throw throwable.classifyLlmFailure(request.provider)
+        }
+        resultFailure?.let { failure ->
+            failure.suppressInOrder(terminalFailures)
+            return Result.failure(failure.classifyLlmFailure(request.provider))
+        }
         if (auditSignals.authFailureSuspected && authFailureMessage != null) {
             humanLogger(authFailureMessage)
         }
@@ -92,35 +152,95 @@ class LlmInvocationAuditor(
         val processFailed = processResult?.didFail() ?: false
 
         if (processResult?.status == ProcessRunStatus.TIMED_OUT) {
-            return Result.failure(LlmInvocationTimedOutException(phaseName))
+            val failure = LlmInvocationTimedOutException(phaseName)
+            failure.suppressInOrder(terminalFailures)
+
+            return Result.failure(failure)
         }
 
         if (processFailed) {
             val failure = IllegalStateException("$phaseName process did not exit cleanly.")
-            cleanupFailure?.let { cleanup -> failure.addSuppressed(cleanup) }
+            failure.suppressInOrder(terminalFailures)
 
             return Result.failure(failure.classifyLlmFailure(request.provider))
         }
 
+        val cleanupFailure = cleanupFailures.filterNotNull().firstOrNull()
         if (cleanupFailure != null) {
+            cleanupFailure.suppressInOrder(
+                cleanupFailures.dropWhile { failure -> failure !== cleanupFailure } + listOf(
+                    observationFailure,
+                    appendFailure,
+                ),
+            )
             return Result.failure(cleanupFailure.classifyLlmFailure(request.provider))
         }
 
-        return result.fold(
-            onSuccess = { invocation ->
-                humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
+        appendFailure?.let { failure ->
+            failure.suppressInOrder(listOf(observationFailure))
+            throw failure.classifyLlmFailure(request.provider)
+        }
 
-                Result.success(
-                    LlmPhaseAuditResult(
-                        invocationResult = invocation,
-                        duration = duration,
-                        authFailureSuspected = auditSignals.authFailureSuspected,
-                        cliErrorReported = auditSignals.cliErrorReported,
-                    ),
-                )
-            },
-            onFailure = { throwable -> Result.failure(throwable.classifyLlmFailure(request.provider)) },
+        val completedInvocation = requireNotNull(invocationResult)
+        humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
+
+        return Result.success(
+            LlmPhaseAuditResult(
+                invocationResult = completedInvocation,
+                duration = duration,
+                authFailureSuspected = auditSignals.authFailureSuspected,
+                cliErrorReported = auditSignals.cliErrorReported,
+                observationAppendFailure = observationFailure,
+            ),
         )
+    }
+
+    private suspend fun cleanupUnstartedManifest(request: LlmInvocationRequest, processStarted: Boolean): Throwable? {
+        if (processStarted) return null
+        val manifestPath = request.mcpServer?.manifestPath ?: return null
+
+        return withContext(NonCancellable) {
+            runCatching { unstartedManifestCleanup(manifestPath) }
+                .exceptionOrNull()
+                ?.also(LlmArtifactCleanupQuarantine::activate)
+        }
+    }
+
+    private fun createSubmissionGateway(
+        request: LlmInvocationRequest,
+        phaseManifest: me.matsumo.fukurou.trading.audit.LlmPhaseInputManifest?,
+    ): LlmDecisionSubmissionGateway? {
+        val server = request.mcpServer ?: return null
+        val manifest = requireNotNull(phaseManifest) { "MCP launch requires a persisted phase manifest." }
+        val repository = requireNotNull(decisionRepository) {
+            "MCP launch requires an app-owned decision repository."
+        }
+        val siblingSocketPath = server.manifestPath.resolveSibling("${server.manifestId}.sock")
+        val isProductionManifestDirectory = server.manifestPath.parent.toAbsolutePath().normalize() ==
+            java.nio.file.Path.of(DEFAULT_MCP_MANIFEST_DIRECTORY).toAbsolutePath().normalize()
+        val socketPath = if (!isProductionManifestDirectory && siblingSocketPath.toString().encodeToByteArray().size > 103) {
+            java.nio.file.Path.of("/tmp", "fukurou-${server.manifestId.take(24)}.sock")
+        } else {
+            siblingSocketPath
+        }
+        val gateway = LlmDecisionSubmissionGateway.start(
+            socketPath = socketPath,
+            repository = repository,
+            invocationId = request.invocationId,
+            phase = request.phase,
+            phaseManifestId = manifest.phaseManifestId,
+            effectiveInvocationHash = manifest.effectiveInvocationHash,
+        )
+        try {
+            McpLaunchManifestWriter.bindSubmissionSocket(server.manifestPath, socketPath)
+
+            return gateway
+        } catch (throwable: Throwable) {
+            runCatching { gateway.close() }
+                .exceptionOrNull()
+                ?.let(throwable::addSuppressed)
+            throw throwable
+        }
     }
 
     /**
@@ -137,6 +257,23 @@ class LlmInvocationAuditor(
             put("durationMillis", duration.toMillis())
             put("details", details)
         }.toString()
+        redactor.requireNoKnownSecret(
+            context.decisionRunId,
+            context.llmProvider,
+            context.promptHash,
+            context.systemPromptVersion,
+            context.marketSnapshotId,
+            context.runtimeConfigVersionId,
+            context.runtimeConfigHash,
+            toolName,
+            context.decisionRunId,
+        )
+        ManifestPersistencePolicy.validateCommandEvent(
+            context = context,
+            toolName = toolName,
+            clientRequestId = context.decisionRunId,
+            payload = payload,
+        )
 
         return commandEventLog.append(
             CommandEvent(
@@ -165,7 +302,8 @@ class LlmInvocationAuditor(
         usage: LlmUsageDetails?,
         auditSignals: LlmPhaseAuditSignals,
     ): JsonObject {
-        return buildJsonObject {
+        val serializedUsage = usage?.let(LlmUsageParser::toJsonObject)
+        val details = buildJsonObject {
             put("provider", request.provider.name.lowercase())
             putAssignmentAuditDetails(request, usage)
             put("status", processResult?.status?.name ?: "FAILED_TO_START")
@@ -200,21 +338,38 @@ class LlmInvocationAuditor(
             if (auditSignals.cliErrorReported) {
                 put("cliErrorReported", "true")
             }
-            usage?.let { parsedUsage ->
-                put("usage", LlmUsageParser.toJsonObject(parsedUsage))
-            }
+            serializedUsage?.let { parsedUsage -> put("usage", parsedUsage) }
         }
+        ManifestPersistencePolicy.validateUsageDetails(
+            observedModels = usage?.modelUsages?.map { modelUsage -> modelUsage.model }.orEmpty(),
+            serializedUsage = serializedUsage?.toString(),
+            serializedDetails = details.toString(),
+        )
+
+        return details
     }
 
     private fun kotlinx.serialization.json.JsonObjectBuilder.putAssignmentAuditDetails(
         request: LlmInvocationRequest,
         usage: LlmUsageDetails?,
     ) {
+        val observedModels = usage?.modelUsages?.map { modelUsage -> modelUsage.model }.orEmpty()
+        redactor.requireNoKnownSecret(
+            request.model,
+            request.effort.name,
+            request.effort.renderedEffortOrNull(),
+            *observedModels.toTypedArray(),
+        )
+        ManifestPersistencePolicy.validateObservedIdentityStrings(
+            request.model,
+            request.effort.name,
+            request.effort.renderedEffortOrNull(),
+            *observedModels.toTypedArray(),
+        )
         request.model?.let { configuredModel -> put("configuredModel", configuredModel) }
         put("configuredEffort", request.effort.name)
         request.effort.renderedEffortOrNull()?.let { renderedEffort -> put("renderedEffort", renderedEffort) }
 
-        val observedModels = usage?.modelUsages?.map { modelUsage -> modelUsage.model }.orEmpty()
         observedModels.takeIf(List<String>::isNotEmpty)?.let { models -> put("observedModels", models.joinToString(",")) }
         put("modelObserved", observedModels.isNotEmpty().toString())
     }
@@ -254,6 +409,30 @@ class LlmInvocationAuditor(
     }
 }
 
+private fun Throwable?.hasSuppressedProcessStartedMarker(): Boolean {
+    return this?.suppressed?.any { failure -> failure === LlmProcessStartedMarker } == true
+}
+
+private fun Throwable.suppressInOrder(failures: List<Throwable?>) {
+    failures.filterNotNull()
+        .filter { failure -> failure !== this }
+        .filterNot { failure -> suppressed.any { existing -> existing === failure } }
+        .forEach(::addSuppressed)
+}
+
+private fun Throwable.asPreLaunchCaptureFailure(
+    request: LlmInvocationRequest,
+    invocationAttempted: Boolean,
+): Throwable {
+    val standardDecisionPhase = request.phase == me.matsumo.fukurou.trading.invoker.LlmInvocationPhase.PROPOSER ||
+        request.phase == me.matsumo.fukurou.trading.invoker.LlmInvocationPhase.FALSIFIER
+    if (!standardDecisionPhase) return this
+    if (invocationAttempted) return this
+    if (this is kotlinx.coroutines.CancellationException) return this
+
+    return LlmPhaseInputCaptureException(this)
+}
+
 /**
  * LLM phase audit の結果。
  *
@@ -267,6 +446,7 @@ data class LlmPhaseAuditResult(
     val duration: Duration,
     val authFailureSuspected: Boolean,
     val cliErrorReported: Boolean,
+    val observationAppendFailure: Throwable? = null,
 )
 
 /**

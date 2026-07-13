@@ -46,11 +46,15 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryDeadline
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryOutcome
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRequest
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRetryPermit
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
@@ -114,6 +118,7 @@ import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.runner.LlmExecutionRecoveryService
 import me.matsumo.fukurou.trading.runner.LlmExecutionTerminationFenceRegistry
+import me.matsumo.fukurou.trading.runner.MISSING_CLAIMANT_TOKEN
 import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
@@ -127,14 +132,17 @@ import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyViolation
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import org.postgresql.ds.PGSimpleDataSource
 import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
+import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
 import java.math.BigDecimal
 import java.nio.file.Files
 import java.nio.file.Path
 import java.sql.Connection
 import java.sql.PreparedStatement
+import java.sql.SQLException
 import java.sql.SQLTimeoutException
 import java.sql.Types
 import java.time.Clock
@@ -145,6 +153,7 @@ import java.time.ZoneOffset
 import java.util.UUID
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.sql.DataSource
 import kotlin.test.Test
@@ -4682,21 +4691,29 @@ class PostgresPersistenceIntegrationTest {
             reservationRepository.findExecutionClaim("current-process-recovery").getOrThrow(),
         )
 
-        assertEquals(
-            setOf("current-process-recovery"),
-            reservationRepository.recoverStaleExecutionClaims(
-                listOf(
-                    LlmExecutionRecoveryRequest(
-                        invocationId = "current-process-recovery",
-                        claimState = LlmExecutionClaimState.CLAIMED,
-                        claimantToken = "recovery-token-12345678",
-                        observedHeartbeatAt = snapshot.heartbeatAt,
-                        observedReservedAt = snapshot.reservedAt,
-                        finishedAt = now.plusSeconds(600),
-                        reason = "STALE_CLAIMED_RESERVATION_RECOVERED",
-                        terminationFence = "PROCESS_TREE_EXITED",
-                    ),
-                ),
+        val recoveryRequest = LlmExecutionRecoveryRequest(
+            invocationId = "current-process-recovery",
+            claimState = LlmExecutionClaimState.CLAIMED,
+            claimantToken = "recovery-token-12345678",
+            observedHeartbeatAt = snapshot.heartbeatAt,
+            observedReservedAt = snapshot.reservedAt,
+            finishedAt = now.plusSeconds(600),
+            reason = "STALE_CLAIMED_RESERVATION_RECOVERED",
+            terminationFence = "PROCESS_TREE_EXITED",
+        )
+        val retryPermit = LlmExecutionRecoveryRetryPermit()
+        assertIs<LlmExecutionRecoveryOutcome.Recovered>(
+            reservationRepository.recoverStaleExecutionClaim(
+                request = recoveryRequest,
+                deadline = recoveryDeadline(),
+                retryPermit = retryPermit,
+            ).getOrThrow(),
+        )
+        assertIs<LlmExecutionRecoveryOutcome.Recovered>(
+            reservationRepository.reconcileStaleExecutionRecovery(
+                request = recoveryRequest,
+                deadline = recoveryDeadline(),
+                retryPermit = retryPermit,
             ).getOrThrow(),
         )
 
@@ -4705,10 +4722,339 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(LlmRunTerminalCause.RUNNER_FAILED, recoveredRun.terminalCause)
         val auditPayload = selectRecoveryAuditPayload(database, "current-process-recovery")
         assertTrue(auditPayload.contains("current_process_periodic_scan"))
+        assertTrue(auditPayload.contains(recoveryRequest.recoveryAttemptId.toString()))
         assertTrue(auditPayload.contains("PROCESS_TREE_EXITED"))
         assertTrue(auditPayload.contains("12345678"))
         assertTrue(auditPayload.contains(Regex("\"runRecovered\"\\s*:\\s*true")))
         assertTrue(auditPayload.contains(Regex("\"reservationRecovered\"\\s*:\\s*true")))
+    }
+
+    @Test
+    fun recoveryCommitResponseLossUsesExactReadbackWithoutAutomaticMutationRetry() = runPostgresTest {
+        val now = fixedInstant()
+        val (faultDataSource, faultController) = createRecoveryCommitFaultDataSource()
+        faultDataSource.use {
+            val faultDatabase = ExposedDatabase.connect(faultDataSource)
+            TradingPersistenceBootstrap(faultDatabase, fixedClock()).ensureSchema().getOrThrow()
+            val repository = ExposedLlmLaunchReservationRepository(faultDatabase)
+            repository.tryReserve(
+                llmLaunchReservationRequest("commit-response-loss", LlmRunnerConfig(), now),
+            ).getOrThrow()
+            val snapshot = requireNotNull(repository.findExecutionClaim("commit-response-loss").getOrThrow())
+            val request = LlmExecutionRecoveryRequest(
+                invocationId = snapshot.invocationId,
+                claimState = requireNotNull(snapshot.claimState),
+                claimantToken = snapshot.claimantToken,
+                observedHeartbeatAt = snapshot.heartbeatAt,
+                observedReservedAt = snapshot.reservedAt,
+                finishedAt = now.plusSeconds(1_800),
+                reason = "STALE_AVAILABLE_RESERVATION_RECOVERED",
+                terminationFence = "NO_CHILD_STARTED",
+            )
+            faultController.armCommitResponseLoss()
+
+            assertIs<LlmExecutionRecoveryOutcome.Recovered>(
+                repository.recoverStaleExecutionClaim(
+                    request = request,
+                    deadline = recoveryDeadline(),
+                    retryPermit = LlmExecutionRecoveryRetryPermit(),
+                ).getOrThrow(),
+            )
+            assertEquals(1, faultController.recoveryMutationEntries)
+            assertEquals(1, faultController.lostCommitResponses)
+            assertEquals(1, countRecoveryAuditEvents(faultDatabase, snapshot.invocationId))
+            assertTrue(selectRecoveryAuditPayload(faultDatabase, snapshot.invocationId).contains(request.recoveryAttemptId.toString()))
+        }
+    }
+
+    @Test
+    fun recoveryPreCommitFailureRetriesMutationExactlyOnceAfterUncommittedReadback() = runPostgresTest {
+        val now = fixedInstant()
+        val (faultDataSource, faultController) = createRecoveryCommitFaultDataSource()
+        faultDataSource.use {
+            val faultDatabase = ExposedDatabase.connect(faultDataSource)
+            TradingPersistenceBootstrap(faultDatabase, fixedClock()).ensureSchema().getOrThrow()
+            val repository = ExposedLlmLaunchReservationRepository(faultDatabase)
+            repository.tryReserve(
+                llmLaunchReservationRequest("pre-commit-retry", LlmRunnerConfig(), now),
+            ).getOrThrow()
+            val snapshot = requireNotNull(repository.findExecutionClaim("pre-commit-retry").getOrThrow())
+            val request = LlmExecutionRecoveryRequest(
+                invocationId = snapshot.invocationId,
+                claimState = requireNotNull(snapshot.claimState),
+                claimantToken = snapshot.claimantToken,
+                observedHeartbeatAt = snapshot.heartbeatAt,
+                observedReservedAt = snapshot.reservedAt,
+                finishedAt = now.plusSeconds(1_800),
+                reason = "STALE_AVAILABLE_RESERVATION_RECOVERED",
+                terminationFence = "NO_CHILD_STARTED",
+            )
+            faultController.armPreCommitMutationFailure()
+
+            assertIs<LlmExecutionRecoveryOutcome.Recovered>(
+                repository.recoverStaleExecutionClaim(
+                    request = request,
+                    deadline = recoveryDeadline(),
+                    retryPermit = LlmExecutionRecoveryRetryPermit(),
+                ).getOrThrow(),
+            )
+            assertEquals(2, faultController.recoveryMutationEntries)
+            assertEquals(1, countRecoveryAuditEvents(faultDatabase, snapshot.invocationId))
+        }
+    }
+
+    @Test
+    fun recoveryExactReadbackClassifiesPartialAndChangedStatesFailClosed() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+
+        suspend fun createRequest(invocationId: String): LlmExecutionRecoveryRequest {
+            repository.tryReserve(llmLaunchReservationRequest(invocationId, LlmRunnerConfig(), now)).getOrThrow()
+            val snapshot = requireNotNull(repository.findExecutionClaim(invocationId).getOrThrow())
+            return LlmExecutionRecoveryRequest(
+                invocationId = invocationId,
+                claimState = requireNotNull(snapshot.claimState),
+                claimantToken = snapshot.claimantToken,
+                observedHeartbeatAt = snapshot.heartbeatAt,
+                observedReservedAt = snapshot.reservedAt,
+                finishedAt = now.plusSeconds(1_800),
+                reason = "STALE_AVAILABLE_RESERVATION_RECOVERED",
+                terminationFence = "NO_CHILD_STARTED",
+            )
+        }
+
+        val changedRequest = createRequest("readback-changed")
+        exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                "UPDATE llm_launch_reservations SET execution_claim_heartbeat_at=? WHERE invocation_id=?",
+            ).use { statement ->
+                statement.setLong(1, changedRequest.finishedAt.toEpochMilli())
+                statement.setString(2, changedRequest.invocationId)
+                statement.executeUpdate()
+            }
+        }
+        assertIs<LlmExecutionRecoveryOutcome.PreconditionChanged>(
+            repository.reconcileStaleExecutionRecovery(
+                request = changedRequest,
+                deadline = recoveryDeadline(),
+                retryPermit = LlmExecutionRecoveryRetryPermit(),
+            ).getOrThrow(),
+        )
+        exposedTransaction(database) {
+            jdbcConnection().prepareStatement("DELETE FROM llm_launch_reservations WHERE invocation_id=?").use { statement ->
+                statement.setString(1, changedRequest.invocationId)
+                statement.executeUpdate()
+            }
+        }
+
+        val terminalOnlyRequest = createRequest("readback-terminal-only")
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = terminalOnlyRequest.invocationId,
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = terminalOnlyRequest.reason,
+                finishedAt = terminalOnlyRequest.finishedAt,
+            ),
+        ).getOrThrow()
+        assertIs<LlmExecutionRecoveryOutcome.OutcomeUnknown>(
+            repository.reconcileStaleExecutionRecovery(
+                request = terminalOnlyRequest,
+                deadline = recoveryDeadline(),
+                retryPermit = LlmExecutionRecoveryRetryPermit(),
+            ).getOrThrow(),
+        )
+
+        val otherTerminalRequest = createRequest("readback-other-terminal")
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = otherTerminalRequest.invocationId,
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = "other",
+                finishedAt = otherTerminalRequest.finishedAt,
+            ),
+        ).getOrThrow()
+        assertIs<LlmExecutionRecoveryOutcome.TerminalObserved>(
+            repository.reconcileStaleExecutionRecovery(
+                request = otherTerminalRequest,
+                deadline = recoveryDeadline(),
+                retryPermit = LlmExecutionRecoveryRetryPermit(),
+            ).getOrThrow(),
+        )
+
+        val auditOnlyRequest = createRequest("readback-audit-only")
+        ExposedCommandEventLog(database).append(recoveryAuditFixture(auditOnlyRequest)).getOrThrow()
+        exposedTransaction(database) {
+            jdbcConnection().prepareStatement("DELETE FROM llm_launch_reservations WHERE invocation_id=?").use { statement ->
+                statement.setString(1, auditOnlyRequest.invocationId)
+                statement.executeUpdate()
+            }
+        }
+        assertIs<LlmExecutionRecoveryOutcome.OutcomeUnknown>(
+            repository.reconcileStaleExecutionRecovery(
+                request = auditOnlyRequest,
+                deadline = recoveryDeadline(),
+                retryPermit = LlmExecutionRecoveryRetryPermit(),
+            ).getOrThrow(),
+        )
+    }
+
+    @Test
+    fun recoveryCommitAndFirstReadbackLossRemainPendingUntilNextTickExactConfirmation() = runPostgresTest {
+        LlmExecutionAdmissionHealth.resetForTest()
+        LlmExecutionTerminationFenceRegistry.resetForTest()
+        val reservedAt = fixedInstant()
+        val now = reservedAt.plusSeconds(1_800)
+        val (faultDataSource, faultController) = createRecoveryCommitFaultDataSource()
+        try {
+            faultDataSource.use {
+                val faultDatabase = ExposedDatabase.connect(faultDataSource)
+                TradingPersistenceBootstrap(faultDatabase, fixedClock()).ensureSchema().getOrThrow()
+                val repository = ExposedLlmLaunchReservationRepository(faultDatabase)
+                repository.tryReserve(
+                    llmLaunchReservationRequest("commit-readback-loss", LlmRunnerConfig(), reservedAt),
+                ).getOrThrow()
+                LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+                    invocationId = "commit-readback-loss",
+                    claimantToken = MISSING_CLAIMANT_TOKEN,
+                    observedAt = reservedAt,
+                )
+                val service = LlmExecutionRecoveryService(
+                    repository = repository,
+                    policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+                    clock = Clock.fixed(now, ZoneOffset.UTC),
+                )
+                faultController.armCommitResponseLoss()
+                faultController.armFirstReadbackFailure()
+
+                assertTrue(service.tick().isFailure)
+                assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+                assertEquals(1, faultController.recoveryMutationEntries)
+                assertEquals(1, countRecoveryAuditEvents(faultDatabase, "commit-readback-loss"))
+                assertEquals(1, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+
+                faultController.clearDatabaseEvents()
+                assertEquals(1, service.tick().getOrThrow())
+                assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+                assertEquals(listOf("READBACK", "SCAN"), faultController.observedDatabaseEvents)
+                assertEquals(1, faultController.recoveryMutationEntries)
+                assertEquals(1, countRecoveryAuditEvents(faultDatabase, "commit-readback-loss"))
+                assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+            }
+        } finally {
+            LlmExecutionAdmissionHealth.resetForTest()
+            LlmExecutionTerminationFenceRegistry.resetForTest()
+        }
+    }
+
+    @Test
+    fun recoveryRetryPermitPreventsThirdMutationAfterTwoPreCommitFailures() = runPostgresTest {
+        LlmExecutionAdmissionHealth.resetForTest()
+        LlmExecutionTerminationFenceRegistry.resetForTest()
+        val reservedAt = fixedInstant()
+        val now = reservedAt.plusSeconds(1_800)
+        val (faultDataSource, faultController) = createRecoveryCommitFaultDataSource()
+        try {
+            faultDataSource.use {
+                val faultDatabase = ExposedDatabase.connect(faultDataSource)
+                TradingPersistenceBootstrap(faultDatabase, fixedClock()).ensureSchema().getOrThrow()
+                val repository = ExposedLlmLaunchReservationRepository(faultDatabase)
+                repository.tryReserve(
+                    llmLaunchReservationRequest("retry-budget-exhausted", LlmRunnerConfig(), reservedAt),
+                ).getOrThrow()
+                LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+                    invocationId = "retry-budget-exhausted",
+                    claimantToken = MISSING_CLAIMANT_TOKEN,
+                    observedAt = reservedAt,
+                )
+                val service = LlmExecutionRecoveryService(
+                    repository = repository,
+                    policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+                    clock = Clock.fixed(now, ZoneOffset.UTC),
+                )
+                faultController.armPreCommitMutationFailure(count = 2)
+
+                assertTrue(service.tick().isFailure)
+                assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+                assertEquals(2, faultController.recoveryMutationEntries)
+                assertEquals(0, countRecoveryAuditEvents(faultDatabase, "retry-budget-exhausted"))
+                assertEquals(
+                    LlmLaunchReservationStatus.RUNNING,
+                    repository.findExecutionClaim("retry-budget-exhausted").getOrThrow()?.status,
+                )
+                assertEquals(1, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+
+                repeat(2) {
+                    faultController.clearDatabaseEvents()
+
+                    assertTrue(service.tick().isFailure)
+                    assertEquals(listOf("READBACK"), faultController.observedDatabaseEvents)
+                    assertEquals(2, faultController.recoveryMutationEntries)
+                    assertEquals(0, countRecoveryAuditEvents(faultDatabase, "retry-budget-exhausted"))
+                    assertEquals(
+                        LlmLaunchReservationStatus.RUNNING,
+                        repository.findExecutionClaim("retry-budget-exhausted").getOrThrow()?.status,
+                    )
+                    assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+                    assertEquals(1, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+                }
+            }
+        } finally {
+            LlmExecutionAdmissionHealth.resetForTest()
+            LlmExecutionTerminationFenceRegistry.resetForTest()
+        }
+    }
+
+    @Test
+    fun recoveryInitialReadbackLossPreservesOneRetryForNextTick() = runPostgresTest {
+        LlmExecutionAdmissionHealth.resetForTest()
+        LlmExecutionTerminationFenceRegistry.resetForTest()
+        val reservedAt = fixedInstant()
+        val now = reservedAt.plusSeconds(1_800)
+        val (faultDataSource, faultController) = createRecoveryCommitFaultDataSource()
+        try {
+            faultDataSource.use {
+                val faultDatabase = ExposedDatabase.connect(faultDataSource)
+                TradingPersistenceBootstrap(faultDatabase, fixedClock()).ensureSchema().getOrThrow()
+                val repository = ExposedLlmLaunchReservationRepository(faultDatabase)
+                repository.tryReserve(
+                    llmLaunchReservationRequest("retry-after-readback-loss", LlmRunnerConfig(), reservedAt),
+                ).getOrThrow()
+                LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+                    invocationId = "retry-after-readback-loss",
+                    claimantToken = MISSING_CLAIMANT_TOKEN,
+                    observedAt = reservedAt,
+                )
+                val service = LlmExecutionRecoveryService(
+                    repository = repository,
+                    policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+                    clock = Clock.fixed(now, ZoneOffset.UTC),
+                )
+                faultController.armPreCommitMutationFailure()
+                faultController.armFirstReadbackFailure()
+
+                assertTrue(service.tick().isFailure)
+                assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+                assertEquals(1, faultController.recoveryMutationEntries)
+                assertEquals(0, countRecoveryAuditEvents(faultDatabase, "retry-after-readback-loss"))
+                assertEquals(1, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+
+                faultController.clearDatabaseEvents()
+                assertEquals(1, service.tick().getOrThrow())
+                assertEquals(listOf("READBACK", "READBACK", "SCAN"), faultController.observedDatabaseEvents)
+                assertEquals(2, faultController.recoveryMutationEntries)
+                assertEquals(1, countRecoveryAuditEvents(faultDatabase, "retry-after-readback-loss"))
+                assertEquals(
+                    LlmLaunchReservationStatus.FAILED,
+                    repository.findExecutionClaim("retry-after-readback-loss").getOrThrow()?.status,
+                )
+                assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+                assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+            }
+        } finally {
+            LlmExecutionAdmissionHealth.resetForTest()
+            LlmExecutionTerminationFenceRegistry.resetForTest()
+        }
     }
 
     @Test
@@ -4745,10 +5091,15 @@ class PostgresPersistenceIntegrationTest {
             )
         }
 
-        assertEquals(
-            fixtures.mapTo(mutableSetOf()) { fixture -> fixture.first },
-            repository.recoverStaleExecutionClaims(requests).getOrThrow(),
-        )
+        requests.forEach { request ->
+            assertIs<LlmExecutionRecoveryOutcome.Recovered>(
+                repository.recoverStaleExecutionClaim(
+                    request = request,
+                    deadline = recoveryDeadline(),
+                    retryPermit = LlmExecutionRecoveryRetryPermit(),
+                ).getOrThrow(),
+            )
+        }
         fixtures.forEach { (invocationId, _, _) ->
             assertEquals(
                 LlmLaunchReservationStatus.FAILED,
@@ -4826,7 +5177,13 @@ class PostgresPersistenceIntegrationTest {
                         ),
                     ).getOrThrow()
                 },
-                async(Dispatchers.IO) { repository.recoverStaleExecutionClaim(recoveryRequest).getOrThrow() },
+                async(Dispatchers.IO) {
+                    repository.recoverStaleExecutionClaim(
+                        request = recoveryRequest,
+                        deadline = recoveryDeadline(),
+                        retryPermit = LlmExecutionRecoveryRetryPermit(),
+                    ).getOrThrow()
+                },
                 async(Dispatchers.IO) { bootstrap.recoverPreviousGeneration().getOrThrow() },
             ).map { it.await() }
         }
@@ -4846,7 +5203,13 @@ class PostgresPersistenceIntegrationTest {
                 claimantToken = "race-token",
             ),
         ).getOrThrow()
-        assertFalse(repository.recoverStaleExecutionClaim(recoveryRequest).getOrThrow())
+        assertIs<LlmExecutionRecoveryOutcome.TerminalObserved>(
+            repository.recoverStaleExecutionClaim(
+                request = recoveryRequest,
+                deadline = recoveryDeadline(),
+                retryPermit = LlmExecutionRecoveryRetryPermit(),
+            ).getOrThrow(),
+        )
         assertEquals(winningReason, selectReservationReason(database, "terminal-race"))
     }
 
@@ -5531,8 +5894,10 @@ class PostgresPersistenceIntegrationTest {
         )
 
         assertEquals(1, recoveryService.tick().getOrThrow())
-        assertEquals(9, statementCount.get(), "one scan plus eight entity-scope recovery statements")
-        assertEquals(listOf(2, 2), queryTimeouts)
+        assertEquals(37, statementCount.get(), "scan, mutation, exact readback, and commit re-arm the page deadline")
+        assertEquals(10, queryTimeouts.size)
+        assertTrue(queryTimeouts.all { timeout -> timeout in 1..5 })
+        assertTrue(queryTimeouts.zipWithNext().all { (current, next) -> current >= next })
     }
 
     @Test
@@ -5546,11 +5911,13 @@ class PostgresPersistenceIntegrationTest {
         )
         val statementCount = AtomicInteger()
         val queryTimeouts = mutableListOf<Int>()
+        val executedSql = mutableListOf<String>()
         val instrumentedDatabase = ExposedDatabase.connect(
             instrumentedDataSource(
                 dataSource = dataSource,
                 statementCount = statementCount,
                 queryTimeouts = queryTimeouts,
+                executedSql = executedSql,
             ),
         )
         val service = LlmExecutionRecoveryService(
@@ -5560,10 +5927,179 @@ class PostgresPersistenceIntegrationTest {
         )
 
         assertEquals(100, service.tick().getOrThrow())
-        assertEquals(801, statementCount.get(), "one scan plus eight statements per fixed-page candidate")
-        assertEquals(List(101) { 2 }, queryTimeouts, "scan and each candidate recovery use the two-second timeout")
+        assertTrue(statementCount.get() <= 3_300, "recovery statement count=${statementCount.get()}")
+        assertEquals(1_102, executedSql.count { sql -> sql.startsWith("SET LOCAL lock_timeout") })
+        assertEquals(1_102, executedSql.count { sql -> sql.startsWith("SET LOCAL statement_timeout") })
+        val statementTimeoutMillis = executedSql.recoveryTimeoutMillis("SET LOCAL statement_timeout")
+        val lockTimeoutMillis = executedSql.recoveryTimeoutMillis("SET LOCAL lock_timeout")
+        assertTrue(statementTimeoutMillis.zipWithNext().all { (current, next) -> current >= next })
+        assertTrue(lockTimeoutMillis.zip(statementTimeoutMillis).all { (lock, statement) -> lock < statement })
+        assertFalse(executedSql.any { sql -> "transaction_timeout" in sql })
+        assertEquals(901, queryTimeouts.size)
+        assertTrue(queryTimeouts.all { timeout -> timeout in 1..5 })
+        assertTrue(queryTimeouts.zipWithNext().all { (current, next) -> current >= next })
         assertEquals(100, countTerminalBatchRecoveryReservations(database))
         assertEquals(0, LlmExecutionTerminationFenceRegistry.transitionLockCountForTest())
+    }
+
+    @Test
+    fun recoveryScanTableLockTimesOutClosedWithoutMutationAndRetryConverges() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val now = fixedInstant()
+        insertRecoverableAvailableReservations(database, rowCount = 1, reservedAt = now.minusSeconds(1_800))
+        val service = LlmExecutionRecoveryService(
+            repository = ExposedLlmLaunchReservationRepository(database),
+            policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+            clock = Clock.fixed(now, ZoneOffset.UTC),
+        )
+        val lockConnection = dataSource.connection
+        lockConnection.autoCommit = false
+        lockConnection.createStatement().use { statement ->
+            statement.execute("LOCK TABLE llm_launch_reservations IN ACCESS EXCLUSIVE MODE")
+        }
+        LlmExecutionAdmissionHealth.resetForTest()
+
+        try {
+            coroutineScope {
+                val recovery = async(Dispatchers.IO) { service.tick() }
+                awaitDatabaseLockWaiters(dataSource, expectedCount = 1)
+                assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+                assertTrue(recovery.await().isFailure)
+            }
+            assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+            lockConnection.commit()
+            assertEquals(0, countTerminalBatchRecoveryReservations(database))
+
+            assertEquals(1, service.tick().getOrThrow())
+            assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+            assertEquals(1, countTerminalBatchRecoveryReservations(database))
+        } finally {
+            if (!lockConnection.isClosed) lockConnection.close()
+            LlmExecutionAdmissionHealth.resetForTest()
+        }
+    }
+
+    @Test
+    fun recoveryGapPopulationTokenLockTimesOutClosedWithoutMutationAndRetryConverges() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val now = fixedInstant()
+        insertRecoverableAvailableReservations(database, rowCount = 1, reservedAt = now.minusSeconds(1_800))
+        val service = LlmExecutionRecoveryService(
+            repository = ExposedLlmLaunchReservationRepository(database),
+            policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+            clock = Clock.fixed(now, ZoneOffset.UTC),
+        )
+        val lockConnection = dataSource.connection
+        lockConnection.autoCommit = false
+        lockConnection.prepareStatement("SELECT id FROM gap_population_control WHERE id=1 FOR UPDATE").use { statement ->
+            statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+        }
+        LlmExecutionAdmissionHealth.resetForTest()
+
+        try {
+            coroutineScope {
+                val recovery = async(Dispatchers.IO) { service.tick() }
+                awaitDatabaseLockWaiters(dataSource, expectedCount = 1)
+                assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+                assertTrue(recovery.await().isFailure)
+            }
+            assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+            assertEquals(0, countTerminalBatchRecoveryReservations(database))
+            exposedTransaction(database) {
+                assertSqlCount(
+                    "SELECT COUNT(*) FROM command_event_log WHERE decision_run_id='batch-recovery-1' " +
+                        "AND event_type='LLM_INVOCATION_RECOVERED'",
+                    0,
+                )
+            }
+
+            lockConnection.commit()
+            assertEquals(1, service.tick().getOrThrow())
+            assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+            assertEquals(1, countTerminalBatchRecoveryReservations(database))
+        } finally {
+            if (!lockConnection.isClosed) lockConnection.close()
+            LlmExecutionAdmissionHealth.resetForTest()
+        }
+    }
+
+    @Test
+    fun latePageStatementTimeoutKeepsCommittedEntitiesAndRetryConvergesRemainingClaim() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val now = fixedInstant()
+        val claimedAt = now.minusSeconds(1_800)
+        val scope = exposedTransaction(database) { fixtureGapPopulationScope(TradingMode.PAPER.name) }
+        val reservationRepository = ExposedLlmLaunchReservationRepository(database)
+        val runRepository = ExposedLlmRunRepository(database)
+        val invocationIds = (1..3).map { index -> "late-page-$index" }
+        invocationIds.forEach { invocationId ->
+            val claimantToken = "$invocationId-token"
+            insertClaimedLlmReservationFixture(
+                database = database,
+                invocationId = invocationId,
+                scope = scope,
+                reservedAt = claimedAt,
+                claimantToken = claimantToken,
+            )
+            runRepository.insertRunning(llmRunStart(invocationId, claimedAt)).getOrThrow()
+            LlmExecutionAdmissionHealth.registerRecoveryBlocker(invocationId, claimantToken)
+            LlmExecutionTerminationFenceRegistry.registerNoChildStarted(invocationId, claimantToken, claimedAt)
+        }
+        installLatePageRecoveryDelay(database, "late-page-3")
+        val service = LlmExecutionRecoveryService(
+            repository = reservationRepository,
+            policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+            clock = Clock.fixed(now, ZoneOffset.UTC),
+        )
+        val startedAt = System.nanoTime()
+
+        try {
+            assertTrue(service.tick().isFailure)
+        } finally {
+            dropLatePageRecoveryDelay(database)
+        }
+        val elapsed = Duration.ofNanos(System.nanoTime() - startedAt)
+        assertTrue(elapsed < Duration.ofMillis(5_750), "late-page deadline elapsed=$elapsed")
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+        assertEquals(1, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        val recoveredReservationCount = invocationIds.count { invocationId ->
+            reservationRepository.findExecutionClaim(invocationId).getOrThrow()?.status ==
+                LlmLaunchReservationStatus.FAILED
+        }
+        assertEquals(2, recoveredReservationCount)
+        invocationIds.take(2).forEach { invocationId ->
+            assertEquals(LLM_RUN_STATUS_FAILED, runRepository.findByInvocationId(invocationId).getOrThrow()?.status)
+            assertTrue(selectRecoveryAuditPayload(database, invocationId).contains("current_process_periodic_scan"))
+        }
+        assertEquals(LLM_RUN_STATUS_RUNNING, runRepository.findByInvocationId("late-page-3").getOrThrow()?.status)
+        assertEquals(0, countRecoveryAuditEvents(database, "late-page-3"))
+
+        assertEquals(1, service.tick().getOrThrow())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        assertEquals(LLM_RUN_STATUS_FAILED, runRepository.findByInvocationId("late-page-3").getOrThrow()?.status)
+        assertTrue(selectRecoveryAuditPayload(database, "late-page-3").contains("current_process_periodic_scan"))
+    }
+
+    @Test
+    fun runtimePoolAcquisitionFailsWithinFiveHundredMillisecondsWhenExhausted() = runPostgresTest {
+        createDeadlineDataSource().use { deadlineDataSource ->
+            deadlineDataSource.connection.use {
+                val startedAt = System.nanoTime()
+                val failure = runCatching { deadlineDataSource.connection.use { } }.exceptionOrNull()
+                val elapsed = Duration.ofNanos(System.nanoTime() - startedAt)
+
+                assertIs<java.sql.SQLTransientConnectionException>(failure)
+                assertTrue(elapsed >= Duration.ofMillis(450), "pool acquisition elapsed=$elapsed")
+                assertTrue(elapsed < Duration.ofMillis(1_000), "pool acquisition elapsed=$elapsed")
+            }
+        }
+        val runtimeSource = Files.readString(
+            postgresRepositoryRoot()
+                .resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/runtime/TradingRuntime.kt"),
+        )
+        assertTrue("CONNECTION_TIMEOUT_MILLIS = 500L" in runtimeSource)
+        assertTrue("connectionTimeout = CONNECTION_TIMEOUT_MILLIS" in runtimeSource)
     }
 
     @Test
@@ -8380,6 +8916,33 @@ private class PostgresTestContext(
         return createDataSource(container, connectionInitSql)
     }
 
+    fun createDeadlineDataSource(): HikariDataSource {
+        return createDataSource(
+            container = container,
+            maximumPoolSize = 1,
+            connectionTimeoutMillis = 500L,
+        )
+    }
+
+    fun createRecoveryCommitFaultDataSource(): Pair<HikariDataSource, RecoveryCommitFaultController> {
+        val controller = RecoveryCommitFaultController()
+        val postgresDataSource = PGSimpleDataSource().apply {
+            setURL(container.jdbcUrl)
+            user = container.username
+            password = container.password
+        }
+        val faultDataSource = RecoveryCommitFaultDataSource(postgresDataSource, controller)
+        val hikariDataSource = HikariDataSource(
+            HikariConfig().apply {
+                dataSource = faultDataSource
+                maximumPoolSize = 1
+                connectionTimeout = 500L
+            },
+        )
+
+        return hikariDataSource to controller
+    }
+
     /**
      * container の接続情報を runtime config に変換する。
      */
@@ -9401,6 +9964,162 @@ private class RaceInjectingPostgresReservationRepository(
     ): Result<LlmActiveLaunchReservation?> = Result.success(null)
 }
 
+private class RecoveryCommitFaultDataSource(
+    private val delegate: DataSource,
+    private val controller: RecoveryCommitFaultController,
+) : DataSource by delegate {
+    override fun getConnection(): Connection = delegate.connection.withRecoveryCommitFault(controller)
+
+    override fun getConnection(username: String, password: String): Connection {
+        return delegate.getConnection(username, password).withRecoveryCommitFault(controller)
+    }
+}
+
+private class RecoveryCommitFaultController {
+    private val commitResponseLossArmed = AtomicBoolean(false)
+    private val readbackFailureArmed = AtomicBoolean(false)
+    private val mutationFailuresRemaining = AtomicInteger(0)
+    private val mutationEntries = AtomicInteger(0)
+    private val lostResponses = AtomicInteger(0)
+    private val failedReadbacks = AtomicInteger(0)
+    private val databaseEvents = java.util.concurrent.CopyOnWriteArrayList<String>()
+
+    val recoveryMutationEntries: Int get() = mutationEntries.get()
+    val lostCommitResponses: Int get() = lostResponses.get()
+    val recoveryReadbackFailures: Int get() = failedReadbacks.get()
+    val observedDatabaseEvents: List<String> get() = databaseEvents.toList()
+
+    fun armCommitResponseLoss() {
+        commitResponseLossArmed.set(true)
+    }
+
+    fun armFirstReadbackFailure() {
+        readbackFailureArmed.set(true)
+    }
+
+    fun armPreCommitMutationFailure(count: Int = 1) {
+        require(count > 0)
+        mutationFailuresRemaining.addAndGet(count)
+    }
+
+    fun recordRecoveryMutationEntry() {
+        mutationEntries.incrementAndGet()
+    }
+
+    fun clearDatabaseEvents() {
+        databaseEvents.clear()
+    }
+
+    fun recordDatabaseEvent(event: String) {
+        databaseEvents += event
+    }
+
+    fun shouldLoseCommitResponse(): Boolean = commitResponseLossArmed.compareAndSet(true, false)
+
+    fun shouldFailReadback(): Boolean = readbackFailureArmed.compareAndSet(true, false)
+
+    fun shouldFailMutation(): Boolean {
+        return mutationFailuresRemaining.getAndUpdate { remaining -> (remaining - 1).coerceAtLeast(0) } > 0
+    }
+
+    fun recordFailedReadback() {
+        failedReadbacks.incrementAndGet()
+    }
+
+    fun recordLostCommitResponse() {
+        lostResponses.incrementAndGet()
+    }
+}
+
+private fun Connection.withRecoveryCommitFault(controller: RecoveryCommitFaultController): Connection {
+    val delegate = this
+    return Proxy.newProxyInstance(
+        Connection::class.java.classLoader,
+        arrayOf(Connection::class.java),
+    ) { _, method, arguments ->
+        try {
+            when {
+                method.name == "prepareStatement" && arguments?.firstOrNull() is String -> {
+                    val sql = arguments.first() as String
+                    val statement = method.invoke(delegate, *arguments) as PreparedStatement
+                    statement.withRecoveryFault(sql, controller)
+                }
+                method.name == "commit" -> {
+                    val result = method.invoke(delegate, *(arguments ?: emptyArray()))
+                    if (controller.shouldLoseCommitResponse()) {
+                        controller.recordLostCommitResponse()
+                        throw SQLException("commit response lost after delegate commit")
+                    }
+                    result
+                }
+                else -> method.invoke(delegate, *(arguments ?: emptyArray()))
+            }
+        } catch (failure: InvocationTargetException) {
+            throw failure.targetException
+        }
+    } as Connection
+}
+
+private fun PreparedStatement.withRecoveryFault(
+    sql: String,
+    controller: RecoveryCommitFaultController,
+): PreparedStatement {
+    val faultKind = recoveryFaultStatementKind(sql)
+    if (faultKind == RecoveryFaultStatementKind.OTHER) return this
+
+    val delegate = this
+    return Proxy.newProxyInstance(
+        PreparedStatement::class.java.classLoader,
+        arrayOf(PreparedStatement::class.java),
+    ) { _, method, arguments ->
+        try {
+            applyRecoveryStatementFault(method.name, faultKind, controller)
+            method.invoke(delegate, *(arguments ?: emptyArray()))
+        } catch (failure: InvocationTargetException) {
+            throw failure.targetException
+        }
+    } as PreparedStatement
+}
+
+private fun recoveryFaultStatementKind(sql: String): RecoveryFaultStatementKind {
+    val recoveryMutation = sql.contains("UPDATE llm_launch_reservations") && sql.contains("SET status = 'FAILED'")
+    if (recoveryMutation) return RecoveryFaultStatementKind.MUTATION
+
+    val recoveryReadback = sql.contains("FROM llm_launch_reservations") &&
+        sql.contains("execution_claim_heartbeat_at, finished_at, reason")
+    if (recoveryReadback) return RecoveryFaultStatementKind.READBACK
+    if (sql.contains("WITH candidates AS")) return RecoveryFaultStatementKind.SCAN
+
+    return RecoveryFaultStatementKind.OTHER
+}
+
+private fun applyRecoveryStatementFault(
+    methodName: String,
+    kind: RecoveryFaultStatementKind,
+    controller: RecoveryCommitFaultController,
+) {
+    when (kind) {
+        RecoveryFaultStatementKind.MUTATION -> if (methodName == "executeUpdate") {
+            controller.recordRecoveryMutationEntry()
+            if (controller.shouldFailMutation()) throw SQLException("recovery mutation failed before commit")
+        }
+        RecoveryFaultStatementKind.READBACK -> if (methodName == "executeQuery") {
+            controller.recordDatabaseEvent("READBACK")
+            if (controller.shouldFailReadback()) {
+                controller.recordFailedReadback()
+                throw SQLException("first recovery exact readback lost")
+            }
+        }
+        RecoveryFaultStatementKind.SCAN -> if (methodName == "executeQuery") {
+            controller.recordDatabaseEvent("SCAN")
+        }
+        RecoveryFaultStatementKind.OTHER -> Unit
+    }
+}
+
+/** recovery fault proxyが識別するJDBC statement種別。 */
+private enum class RecoveryFaultStatementKind { MUTATION, READBACK, SCAN, OTHER }
+
 private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
 
 /**
@@ -9740,6 +10459,7 @@ private fun instrumentedDataSource(
     dataSource: DataSource,
     statementCount: AtomicInteger,
     queryTimeouts: MutableList<Int>,
+    executedSql: MutableList<String>? = null,
 ): DataSource {
     return Proxy.newProxyInstance(
         DataSource::class.java.classLoader,
@@ -9748,7 +10468,7 @@ private fun instrumentedDataSource(
         val result = method.invoke(dataSource, *(arguments ?: emptyArray()))
         if (method.name != "getConnection") return@newProxyInstance result
 
-        instrumentedConnection(result as Connection, statementCount, queryTimeouts)
+        instrumentedConnection(result as Connection, statementCount, queryTimeouts, executedSql)
     } as DataSource
 }
 
@@ -9756,6 +10476,7 @@ private fun instrumentedConnection(
     connection: Connection,
     statementCount: AtomicInteger,
     queryTimeouts: MutableList<Int>,
+    executedSql: MutableList<String>?,
 ): Connection {
     return Proxy.newProxyInstance(
         Connection::class.java.classLoader,
@@ -9765,6 +10486,12 @@ private fun instrumentedConnection(
         if (method.name != "prepareStatement") return@newProxyInstance result
 
         statementCount.incrementAndGet()
+        (arguments?.firstOrNull() as? String)?.let { sql ->
+            val statements = executedSql ?: return@let
+            synchronized(statements) {
+                statements += sql.trim()
+            }
+        }
         instrumentedPreparedStatement(result as PreparedStatement, queryTimeouts)
     } as Connection
 }
@@ -9784,6 +10511,13 @@ private fun instrumentedPreparedStatement(
         }
         method.invoke(statement, *(arguments ?: emptyArray()))
     } as PreparedStatement
+}
+
+private fun List<String>.recoveryTimeoutMillis(prefix: String): List<Long> {
+    return asSequence()
+        .filter { sql -> sql.startsWith(prefix) }
+        .map { sql -> sql.substringAfter("='").substringBefore("ms'").toLong() }
+        .toList()
 }
 
 /**
@@ -9840,13 +10574,16 @@ private fun isDockerAvailable(): Boolean {
 private fun createDataSource(
     container: FukurouPostgresContainer,
     connectionInitSql: String? = null,
+    maximumPoolSize: Int = HIKARI_POOL_SIZE,
+    connectionTimeoutMillis: Long? = null,
 ): HikariDataSource {
     val hikariConfig = HikariConfig().apply {
         jdbcUrl = container.jdbcUrl
         username = container.username
         password = container.password
-        maximumPoolSize = HIKARI_POOL_SIZE
+        this.maximumPoolSize = maximumPoolSize
         this.connectionInitSql = connectionInitSql
+        connectionTimeoutMillis?.let { timeout -> connectionTimeout = timeout }
     }
 
     return HikariDataSource(hikariConfig)
@@ -11432,6 +12169,15 @@ private fun fixedInstant(): Instant {
     return Instant.parse("2026-07-02T00:00:00Z")
 }
 
+private fun postgresRepositoryRoot(): Path {
+    return generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { path -> path.parent }
+        .first { path -> Files.exists(path.resolve("settings.gradle.kts")) }
+}
+
+private fun recoveryDeadline(): LlmExecutionRecoveryDeadline {
+    return LlmExecutionRecoveryDeadline.start(Duration.ofSeconds(5), System::nanoTime)
+}
+
 private fun paperTradeEvent(
     sessionId: UUID,
     sequence: Long,
@@ -11549,5 +12295,70 @@ private fun selectRecoveryAuditPayload(database: ExposedDatabase, invocationId: 
                 resultSet.getString("payload")
             }
         }
+    }
+}
+
+private fun recoveryAuditFixture(request: LlmExecutionRecoveryRequest): CommandEvent {
+    return CommandEvent(
+        id = request.recoveryAttemptId,
+        decisionRunContext = DecisionRunContext(
+            decisionRunId = request.invocationId,
+            llmProvider = null,
+            promptHash = null,
+            systemPromptVersion = null,
+            marketSnapshotId = null,
+        ),
+        toolName = "llm_execution_recovery",
+        toolCallId = null,
+        clientRequestId = request.invocationId,
+        eventType = CommandEventType.LLM_INVOCATION_RECOVERED,
+        payload = """{"recoveryAttemptId":"${request.recoveryAttemptId}"}""",
+        occurredAt = request.finishedAt,
+    )
+}
+
+private fun countRecoveryAuditEvents(database: ExposedDatabase, invocationId: String): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "SELECT COUNT(*) FROM command_event_log " +
+                "WHERE decision_run_id = ? AND event_type = 'LLM_INVOCATION_RECOVERED'",
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+private fun installLatePageRecoveryDelay(database: ExposedDatabase, invocationId: String) {
+    exposedTransaction(database) {
+        executeUpdate(
+            """
+                CREATE OR REPLACE FUNCTION delay_late_page_recovery() RETURNS trigger AS ${'$'}function${'$'}
+                BEGIN
+                    IF OLD.invocation_id = '$invocationId' AND NEW.status = 'FAILED' THEN
+                        PERFORM pg_sleep(6);
+                    END IF;
+                    RETURN NEW;
+                END;
+                ${'$'}function${'$'} LANGUAGE plpgsql
+            """.trimIndent(),
+        )
+        executeUpdate(
+            """
+                CREATE TRIGGER delay_late_page_recovery_trigger
+                BEFORE UPDATE OF status ON llm_launch_reservations
+                FOR EACH ROW EXECUTE FUNCTION delay_late_page_recovery()
+            """.trimIndent(),
+        )
+    }
+}
+
+private fun dropLatePageRecoveryDelay(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        executeUpdate("DROP TRIGGER IF EXISTS delay_late_page_recovery_trigger ON llm_launch_reservations")
+        executeUpdate("DROP FUNCTION IF EXISTS delay_late_page_recovery()")
     }
 }

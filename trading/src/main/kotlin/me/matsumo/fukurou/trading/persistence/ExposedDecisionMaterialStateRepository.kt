@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.persistence
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -11,32 +12,59 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjectionContext
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
+import me.matsumo.fukurou.trading.decision.identity.MarketFeatureBundle
+import me.matsumo.fukurou.trading.decision.identity.MaterialAccountSnapshot
+import me.matsumo.fukurou.trading.decision.identity.MaterialCandleSummary
 import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
+import me.matsumo.fukurou.trading.decision.identity.MaterialIndicatorSnapshot
+import me.matsumo.fukurou.trading.decision.identity.MaterialLedgerFact
 import me.matsumo.fukurou.trading.decision.identity.MaterialMissingSource
+import me.matsumo.fukurou.trading.decision.identity.MaterialOrderbookSummary
+import me.matsumo.fukurou.trading.decision.identity.MaterialSourceMetadata
+import me.matsumo.fukurou.trading.decision.identity.MaterialTickerSnapshot
+import me.matsumo.fukurou.trading.runner.SecretRedactor
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 
 /** PostgreSQL immutable material-state manifest repository。 */
-class ExposedDecisionMaterialStateRepository(private val database: Database) : DecisionMaterialStateRepository {
+class ExposedDecisionMaterialStateRepository(
+    private val database: Database,
+    private val knownSecretValues: Set<String> = SecretRedactor.knownSecretValuesFromEnvironment(System.getenv()),
+) : DecisionMaterialStateRepository {
     override suspend fun append(manifest: DecisionMaterialStateManifest): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
+            manifest.requireValidSnapshotHash()
+            ManifestPersistencePolicy.validateMaterial(manifest, knownSecretValues)
             transaction(database) {
                 jdbcConnection().prepareStatement(
                     "INSERT INTO decision_material_state_manifests " +
                         "(invocation_id, captured_at, schema_version, content_hash, material_projection, manifest_json) " +
-                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (invocation_id) DO NOTHING",
                 ).use { statement ->
                     statement.setString(1, manifest.invocationId)
                     statement.setLong(2, manifest.capturedAt.toEpochMilli())
                     statement.setInt(3, manifest.schemaVersion)
-                    statement.setString(4, manifest.canonicalContentHash)
+                    statement.setString(4, manifest.persistedSnapshotHash())
                     statement.setString(5, manifest.materialProjection)
                     statement.setString(6, manifest.toJson())
-                    statement.executeUpdate()
+                    val inserted = statement.executeUpdate()
+                    if (inserted == 0) {
+                        val existingHash = jdbcConnection().prepareStatement(
+                            "SELECT content_hash FROM decision_material_state_manifests WHERE invocation_id = ?",
+                        ).use { existingStatement ->
+                            existingStatement.setString(1, manifest.invocationId)
+                            existingStatement.executeQuery().use { result ->
+                                require(result.next()) { "material manifest conflict row disappeared." }
+                                result.getString(1)
+                            }
+                        }
+                        require(existingHash == manifest.persistedSnapshotHash()) { "material manifest content mismatch." }
+                    }
                 }
                 Unit
             }
@@ -123,12 +151,15 @@ internal fun String.toMaterialManifest(): DecisionMaterialStateManifest {
             )
         },
         schemaVersion = requireNotNull(text("schemaVersion")).toInt(),
+        snapshotContentHash = text("snapshotContentHash") ?: requireNotNull(text("canonicalContentHash")),
         canonicalContentHash = requireNotNull(text("canonicalContentHash")),
         materialProjection = text("materialProjection").orEmpty(),
+        marketFeatureBundle = value["marketFeatureBundle"]?.takeUnless { it is kotlinx.serialization.json.JsonNull }
+            ?.jsonObject?.toMarketFeatureBundle(),
     )
 }
 
-private fun DecisionMaterialStateManifest.toJson(): String = buildJsonObject {
+internal fun DecisionMaterialStateManifest.toJson(): String = buildJsonObject {
     put("invocationId", invocationId)
     put("capturedAt", capturedAt.toString())
     put("triggerKind", triggerKind.name)
@@ -163,6 +194,194 @@ private fun DecisionMaterialStateManifest.toJson(): String = buildJsonObject {
         },
     )
     put("schemaVersion", schemaVersion)
+    put("snapshotContentHash", snapshotContentHash)
     put("canonicalContentHash", canonicalContentHash)
     put("materialProjection", materialProjection)
+    put("marketFeatureBundle", marketFeatureBundle?.toJson() ?: JsonNull)
 }.toString()
+
+internal fun DecisionMaterialStateManifest.withSnapshotContentHash(): DecisionMaterialStateManifest {
+    if (schemaVersion < 2) return this
+
+    return copy(snapshotContentHash = computeSnapshotContentHash())
+}
+
+internal fun DecisionMaterialStateManifest.requireValidSnapshotHash() {
+    if (schemaVersion >= 2) {
+        require(snapshotContentHash == computeSnapshotContentHash()) { "material manifest snapshot hash mismatch." }
+    }
+}
+
+internal fun DecisionMaterialStateManifest.persistedSnapshotHash(): String =
+    if (schemaVersion >= 2) snapshotContentHash else canonicalContentHash
+
+private fun DecisionMaterialStateManifest.computeSnapshotContentHash(): String =
+    me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy.sha256(copy(snapshotContentHash = "").toJson())
+
+private fun MarketFeatureBundle.toJson() = buildJsonObject {
+    put("ticker", ticker?.toJson() ?: JsonNull)
+    put("candleSummaries", buildJsonArray { candleSummaries.forEach { add(it.toJson()) } })
+    put(
+        "indicators",
+        buildJsonArray {
+            indicators.forEach { indicator ->
+                add(
+                    buildJsonObject {
+                        put("name", indicator.name)
+                        put("value", indicator.value?.toPlainString())
+                        put("sampleCount", indicator.sampleCount)
+                    },
+                )
+            }
+        },
+    )
+    put("orderbookSummary", orderbookSummary?.toJson() ?: JsonNull)
+    put("account", account.toJson())
+    put(
+        "missingSources",
+        buildJsonArray {
+            missingSources.forEach { missing ->
+                add(
+                    buildJsonObject {
+                        put("source", missing.source)
+                        put("reason", missing.reason)
+                    },
+                )
+            }
+        },
+    )
+}
+
+private fun MaterialTickerSnapshot.toJson() = buildJsonObject {
+    put("bestBidJpy", bestBidJpy?.toPlainString())
+    put("bestAskJpy", bestAskJpy?.toPlainString())
+    put("lastPriceJpy", lastPriceJpy?.toPlainString())
+    put("metadata", metadata.toJson())
+}
+
+private fun MaterialCandleSummary.toJson() = buildJsonObject {
+    put("openTime", openTime.toString())
+    put("openJpy", openJpy.toPlainString())
+    put("highJpy", highJpy.toPlainString())
+    put("lowJpy", lowJpy.toPlainString())
+    put("closeJpy", closeJpy.toPlainString())
+    put("volumeBtc", volumeBtc?.toPlainString())
+}
+
+private fun MaterialOrderbookSummary.toJson() = buildJsonObject {
+    put("bestBidJpy", bestBidJpy?.toPlainString())
+    put("bestAskJpy", bestAskJpy?.toPlainString())
+    put("midJpy", midJpy?.toPlainString())
+    put("spreadBps", spreadBps?.toPlainString())
+    put("topBidQuantityBtc", topBidQuantityBtc.toPlainString())
+    put("topAskQuantityBtc", topAskQuantityBtc.toPlainString())
+    put("topBidNotionalJpy", topBidNotionalJpy.toPlainString())
+    put("topAskNotionalJpy", topAskNotionalJpy.toPlainString())
+    put("imbalance", imbalance?.toPlainString())
+    put("levelLimit", levelLimit)
+    put("metadata", metadata.toJson())
+}
+
+private fun MaterialAccountSnapshot.toJson() = buildJsonObject {
+    put("riskState", riskState)
+    put("availableJpy", availableJpy?.toPlainString())
+    put("equityJpy", equityJpy?.toPlainString())
+    put("positions", buildJsonArray { positions.forEach { add(it.toJson()) } })
+    put("openOrders", buildJsonArray { openOrders.forEach { add(it.toJson()) } })
+    put("positionMetadata", positionMetadata.toJson())
+    put("orderMetadata", orderMetadata.toJson())
+}
+
+private fun MaterialLedgerFact.toJson() = buildJsonObject {
+    put("id", id)
+    put("status", status)
+    put("side", side)
+    put("type", type)
+}
+
+private fun MaterialSourceMetadata.toJson() = buildJsonObject {
+    put("observedAt", observedAt?.toString())
+    put("provenance", provenance)
+    put("truncated", truncated)
+    put("totalCount", totalCount)
+}
+
+private fun kotlinx.serialization.json.JsonObject.toMarketFeatureBundle(): MarketFeatureBundle {
+    return MarketFeatureBundle(
+        ticker = this["ticker"]?.takeUnless { it is kotlinx.serialization.json.JsonNull }?.jsonObject?.toTicker(),
+        candleSummaries = getValue("candleSummaries").jsonArray.map { it.jsonObject.toCandle() },
+        indicators = getValue("indicators").jsonArray.map { value ->
+            val fields = value.jsonObject
+            MaterialIndicatorSnapshot(
+                name = fields.text("name"),
+                value = fields.decimal("value"),
+                sampleCount = fields.text("sampleCount").toInt(),
+            )
+        },
+        orderbookSummary = this["orderbookSummary"]?.takeUnless { it is kotlinx.serialization.json.JsonNull }
+            ?.jsonObject?.toOrderbook(),
+        account = getValue("account").jsonObject.toAccount(),
+        missingSources = getValue("missingSources").jsonArray.map { value ->
+            val fields = value.jsonObject
+            MaterialMissingSource(fields.text("source"), fields.text("reason"))
+        },
+    )
+}
+
+private fun kotlinx.serialization.json.JsonObject.toTicker() = MaterialTickerSnapshot(
+    bestBidJpy = decimal("bestBidJpy"),
+    bestAskJpy = decimal("bestAskJpy"),
+    lastPriceJpy = decimal("lastPriceJpy"),
+    metadata = getValue("metadata").jsonObject.toMetadata(),
+)
+
+private fun kotlinx.serialization.json.JsonObject.toCandle() = MaterialCandleSummary(
+    openTime = java.time.Instant.parse(text("openTime")),
+    openJpy = requireNotNull(decimal("openJpy")),
+    highJpy = requireNotNull(decimal("highJpy")),
+    lowJpy = requireNotNull(decimal("lowJpy")),
+    closeJpy = requireNotNull(decimal("closeJpy")),
+    volumeBtc = decimal("volumeBtc"),
+)
+
+private fun kotlinx.serialization.json.JsonObject.toOrderbook() = MaterialOrderbookSummary(
+    bestBidJpy = decimal("bestBidJpy"),
+    bestAskJpy = decimal("bestAskJpy"),
+    midJpy = decimal("midJpy"),
+    spreadBps = decimal("spreadBps"),
+    topBidQuantityBtc = requireNotNull(decimal("topBidQuantityBtc")),
+    topAskQuantityBtc = requireNotNull(decimal("topAskQuantityBtc")),
+    topBidNotionalJpy = requireNotNull(decimal("topBidNotionalJpy")),
+    topAskNotionalJpy = requireNotNull(decimal("topAskNotionalJpy")),
+    imbalance = decimal("imbalance"),
+    levelLimit = text("levelLimit").toInt(),
+    metadata = getValue("metadata").jsonObject.toMetadata(),
+)
+
+private fun kotlinx.serialization.json.JsonObject.toAccount() = MaterialAccountSnapshot(
+    riskState = text("riskState"),
+    availableJpy = decimal("availableJpy"),
+    equityJpy = decimal("equityJpy"),
+    positions = getValue("positions").jsonArray.map { it.jsonObject.toLedgerFact() },
+    openOrders = getValue("openOrders").jsonArray.map { it.jsonObject.toLedgerFact() },
+    positionMetadata = getValue("positionMetadata").jsonObject.toMetadata(),
+    orderMetadata = getValue("orderMetadata").jsonObject.toMetadata(),
+)
+
+private fun kotlinx.serialization.json.JsonObject.toLedgerFact() = MaterialLedgerFact(
+    id = text("id"),
+    status = text("status"),
+    side = optionalText("side"),
+    type = optionalText("type"),
+)
+
+private fun kotlinx.serialization.json.JsonObject.toMetadata() = MaterialSourceMetadata(
+    observedAt = optionalText("observedAt")?.let(java.time.Instant::parse),
+    provenance = text("provenance"),
+    truncated = text("truncated").toBooleanStrict(),
+    totalCount = optionalText("totalCount")?.toInt(),
+)
+
+private fun kotlinx.serialization.json.JsonObject.text(name: String) = getValue(name).jsonPrimitive.content
+private fun kotlinx.serialization.json.JsonObject.optionalText(name: String) = get(name)?.jsonPrimitive?.contentOrNull
+private fun kotlinx.serialization.json.JsonObject.decimal(name: String) = optionalText(name)?.toBigDecimalOrNull()

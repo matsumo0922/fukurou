@@ -35,8 +35,9 @@ class OneShotExecutionPolicyTest {
         assertTrue(LlmInvocationPhase.PRE_FILTER.isClaimedOneShotPhase())
         assertTrue(LlmInvocationPhase.PROPOSER.isClaimedOneShotPhase())
         assertTrue(LlmInvocationPhase.FALSIFIER.isClaimedOneShotPhase())
+        assertTrue(LlmInvocationPhase.RISK_REDUCTION_ONLY.isClaimedOneShotPhase())
         assertFalse(LlmInvocationPhase.REFLECTION.isClaimedOneShotPhase())
         assertFalse(LlmInvocationPhase.EVALUATION_REPORT.isClaimedOneShotPhase())
-        assertEquals(5, LlmInvocationPhase.entries.size)
+        assertEquals(6, LlmInvocationPhase.entries.size)
     }
 }

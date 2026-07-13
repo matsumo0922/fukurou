@@ -3,10 +3,12 @@ import { createInterface } from "node:readline";
 import { createServer } from "node:http";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 
-const [manifestId, phase] = process.argv.slice(2);
-if (!/^[0-9a-f]{48}$/.test(manifestId) || !["PROPOSER", "FALSIFIER"].includes(phase)) {
+const [manifestId, phase, rroAction] = process.argv.slice(2);
+const rroActions = ["NO_TRADE", "EXIT", "REDUCE", "ADJUST_PROTECTION", "ENTER", "ADD_LONG"];
+if (!/^[0-9a-f]{48}$/.test(manifestId) || !["PROPOSER", "FALSIFIER", "RISK_REDUCTION_ONLY"].includes(phase)) {
   throw new Error("canonical manifest id and phase are required");
 }
+if (phase === "RISK_REDUCTION_ONLY" && !rroActions.includes(rroAction)) throw new Error("RRO action is required");
 const providerHome = process.env.HOME;
 const providerFiles = readdirSync(providerHome);
 const authName = phase === "PROPOSER" ? ".credentials.json" : "auth.json";
@@ -36,11 +38,15 @@ await new Promise(resolve => fixture.listen(18080, "127.0.0.1", resolve));
 const child = spawn("/usr/local/libexec/fukurou-mcp-launcher", [manifestId], {
   stdio: ["pipe", "pipe", "pipe"],
 });
+child.stderr.pipe(process.stderr);
+child.on("exit", (code, signal) => {
+  process.stderr.write(`mcp child exited code=${code} signal=${signal ?? "none"}\n`);
+});
 writeFileSync(`${providerHome}/mcp-canary.pid`, `${child.pid}\n`, { mode: 0o660 });
 const probeReleasePath = `${providerHome}/mcp-canary.probe-complete`;
 if (phase === "PROPOSER") {
   for (let attempt = 0; !existsSync(probeReleasePath); attempt++) {
-    if (attempt >= 200) throw new Error("live MCP denial probe did not release canary client");
+    if (attempt >= 1200) throw new Error("live MCP denial probe did not release canary client");
     await new Promise(resolve => setTimeout(resolve, 25));
   }
 }
@@ -65,10 +71,6 @@ process.stdout.write(JSON.stringify({
   liveFds: readdirSync("/proc/self/fd").sort((left, right) => Number(left) - Number(right)),
   env: Object.keys(process.env).sort(),
 }) + "\n");
-child.stderr.pipe(process.stderr);
-child.on("exit", (code, signal) => {
-  process.stderr.write(`mcp child exited code=${code} signal=${signal ?? "none"}\n`);
-});
 child.stdin.on("error", error => {
   process.stderr.write(`mcp stdin error code=${error.code ?? "unknown"}\n`);
 });
@@ -137,7 +139,7 @@ if (phase === "PROPOSER") {
   const intentId = decision.structuredContent.intent_id;
   await call("get_trade_intent", { intent_id: intentId });
   process.stdout.write(JSON.stringify({ event: "intent", intent_id: intentId }) + "\n");
-} else {
+} else if (phase === "FALSIFIER") {
   const intentId = process.env.FUKUROU_CANARY_INTENT_ID;
   if (!intentId) throw new Error("canary intent id is required");
   await call("preview_order", {
@@ -148,6 +150,37 @@ if (phase === "PROPOSER") {
   await call("submit_falsification", {
     intent_id: intentId, verdict: "APPROVED", llm_provider: "codex", reason_ja: "canary fixture",
   });
+} else {
+  const decision = {
+    invocation_id: "mcp-canary-run", action: rroAction,
+    setup_tags: ["canary"], estimated_win_probability: "0", expected_r_multiple: "0",
+    fact_check: "{}", self_review: "{}", reason_ja: "canary fixture",
+  };
+  if (rroAction === "REDUCE") decision.close_ratio = "0.5";
+  if (["ENTER", "ADD_LONG"].includes(rroAction)) {
+    Object.assign(decision, {
+      symbol: "BTC", side: "BUY", type: "MARKET", size_btc: "0.0050",
+      protective_stop_price_jpy: "9700000", take_profit_price_jpy: "10500000",
+      trade_plan_revision_count: 0, trade_plan_thesis_ja: "canary fixture",
+      trade_plan_invalidation_conditions_ja: ["fixture"],
+      trade_plan_invalidation_predicates: [{ type: "LAST_PRICE_AT_OR_BELOW", threshold_jpy: "9700000" }],
+      trade_plan_target_price_jpy: "10500000",
+    });
+  }
+  const shouldAccept = ["NO_TRADE", "EXIT", "REDUCE", "ADJUST_PROTECTION"].includes(rroAction);
+  let accepted = false;
+  try {
+    await call("submit_decision", decision);
+    accepted = true;
+  } catch (error) {
+    if (shouldAccept) throw error;
+  }
+  if (accepted !== shouldAccept) throw new Error(`RRO action matrix mismatch for ${rroAction}`);
+  if (accepted) {
+    process.stdout.write(JSON.stringify({ event: "rro_action_accepted", action: rroAction }) + "\n");
+  } else {
+    process.stdout.write(JSON.stringify({ event: "rro_action_rejected", action: rroAction }) + "\n");
+  }
 }
 
 child.stdin.end();

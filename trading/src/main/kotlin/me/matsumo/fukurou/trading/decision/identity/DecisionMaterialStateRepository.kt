@@ -28,9 +28,9 @@ class InMemoryDecisionMaterialStateRepository : DecisionMaterialStateRepository 
 
     override suspend fun append(manifest: DecisionMaterialStateManifest): Result<Unit> = runCatching {
         mutex.withLock {
-            require(manifests.putIfAbsent(manifest.invocationId, manifest) == null) {
-                "material manifest already exists for invocation."
-            }
+            val existing = manifests[manifest.invocationId]
+            require(existing == null || existing == manifest) { "material manifest content mismatch." }
+            if (existing == null) manifests[manifest.invocationId] = manifest
         }
     }
 

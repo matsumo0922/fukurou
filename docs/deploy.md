@@ -234,7 +234,7 @@ sudo docker run --rm --network fukurou_edge --env-file /srv/fukurou/.env \
   -cp /app/app.jar me.matsumo.fukurou.trading.runner.PaperMarketRecoveryMainKt RECOVER
 ```
 
-MCP credential isolation canary の fixture は disposable database に限り、app role で production repository path を通す `FIXTURE_CREATE` を使う。app role の token なし raw INSERT と MCP role の raw INSERT は失敗し、MCP role に private lifecycle table の SELECT や broad function grantを追加しない。
+MCP credential isolation canary の fixture は disposable database に限り、app role で production repository path を通す `FIXTURE_CREATE` を使う。app role の token なし raw INSERT、MCP role の raw INSERT、opportunity token取得、全許可列INSERT、direct close UPDATEは失敗し、FD5 gatewayのsubmitとopportunity protocol row保存だけが成功することを確認する。MCP role に private lifecycle table の SELECT や broad function grantを追加しない。
 
 ```sh
 FUKUROU_FIXTURE_DATABASE=true \
@@ -320,7 +320,7 @@ scripts/prod-curl /ops/runtime-config
 5. 対象 SHA の新imageを `sudo /usr/local/sbin/deploy-fukurou <commit-sha>` でdeployする。欠落している`llm.launchEnabled`はbootstrapによってfalseでactive snapshotへ追加される。Ktor startupの`TradingPersistenceBootstrap`がMCP evaluation viewを作成するまでrole provisioningを実行しない。
 6. `sudo docker run --rm --network fukurou_edge curlimages/curl -fsS http://ktor:8080/health/ready` を実行し、maintenance connectionでrequired viewの存在を確認する。`/ops/runtime-config`で`daemon.enabled`と`llm.launchEnabled`のactive valueとeffective valueがすべてfalseであることを確認する。`daemon.enabled=false`なのでscheduler workerは作成されず、新しい`DAEMON_STARTED` auditも記録されない。
 7. `POST /ops/trigger`が`LLM_LAUNCH_DISABLED`の409を返すこと、direct `OneShotRunnerMain`がchild processやMCP credentialを使う前にnon-zeroで終了することを確認する。scheduler workerは不在なので`LLM_LAUNCH_DISABLED`のscheduler skip auditを期待しない。その後、手順3のRUNNING 0 queryと`pgrep`を再実行する。
-8. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を実行し、`fukurou_mcp` roleをprovisionする。preflightまたは権限不足ではtransaction全体が失敗するため、gateをOFFのまま維持する。
+8. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を実行し、`fukurou_mcp` roleをprovisionする。scriptはMCPのopportunity token、INSERT、close UPDATEがすべてfalseで、app roleのtokenだけがtrueというpostconditionも検証する。preflight、権限不足、postcondition不一致では失敗するため、gateをOFFのまま維持する。
 9. deploy済みimageを再利用する場合は`scripts/mcp-credential-isolation-check --reuse-image <exact-image>`を実行し、paper smoke、knowledge toolsを含むrequired MCP call matrixを確認する。local buildを検査する場合は`--reuse-image`を外す。role flag、membership、ownership、effective grantも確認する。
 10. canary scan 完了後、旧 shared `config.toml` と session artifact を auth source から分離して削除する。
 11. running Ktor containerの`/run/fukurou/llm-homes`がtmpfsであることを`docker inspect`で確認する。旧`fukurou_llm-runs` volumeが残っている場合は、一時containerへread-only mountして残存per-run auth copy、session、quarantine artifactを監査し、必要な証跡を保存してから`fukurou_llm-runs`だけを削除する。永続auth sourceの`fukurou_llm-auth`とDBの`fukurou_pgdata`は削除しない。

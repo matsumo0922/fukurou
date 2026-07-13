@@ -7,6 +7,8 @@ import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryDeadline
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.PreparedStatement
@@ -110,6 +112,15 @@ class ExposedCommandEventLog(
 ) : CommandEventLog, CommandEventFeedReader {
 
     override suspend fun append(event: CommandEvent): Result<Unit> {
+        runCatching {
+            ManifestPersistencePolicy.validateCommandEvent(
+                context = event.decisionRunContext,
+                toolName = event.toolName,
+                clientRequestId = event.clientRequestId,
+                payload = event.payload,
+            )
+        }.exceptionOrNull()?.let { failure -> return Result.failure(failure) }
+
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
@@ -243,6 +254,31 @@ class ExposedCommandEventLog(
  */
 internal fun JdbcTransaction.insertEvent(event: CommandEvent) {
     jdbcConnection().prepareStatement(INSERT_COMMAND_EVENT_SQL).use { statement ->
+        statement.setObject(1, event.id)
+        statement.setNullableString(2, event.decisionRunContext.decisionRunId)
+        statement.setNullableString(3, event.toolCallId)
+        statement.setNullableString(4, event.clientRequestId)
+        statement.setString(5, event.toolName)
+        statement.setString(6, event.eventType.name)
+        statement.setString(7, event.payload)
+        statement.setLong(8, event.occurredAt.toEpochMilli())
+        statement.setNullableString(9, event.decisionRunContext.llmProvider)
+        statement.setNullableString(10, event.decisionRunContext.promptHash)
+        statement.setNullableString(11, event.decisionRunContext.systemPromptVersion)
+        statement.setNullableString(12, event.decisionRunContext.marketSnapshotId)
+        statement.setNullableString(13, event.decisionRunContext.runtimeConfigVersionId)
+        statement.setNullableString(14, event.decisionRunContext.runtimeConfigHash)
+        statement.executeUpdate()
+    }
+}
+
+/** recovery deadlineを再armしてcommand eventを追加する。 */
+internal fun JdbcTransaction.insertRecoveryEvent(
+    event: CommandEvent,
+    deadline: LlmExecutionRecoveryDeadline,
+    nanoTime: () -> Long,
+) {
+    prepareRecoveryStatement(INSERT_COMMAND_EVENT_SQL, deadline, nanoTime).use { statement ->
         statement.setObject(1, event.id)
         statement.setNullableString(2, event.decisionRunContext.decisionRunId)
         statement.setNullableString(3, event.toolCallId)

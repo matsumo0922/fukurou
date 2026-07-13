@@ -72,6 +72,7 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.exchange.gmo.withGmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_RECENT_LESSONS_LIMIT
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_RECENT_LESSONS_LOOKBACK_DAYS
 import me.matsumo.fukurou.trading.knowledge.DEFAULT_KNOWLEDGE_SIMILAR_SETUPS_LIMIT
@@ -429,6 +430,10 @@ fun main() {
         clientRole = bootstrap.phase.toGmoPublicClientRole(),
         allowedToolNames = bootstrap.allowedTools,
         expiresAt = bootstrap.expiresAt,
+        invocationPhase = bootstrap.phase,
+        submissionGatewayClient = LlmDecisionSubmissionGatewayClient.fromConnectedDescriptor(
+            bootstrap.submissionGatewayBinding,
+        ),
     ).run()
 }
 
@@ -466,6 +471,8 @@ class FukurouMcpServer(
         clock = clock,
     ),
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
+    private val invocationPhase: LlmInvocationPhase? = null,
+    private val submissionGatewayClient: LlmDecisionSubmissionGatewayClient? = null,
     allowedToolNames: Set<String>? = mcpAllowedToolNamesFromEnvironment(),
     expiresAt: Instant? = null,
     private val toolCallLimiter: McpToolCallLimiter = McpToolCallLimiter(
@@ -488,6 +495,7 @@ class FukurouMcpServer(
      */
     fun run() {
         createServer().runStdioMcpServer {
+            submissionGatewayClient?.close()
             tradingRuntime.close()
         }
     }
@@ -577,8 +585,19 @@ class FukurouMcpServer(
     }
 
     private fun registerDecisionTools(server: Server) {
-        server.registerSubmitDecisionTool(tradingRuntime, decisionRunContext, toolCallLimiter)
-        server.registerSubmitFalsificationTool(tradingRuntime, decisionRunContext, toolCallLimiter)
+        server.registerSubmitDecisionTool(
+            tradingRuntime,
+            decisionRunContext,
+            toolCallLimiter,
+            invocationPhase,
+            submissionGatewayClient,
+        )
+        server.registerSubmitFalsificationTool(
+            tradingRuntime,
+            decisionRunContext,
+            toolCallLimiter,
+            submissionGatewayClient,
+        )
     }
 
     private fun registerTradeTools(server: Server) {
@@ -649,6 +668,7 @@ internal fun LlmInvocationPhase.toGmoPublicClientRole(): GmoPublicClientRole {
         LlmInvocationPhase.PRE_FILTER -> GmoPublicClientRole.UNSPECIFIED
         LlmInvocationPhase.PROPOSER -> GmoPublicClientRole.PROPOSER
         LlmInvocationPhase.FALSIFIER -> GmoPublicClientRole.FALSIFIER
+        LlmInvocationPhase.RISK_REDUCTION_ONLY -> GmoPublicClientRole.PROPOSER
         LlmInvocationPhase.REFLECTION -> GmoPublicClientRole.UNSPECIFIED
         LlmInvocationPhase.EVALUATION_REPORT -> GmoPublicClientRole.UNSPECIFIED
     }
@@ -702,7 +722,11 @@ private fun Server.addLimitedTool(
     addTool(
         name = definition.name,
         description = definition.description,
-        inputSchema = definition.inputSchema,
+        inputSchema = if (definition.name in McpToolContractCatalog.allTools) {
+            definition.name.catalogToolSchema()
+        } else {
+            definition.inputSchema
+        },
         toolAnnotations = definition.toolAnnotations,
     ) { request ->
         handleLimitedTool(
@@ -712,6 +736,15 @@ private fun Server.addLimitedTool(
             handler = handler,
         )
     }
+}
+
+private fun String.catalogToolSchema(): ToolSchema {
+    val schema = McpToolContractCatalog.schema(this)
+
+    return ToolSchema(
+        properties = schema["properties"]?.jsonObject,
+        required = schema["required"]?.jsonArray?.map { value -> value.jsonPrimitive.content },
+    )
 }
 
 private suspend fun handleLimitedTool(
@@ -740,10 +773,13 @@ private fun limitedToolContext(
     )
 }
 
+@Suppress("LongMethod")
 private fun Server.registerSubmitDecisionTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    invocationPhase: LlmInvocationPhase?,
+    submissionGatewayClient: LlmDecisionSubmissionGatewayClient?,
 ) {
     addLimitedTool(
         definition = LimitedToolDefinition(
@@ -797,7 +833,14 @@ private fun Server.registerSubmitDecisionTool(
         ),
         context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
-        handleSubmitDecision(request, tradingRuntime, decisionRunContext, call)
+        handleSubmitDecision(
+            request,
+            tradingRuntime,
+            decisionRunContext,
+            call,
+            invocationPhase,
+            submissionGatewayClient,
+        )
     }
 }
 
@@ -805,6 +848,7 @@ private fun Server.registerSubmitFalsificationTool(
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     toolCallLimiter: McpToolCallLimiter,
+    submissionGatewayClient: LlmDecisionSubmissionGatewayClient?,
 ) {
     addLimitedTool(
         definition = LimitedToolDefinition(
@@ -838,7 +882,7 @@ private fun Server.registerSubmitFalsificationTool(
         ),
         context = limitedToolContext(decisionRunContext, toolCallLimiter),
     ) { request, call ->
-        handleSubmitFalsification(request, tradingRuntime, decisionRunContext, call)
+        handleSubmitFalsification(request, tradingRuntime, decisionRunContext, call, submissionGatewayClient)
     }
 }
 
@@ -1419,38 +1463,56 @@ private suspend fun handleGetTradeIntent(
     )
 }
 
+@Suppress("LongParameterList")
 private suspend fun handleSubmitDecision(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     call: GuardedToolCall,
+    invocationPhase: LlmInvocationPhase?,
+    submissionGatewayClient: LlmDecisionSubmissionGatewayClient?,
 ): CallToolResult {
     val result = tradingRuntime.toolCallGuard.runDecisionTool(call) {
         val submission = parseDecisionSubmission(request, decisionRunContext).getOrThrow()
+        if (invocationPhase == LlmInvocationPhase.RISK_REDUCTION_ONLY) {
+            require(submission.action in RISK_REDUCTION_ONLY_ACTIONS) {
+                "RISK_REDUCTION_ONLY rejects risk-increasing decisions."
+            }
+        }
 
-        tradingRuntime.decisionRepository.submitDecision(submission).getOrThrow()
+        submissionGatewayClient?.submitDecision(submission)
+            ?: decisionSubmissionJson(tradingRuntime.decisionRepository.submitDecision(submission).getOrThrow())
     }
 
     return result.fold(
-        onSuccess = { value -> decisionSubmissionResult(value) },
+        onSuccess = { value -> jsonObjectResult(value) },
         onFailure = { throwable -> throwableResult(throwable) },
     )
 }
+
+private val RISK_REDUCTION_ONLY_ACTIONS = setOf(
+    DecisionAction.EXIT,
+    DecisionAction.REDUCE,
+    DecisionAction.ADJUST_PROTECTION,
+    DecisionAction.NO_TRADE,
+)
 
 private suspend fun handleSubmitFalsification(
     request: CallToolRequest,
     tradingRuntime: TradingRuntime,
     decisionRunContext: DecisionRunContext,
     call: GuardedToolCall,
+    submissionGatewayClient: LlmDecisionSubmissionGatewayClient?,
 ): CallToolResult {
     val result = tradingRuntime.toolCallGuard.runDecisionTool(call) {
         val submission = parseFalsificationSubmission(request, decisionRunContext).getOrThrow()
 
-        tradingRuntime.decisionRepository.submitFalsification(submission).getOrThrow()
+        submissionGatewayClient?.submitFalsification(submission)
+            ?: falsificationJson(tradingRuntime.decisionRepository.submitFalsification(submission).getOrThrow())
     }
 
     return result.fold(
-        onSuccess = { value -> falsificationResult(value) },
+        onSuccess = { value -> jsonObjectResult(value) },
         onFailure = { throwable -> throwableResult(throwable) },
     )
 }
@@ -2564,35 +2626,31 @@ private fun previewOrderResult(result: PreviewOrderResult): CallToolResult {
     )
 }
 
-private fun decisionSubmissionResult(result: DecisionSubmissionResult): CallToolResult {
-    return jsonObjectResult(
-        buildJsonObject {
-            put("accepted", true)
-            put("decision_id", result.decision.decisionId.toString())
-            put("action", result.decision.submission.action.name)
-            result.decision.submission.closeRatio?.let { closeRatio ->
-                put("close_ratio", closeRatio.toPlainString())
-            }
-            result.tradeIntent?.let { intent ->
-                put("intent_id", intent.intentId.toString())
-            }
-            result.tradePlan?.let { tradePlan ->
-                put("trade_plan_id", tradePlan.tradePlanId.toString())
-                put("revision_count", tradePlan.draft.revisionCount)
-            }
-        },
-    )
+private fun decisionSubmissionJson(result: DecisionSubmissionResult): JsonObject {
+    return buildJsonObject {
+        put("accepted", true)
+        put("decision_id", result.decision.decisionId.toString())
+        put("action", result.decision.submission.action.name)
+        result.decision.submission.closeRatio?.let { closeRatio ->
+            put("close_ratio", closeRatio.toPlainString())
+        }
+        result.tradeIntent?.let { intent ->
+            put("intent_id", intent.intentId.toString())
+        }
+        result.tradePlan?.let { tradePlan ->
+            put("trade_plan_id", tradePlan.tradePlanId.toString())
+            put("revision_count", tradePlan.draft.revisionCount)
+        }
+    }
 }
 
-private fun falsificationResult(result: FalsificationRecord): CallToolResult {
-    return jsonObjectResult(
-        buildJsonObject {
-            put("accepted", true)
-            put("falsification_id", result.falsificationId.toString())
-            put("intent_id", result.intentId.toString())
-            put("verdict", result.verdict.name)
-        },
-    )
+private fun falsificationJson(result: FalsificationRecord): JsonObject {
+    return buildJsonObject {
+        put("accepted", true)
+        put("falsification_id", result.falsificationId.toString())
+        put("intent_id", result.intentId.toString())
+        put("verdict", result.verdict.name)
+    }
 }
 
 private fun jsonObjectResult(structuredContent: JsonObject): CallToolResult {

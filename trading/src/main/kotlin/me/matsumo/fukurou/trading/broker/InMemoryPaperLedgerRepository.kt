@@ -22,6 +22,7 @@ import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.risk.InMemoryAccountStateBoundary
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import java.math.BigDecimal
 import java.time.Clock
@@ -60,6 +61,9 @@ class InMemoryPaperLedgerRepository private constructor(
     internal val equitySnapshotRepository: InMemoryEquitySnapshotRepository
         get() = state.equitySnapshotRepository
 
+    internal val accountStateBoundary: InMemoryAccountStateBoundary
+        get() = state.accountStateBoundary
+
     private constructor(state: InMemoryPaperLedgerState) : this(
         state = state,
         accountRepository = InMemoryPaperLedgerAccountReader(state),
@@ -80,6 +84,7 @@ class InMemoryPaperLedgerRepository private constructor(
         equitySnapshotRepository: InMemoryEquitySnapshotRepository = InMemoryEquitySnapshotRepository(),
         fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
         clock: Clock = Clock.systemUTC(),
+        accountStateBoundary: InMemoryAccountStateBoundary = InMemoryAccountStateBoundary(),
     ) : this(
         InMemoryPaperLedgerState(
             account = InMemoryPaperLedgerAccountSeed(
@@ -98,6 +103,7 @@ class InMemoryPaperLedgerRepository private constructor(
                 fallbackSymbolRules = fallbackSymbolRules,
                 clock = clock,
             ),
+            accountStateBoundary = accountStateBoundary,
         ),
     )
 
@@ -107,7 +113,27 @@ class InMemoryPaperLedgerRepository private constructor(
     internal fun getAllPositionsForTest(): List<Position> {
         return state.read { positions.toList() }
     }
+
+    /** material manifest 向けに account / position / order を同じ ledger lock 内で取得する。 */
+    internal fun readDecisionAccountSnapshot(positionLimit: Int, orderLimit: Int): InMemoryDecisionLedgerSnapshot {
+        return state.read {
+            InMemoryDecisionLedgerSnapshot(
+                account = accountSnapshot,
+                observedAt = accountUpdatedAt,
+                positions = openPositionsLocked().take(positionLimit),
+                openOrders = openOrdersLocked().take(orderLimit),
+            )
+        }
+    }
 }
+
+/** decision material capture 用の coherent in-memory ledger snapshot。 */
+internal data class InMemoryDecisionLedgerSnapshot(
+    val account: AccountSnapshot,
+    val observedAt: Instant,
+    val positions: List<Position>,
+    val openOrders: List<Order>,
+)
 
 /**
  * InMemory paper ledger の account seed。
@@ -181,8 +207,8 @@ private class InMemoryPaperLedgerState(
     account: InMemoryPaperLedgerAccountSeed,
     records: InMemoryPaperLedgerRecordsSeed,
     runtime: InMemoryPaperLedgerRuntime,
+    val accountStateBoundary: InMemoryAccountStateBoundary,
 ) {
-    private val lock = Any()
     var accountSnapshot: AccountSnapshot = account.accountSnapshot
     var accountUpdatedAt: Instant = account.accountUpdatedAt
     val positions: MutableList<Position> = records.positions.toMutableList()
@@ -202,11 +228,11 @@ private class InMemoryPaperLedgerState(
     var lastMarketSequence: Long = 0
 
     fun <T> read(block: InMemoryPaperLedgerState.() -> T): T {
-        return synchronized(lock) { block() }
+        return accountStateBoundary.read { block() }
     }
 
     fun <T> write(block: InMemoryPaperLedgerState.() -> T): T {
-        return synchronized(lock) { block() }
+        return accountStateBoundary.write { block() }
     }
 }
 

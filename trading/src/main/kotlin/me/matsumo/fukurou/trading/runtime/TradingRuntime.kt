@@ -8,6 +8,8 @@ import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialReader
 import me.matsumo.fukurou.trading.activity.EmptyDecisionRunSafetyDenialReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.audit.InMemoryLlmInputManifestRepository
+import me.matsumo.fukurou.trading.audit.LlmInputManifestRepository
 import me.matsumo.fukurou.trading.broker.Broker
 import me.matsumo.fukurou.trading.broker.DefaultPaperExecutionSimulator
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
@@ -19,7 +21,10 @@ import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
+import me.matsumo.fukurou.trading.decision.identity.DecisionAccountSnapshotReader
+import me.matsumo.fukurou.trading.decision.identity.ExposedDecisionAccountSnapshotReader
 import me.matsumo.fukurou.trading.decision.identity.InMemoryDecisionMaterialStateRepository
+import me.matsumo.fukurou.trading.decision.identity.InMemoryDecisionAccountSnapshotReader
 import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.InMemoryEvaluationRepository
@@ -38,6 +43,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedEquitySnapshotRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedLlmInputManifestRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedReconcilerStatusProvider
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
@@ -52,6 +58,7 @@ import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
 import me.matsumo.fukurou.trading.reconciler.NoReconcilerStatusProvider
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
+import me.matsumo.fukurou.trading.risk.InMemoryAccountStateBoundary
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -88,6 +95,7 @@ private const val MAXIMUM_POOL_SIZE = 4
  * runtime DB pool の初期化失敗 timeout。
  */
 private const val INITIALIZATION_FAIL_TIMEOUT = -1L
+private const val CONNECTION_TIMEOUT_MILLIS = 500L
 
 /**
  * trading module が提供する runtime repository 一式。
@@ -123,7 +131,9 @@ data class TradingRuntime(
     val callerNoTradeGuard: CallerNoTradeGuard,
     val launchReservationRepository: LlmLaunchReservationRepository,
     val close: () -> Unit,
-    val decisionMaterialStateRepository: DecisionMaterialStateRepository = InMemoryDecisionMaterialStateRepository(),
+    val decisionMaterialStateRepository: DecisionMaterialStateRepository,
+    val llmInputManifestRepository: LlmInputManifestRepository,
+    val decisionAccountSnapshotReader: DecisionAccountSnapshotReader,
 ) {
     /**
      * runtime resource を閉じる。
@@ -232,11 +242,16 @@ object TradingRuntimeFactory {
         marketDataSource: MarketDataSource? = null,
         tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     ): TradingRuntime {
-        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val accountStateBoundary = InMemoryAccountStateBoundary()
+        val riskStateRepository = InMemoryRiskStateRepository(
+            clock = clock,
+            accountStateBoundary = accountStateBoundary,
+        )
         val commandEventLog = InMemoryCommandEventLog()
         val llmRunRepository = InMemoryLlmRunRepository()
         val evaluationRepository = InMemoryEvaluationRepository()
         val materialStateRepository = InMemoryDecisionMaterialStateRepository()
+        val inputManifestRepository = InMemoryLlmInputManifestRepository(materialStateRepository)
         val decisionRepository = InMemoryDecisionRepository(
             clock = clock,
             materialStateRepository = materialStateRepository,
@@ -252,6 +267,7 @@ object TradingRuntimeFactory {
             accountUpdatedAt = Instant.now(clock),
             fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
             clock = clock,
+            accountStateBoundary = accountStateBoundary,
         )
         val brokerRepositories = InMemoryBrokerRepositories(
             ledgerRepository = ledgerRepository,
@@ -284,6 +300,11 @@ object TradingRuntimeFactory {
             evaluationRepository = evaluationRepository,
             decisionRepository = decisionRepository,
             decisionMaterialStateRepository = materialStateRepository,
+            llmInputManifestRepository = inputManifestRepository,
+            decisionAccountSnapshotReader = InMemoryDecisionAccountSnapshotReader(
+                ledgerRepository = ledgerRepository,
+                riskStateRepository = riskStateRepository,
+            ),
             safetyViolationRepository = safetyViolationRepository,
             safetyDenialReader = EmptyDecisionRunSafetyDenialReader,
             broker = broker,
@@ -391,6 +412,8 @@ object TradingRuntimeFactory {
             evaluationRepository = repositories.evaluationRepository,
             decisionRepository = repositories.decisionRepository,
             decisionMaterialStateRepository = repositories.decisionMaterialStateRepository,
+            llmInputManifestRepository = repositories.llmInputManifestRepository,
+            decisionAccountSnapshotReader = repositories.decisionAccountSnapshotReader,
             safetyViolationRepository = services.safetyViolationRepository,
             safetyDenialReader = safetyDenialReader,
             broker = services.broker,
@@ -468,6 +491,8 @@ private fun createPostgresRepositories(
         evaluationRepository = ExposedEvaluationRepository(connection.database),
         decisionRepository = ExposedDecisionRepository(connection.database, context.clock),
         decisionMaterialStateRepository = ExposedDecisionMaterialStateRepository(connection.database),
+        llmInputManifestRepository = ExposedLlmInputManifestRepository(connection.database),
+        decisionAccountSnapshotReader = ExposedDecisionAccountSnapshotReader(connection.database),
     )
 }
 
@@ -585,6 +610,8 @@ private data class PostgresRuntimeRepositories(
     val evaluationRepository: ExposedEvaluationRepository,
     val decisionRepository: ExposedDecisionRepository,
     val decisionMaterialStateRepository: ExposedDecisionMaterialStateRepository,
+    val llmInputManifestRepository: ExposedLlmInputManifestRepository,
+    val decisionAccountSnapshotReader: ExposedDecisionAccountSnapshotReader,
 )
 
 /**
@@ -616,6 +643,7 @@ private fun createDataSource(config: TradingDatabaseConfig): HikariDataSource {
         password = config.password
         maximumPoolSize = MAXIMUM_POOL_SIZE
         initializationFailTimeout = INITIALIZATION_FAIL_TIMEOUT
+        connectionTimeout = CONNECTION_TIMEOUT_MILLIS
     }
 
     return HikariDataSource(hikariConfig)

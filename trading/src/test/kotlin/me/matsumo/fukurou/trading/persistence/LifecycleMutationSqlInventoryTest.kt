@@ -4,6 +4,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /** creation/terminal SQL と caller の exact source allowlist。 */
@@ -64,6 +65,8 @@ class LifecycleMutationSqlInventoryTest {
         assertTrue("PaperMarketRecoveryMainKt FIXTURE_CREATE" in script)
         assertTrue("raw app INSERT bypassed lifecycle token" in script)
         assertTrue("MCP role gained llm_runs INSERT" in script)
+        assertTrue("MCP role gained opportunity INSERT" in script)
+        assertTrue("MCP role gained opportunity close UPDATE" in script)
         assertEquals(2, Regex("INSERT INTO llm_runs").findAll(script).count())
     }
 
@@ -80,7 +83,6 @@ class LifecycleMutationSqlInventoryTest {
             OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmLaunchReservationRepository.kt", "override suspend fun tryReserve(", "acquireGapPopulationGenerationToken", "tryReserveLlmLaunchInTransaction("),
             OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmLaunchReservationRepository.kt", "override suspend fun finish(", "acquireGapPopulationGenerationTokenForEntity", "finishLlmLaunchInTransaction("),
             OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmLaunchReservationRepository.kt", "override suspend fun recoverStaleExecutionClaim(", "acquireGapPopulationGenerationTokenForEntity", "recoverStaleExecutionClaimInTransaction("),
-            OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmLaunchReservationRepository.kt", "override suspend fun recoverStaleExecutionClaims(", "acquireGapPopulationGenerationTokenForEntity", "recoverStaleExecutionClaimInTransaction("),
             OrderedLifecycleCall("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedDecisionRepository.kt", "override suspend fun submitDecision(", "acquireOpportunityEpisodeGapPopulationToken", "insertDecisionSubmission("),
             OrderedLifecycleCall("fukurou/src/main/kotlin/me/matsumo/fukurou/EvaluationReportPersistence.kt", "fun admit(", "acquireEvaluationGapPopulationToken", "insertJob("),
             OrderedLifecycleCall("fukurou/src/main/kotlin/me/matsumo/fukurou/EvaluationReportPersistence.kt", "fun complete(", "acquireEvaluationGapPopulationToken", "UPDATE evaluation_report_jobs"),
@@ -107,7 +109,10 @@ class LifecycleMutationSqlInventoryTest {
         val mcpRoleSql = Files.readString(root.resolve("scripts/deploy/sql/mcp-role.sql"))
         assertTrue("decision entry intent is blocked by gap population recovery" in lifecycleSource)
         assertTrue("gap_population_unattributed_containments containment" in lifecycleSource)
-        assertTrue("GRANT EXECUTE ON FUNCTION public.acquire_opportunity_episode_gap_population_token(text)" in mcpRoleSql)
+        assertTrue("REVOKE EXECUTE ON FUNCTION public.acquire_opportunity_episode_gap_population_token(text)" in mcpRoleSql)
+        assertTrue(
+            "GRANT EXECUTE ON FUNCTION public.acquire_opportunity_episode_gap_population_token(text) TO %I" in mcpRoleSql,
+        )
         assertTrue("REVOKE ALL ON gap_population_control, gap_population_entity_scopes" in mcpRoleSql)
         assertTrue("GRANT SELECT ON gap_population_unattributed_containments" !in mcpRoleSql)
     }
@@ -131,6 +136,9 @@ class LifecycleMutationSqlInventoryTest {
     @Test
     fun recoveryEntrypointsUseBoundedPassExactTimeoutsAndMaintenanceRedrive() {
         val root = repositoryRoot()
+        val timeoutHelper = Files.readString(
+            root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/PersistenceTransactionTimeouts.kt"),
+        )
         val lifecycle = Files.readString(
             root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/GapPopulationLifecycle.kt"),
         )
@@ -146,12 +154,46 @@ class LifecycleMutationSqlInventoryTest {
             root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/runner/PaperMarketRecoveryMain.kt"),
         )
 
-        assertTrue("SET LOCAL lock_timeout='2s'" in lifecycle)
-        assertTrue("SET LOCAL statement_timeout='5s'" in lifecycle)
+        assertTrue("SET LOCAL lock_timeout='${'$'}{lockTimeoutSeconds}s'" in timeoutHelper)
+        assertTrue("SET LOCAL statement_timeout='${'$'}{statementTimeoutSeconds}s'" in timeoutHelper)
         assertTrue("GAP_POPULATION_PASS_SIZE = 1_000" in lifecycle)
         assertTrue("recoverGapPopulationPass(recoveredAt)" in integrityRepository)
         assertTrue("recoverStaleSession(clock.instant())" in maintenanceWorker)
         assertTrue("recoverStaleSessionWithSummary(Instant.now())" in standalone)
+    }
+
+    @Test
+    fun executionRecoveryUsesAbsoluteDeadlineForEveryMutationBoundaryWithoutBatchApi() {
+        val root = repositoryRoot()
+        val repository = Files.readString(
+            root.resolve(
+                "trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedLlmLaunchReservationRepository.kt",
+            ),
+        )
+        val lifecycle = Files.readString(
+            root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/GapPopulationLifecycle.kt"),
+        )
+        val eventLog = Files.readString(
+            root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedCommandEventLog.kt"),
+        )
+        val timeoutHelper = Files.readString(
+            root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/PersistenceTransactionTimeouts.kt"),
+        )
+
+        assertFalse("recoverStaleExecutionClaims" in repository)
+        assertTrue("SELECT_STALE_LLM_EXECUTION_CLAIMS_SQL" in repository)
+        assertTrue("prepareRecoveryStatement(" in repository)
+        assertTrue("prepareRecoveryStatement(RECOVER_STALE_LLM_EXECUTION_CLAIM_SQL" in repository)
+        assertTrue("recoverCurrentProcessLlmRun(request, deadline, nanoTime)" in repository)
+        assertTrue("SELECT EXISTS (SELECT 1 FROM llm_runs" in repository)
+        assertTrue("insertRecoveryEvent(request, runRecovered, deadline, nanoTime)" in repository)
+        assertTrue("armRecoveryCommitDeadline(deadline, nanoTime)" in repository)
+        assertTrue("acquireGapPopulationGenerationTokenForEntity" in lifecycle)
+        assertTrue("SELECT acquire_gap_population_generation_token(?,?,?,?,?,?)" in lifecycle)
+        assertTrue("SELECT current_setting('fukurou.gap_population_token', true)" in lifecycle)
+        assertTrue("prepareRecoveryStatement(INSERT_COMMAND_EVENT_SQL" in eventLog)
+        assertTrue("setNetworkTimeout" in timeoutHelper)
+        assertFalse("transaction_timeout" in timeoutHelper)
     }
 }
 
@@ -285,7 +327,6 @@ private val LIFECYCLE_MUTATION_SOURCE_ALLOWLIST = listOf(
             "tryReserve",
             "finish",
             "recoverStaleExecutionClaim",
-            "recoverStaleExecutionClaims",
             "INSERT_LLM_LAUNCH_RESERVATION_SQL",
             "FINISH_LLM_LAUNCH_RESERVATION_SQL",
             "RECOVER_STALE_LLM_EXECUTION_CLAIM_SQL",
@@ -340,8 +381,18 @@ private val LIFECYCLE_MUTATION_SOURCE_ALLOWLIST = listOf(
     ),
     LifecycleMutationSourceEntry(
         file = "scripts/mcp-credential-isolation-check",
-        mutations = setOf(LifecycleMutationTuple("INSERT", "llm_runs")),
-        callers = setOf("FIXTURE_CREATE", "raw app INSERT bypassed lifecycle token", "MCP role gained llm_runs INSERT"),
+        mutations = setOf(
+            LifecycleMutationTuple("INSERT", "llm_runs"),
+            LifecycleMutationTuple("INSERT", "opportunity_episodes"),
+            LifecycleMutationTuple("UPDATE", "opportunity_episodes"),
+        ),
+        callers = setOf(
+            "FIXTURE_CREATE",
+            "raw app INSERT bypassed lifecycle token",
+            "MCP role gained llm_runs INSERT",
+            "MCP role gained opportunity INSERT",
+            "MCP role gained opportunity close UPDATE",
+        ),
         requiresToken = false,
     ),
 )

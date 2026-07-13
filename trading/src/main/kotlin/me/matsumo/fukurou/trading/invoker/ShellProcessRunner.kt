@@ -22,15 +22,18 @@ import kotlin.time.toDuration
 class ShellProcessRunner(
     private val terminationGrace: Duration = Duration.ofSeconds(10),
     private val linuxProcRoot: Path = Path.of(LINUX_PROC_ROOT),
-) : ProcessRunner {
+) : ProcessStartAwareRunner {
 
     init {
         require(!terminationGrace.isNegative && !terminationGrace.isZero) { "terminationGrace must be positive." }
     }
-
     override suspend fun run(command: RenderedLlmCommand): Result<ProcessRunResult> {
+        return run(command) {}
+    }
+
+    override suspend fun run(command: RenderedLlmCommand, onStarted: () -> Unit): Result<ProcessRunResult> {
         return try {
-            Result.success(runProcess(command))
+            Result.success(runProcess(command, onStarted))
         } catch (throwable: CancellationException) {
             throw throwable
         } catch (throwable: Throwable) {
@@ -42,10 +45,11 @@ class ShellProcessRunner(
         return deleteCleanupPathsNonCancellable(command.cleanupPaths)
     }
 
-    private suspend fun runProcess(command: RenderedLlmCommand): ProcessRunResult {
+    private suspend fun runProcess(command: RenderedLlmCommand, onStarted: () -> Unit): ProcessRunResult {
         return coroutineScope {
             val startedProcess = startProcess(command)
             val process = startedProcess.process
+            onStarted()
 
             try {
                 val stdout = async(Dispatchers.IO) { process.inputStream.bufferedReader().readText() }

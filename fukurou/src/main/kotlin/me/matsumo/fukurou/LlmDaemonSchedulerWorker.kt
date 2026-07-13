@@ -13,7 +13,9 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import me.matsumo.fukurou.trading.audit.LlmPhaseManifestRecorder
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.DefaultLlmDaemonPreFilter
 import me.matsumo.fukurou.trading.daemon.DefaultLlmDaemonPreFilterDependencies
@@ -40,6 +42,7 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatusReader
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
+import me.matsumo.fukurou.trading.invoker.ProcessScopedLlmCliVersionProbe
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
@@ -335,6 +338,7 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         runtimeConfigSnapshot = inputs.runtimeConfigSnapshot,
         parentEnvironment = inputs.environment,
         clock = inputs.clock,
+        commandRendererConfig = commandRendererConfig,
     )
     val paperLedgerRepository = ExposedPaperLedgerRepository(
         database = inputs.database,
@@ -384,6 +388,17 @@ private fun createLlmDaemonPreFilter(
                 redactor = SecretRedactor.fromEnvironment(inputs.environment),
                 clock = inputs.clock,
                 authFailureMessage = LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE,
+                phaseManifestRecorder = LlmPhaseManifestRecorder(
+                    repository = tradingRuntime.llmInputManifestRepository,
+                    cliVersionProbe = ProcessScopedLlmCliVersionProbe,
+                    runtimeConfigSnapshot = inputs.runtimeConfigSnapshot,
+                    runtimeEnvironmentSnapshot = RuntimeConfigCatalog.runtimeEnvironment(inputs.tradingConfig)
+                        .toSortedMap()
+                        .entries
+                        .joinToString("\n") { entry -> "${entry.key}=${entry.value}" },
+                    clock = inputs.clock,
+                    commandRendererConfig = commandRendererConfig.copy(claudeModel = HAIKU_PRE_FILTER_MODEL),
+                ),
             ),
         ),
         parentEnvironment = inputs.environment,

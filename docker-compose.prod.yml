@@ -42,6 +42,7 @@ services:
       FUKUROU_MCP_SERVER_COMMAND: /usr/local/libexec/fukurou-mcp-launcher
       FUKUROU_REPOSITORY_ROOT: ${FUKUROU_REPOSITORY_ROOT:-/app}
       FUKUROU_LLM_WORKING_DIRECTORY: ${FUKUROU_LLM_WORKING_DIRECTORY:-/tmp/fukurou-llm}
+      FUKUROU_LLM_IMAGE_DIGEST: ${FUKUROU_IMAGE_TAG:?FUKUROU_IMAGE_TAG is required}
       FUKUROU_CLAUDE_COMMAND_TEMPLATE: /usr/local/libexec/fukurou-llm-agent-launcher claude
       FUKUROU_CODEX_COMMAND_TEMPLATE: /usr/local/libexec/fukurou-llm-agent-launcher codex
       FUKUROU_CLAUDE_COMMON_ARGS: ${FUKUROU_CLAUDE_COMMON_ARGS:-}

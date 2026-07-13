@@ -28,6 +28,13 @@ import me.matsumo.fukurou.trading.audit.FUKUROU_PROMPT_HASH_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_RUNTIME_CONFIG_HASH_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_RUNTIME_CONFIG_VERSION_ID_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_SYSTEM_PROMPT_VERSION_ENV
+import me.matsumo.fukurou.trading.audit.LlmAuditRootKind
+import me.matsumo.fukurou.trading.audit.LlmInvocationAuditRoot
+import me.matsumo.fukurou.trading.audit.LlmManifestJsonCodec
+import me.matsumo.fukurou.trading.audit.LlmRunInputManifest
+import me.matsumo.fukurou.trading.audit.LlmRunTriggerSnapshot
+import me.matsumo.fukurou.trading.audit.LlmPhaseManifestRecorder
+import me.matsumo.fukurou.trading.audit.LlmPhaseInputCaptureException
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
@@ -58,6 +65,12 @@ import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifes
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
 import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
 import me.matsumo.fukurou.trading.decision.identity.MaterialMissingSource
+import me.matsumo.fukurou.trading.decision.identity.MarketFeatureBundle
+import me.matsumo.fukurou.trading.decision.identity.MaterialCandleSummary
+import me.matsumo.fukurou.trading.decision.identity.MaterialIndicatorSnapshot
+import me.matsumo.fukurou.trading.decision.identity.MaterialOrderbookSummary
+import me.matsumo.fukurou.trading.decision.identity.MaterialSourceMetadata
+import me.matsumo.fukurou.trading.decision.identity.MaterialTickerSnapshot
 import me.matsumo.fukurou.trading.decision.isFreshApprovedAt
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
@@ -75,22 +88,30 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProcessTreeTerminationRegistry
+import me.matsumo.fukurou.trading.invoker.LlmCliVersionProbe
+import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
+import me.matsumo.fukurou.trading.invoker.ProcessScopedLlmCliVersionProbe
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifestWriter
 import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProof
+import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.invoker.isCodexProvider
 import me.matsumo.fukurou.trading.invoker.readOptionalEnv
 import me.matsumo.fukurou.trading.invoker.splitCommandTemplate
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
 import me.matsumo.fukurou.trading.market.IndicatorType
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.persistence.persistedSnapshotHash
+import me.matsumo.fukurou.trading.persistence.withSnapshotContentHash
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.tool.CallerInvocation
 import java.math.BigDecimal
+import java.math.RoundingMode
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.withSuppressedFailure
 import java.nio.file.Files
@@ -130,6 +151,7 @@ data class OneShotRunnerRequest(
     val proposerAssignment: LlmRoleAssignment? = null,
     val falsifierAssignment: LlmRoleAssignment? = null,
     val preFilter: (suspend () -> LlmDaemonPreFilterDecision)? = null,
+    val triggerSnapshot: LlmRunTriggerSnapshot? = null,
 )
 
 private fun OneShotRunnerRequest.effectiveProposerAssignment(): LlmRoleAssignment {
@@ -155,6 +177,7 @@ data class OneShotRunnerCliConfig(
     val mcpServerArgs: List<String>? = null,
     val proposerAllowedTools: List<String> = defaultProposerAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME),
     val falsifierAllowedTools: List<String> = defaultFalsifierAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME),
+    val riskReductionAllowedTools: List<String> = defaultRiskReductionAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME),
 ) {
     init {
         require(mcpServerName.isNotBlank()) {
@@ -169,6 +192,7 @@ data class OneShotRunnerCliConfig(
         require(falsifierAllowedTools.isNotEmpty()) {
             "falsifierAllowedTools must not be empty."
         }
+        require(riskReductionAllowedTools.isNotEmpty()) { "riskReductionAllowedTools must not be empty." }
 
         val proposerNonMcpTools = proposerAllowedTools
             .filterNot { toolName -> toolName.isMcpToolNameFor(mcpServerName) }
@@ -197,6 +221,7 @@ data class OneShotRunnerCliConfig(
         require(shortMcpToolNames(falsifierAllowedTools).toSet() == CANONICAL_FALSIFIER_MCP_TOOL_NAMES) {
             "falsifierAllowedTools must match the canonical Falsifier policy."
         }
+        McpToolContractCatalog.requireCanonical(LlmInvocationPhase.RISK_REDUCTION_ONLY, riskReductionAllowedTools)
     }
 
     companion object {
@@ -222,6 +247,7 @@ data class OneShotRunnerCliConfig(
                     name = FUKUROU_FALSIFIER_ALLOWED_TOOLS_ENV,
                     defaultValue = defaultFalsifierAllowedTools(serverName),
                 ),
+                riskReductionAllowedTools = defaultRiskReductionAllowedTools(serverName),
             )
         }
     }
@@ -311,6 +337,8 @@ class OneShotLlmRunner(
     private val clock: Clock = Clock.systemUTC(),
     private val idGenerator: () -> UUID = { UUID.randomUUID() },
     private val logger: (String) -> Unit = { message -> println(message) },
+    private val cliVersionProbe: LlmCliVersionProbe = ProcessScopedLlmCliVersionProbe,
+    private val commandRendererConfig: LlmCommandRendererConfig = LlmCommandRendererConfig(),
 ) {
     private val processOutputRedactor = SecretRedactor.fromEnvironment(parentEnvironment)
     private val invocationAuditor = LlmInvocationAuditor(
@@ -319,6 +347,18 @@ class OneShotLlmRunner(
         clock = clock,
         humanLogger = { message -> logHuman(message) },
         authFailureMessage = LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE,
+        phaseManifestRecorder = LlmPhaseManifestRecorder(
+            repository = tradingRuntime.llmInputManifestRepository,
+            cliVersionProbe = cliVersionProbe,
+            runtimeConfigSnapshot = runtimeConfigSnapshot,
+            runtimeEnvironmentSnapshot = RuntimeConfigCatalog.runtimeEnvironment(tradingConfig)
+                .toSortedMap()
+                .entries
+                .joinToString("\n") { entry -> "${entry.key}=${entry.value}" },
+            clock = clock,
+            commandRendererConfig = commandRendererConfig,
+        ),
+        decisionRepository = tradingRuntime.decisionRepository,
     )
     private val decisionExecutionLifecycle = DecisionExecutionLifecycle(
         tradingRuntime = tradingRuntime,
@@ -778,16 +818,31 @@ class OneShotLlmRunner(
             .withSuppressedFailure(finishResult)
     }
 
+    @Suppress("LongMethod")
     private suspend fun runOneShotBody(input: OneShotRunBodyInput): OneShotRunnerResult {
         requireLiveClaim(
             input.invocationId,
             requireNotNull(activeClaimantTokens[input.invocationId]),
         )
-
-        runCatching { captureMaterialManifest(input) }
-            .onFailure { throwable ->
-                logHuman("material manifest coverage miss invocation=${input.invocationId} cause=${throwable::class.simpleName}")
-            }
+        val triggerSnapshot = input.request.triggerSnapshot ?: LlmRunTriggerSnapshot(
+            kind = input.request.triggerKind?.name ?: "MANUAL",
+            observedAt = input.llmRunStart.startedAt,
+            measurements = emptyList(),
+            entities = emptyList(),
+            notApplicableReason = if (input.request.triggerKind == null) "MANUAL_TRIGGER_HAS_NO_MEASUREMENTS" else null,
+        )
+        val existingRoot = tradingRuntime.llmInputManifestRepository.findRoot(input.invocationId).getOrThrow()
+        if (existingRoot == null) {
+            tradingRuntime.llmInputManifestRepository.appendRoot(
+                LlmInvocationAuditRoot(
+                    rootId = input.invocationId,
+                    kind = LlmAuditRootKind.DECISION_ATTEMPT,
+                    capturedAt = input.llmRunStart.startedAt,
+                ),
+            ).getOrThrow()
+        } else {
+            require(existingRoot.kind == LlmAuditRootKind.DECISION_ATTEMPT) { "decision audit root kind mismatch." }
+        }
 
         requireLiveClaimForInvocation(input.invocationId)
         val promptContent = requestFactory.readSystemPrompt(input.request.repositoryRoot)
@@ -806,73 +861,292 @@ class OneShotLlmRunner(
             return recordTtlSweepFailure(input.invocationId, proposerContext, ttlSweepResult.exceptionOrNull())
         }
 
-        return runOneShotAfterPreflight(
-            OneShotAfterPreflightRequest(
+        val materialResult = runCatching {
+            val manifest = captureMaterialManifest(input)
+            appendRunInputManifest(input, triggerSnapshot, manifest).getOrThrow()
+
+            manifest
+        }
+        if (materialResult.isFailure) {
+            return runRiskReductionOnly(
+                input = input,
+                triggerSnapshot = triggerSnapshot,
+                standardFailure = requireNotNull(materialResult.exceptionOrNull()),
+                persistedStandardMaterial = null,
+            )
+        }
+        val materialManifest = materialResult.getOrThrow()
+
+        val afterPreflightInput = OneShotAfterPreflightRequest(
+            request = input.request,
+            invocationId = input.invocationId,
+            promptContent = promptContent,
+            promptHash = promptHash,
+            marketSnapshotId = input.marketSnapshotId,
+            proposerContext = proposerContext,
+            failureContextUpdated = input.failureContextUpdated,
+        )
+        return try {
+            runOneShotAfterPreflight(afterPreflightInput)
+        } catch (throwable: LlmPhaseInputCaptureException) {
+            runRiskReductionOnly(input, triggerSnapshot, throwable, materialManifest)
+        }
+    }
+
+    private suspend fun appendRunInputManifest(
+        input: OneShotRunBodyInput,
+        triggerSnapshot: LlmRunTriggerSnapshot,
+        materialManifest: DecisionMaterialStateManifest,
+    ): Result<Unit> {
+        val runManifestWithoutHash = LlmRunInputManifest(
+            invocationId = input.invocationId,
+            rootId = input.invocationId,
+            trigger = triggerSnapshot,
+            runtimeConfigVersion = runtimeConfigSnapshot?.versionId,
+            runtimeConfigHash = runtimeConfigSnapshot?.hash,
+            runtimeConfigSnapshot = RuntimeConfigCatalog.runtimeEnvironment(tradingConfig)
+                .toSortedMap()
+                .entries
+                .joinToString("\n") { entry -> "${entry.key}=${entry.value}" },
+            materialInvocationId = materialManifest.invocationId,
+            materialContentHash = materialManifest.persistedSnapshotHash(),
+            schemaVersion = materialManifest.schemaVersion,
+            capturedAt = clock.instant(),
+            canonicalContentHash = "",
+        )
+        val runManifest = runManifestWithoutHash.copy(
+            canonicalContentHash = LlmManifestJsonCodec.contentHash(runManifestWithoutHash),
+        )
+        return tradingRuntime.llmInputManifestRepository.appendRunWithMaterial(materialManifest, runManifest)
+    }
+
+    @Suppress("LongMethod")
+    private suspend fun runRiskReductionOnly(
+        input: OneShotRunBodyInput,
+        triggerSnapshot: LlmRunTriggerSnapshot,
+        standardFailure: Throwable,
+        persistedStandardMaterial: DecisionMaterialStateManifest?,
+    ): OneShotRunnerResult {
+        val manifestResult = if (persistedStandardMaterial == null) {
+            createRiskReductionMaterialManifest(input, standardFailure)
+                .mapCatching { manifest ->
+                    appendRunInputManifest(input, triggerSnapshot, manifest).getOrThrow()
+                    manifest
+                }
+        } else {
+            Result.success(persistedStandardMaterial)
+        }
+        if (manifestResult.isFailure) {
+            runAuditRecorder.recordNoTrade(
+                context = DecisionRunContext.EMPTY,
+                reason = "risk_reduction_only_manifest_unavailable",
+                cause = manifestResult.exceptionOrNull(),
+            ).getOrThrow()
+
+            return OneShotRunnerResult(
+                invocationId = input.invocationId,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                decision = null,
+                intent = null,
+                tradeResult = null,
+            )
+        }
+        val promptHash = SystemPromptV1.calculateContentHash(RISK_REDUCTION_ONLY_PROMPT)
+        val context = requestFactory.decisionRunContext(
+            invocationId = input.invocationId,
+            provider = input.request.effectiveProposerAssignment().provider,
+            promptHash = promptHash,
+            marketSnapshotId = input.marketSnapshotId,
+        )
+        input.failureContextUpdated(context)
+        val request = requestFactory.llmRequest(
+            LlmRequestInput(
+                invocationId = input.invocationId,
+                provider = input.request.effectiveProposerAssignment().provider,
+                assignment = input.request.effectiveProposerAssignment(),
+                phase = LlmInvocationPhase.RISK_REDUCTION_ONLY,
+                prompt = RISK_REDUCTION_ONLY_PROMPT,
+                decisionRunContext = context,
+                request = input.request,
+                intentId = null,
+            ),
+        )
+        val audit = phaseInvoker.invokePhase("risk_reduction_only", context, request)
+        val decision = tradingRuntime.decisionRepository.latestDecisionByInvocationId(input.invocationId).getOrThrow()
+        if (decision == null) {
+            runAuditRecorder.recordNoTrade(
+                context = context,
+                reason = "risk_reduction_only_missing_decision",
+                cause = audit.exceptionOrNull() ?: standardFailure,
+            ).getOrThrow()
+
+            return OneShotRunnerResult(
+                invocationId = input.invocationId,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                decision = null,
+                intent = null,
+                tradeResult = null,
+            )
+        }
+        if (decision.decision.submission.action !in RISK_REDUCTION_ONLY_ACTIONS) {
+            runAuditRecorder.recordNoTrade(
+                context = context,
+                reason = "risk_reduction_only_action_rejected",
+                cause = null,
+            ).getOrThrow()
+
+            return OneShotRunnerResult(
+                invocationId = input.invocationId,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                decision = decision,
+                intent = null,
+                tradeResult = null,
+            )
+        }
+
+        return handleNonEnterDecision(
+            input = OneShotAfterPreflightRequest(
                 request = input.request,
                 invocationId = input.invocationId,
-                promptContent = promptContent,
+                promptContent = RISK_REDUCTION_ONLY_PROMPT,
                 promptHash = promptHash,
                 marketSnapshotId = input.marketSnapshotId,
-                proposerContext = proposerContext,
+                proposerContext = context,
                 failureContextUpdated = input.failureContextUpdated,
             ),
+            decision = decision,
+            attributionIncomplete = audit.getOrNull()?.observationAppendFailure != null,
         )
     }
 
+    private suspend fun createRiskReductionMaterialManifest(
+        input: OneShotRunBodyInput,
+        standardFailure: Throwable,
+    ): Result<DecisionMaterialStateManifest> = runCatching {
+        val account = tradingRuntime.decisionAccountSnapshotReader.read().getOrElse { throwable ->
+            standardFailure.addSuppressed(throwable)
+            throw standardFailure
+        }
+        val missing = MaterialMissingSource("STANDARD_CONTEXT", standardFailure.toStandardContextFailureCode())
+        val canonical = "schema=2\nrisk=${account.riskState}\nmissing=${missing.source}:${missing.reason}"
+        DecisionMaterialStateManifest(
+            invocationId = input.invocationId,
+            capturedAt = clock.instant(),
+            triggerKind = if (input.request.triggerKind == null) DecisionTriggerKind.MANUAL else DecisionTriggerKind.DAEMON,
+            symbol = tradingConfig.symbol.apiSymbol,
+            runtimeConfigVersion = runtimeConfigSnapshot?.versionId,
+            runtimeConfigHash = runtimeConfigSnapshot?.hash,
+            riskState = account.riskState,
+            bestBidJpy = null,
+            bestAskJpy = null,
+            lastPriceJpy = null,
+            sourceTimestamp = null,
+            freshness = MaterialFreshness.UNKNOWN,
+            atr14FiveMinutesJpy = null,
+            latestCandleOpenJpy = null,
+            latestCandleHighJpy = null,
+            latestCandleLowJpy = null,
+            latestCandleCloseJpy = null,
+            openPositionFacts = account.positions.map { fact -> "${fact.id}|${fact.status}|${fact.side}" },
+            openOrderFacts = account.openOrders.map { fact -> "${fact.id}|${fact.status}|${fact.side}|${fact.type}" },
+            missingSources = listOf(missing),
+            schemaVersion = 2,
+            canonicalContentHash = DecisionIdentityGenerator.contentHash(canonical),
+            marketFeatureBundle = MarketFeatureBundle(
+                ticker = null,
+                candleSummaries = emptyList(),
+                indicators = emptyList(),
+                orderbookSummary = null,
+                account = account,
+                missingSources = listOf(missing),
+            ),
+        ).withSnapshotContentHash()
+    }
+
     @Suppress("CyclomaticComplexMethod", "LongMethod")
-    private suspend fun captureMaterialManifest(input: OneShotRunBodyInput) {
+    private suspend fun captureMaterialManifest(input: OneShotRunBodyInput): DecisionMaterialStateManifest {
         val capturedAt = clock.instant()
         requireLiveClaimForInvocation(input.invocationId)
-        val riskState = tradingRuntime.riskStateRepository.current().getOrThrow()
+        val account = tradingRuntime.decisionAccountSnapshotReader.read().getOrThrow()
         requireLiveClaimForInvocation(input.invocationId)
-        val positions = tradingRuntime.broker.getPositions().getOrThrow()
+        val marketDataSource = requireNotNull(materialMarketDataSource) { "material market data source is required." }
+        val ticker = marketDataSource.getTicker(tradingConfig.symbol).getOrThrow()
         requireLiveClaimForInvocation(input.invocationId)
-        val orders = tradingRuntime.broker.getOpenOrders().getOrThrow()
-        val positionFacts = positions.map { position ->
-            "${position.positionId}|${position.status}|${position.side}"
-        }.distinct().sorted().take(32)
-        val orderFacts = orders.map { order ->
-            "${order.orderId}|${order.status}|${order.side}|${order.orderType}"
-        }.distinct().sorted().take(64)
-        requireLiveClaimForInvocation(input.invocationId)
-        val ticker = materialMarketDataSource?.getTicker(tradingConfig.symbol)?.getOrNull()
-        requireLiveClaimForInvocation(input.invocationId)
-        val candles = materialMarketDataSource?.getCandles(
+        val candles = marketDataSource.getCandles(
             symbol = tradingConfig.symbol,
             interval = CandleInterval.FIVE_MINUTES,
             limit = 64,
-        )?.getOrNull()
-        val latestCandle = candles?.maxByOrNull { candle -> candle.openTime }
-        val atr = candles?.let { values ->
-            IndicatorCalculator.calculate(
-                candles = values,
-                indicator = IndicatorType.ATR,
-                params = IndicatorParams(period = 14),
-            ).getOrNull()?.values?.lastOrNull { value -> value.value != null }?.value?.let(BigDecimal::valueOf)
+        ).getOrThrow()
+        requireLiveClaimForInvocation(input.invocationId)
+        val candleSummaries = candles.sortedBy { candle -> candle.openTime }.map { candle ->
+            MaterialCandleSummary(
+                openTime = runCatching { Instant.parse(candle.openTime) }
+                    .getOrElse { throw IllegalArgumentException("Required candle timestamp is malformed.") },
+                openJpy = candle.open.requiredPositiveMarketDecimal("candle open"),
+                highJpy = candle.high.requiredPositiveMarketDecimal("candle high"),
+                lowJpy = candle.low.requiredPositiveMarketDecimal("candle low"),
+                closeJpy = candle.close.requiredPositiveMarketDecimal("candle close"),
+                volumeBtc = candle.volume.toBigDecimalOrNull(),
+            ).also { summary ->
+                require(summary.highJpy >= summary.lowJpy) { "Required candle range is malformed." }
+            }
         }
-        val sourceTimestamp = ticker?.timestamp?.let { value -> runCatching { Instant.parse(value) }.getOrNull() }
+        val orderbookResult = withGmoPublicRequestCorrelation(
+            GmoPublicRequestCorrelation(
+                decisionRunContext = DecisionRunContext.EMPTY.copy(decisionRunId = input.invocationId),
+                toolCallId = idGenerator().toString(),
+                clientRole = GmoPublicClientRole.RUNNER,
+            ),
+        ) {
+            marketDataSource.getOrderbook(tradingConfig.symbol, MATERIAL_ORDERBOOK_LEVEL_LIMIT)
+        }
+        val orderbook = orderbookResult.getOrElse { throwable ->
+            if (throwable is UnsupportedOperationException) null else throw throwable
+        }
+        val latestCandle = candleSummaries.maxByOrNull { candle -> candle.openTime }
+        val atr = IndicatorCalculator.calculate(
+            candles = candles,
+            indicator = IndicatorType.ATR,
+            params = IndicatorParams(period = 14),
+        ).getOrNull()?.values?.lastOrNull { value -> value.value != null }?.value?.let(BigDecimal::valueOf)
+        val sourceTimestamp = runCatching { Instant.parse(ticker.timestamp) }.getOrNull()
         val freshness = when {
             sourceTimestamp == null -> MaterialFreshness.UNKNOWN
             Duration.between(sourceTimestamp, capturedAt) > MATERIAL_QUOTE_FRESHNESS -> MaterialFreshness.STALE
             else -> MaterialFreshness.FRESH
         }
         val missingSources = buildList {
-            if (ticker == null) add(MaterialMissingSource("QUOTE", "FETCH_FAILED"))
             if (sourceTimestamp == null) add(MaterialMissingSource("SOURCE_TIMESTAMP", "MISSING_OR_INVALID"))
-            if (candles == null) add(MaterialMissingSource("FIVE_MINUTE_CANDLES", "FETCH_FAILED"))
-            if (atr == null) add(MaterialMissingSource("ATR14", "UNAVAILABLE"))
+            if (atr == null) add(MaterialMissingSource("ATR14", "INSUFFICIENT_VALID_SAMPLES"))
+            if (orderbook == null) add(MaterialMissingSource("ORDERBOOK", "SOURCE_NOT_IMPLEMENTED"))
         }
-        val bid = ticker?.bid?.toBigDecimalOrNull()
-        val ask = ticker?.ask?.toBigDecimalOrNull()
-        val last = ticker?.last?.toBigDecimalOrNull()
+        val bid = ticker.bid.requiredPositiveMarketDecimal("ticker bid")
+        val ask = ticker.ask.requiredPositiveMarketDecimal("ticker ask")
+        val last = ticker.last.requiredPositiveMarketDecimal("ticker last")
+        require(ask >= bid) { "Required ticker spread is malformed." }
+        val positionFacts = account.positions.map { fact -> "${fact.id}|${fact.status}|${fact.side}" }
+        val orderFacts = account.openOrders.map { fact -> "${fact.id}|${fact.status}|${fact.side}|${fact.type}" }
+        val bundle = MarketFeatureBundle(
+            ticker = MaterialTickerSnapshot(
+                bestBidJpy = bid,
+                bestAskJpy = ask,
+                lastPriceJpy = last,
+                metadata = MaterialSourceMetadata(sourceTimestamp, "GMO_PUBLIC_TICKER", false, 1),
+            ),
+            candleSummaries = candleSummaries,
+            indicators = listOf(MaterialIndicatorSnapshot("ATR14_5M", atr, candles.size)),
+            orderbookSummary = orderbook?.toMaterialSummary(sourceTimestamp, capturedAt),
+            account = account,
+            missingSources = missingSources,
+        )
         val canonical = listOf(
             "symbol=${tradingConfig.symbol.apiSymbol}",
-            "risk=${riskState.state}",
-            "bid=${bid?.let(DecisionIdentityGenerator::canonicalDecimal) ?: "null"}",
-            "ask=${ask?.let(DecisionIdentityGenerator::canonicalDecimal) ?: "null"}",
-            "last=${last?.let(DecisionIdentityGenerator::canonicalDecimal) ?: "null"}",
+            "risk=${account.riskState}",
+            "bid=${DecisionIdentityGenerator.canonicalDecimal(bid)}",
+            "ask=${DecisionIdentityGenerator.canonicalDecimal(ask)}",
+            "last=${DecisionIdentityGenerator.canonicalDecimal(last)}",
             "atr=${atr?.let(DecisionIdentityGenerator::canonicalDecimal) ?: "null"}",
-            "candle=${latestCandle?.let { "${it.open}|${it.high}|${it.low}|${it.close}" } ?: "null"}",
+            "candle=${latestCandle?.let { "${it.openJpy}|${it.highJpy}|${it.lowJpy}|${it.closeJpy}" } ?: "null"}",
             "positions=${positionFacts.joinToString(",")}",
             "orders=${orderFacts.joinToString(",")}",
             "freshness=${freshness.name}",
@@ -886,7 +1160,7 @@ class OneShotLlmRunner(
             symbol = tradingConfig.symbol.apiSymbol,
             runtimeConfigVersion = runtimeConfigSnapshot?.versionId,
             runtimeConfigHash = runtimeConfigSnapshot?.hash,
-            riskState = riskState.state.name,
+            riskState = account.riskState,
             priceMoveThresholdRatio = thresholdRatio,
             bestBidJpy = bid,
             bestAskJpy = ask,
@@ -894,18 +1168,20 @@ class OneShotLlmRunner(
             sourceTimestamp = sourceTimestamp,
             freshness = freshness,
             atr14FiveMinutesJpy = atr,
-            latestCandleOpenJpy = latestCandle?.open?.toBigDecimalOrNull(),
-            latestCandleHighJpy = latestCandle?.high?.toBigDecimalOrNull(),
-            latestCandleLowJpy = latestCandle?.low?.toBigDecimalOrNull(),
-            latestCandleCloseJpy = latestCandle?.close?.toBigDecimalOrNull(),
+            latestCandleOpenJpy = latestCandle?.openJpy,
+            latestCandleHighJpy = latestCandle?.highJpy,
+            latestCandleLowJpy = latestCandle?.lowJpy,
+            latestCandleCloseJpy = latestCandle?.closeJpy,
             openPositionFacts = positionFacts,
             openOrderFacts = orderFacts,
             missingSources = missingSources,
+            schemaVersion = 2,
             canonicalContentHash = DecisionIdentityGenerator.contentHash(canonical),
             materialProjection = "",
-        )
+            marketFeatureBundle = bundle,
+        ).withSnapshotContentHash()
 
-        tradingRuntime.decisionMaterialStateRepository.append(manifest).getOrThrow()
+        return manifest
     }
 
     private suspend fun recordTtlSweepFailure(
@@ -960,7 +1236,23 @@ class OneShotLlmRunner(
         }
 
         if (!decision.decision.submission.action.requiresEntryIntent()) {
-            return handleNonEnterDecision(input, decision)
+            return handleNonEnterDecision(input, decision, proposerResult.attributionIncomplete)
+        }
+
+        if (proposerResult.attributionIncomplete || hasDecisionAttributionGap(invocationId)) {
+            runAuditRecorder.recordNoTrade(
+                context = proposerContext,
+                reason = "phase_observation_missing_entry_rejected",
+                cause = proposerResult.observationAppendFailure,
+            ).getOrThrow()
+
+            return OneShotRunnerResult(
+                invocationId = invocationId,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                decision = decision,
+                intent = decision.tradeIntent,
+                tradeResult = null,
+            )
         }
 
         return runApprovedEntryFlow(input, decision)
@@ -993,16 +1285,26 @@ class OneShotLlmRunner(
             failure = proposerAudit.exceptionOrNull(),
             authFailureSuspected = proposerAudit.getOrNull()?.authFailureSuspected ?: false,
             cliErrorReported = proposerAudit.getOrNull()?.cliErrorReported ?: false,
+            observationAppendFailure = proposerAudit.getOrNull()?.observationAppendFailure,
         )
     }
 
     private suspend fun handleNonEnterDecision(
         input: OneShotAfterPreflightRequest,
         decision: DecisionSubmissionResult,
+        attributionIncomplete: Boolean,
     ): OneShotRunnerResult {
         logHuman("decision saved invocation=${input.invocationId} action=${decision.decision.submission.action}")
 
         requireLiveClaimForInvocation(input.invocationId)
+        if (attributionIncomplete) {
+            runAuditRecorder.appendRunnerPhase(
+                context = input.proposerContext,
+                phase = "infrastructure_attribution",
+                duration = Duration.ZERO,
+                details = buildJsonObject { put("status", "INFRASTRUCTURE_ATTRIBUTION_INCOMPLETE") },
+            ).getOrThrow()
+        }
         val lifecycleResult = when (decision.decision.submission.action) {
             DecisionAction.EXIT -> decisionExecutionLifecycle.executeExitDecision(input.proposerContext, decision)
             DecisionAction.REDUCE -> decisionExecutionLifecycle.executeReduceDecision(input.proposerContext, decision)
@@ -1067,6 +1369,21 @@ class OneShotLlmRunner(
                 intent = intent,
                 status = OneShotRunnerStatus.NO_TRADE_AUDITED,
                 terminalCause = terminalCauseForNoTrade(falsifierResult.failure),
+            )
+        }
+
+        if (falsifierResult.attributionIncomplete || hasDecisionAttributionGap(invocationId)) {
+            runAuditRecorder.recordNoTrade(
+                context = falsifierContext,
+                reason = "phase_observation_missing_entry_rejected",
+                cause = falsifierResult.observationAppendFailure,
+            ).getOrThrow()
+
+            return entryFlowResult(
+                invocationId = invocationId,
+                decision = decision,
+                intent = intent,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
             )
         }
 
@@ -1146,9 +1463,8 @@ class OneShotLlmRunner(
                 intentId = intent.intentId,
             ),
         )
-        val falsifierFailure = phaseInvoker
-            .invokePhase("falsifier", falsifierContext, falsifierRequest)
-            .exceptionOrNull()
+        val falsifierAudit = phaseInvoker.invokePhase("falsifier", falsifierContext, falsifierRequest)
+        val falsifierFailure = falsifierAudit.exceptionOrNull()
         val falsification = tradingRuntime.decisionRepository
             .latestFalsification(intent.intentId)
             .getOrThrow()
@@ -1161,7 +1477,17 @@ class OneShotLlmRunner(
             falsification = falsification,
             failure = falsifierFailure,
             approved = approved,
+            observationAppendFailure = falsifierAudit.getOrNull()?.observationAppendFailure,
         )
+    }
+
+    private suspend fun hasDecisionAttributionGap(invocationId: String): Boolean {
+        return ATTRIBUTION_PHASES.any { phase ->
+            val phaseId = "$invocationId:${phase.name}"
+            val manifest = tradingRuntime.llmInputManifestRepository.findPhase(phaseId).getOrThrow()
+
+            manifest != null && tradingRuntime.llmInputManifestRepository.findObservation(phaseId).getOrThrow() == null
+        }
     }
 
     private suspend fun placeApprovedEntry(
@@ -1774,6 +2100,7 @@ private class OneShotLlmRequestFactory(
             LlmInvocationPhase.PRE_FILTER -> emptyList()
             LlmInvocationPhase.PROPOSER -> cliConfig.proposerAllowedTools
             LlmInvocationPhase.FALSIFIER -> cliConfig.falsifierAllowedTools
+            LlmInvocationPhase.RISK_REDUCTION_ONLY -> cliConfig.riskReductionAllowedTools
             LlmInvocationPhase.REFLECTION -> emptyList()
             LlmInvocationPhase.EVALUATION_REPORT -> emptyList()
         }
@@ -1937,7 +2264,10 @@ private data class ProposerDecisionResult(
     val failure: Throwable?,
     val authFailureSuspected: Boolean,
     val cliErrorReported: Boolean,
-)
+    val observationAppendFailure: Throwable?,
+) {
+    val attributionIncomplete: Boolean get() = observationAppendFailure != null
+}
 
 private suspend fun noDecisionAuditReason(
     input: OneShotAfterPreflightRequest,
@@ -1988,7 +2318,10 @@ private data class FalsifierPhaseResult(
     val falsification: FalsificationRecord?,
     val failure: Throwable?,
     val approved: Boolean,
-)
+    val observationAppendFailure: Throwable?,
+) {
+    val attributionIncomplete: Boolean get() = observationAppendFailure != null
+}
 
 /**
  * runner deterministic entry の preview 結果。
@@ -2106,56 +2439,28 @@ fun defaultFalsifierAllowedTools(serverName: String): List<String> {
     }
 }
 
+/** reduction-only phase の canonical MCP allowlist。 */
+fun defaultRiskReductionAllowedTools(serverName: String): List<String> {
+    return McpToolContractCatalog.riskReductionTools.map { toolName -> mcpToolName(serverName, toolName) }
+}
+
 /**
  * Proposer が既定で呼べる MCP tool の短い名前。
  */
-val CANONICAL_PROPOSER_MCP_TOOL_NAMES = setOf(
-    "get_trade_intent",
-    "get_ticker",
-    "get_candles",
-    "get_orderbook",
-    "get_trades",
-    "get_symbol_rules",
-    "calc_indicator",
-    "get_balance",
-    "get_positions",
-    "get_open_orders",
-    "get_account_status",
-    KNOWLEDGE_GET_RECENT_LESSONS_TOOL_NAME,
-    KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL_NAME,
-    SUBMIT_DECISION_TOOL_NAME,
-)
+val CANONICAL_PROPOSER_MCP_TOOL_NAMES = McpToolContractCatalog.proposerTools
 
 /**
  * Falsifier が既定で呼べる MCP tool の短い名前。
  */
-val CANONICAL_FALSIFIER_MCP_TOOL_NAMES = setOf(
-    "get_trade_intent",
-    "preview_order",
-    "get_ticker",
-    "get_candles",
-    "get_orderbook",
-    "get_trades",
-    "get_symbol_rules",
-    "calc_indicator",
-    "get_balance",
-    "get_positions",
-    "get_open_orders",
-    "get_account_status",
-    KNOWLEDGE_GET_RECENT_LESSONS_TOOL_NAME,
-    KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL_NAME,
-    SUBMIT_FALSIFICATION_TOOL_NAME,
-)
+val CANONICAL_FALSIFIER_MCP_TOOL_NAMES = McpToolContractCatalog.falsifierTools
 
 /**
  * recent lessons を読む read-only Knowledge tool 名。
  */
-private const val KNOWLEDGE_GET_RECENT_LESSONS_TOOL_NAME = "knowledge_get_recent_lessons"
 
 /**
  * similar setups を読む read-only Knowledge tool 名。
  */
-private const val KNOWLEDGE_SEARCH_SIMILAR_SETUPS_TOOL_NAME = "knowledge_search_similar_setups"
 
 /**
  * Proposer の最終判断を保存する write tool 名。
@@ -2280,3 +2585,91 @@ private val SECRET_KEY_PATTERNS = listOf(
 )
 
 private val MATERIAL_QUOTE_FRESHNESS: Duration = Duration.ofMinutes(1)
+private const val MATERIAL_ORDERBOOK_LEVEL_LIMIT = 10
+private val RISK_REDUCTION_ONLY_ACTIONS = setOf(
+    DecisionAction.EXIT,
+    DecisionAction.REDUCE,
+    DecisionAction.ADJUST_PROTECTION,
+    DecisionAction.NO_TRADE,
+)
+
+private val ATTRIBUTION_PHASES = setOf(
+    LlmInvocationPhase.PRE_FILTER,
+    LlmInvocationPhase.PROPOSER,
+    LlmInvocationPhase.FALSIFIER,
+)
+
+private val RISK_REDUCTION_ONLY_PROMPT = """
+    |The standard decision context is unavailable. Run a risk-reduction-only session.
+    |Use only the bounded account, position, and open-order tools.
+    |Submit exactly one EXIT, REDUCE, ADJUST_PROTECTION, or NO_TRADE decision.
+    |ENTER and ADD_LONG are forbidden.
+""".trimMargin()
+
+private fun Throwable.toStandardContextFailureCode(): String {
+    val simpleName = javaClass.simpleName.uppercase()
+
+    return when {
+        simpleName.contains("MARKET") || simpleName.contains("GMO") -> "MARKET_DATA_UNAVAILABLE"
+        simpleName.contains("CLI") || simpleName.contains("PROCESS") -> "CLI_VERSION_UNAVAILABLE"
+        simpleName.contains("CANONICAL") || simpleName.contains("MANIFEST") -> "CANONICALIZATION_UNAVAILABLE"
+        else -> "STANDARD_SNAPSHOT_UNAVAILABLE"
+    }
+}
+
+private fun String.requiredPositiveMarketDecimal(label: String): BigDecimal {
+    val value = toBigDecimalOrNull()
+    require(value != null && value.signum() > 0) { "Required $label is malformed." }
+
+    return value
+}
+
+private fun Orderbook.toMaterialSummary(sourceTimestamp: Instant?, capturedAt: Instant): MaterialOrderbookSummary {
+    val bids = bids.take(MATERIAL_ORDERBOOK_LEVEL_LIMIT).mapNotNull { level ->
+        val price = level.price.toBigDecimalOrNull() ?: return@mapNotNull null
+        val size = level.size.toBigDecimalOrNull() ?: return@mapNotNull null
+        price to size
+    }
+    val asks = asks.take(MATERIAL_ORDERBOOK_LEVEL_LIMIT).mapNotNull { level ->
+        val price = level.price.toBigDecimalOrNull() ?: return@mapNotNull null
+        val size = level.size.toBigDecimalOrNull() ?: return@mapNotNull null
+        price to size
+    }
+    val bestBid = bids.maxOfOrNull { it.first }
+    val bestAsk = asks.minOfOrNull { it.first }
+    val mid = if (bestBid != null && bestAsk != null) {
+        bestBid.add(bestAsk).divide(BigDecimal(2))
+    } else {
+        null
+    }
+    val spreadBps = if (mid != null && mid.signum() > 0) {
+        bestAsk?.subtract(bestBid)?.multiply(BigDecimal(10_000))?.divide(mid, 8, RoundingMode.HALF_UP)
+    } else {
+        null
+    }
+    val bidQuantity = bids.fold(BigDecimal.ZERO) { total, level -> total.add(level.second) }
+    val askQuantity = asks.fold(BigDecimal.ZERO) { total, level -> total.add(level.second) }
+    val totalQuantity = bidQuantity.add(askQuantity)
+
+    return MaterialOrderbookSummary(
+        bestBidJpy = bestBid,
+        bestAskJpy = bestAsk,
+        midJpy = mid,
+        spreadBps = spreadBps,
+        topBidQuantityBtc = bidQuantity,
+        topAskQuantityBtc = askQuantity,
+        topBidNotionalJpy = bids.fold(BigDecimal.ZERO) { total, level -> total.add(level.first.multiply(level.second)) },
+        topAskNotionalJpy = asks.fold(BigDecimal.ZERO) { total, level -> total.add(level.first.multiply(level.second)) },
+        imbalance = if (totalQuantity.signum() == 0) {
+            null
+        } else {
+            bidQuantity.subtract(askQuantity).divide(totalQuantity, 8, RoundingMode.HALF_UP)
+        },
+        metadata = MaterialSourceMetadata(
+            observedAt = sourceTimestamp ?: capturedAt,
+            provenance = "GMO_PUBLIC_ORDERBOOK_TOP10",
+            truncated = this.bids.size > MATERIAL_ORDERBOOK_LEVEL_LIMIT || this.asks.size > MATERIAL_ORDERBOOK_LEVEL_LIMIT,
+            totalCount = null,
+        ),
+    )
+}

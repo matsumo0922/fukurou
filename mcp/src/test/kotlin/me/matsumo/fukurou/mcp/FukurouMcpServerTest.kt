@@ -26,6 +26,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
@@ -99,6 +100,7 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.MCP_MANIFEST_VERSION
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifest
+import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.knowledge.KnowledgeService
 import me.matsumo.fukurou.trading.market.GmoRequestAuditException
 import me.matsumo.fukurou.trading.market.MarketDataSource
@@ -229,6 +231,28 @@ class FukurouMcpServerTest {
             missingToolNames.isEmpty(),
             "Default runner allowlists must reference registered MCP tools: $missingToolNames",
         )
+    }
+
+    @Test
+    fun createServer_stageOneSchemasMatchCanonicalCatalog() {
+        val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        ).createServer()
+
+        McpToolContractCatalog.allTools.forEach { name ->
+            val registered = requireNotNull(server.tools[name]?.tool).inputSchema
+            val registeredJson = buildJsonObject {
+                registered.properties?.let { properties -> put("properties", properties) }
+                registered.required?.let { required ->
+                    put("required", JsonArray(required.map(::JsonPrimitive)))
+                }
+                put("type", "object")
+            }
+
+            assertEquals(McpToolContractCatalog.schema(name), registeredJson, name)
+        }
     }
 
     @Test
@@ -1930,6 +1954,8 @@ class McpDatabaseRoleIntegrationTest {
         container.start()
         val marketFixture = GmoRequiredMatrixFixture.start()
         var runtime: me.matsumo.fukurou.trading.runtime.TradingRuntime? = null
+        var appRuntime: me.matsumo.fukurou.trading.runtime.TradingRuntime? = null
+        var gatewayFixture: GatewayFixture? = null
         try {
             val clock = fixedClock()
             val database = ExposedDatabase.connect(container.jdbcUrl, driver = "org.postgresql.Driver", user = container.username, password = container.password)
@@ -1941,10 +1967,10 @@ class McpDatabaseRoleIntegrationTest {
             provisionMcpRole(container)
             createFuturePrivilegeBoundaryObjects(container)
             assertRoleBoundary(container)
-            TradingRuntimeFactory.postgres(
+            appRuntime = TradingRuntimeFactory.postgres(
                 TradingDatabaseConfig(container.jdbcUrl, container.username, container.password),
                 clock = clock,
-            ).close()
+            )
 
             val bootstrap = requiredMatrixBootstrap(container, clock, LlmInvocationPhase.PROPOSER)
             val tradingConfig = TradingBotConfig(
@@ -1969,6 +1995,10 @@ class McpDatabaseRoleIntegrationTest {
                 marketDataSource = fixtureMarketDataSource,
                 tradingConfig = tradingConfig,
             )
+            gatewayFixture = gatewayFixture(
+                repository = requireNotNull(appRuntime).decisionRepository,
+                bootstrap = bootstrap,
+            )
             var server = FukurouMcpServer(
                 tradingConfig = tradingConfig,
                 requestAuditSink = requestAuditSink,
@@ -1979,6 +2009,8 @@ class McpDatabaseRoleIntegrationTest {
                 clientRole = bootstrap.phase.toGmoPublicClientRole(),
                 allowedToolNames = bootstrap.allowedTools,
                 expiresAt = bootstrap.expiresAt,
+                invocationPhase = bootstrap.phase,
+                submissionGatewayClient = gatewayFixture.client,
             ).createServer()
             val results = linkedMapOf<String, CallToolResult>()
             results["get_ticker"] = callTool(server, "get_ticker")
@@ -2022,6 +2054,8 @@ class McpDatabaseRoleIntegrationTest {
             val intentId = assertNotNull(decision.structuredContent).getValue("intent_id").jsonPrimitive.contentOrNull
             results["get_trade_intent"] = callTool(server, "get_trade_intent", buildJsonObject { put("intent_id", intentId) })
             assertIdentityDualWrite(container)
+            gatewayFixture.close()
+            gatewayFixture = null
             runtime.close()
             val falsifierBootstrap = requiredMatrixBootstrap(container, clock, LlmInvocationPhase.FALSIFIER)
             val falsifierRequestAuditSink = DeferredGmoPublicRequestAuditSink()
@@ -2039,6 +2073,10 @@ class McpDatabaseRoleIntegrationTest {
                 marketDataSource = falsifierMarketDataSource,
                 tradingConfig = tradingConfig,
             )
+            gatewayFixture = gatewayFixture(
+                repository = requireNotNull(appRuntime).decisionRepository,
+                bootstrap = falsifierBootstrap,
+            )
             server = FukurouMcpServer(
                 tradingConfig = tradingConfig,
                 requestAuditSink = falsifierRequestAuditSink,
@@ -2049,6 +2087,8 @@ class McpDatabaseRoleIntegrationTest {
                 clientRole = falsifierBootstrap.phase.toGmoPublicClientRole(),
                 allowedToolNames = falsifierBootstrap.allowedTools,
                 expiresAt = falsifierBootstrap.expiresAt,
+                invocationPhase = falsifierBootstrap.phase,
+                submissionGatewayClient = gatewayFixture.client,
             ).createServer()
             results["submit_falsification"] = callTool(
                 server,
@@ -2067,11 +2107,47 @@ class McpDatabaseRoleIntegrationTest {
             assertForbiddenDml(container)
             assertNoFallback(container, clock)
         } finally {
+            gatewayFixture?.close()
             runtime?.close()
+            appRuntime?.close()
             marketFixture.close()
             container.stop()
         }
     }
+}
+
+private class GatewayFixture(
+    val client: LlmDecisionSubmissionGatewayClient,
+    private val gateway: me.matsumo.fukurou.trading.runner.LlmDecisionSubmissionGateway,
+) : AutoCloseable {
+    override fun close() {
+        client.close()
+        gateway.close()
+    }
+}
+
+private fun gatewayFixture(
+    repository: me.matsumo.fukurou.trading.decision.DecisionRepository,
+    bootstrap: McpBootstrapConfig,
+): GatewayFixture {
+    val path = java.nio.file.Path.of("/tmp/fukurou-role-${System.nanoTime()}.sock")
+    val binding = bootstrap.submissionGatewayBinding
+    val gateway = me.matsumo.fukurou.trading.runner.LlmDecisionSubmissionGateway.start(
+        socketPath = path,
+        repository = repository,
+        invocationId = binding.invocationId,
+        phase = binding.phase,
+        phaseManifestId = binding.phaseManifestId,
+        effectiveInvocationHash = binding.effectiveInvocationHash,
+    )
+    val channel = java.nio.channels.SocketChannel.open(java.net.StandardProtocolFamily.UNIX).apply {
+        connect(java.net.UnixDomainSocketAddress.of(path))
+    }
+
+    return GatewayFixture(
+        client = LlmDecisionSubmissionGatewayClient.fromChannel(channel, binding),
+        gateway = gateway,
+    )
 }
 
 private fun assertIdentityDualWrite(container: PostgreSQLContainer<*>) {
@@ -2085,6 +2161,16 @@ private fun assertIdentityDualWrite(container: PostgreSQLContainer<*>) {
                     AND d.material_state_hash=ti.material_state_hash
                     AND d.identity_schema_version=ti.identity_schema_version
                     AND d.opportunity_episode_id IS NOT NULL
+                """.trimIndent(),
+                1,
+            )
+            assertSqlCount(
+                statement,
+                """SELECT COUNT(*) FROM decisions d
+                    JOIN opportunity_episodes e ON e.id=d.opportunity_episode_id
+                    JOIN trade_intents ti ON ti.decision_id=d.id
+                    WHERE d.invocation_id='$MCP_MATRIX_RUN_ID'
+                    AND e.thesis_id=d.thesis_id AND ti.opportunity_episode_id=e.id
                 """.trimIndent(),
                 1,
             )
@@ -2296,7 +2382,7 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
     }
     mcpTestConnection(container).use { connection ->
         connection.createStatement().use { statement ->
-            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_column_privilege(current_user, 'orders', 'status', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_function_privilege(current_user, 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP'), has_column_privilege(current_user, 'opportunity_episodes', 'closed_at', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'close_reason', 'UPDATE'), has_function_privilege(current_user, 'public.acquire_gap_population_generation_token()', 'EXECUTE'), has_function_privilege(current_user, 'public.acquire_opportunity_episode_gap_population_token(text)', 'EXECUTE'), has_column_privilege(current_user, 'opportunity_episodes', 'birth_sequence', 'INSERT'), has_column_privilege(current_user, 'orders', 'birth_sequence', 'SELECT')").use { rows ->
+            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_column_privilege(current_user, 'orders', 'status', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_function_privilege(current_user, 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP'), has_column_privilege(current_user, 'opportunity_episodes', 'closed_at', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'close_reason', 'UPDATE'), has_function_privilege(current_user, 'public.acquire_gap_population_generation_token()', 'EXECUTE'), has_function_privilege(current_user, 'public.acquire_opportunity_episode_gap_population_token(text)', 'EXECUTE'), has_column_privilege(current_user, 'opportunity_episodes', 'id', 'INSERT'), has_column_privilege(current_user, 'orders', 'birth_sequence', 'SELECT')").use { rows ->
                 assertTrue(rows.next())
                 assertEquals(true, rows.getBoolean(1))
                 assertEquals(true, rows.getBoolean(2))
@@ -2304,10 +2390,10 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
                 assertEquals(true, rows.getBoolean(4))
                 assertEquals(true, rows.getBoolean(5))
                 assertEquals(false, rows.getBoolean(6))
-                assertEquals(true, rows.getBoolean(7))
-                assertEquals(true, rows.getBoolean(8))
+                assertEquals(false, rows.getBoolean(7))
+                assertEquals(false, rows.getBoolean(8))
                 assertEquals(false, rows.getBoolean(9))
-                assertEquals(true, rows.getBoolean(10))
+                assertEquals(false, rows.getBoolean(10))
                 assertEquals(false, rows.getBoolean(11))
                 assertEquals(false, rows.getBoolean(12))
             }
@@ -2354,6 +2440,16 @@ private fun assertForbiddenDml(container: PostgreSQLContainer<*>) {
             "DELETE FROM executions",
             "TRUNCATE positions",
             "INSERT INTO orders DEFAULT VALUES",
+            "INSERT INTO decisions DEFAULT VALUES",
+            "INSERT INTO trade_plans DEFAULT VALUES",
+            "INSERT INTO trade_intents DEFAULT VALUES",
+            "INSERT INTO falsifications DEFAULT VALUES",
+            "INSERT INTO opportunity_episodes (id,symbol,thesis_id,price_move_threshold_ratio,opened_at,closed_at,close_reason) " +
+                "VALUES (gen_random_uuid(),'BTC','forbidden-thesis',0.01,0,NULL,NULL)",
+            "INSERT INTO dedupe_shadow_observations DEFAULT VALUES",
+            "INSERT INTO decision_identity_generation_failures DEFAULT VALUES",
+            "UPDATE opportunity_episodes SET closed_at=closed_at,close_reason=close_reason",
+            "SELECT acquire_opportunity_episode_gap_population_token('BTC')",
             "UPDATE mcp_current_evaluation_scope SET account_initial_cash_jpy=account_initial_cash_jpy",
             "UPDATE mcp_evaluation_epochs SET initial_cash_jpy=initial_cash_jpy",
             "SELECT config_value FROM runtime_config_values LIMIT 1",

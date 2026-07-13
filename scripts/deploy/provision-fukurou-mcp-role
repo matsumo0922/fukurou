@@ -30,6 +30,13 @@ chmod 600 "$temporary_sql"
 } >"$temporary_sql"
 
 psql "$database_url" --no-psqlrc --quiet --file "$temporary_sql"
+privilege_postcondition=$(psql "$database_url" --no-psqlrc --tuples-only --no-align \
+    --set=app_role="$app_role" \
+    --command "SELECT has_function_privilege('$role_name','public.acquire_opportunity_episode_gap_population_token(text)','EXECUTE'), has_column_privilege('$role_name','public.opportunity_episodes','id','INSERT'), has_column_privilege('$role_name','public.opportunity_episodes','closed_at','UPDATE'), has_function_privilege(:'app_role','public.acquire_opportunity_episode_gap_population_token(text)','EXECUTE');")
+[ "$privilege_postcondition" = "f|f|f|t" ] || {
+    echo "MCP role privilege postcondition failed." >&2
+    exit 1
+}
 psql "$database_url" --no-psqlrc --tuples-only --no-align \
     --command "SELECT rolname || ': flags=' || rolsuper || ',' || rolcreatedb || ',' || rolcreaterole || ',' || rolreplication || ',' || rolbypassrls FROM pg_roles WHERE rolname = '$role_name';"
 echo "MCP role provision completed; no fallback credential was configured."

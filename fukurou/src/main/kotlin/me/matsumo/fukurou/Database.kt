@@ -33,6 +33,9 @@ private const val READINESS_QUERY = "SELECT 1"
  */
 private const val READINESS_EXPECTED_VALUE = 1
 
+/** production DB poolからconnectionを取得するときの最大待機時間。 */
+internal const val DATABASE_CONNECTION_TIMEOUT_MILLIS = 500L
+
 /**
  * データベース接続設定。環境変数から組み立てる。
  *
@@ -77,6 +80,7 @@ fun createDataSource(config: DatabaseConfig): HikariDataSource {
         password = config.password
         maximumPoolSize = 4
         initializationFailTimeout = -1L
+        connectionTimeout = DATABASE_CONNECTION_TIMEOUT_MILLIS
     }
 
     return HikariDataSource(hikariConfig)

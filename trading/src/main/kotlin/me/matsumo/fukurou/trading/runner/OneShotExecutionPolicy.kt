@@ -47,6 +47,7 @@ fun LlmInvocationPhase.isClaimedOneShotPhase(): Boolean = when (this) {
     LlmInvocationPhase.PRE_FILTER,
     LlmInvocationPhase.PROPOSER,
     LlmInvocationPhase.FALSIFIER,
+    LlmInvocationPhase.RISK_REDUCTION_ONLY,
     -> true
     LlmInvocationPhase.REFLECTION,
     LlmInvocationPhase.EVALUATION_REPORT,

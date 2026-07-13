@@ -21,6 +21,45 @@ import kotlin.time.toDuration
 class ShellProcessRunnerTest {
 
     @Test
+    fun processTreeProofRegistry_ignoresProofWithoutUnresolvedChild() {
+        val invocationId = "pre-start-proof"
+
+        LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.UNCERTAIN)
+        LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.PROVEN_EXITED)
+
+        assertEquals(null, LlmProcessTreeTerminationRegistry.find(invocationId))
+    }
+
+    @Test
+    fun processTreeProofRegistry_recordsUncertaintyForStartedChild() {
+        val invocationId = "post-start-uncertain-proof"
+        LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+
+        LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.UNCERTAIN)
+
+        assertEquals(
+            ProcessTreeTerminationProof.UNCERTAIN,
+            LlmProcessTreeTerminationRegistry.find(invocationId),
+        )
+        LlmProcessTreeTerminationRegistry.resolve(invocationId)
+    }
+
+    @Test
+    fun processTreeProofRegistry_doesNotDowngradeCompletedProof() {
+        val invocationId = "completed-proof"
+        LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+        LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.PROVEN_EXITED)
+
+        LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.UNCERTAIN)
+
+        assertEquals(
+            ProcessTreeTerminationProof.PROVEN_EXITED,
+            LlmProcessTreeTerminationRegistry.find(invocationId),
+        )
+        LlmProcessTreeTerminationRegistry.resolve(invocationId)
+    }
+
+    @Test
     fun processTreeProofRegistry_doesNotOverwriteEarlierUncertainty() {
         val invocationId = "multi-child-proof"
         LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)

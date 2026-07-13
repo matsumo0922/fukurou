@@ -24,6 +24,10 @@ import me.matsumo.fukurou.trading.audit.FUKUROU_MARKET_SNAPSHOT_ID_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_PROMPT_HASH_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_SYSTEM_PROMPT_VERSION_ENV
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.audit.LlmInputManifestRepository
+import me.matsumo.fukurou.trading.audit.LlmPhaseInputManifest
+import me.matsumo.fukurou.trading.audit.LlmPhaseObservation
+import me.matsumo.fukurou.trading.audit.LlmRunInputManifest
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
@@ -99,14 +103,21 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
+import me.matsumo.fukurou.trading.invoker.DefaultLlmOutputParser
+import me.matsumo.fukurou.trading.invoker.LlmCliVersionProbe
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.invoker.LlmOutputParser
+import me.matsumo.fukurou.trading.invoker.LlmProcessTreeTerminationRegistry
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.ParsedLlmOutput
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ProcessRunner
+import me.matsumo.fukurou.trading.invoker.ProcessStartAwareRunner
+import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProof
 import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.safeCodexFailureOrNull
@@ -138,6 +149,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -266,7 +278,11 @@ class OneShotLlmRunnerTest {
         val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val decisions = fixture.decisionRepository.snapshots.decisions()
 
-        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
+        assertEquals(
+            OneShotRunnerStatus.NO_TRADE_DECISION,
+            result.status,
+            fixture.eventLog.events().joinToString { event -> event.payload },
+        )
         assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.NO_TRADE, result.terminalCause)
         assertEquals(1, fixture.processRunner.launches.size)
         assertEquals(1, decisions.size)
@@ -317,9 +333,18 @@ class OneShotLlmRunnerTest {
         assertNotNull(manifest.lastPriceJpy)
         assertNotNull(manifest.sourceTimestamp)
         assertNotNull(manifest.atr14FiveMinutesJpy)
+        assertEquals(2, manifest.schemaVersion)
+        assertNotNull(manifest.marketFeatureBundle)
         assertTrue(manifest.canonicalContentHash.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(manifest.snapshotContentHash.matches(Regex("[0-9a-f]{64}")))
+        assertNotEquals(manifest.canonicalContentHash, manifest.snapshotContentHash)
         assertTrue(manifest.materialProjection.isEmpty())
         assertFalse(manifest.materialProjection.contains("sourceTimestamp"))
+        val runManifest = assertNotNull(
+            fixture.runtime.llmInputManifestRepository.findRun("material-facts-run").getOrThrow(),
+        )
+        assertEquals(2, runManifest.schemaVersion)
+        assertEquals(manifest.snapshotContentHash, runManifest.materialContentHash)
     }
 
     @Test
@@ -360,9 +385,13 @@ class OneShotLlmRunnerTest {
     fun materialManifestPersistenceFailureRemainsTypedCoverageMiss() = runBlocking {
         val fixture = runnerFixture(
             runtimeTransform = { runtime ->
+                val delegate = runtime.llmInputManifestRepository
                 runtime.copy(
-                    decisionMaterialStateRepository = object : DecisionMaterialStateRepository {
-                        override suspend fun append(manifest: DecisionMaterialStateManifest): Result<Unit> {
+                    llmInputManifestRepository = object : LlmInputManifestRepository by delegate {
+                        override suspend fun appendRunWithMaterial(
+                            materialManifest: DecisionMaterialStateManifest,
+                            runManifest: LlmRunInputManifest,
+                        ): Result<Unit> {
                             return Result.failure(IllegalStateException("manifest unavailable"))
                         }
                     },
@@ -377,7 +406,272 @@ class OneShotLlmRunnerTest {
 
         val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
-        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+    }
+
+    @Test
+    fun standardMarketFailure_launchesRiskReductionOnlyWithoutEntryCapability() = runBlocking {
+        val fixture = runnerFixture(marketDataSource = FailingMaterialMarketDataSource) { command ->
+            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            cleanExit()
+        }
+
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
+        val launch = fixture.processRunner.launches.single()
+        val manifest = launch.mcpManifestContent()
+
+        assertEquals(
+            OneShotRunnerStatus.NO_TRADE_DECISION,
+            result.status,
+            fixture.eventLog.events().joinToString { event -> event.payload },
+        )
+        assertTrue(manifest.contains("RISK_REDUCTION_ONLY"))
+        assertTrue(manifest.contains("submit_decision"))
+        assertFalse(manifest.contains("get_ticker"))
+        assertFalse(manifest.contains("preview_order"))
+    }
+
+    @Test
+    fun standardPhaseProbeFailure_reusesPersistedMaterialAndLaunchesRiskReductionOnly() = runBlocking {
+        var probeCount = 0
+        val fixture = runnerFixture(
+            marketDataSource = MaterialManifestMarketDataSource,
+            cliVersionProbe = {
+                probeCount += 1
+                if (probeCount == 1) {
+                    Result.failure(IllegalStateException("probe unavailable"))
+                } else {
+                    Result.success("fixture-cli 1.0")
+                }
+            },
+        ) { command ->
+            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            cleanExit()
+        }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "probe-fallback-run")).getOrThrow()
+        val material = fixture.runtime.decisionMaterialStateRepository.find("probe-fallback-run").getOrThrow()
+
+        assertEquals(
+            OneShotRunnerStatus.NO_TRADE_DECISION,
+            result.status,
+            fixture.eventLog.events().joinToString { event -> event.payload },
+        )
+        assertEquals(2, probeCount)
+        assertEquals(1, fixture.processRunner.launches.size)
+        assertTrue(fixture.processRunner.launches.single().mcpManifestContent().contains("RISK_REDUCTION_ONLY"))
+        assertNotNull(material?.marketFeatureBundle?.ticker)
+        Unit
+    }
+
+    @Test
+    fun standardManifestLookupAndAppendFailures_reuseRunBundleForRiskReductionOnly() = runBlocking {
+        val transforms: List<(TradingRuntime) -> TradingRuntime> = listOf(
+            { runtime ->
+                val delegate = runtime.llmInputManifestRepository
+                runtime.copy(
+                    llmInputManifestRepository = object : LlmInputManifestRepository by delegate {
+                        private var failed = false
+
+                        override suspend fun findRun(invocationId: String): Result<LlmRunInputManifest?> {
+                            if (!failed) {
+                                failed = true
+                                return Result.failure(IllegalStateException("synthetic run lookup failure"))
+                            }
+
+                            return delegate.findRun(invocationId)
+                        }
+                    },
+                )
+            },
+            { runtime ->
+                val delegate = runtime.llmInputManifestRepository
+                runtime.copy(
+                    llmInputManifestRepository = object : LlmInputManifestRepository by delegate {
+                        override suspend fun appendPhase(manifest: LlmPhaseInputManifest): Result<Unit> {
+                            if (manifest.phase == LlmInvocationPhase.PROPOSER) {
+                                return Result.failure(IllegalStateException("synthetic phase append failure"))
+                            }
+
+                            return delegate.appendPhase(manifest)
+                        }
+                    },
+                )
+            },
+        )
+
+        transforms.forEachIndexed { index, transform ->
+            val invocationId = "manifest-fallback-$index"
+            val fixture = runnerFixture(
+                marketDataSource = MaterialManifestMarketDataSource,
+                runtimeTransform = transform,
+            ) { command ->
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+                cleanExit()
+            }
+
+            val result = fixture.runOneShot(defaultRequest().copy(invocationId = invocationId)).getOrThrow()
+            val material = assertNotNull(
+                fixture.runtime.decisionMaterialStateRepository.find(invocationId).getOrThrow(),
+                fixture.eventLog.events().joinToString { event -> event.payload },
+            )
+            val run = assertNotNull(
+                fixture.runtime.llmInputManifestRepository.findRun(invocationId).getOrThrow(),
+                fixture.eventLog.events().joinToString { event -> event.payload },
+            )
+
+            assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
+            assertEquals(material.snapshotContentHash, run.materialContentHash)
+            assertEquals(1, fixture.processRunner.launches.size)
+            assertTrue(fixture.processRunner.launches.single().mcpManifestContent().contains("RISK_REDUCTION_ONLY"))
+            assertTrue(fixture.runtime.broker.getPositions().getOrThrow().isEmpty())
+        }
+    }
+
+    @Test
+    fun standardPhaseBindAndGatewayStartFailures_launchOnlyRiskReductionProcess() = runBlocking {
+        listOf("phase-bind", "gateway-start").forEach { failurePoint ->
+            val manifestDirectory = Files.createTempDirectory("runner-$failurePoint")
+            var gatewayBlocker: Path? = null
+            var standardManifestPath: Path? = null
+            val environment = defaultParentEnvironment() +
+                ("FUKUROU_MCP_MANIFEST_DIRECTORY" to manifestDirectory.toString())
+            val fixture = runnerFixture(
+                parentEnvironment = environment,
+                marketDataSource = MaterialManifestMarketDataSource,
+                runtimeTransform = { runtime ->
+                    val delegate = runtime.llmInputManifestRepository
+                    runtime.copy(
+                        llmInputManifestRepository = object : LlmInputManifestRepository by delegate {
+                            override suspend fun appendPhase(manifest: LlmPhaseInputManifest): Result<Unit> {
+                                val result = delegate.appendPhase(manifest)
+                                if (result.isSuccess && manifest.phase == LlmInvocationPhase.PROPOSER) {
+                                    val manifestPath = Files.list(manifestDirectory).use { paths ->
+                                        paths.filter { path -> path.fileName.toString().endsWith(".json") }
+                                            .findFirst()
+                                            .orElseThrow()
+                                    }
+                                    standardManifestPath = manifestPath
+                                    if (failurePoint == "phase-bind") {
+                                        Files.delete(manifestPath)
+                                    } else {
+                                        val manifestId = manifestPath.fileName.toString().removeSuffix(".json")
+                                        val socketBlocker = Path.of("/tmp", "fukurou-${manifestId.take(24)}.sock")
+                                        Files.createDirectory(socketBlocker)
+                                        Files.writeString(socketBlocker.resolve("child"), "block unlink")
+                                        gatewayBlocker = socketBlocker
+                                    }
+                                }
+
+                                return result
+                            }
+                        },
+                    )
+                },
+            ) { command ->
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+                cleanExit()
+            }
+            val invocationId = "prelaunch-$failurePoint"
+
+            val result = fixture.runOneShot(defaultRequest().copy(invocationId = invocationId)).getOrThrow()
+            val material =
+                assertNotNull(fixture.runtime.decisionMaterialStateRepository.find(invocationId).getOrThrow())
+            val run = assertNotNull(fixture.runtime.llmInputManifestRepository.findRun(invocationId).getOrThrow())
+
+            assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
+            assertEquals(material.snapshotContentHash, run.materialContentHash)
+            assertEquals(1, fixture.processRunner.launches.size)
+            val launchManifest = fixture.processRunner.launches.single().mcpManifestContent()
+            assertTrue(launchManifest.contains("RISK_REDUCTION_ONLY"), "$failurePoint: $launchManifest")
+            assertTrue(fixture.runtime.broker.getPositions().getOrThrow().isEmpty())
+            assertFalse(Files.exists(requireNotNull(standardManifestPath)))
+            val observation = fixture.runtime.llmInputManifestRepository
+                .findObservation("$invocationId:PROPOSER")
+                .getOrThrow()
+            assertEquals(
+                me.matsumo.fukurou.trading.audit.LlmIdentityCoverageStatus.NOT_OBSERVABLE_BEFORE_START,
+                observation?.modelCoverageStatus,
+            )
+            gatewayBlocker?.let { blocker ->
+                Files.deleteIfExists(blocker.resolve("child"))
+                Files.deleteIfExists(blocker)
+            }
+        }
+    }
+
+    @Test
+    fun malformedRequiredTickerAndCandleValues_failClosedIntoRiskReductionOnly() = runBlocking {
+        listOf(MalformedTickerMarketDataSource, MalformedCandleMarketDataSource).forEachIndexed { index, source ->
+            val fixture = runnerFixture(marketDataSource = source) { command ->
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+                cleanExit()
+            }
+
+            val result = fixture.runOneShot(
+                defaultRequest().copy(invocationId = "malformed-market-$index"),
+            ).getOrThrow()
+
+            assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
+            assertTrue(fixture.processRunner.launches.single().mcpManifestContent().contains("RISK_REDUCTION_ONLY"))
+        }
+    }
+
+    @Test
+    fun phaseObservationFailure_rejectsApprovedEntry() = runBlocking {
+        val fixture = runnerFixture(
+            runtimeTransform = TradingRuntime::withFailingPhaseObservation,
+        ) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.ENTER).getOrThrow()
+            }
+
+            cleanExit()
+        }
+
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertTrue(fixture.runtime.broker.getPositions().getOrThrow().isEmpty())
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("phase_observation_missing_entry_rejected"))
+    }
+
+    @Test
+    fun preFilterObservationGap_rejectsApprovedEntryAfterProposer() = runBlocking {
+        val fixture = runnerFixture(
+            runtimeTransform = TradingRuntime::withMissingPreFilterObservation,
+        ) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.ENTER).getOrThrow()
+            }
+
+            cleanExit()
+        }
+
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertTrue(fixture.runtime.broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(1, fixture.processRunner.launches.size)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("phase_observation_missing_entry_rejected"))
+    }
+
+    @Test
+    fun falsifierObservationFailure_rejectsFreshApprovalWithoutEntry() = runBlocking {
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                runtime.withFailingPhaseObservation(LlmInvocationPhase.FALSIFIER)
+            },
+        ) { command ->
+            handleEnterAndApprovedFalsifier(fixtureRepository, command)
+        }
+
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertTrue(fixture.runtime.broker.getPositions().getOrThrow().isEmpty())
+        assertEquals(2, fixture.processRunner.launches.size)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("phase_observation_missing_entry_rejected"))
     }
 
     @Test
@@ -649,6 +943,26 @@ class OneShotLlmRunnerTest {
         assertEquals(0, openPositions.size)
         assertEquals(1, closeEvents.size)
         assertTrue(violations.isEmpty())
+    }
+
+    @Test
+    fun phaseObservationFailure_keepsRiskReducingExitExecutableAndMarksAttribution() = runBlocking {
+        val fixture = runnerFixture(
+            runtimeTransform = TradingRuntime::withFailingPhaseObservation,
+        ) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.EXIT).getOrThrow()
+            }
+
+            cleanExit()
+        }
+        seedApprovedEntry(fixture)
+
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.PAPER_EXIT_EXECUTED, result.status)
+        assertTrue(fixture.runtime.broker.getPositions().getOrThrow().isEmpty())
+        assertTrue(fixture.eventLog.events().any { event -> event.payload.contains("INFRASTRUCTURE_ATTRIBUTION_INCOMPLETE") })
     }
 
     @Test
@@ -1185,9 +1499,11 @@ class OneShotLlmRunnerTest {
             tradingRuntime = runtime,
             tradingConfig = TradingBotConfig(),
             llmInvoker = FailureResultLlmInvoker(failure),
+            materialMarketDataSource = FakeMarketDataSource,
             parentEnvironment = defaultParentEnvironment(),
             clock = fixedClock(),
             logger = {},
+            cliVersionProbe = { Result.success("fixture-cli 1.0") },
         )
 
         val result = runReservedOneShot(runtime, runner, defaultRequest()).getOrThrow()
@@ -2035,6 +2351,76 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun preStartProcessFailures_terminalizeWithoutRecoveryBlocker() = runBlocking {
+        listOf(
+            "pre-start-generic" to IllegalStateException("synthetic pre-start failure"),
+            "pre-start-cancellation" to CancellationException("synthetic pre-start cancellation"),
+        ).forEach { (invocationId, failure) ->
+            resetProcessRecoveryState(invocationId)
+            val fixture = processRecoveryFixture(
+                processRunner = StartAwareTestProcessRunner(
+                    callbackInvoked = false,
+                    result = Result.failure(failure),
+                ),
+            )
+
+            runCatching {
+                fixture.runOneShot(defaultRequest().copy(invocationId = invocationId)).getOrThrow()
+            }
+
+            assertNull(LlmProcessTreeTerminationRegistry.find(invocationId))
+            assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+            assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        }
+    }
+
+    @Test
+    fun postStartGenericFailure_terminalizesWithRecoveryBlocker() = runBlocking {
+        val invocationId = "post-start-generic"
+        resetProcessRecoveryState(invocationId)
+        val fixture = processRecoveryFixture(
+            processRunner = StartAwareTestProcessRunner(
+                callbackInvoked = true,
+                result = Result.failure(IllegalStateException("synthetic post-start failure")),
+            ),
+        )
+
+        try {
+            fixture.runOneShot(defaultRequest().copy(invocationId = invocationId))
+
+            assertEquals(
+                ProcessTreeTerminationProof.UNCERTAIN,
+                LlmProcessTreeTerminationRegistry.find(invocationId),
+            )
+            assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+            assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        } finally {
+            resetProcessRecoveryState(invocationId)
+        }
+    }
+
+    @Test
+    fun parserFailureAfterProvenExit_terminalizesAndReleasesProcessProof() = runBlocking {
+        val invocationId = "proven-exit-parser-failure"
+        resetProcessRecoveryState(invocationId)
+        val fixture = processRecoveryFixture(
+            processRunner = StartAwareTestProcessRunner(
+                callbackInvoked = true,
+                result = Result.success(
+                    cleanExit().copy(processTreeTerminationProof = ProcessTreeTerminationProof.PROVEN_EXITED),
+                ),
+            ),
+            outputParser = FailingTestOutputParser,
+        )
+
+        fixture.runOneShot(defaultRequest().copy(invocationId = invocationId))
+
+        assertNull(LlmProcessTreeTerminationRegistry.find(invocationId))
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+        assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+    }
+
+    @Test
     fun daemonTickLaunch_recordsTriggerKindInLlmRun() = runBlocking {
         val tradingConfig = TradingBotConfig(
             daemon = LlmDaemonConfig(launchEnabled = true),
@@ -2145,6 +2531,15 @@ private data class RunnerFixture(
     val runner: OneShotLlmRunner,
 )
 
+private data class ProcessRecoveryFixture(
+    val runtime: TradingRuntime,
+    val runner: OneShotLlmRunner,
+)
+
+private suspend fun ProcessRecoveryFixture.runOneShot(request: OneShotRunnerRequest): Result<OneShotRunnerResult> {
+    return runReservedOneShot(runtime, runner, request)
+}
+
 private suspend fun RunnerFixture.runOneShot(
     request: OneShotRunnerRequest,
     reservedAt: Instant = fixedClock().instant(),
@@ -2231,6 +2626,7 @@ private fun runnerFixture(
     logger: (String) -> Unit = {},
     clock: Clock = fixedClock(),
     marketDataSource: MarketDataSource = FakeMarketDataSource,
+    cliVersionProbe: LlmCliVersionProbe = LlmCliVersionProbe { Result.success("fixture-cli 1.0") },
     launchHandler: suspend (RenderedLlmCommand) -> ProcessRunResult,
 ): RunnerFixture {
     val baseRuntime = TradingRuntimeFactory.inMemory(
@@ -2254,6 +2650,7 @@ private fun runnerFixture(
         parentEnvironment = parentEnvironment,
         clock = clock,
         logger = logger,
+        cliVersionProbe = cliVersionProbe,
     )
     fixtureRepository = decisionRepository
 
@@ -2264,6 +2661,41 @@ private fun runnerFixture(
         processRunner = processRunner,
         runner = runner,
     )
+}
+
+private fun processRecoveryFixture(
+    processRunner: ProcessRunner,
+    outputParser: LlmOutputParser = DefaultLlmOutputParser(),
+): ProcessRecoveryFixture {
+    val config = TradingBotConfig()
+    val clock = fixedClock()
+    val runtime = TradingRuntimeFactory.inMemory(
+        clock = clock,
+        marketDataSource = FakeMarketDataSource,
+        tradingConfig = config,
+    )
+    val runner = OneShotLlmRunner(
+        tradingRuntime = runtime,
+        tradingConfig = config,
+        materialMarketDataSource = FakeMarketDataSource,
+        llmInvoker = ShellLlmInvoker(
+            commandRenderer = DefaultLlmCommandRenderer(),
+            processRunner = processRunner,
+            outputParser = outputParser,
+        ),
+        parentEnvironment = defaultParentEnvironment(),
+        clock = clock,
+        cliVersionProbe = LlmCliVersionProbe { Result.success("fixture-cli 1.0") },
+    )
+    fixtureRepository = runtime.decisionRepository
+
+    return ProcessRecoveryFixture(runtime, runner)
+}
+
+private fun resetProcessRecoveryState(invocationId: String) {
+    LlmProcessTreeTerminationRegistry.resolve(invocationId)
+    LlmExecutionAdmissionHealth.resetForTest()
+    LlmExecutionTerminationFenceRegistry.resetForTest()
 }
 
 private class OutcomeUnknownClaimRepository(
@@ -2329,6 +2761,52 @@ private class CountFailureCommandEventLog(
     override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {
         return Result.failure(IllegalStateException("tool call count failed"))
     }
+}
+
+private fun TradingRuntime.withFailingPhaseObservation(): TradingRuntime {
+    return withFailingPhaseObservation(*LlmInvocationPhase.entries.toTypedArray())
+}
+
+private fun TradingRuntime.withFailingPhaseObservation(vararg failingPhases: LlmInvocationPhase): TradingRuntime {
+    val delegate = llmInputManifestRepository
+    val phaseNames = failingPhases.mapTo(mutableSetOf()) { phase -> phase.name }
+
+    return copy(
+        llmInputManifestRepository = object : LlmInputManifestRepository by delegate {
+            override suspend fun appendObservation(observation: LlmPhaseObservation): Result<Unit> {
+                val phaseName = observation.phaseManifestId.substringAfterLast(':')
+
+                return if (phaseName in phaseNames) {
+                    Result.failure(IllegalStateException("phase observation unavailable"))
+                } else {
+                    delegate.appendObservation(observation)
+                }
+            }
+        },
+    )
+}
+
+private fun TradingRuntime.withMissingPreFilterObservation(): TradingRuntime {
+    val delegate = llmInputManifestRepository
+
+    return copy(
+        llmInputManifestRepository = object : LlmInputManifestRepository by delegate {
+            override suspend fun findPhase(phaseManifestId: String) =
+                if (phaseManifestId.endsWith(":${LlmInvocationPhase.PRE_FILTER.name}")) {
+                    val proposerPhaseId = phaseManifestId.substringBeforeLast(':') + ":${LlmInvocationPhase.PROPOSER.name}"
+                    delegate.findPhase(proposerPhaseId)
+                } else {
+                    delegate.findPhase(phaseManifestId)
+                }
+
+            override suspend fun findObservation(phaseManifestId: String) =
+                if (phaseManifestId.endsWith(":${LlmInvocationPhase.PRE_FILTER.name}")) {
+                    Result.success(null)
+                } else {
+                    delegate.findObservation(phaseManifestId)
+                }
+        },
+    )
 }
 
 private fun addLongRunnerFixture(
@@ -2494,9 +2972,11 @@ private fun requestCapturingRunnerFixture(
         tradingRuntime = runtime,
         tradingConfig = tradingConfig,
         llmInvoker = invoker,
+        materialMarketDataSource = FakeMarketDataSource,
         parentEnvironment = parentEnvironment,
         clock = fixedClock(),
         logger = {},
+        cliVersionProbe = { Result.success("fixture-cli 1.0") },
     )
 
     return RequestCapturingRunnerFixture(
@@ -2564,6 +3044,7 @@ private class RequestCapturingLlmInvoker(
             LlmInvocationPhase.FALSIFIER -> {
                 submitFalsificationFromRequest(repository, request, FalsificationVerdict.APPROVED).getOrThrow()
             }
+            LlmInvocationPhase.RISK_REDUCTION_ONLY -> error("Unexpected reduction-only phase in standard fixture.")
             LlmInvocationPhase.REFLECTION -> Unit
             LlmInvocationPhase.EVALUATION_REPORT -> Unit
         }
@@ -2617,6 +3098,33 @@ private class FakeProcessRunner(
         launches += command
 
         return Result.success(launchHandler(command))
+    }
+}
+
+private class StartAwareTestProcessRunner(
+    private val callbackInvoked: Boolean,
+    private val result: Result<ProcessRunResult>,
+) : ProcessStartAwareRunner {
+    override suspend fun run(command: RenderedLlmCommand): Result<ProcessRunResult> {
+        return run(command) {}
+    }
+
+    override suspend fun run(command: RenderedLlmCommand, onStarted: () -> Unit): Result<ProcessRunResult> {
+        if (callbackInvoked) onStarted()
+
+        return result
+    }
+}
+
+private object FailingTestOutputParser : LlmOutputParser {
+    override fun parse(
+        request: LlmInvocationRequest,
+        command: RenderedLlmCommand,
+        processResult: ProcessRunResult,
+        startedAt: Instant,
+        completedAt: Instant,
+    ): ParsedLlmOutput {
+        error("synthetic parser failure")
     }
 }
 
@@ -3258,6 +3766,30 @@ private object MaterialManifestMarketDataSource : MarketDataSource by FakeMarket
                 )
             },
         )
+    }
+}
+
+private object FailingMaterialMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return Result.failure(GmoRateLimitException("fixture market failure"))
+    }
+}
+
+private object MalformedTickerMarketDataSource : MarketDataSource by MaterialManifestMarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        return MaterialManifestMarketDataSource.getTicker(symbol).map { ticker -> ticker.copy(last = "not-a-number") }
+    }
+}
+
+private object MalformedCandleMarketDataSource : MarketDataSource by MaterialManifestMarketDataSource {
+    override suspend fun getCandles(
+        symbol: TradingSymbol,
+        interval: CandleInterval,
+        limit: Int,
+    ): Result<List<Candle>> {
+        return MaterialManifestMarketDataSource.getCandles(symbol, interval, limit).map { candles ->
+            candles.mapIndexed { index, candle -> if (index == 0) candle.copy(high = "malformed") else candle }
+        }
     }
 }
 

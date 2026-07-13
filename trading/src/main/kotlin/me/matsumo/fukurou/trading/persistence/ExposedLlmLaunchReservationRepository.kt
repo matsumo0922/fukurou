@@ -18,6 +18,9 @@ import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRequest
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryOutcome
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryDeadline
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRetryPermit
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryScan
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
@@ -36,8 +39,6 @@ import java.time.Instant
 import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
-
-private const val RECOVERY_SELECT_TIMEOUT_SECONDS = 2
 
 /**
  * LLM 起動予約を追加する SQL。
@@ -194,6 +195,21 @@ private const val RECOVER_STALE_LLM_EXECUTION_CLAIM_SQL = """
         AND execution_claim_heartbeat_at IS NOT DISTINCT FROM ?
 """
 
+/** recovery attempt の reservation exact readback SQL。 */
+private const val SELECT_RECOVERY_RESERVATION_SQL = """
+    SELECT invocation_id, status, execution_claim_state, execution_claim_token, reserved_at,
+        execution_claim_heartbeat_at, finished_at, reason
+    FROM llm_launch_reservations
+    WHERE invocation_id = ?
+"""
+
+/** recovery attempt UUID に対応する audit exact readback SQL。 */
+private const val SELECT_RECOVERY_AUDIT_SQL = """
+    SELECT id, decision_run_id, tool_call_id, client_request_id, tool_name, event_type, payload, ts
+    FROM command_event_log
+    WHERE id = ?
+"""
+
 /** live claimant の heartbeat を更新する SQL。 */
 private const val HEARTBEAT_LLM_EXECUTION_CLAIM_SQL = """
     UPDATE llm_launch_reservations
@@ -234,6 +250,7 @@ private const val SELECT_LLM_LAUNCH_TRIGGER_KIND_SQL = """
 @Suppress("TooManyFunctions")
 class ExposedLlmLaunchReservationRepository(
     private val database: ExposedDatabase,
+    private val nanoTime: () -> Long = System::nanoTime,
 ) : LlmLaunchReservationRepository {
 
     override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
@@ -333,11 +350,15 @@ class ExposedLlmLaunchReservationRepository(
 
     override suspend fun scanStaleExecutionClaims(
         scan: LlmExecutionRecoveryScan,
+        deadline: LlmExecutionRecoveryDeadline,
     ): Result<List<LlmExecutionClaimSnapshot>> = withContext(Dispatchers.IO) {
         runCatching {
             exposedTransaction(database) {
-                jdbcConnection().prepareStatement(SELECT_STALE_LLM_EXECUTION_CLAIMS_SQL).use { statement ->
-                    statement.queryTimeout = RECOVERY_SELECT_TIMEOUT_SECONDS
+                val candidates = prepareRecoveryStatement(
+                    SELECT_STALE_LLM_EXECUTION_CLAIMS_SQL,
+                    deadline,
+                    nanoTime,
+                ).use { statement ->
                     statement.setLong(1, scan.claimedBefore.toEpochMilli())
                     statement.setLong(2, scan.heartbeatBefore.toEpochMilli())
                     statement.setLong(3, scan.availableReservedBefore.toEpochMilli())
@@ -352,45 +373,92 @@ class ExposedLlmLaunchReservationRepository(
                         }
                     }
                 }
+                armRecoveryCommitDeadline(deadline, nanoTime)
+
+                candidates
             }
         }
     }
 
-    override suspend fun recoverStaleExecutionClaim(request: LlmExecutionRecoveryRequest): Result<Boolean> {
+    override suspend fun recoverStaleExecutionClaim(
+        request: LlmExecutionRecoveryRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+        retryPermit: LlmExecutionRecoveryRetryPermit,
+    ): Result<LlmExecutionRecoveryOutcome> {
         return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    acquireGapPopulationGenerationTokenForEntity(
-                        "LLM_RESERVATION",
-                        reservationId(request.invocationId),
-                    )
-                    recoverStaleExecutionClaimInTransaction(request)
-                }
+            val firstAttempt = runRecoveryMutation(request, deadline)
+            if (firstAttempt == LlmExecutionRecoveryOutcome.Recovered) {
+                return@withContext Result.success(readRecoveryOutcome(request, deadline).toPublicOutcome())
             }
+
+            val firstReadback = readRecoveryOutcome(request, deadline)
+            if (firstReadback != RecoveryReadbackOutcome.Uncommitted) {
+                return@withContext Result.success(firstReadback.toPublicOutcome())
+            }
+            if (!retryPermit.isAvailable) return@withContext Result.success(firstReadback.toPublicOutcome())
+
+            runRecoveryMutation(request, deadline, retryPermit)
+
+            Result.success(readRecoveryOutcome(request, deadline).toPublicOutcome())
         }
     }
 
-    override suspend fun recoverStaleExecutionClaims(
-        requests: List<LlmExecutionRecoveryRequest>,
-    ): Result<Set<String>> {
-        if (requests.isEmpty()) return Result.success(emptySet())
-
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                buildSet {
-                    requests.forEach { request ->
-                        val recovered = exposedTransaction(database) {
-                            acquireGapPopulationGenerationTokenForEntity(
-                                "LLM_RESERVATION",
-                                reservationId(request.invocationId),
-                            )
-                            recoverStaleExecutionClaimInTransaction(request)
-                        }
-                        if (recovered) add(request.invocationId)
-                    }
-                }
+    override suspend fun reconcileStaleExecutionRecovery(
+        request: LlmExecutionRecoveryRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+        retryPermit: LlmExecutionRecoveryRetryPermit,
+    ): Result<LlmExecutionRecoveryOutcome> = withContext(Dispatchers.IO) {
+        runCatching {
+            val readback = readRecoveryOutcome(request, deadline)
+            if (readback != RecoveryReadbackOutcome.Uncommitted) {
+                return@runCatching readback.toPublicOutcome()
             }
+            if (!retryPermit.isAvailable) return@runCatching readback.toPublicOutcome()
+
+            runRecoveryMutation(request, deadline, retryPermit)
+
+            readRecoveryOutcome(request, deadline).toPublicOutcome()
         }
+    }
+
+    private fun runRecoveryMutation(
+        request: LlmExecutionRecoveryRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+        retryPermit: LlmExecutionRecoveryRetryPermit? = null,
+    ): LlmExecutionRecoveryOutcome? {
+        return runCatching {
+            exposedTransaction(database) {
+                maxAttempts = 1
+                acquireGapPopulationGenerationTokenForEntity(
+                    "LLM_RESERVATION",
+                    reservationId(request.invocationId),
+                    deadline,
+                    nanoTime,
+                )
+                if (retryPermit != null && !retryPermit.tryConsume()) return@exposedTransaction null
+
+                val recovered = recoverStaleExecutionClaimInTransaction(request, deadline, nanoTime)
+                armRecoveryCommitDeadline(deadline, nanoTime)
+
+                if (recovered) LlmExecutionRecoveryOutcome.Recovered else null
+            }
+        }.getOrNull()
+    }
+
+    private fun readRecoveryOutcome(
+        request: LlmExecutionRecoveryRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): RecoveryReadbackOutcome {
+        return runCatching {
+            exposedTransaction(database) {
+                maxAttempts = 1
+                val reservation = selectRecoveryReservation(request.invocationId, deadline, nanoTime)
+                val audit = selectRecoveryAudit(request.recoveryAttemptId, deadline, nanoTime)
+                armRecoveryCommitDeadline(deadline, nanoTime)
+
+                classifyRecoveryReadback(request, reservation, audit)
+            }
+        }.getOrDefault(RecoveryReadbackOutcome.Unknown)
     }
 
     override suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> =
@@ -441,9 +509,12 @@ class ExposedLlmLaunchReservationRepository(
     }
 }
 
-private fun JdbcTransaction.recoverStaleExecutionClaimInTransaction(request: LlmExecutionRecoveryRequest): Boolean {
-    return jdbcConnection().prepareStatement(RECOVER_STALE_LLM_EXECUTION_CLAIM_SQL).use { statement ->
-        statement.queryTimeout = RECOVERY_SELECT_TIMEOUT_SECONDS
+private fun JdbcTransaction.recoverStaleExecutionClaimInTransaction(
+    request: LlmExecutionRecoveryRequest,
+    deadline: LlmExecutionRecoveryDeadline,
+    nanoTime: () -> Long,
+): Boolean {
+    return prepareRecoveryStatement(RECOVER_STALE_LLM_EXECUTION_CLAIM_SQL, deadline, nanoTime).use { statement ->
         statement.setLong(1, request.finishedAt.toEpochMilli())
         statement.setString(2, request.reason)
         statement.setString(3, request.invocationId)
@@ -453,14 +524,66 @@ private fun JdbcTransaction.recoverStaleExecutionClaimInTransaction(request: Llm
         statement.setNullableLong(7, request.observedHeartbeatAt?.toEpochMilli())
         val recovered = statement.executeUpdate() == 1
         if (recovered) {
-            val runRecovered = recoverCurrentProcessLlmRun(request)
-            insertRecoveryEvent(request, runRecovered)
+            val runRecovered = recoverCurrentProcessLlmRun(request, deadline, nanoTime)
+            insertRecoveryEvent(request, runRecovered, deadline, nanoTime)
         }
         recovered
     }
 }
 
-private fun JdbcTransaction.recoverCurrentProcessLlmRun(request: LlmExecutionRecoveryRequest): Boolean {
+private fun JdbcTransaction.selectRecoveryReservation(
+    invocationId: String,
+    deadline: LlmExecutionRecoveryDeadline,
+    nanoTime: () -> Long,
+): RecoveryReservationSnapshot? {
+    return prepareRecoveryStatement(SELECT_RECOVERY_RESERVATION_SQL, deadline, nanoTime).use { statement ->
+        statement.setString(1, invocationId)
+        statement.executeQuery().use { resultSet ->
+            if (!resultSet.next()) return@use null
+
+            RecoveryReservationSnapshot(
+                invocationId = resultSet.getString("invocation_id"),
+                status = LlmLaunchReservationStatus.valueOf(resultSet.getString("status")),
+                claimState = resultSet.getString("execution_claim_state")?.let(LlmExecutionClaimState::valueOf),
+                claimantToken = resultSet.getString("execution_claim_token"),
+                reservedAt = Instant.ofEpochMilli(resultSet.getLong("reserved_at")),
+                heartbeatAt = resultSet.getNullableInstant("execution_claim_heartbeat_at"),
+                finishedAt = resultSet.getNullableInstant("finished_at"),
+                reason = resultSet.getString("reason"),
+            )
+        }
+    }
+}
+
+private fun JdbcTransaction.selectRecoveryAudit(
+    recoveryAttemptId: UUID,
+    deadline: LlmExecutionRecoveryDeadline,
+    nanoTime: () -> Long,
+): RecoveryAuditSnapshot? {
+    return prepareRecoveryStatement(SELECT_RECOVERY_AUDIT_SQL, deadline, nanoTime).use { statement ->
+        statement.setObject(1, recoveryAttemptId)
+        statement.executeQuery().use { resultSet ->
+            if (!resultSet.next()) return@use null
+
+            RecoveryAuditSnapshot(
+                id = resultSet.getObject("id", UUID::class.java),
+                decisionRunId = resultSet.getString("decision_run_id"),
+                toolCallId = resultSet.getString("tool_call_id"),
+                clientRequestId = resultSet.getString("client_request_id"),
+                toolName = resultSet.getString("tool_name"),
+                eventType = resultSet.getString("event_type"),
+                payload = resultSet.getString("payload"),
+                occurredAt = Instant.ofEpochMilli(resultSet.getLong("ts")),
+            )
+        }
+    }
+}
+
+private fun JdbcTransaction.recoverCurrentProcessLlmRun(
+    request: LlmExecutionRecoveryRequest,
+    deadline: LlmExecutionRecoveryDeadline,
+    nanoTime: () -> Long,
+): Boolean {
     if (request.claimState != LlmExecutionClaimState.CLAIMED) return false
 
     val sql = """
@@ -469,7 +592,7 @@ private fun JdbcTransaction.recoverCurrentProcessLlmRun(request: LlmExecutionRec
         WHERE invocation_id = ? AND status = ? AND finished_at IS NULL
     """.trimIndent()
 
-    return jdbcConnection().prepareStatement(sql).use { statement ->
+    return prepareRecoveryStatement(sql, deadline, nanoTime).use { statement ->
         statement.setString(1, LLM_RUN_STATUS_FAILED)
         statement.setLong(2, request.finishedAt.toEpochMilli())
         statement.setString(3, request.reason)
@@ -480,9 +603,16 @@ private fun JdbcTransaction.recoverCurrentProcessLlmRun(request: LlmExecutionRec
     }
 }
 
-private fun JdbcTransaction.insertRecoveryEvent(request: LlmExecutionRecoveryRequest, runRecovered: Boolean) {
-    val llmRunExists = jdbcConnection().prepareStatement(
+private fun JdbcTransaction.insertRecoveryEvent(
+    request: LlmExecutionRecoveryRequest,
+    runRecovered: Boolean,
+    deadline: LlmExecutionRecoveryDeadline,
+    nanoTime: () -> Long,
+) {
+    val llmRunExists = prepareRecoveryStatement(
         "SELECT EXISTS (SELECT 1 FROM llm_runs WHERE invocation_id = ?)",
+        deadline,
+        nanoTime,
     ).use { statement ->
         statement.setString(1, request.invocationId)
         statement.executeQuery().use { resultSet ->
@@ -490,8 +620,9 @@ private fun JdbcTransaction.insertRecoveryEvent(request: LlmExecutionRecoveryReq
             resultSet.getBoolean(1)
         }
     }
-    insertEvent(
+    insertRecoveryEvent(
         CommandEvent(
+            id = request.recoveryAttemptId,
             decisionRunContext = DecisionRunContext(
                 decisionRunId = request.invocationId,
                 llmProvider = null,
@@ -505,6 +636,7 @@ private fun JdbcTransaction.insertRecoveryEvent(request: LlmExecutionRecoveryReq
             eventType = CommandEventType.LLM_INVOCATION_RECOVERED,
             payload = buildJsonObject {
                 put("source", "current_process_periodic_scan")
+                put("recoveryAttemptId", request.recoveryAttemptId.toString())
                 put("invocationId", request.invocationId)
                 put("executionClaimState", request.claimState.name)
                 put("claimantTokenFingerprint", request.claimantToken?.takeLast(8))
@@ -518,8 +650,104 @@ private fun JdbcTransaction.insertRecoveryEvent(request: LlmExecutionRecoveryReq
             }.toString(),
             occurredAt = request.finishedAt,
         ),
+        deadline,
+        nanoTime,
     )
 }
+
+private fun classifyRecoveryReadback(
+    request: LlmExecutionRecoveryRequest,
+    reservation: RecoveryReservationSnapshot?,
+    audit: RecoveryAuditSnapshot?,
+): RecoveryReadbackOutcome {
+    val exactReservation = reservation?.matchesRecovered(request) == true
+    val exactAudit = audit?.matches(request) == true
+    if (exactReservation && exactAudit) return RecoveryReadbackOutcome.Recovered
+    if (exactReservation || audit != null) return RecoveryReadbackOutcome.Unknown
+    if (reservation == null) return RecoveryReadbackOutcome.Unknown
+    if (reservation.status != LlmLaunchReservationStatus.RUNNING) return RecoveryReadbackOutcome.TerminalObserved
+
+    return if (reservation.matchesPrecondition(request)) {
+        RecoveryReadbackOutcome.Uncommitted
+    } else {
+        RecoveryReadbackOutcome.PreconditionChanged
+    }
+}
+
+private fun RecoveryReservationSnapshot.matchesRecovered(request: LlmExecutionRecoveryRequest): Boolean {
+    return matchesIdentity(request) &&
+        status == LlmLaunchReservationStatus.FAILED &&
+        finishedAt == request.finishedAt &&
+        reason == request.reason
+}
+
+private fun RecoveryReservationSnapshot.matchesPrecondition(request: LlmExecutionRecoveryRequest): Boolean {
+    return status == LlmLaunchReservationStatus.RUNNING && matchesIdentity(request)
+}
+
+private fun RecoveryReservationSnapshot.matchesIdentity(request: LlmExecutionRecoveryRequest): Boolean {
+    return invocationId == request.invocationId &&
+        claimState == request.claimState &&
+        claimantToken == request.claimantToken &&
+        reservedAt == request.observedReservedAt &&
+        heartbeatAt == request.observedHeartbeatAt
+}
+
+private fun RecoveryAuditSnapshot.matches(request: LlmExecutionRecoveryRequest): Boolean {
+    val attemptPayload = "\"recoveryAttemptId\":\"${request.recoveryAttemptId}\""
+
+    return id == request.recoveryAttemptId &&
+        decisionRunId == request.invocationId &&
+        toolCallId == null &&
+        clientRequestId == request.invocationId &&
+        toolName == "llm_execution_recovery" &&
+        eventType == CommandEventType.LLM_INVOCATION_RECOVERED.name &&
+        attemptPayload in payload &&
+        occurredAt == request.finishedAt
+}
+
+private sealed interface RecoveryReadbackOutcome {
+    data object Recovered : RecoveryReadbackOutcome
+    data object TerminalObserved : RecoveryReadbackOutcome
+    data object PreconditionChanged : RecoveryReadbackOutcome
+    data object Uncommitted : RecoveryReadbackOutcome
+    data object Unknown : RecoveryReadbackOutcome
+}
+
+private fun RecoveryReadbackOutcome.toPublicOutcome(): LlmExecutionRecoveryOutcome {
+    return when (this) {
+        RecoveryReadbackOutcome.Recovered -> LlmExecutionRecoveryOutcome.Recovered
+        RecoveryReadbackOutcome.TerminalObserved -> LlmExecutionRecoveryOutcome.TerminalObserved
+        RecoveryReadbackOutcome.PreconditionChanged -> LlmExecutionRecoveryOutcome.PreconditionChanged
+        RecoveryReadbackOutcome.Uncommitted,
+        RecoveryReadbackOutcome.Unknown,
+        -> LlmExecutionRecoveryOutcome.OutcomeUnknown(
+            IllegalStateException("Recovery exact readback could not determine commit outcome: $this"),
+        )
+    }
+}
+
+private data class RecoveryReservationSnapshot(
+    val invocationId: String,
+    val status: LlmLaunchReservationStatus,
+    val claimState: LlmExecutionClaimState?,
+    val claimantToken: String?,
+    val reservedAt: Instant,
+    val heartbeatAt: Instant?,
+    val finishedAt: Instant?,
+    val reason: String?,
+)
+
+private data class RecoveryAuditSnapshot(
+    val id: UUID,
+    val decisionRunId: String?,
+    val toolCallId: String?,
+    val clientRequestId: String?,
+    val toolName: String,
+    val eventType: String,
+    val payload: String,
+    val occurredAt: Instant,
+)
 
 /** risk_state row lock と共通 quota policy を使って LLM 起動を予約する。 */
 fun JdbcTransaction.tryReserveLlmLaunchInTransaction(

@@ -4,13 +4,19 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.LlmRunTriggerSnapshot
+import me.matsumo.fukurou.trading.audit.LlmTriggerEntity
+import me.matsumo.fukurou.trading.audit.LlmTriggerMeasurement
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -322,6 +328,7 @@ class LlmDaemonScheduler(
 
         val trigger = selectTrigger(hasOpenRisk, observedAt)
             ?: return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
+        val triggerSnapshot = trigger.toSnapshot(observedAt, daemonConfig)
 
         val statusSuppression = launchAvailability.statusSuppressionAt(availabilityObservedAt)
         if (statusSuppression != null) {
@@ -361,7 +368,7 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.Skipped("concurrent_invocation", trigger.kind)
         }
 
-        return reserveAndLaunch(trigger, openRisk)
+        return reserveAndLaunch(trigger, triggerSnapshot, openRisk)
     }
 
     private suspend fun skipFlatEconomicEventBlackout(
@@ -384,6 +391,7 @@ class LlmDaemonScheduler(
 
     private suspend fun reserveAndLaunch(
         trigger: LlmDaemonTrigger,
+        triggerSnapshot: LlmRunTriggerSnapshot,
         openRisk: LlmDaemonOpenRiskSnapshot,
     ): LlmDaemonTickResult {
         val invocationId = idGenerator().toString()
@@ -432,7 +440,7 @@ class LlmDaemonScheduler(
 
         suppressReservedLaunchIfScheduled(trigger, invocationId)?.let { suppression -> return suppression }
 
-        return runReservedInvocation(trigger, invocationId, openRisk, observedAt)
+        return runReservedInvocation(trigger, triggerSnapshot, invocationId, openRisk, observedAt)
     }
 
     private suspend fun suppressReservedLaunchIfScheduled(
@@ -461,11 +469,12 @@ class LlmDaemonScheduler(
 
     private suspend fun appendLaunchedOrFinishReservation(
         trigger: LlmDaemonTrigger,
+        triggerSnapshot: LlmRunTriggerSnapshot,
         invocationId: String,
         openRisk: LlmDaemonOpenRiskSnapshot,
         observedAt: Instant,
     ): Result<Unit> {
-        val appendResult = appendLaunched(trigger, invocationId, openRisk, observedAt)
+        val appendResult = appendLaunched(trigger, triggerSnapshot, invocationId, openRisk, observedAt)
         if (appendResult.isFailure) {
             finishReservedInvocation(
                 trigger = trigger,
@@ -481,6 +490,7 @@ class LlmDaemonScheduler(
 
     private suspend fun runReservedInvocation(
         trigger: LlmDaemonTrigger,
+        triggerSnapshot: LlmRunTriggerSnapshot,
         invocationId: String,
         openRisk: LlmDaemonOpenRiskSnapshot,
         observedAt: Instant,
@@ -495,8 +505,10 @@ class LlmDaemonScheduler(
                     triggerKey = trigger.key,
                     invocationId = invocationId,
                     observedAt = observedAt,
+                    triggerSnapshot = triggerSnapshot,
                 )
             },
+            triggerSnapshot = triggerSnapshot,
         )
         suppressReservedLaunchIfScheduled(trigger, invocationId)?.let { suppression -> return suppression }
 
@@ -504,7 +516,13 @@ class LlmDaemonScheduler(
         val result = runCatching {
             launchOneShot(request).getOrThrow()
         }
-        appendLaunchedOrFinishReservation(trigger, invocationId, openRisk, launchObservedAt).getOrThrow()
+        appendLaunchedOrFinishReservation(
+            trigger = trigger,
+            triggerSnapshot = triggerSnapshot,
+            invocationId = invocationId,
+            openRisk = openRisk,
+            observedAt = launchObservedAt,
+        ).getOrThrow()
         val runnerResult = result.getOrNull()
         val failure = result.exceptionOrNull()
 
@@ -964,6 +982,7 @@ class LlmDaemonScheduler(
 
     private suspend fun appendLaunched(
         trigger: LlmDaemonTrigger,
+        triggerSnapshot: LlmRunTriggerSnapshot,
         invocationId: String,
         openRisk: LlmDaemonOpenRiskSnapshot,
         observedAt: Instant,
@@ -984,6 +1003,11 @@ class LlmDaemonScheduler(
                     put("openPositionCount", openRisk.openPositionCount)
                     put("restingEntryOrderCount", openRisk.restingEntryOrders.size)
                     put("observedAt", observedAt.toString())
+                    put("typedTriggerKind", triggerSnapshot.kind)
+                    put("typedTriggerObservedAt", triggerSnapshot.observedAt.toString())
+                    put("typedTriggerMeasurements", triggerSnapshot.measurements.toMeasurementJsonArray())
+                    put("typedTriggerEntities", triggerSnapshot.entities.toEntityJsonArray())
+                    put("typedTriggerNotApplicableReason", triggerSnapshot.notApplicableReason)
                     runtimeConfigSnapshot?.let { snapshot ->
                         put("runtimeConfigVersionId", snapshot.versionId)
                         put("runtimeConfigHash", snapshot.hash)
@@ -1179,6 +1203,92 @@ private data class LlmDaemonTrigger(
     val eventName: String?,
     val details: JsonObject?,
 )
+
+private fun LlmDaemonTrigger.toSnapshot(observedAt: Instant, config: LlmDaemonConfig): LlmRunTriggerSnapshot {
+    val measurements = when (kind) {
+        LlmDaemonTriggerKind.PRICE_MOVE -> {
+            val changeRatio = requireNotNull(details?.get("changeRatio")?.jsonPrimitive?.contentOrNull)
+                .toBigDecimal()
+            listOf(
+                LlmTriggerMeasurement(
+                    metric = "absolute_price_change_ratio",
+                    measuredValue = changeRatio.abs().toPlainString(),
+                    comparator = "GREATER_THAN_OR_EQUAL",
+                    threshold = config.priceMoveThresholdRatio.toPlainString(),
+                    signedMargin = changeRatio.abs()
+                        .subtract(config.priceMoveThresholdRatio)
+                        .toPlainString(),
+                    unit = "RATIO",
+                ),
+            )
+        }
+
+        LlmDaemonTriggerKind.STOP_PROXIMITY -> {
+            val remainingR = requireNotNull(details?.get("remainingR")?.jsonPrimitive?.contentOrNull)
+                .toBigDecimal()
+            listOf(
+                LlmTriggerMeasurement(
+                    metric = "remaining_distance_to_stop",
+                    measuredValue = remainingR.toPlainString(),
+                    comparator = "LESS_THAN_OR_EQUAL",
+                    threshold = config.stopProximityRemainingRThreshold.toPlainString(),
+                    signedMargin = config.stopProximityRemainingRThreshold
+                        .subtract(remainingR)
+                        .toPlainString(),
+                    unit = "R",
+                ),
+            )
+        }
+
+        else -> emptyList()
+    }
+    val entities = buildList {
+        eventName?.let { name -> add(LlmTriggerEntity(type = "ECONOMIC_EVENT", id = name)) }
+        details?.get("positionId")?.jsonPrimitive?.contentOrNull?.let { id ->
+            add(LlmTriggerEntity(type = "POSITION", id = id))
+        }
+        details?.get("orderId")?.jsonPrimitive?.contentOrNull?.let { id ->
+            add(LlmTriggerEntity(type = "ORDER", id = id))
+        }
+        details?.get("executionId")?.jsonPrimitive?.contentOrNull?.let { id ->
+            add(LlmTriggerEntity(type = "EXECUTION", id = id))
+        }
+    }
+
+    return LlmRunTriggerSnapshot(
+        kind = kind.name,
+        observedAt = observedAt,
+        measurements = measurements,
+        entities = entities,
+        notApplicableReason = if (measurements.isEmpty()) "TRIGGER_HAS_NO_NUMERIC_THRESHOLD" else null,
+    )
+}
+
+private fun List<LlmTriggerMeasurement>.toMeasurementJsonArray(): JsonArray {
+    return JsonArray(
+        map { measurement ->
+            buildJsonObject {
+                put("metric", measurement.metric)
+                put("measuredValue", measurement.measuredValue)
+                put("comparator", measurement.comparator)
+                put("threshold", measurement.threshold)
+                put("signedMargin", measurement.signedMargin)
+                put("unit", measurement.unit)
+            }
+        },
+    )
+}
+
+private fun List<LlmTriggerEntity>.toEntityJsonArray(): JsonArray {
+    return JsonArray(
+        map { entity ->
+            buildJsonObject {
+                put("type", entity.type)
+                put("id", entity.id)
+            }
+        },
+    )
+}
 
 /**
  * daemon scheduler の価格 sample。
