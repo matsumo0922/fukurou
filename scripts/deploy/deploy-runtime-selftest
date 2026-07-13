@@ -12,6 +12,7 @@ chmod +x "${FUKUROU_DEPLOY_DB_HELPER}"
 
 # shellcheck source=deploy-fukurou
 source "$(dirname "$0")/deploy-fukurou"
+PRODUCTION_TIMEOUT_DEFINITION="$(declare -f timeout | sed '1s/^timeout/production_timeout/')"
 
 boottime_seconds() { printf '1\n'; }
 
@@ -91,11 +92,14 @@ JSON
 
 create_recovery_fixture() {
   local deployment_id="$1" terminal_state="$2"
+  local expected_state="${terminal_state}"
   local state_dir="${STATE_ROOT}/${deployment_id}"
   mkdir -p "${state_dir}"
   write_recovery_state "${state_dir}" "${deployment_id}"
   ROLLBACK_STATE_DIR="${state_dir}"; DEPLOYMENT_ID="${deployment_id}"
+  journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
   journal_state CAPTURED '{"fixture":true}'
+  journal_state SAFETY_MUTATION_STARTED
   journal_state LAUNCHES_DISABLED
   journal_state CANDIDATE_HEALTHY
   TARGET_GENERATION=7
@@ -104,6 +108,7 @@ create_recovery_fixture() {
   case "${terminal_state}" in
     DB_MAINTENANCE_CLEARED) FUKUROU_DEPLOY_CRASH_AT=AFTER_DB_MAINTENANCE_CLEAR ;;
     ENABLE_ACKED) FUKUROU_DEPLOY_CRASH_AT=AFTER_ENABLE_ACK ;;
+    GAP_CLOSE_APPENDED) FUKUROU_DEPLOY_CRASH_AT=AFTER_GAP_CLOSE_APPEND; expected_state=ENABLE_ACKED ;;
     GAP_CLOSED) FUKUROU_DEPLOY_CRASH_AT=AFTER_GAP_CLOSE ;;
   esac
   if (resume_launches >/dev/null 2>&1); then
@@ -111,12 +116,34 @@ create_recovery_fixture() {
     exit 1
   fi
   unset FUKUROU_DEPLOY_CRASH_AT FUKUROU_DEPLOY_CRASH_MODE
-  [[ "$(tail -n 1 "${state_dir}/journal.jsonl" | jq -r '.state')" == "${terminal_state}" ]]
+  [[ "$(tail -n 1 "${state_dir}/journal.jsonl" | jq -r '.state')" == "${expected_state}" ]]
 }
 
 create_recovery_fixture fixture-clear DB_MAINTENANCE_CLEARED
 create_recovery_fixture fixture-enable ENABLE_ACKED
+create_recovery_fixture fixture-close-append GAP_CLOSE_APPENDED
 create_recovery_fixture fixture-close GAP_CLOSED
+
+create_disable_crash_fixture() {
+  local deployment_id="$1" crash_point="$2" state_dir="${STATE_ROOT}/$1"
+  mkdir -p "${state_dir}"
+  write_recovery_state "${state_dir}" "${deployment_id}"
+  ROLLBACK_STATE_DIR="${state_dir}"; DEPLOYMENT_ID="${deployment_id}"
+  journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
+  journal_state CAPTURED '{"fixture":true}'
+  FENCE_GENERATION=6; TARGET_GENERATION=7; MAINTENANCE_ACTIVE=false; MAINTENANCE_DEPLOYMENT_ID=""
+  DISPATCHED_OPERATION_IDS=""
+  FUKUROU_DEPLOY_CRASH_MODE=RETURN; FUKUROU_DEPLOY_CRASH_AT="${crash_point}"
+  if (disable_launches >/dev/null 2>&1); then
+    echo "deploy-runtime-selftest: crash injection did not interrupt ${crash_point}" >&2
+    exit 1
+  fi
+  unset FUKUROU_DEPLOY_CRASH_AT FUKUROU_DEPLOY_CRASH_MODE
+  [[ "$(tail -n 1 "${state_dir}/journal.jsonl" | jq -r '.state')" == SAFETY_MUTATION_STARTED ]]
+}
+
+create_disable_crash_fixture fixture-maintenance-cas AFTER_MAINTENANCE_CAS
+create_disable_crash_fixture fixture-gap-open AFTER_GAP_OPEN_APPEND
 
 for journal in "${STATE_ROOT}"/*/journal.jsonl; do validate_journal_history "${journal}"; done
 cp "${STATE_ROOT}/fixture-clear/journal.jsonl" "${STATE_ROOT}/fixture-clear/journal-corrupt.jsonl"
@@ -136,7 +163,10 @@ for journal in "${STATE_ROOT}"/*/journal.jsonl; do
 done
 grep -Fq 'ensure-maintenance 7 fixture-clear' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-enable' "${DB_CALLS}"
+grep -Fq 'ensure-maintenance 7 fixture-close-append' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-close' "${DB_CALLS}"
+grep -Fq 'ensure-maintenance 7 fixture-maintenance-cas' "${DB_CALLS}"
+grep -Fq 'ensure-maintenance 7 fixture-gap-open' "${DB_CALLS}"
 grep -Fq 'append-gap fixture-close-recovery OPEN' "${DB_CALLS}"
 grep -Fq 'append-gap fixture-close-recovery CLOSE' "${DB_CALLS}"
 
@@ -186,7 +216,8 @@ prepare_gap_event() {
   GAP_EVENT_OCCURRED_AT=fixture; GAP_EVENT_PAYLOAD_HASH="$(printf 'a%.0s' {1..64})"
 }
 append_prepared_gap_event() { [[ "${GAP_MODE}" == success ]]; }
-journal_state CAPTURED; journal_state LAUNCHES_DISABLED; journal_state CANDIDATE_HEALTHY
+journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
+journal_state CAPTURED; journal_state SAFETY_MUTATION_STARTED; journal_state LAUNCHES_DISABLED; journal_state CANDIDATE_HEALTHY
 
 if (resume_launches >/dev/null 2>&1); then
   echo "deploy-runtime-selftest: enable failure resumed launches" >&2
@@ -194,4 +225,19 @@ if (resume_launches >/dev/null 2>&1); then
 fi
 grep -Fq 'maintenance-cas 7 false fixture 7 true fixture' "${DB_CALLS}"
 
-echo "DEPLOY_RUNTIME_SELFTEST_OK journal=hash-chain-transition-cas recovery=db-clear-enable-gap-close-production rollback=external-boundary-fakes canary=replay-rejected pid0=fail-closed resume=enable-failure-restored"
+if [[ -x /usr/bin/timeout ]] && command -v setsid >/dev/null 2>&1; then
+  eval "${PRODUCTION_TIMEOUT_DEFINITION}"
+  process_fixture="${SELFTEST_ROOT}/process-group"
+  if production_timeout 1 bash -c 'trap "" TERM; echo "$$" > "$1"; sleep 30 & echo "$!" >> "$1"; wait' _ "${process_fixture}"; then
+    echo "deploy-runtime-selftest: timeout process group fixture unexpectedly succeeded" >&2
+    exit 1
+  fi
+  while IFS= read -r process_id; do
+    if kill -0 "${process_id}" 2>/dev/null; then
+      echo "deploy-runtime-selftest: timeout left process ${process_id} alive" >&2
+      exit 1
+    fi
+  done < "${process_fixture}"
+fi
+
+echo "DEPLOY_RUNTIME_SELFTEST_OK journal=hash-chain-transition-cas recovery=db-clear-enable-gap-close-production rollback=external-boundary-fakes canary=replay-rejected pid0=fail-closed resume=enable-failure-restored process-group=signal-propagated"

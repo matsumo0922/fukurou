@@ -351,6 +351,14 @@ static int canonical_identifier(const char *value, size_t maximum) {
     return 1;
 }
 
+static int lowercase_hex(const char *value, size_t expected_length) {
+    if (value == NULL || strlen(value) != expected_length) return 0;
+    for (const char *cursor = value; *cursor != '\0'; cursor++) {
+        if (!((*cursor >= '0' && *cursor <= '9') || (*cursor >= 'a' && *cursor <= 'f'))) return 0;
+    }
+    return 1;
+}
+
 static int canonical_run_directory(const char *value, const char *prefix) {
     static const char *root = "/run/fukurou/llm-homes/";
     size_t root_length = strlen(root), prefix_length = strlen(prefix);
@@ -459,15 +467,61 @@ static int environment_entries_allowed(uint16_t profile, char **environment, uin
             strcmp(environment[0], "PATH=/opt/java/openjdk/bin:/usr/bin:/bin") == 0 &&
             strncmp(environment[1], "FUKUROU_INVOCATION_ID=", 22) == 0;
     }
+    const char *path = environment_value(environment, "PATH");
+    const char *lang = environment_value(environment, "LANG");
+    const char *lc_all = environment_value(environment, "LC_ALL");
+    if (path == NULL || strcmp(path, "/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") != 0 ||
+        lang == NULL || strcmp(lang, "en_US.UTF-8") != 0 || lc_all == NULL || strcmp(lc_all, "en_US.UTF-8") != 0) return 0;
+    if (profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 || profile == FUKUROU_PROFILE_CODEX_CURRENT_V1) {
+        const char *prompt_hash = environment_value(environment, "FUKUROU_PROMPT_HASH");
+        const char *runtime_hash = environment_value(environment, "FUKUROU_RUNTIME_CONFIG_HASH");
+        if (!lowercase_hex(prompt_hash, 64) || (runtime_hash != NULL && !lowercase_hex(runtime_hash, 64))) return 0;
+    }
     if (profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1) {
         const char *home = environment_value(environment, "CLAUDE_CONFIG_DIR");
-        if (home == NULL || !canonical_run_directory(home, "fukurou-llm-config-")) return 0;
+        const char *declared_home = environment_value(environment, "HOME");
+        const char *provider = environment_value(environment, "FUKUROU_LLM_PROVIDER");
+        const char *cache = environment_value(environment, "XDG_CACHE_HOME");
+        if (home == NULL || !canonical_run_directory(home, "fukurou-llm-config-") ||
+            declared_home == NULL || strcmp(declared_home, home) != 0 ||
+            cache == NULL || strncmp(cache, home, strlen(home)) != 0 || strcmp(cache + strlen(home), "/.cache") != 0 ||
+            provider == NULL || strcmp(provider, "claude") != 0) return 0;
     }
     if (profile == FUKUROU_PROFILE_CODEX_CURRENT_V1) {
         const char *home = environment_value(environment, "CODEX_HOME");
-        if (home == NULL || !canonical_run_directory(home, "fukurou-codex-home-")) return 0;
+        const char *declared_home = environment_value(environment, "HOME");
+        const char *provider = environment_value(environment, "FUKUROU_LLM_PROVIDER");
+        const char *cache = environment_value(environment, "XDG_CACHE_HOME");
+        if (home == NULL || !canonical_run_directory(home, "fukurou-codex-home-") ||
+            declared_home == NULL || strcmp(declared_home, home) != 0 ||
+            cache == NULL || strncmp(cache, home, strlen(home)) != 0 || strcmp(cache + strlen(home), "/.cache") != 0 ||
+            provider == NULL || strcmp(provider, "codex") != 0) return 0;
     }
     return 1;
+}
+
+static int canary_environment_allowed(char **arguments, char **environment) {
+    const char *home = environment_value(environment, "HOME");
+    const char *profile_home = strcmp(arguments[3], "PROPOSER") == 0
+        ? environment_value(environment, "CLAUDE_CONFIG_DIR") : environment_value(environment, "CODEX_HOME");
+    const char *provider = environment_value(environment, "FUKUROU_LLM_PROVIDER");
+    const char *cache = environment_value(environment, "XDG_CACHE_HOME");
+    char expected_cache[320];
+    if (home == NULL || profile_home == NULL || provider == NULL || cache == NULL || strcmp(home, profile_home) != 0 ||
+        !canonical_run_directory(home, strcmp(arguments[3], "PROPOSER") == 0 ? "fukurou-llm-config-" : "fukurou-codex-home-")) return 0;
+    snprintf(expected_cache, sizeof(expected_cache), "%s/.cache", home);
+    if (strcmp(cache, expected_cache) != 0) return 0;
+    if (strcmp(provider, strcmp(arguments[3], "PROPOSER") == 0 ? "claude" : "codex") != 0) return 0;
+    const char *prompt_hash = environment_value(environment, "FUKUROU_PROMPT_HASH");
+    const char *prompt_version = environment_value(environment, "FUKUROU_SYSTEM_PROMPT_VERSION");
+    const char *snapshot = environment_value(environment, "FUKUROU_MARKET_SNAPSHOT_ID");
+    const char *config_version = environment_value(environment, "FUKUROU_RUNTIME_CONFIG_VERSION_ID");
+    const char *config_hash = environment_value(environment, "FUKUROU_RUNTIME_CONFIG_HASH");
+    return prompt_hash != NULL && strcmp(prompt_hash, "canary-prompt-hash") == 0 &&
+        prompt_version != NULL && strcmp(prompt_version, "canary-system-prompt") == 0 &&
+        snapshot != NULL && strcmp(snapshot, "canary-snapshot") == 0 &&
+        config_version != NULL && strcmp(config_version, "canary-config") == 0 &&
+        config_hash != NULL && strcmp(config_hash, "canary-config-hash") == 0;
 }
 
 static int request_shape_allowed(struct launch_request *request, char **arguments, char **environment) {
@@ -477,8 +531,11 @@ static int request_shape_allowed(struct launch_request *request, char **argument
         if (request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 ? !claude_arguments_allowed(request, arguments, environment) : !codex_arguments_allowed(request, arguments)) return 0;
     } else if (request->header.profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1 && request->header.fd_role_bitmap == 0x7U &&
         request->header.argc == 4 && strcmp(arguments[0], "node") == 0 &&
-        strcmp(arguments[1], "/usr/local/libexec/fukurou-mcp-canary-client.mjs") == 0) {
-        /* The launcher validates the two canary identifiers before this proxy boundary. */
+        strcmp(arguments[1], "/usr/local/libexec/fukurou-mcp-canary-client.mjs") == 0 &&
+        lowercase_hex(arguments[2], 48) &&
+        (strcmp(arguments[3], "PROPOSER") == 0 || strcmp(arguments[3], "FALSIFIER") == 0) &&
+        canary_environment_allowed(arguments, environment)) {
+        /* Exact signed fixture profile is accepted. */
     } else if (request->header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 && request->header.fd_role_bitmap == 0x1fU &&
         request->header.argc == 3 && strcmp(arguments[0], "java") == 0 &&
         strcmp(arguments[1], "-jar") == 0 && strcmp(arguments[2], "/app/fukurou-mcp-all.jar") == 0) {
@@ -834,6 +891,11 @@ enum accept_selftest_case {
     ACCEPT_BASELINE,
     ACCEPT_PATH_TRAVERSAL,
     ACCEPT_ROOT_HOME,
+    ACCEPT_BAD_PATH,
+    ACCEPT_BAD_MANIFEST,
+    ACCEPT_BAD_PHASE,
+    ACCEPT_BAD_PROVIDER,
+    ACCEPT_BAD_HASH,
     ACCEPT_UNKNOWN_OPTION,
     ACCEPT_ARGUMENT_PERMUTATION,
     ACCEPT_DUPLICATE_ARGUMENT,
@@ -869,18 +931,53 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
         "0123456789abcdef0123456789abcdef0123456789abcdef", "PROPOSER",
     };
     const char *mcp_arguments[] = {"java", "-jar", "/app/fukurou-mcp-all.jar"};
-    const char *canary_environment[] = {"FUKUROU_INVOCATION_ID=accept-fixture"};
-    const char *root_environment[] = {"FUKUROU_INVOCATION_ID=accept-fixture", "HOME=/root"};
+    const char *canary_environment[] = {
+        "FUKUROU_INVOCATION_ID=accept-fixture",
+        "PATH=/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8",
+        "HOME=/run/fukurou/llm-homes/fukurou-llm-config-123",
+        "CLAUDE_CONFIG_DIR=/run/fukurou/llm-homes/fukurou-llm-config-123",
+        "XDG_CACHE_HOME=/run/fukurou/llm-homes/fukurou-llm-config-123/.cache",
+        "FUKUROU_LLM_PROVIDER=claude", "FUKUROU_PROMPT_HASH=canary-prompt-hash",
+        "FUKUROU_SYSTEM_PROMPT_VERSION=canary-system-prompt", "FUKUROU_MARKET_SNAPSHOT_ID=canary-snapshot",
+        "FUKUROU_RUNTIME_CONFIG_VERSION_ID=canary-config", "FUKUROU_RUNTIME_CONFIG_HASH=canary-config-hash",
+    };
+    const char *root_environment[] = {
+        "FUKUROU_INVOCATION_ID=accept-fixture", "HOME=/root",
+        "PATH=/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8",
+        "CLAUDE_CONFIG_DIR=/run/fukurou/llm-homes/fukurou-llm-config-123",
+        "XDG_CACHE_HOME=/run/fukurou/llm-homes/fukurou-llm-config-123/.cache",
+        "FUKUROU_LLM_PROVIDER=claude", "FUKUROU_PROMPT_HASH=canary-prompt-hash",
+        "FUKUROU_SYSTEM_PROMPT_VERSION=canary-system-prompt", "FUKUROU_MARKET_SNAPSHOT_ID=canary-snapshot",
+        "FUKUROU_RUNTIME_CONFIG_VERSION_ID=canary-config", "FUKUROU_RUNTIME_CONFIG_HASH=canary-config-hash",
+    };
     const char *mcp_environment[] = {
         "PATH=/opt/java/openjdk/bin:/usr/bin:/bin", "FUKUROU_INVOCATION_ID=receipt-failure-fixture",
     };
     const char **arguments = test_case == ACCEPT_RECEIPT_FAILURE ? mcp_arguments : canary_arguments;
     const char **environment = test_case == ACCEPT_RECEIPT_FAILURE ? mcp_environment : canary_environment;
     uint16_t argument_count = test_case == ACCEPT_RECEIPT_FAILURE ? 3 : 4;
-    uint16_t environment_count = test_case == ACCEPT_RECEIPT_FAILURE ? 2 : 1;
+    uint16_t environment_count = test_case == ACCEPT_RECEIPT_FAILURE ? 2 : 13;
     const char *mutated_arguments[5];
     memcpy(mutated_arguments, canary_arguments, sizeof(canary_arguments));
+    const char *mutated_environment[13];
+    memcpy(mutated_environment, canary_environment, sizeof(canary_environment));
     if (test_case == ACCEPT_PATH_TRAVERSAL) mutated_arguments[1] = "/usr/local/libexec/../fukurou-mcp-canary-client.mjs";
+    if (test_case == ACCEPT_BAD_MANIFEST) mutated_arguments[2] = "not-a-manifest";
+    if (test_case == ACCEPT_BAD_PHASE) mutated_arguments[3] = "REVIEWER";
+    if (test_case == ACCEPT_BAD_PROVIDER) {
+        mutated_environment[7] = "FUKUROU_LLM_PROVIDER=codex";
+        environment = mutated_environment;
+    }
+    if (test_case == ACCEPT_BAD_PATH) {
+        mutated_environment[1] = "PATH=/tmp:/usr/bin";
+        environment = mutated_environment;
+    }
+    if (test_case == ACCEPT_BAD_HASH) {
+        mutated_environment[8] = "FUKUROU_PROMPT_HASH=wrong";
+        environment = mutated_environment;
+    }
     if (test_case == ACCEPT_UNKNOWN_OPTION) mutated_arguments[1] = "--unknown-option";
     if (test_case == ACCEPT_ARGUMENT_PERMUTATION) {
         mutated_arguments[1] = canary_arguments[2];
@@ -890,10 +987,11 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
         mutated_arguments[4] = canary_arguments[3];
         argument_count = 5;
     }
-    if (test_case >= ACCEPT_PATH_TRAVERSAL && test_case <= ACCEPT_DUPLICATE_ARGUMENT) arguments = mutated_arguments;
+    if ((test_case >= ACCEPT_PATH_TRAVERSAL && test_case <= ACCEPT_BAD_PHASE) ||
+        (test_case >= ACCEPT_UNKNOWN_OPTION && test_case <= ACCEPT_DUPLICATE_ARGUMENT)) arguments = mutated_arguments;
     if (test_case == ACCEPT_ROOT_HOME) {
         environment = root_environment;
-        environment_count = 2;
+        environment_count = 13;
     }
 
     struct fukurou_launch_header header = {
@@ -1038,6 +1136,8 @@ static int protocol_selftest(void) {
         unsigned nonce_seed = test_case == ACCEPT_NONCE_REPLAY ? ACCEPT_BASELINE : (unsigned)test_case;
         if (accept_selftest_case(test_case, nonce_seed) != 0) return 125;
     }
+    reap_jobs();
+    if (available_job_slot() != 0) return 125;
     char fixture_reservation[37], fixture_provider[37], fixture_mcp[37];
     if (deterministic_uuid("fukurou-launch-reservation-v1:", "receipt-e2e-fixture", NULL, fixture_reservation) != 0 ||
         deterministic_uuid("fukurou-pid-registration-v1:", "receipt-e2e-fixture", "PROVIDER", fixture_provider) != 0 ||
@@ -1047,12 +1147,23 @@ static int protocol_selftest(void) {
         strcmp(fixture_mcp, "f02b4431-a53e-e39d-8d42-d7dba634db87") != 0) return 125;
     int after = count_open_descriptors();
     if (after != before) return 125;
-    printf("PROTOCOL_SELFTEST_OK fd_delta=0 attempts=1000 boundary=real-accept cases=baseline,path-traversal,root-env,unknown-option,permutation,duplicate,trailing-bytes,unknown-ancillary,nonce-replay,job-full,receipt-failure,bad-magic,bad-version,bad-header,bad-length,bad-count,missing-fd,msg-ctrunc,duplicate-fd,unexpected-fd,bad-peer,bad-role,duplicate-env,bad-env-value,missing-invocation,payload-length\n");
+    printf("PROTOCOL_SELFTEST_OK fd_delta=0 child_delta=0 attempts=1000 boundary=real-accept cases=baseline,path-traversal,root-env,bad-path,bad-manifest,bad-phase,bad-provider,bad-hash,unknown-option,permutation,duplicate,trailing-bytes,unknown-ancillary,nonce-replay,job-full,receipt-failure,bad-magic,bad-version,bad-header,bad-length,bad-count,missing-fd,msg-ctrunc,duplicate-fd,unexpected-fd,bad-peer,bad-role,duplicate-env,bad-env-value,missing-invocation,payload-length\n");
     return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--protocol-selftest") == 0) return protocol_selftest();
+    if (argc == 7 && strcmp(argv[1], "--deploy-operation-probe") == 0) {
+        const char *catalog_hash = argv[2];
+        if (strlen(catalog_hash) != 64) return 2;
+        for (const char *cursor = catalog_hash; *cursor != '\0'; cursor++) {
+            if (!((*cursor >= '0' && *cursor <= '9') || (*cursor >= 'a' && *cursor <= 'f'))) return 2;
+        }
+        return strcmp(argv[3], "FOUNDATION_PREFLIGHT_V1") == 0 &&
+            strcmp(argv[4], "SMOKE_HOOK_FOUNDATION_V1") == 0 &&
+            strcmp(argv[5], "CANDIDATE_HOOK_V1") == 0 &&
+            strcmp(argv[6], "foundation") == 0 ? 0 : 2;
+    }
     if (argc == 4 && strcmp(argv[1], "--receipt-ids") == 0) {
         char reservation[37], registration[37];
         if ((strcmp(argv[3], "PROVIDER") != 0 && strcmp(argv[3], "MCP") != 0) ||

@@ -117,6 +117,7 @@ jobs:
 
           install -d -m 0700 deploy-artifact
           executor_hash="$(sha256sum scripts/deploy/deploy-fukurou | awk '{print $1}')"
+          foundation_harness_hash="$(sha256sum scripts/mcp-credential-isolation-check scripts/deploy/sql/mcp-role.sql | awk '{print $1}' | sha256sum | awk '{print $1}')"
           public_key_hash="$(sha256sum scripts/deploy/deploy-public-key.pem | awk '{print $1}')"
           capability_catalog="$(jq -cS . scripts/deploy/deploy-capability-catalog-v1.json)"
           catalog_hash="$(printf '%s' "${capability_catalog}" | sha256sum | awk '{print $1}')"
@@ -127,6 +128,7 @@ jobs:
             --arg candidateSha "${DEPLOY_SHA}" \
             --arg candidateImageDigest "${CANDIDATE_DIGEST}" \
             --arg executorSha256 "${executor_hash}" \
+            --arg foundationHarnessSha256 "${foundation_harness_hash}" \
             --arg publicKeySha256 "${public_key_hash}" \
             --argjson capabilityCatalog "${capability_catalog}" \
             --arg capabilityCatalogHash "${catalog_hash}" \
@@ -135,7 +137,7 @@ jobs:
               requiredCapabilities:["CREATE_DIR_V1","DB_MAINTENANCE_V1","DB_MIGRATION_V1","INSTALL_SECRET_REF_V1","RUN_COMPOSE_PROJECT_V1","SMOKE_HOOK_V1"],
               requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
               capabilityCatalog:$capabilityCatalog,capabilityCatalogHash:$capabilityCatalogHash,
-              executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,
+              executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,foundationHarnessSha256:$foundationHarnessSha256,
               operations:[
                 {capability:"CREATE_DIR_V1",operationId:"LAUNCH_FENCE_ROOT"},
                 {capability:"INSTALL_SECRET_REF_V1",operationId:"LLM_LAUNCH_SIGNING_KEY_V1"},

@@ -47,6 +47,7 @@ runner 割り当て待ち（`queued` 状態）の滞留は `timeout-minutes` の
 | root checkout            | `/srv/fukurou/repo`                        |
 | NAS `.env`               | `/srv/fukurou/.env`                        |
 | deploy script            | `/usr/local/sbin/deploy-fukurou`           |
+| foundation harness       | `/usr/local/libexec/fukurou-mcp-credential-isolation-check` |
 | self-hosted runner name  | `dxp4800plus-fukurou-prod`                 |
 | self-hosted runner label | `fukurou-prod`                             |
 | production image         | `ghcr.io/matsumo0922/fukurou@sha256:<digest>` |
@@ -144,6 +145,8 @@ repository の deploy script を root-owned script として反映する。
 ```sh
 sudo install -m 0755 /srv/fukurou/repo/scripts/deploy/deploy-fukurou /usr/local/sbin/deploy-fukurou
 sudo install -m 0755 /srv/fukurou/repo/scripts/deploy/fukurou-deploy-db /usr/local/libexec/fukurou-deploy-db
+sudo install -m 0555 /srv/fukurou/repo/scripts/mcp-credential-isolation-check /usr/local/libexec/fukurou-mcp-credential-isolation-check
+sudo install -m 0444 /srv/fukurou/repo/scripts/deploy/sql/mcp-role.sql /usr/local/share/fukurou/mcp-role.sql
 sudo install -m 0644 /srv/fukurou/repo/scripts/deploy/sql/deploy-foundation-v1.sql /usr/local/share/fukurou/deploy-foundation-v1.sql
 sudo install -m 0644 /srv/fukurou/repo/scripts/deploy/sql/deploy-foundation-v1-indexes.sql /usr/local/share/fukurou/deploy-foundation-v1-indexes.sql
 sudo install -m 0444 /srv/fukurou/repo/scripts/deploy/deploy-capability-catalog-v1.json /usr/local/share/fukurou/deploy-capability-catalog-v1.json
@@ -164,13 +167,13 @@ sudo visudo -cf /etc/sudoers.d/fukurou-deploy
 
 deploy script や sudoers template を変更した場合も、`/usr/local/sbin` と `/etc/sudoers.d` への反映は管理者が手動で行う。GitHub Actions から root-owned script を自動更新しない。
 
-root executor、DB helper、foundation SQL、public key は同じ commit から一組で反映する。workflow は installed contract version と、署名 bundle 内の executor/public-key hash が repository artifact と一致しない場合に typed operation を一件も実行しない。repository 側の変更だけでは root-owned artifact は変わらないため、artifact を変更する PR では production を safe-stop し、管理者が同じ merge SHA の一組を反映してから同じ SHA/digest の workflow を再実行する。
+root executor、DB helper、foundation harness、foundation SQL、public key は同じ commit から一組で反映する。workflow は installed contract version と、署名 bundle 内の executor/public-key/foundation-harness hash が repository artifact と一致しない場合に typed operation を一件も実行しない。repository 側の変更だけでは root-owned artifact は変わらないため、artifact を変更する PR では production を safe-stop し、管理者が同じ merge SHA の一組を反映してから同じ SHA/digest の workflow を再実行する。
 
 GitHub Actions の `DEPLOY_SIGNING_PRIVATE_KEY` secret は、repository の `deploy-public-key.pem` と対になる Ed25519 private key を PEM 形式で保持する。private key は NAS `.env`、repository、workflow artifact、rollback bundleへ保存しない。
 
 ## release / deploy safety foundation
 
-deploy workflow は candidate SHA/image digest、contract version、versioned capability catalog、executor/public-key hashを canonical JSON bundle に固定し、Ed25519 署名を付ける。catalog は各operationのprofile、entrypoint、parameter schemaと親hashを持ち、既存entryをbyte-identicalに保つ単調なsupersetだけを受理する。executorはcatalogから実行planを組み立て、productionで実際にdispatchしたoperation IDを記録し、required operation全件との一致をmutation完了前に確認する。削除、再定義、version downgrade、parent fork、duplicate ID、未知schema/profile/entrypointではmutationを開始しない。
+deploy workflow は candidate SHA/image digest、contract version、versioned capability catalog、executor/public-key/foundation-harness hashを canonical JSON bundle に固定し、Ed25519 署名を付ける。executorはrollback directory、catalog、maintenanceを変更する前にexact digestのcandidate PID 1へrequired hook tupleをprobeし、candidate executableが未実装のoperationを拒否する。実際にdispatchしたoperation IDはhash chain付きroot-only ledgerへ永続化する。削除、再定義、version downgrade、parent fork、duplicate ID、未知schema/profile/entrypoint、candidate未実装operationではmutationを開始しない。
 
 検証後の最初の deploy state mutation は `/srv/fukurou/deploy-state/<deployment-id>/` の rollback bundle capture である。bundle は `FRESH` / `PRE_FOUNDATION` / `FOUNDATION_V1`、previous repository SHA、全compose source/hash、configured image reference/image ID/repo digest/revision、runtime config、maintenance tuple、raw fence hash、foundation fingerprint、PID registration summary、installed artifact hash、DB capture時刻をroot-onlyで保持する。render済み compose、`.env`、credential、key bytesは保持しない。
 
@@ -180,9 +183,9 @@ production container の PID 1 は `fukurou-runtime-supervisor` であり、全L
 
 deploy maintenance は durable disable ACK、同generationのDB maintenance commit、active process drainの順で進む。PID 1が利用できない場合は application containerのPID 0を確認してからDB maintenanceへ進む。再開はDB maintenance clear後に同generationのenable ACKを取得する。startup時はDB maintenanceとhost fenceを照合するまでspawnを許可せず、欠損、破損、generation不一致、DB failureではlaunchを閉じたままApplication/opsを起動する。
 
-candidate hookはproduction fenceを開かない。`CANARY_ONLY` tokenをcandidate SHA/image digest/catalog hashへ固定し、root-generated Compose projectのinternal fixture networkで同じimage、PID 1、read-only、tmpfs、capability条件を使う。foundation hookは同じdigestの一時PID 1に対してproviderとMCPのtyped launch、fixture auth、required tool/output schema、failure cleanupを実行する。終了時は一時container、network、volumeが0件であることを確認する。production DB credential、endpoint、mutation toolは渡さない。tokenはdurableな`ISSUED`→`CONSUMED`→`REVOKED`の一方向状態を取り、署名、期限、SHA/digest/catalog bindingを検証して再利用しない。
+candidate hookはproduction fenceを開かない。`CANARY_ONLY` tokenをcandidate SHA/image digest/catalog hashへ固定し、root-generated Compose projectのinternal fixture networkで同じimage、PID 1、read-only、tmpfs、capability条件を使う。署名bundleへhash固定したinstalled foundation harnessが、同じdigestの一時PID 1に対してproviderとMCPのtyped launch、fixture auth、required tool/output schema、failure cleanupを実行し、repository checkout内のscriptは実行しない。終了時は一時container、internal network、volumeが0件であることを確認する。production DB credential、endpoint、mutation toolは渡さない。
 
-deploy journal と canary audit は sequence、previous state、previous hash、canonical payload hash、現在の末尾 sequence に対するCASを持つappend historyである。executor 起動時はlock取得後、新しいrollback captureより前に既存journalの全chainと許可されたstate遷移を検証する。recoveryは`DB_MAINTENANCE_CLEARED`、`ENABLE_ACKED`、`GAP_CLOSED`を区別し、maintenance再確立、active reservation 0、disable fence、OPEN gapを再確認してから保存済みrollbackを実行する。CLOSE済みならrecovery専用のOPEN/CLOSE gapを追加する。`ROLLED_BACK`を永続化できた場合だけ次のdeployへ進む。chain破損、state欠損、`FRESH` / `PRE_FOUNDATION`の未完了、rollback不成立はmanual recoveryとしてfail closedする。deadlineは`/proc/uptime`のboot timeを使い、Docker、Git、DB helperのforward/recovery callにも個別timeoutを設ける。
+deploy journal と canary audit は sequence、previous state、previous hash、canonical payload hash、現在の末尾 sequence に対するCASを持つappend historyである。rollback capture後かつ最初のsafety mutation前に`PREPARED`、launch disable開始前に`SAFETY_MUTATION_STARTED`を永続化する。live errorとstartup recoveryはいずれもmaintenance再確立、active reservation 0、disable fence、OPEN gapを再確認してから保存済みrollbackを実行する。`ROLLED_BACK`を永続化できた場合だけ次のdeployへ進む。deadlineは`/proc/uptime`のboot timeを使い、Docker、Git、DB helperの全callを残りbudget以下へ制限し、外部commandは独立process groupへTERM/KILLを伝播する。
 
 maintenance intervalはroot DB helperがappend-only `infrastructure_gap_events`へimmutableなOPEN/CLOSE factを直接記録する。decision/run/order/position/execution/tradeはrun開始からexposure終了までの共通causal projectionで`ELIGIBLE` / `INFRASTRUCTURE_GAP` / `ATTRIBUTION_MISSING`に分類し、非terminal run、order/intent/decision/runの不一致、position内execution orderの不一致もmissingにする。summary、setup、calibration、benchmark、prior PnL、kill criterion、run rate、report、reflection、knowledge、usageは同じeligible境界を使い、APIはentity type別件数とgap catalogを返す。依頼期間と交差するgapだけを上限判定し、gap 1,000件超、entity 20,000件超、integrity不整合、timeoutは部分値を返さない。
 

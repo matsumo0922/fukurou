@@ -53,6 +53,14 @@ static void require_canary_flag(void) {
     close(fd);
 }
 
+static int lowercase_hex(const char *value, size_t expected_length) {
+    if (strlen(value) != expected_length) return 0;
+    for (const char *cursor = value; *cursor != '\0'; cursor++) {
+        if (!((*cursor >= '0' && *cursor <= '9') || (*cursor >= 'a' && *cursor <= 'f'))) return 0;
+    }
+    return 1;
+}
+
 static int required_mcp_launcher_capability(int capability) {
     return capability == CAP_CHOWN || capability == CAP_DAC_READ_SEARCH || capability == CAP_SETGID ||
         capability == CAP_SETUID || capability == CAP_SETPCAP;
@@ -278,11 +286,15 @@ int main(int argc, char **argv, char **envp) {
     if (strcmp(argv[1], "codex") == 0) executable = "/usr/local/bin/codex";
     int canary = strcmp(argv[1], "canary") == 0;
     if (canary) {
+        int standard_phase = argc == 4 &&
+            (strcmp(argv[3], "PROPOSER") == 0 || strcmp(argv[3], "FALSIFIER") == 0);
         int rro_action = argc == 5 && strcmp(argv[3], "RISK_REDUCTION_ONLY") == 0 &&
             (strcmp(argv[4], "NO_TRADE") == 0 || strcmp(argv[4], "EXIT") == 0 ||
              strcmp(argv[4], "REDUCE") == 0 || strcmp(argv[4], "ADJUST_PROTECTION") == 0 ||
              strcmp(argv[4], "ENTER") == 0 || strcmp(argv[4], "ADD_LONG") == 0);
-        if (argc != 4 && !rro_action) fail("canary mode requires manifest id, phase, and optional RRO action");
+        if (!lowercase_hex(argv[2], 48) || (!standard_phase && !rro_action)) {
+            fail("canary manifest or phase rejected");
+        }
         require_canary_flag();
         executable = "/usr/bin/node";
     }

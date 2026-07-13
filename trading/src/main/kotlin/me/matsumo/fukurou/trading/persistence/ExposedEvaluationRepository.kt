@@ -58,6 +58,7 @@ private val SELECT_CLOSED_TRADE_FACTS_SQL = """
             p.id,
             p.opened_at,
             p.closed_at,
+            p.decision_run_id,
             p.highest_price_since_entry_jpy,
             p.lowest_price_since_entry_jpy
         FROM positions p
@@ -85,7 +86,10 @@ private val SELECT_CLOSED_TRADE_FACTS_SQL = """
         FROM executions e
         JOIN closed_positions p ON p.id = e.position_id
         WHERE e.side = 'BUY'
-        ORDER BY e.position_id, e.executed_at ASC, e.id ASC
+        ORDER BY e.position_id,
+            (e.decision_run_id IS DISTINCT FROM p.decision_run_id) ASC,
+            e.executed_at ASC,
+            e.id ASC
     ),
     entry_orders AS (
         SELECT
@@ -177,7 +181,7 @@ private val SELECT_CLOSED_TRADE_FACTS_SQL = """
         el.account_epoch_id,
         el.cohort,
         el.execution_semantics_version,
-        CASE WHEN ${evaluationOrderLineageMissingSql("eo", "ti", "d", "run")}
+        CASE WHEN ${evaluationPositionCausalMissingSql("p", "eo", "ti", "d", "run")}
             THEN 'MISSING' ELSE 'ATTRIBUTED' END AS attribution_status,
         ARRAY(
             SELECT gap.gap_id::text
@@ -194,7 +198,7 @@ private val SELECT_CLOSED_TRADE_FACTS_SQL = """
     LEFT JOIN execution_lineage el ON el.position_id = p.id
     LEFT JOIN trade_intents ti ON ti.id = eo.intent_id
     LEFT JOIN decisions d ON d.id = ti.decision_id
-    LEFT JOIN llm_runs run ON run.invocation_id = d.invocation_id
+    LEFT JOIN llm_runs run ON run.invocation_id = eo.decision_run_id
     LEFT JOIN trade_plans tp ON tp.id = ti.trade_plan_id
     ORDER BY p.closed_at ASC
 """
@@ -263,12 +267,12 @@ private val SELECT_DAILY_TRADE_PNL_SQL = """
         JOIN LATERAL (
             SELECT entry.order_id FROM executions entry
             WHERE entry.position_id = p.id AND entry.side = 'BUY'
-            ORDER BY entry.executed_at, entry.id LIMIT 1
+            ORDER BY (entry.decision_run_id IS DISTINCT FROM p.decision_run_id), entry.executed_at, entry.id LIMIT 1
         ) initial ON TRUE
         JOIN orders entry_order ON entry_order.id = initial.order_id
         JOIN trade_intents intent ON intent.id = entry_order.intent_id
         JOIN decisions decision ON decision.id = intent.decision_id
-        JOIN llm_runs run ON run.invocation_id = decision.invocation_id
+        JOIN llm_runs run ON run.invocation_id = entry_order.decision_run_id
         WHERE p.status = 'CLOSED'
             AND p.mode = (
                 SELECT mode
@@ -281,7 +285,7 @@ private val SELECT_DAILY_TRADE_PNL_SQL = """
                 SELECT 1 FROM evaluation_exclusions x
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
-            AND NOT ${evaluationOrderLineageMissingSql("entry_order", "intent", "decision", "run")}
+            AND NOT ${evaluationPositionCausalMissingSql("p", "entry_order", "intent", "decision", "run")}
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
                 WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
     ),
@@ -311,12 +315,12 @@ private val SUM_TRADE_PNL_BEFORE_SQL = """
         JOIN LATERAL (
             SELECT entry.order_id FROM executions entry
             WHERE entry.position_id = p.id AND entry.side = 'BUY'
-            ORDER BY entry.executed_at, entry.id LIMIT 1
+            ORDER BY (entry.decision_run_id IS DISTINCT FROM p.decision_run_id), entry.executed_at, entry.id LIMIT 1
         ) initial ON TRUE
         JOIN orders entry_order ON entry_order.id = initial.order_id
         JOIN trade_intents intent ON intent.id = entry_order.intent_id
         JOIN decisions decision ON decision.id = intent.decision_id
-        JOIN llm_runs run ON run.invocation_id = decision.invocation_id
+        JOIN llm_runs run ON run.invocation_id = entry_order.decision_run_id
         WHERE p.status = 'CLOSED'
             AND p.mode = (
                 SELECT mode
@@ -328,7 +332,7 @@ private val SUM_TRADE_PNL_BEFORE_SQL = """
                 SELECT 1 FROM evaluation_exclusions x
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
-            AND NOT ${evaluationOrderLineageMissingSql("entry_order", "intent", "decision", "run")}
+            AND NOT ${evaluationPositionCausalMissingSql("p", "entry_order", "intent", "decision", "run")}
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
                 WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
     ),
@@ -415,12 +419,12 @@ private val SELECT_KILL_CRITERION_STATS_SQL = """
         JOIN LATERAL (
             SELECT entry.order_id FROM executions entry
             WHERE entry.position_id = p.id AND entry.side = 'BUY'
-            ORDER BY entry.executed_at, entry.id LIMIT 1
+            ORDER BY (entry.decision_run_id IS DISTINCT FROM p.decision_run_id), entry.executed_at, entry.id LIMIT 1
         ) initial ON TRUE
         JOIN orders entry_order ON entry_order.id = initial.order_id
         JOIN trade_intents intent ON intent.id = entry_order.intent_id
         JOIN decisions decision ON decision.id = intent.decision_id
-        JOIN llm_runs run ON run.invocation_id = decision.invocation_id
+        JOIN llm_runs run ON run.invocation_id = entry_order.decision_run_id
         JOIN executions e ON e.position_id = p.id
         LEFT JOIN orders o ON o.id = e.order_id
         WHERE p.status = 'CLOSED'
@@ -429,7 +433,7 @@ private val SELECT_KILL_CRITERION_STATS_SQL = """
                 SELECT 1 FROM evaluation_exclusions x
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
-            AND NOT ${evaluationOrderLineageMissingSql("entry_order", "intent", "decision", "run")}
+            AND NOT ${evaluationPositionCausalMissingSql("p", "entry_order", "intent", "decision", "run")}
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
                 WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
         GROUP BY p.id
@@ -476,12 +480,12 @@ private val SELECT_SCOPED_PNL_BEFORE_SQL = """
         JOIN LATERAL (
             SELECT entry.order_id FROM executions entry
             WHERE entry.position_id = p.id AND entry.side = 'BUY'
-            ORDER BY entry.executed_at, entry.id LIMIT 1
+            ORDER BY (entry.decision_run_id IS DISTINCT FROM p.decision_run_id), entry.executed_at, entry.id LIMIT 1
         ) initial ON TRUE
         JOIN orders entry_order ON entry_order.id = initial.order_id
         JOIN trade_intents intent ON intent.id = entry_order.intent_id
         JOIN decisions decision ON decision.id = intent.decision_id
-        JOIN llm_runs run ON run.invocation_id = decision.invocation_id
+        JOIN llm_runs run ON run.invocation_id = entry_order.decision_run_id
         JOIN executions e ON e.position_id = p.id
         LEFT JOIN orders o ON o.id = e.order_id
         WHERE p.status = 'CLOSED'
@@ -491,7 +495,7 @@ private val SELECT_SCOPED_PNL_BEFORE_SQL = """
                 SELECT 1 FROM evaluation_exclusions x
                 WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
             )
-            AND NOT ${evaluationOrderLineageMissingSql("entry_order", "intent", "decision", "run")}
+            AND NOT ${evaluationPositionCausalMissingSql("p", "entry_order", "intent", "decision", "run")}
             AND NOT EXISTS (SELECT 1 FROM infrastructure_gap_intervals gap
                 WHERE run.started_at < gap.closed_at_ms AND gap.opened_at_ms < p.closed_at)
         GROUP BY p.id
@@ -1024,43 +1028,51 @@ private fun JdbcTransaction.selectPopulationCounts(period: EvaluationPeriod): Ma
                 ORDER BY d.created_at,d.id LIMIT 20001)
                 UNION ALL
                 (SELECT 'ORDER', o.id::text, r.started_at, COALESCE(o.canceled_at,o.expired_at,o.updated_at,?),
-                    ${evaluationOrderLineageMissingSql("o", "i", "d", "r")}
+                    ${evaluationOrderCausalMissingSql("o", "i", "d", "r")}
                 FROM orders o
                 LEFT JOIN trade_intents i ON i.id=o.intent_id
                 LEFT JOIN decisions d ON d.id=i.decision_id
-                LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
+                LEFT JOIN llm_runs r ON r.invocation_id=o.decision_run_id
                 WHERE o.created_at < ? AND o.updated_at >= ?
                 ORDER BY o.created_at,o.id LIMIT 20001)
                 UNION ALL
                 (SELECT 'POSITION', p.id::text, r.started_at, COALESCE(p.closed_at,?),
-                    entry.id IS NULL OR ${evaluationOrderLineageMissingSql("o", "i", "d", "r")}
+                    entry.id IS NULL OR ${evaluationPositionCausalMissingSql("p", "o", "i", "d", "r")}
                 FROM positions p
-                LEFT JOIN LATERAL (SELECT e.id,e.order_id FROM executions e WHERE e.position_id=p.id AND e.side='BUY' ORDER BY e.executed_at,e.id LIMIT 1) entry ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT e.id,e.order_id FROM executions e
+                    WHERE e.position_id=p.id AND e.side='BUY'
+                    ORDER BY (e.decision_run_id IS DISTINCT FROM p.decision_run_id),e.executed_at,e.id LIMIT 1
+                ) entry ON TRUE
                 LEFT JOIN orders o ON o.id=entry.order_id
                 LEFT JOIN trade_intents i ON i.id=o.intent_id
                 LEFT JOIN decisions d ON d.id=i.decision_id
-                LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
+                LEFT JOIN llm_runs r ON r.invocation_id=o.decision_run_id
                 WHERE p.opened_at < ? AND COALESCE(p.closed_at,?) >= ?
                 ORDER BY p.opened_at,p.id LIMIT 20001)
                 UNION ALL
                 (SELECT 'EXECUTION', e.id::text, r.started_at, e.executed_at+1,
-                    e.order_id IS NULL OR ${evaluationOrderLineageMissingSql("o", "i", "d", "r")}
+                    e.order_id IS NULL OR ${evaluationExecutionCausalMissingSql("e", "o", "i", "d", "r")}
                 FROM executions e
                 LEFT JOIN orders o ON o.id=e.order_id
                 LEFT JOIN trade_intents i ON i.id=o.intent_id
                 LEFT JOIN decisions d ON d.id=i.decision_id
-                LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
+                LEFT JOIN llm_runs r ON r.invocation_id=o.decision_run_id
                 WHERE e.executed_at >= ? AND e.executed_at < ?
                 ORDER BY e.executed_at,e.id LIMIT 20001)
                 UNION ALL
                 (SELECT 'TRADE', p.id::text, r.started_at, p.closed_at,
-                    entry.id IS NULL OR ${evaluationOrderLineageMissingSql("o", "i", "d", "r")}
+                    entry.id IS NULL OR ${evaluationPositionCausalMissingSql("p", "o", "i", "d", "r")}
                 FROM positions p
-                LEFT JOIN LATERAL (SELECT e.id,e.order_id FROM executions e WHERE e.position_id=p.id AND e.side='BUY' ORDER BY e.executed_at,e.id LIMIT 1) entry ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT e.id,e.order_id FROM executions e
+                    WHERE e.position_id=p.id AND e.side='BUY'
+                    ORDER BY (e.decision_run_id IS DISTINCT FROM p.decision_run_id),e.executed_at,e.id LIMIT 1
+                ) entry ON TRUE
                 LEFT JOIN orders o ON o.id=entry.order_id
                 LEFT JOIN trade_intents i ON i.id=o.intent_id
                 LEFT JOIN decisions d ON d.id=i.decision_id
-                LEFT JOIN llm_runs r ON r.invocation_id=d.invocation_id
+                LEFT JOIN llm_runs r ON r.invocation_id=o.decision_run_id
                 WHERE p.status='CLOSED' AND p.closed_at >= ? AND p.closed_at < ?
                 ORDER BY p.closed_at,p.id LIMIT 20001)
             ), projected AS (
@@ -1176,14 +1188,22 @@ private fun JdbcTransaction.selectInfrastructureAffectedCounts(period: Evaluatio
             WITH $EVALUATION_GAP_INTERVAL_CTE_V1
             SELECT
                 COUNT(DISTINCT p.id) AS affected_count,
-                COUNT(DISTINCT p.id) FILTER (WHERE ${evaluationOrderLineageMissingSql("o", "ti", "d", "run")})
+                COUNT(DISTINCT p.id) FILTER (
+                    WHERE ${evaluationPositionCausalMissingSql("p", "o", "ti", "d", "run")}
+                )
                     AS attribution_missing_count
             FROM positions p
-            LEFT JOIN executions e ON e.position_id = p.id AND e.side = 'BUY'
+            LEFT JOIN LATERAL (
+                SELECT candidate.id,candidate.order_id FROM executions candidate
+                WHERE candidate.position_id=p.id AND candidate.side='BUY'
+                ORDER BY (candidate.decision_run_id IS DISTINCT FROM p.decision_run_id),
+                    candidate.executed_at,candidate.id
+                LIMIT 1
+            ) e ON TRUE
             LEFT JOIN orders o ON o.id = e.order_id
             LEFT JOIN trade_intents ti ON ti.id = o.intent_id
             LEFT JOIN decisions d ON d.id = ti.decision_id
-            LEFT JOIN llm_runs run ON run.invocation_id = d.invocation_id
+            LEFT JOIN llm_runs run ON run.invocation_id = o.decision_run_id
             WHERE p.status = 'CLOSED'
                 AND p.closed_at >= ? AND p.closed_at < ?
                 AND EXISTS (

@@ -88,3 +88,64 @@ internal fun evaluationOrderLineageMissingSql(
         $orderAlias.decision_run_id IS DISTINCT FROM $decisionAlias.invocation_id OR
         ${evaluationRunMissingSql(runAlias)})
 """.trimIndent()
+
+/** intentを持つentryとdirect runだけを持つsystem/close orderを同じstatusへ投影する。 */
+internal fun evaluationOrderCausalMissingSql(
+    orderAlias: String,
+    intentAlias: String,
+    decisionAlias: String,
+    runAlias: String,
+): String = """
+    ($orderAlias.id IS NULL OR $orderAlias.decision_run_id IS NULL OR
+        ${evaluationRunMissingSql(runAlias)} OR
+        ($orderAlias.intent_id IS NOT NULL AND (
+            $intentAlias.id IS NULL OR $decisionAlias.id IS NULL OR
+            $decisionAlias.invocation_id IS NULL OR
+            $orderAlias.decision_run_id IS DISTINCT FROM $decisionAlias.invocation_id
+        )))
+""".trimIndent()
+
+/** execution direct run、order direct run、任意entry intentのchainをexactに照合する。 */
+internal fun evaluationExecutionCausalMissingSql(
+    executionAlias: String,
+    orderAlias: String,
+    intentAlias: String,
+    decisionAlias: String,
+    runAlias: String,
+): String = """
+    ($executionAlias.id IS NULL OR $executionAlias.decision_run_id IS NULL OR
+        $executionAlias.decision_run_id IS DISTINCT FROM $orderAlias.decision_run_id OR
+        ${evaluationOrderCausalMissingSql(orderAlias, intentAlias, decisionAlias, runAlias)})
+""".trimIndent()
+
+/** position direct runと全execution/orderのcausal chainを一つのmissing predicateへ畳み込む。 */
+internal fun evaluationPositionCausalMissingSql(
+    positionAlias: String,
+    entryOrderAlias: String,
+    intentAlias: String,
+    decisionAlias: String,
+    runAlias: String,
+): String {
+    val orderMissing = evaluationOrderCausalMissingSql(entryOrderAlias, intentAlias, decisionAlias, runAlias)
+    val executionMissing = evaluationExecutionCausalMissingSql(
+        executionAlias = "position_execution",
+        orderAlias = "execution_order",
+        intentAlias = "execution_intent",
+        decisionAlias = "execution_decision",
+        runAlias = "execution_run",
+    )
+
+    return """
+        ($positionAlias.decision_run_id IS NULL OR
+            $positionAlias.decision_run_id IS DISTINCT FROM $entryOrderAlias.decision_run_id OR
+            $orderMissing OR
+            EXISTS (
+                SELECT 1 FROM executions position_execution
+                LEFT JOIN orders execution_order ON execution_order.id=position_execution.order_id
+                LEFT JOIN trade_intents execution_intent ON execution_intent.id=execution_order.intent_id
+                LEFT JOIN decisions execution_decision ON execution_decision.id=execution_intent.decision_id
+                LEFT JOIN llm_runs execution_run ON execution_run.invocation_id=execution_order.decision_run_id
+                WHERE position_execution.position_id=$positionAlias.id AND $executionMissing
+            ))
+    """.trimIndent()
+}

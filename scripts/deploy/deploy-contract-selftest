@@ -2,7 +2,19 @@
 set -Eeuo pipefail
 
 readonly SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELFTEST_HARNESS="$(mktemp)"
+SELFTEST_HARNESS_SQL="$(mktemp)"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "${SELFTEST_HARNESS}"
+printf '%s\n' 'SELECT 1;' > "${SELFTEST_HARNESS_SQL}"
+chmod 0755 "${SELFTEST_HARNESS}"
+export FUKUROU_FOUNDATION_HARNESS="${SELFTEST_HARNESS}"
+export FUKUROU_FOUNDATION_HARNESS_SQL="${SELFTEST_HARNESS_SQL}"
 source "${SCRIPT_DIRECTORY}/deploy-fukurou"
+
+timeout() {
+  shift
+  "$@"
+}
 
 fail_selftest() {
   echo "deploy-contract-selftest: $*" >&2
@@ -61,4 +73,36 @@ expect_rejected unsupported-profile validate_catalog_dispatchability "${unsuppor
 bad_entrypoint_catalog="$(jq -cS '(.operations[]|select(.operationId=="FOUNDATION_PREFLIGHT_V1").entrypoint)=["/bin/sh","-c"]' <<<"${installed_catalog}")"
 expect_rejected unsupported-entrypoint validate_catalog_dispatchability "${bad_entrypoint_catalog}"
 
-echo "DEPLOY_CONTRACT_SELFTEST_OK superset=accepted-dispatched deletion=rejected redefinition=rejected fork=rejected downgrade=rejected schema-profile-entrypoint-duplicates=rejected"
+CANDIDATE_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
+CANDIDATE_CATALOG_HASH="${installed_hash}"
+CANDIDATE_CATALOG="${installed_catalog}"
+SIGNED_BUNDLE_JSON="${baseline_bundle}"
+docker() {
+  if [[ "$1" == image && "$2" == inspect ]]; then
+    printf '%s@%s\n' "${IMAGE_REPOSITORY}" "${CANDIDATE_DIGEST}"
+    return 0
+  fi
+  if [[ "$1" == run ]]; then
+    [[ " $* " == *" FOUNDATION_PREFLIGHT_V1 SMOKE_HOOK_FOUNDATION_V1 CANDIDATE_HOOK_V1 foundation "* ]]
+    return
+  fi
+  return 0
+}
+probe_candidate_operations || fail_selftest "exact candidate foundation probe rejected"
+CANDIDATE_CATALOG="${superset_catalog}"
+SIGNED_BUNDLE_JSON="${superset_bundle}"
+expect_rejected future-image-operation probe_candidate_operations
+
+ROLLBACK_STATE_DIR="$(mktemp -d)"
+DISPATCHED_OPERATION_IDS=""
+record_operation_dispatch FOUNDATION_PREFLIGHT_V1
+record_operation_dispatch PRODUCTION
+[[ "$(wc -l < "${ROLLBACK_STATE_DIR}/operation-dispatch.jsonl" | tr -d ' ')" == 2 ]] || fail_selftest "durable dispatch ledger missing entries"
+expect_rejected duplicate-durable-dispatch record_operation_dispatch PRODUCTION
+MUTATION_COUNT=0
+harness_hash="$(sha256sum "${SELFTEST_HARNESS}" "${SELFTEST_HARNESS_SQL}" | awk '{print $1}' | sha256sum | awk '{print $1}')"
+validate_foundation_harness_hash "${harness_hash}" || fail_selftest "signed harness hash rejected"
+expect_rejected tampered-harness-mutation0 validate_foundation_harness_hash "$(printf '0%.0s' {1..64})"
+[[ "${MUTATION_COUNT}" == 0 ]] || fail_selftest "harness mismatch mutated state"
+
+echo "DEPLOY_CONTRACT_SELFTEST_OK superset=accepted-dispatched exact-image-probe=future-rejected-mutation0 durable-dispatch=recorded deletion=rejected redefinition=rejected fork=rejected downgrade=rejected schema-profile-entrypoint-duplicates=rejected"

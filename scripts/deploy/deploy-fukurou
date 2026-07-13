@@ -16,6 +16,8 @@ readonly INSTALLED_CATALOG="${FUKUROU_DEPLOY_CATALOG:-/usr/local/share/fukurou/d
 readonly CATALOG_LEDGER="${FUKUROU_DEPLOY_CATALOG_LEDGER:-${DEPLOY_ROOT}/deploy-catalog-ledger}"
 readonly DB_HELPER="${FUKUROU_DEPLOY_DB_HELPER:-/usr/local/libexec/fukurou-deploy-db}"
 readonly SUPERVISOR_BINARY="/usr/local/libexec/fukurou-runtime-supervisor"
+readonly FOUNDATION_HARNESS="${FUKUROU_FOUNDATION_HARNESS:-/usr/local/libexec/fukurou-mcp-credential-isolation-check}"
+readonly FOUNDATION_HARNESS_SQL="${FUKUROU_FOUNDATION_HARNESS_SQL:-/usr/local/share/fukurou/mcp-role.sql}"
 readonly CANARY_PRIVATE_KEY="${DEPLOY_ROOT}/secrets/llm-launch-ed25519"
 readonly CANARY_PUBLIC_KEY="${DEPLOY_ROOT}/secrets/llm-launch-ed25519.pub"
 readonly IMAGE_RETENTION_COUNT="${FUKUROU_IMAGE_RETENTION_COUNT:-10}"
@@ -36,13 +38,39 @@ boottime_seconds() {
 on_signal() {
   local signal_name="$1" code="$2"
   SIGNAL_NAME="${signal_name}"
+  terminate_active_external_process_group
   journal_state SIGNAL_RECEIVED "{\"signal\":\"${signal_name}\"}" 2>/dev/null || true
   (exit "${code}")
   rollback_on_error
 }
 
+terminate_active_external_process_group() {
+  [[ -n "${ACTIVE_EXTERNAL_PGID:-}" ]] || return 0
+  kill -TERM -- "-${ACTIVE_EXTERNAL_PGID}" 2>/dev/null || true
+  local deadline=$(( $(boottime_seconds) + 5 ))
+  while kill -0 "${ACTIVE_EXTERNAL_PGID}" 2>/dev/null && (( $(boottime_seconds) < deadline )); do sleep 1; done
+  kill -KILL -- "-${ACTIVE_EXTERNAL_PGID}" 2>/dev/null || true
+}
+
 check_forward_deadline() {
   [[ "$(boottime_seconds)" -lt "${FORWARD_DEADLINE_BOOTTIME}" ]] || fail "FORWARD_DEADLINE_EXCEEDED"
+}
+
+timeout() {
+  local requested="$1"
+  shift
+  local deadline="${RECOVERY_DEADLINE_BOOTTIME:-${FORWARD_DEADLINE_BOOTTIME:-}}"
+  if [[ -n "${deadline}" ]]; then
+    local remaining=$((deadline - $(boottime_seconds)))
+    (( remaining > 0 )) || return 124
+    (( requested <= remaining )) || requested="${remaining}"
+  fi
+  command setsid timeout --signal=TERM --kill-after=5 "${requested}" "$@" &
+  ACTIVE_EXTERNAL_PGID="$!"
+  local status=0
+  wait "${ACTIVE_EXTERNAL_PGID}" || status="$?"
+  ACTIVE_EXTERNAL_PGID=""
+  return "${status}"
 }
 
 usage() {
@@ -153,8 +181,29 @@ required_operation_plan() {
 
 record_operation_dispatch() {
   local operation_id="$1"
-  [[ "${DISPATCHED_OPERATION_IDS:-}" != *$'\n'"${operation_id}"$'\n'* ]] || fail "DUPLICATE_OPERATION_DISPATCH:${operation_id}"
+  [[ "${DISPATCHED_OPERATION_IDS:-}" != *$'\n'"${operation_id}"$'\n'* ]] || {
+    fail "DUPLICATE_OPERATION_DISPATCH:${operation_id}"
+    return 1
+  }
   DISPATCHED_OPERATION_IDS="${DISPATCHED_OPERATION_IDS:-}"$'\n'"${operation_id}"$'\n'
+  local target="${ROLLBACK_STATE_DIR}/operation-dispatch.jsonl" sequence=0 previous_hash="" entry payload payload_hash
+  if [[ -f "${target}" ]]; then
+    sequence="$(tail -n 1 "${target}" | jq -er '.sequence')"
+    previous_hash="$(tail -n 1 "${target}" | jq -er '.payloadHash')"
+  fi
+  payload="$(jq -cS -n --arg operationId "${operation_id}" --arg previousHash "${previous_hash}" \
+    --argjson sequence "$((sequence + 1))" '{version:1,sequence:$sequence,previousHash:$previousHash,operationId:$operationId}')"
+  payload_hash="$(printf '%s' "${payload}" | sha256sum | awk '{print $1}')"
+  entry="${target}.entry.$$"
+  jq -cS --arg payloadHash "${payload_hash}" '. + {payloadHash:$payloadHash}' <<<"${payload}" > "${entry}"
+  chmod 0600 "${entry}"; sync -f "${entry}"
+  if [[ -f "${target}" ]]; then
+    command cat "${target}" "${entry}" > "${target}.tmp.$$"
+  else
+    command cat "${entry}" > "${target}.tmp.$$"
+  fi
+  chmod 0600 "${target}.tmp.$$"; sync -f "${target}.tmp.$$"
+  mv "${target}.tmp.$$" "${target}"; rm -f "${entry}"; sync -f "${ROLLBACK_STATE_DIR}"
 }
 
 verify_required_operations_dispatched() {
@@ -185,6 +234,16 @@ validate_catalog_extension() {
   ' <<<"${candidate_catalog}" >/dev/null
 }
 
+validate_foundation_harness_hash() {
+  local expected_hash="$1"
+  [[ -x "${FOUNDATION_HARNESS}" && ! -L "${FOUNDATION_HARNESS}" ]] || fail "INSTALLED_FOUNDATION_HARNESS_MISSING"
+  [[ -f "${FOUNDATION_HARNESS_SQL}" && ! -L "${FOUNDATION_HARNESS_SQL}" ]] || fail "INSTALLED_FOUNDATION_HARNESS_SQL_MISSING"
+  local actual_hash
+  actual_hash="$(sha256sum "${FOUNDATION_HARNESS}" "${FOUNDATION_HARNESS_SQL}" | awk '{print $1}' | sha256sum | awk '{print $1}')"
+  [[ "${actual_hash}" == "${expected_hash}" ]] || \
+    fail "INSTALLED_FOUNDATION_HARNESS_HASH_MISMATCH"
+}
+
 validate_signed_bundle() {
   [[ -f "${BUNDLE_PATH}" && -f "${SIGNATURE_PATH}" ]] || fail "bundle or signature is missing"
   [[ -f "${PUBLIC_KEY}" ]] || fail "installed deploy public key is missing"
@@ -202,13 +261,14 @@ validate_signed_bundle() {
     -in <(printf '%s' "${bundle_json}") \
     -sigfile <(printf '%s' "${signature_base64}" | base64 -d) >/dev/null 2>&1 || fail "INVALID_BUNDLE_SIGNATURE"
 
-  local candidate_sha minimum_version executor_hash public_key_hash self_hash installed_key_hash
+  local candidate_sha minimum_version executor_hash public_key_hash harness_hash self_hash installed_key_hash
   candidate_sha="$(jq -er '.candidateSha' <<<"${bundle_json}")"
   minimum_version="$(jq -er '.minimumContractVersion' <<<"${bundle_json}")"
   CANDIDATE_CATALOG="$(jq -cS '.capabilityCatalog' <<<"${bundle_json}")"
   CANDIDATE_CATALOG_HASH="$(jq -er '.capabilityCatalogHash' <<<"${bundle_json}")"
   executor_hash="$(jq -er '.executorSha256' <<<"${bundle_json}")"
   public_key_hash="$(jq -er '.publicKeySha256' <<<"${bundle_json}")"
+  harness_hash="$(jq -er '.foundationHarnessSha256' <<<"${bundle_json}")"
   DEPLOYMENT_ID="$(jq -er '.deploymentId' <<<"${bundle_json}")"
   CANDIDATE_DIGEST="$(jq -er '.candidateImageDigest' <<<"${bundle_json}")"
 
@@ -222,6 +282,7 @@ validate_signed_bundle() {
   installed_key_hash="$(sha256sum "${PUBLIC_KEY}" | awk '{print $1}')"
   [[ "${executor_hash}" == "${self_hash}" ]] || fail "INSTALLED_EXECUTOR_HASH_MISMATCH"
   [[ "${public_key_hash}" == "${installed_key_hash}" ]] || fail "INSTALLED_PUBLIC_KEY_HASH_MISMATCH"
+  validate_foundation_harness_hash "${harness_hash}" || return 1
 
   validate_typed_operation_set "${bundle_json}" "${CANDIDATE_CATALOG}" || fail "INVALID_TYPED_OPERATION_SET"
   REQUIRED_HOOKS_JSON="$(jq -cS '.requiredHooks' <<<"${bundle_json}")"
@@ -234,6 +295,23 @@ validate_signed_bundle() {
     validate_catalog_extension "${installed_canonical}" "${CANDIDATE_CATALOG}" "${installed_hash}" || \
       fail "CAPABILITY_CATALOG_REDEFINITION_OR_FORK"
   fi
+}
+
+probe_candidate_operations() {
+  local image_reference="${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" resolved operation operation_id schema profile slug
+  timeout 180 docker pull "${image_reference}" >/dev/null
+  resolved="$(timeout 10 docker image inspect --format '{{join .RepoDigests "|"}}' "${image_reference}")"
+  [[ "${resolved}" == *"${image_reference}"* ]] || fail "CANDIDATE_DIGEST_MISMATCH"
+  while IFS= read -r operation; do
+    [[ -n "${operation}" ]] || continue
+    operation_id="$(jq -er '.operationId' <<<"${operation}")"
+    schema="$(jq -er '.parameterSchemaId' <<<"${operation}")"
+    profile="$(jq -er '.profile' <<<"${operation}")"
+    slug="$(jq -er '.entrypoint[1]' <<<"${operation}")"
+    timeout 30 docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges=true \
+      "${image_reference}" --deploy-operation-probe "${CANDIDATE_CATALOG_HASH}" "${operation_id}" "${schema}" "${profile}" "${slug}" >/dev/null || \
+      fail "CANDIDATE_OPERATION_UNSUPPORTED:${operation_id}"
+  done < <(required_operation_plan CANDIDATE_HOOK_V1)
 }
 
 require_initial_state() {
@@ -344,9 +422,17 @@ rollback_on_error() {
   local exit_code="$?"
   trap - ERR
   if [[ -n "${DEADLINE_WATCHDOG_PID:-}" ]]; then kill "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true; fi
-  local recovery_deadline=$(( $(boottime_seconds) + 300 ))
+  RECOVERY_DEADLINE_BOOTTIME=$(( $(boottime_seconds) + 300 ))
   echo "deploy-fukurou: deployment failed; entering durable recovery" >&2
   [[ "${RECOVERY_ALREADY_STARTED:-false}" == true ]] || journal_state RECOVERY_STARTED "{\"failedExitCode\":${exit_code}}" || true
+  local origin_state
+  origin_state="$(recovery_origin_state "${ROLLBACK_STATE_DIR}/journal.jsonl")"
+  if [[ "${origin_state}" != PREPARED && "${origin_state}" != CAPTURED ]]; then
+    reassert_recovery_safe_boundary "${origin_state}" || {
+      echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_SAFE_BOUNDARY" >&2
+      exit "${exit_code}"
+    }
+  fi
   revoke_active_canary || { echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_CANARY_NAMESPACE" >&2; exit "${exit_code}"; }
 
   if ! timeout 30 git -C "${REPO_DIR}" checkout --detach "${PREVIOUS_REPO_SHA}" >/dev/null 2>&1; then
@@ -368,7 +454,7 @@ rollback_on_error() {
       "$(jq -er '.runtimeConfigHash' <<<"${current_snapshot}")" == "${RUNTIME_CONFIG_HASH}" ]] || {
     echo "deploy-fukurou: RUNTIME_CONFIG_CAS_MISMATCH" >&2; exit "${exit_code}";
   }
-  (( $(boottime_seconds) < recovery_deadline )) || exit "${exit_code}"
+  (( $(boottime_seconds) < RECOVERY_DEADLINE_BOOTTIME )) || exit "${exit_code}"
   timeout 45 docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop -t 30 ktor || exit "${exit_code}"
   assert_application_pid_zero || exit "${exit_code}"
   export FUKUROU_IMAGE_REFERENCE="${previous_reference}"
@@ -534,12 +620,15 @@ journal_state() {
 
 journal_transition_allowed() {
   case "$1:$2" in
-    :CAPTURED|CAPTURED:LAUNCHES_DISABLED|LAUNCHES_DISABLED:CANDIDATE_HEALTHY|\
+    :PREPARED|PREPARED:CAPTURED|CAPTURED:SAFETY_MUTATION_STARTED|SAFETY_MUTATION_STARTED:LAUNCHES_DISABLED|\
+    LAUNCHES_DISABLED:CANDIDATE_HEALTHY|\
     CANDIDATE_HEALTHY:DB_MAINTENANCE_CLEARED|DB_MAINTENANCE_CLEARED:ENABLE_ACKED|\
     ENABLE_ACKED:GAP_CLOSED|GAP_CLOSED:COMPLETE|\
-    CAPTURED:RECOVERY_STARTED|LAUNCHES_DISABLED:RECOVERY_STARTED|CANDIDATE_HEALTHY:RECOVERY_STARTED|\
+    PREPARED:RECOVERY_STARTED|CAPTURED:RECOVERY_STARTED|SAFETY_MUTATION_STARTED:RECOVERY_STARTED|\
+    LAUNCHES_DISABLED:RECOVERY_STARTED|CANDIDATE_HEALTHY:RECOVERY_STARTED|\
     DB_MAINTENANCE_CLEARED:RECOVERY_STARTED|ENABLE_ACKED:RECOVERY_STARTED|GAP_CLOSED:RECOVERY_STARTED|\
-    CAPTURED:SIGNAL_RECEIVED|LAUNCHES_DISABLED:SIGNAL_RECEIVED|CANDIDATE_HEALTHY:SIGNAL_RECEIVED|\
+    PREPARED:SIGNAL_RECEIVED|CAPTURED:SIGNAL_RECEIVED|SAFETY_MUTATION_STARTED:SIGNAL_RECEIVED|\
+    LAUNCHES_DISABLED:SIGNAL_RECEIVED|CANDIDATE_HEALTHY:SIGNAL_RECEIVED|\
     DB_MAINTENANCE_CLEARED:SIGNAL_RECEIVED|ENABLE_ACKED:SIGNAL_RECEIVED|GAP_CLOSED:SIGNAL_RECEIVED|\
     SIGNAL_RECEIVED:RECOVERY_STARTED|RECOVERY_STARTED:ROLLED_BACK|RECOVERY_STARTED:MANUAL_RECOVERY_REQUIRED) return 0 ;;
     *) return 1 ;;
@@ -592,14 +681,14 @@ recover_unfinished_deployments() {
 
     echo "deploy-fukurou: recovering unfinished deployment ${DEPLOYMENT_ID} from ${last_state}" >&2
     origin_state="$(recovery_origin_state "${journal}")"
-    if [[ "${origin_state}" == CAPTURED ]]; then
+    if [[ "${origin_state}" == PREPARED || "${origin_state}" == CAPTURED ]]; then
       journal_state RECOVERY_STARTED '{"reason":"startup-captured"}'
       timeout 30 git -C "${REPO_DIR}" checkout --detach "${PREVIOUS_REPO_SHA}" >/dev/null
       journal_state ROLLED_BACK
       continue
     fi
     case "${origin_state}" in
-      LAUNCHES_DISABLED|CANDIDATE_HEALTHY|DB_MAINTENANCE_CLEARED|ENABLE_ACKED|GAP_CLOSED) ;;
+      SAFETY_MUTATION_STARTED|LAUNCHES_DISABLED|CANDIDATE_HEALTHY|DB_MAINTENANCE_CLEARED|ENABLE_ACKED|GAP_CLOSED) ;;
       *) fail "RECOVERY_STATE_UNSUPPORTED:${origin_state}" ;;
     esac
     reassert_recovery_safe_boundary "${origin_state}" || fail "RECOVERY_SAFE_BOUNDARY_UNPROVEN:${DEPLOYMENT_ID}:${origin_state}"
@@ -725,6 +814,7 @@ restore_disabled_after_resume_failure() {
 }
 
 disable_launches() {
+  journal_state SAFETY_MUTATION_STARTED
   if ! request_supervisor DISABLE "${TARGET_GENERATION}"; then
     timeout 45 docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop -t 30 ktor
     assert_application_pid_zero
@@ -738,8 +828,10 @@ disable_launches() {
   prepare_gap_event OPEN
   timeout 30 "${DB_HELPER}" maintenance-cas "${FENCE_GENERATION}" "${MAINTENANCE_ACTIVE}" "${MAINTENANCE_DEPLOYMENT_ID}" \
     "${TARGET_GENERATION}" true "${DEPLOYMENT_ID}"
+  crash_injection_point AFTER_MAINTENANCE_CAS || return $?
   record_operation_dispatch SET_LAUNCH_MAINTENANCE
   append_prepared_gap_event
+  crash_injection_point AFTER_GAP_OPEN_APPEND || return $?
   record_operation_dispatch OPEN_INFRASTRUCTURE_GAP
   if ! request_supervisor COMMIT "${TARGET_GENERATION}"; then
     write_fence_fallback DISABLED_COMMITTED "${TARGET_GENERATION}"
@@ -830,7 +922,7 @@ run_candidate_preflight() {
       -f "${COMPOSE_FILE}" -f "${canary_compose}" run --rm --no-deps ktor || \
       fail "REQUIRED_HOOK_FAILED:${operation_id}"
     if [[ "${operation_id}" == "FOUNDATION_PREFLIGHT_V1" ]]; then
-      timeout 900 "${REPO_DIR}/scripts/mcp-credential-isolation-check" --reuse-image \
+      FUKUROU_MCP_ROLE_SQL="${FOUNDATION_HARNESS_SQL}" timeout 900 "${FOUNDATION_HARNESS}" --reuse-image \
         "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" || fail "FOUNDATION_LIFECYCLE_CANARY_FAILED"
     fi
     record_operation_dispatch "${operation_id}"
@@ -898,6 +990,7 @@ resume_launches() {
     fail "GAP_CLOSE_FAILED"
     return 1
   fi
+  crash_injection_point AFTER_GAP_CLOSE_APPEND || return $?
   record_operation_dispatch CLOSE_INFRASTRUCTURE_GAP
   journal_state GAP_CLOSED
   crash_injection_point AFTER_GAP_CLOSE || return $?
@@ -930,7 +1023,7 @@ main() {
   fi
 
   require_root
-  for command in base64 cat docker flock git jq md5sum openssl sha256sum sync timeout; do require_command "${command}"; done
+  for command in base64 cat docker flock git jq md5sum openssl setsid sha256sum sync timeout; do require_command "${command}"; done
   parse_arguments "$@"
   validate_signed_bundle
   require_initial_state
@@ -939,15 +1032,17 @@ main() {
   flock -n 9 || fail "another deployment is already running"
 
   recover_unfinished_deployments
+  probe_candidate_operations
   capture_rollback_state
   trap rollback_on_error ERR
   trap 'on_signal TERM 143' TERM
   trap 'on_signal INT 130' INT
   trap 'on_signal HUP 129' HUP
   trap 'on_signal DEADLINE 124' USR1
-  (sleep 1500; kill -USR1 "$$" 2>/dev/null || true) &
+  (sleep 1200; kill -USR1 "$$" 2>/dev/null || true) &
   DEADLINE_WATCHDOG_PID="$!"
-  FORWARD_DEADLINE_BOOTTIME=$(( $(boottime_seconds) + 1500 ))
+  FORWARD_DEADLINE_BOOTTIME=$(( $(boottime_seconds) + 1200 ))
+  journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
   journal_state CAPTURED
   accept_capability_catalog
   check_forward_deadline

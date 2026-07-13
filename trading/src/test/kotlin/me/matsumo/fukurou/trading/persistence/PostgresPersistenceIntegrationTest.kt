@@ -7631,12 +7631,15 @@ class PostgresPersistenceIntegrationTest {
             clock = fixedClock(),
         )
         val entryOrderIds = mutableListOf<UUID>()
+        val entryRunIds = mutableListOf<String>()
         repeat(10) {
             val command = approvedPostgresEntryCommand(
                 repository = decisions,
                 command = postgresEntryCommand(takeProfitPriceJpy = BigDecimal("10100000")),
             )
-            insertFinishedLlmRun(database, "run-entry-${command.commandId}")
+            val runId = "run-entry-${command.commandId}"
+            insertFinishedLlmRun(database, runId)
+            entryRunIds += runId
             val placed = broker.placeOrder(command).getOrThrow()
             entryOrderIds += UUID.fromString(placed.orderIds.first())
             ledger.reconcile(takeProfitTickSnapshot(), FillSimulator(clock = fixedClock())).getOrThrow()
@@ -7675,7 +7678,60 @@ class PostgresPersistenceIntegrationTest {
             scope = scope,
         ).getOrThrow()
         assertEquals(10, withMissing.trades.size)
-        assertEquals(1, withMissing.attributionCoverage.missing)
+        assertEquals(0, withMissing.attributionCoverage.missing)
+
+        exposedTransaction(database) {
+            prepare(
+                """
+                UPDATE executions
+                SET decision_run_id=?
+                WHERE id=(
+                    SELECT e.id FROM executions e
+                    JOIN orders o ON o.id=e.order_id
+                    WHERE o.position_id=(SELECT position_id FROM orders WHERE id=?) AND e.side='SELL'
+                    ORDER BY e.executed_at DESC,e.id DESC LIMIT 1
+                )
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, entryRunIds.first())
+                statement.setObject(2, entryOrderIds.last())
+                statement.executeUpdate()
+            }
+        }
+        val executionConflict = repository.fetchClosedTrades(
+            period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1)),
+            scope = scope,
+        ).getOrThrow()
+        assertEquals(1, executionConflict.attributionCoverage.missing)
+
+        exposedTransaction(database) {
+            prepare(
+                """
+                UPDATE executions
+                SET decision_run_id=?
+                WHERE id=(
+                    SELECT e.id FROM executions e
+                    JOIN orders o ON o.id=e.order_id
+                    WHERE o.position_id=(SELECT position_id FROM orders WHERE id=?) AND e.side='SELL'
+                    ORDER BY e.executed_at DESC,e.id DESC LIMIT 1
+                )
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, entryRunIds.last())
+                statement.setObject(2, entryOrderIds.last())
+                statement.executeUpdate()
+            }
+            prepare("UPDATE positions SET decision_run_id=? WHERE id=(SELECT position_id FROM orders WHERE id=?)").use { statement ->
+                statement.setString(1, entryRunIds.first())
+                statement.setObject(2, entryOrderIds.last())
+                statement.executeUpdate()
+            }
+        }
+        val positionConflict = repository.fetchClosedTrades(
+            period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1)),
+            scope = scope,
+        ).getOrThrow()
+        assertEquals(1, positionConflict.attributionCoverage.missing)
     }
 
     @Test
@@ -7882,8 +7938,31 @@ class PostgresPersistenceIntegrationTest {
             )
         val evaluatedTrade = EvaluationMath.evaluateTrade(trade)
         val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
+        val firstEntryRunId = "run-entry-${firstEntry.commandId}"
+        val directRunMismatches = exposedTransaction(database) {
+            prepare(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM positions WHERE id=? AND decision_run_id IS DISTINCT FROM ?) +
+                    (SELECT COUNT(*) FROM orders WHERE position_id=? AND side='SELL' AND decision_run_id IS DISTINCT FROM ?) +
+                    (SELECT COUNT(*) FROM executions WHERE position_id=? AND side='SELL' AND decision_run_id IS DISTINCT FROM ?)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, UUID.fromString(positionAfterAdd.positionId))
+                statement.setString(2, firstEntryRunId)
+                statement.setObject(3, UUID.fromString(positionAfterAdd.positionId))
+                statement.setString(4, firstEntryRunId)
+                statement.setObject(5, UUID.fromString(positionAfterAdd.positionId))
+                statement.setString(6, firstEntryRunId)
+                statement.executeQuery().use { resultSet ->
+                    check(resultSet.next())
+                    resultSet.getInt(1)
+                }
+            }
+        }
 
         assertEquals(1, killStats.closedTrades)
+        assertEquals(0, directRunMismatches)
         assertEquals(2, executions.count { execution -> execution.side == OrderSide.BUY })
         assertEquals(2, executions.count { execution -> execution.side == OrderSide.SELL })
         assertEquals("0.005", trade.sizeBtc.stripTrailingZeros().toPlainString())
