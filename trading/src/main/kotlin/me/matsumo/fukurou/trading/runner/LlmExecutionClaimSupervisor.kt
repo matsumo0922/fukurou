@@ -103,8 +103,13 @@ class LlmExecutionRecoveryService(
     private var cursor: LlmExecutionRecoveryCursor? = null
 
     /** 1 bounded scan を実行し、競合安全に stale claim を回収する。 */
-    suspend fun tick(): Result<Int> = runCatching {
-        withTimeout(EXECUTION_RECOVERY_TICK_TIMEOUT.toMillis()) { tickWithinBudget() }
+    suspend fun tick(): Result<Int> {
+        val result = runCatching {
+            withTimeout(EXECUTION_RECOVERY_TICK_TIMEOUT.toMillis()) { tickWithinBudget() }
+        }
+        if (result.isFailure) LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+
+        return result
     }
 
     private suspend fun tickWithinBudget(): Int {

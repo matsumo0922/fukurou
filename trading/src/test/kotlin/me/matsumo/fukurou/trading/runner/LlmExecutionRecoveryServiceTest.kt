@@ -1,5 +1,7 @@
 package me.matsumo.fukurou.trading.runner
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
@@ -13,7 +15,13 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
+import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProof
+import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
+import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import java.nio.file.Files
+import java.nio.file.Path
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -49,6 +57,21 @@ class LlmExecutionRecoveryServiceTest {
             LlmLaunchReservationStatus.FAILED,
             delegate.findExecutionClaim("available").getOrThrow()?.status,
         )
+    }
+
+    @Test
+    fun periodicTickFailsClosedWithinFiveSecondWallClockBudget() = runBlocking {
+        val delegate = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val repository = SlowRecoveryRepository(delegate)
+        val service = recoveryService(repository, RECOVERY_INSTANT)
+        val startedAt = System.nanoTime()
+
+        assertTrue(service.tick().isFailure)
+
+        val elapsed = Duration.ofNanos(System.nanoTime() - startedAt)
+        assertTrue(elapsed >= Duration.ofSeconds(5), "tick elapsed=$elapsed")
+        assertTrue(elapsed < Duration.ofMillis(5_750), "tick elapsed=$elapsed")
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
     }
 
     @Test
@@ -147,6 +170,54 @@ class LlmExecutionRecoveryServiceTest {
         assertEquals(1, service.tick().getOrThrow())
         assertEquals(101, repository.recovered.size)
     }
+
+    @Test
+    fun linuxLiveChildHeartbeatOutage_recoversWithoutRestartOnlyAfterProcessGroupExit() = runBlocking {
+        if (!Files.isExecutable(Path.of("/usr/bin/setsid"))) return@runBlocking
+        val claimedAt = RECOVERY_INSTANT
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        reserve(repository, "live-child-outage", claimedAt)
+        claim(repository, "live-child-outage", claimedAt)
+        val tempDirectory = Files.createTempDirectory("fukurou-live-child-outage-test")
+        val childPidFile = tempDirectory.resolve("child.pid")
+        val command = RenderedLlmCommand(
+            executable = "/bin/sh",
+            args = listOf("-c", "(/bin/sleep 30) & echo $! > '$childPidFile'; wait"),
+            environment = emptyMap(),
+            workingDirectory = tempDirectory,
+            timeout = Duration.ofSeconds(1),
+            stdin = null,
+        )
+        val processResult = async { ShellProcessRunner(Duration.ofMillis(100)).run(command).getOrThrow() }
+        repeat(100) {
+            if (Files.exists(childPidFile)) return@repeat
+            delay(10)
+        }
+        val childPid = Files.readString(childPidFile).trim().toLong()
+
+        LlmExecutionAdmissionHealth.recordHeartbeatResult("live-child-outage", CLAIM_TOKEN, healthy = false)
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+        assertTrue(repository.tryReserve(launchRequest("blocked-during-outage", claimedAt.plusSeconds(1))).isFailure)
+
+        val terminated = processResult.await()
+        assertEquals(ProcessRunStatus.TIMED_OUT, terminated.status)
+        assertEquals(ProcessTreeTerminationProof.PROVEN_EXITED, terminated.processTreeTerminationProof)
+        LlmExecutionTerminationFenceRegistry.markProcessTreeExited(
+            invocationId = "live-child-outage",
+            claimantToken = CLAIM_TOKEN,
+            observedAt = claimedAt.plusSeconds(1),
+        )
+        val service = recoveryService(repository, claimedAt.plusSeconds(600))
+
+        assertEquals(1, service.tick().getOrThrow())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+        assertEquals(
+            LlmLaunchReservationStatus.FAILED,
+            repository.findExecutionClaim("live-child-outage").getOrThrow()?.status,
+        )
+        assertFalse(isLinuxProcessRunning(childPid))
+        assertTrue(repository.tryReserve(launchRequest("after-recovery", claimedAt.plusSeconds(601))).isSuccess)
+    }
 }
 
 private class MutableClock(var current: Instant) : Clock() {
@@ -165,6 +236,15 @@ private class FaultingRecoveryRepository(
         } else {
             delegate.scanStaleExecutionClaims(scan)
         }
+    }
+}
+
+private class SlowRecoveryRepository(
+    private val delegate: LlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+    override suspend fun scanStaleExecutionClaims(scan: LlmExecutionRecoveryScan): Result<RecoverySnapshots> {
+        delay(6_000)
+        return delegate.scanStaleExecutionClaims(scan)
     }
 }
 
@@ -221,6 +301,24 @@ private fun recoveryService(repository: LlmLaunchReservationRepository, now: Ins
         policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
         clock = Clock.fixed(now, ZoneId.of("UTC")),
     )
+}
+
+private fun launchRequest(invocationId: String, now: Instant): LlmLaunchReservationRequest {
+    return LlmLaunchReservationRequest(
+        invocationId = invocationId,
+        triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+        triggerKey = invocationId,
+        reservedAt = now,
+        runnerConfig = LlmRunnerConfig(),
+        hourlyWindow = Duration.ofHours(1),
+        dailyWindow = Duration.ofDays(1),
+        activeReservationStaleAfter = Duration.ofMinutes(30),
+    )
+}
+
+private fun isLinuxProcessRunning(processId: Long): Boolean {
+    val stat = runCatching { Files.readString(Path.of("/proc/$processId/stat")) }.getOrNull() ?: return false
+    return stat.substringAfterLast(") ").firstOrNull() != 'Z'
 }
 
 private suspend fun reserve(

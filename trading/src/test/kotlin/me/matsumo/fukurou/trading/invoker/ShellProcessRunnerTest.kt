@@ -269,6 +269,29 @@ class ShellProcessRunnerTest {
         assertFalse(waitForProcessExit(childPid))
     }
 
+    @Test
+    fun run_linuxProcEnumerationFailureDoesNotClaimTerminationProof() = runBlocking {
+        if (!Files.isExecutable(Path.of("/usr/bin/setsid"))) return@runBlocking
+        val tempDirectory = Files.createTempDirectory("fukurou-process-runner-enumeration-failure-test")
+        val command = RenderedLlmCommand(
+            executable = "/bin/sh",
+            args = listOf("-c", "/bin/sleep 30"),
+            environment = emptyMap(),
+            workingDirectory = tempDirectory,
+            timeout = Duration.ofMillis(200),
+            stdin = null,
+        )
+        val runner = ShellProcessRunner(
+            terminationGrace = Duration.ofMillis(100),
+            linuxProcRoot = tempDirectory.resolve("missing-proc"),
+        )
+
+        val result = runner.run(command)
+
+        assertTrue(result.isFailure)
+        assertFalse(result.exceptionOrNull() is ProcessTreeTerminationProvenCancellationException)
+    }
+
     private suspend fun waitForChildPid(childPidFile: Path): Long {
         repeat(CHILD_PID_FILE_WAIT_ATTEMPTS) {
             if (Files.exists(childPidFile)) {

@@ -60,7 +60,7 @@ private const val INSERT_LLM_LAUNCH_RESERVATION_SQL = """
 /**
  * RUNNING の LLM 起動予約数を数える SQL。
  */
-private const val SELECT_ACTIVE_LLM_LAUNCH_RESERVATION_SQL = """
+internal const val SELECT_ACTIVE_LLM_LAUNCH_RESERVATION_SQL = """
     SELECT candidate.invocation_id, candidate.trigger_kind, candidate.trigger_key, candidate.reserved_at,
         EXISTS (
             SELECT 1 FROM llm_launch_reservations

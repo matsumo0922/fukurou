@@ -309,6 +309,53 @@ class LlmLaunchReservationRepositoryTest {
     }
 
     @Test
+    fun defaultDailyCapAllowsNormal112ThenFourInvocationsForEachCriticalTrigger() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val config = LlmRunnerConfig()
+        val now = launchBudgetFixedInstant()
+
+        repeat(112) { index ->
+            reserveAndFinishLaunchBudget(
+                repository = repository,
+                invocationId = "normal-daily-$index",
+                config = config,
+                reservedAt = now.plusSeconds(index * 721L),
+            )
+        }
+        repeat(4) { index ->
+            reserveAndFinishLaunchBudget(
+                repository = repository,
+                invocationId = "entry-daily-$index",
+                config = config,
+                reservedAt = now.plusSeconds((112L + index) * 721L),
+                triggerKind = LlmDaemonTriggerKind.ENTRY_FILL,
+            )
+        }
+        repeat(4) { index ->
+            reserveAndFinishLaunchBudget(
+                repository = repository,
+                invocationId = "stop-daily-$index",
+                config = config,
+                reservedAt = now.plusSeconds((116L + index) * 721L),
+                triggerKind = LlmDaemonTriggerKind.STOP_PROXIMITY,
+            )
+        }
+
+        val exhausted = repository.tryReserve(
+            launchBudgetRequest(
+                invocationId = "daily-exhausted",
+                config = config,
+                reservedAt = now.plusSeconds(119L * 721L + 1L),
+            ),
+        ).getOrThrow()
+
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY),
+            exhausted,
+        )
+    }
+
+    @Test
     fun legacyBooleanHelperDerivesFromBlockingReservationIdentity() = runBlocking {
         val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         val reservedAt = launchBudgetFixedInstant()
@@ -386,7 +433,7 @@ private suspend fun reserveAndFinishLaunchBudget(
         ),
     ).getOrThrow()
 
-    assertIs<LlmLaunchReservationOutcome.Reserved>(outcome)
+    assertIs<LlmLaunchReservationOutcome.Reserved>(outcome, "invocation=$invocationId outcome=$outcome")
     repository.finish(
         LlmLaunchReservationFinish(
             invocationId = invocationId,

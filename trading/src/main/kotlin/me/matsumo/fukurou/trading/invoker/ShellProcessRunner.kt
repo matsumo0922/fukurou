@@ -21,6 +21,7 @@ import kotlin.time.toDuration
  */
 class ShellProcessRunner(
     private val terminationGrace: Duration = Duration.ofSeconds(10),
+    private val linuxProcRoot: Path = Path.of(LINUX_PROC_ROOT),
 ) : ProcessRunner {
 
     init {
@@ -183,7 +184,7 @@ class ShellProcessRunner(
 
     private fun isLinuxProcessGroupRunning(processGroupId: Long): Boolean {
         return runCatching {
-            Files.list(Path.of(LINUX_PROC_ROOT)).use { entries ->
+            Files.list(linuxProcRoot).use { entries ->
                 entries.filter { entry -> entry.fileName.toString().all(Char::isDigit) }
                     .anyMatch { entry -> entry.runningProcessGroupIdOrNull() == processGroupId }
             }
