@@ -125,6 +125,32 @@ class LifecycleMutationSqlInventoryTest {
             normalizedMutationTuples("WITH changed AS (UPDATE positions SET status='CLOSED' RETURNING id) SELECT * FROM changed"),
         )
     }
+
+    @Test
+    fun recoveryEntrypointsUseBoundedPassExactTimeoutsAndMaintenanceRedrive() {
+        val root = repositoryRoot()
+        val lifecycle = Files.readString(
+            root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/GapPopulationLifecycle.kt"),
+        )
+        val integrityRepository = Files.readString(
+            root.resolve(
+                "trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/ExposedMarketDataIntegrityRepository.kt",
+            ),
+        )
+        val maintenanceWorker = Files.readString(
+            root.resolve("fukurou/src/main/kotlin/me/matsumo/fukurou/ProtectionReconcilerWorker.kt"),
+        )
+        val standalone = Files.readString(
+            root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/runner/PaperMarketRecoveryMain.kt"),
+        )
+
+        assertTrue("SET LOCAL lock_timeout='2s'" in lifecycle)
+        assertTrue("SET LOCAL statement_timeout='5s'" in lifecycle)
+        assertTrue("GAP_POPULATION_INVOCATION_LIMIT" in lifecycle)
+        assertTrue("recoverGapPopulationPass(recoveredAt)" in integrityRepository)
+        assertTrue("recoverStaleSession(clock.instant())" in maintenanceWorker)
+        assertTrue("recoverStaleSessionWithSummary(Instant.now())" in standalone)
+    }
 }
 
 /** production capacity predicatesのexact boundary。 */
