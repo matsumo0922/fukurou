@@ -213,6 +213,33 @@ Public Hostname は次のように設定する。
 Cloudflare Access で Service Auth policy を作成し、手元の検証環境には Service Token を保存する。NAS `.env` には Service Token を置かない。
 Access policy は `/app/*` と `/ops/*` を対象にし、runtime config draft / validate / activate / rollback を含む state-changing ops endpoints を Access なしで公開しない。
 
+## Market-data gap recovery の確認
+
+deploy 前の停止中 DB または disposable canary DB では、network listener を起動しない standalone command で stale session と durable gap work を収束させる。
+
+```sh
+DB_URL="$DB_URL" DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" scripts/recover-paper-market
+```
+
+production image と同じ classpath を使う場合は、対象 image を one-shot container として起動し `PaperMarketRecoveryMainKt RECOVER` を実行する。出力は operation、status、count だけを保持し、work identity、entity ID、projection、credential をログへ出さない。終了 code 0 は全 work が `APPLIED` または明示的な `UNKNOWN` に到達したことを表す。`UNKNOWN` が残る場合は Ktor を停止したまま同じ image で原因を修復し、token 非対応の旧 image を起動しない。
+
+```sh
+sudo docker run --rm --network fukurou_edge --env-file /srv/fukurou/.env \
+  --entrypoint /opt/java/openjdk/bin/java \
+  ghcr.io/matsumo0922/fukurou:<commit-sha> \
+  -cp /app/app.jar me.matsumo.fukurou.trading.runner.PaperMarketRecoveryMainKt RECOVER
+```
+
+MCP credential isolation canary の fixture は disposable database に限り、app role で production repository path を通す `FIXTURE_CREATE` を使う。app role の token なし raw INSERT と MCP role の raw INSERT は失敗し、MCP role に private lifecycle table の SELECT や broad function grantを追加しない。
+
+```sh
+FUKUROU_FIXTURE_DATABASE=true \
+DB_URL="$CANARY_DB_URL" DB_USER="$CANARY_DB_USER" DB_PASSWORD="$CANARY_DB_PASSWORD" \
+./gradlew :trading:runPaperMarketRecovery --args="FIXTURE_CREATE <canary-invocation-id>"
+```
+
+rollback は `CONNECTED` session、active/queued work、未適用 member がなく、全 gap work が `APPLIED` であることを確認してから行う。`UNKNOWN`、overflow、未消費 terminal journal がある状態では旧 image へ切り替えない。
+
 ## 初回デプロイ確認
 
 `main` push により `.github/workflows/deploy.yml` が実行される。build job が image を push し、deploy job が NAS runner 上で次を実行する。
