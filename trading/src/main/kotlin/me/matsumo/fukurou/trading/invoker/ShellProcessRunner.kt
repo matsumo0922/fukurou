@@ -105,8 +105,8 @@ class ShellProcessRunner(
 
             val remainingDescendants = (descendants + process.descendantsDeepestFirst())
                 .distinctBy(ProcessHandle::pid)
-            remainingDescendants.filter(ProcessHandle::isAlive)
-                .forEach { descendant -> descendant.destroyForcibly() }
+            remainingDescendants.filter(ProcessHandle::isAliveSafely)
+                .forEach { descendant -> runCatching { descendant.destroyForcibly() } }
             remainingDescendants.forEach { descendant -> descendant.awaitExitQuietly() }
 
             process.destroy()
@@ -222,13 +222,18 @@ private fun Process.descendantsDeepestFirst(): List<ProcessHandle> {
 
 private fun awaitProcessHandles(processHandles: List<ProcessHandle>, timeout: Duration) {
     val deadline = System.nanoTime() + timeout.toNanos()
-    while (processHandles.any(ProcessHandle::isAlive) && System.nanoTime() < deadline) {
+    while (processHandles.any(ProcessHandle::isAliveSafely) && System.nanoTime() < deadline) {
         Thread.sleep(PROCESS_TREE_EXIT_POLL_MILLIS)
     }
 }
 
 private fun Long.isProcessAlive(): Boolean {
-    return ProcessHandle.of(this).map(ProcessHandle::isAlive).orElse(false)
+    return runCatching { ProcessHandle.of(this).map(ProcessHandle::isAliveSafely).orElse(false) }
+        .getOrDefault(true)
+}
+
+private fun ProcessHandle.isAliveSafely(): Boolean {
+    return runCatching { isAlive }.getOrDefault(true)
 }
 
 private fun Path.isProductionPerRunHome(): Boolean {

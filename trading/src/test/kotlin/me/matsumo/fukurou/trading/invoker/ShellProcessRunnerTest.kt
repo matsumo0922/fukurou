@@ -209,15 +209,19 @@ class ShellProcessRunnerTest {
 
     private suspend fun waitForProcessExit(processId: Long): Boolean {
         repeat(CHILD_PID_FILE_WAIT_ATTEMPTS) {
-            val processIsAlive = ProcessHandle.of(processId)
-                .map { handle -> handle.isAlive }
-                .orElse(false)
+            val processIsAlive = isProcessAlive(processId)
             if (!processIsAlive) return false
 
             delay(CHILD_PID_FILE_WAIT_DELAY_MS.toDuration(DurationUnit.MILLISECONDS))
         }
 
-        return ProcessHandle.of(processId).map { handle -> handle.isAlive }.orElse(false)
+        return isProcessAlive(processId)
+    }
+
+    private fun isProcessAlive(processId: Long): Boolean {
+        return runCatching {
+            ProcessHandle.of(processId).map { handle -> handle.isAlive }.orElse(false)
+        }.getOrDefault(true)
     }
 }
 
