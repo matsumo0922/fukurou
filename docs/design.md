@@ -1445,9 +1445,11 @@ suspend fun handleTrigger(
 
 [確定] daemonはCLI起動時に `FUKUROU_INVOCATION_ID`（= `decisionRunId`）を環境変数へ注入する。MCPは全tool callへこのIDを自動付与し、`decision_run_id` / `tool_call_id` / `client_request_id` / `llm_provider` / `prompt_hash` / `system_prompt_version` / `market_snapshot_id` をauditとして保存する。
 
-[確定] 学習期は flat / 保有中とも15分 cadence を採用する。routine cadence は最大 4/hour・96/day を使い、hard cap は 7/hour・120/day とする。Step1スパイクと #19 の実測値を入力にしつつ、#28 で実運用 token・所要時間・tool call数・サブスク枠消費を集計する。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
+[確定] 学習期は flat / 保有中とも15分 cadence を採用し、hard cap は 7/hour・120/day とする。normal trigger は `ENTRY_FILL` と `STOP_PROXIMITY` の未使用 reserve を侵食しない。Step1スパイクと #19 の実測値を入力にしつつ、#28 で実運用 token・所要時間・tool call数・サブスク枠消費を集計する。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
 
-[確定] runtime catalog default の hard cap は 7/hour・120/day で、`ENTRY_FILL` と `STOP_PROXIMITY` にそれぞれ 1/hour・4/day の対称 reserve を持つ。critical trigger は他方の未使用 reserve を侵食せず、自分の保証量を超える場合は normal 余力を使う。direct runner も `MANUAL` として予約し、runner は invocation ID と trigger kind が予約に一致する場合だけ LLM process を開始する。
+[確定] runtime catalog default の hard cap は 7/hour・120/day で、`ENTRY_FILL` と `STOP_PROXIMITY` にそれぞれ 1/hour・4/day の対称 reserve を持つ。critical trigger は他方の未使用 reserve を侵食せず、自分の保証量を超える場合は normal 余力を使う。direct runner も `MANUAL` として予約する。one-shot reservation は `AVAILABLE` で作成され、runner は invocation ID / trigger kind に一致する `RUNNING` rowを claimant token 付きの単一 conditional update で `CLAIMED` にした後だけ、pre-filter、`llm_runs`、material I/O、LLM / MCP processへ進む。並列 replay、terminal row、migration 前の claim state が `NULL` の row、`NOT_REQUIRED` row は child process を起動しない。reflection と evaluation report は `NOT_REQUIRED` として caller-owned lifecycle を維持する。
+
+runner は claim 後の reservation lifecycle を所有し、success、failure、cancellationを claimant token 付き conditional finish で terminal にする。claim commit の応答が不明な場合は child process を起動せず同じ token で read-after-unknown を行い、未解決中は readiness と新規 admission を fail closed にする。claim heartbeat と current-process reconciliation は bootstrap に依存せず継続し、whole-run hard timeout は PRE_FILTER / PROPOSER / FALSIFIER の各1回、TERM/KILL grace、terminal persistence timeoutから checked arithmetic で導出する。
 
 ### 6.4 1起動内で許可すること/禁止すること
 
@@ -3611,7 +3613,7 @@ LLM CLI:
 | LLM calls (trading)    |             7/hour, 120/day | サブスク/ToS/制限対策                                               |
 | LLM calls (reflection) | 完了済み前週の PromptCandidates のみ | trading と同じ cap を消費し、1時間で1回分・24時間で4回分の headroom がない場合は起動しない |
 
-flat / holding の15分 cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。hard cap 到達後は後続 heartbeat が skip されうる。
+flat / holding、manual、direct、legacy fallback は normal usage として、`ENTRY_FILL` と `STOP_PROXIMITY` の未使用 reserve を侵食しない。critical trigger は他方の未使用 reserve を侵食せず、normal 側に余力があれば自分の最低保証量を超えて起動できる。
 
 Private POSTは取引所上限より安全側に、bot内部の実効上限を `5 req/s` 程度へ下げてもよい。設定は上の既定を上限として、実運用で調整する。
 

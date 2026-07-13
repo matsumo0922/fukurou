@@ -5,10 +5,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.nio.file.Files
 import java.nio.file.Path
+import java.time.Duration
 import java.util.Comparator
 import java.util.concurrent.TimeUnit
 import kotlin.time.DurationUnit
@@ -17,7 +19,13 @@ import kotlin.time.toDuration
 /**
  * JVM の ProcessBuilder を使う ProcessRunner。
  */
-class ShellProcessRunner : ProcessRunner {
+class ShellProcessRunner(
+    private val terminationGrace: Duration = Duration.ofSeconds(10),
+) : ProcessRunner {
+
+    init {
+        require(!terminationGrace.isNegative && !terminationGrace.isZero) { "terminationGrace must be positive." }
+    }
 
     override suspend fun run(command: RenderedLlmCommand): Result<ProcessRunResult> {
         return try {
@@ -44,7 +52,7 @@ class ShellProcessRunner : ProcessRunner {
                 writeStdin(process, command.stdin)
 
                 val exitCode = withTimeoutOrNull(command.timeout.toMillis().toDuration(DurationUnit.MILLISECONDS)) {
-                    withContext(Dispatchers.IO) {
+                    runInterruptible(Dispatchers.IO) {
                         process.waitFor()
                     }
                 }
@@ -90,16 +98,27 @@ class ShellProcessRunner : ProcessRunner {
 
     private suspend fun destroyProcessTree(process: Process) {
         withContext(Dispatchers.IO) {
-            val descendants = process.toHandle()
-                .descendants()
-                .toList()
-                .asReversed()
+            val descendants = process.descendantsDeepestFirst()
 
-            descendants.forEach { descendant -> descendant.destroyForcibly() }
-            process.destroyForcibly()
+            descendants.forEach { descendant -> descendant.destroy() }
+            process.destroy()
+            process.waitFor(terminationGrace.toMillis(), TimeUnit.MILLISECONDS)
 
-            descendants.forEach { descendant -> descendant.awaitExitQuietly() }
-            process.waitFor(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)
+            val remainingDescendants = (descendants + process.descendantsDeepestFirst())
+                .distinctBy(ProcessHandle::pid)
+            val requiresForce = process.isAlive || remainingDescendants.any(ProcessHandle::isAlive)
+            if (requiresForce) {
+                remainingDescendants.filter(ProcessHandle::isAlive)
+                    .forEach { descendant -> descendant.destroyForcibly() }
+                if (process.isAlive) process.destroyForcibly()
+            }
+            remainingDescendants.forEach { descendant -> descendant.awaitExitQuietly() }
+
+            val processExited = process.waitFor(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)
+            val processTreeExited = remainingDescendants.none(ProcessHandle::isAlive)
+            check(processExited && processTreeExited) {
+                "LLM process tree did not exit after TERM/KILL sequence."
+            }
         }
     }
 
@@ -186,6 +205,10 @@ class ShellProcessRunner : ProcessRunner {
             "Production LLM per-run home cleanup failed: ${stderr.trim()}"
         }
     }
+}
+
+private fun Process.descendantsDeepestFirst(): List<ProcessHandle> {
+    return toHandle().descendants().toList().asReversed()
 }
 
 private fun Path.isProductionPerRunHome(): Boolean {

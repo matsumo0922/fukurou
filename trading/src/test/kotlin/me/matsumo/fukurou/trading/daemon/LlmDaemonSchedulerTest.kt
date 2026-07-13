@@ -454,7 +454,7 @@ class LlmDaemonSchedulerTest {
         assertIs<LlmDaemonTickResult.Skipped>(result)
         assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
         assertEquals("pre_filter_no_change", result.reason)
-        assertEquals(0, fixture.launches.size)
+        assertEquals(1, fixture.launches.size)
         assertEquals(1, preFilter.requests.size)
         assertTrue(skipEvents.any { event -> event.payload.contains("pre_filter_no_change") })
     }
@@ -1300,7 +1300,52 @@ private fun schedulerFixture(
             ),
             launchOneShot = { request ->
                 launches += request
-                Result.success(launchHandler(request))
+                val invocationId = requireNotNull(request.invocationId)
+                val triggerKind = requireNotNull(request.triggerKind)
+                val claimantToken = "scheduler-test:$invocationId"
+                val claim = reservations.claimForExecution(
+                    LlmExecutionClaimRequest(
+                        invocationId = invocationId,
+                        triggerKind = triggerKind,
+                        claimantToken = claimantToken,
+                        claimedAt = clock.instant(),
+                    ),
+                )
+                assertIs<LlmExecutionClaimOutcome.Claimed>(claim)
+                try {
+                    val result = if (request.preFilter?.invoke() == LlmDaemonPreFilterDecision.SKIP_NO_CHANGE) {
+                        OneShotRunnerResult(
+                            invocationId = invocationId,
+                            status = OneShotRunnerStatus.PRE_FILTER_SKIPPED,
+                            decision = null,
+                            intent = null,
+                            tradeResult = null,
+                        )
+                    } else {
+                        launchHandler(request)
+                    }
+                    reservations.finish(
+                        LlmLaunchReservationFinish(
+                            invocationId = invocationId,
+                            status = LlmLaunchReservationStatus.FINISHED,
+                            reason = result.terminalCause.name,
+                            finishedAt = clock.instant(),
+                            claimantToken = claimantToken,
+                        ),
+                    ).getOrThrow()
+                    Result.success(result)
+                } catch (throwable: Throwable) {
+                    reservations.finish(
+                        LlmLaunchReservationFinish(
+                            invocationId = invocationId,
+                            status = LlmLaunchReservationStatus.FAILED,
+                            reason = throwable.javaClass.simpleName,
+                            finishedAt = clock.instant(),
+                            claimantToken = claimantToken,
+                        ),
+                    ).getOrThrow()
+                    throw throwable
+                }
             },
             preFilter = preFilter,
             clock = clock,

@@ -424,6 +424,8 @@ private fun validateTypedConfigConstraints(
         requireIntBetweenInclusive(values, "runner.maxToolCallsPerRun", 1, defaultInt(runtimeItemsByKey, "runner.maxToolCallsPerRun"))
         requireIntBetweenInclusive(values, "runner.maxActToolCallsPerRun", 1, defaultInt(runtimeItemsByKey, "runner.maxActToolCallsPerRun"))
         requireLongBetweenInclusive(values, "runner.perRunTimeout", 1, defaultLong(runtimeItemsByKey, "runner.perRunTimeout"))
+        requireLongBetweenInclusive(values, "runner.processTerminationGrace", 1, 30)
+        requireLongBetweenInclusive(values, "runner.persistenceTerminalTimeout", 1, 30)
         requireIntBetweenInclusive(values, "runner.maxInvocationsPerHour", 1, defaultInt(runtimeItemsByKey, "runner.maxInvocationsPerHour"))
         requireIntBetweenInclusive(values, "runner.maxInvocationsPerDay", 1, defaultInt(runtimeItemsByKey, "runner.maxInvocationsPerDay"))
         requireIntBetweenInclusive(values, "runner.entryFillReservePerHour", 0, defaultInt(runtimeItemsByKey, "runner.maxInvocationsPerHour"))

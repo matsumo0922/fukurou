@@ -229,6 +229,8 @@ data class PaperMarketConfig(
  * @param maxToolCallsPerRun 1 MCP server instance あたりの総 tool call 上限
  * @param maxActToolCallsPerRun 1 MCP server instance あたりの act 系 tool call 上限
  * @param perRunTimeout 1 LLM CLI 起動の timeout
+ * @param processTerminationGrace TERM 後に KILL へ移るまでの猶予
+ * @param persistenceTerminalTimeout terminal persistence の timeout
  * @param maxInvocationsPerHour 直近 1 時間に許可する runner 起動数
  * @param maxInvocationsPerDay 直近 24 時間に許可する runner 起動数
  * @param entryFillReservePerHour ENTRY_FILL に保証する 1 時間の起動数
@@ -240,6 +242,8 @@ data class LlmRunnerConfig(
     val maxToolCallsPerRun: Int = DEFAULT_MAX_TOOL_CALLS_PER_RUN,
     val maxActToolCallsPerRun: Int = DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN,
     val perRunTimeout: Duration = DEFAULT_LLM_PER_RUN_TIMEOUT,
+    val processTerminationGrace: Duration = DEFAULT_LLM_PROCESS_TERMINATION_GRACE,
+    val persistenceTerminalTimeout: Duration = DEFAULT_LLM_PERSISTENCE_TERMINAL_TIMEOUT,
     val maxInvocationsPerHour: Int = DEFAULT_MAX_INVOCATIONS_PER_HOUR,
     val maxInvocationsPerDay: Int = DEFAULT_MAX_INVOCATIONS_PER_DAY,
     val entryFillReservePerHour: Int = DEFAULT_ENTRY_FILL_RESERVE_PER_HOUR,
@@ -252,6 +256,8 @@ data class LlmRunnerConfig(
         val actLimitIsConservative = maxActToolCallsPerRun in 1..DEFAULT_MAX_ACT_TOOL_CALLS_PER_RUN
         val timeoutIsPositive = !perRunTimeout.isNegative && !perRunTimeout.isZero
         val timeoutIsWithinCap = timeoutIsPositive && perRunTimeout <= MAX_LLM_PER_RUN_TIMEOUT
+        val terminationGraceIsValid = processTerminationGrace in MIN_LLM_PROCESS_TERMINATION_GRACE..MAX_LLM_PROCESS_TERMINATION_GRACE
+        val persistenceTimeoutIsValid = persistenceTerminalTimeout in MIN_LLM_PERSISTENCE_TERMINAL_TIMEOUT..MAX_LLM_PERSISTENCE_TERMINAL_TIMEOUT
         val hourlyLimitIsConservative = maxInvocationsPerHour in 1..DEFAULT_MAX_INVOCATIONS_PER_HOUR
         val dailyLimitIsConservative = maxInvocationsPerDay in 1..DEFAULT_MAX_INVOCATIONS_PER_DAY
         val actLimitFitsTotal = maxActToolCallsPerRun <= maxToolCallsPerRun
@@ -261,8 +267,10 @@ data class LlmRunnerConfig(
             stopProximityReservePerHour,
             stopProximityReservePerDay,
         ).all { reserve -> reserve >= 0 }
-        val hourlyReservesFit = entryFillReservePerHour + stopProximityReservePerHour < maxInvocationsPerHour
-        val dailyReservesFit = entryFillReservePerDay + stopProximityReservePerDay < maxInvocationsPerDay
+        val hourlyReservesFit = entryFillReservePerHour.toLong() + stopProximityReservePerHour.toLong() <
+            maxInvocationsPerHour.toLong()
+        val dailyReservesFit = entryFillReservePerDay.toLong() + stopProximityReservePerDay.toLong() <
+            maxInvocationsPerDay.toLong()
 
         require(toolLimitIsConservative) {
             "maxToolCallsPerRun must be between 1 and $DEFAULT_MAX_TOOL_CALLS_PER_RUN."
@@ -272,6 +280,12 @@ data class LlmRunnerConfig(
         }
         require(timeoutIsWithinCap) {
             "perRunTimeout must be greater than 0 and less than or equal to ${MAX_LLM_PER_RUN_TIMEOUT.seconds} seconds."
+        }
+        require(terminationGraceIsValid) {
+            "processTerminationGrace must be between 1 and ${MAX_LLM_PROCESS_TERMINATION_GRACE.seconds} seconds."
+        }
+        require(persistenceTimeoutIsValid) {
+            "persistenceTerminalTimeout must be between 1 and ${MAX_LLM_PERSISTENCE_TERMINAL_TIMEOUT.seconds} seconds."
         }
         require(hourlyLimitIsConservative) {
             "maxInvocationsPerHour must be between 1 and $DEFAULT_MAX_INVOCATIONS_PER_HOUR."
@@ -533,6 +547,10 @@ const val FUKUROU_MCP_ACT_TOOL_CALL_LIMIT_ENV = "FUKUROU_MCP_ACT_TOOL_CALL_LIMIT
  * LLM CLI 1 起動 timeout 秒数の環境変数名。
  */
 private const val FUKUROU_LLM_RUN_TIMEOUT_SECONDS_ENV = "FUKUROU_LLM_RUN_TIMEOUT_SECONDS"
+private const val FUKUROU_LLM_PROCESS_TERMINATION_GRACE_SECONDS_ENV =
+    "FUKUROU_LLM_PROCESS_TERMINATION_GRACE_SECONDS"
+private const val FUKUROU_LLM_PERSISTENCE_TERMINAL_TIMEOUT_SECONDS_ENV =
+    "FUKUROU_LLM_PERSISTENCE_TERMINAL_TIMEOUT_SECONDS"
 
 /**
  * 直近 1 時間の runner 起動上限の環境変数名。
@@ -756,6 +774,24 @@ val DEFAULT_LLM_PER_RUN_TIMEOUT: Duration = Duration.ofSeconds(180)
  * ENTER 経路の実測 4〜5 分 + 余裕として、暴走防止を残したまま 600 秒まで許可する。
  */
 val MAX_LLM_PER_RUN_TIMEOUT: Duration = Duration.ofSeconds(600)
+
+/** process tree の既定 TERM grace。 */
+val DEFAULT_LLM_PROCESS_TERMINATION_GRACE: Duration = Duration.ofSeconds(10)
+
+/** process tree の最小 TERM grace。 */
+val MIN_LLM_PROCESS_TERMINATION_GRACE: Duration = Duration.ofSeconds(1)
+
+/** process tree の最大 TERM grace。 */
+val MAX_LLM_PROCESS_TERMINATION_GRACE: Duration = Duration.ofSeconds(30)
+
+/** terminal persistence の既定 timeout。 */
+val DEFAULT_LLM_PERSISTENCE_TERMINAL_TIMEOUT: Duration = Duration.ofSeconds(10)
+
+/** terminal persistence の最小 timeout。 */
+val MIN_LLM_PERSISTENCE_TERMINAL_TIMEOUT: Duration = Duration.ofSeconds(1)
+
+/** terminal persistence の最大 timeout。 */
+val MAX_LLM_PERSISTENCE_TERMINAL_TIMEOUT: Duration = Duration.ofSeconds(30)
 
 /**
  * 直近 1 時間の既定 runner 起動上限。
@@ -1023,6 +1059,14 @@ private fun Map<String, String>.readLlmRunnerConfig(): LlmRunnerConfig {
             readOptional(FUKUROU_LLM_RUN_TIMEOUT_SECONDS_ENV)
                 ?.toLong()
                 ?: DEFAULT_LLM_PER_RUN_TIMEOUT.seconds,
+        ),
+        processTerminationGrace = Duration.ofSeconds(
+            readOptional(FUKUROU_LLM_PROCESS_TERMINATION_GRACE_SECONDS_ENV)?.toLong()
+                ?: DEFAULT_LLM_PROCESS_TERMINATION_GRACE.seconds,
+        ),
+        persistenceTerminalTimeout = Duration.ofSeconds(
+            readOptional(FUKUROU_LLM_PERSISTENCE_TERMINAL_TIMEOUT_SECONDS_ENV)?.toLong()
+                ?: DEFAULT_LLM_PERSISTENCE_TERMINAL_TIMEOUT.seconds,
         ),
         maxInvocationsPerHour = readOptional(FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR_ENV)
             ?.toInt()

@@ -1,9 +1,12 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -131,13 +134,49 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
-import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
  * OneShotLlmRunner の DB 正本 contract を検証するテスト。
  */
 class OneShotLlmRunnerTest {
+
+    @Test
+    fun parallelReplay_hasOneClaimWinnerAndAtMostOneChild() = runBlocking {
+        val fixture = runnerFixture { cleanExit() }
+        val invocationId = "parallel-replay"
+        val request = defaultRequest().copy(
+            invocationId = invocationId,
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+        )
+        fixture.runtime.launchReservationRepository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                triggerKey = "test:$invocationId",
+                reservedAt = fixedInstant(),
+                runnerConfig = LlmRunnerConfig(),
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofHours(24),
+                activeReservationStaleAfter = Duration.ofMinutes(30),
+            ),
+        ).getOrThrow()
+
+        val results = coroutineScope {
+            listOf(
+                async { fixture.runner.runOneShot(request) },
+                async { fixture.runner.runOneShot(request) },
+            ).map { it.await() }
+        }
+
+        assertEquals(1, results.count(Result<OneShotRunnerResult>::isSuccess))
+        assertEquals(1, results.count { it.exceptionOrNull()?.message == "launch_reservation_already_claimed" })
+        assertEquals(1, fixture.processRunner.launches.size)
+
+        val terminalReplay = fixture.runner.runOneShot(request)
+        assertEquals("launch_reservation_terminal", terminalReplay.exceptionOrNull()?.message)
+        assertEquals(1, fixture.processRunner.launches.size)
+    }
 
     @Test
     fun reservationMissing_failsBeforeChildProcess() = runBlocking {
@@ -1161,7 +1200,7 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun maxInvocationsPerHourExceeded_rejectsLaunchAndAuditsNoTrade() = runBlocking {
+    fun reservationBackedRunner_doesNotRecountLegacyHourlyAuditAfterAdmission() = runBlocking {
         val config = TradingBotConfig(
             runner = LlmRunnerConfig(maxInvocationsPerHour = 1, entryFillReservePerHour = 0, stopProximityReservePerHour = 0),
         )
@@ -1186,11 +1225,10 @@ class OneShotLlmRunnerTest {
 
         val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
-        assertEquals(OneShotRunnerStatus.LAUNCH_REJECTED, result.status)
-        assertEquals(0, fixture.processRunner.launches.size)
-        assertTrue(fixture.eventLog.events().containsNoTradeReason("max_invocations_per_hour_exceeded"))
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(1, fixture.processRunner.launches.size)
         assertEquals(
-            OneShotRunnerStatus.LAUNCH_REJECTED.name,
+            OneShotRunnerStatus.NO_TRADE_AUDITED.name,
             fixture.runtime.llmRunRepository.findByInvocationId(result.invocationId).getOrThrow()?.status,
         )
     }
@@ -1238,7 +1276,7 @@ class OneShotLlmRunnerTest {
             fixture.runtime.llmRunRepository.findByInvocationId(result.invocationId).getOrThrow(),
         )
         val preflightPayload = fixture.eventLog.events()
-            .single { event -> event.isRunnerPhaseCompleted("preflight") }
+            .single { event -> event.isRunnerPhaseCompleted("reservation_claim") }
             .payloadJsonObject()
 
         assertEquals("runtime-version-1", llmRun.runtimeConfigVersionId)
@@ -1248,7 +1286,7 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
-    fun maxInvocationsPerDayExceeded_rejectsLaunchAndAuditsNoTrade() = runBlocking {
+    fun reservationBackedRunner_doesNotRecountLegacyDailyAuditAfterAdmission() = runBlocking {
         val config = TradingBotConfig(
             runner = LlmRunnerConfig(
                 maxInvocationsPerHour = 1,
@@ -1280,9 +1318,8 @@ class OneShotLlmRunnerTest {
 
         val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
-        assertEquals(OneShotRunnerStatus.LAUNCH_REJECTED, result.status)
-        assertEquals(0, fixture.processRunner.launches.size)
-        assertTrue(fixture.eventLog.events().containsNoTradeReason("max_invocations_per_day_exceeded"))
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(1, fixture.processRunner.launches.size)
     }
 
     @Test
@@ -1830,8 +1867,8 @@ class OneShotLlmRunnerTest {
         val noTradeEvent = (runtime.commandEventLog as InMemoryCommandEventLog).events()
             .single { event -> event.eventType == CommandEventType.NO_TRADE_EXIT }
 
-        assertSame(cancellation, propagated)
-        assertTrue(propagated.suppressed.contains(cleanupFailure))
+        assertEquals(cancellation.message, propagated.message)
+        assertTrue(propagated.suppressed.any { it.message == cleanupFailure.message })
         assertEquals("CancellationException", propagated.safeCodexFailureOrNull()?.type)
         assertEquals("Codex invocation failure details omitted.", record?.errorMessage)
         assertFalse(noTradeEvent.payload.contains("auth-path-marker"))

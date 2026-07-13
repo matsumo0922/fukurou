@@ -149,12 +149,14 @@ LLM daemon を有効化する前に、少なくとも次を満たすこと。
 - `codex login status` と `codex exec ...` の smoke test が成功している。
 - fixed MCP launcher、manifest directory、root-only password fileがrunning containerに反映されている。
 - `FUKUROU_TRADING_MODE=PAPER` のままになっている。
-- WebUI `/app/config` で `runner.maxInvocationsPerHour` / `runner.maxInvocationsPerDay` が意図した上限になっている。
+- WebUI `/app/config` で `runner.maxInvocationsPerHour` / `runner.maxInvocationsPerDay`、`ENTRY_FILL` / `STOP_PROXIMITY` の hour/day reserve、process termination grace、terminal persistence timeoutが意図した値になっている。
 - Codex の model / cost 方針を確認している。
 
 WebUI `/app/config` で `daemon.enabled=true` と `llm.launchEnabled=true` を同じ Runtime draft に設定し、validate / activate してからKtor processを1回再起動する。再起動後に両キーのeffective valueがtrueであることを確認し、その後、revisionとcontainer logを確認する。
 
 productionでの有効化確認はschedulerの通常cycleとreservationを共有する`POST /ops/trigger`に限定する。direct `OneShotRunnerMain`はschedulerと同時実行せず、必要な場合だけ`docs/mcp-runtime.md`のdirect runner maintenance境界で隔離して実行する。
+
+起動後は `/health/ready` が200で、`llm_launch_reservations` の新規one-shot rowが `AVAILABLE` から `CLAIMED` を経てterminalになることを確認する。migration前rowの claim stateは`NULL`のまま維持し、backfillしない。claim outcome unknown、heartbeat persistence failure、unfenced stale claimがある間はready 503かつ新規child 0を期待する。runtime configのdraft / validate / activateとrestartはoperatorが明示したmaintenanceとして実行し、code defaultだけをproduction active値の証拠にしない。
 
 ```sh
 scripts/prod-curl "/revision" -fsS

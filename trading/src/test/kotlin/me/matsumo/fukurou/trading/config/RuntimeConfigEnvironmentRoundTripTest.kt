@@ -48,6 +48,8 @@ class RuntimeConfigEnvironmentRoundTripTest {
         assertEquals("123456.7800", environment.getValue("FUKUROU_PAPER_INITIAL_CASH_JPY"))
         assertEquals("0.0010", environment.getValue("FUKUROU_FALLBACK_TAKER_FEE_RATE"))
         assertEquals("240", environment.getValue("FUKUROU_LLM_RUN_TIMEOUT_SECONDS"))
+        assertEquals("11", environment.getValue("FUKUROU_LLM_PROCESS_TERMINATION_GRACE_SECONDS"))
+        assertEquals("12", environment.getValue("FUKUROU_LLM_PERSISTENCE_TERMINAL_TIMEOUT_SECONDS"))
         assertEquals("claude-runtime-test", environment.getValue("FUKUROU_CLAUDE_MODEL"))
         assertEquals("codex-runtime-test", environment.getValue("FUKUROU_CODEX_MODEL"))
         assertEquals("CODEX", environment.getValue("FUKUROU_PROPOSER_PROVIDER"))
@@ -135,6 +137,8 @@ private fun nonDefaultRuntimeConfig(): TradingBotConfig {
             maxToolCallsPerRun = 24,
             maxActToolCallsPerRun = 2,
             perRunTimeout = Duration.ofSeconds(240),
+            processTerminationGrace = Duration.ofSeconds(11),
+            persistenceTerminalTimeout = Duration.ofSeconds(12),
             maxInvocationsPerHour = 3,
             maxInvocationsPerDay = 48,
             entryFillReservePerHour = 0,

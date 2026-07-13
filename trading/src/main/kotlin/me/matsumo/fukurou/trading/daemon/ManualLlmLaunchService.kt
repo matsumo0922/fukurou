@@ -18,7 +18,6 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
-import me.matsumo.fukurou.trading.evaluation.terminalCauseForInvocationFailure
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -248,21 +247,7 @@ class DefaultManualLlmLaunchService(
         val result = runCatching {
             launchOneShot(request).getOrThrow()
         }
-        val runnerResult = result.getOrNull()
         val failure = result.exceptionOrNull()
-        val status = if (failure == null) {
-            LlmLaunchReservationStatus.FINISHED
-        } else {
-            LlmLaunchReservationStatus.FAILED
-        }
-        val finishReason = (runnerResult?.terminalCause ?: terminalCauseForInvocationFailure(failure)).name
-
-        finishReservedInvocation(
-            invocationId = invocationId,
-            status = status,
-            reason = finishReason,
-            finishedAt = Instant.now(clock),
-        )
 
         if (failure is CancellationException) {
             throw failure

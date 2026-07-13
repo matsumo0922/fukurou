@@ -98,6 +98,30 @@ class ShellProcessRunnerTest {
     }
 
     @Test
+    fun run_timeoutForceKillsProcessTreeThatIgnoresTerm() = runBlocking {
+        val shellPath = Path.of("/bin/sh")
+        if (!Files.isExecutable(shellPath)) return@runBlocking
+
+        val tempDirectory = Files.createTempDirectory("fukurou-process-runner-term-ignore-test")
+        val childPidFile = tempDirectory.resolve("child.pid")
+        val script = $$"(/bin/sh -c 'trap \"\" TERM; exec /bin/sleep 30') >/dev/null 2>&1 & child_pid=$!; echo $child_pid > $${childPidFile.shellQuoted()}; wait $child_pid"
+        val command = RenderedLlmCommand(
+            executable = shellPath.toString(),
+            args = listOf("-c", script),
+            environment = emptyMap(),
+            workingDirectory = tempDirectory,
+            timeout = Duration.ofMillis(200),
+            stdin = null,
+        )
+
+        val result = ShellProcessRunner(Duration.ofMillis(50)).run(command).getOrThrow()
+        val childPid = waitForChildPid(childPidFile)
+
+        assertEquals(ProcessRunStatus.TIMED_OUT, result.status)
+        assertFalse(ProcessHandle.of(childPid).map { handle -> handle.isAlive }.orElse(false))
+    }
+
+    @Test
     fun cleanup_deletesPathsAfterCallerFinishesParsing() = runBlocking {
         val shellPath = Path.of("/bin/sh")
         if (!Files.isExecutable(shellPath)) {

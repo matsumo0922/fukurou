@@ -16,6 +16,23 @@ import kotlin.test.assertFailsWith
 class TradingBotConfigTest {
 
     @Test
+    fun runnerConfig_rejectsReserveOverflowAndTimeoutsOutsideGuard() {
+        assertFailsWith<IllegalArgumentException> {
+            LlmRunnerConfig(
+                maxInvocationsPerHour = 7,
+                entryFillReservePerHour = Int.MAX_VALUE,
+                stopProximityReservePerHour = Int.MAX_VALUE,
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmRunnerConfig(processTerminationGrace = Duration.ofSeconds(31))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LlmRunnerConfig(persistenceTerminalTimeout = Duration.ZERO)
+        }
+    }
+
+    @Test
     fun fromEnvironment_usesDefaultsWhenEnvironmentIsEmpty() {
         val config = TradingBotConfig.fromEnvironment(emptyMap())
 

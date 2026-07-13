@@ -46,6 +46,10 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRejectionReason
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
@@ -374,7 +378,8 @@ private const val SELECT_LLM_LAUNCH_RESERVATION_INDEX_COUNT_SQL = """
         AND indexname IN (
             'idx_llm_launch_reservations_invocation_id_unique',
             'idx_llm_launch_reservations_trigger_key_reserved_at',
-            'idx_llm_launch_reservations_status_reserved_at'
+            'idx_llm_launch_reservations_status_reserved_at',
+            'idx_llm_launch_reservations_claim_recovery'
         )
 """
 
@@ -3414,6 +3419,81 @@ class PostgresPersistenceIntegrationTest {
             assertEquals(1, reservedCount)
             assertEquals(listOf(LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION), rejectedReasons)
         }
+    }
+
+    @Test
+    fun llm_launch_reservation_atomicClaimHasOneWinnerAcrossOneHundredContenders() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val now = fixedClock().instant()
+        assertIs<LlmLaunchReservationOutcome.Reserved>(
+            repository.tryReserve(llmLaunchReservationRequest("claim-race", LlmRunnerConfig())).getOrThrow(),
+        )
+
+        val outcomes = coroutineScope {
+            (0 until 100).map { index ->
+                async(Dispatchers.IO) {
+                    repository.claimForExecution(
+                        LlmExecutionClaimRequest(
+                            invocationId = "claim-race",
+                            triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                            claimantToken = "claim-token-$index",
+                            claimedAt = now.plusMillis(index.toLong()),
+                        ),
+                    )
+                }
+            }.map { it.await() }
+        }
+
+        assertEquals(1, outcomes.count { it is LlmExecutionClaimOutcome.Claimed })
+        assertEquals(
+            99,
+            outcomes.count { outcome ->
+                outcome == LlmExecutionClaimOutcome.Rejected(
+                    LlmExecutionClaimRejectionReason.ALREADY_CLAIMED,
+                )
+            },
+        )
+        val snapshot = requireNotNull(repository.findExecutionClaim("claim-race").getOrThrow())
+        assertEquals(LlmExecutionClaimState.CLAIMED, snapshot.claimState)
+        assertEquals(LlmLaunchReservationStatus.RUNNING, snapshot.status)
+    }
+
+    @Test
+    fun bootstrap_addsNullableClaimColumnsWithoutBackfillOrTableRewrite() = runPostgresTest {
+        exposedTransaction(database) {
+            executeUpdate(
+                """
+                    CREATE TABLE llm_launch_reservations (
+                        id UUID PRIMARY KEY, invocation_id VARCHAR(128) NOT NULL, trigger_kind VARCHAR(64) NOT NULL,
+                        trigger_key VARCHAR(256) NOT NULL, status VARCHAR(32) NOT NULL, reserved_at BIGINT NOT NULL,
+                        finished_at BIGINT NULL, reason TEXT NULL
+                    )
+                """.trimIndent(),
+            )
+            repeat(1_000) { index ->
+                jdbcConnection().prepareStatement(
+                    "INSERT INTO llm_launch_reservations VALUES (?, ?, 'MANUAL', ?, 'FINISHED', ?, ?, NULL)",
+                ).use { statement ->
+                    statement.setObject(1, UUID.randomUUID())
+                    statement.setString(2, "legacy-$index")
+                    statement.setString(3, "legacy:$index")
+                    statement.setLong(4, index.toLong())
+                    statement.setLong(5, index.toLong())
+                    statement.executeUpdate()
+                }
+            }
+        }
+        val before = selectClaimMigrationEvidence(database)
+
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val after = selectClaimMigrationEvidence(database)
+        assertEquals(before.relationFileNode, after.relationFileNode)
+        assertEquals(before.rowCount, after.rowCount)
+        assertEquals(before.invocationChecksum, after.invocationChecksum)
+        assertEquals(0, after.claimedRowCount)
+        assertEquals(4, selectLlmLaunchReservationIndexCount(database))
     }
 
     @Test
@@ -7404,6 +7484,66 @@ private fun selectLlmLaunchReservationIndexCount(database: ExposedDatabase): Int
                 require(resultSet.next()) { "llm launch reservation index count did not return a row." }
 
                 resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+private data class ClaimMigrationEvidence(
+    val relationFileNode: Long,
+    val rowCount: Int,
+    val invocationChecksum: String,
+    val claimedRowCount: Int?,
+)
+
+/** claim migration 前後の table identity と legacy row 不変性を読む。 */
+private fun selectClaimMigrationEvidence(database: ExposedDatabase): ClaimMigrationEvidence {
+    return exposedTransaction(database) {
+        val hasClaimColumn = jdbcConnection().prepareStatement(
+            """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                        AND table_name = 'llm_launch_reservations'
+                        AND column_name = 'execution_claim_state'
+                )
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getBoolean(1)
+            }
+        }
+        val claimedRowCount = if (hasClaimColumn) {
+            jdbcConnection().prepareStatement(
+                "SELECT COUNT(*) FROM llm_launch_reservations WHERE execution_claim_state IS NOT NULL",
+            ).use { statement ->
+                statement.executeQuery().use { resultSet ->
+                    check(resultSet.next())
+                    resultSet.getInt(1)
+                }
+            }
+        } else {
+            null
+        }
+        jdbcConnection().prepareStatement(
+            """
+                SELECT c.relfilenode,
+                    (SELECT COUNT(*) FROM llm_launch_reservations) AS row_count,
+                    (SELECT md5(string_agg(invocation_id, ',' ORDER BY invocation_id))
+                     FROM llm_launch_reservations) AS invocation_checksum
+                FROM pg_class c
+                WHERE c.oid = 'llm_launch_reservations'::regclass
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "claim migration evidence query returned no row." }
+                ClaimMigrationEvidence(
+                    relationFileNode = resultSet.getLong("relfilenode"),
+                    rowCount = resultSet.getInt("row_count"),
+                    invocationChecksum = resultSet.getString("invocation_checksum"),
+                    claimedRowCount = claimedRowCount,
+                )
             }
         }
     }

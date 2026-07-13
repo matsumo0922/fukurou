@@ -1,6 +1,8 @@
 package me.matsumo.fukurou.trading.reflection
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -228,7 +230,9 @@ class ReflectionPromptCandidateGenerator(
                 validation = validation,
             )
         } catch (throwable: CancellationException) {
-            finishFailedRun(start, throwable)
+            withContext(NonCancellable) {
+                finishFailedRun(start, throwable)
+            }
 
             throw throwable
         } catch (throwable: Throwable) {

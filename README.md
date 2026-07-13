@@ -55,7 +55,7 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `GET /swagger`
 - `GET /openapi.json`
 
-`/health/ready` は、Hikari + Exposed による PostgreSQL 接続、runtime config の有効性、startup recovery 完了、WebSocket が `CONNECTED`、未回復の market-data gap がないこと、fresh な transport activity と periodic maintenance をすべて確認して ready を返します。trade は正常に無音になり得るため、readiness の必須条件にしません。
+`/health/ready` は、Hikari + Exposed による PostgreSQL 接続、runtime config の有効性、startup recovery 完了、LLM execution claim の outcome-unknown registry と heartbeat、WebSocket が `CONNECTED`、未回復の market-data gap がないこと、fresh な transport activity と periodic maintenance をすべて確認して ready を返します。未解決の claim または heartbeat persistence failure がある間は新しい LLM admission も fail closed します。trade は正常に無音になり得るため、readiness の必須条件にしません。
 
 ## Local development
 

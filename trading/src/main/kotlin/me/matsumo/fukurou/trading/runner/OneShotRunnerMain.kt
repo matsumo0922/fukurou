@@ -3,10 +3,8 @@ package me.matsumo.fukurou.trading.runner
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.daemon.LLM_LAUNCH_DISABLED
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
-import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
-import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
@@ -100,7 +98,7 @@ private suspend fun launchOneShotRunner(environment: Map<String, String>): OneSh
                         environment = environment,
                     ),
                 ),
-                processRunner = ShellProcessRunner(),
+                processRunner = ShellProcessRunner(tradingConfig.runner.processTerminationGrace),
             ),
             parentEnvironment = environment,
             runtimeConfigSnapshot = runtimeConfigResolution.auditSnapshot,
@@ -122,18 +120,7 @@ private suspend fun launchOneShotRunner(environment: Map<String, String>): OneSh
             invocationId = invocationId,
             triggerKind = LlmDaemonTriggerKind.MANUAL,
         )
-        return try {
-            runner.runOneShot(request).getOrThrow().also {
-                tradingRuntime.launchReservationRepository.finish(
-                    LlmLaunchReservationFinish(invocationId, LlmLaunchReservationStatus.FINISHED, null, Instant.now()),
-                ).getOrThrow()
-            }
-        } catch (throwable: Throwable) {
-            tradingRuntime.launchReservationRepository.finish(
-                LlmLaunchReservationFinish(invocationId, LlmLaunchReservationStatus.FAILED, throwable.javaClass.simpleName, Instant.now()),
-            ).getOrThrow()
-            throw throwable
-        }
+        return runner.runOneShot(request).getOrThrow()
     } finally {
         tradingRuntime.close()
     }

@@ -1,5 +1,10 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.daemon
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
@@ -14,6 +19,131 @@ import kotlin.test.assertNotNull
  * LLM 起動予約の既定 hourly / daily 境界を検証するテスト。
  */
 class LlmLaunchReservationRepositoryTest {
+
+    @Test
+    fun parallelExecutionClaim_hasOneWinnerAndLoserCannotFinishWinner() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val now = launchBudgetFixedInstant()
+        repository.tryReserve(launchBudgetRequest("claim-race", LlmRunnerConfig(), now)).getOrThrow()
+
+        val outcomes = coroutineScope {
+            (0 until 100).map { index ->
+                async {
+                    repository.claimForExecution(
+                        LlmExecutionClaimRequest(
+                            invocationId = "claim-race",
+                            triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                            claimantToken = "token-$index",
+                            claimedAt = now.plusMillis(index.toLong()),
+                        ),
+                    )
+                }
+            }.awaitAll()
+        }
+        val winnerIndex = outcomes.indexOfFirst { it is LlmExecutionClaimOutcome.Claimed }
+        assertEquals(1, outcomes.count { it is LlmExecutionClaimOutcome.Claimed })
+        assertEquals(
+            99,
+            outcomes.count { outcome ->
+                outcome == LlmExecutionClaimOutcome.Rejected(
+                    LlmExecutionClaimRejectionReason.ALREADY_CLAIMED,
+                )
+            },
+        )
+
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "claim-race",
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = "loser",
+                finishedAt = now.plusSeconds(1),
+                claimantToken = "token-${(winnerIndex + 1) % 100}",
+            ),
+        ).getOrThrow()
+        assertEquals(
+            LlmLaunchReservationStatus.RUNNING,
+            repository.findExecutionClaim("claim-race").getOrThrow()?.status,
+        )
+
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "claim-race",
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = "winner",
+                finishedAt = now.plusSeconds(2),
+                claimantToken = "token-$winnerIndex",
+            ),
+        ).getOrThrow()
+        assertEquals(
+            LlmLaunchReservationStatus.FINISHED,
+            repository.findExecutionClaim("claim-race").getOrThrow()?.status,
+        )
+    }
+
+    @Test
+    fun terminalAndNotRequiredReservationsRejectExecutionClaim() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val now = launchBudgetFixedInstant()
+        repository.tryReserve(launchBudgetRequest("terminal", LlmRunnerConfig(), now)).getOrThrow()
+        repository.finish(
+            LlmLaunchReservationFinish("terminal", LlmLaunchReservationStatus.FINISHED, null, now.plusSeconds(1)),
+        ).getOrThrow()
+        repository.tryReserve(
+            launchBudgetRequest("reflection-claim", LlmRunnerConfig(), now.plusSeconds(2), LlmDaemonTriggerKind.REFLECTION),
+        ).getOrThrow()
+
+        val terminal = repository.claimForExecution(
+            LlmExecutionClaimRequest("terminal", LlmDaemonTriggerKind.FLAT_HEARTBEAT, "token", now.plusSeconds(3)),
+        )
+        val notRequired = repository.claimForExecution(
+            LlmExecutionClaimRequest("reflection-claim", LlmDaemonTriggerKind.REFLECTION, "token", now.plusSeconds(3)),
+        )
+
+        assertEquals(
+            LlmExecutionClaimOutcome.Rejected(LlmExecutionClaimRejectionReason.TERMINAL),
+            terminal,
+        )
+        assertEquals(
+            LlmExecutionClaimOutcome.Rejected(LlmExecutionClaimRejectionReason.CLAIM_NOT_REQUIRED),
+            notRequired,
+        )
+    }
+
+    @Test
+    fun staleRecoveryFinish_losesWhenClaimHeartbeatAdvances() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val claimedAt = launchBudgetFixedInstant()
+        val heartbeatAt = claimedAt.plusSeconds(10)
+        repository.tryReserve(launchBudgetRequest("heartbeat-race", LlmRunnerConfig(), claimedAt)).getOrThrow()
+        repository.claimForExecution(
+            LlmExecutionClaimRequest(
+                invocationId = "heartbeat-race",
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                claimantToken = "winner-token",
+                claimedAt = claimedAt,
+            ),
+        )
+        repository.heartbeatExecutionClaim(
+            invocationId = "heartbeat-race",
+            claimantToken = "winner-token",
+            heartbeatAt = heartbeatAt,
+        ).getOrThrow()
+
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = "heartbeat-race",
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = "stale_recovery",
+                finishedAt = heartbeatAt.plusSeconds(1),
+                claimantToken = "winner-token",
+                observedHeartbeatAt = claimedAt,
+            ),
+        ).getOrThrow()
+
+        val snapshot = assertNotNull(repository.findExecutionClaim("heartbeat-race").getOrThrow())
+        assertEquals(LlmLaunchReservationStatus.RUNNING, snapshot.status)
+        assertEquals(heartbeatAt, snapshot.heartbeatAt)
+    }
 
     @Test
     fun evaluationReport_blocksOnReflectionAndPreservesTradingHeadroom() = runBlocking {

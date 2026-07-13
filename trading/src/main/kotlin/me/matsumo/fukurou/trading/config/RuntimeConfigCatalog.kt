@@ -307,6 +307,24 @@ object RuntimeConfigCatalog {
                     safetyTier = RuntimeConfigSafetyTier.GUARDED,
                 ),
                 runtimeItem(
+                    key = "runner.processTerminationGrace",
+                    legacyEnvName = FUKUROU_LLM_PROCESS_TERMINATION_GRACE_SECONDS_ENV,
+                    valueType = RuntimeConfigValueType.DURATION_SECONDS,
+                    defaultValue = defaults.config.runner.processTerminationGrace.seconds.toString(),
+                    effectiveValue = config.runner.processTerminationGrace.seconds.toString(),
+                    unit = "seconds",
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
+                    key = "runner.persistenceTerminalTimeout",
+                    legacyEnvName = FUKUROU_LLM_PERSISTENCE_TERMINAL_TIMEOUT_SECONDS_ENV,
+                    valueType = RuntimeConfigValueType.DURATION_SECONDS,
+                    defaultValue = defaults.config.runner.persistenceTerminalTimeout.seconds.toString(),
+                    effectiveValue = config.runner.persistenceTerminalTimeout.seconds.toString(),
+                    unit = "seconds",
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
                     key = "runner.maxInvocationsPerHour",
                     legacyEnvName = FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR_ENV,
                     valueType = RuntimeConfigValueType.INT,
@@ -1301,6 +1319,10 @@ private const val FUKUROU_DATA_QUALITY_CAPPED_PROBABILITY_ENV = "FUKUROU_DATA_QU
 private const val FUKUROU_FALSIFICATION_FRESHNESS_SECONDS_ENV = "FUKUROU_FALSIFICATION_FRESHNESS_SECONDS"
 private const val FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS_ENV = "FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS"
 private const val FUKUROU_LLM_RUN_TIMEOUT_SECONDS_ENV = "FUKUROU_LLM_RUN_TIMEOUT_SECONDS"
+private const val FUKUROU_LLM_PROCESS_TERMINATION_GRACE_SECONDS_ENV =
+    "FUKUROU_LLM_PROCESS_TERMINATION_GRACE_SECONDS"
+private const val FUKUROU_LLM_PERSISTENCE_TERMINAL_TIMEOUT_SECONDS_ENV =
+    "FUKUROU_LLM_PERSISTENCE_TERMINAL_TIMEOUT_SECONDS"
 private const val FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR_ENV = "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"
 private const val FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY_ENV = "FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY"
 private const val FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_HOUR_ENV = "FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_HOUR"

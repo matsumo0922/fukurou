@@ -47,6 +47,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRuntimeConfigRepository
 import me.matsumo.fukurou.trading.persistence.RuntimeConfigPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.persistence.staleLlmRunRecoveryThreshold
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
@@ -767,7 +768,7 @@ private fun createApplicationReadinessProbe(
     return ReadinessProbe {
         val runtimeAvailable = runtime.runtimeConfigState.snapshot().tradingRuntimeAvailable
 
-        if (!runtimeAvailable) {
+        if (!runtimeAvailable || !LlmExecutionAdmissionHealth.isHealthy()) {
             return@ReadinessProbe false
         }
 
