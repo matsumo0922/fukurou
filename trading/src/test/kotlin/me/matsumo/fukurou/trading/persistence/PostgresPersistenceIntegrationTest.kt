@@ -760,6 +760,7 @@ private const val INSERT_ACTIVITY_CONTEXT_EXECUTION_SQL = """
 private const val INSERT_OBSIDIAN_CLOSED_POSITION_SQL = """
     INSERT INTO positions (
         id,
+        account_epoch_id,
         trade_group_id,
         mode,
         symbol,
@@ -780,6 +781,7 @@ private const val INSERT_OBSIDIAN_CLOSED_POSITION_SQL = """
         decision_run_id
     )
     VALUES (
+        ?,
         ?,
         ?,
         'PAPER',
@@ -808,6 +810,8 @@ private const val INSERT_OBSIDIAN_CLOSED_POSITION_SQL = """
 private const val INSERT_OBSIDIAN_EXECUTION_SQL = """
     INSERT INTO executions (
         id,
+        account_epoch_id,
+        execution_semantics_version,
         order_id,
         position_id,
         mode,
@@ -821,6 +825,8 @@ private const val INSERT_OBSIDIAN_EXECUTION_SQL = """
         executed_at
     )
     VALUES (
+        ?,
+        ?,
         ?,
         ?,
         ?,
@@ -4273,16 +4279,21 @@ class PostgresPersistenceIntegrationTest {
 
         bootstrap.ensureSchema().getOrThrow()
         exposedTransaction(database) {
-            insertBackfillPosition(
-                positionId = openPositionId,
-                status = "OPEN",
-                currentPriceJpy = BigDecimal("9900000"),
-            )
-            insertBackfillPosition(
-                positionId = closedPositionId,
-                status = "CLOSED",
-                currentPriceJpy = BigDecimal("9800000"),
-            )
+            try {
+                executeUpdate("ALTER TABLE positions DISABLE TRIGGER positions_gap_population_create")
+                insertPreCBackfillPosition(
+                    positionId = openPositionId,
+                    status = "OPEN",
+                    currentPriceJpy = BigDecimal("9900000"),
+                )
+                insertPreCBackfillPosition(
+                    positionId = closedPositionId,
+                    status = "CLOSED",
+                    currentPriceJpy = BigDecimal("9800000"),
+                )
+            } finally {
+                executeUpdate("ALTER TABLE positions ENABLE TRIGGER positions_gap_population_create")
+            }
         }
 
         bootstrap.ensureSchema().getOrThrow()
@@ -6258,13 +6269,33 @@ class PostgresPersistenceIntegrationTest {
             MarketDataGapReason.DISCONNECTED,
             second.receivedAt.plusSeconds(1),
         ).getOrThrow()
+        exposedTransaction(database) {
+            assertEquals(GapPopulationResumeMode.STOPPED, selectGapPopulationResumeMode())
+            assertTrue(runCatching { requireFullGapPopulationAdmission("test entry") }.isFailure)
+        }
+        assertEquals(3, integrityRepository.snapshot().getOrThrow().lastProcessedSequence)
+
+        var recoverySummary = integrityRepository
+            .recoverStaleSessionWithSummary(second.receivedAt.plusSeconds(2))
+            .getOrThrow()
+        var recoveryPassCount = 1
+        while (recoverySummary.remaining > 0 && recoveryPassCount < 10) {
+            recoverySummary = integrityRepository
+                .recoverStaleSessionWithSummary(second.receivedAt.plusSeconds(2))
+                .getOrThrow()
+            recoveryPassCount += 1
+        }
+        assertEquals(0, recoverySummary.remaining)
         val exclusionSummary = ExposedEvaluationRepository(database).fetchExclusionSummary(
-            EvaluationPeriod(fixedInstant(), second.receivedAt.plusSeconds(2)),
+            EvaluationPeriod(fixedInstant(), second.receivedAt.plusSeconds(3)),
         ).getOrThrow()
 
         assertEquals(1, exclusionSummary.positionCount)
         assertEquals(2, exclusionSummary.decisionRunCount)
         assertEquals(MarketDataGapReason.DISCONNECTED, integrityRepository.snapshot().getOrThrow().gapReason)
+        exposedTransaction(database) {
+            assertEquals(GapPopulationResumeMode.FULL, selectGapPopulationResumeMode())
+        }
     }
 
     @Test
@@ -8675,14 +8706,13 @@ private fun selectOrderPositionId(database: ExposedDatabase, orderId: UUID): UUI
 }
 
 /**
- * backfill 検証用 position 行を lowest なしで追加する。
+ * C0 creation fence導入前のbackfill対象positionをlowestなしで追加する。
  */
-private fun JdbcTransaction.insertBackfillPosition(
+private fun JdbcTransaction.insertPreCBackfillPosition(
     positionId: UUID,
     status: String,
     currentPriceJpy: BigDecimal,
 ) {
-    acquireGapPopulationGenerationToken()
     jdbcConnection().prepareStatement(INSERT_BACKFILL_POSITION_SQL).use { statement ->
         statement.setObject(1, positionId)
         statement.setObject(2, UUID.randomUUID())
@@ -8865,12 +8895,14 @@ private fun insertObsidianClosedPositionRows(
 ) {
     exposedTransaction(database) {
         val tradeGroupId = UUID.randomUUID()
+        val scope = acquireFixtureGapPopulationGenerationToken(TradingMode.PAPER.name)
 
         insertObsidianClosedPosition(
             positionId = positionId,
             tradeGroupId = tradeGroupId,
             decisionRunId = decisionRunId,
             closedAt = closedAt,
+            scope = scope,
         )
         insertObsidianExecution(
             positionId = positionId,
@@ -8879,6 +8911,7 @@ private fun insertObsidianClosedPositionRows(
             feeJpy = BigDecimal("50"),
             realizedPnlJpy = BigDecimal.ZERO,
             executedAt = fixedInstant(),
+            scope = scope,
         )
         insertObsidianExecution(
             positionId = positionId,
@@ -8887,6 +8920,7 @@ private fun insertObsidianClosedPositionRows(
             feeJpy = BigDecimal("60"),
             realizedPnlJpy = realizedPnlJpy,
             executedAt = closedAt,
+            scope = scope,
         )
     }
 }
@@ -8899,14 +8933,15 @@ private fun JdbcTransaction.insertObsidianClosedPosition(
     tradeGroupId: UUID,
     decisionRunId: String,
     closedAt: Instant,
+    scope: GapPopulationScope,
 ) {
-    acquireGapPopulationGenerationToken()
     jdbcConnection().prepareStatement(INSERT_OBSIDIAN_CLOSED_POSITION_SQL).use { statement ->
         statement.setObject(1, positionId)
-        statement.setObject(2, tradeGroupId)
-        statement.setLong(3, fixedInstant().toEpochMilli())
-        statement.setLong(4, closedAt.toEpochMilli())
-        statement.setString(5, decisionRunId)
+        statement.setObject(2, scope.accountEpochId)
+        statement.setObject(3, tradeGroupId)
+        statement.setLong(4, fixedInstant().toEpochMilli())
+        statement.setLong(5, closedAt.toEpochMilli())
+        statement.setString(6, decisionRunId)
         statement.executeUpdate()
     }
 }
@@ -8921,16 +8956,19 @@ private fun JdbcTransaction.insertObsidianExecution(
     feeJpy: BigDecimal,
     realizedPnlJpy: BigDecimal,
     executedAt: Instant,
+    scope: GapPopulationScope,
 ) {
     jdbcConnection().prepareStatement(INSERT_OBSIDIAN_EXECUTION_SQL).use { statement ->
         statement.setObject(1, UUID.randomUUID())
-        statement.setObject(2, UUID.randomUUID())
-        statement.setObject(3, positionId)
-        statement.setString(4, side.name)
-        statement.setBigDecimal(5, priceJpy)
-        statement.setBigDecimal(6, feeJpy)
-        statement.setBigDecimal(7, realizedPnlJpy)
-        statement.setLong(8, executedAt.toEpochMilli())
+        statement.setObject(2, scope.accountEpochId)
+        statement.setString(3, scope.executionSemanticsVersion)
+        statement.setObject(4, UUID.randomUUID())
+        statement.setObject(5, positionId)
+        statement.setString(6, side.name)
+        statement.setBigDecimal(7, priceJpy)
+        statement.setBigDecimal(8, feeJpy)
+        statement.setBigDecimal(9, realizedPnlJpy)
+        statement.setLong(10, executedAt.toEpochMilli())
         statement.executeUpdate()
     }
 }
@@ -9373,13 +9411,15 @@ private fun paperTradeEvent(
     )
 }
 
-/** filled entry と current position の decision run が異なる trade group を再現する。 */
+/** filled entry に current scope の decision run を関連付ける。 */
 private fun updateOrderDecisionRun(
     database: ExposedDatabase,
     orderId: String,
     decisionRunId: String,
 ) {
     exposedTransaction(database) {
+        insertDecisionRunScope("ORDER", orderId, decisionRunId)
+
         prepare("UPDATE orders SET decision_run_id = ? WHERE id = ?").use { statement ->
             statement.setString(1, decisionRunId)
             statement.setObject(2, UUID.fromString(orderId))
@@ -9391,10 +9431,41 @@ private fun updateOrderDecisionRun(
 /** current position と先行 filled entry の decision run が異なる group を再現する。 */
 private fun updateOpenPositionDecisionRun(database: ExposedDatabase, decisionRunId: String) {
     exposedTransaction(database) {
-        prepare("UPDATE positions SET decision_run_id = ? WHERE status = 'OPEN'").use { statement ->
+        val positionId = prepare("SELECT id::text FROM positions WHERE status = 'OPEN'").use { statement ->
+            statement.executeQuery().use { rows ->
+                require(rows.next()) { "open position was not found." }
+                rows.getString(1)
+            }
+        }
+        insertDecisionRunScope("POSITION", positionId, decisionRunId)
+
+        prepare("UPDATE positions SET decision_run_id = ? WHERE id = ?").use { statement ->
             statement.setString(1, decisionRunId)
+            statement.setObject(2, UUID.fromString(positionId))
             require(statement.executeUpdate() == 1) { "open position was not found." }
         }
+    }
+}
+
+/** entity と同じ current scope の decision run を fixture に追加する。 */
+private fun JdbcTransaction.insertDecisionRunScope(entityType: String, entityId: String, decisionRunId: String) {
+    prepare(
+        """
+            INSERT INTO gap_population_entity_scopes (
+                entity_type, entity_id, birth_sequence, scope_kind, mode, symbol,
+                account_epoch_id, cohort, execution_semantics_version, scope_hash, created_at
+            )
+            SELECT 'DECISION_RUN', ?, scope.birth_sequence, scope.scope_kind, scope.mode, scope.symbol,
+                scope.account_epoch_id, scope.cohort, scope.execution_semantics_version, scope.scope_hash,
+                scope.created_at
+            FROM gap_population_entity_scopes scope
+            WHERE scope.entity_type = ? AND scope.entity_id = ?
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setString(1, decisionRunId)
+        statement.setString(2, entityType)
+        statement.setString(3, entityId)
+        require(statement.executeUpdate() == 1) { "$entityType population scope was not found." }
     }
 }
 
