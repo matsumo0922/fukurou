@@ -268,7 +268,7 @@ class LlmDaemonSchedulerTest {
         val eventAt = fixedInstant().plus(Duration.ofMinutes(10))
         val fixture = schedulerFixture(
             tradingConfig = tradingConfig(
-                runner = LlmRunnerConfig(maxInvocationsPerHour = 1),
+                runner = LlmRunnerConfig(maxInvocationsPerHour = 1, entryFillReservePerHour = 0, stopProximityReservePerHour = 0),
                 events = listOf(
                     EconomicEventBlackout(
                         eventId = "cpi-20260703",
@@ -350,7 +350,7 @@ class LlmDaemonSchedulerTest {
         val entryFillReader = FakeEntryFillReader()
         val fixture = schedulerFixture(
             tradingConfig = tradingConfig(
-                runner = LlmRunnerConfig(maxInvocationsPerHour = 1),
+                runner = LlmRunnerConfig(maxInvocationsPerHour = 1, entryFillReservePerHour = 0, stopProximityReservePerHour = 0),
             ),
             hasOpenRisk = true,
             entryFillReader = entryFillReader,
@@ -1163,7 +1163,7 @@ class LlmDaemonSchedulerTest {
     fun priceMoveDoesNotBypassDailyLaunchCap() = runBlocking {
         val fixture = schedulerFixture(
             tradingConfig = tradingConfig(
-                runner = LlmRunnerConfig(maxInvocationsPerDay = 1),
+                runner = LlmRunnerConfig(maxInvocationsPerDay = 1, entryFillReservePerDay = 0, stopProximityReservePerDay = 0),
             ),
         )
         fixture.scheduler.tick()

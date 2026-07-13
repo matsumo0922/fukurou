@@ -27,19 +27,19 @@ class LlmLaunchReservationRepositoryTest {
         assertEquals("reflection", assertIs<LlmLaunchReservationOutcome.Rejected>(blocked).activeReservation?.invocationId)
 
         repository.finish(LlmLaunchReservationFinish("reflection", LlmLaunchReservationStatus.FINISHED, null, now.plusSeconds(2))).getOrThrow()
-        repeat(6) { index -> reserveAndFinishLaunchBudget(repository, "decision-$index", LlmRunnerConfig(), now.plusSeconds(10 + index.toLong())) }
+        repeat(4) { index -> reserveAndFinishLaunchBudget(repository, "decision-$index", LlmRunnerConfig(), now.plusSeconds(10 + index.toLong())) }
         val headroom = repository.tryReserve(
             launchBudgetRequest("report-headroom", LlmRunnerConfig(), now.plusSeconds(20), LlmDaemonTriggerKind.EVALUATION_REPORT),
         ).getOrThrow()
-        assertEquals(LlmLaunchReservationRejectionReason.INSUFFICIENT_EVALUATION_HOURLY_HEADROOM, assertIs<LlmLaunchReservationOutcome.Rejected>(headroom).reason)
+        assertEquals(LlmLaunchReservationRejectionReason.ENTRY_FILL_HOURLY_RESERVE, assertIs<LlmLaunchReservationOutcome.Rejected>(headroom).reason)
     }
 
     @Test
-    fun defaultHourlyCap_allowsSeventhAndRejectsEighthReservation() = runBlocking {
+    fun defaultHourlyCap_preservesBothCriticalReserves() = runBlocking {
         val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         val config = LlmRunnerConfig()
 
-        repeat(7) { index ->
+        repeat(5) { index ->
             val reservedAt = launchBudgetFixedInstant().plus(Duration.ofMinutes(index.toLong()))
 
             reserveAndFinishLaunchBudget(
@@ -49,6 +49,8 @@ class LlmLaunchReservationRepositoryTest {
                 reservedAt = reservedAt,
             )
         }
+        reserveAndFinishLaunchBudget(repository, "entry", config, launchBudgetFixedInstant().plusSeconds(301), LlmDaemonTriggerKind.ENTRY_FILL)
+        reserveAndFinishLaunchBudget(repository, "stop", config, launchBudgetFixedInstant().plusSeconds(302), LlmDaemonTriggerKind.STOP_PROXIMITY)
 
         val eighthOutcome = repository.tryReserve(
             launchBudgetRequest(
@@ -65,18 +67,24 @@ class LlmLaunchReservationRepositoryTest {
     }
 
     @Test
-    fun defaultDailyCap_allowsHundredTwentiethAndRejectsHundredTwentyFirstReservation() = runBlocking {
+    fun defaultDailyCap_preservesBothCriticalReserves() = runBlocking {
         val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         val config = LlmRunnerConfig()
 
         repeat(120) { index ->
-            val reservedAt = launchBudgetFixedInstant().plus(Duration.ofMinutes(index * 12L))
+            val reservedAt = launchBudgetFixedInstant().plusSeconds(index * 721L)
+            val triggerKind = when (index) {
+                in 0..3 -> LlmDaemonTriggerKind.ENTRY_FILL
+                in 4..7 -> LlmDaemonTriggerKind.STOP_PROXIMITY
+                else -> LlmDaemonTriggerKind.FLAT_HEARTBEAT
+            }
 
             reserveAndFinishLaunchBudget(
                 repository = repository,
                 invocationId = "daily-$index",
                 config = config,
                 reservedAt = reservedAt,
+                triggerKind = triggerKind,
             )
         }
 
@@ -116,12 +124,14 @@ private suspend fun reserveAndFinishLaunchBudget(
     invocationId: String,
     config: LlmRunnerConfig,
     reservedAt: Instant,
+    triggerKind: LlmDaemonTriggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
 ) {
     val outcome = repository.tryReserve(
         launchBudgetRequest(
             invocationId = invocationId,
             config = config,
             reservedAt = reservedAt,
+            triggerKind = triggerKind,
         ),
     ).getOrThrow()
 

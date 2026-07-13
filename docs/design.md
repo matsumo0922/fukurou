@@ -48,7 +48,7 @@
 
 [確定事項の改訂: 2026-07-03] 2026-07-02 の「flat時15分定期発火廃止」は、サブスク枠の実数が未確定な段階で token 消費を抑えるための保守運用案だった。Claude Max / Codex Pro 20x の Usage UI と #28 の token / cost 集計で消費を別途監視する前提で、学習データ収集を優先し、daemon 学習期は flat / 保有中とも 15分 cadence を暫定採用する。
 
-- 既定値は flat heartbeat 15分、保有中 check 15分、hard cap 7/hour・120/day とする。routine cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。
+- 既定値は flat heartbeat 15分、保有中 check 15分、hard cap 7/hour・120/day とする。`ENTRY_FILL` と `STOP_PROXIMITY` にそれぞれ 1/hour・4/day を保証し、normal trigger は両方の未使用 reserve を侵食しない。
 - 経済イベント trigger も同じ hourly / daily 予算を消費し、heartbeat とは別枠にしない。
 - open position が 0 件で position 未紐付けの BUY resting entry だけが生存する tick は、trigger reservation より前に決定論的 maintenance へ分岐する。データ欠損時も full LLM へ fail-openせず typed suppression reason を残し、注文の TTL、価格、種別、fill 判定は変更しない。open position が併存する場合は position safety 用 trigger を優先する。
 - Proposer 起動前の material-state manifest は invocation ID を主キーに append-only で保存する。decision と intent の episode / thesis / geometry / material-state identity は同一 transaction で dual-writeし、proposal の関係を append-only shadow observation として記録する。
@@ -57,7 +57,7 @@
 
 ### 1.2.2 paper trading 週次反省会による runtime / prompt 改訂
 
-[確定] `safety.minExpectedMoveToCostRatio` の既定値は 2.5、`runner.maxInvocationsPerHour` の既定値は 7、`runner.maxInvocationsPerDay` は 120、flat / holding cadence は 15分とする。routine cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。production の active runtime config に明示値が保存済みの場合、catalog default 変更では上書きされないため、`/ops/runtime-config` の draft / activate で active 値を更新する。
+[確定] `safety.minExpectedMoveToCostRatio` の既定値は 2.5、runner hard cap は 7/hour・120/day、`ENTRY_FILL` と `STOP_PROXIMITY` の reserve はそれぞれ 1/hour・4/day とする。normal trigger の保証枠は 5/hour・112/day である。production active 値は catalog default で上書きせず、明示的な runtime config operation でだけ変更する。
 
 system prompt v1.13 は、直近 `no_trade_conditions_ja` の entry trigger / invalidation 分類、goalpost-moving 禁止、高 volatility 時の risk-based sizing と ATR based STOP、ブレイク水準への STOP entry intent 検討を要求する。`knowledge_get_recent_lessons` の SafetyFloor 拒否は Falsifier verdict と別 layer として読み、同一 setup / thesis を再提案する場合は現在の MCP evidence と prior intent の客観差分を示す。申告勝率・expected R・TP・STOP を threshold に合わせるだけの変更は改善と扱わず、差分を示せない場合は NO_TRADE とする。EV gate は resting LIMIT entry を maker fee(rebate) と保護 exit 側 taker fee / slippage reserve で評価し、板を跨ぐ LIMIT / MARKET / STOP entry を taker fee と entry / exit 両側の market slippage reserve で評価する。既定 NO_TRADE、STOP 必須、ナンピン禁止、最大 drawdown 停止、exposure 上限は維持する。
 
@@ -1447,7 +1447,7 @@ suspend fun handleTrigger(
 
 [確定] 学習期は flat / 保有中とも15分 cadence を採用する。routine cadence は最大 4/hour・96/day を使い、hard cap は 7/hour・120/day とする。Step1スパイクと #19 の実測値を入力にしつつ、#28 で実運用 token・所要時間・tool call数・サブスク枠消費を集計する。起動あたりエントリー率は行動バイアスの健全性メトリクスとして監視する。
 
-[確定] runtime catalog default の `runner.maxInvocationsPerHour` は 7/hour、`runner.maxInvocationsPerDay` は 120/day とする。flat / holding の15分 cadence は最大 4/hour・96/day を使う。event trigger に専用 headroom は予約せず、同じ hard cap の未使用予算を追加で最大 3/hour・24/day まで使う。既存 production active config の明示値は catalog default 変更で上書きされないため、deploy 後に `/ops/runtime-config` の draft / activate で active 値を更新する。
+[確定] runtime catalog default の hard cap は 7/hour・120/day で、`ENTRY_FILL` と `STOP_PROXIMITY` にそれぞれ 1/hour・4/day の対称 reserve を持つ。critical trigger は他方の未使用 reserve を侵食せず、自分の保証量を超える場合は normal 余力を使う。direct runner も `MANUAL` として予約し、runner は invocation ID と trigger kind が予約に一致する場合だけ LLM process を開始する。
 
 ### 6.4 1起動内で許可すること/禁止すること
 

@@ -2,6 +2,11 @@ package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.daemon.LLM_LAUNCH_DISABLED
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
@@ -9,6 +14,9 @@ import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.invoker.safeCodexFailureOrNull
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import java.nio.file.Path
+import java.time.Duration
+import java.time.Instant
+import java.util.UUID
 import kotlin.system.exitProcess
 
 /**
@@ -57,6 +65,7 @@ internal suspend fun runOneShotRunnerMain(
     )
 }
 
+@Suppress("LongMethod")
 private suspend fun launchOneShotRunner(environment: Map<String, String>): OneShotRunnerResult {
     val runtimeConfigResolution = TradingRuntimeFactory.resolveRuntimeConfigFromEnvironment(environment)
     val tradingConfig = runtimeConfigResolution.tradingConfig
@@ -66,6 +75,22 @@ private suspend fun launchOneShotRunner(environment: Map<String, String>): OneSh
     )
 
     try {
+        val invocationId = UUID.randomUUID().toString()
+        val reservation = tradingRuntime.launchReservationRepository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                triggerKey = "direct:$invocationId",
+                reservedAt = Instant.now(),
+                runnerConfig = tradingConfig.runner,
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofHours(24),
+                activeReservationStaleAfter = tradingConfig.daemon.launchReservationStaleAfter,
+            ),
+        ).getOrThrow()
+        check(reservation is LlmLaunchReservationOutcome.Reserved) {
+            "LLM launch reservation rejected: ${(reservation as LlmLaunchReservationOutcome.Rejected).reason.name}"
+        }
         val runner = OneShotLlmRunner(
             tradingRuntime = tradingRuntime,
             tradingConfig = tradingConfig,
@@ -94,8 +119,21 @@ private suspend fun launchOneShotRunner(environment: Map<String, String>): OneSh
             marketSnapshotId = environment["FUKUROU_MARKET_SNAPSHOT_ID"],
             proposerAssignment = tradingConfig.llmRoleAssignments.proposer,
             falsifierAssignment = tradingConfig.llmRoleAssignments.falsifier,
+            invocationId = invocationId,
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
         )
-        return runner.runOneShot(request).getOrThrow()
+        return try {
+            runner.runOneShot(request).getOrThrow().also {
+                tradingRuntime.launchReservationRepository.finish(
+                    LlmLaunchReservationFinish(invocationId, LlmLaunchReservationStatus.FINISHED, null, Instant.now()),
+                ).getOrThrow()
+            }
+        } catch (throwable: Throwable) {
+            tradingRuntime.launchReservationRepository.finish(
+                LlmLaunchReservationFinish(invocationId, LlmLaunchReservationStatus.FAILED, throwable.javaClass.simpleName, Instant.now()),
+            ).getOrThrow()
+            throw throwable
+        }
     } finally {
         tradingRuntime.close()
     }

@@ -231,6 +231,10 @@ data class PaperMarketConfig(
  * @param perRunTimeout 1 LLM CLI 起動の timeout
  * @param maxInvocationsPerHour 直近 1 時間に許可する runner 起動数
  * @param maxInvocationsPerDay 直近 24 時間に許可する runner 起動数
+ * @param entryFillReservePerHour ENTRY_FILL に保証する 1 時間の起動数
+ * @param entryFillReservePerDay ENTRY_FILL に保証する 24 時間の起動数
+ * @param stopProximityReservePerHour STOP_PROXIMITY に保証する 1 時間の起動数
+ * @param stopProximityReservePerDay STOP_PROXIMITY に保証する 24 時間の起動数
  */
 data class LlmRunnerConfig(
     val maxToolCallsPerRun: Int = DEFAULT_MAX_TOOL_CALLS_PER_RUN,
@@ -238,6 +242,10 @@ data class LlmRunnerConfig(
     val perRunTimeout: Duration = DEFAULT_LLM_PER_RUN_TIMEOUT,
     val maxInvocationsPerHour: Int = DEFAULT_MAX_INVOCATIONS_PER_HOUR,
     val maxInvocationsPerDay: Int = DEFAULT_MAX_INVOCATIONS_PER_DAY,
+    val entryFillReservePerHour: Int = DEFAULT_ENTRY_FILL_RESERVE_PER_HOUR,
+    val entryFillReservePerDay: Int = DEFAULT_ENTRY_FILL_RESERVE_PER_DAY,
+    val stopProximityReservePerHour: Int = DEFAULT_STOP_PROXIMITY_RESERVE_PER_HOUR,
+    val stopProximityReservePerDay: Int = DEFAULT_STOP_PROXIMITY_RESERVE_PER_DAY,
 ) {
     init {
         val toolLimitIsConservative = maxToolCallsPerRun in 1..DEFAULT_MAX_TOOL_CALLS_PER_RUN
@@ -247,6 +255,14 @@ data class LlmRunnerConfig(
         val hourlyLimitIsConservative = maxInvocationsPerHour in 1..DEFAULT_MAX_INVOCATIONS_PER_HOUR
         val dailyLimitIsConservative = maxInvocationsPerDay in 1..DEFAULT_MAX_INVOCATIONS_PER_DAY
         val actLimitFitsTotal = maxActToolCallsPerRun <= maxToolCallsPerRun
+        val reservesAreNonNegative = listOf(
+            entryFillReservePerHour,
+            entryFillReservePerDay,
+            stopProximityReservePerHour,
+            stopProximityReservePerDay,
+        ).all { reserve -> reserve >= 0 }
+        val hourlyReservesFit = entryFillReservePerHour + stopProximityReservePerHour < maxInvocationsPerHour
+        val dailyReservesFit = entryFillReservePerDay + stopProximityReservePerDay < maxInvocationsPerDay
 
         require(toolLimitIsConservative) {
             "maxToolCallsPerRun must be between 1 and $DEFAULT_MAX_TOOL_CALLS_PER_RUN."
@@ -266,6 +282,9 @@ data class LlmRunnerConfig(
         require(actLimitFitsTotal) {
             "maxActToolCallsPerRun must be less than or equal to maxToolCallsPerRun."
         }
+        require(reservesAreNonNegative) { "Critical launch reserves must not be negative." }
+        require(hourlyReservesFit) { "Hourly critical launch reserves must total less than maxInvocationsPerHour." }
+        require(dailyReservesFit) { "Daily critical launch reserves must total less than maxInvocationsPerDay." }
     }
 }
 
@@ -524,6 +543,10 @@ private const val FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR_ENV = "FUKUROU_LLM_MAX_IN
  * 直近 24 時間の runner 起動上限の環境変数名。
  */
 private const val FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY_ENV = "FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY"
+private const val FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_HOUR_ENV = "FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_HOUR"
+private const val FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_DAY_ENV = "FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_DAY"
+private const val FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_HOUR_ENV = "FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_HOUR"
+private const val FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_DAY_ENV = "FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_DAY"
 
 /**
  * LLM daemon scheduler 有効化の環境変数名。
@@ -743,6 +766,10 @@ const val DEFAULT_MAX_INVOCATIONS_PER_HOUR = 7
  * 直近 24 時間の既定 runner 起動上限。
  */
 const val DEFAULT_MAX_INVOCATIONS_PER_DAY = 120
+const val DEFAULT_ENTRY_FILL_RESERVE_PER_HOUR = 1
+const val DEFAULT_ENTRY_FILL_RESERVE_PER_DAY = 4
+const val DEFAULT_STOP_PROXIMITY_RESERVE_PER_HOUR = 1
+const val DEFAULT_STOP_PROXIMITY_RESERVE_PER_DAY = 4
 
 /**
  * LLM daemon scheduler 有効化の既定値。
@@ -1003,6 +1030,14 @@ private fun Map<String, String>.readLlmRunnerConfig(): LlmRunnerConfig {
         maxInvocationsPerDay = readOptional(FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY_ENV)
             ?.toInt()
             ?: DEFAULT_MAX_INVOCATIONS_PER_DAY,
+        entryFillReservePerHour = readOptional(FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_HOUR_ENV)
+            ?.toInt() ?: DEFAULT_ENTRY_FILL_RESERVE_PER_HOUR,
+        entryFillReservePerDay = readOptional(FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_DAY_ENV)
+            ?.toInt() ?: DEFAULT_ENTRY_FILL_RESERVE_PER_DAY,
+        stopProximityReservePerHour = readOptional(FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_HOUR_ENV)
+            ?.toInt() ?: DEFAULT_STOP_PROXIMITY_RESERVE_PER_HOUR,
+        stopProximityReservePerDay = readOptional(FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_DAY_ENV)
+            ?.toInt() ?: DEFAULT_STOP_PROXIMITY_RESERVE_PER_DAY,
     )
 }
 

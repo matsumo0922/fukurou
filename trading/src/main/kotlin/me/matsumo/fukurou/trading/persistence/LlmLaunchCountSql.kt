@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.persistence
 
+import me.matsumo.fukurou.trading.daemon.LlmLaunchUsage
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.time.Instant
 
@@ -7,14 +8,17 @@ import java.time.Instant
  * LLM 起動数を reservation 優先、legacy audit fallback で数える SQL。
  */
 private const val COUNT_DISTINCT_LLM_LAUNCHES_SINCE_SQL = """
-    SELECT COUNT(DISTINCT launch_id)
+    SELECT
+        COUNT(DISTINCT launch_id) AS total,
+        COUNT(DISTINCT launch_id) FILTER (WHERE trigger_kind = 'ENTRY_FILL') AS entry_fill,
+        COUNT(DISTINCT launch_id) FILTER (WHERE trigger_kind = 'STOP_PROXIMITY') AS stop_proximity
     FROM (
-        SELECT reservations.invocation_id AS launch_id
+        SELECT reservations.invocation_id AS launch_id, reservations.trigger_kind AS trigger_kind
         FROM llm_launch_reservations AS reservations
         WHERE reservations.reserved_at >= ?
             AND (? IS NULL OR reservations.invocation_id <> ?)
         UNION
-        SELECT events.decision_run_id AS launch_id
+        SELECT events.decision_run_id AS launch_id, NULL AS trigger_kind
         FROM command_event_log AS events
         WHERE events.decision_run_id IS NOT NULL
             AND events.event_type IN ('RUNNER_PHASE_COMPLETED', 'NO_TRADE_EXIT')
@@ -35,6 +39,14 @@ private const val COUNT_DISTINCT_LLM_LAUNCHES_SINCE_SQL = """
  * @param excludedInvocationId 集計から除外する invocation ID
  */
 internal fun JdbcTransaction.countDistinctLlmLaunchesSince(since: Instant, excludedInvocationId: String? = null): Int {
+    return aggregateLlmLaunchUsageSince(since, excludedInvocationId).total
+}
+
+/** total と critical trigger 別 usage を1 aggregate queryで返す。 */
+internal fun JdbcTransaction.aggregateLlmLaunchUsageSince(
+    since: Instant,
+    excludedInvocationId: String? = null,
+): LlmLaunchUsage {
     return jdbcConnection().prepareStatement(COUNT_DISTINCT_LLM_LAUNCHES_SINCE_SQL).use { statement ->
         statement.setLong(1, since.toEpochMilli())
         statement.setNullableString(2, excludedInvocationId)
@@ -43,7 +55,8 @@ internal fun JdbcTransaction.countDistinctLlmLaunchesSince(since: Instant, exclu
         statement.setNullableString(5, excludedInvocationId)
         statement.setNullableString(6, excludedInvocationId)
         statement.executeQuery().use { resultSet ->
-            if (resultSet.next()) resultSet.getInt(1) else 0
+            check(resultSet.next()) { "LLM launch aggregate query returned no row." }
+            LlmLaunchUsage(resultSet.getInt("total"), resultSet.getInt("entry_fill"), resultSet.getInt("stop_proximity"))
         }
     }
 }

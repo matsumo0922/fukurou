@@ -324,6 +324,16 @@ class OneShotLlmRunner(
      */
     suspend fun runOneShot(request: OneShotRunnerRequest): Result<OneShotRunnerResult> {
         val invocationId = request.invocationId ?: idGenerator().toString()
+        val triggerKind = request.triggerKind
+            ?: return Result.failure(IllegalStateException(LAUNCH_RESERVATION_MISSING))
+        val reservedTrigger = tradingRuntime.launchReservationRepository.findTriggerKind(invocationId)
+            .getOrElse { return Result.failure(IllegalStateException(LAUNCH_RESERVATION_QUERY_FAILED, it)) }
+            ?: return Result.failure(IllegalStateException(LAUNCH_RESERVATION_MISSING))
+
+        if (reservedTrigger != triggerKind) {
+            return Result.failure(IllegalStateException(LAUNCH_RESERVATION_TRIGGER_MISMATCH))
+        }
+
         val marketSnapshotId = request.marketSnapshotId ?: "manual-$invocationId"
         val llmRunStart = LlmRunStart(
             invocationId = invocationId,
@@ -1074,6 +1084,10 @@ class OneShotLlmRunner(
         logger("[fukurou-runner] $message")
     }
 }
+
+internal const val LAUNCH_RESERVATION_MISSING = "launch_reservation_missing"
+internal const val LAUNCH_RESERVATION_TRIGGER_MISMATCH = "launch_reservation_trigger_mismatch"
+internal const val LAUNCH_RESERVATION_QUERY_FAILED = "launch_reservation_query_failed"
 
 private fun TradeIntentRecord.toPlaceOrderCommand(
     call: GuardedToolCall,

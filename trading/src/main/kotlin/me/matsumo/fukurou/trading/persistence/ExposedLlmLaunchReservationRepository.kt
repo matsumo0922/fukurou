@@ -78,6 +78,9 @@ private const val SELECT_LATEST_FINISHED_LLM_LAUNCH_RESERVED_AT_SQL = """
     WHERE trigger_key = ?
         AND status = ?
 """
+private const val SELECT_LLM_LAUNCH_TRIGGER_KIND_SQL = """
+    SELECT trigger_kind FROM llm_launch_reservations WHERE invocation_id = ?
+"""
 
 /**
  * Exposed/JDBC で LLM daemon scheduler の起動予約を扱う repository。
@@ -107,6 +110,20 @@ class ExposedLlmLaunchReservationRepository(
             }
         }
     }
+
+    override suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    jdbcConnection().prepareStatement(SELECT_LLM_LAUNCH_TRIGGER_KIND_SQL).use { statement ->
+                        statement.setString(1, invocationId)
+                        statement.executeQuery().use { resultSet ->
+                            if (resultSet.next()) LlmDaemonTriggerKind.valueOf(resultSet.getString(1)) else null
+                        }
+                    }
+                }
+            }
+        }
 
     override suspend fun latestReservedAt(triggerKey: String): Result<Instant?> {
         return withContext(Dispatchers.IO) {
@@ -162,10 +179,10 @@ fun JdbcTransaction.tryReserveLlmLaunchInTransaction(
         )
     }
 
-    val hourlyCount = countDistinctLlmLaunchesSince(request.reservedAt.minus(request.hourlyWindow))
-    val dailyCount = countDistinctLlmLaunchesSince(request.reservedAt.minus(request.dailyWindow))
+    val hourlyUsage = aggregateLlmLaunchUsageSince(request.reservedAt.minus(request.hourlyWindow))
+    val dailyUsage = aggregateLlmLaunchUsageSince(request.reservedAt.minus(request.dailyWindow))
 
-    launchBudgetRejection(request, hourlyCount, dailyCount)?.let { rejectionReason ->
+    launchBudgetRejection(request, hourlyUsage, dailyUsage)?.let { rejectionReason ->
         return LlmLaunchReservationOutcome.Rejected(rejectionReason)
     }
 

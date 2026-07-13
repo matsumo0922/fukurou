@@ -447,10 +447,14 @@ private fun retryAfterSeconds(reason: LlmLaunchReservationRejectionReason): Long
     LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION -> 15
     LlmLaunchReservationRejectionReason.REPORT_RATE_LIMIT,
     LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR,
+    LlmLaunchReservationRejectionReason.ENTRY_FILL_HOURLY_RESERVE,
+    LlmLaunchReservationRejectionReason.STOP_PROXIMITY_HOURLY_RESERVE,
     LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM,
     LlmLaunchReservationRejectionReason.INSUFFICIENT_EVALUATION_HOURLY_HEADROOM,
     -> Duration.ofHours(1).seconds
     LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY,
+    LlmLaunchReservationRejectionReason.ENTRY_FILL_DAILY_RESERVE,
+    LlmLaunchReservationRejectionReason.STOP_PROXIMITY_DAILY_RESERVE,
     LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_DAILY_HEADROOM,
     LlmLaunchReservationRejectionReason.INSUFFICIENT_EVALUATION_DAILY_HEADROOM,
     -> Duration.ofDays(1).seconds

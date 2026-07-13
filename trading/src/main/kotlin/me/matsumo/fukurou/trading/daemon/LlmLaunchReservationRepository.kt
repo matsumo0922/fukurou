@@ -177,6 +177,18 @@ enum class LlmLaunchReservationRejectionReason {
      */
     MAX_INVOCATIONS_PER_DAY,
 
+    /** ENTRY_FILL の未使用 1 時間 reserve を保護した。 */
+    ENTRY_FILL_HOURLY_RESERVE,
+
+    /** ENTRY_FILL の未使用 24 時間 reserve を保護した。 */
+    ENTRY_FILL_DAILY_RESERVE,
+
+    /** STOP_PROXIMITY の未使用 1 時間 reserve を保護した。 */
+    STOP_PROXIMITY_HOURLY_RESERVE,
+
+    /** STOP_PROXIMITY の未使用 24 時間 reserve を保護した。 */
+    STOP_PROXIMITY_DAILY_RESERVE,
+
     /**
      * reflection 用に残すべき 1 時間 headroom を下回っていた。
      */
@@ -211,6 +223,11 @@ interface LlmLaunchReservationRepository {
      * 起動予約を完了状態へ更新する。
      */
     suspend fun finish(finish: LlmLaunchReservationFinish): Result<Unit>
+
+    /** runner preflight 用に予約の trigger identity を返す。 */
+    suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> {
+        return Result.failure(UnsupportedOperationException("Reservation identity lookup is not implemented."))
+    }
 
     /**
      * trigger key ごとの最後の予約時刻を返す。
@@ -274,6 +291,10 @@ class InMemoryLlmLaunchReservationRepository(
                 )
             }
         }
+    }
+
+    override suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> = runCatching {
+        mutex.withLock { reservations.firstOrNull { it.invocationId == invocationId }?.triggerKind }
     }
 
     override suspend fun latestReservedAt(triggerKey: String): Result<Instant?> {
@@ -343,10 +364,10 @@ class InMemoryLlmLaunchReservationRepository(
             )
         }
 
-        val hourlyCount = countReservationsSince(request.reservedAt.minus(request.hourlyWindow))
-        val dailyCount = countReservationsSince(request.reservedAt.minus(request.dailyWindow))
+        val hourlyUsage = usageSince(request.reservedAt.minus(request.hourlyWindow))
+        val dailyUsage = usageSince(request.reservedAt.minus(request.dailyWindow))
 
-        launchBudgetRejection(request, hourlyCount, dailyCount)?.let { rejectionReason ->
+        launchBudgetRejection(request, hourlyUsage, dailyUsage)?.let { rejectionReason ->
             return LlmLaunchReservationOutcome.Rejected(rejectionReason)
         }
 
@@ -363,12 +384,15 @@ class InMemoryLlmLaunchReservationRepository(
         return LlmLaunchReservationOutcome.Reserved(request.invocationId)
     }
 
-    private fun countReservationsSince(since: Instant): Int {
-        return reservations
-            .filter { reservation -> !reservation.reservedAt.isBefore(since) }
-            .map { reservation -> reservation.invocationId }
-            .distinct()
-            .size
+    private fun usageSince(since: Instant): LlmLaunchUsage {
+        val current = reservations.filter { reservation -> !reservation.reservedAt.isBefore(since) }
+        return LlmLaunchUsage(
+            total = current.distinctBy { it.invocationId }.size,
+            entryFill = current.filter { it.triggerKind == LlmDaemonTriggerKind.ENTRY_FILL }.distinctBy { it.invocationId }.size,
+            stopProximity = current.filter {
+                it.triggerKind == LlmDaemonTriggerKind.STOP_PROXIMITY
+            }.distinctBy { it.invocationId }.size,
+        )
     }
 }
 
@@ -425,15 +449,21 @@ const val REFLECTION_MIN_REMAINING_DAILY_INVOCATIONS = 4
 
 internal fun launchBudgetRejection(
     request: LlmLaunchReservationRequest,
-    hourlyCount: Int,
-    dailyCount: Int,
+    hourlyUsage: LlmLaunchUsage,
+    dailyUsage: LlmLaunchUsage,
 ): LlmLaunchReservationRejectionReason? {
-    val hourlyRemaining = request.runnerConfig.maxInvocationsPerHour - hourlyCount
-    val dailyRemaining = request.runnerConfig.maxInvocationsPerDay - dailyCount
+    val hourlyRemaining = request.runnerConfig.maxInvocationsPerHour - hourlyUsage.total
+    val dailyRemaining = request.runnerConfig.maxInvocationsPerDay - dailyUsage.total
     val reflectionRequest = request.triggerKind == LlmDaemonTriggerKind.REFLECTION
     val evaluationRequest = request.triggerKind == LlmDaemonTriggerKind.EVALUATION_REPORT
     val hourlyExceeded = hourlyRemaining <= 0
     val dailyExceeded = dailyRemaining <= 0
+
+    if (hourlyExceeded) return LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR
+    if (dailyExceeded) return LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY
+
+    reserveRejection(request, hourlyUsage, hourly = true)?.let { return it }
+    reserveRejection(request, dailyUsage, hourly = false)?.let { return it }
 
     if (reflectionRequest && hourlyRemaining <= REFLECTION_MIN_REMAINING_HOURLY_INVOCATIONS) {
         return LlmLaunchReservationRejectionReason.INSUFFICIENT_REFLECTION_HOURLY_HEADROOM
@@ -448,12 +478,32 @@ internal fun launchBudgetRejection(
         return LlmLaunchReservationRejectionReason.INSUFFICIENT_EVALUATION_DAILY_HEADROOM
     }
 
-    if (hourlyExceeded) {
-        return LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR
-    }
-    if (dailyExceeded) {
-        return LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY
-    }
-
     return null
+}
+
+/** rolling window 内の total と critical trigger 別 usage。 */
+data class LlmLaunchUsage(val total: Int, val entryFill: Int, val stopProximity: Int)
+
+@Suppress("CyclomaticComplexMethod")
+private fun reserveRejection(
+    request: LlmLaunchReservationRequest,
+    usage: LlmLaunchUsage,
+    hourly: Boolean,
+): LlmLaunchReservationRejectionReason? {
+    val config = request.runnerConfig
+    val hardCap = if (hourly) config.maxInvocationsPerHour else config.maxInvocationsPerDay
+    val entryReserve = if (hourly) config.entryFillReservePerHour else config.entryFillReservePerDay
+    val stopReserve = if (hourly) config.stopProximityReservePerHour else config.stopProximityReservePerDay
+    val unusedEntry = (entryReserve - usage.entryFill).coerceAtLeast(0)
+    val unusedStop = (stopReserve - usage.stopProximity).coerceAtLeast(0)
+    val protectedEntry = request.triggerKind != LlmDaemonTriggerKind.ENTRY_FILL && usage.total >= hardCap - unusedEntry - if (request.triggerKind == LlmDaemonTriggerKind.STOP_PROXIMITY) 0 else unusedStop
+    val protectedStop = request.triggerKind != LlmDaemonTriggerKind.STOP_PROXIMITY && usage.total >= hardCap - unusedStop - if (request.triggerKind == LlmDaemonTriggerKind.ENTRY_FILL) 0 else unusedEntry
+
+    return when {
+        protectedEntry && hourly -> LlmLaunchReservationRejectionReason.ENTRY_FILL_HOURLY_RESERVE
+        protectedEntry -> LlmLaunchReservationRejectionReason.ENTRY_FILL_DAILY_RESERVE
+        protectedStop && hourly -> LlmLaunchReservationRejectionReason.STOP_PROXIMITY_HOURLY_RESERVE
+        protectedStop -> LlmLaunchReservationRejectionReason.STOP_PROXIMITY_DAILY_RESERVE
+        else -> null
+    }
 }

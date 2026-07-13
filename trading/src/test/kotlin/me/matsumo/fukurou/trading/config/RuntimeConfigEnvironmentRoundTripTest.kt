@@ -137,6 +137,10 @@ private fun nonDefaultRuntimeConfig(): TradingBotConfig {
             perRunTimeout = Duration.ofSeconds(240),
             maxInvocationsPerHour = 3,
             maxInvocationsPerDay = 48,
+            entryFillReservePerHour = 0,
+            entryFillReservePerDay = 3,
+            stopProximityReservePerHour = 0,
+            stopProximityReservePerDay = 3,
         ),
         daemon = config.daemon.copy(
             enabled = true,

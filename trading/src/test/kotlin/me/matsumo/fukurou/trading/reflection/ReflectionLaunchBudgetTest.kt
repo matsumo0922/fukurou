@@ -64,7 +64,11 @@ class ReflectionLaunchBudgetTest {
             reflectionReservationRequest(
                 invocationId = "hourly-trading-run",
                 triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
-                runnerConfig = LlmRunnerConfig(maxInvocationsPerHour = 2),
+                runnerConfig = LlmRunnerConfig(
+                    maxInvocationsPerHour = 2,
+                    entryFillReservePerHour = 0,
+                    stopProximityReservePerHour = 0,
+                ),
             ),
         ).getOrThrow()
         hourlyFixture.reservationRepository.finish(
@@ -75,7 +79,11 @@ class ReflectionLaunchBudgetTest {
             reflectionReservationRequest(
                 invocationId = "hourly-reflection-run",
                 triggerKind = LlmDaemonTriggerKind.REFLECTION,
-                runnerConfig = LlmRunnerConfig(maxInvocationsPerHour = 2),
+                runnerConfig = LlmRunnerConfig(
+                    maxInvocationsPerHour = 2,
+                    entryFillReservePerHour = 0,
+                    stopProximityReservePerHour = 0,
+                ),
             ),
         ).getOrThrow()
 
@@ -84,7 +92,11 @@ class ReflectionLaunchBudgetTest {
             reflectionReservationRequest(
                 invocationId = "daily-trading-run",
                 triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
-                runnerConfig = LlmRunnerConfig(maxInvocationsPerDay = 5),
+                runnerConfig = LlmRunnerConfig(
+                    maxInvocationsPerDay = 5,
+                    entryFillReservePerDay = 0,
+                    stopProximityReservePerDay = 0,
+                ),
             ),
         ).getOrThrow()
         dailyFixture.reservationRepository.finish(
@@ -95,7 +107,11 @@ class ReflectionLaunchBudgetTest {
             reflectionReservationRequest(
                 invocationId = "daily-reflection-run",
                 triggerKind = LlmDaemonTriggerKind.REFLECTION,
-                runnerConfig = LlmRunnerConfig(maxInvocationsPerDay = 5),
+                runnerConfig = LlmRunnerConfig(
+                    maxInvocationsPerDay = 5,
+                    entryFillReservePerDay = 0,
+                    stopProximityReservePerDay = 0,
+                ),
             ),
         ).getOrThrow()
 

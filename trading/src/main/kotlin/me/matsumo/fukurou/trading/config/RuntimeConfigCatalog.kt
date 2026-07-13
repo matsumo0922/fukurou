@@ -324,6 +324,10 @@ object RuntimeConfigCatalog {
                     unit = "invocations",
                     safetyTier = RuntimeConfigSafetyTier.GUARDED,
                 ),
+                runtimeItem("runner.entryFillReservePerHour", FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_HOUR_ENV, RuntimeConfigValueType.INT, defaults.config.runner.entryFillReservePerHour.toString(), config.runner.entryFillReservePerHour.toString(), "invocations", safetyTier = RuntimeConfigSafetyTier.GUARDED),
+                runtimeItem("runner.entryFillReservePerDay", FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_DAY_ENV, RuntimeConfigValueType.INT, defaults.config.runner.entryFillReservePerDay.toString(), config.runner.entryFillReservePerDay.toString(), "invocations", safetyTier = RuntimeConfigSafetyTier.GUARDED),
+                runtimeItem("runner.stopProximityReservePerHour", FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_HOUR_ENV, RuntimeConfigValueType.INT, defaults.config.runner.stopProximityReservePerHour.toString(), config.runner.stopProximityReservePerHour.toString(), "invocations", safetyTier = RuntimeConfigSafetyTier.GUARDED),
+                runtimeItem("runner.stopProximityReservePerDay", FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_DAY_ENV, RuntimeConfigValueType.INT, defaults.config.runner.stopProximityReservePerDay.toString(), config.runner.stopProximityReservePerDay.toString(), "invocations", safetyTier = RuntimeConfigSafetyTier.GUARDED),
                 runtimeItem(
                     key = "llm.proposer.provider",
                     legacyEnvName = FUKUROU_PROPOSER_PROVIDER_ENV,
@@ -1299,6 +1303,10 @@ private const val FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS_ENV = "FUKUROU_RESTING
 private const val FUKUROU_LLM_RUN_TIMEOUT_SECONDS_ENV = "FUKUROU_LLM_RUN_TIMEOUT_SECONDS"
 private const val FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR_ENV = "FUKUROU_LLM_MAX_INVOCATIONS_PER_HOUR"
 private const val FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY_ENV = "FUKUROU_LLM_MAX_INVOCATIONS_PER_DAY"
+private const val FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_HOUR_ENV = "FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_HOUR"
+private const val FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_DAY_ENV = "FUKUROU_LLM_ENTRY_FILL_RESERVE_PER_DAY"
+private const val FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_HOUR_ENV = "FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_HOUR"
+private const val FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_DAY_ENV = "FUKUROU_LLM_STOP_PROXIMITY_RESERVE_PER_DAY"
 private const val FUKUROU_LLM_DAEMON_ENABLED_ENV = "FUKUROU_LLM_DAEMON_ENABLED"
 private const val FUKUROU_LLM_DAEMON_POLL_SECONDS_ENV = "FUKUROU_LLM_DAEMON_POLL_SECONDS"
 private const val FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS_ENV = "FUKUROU_LLM_FLAT_HEARTBEAT_SECONDS"

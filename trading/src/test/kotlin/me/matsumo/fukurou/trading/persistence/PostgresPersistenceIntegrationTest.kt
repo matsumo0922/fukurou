@@ -3421,7 +3421,8 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedLlmLaunchReservationRepository(database)
-        val config = LlmRunnerConfig(maxInvocationsPerDay = 1)
+        val config =
+            LlmRunnerConfig(maxInvocationsPerDay = 1, entryFillReservePerDay = 0, stopProximityReservePerDay = 0)
 
         reserveAndFinishLlmLaunch(
             repository = repository,
@@ -3454,7 +3455,8 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedLlmLaunchReservationRepository(database)
-        val config = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1)
+        val config =
+            LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1, entryFillReservePerHour = 0, entryFillReservePerDay = 0, stopProximityReservePerHour = 0, stopProximityReservePerDay = 0)
         val nextReservedAt = fixedInstant().plus(Duration.ofHours(25))
 
         reserveAndFinishLlmLaunch(
@@ -3485,7 +3487,14 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedLlmLaunchReservationRepository(database)
-        val config = LlmRunnerConfig(maxInvocationsPerHour = 2, maxInvocationsPerDay = 2)
+        val config = LlmRunnerConfig(
+            maxInvocationsPerHour = 2,
+            maxInvocationsPerDay = 2,
+            entryFillReservePerHour = 0,
+            entryFillReservePerDay = 0,
+            stopProximityReservePerHour = 0,
+            stopProximityReservePerDay = 0,
+        )
 
         appendLlmLaunchAudit(
             database = database,
@@ -3524,7 +3533,8 @@ class PostgresPersistenceIntegrationTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
         val repository = ExposedLlmLaunchReservationRepository(database)
-        val config = LlmRunnerConfig(maxInvocationsPerHour = 2, maxInvocationsPerDay = 2)
+        val config =
+            LlmRunnerConfig(maxInvocationsPerHour = 2, maxInvocationsPerDay = 2, entryFillReservePerHour = 0, entryFillReservePerDay = 0, stopProximityReservePerHour = 0, stopProximityReservePerDay = 0)
 
         reserveAndFinishLlmLaunch(
             repository = repository,
@@ -3569,7 +3579,14 @@ class PostgresPersistenceIntegrationTest {
         val observedAt = fixedInstant().plus(Duration.ofHours(25))
         val clock = Clock.fixed(observedAt, ZoneOffset.UTC)
         val config = TradingBotConfig(
-            runner = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1),
+            runner = LlmRunnerConfig(
+                maxInvocationsPerHour = 1,
+                maxInvocationsPerDay = 1,
+                entryFillReservePerHour = 0,
+                entryFillReservePerDay = 0,
+                stopProximityReservePerHour = 0,
+                stopProximityReservePerDay = 0,
+            ),
         )
 
         TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
@@ -3617,7 +3634,14 @@ class PostgresPersistenceIntegrationTest {
         val observedAt = fixedInstant().plus(Duration.ofHours(1))
         val clock = Clock.fixed(observedAt, ZoneOffset.UTC)
         val config = TradingBotConfig(
-            runner = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 1),
+            runner = LlmRunnerConfig(
+                maxInvocationsPerHour = 1,
+                maxInvocationsPerDay = 1,
+                entryFillReservePerHour = 0,
+                entryFillReservePerDay = 0,
+                stopProximityReservePerHour = 0,
+                stopProximityReservePerDay = 0,
+            ),
         )
 
         TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
@@ -3628,21 +3652,14 @@ class PostgresPersistenceIntegrationTest {
             config = config.runner,
             reservedAt = observedAt.minus(Duration.ofMinutes(1)),
         )
-        val fixture = postgresOneShotFixture(config, clock)
+        val outcome = ExposedLlmLaunchReservationRepository(database).tryReserve(
+            llmLaunchReservationRequest("direct-run-current", config.runner, observedAt),
+        ).getOrThrow()
 
-        try {
-            val result = fixture.runner.runOneShot(postgresOneShotRequest("direct-run-current")).getOrThrow()
-            val noTradeEvents = fixture.eventLog.findEvents(
-                limit = 100,
-                eventType = CommandEventType.NO_TRADE_EXIT,
-            ).getOrThrow()
-
-            assertEquals(OneShotRunnerStatus.LAUNCH_REJECTED, result.status)
-            assertEquals(0, fixture.invoker.requests.size)
-            assertTrue(noTradeEvents.any { event -> event.payload.contains("max_invocations_per_hour_exceeded") })
-        } finally {
-            fixture.runtime.close()
-        }
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR),
+            outcome,
+        )
     }
 
     @Test
@@ -3798,7 +3815,8 @@ class PostgresPersistenceIntegrationTest {
             ),
         ).getOrThrow()
         val repository = ExposedLlmLaunchReservationRepository(database)
-        val config = LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 10)
+        val config =
+            LlmRunnerConfig(maxInvocationsPerHour = 1, maxInvocationsPerDay = 10, entryFillReservePerHour = 0, stopProximityReservePerHour = 0)
         val outcome = repository.tryReserve(llmLaunchReservationRequest("daemon-run-1", config)).getOrThrow()
 
         assertEquals(LlmLaunchReservationOutcome.Reserved("daemon-run-1"), outcome)

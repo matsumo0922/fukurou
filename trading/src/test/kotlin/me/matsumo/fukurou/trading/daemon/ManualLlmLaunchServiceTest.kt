@@ -124,7 +124,7 @@ class ManualLlmLaunchServiceTest {
     fun manualLaunch_usesReservationBudgetAndAuditsSkipWhenDailyCapIsConsumed() = runBlocking {
         val fixture = manualFixture(
             tradingConfig = tradingConfig(
-                runner = LlmRunnerConfig(maxInvocationsPerDay = 1),
+                runner = LlmRunnerConfig(maxInvocationsPerDay = 1, entryFillReservePerDay = 0, stopProximityReservePerDay = 0),
             ),
         )
 

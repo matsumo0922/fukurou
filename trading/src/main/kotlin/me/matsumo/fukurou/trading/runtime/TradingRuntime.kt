@@ -26,6 +26,8 @@ import me.matsumo.fukurou.trading.evaluation.InMemoryEvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.InMemoryLlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
+import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
@@ -35,6 +37,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedDecisionRunProjectionReposi
 import me.matsumo.fukurou.trading.persistence.ExposedEquitySnapshotRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
+import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedReconcilerStatusProvider
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
@@ -118,6 +121,7 @@ data class TradingRuntime(
     val tradingLock: TradingLock,
     val toolCallGuard: ToolCallGuard,
     val callerNoTradeGuard: CallerNoTradeGuard,
+    val launchReservationRepository: LlmLaunchReservationRepository,
     val close: () -> Unit,
     val decisionMaterialStateRepository: DecisionMaterialStateRepository = InMemoryDecisionMaterialStateRepository(),
 ) {
@@ -286,6 +290,7 @@ object TradingRuntimeFactory {
             tradingLock = tradingLock,
             toolCallGuard = toolCallGuard,
             callerNoTradeGuard = callerNoTradeGuard,
+            launchReservationRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository),
             close = {},
         )
     }
@@ -392,6 +397,7 @@ object TradingRuntimeFactory {
             tradingLock = services.tradingLock,
             toolCallGuard = services.toolCallGuard,
             callerNoTradeGuard = services.callerNoTradeGuard,
+            launchReservationRepository = ExposedLlmLaunchReservationRepository(connection.database),
             close = closeAction,
         )
     }
