@@ -5059,6 +5059,10 @@ class PostgresPersistenceIntegrationTest {
                 realizedPnlJpy = "20.00000000",
             )
         }.isFailure
+        val preCLivePositionId = insertPreCLiveLedgerRows(
+            database = database,
+            realizedPnlJpy = "20.00000000",
+        )
 
         val repository = ExposedPaperLedgerRepository(database)
         val positions = repository.getOpenPositions().getOrThrow()
@@ -5071,6 +5075,29 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(listOf(TradingMode.PAPER), executions.map { execution -> execution.mode })
         assertEquals("10.00000000", realizedPnl.toPlainString())
         assertTrue(liveFixtureRejected)
+        assertTrue(positions.none { position -> position.positionId == preCLivePositionId.toString() })
+        assertTrue(orders.none { order -> order.positionId == preCLivePositionId.toString() })
+        assertTrue(executions.none { execution -> execution.positionId == preCLivePositionId.toString() })
+    }
+
+    @Test
+    fun newLiveLedgerCreationFailsClosedAfterC0() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val result = runCatching {
+            insertLedgerRows(
+                database = database,
+                mode = TradingMode.LIVE.name,
+                realizedPnlJpy = "20.00000000",
+            )
+        }
+
+        assertTrue(result.isFailure)
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM positions WHERE mode='LIVE'", 0)
+            assertSqlCount("SELECT COUNT(*) FROM orders WHERE mode='LIVE'", 0)
+            assertSqlCount("SELECT COUNT(*) FROM executions WHERE mode='LIVE'", 0)
+        }
     }
 
     @Test
@@ -5091,6 +5118,11 @@ class PostgresPersistenceIntegrationTest {
                 executedAt = fixedInstant().plusSeconds(240),
             )
         }.isFailure
+        val newestPreCLivePositionId = insertPreCLiveLedgerRows(
+            database = database,
+            realizedPnlJpy = "99.00000000",
+            executedAt = fixedInstant().plusSeconds(240),
+        )
         val middlePaperPositionId = insertLedgerRows(
             database = database,
             mode = "PAPER",
@@ -5131,6 +5163,7 @@ class PostgresPersistenceIntegrationTest {
             executions.none { execution -> execution.positionId == oldestPaperPositionId.toString() },
         )
         assertTrue(liveFixtureRejected)
+        assertTrue(executions.none { execution -> execution.positionId == newestPreCLivePositionId.toString() })
     }
 
     @Test
@@ -8692,6 +8725,62 @@ private fun insertLedgerRows(
             realizedPnlJpy = realizedPnlJpy,
             executedAt = executedAt,
         )
+    }
+
+    return positionId
+}
+
+/**
+ * C0 creation fence導入前に存在し得るLIVE ledger行を再現する。
+ *
+ * test DBの対象creation triggerだけをtransaction内で一時停止し、必ず復元する。
+ */
+private fun insertPreCLiveLedgerRows(
+    database: ExposedDatabase,
+    realizedPnlJpy: String,
+    executedAt: Instant = fixedInstant(),
+): UUID {
+    val positionId = UUID.randomUUID()
+    val tradeGroupId = UUID.randomUUID()
+
+    exposedTransaction(database) {
+        try {
+            executeUpdate("ALTER TABLE positions DISABLE TRIGGER positions_gap_population_create")
+            executeUpdate("ALTER TABLE orders DISABLE TRIGGER orders_gap_population_create")
+
+            jdbcConnection().prepareStatement(INSERT_TEST_POSITION_SQL).use { statement ->
+                statement.setObject(1, positionId)
+                statement.setNull(2, Types.OTHER)
+                statement.setObject(3, tradeGroupId)
+                statement.setString(4, TradingMode.LIVE.name)
+                statement.setLong(5, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+            jdbcConnection().prepareStatement(INSERT_TEST_ORDER_SQL).use { statement ->
+                statement.setObject(1, UUID.randomUUID())
+                statement.setNull(2, Types.OTHER)
+                statement.setNull(3, Types.VARCHAR)
+                statement.setObject(4, positionId)
+                statement.setObject(5, tradeGroupId)
+                statement.setString(6, TradingMode.LIVE.name)
+                statement.setLong(7, fixedInstant().toEpochMilli())
+                statement.setLong(8, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+            jdbcConnection().prepareStatement(INSERT_TEST_EXECUTION_SQL).use { statement ->
+                statement.setObject(1, UUID.randomUUID())
+                statement.setNull(2, Types.OTHER)
+                statement.setNull(3, Types.VARCHAR)
+                statement.setObject(4, positionId)
+                statement.setString(5, TradingMode.LIVE.name)
+                statement.setBigDecimal(6, realizedPnlJpy.toBigDecimal())
+                statement.setLong(7, executedAt.toEpochMilli())
+                statement.executeUpdate()
+            }
+        } finally {
+            executeUpdate("ALTER TABLE orders ENABLE TRIGGER orders_gap_population_create")
+            executeUpdate("ALTER TABLE positions ENABLE TRIGGER positions_gap_population_create")
+        }
     }
 
     return positionId
