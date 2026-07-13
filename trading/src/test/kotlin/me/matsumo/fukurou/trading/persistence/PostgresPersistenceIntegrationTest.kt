@@ -5086,13 +5086,13 @@ class PostgresPersistenceIntegrationTest {
     @Test
     fun economicEventMigrationLockTimeoutRollsBackWithoutAcceptingPartialSchema() = runPostgresTest {
         createEconomicEventMigrationFixture(database, invocationId = "lock-timeout-event")
+        exposedTransaction(database) {
+            executeUpdate("ALTER TABLE llm_launch_reservations DROP COLUMN single_attempt_key")
+        }
         val lockConnection = dataSource.connection
         lockConnection.autoCommit = false
-        lockConnection.prepareStatement(
-            "SELECT invocation_id FROM llm_launch_reservations WHERE invocation_id = ? FOR UPDATE",
-        ).use { statement ->
-            statement.setString(1, "lock-timeout-event")
-            statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+        lockConnection.createStatement().use { statement ->
+            statement.execute("LOCK TABLE llm_launch_reservations IN ACCESS SHARE MODE")
         }
         val audits = mutableListOf<EconomicEventAttemptMigrationAudit>()
         EconomicEventAttemptMigrationAuditSink.observer = audits::add
@@ -5107,7 +5107,7 @@ class PostgresPersistenceIntegrationTest {
 
         val audit = audits.single()
         assertTrue(result.isFailure)
-        assertEquals(1L, audit.candidateRowCount)
+        assertNull(audit.candidateRowCount)
         assertNull(audit.affectedCanonicalRowCount)
         assertEquals(EconomicEventAttemptMigrationIndexOutcome.NOT_ATTEMPTED, audit.indexOutcome)
         assertFalse(audit.transactionCommitted)
@@ -5119,8 +5119,61 @@ class PostgresPersistenceIntegrationTest {
             audit.elapsed < ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT.plusSeconds(3),
             "migration audit=$audit",
         )
-        assertEquals(0, selectNonNullSingleAttemptKeyCount(database))
+        assertFalse(singleAttemptColumnExists(database))
         assertFalse(singleAttemptIndexExists(database))
+        assertTrue(TradingPersistenceBootstrap(database, fixedClock()).verifySchema().isFailure)
+    }
+
+    @Test
+    fun invalidEconomicEventAttemptIndexFailsClosedWithoutAutomaticRepair() = runPostgresTest {
+        createEconomicEventMigrationFixture(database, invocationId = "invalid-index-event")
+        exposedTransaction(database) {
+            executeUpdate(
+                "UPDATE llm_launch_reservations " +
+                    "SET single_attempt_key = 'ECONOMIC_EVENT:economic-event:invalid-index' " +
+                    "WHERE invocation_id = 'invalid-index-event'",
+            )
+            executeUpdate("ALTER TABLE llm_launch_reservations DISABLE TRIGGER USER")
+            executeUpdate(
+                "INSERT INTO llm_launch_reservations (" +
+                    "id, invocation_id, trigger_kind, trigger_key, single_attempt_key, " +
+                    "status, reserved_at, finished_at, reason" +
+                    ") SELECT gen_random_uuid(), 'invalid-index-duplicate', trigger_kind, trigger_key, " +
+                    "single_attempt_key, status, reserved_at + 1, finished_at, reason " +
+                    "FROM llm_launch_reservations WHERE invocation_id = 'invalid-index-event'",
+            )
+            executeUpdate("ALTER TABLE llm_launch_reservations ENABLE TRIGGER USER")
+        }
+        val invalidIndexCreation = dataSource.connection.use { connection ->
+            runCatching {
+                connection.createStatement().use { statement ->
+                    statement.execute(
+                        "CREATE UNIQUE INDEX CONCURRENTLY " +
+                            "idx_llm_launch_reservations_single_attempt_key_unique " +
+                            "ON llm_launch_reservations (single_attempt_key) " +
+                            "WHERE single_attempt_key IS NOT NULL",
+                    )
+                }
+            }
+        }
+        assertTrue(invalidIndexCreation.isFailure)
+        val audits = mutableListOf<EconomicEventAttemptMigrationAudit>()
+        EconomicEventAttemptMigrationAuditSink.observer = audits::add
+
+        val result = try {
+            TradingPersistenceBootstrap(database, fixedClock()).ensureSchema()
+        } finally {
+            EconomicEventAttemptMigrationAuditSink.observer = null
+        }
+
+        val audit = audits.single()
+        assertTrue(result.isFailure)
+        assertEquals(2L, audit.candidateRowCount)
+        assertEquals(0, audit.affectedCanonicalRowCount)
+        assertEquals(EconomicEventAttemptMigrationIndexOutcome.FAILED, audit.indexOutcome)
+        assertFalse(audit.transactionCommitted)
+        assertEquals(2, selectNonNullSingleAttemptKeyCount(database))
+        assertFalse(singleAttemptIndexIsValid(database))
         assertTrue(TradingPersistenceBootstrap(database, fixedClock()).verifySchema().isFailure)
     }
 
@@ -9079,6 +9132,35 @@ private fun singleAttemptIndexExists(database: ExposedDatabase): Boolean {
                         AND indexname = 'idx_llm_launch_reservations_single_attempt_key_unique'
                 )
             """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next())
+                resultSet.getBoolean(1)
+            }
+        }
+    }
+}
+
+private fun singleAttemptColumnExists(database: ExposedDatabase): Boolean {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns " +
+                "WHERE table_schema = current_schema() AND table_name = 'llm_launch_reservations' " +
+                "AND column_name = 'single_attempt_key')",
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next())
+                resultSet.getBoolean(1)
+            }
+        }
+    }
+}
+
+private fun singleAttemptIndexIsValid(database: ExposedDatabase): Boolean {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = " +
+                "'idx_llm_launch_reservations_single_attempt_key_unique'::regclass",
         ).use { statement ->
             statement.executeQuery().use { resultSet ->
                 require(resultSet.next())

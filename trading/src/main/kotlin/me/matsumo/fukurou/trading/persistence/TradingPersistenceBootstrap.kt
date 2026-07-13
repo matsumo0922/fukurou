@@ -535,6 +535,12 @@ private const val COUNT_LLM_LAUNCH_ECONOMIC_EVENT_CANDIDATES_SQL = """
     WHERE trigger_kind = 'ECONOMIC_EVENT'
 """
 
+/** legacy table の single-attempt key column を bounded DDL で追加する SQL。 */
+private const val ENSURE_LLM_LAUNCH_SINGLE_ATTEMPT_KEY_COLUMN_SQL = """
+    ALTER TABLE IF EXISTS llm_launch_reservations
+    ADD COLUMN IF NOT EXISTS single_attempt_key TEXT NULL
+"""
+
 /** 既存 ECONOMIC_EVENT history の canonical 1 row だけへ single-attempt key を付与する SQL。 */
 private const val BACKFILL_LLM_LAUNCH_SINGLE_ATTEMPT_KEY_SQL = """
     WITH ranked AS (
@@ -753,15 +759,41 @@ private const val VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL = """
     HAVING COUNT(*) = 6
 """
 
-/** single-attempt unique index の column / predicate を確認する SQL。 */
+/** single-attempt unique index の state / table / column / predicate を確認する SQL。 */
 private const val VERIFY_LLM_LAUNCH_SINGLE_ATTEMPT_UNIQUE_INDEX_SQL = """
     SELECT 1
-    FROM pg_indexes
-    WHERE schemaname = current_schema()
-        AND tablename = 'llm_launch_reservations'
-        AND indexname = 'idx_llm_launch_reservations_single_attempt_key_unique'
-        AND indexdef ILIKE 'CREATE UNIQUE INDEX%USING btree (single_attempt_key)%'
-        AND indexdef ILIKE '%WHERE (single_attempt_key IS NOT NULL)'
+    FROM pg_index index_state
+    JOIN pg_class index_relation ON index_relation.oid = index_state.indexrelid
+    JOIN pg_namespace index_namespace ON index_namespace.oid = index_relation.relnamespace
+    JOIN pg_class table_relation ON table_relation.oid = index_state.indrelid
+    JOIN pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace
+    JOIN pg_am access_method ON access_method.oid = index_relation.relam
+    WHERE index_namespace.nspname = current_schema()
+        AND table_namespace.nspname = current_schema()
+        AND table_relation.relname = 'llm_launch_reservations'
+        AND index_relation.relname = 'idx_llm_launch_reservations_single_attempt_key_unique'
+        AND access_method.amname = 'btree'
+        AND index_state.indisunique
+        AND index_state.indisvalid
+        AND index_state.indisready
+        AND index_state.indislive
+        AND index_state.indimmediate
+        AND index_state.indnatts = 1
+        AND index_state.indnkeyatts = 1
+        AND index_state.indexprs IS NULL
+        AND index_state.indkey[0] = (
+            SELECT attribute.attnum
+            FROM pg_attribute attribute
+            WHERE attribute.attrelid = table_relation.oid
+                AND attribute.attname = 'single_attempt_key'
+                AND NOT attribute.attisdropped
+        )
+        AND REGEXP_REPLACE(
+            PG_GET_EXPR(index_state.indpred, index_state.indrelid, TRUE),
+            '[() ]',
+            '',
+            'g'
+        ) = 'single_attempt_keyISNOTNULL'
 """
 
 /**
@@ -1156,6 +1188,18 @@ class TradingPersistenceBootstrap(
         val schemaResult = runCatching {
             exposedTransaction(database) {
                 maxAttempts = 1
+                migrationObservation.start()
+                val previousLockTimeout = currentPostgresSetting("lock_timeout")
+                val previousStatementTimeout = currentPostgresSetting("statement_timeout")
+                setLocalPostgresSetting(
+                    name = "lock_timeout",
+                    value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT.toPostgresTimeout(),
+                )
+                setLocalPostgresSetting(
+                    name = "statement_timeout",
+                    value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT.toPostgresTimeout(),
+                )
+                executeUpdate(ENSURE_LLM_LAUNCH_SINGLE_ATTEMPT_KEY_COLUMN_SQL)
                 @Suppress("DEPRECATION")
                 SchemaUtils.createMissingTablesAndColumns(
                     RuntimeConfigVersionsTable,
@@ -1187,7 +1231,17 @@ class TradingPersistenceBootstrap(
                     TradeIntentConsumptionsTable,
                     withLogs = false,
                 )
+                setLocalPostgresSetting(
+                    name = "lock_timeout",
+                    value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT.toPostgresTimeout(),
+                )
+                setLocalPostgresSetting(
+                    name = "statement_timeout",
+                    value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT.toPostgresTimeout(),
+                )
                 ensureRuntimeSchemaObjects(migrationObservation)
+                setLocalPostgresSetting("lock_timeout", previousLockTimeout)
+                setLocalPostgresSetting("statement_timeout", previousStatementTimeout)
                 ensureGapPopulationLifecycleSchema()
                 val now = Instant.now(clock)
 
@@ -1433,20 +1487,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects(
 private fun JdbcTransaction.ensureEconomicEventAttemptMigration(
     observation: EconomicEventAttemptMigrationObservation,
 ) {
-    observation.start()
-    val previousLockTimeout = currentPostgresSetting("lock_timeout")
-    val previousStatementTimeout = currentPostgresSetting("statement_timeout")
-    var completed = false
-
     try {
-        setLocalPostgresSetting(
-            name = "lock_timeout",
-            value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT.toPostgresTimeout(),
-        )
-        setLocalPostgresSetting(
-            name = "statement_timeout",
-            value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT.toPostgresTimeout(),
-        )
         observation.candidateRowCount = selectLong(COUNT_LLM_LAUNCH_ECONOMIC_EVENT_CANDIDATES_SQL)
         observation.affectedCanonicalRowCount = executeUpdateReturningCount(
             BACKFILL_LLM_LAUNCH_SINGLE_ATTEMPT_KEY_SQL,
@@ -1464,12 +1505,7 @@ private fun JdbcTransaction.ensureEconomicEventAttemptMigration(
         } else {
             EconomicEventAttemptMigrationIndexOutcome.CREATED_AND_VERIFIED
         }
-        completed = true
     } finally {
-        if (completed) {
-            setLocalPostgresSetting("lock_timeout", previousLockTimeout)
-            setLocalPostgresSetting("statement_timeout", previousStatementTimeout)
-        }
         observation.finish()
     }
 }

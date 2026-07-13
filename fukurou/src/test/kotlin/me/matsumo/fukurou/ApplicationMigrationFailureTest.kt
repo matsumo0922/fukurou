@@ -38,10 +38,19 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 class ApplicationMigrationFailureTest {
 
     @Test
-    fun economicEventMigrationFailureKeepsReadinessFalseAndStartsNoWorkers() = testApplication {
+    fun missingSingleAttemptColumnLockTimesOutBeforeFirstDdlAndKeepsApplicationFailClosed() {
+        assertEconomicEventMigrationFailure(EconomicEventMigrationFailureFixture.MISSING_COLUMN_LOCK)
+    }
+
+    @Test
+    fun invalidSingleAttemptIndexKeepsApplicationFailClosedWithoutRepair() {
+        assertEconomicEventMigrationFailure(EconomicEventMigrationFailureFixture.INVALID_INDEX)
+    }
+
+    private fun assertEconomicEventMigrationFailure(fixture: EconomicEventMigrationFailureFixture) {
         if (!applicationMigrationDockerAvailable()) {
             println("Skipping migration failure application test because Docker is unavailable.")
-            return@testApplication
+            return
         }
 
         val container = ApplicationMigrationPostgresContainer()
@@ -93,55 +102,114 @@ class ApplicationMigrationFailureTest {
                 ).getOrThrow()
             }
             exposedTransaction(database) {
-                executeMigrationFixtureUpdate(
-                    "DROP INDEX idx_llm_launch_reservations_single_attempt_key_unique",
-                )
-                migrationTestConnection().prepareStatement(
-                    "UPDATE llm_launch_reservations SET single_attempt_key = NULL WHERE invocation_id = ?",
-                ).use { statement ->
-                    statement.setString(1, invocationId)
-                    assertEquals(1, statement.executeUpdate())
+                when (fixture) {
+                    EconomicEventMigrationFailureFixture.MISSING_COLUMN_LOCK -> {
+                        executeMigrationFixtureUpdate(
+                            "ALTER TABLE llm_launch_reservations DROP COLUMN single_attempt_key",
+                        )
+                    }
+
+                    EconomicEventMigrationFailureFixture.INVALID_INDEX -> {
+                        executeMigrationFixtureUpdate(
+                            "DROP INDEX idx_llm_launch_reservations_single_attempt_key_unique",
+                        )
+                        executeMigrationFixtureUpdate(
+                            "ALTER TABLE llm_launch_reservations DISABLE TRIGGER USER",
+                        )
+                        executeMigrationFixtureUpdate(
+                            "INSERT INTO llm_launch_reservations (" +
+                                "id, invocation_id, trigger_kind, trigger_key, single_attempt_key, " +
+                                "status, reserved_at, finished_at, reason" +
+                                ") SELECT gen_random_uuid(), 'application-invalid-index-duplicate', " +
+                                "trigger_kind, trigger_key, single_attempt_key, status, " +
+                                "reserved_at + 1, finished_at, reason FROM llm_launch_reservations " +
+                                "WHERE invocation_id = 'application-migration-lock'",
+                        )
+                        executeMigrationFixtureUpdate(
+                            "ALTER TABLE llm_launch_reservations ENABLE TRIGGER USER",
+                        )
+                    }
                 }
             }
 
-            lockConnection = java.sql.DriverManager.getConnection(
-                container.jdbcUrl,
-                container.username,
-                container.password,
-            ).apply { autoCommit = false }
-            lockConnection.prepareStatement(
-                "SELECT invocation_id FROM llm_launch_reservations WHERE invocation_id = ? FOR UPDATE",
-            ).use { statement ->
-                statement.setString(1, invocationId)
-                statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+            if (fixture == EconomicEventMigrationFailureFixture.INVALID_INDEX) {
+                createInvalidSingleAttemptIndex(container)
+            }
+
+            if (fixture == EconomicEventMigrationFailureFixture.MISSING_COLUMN_LOCK) {
+                lockConnection = java.sql.DriverManager.getConnection(
+                    container.jdbcUrl,
+                    container.username,
+                    container.password,
+                ).apply { autoCommit = false }
+                lockConnection.createStatement().use { statement ->
+                    statement.execute("LOCK TABLE llm_launch_reservations IN ACCESS SHARE MODE")
+                }
             }
             val reconcilerStatus = MutableReconcilerStatus()
+            var requestElapsed = Duration.ZERO
 
-            application {
-                module(
-                    clock = clock,
-                    reconcilerStatus = reconcilerStatus,
-                    tradingConfig = TradingBotConfig(),
-                    databaseConfig = databaseConfig,
-                )
+            testApplication {
+                application {
+                    module(
+                        clock = clock,
+                        reconcilerStatus = reconcilerStatus,
+                        tradingConfig = TradingBotConfig(),
+                        databaseConfig = databaseConfig,
+                    )
+                }
+
+                val requestStartedAt = System.nanoTime()
+                val response = client.get("/health/ready")
+                assertEquals(HttpStatusCode.ServiceUnavailable, response.status)
+
+                requestElapsed = Duration.ofNanos(System.nanoTime() - requestStartedAt)
             }
 
-            val requestStartedAt = System.nanoTime()
-            val response = client.get("/health/ready")
-            val requestElapsed = Duration.ofNanos(System.nanoTime() - requestStartedAt)
-
-            assertEquals(HttpStatusCode.ServiceUnavailable, response.status)
             assertTrue(requestElapsed < Duration.ofSeconds(6), "request elapsed=$requestElapsed")
             assertFalse(reconcilerStatus.snapshot().startupFullReconcileCompleted)
             assertEquals(0, countWorkerStartedEvents(database))
-            assertFalse(singleAttemptMigrationIndexExists(database))
-            assertEquals(0, countBackfilledAttemptKeys(database))
+
+            when (fixture) {
+                EconomicEventMigrationFailureFixture.MISSING_COLUMN_LOCK -> {
+                    assertTrue(requestElapsed >= Duration.ofMillis(1_500), "request elapsed=$requestElapsed")
+                    assertFalse(singleAttemptMigrationColumnExists(database))
+                    assertFalse(singleAttemptMigrationIndexExists(database))
+                }
+
+                EconomicEventMigrationFailureFixture.INVALID_INDEX -> {
+                    assertFalse(singleAttemptMigrationIndexIsValid(database))
+                    assertEquals(2, countBackfilledAttemptKeys(database))
+                }
+            }
         } finally {
             lockConnection?.rollback()
             lockConnection?.close()
             container.stop()
         }
     }
+}
+
+private fun createInvalidSingleAttemptIndex(container: ApplicationMigrationPostgresContainer) {
+    java.sql.DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
+        val result = runCatching {
+            connection.createStatement().use { statement ->
+                statement.execute(
+                    "CREATE UNIQUE INDEX CONCURRENTLY " +
+                        "idx_llm_launch_reservations_single_attempt_key_unique " +
+                        "ON llm_launch_reservations (single_attempt_key) " +
+                        "WHERE single_attempt_key IS NOT NULL",
+                )
+            }
+        }
+        assertTrue(result.isFailure)
+    }
+}
+
+/** application migration failure test の破損 fixture。 */
+private enum class EconomicEventMigrationFailureFixture {
+    MISSING_COLUMN_LOCK,
+    INVALID_INDEX,
 }
 
 private fun JdbcTransaction.executeMigrationFixtureUpdate(sql: String) {
@@ -169,6 +237,35 @@ private fun singleAttemptMigrationIndexExists(database: ExposedDatabase): Boolea
     return exposedTransaction(database) {
         migrationTestConnection().prepareStatement(
             "SELECT to_regclass('idx_llm_launch_reservations_single_attempt_key_unique') IS NOT NULL",
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next())
+                resultSet.getBoolean(1)
+            }
+        }
+    }
+}
+
+private fun singleAttemptMigrationColumnExists(database: ExposedDatabase): Boolean {
+    return exposedTransaction(database) {
+        migrationTestConnection().prepareStatement(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns " +
+                "WHERE table_schema = current_schema() AND table_name = 'llm_launch_reservations' " +
+                "AND column_name = 'single_attempt_key')",
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next())
+                resultSet.getBoolean(1)
+            }
+        }
+    }
+}
+
+private fun singleAttemptMigrationIndexIsValid(database: ExposedDatabase): Boolean {
+    return exposedTransaction(database) {
+        migrationTestConnection().prepareStatement(
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = " +
+                "'idx_llm_launch_reservations_single_attempt_key_unique'::regclass",
         ).use { statement ->
             statement.executeQuery().use { resultSet ->
                 require(resultSet.next())
